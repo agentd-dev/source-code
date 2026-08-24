@@ -3,18 +3,19 @@
 //! command must not echo a credential.** Two properties of the A2A surface that
 //! only a real daemon can show, one of them across a restart.
 //!
-//! *Task ids* were `task-<seq>`, and `seq` is a process-local counter that
-//! starts at 0 — while the tasks of the previous life come back from the store.
-//! So the id the listener pre-mints for a new message ("task-1") already named a
-//! RESTORED task, and `SendMessage` read the message as a continuation of it:
-//! the caller was handed someone else's task and history, and that task's state
-//! was advanced by an unrelated message. The store here is therefore a mock MCP
-//! server that outlives both lives — with an in-memory store there is nothing to
-//! collide with and the test would pass against the bug it exists to catch.
+//! *Task ids* must not come from `task-<seq>` over a process-local counter that
+//! starts at 0 — the tasks of the previous life come back from the store, so the
+//! id the listener pre-mints for a new message ("task-1") can already name a
+//! RESTORED task, and `SendMessage` then reads the message as a continuation of
+//! it: the caller is handed someone else's task and history, and that task's
+//! state is advanced by an unrelated message. The store here is therefore a mock
+//! MCP server that outlives both lives — with an in-memory store there is
+//! nothing to collide with and the test would pass against the very failure it
+//! exists to catch.
 //!
-//! *The `config` command* answered with the raw merged settings document. A
-//! credential supplied by env or flag sits INLINE in that document (only a FILE
-//! is held to `{{secret:…}}` references, RFC 0030 §5), so the reply put live
+//! *The `config` command* must not answer with the raw merged settings document.
+//! A credential supplied by env or flag sits INLINE in that document (only a
+//! FILE is held to `{{secret:…}}` references), so such a reply would put live
 //! credentials on the wire — which the secret discipline forbids on every
 //! surface. The assertion is the blunt one: the token text appears NOWHERE in
 //! the response bytes.
@@ -287,9 +288,9 @@ fn a_new_message_after_a_restart_gets_its_own_task_not_a_restored_one() {
         "the task really was restored — without that this test proves nothing: {restored}"
     );
 
-    // The regression: the listener pre-mints the id for this message. A
-    // counter-minted one collides with the restored task above, and the message
-    // silently continues THAT task instead of starting its own.
+    // The failure this guards against: the listener pre-mints the id for this
+    // message, and a counter-minted one collides with the restored task above,
+    // so the message silently continues THAT task instead of starting its own.
     let params =
         json!({"message": {"messageId": "m2", "parts": [{"text": "second-life-question"}]}});
     let second = rpc(&addr, 3, "SendMessage", params)["task"].clone();
@@ -333,7 +334,7 @@ fn the_config_command_never_echoes_a_credential() {
         ),
     );
     // The token comes from the ENVIRONMENT, which is exactly the layer a file
-    // may not use (RFC 0030 §5) and the one that lands inline in the merged doc.
+    // may not use, and the one that lands inline in the merged doc.
     let daemon = spawn_daemon(&cfg, &[("AGENTD_INTELLIGENCE_TOKEN", ENV_TOKEN)]);
     wait_ready(&daemon, &addr);
 

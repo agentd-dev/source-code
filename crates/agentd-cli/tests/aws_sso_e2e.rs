@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! `agentd login` for **AWS IAM Identity Center (SSO)** (RFC 0031 §8) end to end:
+//! `agentd login` for **AWS IAM Identity Center (SSO)**, end to end:
 //! the binary runs the SSO-OIDC device flow against a mock (register → device →
 //! poll pending/authorized → exchange for temporary AWS credentials) and caches
 //! the temp keys the SigV4 signer will use. Proves the "enterprise login for

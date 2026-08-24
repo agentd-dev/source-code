@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! RFC 0031: the configured `intelligence.headers` (and a device-login bearer)
-//! reach the LLM wire. A real `IntelClient` with `with_headers(...)` dials a mock
+//! The configured `intelligence.headers` (and a device-login bearer) reach the
+//! LLM wire. A real `IntelClient` with `with_headers(...)` dials a mock
 //! OpenAI-compatible endpoint that captures the request headers; the configured
 //! headers and the bearer are all present on the model call.
 

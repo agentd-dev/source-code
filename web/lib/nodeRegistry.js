@@ -1,7 +1,8 @@
 // The workflow node registry that drives the editor palette and property forms.
 // The data (`workflow-nodes.json`) is generated from the agentd binary's
-// `--workflow-schema` output — the single source of truth for the node catalogue
-// (RFC 0027 dialect 3). Regenerate with:
+// `--workflow-schema` output — the single source of truth for the node
+// catalogue, so the editor can only offer kinds and fields the binary accepts.
+// Regenerate whenever the binary's registry changes:
 //   agentd --workflow-schema | jq … > web/lib/workflow-nodes.json   (see docs)
 import NODES from "./workflow-nodes.json";
 

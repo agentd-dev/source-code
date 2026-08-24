@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! agentd daemon lifecycle: a `run_until: drained` instance stays up,
-//! applies a SIGHUP reload of the reloadable partition (RFC 0030 §6), refuses a
-//! restart-only change, and drains cleanly on SIGTERM (exit 0).
+//! agentd daemon lifecycle: a `run_until: drained` instance stays up, applies
+//! a SIGHUP reload of the reloadable partition, refuses a restart-only change,
+//! and drains cleanly on SIGTERM (exit 0).
 #![cfg(all(feature = "hot-reload", unix))]
 
 mod common;

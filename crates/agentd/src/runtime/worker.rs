@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The **turn worker** (RFC 0026 §2, §3.2): a child process (`Role::Turn`) that
+//! The **turn worker**: a child process (`Role::Turn`) that
 //! runs ONE turn over the context slice the supervisor handed it — a root /
 //! conversation turn, a bounded `agent` step, or a structured `think` — and
 //! reports the transcript delta, the usage and the outcome (`TurnDone`).
@@ -10,12 +10,12 @@
 //! owner. Before each model call it may ask for budget admission
 //! (`BudgetRequest` → `BudgetGrant`).
 //!
-//! Compared with the 1.x ReAct loop this turn keeps **structured** tool
-//! results (`structuredContent` first, text-JSON second, text last),
-//! validates a schema'd final answer and re-asks on a miss, keeps a
-//! serializable transcript, estimates tokens for admission, and detects
-//! call loops. The loop body is [`run_turn`], generic over a [`Bridge`] so it
-//! is unit-testable in-process; [`run_turn_child`] is the process entry.
+//! The turn keeps tool results **structured** (`structuredContent` first,
+//! text-JSON second, text last), validates a schema'd final answer and
+//! re-asks on a miss, keeps a serializable transcript, estimates tokens for
+//! admission, and detects call loops. The loop body is [`run_turn`], generic
+//! over a [`Bridge`] so it is unit-testable in-process; [`run_turn_child`] is
+//! the process entry.
 
 use crate::context::{Msg, tokens};
 use crate::intel::client::IntelClient;
@@ -152,8 +152,9 @@ impl McpCaller for McpClients<'_> {
         meta: Value,
         timeout: Duration,
     ) -> Result<(Value, bool), String> {
-        // RFC 0037 §4: this worker paces its own in-loop calls — the registry
-        // was seeded when THIS process dialed its clients.
+        // Pace the call against the server's rate bucket before dialing out.
+        // The registry is per-process, seeded when THIS process connected its
+        // clients, so a worker only paces the calls it makes itself.
         crate::mcp::pace::take(server)?;
         let c = self
             .0
@@ -228,7 +229,7 @@ pub fn run_turn(
     let mut usage_total = Usage::default();
     let mut delta: Vec<Msg> = Vec::new();
     let mut last_text: Option<String> = None;
-    // The OTEL `invoke_agent` span for this turn (plan §3.11) — a no-op handle
+    // The OTEL `invoke_agent` span for this turn — a no-op handle
     // without the `otel` feature / an endpoint. `Option` so `finish` (which
     // consumes the span) can be `take`n from the return-macro without a move
     // across the loop.
@@ -266,7 +267,9 @@ pub fn run_turn(
         if limits.max_tokens > 0 && usage_total.total() >= limits.max_tokens {
             finish_with!("exhausted_tokens");
         }
-        // Budget admission (RFC 0026 §7).
+        // Budget admission: the supervisor owns the token budget, so estimate
+        // what this call will cost (prompt + tool schemas + the completion cap)
+        // and ask before spending it.
         if spec.budget_admission {
             let estimate: u64 = messages
                 .iter()
@@ -325,9 +328,9 @@ pub fn run_turn(
                 }
             }
         }
-        // The model call. Announce it first (RFC 0032 §17): the supervisor turns
-        // this into the display clients' live activity — `thinking` from here
-        // until the response lands.
+        // The model call. Announce it first: the supervisor turns this into the
+        // display clients' live activity — `thinking` from here until the
+        // response lands.
         bridge.progress(
             "turn.think",
             json!({"turn": spec.turn_id, "round": result.rounds + 1}),

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The whole agent from ONE markdown file (RFC 0034 + the config-defining
-//! directives): `agentd --instruction-file agent.md`, no `--config` at all.
+//! The whole agent from ONE markdown file, through the config-defining
+//! directives: `agentd --instruction-file agent.md`, no `--config` at all.
 //! The document declares its runtime (`:::config`), an event stream
 //! (`:::stream`), and two workflows (`:::workflow`) that talk to each other
 //! over that stream — and the process runs them and exits clean. Also: the

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! A compact, dependency-free SHA-256 (FIPS 180-4) — content identity: the
-//! workflow hash (RFC 0021 §8.2 / RFC 0027 §9), skill body hashes, artifact
-//! digests. A checkpoint envelope binds the graph it was taken from by
+//! A compact, dependency-free SHA-256 (FIPS 180-4) — content identity: workflow
+//! hashes, skill body hashes, artifact digests. A checkpoint envelope binds the
+//! graph it was taken from by
 //! `sha256(canonical graph JSON)`; resume refuses a mismatch. Hand-rolled like
 //! the cron parser and FNV-1a (the minimalism moat): ~60 lines, byte-oriented,
 //! verified against the FIPS/NIST test vectors below. Also backs
@@ -36,14 +36,9 @@ pub fn sha256(bytes: &[u8]) -> [u8; 32] {
 
     let mut w = [0u32; 64];
     // `as_chunks` rather than `chunks_exact`: the chunk size is a constant, so
-    // the compiler can hand back fixed-size ARRAYS and `from_be_bytes` takes one
-    // directly — no indexing, and no bounds checks to elide. (Rust 1.98's
-    // `clippy::chunks_exact_to_array` asks for this.)
-    // `as_chunks` rather than `chunks_exact`: the size is a constant, so the
-    // compiler hands back fixed-size ARRAYS and `from_be_bytes` takes one
-    // directly — no indexing and no bounds checks to elide. (Rust 1.98's
-    // `clippy::chunks_exact_to_array` asks for this.) The padding above makes
-    // the length an exact multiple of 64, so the remainder is empty by
+    // the compiler hands back fixed-size ARRAYS and `from_be_bytes` takes one
+    // directly — no indexing and no bounds checks to elide. The padding above
+    // makes the length an exact multiple of 64, so the remainder is empty by
     // construction; the compression still runs once PER block.
     let (blocks, _) = msg.as_chunks::<64>();
     for block in blocks {
@@ -154,10 +149,9 @@ pub fn to_hex(bytes: &[u8]) -> String {
 mod tests {
     /// A message spanning SEVERAL blocks.
     ///
-    /// The single-block vectors pass under a rewrite that flattens the word
-    /// loop across every block at once — it only goes wrong from block two,
-    /// where `w` is indexed past 64. That is exactly the mistake a
-    /// `chunks_exact` → `as_chunks` conversion invites, so it gets a test.
+    /// The single-block vectors cannot catch a compression loop that flattens
+    /// the word schedule across every block at once: that only goes wrong from
+    /// block two, where `w` is indexed past 64. This vector covers it.
     #[test]
     fn a_multi_block_message_digests_correctly() {
         // openssl: printf 'a%.0s' {1..200} | sha256sum

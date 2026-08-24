@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The MCP client against a real server.
 //!
-//! The point of adopting [`rmcp`] is inheriting spec-tracking from upstream, so
-//! these tests assert on the things that would silently regress if the facade
-//! were wired wrong: that the revision on the wire is the one the SDK declares
-//! (not one we picked), that declared capabilities reach the handshake, and that
+//! Building on [`rmcp`] means inheriting spec-tracking from upstream, so these
+//! tests assert on the things that would silently break if the facade were
+//! wired wrong: that the revision on the wire is the one the SDK declares (not
+//! one we picked), that declared capabilities reach the handshake, and that
 //! tools and resources come back in agentd's own wire types.
 
 use std::io::{BufRead, BufReader, Read, Write};

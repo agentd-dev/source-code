@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Spawning a subagent process. RFC 0009 §re-exec, RFC 0003 §process-group.
+//! Spawning a subagent process.
 //!
 //! A subagent is the **same binary re-exec'd** with `AGENT_SUBAGENT` set, so
 //! the one artifact is CLI, supervisor, and subagent. Each child is put in its
 //! own **process group** (`setpgid` in `pre_exec`) so the kill ladder can
-//! `killpg` a whole subtree (RFC 0003). The supervisor delivers the
-//! [`SpawnPayload`] as the first control frame; the child's upward
-//! [`AgentMsg`]s are read on a dedicated thread and forwarded — tagged with
-//! the child's [`NodeId`] — onto the reactor's single **merged channel**
-//! (RFC 0002 §reactor).
+//! `killpg` a whole subtree in one call, including grandchildren the subagent
+//! forked itself. The supervisor delivers the [`SpawnPayload`] as the first
+//! control frame; the child's upward [`AgentMsg`]s are read on a dedicated
+//! thread and forwarded — tagged with the child's [`NodeId`] — onto the
+//! reactor's single **merged channel**, which is what lets the reactor stay
+//! single-threaded no matter how many children are live.
 //!
 //! Teardown is **reap-safe**: once the reactor has reaped a child via
 //! `waitpid(-1)` it calls [`Subagent::mark_reaped`], so `Drop` will not signal
@@ -41,7 +42,7 @@ pub struct Subagent {
     reader: Option<JoinHandle<()>>,
     /// The child's own cgroup leaf (`security.cgroup`), held for its lifetime —
     /// its Drop writes `cgroup.kill` + removes the leaf (the atomic teardown
-    /// backstop). `None` when cgroups are not configured. RFC 0009 §cgroup.
+    /// backstop). `None` when cgroups are not configured.
     _cgroup: Option<crate::supervisor::cgroup::CgroupGuard>,
 }
 
@@ -117,7 +118,7 @@ pub fn spawn(
     // process/memory pressure (a wide fan-out starting many subagents at once, or
     // a CPU-starved host). Bounded (~1s total, short backoff); a genuine error
     // (ENOENT, EMFILE-persisted, …) still surfaces. Real robustness, not just a
-    // test artifact: a busy agent tree hits the same refusal. RFC 0003.
+    // test artifact: a busy agent tree hits the same refusal.
     let mut child = {
         let mut attempt = 0u32;
         loop {

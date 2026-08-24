@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The agent's Ed25519 identity key (RFC 0023 §keys) — generate, persist, load,
+//! The agent's Ed25519 identity key — generate, persist, load,
 //! sign, and export the public JWK. Backed by `ring` (the same crypto provider
 //! rustls already links; no new crate). The private key is a 32-byte seed,
 //! stored base64url in a 0600 file; the file is the agent's durable identity.
@@ -44,9 +44,10 @@ impl AgentKey {
         Ok(AgentKey { pair, seed })
     }
 
-    /// Load a key from `path`, or GENERATE + persist one if it does not exist —
-    /// the "durable key, kept safely" of RFC 0023 §Step 0. The file is the
-    /// base64url seed; created 0600.
+    /// Load a key from `path`, or GENERATE + persist one if it does not exist.
+    /// The file *is* the agent's identity: lose it and the agent enrolls as a
+    /// stranger, so it must outlive the process. The file is the base64url
+    /// seed; created 0600.
     pub fn load_or_create(path: &Path) -> Result<AgentKey, String> {
         if path.exists() {
             let text = std::fs::read_to_string(path)
@@ -82,8 +83,7 @@ impl AgentKey {
     }
 
     /// The public key as an Ed25519 JWK (`{kty:OKP, crv:Ed25519, x:…}`), the
-    /// form the Agent Provider enrolls (RFC 0023 §enroll) and the JWK thumbprint
-    /// is computed from.
+    /// form the Agent Provider enrolls and the JWK thumbprint is computed from.
     pub fn public_jwk(&self) -> serde_json::Value {
         serde_json::json!({
             "kty": "OKP",

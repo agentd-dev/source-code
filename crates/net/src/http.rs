@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! A minimal blocking HTTP/1.1 client over any `Read + Write`. RFC 0006.
+//! A minimal blocking HTTP/1.1 client over any `Read + Write`.
 //!
-//! This is the single highest-leverage minimalism decision (RFC 0002): one
+//! This is the single highest-leverage minimalism decision: one
 //! ~250-line module replaces the `ureq`/`url`→IDNA→ICU dependency tax. It
 //! carries the intelligence wire over TCP, TLS, unix sockets, and vsock
 //! alike — the transport is just the stream.
@@ -175,8 +175,8 @@ pub fn send<S: Read + Write + ?Sized>(
     // a peer-supplied A2A push-notification URL — and CR/LF there splits the
     // request line exactly as it splits a header, letting an injected
     // `Authorization:` shadow the operator's real one further down. Scanned
-    // before anything is written so the framing layer stays closed on both
-    // caller surfaces, not just headers (RFC 0012).
+    // before anything is written, so the framing layer stays closed on both
+    // caller surfaces — the target as well as the headers.
     let mut req: Vec<u8> = Vec::with_capacity(256 + body.len());
     if path.contains(['\r', '\n']) {
         return Err(io::Error::new(
@@ -188,7 +188,8 @@ pub fn send<S: Read + Write + ?Sized>(
     write!(req, "Host: {host_header}\r\n")?;
     req.extend_from_slice(b"Connection: close\r\n");
     for (k, v) in headers {
-        // Reject CR/LF injection in caller-supplied headers (RFC 0012).
+        // Reject CR/LF injection in caller-supplied headers: either would end
+        // the current header line and let the rest be read as new headers.
         if k.contains(['\r', '\n']) || v.contains(['\r', '\n']) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -458,8 +459,8 @@ pub fn send_streaming<S: Read + Write>(
     })
 }
 
-/// One parsed SSE event (RFC 6455-style `text/event-stream`). For MCP, `data` is
-/// a JSON-RPC message; `event`/`id` are the optional SSE field lines.
+/// One parsed `text/event-stream` event. For MCP, `data` is a JSON-RPC message;
+/// `event`/`id` are the optional SSE field lines.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SseEvent {
     pub event: Option<String>,

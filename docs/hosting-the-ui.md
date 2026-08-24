@@ -15,23 +15,24 @@ reach every user's daemon. The CI job asserts the bundle stays a thin client.
 
 ---
 
-## 1. What had to change in agentd
+## 1. What the daemon has to grant
 
 **Private Network Access.** A page on a public origin reaching a daemon on
-loopback or a LAN address is the exact shape browsers now gate. Chrome sends
+loopback or a LAN address is the exact shape browsers gate. Chrome sends
 `Access-Control-Request-Private-Network: true` on the CORS preflight and drops
 the real request unless the answer carries
-`Access-Control-Allow-Private-Network: true`. agentd did not send it, so a
-hosted client failed with a CORS error naming no cause.
+`Access-Control-Allow-Private-Network: true`. Without that answer a hosted
+client fails with a CORS error that names no cause.
 
-It does now (`crates/agentd/src/a2a/serve.rs`), and the grant is deliberately
-narrow: it rides the **existing** `interface.origins` allow-list, so it says
+agentd answers it (`crates/agentd/src/a2a/serve.rs`), and the grant is
+deliberately narrow: it rides the `interface.origins` allow-list, so it says
 "the origin you already configured may reach this daemon", never "any website
 may". An unconfigured origin is refused before the header is considered, and
 the header is not volunteered when the browser did not ask.
 
-This ships in the daemon, so a hosted UI only works against a daemon new enough
-to answer it. Below that, users get the local `agentd ui`.
+The grant lives in the daemon, not in the page, so a hosted UI works only
+against a daemon that answers the preflight. Where it does not, users get the
+local `agentd ui`.
 
 ## 2. What a user must configure
 

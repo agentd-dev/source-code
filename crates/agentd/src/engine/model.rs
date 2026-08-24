@@ -1,11 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The **dialect-3 workflow model** (RFC 0027 §2–§5, §8): a named DAG of steps
-//! beginning at start nodes, parsed from a JSON/YAML document with a strict
-//! per-kind field check (unknown fields are refused — the RFC 0021 §4.1 typo
-//! shield carried over), validated for acyclicity, reachability, `finish`
-//! reachability, dependency existence, schema well-formedness, CEL
-//! compilation and the caps. The node catalogue is one table ([`KINDS`]) —
-//! the validator, the executor and `--workflow-schema` all read it.
+//! The **workflow model**: a named DAG of steps beginning at start nodes,
+//! parsed from a JSON or YAML document and validated for acyclicity,
+//! reachability, `finish` reachability, dependency existence, schema
+//! well-formedness, CEL compilation and the caps.
+//!
+//! Field checking is strict per kind: a field the kind does not declare is a
+//! validation error, not something to ignore. A misspelled key is the failure
+//! mode that hurts most here — the workflow parses, runs, and quietly does not
+//! do the thing that key was meant to configure — so an unknown field must be
+//! refused where someone is still looking at it.
+//!
+//! The node catalogue is one table ([`KINDS`]); the validator, the executor
+//! and `--workflow-schema` all read it, so a kind cannot be documented without
+//! being validated or exposed without being described.
 
 use crate::jsonschema;
 use serde::{Deserialize, Serialize};
@@ -14,15 +21,17 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// The dialect this model speaks.
 pub const DIALECT: u32 = 3;
-/// Caps (RFC 0027 §8).
+/// Structural caps, enforced at validation so a pathological document is
+/// refused when it is submitted rather than after it has been scheduled.
 pub const MAX_STEPS: usize = 512;
 pub const MAX_NESTING: usize = 4;
 pub const MAX_BATCH_PARALLEL: u64 = 8;
 /// Lanes a `foreach`/`batch` uses when the definition does not say.
 ///
-/// Was 1 — a fan-out that ran one item at a time, which is a loop with extra
-/// syntax. Four is concurrent enough to be worth writing `foreach` for and low
-/// enough not to stampede an MCP server that never asked for the traffic.
+/// Four: concurrent enough to be worth writing `foreach` for rather than a
+/// loop, and low enough not to stampede an MCP server that never asked for the
+/// traffic. A definition that knows better sets its own, up to
+/// [`MAX_BATCH_PARALLEL`].
 pub const DEFAULT_FAN_OUT: u64 = 4;
 pub const MAX_ITERATIONS: u64 = 10_000;
 pub const MAX_ID_LEN: usize = 64;
@@ -37,8 +46,9 @@ pub struct KindInfo {
     pub fields: &'static [&'static str],
     /// Required kind-specific fields.
     pub required: &'static [&'static str],
-    /// Executable in this build (`false` = parses/validates but the run
-    /// engine refuses it: it lands in a later phase).
+    /// Executable in this build. A kind marked `false` still parses and
+    /// validates structurally, but validation then refuses the document, so a
+    /// definition can never reach the scheduler naming a kind nothing runs.
     pub implemented: bool,
     /// Has a nested body sub-DAG (`body: {steps: …}`) / branches.
     pub nested: bool,
@@ -62,8 +72,10 @@ const fn k(
     }
 }
 
-/// The node catalogue (RFC 0027 §4–§5). `implemented` marks the P3 executor
-/// subset; the rest arrives with the P4 engine.
+/// The node catalogue: every step kind, its start-node status, the fields it
+/// accepts, the fields it requires, whether this build executes it, and
+/// whether it carries a nested sub-DAG. This table is the single source the
+/// validator, the schema generator and the executor all consult.
 pub const KINDS: &[KindInfo] = &[
     // ---- start nodes ----
     k("once", true, &["policy", "inputs"], &[], true, false),
@@ -601,9 +613,10 @@ pub const KINDS: &[KindInfo] = &[
         true,
         false,
     ),
-    // RFC 0036: `template`/`params` instantiate a declared subagents.template;
-    // the vestigial `workflow` field (v1 in-child driver, silently ignored
-    // since its removal) is gone — Decision 11.
+    // `template`/`params` instantiate a declared `subagents.templates` entry:
+    // the step names a template and supplies its parameters rather than
+    // spelling out the whole child, so one reviewed definition backs every
+    // child that uses it.
     k(
         "subagent",
         false,
@@ -636,7 +649,9 @@ pub const KINDS: &[KindInfo] = &[
     ),
 ];
 
-/// Cross-cutting fields every step may carry (RFC 0027 §5).
+/// Cross-cutting fields every step may carry, whatever its kind. Field
+/// checking is the union of these and the kind's own list, so a name that
+/// appears in neither is refused.
 pub const COMMON_FIELDS: &[&str] = &[
     "kind",
     "depends_on",
@@ -655,11 +670,13 @@ pub const COMMON_FIELDS: &[&str] = &[
 ];
 
 /// Step kinds that are PURE data transforms: no external effect, no durable
-/// write of their own, fully deterministic over the run's data. The scheduler
-/// may skip the checkpoint-before-effect for these (RFC 0025 §7 guards
-/// effects; a crash simply replays a pure step from the last checkpoint), so
-/// an inline chain batches into its tick's one checkpoint instead of paying a
-/// serialize+write per step — measured at ~40% of a chain's cycles.
+/// write of their own, fully deterministic over the run's data. The
+/// checkpoint-before-effect rule exists to stop a crash from losing or
+/// repeating an effect, and these steps have none — a crash simply replays
+/// them from the last checkpoint and reaches the same values. So the scheduler
+/// skips the checkpoint for them, and an inline chain batches into its tick's
+/// single checkpoint instead of paying a serialize-and-write per step, which
+/// measures at roughly 40% of such a chain's cycles.
 pub fn pure_data_kind(kind: &str) -> bool {
     matches!(
         kind,
@@ -888,8 +905,8 @@ pub struct StateDecl {
 pub struct Workflow {
     pub name: String,
     pub version: u32,
-    /// Scheduling weight under contention (RFC: pressure §priority). `low`
-    /// admissions shed one pressure level EARLIER (at `warn`, not just `shed`),
+    /// Scheduling weight under contention. `low` admissions shed one pressure
+    /// level EARLIER (at `warn`, not just `shed`),
     /// and ready steps of higher-priority runs are scheduled first each tick.
     /// It is a tiebreak under scarcity, not a reservation.
     #[serde(default)]
@@ -926,7 +943,9 @@ pub struct Workflow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outputs_schema: Option<Value>,
     pub steps: BTreeMap<String, Step>,
-    /// SHA-256 of the canonical definition (RFC 0027 §9).
+    /// SHA-256 of the canonical definition. A run pins the hash it started
+    /// against, so a redefinition never changes the shape of work already in
+    /// flight, and `workflow.list` can show whether two instances agree.
     pub hash: String,
     /// The definition as given (canonical JSON), for `workflow.list`/hash.
     pub definition: Value,
@@ -936,11 +955,12 @@ fn default_true() -> bool {
     true
 }
 
-/// What happens to a workflow's LIVE runs when its definition is retired —
-/// removed from the config, replaced by a new version, or `workflow.delete`d.
-/// Whatever the policy, retirement always disarms starts, unsubscribes the
-/// definition's MCP resources, stops admitting new runs, and pins the old
-/// definition for whatever keeps running.
+/// What happens to a workflow's LIVE runs when its definition goes away —
+/// removed from the config, replaced by another version, or `workflow.delete`d.
+/// Whatever the policy, withdrawing a definition always disarms its starts,
+/// unsubscribes its MCP resources, stops admitting new runs, and pins the
+/// definition each surviving run started against, so a run's shape never
+/// changes underneath it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum UnloadPolicy {
@@ -1034,7 +1054,13 @@ impl Workflow {
             .filter(|s| s.depends_on.iter().any(|d| d == id))
             .collect()
     }
-    /// The start nodes considered long-lived (RFC 0030 §5 durability rule).
+    /// Whether any start node makes this workflow long-lived: one that keeps
+    /// firing — a timer, a schedule, a subscription, an inbound signal, event,
+    /// A2A message or stream — rather than running once and finishing.
+    ///
+    /// This decides daemon shape. An instance holding a long-lived workflow
+    /// must not idle-exit, because the workflow's whole purpose is to still be
+    /// there when its trigger arrives.
     pub fn is_long_lived(&self) -> bool {
         self.start_steps().iter().any(|s| {
             matches!(
@@ -1366,7 +1392,7 @@ fn parse_step(
     };
     let Some(info) = kind_info(&kind) else {
         errs.push(format!(
-            "{at}: unknown kind {kind:?} (see the RFC 0027 §5 catalogue)"
+            "{at}: unknown kind {kind:?} (run `agentd --workflow-schema` for the kind catalogue)"
         ));
         return None;
     };
@@ -1374,14 +1400,14 @@ fn parse_step(
     let mut spec = Map::new();
     for (key, v) in o {
         // A field the KIND declares wins over the cross-cutting list, and the
-        // order matters: `output_schema` is both. `extract` declares it and
-        // *requires* it, but the required check below looks in `spec`, so
-        // skipping it as a common field made `extract` impossible to satisfy —
-        // and the presets that merely accept it (`think`, `classify`, `judge`,
-        // `route`, `summarize`) read it from `spec` at dispatch, so they were
-        // silently never given a schema to shape the model's answer. The
-        // cross-cutting copy that validates a step's OUTPUT is taken from `o`
-        // directly, so both readings still work.
+        // order matters, because `output_schema` is both. The required check
+        // below looks only in `spec`, so treating it as a common field would
+        // make `extract` — which declares and requires it — impossible to
+        // satisfy; and the presets that merely accept it (`think`, `classify`,
+        // `judge`, `route`, `summarize`) read it from `spec` at dispatch, so
+        // they would silently get no schema to shape the model's answer. The
+        // cross-cutting reading, which validates a step's OUTPUT, takes its
+        // copy from `o` directly, so both readings still see the field.
         if info.fields.contains(&key.as_str()) {
             spec.insert(key.clone(), v.clone());
         } else if COMMON_FIELDS.contains(&key.as_str()) {
@@ -1399,7 +1425,10 @@ fn parse_step(
         }
     }
     if !info.implemented {
-        errs.push(format!("{at}: kind {kind:?} is not available in this build yet (it lands with the P4 engine); implemented kinds: {}", implemented_kinds().join(", ")));
+        errs.push(format!(
+            "{at}: kind {kind:?} is not available in this build; implemented kinds: {}",
+            implemented_kinds().join(", ")
+        ));
     }
     // Nested bodies / branches: parsed into typed sub-DAGs and validated.
     let mut body: Option<Body> = None;
@@ -1624,8 +1653,9 @@ fn parse_step(
                 errs.push(format!("{at}: `args` needs `command`"));
             }
         }
-        // RFC 0036: a subagent step needs a definition — freeform prose or a
-        // declared template, never both, never neither.
+        // A subagent step needs exactly one definition — freeform prose or a
+        // declared template, never both, never neither. Both would leave the
+        // child's grant ambiguous; neither leaves nothing to run.
         "subagent" => {
             match (spec.get("instruction").is_some(), spec.get("template").is_some()) {
                 (false, false) => errs.push(format!(
@@ -1647,8 +1677,10 @@ fn parse_step(
                 }
             }
         }
-        // `emit` publishes to a stream when `stream:` is present (RFC 0035);
-        // the two addressing fields travel together or not at all.
+        // `emit` publishes to a stream when `stream:` is present. The two
+        // addressing fields travel together or not at all: a stream without a
+        // subject has nowhere to land, and a subject without a stream names a
+        // destination that does not exist.
         "emit" => {
             if spec.get("stream").is_some() != spec.get("subject").is_some() {
                 errs.push(format!(
@@ -1889,7 +1921,9 @@ fn parse_body(at: &str, bv: &Value, depth: usize, errs: &mut Vec<String>) -> Opt
     Some(body)
 }
 
-/// Graph-level validation (RFC 0027 §8).
+/// Graph-level validation of declared state: a check that needs the whole DAG,
+/// because it is about steps that can run *concurrently*.
+///
 /// Two steps that can run in the same wave, both writing one var with modes
 /// that disagree, is a silent last-write-wins race: which value survives
 /// depends on completion order, which is not a thing the author controls.
@@ -2236,13 +2270,15 @@ pub fn canonical(v: &Value) -> String {
     v.to_string()
 }
 
-/// The dialect-3 JSON Schema (`--workflow-schema`).
+/// The workflow JSON Schema, as `--workflow-schema` prints it. Generated from
+/// [`KINDS`] rather than written by hand, so the schema and the validator can
+/// never disagree about which fields a kind accepts.
 pub fn workflow_schema() -> Value {
     let kinds: Vec<&str> = KINDS.iter().map(|k| k.name).collect();
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "$id": "https://agentd.dev/schemas/workflow-3.json",
-        "title": "agentd workflow (dialect 3)",
+        "title": "agentd workflow",
         "type": "object",
         "required": ["name", "steps"],
         "properties": {
@@ -2293,12 +2329,12 @@ pub fn workflow_schema() -> Value {
 #[cfg(test)]
 mod tests {
     /// `output_schema` is both a cross-cutting step field and a field several
-    /// kinds declare for themselves. The kind's reading must win: `extract`
-    /// REQUIRES it, and the required-field check reads `spec`, so while the
-    /// common-field skip came first `extract` could never validate — a
-    /// documented, "implemented" node that was impossible to use. The presets
-    /// that merely accept it were quietly affected too: they read it from
-    /// `spec` at dispatch, so they were never handed a schema at all.
+    /// kinds declare for themselves. The kind's reading must win. `extract`
+    /// REQUIRES it and the required-field check reads `spec`, so if the
+    /// common-field skip took precedence `extract` could never validate — a
+    /// documented, "implemented" node impossible to use. The presets that
+    /// merely accept it read it from `spec` at dispatch, so they would be
+    /// handed no schema at all and would fail silently rather than loudly.
     #[test]
     fn a_kind_that_declares_output_schema_receives_it() {
         let doc = serde_json::json!({
@@ -2458,7 +2494,7 @@ mod tests {
     // Asserts a `when: CEL parse` diagnostic, so it needs the `cel` feature.
     #[cfg(feature = "cel")]
     #[test]
-    fn validation_catches_the_rfc_0027_section_8_failures() {
+    fn validation_catches_the_parse_and_graph_level_failures() {
         // Parse-level failures (reported together, before graph checks).
         let e = wf(json!({"name": "bad name", "start": "x", "steps": {
             "a": {"kind": "agent", "instruction": "x"},

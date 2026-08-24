@@ -1,21 +1,26 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! **Subagent templates** (RFC 0036): compile the `subagents.templates`
-//! section at boot — RFC 0034 extraction runs ONCE here, on operator-authored
-//! text — resolving each template to its tier (flat worker vs instance-tier
-//! child) and validating everything that can be judged before params exist.
-//! Params fold in at spawn as *data* ([`fold_params`]) and are never re-parsed
-//! for directives; [`params_introduced_machinery`] is the spawn-time guard
-//! that makes the ordering enforceable (§8.2).
+//! **Subagent templates**: compile the `subagents.templates` section at boot,
+//! resolving each template to its tier (flat worker vs instance-tier child) and
+//! validating everything that can be judged before params exist.
+//!
+//! Directive extraction runs exactly ONCE, here, on operator-authored text.
+//! Params fold in later at spawn as *data* ([`fold_params`]) and are never
+//! re-parsed for directives, so a caller-supplied param value can never turn
+//! into machinery (an `:::mcp` block smuggled through a param stays inert
+//! prose). [`params_introduced_machinery`] is the spawn-time guard that makes
+//! that ordering enforceable rather than merely intended.
 
 use super::directives::{self, InlineSkill};
 use super::v2::{self, ParamSpec, Settings, SubagentTemplate};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
-/// The two tiers one resolution rule yields (RFC 0036 §3 Decision 3).
+/// The two tiers a template can resolve to. The tier is not declared: it
+/// follows from whether the instruction carries machinery, so one rule decides
+/// it and an operator cannot ask for a tier the text does not justify.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
-    /// The existing RFC 0009 worker: one loop, one result, no machinery.
+    /// A plain worker: one loop, one result, no machinery.
     Flat,
     /// A full reactor child: workflows, signals, streams, schedules, store.
     Instance,
@@ -46,10 +51,10 @@ pub struct CompiledTemplate {
     pub spec: SubagentTemplate,
 }
 
-/// Config sections a template's machinery may NOT define (RFC 0036 §7):
-/// listeners and the store belong to the parent's composition; `security`
-/// would let a template relax its own gate; nested `subagents` means
-/// recursive fleets (Phase C at the earliest).
+/// Config sections a template's machinery may NOT define: listeners and the
+/// store belong to the parent's composition, `security` would let a template
+/// relax the gate it is being judged by, and nested `subagents` would make a
+/// child able to spawn its own fleet.
 const REFUSED_FRAGMENT_KEYS: &[&str] = &[
     "webhooks",
     "interface",
@@ -86,7 +91,7 @@ fn compile_one(
     if t.instruction.trim().is_empty() {
         return Err(vec![at("instruction must be non-empty".into())]);
     }
-    // RFC 0034 extraction — once, at boot, on the operator surface.
+    // Directive extraction: once, at boot, on the operator-authored surface.
     let ex = match directives::extract(&t.instruction) {
         Ok(ex) => ex,
         Err(es) => return Err(es.into_iter().map(at).collect()),
@@ -173,8 +178,9 @@ fn compile_one(
                     "instance-tier children support mode `detached` or `sync` (got '{m}')"
                 )));
             }
-            // Phase B: `mode: sync` needs a `result: {workflow}` naming a
-            // machinery workflow — the composed reporter watches it complete.
+            // `mode: sync` needs a `result: {workflow}` naming a machinery
+            // workflow: the composed reporter watches that workflow complete,
+            // so a name that is not in this template resolves nothing.
             let machinery_workflows: Vec<&str> = ex
                 .workflows
                 .iter()
@@ -198,8 +204,9 @@ fn compile_one(
             } else if t.result.is_some() {
                 errs.push(at("`result` needs `mode: sync`".into()));
             }
-            // Phase B: mirrored streams must exist on BOTH sides — the child
-            // declares them in machinery, the parent under its own `streams:`.
+            // A mirrored stream must exist on BOTH sides — the child declares
+            // it in machinery, the parent under its own `streams:` — or the
+            // mirror has nowhere to land.
             if let Some(mirrors) = &t.mirror_streams {
                 let machinery_streams: Vec<&str> = ex
                     .config
@@ -234,9 +241,10 @@ fn compile_one(
                 && t.until.as_deref().is_some_and(|u| !u.contains("{{params."))
                 && t.until.is_some()
             {
-                // A fixed `until` on a reusable room is almost certainly a bug
-                // — but singleton means ONE live child, so a fixed signal is
-                // coherent there. The §7 rule targets the opposite case:
+                // A fixed `until` is coherent here and deliberately allowed:
+                // `singleton` means at most ONE live child, so a constant
+                // retirement signal names exactly that child. The refusal
+                // below targets the opposite case.
             }
             if !t.singleton
                 && let Some(u) = &t.until
@@ -297,13 +305,14 @@ fn validate_instance_machinery(
         for k in REFUSED_FRAGMENT_KEYS {
             if o.contains_key(*k) {
                 errs.push(at(format!(
-                    "machinery may not define `{k}:` — the parent composes listeners, store, lifecycle and security (RFC 0036 §7)"
+                    "machinery may not define `{k}:` — the parent composes listeners, store, lifecycle and security"
                 )));
             }
         }
     }
-    // No webhook starts / webhook waits: external events enter through the
-    // parent's static HMAC routes (Decision 7).
+    // No webhook starts and no webhook waits: an instance child has no
+    // listener of its own, so external events must enter through the parent's
+    // static HMAC-verified routes and reach the child as commands or signals.
     for wf in &ex.workflows {
         let wname = wf.get("name").and_then(Value::as_str).unwrap_or("?");
         if let Some(steps) = wf.get("steps").and_then(Value::as_object) {
@@ -351,7 +360,7 @@ fn validate_instance_machinery(
                     == crate::sec::scope::TrifectaVerdict::RefusedTrifecta
                 {
                     errs.push(at(
-                        "machinery composes the lethal trifecta (untrusted_input + sensitive + egress) — split the role (RFC 0012)".into(),
+                        "machinery composes the lethal trifecta (untrusted_input + sensitive + egress) — split the role".into(),
                     ));
                 }
             }
@@ -366,9 +375,9 @@ fn validate_instance_machinery(
     errs
 }
 
-/// Validate spawn-time params against the declared schema (RFC 0036 §5):
-/// unknown keys, missing required keys and type/enum mismatches are refused
-/// naming the field; declared defaults fill in. Returns the effective map.
+/// Validate spawn-time params against the declared schema: unknown keys,
+/// missing required keys and type/enum mismatches are refused naming the
+/// field; declared defaults fill in. Returns the effective map.
 pub fn validate_params(
     declared: &BTreeMap<String, ParamSpec>,
     given: &Value,
@@ -465,9 +474,10 @@ pub fn fold_params_value(v: &mut Value, params: &Map<String, Value>) {
     }
 }
 
-/// The §8.2 spawn guard: after folding, the prose must still contain no
-/// directives — the template's own were already replaced by one-line notes at
-/// boot, so any fence found now came from a param value. Refuse the spawn.
+/// The spawn guard that keeps params data: after folding, the prose must still
+/// contain no directives — the template's own were replaced by one-line notes
+/// at boot, so any fence found now can only have come from a param value.
+/// Returns `true` when the spawn must be refused.
 pub fn params_introduced_machinery(folded_prose: &str) -> bool {
     match directives::extract(folded_prose) {
         Ok(ex) => {

@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The inotify file-watch reload trigger (RFC 0017 §5.2).
+//! The inotify file-watch reload trigger.
 //!
 //! A `--watch-config`-armed, dependency-free (raw `libc` inotify) watch that sets
 //! the SAME `RELOAD` latch SIGHUP does — so a Kubernetes ConfigMap volume update
 //! reloads with no signal plumbing. Both triggers funnel into the one reload
-//! routine (RFC 0017 §5.2: "there is one code path"); this module only *sets the
-//! latch* (attributed `trigger:"watch"`), never re-implements the reload.
+//! routine — there is exactly one reload code path, and this module only *sets
+//! the latch* (attributed `trigger:"watch"`), never re-implements the reload.
 //!
 //! ## Why we watch the DIRECTORY, not the file
 //!
@@ -92,7 +92,7 @@ pub fn parse_events(buf: &[u8]) -> Vec<Event> {
     out
 }
 
-/// Spawn the dedicated inotify watcher thread (RFC 0017 §5.2). Returns
+/// Spawn the dedicated inotify watcher thread. Returns
 /// immediately; the thread lives for the process. A blocking `read` loop on its
 /// own thread is the simplest correct shape — the supervisor reactor is never
 /// blocked by it, and on a config change the thread sets the `RELOAD` latch +
@@ -204,7 +204,8 @@ fn watch_loop(dir: &Path, basename: &str, log: &Logger) {
         for (mask, name) in parse_events(&buf[..n as usize]) {
             // The watch was dropped (the projected dir was swapped out from under
             // us, or removed) — re-arm on the stable parent path so a SECOND
-            // ConfigMap update still fires (RFC 0017 §5.2 symlink-swap bit).
+            // ConfigMap update still fires — the projected volume is swapped by
+            // symlink, so the inode we armed on disappears rather than changing.
             if mask & libc::IN_IGNORED != 0 {
                 rearm = true;
             }
@@ -456,8 +457,8 @@ mod tests {
             fired,
             "the file-watch trigger should set the RELOAD latch within 5s of a rename"
         );
-        // The trigger is attributed to the watch (RFC 0017 §5.6): the apply step
-        // would read this as `trigger:"watch"`.
+        // The trigger is attributed to the watch: the apply step reads this as
+        // `trigger:"watch"` rather than as a signal.
         assert!(
             crate::signals::take_reload_was_watch(),
             "the reload should be attributed to the watch trigger"

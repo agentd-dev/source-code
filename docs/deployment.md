@@ -1,19 +1,20 @@
 # Deploying agentd
 
 `agentd` is one binary that runs **one durable agent**. An external scheduler
-starts, stops, replicates, and watches it; the binary owns no control plane
-(RFC 0011 §1). This page is a set of deployment recipes:
+starts, stops, replicates, and watches it; the binary owns no control plane of
+its own. This page is a set of deployment recipes:
 
 1. [Standalone CLI — one-shot job](#1-standalone-cli--one-shot)
 2. [Long-lived A2A daemon](#2-long-lived-daemon-a2a--reactive-triggers)
 3. [Container — minimal scratch/distroless image](#3-container--minimal-scratchdistroless-image)
 4. [Scheduled by an external orchestrator (Kubernetes)](#4-scheduled-by-an-external-orchestrator-kubernetes)
 
-The **same durable runtime** backs every shape (RFC 0026); they differ only in the
+The **same durable runtime** backs every shape; they differ only in the
 lifecycle shape (`lifecycle.run_until`) and what triggers runs. A one-shot **job**
-goes empty-and-final and exits, mapping its outcome to the exit-code table
-(RFC 0011 §7); a **daemon** idles on its triggers (an A2A listener, a `subscribe` /
-`schedule` / `loop` start node) and exits only on a SIGTERM drain.
+goes empty-and-final and exits, mapping its outcome to the
+[exit-code table](#the-exit-code-contract); a **daemon** idles on its triggers
+(an A2A listener, a `subscribe` / `schedule` / `loop` start node) and exits only
+on a SIGTERM drain.
 
 ---
 
@@ -31,7 +32,7 @@ resolved from env / mounted files — never inline values.
 |---|---|---|
 | Instruction | `agent.instruction` (text or a resource URI) | `--instruction` / `--instruction-file` |
 | Intelligence | `intelligence.endpoints` (ordered failover), `.model`, `.token` | `--intelligence` / `--model` / `--intelligence-token` |
-| Token budget | `intelligence.budget.windows` (rate-limit the burn, RFC 0025) | — |
+| Token budget | `intelligence.budget.windows` (rate-limit the burn) | — |
 | MCP servers | `mcp.servers: [{name, endpoint}]` | `--mcp name=<endpoint>` |
 | Durable store | `store.kind: file\|mcp\|http\|memory\|none` (defaults: `file` for a long-lived instance, `none` for a one-shot), `store.file.path`, `store.mcp.server` | — |
 | **A2A listener** | `a2a.listen`, `a2a.tls`, `a2a.principals`, `a2a.bearer` | — |
@@ -52,9 +53,10 @@ side effect**:
 `agentd --validate-config` (exit 2 on error), `agentd --config-schema` (the
 machine-readable schema), `agentd --capabilities` (the effective surface).
 
-> **Scope.** The external channel is **A2A** (`a2a.listen`, RFC 0029): one HTTPS
-> listener carries conversations, operator commands, and durable tasks. MCP
-> tasks/sampling/roots are deferred (RFC 0013).
+> **Scope.** The external channel is **A2A** (`a2a.listen`): one HTTPS listener
+> carries conversations, operator commands, and durable tasks. On its MCP side
+> agentd is a client only — it declares no client capabilities, so it services
+> no `roots`, `sampling`, `elicitation` or `tasks` requests from a server.
 
 ---
 
@@ -78,10 +80,10 @@ agentd \
 
 stdout carries the agent's final result; stderr carries one NDJSON event per
 line. The canonical fields are
-`ts level event run_id agent_id agent_path comp pid …` (RFC 0010):
+`ts level event run_id agent_id agent_path comp pid …`:
 
 ```json
-{"ts":"2026-06-25T18:30:01.412Z","level":"info","event":"proc.start","run_id":"01M06TKN6W88955NQDJNKCS0SC","agent_id":"sup","agent_path":"0","comp":"supervisor","pid":4711,"version":"2.0.0","runtime":"2.0","instance":"agentd","config_files":["/etc/agentd/task.yaml"]}
+{"ts":"2026-06-25T18:30:01.412Z","level":"info","event":"proc.start","run_id":"01M06TKN6W88955NQDJNKCS0SC","agent_id":"sup","agent_path":"0","comp":"supervisor","pid":4711,"version":"1.1.0","runtime":"1","instance":"agentd","config_files":["/etc/agentd/task.yaml"]}
 ```
 
 Because stdout is the result and stderr is telemetry, you compose with ordinary
@@ -100,7 +102,7 @@ token is **never** logged — pass it via `AGENT_INTELLIGENCE_TOKEN` or
 
 **Idempotent retries.** A bare run mints a random `run_id` per process. For a
 unit of work that a scheduler may retry, pin a **stable** key so backing MCP
-services can dedupe the side effect (RFC 0011 §6):
+services can dedupe the side effect:
 
 ```bash
 agentd --run-id "nightly-digest-2026-06-25" \
@@ -122,7 +124,7 @@ otherwise — §2, §3.)
 A **daemon** (`lifecycle.run_until: drained`) idles cheaply and wakes on its
 triggers — an A2A message/command, or a `subscribe` / `schedule` / `loop` start
 node. It exits only on a SIGTERM drain, never on an individual run failing. A
-daemon is **durable** (RFC 0025) so state survives a restart: name no `store`
+daemon is **durable** so state survives a restart: name no `store`
 and it gets `kind: file` under the state-directory chain
 ([`configuration.md`](configuration.md) §12.3), which is the right answer on a
 laptop or a VM with a real disk. The config below names `kind: mcp` instead
@@ -167,7 +169,7 @@ agentd reads on the notification, not the notification alone.
 ### Graceful shutdown
 
 On `SIGTERM`/`SIGINT` the daemon flips a one-way `DRAINING` latch and runs a
-**bounded drain** (RFC 0011 §4, ladder in RFC 0003 §3.5):
+**bounded drain**:
 
 1. Disarm triggers — stop routing new resource updates; reject new
    `subagent.spawn`; flip readiness to not-ready.
@@ -217,7 +219,7 @@ filesystem tools** — every external effect leaves through MCP or A2A — so th
 image stays small (an 8.5 MiB binary on `scratch`). The recommended entrypoint is
 `agentd` itself: it sets
 `PR_SET_CHILD_SUBREAPER` and reaps orphans, acting as a tini-class init for its
-own process tree (RFC 0003 §3.1). You do **not** need an external `tini`.
+own process tree. You do **not** need an external `tini`.
 
 The published image (`Dockerfile` at the repo root) ships the **cloud-native
 feature set** by default —
@@ -230,13 +232,13 @@ each adds:
 | Feature | Adds |
 |---|---|
 | `metrics` | The `/metrics` + `/healthz` + `/readyz` HTTP probe surface (`observability.metrics_addr`) — so k8s liveness/readiness probes work against a shell-less scratch image. |
-| `a2a` | The A2A v2 HTTPS listener (`a2a.listen`, RFC 0029) — the external channel + outbound delegation peers. Pulls the TLS stack. |
+| `a2a` | The A2A HTTPS listener (`a2a.listen`) — the external channel + outbound delegation peers. Pulls the TLS stack. |
 | `cron` | UTC 5-field cron scheduling for the `schedule` start node's `cron` field. |
 | `otel` | OTLP-over-HTTP/JSON trace + log export + GenAI semconv (hand-rolled, no protobuf/opentelemetry deps). |
 | `hot-reload` | SIGHUP-triggered, validate-first reload of the reloadable config subset at a quiesce boundary. |
 | `config-watch` | The `inotify` file-watch reload trigger (`lifecycle.watch_config`) — a ConfigMap volume swap reloads in place. Implies `hot-reload`. |
 | `oauth` | OAuth 2.1 endpoint credentials (device, authorization-code + PKCE, client-credentials, refresh, OIDC discovery) for intelligence / MCP / A2A endpoints — see [`authentication.md`](authentication.md). |
-| `aauth` | AAuth agent identity: an Ed25519 keypair, agent-token enrolment, and RFC 9421 signatures on outbound MCP requests (RFC 0023). |
+| `aauth` | AAuth agent identity: an Ed25519 keypair, agent-token enrolment, and RFC 9421 HTTP message signatures on outbound MCP requests. |
 
 Build a narrower (or wider) surface with `--build-arg FEATURES=…`. Other features
 `exec` (the guarded local-command tool, off at runtime too), `cel` (CEL
@@ -310,7 +312,7 @@ Two ways to mean it:
 # Deployment/StatefulSet pod spec — a file store that survives a reschedule.
 containers:
   - name: agent
-    image: ghcr.io/agentd-dev/agentd:2.1.0
+    image: ghcr.io/agentd-dev/agentd:1.1.0
     args: [--config=/etc/agentd/triage.yaml]     # store: { kind: file, file: { path: /var/lib/agentd } }
     volumeMounts:
       - { name: state, mountPath: /var/lib/agentd }
@@ -369,7 +371,7 @@ stale; `/readyz` flips to not-ready on drain so the pod leaves rotation. An idle
 daemon is healthy — liveness tracks the runtime, not whether work is flowing.
 
 > **External channel.** The way other agents (and operators) reach this one is
-> **A2A** (`a2a.listen`, `--features a2a`, RFC 0029) — an HTTPS listener with
+> **A2A** (`a2a.listen`, `--features a2a`) — an HTTPS listener with
 > trust minted per request by mTLS or a bearer token, resolved to a **principal**
 > and authorized against a role matrix. A non-loopback bind must authenticate
 > (`a2a.tls.client_ca`, `a2a.bearer`, and/or `interface.pairing`) and must be
@@ -380,7 +382,7 @@ daemon is healthy — liveness tracks the runtime, not whether work is flowing.
 ## 4. Scheduled by an external orchestrator (Kubernetes)
 
 The orchestrator (a K8s operator, Knative, Nomad, a bare-metal supervisor) is
-**not part of this project** (RFC 0011 §1). agentd just honours a contract:
+**not part of this project**. agentd just honours a contract:
 config from env/flags, signal-driven drain, and a public exit-code table a
 `podFailurePolicy` can branch on. Below are the deploy shapes; runnable manifests
 live in [`examples/`](../examples/).
@@ -388,7 +390,7 @@ live in [`examples/`](../examples/).
 ### The exit-code contract
 
 This table is a **stable, machine-actionable API** — author `podFailurePolicy`
-against it (RFC 0011 §5; constants in
+against it (the constants live in
 [`crates/agentd/src/exit.rs`](../crates/agentd/src/exit.rs)):
 
 | Code | Meaning | Scheduler hint |
@@ -475,9 +477,10 @@ Job name — so retries dedupe through your MCP backing services.
 ### 4b. CronJob — on a schedule
 
 Prefer an **external** `CronJob` firing a `once` job per tick over an in-agent
-`schedule` start node — it is more robust, observable, and 12-factor (RFC 0011
-§9). agentd's internal `schedule` node is a standalone convenience, not a
-calendar (no DST/missed-tick catch-up; UTC).
+`schedule` start node — it is more robust, more observable, and keeps the
+schedule in the system that already owns schedules. agentd's internal
+`schedule` node is a standalone convenience, not a calendar (no DST/missed-tick
+catch-up; UTC).
 
 ```yaml
 apiVersion: batch/v1
@@ -507,7 +510,8 @@ spec:
 
 A long-lived Pod (`lifecycle.run_until: drained`) that idles on its triggers (an
 A2A listener, a `subscribe` start node) and survives rolls cleanly because a
-clean drain exits `0`. It mounts a v2 config (see §2, incl. a durable `store`).
+clean drain exits `0`. It mounts a config file (see §2, incl. a durable
+`store`).
 
 ```yaml
 apiVersion: apps/v1
@@ -535,7 +539,7 @@ spec:
             # The reactor heartbeats the health file; a wedged reactor goes stale.
             exec: { command: ["/bin/sh", "-c", "test $(( $(date +%s) - $(stat -c %Y /run/agent/health) )) -lt 30"] }
             periodSeconds: 10
-          # If built/served with the HTTP health surface (RFC 0010), use instead:
+          # If built/served with the HTTP health surface, use instead:
           #   httpGet: { path: /healthz, port: 8080 }
           resources:
             limits: { memory: "512Mi" }   # 137 on OOM → raise this
@@ -554,23 +558,21 @@ overlap surfaces as the `seq`-CAS `Conflict` described in §4d.
 
 Note the liveness probe targets the **supervisor reactor**, not the agentic
 work — a subagent legitimately busy on a long tool call must not flip pod
-liveness (RFC 0003 §3.4, RFC 0010). Set `resources.limits.memory` deliberately:
-aggregate subtree memory is a cgroup/pod concern, not enforced in-binary, so an
-OOM surfaces as `137` and means "raise the limit" (RFC 0003 §3.10).
+liveness. Set `resources.limits.memory` deliberately: aggregate subtree memory
+is a cgroup/pod concern, not enforced in-binary, so an OOM surfaces as `137`
+and means "raise the limit".
 
 ### 4d. StatefulSet — a fleet
 
 One `agentd` process is one durable agent **instance**, and its identity is
-baked into every durable key it writes: `<store.prefix>/<instance>/<kind>/<id>`
-(RFC 0025 §3.1). `instance` comes from `agent.name`, falling back to the
-downward-API pod name (`AGENT_POD_NAME`), then `HOSTNAME`. Two consequences
-shape a fleet:
+baked into every durable key it writes: `<store.prefix>/<instance>/<kind>/<id>`.
+`instance` comes from `agent.name`, falling back to the downward-API pod name
+(`AGENT_POD_NAME`), then `HOSTNAME`. Two consequences shape a fleet:
 
 - **Identity must be unique per replica.** If two processes claim the same
   `store.prefix` + instance name, the store's `seq`-CAS fences them: the loser
   gets a `Conflict`, logs `store.conflict`, and stops accepting work rather than
-  double-writing (RFC 0025 §2). The store is a correctness **fence**, not a work
-  distributor.
+  double-writing. The store is a correctness **fence**, not a work distributor.
 - **Restart is restore, in place.** A replica that comes back under the same
   identity re-adopts its own runs, timers, artifacts and pending inbox, so a
   rescheduled pod resumes rather than restarts.
@@ -598,7 +600,7 @@ spec:
       terminationGracePeriodSeconds: 30
       containers:
         - name: agent
-          image: ghcr.io/agentd-dev/agentd:2.0.0
+          image: ghcr.io/agentd-dev/agentd:1.1.0
           args:
             - --config=/etc/agentd/worker.yaml   # includes a durable `store`
           env:
@@ -634,7 +636,7 @@ three shapes above, all of which put it in a system that can arbitrate it. See
 ### 4e. Hot reload via a ConfigMap (`hot-reload` / `config-watch` features)
 
 A daemon can apply a new **reloadable** config subset without a restart
-(RFC 0017 §5; [`configuration.md`](configuration.md) carries the full
+([`configuration.md`](configuration.md) carries the full
 reloadable-vs-restart-only partition). Mount the config file from a ConfigMap and
 either send `SIGHUP` or run `--watch-config`:
 
@@ -661,7 +663,7 @@ spec:
     spec:
       containers:
         - name: agent
-          image: ghcr.io/agentd-dev/agentd:2.0.0   # built with config-watch
+          image: ghcr.io/agentd-dev/agentd:1.1.0   # built with config-watch
           args:
             - --config=/etc/agentd/config.json      # mounted from the ConfigMap
             - --watch-config                        # reload on a ConfigMap update
@@ -724,17 +726,9 @@ files:
   every start node — which trigger fires runs, and when the process exits.
 - [`docs/operations.md`](operations.md): the A2A control commands, hot reload,
   and the capabilities manifest from the operator's side.
-- [RFC 0011 — cloud-native contract](../rfcs/0011-cloud-native-contract.md):
-  config precedence, signals, the exit-code table, idempotency.
-- [RFC 0003 — process supervision & recovery](../rfcs/0003-process-supervision-and-recovery.md):
-  the kill ladder, reaping, restart governor, rebuild + reconcile.
-- [RFC 0025 — durable state & store adapters](../rfcs/0025-durable-state-and-store-adapters.md):
-  the store contract, key namespacing, the `seq`-CAS fence, the restore protocol.
-- [RFC 0026 — agent loop & lifecycle](../rfcs/0026-agent-loop-and-lifecycle.md):
-  the single durable runtime, `lifecycle.run_until`, drain.
-- [RFC 0017 — declarative config & hot reload](../rfcs/0017-declarative-config-and-hot-reload.md):
-  the config file, `--validate-config`/`--config-schema`, SIGHUP/`--watch-config`.
-- [RFC 0018 — intelligence transport resilience](../rfcs/0018-intelligence-transport-resilience.md):
-  the endpoint list, per-endpoint creds, `--model-swap`.
-- [RFC 0029 — A2A conversations, principals, commands](../rfcs/0029-a2a-conversations-principals-commands.md):
-  the external channel, principals and roles, the command surface.
+- [`docs/scaling.md`](scaling.md): partitioning work across replicas, durable
+  identity per replica, and the metrics an autoscaler reads.
+- [`docs/observability.md`](observability.md): the event schema behind the
+  NDJSON lines above, the metrics surface, and the health endpoints.
+- [`docs/intelligence.md`](intelligence.md): the endpoint list, per-endpoint
+  credentials, failover, and `--model-swap`.

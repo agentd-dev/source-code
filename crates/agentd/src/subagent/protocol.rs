@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The supervisor↔subagent control protocol. RFC 0005 §control-protocol,
-//! RFC 0009 §spawn-payload.
+//! The supervisor↔subagent control protocol.
 //!
 //! A minimal JSON-RPC *sibling* — not literal MCP (no `initialize`
 //! handshake) — carried length-framed (4-byte prefix, [`crate::json::frame`])
@@ -9,9 +8,11 @@
 //! [`ControlMsg`] flows down (supervisor→child), [`AgentMsg`] flows up.
 //!
 //! The control reader inside the child runs on a thread **separate from the
-//! agentic loop** (RFC 0003), so `Ping`/`Pong` liveness survives a long
-//! in-flight tool/model call. This module is just the wire types; the spawn
-//! mechanics are `supervisor/spawn.rs`, the child side `subagent/control.rs`.
+//! agentic loop**, so `Ping`/`Pong` liveness survives a long in-flight tool or
+//! model call: if the reader shared the loop's thread, a slow model call would
+//! read as a hung child and the supervisor would reap a healthy process. This
+//! module is just the wire types; the spawn mechanics are `supervisor/spawn.rs`,
+//! the child side `subagent/control.rs`.
 
 use crate::agentloop::stop::Outcome;
 use crate::config::{A2aPeerSpec, McpServerSpec, SwapPolicy};
@@ -32,11 +33,13 @@ pub enum ControlMsg {
     Spawn(Box<SpawnPayload>),
     /// Liveness probe; the child's control thread answers [`AgentMsg::Pong`].
     Ping { seq: u64 },
-    /// Suspend the agentic loop at its next turn boundary (RFC 0005 §4.3,
-    /// RFC 0015 §4.3). The child's control thread sets a `paused` flag; the loop
-    /// waits between turns until [`ControlMsg::Resume`] clears it. The control
-    /// thread keeps running while the loop is suspended, so `Resume`/`Ping`/
-    /// `Cancel` still arrive — `Cancel` always wins over a pause.
+    /// Suspend the agentic loop at its next turn boundary. The child's control
+    /// thread sets a `paused` flag; the loop waits between turns until
+    /// [`ControlMsg::Resume`] clears it. Pausing at a boundary and never
+    /// mid-turn keeps the transcript coherent — a half-finished model call is
+    /// never abandoned. The control thread keeps running while the loop is
+    /// suspended, so `Resume`/`Ping`/`Cancel` still arrive, and `Cancel` always
+    /// wins over a pause so a paused child can still be drained.
     Pause,
     /// Clear a prior [`ControlMsg::Pause`]: the loop resumes at the next turn.
     Resume,
@@ -45,31 +48,33 @@ pub enum ControlMsg {
     /// Inject a message into the child's running warm session (parent `send` /
     /// reactive continue); forwarded to the loop by the control reader thread.
     Inject { message: String },
-    /// Hot-swap the child's intelligence config at its next turn boundary (RFC
-    /// 0018 §5.2). Sent by the supervisor's reload fan-out to every in-flight
-    /// child when a reload's diff touches `intelligence`/`model`/`model_swap` —
-    /// the same fan-out shape as [`ControlMsg::Pause`], with a payload. The
-    /// child's control thread stores it into a child-local LIVE handle; the
-    /// agentic loop reads it ONCE at the next turn boundary (where `pause_wait`
-    /// sits), rebuilds its [`crate::intel::client::IntelClient`] from the new
-    /// endpoint list (fresh health/breaker — a repointed endpoint starts CLOSED,
-    /// §5.2 step 2), and adopts the new model. An in-flight `complete_once` is
-    /// NEVER torn; the transcript is CONTINUOUS (§5.3, no context reset). The
-    /// `token` is a credential carried on the wire like [`SpawnPayload`]'s — it
-    /// is NEVER logged (the swap event/logs carry transport+index only).
+    /// Hot-swap the child's intelligence config at its next turn boundary. Sent
+    /// by the supervisor's reload fan-out to every in-flight child when a
+    /// reload's diff touches `intelligence`/`model`/`model_swap` — the same
+    /// fan-out shape as [`ControlMsg::Pause`], with a payload. The child's
+    /// control thread stores it into a child-local LIVE handle; the agentic loop
+    /// reads it ONCE at the next turn boundary (where `pause_wait` sits),
+    /// rebuilds its [`crate::intel::client::IntelClient`] from the new endpoint
+    /// list, and adopts the new model. The rebuilt client starts with fresh
+    /// health and a CLOSED breaker, because breaker state describes the endpoint
+    /// that was just replaced and must not condemn the new one. An in-flight
+    /// `complete_once` is NEVER torn and the transcript stays CONTINUOUS, so a
+    /// swap costs no context. The `token` is a credential carried on the wire
+    /// like [`SpawnPayload`]'s and is NEVER logged — the swap event and logs
+    /// carry transport and endpoint index only.
     SwapIntel(Box<SwapIntel>),
-    /// agentd (RFC 0026 §2): the answer to an [`AgentMsg::ToolRequest`] —
-    /// the supervisor executed the internal tool; `result` is the tool's
-    /// output (or an error message when `is_error`).
+    /// The answer to an [`AgentMsg::ToolRequest`] — the supervisor executed the
+    /// internal tool; `result` is the tool's output (or an error message when
+    /// `is_error`).
     ToolResult {
         id: u64,
         result: Value,
         #[serde(default)]
         is_error: bool,
     },
-    /// agentd (RFC 0026 §7): the answer to an [`AgentMsg::BudgetRequest`].
-    /// `ok` = proceed now; else wait `wait_ms` and ask again (`wait`/`slow`),
-    /// or the request is refused (`reason`); `model` = a degrade swap.
+    /// The answer to an [`AgentMsg::BudgetRequest`]. `ok` means proceed now;
+    /// otherwise wait `wait_ms` and ask again, or the request is refused with a
+    /// `reason`. A `model` names a cheaper model to degrade to.
     BudgetGrant {
         id: u64,
         ok: bool,
@@ -82,13 +87,14 @@ pub enum ControlMsg {
     },
 }
 
-/// The intelligence config the child rebuilds its client from on a hot-swap (RFC
-/// 0018 §5.2). The endpoint-list URI + the default endpoint-1 credential + the
-/// model + the swap policy — exactly the parts [`IntelConfig`] carries plus the
-/// policy. Boxed in [`ControlMsg`] to keep the enum small (like [`SpawnPayload`]).
+/// The intelligence config the child rebuilds its client from on a hot-swap:
+/// the endpoint-list URI, the default endpoint-1 credential, the model, and the
+/// swap policy — exactly the parts [`IntelConfig`] carries plus the policy.
+/// Boxed in [`ControlMsg`] to keep the enum small, as [`SpawnPayload`] is.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SwapIntel {
-    /// The new endpoint *list* URI (RFC 0018 §3.1) — a single element is RFC 0006.
+    /// The new endpoint *list* URI. A list of one is the ordinary single-endpoint
+    /// case; more elements are failover candidates tried in order.
     pub uri: String,
     /// Endpoint 1's resolved default credential when its env override is unset
     /// (the same role as [`IntelConfig::token`]); NEVER logged.
@@ -97,8 +103,9 @@ pub struct SwapIntel {
     /// The new model (`None` ⇒ unchanged from the spawn payload's resolved model).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// The model-swap policy (RFC 0018 §5.3): `finish-on-old` (default) |
-    /// `restart-turn`. Only matters when `model` actually changed.
+    /// The model-swap policy: `finish-on-old` (default) or `restart-turn`. Only
+    /// matters when `model` actually changed — an endpoint repoint alone never
+    /// restarts a turn.
     #[serde(default)]
     pub policy: SwapPolicy,
 }
@@ -109,28 +116,32 @@ pub struct SwapIntel {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentMsg {
     /// Setup done (intel + scoped MCP connected); the child is about to loop.
-    /// The supervisor's crash-on-spawn fast-fail waits for this (RFC 0003).
+    /// The supervisor's crash-on-spawn fast-fail waits for this frame, so a
+    /// child that dies during setup is detected without waiting for a deadline.
     Ready,
     /// Answer to a [`ControlMsg::Ping`].
     Pong { seq: u64 },
-    /// A progress event (loop.step, tool.call, …) — also resets the
-    /// no-progress watchdog (Detector B, RFC 0003). `fields` is opaque to the
-    /// supervisor except for correlation.
+    /// A progress event (loop.step, tool.call, …). Arrival also resets the
+    /// supervisor's no-progress watchdog, so a child doing visible work is never
+    /// reaped for silence. `fields` is opaque to the supervisor except for
+    /// correlation.
     Event { event: String, fields: Value },
-    /// Incremental token/step usage for hierarchical accounting (RFC 0003).
+    /// Incremental token/step usage, which the supervisor folds into the tree's
+    /// hierarchical accounting so a subtree cannot outspend the tree ceiling.
     Usage(Usage),
     /// A **warm session** finished one turn (its reaction to one delivered
     /// event) and stays alive for the next. Carries that turn's distilled
-    /// outcome; unlike [`AgentMsg::Result`] it is **not** terminal (RFC 0008
-    /// §spawn-vs-continue). The supervisor applies the turn's self-schedule /
-    /// self-subscribe effects and may then `Inject` the next event.
+    /// outcome; unlike [`AgentMsg::Result`] it is **not** terminal, so the
+    /// supervisor must not reap the child on seeing it. The supervisor applies
+    /// the turn's self-schedule / self-subscribe effects and may then `Inject`
+    /// the next event.
     Turn { outcome: Outcome },
     /// Terminal: the distilled result + final status. Sent exactly once.
     Result { outcome: Outcome },
     /// Terminal: a fatal infrastructure failure (intel/mcp unreachable).
     Failed { error: String },
-    /// A HUMAN GATE opened (RFC 0021 §7): a workflow `human` node suspended
-    /// awaiting input. `node` is the workflow node id; `payload` is the resolved
+    /// A HUMAN GATE opened: a workflow `human` node suspended awaiting input.
+    /// `node` is the workflow node id; `payload` is the resolved
     /// gate payload (what the human is being asked to look at). The supervisor
     /// records it (the served A2A task projects `input-required`, the gate
     /// resource serves the payload) and later fans the human's reply DOWN as
@@ -140,39 +151,45 @@ pub enum AgentMsg {
     /// supervisor clears the recorded gate and the A2A task returns to
     /// `working`. Non-terminal.
     GateClosed { node: String, via: String },
-    /// The child's intelligence reachability, edge-triggered at the breaker/
-    /// failover seam (RFC 0018 §6). Emitted ONLY on a transition: on **entering**
-    /// all-endpoints-down (every configured endpoint's breaker open / the failover
-    /// sweep exhausted) and on **recovering** (any endpoint usable again). The
-    /// supervisor has no LLM of its own and no live view of a child's breaker
-    /// state, so the child reports it upward; the supervisor latches it into the
-    /// `intel_all_down` process-global the readiness probe + `agentd_intel_all_down`
-    /// gauge + `agentd://intelligence`/`capacity` bodies read (the one latched
-    /// truth, eventually-consistent — see [`crate::signals::set_intel_all_down`]).
-    /// `active` is best-effort transport+index ONLY — NEVER a URL or credential
-    /// (mirrors the `agentd://intelligence` redaction, RFC 0012 §3.7).
+    /// The child's intelligence reachability, edge-triggered at the breaker /
+    /// failover seam. Emitted ONLY on a transition: on **entering**
+    /// all-endpoints-down (every configured endpoint's breaker open, the
+    /// failover sweep exhausted) and on **recovering** (any endpoint usable
+    /// again). Edge-triggering keeps a wedged fleet from flooding the control
+    /// channel. The supervisor has no LLM of its own and no live view of a
+    /// child's breaker state, so the child is the only party that can report
+    /// this; the supervisor latches it into the `intel_all_down` process-global
+    /// that the readiness probe, the `agentd_intel_all_down` gauge, and the
+    /// `agentd://intelligence` / `capacity` bodies all read — one latched truth,
+    /// eventually consistent (see [`crate::signals::set_intel_all_down`]).
+    /// `active` is best-effort transport and index ONLY — never a URL or a
+    /// credential, matching what the `agentd://intelligence` resource redacts.
     IntelHealth {
         all_down: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         active: Option<IntelActive>,
     },
-    /// agentd (RFC 0026 §2): a turn worker / subagent asks the supervisor
-    /// to execute an **internal** tool (memory, plan, subagent.run, sleep…) —
-    /// state changes are made by the state owner. Answered by
-    /// [`ControlMsg::ToolResult`] with the same `id`.
+    /// A turn worker / subagent asks the supervisor to execute an **internal**
+    /// tool (memory, plan, subagent.run, sleep…). These round-trip rather than
+    /// run in the child because the supervisor owns that state; letting a child
+    /// mutate it directly would let concurrent children race each other.
+    /// Answered by [`ControlMsg::ToolResult`] with the same `id`.
     ToolRequest { id: u64, name: String, args: Value },
-    /// agentd (RFC 0026 §7): budget admission before a model call.
-    /// Answered by [`ControlMsg::BudgetGrant`].
+    /// Budget admission asked for before a model call, answered by
+    /// [`ControlMsg::BudgetGrant`]. Asking first is what lets the supervisor
+    /// shape spend across the whole tree instead of after the fact.
     BudgetRequest { id: u64, estimate: u64 },
-    /// agentd: a `Role::Turn` worker finished its turn (terminal for the
-    /// worker). Carries the transcript delta, the usage, and the outcome.
+    /// A `Role::Turn` worker finished its turn — terminal for that worker.
+    /// Carries the transcript delta, the usage, and the outcome.
     TurnDone { turn: Box<TurnResult> },
 }
 
-/// Which endpoint is serving the child's intelligence, for [`AgentMsg::IntelHealth`].
-/// The bounded structural identity ONLY — the list index + the transport scheme
-/// (`unix`/`vsock`/`https`) — never the URL/cid/host or any credential (RFC 0012
-/// §3.7, mirroring the `agentd://intelligence` resource redaction).
+/// Which endpoint is serving the child's intelligence, for
+/// [`AgentMsg::IntelHealth`]. The bounded structural identity ONLY — the list
+/// index and the transport scheme (`unix`/`vsock`/`https`) — never the URL, cid,
+/// host, or any credential, matching what the `agentd://intelligence` resource
+/// redacts. An index plus a scheme is enough to tell operators which configured
+/// endpoint is live without putting an address into logs or events.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IntelActive {
     pub index: usize,
@@ -182,44 +199,51 @@ pub struct IntelActive {
 // ---- spawn payload ----
 
 /// Everything a subagent needs to run, minted by the supervisor. The child
-/// trusts none of this from its own request — `depth` in particular is
-/// **minted by the supervisor** from the caller's handle (RFC 0009).
+/// takes none of these fields from its own request — `depth` in particular is
+/// derived by the supervisor from the caller's handle, so a child cannot claim a
+/// shallower depth to buy itself more levels of delegation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpawnPayload {
     /// The task. For a delegated child this is the parent's `instruction`
     /// argument; see also `output_contract`.
     pub instruction: String,
-    /// Objective + required output format + boundaries — a real delegation
-    /// contract, not a bare string (RFC 0009 §spawn-payload).
+    /// Objective, required output format, and boundaries — a real delegation
+    /// contract rather than a bare string, so the child's result can be checked
+    /// against something.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_contract: Option<String>,
-    /// The narrowed context the parent chose to share — never the full
-    /// transcript (context hygiene + injection firewall, RFC 0012).
+    /// The narrowed context the parent chose to share — never the parent's full
+    /// transcript. Passing only what the child needs keeps its context clean and
+    /// stops a prompt injection landed in the parent from riding down the tree.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub context_seed: Vec<SeedMessage>,
     /// How to reach the LLM (env/flag-sourced; never logged).
     pub intelligence: IntelConfig,
-    /// The child's **scoped** MCP server subset (⊆ parent's; RFC 0009).
+    /// The child's **scoped** MCP server subset. Always a subset of the parent's,
+    /// because scope narrows monotonically down the tree: no child may reach a
+    /// server its parent could not.
     #[serde(default)]
     pub mcp_servers: Vec<McpServerSpec>,
-    /// Declared remote-A2A delegation peers (RFC 0020 §3). Inherited by children
-    /// like `mcp_servers` so a subagent can also delegate over A2A; the
-    /// `a2a.delegate` self-tool dials these. `#[serde(default)]` keeps older
-    /// frames (and non-`a2a` peers, which simply send an empty vec) parseable.
+    /// Declared remote-A2A delegation peers. Inherited by children like
+    /// `mcp_servers` so a subagent can also delegate over A2A; the `a2a.delegate`
+    /// self-tool dials these. `#[serde(default)]` so a frame that omits the field
+    /// — the common case, with no peers configured — parses to an empty list.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub a2a_peers: Vec<A2aPeerSpec>,
     /// Extra PEM CA **file path** for outbound TLS trust (`--tls-ca`, the
     /// private/in-cluster PKI anchor). PUBLIC material — a path to a CA
-    /// certificate, never key bytes — so it may ride the payload; the child
-    /// installs it process-wide before its first dial and passes it on to its
-    /// own children. `#[serde(default)]` keeps older frames parseable.
+    /// certificate, never key bytes — so it may ride the payload. The child
+    /// installs it process-wide before its first dial, so no dial can escape the
+    /// anchor, and passes it on to its own children. `#[serde(default)]` so a
+    /// frame that omits it parses as "no extra anchor".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_ca: Option<String>,
-    /// AAuth [DRAFT] agent-identity settings (RFC 0023): inherited by every
-    /// subagent so the whole process tree signs MCP requests under ONE identity.
-    /// The key file is a shared-fs path (like `tls_ca`); no secret rides here
-    /// (the enrollment token is a `{{secret:…}}` template). `#[serde(default)]`
-    /// keeps older frames parseable.
+    /// AAuth agent-identity settings, inherited by every subagent so the whole
+    /// process tree signs MCP requests under ONE identity — a peer sees the tree
+    /// as a single agent rather than a crowd of anonymous processes. The key file
+    /// is a shared-fs path, like `tls_ca`, and no secret rides here: the
+    /// enrollment token stays a `{{secret:…}}` template resolved in the child.
+    /// `#[serde(default)]` so a frame that omits it parses as "no identity".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aauth: Option<crate::config::AAuthSettings>,
     pub limits: Limits,
@@ -228,15 +252,15 @@ pub struct SpawnPayload {
     pub depth: u32,
     /// Run as a **warm continue-session**: after each turn, stay alive and wait
     /// for the next injected event ([`ControlMsg::Inject`]) instead of exiting,
-    /// continuing the same transcript (RFC 0008 §spawn-vs-continue). Default
-    /// (false) = a one-shot per-event run. `#[serde(default)]` keeps older frames
-    /// parseable.
+    /// continuing the same transcript so the agent keeps its memory of earlier
+    /// events. Default (false) is a one-shot run per event, which starts each
+    /// event from a clean context. `#[serde(default)]` so a frame that omits it
+    /// parses as one-shot.
     #[serde(default)]
     pub warm: bool,
-    /// agentd (RFC 0026 §2): the child's role. `agent` (default) is the
-    /// RFC 0009 subagent (ReAct loop / workflow driver); `turn` is a **turn
-    /// worker** driven by `turn` below. `#[serde(default)]` keeps older frames
-    /// parseable.
+    /// The child's role. `agent` (default) runs the ReAct loop on `instruction`
+    /// or drives a workflow; `turn` is a **turn worker** driven by `turn` below.
+    /// `#[serde(default)]` so a frame that omits it parses as `agent`.
     #[serde(default)]
     pub role: Role,
     /// The turn worker's input (`role: turn`).
@@ -245,8 +269,8 @@ pub struct SpawnPayload {
 }
 
 /// The reserved [`SeedMessage::role`] that carries a child's **tool allow-list**
-/// — `subagent.run`'s `tools:` narrowing (RFC 0009: scope narrows monotonically
-/// down the tree). Minted by the supervisor with
+/// — `subagent.run`'s `tools:` narrowing, which is how scope narrows
+/// monotonically down the tree. Minted by the supervisor with
 /// [`SpawnPayload::narrow_tools`], enforced by the child in
 /// [`crate::agentloop::runner::Session::prepare`], which filters its assembled
 /// catalogue AND its dispatch against it.
@@ -268,8 +292,8 @@ pub fn parse_allowed_tools(content: &str) -> Vec<String> {
 }
 
 impl SpawnPayload {
-    /// Narrow this child's tool grant to `allow` (RFC 0009). Any allow-list entry
-    /// already in the seed is dropped first, so the SUPERVISOR's mint is the only
+    /// Narrow this child's tool grant to `allow`. Any allow-list entry already
+    /// in the seed is dropped first, so the SUPERVISOR's mint is the only
     /// grant the child sees — a caller-supplied `context` array cannot forge or
     /// widen one. An empty `allow` is a real narrowing to nothing, not "no
     /// narrowing"; leave the marker off entirely for the unnarrowed case.
@@ -296,10 +320,9 @@ impl SpawnPayload {
     }
 }
 
-/// A checkpoint-resume reference (RFC 0021 §8.4). Retained for the (dead) v1
-/// `Config` `--workflow-resume` parsing until the full v1-`Config` deletion; the
-/// v1 in-child workflow driver that consumed it was removed with the mode
-/// cut-over.
+/// A checkpoint-resume reference: which checkpoint store (`server`) holds the
+/// run under `key`, optionally pinned to a sequence number, and whether to
+/// resume `force`fully past a mismatch. Parsed from `--workflow-resume`.
 #[cfg(feature = "workflow")]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowResumeRef {
@@ -311,15 +334,15 @@ pub struct WorkflowResumeRef {
     pub force: bool,
 }
 
-/// The child's role (agentd, RFC 0026 §2).
+/// The child's role: which driver the child process runs after spawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
-    /// An RFC 0009 subagent: the ReAct loop on `instruction` (or a workflow).
+    /// A subagent: the ReAct loop on `instruction`, or a workflow driver.
     #[default]
     Agent,
-    /// A turn worker: ONE turn over a supplied context slice, internal tools
-    /// round-tripped to the supervisor (RFC 0026 §2).
+    /// A turn worker: ONE turn over a supplied context slice, with internal
+    /// tools round-tripped to the supervisor rather than executed in the child.
     Turn,
 }
 
@@ -338,9 +361,10 @@ pub enum TurnKind {
     Agent,
 }
 
-/// The turn worker's input (RFC 0026 §3.2). Everything the child needs to run
-/// one turn: the system prompt, the context slice, the tool definitions and
-/// which of them round-trip, the output schema, and the knobs.
+/// The turn worker's input: everything the child needs to run exactly one turn
+/// — the system prompt, the context slice, the tool definitions and which of
+/// them round-trip to the supervisor, the output schema, and the knobs. The
+/// worker holds no state of its own between turns; whatever it needs is here.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TurnSpec {
     #[serde(default)]
@@ -368,7 +392,9 @@ pub struct TurnSpec {
     /// Ask the supervisor for budget admission before every model call.
     #[serde(default)]
     pub budget_admission: bool,
-    /// The idempotency-key prefix for effects (`<ctx>/<turn>`), RFC 0025 §7.
+    /// The idempotency-key prefix for effects (`<ctx>/<turn>`). Every effect this
+    /// turn issues derives its key from this prefix, so a replayed turn reuses
+    /// the same keys and a retried effect is deduplicated instead of repeated.
     #[serde(default)]
     pub idempotency_prefix: String,
     /// Extra `_meta` stamped on MCP tool calls (run/ctx/principal).
@@ -384,8 +410,10 @@ pub struct TurnSpec {
     pub turn_id: String,
 }
 
-/// A finished turn (RFC 0026 §3.2 step 4). `messages` is the transcript delta
-/// (assistant/tool messages appended during the turn, in order).
+/// A finished turn. `messages` is the transcript DELTA — only the assistant and
+/// tool messages appended during this turn, in order — which the supervisor
+/// concatenates onto the context it already holds. Sending a delta rather than
+/// the whole transcript keeps the frame bounded as a conversation grows.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TurnResult {
     /// `completed` | `refused` | `exhausted_steps` | `exhausted_tokens` |
@@ -427,19 +455,19 @@ pub struct IntelConfig {
     pub token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// The resolved `intelligence.headers` (RFC 0031) — arbitrary per-dial
-    /// headers (e.g. a gateway routing header). Secret-free at rest is not
-    /// guaranteed (values may resolve secrets), so this rides the payload
-    /// resolved and is never logged. Empty by default.
+    /// The resolved `intelligence.headers` — arbitrary per-dial headers, such as
+    /// a gateway routing header. A value may itself resolve a secret, so these
+    /// ride the payload already resolved and are never logged. Empty by default.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub headers: Vec<(String, String)>,
-    /// An `intelligence.auth: { kind: aws }` spec (RFC 0031) so the child can
-    /// SigV4-sign the LLM dial. Secret-free (creds come from env/imds/irsa/the
-    /// SSO cache at dial time). `None` for the non-AWS path.
+    /// An `intelligence.auth: { kind: aws }` spec so the child can SigV4-sign
+    /// the LLM dial. Carries no secret: the credentials are fetched from the
+    /// environment, IMDS, IRSA, or the SSO cache at dial time. `None` when the
+    /// endpoint is not AWS-signed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aws_auth: Option<crate::config::AuthSpec>,
-    /// The wire dialect (RFC 0031 §8): `openai` (default), `anthropic`, or
-    /// `bedrock`. `None` ⇒ OpenAI-compatible (the byte-identical legacy path).
+    /// The wire dialect: `openai` (default), `anthropic`, or `bedrock`. `None`
+    /// means the OpenAI-compatible request shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dialect: Option<String>,
 }
@@ -449,8 +477,9 @@ pub struct Limits {
     pub max_steps: u32,
     pub max_tokens: u64,
     /// Wall-clock deadline in milliseconds from the child's start. The child
-    /// arms its own deadline; the supervisor also tracks an absolute one
-    /// (Detector A, RFC 0003).
+    /// arms its own deadline AND the supervisor tracks an absolute one: the
+    /// second copy is what still fires when the child is too wedged to honour
+    /// the first.
     pub deadline_ms: u64,
     pub max_depth: u32,
     /// OS-level caps, applied between fork and exec (`setrlimit`) — real
@@ -467,8 +496,8 @@ pub struct Limits {
     pub nice: Option<i32>,
 }
 
-/// The correlation block stamped into the child's logs (RFC 0010
-/// §tree-correlation).
+/// The correlation block stamped into the child's logs, so every line a subtree
+/// emits can be joined back to the run and to its position in the tree.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Telemetry {
     pub run_id: String,
@@ -477,8 +506,9 @@ pub struct Telemetry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
     pub log_level: String,
-    /// Content-capture policy (RFC 0010 §2.9): when true the child logs tool
-    /// args/results, not just lengths. Inherited from the parent's `--log-content`.
+    /// Content-capture policy: when true the child logs tool args and results,
+    /// not just their lengths. Off by default because those payloads routinely
+    /// carry sensitive data. Inherited from the parent's `--log-content`.
     #[serde(default)]
     pub log_content: bool,
 }
@@ -595,9 +625,9 @@ mod tests {
 
     #[test]
     fn control_swap_intel_roundtrip_and_policy_default() {
-        // RFC 0018 §5.2: the swap frame carries the new list/model/policy. The
-        // token rides the wire (like Spawn) but is never logged — the resource
-        // body / events carry transport+index only.
+        // The swap frame carries the new endpoint list, model and policy. The
+        // token rides the wire, as Spawn's does, but is never logged — the
+        // resource body and events carry transport and index only.
         let swap = ControlMsg::SwapIntel(Box::new(SwapIntel {
             uri: "https://gw-a.example,https://gw-b.example".into(),
             token: Some("rotated-secret".into()),
@@ -625,8 +655,9 @@ mod tests {
 
     #[test]
     fn intel_health_roundtrips_and_carries_no_url_or_secret() {
-        // The child→supervisor reachability report (RFC 0018 §6): tagged like the
-        // other AgentMsgs, edge-triggered, transport+index ONLY (never a URL/cred).
+        // The child→supervisor reachability report: tagged like the other
+        // AgentMsgs, edge-triggered, transport and index ONLY — never a URL or
+        // a credential.
         let down = AgentMsg::IntelHealth {
             all_down: true,
             active: None,
@@ -657,8 +688,8 @@ mod tests {
         assert!(s.contains("\"all_down\":false"));
         assert!(s.contains("\"index\":1"));
         assert!(s.contains("\"transport\":\"https\""));
-        // RFC 0012 §3.7: the structural transport scheme only — no scheme-borne
-        // address/cid/host/credential rides this message.
+        // The structural transport scheme only — no address, cid, host or
+        // credential rides this message.
         assert!(!s.contains("https://"), "no full URI in the report: {s}");
         let back: AgentMsg = serde_json::from_str(&s).unwrap();
         match back {
@@ -674,8 +705,8 @@ mod tests {
 
     #[test]
     fn narrow_tools_mints_one_supervisor_grant_and_survives_the_wire() {
-        // RFC 0009: `subagent.run`'s `tools:` is a GRANT the child enforces. It
-        // rides the seed under the reserved role, exactly once, minted by the
+        // `subagent.run`'s `tools:` is a GRANT the child enforces. It rides
+        // the seed under the reserved role, exactly once, minted by the
         // supervisor — a forged entry a caller smuggled in through `context` is
         // dropped, so the child can never see two disagreeing grants.
         let mut p = payload();
@@ -730,7 +761,7 @@ mod tests {
 
     #[test]
     fn control_pause_resume_roundtrip() {
-        // No-param, serde-tagged like Ready/Pong (RFC 0005 §4.3 / RFC 0015 §4.3).
+        // No-param, serde-tagged like Ready/Pong.
         let pause = serde_json::to_string(&ControlMsg::Pause).unwrap();
         assert_eq!(pause, "{\"type\":\"pause\"}");
         let resume = serde_json::to_string(&ControlMsg::Resume).unwrap();

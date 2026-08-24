@@ -2,10 +2,10 @@
 //! Hand-rolled JSON-lines logger. ~150 lines reusing the `serde_json`
 //! serializer — deliberately not `tracing` (its implicit async span context
 //! is moot for a processes-plus-threads design, and the process tree gives
-//! us correlation for free). RFC 0010 §default-logging.
+//! us correlation for free).
 //!
 //! One NDJSON event per line to **stderr** (stdout is reserved for the
-//! agent's result). The canonical line schema (RFC 0010 §line-schema) is:
+//! agent's result). The canonical line schema is:
 //! `ts level event run_id agent_id agent_path comp pid [span_id parent_span_id
 //! trace_id] [dur_ms] [err] <event-specific>`.
 
@@ -71,8 +71,7 @@ impl Comp {
 
 /// The correlation context stamped on every line. Children inherit `run_id`
 /// and `trace_id` and extend `agent_path` (the cheap subtree-query superpower:
-/// an `agent_path` prefix selects a subtree with no backend join). RFC 0010
-/// §tree-correlation.
+/// an `agent_path` prefix selects a subtree with no backend join).
 #[derive(Debug, Clone)]
 pub struct LogCtx {
     pub run_id: String,
@@ -96,44 +95,44 @@ pub struct Logger {
 static STDERR_LOCK: Mutex<()> = Mutex::new(());
 
 // ---------------------------------------------------------------------------
-// The bounded in-memory event ring (RFC 0016 §7.2). A projection of the same
-// stderr stream — identical lines, identical closed vocabulary (RFC 0010
-// §3.2/§3.3) — captured into a fixed-size ring the `agentd://events` resource
-// drains with an `?after=<seq>` cursor (the self-MCP server reads it; this
-// module only owns the store). NOT a second telemetry path: stderr stays the
-// source of truth; the ring is the live-tail convenience.
+// The bounded in-memory event ring. A projection of the same stderr stream —
+// identical lines, identical closed event vocabulary — captured into a
+// fixed-size ring the `agentd://events` resource drains with an `?after=<seq>`
+// cursor (the self-MCP server reads it; this module only owns the store). NOT a
+// second telemetry path: stderr stays the source of truth; the ring is the
+// live-tail convenience.
 //
 // It is installed only when serving wants it (the supervisor calls
 // [`install_event_ring`] once at startup); without that, capture is a single
 // relaxed atomic load that short-circuits, so the default build pays nothing.
-// The ring is lossy and bounded by design (§8.4): an overrun drops the oldest
-// and bumps `dropped`, never blocking — a slow/dead subscriber can never
-// back-pressure the supervisor.
+// The ring is lossy and bounded by design: an overrun drops the oldest and bumps
+// `dropped`, never blocking — a slow or dead subscriber can never back-pressure
+// the supervisor.
 
-/// Envelope version for the `agentd://events` read body (RFC 0016 §7.2/§8.1).
-/// Bumped only on a breaking change to the `{oldest_seq,newest_seq,dropped,
-/// events}` envelope — NOT the line schema (RFC 0010 owns + versions that).
+/// Envelope version for the `agentd://events` read body. Bumped only on a
+/// breaking change to the `{oldest_seq,newest_seq,dropped,events}` envelope —
+/// never for the per-line schema, which is versioned independently of this.
 pub const EVENTS_SCHEMA: &str = "1.0";
 
-/// Default ring capacity (`AGENTD_EVENTS_RING`, RFC 0016 §7.2/§11): the last N
+/// Default ring capacity, overridable with `AGENTD_EVENTS_RING`: the last N
 /// emitted lines held in memory. Bounds memory on a slow subscriber.
 pub const EVENTS_RING_DEFAULT: usize = 1024;
 
-/// One captured line plus its monotonic ring `seq` (the only field added over
-/// the RFC 0010 §3.2 line — the cursor key the subscriber advances).
+/// One captured line plus its monotonic ring `seq` — the only field added over
+/// the emitted line, and the cursor key the subscriber advances.
 struct RingEntry {
     seq: u64,
     /// The captured `level` (cheap prefix-filterable without re-parsing).
     level: &'static str,
     /// The captured `event` name (cheap prefix-filterable without re-parsing).
     event: String,
-    /// The full RFC 0010 §3.2 line object (the `seq` is added on read).
+    /// The full emitted line object (the `seq` is added on read).
     line: Value,
 }
 
 /// A fixed-capacity ring of the last `cap` emitted lines. Lossy oldest-evicted;
 /// `dropped` counts lines evicted to date (a subscriber whose `after` predates
-/// `oldest_seq` learns it fell behind and re-baselines). RFC 0016 §7.2.
+/// `oldest_seq` learns it fell behind and re-baselines).
 struct EventRing {
     buf: VecDeque<RingEntry>,
     cap: usize,
@@ -173,24 +172,25 @@ static RING_INSTALLED: AtomicU64 = AtomicU64::new(0);
 /// process so every captured line gets a globally-ordered `seq`.
 static RING_SEQ: AtomicU64 = AtomicU64::new(0);
 /// Set on every ring push; the served `agentd://events` resource coalesces this
-/// into one `notifications/resources/updated` per tick (RFC 0016 §7.2: "a small
-/// coalescing batch"). A flag, not a callback, keeps this `obs` layer free of any
-/// self-MCP server type — the server polls + clears it. Non-blocking (§8.4).
+/// into one `notifications/resources/updated` per tick rather than notifying per
+/// captured line. A flag, not a callback, keeps this `obs` layer free of any
+/// self-MCP server type — the server polls and clears it. Non-blocking, so a
+/// push never waits on a subscriber.
 static EVENTS_DIRTY: AtomicU64 = AtomicU64::new(0);
 
 /// Take-and-clear the "new events since last check" flag — the served
 /// `agentd://events` resource calls this on its coalescing tick to decide whether
 /// to fire a `notifications/resources/updated`. Returns `true` if any line was
-/// captured since the last call. RFC 0016 §7.2.
+/// captured since the last call.
 pub fn take_events_dirty() -> bool {
     EVENTS_DIRTY.swap(0, Ordering::Relaxed) != 0
 }
 
-/// Install the bounded event ring with capacity `cap` (RFC 0016 §7.2). Called
-/// once by the supervisor when the served `agentd://events` resource is wanted
-/// (gated by `--serve-mcp` + the `events` feature at the call site). Idempotent
-/// — a second call resizes/clears. Never fatal (telemetry never crashes the
-/// run, §8.4).
+/// Install the bounded event ring with capacity `cap`. Called once by the
+/// supervisor when the served `agentd://events` resource is wanted (gated by
+/// `--serve-mcp` plus the `events` feature at the call site). Idempotent — a
+/// second call resizes and clears. Never fatal: telemetry must not crash the
+/// run, so a poisoned lock is recovered rather than propagated.
 pub fn install_event_ring(cap: usize) {
     let mut g = EVENT_RING.lock().unwrap_or_else(|e| e.into_inner());
     *g = Some(EventRing::new(cap));
@@ -199,7 +199,7 @@ pub fn install_event_ring(cap: usize) {
 
 /// A snapshot of the ring window an `agentd://events?after=<seq>` read returns:
 /// the entries with `seq > after` (after optional level/event-prefix filtering),
-/// plus the ring's current window bounds and cumulative `dropped`. RFC 0016 §7.2.
+/// plus the ring's current window bounds and cumulative `dropped`.
 pub struct EventWindow {
     pub events: Vec<Value>,
     pub oldest_seq: u64,
@@ -209,10 +209,9 @@ pub struct EventWindow {
 
 /// Drain the ring into an [`EventWindow`] for a cursor read. Returns the entries
 /// with `seq > after`, capped at `limit` (oldest-first), each with its `seq`
-/// folded into the RFC 0010 §3.2 line object. `level`/`event_prefixes` are the
-/// optional §7.3 server-side filters (a cheap prefix match over the held lines —
-/// no query engine). `None` when no ring is installed (the resource 404s at the
-/// server). RFC 0016 §7.2/§7.3.
+/// folded into the emitted line object. `level`/`event_prefixes` are optional
+/// server-side filters — a cheap prefix match over the held lines, not a query
+/// engine. `None` when no ring is installed (the resource 404s at the server).
 pub fn read_event_window(
     after: u64,
     limit: usize,
@@ -262,7 +261,8 @@ pub fn read_event_window(
 /// Capture one already-assembled line into the ring (a no-op when none is
 /// installed). Pulls `level`/`event` off the object for cheap filterable
 /// metadata, mints a `seq`, and pushes — lossy oldest-evicted, never blocking.
-/// Best-effort: a poisoned lock is recovered, never fatal (§8.4).
+/// Best-effort: a poisoned lock is recovered, never fatal — telemetry must not
+/// take down the run it is describing.
 fn capture_to_ring(level: &'static str, event: &str, line: &Value) {
     if RING_INSTALLED.load(Ordering::Relaxed) == 0 {
         return;
@@ -276,7 +276,7 @@ fn capture_to_ring(level: &'static str, event: &str, line: &Value) {
             event: event.to_string(),
             line: line.clone(),
         });
-        // Mark the ring dirty so the served resource coalesces a notify (§7.2).
+        // Mark the ring dirty so the served resource coalesces a notify.
         EVENTS_DIRTY.store(1, Ordering::Relaxed);
     }
 }
@@ -290,8 +290,9 @@ impl Logger {
         }
     }
 
-    /// Opt into content capture (RFC 0010 §2.9): callers that log tool
-    /// args/results consult [`Logger::content_capture`]. Off by default.
+    /// Opt into content capture: callers that log tool args/results consult
+    /// [`Logger::content_capture`] first. Off by default, so args and results
+    /// are recorded as lengths only unless an operator asks for the bodies.
     pub fn with_content(mut self, on: bool) -> Self {
         self.log_content = on;
         self
@@ -337,13 +338,13 @@ impl Logger {
             }
         }
         let value = Value::Object(m);
-        // Project the line into the bounded `agentd://events` ring (RFC 0016
-        // §7.2) — the same line, captured for the live-tail resource. A no-op
-        // (one relaxed atomic load) unless a ring is installed. Best-effort:
-        // capture never blocks and never fails the log write (§8.4).
+        // Project the line into the bounded `agentd://events` ring — the same
+        // line, captured for the live-tail resource. A no-op (one relaxed atomic
+        // load) unless a ring is installed. Best-effort: capture never blocks and
+        // never fails the log write.
         capture_to_ring(level.as_str(), event, &value);
-        // Mirror to the OTLP logs exporter (plan §3.11) — a no-op (one atomic
-        // load) unless `otel.logs` armed it. Best-effort, never blocks the write.
+        // Mirror to the OTLP logs exporter — a no-op (one atomic load) unless
+        // `otel.logs` armed it. Best-effort, never blocks the write.
         crate::obs::otel::capture_log(
             crate::obs::otel::now_unix_nanos(),
             level.as_str(),
@@ -445,7 +446,7 @@ mod tests {
     #[test]
     fn ring_evicts_oldest_and_counts_dropped() {
         // A 2-slot ring: pushing 3 lines drops exactly the oldest and bumps
-        // `dropped` once (lossy-by-design, RFC 0016 §7.2/§8.4).
+        // `dropped` once — the ring is lossy by design.
         let mut r = EventRing::new(2);
         r.push(ring_entry(1, "info", "loop.step"));
         r.push(ring_entry(2, "info", "loop.step"));
@@ -474,7 +475,7 @@ mod tests {
         // The ring is process-global, so this test owns it for its duration. It
         // installs a fresh ring, emits a few lines through a real Logger (the
         // capture path), then drains the window with the `?after` cursor and the
-        // §7.3 level/event-prefix filters.
+        // level/event-prefix filters.
         install_event_ring(64);
         let base = RING_SEQ.load(Ordering::Relaxed); // cursor is global+monotonic
         let log = Logger::new(

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! **Compaction** (RFC 0026 §5.2): when a context's token estimate crosses
+//! **Compaction**: when a context's token estimate crosses
 //! `context.compact_at × model_window` (or `context.compact` is called), the
 //! older messages are summarized by a structured `think` into the summary
 //! block, the last `keep_last` messages stay verbatim, the plan stays
@@ -27,11 +27,16 @@ pub struct CompactionRequest {
     pub input: String,
     /// The summarizer's output schema.
     pub output_schema: Value,
-    /// The context version this plan was made against (apply refuses drift).
+    /// The context version this plan was made against. The model call happens
+    /// between planning and applying, so [`apply_compaction`] refuses if the
+    /// context has moved on in the meantime — folding by a stale message count
+    /// would drop messages the plan never summarized.
     pub version: u64,
 }
 
-/// The summarizer's output schema (RFC 0026 §5.1 summary block).
+/// The summarizer's output schema: the fields of the summary block, all
+/// required, with no additional properties so a model cannot smuggle unread
+/// keys into a record that is kept forever.
 pub fn summary_schema() -> Value {
     json!({
         "type": "object",
@@ -86,8 +91,8 @@ pub fn plan_compaction(
     //     shield, system messages hoist into the top-level `system` field
     //     (`intel/anthropic.rs`), so the assistant really is first on the wire;
     //   * a `Tool` first is a `tool_result` block whose `tool_use` was folded
-    //     away — a dangling id, the split the old tool-round rule guarded
-    //     against from the other end.
+    //     away — a dangling id, which is the same tool round split from the
+    //     other end.
     // Walking back only ever keeps *more*, so both the "at least 2 kept" floor
     // and the target-token loop above stay satisfied. `get` (not an index) is
     // load-bearing: `keep_last` is caller-supplied and may be 0, and folding
@@ -178,7 +183,8 @@ fn render_for_summary(m: &Msg) -> String {
 /// Fold the summarizer's verdict into the context: absorb the summary, drop
 /// the folded messages, bump the version, evict unreferenced skill bodies
 /// (names stay — the caller drops the bodies from its cache), recount.
-/// Refuses when the context changed since the plan (`version` drift).
+/// Refuses when the context's `version` has moved since the plan was made, or
+/// when the plan's fold exceeds the messages actually present.
 pub fn apply_compaction(
     ctx: &mut ContextState,
     req: &CompactionRequest,
@@ -350,7 +356,7 @@ mod tests {
         // keep_last 5 → fold 6 already lands on the user; nothing to correct.
         assert_eq!(plan_compaction(&c, 5, None).unwrap().fold, 6);
         // keep_last 7 → fold 4 is a tool result → back past its call at 3 to
-        // the user at 2 (the old rule stopped at 3, an assistant).
+        // the user at 2; stopping at 3 would leave an assistant first.
         let req = plan_compaction(&c, 7, None).unwrap();
         assert_eq!(req.fold, 2);
         assert!(c.messages[req.fold].is_user());
@@ -430,7 +436,7 @@ mod tests {
         assert!(c.plan.is_some(), "plan kept verbatim");
         assert_eq!(c.skills.len(), 1, "skill names kept");
         assert!(c.dirty);
-        // Version drift is refused.
+        // A plan made against a different context version is refused.
         let req2 = plan_compaction(&ctx_with(10), 3, None).unwrap();
         assert!(apply_compaction(&mut c, &req2, &json!({})).is_err());
         // Fallback path.

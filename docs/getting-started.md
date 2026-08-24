@@ -12,7 +12,7 @@ This page gets you from a checkout to a first end-to-end run, then shows the sam
 instruction as a recurring **loop** and a **reactive** daemon. For the full knob list see
 [configuration.md](configuration.md); for how triggers and modes work in depth
 see [modes-and-triggers.md](modes-and-triggers.md). The architecture is in
-[RFC 0001](../rfcs/0001-mcp-native-agent-runtime.md).
+[architecture.md](architecture.md).
 
 ## Install / build
 
@@ -55,7 +55,7 @@ so it never weighs down a minimal build):
 
 ```console
 $ cargo build -p agentd-cli --release                                  # default: tls (https)
-$ cargo build -p agentd-cli --release --features a2a                   # + the A2A v2 listener (RFC 0029)
+$ cargo build -p agentd-cli --release --features a2a                   # + the A2A listener
 $ cargo build -p agentd-cli --release --features a2a,cron,metrics,otel  # + scheduling, metrics, OTLP traces
 ```
 
@@ -267,12 +267,14 @@ workflows:
 - Subscribe to **concrete URIs**, not templates — enumerate via `resources/list`
   and add one `subscribe` node per URI.
 
-> **Scope notes.** The external channel is **A2A** (`a2a.listen`, RFC 0029) — an
-> HTTPS listener with mTLS/bearer **principals** and a role matrix — not a served
-> MCP surface (the v1 self-MCP server was removed). Subagents are RFC 0026
-> flat-tree leaves. Workflows are the RFC 0027 **v3** engine (always compiled).
-> MCP tasks/sampling/roots are deferred
-> ([RFC 0013](../rfcs/0013-deferred-v2-surface.md)).
+> **Scope notes.** The external channel is **A2A** (`a2a.listen`) — an HTTPS
+> listener with mTLS/bearer **principals** and a role matrix. agentd is an MCP
+> *client* only; it serves no MCP surface of its own, so nothing reaches in over
+> MCP. Subagents are flat-tree leaves: the process tree is one generation of
+> children under the supervisor, with no hierarchy to walk.
+> The workflow engine is always compiled in. MCP tasks, sampling and roots are
+> not implemented, and agentd declares no client capability for them — a server
+> request for one is dropped rather than answered.
 
 ---
 
@@ -307,11 +309,9 @@ from source with `cd interface && npm install && npm run build`.
   approvals, budgets, and the practices that keep it safe.
 - **[configuration.md](configuration.md)** — every flag and env var, precedence
   (`default < config file < env < flag`), limits, secrets, exit codes.
-- **[modes-and-triggers.md](modes-and-triggers.md)** — the v2 lifecycle
+- **[modes-and-triggers.md](modes-and-triggers.md)** — the lifecycle
   (`lifecycle.run_until`) and workflow start-node triggers as exit predicates,
   reactive routing (exactly-one-owner, spawn-vs-continue, debounce/coalesce),
   self-subscribe, and `schedule`/cron.
-- **[RFC 0001](../rfcs/0001-mcp-native-agent-runtime.md)** — the architecture
-  front door; sub-RFCs 0002–0013 cover each mechanism in depth.
-- **[docs/design/PLAN.md](design/PLAN.md)** — the design plan and milestone
-  history for the loop, MCP client, and intelligence client.
+- **[architecture.md](architecture.md)** — how the supervisor, the reactor, the
+  child loop and the durable store fit together.

@@ -10,8 +10,8 @@
 //! 3. definition REMOVED: the run still finishes (pin again), then the pin
 //!    is garbage-collected.
 //!
-//! Before durable pins, 2 and 3 ended in `run.refused` — a restart plus a
-//! config edit could strand work the daemon had already promised to do.
+//! Without the durable pin, 2 and 3 end in `run.refused` — a restart plus a
+//! config edit strands work the daemon had already promised to do.
 #![cfg(all(unix, feature = "workflow"))]
 
 mod common;

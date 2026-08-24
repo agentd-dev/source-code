@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Token **estimates** (RFC 0026 §5.2, §7). agentd never counts provider tokens
-//! itself — the provider's `usage` is the truth once a call returns — but the
+//! Token **estimates**. agentd never counts provider tokens itself — the
+//! provider's `usage` is the truth once a call returns — but the
 //! governor's reservation and the compaction trigger need a number *before*
 //! the call. The heuristic is the usual `chars / 4` (English prose ≈ 4 chars a
 //! token; JSON and code run denser, which errs on the safe side for a

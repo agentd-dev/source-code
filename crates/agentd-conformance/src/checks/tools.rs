@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The tool-registry contract (RFC 0028): internal tools round-trip to the
+//! The tool-registry contract: internal tools round-trip to the
 //! supervisor and take effect; an unknown tool the model invents is answered as
 //! an error by the child without sinking the run; and the introspected surface
 //! (`--capabilities`) lists the internal tools. Driven black-box against the real
@@ -26,7 +26,7 @@ pub fn checks() -> Vec<Check> {
         Check {
             id: "tools/registry-introspection",
             category: Category::Tools,
-            desc: "--capabilities lists the internal tool registry (2.0 runtime)",
+            desc: "--capabilities lists the internal tool registry",
             run: registry_introspection,
         },
     ]

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Security posture (RFC 0012): the Rule-of-Two lethal-trifecta refusal and its
-//! explicit override, plus secret redaction in telemetry.
+//! Security posture: the Rule-of-Two lethal-trifecta refusal and its explicit
+//! override, plus secret redaction in telemetry.
 
 use crate::{Category, Check, Harness, Outcome};
 
@@ -42,12 +42,12 @@ fn trifecta_refused(h: &Harness) -> Outcome {
     // → exit 2 (config/usage). Exit 5 is reserved for a *runtime* refusal after
     // the agent ran.
     //
-    // The trifecta gate now lives in `Config::validate()` — the single validation
-    // authority (RFC 0017 §7), so `--validate-config` and startup agree. That means
-    // the refusal happens during config load, BEFORE the logger is constructed, so
-    // it surfaces as the usage-refusal MESSAGE on stderr (exactly like every other
-    // `validate()` failure) rather than a structured `scope.trifecta_refused` log
-    // event. We assert that human-readable refusal text instead of the event.
+    // The trifecta gate lives in `Config::validate()` — the single validation
+    // authority, so `--validate-config` and startup cannot disagree about what
+    // is refusable. A consequence: the refusal happens during config load,
+    // BEFORE the logger is constructed, so it surfaces as the usage-refusal
+    // MESSAGE on stderr (like every other `validate()` failure) and not as a
+    // structured log event. Assert the human-readable text accordingly.
     Outcome::require(
         r.code == Some(2),
         format!(

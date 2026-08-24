@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The Agent Provider (apd) client (RFC 0023 §Step 1–2): enroll the durable key
-//! once for an identity, then fetch + cache + proactively-refresh a short-lived
+//! The Agent Provider (apd) client: enroll the durable key once for an
+//! identity, then fetch + cache + proactively-refresh a short-lived
 //! **agent token**. All signed with the agent's own key (RFC 9421, `hwk`
 //! scheme — the agent has no token yet), so there is no shared secret.
 //!
@@ -24,18 +24,17 @@ const DEFAULT_TTL: Duration = Duration::from_secs(3600);
 pub struct ApdConfig {
     /// The apd base URL (e.g. `https://apd.example`).
     pub base_url: String,
-    /// A one-time enrollment token, if the apd runs in `token` mode
-    /// (RFC 0023 §Step 1 — the human/operator provides it). `None` for
-    /// open/self-hosted mode.
+    /// A one-time enrollment token, if the apd runs in `token` mode (the
+    /// human/operator provides it). `None` for open/self-hosted mode.
     pub enrollment_token: Option<String>,
-    /// Path to an enrollment-assertion file for the provider's `federated` gate
-    /// (RFC 0023 §5.1) — e.g. a Kubernetes projected ServiceAccount token. Read
+    /// Path to an enrollment-assertion file for the provider's `federated`
+    /// gate — e.g. a Kubernetes projected ServiceAccount token. Read
     /// **fresh on every enroll** (the projected token rotates), so we hold the
     /// path, never the assertion. `None` when not using assertion enrollment.
     pub enroll_assertion_file: Option<String>,
     /// The user's chosen Person Server (`ps` claim), if this agent acts for a
     /// human under Case C. `None` for identity-only (Case A). Forwarded to
-    /// enroll; the PS consent flow itself is a roadmap item (RFC 0023 §Case C).
+    /// enroll, and cross-checked against the `ps` the issued token carries.
     pub person_server: Option<String>,
     /// Platform hint (`workload`, `cli`, …).
     pub platform: String,
@@ -90,8 +89,9 @@ impl ApdClient {
             .clone()
     }
 
-    /// The signing key (the request signer signs with the agent's own key even
-    /// when presenting an agent-token key id — RFC 0023 §Step 6).
+    /// The signing key. The request signer always signs with the agent's own
+    /// key, even when the `Signature-Key` it presents is a bearer-looking
+    /// agent/auth token: the token names the identity, the key proves it.
     pub(super) fn key(&self) -> &AgentKey {
         &self.key
     }
@@ -100,11 +100,11 @@ impl ApdClient {
     /// [`REFRESH_SKEW`] of expiry (or absent). Enrolls first if needed. This is
     /// the whole "fully automatic, the user is never involved" refresh path.
     ///
-    /// The cache is **in-memory by design** (RFC 0031 §15 P5 — a deliberate
-    /// non-goal): the agent *key* is durable and `/enroll` is idempotent, so a
-    /// restart costs only one cheap signed `/agent-token`. Persisting this
-    /// short-lived JWT would add a secret-at-rest surface to save a round-trip
-    /// that is usually already inside [`REFRESH_SKEW`] on the next start.
+    /// The cache is **in-memory by design**: the agent *key* is durable and
+    /// `/enroll` is idempotent, so a restart costs only one cheap signed
+    /// `/agent-token`. Persisting this short-lived JWT would add a
+    /// secret-at-rest surface to save a round-trip that is usually already
+    /// inside [`REFRESH_SKEW`] on the next start.
     pub fn token(&self) -> Result<String, String> {
         {
             let cache = self.cached.lock().unwrap_or_else(|e| e.into_inner());
@@ -122,7 +122,7 @@ impl ApdClient {
     }
 
     /// Enroll the durable key for an identity, once (idempotent — a second call
-    /// after `agent_id` is set is a no-op). RFC 0023 §Step 1.
+    /// after `agent_id` is set is a no-op).
     fn enroll_if_needed(&self) -> Result<(), String> {
         if self.agent_id().is_some() {
             return Ok(());
@@ -131,10 +131,11 @@ impl ApdClient {
         if let Some(t) = &self.config.enrollment_token {
             body["enrollment_token"] = serde_json::Value::String(t.clone());
         }
-        // Federated gate (RFC 0023 §5.1): read the assertion FRESH on every
-        // enroll — a projected SA token rotates, so a value cached at construction
-        // would go stale across restarts/re-enrolls. The path rode the spawn
-        // payload; the short-lived token never touches config or logs.
+        // Federated gate: read the assertion FRESH on every enroll — a projected
+        // SA token rotates, so a value cached at construction would go stale
+        // across restarts/re-enrolls. Only the path travels in config and the
+        // spawn payload; the short-lived token itself never touches either, nor
+        // the logs.
         if let Some(path) = &self.config.enroll_assertion_file {
             let assertion = std::fs::read_to_string(path)
                 .map_err(|e| format!("aauth: enrollment assertion file {path}: {e}"))?;
@@ -152,11 +153,11 @@ impl ApdClient {
         Ok(())
     }
 
-    /// Validate the Agent-Provider metadata document (RFC 0023 §7.1 G1): if the
-    /// AP publishes `/.well-known/aauth-agent.json`, its `issuer` MUST match the
-    /// configured provider (§12.10 anti-host-poisoning). An absent document is
-    /// fine (the enroll/token endpoints are bootstrap conventions, not
-    /// advertised); a contradicting one is fatal. Called once at prime.
+    /// Validate the Agent-Provider metadata document: if the AP publishes
+    /// `/.well-known/aauth-agent.json`, its `issuer` MUST match the configured
+    /// provider (§12.10 anti-host-poisoning). An absent document is fine (the
+    /// enroll/token endpoints are bootstrap conventions, not advertised); a
+    /// contradicting one is fatal. Called once at prime.
     pub(super) fn verify_provider_metadata(&self) -> Result<(), String> {
         super::discover::fetch_agent_provider(&self.config.base_url, self.timeout).map(|_| ())
     }
@@ -166,10 +167,9 @@ impl ApdClient {
         if let Some(agent) = resp.agent {
             *self.agent_id.lock().unwrap_or_else(|e| e.into_inner()) = Some(agent);
         }
-        // Act on the token's own claims (RFC 0023 §7.1 G4): the agent token is a
-        // JWT, so its `exp` is the authoritative refresh deadline (the AP may omit
-        // or disagree with `expires_in`), its `iss` MUST be the provider we
-        // enrolled with (G1 ties the token to the configured AP), and its
+        // Act on the token's own claims: the agent token is a JWT, so its `exp`
+        // is the authoritative refresh deadline (the AP may omit or disagree with
+        // `expires_in`), its `iss` MUST be the provider we enrolled with, and its
         // `cnf.jwk` MUST be our signing key — a mismatch on either is fatal (every
         // signed request would be rejected), so we fail fast here rather than let
         // it surface as a downstream 401 storm. Opaque / non-JWT tokens parse to
@@ -283,7 +283,7 @@ fn inspect_agent_token(
 ) -> Result<Option<u64>, String> {
     // JWT = header.payload.signature; read only the payload segment.
     let Some(payload_b64) = token.split('.').nth(1) else {
-        return Ok(None); // not JWT-shaped → opaque token, keep legacy behavior
+        return Ok(None); // not JWT-shaped → opaque token; nothing local to check
     };
     let Ok(bytes) = b64::url_decode(payload_b64) else {
         return Ok(None);
@@ -291,7 +291,7 @@ fn inspect_agent_token(
     let Ok(claims) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
         return Ok(None);
     };
-    // iss: the token must come from the provider we enrolled with (G1) — a token
+    // iss: the token must come from the provider we enrolled with — a token
     // issued by some other AP is not one we should present.
     if let (Some(want), Some(iss)) = (expected_iss, claims.get("iss").and_then(|v| v.as_str()))
         && !super::discover::issuer_matches(iss, want)
@@ -302,7 +302,7 @@ fn inspect_agent_token(
     }
     // ps: the protocol makes `ps` a per-agent-instance claim (§5.2.1), enrolled
     // from our config; if the AP echoed a DIFFERENT person server, Case C would
-    // route the exchange to the wrong PS — reject it (G5).
+    // route the consent exchange — resource token and all — to the wrong PS.
     if let (Some(want), Some(ps)) = (expected_ps, claims.get("ps").and_then(|v| v.as_str()))
         && !super::discover::issuer_matches(ps, want)
     {
@@ -390,7 +390,7 @@ mod tests {
     #[test]
     fn matching_ps_passes_mismatched_ps_hard_errors() {
         let key = test_key();
-        // ps == configured person server → ok (G5).
+        // ps == configured person server → ok.
         let tok = jwt(serde_json::json!({ "exp": 42u64, "ps": "https://ps.example" }));
         assert_eq!(inspect_agent_token(&tok, &key, AP, PS).unwrap(), Some(42));
         // ps is a DIFFERENT person server → fail fast.

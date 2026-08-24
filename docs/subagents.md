@@ -101,11 +101,15 @@ matching no configured server is silently dropped, so a typo yields a quieter
 subagent rather than an error. A granted server the child cannot reach within
 60 s is fatal for the child.
 
-**`tools`** looks like a per-call allow-list and is not one today. It is stored
-on the persisted payload as `allowed_tools` and read by nothing; the registry
-gate a subagent is checked against is hardcoded to *no* allow-list, so the
-default grants stand and nothing narrows within a granted server. Treat
-`servers` as the capability control and `tools` as documentation.
+**`tools`** is a per-call allow-list that narrows *within* the granted servers,
+and it can only ever narrow. The supervisor mints it into the payload and the
+child enforces it, filtering both its tool catalogue and its dispatch routing —
+so an excluded tool is unreachable, not merely unadvertised. Patterns are the
+registry's (`*`, an exact name, `prefix*`). A caller-supplied `context` array
+cannot forge or widen a grant, because the supervisor's mint replaces any
+marker already in the seed, and a grant the child cannot parse narrows to
+nothing rather than to everything. Use `servers` to choose which servers the
+child reaches and `tools` to cut individual tools inside them.
 
 **`output_contract`** is prose appended to the child's brief. Pass
 `output_schema` instead and it is folded textually into that contract ("Reply
@@ -218,7 +222,7 @@ sequenceDiagram
     participant D as Durable store
     participant S as Subagent process
     W->>R: tool call subagent.run
-    R->>R: eight admission gates
+    R->>R: nine admission gates
     R->>S: fork + exec, then the payload on stdin
     R->>D: put record, status running
     S-->>R: Ready
@@ -261,8 +265,8 @@ stateDiagram-v2
     failed --> [*]
 ```
 
-The six terminal statuses are `completed`, `failed`, `cancelled`, `refused`,
-`killed` and `crashed`; every waiter tests against that set.
+The seven terminal statuses are `completed`, `failed`, `cancelled`, `refused`,
+`killed`, `crashed` and `retired`; every waiter tests against that set.
 
 **Liveness is probed, not assumed.** The reactor pings each child and classifies
 it on two axes: EOF and the hard deadline dominate; then recent events mean
@@ -302,7 +306,7 @@ restart. One further hazard: handle sequence numbers reset to zero on every star
 while restored records keep their `sub-N` handles, so a fresh handle can collide
 with and overwrite a restored record.
 
-## Templates and the instance tier (RFC 0036)
+## Templates and the instance tier
 
 The `subagents:` config section turns "what a worker here looks like" into an
 operator-declared, reviewable definition the model may *instantiate* but never
@@ -354,11 +358,11 @@ folded into the definition as *data* — never re-parsed for directives; a
 param value that would introduce a `:::` fence refuses the spawn. Everything
 that can be judged earlier is: extraction runs once at the parent's boot,
 where a template that composes the lethal trifecta, points at an
-uncatalogued endpoint under `security.egress: closed` (RFC 0037), declares a
+uncatalogued endpoint under `security.egress: closed`, declares a
 webhook start, or tries to define `webhooks:`/`a2a:`/`security:`/`store:`
 sections refuses the parent's startup with the template named.
 
-Three Phase-B conveniences ride the same wiring. **`mode: sync`** with
+Three conveniences ride the same wiring. **`mode: sync`** with
 `result: {workflow: <name>}` parks the spawn until the child's named workflow
 first completes, then resolves it with that run's output — a composed
 reporter workflow inside the child (existing nodes only) dials the parent's
@@ -428,9 +432,10 @@ reply is dropped. Prefer `async` plus `subagent.await`, or a workflow step.
 **When the child must delegate onward or act as the agent's A2A identity.**
 Neither is wired: no self-tools, no inherited peers, no inherited AAuth key.
 
-**When per-tool restriction is the requirement.** `servers` narrows to whole
-servers. To hide one tool on a server the child otherwise needs, split the server
-or run a separate agentd instance.
+**When a whole server must disappear rather than a few of its tools.** `tools`
+hides individual tools inside a granted server, but the child still connects to
+that server and pays its handshake and its trifecta tags. Where the server
+itself must be out of reach, leave it out of `servers`.
 
 ## Reference
 
@@ -441,19 +446,19 @@ calls are pushed onto the interface feed, so display clients see them.
 
 | Tool | Notes |
 |---|---|
-| `subagent.run` | `instruction` (freeform) or `template` + `params` (RFC 0036) — one or the other, never both; `mode`, `limits`, `context`, `output_contract`, `output_schema` optional; `servers`/`tools` only without `template` (the template defines the grant). |
+| `subagent.run` | `instruction` (freeform) or `template` + `params` — one or the other, never both; `mode`, `limits`, `context`, `output_contract`, `output_schema` optional; `servers`/`tools` only without `template` (the template defines the grant). |
 | `subagent.send` | Warm subagents only — except instance-tier children, where the message rides A2A over the child's socket into its conversation surface. |
 | `subagent.retire` | Instance children only: begin graceful retirement (drain → clean exit); SIGKILL only after the drain window. |
+| `subagent.status` | Status, mode, result, error, tokens. Safe to poll. |
+| `subagent.await` | Returns immediately if already terminal; `timeout` ignored. |
+| `subagent.kill` | Graceful cancel; marks the record `cancelled` at once. |
+| `subagent.list` | Handles, modes, statuses; instruction previews cut to 80 chars. |
 
 `durable: false` on a spawn (call site, template, `subagents.defaults`, or the
 deployment-wide `store.durability.work: ephemeral`) makes the record
 memory-only: never persisted, never restore-respawned — the fast path for
 throwaway workers. A non-durable **instance child** additionally runs on a
 memory store and is not respawned after a parent restart.
-| `subagent.status` | Status, mode, result, error, tokens. Safe to poll. |
-| `subagent.await` | Returns immediately if already terminal; `timeout` ignored. |
-| `subagent.kill` | Graceful cancel; marks the record `cancelled` at once. |
-| `subagent.list` | Handles, modes, statuses; instruction previews cut to 80 chars. |
 
 Per-run defaults inherited by each subagent unless the call overrides them: 500
 steps, 2,000,000 tokens, a 1 h deadline (floor 1 s). `--max-depth` is the CLI

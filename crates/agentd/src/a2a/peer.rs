@@ -12,7 +12,7 @@
 //! What is **not** delegated to a2a-rs is the transport. agentd presents real
 //! credentials to a peer — a bearer that may be an OAuth token it refreshes, an
 //! mTLS client identity, a per-request AWS SigV4 signature, an AAuth HTTP
-//! Message Signature (RFC 0031 §7) — and it does so from a blocking turn worker
+//! Message Signature — and it does so from a blocking turn worker
 //! with no async runtime in sight. a2a-rs's own client is reqwest with a static
 //! bearer, so adopting it would mean dropping four kinds of peer authentication
 //! to gain a wire format we can build from its types anyway. The types are the

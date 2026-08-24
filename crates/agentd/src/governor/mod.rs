@@ -1,18 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The **token governor** (RFC 0026 §7, plan §3.17): windowed, durable token/
-//! request budgets that pace how fast an instance burns intelligence, with the
-//! tactics `wait | slow | degrade | refuse | fail` when a window is exhausted.
+//! The **token governor**: windowed, durable token/request budgets that pace
+//! how fast an instance burns intelligence, with the tactics
+//! `wait | slow | degrade | refuse | fail` when a window is exhausted.
 //!
 //! - **Windows** — `intelligence.budget.windows[]`: `{per: second|minute|hour|
 //!   day|week, tokens?, requests?, reset?}`. Every window is a **fixed window
 //!   aligned to its unit** (a rolling `second|minute|hour` window is the
 //!   current unit-aligned bucket; a calendar `day|week` window resets at
 //!   `reset` `HH:MMZ`, default `00:00Z`, weeks on Monday). Counters
-//!   `{index, tokens, requests}` are durable in the manifest (RFC 0025 §3.3):
-//!   a restart never re-opens a spent daily budget.
+//!   `{index, tokens, requests}` are durable in the manifest: a restart never
+//!   re-opens a spent daily budget.
 //! - **Scopes** — the instance governor plus optional sub-budgets per run /
 //!   conversation / principal ([`Governor::admit`] takes the applicable scoped
-//!   budgets); the tightest applicable window wins.
+//!   budgets). Sub-scopes are checked before the instance and the first refusal
+//!   decides, so a tighter sub-budget shapes the verdict — including which
+//!   scope's tactic applies.
 //! - **Reservation** — `admit` reserves an estimate against every window; the
 //!   reported usage `settle`s it (replacing the estimate).
 //! - **Lifetime** — `lifetime_tokens` is the hard ceiling (always `fail`).
@@ -115,7 +117,9 @@ impl Window {
 /// Unix epoch (1970-01-01) was a Thursday; shift so week windows start Monday.
 fn week_epoch_shift(unit: WindowUnit) -> u64 {
     match unit {
-        WindowUnit::Week => 4 * 86_400_000, // Thursday → the previous Monday is 3 days back; +4 aligns Monday 00:00
+        // Thursday + 4 days = Monday 1970-01-05, so every bucket boundary is a
+        // Monday 00:00Z (before the window's own `reset` offset is applied).
+        WindowUnit::Week => 4 * 86_400_000,
         _ => 0,
     }
 }
@@ -341,8 +345,9 @@ impl Governor {
                 s.roll(now_ms);
             }
         }
-        // The tightest applicable verdict: check the sub-scopes first (they
-        // nest under the instance), then the instance.
+        // The first refusal decides. Sub-scopes are checked before the instance
+        // (they nest under it), so a tighter sub-budget supplies both the wait
+        // time and the tactic that shapes the verdict.
         let mut verdict: Option<(Exhausted, String, BudgetTactic, Option<String>)> = None;
         for k in scopes {
             if let Some(s) = self.scopes.get(k)

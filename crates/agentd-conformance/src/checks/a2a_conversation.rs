@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! A2A conversations, principals & commands (RFC 0029). A v2 daemon binds the
+//! A2A conversations, principals & commands. The daemon binds the
 //! real A2A listener over plaintext loopback (⇒ the `operator` principal, so no
 //! cert plumbing is needed to exercise the wiring). A JSON-RPC peer drives the
 //! surface: a `status` command DataPart completes deterministically without a
@@ -186,7 +186,8 @@ fn status_command(h: &Harness) -> Outcome {
 /// expected, an integer where a `google.protobuf.Timestamp` string is expected,
 /// or a flat `state` where a `TaskStatus` is expected — and the failure lands in
 /// the peer, not here. Every path that emits a task is checked, because they are
-/// separate code (full projection, listing projection) and drift apart quietly.
+/// separate code (full projection, listing projection) and nothing forces them
+/// to stay in agreement — a divergence would otherwise surface only at a peer.
 fn task_shape(h: &Harness) -> Outcome {
     let tmp = h.tempdir();
     let llm = mock_llm(h, &tmp, &json!({"turns": [{"content": "unused"}]}));

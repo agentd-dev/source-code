@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The **run record** and the **scheduler** (RFC 0027 §6, §7, §9): a run is a
-//! durable transition log over a workflow's DAG — per-step `{status, attempt,
+//! The **run record** and the **scheduler**: a run is a durable transition
+//! log over a workflow's DAG — per-step `{status, attempt,
 //! started, finished, output, error}`, `vars`, the start payload, budgets and
 //! the terminal outcome. The scheduler is pure: given a workflow and a run it
 //! names the steps that are ready (all `depends_on` terminal, `when` true),
@@ -36,7 +36,7 @@ pub enum StepStatus {
     /// start nodes fire one and still run the steps below the others, and what
     /// lets an uneven join proceed without LangGraph's `defer=True`. A pruned
     /// step must not satisfy anything, or the tail of a branch nobody chose
-    /// runs anyway — which it did, before this existed.
+    /// runs anyway.
     Pruned,
 }
 
@@ -127,7 +127,8 @@ impl RunStatus {
     }
 }
 
-/// How the run started (RFC 0027 §3 `run.start`).
+/// How the run started: which start node fired, what payload it carried, and
+/// when. Visible to templates as `run.start`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct Start {
     pub node: String,
@@ -137,7 +138,8 @@ pub struct Start {
     pub ts: u64,
 }
 
-/// The durable run record (RFC 0025 §3.3 `run`, RFC 0027 §9).
+/// The durable run record: the whole state of one run, and the only thing that
+/// has to survive a restart for the scheduler to carry on where it stopped.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunState {
     /// Stop this run just before the named step starts (a breakpoint set with
@@ -259,8 +261,10 @@ impl RunState {
         self.steps.get(id)
     }
 
-    /// The template data view of this run (RFC 0027 §3). `memory` and `env`
-    /// are supplied by the caller (`env` curated + secret-free).
+    /// The template data view of this run: the root names `{{…}}` and CEL
+    /// expressions may reference. `memory` and `env` are supplied by the
+    /// caller rather than read here, because `env` must be curated and
+    /// secret-free before a template can see it.
     pub fn data(&self, env: Value, memory: Value) -> Data {
         let mut d = Data::new();
         d.insert("inputs".into(), self.inputs.clone());

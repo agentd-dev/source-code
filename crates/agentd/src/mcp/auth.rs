@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Auth material resolution for remote MCP endpoints (RFC 0012 §3.7).
+//! Auth material resolution for remote MCP endpoints.
 //!
 //! An [`crate::config::McpServerSpec`] carries secret-**free** header templates
 //! (e.g. `Authorization: Bearer {{secret:MCP_TOKEN}}`); this materializes them to
@@ -13,8 +13,9 @@ use crate::sec::secret;
 /// Resolve every `{{secret:NAME}}` / `{{secret-file:PATH}}` ref in each header
 /// VALUE against the process environment + filesystem, returning materialized
 /// `(name, value)` headers ready for the wire. Header names pass through as-is.
-/// An unresolved ref is an `Err` that names the ref but never the resolved value
-/// (RFC 0012 §3.7 secret-freedom).
+/// An unresolved ref is an `Err` that names the ref but never any resolved
+/// value: diagnostics travel to logs and operators, so a credential must never
+/// ride along in one.
 pub fn resolve_headers(templates: &[(String, String)]) -> Result<Vec<(String, String)>, String> {
     let env = |k: &str| std::env::var(k).ok();
     templates

@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The display-client interface (RFC 0032). A v2 daemon with
-//! `interface.enabled` serves the observation plane on its A2A listener: the
-//! `SubscribeToEvents` feed (hello → events, cursor replay), the taskless
-//! reads, and the human-in-the-loop gate (`ask_human` → `input-required` → a
-//! `taskId` reply resumes the asker). With the interface OFF, the surface
-//! refuses and the core RFC 0029 wire is untouched — the default-OFF contract.
+//! The display-client interface. A daemon with `interface.enabled` serves the
+//! observation plane on its A2A listener: the `SubscribeToEvents` feed
+//! (hello → events, cursor replay), the taskless reads, and the
+//! human-in-the-loop gate (`ask_human` → `input-required` → a `taskId` reply
+//! resumes the asker). With the interface OFF the surface refuses and the core
+//! A2A wire still answers — the default-OFF contract, so enabling an
+//! observation plane is always a deliberate act and never a side effect.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};

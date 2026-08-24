@@ -5,19 +5,19 @@
 //!
 //! `crates/net/tests/ssrf_rebinding.rs` proves the primitive. This file proves
 //! the thing that actually ships: that the callers *use* it. A classifier that
-//! nobody composes is decorative, and the shape it replaced —
+//! nobody composes is decorative, and the composition it must never be given —
 //! `ssrf::guard_host(host)` followed by `http::connect_tcp(host)` — is two
 //! resolutions of the same name, so an attacker who controls the authoritative
 //! DNS answers the check `93.184.216.34` and the connect `169.254.169.254`.
 //!
 //! A hermetic test cannot install a lying nameserver under `getaddrinfo`, so the
 //! rebinding assertion runs through the resolver seam
-//! (`ssrf::connect_vetted_with`) on the exact *sequence* the push path now
+//! (`ssrf::connect_vetted_with`) on the exact *sequence* the push path
 //! performs — guard, then vetted dial — and contrasts it with a reconstruction
-//! of the sequence that was there before, which really does reach the address
-//! the second answer named. The real callers are then driven for their own
-//! sake: a refusal must not dial, and — the other half of the bar — an allowed
-//! target must still be reached, with SNI/`Host` untouched.
+//! of the naive two-lookup sequence, which really does reach the address the
+//! second answer named. The real callers are then driven for their own sake: a
+//! refusal must not dial, and — the other half of the bar — an allowed target
+//! must still be reached, with SNI/`Host` untouched.
 #![cfg(all(unix, feature = "a2a", feature = "workflow"))]
 
 mod common;
@@ -196,7 +196,7 @@ fn a_target_the_operator_allowed_still_arrives_with_the_host_header_on_the_name(
         .expect("the receiver saw the delivery");
     assert_eq!(got.method, "POST");
     assert_eq!(got.path, "/hook");
-    // Connect by address, verify/address by name: the dial now takes a vetted
+    // Connect by address, verify/address by name: the dial takes a vetted
     // `SocketAddr`, but the `Host` header (and, over TLS, the SNI name) must
     // still be the authority from the URL — swapping in the IP would break
     // virtual hosting and certificate validation alike.
@@ -216,7 +216,7 @@ fn a_target_the_operator_allowed_still_arrives_with_the_host_header_on_the_name(
 }
 
 // ---------------------------------------------------------------------------
-// 2. The rebinding property, on the sequence the push path now performs.
+// 2. The rebinding property, on the sequence the push path performs.
 // ---------------------------------------------------------------------------
 
 static CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -239,10 +239,12 @@ fn rebinding_resolver(_host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
 
 #[test]
 fn the_guard_then_dial_sequence_refuses_the_second_answer_where_the_old_one_dialled_it() {
-    // Phase 1 — a reconstruction of the composition that used to be here:
-    // guard the NAME, then hand the NAME to `connect_tcp`, which resolves it a
-    // second time. This is not live code; it is the control. If it did NOT
-    // reach the honeypot the rest of this test would prove nothing.
+    // Phase 1 — the control: the naive composition an SSRF check invites, guard
+    // the NAME and then hand the NAME to `connect_tcp`, which resolves it a
+    // second time. This is not live code; it is here to show the attack lands
+    // when the two lookups are independent. If it did NOT reach the honeypot,
+    // Phase 2 would prove nothing — a dial that refuses everything also never
+    // reaches it.
     let (old_shape, old_addr) = honeypot();
     CALLS.store(0, Ordering::SeqCst);
     REBIND_PORT.store(old_addr.port(), Ordering::SeqCst);
@@ -257,11 +259,11 @@ fn the_guard_then_dial_sequence_refuses_the_second_answer_where_the_old_one_dial
          the two compositions apart"
     );
 
-    // Phase 2 — the sequence `a2a::push::deliver` performs today: `check_url`
-    // (which still resolves, for the yes/no admission answer), then a dial that
-    // resolves ONCE and classifies what it is about to connect to. The hostile
-    // server answers the dial's lookup with the honeypot, and that answer is
-    // the one the classifier sees, so it is refused at the syscall boundary.
+    // Phase 2 — the sequence `a2a::push::deliver` performs: `check_url` (which
+    // resolves, for the yes/no admission answer), then a dial that resolves
+    // ONCE and classifies what it is about to connect to. The hostile server
+    // answers the dial's lookup with the honeypot, and that answer is the one
+    // the classifier sees, so it is refused at the syscall boundary.
     let (new_shape, new_addr) = honeypot();
     CALLS.store(0, Ordering::SeqCst);
     REBIND_PORT.store(new_addr.port(), Ordering::SeqCst);
@@ -292,7 +294,7 @@ fn public_resolver(_host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
 #[test]
 fn the_vetted_dial_approves_public_names_and_still_opens_sockets() {
     // Approval, with no I/O: a public answer passes and carries its port, so a
-    // guarded surface pointed at a real endpoint is not broken by the fix.
+    // guarded surface pointed at a real endpoint still reaches it.
     let addrs = ssrf::resolve_guarded_with("api.example.com", 8443, false, public_resolver)
         .expect("a public name must pass");
     assert_eq!(addrs, vec![SocketAddr::new(public(), 8443)]);
@@ -452,13 +454,13 @@ fn code_of(path: &str) -> String {
 
 #[test]
 fn the_guarded_surfaces_dial_the_vetted_addresses_and_not_the_name() {
-    // This is the one assertion in this file that a revert would fail, and it
-    // is deliberately structural: the two dials differ ONLY when a name resolves
-    // to different addresses on two consecutive lookups, and a test cannot make
-    // `getaddrinfo` do that without owning the machine's resolver. The property
-    // itself is proven above through the seam; what remains to pin down is that
-    // these surfaces are wired to the dial that has it — because the defect was
-    // never in the classifier, it was that nobody's socket went through it.
+    // This assertion is deliberately structural: the two dials differ ONLY when
+    // a name resolves to different addresses on two consecutive lookups, and a
+    // test cannot make `getaddrinfo` do that without owning the machine's
+    // resolver. The property itself is proven above through the seam; what
+    // remains to pin down is that these surfaces are wired to the dial that has
+    // it — this class of hole is never a broken classifier, it is a socket that
+    // never went through one.
     for path in [
         concat!(env!("CARGO_MANIFEST_DIR"), "/../agentd/src/a2a/push.rs"),
         concat!(

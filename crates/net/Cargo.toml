@@ -1,7 +1,7 @@
 # Hand-rolled transport primitives shared by the `mcp` crate and agentd's intel
 # client: a minimal blocking HTTP/1.1 client over any `Read + Write` (+ SSE),
 # unix-socket + feature-gated TLS/vsock connects, and an SSRF egress classifier.
-# The single highest-leverage minimalism decision (RFC 0002): no url→IDNA→ICU,
+# The single highest-leverage minimalism decision: no url→IDNA→ICU,
 # no async runtime. serde-free; TLS/vsock are the only (optional) deps.
 [package]
 name = "agentd-net"

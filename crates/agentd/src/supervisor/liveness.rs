@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Dead/stuck detection — the three-detector model + the EOF×pong classifier.
-//! RFC 0003 §dead-stuck.
+//! Dead/stuck detection — the three-detector model + the EOF x pong classifier.
 //!
 //! This is the *pure* heart of supervision: given timestamps and flags, decide
 //! whether a child is healthy, legitimately busy, stuck-alive, or dead. The
@@ -33,7 +32,8 @@ pub enum Health {
     /// The control channel hit EOF — the child likely exited. Confirm via
     /// `waitpid` (`reap.rs`), then remove.
     Dead,
-    /// The hard wall-clock deadline passed. Tear down (RFC 0011 → exit 124).
+    /// The hard wall-clock deadline passed. Tear down; a one-shot run reports
+    /// exit code 124.
     DeadlineExceeded,
 }
 
@@ -143,9 +143,10 @@ impl Liveness {
         self.deadline
     }
 
-    /// The 2×2 classifier (RFC 0003 §2.8). Order matters: EOF and the hard
-    /// deadline dominate; otherwise recent events = Healthy, else recent pongs
-    /// = Busy, else Stuck.
+    /// The 2x2 classifier. Order matters: EOF and the hard deadline dominate —
+    /// a child that has already closed its channel or blown its deadline must
+    /// not be reported `Healthy` just because an event landed a moment earlier.
+    /// Otherwise recent events = Healthy, else recent pongs = Busy, else Stuck.
     pub fn classify(&self, now: Instant) -> Health {
         if self.eof {
             return Health::Dead;

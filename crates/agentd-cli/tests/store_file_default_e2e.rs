@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The file store as the DEFAULT for a long-lived instance (RFC 0033 §5), end
-//! to end through the real binary.
+//! The file store as the DEFAULT for a long-lived instance, end to end through
+//! the real binary.
 //!
 //! Four properties, in the order they matter:
-//!   1. a long-lived config with no `store` block STARTS (it used to exit 2) and
-//!      says on one line what its durability actually is (`store.file`);
+//!   1. a long-lived config with no `store` block must START, not exit 2, and
+//!      say on one line what its durability actually is (`store.file`);
 //!   2. an EXPLICIT `store.kind: none` on the same config still exits 2 — the
 //!      default must never override a stated choice;
-//!   3. a ONE-SHOT config with no `store` block writes NOTHING to disk — the
-//!      regression that would surprise every existing user of `agentd --instruction`;
+//!   3. a ONE-SHOT config with no `store` block writes NOTHING to disk — a state
+//!      directory there would surprise every user of `agentd --instruction`;
 //!   4. state survives a kill: the second life resumes rather than starting
-//!      fresh, which is the property the whole RFC exists for.
+//!      fresh, which is the whole point of a durable store.
 #![cfg(feature = "workflow")]
 
 mod common;
@@ -89,8 +89,8 @@ fn a_long_lived_instance_with_no_store_block_starts_on_the_file_store() {
         "config_version: \"1\"\nagent:\n  name: sched-default\nworkflows:\n  - name: cron\n    steps: {SCHEDULE_STEPS}\nlifecycle:\n  run_until: drained\n  drain_timeout: 3s\nobservability:\n  log_level: info\n"
     ));
     let (code, stderr) = run_daemon(&cfg, &dir, 300);
-    // It used to exit 2 here with "store.kind is none but the instance is
-    // long-lived"; a clean drain is the whole change.
+    // No refusal with "store.kind is none but the instance is long-lived":
+    // this config must start and drain cleanly, not exit 2.
     assert_eq!(
         code,
         Some(0),
@@ -100,7 +100,7 @@ fn a_long_lived_instance_with_no_store_block_starts_on_the_file_store() {
         !stderr.contains("store.kind is none"),
         "no refusal: {stderr}"
     );
-    // …and it is honest about what that durability is worth (RFC 0033 §5.1).
+    // …and it is honest about what that durability is worth.
     let told = events(&stderr, "store.file");
     assert_eq!(told.len(), 1, "logged once at startup: {stderr}");
     assert_eq!(told[0]["defaulted"], true, "nobody wrote store.kind");
@@ -122,8 +122,8 @@ fn a_long_lived_instance_with_no_store_block_starts_on_the_file_store() {
         std::path::Path::new(&dir).exists(),
         "the state root was created"
     );
-    // The instance keys its state by `agent.name` (RFC 0033 §3), not by a hash
-    // of the config: `<root>/<prefix>/<instance>/…`, a path a human can read.
+    // The instance keys its state by `agent.name`, not by a hash of the config:
+    // `<root>/<prefix>/<instance>/…`, a path a human can read.
     let inst = std::path::Path::new(&dir)
         .join("agentd")
         .join("sched-default");
@@ -219,18 +219,18 @@ fn state_survives_a_kill_and_the_second_life_resumes_instead_of_starting_fresh()
     );
 
     // Life 2: the same directory, a new process (the first one is fully gone, so
-    // its exclusive lock is released — RFC 0033 §4.1).
+    // its exclusive lock is released).
     let (code, second) = run_daemon(&cfg, &dir, 300);
     assert_eq!(code, Some(0), "life 2 drains; stderr:\n{second}");
     assert!(
         events(&second, "restore.fresh").is_empty(),
-        "life 2 must NOT start fresh — this is the property RFC 0033 exists for:\n{second}"
+        "life 2 must NOT start fresh — a restart resumes the instance's state:\n{second}"
     );
     let done = events(&second, "restore.done");
     assert_eq!(done.len(), 1, "life 2 restored a manifest: {second}");
     assert_eq!(
         done[0]["generation"], 2,
-        "the generation counts the lives (RFC 0025 §6): {second}"
+        "the generation counts how many times this instance has started: {second}"
     );
     assert_eq!(
         events(&second, "store.file")[0]["generation"],

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The **mapping language** the store adapters and the tool overrides share
-//! (RFC 0025 §4, RFC 0028 §4): render an argument object / URL / body from a
-//! template over named inputs, and extract a value from a result.
+//! The **mapping language** the store adapters and the tool overrides share:
+//! render an argument object / URL / body from a template over named inputs,
+//! and extract a value from a result.
 //!
 //! - **JSON templates** — a JSON text with `{name}` placeholders: a placeholder
 //!   inside quotes (`"{key}"`) is substituted as JSON-escaped string content; a
@@ -199,8 +199,9 @@ fn substitute(t: &str, vars: &Vars, mode: Mode) -> Result<String, MappingError> 
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'{' {
-            // `{name}` or `{{name}}` (both accepted; the double form is the
-            // RFC 0028 override spelling). Find the identifier + closing braces.
+            // `{name}` or `{{name}}` — both are accepted, and the double form
+            // is the spelling tool overrides use. Find the identifier and its
+            // closing braces.
             let open = if i + 1 < bytes.len() && bytes[i + 1] == b'{' {
                 2
             } else {
@@ -317,7 +318,7 @@ mod tests {
             render_json(r#"{"k": {key}}"#, &vars()).unwrap(),
             json!({"k": "agentd/x/run/1"})
         );
-        // Double-brace spelling (RFC 0028 overrides) is the same placeholder.
+        // The double-brace spelling names the same placeholder.
         assert_eq!(
             render_json(r#"{"k": "{{key}}", "n": {{nested.deep.n}}}"#, &vars()).unwrap(),
             json!({"k": "agentd/x/run/1", "n": 3})

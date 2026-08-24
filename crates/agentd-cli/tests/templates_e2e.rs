@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! RFC 0036 end to end: subagent templates — flat-tier instantiation with
-//! schema-checked params, the freeform switch, and the instance tier (a
-//! template whose instruction defines machinery spawning a FULL child daemon:
-//! typed A2A commands answered by the child's own workflow over its unix
-//! socket, ttl retirement, singleton refusal) — plus the boot-time refusal of
-//! template machinery that tries to define listeners.
+//! Subagent templates end to end: flat-tier instantiation with schema-checked
+//! params, the freeform switch, and the instance tier (a template whose
+//! instruction defines machinery spawning a FULL child daemon: typed A2A
+//! commands answered by the child's own workflow over its unix socket, ttl
+//! retirement, singleton refusal) — plus the boot-time refusal of template
+//! machinery that tries to define listeners.
 #![cfg(all(unix, feature = "workflow"))]
 
 mod common;
@@ -128,7 +128,7 @@ fn template_params_are_schema_checked_at_the_chokepoint() {
 #[cfg(feature = "a2a")]
 #[test]
 fn an_instance_template_boots_answers_typed_commands_and_retires_on_ttl() {
-    // The full RFC 0036 §6 arc in one daemon: a template whose machinery is a
+    // The full instance-tier arc in one daemon: a template whose machinery is a
     // typed-command workflow spawns a CHILD DAEMON; the parent delegates to it
     // by handle over the auto-wired unix socket; the ttl retires it through
     // the child's own graceful drain.

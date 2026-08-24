@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The local-filesystem store (RFC 0033) — `store.kind: file`. One file per
-//! key, atomic writes, an exclusive instance lock, and traversal closed at the
-//! adapter.
+//! The local-filesystem store — `store.kind: file`. One file per key, atomic
+//! writes, an exclusive instance lock, and traversal closed at the adapter.
 //!
 //! This is the adapter that lets a laptop satisfy durability without standing
-//! up a coordination backend, so it is the default for a long-lived instance
-//! (RFC 0033 §5). It is deliberately NOT a fleet store: a directory has no
+//! up a coordination backend, which is why it is the default for a long-lived
+//! instance. It is deliberately NOT a fleet store: a directory has no
 //! compare-and-set a second process would respect, so instead of pretending,
 //! `open` takes an exclusive `flock` and a second instance fails at startup
 //! with the holder's pid. Finding that out at startup is much cheaper than
@@ -37,9 +36,9 @@ pub struct FileStore {
     /// the ONLY writer of the root, so the cache is exact once a key has been
     /// touched — and the per-put CAS can compare against it instead of reading
     /// and parsing the whole envelope back from disk on EVERY write (measured:
-    /// that read-back was ~20% of a step-heavy run's cycles). A key not yet in
-    /// the cache still reads disk once, so state written by a PREVIOUS life is
-    /// respected exactly as before.
+    /// that read-back is ~20% of a step-heavy run's cycles). A key not yet in
+    /// the cache still reads disk once, so state written by a PREVIOUS life
+    /// still wins the compare-and-set.
     seqs: std::sync::Mutex<std::collections::HashMap<String, u64>>,
     /// Held for the life of the store: dropping it releases the `flock`.
     _lock: LockFile,
@@ -142,7 +141,8 @@ impl Store for FileStore {
     fn get(&self, key: &str, _seq: Option<u64>) -> Result<Option<Value>, StoreError> {
         // Latest-only, like the http adapter: a pinned seq reads as the latest.
         let v = self.read(&self.path_of(key)?)?;
-        // A tombstone (latest state null) reads as absent, per RFC 0025 §3.
+        // A tombstone (latest state null) reads as absent, so a deleted entity
+        // cannot come back to life through a restore.
         Ok(v.filter(|v| !v.get("state").is_some_and(Value::is_null)))
     }
 

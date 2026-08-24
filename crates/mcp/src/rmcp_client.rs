@@ -1,16 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The **official SDK**, wrapped so the rest of agentd stays blocking.
 //!
-//! agentd's own MCP client is hand-rolled, for the same reason everything else
-//! here is: the default build has three external dependencies and a sub-millisecond
-//! start. That is a real property, and it is also a real bet — a bet that we
-//! track the specification correctly by ourselves.
-//!
-//! This module is the other side of that bet, for deployments that would rather
-//! inherit spec-tracking from upstream than own it: the same operations, served
-//! by [`rmcp`], the Rust SDK maintained with the protocol. Turning it on costs
-//! ~77 additional crates including tokio, so it is opt-in and the hand-rolled
-//! client stays the default.
+//! [`rmcp`] — the Rust SDK maintained alongside the protocol — owns the
+//! handshake and the core operations (tools, resources, subscriptions), so
+//! spec-tracking for those is inherited rather than hand-maintained. The
+//! hand-rolled client in [`crate::client`] still serves the surface the SDK does
+//! not cover (prompts, completion, resource templates, ping, the tasks
+//! extension) over the same socket.
 //!
 //! **Blocking on the outside.** agentd has no async runtime: the supervisor is a
 //! single-threaded reactor and the turn worker is a straight-line state machine,
@@ -26,8 +22,8 @@
 //! dialect the SDK may not fully implement, which is the opposite of why one
 //! adopts an SDK. So this backend speaks whatever rmcp says is current, and
 //! picks up the stateless revision automatically on the release that promotes
-//! it. (The hand-rolled client, which implements the stateless dialect itself,
-//! continues to negotiate `2026-07-28` — see `crate::version`.)
+//! it. Everything version-dependent here (notably [`RmcpClient::subscribe`])
+//! therefore branches on the *negotiated* version, never on a hard-coded era.
 
 use crate::client::McpError;
 use crate::inbound;
@@ -150,8 +146,8 @@ impl ClientHandler for Handler {
         self.queue("notifications/prompts/list_changed", json!({}));
     }
 
-    // Logging is deprecated by SEP-2577 upstream, but a server that still sends
-    // it should still be heard while it exists.
+    // Upstream marks logging notifications deprecated, but a server that still
+    // sends them is better heard than silently ignored.
     #[allow(deprecated)]
     async fn on_logging_message(
         &self,
@@ -457,11 +453,11 @@ impl RmcpClient {
     /// actually defines.
     ///
     /// The two eras disagree: legacy uses `resources/subscribe`, and the
-    /// stateless revision replaces it with `subscriptions/listen` (rmcp
-    /// deprecates the former *for that version*). Since this backend speaks
-    /// whatever revision the SDK says is current, the choice has to be made
-    /// from the negotiated version rather than hard-coded — which also means it
-    /// starts using `listen` on its own the day rmcp promotes `LATEST`.
+    /// stateless revision replaces it with `subscriptions/listen` (rmcp marks
+    /// the former deprecated *for that version only*). Because this backend
+    /// speaks whatever revision the SDK negotiates, the choice must be read off
+    /// the negotiated version rather than hard-coded — calling the wrong one
+    /// leaves the host with a subscription the server never honours.
     ///
     /// In the modern case one subscription covers every tracked URI: adding a
     /// URI reopens it with the widened filter, and its notifications pump into
@@ -504,8 +500,8 @@ impl RmcpClient {
     /// notifications into the drain queue on a background task.
     fn relisten(&self) -> Result<(), McpError> {
         // Legacy revisions have no `subscriptions/listen`; the per-URI
-        // `resources/subscribe` is the correct call there, deprecated only
-        // relative to the newer dialect.
+        // `resources/subscribe` is the correct call there, and is marked
+        // deprecated only relative to the newer dialect.
         if !self.modern() {
             return self.legacy_subscribe_all();
         }

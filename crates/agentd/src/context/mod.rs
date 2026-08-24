@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! **Contexts** (RFC 0026 §5): the durable, self-compacting working memory of
-//! the root agent (`context/root`) and of every A2A conversation
-//! (`context/<contextId>`). A context is a versioned record of messages, a
-//! structured summary block, the loaded skill set, the working **plan**
-//! (RFC 0026 §5.3), the last preflight verdict and a token estimate; the
-//! runtime is its single writer and checkpoints it after every turn.
+//! **Contexts**: the durable, self-compacting working memory of the root agent
+//! (`context/root`) and of every A2A conversation (`context/<contextId>`). A
+//! context is a versioned record of messages, a structured summary block, the
+//! loaded skill set, the working **plan**, the last preflight verdict and a
+//! token estimate. The runtime is its single writer and checkpoints it after
+//! every turn, so nothing here needs locking and a crash loses at most the
+//! turn in flight.
 //!
 //! The transcript representation here ([`Msg`]) is **serializable** (unlike
 //! the provider wire type) and converts to [`crate::wire::intel::Message`]
@@ -26,7 +27,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// The root context id (RFC 0025 §3.3).
+/// The root context id: the one context that always exists, holding the root
+/// agent's own working memory rather than any caller's conversation.
 pub const ROOT: &str = "root";
 
 /// One transcript entry. `ts` is wall-clock ms; tool results keep the parsed
@@ -173,7 +175,9 @@ impl Msg {
     }
 }
 
-/// The structured summary block a compaction produces (RFC 0026 §5.2).
+/// The structured summary block a compaction produces: what the dropped
+/// messages amounted to, kept in fields so a later compaction can merge two
+/// summaries instead of summarising a summary.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct Summary {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -253,7 +257,9 @@ impl Summary {
     }
 }
 
-/// A loaded skill reference (name + version hash), RFC 0028 §7.
+/// A loaded skill reference: its name plus the hash of the version that was
+/// loaded, so a skill edited on disk is detectable rather than silently
+/// diverging from what the transcript was built against.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillRef {
     pub name: String,
@@ -269,7 +275,8 @@ pub enum ContextKind {
     Conversation,
 }
 
-/// The durable context record (RFC 0025 §3.3 `context`).
+/// The durable context record: everything about a conversation that must
+/// survive a restart.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContextState {
     #[serde(default)]
@@ -500,8 +507,11 @@ impl Contexts {
         self.map.remove(id)
     }
 
-    /// Checkpoint every dirty context (RFC 0025 §5: after each turn /
-    /// compaction). Returns the ids written.
+    /// Checkpoint every dirty context — called after each turn and after each
+    /// compaction, which bounds a crash's loss to the work in flight.
+    ///
+    /// Returns the ids written. A clean context is skipped, so repeated calls
+    /// are cheap and the write count tracks real change.
     pub fn checkpoint(&mut self, durable: &Durable) -> Result<Vec<String>, StoreError> {
         let mut written = Vec::new();
         for (id, c) in self.map.iter_mut() {

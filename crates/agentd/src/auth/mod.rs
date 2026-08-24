@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Endpoint authentication — the interactive & workload credential providers and
-//! the durable token cache they share (RFC 0031).
+//! Endpoint authentication — the interactive and workload credential providers
+//! and the token cache they share.
 //!
-//! The existing static-header path (`mcp::auth`) and the AAuth request-signer
-//! (`aauth`) are the `static`/`aauth` providers. This module owns the *new*
-//! surfaces: the durable [`Kind::Cred`](crate::state::Kind::Cred) [`cache`], and
-//! the OAuth 2.1 / OIDC [`oauth2`] flows (device grant + refresh + discovery)
-//! that power `agentd login`. AWS SigV4/SSO and SPIFFE providers land behind the
-//! `aws`/`spiffe` features in later phases.
+//! Static headers (`mcp::auth`) and the AAuth request-signer (`aauth`) supply
+//! the `static` and `aauth` providers. This module owns the rest: the
+//! [`Kind::Cred`](crate::state::Kind::Cred)-backed [`cache`], the OAuth 2.1 /
+//! OIDC [`oauth2`] flows (device grant, browser + PKCE, refresh, discovery)
+//! behind `agentd login`, and the AWS SigV4 / IAM Identity Center providers.
+//! Everything but the cache is gated on the `oauth` cargo feature, so a build
+//! without it carries no interactive-login code at all.
 
 pub mod cache;
 
@@ -32,10 +33,12 @@ pub mod aws_sso;
 #[cfg(feature = "oauth")]
 pub mod browser;
 
-/// Canonicalize a login/logout target (RFC 0037): `mcp:<name>` on a server that
-/// references a catalog entry becomes `service:<entry>` — the key the daemon's
-/// connect path reads — so a login (or logout) lands where every consumer of
-/// the entry shares it. Feature-free: logout works without `oauth`.
+/// Canonicalize a login/logout target: `mcp:<name>` on a server that references
+/// a service-catalog entry becomes `service:<entry>`, the key the daemon's
+/// connect path actually reads. Every server pointing at that entry shares one
+/// credential, so a login must land where all of them look and a logout must
+/// revoke it for all of them at once. Deliberately outside the `oauth` feature
+/// gate, so logout still resolves in a build without interactive login.
 pub fn canonical_target(settings: &crate::config::v2::Settings, target: &str) -> String {
     if let Some(name) = target.strip_prefix("mcp:")
         && let Some(svc) = settings

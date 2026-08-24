@@ -1,19 +1,23 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The **internal tool contracts** (RFC 0028 §3): name, description, input and
-//! output JSON Schemas, whether a built-in implementation exists (mapping-only
-//! contracts are `code.run`, `knowledge.*`, `search.*`), and the default
-//! grants. Contracts are what callers see; an override (RFC 0028 §4) swaps the
-//! implementation, never the contract.
+//! The **internal tool contracts**: name, description, input and output JSON
+//! Schemas, whether a built-in implementation exists (mapping-only contracts
+//! are `code.run`, `knowledge.*`, `search.*`), and the default grants.
+//!
+//! The contract is what callers see, and an override swaps only the
+//! implementation behind it. That separation is what lets an operator move a
+//! tool onto an MCP server without any caller — model, workflow or subagent —
+//! having to be told, and it is why the schemas here are the authority on a
+//! tool's shape rather than whatever a mapped server happens to advertise.
 
 use serde_json::{Value, json};
 
-/// Who may call a tool by default (RFC 0028 §3 "Grants default").
+/// Who may call a tool by default, before configuration widens or narrows it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DefaultGrant {
     pub root: bool,
     pub workflows: bool,
     pub subagents: bool,
-    /// Granted to A2A `user` principals by default (RFC 0029 §2).
+    /// Granted to A2A `user` principals by default.
     pub user: bool,
     /// Granted to A2A `agent` principals by default.
     pub agent: bool,
@@ -128,7 +132,7 @@ pub fn contracts() -> Vec<Contract> {
         obj(
             json!({
                 "instruction": s("The subagent's brief (freeform; mutually exclusive with template)"),
-                "template": s("A subagents.templates entry to instantiate (RFC 0036)"),
+                "template": s("A subagents.templates entry to instantiate"),
                 "params": {"type": "object", "description": "Values for the template's declared params (schema-validated)"},
                 "mode": {"enum": ["sync", "async", "detached", "warm"], "default": "sync"},
                 "tools": arr(json!({"type": "string"})),
@@ -153,7 +157,7 @@ pub fn contracts() -> Vec<Contract> {
     c(
         "subagent.retire",
         "subagent",
-        "Begin graceful retirement of an instance-tier child (RFC 0036): it drains its own runs and exits cleanly; escalation to SIGKILL only after the drain window.",
+        "Begin graceful retirement of an instance-tier child: it drains its own runs and exits cleanly; escalation to SIGKILL only after the drain window.",
         obj(
             json!({"handle": s("The instance child's handle")}),
             &["handle"],
@@ -419,7 +423,7 @@ pub fn contracts() -> Vec<Contract> {
     c(
         "workflow.create",
         "workflow",
-        "Define a new workflow (dialect 3) at runtime.",
+        "Define a new workflow at runtime.",
         obj(
             json!({"definition": {"type": "object"}, "arm": {"type": "boolean"}}),
             &["definition"],
@@ -814,15 +818,19 @@ pub fn contracts() -> Vec<Contract> {
         ALL,
     );
 
-    // ---- exec (guarded local command runner; DEFAULT-OFF, RFC 0028 §exec) ----
-    // A mapping-only contract by default: agentd runs no local code (RFC 0012)
-    // unless an operator both builds `--features exec` AND sets `security.exec`.
-    // Otherwise `exec` is delegated off-box via `tools.overrides`. It carries the
-    // `sensitive` + `egress` trifecta tags (attached in `Registry::build`).
+    // ---- exec (guarded local command runner; DEFAULT-OFF) -------------------
+    // A mapping-only contract by default: agentd runs no local code unless an
+    // operator both builds `--features exec` AND sets `security.exec`. Two
+    // independent switches, because arbitrary local execution is the one
+    // capability that turns a prompt-injection into host compromise. Failing
+    // either, `exec` is delegated off-box via `tools.overrides`. It always
+    // carries the `sensitive` + `egress` trifecta tags (attached in
+    // `Registry::build`), so the Rule-of-Two gate refuses to combine it with
+    // untrusted input.
     c(
         "exec",
         "exec",
-        "Run a local command (argv — NO shell interpretation) and return {stdout, stderr, exit_code, timed_out}. GUARDED and default-OFF (RFC 0028): runs only allow-listed commands, confined to a working directory, with a timeout, an output cap, and a minimal environment. Enable a local runner via `security.exec` in a build with `--features exec`, or map it onto an MCP server with `tools.overrides` to delegate execution off-box.",
+        "Run a local command (argv — NO shell interpretation) and return {stdout, stderr, exit_code, timed_out}. GUARDED and default-OFF: runs only allow-listed commands, confined to a working directory, with a timeout, an output cap, and a minimal environment. Enable a local runner via `security.exec` in a build with `--features exec`, or map it onto an MCP server with `tools.overrides` to delegate execution off-box.",
         obj(
             json!({
                 "cmd": s("The command to run (argv[0]) — must be in security.exec.allow"),
@@ -856,7 +864,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn contracts_are_unique_well_formed_and_cover_the_rfc_table() {
+    fn contracts_are_unique_well_formed_and_cover_the_catalogue() {
         let all = contracts();
         let mut seen = std::collections::BTreeSet::new();
         for c in &all {

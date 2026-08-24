@@ -1,7 +1,7 @@
 # Lifecycle & triggers
 
 agentd has **one durable runtime** — a single-writer event loop over durable
-state (RFC 0026). There are **no modes** to choose between. When a run happens is
+state. There are **no modes** to choose between. When a run happens is
 decided by two independent things:
 
 - the process **lifecycle shape** — whether the instance is a one-shot *job* or a
@@ -44,19 +44,19 @@ flowchart LR
   class daemon accent;
 ```
 
-A job maps its outcome to the exit-code table (RFC 0011 §5): `0` completed, `2`
+A job maps its outcome to the exit-code table: `0` completed, `2`
 config/usage, `4` intelligence unavailable, `6` a required MCP server down, `7`
 budget/step exhaustion, etc. A daemon exits `0` on a graceful SIGTERM drain.
 
 The **quickstart** — `agentd --instruction "…" --intelligence https://…` — is a
-job: the `--instruction` sugar expands to a `once → agent → finish` workflow
-(RFC 0030 §5), runs one turn, and exits.
+job: the `--instruction` sugar expands to a `once → agent → finish` workflow,
+runs one turn, and exits.
 
 ---
 
 ## Triggers — workflow start nodes
 
-A workflow is a DAG (RFC 0027). Its entry point is a **start node** whose `kind`
+A workflow is a DAG. Its entry point is a **start node** whose `kind`
 decides *when* a run fires. One workflow may have several.
 
 ```yaml
@@ -96,7 +96,7 @@ Each workflow bounds its own live runs:
 
 ## The A2A channel — the daemon's inbox
 
-A daemon's external channel is **A2A** (RFC 0029), not a mode. Set `a2a.listen`
+A daemon's external channel is **A2A**, not a mode. Set `a2a.listen`
 and the runtime binds an HTTPS listener that turns A2A requests into runtime
 work (this alone makes `run_until: auto` a daemon):
 
@@ -113,13 +113,13 @@ a2a:
 - A **natural-language** message becomes a durable conversation turn; the answer
   comes back as the A2A task's artifact.
 - A **command** DataPart (`{"data":{"agentd":{"op":"workflow.run","name":"…"}}}`)
-  runs a registry action — the modern equivalent of poking a v1 daemon.
+  runs a registry action directly, with no model in the path — deterministic
+  dispatch rather than prose the receiving agent has to interpret.
 - Every call is resolved to a **principal** (mTLS / bearer → `operator | user |
   agent | anonymous`), authorized against a role matrix, and (optionally)
   **audited** (`observability.audit`).
 
-See [`docs/configuration.md`](configuration.md) for the full `a2a` schema and
-[RFC 0029](../rfcs/0029-a2a-conversations-principals-commands.md) for the wire contract.
+See [`docs/configuration.md`](configuration.md) for the full `a2a` schema.
 
 
 

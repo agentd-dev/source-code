@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Amazon Bedrock **Converse** API adapter (RFC 0031 §8 — native Bedrock). Pure
-//! translation, no I/O; the SigV4 signing that authenticates the dial is a
-//! separate axis ([`crate::auth::aws`], applied by the transport in
-//! [`super::endpoints`]).
+//! Amazon Bedrock **Converse** API adapter. Pure translation, no I/O; the SigV4
+//! signing that authenticates the dial is a separate axis
+//! ([`crate::auth::aws`], applied by the transport in [`super::endpoints`]).
 //!
 //! Converse is Bedrock's provider-neutral chat surface, so agentd speaks ONE
 //! dialect to every Bedrock model (Anthropic, Llama, Titan, …). It differs from
@@ -39,8 +38,12 @@ pub fn converse_path(model: &str) -> String {
     format!("/model/{}/converse", encode_segment(model))
 }
 
-/// Percent-encode one path segment per RFC 3986 / AWS SigV4: unreserved bytes
-/// pass; every other byte (including `/` and `:`) → uppercase `%XX`.
+/// Percent-encode one path segment per RFC 3986, the way SigV4 canonicalisation
+/// requires:
+/// the unreserved set `A-Za-z0-9-._~` passes through, and every other byte —
+/// including `/` and `:` — becomes an uppercase `%XX` escape. Uppercase hex is
+/// mandatory: the signer compares the canonical URI byte-for-byte, so lowercase
+/// escapes would produce a signature mismatch.
 fn encode_segment(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for &b in s.as_bytes() {

@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! base64 helpers for AAuth (RFC 0023): url-safe **unpadded** (JWK/JWT, per RFC
-//! 4648 §5 + RFC 7515) and standard **padded** (the RFC 9421 `:…:` signature
-//! byte-sequence). Hand-rolled — no `base64` crate (the minimalism moat).
+//! base64 helpers for AAuth: url-safe **unpadded** (JWK/JWT, per RFC 4648 §5
+//! and RFC 7515) and standard **padded** (the RFC 9421 `:…:` signature
+//! byte-sequence). The two alphabets are not interchangeable on the wire — a
+//! JWK member encoded with `+/` is rejected, so pick by consumer, not by taste.
+//! Hand-rolled — no `base64` crate (the minimalism moat).
 
 const STD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 const URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! AWS workload-identity credential sources (RFC 0031 §8): `source: irsa` (EKS
-//! web identity → STS AssumeRoleWithWebIdentity) and `source: imds` (EC2 instance
-//! metadata, IMDSv2). Each mock server yields temporary credentials; the SigV4
-//! signer fetches, caches, and signs with them. Both run in one test (sequential)
-//! to avoid process-env races.
+//! AWS workload-identity credential sources: `source: irsa` (EKS web identity →
+//! STS AssumeRoleWithWebIdentity) and `source: imds` (EC2 instance metadata,
+//! IMDSv2). Each mock server yields temporary credentials; the SigV4 signer
+//! fetches, caches, and signs with them. Both run in one test (sequential) to
+//! avoid process-env races.
 #![cfg(all(unix, feature = "oauth"))]
 
 use std::io::{BufRead, BufReader, Read, Write};

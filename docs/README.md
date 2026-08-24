@@ -70,11 +70,7 @@ Three properties make it different from an agent framework:
 | [intelligence.md](intelligence.md) | The model endpoint: the wire, failover, budgets, credentials. |
 | [aauth.md](aauth.md) | Agent identity for AAuth-protected servers — an Ed25519 key and signed requests. |
 
-## Specifications
-
-The **normative specs** live in [`../rfcs/`](../rfcs/README.md) — read those when
-you need the exact contract rather than an explanation of it.
-[RFC 0001](../rfcs/0001-mcp-native-agent-runtime.md) is the narrative front door.
+## Design records
 
 The **decision records** live in [`design/`](design/): they record why the
 system is shaped this way, including options that were considered and rejected.

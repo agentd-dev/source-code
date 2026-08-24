@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The **state store** contract and adapters (RFC 0025 §2, §4).
+//! The **state store** contract and adapters.
 //!
 //! agentd's durability rests on four operations —
 //! `put(key, seq, envelope) / get(key[, seq]) / list(prefix) / delete(key)` —
 //! implemented by an adapter chosen in `store.kind`: [`mcp`] (any MCP server's
-//! tools, mapped), [`http`] (plain HTTP), [`file`] (the local filesystem, RFC
-//! 0033 — durable for one host, single-writer), or [`memory`] (in-process;
-//! tests and dev). `put` is a **compare-and-set on `seq`**: the stored seq
-//! must be lower, else `Conflict` — the split-brain guard every caller treats
-//! as fatal.
+//! tools, mapped), [`http`] (plain HTTP), [`file`] (the local filesystem —
+//! durable for one host, single-writer), or [`memory`] (in-process; tests and
+//! dev). `put` is a **compare-and-set on `seq`**: the stored seq must be lower,
+//! else `Conflict` — the split-brain guard every caller treats as fatal.
 //! agentd links no database client and defines no schema beyond the
 //! [`Envelope`].
 
@@ -23,7 +22,9 @@ use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// The envelope major this build writes and accepts (RFC 0025 §3.2).
+/// The envelope major this build writes and accepts. A record carrying any
+/// other major is refused as [`StoreError::Corrupt`] rather than guessed at:
+/// misreading a record's shape would silently corrupt restored state.
 pub const ENVELOPE_VERSION: u32 = 2;
 
 /// A versioned store record: `state` is the kind-specific payload; a tombstone
@@ -85,7 +86,9 @@ impl Envelope {
     }
 }
 
-/// `<prefix>/<instance>/<kind>/<id>` (RFC 0025 §3.1).
+/// The store key layout: `<prefix>/<instance>/<kind>/<id>`. The instance segment
+/// keeps two agents sharing one backing store from colliding, and the kind
+/// segment lets a restore enumerate one entity kind by prefix alone.
 pub fn key(prefix: &str, instance: &str, kind: &str, id: &str) -> String {
     format!("{prefix}/{instance}/{kind}/{id}")
 }
@@ -145,9 +148,9 @@ impl std::fmt::Display for StoreError {
 
 impl std::error::Error for StoreError {}
 
-/// The four-operation contract (RFC 0025 §2). Implementations are `Send +
-/// Sync` so the runtime's executor pool can call them; every operation is
-/// bounded by the adapter's timeout.
+/// The four-operation store contract. Implementations are `Send + Sync` so the
+/// runtime's executor pool can call them from any thread; every operation is
+/// bounded by the adapter's timeout, so no store call can wedge a worker.
 pub trait Store: Send + Sync {
     /// Compare-and-set write: `seq` must exceed the stored one.
     fn put(&self, key: &str, seq: u64, envelope: &Value) -> Result<PutOutcome, StoreError>;
@@ -165,8 +168,9 @@ pub trait Store: Send + Sync {
 /// A shared store handle.
 pub type SharedStore = Arc<dyn Store>;
 
-/// The store timeout class: the management timeout (RFC 0016 §10) unless the
-/// settings say otherwise.
+/// The store timeout class: store calls are management traffic rather than model
+/// traffic, so they inherit the management timeout unless the settings override
+/// it with an explicit `store.timeout`.
 pub fn default_timeout() -> Duration {
     crate::obs::health::management_timeout()
 }
@@ -198,7 +202,7 @@ pub(crate) fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Build the store an instance is configured with (RFC 0030 §3.5). `servers`
+/// Build the store an instance is configured with. `servers`
 /// resolves the `mcp` adapter's coordination server by name; `kind: none`
 /// yields no store (the caller decides whether that is allowed).
 pub fn open(
@@ -230,13 +234,13 @@ pub fn open(
             ))))
         }
         StoreKind::File => {
-            // The root is resolved by the config module (RFC 0033 §4) so the
-            // startup log, `--capabilities` and this open all name the same
-            // directory. `store.file` may be absent entirely — the chain then
-            // runs on the environment alone.
+            // The root is resolved by the config module, so the startup log,
+            // `--capabilities` and this open all name the same directory rather
+            // than each deriving one. `store.file` may be absent entirely — the
+            // resolution chain then runs on the environment alone.
             let root = crate::config::v2::file_store_root(settings);
             // `open` takes the exclusive instance lock, and a held lock arrives
-            // as `Io` (RFC 0033 §4.1) carrying the holder's pid. Name the
+            // as `Io` carrying the holder's pid. Name the
             // adapter in front of it: the operator reads this at exit, where
             // "store i/o: …" alone would not say which store or which path.
             let store = file::FileStore::open(&root).map_err(|e| match e {

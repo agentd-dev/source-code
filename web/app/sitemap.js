@@ -29,8 +29,7 @@ export default function sitemap() {
     url: `${BASE}/docs/${d.slug}/`,
     lastModified: mtime(d.file),
     changeFrequency: "weekly",
-    // Specs are reference material; guides and concepts are the landing surface.
-    priority: d.group.startsWith("rfc-") ? 0.5 : 0.8,
+    priority: 0.8,
   }));
   return [...top, ...docs];
 }

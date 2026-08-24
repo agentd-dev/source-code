@@ -9,19 +9,19 @@
 //! an `input-required` A2A task an operator can answer → the answer back down
 //! the same wire, shaped to the server's `requestedSchema`.
 //!
-//! One link was broken: `ask_human` answered with a bare string, and the bridge
-//! reads `reply` out of the tool result to build the spec's `accept` content.
-//! It found nothing, so *every* elicitation came back `cancel` — the capability
-//! was advertised and could not be honoured. The first test asserts from the
-//! **server's** side, which is the only side that can tell: the JSON-RPC
-//! response to `elicitation/create` carries `"action": "accept"` and the
-//! operator's answer as `content`.
+//! Every link is load-bearing, and the thinnest is `ask_human`'s result: the
+//! bridge lifts `reply` out of it to build the spec's `accept` content, so an
+//! answer that arrives as a bare string leaves the bridge with nothing and
+//! *every* elicitation comes back `cancel` — a capability advertised and not
+//! honoured. The first test asserts from the **server's** side, which is the
+//! only side that can tell: the JSON-RPC response to `elicitation/create`
+//! carries `"action": "accept"` and the operator's answer as `content`.
 //!
 //! The second test covers the other half of the same machinery: a gate whose
-//! asking child is gone. The `ToolResult` slot died with the process, so an
-//! answer can never reach the model — and the gate used to sit in
+//! asking child is gone. The `ToolResult` slot dies with the process, so an
+//! answer can never reach the model — and the gate must not sit in
 //! `input-required` for the whole 24 h ask timeout with an operator staring at
-//! an answerable question whose answer went nowhere. It must end explicitly.
+//! an answerable question whose answer goes nowhere. It must end explicitly.
 #![cfg(all(unix, feature = "a2a"))]
 
 mod common;
@@ -444,8 +444,8 @@ fn an_mcp_elicitation_reaches_the_operator_and_the_server_sees_accept_with_the_c
     );
 
     // THE assertion: from the server's side, the elicitation was accepted and
-    // carries the operator's answer bound to the property it asked for. A bare
-    // string tool result made this a `cancel` every single time.
+    // carries the operator's answer bound to the property it asked for. A tool
+    // result the bridge cannot lift `reply` out of makes this a `cancel`.
     let deadline = Instant::now() + Duration::from_secs(30);
     let answered = loop {
         if let Some(a) = seen.0.lock().unwrap().elicit_result.clone() {

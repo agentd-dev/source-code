@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The **MCP-mapped store** (RFC 0025 §4.1): the four store operations are
-//! `tools/call`s against a declared MCP server, with argument templates and
-//! result extraction from `store.mcp.{put,get,list,delete}`. The **default
-//! mapping is the RFC 0021 §8.3 checkpointer profile** (`state.put/get/list`,
-//! `state.delete`), so a server advertising those tools needs no mapping.
+//! The **MCP-mapped store**: the four store operations are `tools/call`s
+//! against a declared MCP server, with argument templates and result extraction
+//! from `store.mcp.{put,get,list,delete}`. The **default mapping is the
+//! checkpointer profile** (`state.put` / `state.get` / `state.list` /
+//! `state.delete`), so a server advertising those tools needs no mapping at all.
 //!
 //! Every call carries `_meta["agent/idempotency_key"] = "<key>#<seq>"` and
 //! `_meta["agent/instance"]`, and is bounded by the store timeout.
@@ -46,7 +46,8 @@ impl McpCall for crate::mcp::client::McpClient {
     }
 }
 
-/// The default checkpointer profile (RFC 0021 §8.3 + `state.delete`).
+/// The default checkpointer profile: `state.put` / `state.get` / `state.list` /
+/// `state.delete`, mapped onto the four store operations in that order.
 pub fn default_ops() -> (StoreOp, StoreOp, StoreOp, StoreOp) {
     let op = |tool: &str, args: &str| StoreOp {
         tool: tool.into(),

@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! `agentd login <target>` — the interactive device-authorization flow
-//! (RFC 0031 §12). Resolves a configured endpoint's `auth:` block, runs the
-//! RFC 8628 device grant (print a URL + short code, poll until the human
-//! authorizes), and writes the obtained token to the per-user file cache the
-//! daemon reads at startup.
+//! `agentd login <target>` — the interactive login flow. Resolves a configured
+//! endpoint's `auth:` block, runs the RFC 8628 device grant (print a URL and a
+//! short code, poll until the human authorizes), and writes the obtained token
+//! to the per-user file cache the daemon reads at startup.
 //!
-//! `<target>` is `mcp:<name>` (an MCP server) or `intelligence`. The flow is
-//! fail-closed: a token is only cached on success; nothing is printed but the
-//! code + URL (never the token).
+//! `<target>` is `mcp:<name>` (an MCP server), `service:<name>` (a catalog
+//! entry shared by several servers), or `intelligence`. The flow is
+//! fail-closed: a token is cached only on success, and nothing is printed but
+//! the code and URL — never the token itself.
 
 use std::time::{Duration, Instant};
 
@@ -45,7 +45,8 @@ pub fn resolve_auth<'a>(settings: &'a Settings, target: &str) -> Result<&'a Auth
             .as_ref()
             .ok_or_else(|| format!("mcp server '{name}' has no `auth:` block to log in with"));
     }
-    // RFC 0037: a service-catalog entry's shared credential.
+    // A service-catalog entry holds one credential shared by every server
+    // that references it, so it is logged into once under its own name.
     if let Some(name) = target.strip_prefix("service:") {
         let e = settings
             .services

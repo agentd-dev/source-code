@@ -6,8 +6,9 @@ attach the TUI, and read a non-zero exit code.
 
 > **Not to be confused with agentd's own `skills:` config section.** Those are
 > instruction bundles the *agent* loads at runtime, and the stock binary
-> discovers them from **MCP servers** — there are deliberately no local skill
-> directories in agentd itself (RFC 0028 §7). This directory is for the tools
+> discovers them from **MCP servers** — agentd deliberately reads no local skill
+> directory, so a skill cannot be planted on the host filesystem. This directory
+> is for the tools
 > that help you build with agentd, not for agentd.
 
 | skill | use it when |

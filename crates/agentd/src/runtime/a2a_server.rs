@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The **A2A v2 transport binding** (RFC 0029): the HTTPS listener that turns
-//! A2A requests into runtime work, and the durable-task lifecycle behind it.
+//! The **A2A transport binding**: the HTTPS listener that turns A2A requests
+//! into runtime work, and the durable-task lifecycle behind it.
 //!
 //! Two halves meet here. The **transport** ([`A2aAuth`], [`A2aHandler`]) runs
 //! on the framework's per-connection threads: it resolves the caller to a
@@ -13,16 +13,22 @@
 //! loop — a blocking `SendMessage`, a stream — are served by the transport
 //! thread polling a **shared task-snapshot map** the loop keeps current.
 //!
-//! Identity note: `PeerOrigin` is two-valued, so the caller's evidence — the
-//! presented bearer AND the verified mTLS leaf identity (subject CN + SANs, RFC
-//! 0029 §10.3) — is threaded from `authenticate` to `dispatch` via per-connection
-//! **thread-locals** (one connection = one thread = one request). The serve
-//! framework now surfaces the client-cert subject/SANs (`net::x509`), so
-//! `san`/`sub` principal rules match a client cert directly (a SPIFFE X.509-SVID's
-//! `spiffe://…` arrives as a URI SAN); an all-empty-principals listener keeps the
-//! "any verified cert ⇒ operator" default. Inbound AAuth-agent attribution
-//! (`aauth_agent`) still awaits an inbound AAuth verifier (agentd signs, but does
-//! not yet verify, AAuth) — the one remaining identity axis.
+//! Identity note: `PeerOrigin` carries only two values, so the caller's full
+//! evidence — the presented bearer AND the verified mTLS leaf identity, subject
+//! CN plus SANs — is threaded from `authenticate` to `dispatch` through
+//! per-connection **thread-locals**. That is sound only because one connection
+//! is one thread serving one request; nothing here may be reused across
+//! connections.
+//!
+//! The serve framework surfaces the client-cert subject and SANs (`net::x509`),
+//! so `san`/`sub` principal rules match a client certificate directly — a
+//! SPIFFE X.509-SVID's `spiffe://…` arrives as a URI SAN. A listener that
+//! declares no principals at all falls back to "any verified cert is an
+//! operator", which is why declaring even one principal turns the allowlist on.
+//!
+//! Inbound AAuth-agent attribution (`aauth_agent`) is not populated: agentd
+//! signs AAuth outbound but does not verify it inbound, so no inbound request
+//! carries a trusted AAuth agent identity.
 
 use crate::a2a::tasks::{Link, State, Task};
 use crate::a2a::{CallerIdentity, Principal, Resolver};
@@ -34,8 +40,8 @@ use std::sync::mpsc::{Sender, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// The A2A methods this surface serves (PascalCase dialect, RFC 0029 §3).
-/// `SubscribeToEvents` (RFC 0032) is served only while `interface.enabled`.
+/// The A2A methods this surface serves, in the PascalCase dialect.
+/// `SubscribeToEvents` is served only while `interface.enabled`.
 pub const METHODS: &[&str] = &[
     "SendMessage",
     "SendStreamingMessage",
@@ -52,13 +58,13 @@ pub const METHODS: &[&str] = &[
 ];
 /// A2A error: no such task.
 pub const TASK_NOT_FOUND: i64 = -32001;
-/// A2A error: the operation is not supported over this surface (yet).
+/// A2A error: the operation is not supported over this surface.
 pub const UNSUPPORTED_OPERATION: i64 = -32004;
-/// The interface feed ring capacity (RFC 0032 §4): the replay window a
-/// reconnecting client can resume across without a re-bootstrap.
+/// The interface feed ring capacity: the replay window a reconnecting client
+/// can resume across without a full re-bootstrap.
 pub const FEED_RING: usize = 1024;
 
-// ---- the interface event feed (RFC 0032) -----------------------------------
+// ---- the interface event feed ----------------------------------------------
 
 /// Who may see a feed event.
 #[derive(Debug, Clone, PartialEq)]
@@ -71,12 +77,15 @@ pub enum FeedVis {
     Owner(Option<String>),
 }
 
-/// The global observation feed (RFC 0032 §4): a bounded ring of state-change
-/// events the loop pushes and the `SubscribeToEvents` transport threads drain.
-/// Events carry a monotonic `seq` so a reconnecting client resumes from a
-/// cursor (`fromSeq`); an overrun evicts the oldest (the client re-bootstraps
-/// via the `status` command when its cursor predates the window). Same
-/// The loop writes; the listener's stream tasks only read.
+/// The global observation feed: a bounded ring of state-change events the loop
+/// pushes and the `SubscribeToEvents` transport threads drain.
+///
+/// Events carry a monotonic `seq`, so a reconnecting client resumes from its
+/// cursor (`fromSeq`) instead of replaying everything. The ring is bounded, so
+/// an overrun evicts the oldest event; a client whose cursor predates the
+/// window is told so and re-bootstraps with the `status` command rather than
+/// silently missing state. Only the loop writes; the listener's stream tasks
+/// only read.
 pub struct SharedFeed {
     inner: Mutex<FeedInner>,
     /// `interface.debug` — gates the debug event kinds (audit, logs). Atomic
@@ -183,7 +192,7 @@ impl SharedFeed {
     }
 }
 
-// ---- pairing-code login (RFC 0032 §13) --------------------------------------
+// ---- pairing-code login -----------------------------------------------------
 
 /// The pairing window (how often the code rotates).
 const PAIR_WINDOW_SECS: u64 = 60;
@@ -323,7 +332,7 @@ pub struct A2aRequest {
 /// The transport's post-office into the loop + the shared view.
 pub struct A2aBridge {
     events_tx: Sender<Event>,
-    /// The interface event feed (RFC 0032) — `None` unless `interface.enabled`.
+    /// The interface event feed — `None` unless `interface.enabled`.
     feed: Option<Arc<SharedFeed>>,
     resolver: Arc<Resolver>,
     pub request_timeout: Duration,
@@ -336,7 +345,7 @@ impl A2aBridge {
         Self::with_feed(events_tx, resolver, None)
     }
 
-    /// [`A2aBridge::new`] with the interface feed attached (RFC 0032).
+    /// [`A2aBridge::new`] with the interface feed attached.
     pub fn with_feed(
         events_tx: Sender<Event>,
         resolver: Resolver,
@@ -352,11 +361,13 @@ impl A2aBridge {
     }
 
     /// Resolve the caller from the transport's evidence: the verified mTLS
-    /// identity (subject CN + SANs — RFC 0029 §10.3) and the presented bearer.
-    /// The resolver tries the configured `san`/`sub` principal rules FIRST, then
-    /// the management/loopback operator fallback, so a matched cert identity wins
-    /// its declared role while an all-empty-principals listener keeps the "any
-    /// verified cert ⇒ operator" default.
+    /// identity (subject CN + SANs) and the presented bearer.
+    ///
+    /// The resolver tries the configured `san`/`sub` principal rules FIRST and
+    /// only then the management/loopback operator fallback, so a certificate
+    /// that matches a declared rule gets that rule's role rather than being
+    /// promoted by the fallback. A listener that declares no principals at all
+    /// keeps the "any verified cert is an operator" default.
     pub fn principal_of(
         &self,
         mgmt: bool,
@@ -410,7 +421,7 @@ fn bare(m: &str) -> &str {
     m.strip_prefix("a2a.").unwrap_or(m)
 }
 
-/// The default client chrome (RFC 0032 §12) when `interface.display` is unset.
+/// The default client chrome when `interface.display` is unset.
 fn default_display_top() -> Vec<String> {
     ["name", "version", "instance", "debug"]
         .map(String::from)
@@ -424,7 +435,7 @@ fn default_display_bottom() -> Vec<String> {
     .to_vec()
 }
 
-/// The principal a live pairing session resolves to (RFC 0032 §13).
+/// The principal a live pairing session resolves to.
 pub fn paired_principal(role: crate::config::v2::Role) -> Principal {
     use crate::config::v2::Role;
     match role {
@@ -564,11 +575,11 @@ const REDACTED: &str = "***";
 /// [`REDACTED`].
 ///
 /// `settings_doc` is the merged files←env←flags layer. A FILE may only carry
-/// `{{secret:…}}` references (RFC 0030 §5 refuses an inline one), but an env- or
-/// flag-supplied credential sits INLINE in that document — so answering the
-/// `config` command with the raw doc echoes live credentials back over a remote
-/// protocol surface, which the secret discipline forbids everywhere (RFC 0012
-/// §3.7).
+/// `{{secret:…}}` references — an inline credential in a file is refused at
+/// load — but an env- or flag-supplied credential sits INLINE in that
+/// document. Answering the `config` command with the raw doc would therefore
+/// echo live credentials back over a remote protocol surface, so every
+/// credential is replaced before the document leaves the process.
 ///
 /// Which values are credentials is not guessed from key names: the walk is
 /// driven by the config JSON Schema, where every `Secret`-typed field is
@@ -746,7 +757,8 @@ impl Runtime {
         };
         self.reserved_task_id = None;
         // Audit every A2A call: who (principal + role), what (method + command
-        // op), and the outcome — the plan §3.11 audit trail.
+        // op), and the outcome. This is the record of who authorized what, so
+        // it is emitted for refusals as well as successes.
         let op = params.get("message").and_then(command_op);
         let outcome = if out.get("_error").is_some() {
             "error"
@@ -786,9 +798,9 @@ impl Runtime {
         // and takes the ordinary message path: written ahead to the durable
         // inbox, then matched against the start nodes (roles included) by the
         // reactor. A built-in wins, so a workflow cannot shadow `status`.
-        // RFC 0036 Phase B: `_instance.*` ops are the runtime's own children
-        // reporting home (sync results, mirrored stream events). They take the
-        // inbox path like a declared command — the REACTOR consumes them
+        // `_instance.*` ops are the runtime's own children reporting home
+        // (sync results, mirrored stream events). They take the inbox path
+        // like a declared command — the REACTOR consumes them
         // before start matching; they never reach a model or a workflow.
         let internal_op = command_op(message).is_some_and(|op| op.starts_with("_instance."));
         let declared = internal_op
@@ -839,7 +851,7 @@ impl Runtime {
                 .get(tid)
                 .map(|t| (tid.to_string(), t.context_id.clone(), t.principal.clone()))
         });
-        // A LIVE human gate on the addressed task (RFC 0032 §16): the reply
+        // A LIVE human gate on the addressed task: the reply
         // resolves the suspended asker directly — the tool call returns the
         // text to the model, the `human` step completes with it — instead of
         // becoming a new conversation turn.
@@ -894,7 +906,7 @@ impl Runtime {
                     t.transition(State::Working, None);
                 }
                 self.task_sync(&task_id);
-                // Surface the prompt on the interface feed (RFC 0032 §4): this
+                // Surface the prompt on the interface feed: this
                 // is what lets a SECOND display client render the transcript a
                 // first client is driving — the reply follows as the task's
                 // terminal artifact on its `task` events.
@@ -912,10 +924,10 @@ impl Runtime {
         }
     }
 
-    /// A command DataPart (RFC 0029 §5). The synchronous subset completes at
-    /// once; `workflow.run` links its task to the run it starts. The
-    /// `interface.*` / debug reads (RFC 0032) are **taskless** — pure reads
-    /// that create no durable task, so a display client can poll them freely.
+    /// A command DataPart. The synchronous subset completes at once;
+    /// `workflow.run` links its task to the run it starts. The `interface.*`
+    /// and debug reads are **taskless** — pure reads that create no durable
+    /// task, so a display client can poll them without filling the task store.
     /// Whether any loaded workflow has an `a2a` start node declaring `op` as its
     /// command. This is what turns a start node into a registered part of the
     /// A2A command surface (see the call site in `a2a_send`).
@@ -946,7 +958,8 @@ impl Runtime {
             );
         }
         let data = command_data(message).unwrap_or_else(|| json!({}));
-        // The taskless interface reads + controls (RFC 0032 §5, §13–14).
+        // The taskless interface reads and controls: answered inline, before
+        // any task is created.
         match op {
             "interface.info" => return self.interface_info(),
             "conversation.get" => return self.interface_conversation_get(principal, &data),
@@ -962,7 +975,7 @@ impl Runtime {
             .map(str::to_string)
             .unwrap_or_else(|| self.next_id("a2a"));
         // Surface MUTATING commands on the interface feed so every attached
-        // display client sees what its peers asked for (RFC 0032 §4). Read ops
+        // display client sees what its peers asked for. Read ops
         // (`status`, `config`, `workflow.status`) stay off the feed — they are
         // the observation plumbing itself, and N clients polling them would
         // spam every transcript.
@@ -1096,7 +1109,7 @@ impl Runtime {
                 }
                 _ => err_obj(TASK_NOT_FOUND, "no such run"),
             },
-            // ---- steering (RFC 0029 §5 — now dispatched) ------------------
+            // ---- steering: redirect live work without restarting it ------
             "workflow.signal" => {
                 let name = data["name"].as_str().unwrap_or("").to_string();
                 if name.is_empty() {
@@ -1175,7 +1188,7 @@ impl Runtime {
         }
     }
 
-    // ---- the interface surface (RFC 0032) ---------------------------------
+    // ---- the interface surface --------------------------------------------
 
     /// Push an event onto the interface feed (a no-op unless `interface.enabled`).
     pub(crate) fn feed_push(&self, kind: &str, vis: FeedVis, data: Value) {
@@ -1201,9 +1214,11 @@ impl Runtime {
         None
     }
 
-    /// `interface.info` — what this instance's interface serves. The client's
-    /// first call: it learns whether the surface is on, whether debug panes may
-    /// render, which ops exist, and what to render in its chrome (§12).
+    /// `interface.info` — what this instance's interface serves. This is the
+    /// client's first call: it learns whether the surface is on, whether debug
+    /// panes may render, which ops exist, and what to put in its chrome, so a
+    /// client never has to guess at a capability and offer an action the
+    /// daemon would refuse.
     fn interface_info(&self) -> Value {
         if !self.settings.interface.enabled {
             return err_obj(
@@ -1309,8 +1324,9 @@ impl Runtime {
         }})
     }
 
-    /// `Pair {code}` — exchange the rotating code for a session token
-    /// (RFC 0032 §13). The ONE method an anonymous caller may use.
+    /// `Pair {code}` — exchange the rotating code for a session token. This is
+    /// the ONE method an anonymous caller may use, so it is rate-limited and
+    /// locks out after too many failures within a window.
     fn a2a_pair(&mut self, params: &Value) -> Value {
         let Some(p) = &self.a2a_pairing else {
             return err_obj(
@@ -1341,10 +1357,11 @@ impl Runtime {
         }
     }
 
-    /// `config.set {path, value}` (operator): runtime updates for the
-    /// WHITELISTED interface knobs (RFC 0032 §14). Everything else belongs to
-    /// the config file + SIGHUP reload — this deliberately never writes files,
-    /// so provenance stays with the operator's documents.
+    /// `config.set {path, value}` (operator): runtime updates for a small
+    /// WHITELIST of interface knobs. Everything else belongs to the config
+    /// file plus a SIGHUP reload. This deliberately never writes files, so the
+    /// operator's documents stay the single source of truth and a remote
+    /// caller cannot make a change that outlives the process unnoticed.
     fn interface_config_set(&mut self, data: &Value) -> Value {
         if !self.settings.interface.enabled {
             return err_obj(
@@ -1545,7 +1562,7 @@ impl Runtime {
     }
 
     /// `debug.events {after?, limit?, level?, prefix?}` (debug, operator): a
-    /// cursor read of the live log ring (RFC 0016 §7.2) — the TUI's log tail.
+    /// cursor read of the live log ring — the TUI's log tail.
     fn interface_debug_events(&self, data: &Value) -> Value {
         if let Some(gate) = self.debug_gate() {
             return gate;
@@ -1562,7 +1579,7 @@ impl Runtime {
         }
     }
 
-    /// The feed's **section diff** (RFC 0032 §4): one hook point in the loop
+    /// The feed's **section diff**: one hook point in the loop
     /// that catches every state transition the explicit pushes don't — runs,
     /// conversations, subagents, OS children and the slim status — by
     /// fingerprinting each item and emitting an event when it changed (or
@@ -1694,7 +1711,7 @@ impl Runtime {
         json!({"tasks": tasks, "totalSize": n, "pageSize": n, "nextPageToken": ""})
     }
 
-    // ---- push notifications (RFC 0029 / A2A `*TaskPushNotificationConfig`) --
+    // ---- push notifications (the `*TaskPushNotificationConfig` family) -----
 
     /// The task this request names, if the caller may touch it.
     ///
@@ -1763,8 +1780,11 @@ impl Runtime {
                 &format!("push url refused: {e}"),
             );
         }
-        // RFC 0037 §5: in `closed` mode a caller-chosen push target must ALSO
-        // match the service catalog — two locks, one door.
+        // In `closed` mode a caller-chosen push target must clear the service
+        // catalog as well as the SSRF check above. The two guards answer
+        // different questions — "is this address reachable from here?" and "is
+        // this endpoint one we declared?" — and a push URL comes from the
+        // caller, so both have to hold.
         if let Err(e) = crate::config::v2::egress_allows(
             &self.settings.services,
             self.settings.security.egress,
@@ -1876,7 +1896,7 @@ impl Runtime {
             return self.tasks.get(&id).map(Task::to_a2a).unwrap_or(Value::Null);
         }
         // A live human gate on this task: unblock the asker with an error so
-        // the turn/step resolves instead of dangling (RFC 0032 §16).
+        // the turn or step resolves instead of dangling until its ask timeout.
         if let Some(i) = self
             .pending
             .iter()
@@ -1922,7 +1942,7 @@ impl Runtime {
                     err_obj(::mcp::rpc::INVALID_PARAMS, "cancel needs a run id")
                 }
             }
-            // Pause/resume (RFC 0029 §7): with a `run`, flip that run between
+            // Pause/resume: with a `run`, flip that run between
             // Paused and Running (the scheduler already skips Paused runs);
             // without one, hold the WHOLE instance — intake continues (inbox,
             // tasks), but no new turns dispatch and no steps schedule until
@@ -1995,9 +2015,9 @@ impl Runtime {
             "pushNotifications": self.settings.a2a.push.enabled,
             "stateTransitionHistory": true,
         });
-        // Advertise the interface surface (RFC 0032) so a display client can
-        // discover it pre-auth. The card is public — only the on/off bit rides
-        // here; `interface.info` (authenticated) carries the rest.
+        // Advertise the interface surface so a display client can discover it
+        // before authenticating. The card is public, so only the on/off bit
+        // rides here; `interface.info` is authenticated and carries the rest.
         if self.settings.interface.enabled {
             capabilities["extensions"] =
                 json!([{"uri": "urn:agentd:interface", "params": {"enabled": true}}]);
@@ -2088,8 +2108,7 @@ impl Runtime {
     }
 
     /// Publish a task transition: to A2A subscribers, and onto the interface
-    /// feed (RFC 0032 §4) so every attached display client converges without
-    /// polling.
+    /// feed so every attached display client converges without polling.
     ///
     /// The A2A half is also what *settles a blocking send* — the protocol layer
     /// waits on this stream rather than polling a snapshot — so a task that
@@ -2102,9 +2121,10 @@ impl Runtime {
         let allow_private = self.settings.a2a.push.allow_private;
         match self.tasks.get(id) {
             Some(t) => {
-                // Artifact BEFORE the terminal status: a conformant streaming
-                // client terminates on the terminal state (§3.5.2), so a result
-                // frame sent after it is a result nobody reads.
+                // Send the artifact BEFORE the terminal status frame. A
+                // conformant streaming client stops reading as soon as it sees
+                // a terminal state, so a result frame sent after it is a result
+                // nobody reads.
                 if t.state.is_terminal()
                     && let Some(a) = crate::a2a::wire::result_artifact(t)
                 {
@@ -2213,8 +2233,9 @@ impl Runtime {
         self.task_sync(id);
     }
 
-    /// Restore durable tasks (called at startup); seed the shared view and
-    /// re-arm run-linked human gates (RFC 0032 §16).
+    /// Restore durable tasks at startup: seed the shared view the transport
+    /// threads read, and re-arm run-linked human gates so a question asked
+    /// before the restart is still answerable after it.
     pub(crate) fn restore_a2a_tasks(&mut self, envs: &[crate::store::Envelope]) {
         for env in envs {
             match serde_json::from_value::<Task>(env.state.clone()) {
@@ -2281,7 +2302,7 @@ pub(crate) fn spawn_a2a_listener(
         }
         None => None,
     };
-    // Pairing-code login (RFC 0032 §13): armed with the interface. On a
+    // Pairing-code login is armed with the interface. On a
     // NON-loopback listener it also counts as "client auth exists" — an
     // uncredentialed caller then gets through as anonymous (able to call
     // exactly `Pair` + the public card) instead of 401.
@@ -2329,7 +2350,7 @@ pub(crate) fn spawn_a2a_listener(
         None
     };
 
-    // The interface feed (RFC 0032) exists only while `interface.enabled`.
+    // The interface feed exists only while `interface.enabled`.
     let feed = interface
         .enabled
         .then(|| Arc::new(SharedFeed::new(interface.debug)));
@@ -2451,9 +2472,9 @@ mod tests {
     #[cfg(feature = "a2a")]
     #[test]
     fn mtls_san_resolves_to_the_matched_principal_role() {
-        // RFC 0029 §10.3: the surfaced client-cert SAN/subject now drives the
-        // principal — a SPIFFE URI SAN matches a `san` rule, and its role wins
-        // over the bare management/operator fallback.
+        // The client-cert SAN/subject drives the principal: a SPIFFE URI SAN
+        // matches a `san` rule, and that rule's role wins over the bare
+        // management/operator fallback.
         use crate::a2a::Resolver;
         use crate::obs::log::{Comp, Level, LogCtx, Logger};
 
@@ -2491,9 +2512,9 @@ mod tests {
         // A cert under the ops path → operator (a different rule).
         let op = bridge.principal_of(true, None, None, vec!["spiffe://corp/ops/root".into()]);
         assert!(op.is_operator());
-        // A cert matching NO rule, with principals configured, is NOT operator
-        // (the surfaced identity turns the allowlist on — mgmt no longer blanket-
-        // grants operator once explicit rules exist).
+        // A cert matching NO rule, with principals configured, is NOT
+        // operator: declaring any principal rule turns the allowlist on, so
+        // the management fallback stops blanket-granting operator.
         let anon = bridge.principal_of(true, None, None, vec!["spiffe://other/x".into()]);
         assert!(
             anon.is_anonymous(),

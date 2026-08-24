@@ -3,13 +3,13 @@
 //! byte for byte.**
 //!
 //! `.json`/`.jsonc` documents go through `config::file::strip_jsonc` before
-//! serde_json sees them, because the RFC set shows jsonc and the moat forbids a
-//! jsonc *crate*. That stripper scans bytes — correctly, since every byte it
-//! matches on (`"`, `\`, `/`, `*`, `\n`) is ASCII and can never appear inside a
-//! multibyte UTF-8 sequence — but it used to *emit* bytes too, via `byte as
-//! char`. That cast is a Latin-1 reinterpretation: `0xE2 as char` is 'â', so an
-//! em-dash, an accented name or any CJK text inside a string literal came out
-//! mojibake'd.
+//! serde_json sees them, because agentd accepts jsonc and the dependency moat
+//! forbids a jsonc *crate*. That stripper may scan bytes — correctly, since
+//! every byte it matches on (`"`, `\`, `/`, `*`, `\n`) is ASCII and can never
+//! appear inside a multibyte UTF-8 sequence — but it must not *emit* bytes, via
+//! `byte as char`. That cast is a Latin-1 reinterpretation: `0xE2 as char` is
+//! 'â', so an em-dash, an accented name or any CJK text inside a string literal
+//! comes out mojibake'd.
 //!
 //! The failure mode is the worst one available: mojibake is still valid JSON, so
 //! there is no parse error, no validation failure, no log line — the agent just
@@ -28,9 +28,9 @@ use std::process::{Command, Stdio};
 /// sequence length the stripper can split.
 const INSTRUCTION: &str = "Résumé the brief — 日本語で요약 ✅ (τέλος)";
 
-/// The Latin-1 mojibake the byte-wise stripper produced: exactly `byte as char`
-/// over the UTF-8 encoding. Computed rather than pasted so the probe can never
-/// drift from what the bug actually did.
+/// The Latin-1 mojibake a byte-wise copy produces: exactly `byte as char` over
+/// the UTF-8 encoding. Computed rather than pasted so the probe can never drift
+/// from the corruption it is watching for.
 fn mojibake(s: &str) -> String {
     s.bytes().map(|b| b as char).collect()
 }
@@ -99,7 +99,7 @@ fn json_and_jsonc_documents_round_trip_non_ascii_byte_for_byte() {
             INSTRUCTION.as_bytes(),
             "{ext}: the instruction was corrupted in transit\n  wrote: {INSTRUCTION}\n  read : {got}"
         );
-        // …and specifically NOT the Latin-1 shadow the old stripper produced.
+        // …and specifically NOT the Latin-1 shadow a byte-wise copy produces.
         assert_ne!(got, mojibake(INSTRUCTION), "{ext}: mojibake");
         // The comments themselves left nothing behind: the neighbouring scalars
         // are intact, so the stripper resumed on a char boundary after each one.

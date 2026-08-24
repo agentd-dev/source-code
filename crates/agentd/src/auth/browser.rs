@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! OAuth 2.1 **authorization-code + PKCE** loopback flow (RFC 0031 §7; RFC 7636 /
-//! RFC 8252) — the browser alternative to the device grant, selected by
+//! OAuth 2.1 **authorization-code + PKCE** loopback flow (RFC 7636 / RFC 8252)
+//! — the browser alternative to the device grant, selected by
 //! `auth: { grant: authorization_code }`.
 //!
-//! agentd **prints** the authorization URL rather than shelling out to a browser
-//! (no local execution, RFC 0012); it runs a one-shot loopback callback server to
-//! capture the redirect, verifies the `state` (CSRF), and exchanges the code plus
-//! the PKCE `code_verifier` for tokens. Randomness is from `/dev/urandom`.
+//! agentd **prints** the authorization URL instead of shelling out to a
+//! browser: launching one would mean executing a local program chosen by the
+//! environment, which this binary never does. It runs a one-shot loopback
+//! callback server to capture the redirect, verifies the `state` (a mismatch
+//! means the callback did not come from the request we started, so the code is
+//! discarded), and exchanges the code plus the PKCE `code_verifier` for tokens.
+//! Randomness comes from `/dev/urandom`.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
@@ -110,8 +113,11 @@ fn wait_for_callback(
 
 // --- encoders (dependency-free) --------------------------------------------
 
-/// `n` random bytes from `/dev/urandom`, base64url-encoded (no padding). Falls
-/// back to a splitmix over time+pid if `/dev/urandom` is unavailable.
+/// `n` random bytes from `/dev/urandom`, base64url-encoded without padding.
+/// Both callers depend on unpredictability — the PKCE verifier and the CSRF
+/// `state` — so the `/dev/urandom` path is the one that matters. The splitmix
+/// over clock and pid is only a last resort for a host with no `/dev/urandom`
+/// to open: it keeps the flow working, but it is guessable, not secure.
 fn rand_b64url(n: usize) -> String {
     let mut buf = vec![0u8; n];
     let ok = std::fs::File::open("/dev/urandom")
@@ -204,8 +210,8 @@ mod tests {
 
     #[test]
     fn b64url_matches_rfc7636_example() {
-        // RFC 7636 Appendix B: the ASCII verifier bytes hash to this challenge.
-        // Here we just check the encoder against a known vector.
+        // The S256 challenge is this encoding applied to the SHA-256 of the
+        // verifier, so the encoder is checked against known vectors here.
         assert_eq!(b64url_nopad(b""), "");
         assert_eq!(b64url_nopad(b"f"), "Zg");
         assert_eq!(b64url_nopad(b"foobar"), "Zm9vYmFy");

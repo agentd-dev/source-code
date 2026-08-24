@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! **Orchestration steps** (RFC 0027 §5 integration / intelligence / control):
+//! **Orchestration steps** — the integration, intelligence and control kinds:
 //! `wait` (on a resource update, a CEL condition, a signal, a run, a subagent,
 //! a conversation message, or a deadline), `join` (fan-in of runs/subagents),
 //! `workflow` (a child run: `sync | async | detached`, `cascade`),
 //! `workflow.signal` / `workflow.wait` / `workflow.cancel`, `subagent`,
 //! `human` (through the `ask_human` contract), `mcp.resource`
-//! (`read | list | prompt | complete`), `a2a.delegate` (the 1.x A2A client),
+//! (`read | list | prompt | complete`), `a2a.delegate` (the outbound A2A
+//! client),
 //! the `think` presets (`classify | extract | summarize | judge | route`), and
 //! step `cache` (memoized outputs by input hash). Waits suspend the step
 //! durably (`StepState.wait`) and are resolved by the loop's tick.
@@ -592,16 +593,14 @@ impl Runtime {
             .ok();
     }
 
-    /// Deliver a named signal: to `wait signal` steps (any run, or `run` only),
-    /// to `signal` start nodes (P4 starts), and into the recent-signals view.
     /// An A2A message arrived on a conversation: resolve every step suspended
     /// waiting for one. Returns how many were woken.
     ///
-    /// This is the half that was missing. `wait {on: message}` and `a2a.wait`
-    /// both suspend on a `{kind: message, conversation}` record, but nothing
-    /// ever resolved one — so before this they could only ever end by timing
-    /// out, which made the asynchronous half of an A2A conversation
-    /// inexpressible: you could send, but never be woken by the reply.
+    /// This is what makes the asynchronous half of an A2A conversation
+    /// expressible: `wait {on: message}` and `a2a.wait` both suspend on a
+    /// `{kind: message, conversation}` record, and without a resolver they
+    /// could only ever end by timing out — a workflow could send but never be
+    /// woken by the reply.
     ///
     /// A wait with an EMPTY conversation matches any conversation, which is how
     /// a workflow awaits "the next thing anyone says" without knowing the id in
@@ -645,6 +644,9 @@ impl Runtime {
         delivered
     }
 
+    /// Deliver a named signal: to `wait signal` steps (any run, or only the
+    /// `run` named as the target), to `signal` start nodes, and into the
+    /// recent-signals view. Returns how many waiting steps were woken.
     pub(crate) fn deliver_signal(
         &mut self,
         name: &str,
@@ -693,10 +695,11 @@ impl Runtime {
         }
         // Signal start nodes.
         delivered += self.fire_signal_starts(name, &payload, target_run.is_none());
-        // RFC 0036 §6 `until_signal`: this signal IS the retirement trigger —
-        // stop admitting, drain live runs, exit cleanly. The signal still
-        // delivered to whatever was parked on it first (above), so an
-        // all-clear both completes the waiting run and retires the instance.
+        // When this signal is the configured `lifecycle.until_signal` it is the
+        // retirement trigger: stop admitting, drain live runs, exit cleanly.
+        // Delivery to whatever was parked on the signal happens first (above),
+        // so an all-clear both completes the waiting run and retires the
+        // instance.
         if self
             .settings
             .lifecycle
@@ -915,7 +918,7 @@ impl Runtime {
     ///
     /// Shared by `a2a.delegate` and `a2a.send`, which differ only in what they
     /// do once connected — everything up to the socket is identical, and it is
-    /// ~140 lines of credential plumbing that must not drift between the two.
+    /// ~140 lines of credential plumbing that must not diverge between the two.
     #[cfg(feature = "a2a")]
     // `timeout` bounds only the interactive credential fetch, which lives behind
     // `oauth`; without that feature there is nothing to bound and the parameter
@@ -935,8 +938,9 @@ impl Runtime {
             .iter()
             .find(|p| p.name == peer_name)
             .cloned();
-        // RFC 0036 Decision 6: live instance children ARE peers — by handle,
-        // or by template name for a singleton. Configured peers win the name.
+        // Live instance children are dialable as peers too — by handle, or by
+        // template name when that template has a single instance. A configured
+        // peer wins the name, so an operator can always override the lookup.
         let peer = match configured {
             Some(p) => p,
             None => match self.instance_peer_endpoint(peer_name) {
@@ -973,7 +977,7 @@ impl Runtime {
         #[allow(unused_mut)]
         let mut headers = crate::mcp::auth::resolve_headers(&spec_v1.headers)
             .map_err(|e| format!("{what}: peer headers: {e}"))?;
-        // RFC 0031: a peer `auth:` block resolves at dial time. A body-INDEPENDENT
+        // A peer `auth:` block resolves at dial time. A body-INDEPENDENT
         // bearer (static / oauth2 device-login / spiffe jwt) is baked into the
         // static headers; SigV4 (`kind: aws`) covers the exact body, so it rides
         // as a PER-REQUEST signer on `PeerAuth` (re-run on every POST).
@@ -982,9 +986,10 @@ impl Runtime {
         #[cfg(feature = "oauth")]
         if let Some(a) = &peer.auth {
             let aspec = a.to_spec();
-            // RFC 0037 Phase B: a catalog-referencing peer caches its shared
-            // credential under `service:<entry>` — one `agentd login
-            // service:<entry>` serves every consumer.
+            // A peer that names a catalog `service:` caches its credential
+            // under `service:<entry>`, shared with every other consumer of that
+            // entry, so one `agentd login service:<entry>` serves them all.
+            // Without one the cache is private to this peer's name.
             let target = match &peer.service {
                 Some(svc) => format!("service:{svc}"),
                 None => format!("a2a:{}", peer.name),
@@ -1124,7 +1129,8 @@ impl Runtime {
             .ok();
     }
 
-    /// `a2a.delegate {peer, objective, output_contract?, timeout?}` (RFC 0020 client).
+    /// `a2a.delegate {peer, objective, output_contract?, timeout?}`: hand a unit
+    /// of work to a peer agent over A2A and suspend until it answers.
     #[cfg(feature = "a2a")]
     fn step_a2a_delegate(&mut self, run_id: &str, step_id: &str, spec: &Map<String, Value>) {
         let peer_name = spec

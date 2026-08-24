@@ -10,9 +10,9 @@ step's side effect. Kill the process mid-run and it resumes from that record.
 
 This page is the working guide — how a document is put together, how runs begin,
 what each node kind accepts, how data moves, and what durability does and does
-not promise. [RFC 0027](../rfcs/0027-workflow-dialect-3.md) is the formal
-grammar; `agentd --workflow-schema` prints the node catalogue your build
-compiled, as JSON Schema.
+not promise. `agentd --workflow-schema` prints the node catalogue your build
+compiled, as JSON Schema — that output is the authoritative grammar for the
+binary you are running.
 
 ## When a graph beats a conversation
 
@@ -42,16 +42,17 @@ file. The top-level keys are a closed set — anything else is a parse error.
 | Key | Meaning |
 |---|---|
 | `name` | required; must match `[a-zA-Z_][a-zA-Z0-9_-]{0,63}` |
-| `version` | the dialect; defaults to `3` and must be `3` if written |
+| `version` | the document version; defaults to `3`, and `3` is the only value accepted if written |
 | `description` | free text |
 | `armed` | default `true`; `false` loads the definition without arming its triggers |
 | `inputs` | `{schema: <JSON Schema>}` — enforced when a run is created |
-| `outputs` | `{schema: …}` — checked for well-formedness only (see below) |
+| `outputs` | `{schema: …}` — the shape the run promises its caller; a `finish` that would complete the run with an output that does not match it fails the step instead |
 | `concurrency` | `{max_runs, on_overflow}` — default 4 runs, `queue` |
 | `limits` | `{steps, tokens, deadline, budget}` for the whole run |
 | `priority` | `low\|normal\|high` (default `normal`) — contention weight: `low` admissions shed one pressure level early (at *warn*), and each tick schedules ready steps of higher-priority runs first. A tiebreak under scarcity, not a reservation. |
 | `unload` | `{policy: drain\|cancel\|detach, timeout}` — what happens to LIVE runs when this definition is retired (removed, replaced, or deleted). Default `drain`: they finish. See §retirement below. |
 | `durable` | default `true` (or the `store.durability.work` deployment default) — `false` makes runs memory-only: no run record, no checkpoints, forgotten by a restart. The fast path for recomputable work; see §durability. |
+| `state` | declares the run variables: a per-key `schema` that gates every write, and/or a `reducer` saying how concurrent writes combine (see §declared state) |
 | `steps` | the graph: an object of step id to step |
 | `file` / `uri` | load the document from a path or an MCP resource instead of inline (a config entry can also use `url:` with headers, or a `dir:`+`glob:` scan — see the configuration doc §6.1) |
 
@@ -228,7 +229,7 @@ Invalid inputs are not an error you can catch: the event is logged as
 
 ## The node catalogue
 
-There are 67 kinds, and all of them are wired. The four A2A ones split by
+There are 71 kinds, and all of them are wired. The four A2A ones split by
 direction and by whether they block: `a2a` is a START node (an inbound message
 whose command matches begins a run), `a2a.send` notifies a peer without waiting,
 `a2a.wait` suspends until a message lands on a conversation, and `a2a.delegate`
@@ -238,7 +239,8 @@ result.
 Every step also accepts the cross-cutting fields, on any kind:
 `kind`, `depends_on`, `when`, `retry`, `timeout`, `on_error`, `idempotent`,
 `on_replay`, `output_schema`, `cache`, `budget`, `skills`, `otel`, `description`.
-`idempotent`, `on_replay` and `otel` parse but no runtime code reads them.
+`idempotent` and `otel` parse but no runtime code reads them; `on_replay` is
+read at restore, where it decides what happens to a step caught in flight.
 
 ### Ask the model something
 
@@ -246,7 +248,7 @@ Every step also accepts the cross-cutting fields, on any kind:
 |---|---|
 | `agent` | **`instruction`**, `output_contract`, `output_schema`, `tools`, `servers`, `limits`, `context`, `skills`, `system` |
 | `think` | **`prompt`**, `output_schema`, `reads`, `check`, `retries`, `skills`, `system` |
-| `subagent` | **`instruction`**, `mode`, `workflow`, `tools`, `servers`, `limits`, `priority`, `context`, `output_contract`, `output_schema`, `skills` |
+| `subagent` | **`instruction`** *or* **`template`** (never both), `params` (only with `template`), `mode`, `tools`, `servers`, `limits`, `priority`, `context`, `output_contract`, `output_schema`, `skills`, `durable` |
 | `classify` | **`input`**, **`classes`**, `prompt`, `skills` |
 | `extract` | **`input`**, **`output_schema`**, `prompt`, `skills` |
 | `summarize` | **`input`**, `length`, `prompt`, `skills` |
@@ -516,11 +518,12 @@ capped at 4 levels.
   and is capped at 10 000.
 - `parallel` fans in an object keyed by branch name and appends `_errors` when a
   branch failed. A branch failure aborts the step only when the parent's
-  `on_error` is `fail`. There is no `min_success` on `parallel` — the parser
-  allows that field only on `race`, where nothing reads it.
+  `on_error` is `fail`. `min_success` is not accepted here — the parser allows
+  it on `race` only, so "wait for N of these" is a `race`, not a `parallel`.
 - `race` outputs `{winner, output}` for the first branch to finish and cancels
-  the rest. If every branch fails the step fails; if `timeout` elapses first the
-  step ends `Timeout`.
+  the rest. `min_success: N` waits for N branches to succeed instead of one, and
+  the step fails if fewer do. If every branch fails the step fails; if `timeout`
+  elapses first the step ends `Timeout`.
 
 ## Waits, signals and human gates
 
@@ -558,7 +561,8 @@ A named signal does two things at once: it resolves matching `wait on: signal`
 steps in every live run (or only a targeted `run`), then fires matching `signal`
 start nodes. The `workflow.signal` *step* delivers immediately; the
 `workflow.signal` *tool* only enqueues a durable inbox event and returns
-`{"delivered": 0, …}` — stale text, not a failure. Retrying on that zero
+`{"delivered": 0, …}` — a placeholder count, not a delivery report, because
+delivery happens on a later reactor tick. Retrying because that number was zero
 double-delivers.
 
 ## Durability, checkpointing and resume
@@ -634,8 +638,11 @@ acknowledgement, in which case the replay re-sends. What makes that safe is the
 idempotency key above — stable across the replay, so a deduplicating callee
 treats the re-send as the retry it is. A callee that does not deduplicate sees
 the operation at least once, `idempotency` field or not.
-`on_replay: retry|skip|fail` looks like an escape hatch, but no runtime code
-consults it — the replay policy is hardwired. Suspended steps keep their wait
+`on_replay` chooses what a step caught in flight does when restore finds it:
+`retry` (the default) re-executes it, `skip` marks it `Skipped` and lets the run
+continue past it (`restore.step.skipped`), and `fail` fails it outright
+(`restore.step.failed`) — the setting for an effect that must never run twice
+unattended. Suspended steps keep their wait
 record and are swept again; pending inbox events are re-queued, so an
 unconsumed start event still fires after the crash.
 
@@ -664,12 +671,12 @@ statuses are `pending`, `running`, `done`, `failed`, `skipped`, `cancelled`,
 
 Three things remove a definition: a config reload that drops or changes it,
 `workflow.delete`, and (for instruction-embedded workflows) an instruction
-edit. All three now leave through **one path**:
+edit. All three leave through **one path**:
 
 1. Starts are disarmed and the definition's MCP resource subscriptions are
    released — unless another armed workflow still subscribes the same
    `(server, uri)`, in which case the subscription is theirs now.
-2. The old definition is **pinned** for its live runs, which keep executing
+2. The outgoing definition is **pinned** for its live runs, which keep executing
    against the hash they started with.
 3. New runs stop being admitted.
 4. The workflow's own `unload:` policy applies: **`drain`** (default) lets
@@ -679,13 +686,16 @@ edit. All three now leave through **one path**:
    (`workflow.unloaded` in the log; `workflow.retiring` marked the start).
 
 Replacing a definition is retirement plus arrival: the new version arms and
-takes new runs immediately, the old version's runs finish under their pinned
+takes new runs immediately, the outgoing version's runs finish under their pinned
 hash. Pins are **durable**: the definition a run starts under is written to
 the store once per version, so even a SIGKILL followed by a restart with a
 *changed or removed* workflow resumes the run under the definition it started
 with (`workflow.pin_restored`), and the pin is garbage-collected when its
-last run lands. Only a store from before this mechanism falls back to the
-old refusal (`resume_policy`, RFC 0027 §9).
+last run lands. If a restored run finds neither its pin nor a current
+definition at the same hash, it is **refused** rather than re-pointed at a
+different graph: `run.refused` names the workflow and the hash it was pinned
+to. Running a half-finished run against a changed graph would silently skip
+or repeat steps, so refusing is the safe direction.
 
 ## Validation, and the errors you will actually hit
 
@@ -749,9 +759,12 @@ The failure modes that cost the most debugging time:
 - **`switch` and `on_error: goto` force their target** to run even with its
   `depends_on` unsatisfied — the only backward edge in an otherwise acyclic
   graph. `switch` also marks every other case target and the `default` `Skipped`.
-- **`outputs.schema` gives false assurance.** It is checked for well-formedness
-  at parse time and never validated against a run's actual output. Only per-step
-  `output_schema` is enforced.
+- **`outputs.schema` turns a bad result into a failed run.** It is checked for
+  well-formedness at parse time, and applied at `finish`: a run that would
+  complete with an output the schema rejects fails that `finish` step instead,
+  naming the mismatch. Only *completing* runs are checked — `refused` and
+  `cancelled` finishes carry no promise. Per-step `output_schema` is separate
+  and applies to that step's own output.
 - **`cache` stops memoising for any step that suspends or nests**, because the
   pending cache key is parked in the same state field that wait and nested
   progress records overwrite. Cache *hits* still work; cache *writes* never
@@ -762,13 +775,6 @@ The failure modes that cost the most debugging time:
   it.
 - **Memory read-through is not free.** Populating `memory.<key>` re-scans every
   step spec and re-fetches every referenced key on every tick, for every live run.
-
-## See also
-
-- [RFC 0027 — Workflow dialect 3](../rfcs/0027-workflow-dialect-3.md) — the formal spec.
-- [RFC 0025 — Durable state and store adapters](../rfcs/0025-durable-state-and-store-adapters.md) and [RFC 0026 — Agent loop and lifecycle](../rfcs/0026-agent-loop-and-lifecycle.md).
-- [Lifecycle and triggers](modes-and-triggers.md), [Configuration](configuration.md), [Security](security.md).
-- `agentd --workflow-schema` — the node registry your build actually compiled.
 
 ## Declared state
 
@@ -787,4 +793,12 @@ writes combine, which turns the concurrent-write check from a heuristic into a
 policy — a step writing that key with a contradicting `mode` is a config error,
 and a key with a declared reducer is exempt from the race check entirely.
 
-Both are optional; a workflow that declares nothing behaves exactly as before.
+Both parts are optional, and so is the block: a workflow with no `state`
+declaration gets untyped run vars and the heuristic concurrent-write check.
+
+## See also
+
+- [Node registry](node-registry.md) — every start and step kind, field by field.
+- [Lifecycle and triggers](modes-and-triggers.md), [Configuration](configuration.md), [Security](security.md).
+- [The agent loop](agent-loop.md) — what an `agent` step does inside one node.
+- `agentd --workflow-schema` — the node registry your build actually compiled.

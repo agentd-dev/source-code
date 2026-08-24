@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! A turn worker that dies **without a terminal frame** must still fail its
-//! unit (RFC 0026 §3.2). The supervisor learns of the death only through the
-//! reaper, and by then `Children::on_reaped` has already removed the child from
-//! the table — so "did this worker report a `TurnDone`?" cannot be answered by
-//! asking whether the child is still there: that is false for a settled worker
-//! and an orphaned one alike. A `settled` marker on the child record, left by
-//! `on_turn_done` / `on_turn_failed` and carried past the removal, answers it.
+//! unit. The supervisor learns of the death only through the reaper, and by
+//! then `Children::on_reaped` has already removed the child from the table — so
+//! "did this worker report a `TurnDone`?" cannot be answered by asking whether
+//! the child is still there: that is false for a settled worker and an orphaned
+//! one alike. A `settled` marker on the child record, left by `on_turn_done` /
+//! `on_turn_failed` and carried past the removal, answers it.
 //!
-//! The regression this exists for: a SIGKILLed **root-turn** worker fell
-//! through that broken guard entirely. Its budget reservation was never
-//! released — the tokens stayed reserved for the life of the window, so the
-//! next turn could not be admitted — and its inbox event stayed pending until a
-//! restart replayed it. The `StepTurn` half of the same defect is decided from
-//! the step's own state and was fixed first; this covers the root turn.
+//! The failure this guards against: a SIGKILLed **root-turn** worker falling
+//! through that guard entirely. Its budget reservation is then never
+//! released — the tokens stay reserved for the life of the window, so the next
+//! turn cannot be admitted — and its inbox event stays pending until a restart
+//! replays it. The `StepTurn` half of the same question is decided from the
+//! step's own state; this covers the root turn.
 
 mod common;
 
@@ -122,7 +122,7 @@ fn wait_for(err_path: &str, what: &str, want: impl Fn(&str) -> bool) -> String {
 }
 
 /// The daemon's live children, from `pgrep -P` — the turn worker is a DIRECT
-/// child of the supervisor (the flat child tree, RFC 0026 §2).
+/// child of the supervisor (the child tree is flat).
 fn children_of(pid: i32) -> Vec<i32> {
     let out = Command::new("pgrep")
         .args(["-P", &pid.to_string()])
@@ -138,7 +138,7 @@ fn children_of(pid: i32) -> Vec<i32> {
 fn a_sigkilled_root_turn_worker_fails_its_turn_and_releases_its_reservation() {
     let llm = spawn_hanging_llm();
     // No `instruction` sugar workflow: a `manual` workflow keeps the daemon up
-    // as a conversation host, the way the other v2 conversation suites do.
+    // as a conversation host, the way the other conversation suites do.
     let cfg = write_file(
         "agentd-orphan",
         "yaml",
@@ -199,9 +199,9 @@ lifecycle:\n  run_until: idle\n  idle_grace: 1s\nobservability:\n  log_level: in
         "SIGKILL the turn worker {worker}"
     );
 
-    // 3. The turn must FAIL (it hung forever before the fix), and the second
-    //    turn must then be admitted — which it can only be if the dead
-    //    worker's reservation went back to the window.
+    // 3. The turn must FAIL — nothing else will ever report it — and the second
+    //    turn must then be admitted, which it can only be if the dead worker's
+    //    reservation went back to the window.
     let log = wait_for(&err_path, "the orphaned turn to fail", |log| {
         events(log, "turn.failed")
             .iter()

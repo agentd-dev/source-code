@@ -12,8 +12,8 @@
 //!
 //! Four kinds of evidence, in the order they are trusted:
 //!
-//! 1. a **pairing session token** (RFC 0032 §13) — the code-for-token exchange
-//!    that logs a display client in;
+//! 1. a **pairing session token** — the code-for-token exchange that logs a
+//!    display client in;
 //! 2. a **verified client certificate** — subject CN and SANs, so a `san`/`sub`
 //!    principal rule matches a cert directly (a SPIFFE X.509-SVID's
 //!    `spiffe://…` arrives as a URI SAN);
@@ -56,14 +56,18 @@ pub struct Auth {
     pub require_auth: bool,
     /// The resolved server bearer; presenting it is the operator.
     pub server_bearer: Option<String>,
-    /// Pairing-code login (RFC 0032 §13), when the interface arms it.
+    /// Pairing-code login, present only when the interface arms it. `None`
+    /// means the `Pair` exchange is unavailable and no session token is
+    /// accepted as evidence of identity.
     pub pairing: Option<Arc<PairingState>>,
 }
 
 /// Everything the listener needs that is not the bridge.
 pub struct Opts {
     pub auth: Auth,
-    /// Origins a browser UI may be served from, beyond loopback (RFC 0032 §7).
+    /// Origins a browser UI may be served from, beyond loopback. Any other
+    /// `Origin` is refused outright, which is what stops a page the operator
+    /// never authorised from driving this endpoint through their browser.
     pub extra_origins: Vec<String>,
     /// TLS, when the listen URL is `https://`.
     pub tls: Option<Arc<tokio_rustls::rustls::ServerConfig>>,
@@ -345,9 +349,9 @@ impl CardFromRuntime {
     }
 }
 
-/// A CORS preflight. A browser UI served from a configured origin (RFC 0032 §7)
-/// has to be told it may POST here; every other origin is refused, which is the
-/// same DNS-rebind answer the POST itself gives.
+/// A CORS preflight. A browser UI served from a configured origin has to be
+/// told it may POST here; every other origin is refused, which is the same
+/// DNS-rebind answer the POST itself gives.
 ///
 /// **Private Network Access.** A page on a public origin — a hosted UI at
 /// `https://code.agentd.dev` — reaching a daemon on loopback or a LAN address
@@ -455,7 +459,8 @@ async fn dispatch(
     body: Bytes,
 ) -> Response {
     // A browser page on an unexpected origin must not be able to drive this
-    // endpoint through a victim's browser (DNS rebinding, RFC 0032 §7).
+    // endpoint through a victim's browser (DNS rebinding). Checked before the
+    // body is even parsed, so an unauthorised origin reaches no dispatch logic.
     let origin = headers
         .get(header::ORIGIN)
         .and_then(|v| v.to_str().ok())
@@ -518,7 +523,8 @@ async fn dispatch(
             return unary(&app, id, "GetExtendedAgentCard", json!({}), principal).await;
         }
         // The one method an anonymous caller may use: exchanging the rotating
-        // code for a session token IS the login (RFC 0032 §13).
+        // code for a session token IS the login, so requiring a principal here
+        // would make pairing impossible.
         "Pair" | "interface.pair" => {
             return unary(&app, id, "Pair", params, principal).await;
         }
@@ -561,8 +567,8 @@ async fn dispatch(
     }
 
     // A command DataPart is agentd's own vocabulary riding the spec's data
-    // part, not an A2A concept: some of them answer without creating a task at
-    // all (RFC 0032's taskless reads). Forcing those through a port that must
+    // part, not an A2A concept: some commands are plain reads that answer
+    // without creating a task at all. Forcing those through a port that must
     // return a `Task` would mean inventing one. So they go straight to the
     // runtime, and its answer — task or not — is returned as it stands.
     if matches!(bare.as_str(), "SendMessage" | "SendStreamingMessage")
@@ -615,17 +621,16 @@ async fn dispatch(
 /// Prepare a send for the protocol layer, returning a rewritten request body —
 /// or `None` when nothing needed changing.
 ///
-/// Two adjustments, both about meeting the specification where agentd used to
-/// differ:
+/// Two adjustments:
 ///
-/// * **The task id.** A send that names no task gets one now, because the
+/// * **The task id.** A send that names no task is given one here, because the
 ///   protocol layer subscribes to a task's updates *before* it processes the
 ///   message — so a fast transition cannot be missed — and it can only do that
 ///   if the id exists first.
 /// * **`blocking` → `returnImmediately`.** agentd's own clients ask not to wait
 ///   with `configuration.blocking: false`; the spec spells the same thing
-///   `returnImmediately: true`. Translating here keeps those clients working
-///   against a server that now speaks only the specification's field.
+///   `returnImmediately: true`. Translating here lets those clients keep their
+///   spelling against a server that speaks only the specification's field.
 ///
 /// Both rewrites write *into* `params`, which is whatever a remote caller put on
 /// the wire. Neither is attempted unless the params carry the shape the spec
@@ -813,7 +818,7 @@ fn origin_allowed(origin: &str, extra: &[String]) -> bool {
 
 // ---- the observation feed ----------------------------------------------------
 
-/// `SubscribeToEvents` (RFC 0032 §4): agentd's own stream, not the spec's.
+/// `SubscribeToEvents`: agentd's own stream, not the spec's.
 ///
 /// A `hello` frame states the cursor the client resumed from and whether that
 /// cursor still exists — a cursor evicted from the replay window comes back
@@ -897,9 +902,9 @@ mod tests {
     use super::*;
 
     /// A bridge with a stand-in for the reactor: it answers `NewTaskId` with an
-    /// id, because a bridge whose loop is missing fails fast and would leave the
-    /// rewrite — the code that used to panic — unreached, making these tests pass
-    /// against the bug they exist to catch.
+    /// id, because a bridge whose loop is missing fails fast and would leave
+    /// the rewrite unreached — making these tests pass without ever exercising
+    /// the code path they exist to guard.
     fn stub_bridge() -> Arc<A2aBridge> {
         let resolver =
             crate::a2a::Resolver::build(&crate::config::v2::A2a::default(), &|_| None).unwrap();
@@ -913,8 +918,8 @@ mod tests {
     }
 
     /// Params are remote input, and a send whose params are not the shape the
-    /// spec requires used to reach serde_json's `IndexMut` and panic the
-    /// listener — which under the release profile's `panic = "abort"` is a dead
+    /// spec requires must never reach serde_json's `IndexMut`, which panics the
+    /// listener — under the release profile's `panic = "abort"` that is a dead
     /// daemon from one curl. Every one of these must come back "nothing to
     /// rewrite" so the body travels on and a2a-rs answers it with -32602.
     #[tokio::test]

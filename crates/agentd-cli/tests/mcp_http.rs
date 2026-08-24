@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! End-to-end test of the Streamable HTTP MCP client (RFC 0004, v2.0.0) against a
-//! mock HTTP-MCP server on a loopback TCP socket. Exercises the full lifecycle —
-//! connect → initialize (capturing `Mcp-Session-Id`) → tools/list (application/json
+//! End-to-end test of the Streamable HTTP MCP client against a mock HTTP-MCP
+//! server on a loopback TCP socket. Exercises the full lifecycle — connect →
+//! initialize (capturing `Mcp-Session-Id`) → tools/list (application/json
 //! response) → tools/call (SSE response with an interleaved notification) →
 //! resources/read — with no process spawned, proving the transport end to end.
 //!
@@ -191,15 +191,12 @@ fn spawn_mock() -> (String, Arc<Mutex<Seen>>) {
     (endpoint, seen)
 }
 
-// The MODERN (stateless) MCP revision, the `server/discover` era probe, the
-// version-negotiation ladder and the tasks extension used to be exercised here
-// against hand-written mock servers, because agentd implemented all of it
-// itself. The official SDK owns the handshake now, and it currently pins its
-// LATEST to the legacy revision — so agentd speaks whatever revision the SDK
-// speaks, and gains the stateless one when the SDK does. Testing agentd against
-// a dialect it no longer implements would have been testing the mocks.
+// Scope: the handshake dialect belongs to the official SDK, which pins its
+// LATEST to the legacy revision — agentd speaks whatever revision the SDK
+// speaks, and gains the stateless (MODERN) one when the SDK does. Exercising a
+// dialect agentd does not implement would be testing the mocks, not agentd.
 //
-// What remains here is the part that is still agentd's: that a real server's
+// So what these cover is the part that is agentd's own: that a real server's
 // lifecycle works end to end over agentd's own credentialed transport, that
 // server-pushed notifications reach the reactor (the reactive wake), and that a
 // dead endpoint fails as a transport error rather than a hang.
@@ -243,10 +240,10 @@ fn streamable_http_full_lifecycle() {
     // returns what the SDK's reader task has queued so far, and that task is
     // not synchronised with the return of an unrelated `tools/call`: the
     // notification is delivered, just not necessarily before this line runs.
-    // Asserting immediately encoded a happens-before the transport never
-    // promised, and it failed roughly one run in six here and more often on a
-    // loaded CI runner. What the reactive path actually needs is that the wake
-    // ARRIVES, which is what this waits for.
+    // The failure this guards against: asserting immediately encodes a
+    // happens-before the transport never promised, and flakes roughly one run in
+    // six locally and more often on a loaded CI runner. What the reactive path
+    // actually needs is that the wake ARRIVES, which is what this waits for.
     let mut notes = Vec::new();
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while notes.is_empty() && std::time::Instant::now() < deadline {

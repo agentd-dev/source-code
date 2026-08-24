@@ -3,7 +3,7 @@
 # supervisor path, the subagent re-exec, the hidden test mocks) and the process
 # exit code. All business logic lives in the library; an embedder building its
 # own CLI on `agentd-core` replicates only the ~10-line dispatch in
-# `src/main.rs` (RFC 0022 §3). Every feature below is a 1:1 forward to the
+# `src/main.rs`. Every feature below is a 1:1 forward to the
 # library — `cargo build -p agentd-cli --features X` means what
 # `-p agentd-core --features X` means.
 [package]
@@ -50,7 +50,7 @@ internal-mocks = ["agentd/internal-mocks"]
 agentd = { package = "agentd-core", path = "../agentd", version = "1.1.0", default-features = false }
 serde_json = "1"
 
-# The `agentd tui`/`agentd ui` passthrough (RFC 0032 §8): fd plumbing (hand the
+# The `agentd tui`/`agentd ui` passthrough: fd plumbing (hand the
 # tty to the client child, redirect daemon logs) + signal-driven lifetime tie.
 # Within the 3-dependency moat (libc is a core dependency already).
 [target.'cfg(unix)'.dependencies]

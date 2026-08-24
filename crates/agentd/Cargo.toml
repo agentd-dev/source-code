@@ -26,7 +26,7 @@ default = ["tls"]
 # has trust anchors with no system CA bundle. On by default; opt out with
 # `--no-default-features` to reach https only via a TLS-terminating sidecar.
 tls = ["net/tls", "mcp/tls"]
-# A2A (Agent2Agent, RFC 0029): agentd's channel to other agents and to its own
+# A2A (Agent2Agent): agentd's channel to other agents and to its own
 # display clients. The protocol itself is `a2a-rs` — an implementation of the
 # published A2A specification, so method dispatch, the typed request/response
 # shapes, the streaming events, the error mapping and the agent card come from
@@ -52,33 +52,32 @@ a2a = [
 # Optional cron-expression scheduling (internal time event source).
 # Hand-rolled 5-field UTC parser — no dep (the minimalism moat, rfcs/0002).
 cron = []
-# OAuth 2.1 client-credentials (M2M) auth for remote intelligence/MCP endpoints
-# (RFC 0006 §auth): fetch+cache a bearer token from a token endpoint, refresh on
-# expiry. Dependency-free — reuses the hand-rolled HTTP client + serde_json + the
+# OAuth 2.1 client-credentials (M2M) auth for remote intelligence/MCP endpoints:
+# fetch+cache a bearer token from a token endpoint, refresh on expiry. Dependency-free — reuses the hand-rolled HTTP client + serde_json + the
 # sec::secret resolver; the form encoder is hand-rolled (no url/form_urlencoded
 # crate). Rides `tls` for an https token endpoint (the common case).
 oauth = []
-# The GUARDED local command runner behind the `exec` tool (RFC 0028 §exec).
-# Default-OFF and cuts against the "no local execution" posture (RFC 0012), so it
+# The GUARDED local command runner behind the `exec` tool.
+# Default-OFF and cuts against the "no local execution" posture, so it
 # is opt-in at BUILD time (this feature) AND at RUN time (security.exec.enabled)
 # — without both, `exec` is a mapping-only contract (delegate off-box). Dep-free
 # (std::process). Never in the default binary.
 exec = []
 # Hand-written Prometheus text on the opt-in HTTP/socket surface (no dep).
 metrics = []
-# Restart-free reconfiguration (RFC 0017 §5): a SIGHUP-triggered, validate-first,
+# Restart-free reconfiguration: a SIGHUP-triggered, validate-first,
 # quiesce-and-reapply hot reload of the reloadable config subset (model/limits/
 # log_level/subscribe/mcp_servers), gated at a reactive quiesce boundary.
 # Dependency-free — raw `libc::sigaction` + the existing self-pipe (no
 # signal-hook), reusing the one `Config::load` validation pipeline. SIGHUP keeps
-# its default disposition when this feature is OFF. `mcp_servers` is RELOADABLE
-# (RFC 0017 §5.1/§5.3 step 4): a validated reload re-handshakes the MCP server set
+# its default disposition when this feature is OFF. `mcp_servers` is RELOADABLE:
+# a validated reload re-handshakes the MCP server set
 # live — removed servers stop+reap via the stdio shutdown ladder, added servers
 # spawn+handshake+subscribe (read-after-subscribe), changed servers remove-then-
 # add. The supervisor's name-keyed `servers`/`owner`/claim wiring makes the live
 # re-handshake safe (a remove/add never shifts another server's identity).
 hot-reload = []
-# The inotify file-watch reload trigger (RFC 0017 §5.2): a `--watch-config`-armed
+# The inotify file-watch reload trigger: a `--watch-config`-armed
 # raw `inotify` watch on the config file's PARENT DIRECTORY that sets the SAME
 # RELOAD latch SIGHUP does, so a Kubernetes ConfigMap volume swap (an atomic
 # directory-symlink rename) reloads with no signal plumbing. Implies `hot-reload`
@@ -118,8 +117,8 @@ internal-mocks = []
 # a build-from-source job. A non-cel build still REJECTS graphs using CEL at
 # define time (fail-closed, clear message). Costs ~1.8 MiB. Rides `workflow`.
 cel = ["dep:cel-interpreter"]
-# AAuth [DRAFT] — agent-side auth for calling AAuth-protected MCP servers
-# (RFC 0023): an Ed25519 agent identity, an Agent-Provider token client
+# AAuth [DRAFT] — agent-side auth for calling AAuth-protected MCP servers:
+# an Ed25519 agent identity, an Agent-Provider token client
 # (enroll + agent-token cache/refresh), and RFC 9421 HTTP Message Signatures on
 # every outbound MCP request. Rides `tls` (the token/enroll dials are https).
 # `ring` is ALREADY in the tree (rustls's crypto provider), so this adds a

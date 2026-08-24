@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Event streams (RFC 0035 Phase A), end to end: one workflow `emit`s domain
-//! events, a DIFFERENT workflow's `stream` start consumes them — and, the
-//! property no other edge has, a consumer that did not exist when the events
-//! were published still processes them: life 1 emits with no consumer
-//! configured; life 2 adds the consumer with `from: earliest` and the
-//! backlog replays, in order, exactly once. Life 3 proves the durable
-//! offset: nothing re-fires.
+//! Event streams, end to end: one workflow `emit`s domain events, a DIFFERENT
+//! workflow's `stream` start consumes them — and, the property no other edge
+//! has, a consumer that did not exist when the events were published still
+//! processes them: life 1 emits with no consumer configured; life 2 adds the
+//! consumer with `from: earliest` and the backlog replays, in order, exactly
+//! once. Life 3 proves the durable offset: nothing re-fires.
 #![cfg(all(unix, feature = "workflow"))]
 
 mod common;

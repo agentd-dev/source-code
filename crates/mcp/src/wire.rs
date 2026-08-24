@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! MCP wire types — the Model Context Protocol message surface. RFC 0004 (client),
-//! RFC 0005 (server).
+//! MCP wire types — the Model Context Protocol message surface, shared by the
+//! client and the served-MCP side.
 //!
 //! Method/notification names are constants (typos become compile errors).
 //! Result/param structs use `camelCase` to match the spec. `content[]` and
@@ -16,7 +16,8 @@ use serde_json::Value;
 
 pub use crate::version::*;
 
-/// Method + notification names (RFC 0004 §wire).
+/// Method + notification names. Constants, so a typo is a compile error rather
+/// than a `-32601` at runtime.
 pub mod method {
     pub const INITIALIZE: &str = "initialize";
     pub const INITIALIZED: &str = "notifications/initialized";
@@ -68,8 +69,9 @@ pub struct Implementation {
     pub title: Option<String>,
 }
 
-/// Capabilities a client declares. agentd declares **none** in v1 (no roots /
-/// sampling / elicitation / tasks) — RFC 0004 §declare-no-client-caps.
+/// Capabilities a client declares. Only declare what the client can actually
+/// service: a server is entitled to call anything advertised here, and a
+/// declared-but-unanswerable capability strands it waiting on a reply.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ClientCapabilities {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -126,9 +128,10 @@ pub struct DiscoverResult {
     pub cache_scope: Option<String>,
 }
 
-/// What a server says it can do. We gate every call on these (RFC 0004
-/// §capability-gating): no `tools/call` unless `tools` is present; no
-/// `resources/subscribe` unless `resources.subscribe == Some(true)`.
+/// What a server says it can do. Every call is gated on these, and the gate is
+/// fail-closed — an absent capability is a refusal, not a maybe: no `tools/call`
+/// unless `tools` is present; no `resources/subscribe` unless
+/// `resources.subscribe == Some(true)`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ServerCapabilities {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -212,8 +215,8 @@ pub struct CallToolParams {
 }
 
 /// Result of `tools/call`. `is_error: true` is a **tool-domain** failure (fed
-/// to the model as an observation), distinct from a JSON-RPC transport error
-/// (RFC 0004 §isError).
+/// to the model as an observation so it can adapt), distinct from a JSON-RPC
+/// transport error, which fails the call outright.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CallToolResult {
@@ -304,15 +307,18 @@ pub struct ListResourceTemplatesResult {
     pub next_cursor: Option<String>,
 }
 
-/// `resources/subscribe` / `resources/unsubscribe` params (per-URI only —
-/// templates are NOT subscribable, RFC 0004 §item-vs-list).
+/// `resources/subscribe` / `resources/unsubscribe` params. Per-URI only: a
+/// subscription names one concrete resource, never a [`ResourceTemplate`], since
+/// a template matches an open-ended set with no item to watch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubscribeParams {
     pub uri: String,
 }
 
-/// Payload of `notifications/resources/updated` — **URI only** (no diff). The
-/// reactive core re-reads on wake: notify-then-read (RFC 0004 §1.3, RFC 0008).
+/// Payload of `notifications/resources/updated` — **URI only**, never a diff.
+/// The notification is a wake-up, not the data: the reader re-reads the URI on
+/// wake, so a burst of updates collapses into one read of the current state and
+/// a missed notification costs freshness, not correctness.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceUpdatedParams {
     pub uri: String,
@@ -375,7 +381,7 @@ pub fn as_task_result(result: &Value) -> Option<Task> {
 
 // ---- prompts ----
 
-/// A prompt template a server offers (RFC 0004 §prompts). `arguments` describe
+/// A prompt template a server offers via `prompts/list`. `arguments` describe
 /// the template's fill-ins.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

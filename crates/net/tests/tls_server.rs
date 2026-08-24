@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Loopback round-trip tests for the TLS **server** acceptor + pinned-CA client
-//! (the HTTPS serving substrate for the target-vision pivot): a real handshake
-//! over a real TCP socket, both plain-TLS and mutual-TLS, using the committed
-//! test PKI under `tests/fixtures/` (see its README — test data, not secrets).
+//! (the substrate everything agentd serves over HTTPS sits on): a real
+//! handshake over a real TCP socket, both plain-TLS and mutual-TLS, using the
+//! committed test PKI under `tests/fixtures/` (see its README — test data, not
+//! secrets).
 #![cfg(feature = "tls")]
 
 use net::tls::{ClientIdentity, ServerIdentity, TlsAcceptor, connect_with_ca, peer_presented_cert};

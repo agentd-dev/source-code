@@ -1,25 +1,25 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Nested-body **cancellation and deadlines** (RFC 0027 §7) end to end: when a
-//! `foreach` element fails under `on_error: fail`, and when a `race` runs out
-//! of time, the siblings still in flight must actually STOP — their steps
-//! cancelled, their timers disarmed, their turn workers killed.
+//! Nested-body **cancellation and deadlines** end to end: when a `foreach`
+//! element fails under `on_error: fail`, and when a `race` runs out of time,
+//! the siblings still in flight must actually STOP — their steps cancelled,
+//! their timers disarmed, their turn workers killed.
 //!
-//! The two regressions these tests exist for:
+//! The two failures these tests guard against:
 //!
-//! 1. `cancel_scoped_children` matched children with `starts_with("{prefix}.")`,
-//!    but an element/branch instance is keyed `parent[ix].step` /
-//!    `parent{branch}.step` — neither starts with `parent.`. The race WINNER
-//!    path passes an already-scoped id and worked; the three failure paths
-//!    (`foreach` on_error fail, `parallel` on_error fail, race timeout) pass the
-//!    parent's bare id and cancelled precisely nothing. A sibling's `sleep`
-//!    stayed armed, so the instance outlived the run that abandoned it and the
-//!    daemon — which counts a live timer as busy — could not idle-exit.
+//! 1. `cancel_scoped_children` matching children with `starts_with("{prefix}.")`
+//!    cancels nothing nested: an element/branch instance is keyed
+//!    `parent[ix].step` / `parent{branch}.step` — neither starts with
+//!    `parent.`. The race WINNER path passes an already-scoped id, but the
+//!    three failure paths (`foreach` on_error fail, `parallel` on_error fail,
+//!    race timeout) pass the parent's bare id. A sibling's `sleep` then stays
+//!    armed, so the instance outlives the run that abandoned it and the
+//!    daemon — which counts a live timer as busy — cannot idle-exit.
 //! 2. `timeout` is a COMMON_FIELD: the parser lifts it into `step.timeout_ms`
-//!    and never copies it into `spec`, so `race` read its deadline back out of
-//!    `spec` and always got null. A `race` with a timeout waited forever.
+//!    and never copies it into `spec`, so a `race` that reads its deadline back
+//!    out of `spec` gets null and waits forever.
 //!
 //! Both tests therefore assert that the process EXITS, promptly, under a hard
-//! timeout: a regression fails fast instead of hanging CI for the full 90 s of
+//! timeout: a failure fails fast instead of hanging CI for the full 90 s of
 //! the sibling sleep it was supposed to cancel.
 
 mod common;
@@ -28,12 +28,13 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// The sleep a cancelled sibling is parked on. Long enough that waiting it out
-/// is unmistakably a regression rather than a slow machine.
+/// is unmistakably a failure rather than a slow machine.
 const SIBLING_SLEEP: &str = "90s";
 
-/// How long a bounded life may take before the test calls it wedged. The fixed
-/// build exits in ~1.5 s (the failure plus `idle_grace`); the buggy one needs
-/// 90 s, so anything in between separates them cleanly.
+/// How long a bounded life may take before the test calls it wedged. A build
+/// that cancels its siblings exits in ~1.5 s (the failure plus `idle_grace`);
+/// one that leaves a sibling timer armed needs 90 s, so anything in between
+/// separates them cleanly.
 const HARD_TIMEOUT: Duration = Duration::from_secs(20);
 
 fn write_file(tag: &str, ext: &str, body: &str) -> String {
@@ -140,8 +141,8 @@ fn a_failed_foreach_element_cancels_the_siblings_still_sleeping() {
             .any(|e| e["step"] == "each[1].explode" && e["status"] == "failed"),
         "the second element failed:\n{stderr}"
     );
-    // The regression: element 0's sleep was disarmed, so it never woke and the
-    // instance went idle at once instead of outliving the run by 90 seconds.
+    // The invariant: element 0's sleep is disarmed, so it never wakes and the
+    // instance goes idle at once instead of outliving the run by 90 seconds.
     assert!(
         !saw_step(&stderr, "step.done", "each[0].sleeper"),
         "the cancelled sibling must never finish its sleep:\n{stderr}"
@@ -185,8 +186,8 @@ fn a_race_timeout_fires_and_cancels_every_branch() {
             "branch step {branch} was cancelled, not slept out:\n{stderr}"
         );
     }
-    // The deadline is honoured at all — it used to be read from a spec that
-    // never carries it, leaving the race waiting on a 90 s branch.
+    // The deadline is honoured at all — read out of a spec that never carries
+    // it, it is null, and the race waits on a 90 s branch instead.
     assert!(
         events(&stderr, "step.done")
             .iter()

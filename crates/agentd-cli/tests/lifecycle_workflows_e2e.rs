@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Init and deinit workflows, end to end on the exact motivating scenario: a
 //! daemon that REGISTERS its webhook URL with a third-party service when it
-//! starts (`once {policy: always}` — the init idiom that always existed) and
-//! DEREGISTERS it during shutdown (`event {on: lifecycle.shutdown}` — new),
-//! with the drain WAITING for the deregistration to land before exit 0.
+//! starts (`once {policy: always}`) and DEREGISTERS it during shutdown
+//! (`event {on: lifecycle.shutdown}`), with the drain WAITING for the
+//! deregistration to land before exit 0.
 #![cfg(all(unix, feature = "workflow"))]
 
 mod common;

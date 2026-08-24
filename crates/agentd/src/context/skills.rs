@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! **Skills** (RFC 0028 §7): named instruction bundles — the SKILL.md idiom —
+//! **Skills**: named instruction bundles — the SKILL.md idiom —
 //! discovered from MCP servers as **prompts** (`prompts/list` = catalogue,
 //! `prompts/get` = body) or **resources** (`skill://<name>` URIs or
 //! `mimeType: text/x-skill+markdown`), referenced as `@skill:<name>` in the

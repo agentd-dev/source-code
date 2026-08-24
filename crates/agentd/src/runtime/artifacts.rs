@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! **Artifacts** (RFC 0028 §3 `artifact.*`, RFC 0025 §3.3 `artifact`): named
-//! pieces of content produced by turns and steps, store-backed, delivered on
-//! A2A tasks (P5) and referenced by large step outputs (`{"$artifact": id}`,
-//! P4). Content is stored inline (JSON or text) up to a cap; the record
-//! carries `{name, mime, size, sha256, content, created_by, sensitive}`.
+//! **Artifacts**: named pieces of content produced by turns and steps,
+//! store-backed, delivered on A2A tasks and referenced by large step outputs
+//! as `{"$artifact": id}` so a big payload travels by reference rather than
+//! being copied into every message that mentions it. Content is stored inline
+//! (JSON or text) up to [`MAX_INLINE_BYTES`]; the record carries
+//! `{name, mime, size, sha256, content, created_by, sensitive}`.
 
 use crate::state::{Durable, Kind, now_ms, ulid};
 use serde::{Deserialize, Serialize};
@@ -130,8 +131,9 @@ impl Artifacts {
         self.map.get(id)
     }
 
-    /// `artifact.get` as a tool result (content included unless sensitive
-    /// and the caller is not allowed — P5 refines by principal).
+    /// `artifact.get` as a tool result: the metadata plus the inline content.
+    /// The `sensitive` flag rides along on the metadata so the caller's own
+    /// redaction rules can act on it.
     pub fn get_value(&self, id: &str) -> Result<Value, String> {
         let a = self
             .map

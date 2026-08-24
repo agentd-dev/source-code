@@ -1,28 +1,32 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! File-based secret refs (RFC 0017 §6, riding RFC 0006 §6 / RFC 0012 §3.7).
+//! The secret front door — interpolation tokens that let a config name a
+//! credential without ever containing one.
 //!
-//! Secrets are env/file only — **never** in the config file, **never** logged
-//! (RFC 0012 §3.7). This module is the file-backed half of the secret front
-//! door: it reads a credential from a mounted file (a Kubernetes `Secret`
-//! volume), trims the trailing newline kubelet leaves on a projected file, and
-//! resolves the two interpolation tokens a declared header value may carry:
+//! Secrets come from the environment, a mounted file, or an interactive
+//! startup prompt: **never** from the config file and **never** into a log
+//! line. This module reads a credential from a mounted file (a Kubernetes
+//! `Secret` volume), trims the trailing newline kubelet leaves on a projected
+//! file, and resolves the two interpolation tokens a declared header value may
+//! carry:
 //!
-//! - `{{secret:NAME}}` — the value of process env var `NAME`.
+//! - `{{secret:NAME}}` — the value entered at startup for `NAME` under
+//!   `--prompt-missing` if there is one, else the process env var `NAME`.
 //! - `{{secret-file:PATH}}` — the contents of the mounted file at `PATH`,
-//!   re-read at the moment of use so a rotation takes effect without a restart
-//!   (RFC 0017 §6.1/§6.2).
+//!   re-read at the moment of use, so rotating the mounted file takes effect
+//!   without restarting the daemon.
 //!
-//! Both are `read_local` only (RFC 0011 §3.1): a filesystem path, no URL
-//! scheme, no network. The **template** (`{{secret:…}}` / `{{secret-file:…}}`)
-//! is structural and may live in the config file or a flag; the **resolved
-//! value** is materialized only at the instant of use and is never retained,
-//! never logged. A reference is structural; the value is not in the file — so
-//! the RFC 0011/0012 "the file is secret-free" invariant holds exactly.
+//! Both resolve locally — a filesystem path or an env var, never a URL and
+//! never a network fetch — so resolving a secret can never itself become an
+//! egress channel. The **template** is structural and may live in the config
+//! file or on a flag; the **resolved value** is materialized only at the
+//! instant of use, is never retained, and never reaches a log or error line.
+//! That split is what makes "the config file is secret-free" a fact rather
+//! than a convention: what the file holds is a reference, not a value.
 
 /// Read a credential from a mounted file, trimming a single trailing newline
-/// (kubelet projects a Secret value verbatim; an editor/`echo` commonly appends
-/// a `\n`). Errors carry the path but NOT the contents (RFC 0012 §3.7 — a
-/// secret never reaches a log/error line).
+/// (kubelet projects a Secret value verbatim; an editor or `echo` commonly
+/// appends a `\n`). Errors carry the path but never the contents, so a failed
+/// read cannot spill the credential into a log or an error line.
 pub fn read_token_file(path: &str) -> Result<String, String> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read secret file {path}: {e}"))?;
@@ -70,8 +74,8 @@ pub fn prompted_of(name: &str) -> Option<String> {
 /// Resolve every `{{secret:NAME}}` / `{{secret-file:PATH}}` token in `template`
 /// against `env` (the process environment) and the local filesystem, returning
 /// the materialized string. Plain text passes through unchanged. A bad token
-/// (missing env var, unreadable file, or an unterminated `{{`) is an `Err` with
-/// a message that names the ref but NOT the resolved value (RFC 0012 §3.7).
+/// (missing env var, unreadable file, or an unterminated `{{`) is an `Err`
+/// with a message that names the ref but never the resolved value.
 ///
 /// This is the runtime resolver — it is called at the moment of use, so a
 /// rotated `{{secret-file:…}}` is picked up on the next call. `--validate-config`
@@ -123,18 +127,21 @@ fn resolve_one(token: &str, env: &dyn Fn(&str) -> Option<String>) -> Result<Stri
 }
 
 /// Does `value` contain at least one `{{secret:…}}` / `{{secret-file:…}}` ref?
-/// Used by the validator to distinguish a (legal) secret *reference* from an
-/// (illegal) inline secret-shaped scalar in a declared header (RFC 0017 §3.1).
+/// The validator uses this to tell a legal secret *reference* apart from an
+/// illegal inline literal under a secret-shaped key: a header named
+/// `Authorization` holding a reference is fine, the same header holding the
+/// token itself is a config error.
 pub fn has_secret_ref(value: &str) -> bool {
     value.contains("{{secret:") || value.contains("{{secret-file:")
 }
 
 /// Side-effect-free-as-possible pre-flight for `--validate-config` / startup:
-/// every ref in `template` must resolve (the env var is set; the file exists and
-/// is readable). Returns the same diagnostics `resolve` would, without retaining
-/// the resolved bytes. A `{{secret-file:…}}` IS read here (it must exist to be
-/// valid, RFC 0017 §6.2 — "missing/unreadable at startup → exit 2"), but the
-/// contents are dropped immediately.
+/// every ref in `template` must resolve (the env var is set; the file exists
+/// and is readable). Returns the same diagnostics `resolve` would, without
+/// retaining the resolved bytes. A `{{secret-file:…}}` IS read here — an
+/// unreadable secret file must fail the config check rather than surface as a
+/// mystery 401 on the first outbound request — but the contents are dropped
+/// immediately.
 pub fn refs_resolvable(template: &str, env: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
     resolve(template, env).map(|_| ())
 }

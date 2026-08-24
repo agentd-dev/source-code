@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The **notify-then-read must not run on the reactor thread** (RFC 0027 §5
-//! `wait on: resource`).
+//! The **notify-then-read must not run on the reactor thread** (the
+//! `wait on: resource` path).
 //!
 //! A `resources/updated` notification resolves suspended `wait resource` steps
 //! by reading the resource back. That read is a network round trip bounded only
@@ -10,12 +10,12 @@
 //! progress and SIGTERM is not observed. Subscriptions ARE agentd's reactivity
 //! story, so this is the hot path, not an edge.
 //!
-//! The regression this suite exists for: `on_resource_updated` called
+//! The failure this suite guards against: `on_resource_updated` calling
 //! `read_resource` inline. The test points a subscription at a mock MCP server
 //! that sits on `resources/read` for [`READ_DELAY`], and asserts that a durable
 //! `sleep` timer armed in another run fires (and its run completes) DURING that
 //! window — both by wall clock and, timing-free, by log order: the timer-driven
-//! run must finish BEFORE the delayed read lands. With the inline read the
+//! run must finish BEFORE the delayed read lands. With an inline read the
 //! reactor is parked in `recv_timeout`'s callee and both assertions fail.
 
 mod common;

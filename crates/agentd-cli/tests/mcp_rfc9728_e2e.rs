@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! RFC 0031 (rollout P2) / RFC 9728: **issuer discovery from an MCP server's 401
-//! challenge**. A mock MCP endpoint answers an unauthenticated request with
+//! RFC 9728: **issuer discovery from an MCP server's 401 challenge**. A mock
+//! MCP endpoint answers an unauthenticated request with
 //! `401 WWW-Authenticate: Bearer resource_metadata="…"`; that metadata document
 //! lists `authorization_servers`. `agentd login mcp:<name>` with no configured
 //! `issuer` walks this chain and learns the authorization server. [feature: oauth]

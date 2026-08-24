@@ -31,8 +31,8 @@ as an adaptation:
 
 | init duty | what agentd already does |
 |---|---|
-| **Reap orphans.** PID 1 must `waitpid` every child the kernel reparents to it, or the process table fills with zombies. | The supervisor's reaper is process-global by construction: one thread owns `waitpid(-1, WNOHANG)` behind a lock and routes every reaped pid to its owner — an *unowned* pid (exactly what a reparented orphan is) is reaped and logged rather than leaked. This is the hard init duty, and it is not an add-on: it is how agentd's own subagent tree works. |
-| **Supervise and restart.** Services crash; init's descendants must be restarted with backoff, not in a hot loop. | The restart governor (exponential backoff + a circuit breaker), the dead/stuck detectors, and the SIGTERM→SIGKILL ladder are the supervisor's core (RFC 0003). A wedged child is killed by its process group; `PR_SET_PDEATHSIG` means nothing outlives its parent silently. |
+| **Reap orphans.** PID 1 must `waitpid` every child the kernel reparents to it, or the process table fills with zombies. | The supervisor's reaper is process-global by construction: one thread owns `waitpid(-1, WNOHANG)` behind a lock and routes every reaped pid to its owner — an *unowned* pid (exactly what a reparented orphan is) is reaped and its status discarded, because nothing here owns it — the zombie is collected either way. This is the hard init duty, and it is not an add-on: it is how agentd's own subagent tree works. |
+| **Supervise and restart.** Services crash; init's descendants must be restarted with backoff, not in a hot loop. | The restart governor (exponential backoff + a circuit breaker), the dead/stuck detectors, and the SIGTERM→SIGKILL ladder are the supervisor's core. A wedged child is killed by its process group; `PR_SET_PDEATHSIG` means nothing outlives its parent silently. |
 | **Handle signals.** PID 1 is special: signals it has no handler for are *ignored*, not defaulted — an init that installs no handlers cannot even be shut down. | agentd installs real handlers on day one: SIGTERM drains (finish in-flight work, refuse new), SIGHUP hot-reloads config, SIGCHLD wakes the reaper. The drain semantics — stop admitting, let running work finish, exit cleanly — are precisely what a power-button press should mean on a robot. |
 | **Own system state.** Init decides what runs, in what order, with what limits. | The workflow engine is a dependency graph with durable state; `lifecycle.run_until` is a boot target; per-child rlimits (`limits: {memory, cpu}`), niceness by `priority`, and cgroup confinement are resource control; the pressure system (shed under low disk/memory, drain in-flight) is graceful degradation a service manager would envy. |
 | **Bring up the world.** Mount `/proc`, `/sys`, `/dev`; set the hostname; raise loopback; then start userland. | The one duty agentd does **not** do — deliberately. It is ~20 lines of pre-init shim (§4.2), or one small upstream flag (§4.3). |
@@ -55,8 +55,8 @@ Two properties make the fit unusually clean:
 - **You cannot be killed.** SIGKILL and SIGSTOP do not apply to PID 1, and a
   crash is a kernel panic (`panic: Attempted to kill init!`). The restart
   governor that supervises everyone else does not supervise *you*. The honest
-  mitigations are the kernel's: a hardware **watchdog** (§5.4) and
-  `panic=<seconds>` + a known-good A/B rootfs (§5.6), so a dead brain becomes
+  mitigations are the kernel's: a hardware **watchdog**, and `panic=<seconds>`
+  over a known-good A/B rootfs (both sketched in §5), so a dead brain becomes
   a reboot into the previous image rather than a frozen robot.
 - **Exit means reboot.** When init exits the kernel panics, so agentd's exit
   codes — its API on a server — become reboot policy on an appliance: the
@@ -112,7 +112,7 @@ Read it as three trust rings. The **kernel and PID 1** never reason. The
 **agents** reason but are budgeted, rlimited, and killable. The **drivers**
 touch hardware but expose only the tools they declare — an agent can call
 `motor.move`, it cannot open `/dev/ttyCAN0`, because there is no filesystem
-tool and no shell. The lethal-trifecta gate (RFC 0012) applies verbatim with
+tool and no shell. The lethal-trifecta gate applies verbatim with
 one word changed: on a robot, *actuation is egress*. An agent that holds
 untrusted input (a voice command, a QR code in the camera frame) + sensitive
 context + actuator access is the configuration agentd refuses at startup
@@ -317,5 +317,5 @@ first userland instruction, **is** one.
   server-side siblings of these patterns.
 - [Security](security.md) — the trifecta rule; read "actuation as egress"
   against it.
-- [RFC 0014](../rfcs/0014-control-plane-contract.md) — the fleet control-plane
-  direction.
+- [Operations](operations.md) — the admin surface a fleet control plane drives
+  each unit through.

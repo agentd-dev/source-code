@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! **Nested bodies** (RFC 0027 §5–§7): `foreach`/`batch` (dynamic fan-out
+//! **Nested bodies**: `foreach`/`batch` (dynamic fan-out
 //! over an array, batches with bounded parallelism and rate pacing, per-batch
 //! durable progress, positional collection, `on_error: continue` slots),
 //! `iterate` (a bounded structured loop with `while`/`until`/

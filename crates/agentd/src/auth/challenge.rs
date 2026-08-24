@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! RFC 9728 **OAuth 2.0 Protected Resource Metadata** discovery (RFC 0031 §7 /
-//! rollout P2). When an MCP `auth: { kind: oauth2 }` block names no `issuer`,
-//! agentd probes the server before login: an unauthenticated request draws a
+//! RFC 9728 **OAuth 2.0 Protected Resource Metadata** discovery. When an MCP
+//! `auth: { kind: oauth2 }` block names no `issuer`, agentd probes the server
+//! before login: an unauthenticated request draws a
 //! `401 WWW-Authenticate: Bearer resource_metadata="…"`, and that metadata
-//! document lists the `authorization_servers` — the issuer to run OIDC / RFC 8414
-//! discovery against. Best-effort: any failure returns `None`, so an explicit
-//! `issuer` still wins and the caller reports the usual "issuer required" error.
+//! document lists the `authorization_servers` — the issuer to run OIDC /
+//! RFC 8414 discovery against. Best-effort throughout: any failure returns
+//! `None`, so an explicit `issuer` still wins and the caller reports its usual
+//! "issuer required" error rather than a confusing discovery failure.
 
 use std::time::Duration;
 

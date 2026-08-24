@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! OAuth 2.1 / OIDC flows for **interactive login** and token refresh
-//! (RFC 0031 §7): the **device authorization grant** (RFC 8628) — the default
-//! interactive UX, working headless / over SSH with no browser or open port —
-//! plus refresh-token renewal and authorization-server metadata discovery
+//! OAuth 2.1 / OIDC flows for **interactive login** and token refresh: the
+//! **device authorization grant** (RFC 8628) — the default interactive UX,
+//! which works headless and over SSH with no browser and no open port — plus
+//! refresh-token renewal and authorization-server metadata discovery
 //! (RFC 8414 / OIDC `.well-known/openid-configuration`).
 //!
-//! Dependency-free (the minimalism moat, RFC 0002): the hand-rolled HTTP client
-//! (`net::http` + `net::tls`), `serde_json`, and a tiny form encoder — no
-//! `oauth2` / `url` / `reqwest`. Secret-freedom (RFC 0012 §3.7): a confidential
-//! client's `client_secret` is a `{{secret:…}}` template resolved only at the
-//! moment of the token POST, form-posted, never logged.
+//! Dependency-free by design: the hand-rolled HTTP client (`net::http` +
+//! `net::tls`), `serde_json`, and a tiny form encoder — no `oauth2` / `url` /
+//! `reqwest`. A confidential client's `client_secret` stays a `{{secret:…}}`
+//! template until the moment of the token POST, where it is resolved, sent in
+//! the form body, and dropped — so it is never held in a config value and
+//! never reaches a log line.
 
 use crate::net::http::{self, Url};
 use serde::Deserialize;
@@ -21,7 +22,7 @@ pub struct OAuth2Params {
     pub token_url: String,
     /// RFC 8628 device-authorization endpoint (required for the device grant).
     pub device_authorization_url: Option<String>,
-    /// The user-facing authorization endpoint (authorization-code grant; P5).
+    /// The user-facing authorization endpoint (authorization-code grant).
     pub authorization_url: Option<String>,
     pub client_id: String,
     /// A `{{secret:NAME}}` template for a confidential client, or `None` for a
@@ -91,7 +92,8 @@ pub struct Tokens {
 pub enum PollOutcome {
     /// The user has not yet authorized — keep polling at the current interval.
     Pending,
-    /// The server asked us to back off — increase the interval by 5s (RFC 8628).
+    /// The server asked us to back off — add 5s to the interval and keep it
+    /// there for the rest of the flow; polling faster risks being cut off.
     SlowDown,
     /// Authorized — the tokens.
     Token(Box<Tokens>),
@@ -333,9 +335,11 @@ fn get_json<T: serde::de::DeserializeOwned>(url: &str, timeout: Duration) -> Res
     serde_json::from_slice(&resp.body).map_err(|e| format!("bad json: {e}"))
 }
 
-/// Connect to an OAuth endpoint (`https://` over TLS, `http://` plain — loopback
-/// only in practice, guarded by the endpoint being an operator-declared IdP).
-/// Shared with the RFC 9728 challenge probe ([`super::challenge`]).
+/// Connect to an OAuth endpoint: `https://` over TLS, `http://` plain. Plain
+/// HTTP is only ever sane for a loopback development IdP — an authorization
+/// server reached in the clear sees the client secret and returns the token in
+/// the clear — so a real deployment configures `https` endpoints. Shared with
+/// the protected-resource-metadata probe ([`super::challenge`]).
 pub(super) fn connect(url: &Url, timeout: Duration) -> Result<Box<dyn http::Stream>, String> {
     let tcp = http::connect_tcp(&url.host, url.port, timeout)
         .map_err(|e| format!("oauth: connect {}: {e}", url.host))?;

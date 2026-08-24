@@ -24,8 +24,9 @@ per node in the process tree, not once per deployment.
 
 **It must be auditable.** The supervisor holds API keys and brokers whatever a
 model asks for; every crate linked into it sits inside that trust boundary. That
-argues for a small graph — and it argued, for a while, against depending on
-anyone else for MCP and A2A. The next section is why that was wrong.
+argues for a small dependency graph wherever the thing being written is small,
+frozen, and only partly needed. The next section is where that argument runs
+out.
 
 **It must be able to stop a model.** The cancel that matters is not dropping a
 future. A wedged turn is a child process with an open socket to a provider; the
@@ -38,20 +39,19 @@ without giving up memory safety.
 
 ## Two protocols we do not implement
 
-agentd used to implement MCP and A2A itself, and for a while that was defensible:
-both are small, and a hand-written subset is auditable in a way a dependency
-tree is not. It stopped being defensible for a reason worth stating plainly,
-because it is the argument against the version of this document that came
-before.
+MCP and A2A are both small enough to hand-write, and a hand-written subset is
+auditable in a way a dependency tree is not. agentd does not hand-write them
+anyway, for a reason that outweighs both.
 
 A protocol you implement from your own reading of the specification fails in one
 particular way: **silently, in the peer**. The tests you write encode the same
 reading as the code, so they agree with it. What finally disagrees is somebody
 else's client, in production, and what it reports is nothing — a message that
-never arrived, a task that never looked finished. We proved this on ourselves:
-checking agentd's A2A output against an independent implementation of the same
-spec found four such faults in an hour, every one of them valid JSON.
-([a2a.md](a2a.md) lists them.)
+never arrived, a task that never looked finished. That failure mode is
+demonstrable, not hypothetical: handing agentd's A2A responses to an
+independent implementation of the same spec turns up faults of exactly this
+shape — every one of them valid JSON that agentd's own tests accept.
+([a2a.md](a2a.md) lists them; `crates/a2a-oracle` is the harness.)
 
 So MCP is [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk), the
 official Rust SDK, and A2A is [`a2a-rs`](https://github.com/emillindfors/a2a-rs),
@@ -60,10 +60,10 @@ the handshakes, the typed request and response shapes, capability negotiation,
 the streaming rules, the error codes and the version tables. agentd tracks the
 specifications by upgrading a dependency rather than by re-reading a document.
 
-What agentd kept is the part a protocol crate has no opinion about: **the
-socket**. Both SDKs plug into agentd's own HTTP transport, so adopting them cost
-nothing that was already working — an AAuth request signature with its
-challenge/re-sign loop, an AWS SigV4 signature per request, an mTLS client
+What agentd owns is the part a protocol crate has no opinion about: **the
+socket**. Both SDKs plug into agentd's own HTTP transport, so everything that
+hangs off a dial applies under them unchanged — an AAuth request signature with
+its challenge/re-sign loop, an AWS SigV4 signature per request, an mTLS client
 identity, a refreshed OAuth token, the SSRF guard on every dial. rmcp's
 `StreamableHttpClient` and a2a-rs's ports are both traits; that seam is the whole
 integration.
@@ -75,31 +75,31 @@ integration.
 | `--no-default-features` | 75 |
 | default (`tls` + MCP) | 88 |
 | shipped release feature set (adds A2A) | 156 |
-| … plus CEL, shipped since 2.3.0 | 179 |
+| … plus CEL | 179 |
 
-An earlier version of this page counted three direct dependencies and had CI
-fail the build if that number moved. That gate is gone, replaced by one that
-guards what actually reaches a user: the release binary is still a **statically
-linked musl artifact that runs on `scratch`** — about 8.5 MiB, a 3.6 MiB download,
-no shell, no libc, no package manager. The dependency count moved by two orders of
-magnitude; the attack surface of the thing that ships did not.
+What CI gates is not that count but what actually reaches a user: the release
+binary is a **statically linked musl artifact that runs on `scratch`** — about
+8.5 MiB, a 3.6 MiB download, no shell, no libc, no package manager. A wide
+build-time dependency graph and a narrow shipped attack surface are separate
+questions, and it is the second one that is enforced.
 
-The build nearly gained a C toolchain. `connectrpc`, underneath `a2a-rs`, asks
-for `rustls` with default features, which selects the C/assembly `aws-lc-rs`
-provider — and because Cargo unifies features additively, that single default
-applies to the entire graph no matter how carefully every other crate asks for
-`ring`. It cost a release build 90 minutes of hanging under `cross` before it
-was tracked down. Three corrected dependency entries in a vendored copy
-(`third_party/connectrpc/PATCH.md`) removed it; CI now fails if `aws-lc`
-reappears.
+The build must also stay free of a C toolchain, and one transitive default is
+enough to lose it. `connectrpc`, underneath `a2a-rs`, asks for `rustls` with
+default features, which selects the C/assembly `aws-lc-rs` provider — and
+because Cargo unifies features additively, that single default applies to the
+entire graph no matter how carefully every other crate asks for `ring`. The
+symptom is not a compile error but a cross build that hangs for tens of minutes
+looking for a compiler. Three corrected dependency entries in a vendored copy
+(`third_party/connectrpc/PATCH.md`) keep it out, and CI fails the build if
+`aws-lc` reappears anywhere in the tree.
 
-Quarantine survives as a habit rather than a rule: third-party code still
-reaches the engine through `crates/net` and `crates/mcp`, and `deny.toml` still
-denies wildcards and yanked crates against a hand-maintained permissive-only
-licence allow-list. What is no longer true is that you can hold the whole
-dependency graph in your head. Trading that for protocol implementations two
-independent readings agree on was the right trade, and it should be described as
-a trade rather than as a win.
+Quarantine is a habit rather than a rule: third-party code reaches the engine
+through `crates/net` and `crates/mcp`, and `deny.toml` denies wildcards and
+yanked crates against a hand-maintained permissive-only licence allow-list. What
+the habit does not buy is a dependency graph you can hold in your head. That is
+the trade — protocol implementations two independent readings agree on, paid for
+in crates nobody here has read line by line — and it is worth describing as a
+trade rather than as a win.
 
 ```mermaid
 flowchart LR
@@ -134,11 +134,11 @@ at the framing layer, closing header injection once.
 
 | Hand-rolled | Where | What a dependency would have cost |
 |---|---|---|
-| HTTP/1.1 client + SSE reader | `net/src/http.rs`, 644 lines | `ureq` → `url` → IDNA → ICU |
-| X.509 field extraction | `net/src/x509.rs`, 303 lines | `x509-parser` |
+| HTTP/1.1 client + SSE reader | `net/src/http.rs`, 690 lines | `ureq` → `url` → IDNA → ICU |
+| X.509 field extraction | `net/src/x509.rs`, 304 lines | `x509-parser` |
 | YAML subset reader | `config/yaml.rs`, 1,307 lines | `serde_yaml` (unmaintained) |
 | JSON Schema subset (2020-12) | `jsonschema.rs`, 803 lines | a validator **and** a regex engine |
-| 5-field UTC cron | `triggers/timer.rs`, 215 lines | `croner` / `cron` |
+| 5-field UTC cron | `triggers/timer.rs`, 216 lines | `croner` / `cron` |
 | Prometheus exposition text | `obs/metrics.rs` | `prometheus` / `metrics` |
 | OTLP export over HTTP/JSON | `obs/otel.rs` | `opentelemetry` + protobuf + tonic → tokio |
 | NDJSON logger | `obs/log.rs` | `tracing` + a subscriber stack |
@@ -228,18 +228,15 @@ The artifact that ships is a static-PIE musl build (LTO, stripped,
 
 That is the whole image too: `FROM scratch` plus this file.
 
-An earlier revision of this table read 2.98 MiB, measured by downloading the
-published v2.0.0 asset on the reasoning that a released artifact beats a local
-build. The asset was six weeks stale — built before the protocol SDKs landed —
-so the figure described code nobody was running, and the local build it was
-"correcting" had been right. Provenance is part of a measurement: an artifact is
-only authoritative once you know what it was built from.
+Every figure on this page is only as good as its provenance, which is why each
+one names what it was measured on. A published release asset is not
+automatically more authoritative than a local build: if it was cut before the
+code you are describing, it documents software nobody is running. Record what a
+number was built from, or it is not a number.
 
-An idle daemon running a schedule workflow, on the shipped v2.1.0 build with a
-file store: `Threads: 1`, `VmRSS` **5.5 MiB**, and **1 CPU tick** over 6 seconds
-at `CLK_TCK=100` — under 0.2% of a core, despite the 200 ms tick. (The earlier
-3.8–3.9 MiB here, and the ~2 MiB the README used to claim, both predated the
-protocol SDKs. Neither had been re-measured since.)
+An idle daemon running a schedule workflow, on a release build with a file
+store: `Threads: 1`, `VmRSS` **5.5 MiB**, and **1 CPU tick** over 6 seconds
+at `CLK_TCK=100` — under 0.2% of a core, despite the 200 ms tick.
 
 Spawn cost is easily misquoted. A loop of 100 `agentd --version` invocations
 costs ~2.7 ms each on this build, against a `/bin/true` floor of ~0.93 ms —
@@ -254,15 +251,16 @@ right for a shipped appliance and wrong for a fast edit loop. CI compounds it:
 17 feature rows, two crates each, clippy and tests — because `--all-features`
 unification hides a build that is broken on its own.
 
-**You own the hand-rolled code forever.** 84,322 lines across the workspace,
-65,170 in the engine. The YAML reader is a subset; the cron parser is 5-field UTC
+**You own the hand-rolled code forever.** Roughly 93,000 lines of source across
+the workspace, 81,000 of them in the engine. The YAML reader is a subset; the
+cron parser is 5-field UTC
 only and finds the next fire by stepping a minute at a time for up to four years.
 Each is a spec revision you will handle yourself, and a bug nobody else reports.
 
 **`unsafe` is quarantined, not absent, and `panic = "abort"` is unforgiving.**
-Zero `unsafe` in `net` and `mcp`; 48 blocks in the engine, 20 of them env-var
-juggling inside `#[cfg(test)]` (edition 2024 made `set_var` unsafe) and the
-remaining 28 libc FFI across eight files. A panic in the supervisor path takes
+Zero `unsafe` in `net` and `mcp`; 60 blocks in the engine, half of them inside
+`#[cfg(test)]` and mostly env-var juggling (edition 2024 made `set_var` unsafe),
+the other 30 libc FFI across thirteen files. A panic in the supervisor path takes
 the whole tree down by design, which makes every `unwrap` an availability
 decision.
 
@@ -272,11 +270,9 @@ depending on somebody else's crate — a
 transport generic over `Read + Write`, raw signal handling: working here demands
 comfort with async-signal-safety rules, not only the borrow checker.
 
-The moat is not a religion, and it has a documented exit hatch: each protocol's
+The moat is not a religion, and it has a deliberate exit hatch: each protocol's
 wire types sit behind `serde` in one module — `wire/intel.rs` for intelligence,
 `mcp::wire` for MCP — precisely so the codec could be swapped for a lighter
-encoder mechanically, if proc-macro compile weight ever has to go. Specified in
-[`rfcs/0004`](../rfcs/0004-mcp-client-subset-and-codec.md) and
-[`rfcs/0006`](../rfcs/0006-intelligence-transport-and-wire.md); the reactor in
-[`rfcs/0002`](../rfcs/0002-supervisor-reactor-and-concurrency.md), mapped module
-by module in [architecture.md](architecture.md).
+encoder mechanically, if proc-macro compile weight ever has to go. The reactor
+those modules feed is mapped module by module in
+[architecture.md](architecture.md).

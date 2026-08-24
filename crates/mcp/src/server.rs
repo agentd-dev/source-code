@@ -10,7 +10,7 @@
 //! while the embedder owns the *domain* (which tools exist, which resources are
 //! readable, who may subscribe to what). One [`Handler`] trait is the seam.
 //!
-//! Transport is deliberately minimal and dependency-light (RFC 0015 §3.6): a
+//! Transport is deliberately minimal and dependency-light: a
 //! blocking listener, one thread per connection, speaking the same NDJSON JSON-RPC
 //! codec ([`crate::rpc::frame`]) as the client. No async, no mio. [`ServeStream`]
 //! type-erases unix vs. vsock so the framing, threading, and dispatch are entirely
@@ -27,9 +27,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-/// Which transport a connection arrived on, and therefore its trust domain (RFC
-/// 0015 §3.3-§3.4). A generic two-domain model the framework only carries and
-/// hands to the [`Handler`]; the embedder assigns meaning:
+/// Which transport a connection arrived on, and therefore its trust domain. The
+/// framework only carries this two-domain model and hands it to the [`Handler`];
+/// the embedder assigns meaning, and is the layer that must refuse a management
+/// peer anything reserved for the in-process caller:
 ///   * [`Stdio`](PeerOrigin::Stdio) — an in-process / same-trust caller (agentd's
 ///     own driving harness over the process stdio).
 ///   * [`Management`](PeerOrigin::Management) — a peer that dialed a listener (unix
@@ -348,7 +349,8 @@ pub trait Handler: Send + Sync + 'static {
 ///   * `server/discover` (modern, stateless): advertise the full
 ///     [`SUPPORTED_PROTOCOL_VERSIONS`](crate::version::SUPPORTED_PROTOCOL_VERSIONS)
 ///     list + capabilities in one call, so a modern client needn't fall back to the
-///     legacy handshake. This is what makes the embedder a *dual-era server*.
+///     legacy handshake. Answering both is what makes the embedder a *dual-era
+///     server*: a peer of either era completes its lifecycle unaided.
 ///   * `ping`: an empty result.
 ///
 /// `server_info` is the `{name, version}` object and `capabilities` the advertised
@@ -479,8 +481,8 @@ pub fn spawn_accept_unix(
         .map(|_| ())
 }
 
-/// Bind an AF_VSOCK `(cid, port)` for serving — the management transport (RFC 0015
-/// §3.2). The vsock counterpart of [`bind_unix`].
+/// Bind an AF_VSOCK `(cid, port)` for serving — the management transport for a
+/// host↔guest boundary. The vsock counterpart of [`bind_unix`].
 #[cfg(feature = "vsock")]
 pub fn bind_vsock(cid: u32, port: u32) -> io::Result<vsock::VsockListener> {
     vsock::VsockListener::bind_with_cid_port(cid, port)

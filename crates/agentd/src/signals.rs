@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Signal handling + the self-pipe wakeup. RFC 0003 §signals, RFC 0011 §signals.
+//! Signal handling + the self-pipe wakeup.
 //!
 //! Handlers are async-signal-safe — they only touch atomics and `write()` one
 //! byte to a **self-pipe** so a blocked reactor wakes promptly (`SA_RESTART`
@@ -18,50 +18,51 @@ mod imp {
     static DRAINING: AtomicBool = AtomicBool::new(false);
     static FORCE: AtomicBool = AtomicBool::new(false);
     static CHILD_EXIT: AtomicBool = AtomicBool::new(false);
-    // Hot-reload request latch (RFC 0017 §5.2). The SIGHUP handler sets it +
-    // wakes the reactor; the reactive supervisor consults `reload_requested()`
-    // on its next tick (after `health::tick()`, like `draining()`) and runs the
+    // Hot-reload request latch. The SIGHUP handler sets it and wakes the
+    // reactor; the reactive supervisor consults `reload_requested()` on its next
+    // tick (after `health::tick()`, like `draining()`) and runs the
     // validate-first/quiesce/apply choreography, then `clear_reload()`s it. A
     // SIGHUP while DRAINING is ignored (drain wins — checked at the consult site),
     // so this latch can be set-but-never-honoured during a drain, which is fine:
     // the process is exiting. The handler is registered ONLY under the
     // `hot-reload` feature; without it SIGHUP keeps its default disposition.
     static RELOAD: AtomicBool = AtomicBool::new(false);
-    // Trigger-attribution latch for the `config.reload_requested` event (RFC 0017
-    // §5.6 — `{trigger:"sighup"|"watch"}`). The inotify file-watch thread
-    // (RFC 0017 §5.2) sets BOTH `RELOAD` and this flag via
-    // `request_reload_from_watch()`; the reactive apply step reads-and-clears it
-    // with `take_reload_was_watch()` to pick the trigger string, DEFAULTING to
+    // Trigger-attribution latch for the `config.reload_requested` event, whose
+    // `trigger` field is either "sighup" or "watch". The inotify file-watch thread
+    // sets BOTH `RELOAD` and this flag via `request_reload_from_watch()`; the
+    // reactive apply step reads-and-clears it with `take_reload_was_watch()` to
+    // pick the trigger string, DEFAULTING to
     // "sighup" when unset (the SIGHUP handler / `request_reload()` never set it).
     // The watcher is a normal thread (not a signal handler), so a plain atomic
     // store is fine — no async-signal-safety constraint here.
     static RELOAD_FROM_WATCH: AtomicBool = AtomicBool::new(false);
-    // Reload-in-progress guard (RFC 0017 §5.3 step 3). Set while the reactive
-    // supervisor is APPLYING a validated reload; the served `subagent.spawn`
-    // chokepoint consults it and returns a transient "reload in progress" error to
-    // NEW spawns (mirrors the `draining` guard, but transient — cleared in step 6).
-    // Like PAUSED/LAME_DUCK it rides here (not a feature-gated module) so it is one
-    // process-global truth the served surface reads without a feature dependency;
-    // it is only ever SET by the `hot-reload` reactive apply step.
+    // Reload-in-progress guard: true only while the reactive supervisor is
+    // APPLYING a validated reload's diff, so a reader can tell a mid-apply moment
+    // (where config values may be half old, half new) from a settled one. Unlike
+    // `DRAINING` it is transient — the apply step brackets itself and always
+    // clears it, so a reader that refuses work while it is set cannot wedge.
+    // Like PAUSED/LAME_DUCK it rides here rather than in a feature-gated module,
+    // so any feature can read it without depending on another; only the
+    // `hot-reload` apply step ever sets it.
     static RELOADING: AtomicBool = AtomicBool::new(false);
-    // Lame-duck override (RFC 0015 §4.2): a one-way-per-call readiness override
-    // toward NotReady, flipped by the `a2a.LameDuck` admin method — NOT a signal.
-    // It rides here (not in a feature-gated module) so it is one process-global
-    // truth consulted by BOTH the `/readyz` probe (obs::serve, `metrics`) and the
-    // served control surface (mcp::server, `a2a`), with neither feature depending
-    // on the other. Distinct from `DRAINING`: lame-duck never exits.
+    // Lame-duck override: forces readiness toward NotReady without exiting —
+    // set when a drain begins so a load balancer stops sending new work while the
+    // tree winds down, and clearable again. NOT a signal. It rides here rather
+    // than in a feature-gated module so both the `/readyz` probe (obs::serve,
+    // `metrics`) and the served control surface (mcp::server, `a2a`) read one
+    // process-global truth without either feature depending on the other.
+    // Distinct from `DRAINING`: lame-duck never exits.
     static LAME_DUCK: AtomicBool = AtomicBool::new(false);
-    // Tree-wide pause state (RFC 0015 §4.3): set by the `a2a.Pause` admin method,
-    // cleared by `a2a.Resume`. Like `LAME_DUCK`, it rides here (not a feature-gated
-    // module) so it is one process-global truth read by BOTH the served operator
-    // surface (`agentd://inventory`, `serve-mcp`) and the `agentd_paused` gauge
-    // (`metrics`), with neither feature depending on the other. Distinct from
-    // DRAINING/LAME_DUCK: pause freezes the agentic loops only — never exits, never
-    // touches readiness (the supervisor reactor and liveness heartbeat run on).
+    // Tree-wide pause state. Like `LAME_DUCK`, it rides here rather than in a
+    // feature-gated module so any feature can read one process-global truth
+    // without depending on another. Distinct from DRAINING/LAME_DUCK: pause
+    // freezes the agentic loops only — it never exits and never touches
+    // readiness, so the supervisor reactor and the liveness heartbeat keep
+    // running and a paused instance still answers probes.
     static PAUSED: AtomicBool = AtomicBool::new(false);
-    // Intelligence all-endpoints-down latch (RFC 0018 §6). The model loop runs in
-    // a re-exec'd CHILD process that owns its own intel client + circuit-breaker /
-    // failover state; the supervisor has NO LLM and no live view of that breaker
+    // Intelligence all-endpoints-down latch. The model loop runs in a re-exec'd
+    // CHILD process that owns its own intel client + circuit-breaker / failover
+    // state; the supervisor has NO LLM and no live view of that breaker
     // state. The child therefore reports its reachability UPWARD (an edge-triggered
     // `AgentMsg::IntelHealth` at the breaker/failover seam — on entering all-down
     // and on recovering); the supervisor latches it HERE so the readiness probe,
@@ -107,10 +108,11 @@ mod imp {
         wake();
     }
 
-    /// Async-signal-safe SIGHUP handler (RFC 0017 §5.2): set the RELOAD latch +
-    /// wake the reactor. Exactly the SIGTERM pattern (one atomic store + one
-    /// self-pipe byte); the heavy lifting (re-load, validate, apply) runs on the
-    /// reactor thread, never here. Registered only under the `hot-reload` feature.
+    /// Async-signal-safe SIGHUP handler: set the RELOAD latch + wake the reactor.
+    /// Exactly the SIGTERM pattern (one atomic store + one self-pipe byte); the
+    /// heavy lifting (re-load, validate, apply) runs on the reactor thread, never
+    /// here — none of it is async-signal-safe. Registered only under the
+    /// `hot-reload` feature.
     #[cfg(feature = "hot-reload")]
     extern "C" fn on_hup(_sig: libc::c_int) {
         RELOAD.store(true, Ordering::SeqCst);
@@ -156,9 +158,9 @@ mod imp {
         // SA_NOCLDSTOP: only fire on child *termination*, not stop/continue.
         set_handler(libc::SIGCHLD, chld, libc::SA_NOCLDSTOP);
         set_handler(libc::SIGPIPE, libc::SIG_IGN, 0);
-        // SIGHUP → hot reload (RFC 0017 §5.2), only when the feature is built.
-        // Without it SIGHUP keeps its default disposition (terminate) — exactly
-        // the RFC 0011 §4.1 signal table (this is the *one* amendment, gated).
+        // SIGHUP -> hot reload, only when the feature is built. Without it
+        // SIGHUP keeps its default disposition (terminate), so a build that
+        // cannot reload never swallows the signal and looks wedged instead.
         #[cfg(feature = "hot-reload")]
         {
             let hup = on_hup as extern "C" fn(libc::c_int) as libc::sighandler_t;
@@ -173,15 +175,15 @@ mod imp {
         FORCE.load(Ordering::SeqCst)
     }
 
-    /// Programmatically request a graceful drain (the `drain` operator tool,
-    /// RFC 0015 §4.1) — the SAME one-way latch SIGTERM sets, plus a wakeup so a
-    /// blocked reactor begins the drain choreography promptly. Idempotent and
-    /// monotonic: a request after drain has begun is a no-op that never escalates
-    /// to FORCE (force remains the *second signal*, RFC 0011 §4.3).
+    /// Programmatically request a graceful drain — the SAME one-way latch
+    /// SIGTERM sets, plus a wakeup so a blocked reactor begins the drain
+    /// choreography promptly. Idempotent and monotonic: a request after drain has
+    /// begun is a no-op that never escalates to FORCE. Only a *second* signal
+    /// escalates, so a programmatic call can never cut a drain short.
     pub fn request_drain() {
         DRAINING.store(true, Ordering::SeqCst);
         // Reuse the signal-handler wakeup so the reactor leaves its blocking
-        // select and runs the drain state machine (RFC 0011 §4.2).
+        // select and runs the drain state machine.
         wake();
     }
 
@@ -189,10 +191,10 @@ mod imp {
         LAME_DUCK.load(Ordering::SeqCst)
     }
 
-    /// Set/clear the lame-duck readiness override (RFC 0015 §4.2). `true` forces
-    /// `/readyz` NotReady while the supervisor keeps running; `false` clears the
-    /// override (readiness then reflects the genuine computed state). No drain,
-    /// no exit, reversible.
+    /// Set/clear the lame-duck readiness override. `true` forces `/readyz`
+    /// NotReady while the supervisor keeps running; `false` clears the override
+    /// (readiness then reflects the genuine computed state). No drain, no exit,
+    /// reversible.
     pub fn set_lame_duck(on: bool) {
         LAME_DUCK.store(on, Ordering::SeqCst);
     }
@@ -201,10 +203,10 @@ mod imp {
         PAUSED.load(Ordering::SeqCst)
     }
 
-    /// Set/clear the instance-wide pause state (the `pause`/`resume` operator
-    /// tools, RFC 0015 §4.3). Reporting-only: the per-session pause channels do
-    /// the actual loop suspension; this flag is the single truth `agentd://inventory`
-    /// and `agentd_paused` read. Reversible; never exits, never touches readiness.
+    /// Set/clear the instance-wide pause state. Reporting-only: the per-session
+    /// pause channels do the actual loop suspension, so clearing this flag alone
+    /// does not resume anything. Reversible; never exits, never touches
+    /// readiness.
     pub fn set_paused(on: bool) {
         PAUSED.store(on, Ordering::SeqCst);
     }
@@ -214,7 +216,7 @@ mod imp {
     }
 
     /// Latch the intelligence all-endpoints-down state from a child's upward
-    /// `AgentMsg::IntelHealth` report (RFC 0018 §6). Returns `true` iff the value
+    /// `AgentMsg::IntelHealth` report. Returns `true` iff the value
     /// TRANSITIONED (so the supervisor fires the `agentd://intelligence`
     /// notify-then-read exactly on a breaker enter/exit, not on every report).
     /// Eventually-consistent / last-child-experience — see the static's doc above.
@@ -227,8 +229,8 @@ mod imp {
         CHILD_EXIT.swap(false, Ordering::SeqCst)
     }
 
-    /// Has a hot reload been requested (SIGHUP, RFC 0017 §5.2)? Read by the
-    /// reactive supervisor's tick; cleared with `clear_reload()` once the reload
+    /// Has a hot reload been requested (SIGHUP)? Read by the reactive
+    /// supervisor's tick; cleared with `clear_reload()` once the reload
     /// routine has run (whether it applied or was rejected — both consume the
     /// request). Always readable, but only ever SET under the `hot-reload`
     /// feature (the handler is the only setter besides `request_reload`).
@@ -251,11 +253,11 @@ mod imp {
         wake();
     }
 
-    /// Request a hot reload attributed to the file-watch trigger (RFC 0017 §5.2):
-    /// set the SAME RELOAD latch SIGHUP/`request_reload` do, PLUS the
-    /// watch-attribution flag the apply step reads for the `config.reload_requested`
-    /// `{trigger:"watch"}` event (§5.6). Called by the inotify watcher thread; a
-    /// reactor wakeup follows. Inert on a build without the reactive reload loop.
+    /// Request a hot reload attributed to the file-watch trigger: set the SAME
+    /// RELOAD latch SIGHUP/`request_reload` do, PLUS the watch-attribution flag
+    /// the apply step reads to emit `config.reload_requested{trigger:"watch"}`.
+    /// Called by the inotify watcher thread; a reactor wakeup follows. Inert on a
+    /// build without the reactive reload loop.
     pub fn request_reload_from_watch() {
         RELOAD_FROM_WATCH.store(true, Ordering::SeqCst);
         RELOAD.store(true, Ordering::SeqCst);
@@ -263,15 +265,16 @@ mod imp {
     }
 
     /// Take-and-clear the watch-attribution flag: `true` if the pending reload was
-    /// set by the file-watch trigger (RFC 0017 §5.2), `false` (the default) for
-    /// SIGHUP / a programmatic `request_reload`. The apply step calls this once per
-    /// reload to pick the `config.reload_requested` `trigger` string (§5.6).
+    /// set by the file-watch trigger, `false` (the default) for SIGHUP / a
+    /// programmatic `request_reload`. The apply step calls this once per reload to
+    /// pick the `config.reload_requested` `trigger` string.
     pub fn take_reload_was_watch() -> bool {
         RELOAD_FROM_WATCH.swap(false, Ordering::SeqCst)
     }
 
-    /// Is a validated reload mid-apply (RFC 0017 §5.3 step 3)? The served
-    /// `subagent.spawn` chokepoint reads this and transiently refuses NEW spawns.
+    /// Is a validated reload mid-apply? True only between the apply step's
+    /// `set_reloading(true)` and `(false)`, so a reader can refuse work that
+    /// would otherwise observe a half-applied config.
     pub fn reloading() -> bool {
         RELOADING.load(Ordering::SeqCst)
     }
@@ -376,40 +379,41 @@ pub fn force() -> bool {
     imp::force()
 }
 
-/// Request a graceful drain programmatically (the `drain` operator tool,
-/// RFC 0015 §4.1) — the same one-way `DRAINING` latch SIGTERM sets, plus a
-/// reactor wakeup. Idempotent/monotonic; never escalates to FORCE.
+/// Request a graceful drain programmatically — the same one-way `DRAINING` latch
+/// SIGTERM sets, plus a reactor wakeup. Idempotent and monotonic; never
+/// escalates to FORCE (only a second signal does), so a caller cannot cut an
+/// in-flight drain short.
 pub fn request_drain() {
     imp::request_drain()
 }
 
-/// Is the lame-duck readiness override active (RFC 0015 §4.2)? When true,
+/// Is the lame-duck readiness override active? When true,
 /// `/readyz` reports NotReady even though the supervisor keeps running.
 pub fn lame_duck() -> bool {
     imp::lame_duck()
 }
 
-/// Set or clear the lame-duck readiness override (the `lame-duck` operator tool,
-/// RFC 0015 §4.2). `true` overrides readiness toward NotReady; `false` clears it.
+/// Set or clear the lame-duck readiness override. `true` overrides readiness
+/// toward NotReady; `false` clears it. The reactor sets it when a drain begins,
+/// so traffic stops arriving while the tree winds down.
 pub fn set_lame_duck(on: bool) {
     imp::set_lame_duck(on)
 }
 
-/// Is the instance-wide pause active (RFC 0015 §4.3)? When true, the agentic
+/// Is the instance-wide pause active? When true, the agentic
 /// loops are suspended at their turn boundaries; the supervisor and readiness
 /// are unaffected.
 pub fn paused() -> bool {
     imp::paused()
 }
 
-/// Set or clear the instance-wide pause state (the `pause`/`resume` operator
-/// tools, RFC 0015 §4.3). Reporting truth for `agentd://inventory` + the
-/// `agentd_paused` gauge; the per-session pause channels do the suspension.
+/// Set or clear the instance-wide pause state. Reporting-only — the per-session
+/// pause channels perform the actual suspension.
 pub fn set_paused(on: bool) {
     imp::set_paused(on)
 }
 
-/// Is the intelligence channel all-endpoints-down (RFC 0018 §6)? The latched,
+/// Is the intelligence channel all-endpoints-down? The latched,
 /// EVENTUALLY-CONSISTENT last-child-experience truth a child reports up via
 /// `AgentMsg::IntelHealth` — read by `/readyz` (flips NotReady), the
 /// `agentd_intel_all_down` gauge, and the `agentd://intelligence`/`capacity`
@@ -420,7 +424,7 @@ pub fn intel_all_down() -> bool {
 }
 
 /// Latch the intelligence all-endpoints-down state from a child's `AgentMsg::
-/// IntelHealth` report (RFC 0018 §6). Returns `true` iff the value TRANSITIONED,
+/// IntelHealth` report. Returns `true` iff the value TRANSITIONED,
 /// so the supervisor can fire the `agentd://intelligence` notify exactly on a
 /// breaker enter/exit. Eventually-consistent / last-child-experience: a fresh
 /// spawn has fresh breakers, so this reflects the most recent child's reachability
@@ -435,8 +439,8 @@ pub fn take_child_exit() -> bool {
     imp::take_child_exit()
 }
 
-/// Has a hot reload been requested (SIGHUP, RFC 0017 §5.2)? The reactive
-/// supervisor consults this each tick; a drain supersedes it (the caller checks
+/// Has a hot reload been requested (SIGHUP)? The reactive supervisor consults
+/// this each tick; a drain supersedes it (the caller checks
 /// `draining()` first). Always `false` on a build without the `hot-reload`
 /// feature (the handler that sets it is feature-gated).
 pub fn reload_requested() -> bool {
@@ -456,26 +460,26 @@ pub fn request_reload() {
     imp::request_reload()
 }
 
-/// Request a hot reload attributed to the **file-watch** trigger (RFC 0017 §5.2):
-/// the same RELOAD latch SIGHUP/`request_reload` set, plus the watch-attribution
-/// flag the apply step reads for the `config.reload_requested{trigger:"watch"}`
-/// event (§5.6). Called by the inotify watcher thread (`config-watch`).
+/// Request a hot reload attributed to the **file-watch** trigger: the same
+/// RELOAD latch SIGHUP/`request_reload` set, plus the watch-attribution flag the
+/// apply step reads to emit `config.reload_requested{trigger:"watch"}`. Called by
+/// the inotify watcher thread (`config-watch`).
 pub fn request_reload_from_watch() {
     imp::request_reload_from_watch()
 }
 
 /// Take-and-clear the watch-attribution flag — `true` if the pending reload came
-/// from the file-watch trigger (RFC 0017 §5.2), `false` (the default) for SIGHUP
-/// or a programmatic `request_reload`. The reactive apply step calls this once per
-/// reload to label the `config.reload_requested` `trigger` (§5.6).
+/// from the file-watch trigger, `false` (the default) for SIGHUP or a
+/// programmatic `request_reload`. The reactive apply step calls this once per
+/// reload to label the `config.reload_requested` `trigger`.
 pub fn take_reload_was_watch() -> bool {
     imp::take_reload_was_watch()
 }
 
-/// Is a validated reload mid-apply (RFC 0017 §5.3 step 3)? The served
-/// `subagent.spawn` chokepoint reads this to transiently refuse NEW spawns while
-/// the reloadable diff is being applied. Always `false` off the `hot-reload` path
-/// (only the reactive apply step ever sets it).
+/// Is a validated reload mid-apply? True only while the reloadable diff is being
+/// written into the live runtime, so a reader can refuse work that would
+/// otherwise observe a half-applied config. Always `false` off the `hot-reload`
+/// path (only the reactive apply step ever sets it).
 pub fn reloading() -> bool {
     imp::reloading()
 }
@@ -499,12 +503,11 @@ pub fn drain_wakeup() {
 
 // ── Test isolation for the process-global signal state ──────────────────────
 // `DRAINING` is a one-way latch and `PAUSED`/`LAME_DUCK`/`RELOADING`/
-// `INTEL_ALL_DOWN` are process-global, so tests that touch them race + poison
-// each other when cargo
-// runs them in parallel within one test binary (e.g. a drain test leaves
-// `DRAINING` set, breaking every later readiness assertion). Every test that
-// reads OR writes this state takes `test_guard()`: it serializes them on one
-// mutex and resets the state to a clean slate for the test body.
+// `INTEL_ALL_DOWN` are process-global, so tests that touch them race and poison
+// each other when cargo runs them in parallel within one test binary (e.g. a
+// drain test leaves `DRAINING` set, breaking every later readiness assertion).
+// Every test that reads OR writes this state takes `test_guard()`: it serializes
+// them on one mutex and resets the state to a clean slate for the test body.
 #[cfg(test)]
 static SIGNALS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

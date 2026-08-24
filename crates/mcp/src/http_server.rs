@@ -5,7 +5,7 @@
 //! serving mirror of the crate's HTTP *client* ([`crate::http`]) and the transport
 //! the HTTPS control plane rides.
 //!
-//! Model (RFC 0004 Streamable HTTP, both eras):
+//! Model (Streamable HTTP, both eras):
 //!   * **Unary** — one `POST` carrying a JSON-RPC request; the reply is
 //!     `application/json`. `initialize` is stamped with an `Mcp-Session-Id`
 //!     (legacy). One request per connection (`Connection: close`), matching the
@@ -55,9 +55,11 @@ const MAX_HEAD_BYTES: usize = 64 * 1024;
 /// as well. Real callers send a handful.
 const MAX_HEADERS: usize = 100;
 
-/// A verified mTLS peer's identity, surfaced to trust classification (RFC 0029
-/// §10.3). All-empty for a plain / no-client-cert connection. rustls has already
-/// verified the chain; these fields are only *read* from the leaf certificate.
+/// A verified mTLS peer's identity, surfaced so an embedder can match a caller
+/// to a named principal rather than merely observing "a cert was presented".
+/// All-empty for a plain / no-client-cert connection. rustls has already verified
+/// the chain; these fields are only *read* from the leaf certificate, so they are
+/// safe to compare against — but only because verification already happened.
 #[derive(Default, Clone)]
 pub struct PeerId {
     /// A verified client certificate was presented (mutual TLS).
@@ -75,7 +77,7 @@ pub struct RequestParts<'a> {
     pub headers: &'a [(String, String)],
     /// Whether the peer presented a verified client certificate (mutual TLS).
     pub peer_cert: bool,
-    /// The verified mTLS leaf subject CN (RFC 0029 §10.3), if any.
+    /// The verified mTLS leaf subject CN, if any.
     pub peer_subject: Option<&'a str>,
     /// The verified mTLS leaf SANs (DNS / URI / IP); empty without a client cert.
     pub peer_sans: &'a [String],
@@ -243,8 +245,9 @@ fn accept_and_serve(
     }
 }
 
-/// Lift the verified mTLS peer's identity (subject CN + SANs) for trust
-/// classification (RFC 0029 §10.3). `default()` when no client cert was presented.
+/// Lift the verified mTLS peer's identity (subject CN + SANs) so the embedder's
+/// auth policy can match it to a principal. `default()` when no client cert was
+/// presented — an absent identity must read as "unidentified", never as a match.
 #[cfg(feature = "tls")]
 fn peer_id(stream: &net::tls::ServerTlsStream) -> PeerId {
     match net::tls::peer_identity(stream) {
@@ -287,7 +290,7 @@ fn serve_conn<S: Read + Write + Send + 'static>(
         Err(ReadError::Incomplete) => return, // malformed / EOF before a full request
     };
 
-    // DNS-rebinding defense (Streamable HTTP security MUST / RFC 0005): a browser
+    // DNS-rebinding defense, which Streamable HTTP requires: a browser
     // always sends `Origin`, so a page tricked into POSTing to a local agentd
     // carries its own site there. Reject any request whose `Origin` is present and
     // NOT a loopback origin (or a configured `ServeOptions::extra_origins` entry) —
@@ -634,7 +637,7 @@ pub struct RawRequest {
     pub body: Vec<u8>,
     /// Whether the peer presented a verified client certificate (mutual TLS).
     pub peer_cert: bool,
-    /// The verified mTLS leaf subject CN (RFC 0029 §10.3), if any.
+    /// The verified mTLS leaf subject CN, if any.
     pub peer_subject: Option<String>,
     /// The verified mTLS leaf SANs (DNS / URI / IP); empty without a client cert.
     pub peer_sans: Vec<String>,

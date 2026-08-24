@@ -159,8 +159,8 @@ sequenceDiagram
   participant R as reactor (single writer)
   participant S as durable store
   W->>P: ToolRequest {id, name, args}
-  P->>R: merged channel (queued only)
-  Note over R: the loop is blocked in recv_timeout —<br/>the frame does not wake it
+  P->>R: merged channel
+  Note over R: the frame lands on the channel the loop<br/>parks on, so its arrival wakes the loop
   R->>R: grant check + input-schema validation
   alt Ready — memory / plan / artifact / status
     R->>S: durable put
@@ -287,9 +287,11 @@ A clean drain exits **0, not 143**.
 
 A `subagent.run` request passes an ordered gauntlet before any fork happens: non-empty
 instruction → a valid `mode` (`sync`|`async`|`detached`|`warm`) → live breadth →
-lifetime total → delegation depth → spawn rate → memory pressure → the lethal-trifecta
-tag check over the narrowed server set. Depth is derived from the *requester's stored*
-record, never read from the request — a child cannot claim to be shallower than it is.
+lifetime total → delegation depth → spawn rate → resource pressure → the lethal-trifecta
+tag check over the narrowed server set → well-formed OS caps and `priority`, which is
+also where a `priority: low` spawn is shed one pressure level early. Depth is derived
+from the *requester's stored* record, never read from the request — a child cannot
+claim to be shallower than it is.
 
 ```yaml
 config_version: "1"
@@ -427,12 +429,15 @@ A2A message is acknowledged only when its turn finishes; signal and unknown kind
 acknowledged immediately, and a start event as soon as its run is admitted — one held
 off by a concurrency overflow stays queued.
 
-Two costs follow. **Child frames do not wake the loop** — they queue on a channel the
-blocking wait does not select on, so an internal-tool round trip costs up to one tick
-of added latency. And **store I/O is synchronous on the reactor thread**, retrying with
-a blocking 50 ms × attempt backoff up to 3 times, so a degraded store stalls timers,
-liveness, drains, and reaping alike. The `/healthz` heartbeat age is the sole input to
-the liveness verdict; a large age means the reactor is wedged.
+Child frames ride that same channel, so an internal-tool round trip *wakes* the loop
+rather than waiting out the tick. The reader threads send into it directly, with no
+forwarding hop, because that is what makes joining a child's reader an ordering
+guarantee: everything the child wrote is already queued when the join returns, so a
+reap requeued behind those frames can never settle a child before its last words are
+read. The cost that does remain is that **store I/O is synchronous on the reactor
+thread**, retrying with a blocking 50 ms × attempt backoff up to 3 times, so a degraded
+store stalls timers, liveness, drains, and reaping alike. The `/healthz` heartbeat age
+is the sole input to the liveness verdict; a large age means the reactor is wedged.
 
 ## Checkpoints and crash recovery
 
@@ -491,8 +496,8 @@ process at `state.before_put`, `state.after_put`, `inbox.after_put`, `step.runni
 
 Accepted by design:
 
-- **Latency at the round trip.** Up to one tick per internal tool call, and one before
-  a SIGTERM is noticed.
+- **Signal latency.** The signal self-pipe is drained rather than selected on, so a
+  SIGTERM is noticed on the next iteration — up to one tick later.
 - **A stalled store stalls everything.** No second thread ticks while it retries.
 - **Ids are process-local.** The counter resets at startup, so after a restart `sub-1`
   is minted again and can overwrite a restored record, and a conversation-turn
@@ -508,20 +513,17 @@ Accepted by design:
 
 Known gaps, stated here rather than discovered later:
 
-- **A hard-crashed turn worker does not fail its unit.** The "died without a terminal
-  frame" path removes the child from the registry before its handlers look it up, and
-  each early-returns on a missing child. A SIGKILLed, OOM-killed, or panicking worker
-  leaves no context note, no inbox acknowledgement (the event replays next restart), a
-  leaked reservation, and a `Running` step that unwinds only at the run deadline.
-- **Killing a stuck child leaves a phantom entry.** The kill path reaps the child
-  itself after deregistering its route, so no reap event is dispatched and the map
-  entry is never removed. Idle-exit never fires again, every drain runs the full
-  timeout, `child.unhealthy` re-fires every tick, and the cgroup leaf is not reclaimed.
-- **A `context.compact` call parks a pending entry that nothing removes.** After one
-  compaction the instance cannot idle-exit and the wake interval is pinned at 50 ms.
-- **There is no crash-on-spawn fast-fail.** `Ready` only refreshes liveness; a child
-  that dies during setup is caught by the reap path, which — per the first item — does
-  not fail its unit.
+- **Killing a stuck child leaves a phantom entry.** The kill path deregisters the
+  pid from the global reaper and reaps the child itself, so no reap event is
+  dispatched and the child's map entry is never removed. Idle-exit never fires again,
+  every drain runs the full timeout, `child.unhealthy` re-fires every tick, and the
+  cgroup leaf is not reclaimed until the process exits.
+- **There is no crash-on-spawn fast-fail.** `Ready` only refreshes liveness, so a
+  child that dies during setup is not noticed until the reap path runs on the next
+  tick. It does fail its unit there — a worker reaped while its step is still
+  `Running` and still owned by that worker fails the step, releases the reservation
+  and logs `turn.failed` with "worker exited without a result" — but the detection
+  costs a tick rather than being immediate.
 
 ## What it costs, and what it buys
 

@@ -4,13 +4,12 @@
 //! One set of wire types serves three surfaces: the MCP client (to external
 //! servers), the self-MCP server, and the private supervisor↔subagent
 //! control channel. They differ only in *framing* (see [`frame`]): MCP stdio
-//! is newline-delimited; the control channel is length-prefixed. RFC 0004,
-//! RFC 0005.
+//! is newline-delimited; the control channel is length-prefixed.
 //!
 //! Keeping every wire type behind `serde` in this one module is deliberate: it
 //! is the single isolation point from which the codec could be swapped to a
 //! lighter encoder (e.g. miniserde) without touching call sites, should the
-//! proc-macro compile weight ever need to go (rfcs/0002 §dependency-budget).
+//! proc-macro compile weight ever need to come out of the dependency budget.
 
 pub mod frame;
 
@@ -70,7 +69,8 @@ pub struct Response {
 /// A JSON-RPC 2.0 error object. Distinct from a *successful* result that
 /// carries `isError: true` — the latter is a tool-domain failure fed back to
 /// the model as an observation, the former is a protocol/transport failure.
-/// That distinction is load-bearing in the loop (RFC 0004 §isError).
+/// That distinction is load-bearing in the loop: an `isError` result keeps the
+/// conversation going, an `RpcError` aborts the call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RpcError {
     pub code: i64,

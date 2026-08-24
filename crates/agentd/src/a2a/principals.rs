@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! **Principals, roles and authorization** (RFC 0029 §2): every A2A caller is
-//! resolved to a principal (identity from mTLS SAN / bearer subject / AAuth
-//! agent id) with a role (`operator | user | agent | anonymous`), a set of
-//! granted tool patterns, and optional per-principal quotas. The
-//! authorization matrix — which methods/commands a role may call — is decided
-//! here; the served surface calls [`Resolver::resolve`] then
-//! [`Principal::may`].
+//! **Principals, roles and authorization**: every A2A caller is resolved to a
+//! principal (identity from mTLS SAN / bearer subject / AAuth agent id) with a
+//! role (`operator | user | agent | anonymous`), a set of granted tool
+//! patterns, and optional per-principal quotas. The authorization matrix —
+//! which methods and commands a role may call — is decided here; the served
+//! surface calls [`Resolver::resolve`] then [`Principal::may`]. Anything that
+//! does not match a rule lands on the anonymous principal, which may call
+//! nothing, so a caller agentd cannot identify gets no surface at all.
 
 use crate::config::v2::{self, Role};
 use crate::sec::secret;
@@ -50,8 +51,12 @@ impl Principal {
         }
     }
 
-    /// May this principal invoke A2A method `method` (RFC 0029 §2 matrix)?
+    /// May this principal invoke A2A method `method`?
     /// `op` is the command tool name for a command DataPart (else `None`).
+    ///
+    /// The matrix is deny-by-default: anonymous callers get nothing, operators
+    /// get everything, and every other role is limited to the named read/task
+    /// methods below — an unrecognised method falls through to `false`.
     pub fn may(&self, method: &str, op: Option<&str>) -> bool {
         match self.role {
             Role::Anonymous => false,
@@ -59,8 +64,9 @@ impl Principal {
             _ => match method {
                 // The read/task methods every non-anonymous role may use on its
                 // own conversations/tasks (ownership is enforced at the object).
-                // `SubscribeToEvents` (RFC 0032) is principal-scoped at the
-                // feed, so any non-anonymous role may attach.
+                // `SubscribeToEvents` is principal-scoped at the feed itself,
+                // so any non-anonymous role may attach and will only see the
+                // frames belonging to it.
                 "SendMessage"
                 | "SendStreamingMessage"
                 | "GetTask"
@@ -95,8 +101,10 @@ impl Principal {
             return false;
         }
         if tool == "status" || tool == "interface.info" {
-            // Always granted to non-anonymous roles (RFC 0029 §5 / RFC 0032 §5;
-            // the interface gate itself still applies at the op).
+            // Liveness and capability discovery: a named caller must be able to
+            // learn whether agentd is up and what interface it offers before it
+            // can ask for anything else, so these need no grant. Neither leaks
+            // work product, and the interface gate still applies at the op.
             return true;
         }
         if self
@@ -106,9 +114,10 @@ impl Principal {
         {
             return true;
         }
-        // Role defaults (RFC 0029 §2 "command ops"). The debug reads
+        // Role defaults for command ops. The debug reads
         // (`conversation.get`/`run.get`) are owner-scoped at the object; the
-        // log ring (`debug.events`) stays operator-only.
+        // log ring (`debug.events`) stays operator-only, because it spans every
+        // principal's activity and cannot be scoped to the caller.
         match self.role {
             Role::Operator => true,
             Role::User => matches!(
@@ -175,7 +184,8 @@ pub struct CallerIdentity {
     pub subject: Option<String>,
     /// A verified bearer subject (post token check), if the transport resolved it.
     pub bearer_ref: Option<String>,
-    /// The verified AAuth agent id (roadmap).
+    /// The verified AAuth agent id, set only when an inbound AAuth verifier
+    /// established one; an `aauth_agent` principal rule matches against it.
     pub aauth_agent: Option<String>,
     /// Whether the connection is loopback (dev operator default).
     pub loopback: bool,
@@ -190,7 +200,10 @@ pub struct Resolver {
     /// A bearer whose match resolves to the operator, when `a2a.bearer` is set
     /// and no principal claims it (the loopback/single-operator default).
     default_operator_on_bearer: bool,
-    /// Loopback with no principals ⇒ operator (the 1.x default).
+    /// Whether an unconfigured deployment treats a loopback caller as the
+    /// operator. True only while `a2a.principals` is empty: once an operator
+    /// has written any rule, the implicit local operator disappears rather
+    /// than sitting behind their matrix as a way in.
     loopback_operator: bool,
 }
 
@@ -425,7 +438,7 @@ mod tests {
 
     #[test]
     fn loopback_and_bearer_defaults() {
-        // No principals + loopback ⇒ operator (the 1.x default).
+        // No principals configured + loopback ⇒ operator.
         let r = Resolver::build(&a2a(json!({})), &|_| None).unwrap();
         assert!(r.resolve(&ident(&[], None, true, true), None).is_operator());
         assert!(

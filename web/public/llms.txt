@@ -143,12 +143,15 @@ the source. Setting a path **sets** it (a list/map from env or flag *replaces*
 the file's); the repeatable named flags `--mcp`, `--a2a-peer`, `--workflow`
 **add** one element.
 
-### 5.3 The 20 sections
+### 5.3 The sections
 
-`agent`, `goal`, `intelligence`, `mcp`, `tools`, `store`, `memory`, `context`,
-`knowledge`, `search`, `skills`, `workflows`, `webhooks`, `limits`, `lifecycle`,
-`a2a`, `interface`, `observability`, `security`, plus `config_version` (must be
-`"1"`).
+`vars`, `services`, `streams`, `agent`, `goal`, `intelligence`, `mcp`, `tools`,
+`store`, `memory`, `context`, `knowledge`, `search`, `skills`, `workflows`,
+`subagents`, `webhooks`, `limits`, `lifecycle`, `a2a`, `interface`,
+`observability`, `security`, plus `config_version` (must be `"1"`).
+
+Every section rejects unknown keys, so a misspelled name is exit `2` naming the
+key — never a silently ignored setting.
 
 Most-used options:
 
@@ -163,7 +166,7 @@ Most-used options:
 | `store.kind` | `file` (default for long-lived) · `mcp` · `http` · `memory` · `none` |
 | `limits.run.steps` / `.tokens` / `.deadline` | bound a single run |
 | `limits.max_runs` | global concurrent runs (default 8) |
-| `lifecycle.run_until` | `once` · `idle` · `forever` |
+| `lifecycle.run_until` | `auto` (default) · `idle` · `drained` |
 | `lifecycle.exit_code_map` | remap the *policy* codes 3 and 7 (e.g. so a budget stop is not a pod failure) |
 | `a2a.listen` | serve the A2A surface (needs client auth off loopback) |
 | `webhooks.listen` | serve inbound webhooks — required by any `webhook` node (§5.7) |
@@ -290,7 +293,7 @@ expressed with `loop`/`iterate`/`foreach`.
 ```yaml
 workflows:
   - name: pipeline          # required, [a-zA-Z_][a-zA-Z0-9_-]{0,63}
-    version: 3              # the dialect; defaults to 3
+    version: 3              # the workflow schema version; defaults to 3
     description: free text
     armed: true             # false loads the definition without arming triggers
     inputs:  { schema: {…} } # JSON Schema, enforced when a run is created
@@ -410,8 +413,8 @@ Required fields in **bold**.
 - **Replay**: a step that was in flight when the process died is replayed on
   restore. Make effects `idempotent`, or set `on_replay`.
 - **CEL** guards (`when`, `until`, `filter`) need the `cel` build feature, which
-  ships in the release binaries from 2.3.0. On an older binary they are refused
-  at validation, not ignored.
+  is in the release binaries. A build without it refuses a graph that uses them
+  at validation time — fail-closed, never silently ignored.
 - **Validation is author-time and fail-closed**: an unknown field or kind is
   exit `2` naming the step, before anything runs.
 
@@ -468,10 +471,11 @@ Required fields in **bold**.
 Compile-time; `--capabilities` reports what a given binary has.
 
 In the release binaries: `a2a`, `metrics`, `cron`, `otel`, `hot-reload`,
-`config-watch`, `aauth`, `oauth`, and `tls` (on by default).
+`config-watch`, `aauth`, `oauth`, `cel`, and `tls` (on by default).
 
-**Not** in the release binaries — build from source to get them:
-`exec` (the local command runner) and `cel` (expression guards).
+**Not** in the release binaries — build from source to get it: `exec`, the
+guarded local command runner, which is off at the cargo feature *and* at
+`security.exec.enabled`.
 
 ---
 
@@ -483,10 +487,10 @@ Useful to know so you do not assume otherwise:
   for the model. Capability comes from MCP servers you declare.
 - It has **no cycles** in workflows, and no generic "run this code" step.
 - It is **not a fleet coordinator**: the `file` store is single-writer, and
-  clustering/sharding was removed rather than half-finished. Partition upstream
-  (one subscription per replica, or the queue's own claim semantics).
-- It does **not** stream model tokens to display clients (deliberate — live
-  activity events instead).
+  there is no clustering or sharding of its own. Partition upstream — one
+  subscription per replica, or the queue's own claim semantics.
+- It does **not** stream model tokens to display clients; they render live
+  activity events instead.
 - It does **not** encrypt durable state at rest; point the store at an encrypted
   volume if you need that.
 
@@ -538,10 +542,9 @@ Useful to know so you do not assume otherwise:
 | https://agentd.dev/docs/why-rust/ | the dependency posture and measured footprint |
 | https://agentd.dev/docs/pid-1/ | agentd as Linux init (PID 1) — robots, appliances, boot recipes |
 | https://agentd.dev/docs/directives/ | instruction documents: :::workflow / :::skill / :::context directives, hot reload, graceful retirement |
-| https://agentd.dev/docs/rfc-0027/ | RFC 0027 — the workflow dialect, normative |
-| https://agentd.dev/docs/rfc-0025/ | RFC 0025 — durable state and store adapters |
-| https://agentd.dev/docs/rfc-0029/ | RFC 0029 — A2A conversations, principals, commands |
-| https://agentd.dev/docs/rfc-0030/ | RFC 0030 — the config schema, normative |
+| https://agentd.dev/docs/experience/ | validation, exit codes, telemetry you can filter |
+| https://agentd.dev/docs/hosting-the-ui/ | serving the web UI on a public domain |
+| https://agentd.dev/docs/two-person-company/ | a worked multi-agent deployment |
 
 The authoritative machine-readable schemas are `agentd --config-schema` and
 `agentd --workflow-schema`; when this file and the binary disagree, the binary

@@ -44,7 +44,8 @@ struct Bins {
     /// The default agentd (the a2a listener + the mock LLM/MCP re-exec) the
     /// checks run.
     agentd: PathBuf,
-    /// The recording reference MCP server (kept for the P7 v2 client family).
+    /// The recording reference MCP server — a spec-correct peer whose recorded
+    /// request log lets a check assert what agentd actually sent on the wire.
     confmcp: PathBuf,
 }
 
@@ -120,8 +121,8 @@ impl Harness {
         &self.agentd
     }
 
-    /// Path to the recording reference MCP server (kept for the P7 v2 client
-    /// conformance family).
+    /// Path to the recording reference MCP server, for a check that needs to
+    /// inspect the requests agentd issued rather than only their effects.
     pub fn confmcp(&self) -> &Path {
         &self.confmcp
     }
@@ -216,11 +217,11 @@ impl Harness {
 }
 
 /// A spawned conformance MCP server serving Streamable HTTP. agentd (or a
-/// probe) dials [`ConfServer::endpoint`]. Killed (and its socket/addr-file
-/// removed) on drop. Two spawn shapes: `confmcp`/`workmcp` still bind a unix
-/// socket ([`spawn`](ConfServer::spawn)); the built-in agentd mock binds
-/// loopback TCP and announces through an addr-file
-/// ([`spawn_http`](ConfServer::spawn_http)).
+/// probe) dials [`ConfServer::endpoint`]. Killed (and its addr-file removed) on
+/// drop, so a failed check leaks neither a process nor a stale address file.
+/// The server binds loopback TCP on an ephemeral port and announces the address
+/// it actually got through an addr-file, which the spawner blocks on: a fixed
+/// port would make two concurrent checks collide.
 pub struct ConfServer {
     child: Child,
     /// The socket path (unix) or addr-file (http) — removed on drop.

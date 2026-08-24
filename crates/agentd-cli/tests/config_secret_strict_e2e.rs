@@ -1,25 +1,25 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Config admission, end to end — the four ways the loader used to let a bad or
-//! untrusted configuration through the door.
+//! Config admission, end to end — the four ways a bad or untrusted
+//! configuration must not get through the door.
 //!
 //! Admission is the one place a mistake is still cheap: nothing has been dialed,
 //! no credential has left the process, no effect has been checkpointed. So the
 //! contract is narrow and absolute — a configuration agentd cannot honour EXITS
 //! 2, before any side effect, with a message that names what is wrong. These
-//! tests hold that line for the four regressions:
+//! tests hold that line for four cases:
 //!
-//! 1. an `intelligence.headers` `{{secret:…}}` ref that does not resolve was
-//!    dropped at dial time, so the daemon started and talked to the model with
-//!    NO credential (the request goes out, unauthenticated, on a header the
-//!    operator believes is set);
-//! 2. a `.agentd.yml` merely FOUND in the working directory could lift the
-//!    lethal-trifecta gate — `cd` into a repo you cloned, run a flags-only
-//!    `agentd`, and that repo's dotfile governs your grant;
-//! 3. a `reset` value with a multi-byte character sliced a `str` off a char
-//!    boundary and panicked (exit 101) instead of exiting 2;
+//! 1. an `intelligence.headers` `{{secret:…}}` ref that does not resolve must
+//!    never be dropped at dial time — a daemon that comes up and talks to the
+//!    model with NO credential sends the request out unauthenticated, on a
+//!    header the operator believes is set;
+//! 2. a `.agentd.yml` merely FOUND in the working directory must not lift the
+//!    lethal-trifecta gate — otherwise `cd` into a repo you cloned, run a
+//!    flags-only `agentd`, and that repo's dotfile governs your grant;
+//! 3. a `reset` value with a multi-byte character is a config error (exit 2),
+//!    never a `str` sliced off a char boundary and a panic (exit 101);
 //! 4. the "both dotfile spellings" refusal — which exists because DISCOVERY
-//!    cannot choose between them — also fired on `--config` paths the operator
-//!    had explicitly named and ordered.
+//!    cannot choose between them — must not fire on `--config` paths the
+//!    operator has explicitly named and ordered.
 
 mod common;
 
@@ -66,19 +66,19 @@ fn agentd(dir: &str, args: &[&str], env: &[(&str, &str)]) -> (i32, String) {
 }
 
 /// A configuration whose only credential is a `{{secret:…}}` reference — the
-/// shape RFC 0017 §6 asks for (the file is secret-free; the value lives in the
-/// environment).
+/// secret-free shape: the config file carries a reference, the value lives in
+/// the environment.
 const HEADER_REF: &str = "config_version: \"1\"\nstore: {kind: memory}\n\
      intelligence:\n  endpoints: [\"https://intel.invalid/v1\"]\n  model: m\n\
      \x20 headers:\n    authorization: \"Bearer {{secret:AGENTD_TEST_ABSENT_INTEL_KEY}}\"\n";
 
-/// DEFECT 1 — an unresolvable secret ref in `intelligence.headers` must be
+/// CASE 1 — an unresolvable secret ref in `intelligence.headers` must be
 /// exit 2 naming the ref, not a silent drop.
 ///
-/// The old behaviour resolved the header with `.ok()` and filtered the failures
-/// out of the list, which is the worst possible failure mode for a credential:
-/// the daemon comes up healthy and dials the model with the `authorization`
-/// header simply absent.
+/// A header whose secret cannot be resolved has to fail loudly, not be filtered
+/// out of the list: dropping it is the worst possible failure mode for a
+/// credential, because the daemon comes up healthy and dials the model with the
+/// `authorization` header simply absent.
 #[test]
 fn an_unresolvable_intelligence_header_ref_is_exit_2_and_names_the_ref() {
     let dir = workdir("cfg-secret");
@@ -122,7 +122,7 @@ const TRIFECTA_MCP: &str = "config_version: \"1\"\nstore: {kind: memory}\n\
      \x20   - name: web\n      endpoint: https://mcp-web.invalid/mcp\n      tags: {\"*\": [untrusted_input]}\n\
      \x20   - name: vault\n      endpoint: https://mcp-vault.invalid/mcp\n      tags: {\"*\": [sensitive, egress]}\n";
 
-/// DEFECT 2 — a DISCOVERED `.agentd.yml` may not relax a security control.
+/// CASE 2 — a DISCOVERED `.agentd.yml` may not relax a security control.
 ///
 /// Discovery is a convenience for the operator's own project directory, but the
 /// invocation that gets it never named it: a flags-only `agentd --prompt …` in
@@ -175,12 +175,13 @@ fn a_discovered_dotfile_cannot_lift_the_trifecta_gate() {
     }
 }
 
-/// DEFECT 3 — a config value must never panic the process.
+/// CASE 3 — a config value must never panic the process.
 ///
-/// `HH:MMZ` was matched by byte-slicing a `str` whose LENGTH had been checked in
-/// bytes, so a six-byte value carrying a multi-byte character (`0é:0Z`) sliced
-/// through the middle of a character and panicked: exit 101, a stack trace, and
-/// a config error reported as a crash.
+/// `HH:MMZ` is matched by slicing a `str` whose LENGTH is checked in bytes, so a
+/// six-byte value carrying a multi-byte character (`0é:0Z`) is exactly the input
+/// that cuts through the middle of a character. That has to come out as exit 2
+/// naming the field, never exit 101 and a stack trace: a config mistake reported
+/// as a crash tells the operator nothing about what to edit.
 #[test]
 fn a_multibyte_budget_reset_is_exit_2_not_a_panic() {
     let dir = workdir("cfg-reset");
@@ -202,7 +203,7 @@ fn a_multibyte_budget_reset_is_exit_2_not_a_panic() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// DEFECT 4 — the both-spellings refusal belongs to DISCOVERY only.
+/// CASE 4 — the both-spellings refusal belongs to DISCOVERY only.
 ///
 /// Two dotfiles in one directory are ambiguous because nothing states an order;
 /// whichever agentd picked, somebody would be editing the other. Two `--config`

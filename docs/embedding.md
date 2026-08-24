@@ -13,8 +13,7 @@ tools** registered into the agent.
 | just MCP client/server or transports | `agentd-mcp` / `agentd-net` |
 | to drive agentd from another program | the process contract ([operations.md](operations.md)) or the served MCP/A2A wire ([mcp.md](mcp.md)) — no linking needed |
 
-> The normative contract is **RFC 0022** (obligations, precedence, stability
-> tiers). The compile-guaranteed reference is
+> The compile-guaranteed reference is
 > [`crates/agentd/examples/embedded-agent.rs`](../crates/agentd/examples/embedded-agent.rs)
 > — run it with `cargo run -p agentd-core --example embedded-agent`.
 
@@ -42,7 +41,7 @@ fn main() {
         },
     )).expect("unique tool name");
 
-    // 3. RUN — either the full stock stack (load a v2 settings document and
+    // 3. RUN — either the full stock stack (load a settings document and
     //    hand it to agentd::runtime::run, exactly like agentd-cli/src/main.rs),
     //    or the agent loop directly.
     // …
@@ -208,4 +207,5 @@ same one the stock CLI forwards.
   dispatch pair (`SUBAGENT_ENV` + `subagent::control::run`),
   `config::v2::load`, `runtime::run`, `exit::*`.
 - **Everything else `pub`** is visible but unstable — it exists for the CLI
-  and the test suites. Pin a version. RFC 0022 §5 is the authoritative list.
+  and the test suites, and may change in any release. Pin a version, and treat
+  the two lists above as the whole of what you may depend on.

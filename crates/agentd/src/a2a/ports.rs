@@ -14,12 +14,11 @@
 //! single-threaded and knows nothing about tokio; the protocol layer stays async
 //! and knows nothing about the reactor.
 //!
-//! Two ports are deliberately refusals rather than implementations. Task
-//! *creation* and *status updates* are not things a caller may do out of band —
-//! agentd's runtime owns when a task exists and what state it is in — and push
-//! notifications are not implemented, which the agent card says out loud. Both
-//! answer with the spec's own error for "not here" rather than a half-built
-//! result.
+//! Two ports are deliberately refusals rather than implementations: task
+//! *creation* and *status updates* are not things a caller may do out of band,
+//! because agentd's runtime owns when a task exists and what state it is in.
+//! They answer with the spec's own error for "not here" rather than a
+//! half-built result.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -91,7 +90,7 @@ tokio::task_local! {
     /// were drawn for a server whose store is not per-principal. agentd's is:
     /// a task belongs to whoever started it, and a non-operator may only see
     /// its own. So the caller travels out-of-band, scoped to the request's
-    /// tokio task, exactly as it used to travel per-connection on a thread.
+    /// tokio task rather than passed down through the port signatures.
     ///
     /// Set once by the transport ([`crate::a2a::serve`]) around the whole
     /// dispatch. Unset means nobody is being served, which reads as anonymous —
@@ -374,9 +373,9 @@ impl AsyncNotificationManager for RuntimePorts {
 /// publishes transitions in through [`StreamSink`]; but the fan-out is keyed by
 /// task id alone, and agentd's tasks belong to principals. Attaching is
 /// therefore gated on the same ownership the task reads enforce (see
-/// [`STREAMABLE`]) — without it, naming another principal's task id was enough
-/// to watch its transitions and, with a `Last-Event-ID`, to replay its result
-/// artifact.
+/// [`STREAMABLE`]) — without that gate, naming another principal's task id
+/// would be enough to watch its transitions and, with a `Last-Event-ID`, to
+/// replay its result artifact.
 ///
 /// The type exists at all because the adapter takes the handler by value while
 /// the reactor needs a handle to the same one.
@@ -457,7 +456,7 @@ impl AsyncStreamingHandler for SharedStreaming {
     /// * A **send** attaches *before* the message is processed, deliberately, so
     ///   that a task settling immediately cannot be missed. Nothing is known
     ///   about the id at that moment — it came off the wire — so the
-    ///   subscription is made as before and the verdict applied at the first
+    ///   subscription is made anyway and the verdict applied at the first
     ///   poll, by which time the send has recorded the task it really created.
     ///   Anything still unproved by then delivers nothing.
     async fn combined_update_stream(

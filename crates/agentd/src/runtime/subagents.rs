@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The **subagent registry** (RFC 0026 §6, RFC 0028 §3 `subagent.*`): flat
+//! The **subagent registry** behind the `subagent.*` tools: flat
 //! children spawned from the one chokepoint (caps: depth/breadth/total/rate),
 //! recorded durably as `subagent/<handle>` (payload, mode, status, result),
 //! with `sync` (the caller waits), `async` (a handle; `subagent.await`),
@@ -35,8 +35,9 @@ impl Runtime {
             "subagent.send" => {
                 let handle = args["handle"].as_str().unwrap_or("").to_string();
                 let message = args["message"].as_str().unwrap_or("").to_string();
-                // RFC 0036: an instance-tier child receives over its A2A
-                // socket — the message lands in its conversation surface.
+                // An instance-tier child is a separate agent, not a worker in
+                // this process's tree, so it receives over its A2A socket and
+                // the message lands in its own conversation surface.
                 if self
                     .subagents
                     .get(&handle)
@@ -61,8 +62,8 @@ impl Runtime {
                 }
             }
             "subagent.retire" => {
-                // RFC 0036 §6: begin graceful retirement of an instance child
-                // (SIGTERM → the child drains its own runs and exits cleanly).
+                // Begin graceful retirement of an instance child: SIGTERM, then
+                // the child drains its own runs and exits cleanly.
                 let handle = args["handle"].as_str().unwrap_or("").to_string();
                 match self.subagents.get(&handle) {
                     None => err(format!("no such subagent {handle:?}")),
@@ -132,9 +133,10 @@ impl Runtime {
         }
     }
 
-    /// `subagent.run`: caps → durable record → spawn (RFC 0026 §6). A
-    /// `template:` reference (RFC 0036) resolves first — flat templates merge
-    /// into the args below; instance templates take the daemon-child path.
+    /// `subagent.run`: caps → durable record → spawn, in that order, so a
+    /// child that survives a crash always has a record to be reconciled
+    /// against. A `template:` reference resolves first — a flat template merges
+    /// into the args below; an instance template takes the daemon-child path.
     fn subagent_run(&mut self, caller: &ToolCaller, args: &Value) -> ToolOutcome {
         let err = |e: String| ToolOutcome::Ready(Value::String(e), true);
         let (eff_args, tmeta) = match self.resolve_spawn_args(args) {
@@ -164,9 +166,10 @@ impl Runtime {
         if !matches!(mode.as_str(), "sync" | "async" | "detached" | "warm") {
             return err("subagent.run: mode must be sync|async|detached|warm".into());
         }
-        // Caps (RFC 0026 §2): breadth (live), total (lifetime), rate, depth
-        // (a subagent asking for a subagent goes through the same chokepoint;
-        // logical depth = the requester's depth + 1).
+        // Caps: breadth (live), total (lifetime), rate, depth. A subagent
+        // asking for a subagent goes through this same chokepoint, so the
+        // logical depth is the requester's depth + 1 and no branch of the tree
+        // can grow past the configured limits by recursing.
         let live = self
             .subagents
             .values()
@@ -324,7 +327,9 @@ impl Runtime {
             intelligence: IntelConfig {
                 uri: self.intel_uri.clone(),
                 token: self.current_intel_bearer(),
-                // RFC 0036: a template/defaults `model:` overrides the parent's.
+                // An explicit `model:` (from the call, the template or the
+                // spawn defaults) overrides the parent's model; otherwise the
+                // child inherits it.
                 model: args
                     .get("model")
                     .and_then(Value::as_str)
@@ -373,7 +378,7 @@ impl Runtime {
         // its dispatch against it (`agentloop::runner::Session::prepare`). Without
         // the mint the argument would be recorded and ignored, and a parent
         // bounding an untrusted sub-task would silently get a child holding
-        // everything — the opposite of RFC 0009's monotonically narrowing scope.
+        // everything, when a child's authority must only ever narrow.
         if let Some(a) = &allow {
             payload.narrow_tools(a);
         }
@@ -446,7 +451,7 @@ impl Runtime {
         }
     }
 
-    /// RFC 0036 §5: resolve `template:`/`params:` into effective spawn args.
+    /// Resolve `template:`/`params:` into effective spawn args.
     /// Returns the args plus `(template, tier)` when a template was named.
     /// Freeform spawns pass through with defaults applied — unless
     /// `subagents.allow_freeform: false` refuses them.
@@ -499,7 +504,7 @@ impl Runtime {
         let folded = tpl::fold_params(&t.cleaned, &params);
         if tpl::params_introduced_machinery(&folded) {
             return Err(format!(
-                "subagent.run refused: params for template '{tname}' introduced directive machinery (RFC 0036 §8.2)"
+                "subagent.run refused: params for template '{tname}' introduced directive machinery"
             ));
         }
         if t.tier == tpl::Tier::Instance {
@@ -641,7 +646,9 @@ impl Runtime {
                 false,
             );
         }
-        // Plan bindings + the root note (RFC 0026 §5.3, §3.1 wake policy).
+        // Settle whatever plan item this subagent was bound to, then note the
+        // outcome to the root only when the wake policy asks for subagent
+        // results — an unwanted note would wake a root that has nothing to do.
         let ok = status == "completed";
         let note = result
             .as_ref()
@@ -772,10 +779,9 @@ pub fn parse_rate(s: &str) -> (u32, f64) {
     (burst, burst as f64 / per)
 }
 
-/// The payload as stored (no credential: the intelligence token is re-supplied
-/// from the live settings on restore).
-/// RFC 0036 §4 `subagents.defaults`: applied to every spawn when neither the
-/// call site nor the template set the field.
+/// Apply `subagents.defaults` to a spawn: each field lands only when neither
+/// the call site nor the template set it, so a default never overrides an
+/// explicit choice.
 fn apply_spawn_defaults(
     o: &mut serde_json::Map<String, Value>,
     d: &crate::config::v2::SubagentDefaults,
@@ -803,6 +809,8 @@ fn apply_spawn_defaults(
     }
 }
 
+/// The payload as stored: no credential, because the intelligence token is
+/// re-supplied from the live settings on restore.
 fn secret_free_payload(p: &SpawnPayload) -> Value {
     let mut clean = p.clone();
     clean.intelligence.token = None;

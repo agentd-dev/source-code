@@ -225,7 +225,7 @@ What happens when nobody is watching is a policy you set
   cooperation is not a control. Start read-only and widen as you trust it.
 - **Durability.** `store.kind: memory` keeps everything in the process — fine
   to start, but the session dies with the daemon. Point `store` at an MCP or
-  HTTP store ([RFC 0025](../rfcs/0025-durable-state-and-store-adapters.md)) and
+  HTTP store ([configuration.md](configuration.md)) and
   conversations, tasks and workflow runs survive a restart — including a
   pending approval.
 
@@ -269,7 +269,7 @@ What happens when nobody is watching is a policy you set
 The same instance that answers you in the TUI can run engineering chores on its
 own — this is the part a coding CLI structurally cannot do. Workflows are
 durable DAGs with schedule / webhook / signal triggers
-([workflows](../rfcs/0027-workflow-dialect-3.md)):
+([workflows.md](workflows.md)):
 
 ```yaml
 workflows:
@@ -293,8 +293,9 @@ waited overnight because the run is durable.
 
 - **No token-by-token streaming.** You get live *activity* — phase, current
   tool, elapsed, spend — and then the finished answer, not a typewriter. This
-  is deliberate; the reasoning and the alternatives are recorded in
-  [RFC 0032 §17/§19](../rfcs/0032-interface-and-observation-plane.md).
+  is deliberate: the daemon emits one event per phase change rather than per
+  token, so any number of attached clients costs the same, and the answer that
+  lands is the one the durable store already holds.
 - **No built-in editing tools.** §2 is not a formality: you choose the powers,
   and a config that grants none is an agent that can only talk.
 - **`exec` is not in release binaries.** Build with `--features exec`, on

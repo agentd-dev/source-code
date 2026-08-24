@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! SSRF classifier (RFC 0012 — security posture, §"SSRF guard").
+//! SSRF classifier.
 //!
-//! A *pure* address classifier plus a DNS-resolving host guard. The
-//! acceptance bar from assessment §4 M6 is blunt: "HTTP client refuses
-//! RFC-1918 / link-local by default". This module is the mechanism; it is
-//! composed at every call site that introduces a model/agent/peer-supplied
-//! URL (A2A push targets, `http` workflow nodes), while the only
-//! operator-configured outbound (`intel/client.rs`) is exempt.
+//! A *pure* address classifier plus a DNS-resolving host guard. The rule it
+//! enforces is blunt: the HTTP client refuses RFC-1918 and link-local
+//! destinations by default. This module is the mechanism; it is composed at
+//! every call site that introduces a model/agent/peer-supplied URL (A2A push
+//! targets, `http` workflow nodes), while the only operator-configured
+//! outbound (`intel/client.rs`) is exempt — its address comes from the
+//! operator, not from anything the model can steer.
 //!
 //! ## Resolve once, dial what you vetted
 //!
@@ -24,9 +25,9 @@
 //! header stay on the original hostname — connect by IP, verify by name —
 //! so SNI and certificate validation are unaffected.
 //!
-//! [`guard_host`] is retained for the yes/no admission check at
-//! *registration* time, where there is no socket to dial yet; it is not
-//! sufficient on its own at delivery time.
+//! [`guard_host`] serves the yes/no admission check at *registration*
+//! time, where there is no socket to dial yet; it is not sufficient on
+//! its own at delivery time.
 //!
 //! ## What "non-global" means here
 //!
@@ -49,9 +50,9 @@
 //!
 //! We deliberately do NOT lean on `std`'s unstable `IpAddr::is_global`
 //! (feature `ip`, issue #27709) — it is not available on our MSRV and
-//! its semantics drift. Every range below is spelled out by hand from
-//! primitives that are stable on Rust 1.88, in the same
-//! enumerate-the-bytes spirit as the rest of the crate.
+//! its semantics are still in flux. Every range below is spelled out by
+//! hand from primitives that are stable, in the same enumerate-the-bytes
+//! spirit as the rest of the crate.
 //!
 //! ## Logging posture
 //!

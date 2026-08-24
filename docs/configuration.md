@@ -1,7 +1,7 @@
 # Configuration reference
 
 `agentd` is configured from the **environment, the command line, and an optional
-local config file** — no network config, ever (RFC 0011 §1). The whole
+local config file** — no network config, ever. The whole
 configuration is assembled and **validated before any side effect**: a bad flag,
 a malformed endpoint, a mistyped workflow step, or an unresolvable secret
 reference exits `2` in milliseconds, not after an LLM round-trip or an MCP
@@ -38,7 +38,7 @@ built-in default  <  config file  <  env var  <  CLI flag
   `AGENT_CONFIG=a.yaml:b.yaml`) carrying verbose **structural**
   config (the MCP-server inventory, workflow definitions, A2A peers and
   principals, the store, limits, model/log knobs, intelligence endpoint list +
-  headers). **Live** (RFC 0017 §3). Several files compose into **one document,
+  headers). **Live.** Several files compose into **one document,
   in order — a later file overrides the earlier ones** (§12.2). The merged
   document slots between *default* and *env*, so env and flags still override
   it. **Repeatable list flags ADD to the file's lists**
@@ -109,8 +109,8 @@ Validation runs **after** all layers merge and **before** the first side effect
 and sub-millisecond. Diagnostics are **collected in one pass**: every problem in
 the document is reported, not just the first. Each one prints a
 `{"event":"config.invalid","msg":…}` line to stderr and the process exits **`2`**
-(`EXIT_USAGE`, a non-retriable config error for a `podFailurePolicy`;
-RFC 0011 §5).
+(`EXIT_USAGE`, a non-retriable config error for a `podFailurePolicy` — retrying
+a bad document only reproduces it).
 
 | Check | Example diagnostic (exit 2) |
 |---|---|
@@ -120,9 +120,9 @@ RFC 0011 §5).
 | every `mcp.servers[]` has a unique non-reserved name, a valid endpoint, and parseable tags | `mcp.servers[]: a server has an empty name` · `mcp.servers[]: duplicate server name 'fs'` · `mcp server 'a': mcp endpoint must be https://host[:port][/path] (got: ftp://x)` |
 | every server reference resolves (`store.mcp.server`, `knowledge.server`, `search.server`, `skills.sources[].server`, `tools.overrides[].server`) | `store.mcp.server 'state' is not a declared MCP server` |
 | the chosen `store.kind` carries its block | `store.kind is mcp but store.mcp is not set` · `store.http needs at least 'get' and 'put' operations` · `store.file.path is empty — set a directory, or omit the field to use $AGENTD_STATE_DIR / $XDG_STATE_HOME/agentd/state` |
-| a **long-lived** instance (an `a2a.listen`/`webhooks.listen`, a `goal`, or a `loop`/`schedule`/`subscribe`/`signal`/`event`/`stream`/`a2a`/`webhook` start node) has a durable `store` — it now **defaults** to `kind: file` (§12.3), so this only fires when a config asks for `kind: none` outright | `store.kind is none but the instance is long-lived … — configure a durable store (store.kind: file \| mcp \| http), or drop store.kind to get the local file store by default` |
+| a **long-lived** instance (an `a2a.listen`/`webhooks.listen`, a `goal`, or a `loop`/`schedule`/`subscribe`/`signal`/`event`/`stream`/`a2a`/`webhook` start node) has a durable `store` — naming no store at all **defaults** to `kind: file` (§12.3), so this fires only when a config asks for `kind: none` outright | `store.kind is none but the instance is long-lived … — configure a durable store (store.kind: file \| mcp \| http), or drop store.kind to get the local file store by default` |
 | every workflow is named, unique, and has exactly one of `file` \| `uri` \| `steps` | `workflows['w'] must have exactly one of file \| uri \| steps` |
-| every inline workflow parses under the dialect-3 node registry — the *same* parse the runtime runs at startup | `workflow "w" step "s": unknown field "every" for kind "loop" (allowed: interval, delay, until, max_iterations, backoff, inputs)` |
+| every inline workflow parses under the workflow node registry — the *same* parse the runtime runs at startup | `workflow "w" step "s": unknown field "every" for kind "loop" (allowed: interval, delay, until, max_iterations, backoff, inputs)` |
 | an `a2a.listen: https://…` sets `a2a.tls.cert` + `a2a.tls.key`, and a non-loopback bind authenticates its clients | `a2a.listen is https:// but a2a.tls.cert / a2a.tls.key are not set` · `a2a.listen on a non-loopback address needs client auth: a2a.tls.client_ca, a2a.bearer, and/or interface.pairing` |
 | `interface.enabled` has a listener to ride, and pairing has an interface | `interface.enabled requires a2a.listen (the interface is served on the A2A listener)` |
 | a `webhook` node has a listener | `a 'webhook' node (start or wait) is used but webhooks.listen is not set — configure webhooks.listen (https://host:port)` |
@@ -185,7 +185,7 @@ file spelling is never in doubt.
 | `--instruction-file <PATH>` | `agent.instruction` | — | — | Read the instruction from a local file (e.g. a ConfigMap/Secret projection). |
 | `--prompt <TEXT>` | `agent.prompt` | `PROMPT` | *(none)* | A one-shot task: with no workflows configured, the generated run executes this while `instruction` stays the standing policy. |
 | `--prompt-file <PATH>` | `agent.prompt` | — | — | Read the prompt from a local file. |
-| `--intelligence <LIST>` | `intelligence.endpoints` | `INTELLIGENCE` | *(none)* | Ordered, comma-separated LLM endpoint **list** for failover (RFC 0018). Each element is `https://host[:port][/path]` (or a loopback `http://` for a same-host dev gateway) — see §4. |
+| `--intelligence <LIST>` | `intelligence.endpoints` | `INTELLIGENCE` | *(none)* | Ordered, comma-separated LLM endpoint **list** for failover. Each element is `https://host[:port][/path]` (or a loopback `http://` for a same-host dev gateway) — see §4. |
 | `-c`, `--config <PATH>` | — | `AGENT_CONFIG` | *(none)* | Load a declarative config file — YAML or JSON (§12). Repeatable; the `=` form works too. |
 
 ### 3.2 Intelligence
@@ -196,7 +196,7 @@ file spelling is never in doubt.
 | `--intelligence-token-file <PATH>` | `intelligence.token_file` | `INTELLIGENCE_TOKEN_FILE` | *(none)* | Read endpoint 1's token from a mounted file (rotation-friendly). An inline token wins over it (and setting both is a warning). |
 | — | — | `AGENTD_INTELLIGENCE_TOKEN_<N>` / `…_<N>_FILE` | *(none)* | Per-endpoint credential for endpoint *N* (1-indexed; endpoint 1 uses the bare names above, endpoint 2 → `_2`/`_2_FILE`, etc.). Env-only. |
 | `--model <NAME>` | `intelligence.model` | `MODEL` | *(none)* | Model id passed to the endpoint. **Reloadable** (§11). |
-| `--model-swap <P>` | `intelligence.swap_policy` | `MODEL_SWAP` | `finish-on-old` | What an in-flight run does when a reload changes `model`: `finish-on-old` (the in-flight turn finishes on the old model, the next turn uses the new one) \| `restart-turn` (the in-flight turn is re-run on the new model from the same pre-turn state). An endpoint repoint with the model unchanged is always finish-on-old regardless (RFC 0018 §5). |
+| `--model-swap <P>` | `intelligence.swap_policy` | `MODEL_SWAP` | `finish-on-old` | What an in-flight run does when a reload changes `model`: `finish-on-old` (the in-flight turn finishes on the old model, the next turn uses the new one) \| `restart-turn` (the in-flight turn is re-run on the new model from the same pre-turn state). An endpoint repoint with the model unchanged is always finish-on-old regardless — the conversation is identical on either endpoint, so there is nothing to re-run. |
 | `--tls-ca <PATH>` | `security.tls_ca` | `TLS_CA` | *(none — bundled webpki roots only)* | Extra PEM CA certificate(s) trusted for **every outbound** `https://` dial (intelligence, MCP servers, A2A peers, OAuth token endpoints), **added to** the bundled webpki roots — the private/in-cluster PKI anchor. Public material (a CA cert path, never a key). Read at startup — a missing/unreadable/non-CA PEM is `security.tls_ca <path>: …` → exit `2` before the first dial (the path is *not* checked by `--validate-config`, which never touches the filesystem for credentials). Installed process-wide and inherited by every subagent via the spawn payload. Restart-only. Needs the `tls` build feature. |
 
 The endpoint's `auth` block (`intelligence.auth.*` — OAuth 2.1, AWS SigV4,
@@ -209,20 +209,19 @@ SPIFFE) and `intelligence.dialect` / `intelligence.headers` /
 | Flag | Path | Env | Default | Description |
 |---|---|---|---|---|
 | `--mcp name=<endpoint>` | `mcp.servers` *(adds one)* | — | *(none)* | Declare a remote MCP server, reached over **Streamable HTTP** — `name=https://host[:port][/path]` (or a loopback `http://` for dev). agentd spawns no local process. Repeatable. See §5. **Reloadable** (§11). |
-| `--mcp-tags name=tag,tag` | `mcp.servers[].tags` | — | *(none)* | Capability tags for the Rule-of-Two check: `untrusted_input`\|`sensitive`\|`egress` (RFC 0012 §3.1). Attaches to a declared server (order-independent); an unknown name is exit `2`. Repeatable. |
-| `--listen <TARGET>` | `a2a.listen` | `SERVE_MCP` | *(off)* | Arm the A2A listener — the daemon's external channel and operator control (RFC 0029): `https://host:port` (mTLS/bearer auth) or a loopback `http://host:port` (dev). `--serve-mcp` is the same alias. Needs `--features a2a`. |
+| `--mcp-tags name=tag,tag` | `mcp.servers[].tags` | — | *(none)* | Capability tags for the Rule-of-Two check: `untrusted_input`\|`sensitive`\|`egress`. Attaches to a declared server (order-independent); an unknown name is exit `2`. Repeatable. |
+| `--listen <TARGET>` | `a2a.listen` | `SERVE_MCP` | *(off)* | Arm the A2A listener — the daemon's external channel and operator control: `https://host:port` (mTLS/bearer auth) or a loopback `http://host:port` (dev). `--serve-mcp` is the same alias. Needs `--features a2a`. |
 | `--serve-cert` / `--serve-key` / `--serve-client-ca` | `a2a.tls.cert` / `.key` / `.client_ca` | — | *(none)* | The listener's server certificate, private key, and client-CA bundle for mTLS. An `https://` listen without cert+key is exit `2`. |
 | `--serve-bearer <T>` | `a2a.bearer` | `SERVE_BEARER` | *(none)* | Static bearer token accepted by the listener. From a *file* it must be a `{{secret:…}}` reference. |
 | `--a2a-peer name=<ENDPOINT>` | `a2a.peers` *(adds one)* | — | *(none)* | Declare a remote A2A delegation peer: `https://host[:port]` (or a loopback `http://`, or `unix:///path` for a co-located instance). Repeatable. Needs `--features a2a`. |
-| `--workflow <FILE>` | `workflows` *(adds one)* | — | *(none)* | Append a workflow definition (dialect 3, RFC 0027) to `workflows:` as `{name: <file stem>, file: <path>}` — its start node is the trigger. Repeatable; the same as an inline `workflows:` entry. See [RFC 0027](../rfcs/0027-workflow-dialect-3.md). |
-| `--allow-trifecta` | `security.allow_trifecta` | `ALLOW_TRIFECTA` | `false` | Permit all three lethal-trifecta legs in one agent instead of refusing at startup (RFC 0012 §3.2). |
+| `--workflow <FILE>` | `workflows` *(adds one)* | — | *(none)* | Append a workflow definition to `workflows:` as `{name: <file stem>, file: <path>}` — its start node is the trigger. Repeatable; the same as an inline `workflows:` entry. See [`workflows.md`](workflows.md). |
+| `--allow-trifecta` | `security.allow_trifecta` | `ALLOW_TRIFECTA` | `false` | Permit all three lethal-trifecta legs in one agent: the startup refusal is downgraded to a loud, audited warning rather than dropped. |
 | `--env <FILE>` | *(process env)* | — | *(none)* | Load a dotenv file into this process's environment before anything reads it — `${VAR}` expansion, `{{secret:NAME}}` resolution, subagent inheritance all see it. Repeatable: later files win; the **real environment always wins** over any file. `KEY=VALUE`, `export` prefix ok, `#` comments, `'…'` literal, `"…"` with `\n`-style escapes, no `$VAR` interpolation inside the file. A malformed line refuses startup naming file:line. |
-| `--fresh` | *(process intent)* | — | *(none)* | Start a NEW durable-store generation instead of resuming (RFC 0033 §3.2); the previous generation stays on the store. |
+| `--fresh` | *(process intent)* | — | *(none)* | Start a NEW durable-store generation instead of resuming; the previous generation stays on the store, so nothing is deleted by starting clean. |
 | `--prompt-missing` | *(process intent)* | — | *(none)* | Ask interactively on `/dev/tty` (echo off) for each `{{secret:NAME}}` the startup preflight finds missing. Values live in process memory only; a restart re-asks. Refused without a controlling terminal (§12.3). |
 
-Durable runs **resume automatically** from the store on restart (RFC 0025); a
-workflow's own `resume_policy` (`force` to always restart it) is the per-graph
-control.
+Durable runs **resume automatically** from the store on restart; a workflow's
+own `resume_policy` (`force` to always restart it) is the per-graph control.
 
 ### 3.4 Limits & budgets
 
@@ -231,15 +230,15 @@ control.
 | `--max-steps <N>` | `limits.run.steps` | `MAX_STEPS` | `500` | Per-run step cap. **Reloadable** (§11). |
 | `--max-tokens <N>` | `limits.run.tokens` | `MAX_TOKENS` | `2000000` | Token budget for a single **run**. **Reloadable** (§11). |
 | `--deadline <dur>` | `limits.run.deadline` | `DEADLINE` | `3600s` | Per-run wall-clock deadline (duration syntax, §7). **Reloadable** (§11). |
-| `--max-depth <N>` | `limits.subagents.depth` | — | `3` | Subagent tree depth cap (RFC 0009). |
-| `--budget-tokens-lifetime <N>` | `intelligence.budget.lifetime_tokens` | `BUDGET_TOKENS` | `0` (unbounded) | Per-**instance** cumulative token cap across **all** runs (RFC 0025). See §3.4a. |
+| `--max-depth <N>` | `limits.subagents.depth` | — | `3` | Subagent tree depth cap — how many levels of children a tree may nest. |
+| `--budget-tokens-lifetime <N>` | `intelligence.budget.lifetime_tokens` | `BUDGET_TOKENS` | `0` (unbounded) | Per-**instance** cumulative token cap across **all** runs. See §3.4a. |
 | `--budget-exit-code <N>` | `lifecycle.exit_code_map` | — | *(none)* | Remap the policy exit codes `3` and `7` to `N` (`0..=255`) — e.g. exit `0` so a budget stop is not a pod failure. |
 
 `limits.max_runs` (concurrent runs, default `8`), `limits.step_timeout`,
 `limits.inline_max_bytes`, and `limits.subagents.{breadth,total,rate}` have no
 short alias; set them by path.
 
-#### 3.4a The lifetime token budget (`--budget-tokens-lifetime`, RFC 0025)
+#### 3.4a The lifetime token budget (`--budget-tokens-lifetime`)
 
 `--max-tokens` boxes a single run; `--budget-tokens-lifetime` bounds the **whole
 instance** — the cumulative tokens across every run the process performs. It
@@ -264,54 +263,49 @@ rolling `windows` (`{per: hour, tokens: 2000000}`), an `on_exhausted` tactic
 (`wait`\|`slow`\|`degrade`\|`refuse`\|`fail`), a `reserve`, and a `scope`.
 `agent.conversation_budget` is the same shape applied per conversation.
 
-### 3.5 Cluster identity
-
-| Flag | Path | Env | Default | Description |
-|---|---|---|---|---|
-
-### 3.6 Runtime / observability / security
+### 3.5 Runtime / observability / security
 
 | Flag | Path | Env | Default | Description |
 |---|---|---|---|---|
 | `--run-id <ID>` | `lifecycle.run_id` | `RUN_ID` | *(auto)* | Idempotency key (§8). Default: a freshly minted ULID. |
-| `--drain-timeout <dur>` | `lifecycle.drain_timeout` | `DRAIN_TIMEOUT` | `25s` | Graceful drain budget. Keep **< pod `terminationGracePeriodSeconds`** (RFC 0011 §3.3). |
+| `--drain-timeout <dur>` | `lifecycle.drain_timeout` | `DRAIN_TIMEOUT` | `25s` | Graceful drain budget. Keep **< pod `terminationGracePeriodSeconds`**, or the kubelet's `SIGKILL` lands mid-drain. |
 | `--log-level <L>` | `observability.log_level` | `LOG_LEVEL` | `info` | `trace`\|`debug`\|`info`\|`warn`\|`error`. **Reloadable** (§11). |
-| `--log-content` | `observability.log_content` | `LOG_CONTENT` | `false` | Log tool args/results, not just lengths (RFC 0010 §2.9). Off by default (content-capture-off); propagates to children. **Reloadable** (§11). |
-| `--health-file <PATH>` | `observability.health_file` | — | *(none)* | Liveness heartbeat file, rewritten every 10s (exec-probe target; RFC 0010). |
+| `--log-content` | `observability.log_content` | `LOG_CONTENT` | `false` | Log tool args/results, not just lengths. Off by default (content-capture-off), because arguments and results routinely carry data the log is not the right home for; propagates to children. **Reloadable** (§11). |
+| `--health-file <PATH>` | `observability.health_file` | — | *(none)* | Liveness heartbeat file, rewritten every 10s — the exec-probe target for images with no HTTP surface. |
 | `--metrics-addr <ADDR>` | `observability.metrics_addr` | `METRICS_ADDR` | *(off)* | Serve `/metrics`+`/healthz`+`/readyz` on a TCP addr — `host:port`, or `:port` for all IPv4 interfaces (read-only; restrict via firewall/NetworkPolicy if exposed). Needs `--features metrics`. |
-| `--traceparent <W3C>` | `observability.traceparent` | `TRACEPARENT` | *(none)* | Continue an upstream W3C trace; else a trace id is minted from the run id (RFC 0010). |
-| `--events-ring <N>` | `observability.events_ring` | — | `1024` | Capacity of the in-memory log ring the interface's debug feed tails. Installed only when `interface.enabled` **and** `interface.debug` are on (RFC 0032 §5). |
+| `--traceparent <W3C>` | `observability.traceparent` | `TRACEPARENT` | *(none)* | Continue an upstream W3C trace; else a trace id is minted from the run id. |
+| `--events-ring <N>` | `observability.events_ring` | — | `1024` | Capacity of the in-memory log ring the interface's debug feed tails. Installed only when `interface.enabled` **and** `interface.debug` are on, so an instance with no debug UI pays nothing for it. |
 | `--report-file <PATH>` | `observability.report_file` | — | *(off)* | Path for a run-outcome report file. Accepted by the schema; the runtime does not write it — the terminal outcome is the `proc.exit` event and the A2A task artifact. |
-| `--cgroup <auto\|PATH>` | `security.cgroup.spec` | — | *(off)* | cgroup-v2 parent for spawned children (turn workers + subagents), each placed in its own leaf for atomic `cgroup.kill` teardown: `auto` (derive `<own-cgroup>/agent`) or an absolute path under `/sys/fs/cgroup`. Best-effort — disabled if not writable (RFC 0010). Linux only. |
+| `--cgroup <auto\|PATH>` | `security.cgroup.spec` | — | *(off)* | cgroup-v2 parent for spawned children (turn workers + subagents), each placed in its own leaf for atomic `cgroup.kill` teardown: `auto` (derive `<own-cgroup>/agent`) or an absolute path under `/sys/fs/cgroup`. Best-effort — disabled if not writable. Linux only. |
 | `--cgroup-memory-max <SIZE>` | `security.cgroup.memory_max` | — | *(none)* | Per-child `memory.max`: `max` or a size (`512M`/`2G`/bytes). Needs a parent that can delegate the `memory` controller. |
 | `--cgroup-pids-max <N>` | `security.cgroup.pids_max` | — | *(none)* | Per-child `pids.max`: `max` or a count. **Counts threads** — set it generously. Needs delegation. |
-| `--aauth-provider`, `--aauth-key-file`, `--aauth-enroll-token`, `--aauth-enroll-assertion-file`, `--aauth-person-server` | `security.aauth.*` | — | *(none)* | Agent-identity signing for AAuth-protected servers (RFC 0023). Needs `--features aauth`; see [`aauth.md`](aauth.md). |
+| `--aauth-provider`, `--aauth-key-file`, `--aauth-enroll-token`, `--aauth-enroll-assertion-file`, `--aauth-person-server` | `security.aauth.*` | — | *(none)* | Agent-identity signing for AAuth-protected servers. Needs `--features aauth`; see [`aauth.md`](aauth.md). |
 | `--login <target>` | — | — | — | Complete an interactive OAuth device login for an endpoint (e.g. `mcp:<name>`) and cache the token; exits. Needs `--features oauth`; see [`authentication.md`](authentication.md). |
 | `--logout <target>` | — | — | — | Evict a cached credential; exits. |
-| `--capabilities` | — | — | — | Print the capabilities manifest (JSON) and exit `0` — the side-effect-free admission probe. RFC 0015. |
+| `--capabilities` | — | — | — | Print the capabilities manifest (JSON) and exit `0` — the side-effect-free admission probe. |
 | `-h`, `--help` | — | — | — | Print help (including the full `CONFIG PATHS` table) and exit `0`. |
 | `-V`, `--version` | — | — | — | Print version and exit `0`. |
 
 `security.exec.*` (the guarded local command runner, default-OFF at both build
 and run time) is documented in [`security.md`](security.md) §11.
 
-### 3.7 Config file & hot reload (RFC 0017)
+### 3.6 Config file & hot reload
 
 | Flag | Path | Env | Default | Description |
 |---|---|---|---|---|
 | `-c`, `--config <PATH>` | — | `AGENT_CONFIG` | *(none)* | Load a declarative config file — YAML (`.yaml`/`.yml`) or JSON (`.json`/`.jsonc`; other extensions are sniffed) (§12). The lowest non-default precedence layer. |
 | `--validate-config` | — | — | — | Load + validate (files + env + flags), print the admission verdict (one `config.valid` line, or one `config.invalid` line per diagnostic — **all** collected in one pass), exit `0`/`2`. Side-effect-free. |
 | `--config-schema` | — | — | — | Print the settings JSON Schema (Draft 2020-12) to stdout and exit `0`. Side-effect-free. |
-| `--workflow-schema` | — | — | — | Print the workflow (dialect 3) JSON Schema + node registry to stdout and exit `0`. |
+| `--workflow-schema` | — | — | — | Print the workflow JSON Schema + node registry to stdout and exit `0`. |
 | `--watch-config` | `lifecycle.watch_config` | `WATCH_CONFIG` | `false` | Watch each config file's parent directory via `inotify` and reload on change (the same reload SIGHUP triggers). Needs a `--config`/`AGENT_CONFIG` file (validated, exit `2`) and the `config-watch` build feature — without the feature the watch is simply not installed. See §11. |
 
 Hot reload itself (the `hot-reload` feature) is triggered by **SIGHUP** — there
 is no flag for it (§9, §11).
 
-### 3.8 Subcommands
+### 3.7 Subcommands
 
-`agentd tui` and `agentd ui` run the daemon with a display client attached
-(RFC 0032): the terminal UI (`--inline` for in-place instead of fullscreen) or
+`agentd tui` and `agentd ui` run the daemon with a display client attached:
+the terminal UI (`--inline` for in-place instead of fullscreen) or
 the web UI opened in a browser. Both set `interface.enabled: true` for you, and
 the client exits with the daemon. To attach detached instead, run `agentd -c …`
 and point `agentd-tui --endpoint <url>` at it. See [`interface.md`](interface.md).
@@ -326,11 +320,11 @@ and point `agentd-tui --endpoint <url>` at it. See [`interface.md`](interface.md
 
 ## 4. Intelligence endpoints — schemes & failover
 
-`intelligence.endpoints` is an **ordered endpoint list** (RFC 0018 §3.1) — a YAML
-sequence, or the comma-separated string `--intelligence` takes. A single element
-is the common case; multiple elements give sticky-primary **failover** — agentd
-prefers the first healthy endpoint and falls back on a circuit-breaker trip. Each
-element is selected by URI scheme (RFC 0006):
+`intelligence.endpoints` is an **ordered endpoint list** — a YAML sequence, or
+the comma-separated string `--intelligence` takes. A single element is the
+common case; multiple elements give sticky-primary **failover** — agentd
+prefers the first healthy endpoint and falls back on a circuit-breaker trip.
+Each element is selected by URI scheme:
 
 | Scheme | Form | Use |
 |---|---|---|
@@ -407,7 +401,7 @@ is `mcp.servers[]: a server has an empty name`; a repeated name is
 code-registered tools; and a non-`https`/non-loopback-`http` endpoint is rejected
 at startup. All exit `2`.
 
-### The system prompt — `context.template:` (RFC 0038)
+### The system prompt — `context.template:`
 
 The system prompt is **data plus a template**. The runtime exposes what it
 knows — `instance`, `instruction`, `workflows`, `services`, `streams`,
@@ -470,7 +464,7 @@ cheaper model. The summary's JSON schema is **not** overridable — it is parsed
 back into the context, so a prompt asking for another shape produces a refusal
 rather than a nicer summary.
 
-### The service catalog — `services:` (RFC 0037)
+### The service catalog — `services:`
 
 For deployments past a handful of servers, the catalog names the external
 services the deployment may use **once**, and `mcp.servers` entries reference
@@ -499,9 +493,10 @@ ceiling itself. **Catalog tags are a floor, unconditionally** — any server
 whose endpoint matches an entry (referencing *or* inline, `open` *or*
 `closed`) gets the entry's tags unioned in before the trifecta gate runs, so
 under-tagging cannot launder a sensitive endpoint. **`security.egress:
-closed` makes the catalog enforceable** — a configured MCP server, an RFC
-0036 template's machinery, or a caller-registered A2A push target whose URL
-matches no entry is refused; URL matching is scheme + authority + path prefix
+closed` makes the catalog enforceable** — a configured MCP server, the
+machinery a subagent template brings with it, or a caller-registered A2A push
+target whose URL matches no entry is refused; URL matching is scheme +
+authority + path prefix
 on segment boundaries, and prefix-comparable entries are themselves a
 validation error. `--validate-config` prints each consumer's *effective*
 endpoint, admission lists and tags, so review reads the outcome.
@@ -526,8 +521,8 @@ Two more per-entry knobs: `rate:` paces every consumer's calls **in each
 process** — the reactor's steps and the worker/subagent processes' own
 in-loop calls alike (a dry bucket is a tool/step failure a retry absorbs;
 rate changes take a restart) — and `breaker: {failures, cooldown}` is the
-default breaker POLICY for `mcp.tool` steps against the entry (state stays
-per step, as always).
+default breaker POLICY for `mcp.tool` steps against the entry, while the
+breaker's open/closed state stays per step.
 
 ---
 
@@ -553,7 +548,7 @@ long-lived **daemon**, and what wakes it:
 | `subscribe` | when an MCP **resource** updates | `server`, `uri` (both required), `debounce_ms`, `coalesce`, `filter`, `deliver`, `on_no_listener`, `window` |
 | `signal` | when a named signal arrives | `name` (required), `filter`, `deliver` |
 | `event` | on a runtime event | `on` (required — e.g. `workflow_finished`), `filter` |
-| `stream` | on each event of a declared stream (RFC 0035) | `stream` (required), `subject` (exact or `prefix.*`), `filter`, `from` (`new` \| `earliest`) |
+| `stream` | on each event of a declared stream | `stream` (required), `subject` (exact or `prefix.*`), `filter`, `from` (`new` \| `earliest`) |
 | `webhook` | on an inbound HTTP request | `path` (required), `methods`, `auth`, `parallelism`, `on_overflow`, `rate`, `idempotency`, `respond` |
 
 The **long-lived** kinds — `loop`, `schedule`, `subscribe`, `signal`, `event`,
@@ -577,12 +572,12 @@ workflows:
 ```
 
 Every workflow needs a start node and a `finish` step, and every non-start step
-declares `depends_on`; `--validate-config` runs the same dialect-3 parse the
+declares `depends_on`; `--validate-config` runs the same workflow parse the
 runtime does, so a mistyped field is caught before the first side effect (§2).
 
 The **job** shape needs no workflow at all: `agentd --instruction "…"
 --intelligence https://…` expands to a `once → agent → finish` workflow, runs one
-turn, and exits (RFC 0030 §5).
+turn, and exits.
 
 ### 6.1 Where definitions come from
 
@@ -615,18 +610,19 @@ a run started under one hash finishes under it.
 *agent itself*: `workflow.create` / `workflow.update` / `workflow.delete` tool
 calls are refused (logged as `workflow.locked`), so a model cannot rewrite its
 own standing orders — the definitions are exactly what the operator deployed,
-GitOps-style. Operators change them the same way they always did: edit the
-source and restart (or hot-reload).
+GitOps-style. Operators still change them by editing the source and restarting
+(or hot-reloading).
 
 > **Scope.** Reactivity rides the MCP servers' Streamable-HTTP subscriptions. The
 > A2A listener (`a2a.listen`) is HTTP(S) with mTLS/bearer auth (loopback
 > `http://` for dev). For time-scheduling at scale, prefer an external `CronJob`
-> firing a job per tick (RFC 0011 §9); the built-in `loop`/`schedule` start nodes
-> are the standalone convenience.
+> firing a job per tick; the built-in `loop`/`schedule` start nodes are the
+> standalone convenience. A schedule that comes due while the process was down
+> fires once on restart — missed occurrences collapse rather than replay.
 
 See [`modes-and-triggers.md`](modes-and-triggers.md) for the lifecycle in depth
-and [RFC 0027](../rfcs/0027-workflow-dialect-3.md) for the full node registry
-(`agentd --workflow-schema` prints it).
+and [`workflows.md`](workflows.md) for the node catalogue —
+`agentd --workflow-schema` prints the authoritative registry.
 
 ---
 
@@ -682,8 +678,7 @@ surfaces — never from conversation text; executing definitions out of less
 trusted text would be prompt injection as a feature.
 
 The full story — the precise grammar, the trust rule, retirement, and what
-is deliberately out — is [`directives.md`](directives.md); the normative
-contract is [RFC 0034](../rfcs/0034-instruction-documents-and-directives.md).
+is deliberately out — is [`directives.md`](directives.md).
 
 ## 7. Duration syntax
 
@@ -715,8 +710,7 @@ number, or an unknown unit is a usage error (exit `2`), e.g.
 
 `lifecycle.run_id` (`--run-id` / `AGENT_RUN_ID`) is the idempotency key
 propagated into every outbound MCP `tools/call` `_meta` — alongside
-`agent/instance` and a `traceparent` — so backing services can dedupe retries
-(RFC 0011 §6).
+`agent/instance` and a `traceparent` — so backing services can dedupe retries.
 
 - **Default** — when unset, agentd mints a fresh ULID. It correlates logs/traces
   across the subagent tree but does **not** dedupe retries (each retry gets a
@@ -734,14 +728,14 @@ $ agentd --instruction 'enqueue digest' \
 
 agentd introduces **no local non-idempotent side effects**: its own durable state
 (runs, memory, artifacts) goes through the configured `store`, and every other
-effect is externalized through MCP, where the key acts (RFC 0011 §6.4).
+effect is externalized through MCP, which is where the key does its work.
 
 ---
 
 ## 9. Drain timeout & signals
 
-`--drain-timeout` (default `25s`) bounds the graceful drain on `SIGTERM`/`SIGINT`
-(RFC 0011 §4). A clean drain exits **`0`, not `143`**. Keep the drain timeout
+`--drain-timeout` (default `25s`) bounds the graceful drain on
+`SIGTERM`/`SIGINT`. A clean drain exits **`0`, not `143`**. Keep the drain timeout
 **strictly less than** the pod's `terminationGracePeriodSeconds` (recommended
 `30`) so the supervisor's own ladder finishes before the kubelet's `SIGKILL`
 lands.
@@ -782,14 +776,14 @@ Once the configuration is accepted the supervisor announces itself:
 ```
 
 Content-capture stays **off**: no startup line carries the instruction body, an
-endpoint credential, or a header value — header *names* only. The exact log
-schema is owned by RFC 0010 (see [`observability.md`](observability.md)). A
-reload adds `config.reloaded`, `config.reload.invalid`, and
+endpoint credential, or a header value — header *names* only. The full event
+schema is in [`observability.md`](observability.md). A reload adds
+`config.reloaded`, `config.reload.invalid`, and
 `config.reload.restart_required` (§11).
 
 ---
 
-## 11. Hot reload & the reloadable/restart-only partition (RFC 0030 §6)
+## 11. Hot reload & the reloadable/restart-only partition
 
 In a `--features hot-reload` build a running daemon applies a new config without
 a process restart. Two triggers funnel into the **identical** reload routine:
@@ -814,8 +808,8 @@ the work — every turn worker is spawned fresh from the live settings, so the n
 unit of work picks the new values up):
 
 - `intelligence.endpoints` / `model` / `token` / `token_file` — repointed via the
-  runtime hot-swap primitive; in-flight turns follow the `swap_policy`
-  (RFC 0018 §5) — and `intelligence.budget` (new windows, counters carried over)
+  runtime hot-swap primitive; in-flight turns follow the `swap_policy` — and
+  `intelligence.budget` (fresh windows, counters carried over)
 - `agent.instruction` (a resource instruction re-subscribes) and the rest of
   `agent` — `preflight`, `wake_on`, `tools`, `max_parallel_turns`,
   `on_workflow_finished`, `conversation_budget`
@@ -833,11 +827,15 @@ unit of work picks the new values up):
 these is **refused** with `restart_required` (roll the pod instead):
 
 `config_version`, `agent.name`, `store.kind`, `store.prefix`, `store.mcp`,
-`store.http`, `lifecycle.run_until`, `lifecycle.drain_timeout`,
+`store.http`, `store.file`, `lifecycle.run_until`, `lifecycle.drain_timeout`,
 `lifecycle.run_id`, `lifecycle.exit_code_map`, `lifecycle.watch_config`,
 `a2a.listen`, `a2a.tls`, `a2a.bearer`, `observability.otel`,
 `observability.metrics_addr`, `observability.health_file`,
-`observability.events_ring`, `observability.traceparent`, `security`, `cluster`.
+`observability.events_ring`, `observability.traceparent`, `security`.
+
+`store.file` is restart-only for the same reason as the rest of `store`: moving
+the state directory under a running instance would strand every key it has
+already written there.
 
 Every applied reload logs `config.reloaded` with the changed groups, bumps
 `lifecycle.config_generation` in the durable manifest, and is **audited** as a
@@ -845,7 +843,7 @@ Every applied reload logs `config.reloaded` with the changed groups, bumps
 
 ---
 
-## 12. The config file (`--config`, RFC 0017 §3)
+## 12. The config file (`--config`)
 
 `--config <PATH>` (repeatable) / `AGENT_CONFIG` loads one or more documents in
 **YAML or JSON** (§12.2 for how several compose). The extension picks the syntax
@@ -937,41 +935,39 @@ each path is equally reachable from env and flags (§1.1), so
 
 | Section | Carries |
 |---|---|
-| `config_version` | `"2"`. Optional, but pin it. |
+| `config_version` | `"1"`. Optional, but pin it — any other value is exit `2`. |
 | `vars` | Named values (any JSON type, nestable) referenced as `{{config.NAME}}` anywhere a string sits — see §12.4. |
 | `agent` | `name`, `instruction`, `prompt`, `preflight`, `wake_on`, `tools` (`internal`/`mcp`/`code` allow-lists), `max_parallel_turns`, `conversation_budget`, `ask_human_fallback`, `on_workflow_finished`. |
 | `intelligence` | `endpoints[]`, `model`, `dialect`, `swap_policy`, `timeout`, `headers{}`, `token`/`token_file`, `auth{}` (OAuth 2.1 / AWS SigV4 / SPIFFE), `budget{}`, `pricing`, `structured_output`. |
 | `mcp` | `servers[]` — `{name, endpoint, headers{}, tags{glob:[…]}, ns, allow[], exclude[], timeout, auth{}, oauth{}, aauth}` — and `default_timeout`. `allow`/`exclude` gate the server's advertised tool names by glob (exclude beats allow; a gated-out tool never registers). |
 | `tools` | `disabled[]`, `overrides{}` (retarget a tool at a declared server, optionally rewriting `args`/`result`). |
-| `context` | `template` (the system-prompt template — RFC 0038; unset = the built-in, printed by `agentd --context-template`), `templates{}` (named alternates a node picks with `context: {template: <name>}`), `summarize{prompt, model}` (the compaction guidance and a cheaper model to run it on), `compact_at`, `keep_last`, `model_window`, `plan{}`. |
+| `context` | `template` (the system-prompt template; unset = the built-in, printed by `agentd --context-template`), `templates{}` (named alternates a node picks with `context: {template: <name>}`), `summarize{prompt, model}` (the compaction guidance and a cheaper model to run it on), `compact_at`, `keep_last`, `model_window`, `plan{}`. |
 | `store` | `kind` (`file`\|`mcp`\|`http`\|`memory`\|`none`), the matching `file{path, min_free}` / `mcp{}` / `http{}` block, `prefix`, `timeout`, `on_error`, `durability{a2a, steps, work}`, `checkpoint{}`, `audit`. Defaults per instance shape — see below. `durability.work: ephemeral` flips the deployment's durability CLASS: runs and subagent records are memory-only unless a workflow says `durable: true` (docs/workflows.md §durability) — the fast path when all work is recomputable. |
-| `workflows` | Inline dialect-3 definitions, or `{name, file}` / `{name, uri}` / `{name, url, headers, timeout, allow_private}` references, or a `{dir, glob}` scan (§6). `security.workflows.immutable: true` locks the loaded set. |
-| `streams` | Declared event streams (RFC 0035): `streams: {orders: {retention: {max_events: 10000, max_age: 7d}}}`. An `emit` step or `stream` start naming an undeclared stream is exit `2`. Events are durable in the store; retention trims from the head (`max_events` defaults to 10000). |
-| `goal` | The goal watchdog: `statement`, `check{via,condition,every}`, `stuck_after`, `on_achieved`, `on_stuck` (RFC 0026). |
+| `workflows` | Inline definitions, or `{name, file}` / `{name, uri}` / `{name, url, headers, timeout, allow_private}` references, or a `{dir, glob}` scan (§6). `security.workflows.immutable: true` locks the loaded set. |
+| `streams` | Declared event streams: `streams: {orders: {retention: {max_events: 10000, max_age: 7d}}}`. An `emit` step or `stream` start naming an undeclared stream is exit `2`. Events are durable in the store; retention trims from the head (`max_events` defaults to 10000). |
+| `goal` | The goal watchdog: `statement`, `check{via,condition,every}`, `stuck_after`, `on_achieved`, `on_stuck`. |
 | `limits` | `max_runs`, `run{steps,tokens,deadline}`, `step_timeout`, `inline_max_bytes`, `subagents{depth,breadth,total,rate}`. |
 | `lifecycle` | `run_until`, `idle_grace`, `drain_timeout`, `run_id`, `exit_code_map`, `watch_config` (§6, §9). |
-| `a2a` | `listen` (`https://host:port`, loopback `http://`, or `unix:///path` for co-located peers — kernel-authenticated, no TLS), `tls{cert,key,client_ca}`, `bearer`, `principals[]`, `peers[]` (endpoints may also be `unix:///path`), `conversation_ttl` (RFC 0029). |
+| `a2a` | `listen` (`https://host:port`, loopback `http://`, or `unix:///path` for co-located peers — kernel-authenticated, no TLS), `tls{cert,key,client_ca}`, `bearer`, `principals[]`, `peers[]` (endpoints may also be `unix:///path`), `conversation_ttl`. |
 | `webhooks` | `listen`, `tls{}`, `default_auth{}` for `webhook` nodes. |
-| `interface` | The TUI/web-UI surface served on the A2A listener: `enabled`, `origins[]`, `display{}`, `pairing{}`, `debug` (RFC 0032). |
+| `interface` | The TUI/web-UI surface served on the A2A listener: `enabled`, `origins[]`, `display{}`, `pairing{}`, `debug`. |
 | `memory`, `context`, `knowledge`, `search`, `skills` | Working-memory caps, context window/compaction, and the MCP servers backing knowledge, search, and the skill catalogue. |
 | `observability` | `log_level`, `log_content`, `metrics_addr`, `health_file`, `events_ring`, `traceparent`, `report_file`, `otel{}`, `audit{sink}`. |
 | `security` | `allow_trifecta`, `tls_ca`, `cgroup{}`, `aauth{}`, `exec{}`, `workflows{immutable}`. |
 
-**The `store` section, and the default a daemon now gets.** `store.kind` picks
-the adapter: `mcp` (a coordination MCP server's `state.*` tools), `http` (a plain
-HTTP key-value endpoint), `file` (this host's filesystem), `memory` (in-process,
-lost on exit — dev only), `none` (no durable state). Set it and it wins. Leave
-the whole section out and the **shape of the instance** decides (RFC 0033 §5):
+**The `store` section, and the default each instance shape gets.** `store.kind`
+picks the adapter: `mcp` (a coordination MCP server's `state.*` tools), `http` (a
+plain HTTP key-value endpoint), `file` (this host's filesystem), `memory`
+(in-process, lost on exit — dev only), `none` (no durable state). Set it and it
+wins. Leave the whole section out and the **shape of the instance** decides:
 
 | instance shape | default `store.kind` |
 |---|---|
-| one-shot (no long-lived start node, no listener, no `goal`) | `none` — unchanged. A job that quietly began writing state to disk would surprise everyone who runs one. |
-| long-lived (§6) | **`file`** — where it used to be exit `2`. |
+| one-shot (no long-lived start node, no listener, no `goal`) | `none` — a job that quietly began writing state to disk would surprise everyone who runs one, and a crash simply re-runs it. |
+| long-lived (§6) | **`file`** — durability a laptop or a VM already satisfies, with no backend to stand up first. |
 
-That exit `2` was the wrong order of business: the first `schedule` anybody
-wrote refused to start until they had stood up a coordination backend. Durability
-should be what a laptop already satisfies; a shared backend is what you graduate
-to when you have a fleet.
+A shared backend (`mcp` or `http`) is what you graduate to when one instance
+becomes a fleet, because the `file` adapter admits exactly one writer.
 
 ```yaml
 store:
@@ -982,7 +978,7 @@ store:
 ```
 
 **Where the directory comes from**, first that applies — the same chain the
-credential cache uses (RFC 0031 §11), so it is one chain to learn:
+credential cache uses, so it is one chain to learn:
 
 1. `store.file.path`
 2. `$AGENTD_STATE_DIR`
@@ -992,7 +988,7 @@ credential cache uses (RFC 0031 §11), so it is one chain to learn:
    on, and state under `/tmp` survives a restart of the process but not a reboot
 
 Under that root the keys are the ordinary ones — `<prefix>/<instance>/<kind>/<id>`
-(RFC 0025 §3.1) — one JSON file per key, every path segment percent-encoded (so
+— one JSON file per key, every path segment percent-encoded (so
 an id of `../..` is a filename, never a directory hop). Nothing about the key
 changes with the adapter, so an instance that outgrows `file` and moves to `mcp`
 keeps the identity of everything it wrote.
@@ -1092,7 +1088,8 @@ namespace `assign` writes at runtime; these are deployment constants. An
 undefined reference is exit `2`, all misses reported together; there is no
 escape syntax, because a URL still containing `{{config.region}}` at runtime is
 a bug wherever it was headed. Values are plain data, not secrets — credentials
-keep using `{{secret:…}}`, which the credential lint still enforces per §12.3.
+keep using `{{secret:…}}`, and the credential lint of §12.3 still applies to
+them.
 
 A YAML example (`/etc/agentd/config.yaml`):
 
@@ -1142,7 +1139,7 @@ And a JSON one:
 ```jsonc
 // /etc/agentd/config.json — structural config; secrets stay in env / mounted files
 {
-  "config_version": "2",
+  "config_version": "1",
   "agent": { "instruction": "Triage the inbound queue." },
   "intelligence": {
     "endpoints": ["https://primary.internal/v1", "https://fallback.internal/v1"],
@@ -1175,13 +1172,9 @@ For the reloadable-vs-restart-only partition of these fields, see §11.
 ## 13. Running a fleet
 
 There is no `cluster` section, no `--shard` flag, and no per-start `claim` or
-`shard` option. agentd carries **no coordination protocol of its own**.
-
-An earlier version declared all of it — shard identity, work-claim leases, a
-standby pool — and none of it was ever wired to anything. It was removed rather
-than finished, because coordination needs a shared source of truth and agentd
-already talks to two that are better placed to own it: the MCP server the work
-comes from, and the store.
+`shard` option. agentd carries **no coordination protocol of its own**, because
+coordination needs a shared source of truth and agentd already talks to two that
+are better placed to own it: the MCP server the work comes from, and the store.
 
 So a fleet partitions **upstream**: one queue subscription per replica, or a
 coordination server that hands out work and takes it back when a lease expires.
@@ -1221,11 +1214,11 @@ mcp:
     - { name: queue, endpoint: https://mcp-queue.internal/mcp }
     - { name: state, endpoint: https://mcp-state.internal/mcp }
 
-store:                                  # a daemon must be durable (RFC 0025)
+store:                                  # a daemon must be durable
   kind: mcp
   mcp: { server: state }
 
-a2a:                                    # the external channel (RFC 0029)
+a2a:                                    # the external channel
   listen: https://0.0.0.0:8443
   tls: { cert: /tls/cert.pem, key: /tls/key.pem, client_ca: /tls/clients.pem }
   principals:

@@ -1,34 +1,36 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The intelligence endpoint *list* and per-endpoint credentials. RFC 0018 §3.1/§3.2.
+//! The intelligence endpoint *list* and per-endpoint credentials.
 //!
 //! `--intelligence` / `AGENTD_INTELLIGENCE` is an **ordered, comma-separated
-//! list** (`https://gw-a.example,https://gw-b.example`); list order IS failover
-//! priority (`eps[0]` is the primary). Each element is parsed by the HTTPS-only
-//! transport resolver (target-vision pivot; plaintext `http://` is loopback-only
-//! for dev/tests) and resolves its **own** credential by env name (§3.2). A
-//! single-element list is exactly RFC 0006 — the failover/breaker machinery is
-//! inert with one endpoint.
+//! list** (`https://gw-a.example,https://gw-b.example`), and list order IS
+//! failover priority: `eps[0]` is the primary. Each element goes through the
+//! HTTPS-only transport resolver — plaintext `http://` is admitted for loopback
+//! only — and resolves its **own** credential by env name. With a single
+//! element the failover and breaker machinery is inert, so a one-endpoint list
+//! behaves exactly like a plain dial.
 //!
-//! Per-endpoint credential naming (RFC 0014 §6.4 / §3.2): the default
-//! `AGENTD_INTELLIGENCE_TOKEN` (≡ endpoint 1), then `_2`, `_3`, … (1-indexed by
-//! list position). Each has a `…_FILE` variant read through [`crate::sec::secret`]
-//! (the secret-file reader landed in 0017-A). **The list URI carries no key**;
-//! the resolved value is never logged/serialized (the `Secret`-no-`Serialize`
-//! property holds — we hold it as an opaque `String` only in the dialer, never
-//! in a config/manifest).
+//! Per-endpoint credential naming: the default `AGENTD_INTELLIGENCE_TOKEN`
+//! belongs to endpoint 1, then `_2`, `_3`, … 1-indexed by list position. Each
+//! has a `…_FILE` variant read through [`crate::sec::secret`], which is what
+//! makes credential rotation possible without restarting. **The list URI itself
+//! carries no key**: the resolved value is held as an opaque `String` in the
+//! dialer only, never placed in a config or manifest struct, and never logged or
+//! serialized — that is why no `Serialize` impl may ever be added to a type
+//! holding it.
 
 use std::time::Duration;
 
 use super::client::{IntelError, Provider, Transport, resolve};
 use super::health::{BreakerConfig, HealthRecord};
 
-/// The default per-endpoint credential env var (≡ endpoint 1, RFC 0018 §3.2) —
-/// the branded spelling agentd documents/emits.
+/// The default per-endpoint credential env var, belonging to endpoint 1. This is
+/// the branded spelling agentd documents and emits.
 const TOKEN_ENV: &str = "AGENTD_INTELLIGENCE_TOKEN";
 
-/// The neutral (de-branded) credential env var (ACC SPEC L4 / env-convention.json)
-/// accepted as an input alias for [`TOKEN_ENV`]. Credentials path only — the
-/// resolved value is still held opaquely and never logged/serialized (L5).
+/// The neutral, de-branded credential env var accepted as an input alias for
+/// [`TOKEN_ENV`], so a host that standardises on vendor-neutral `AGENT_*` names
+/// needs no agentd-specific variable. It is an input alias only: the resolved
+/// value is still held opaquely and never logged or serialized.
 const TOKEN_ENV_NEUTRAL: &str = "AGENT_INTELLIGENCE_TOKEN";
 
 /// A single resolved endpoint: its transport + the per-request HTTP framing +
@@ -41,29 +43,31 @@ pub struct Endpoint {
     /// The resolved bearer credential for THIS endpoint (never logged/serialized).
     pub(super) token: Option<String>,
     pub(super) provider: Provider,
-    /// Structural transport scheme for the §4.4 resource body (`https`, or
-    /// `http` for the loopback dev carve-out) — never the URL (RFC 0012 §3.7).
+    /// Structural transport scheme reported in the observable resource body:
+    /// `https`, or `http` for the loopback dev carve-out. Never the URL, which
+    /// can carry a credential in its userinfo or path.
     pub(super) scheme: &'static str,
-    /// Structural address for the §4.4 resource body (`host[:port]`) — the host
-    /// only, no secret, no scheme, no path.
+    /// Structural address reported in the observable resource body — `host[:port]`
+    /// only, with no scheme, no path and therefore no secret.
     pub(super) addr: String,
-    /// Extra request headers (RFC 0031): the resolved `intelligence.headers`,
-    /// pushed on every dial. Empty by default (byte-identical legacy path).
+    /// Extra request headers: the resolved `intelligence.headers`, pushed on
+    /// every dial. Empty unless configured.
     pub(super) extra_headers: Vec<(String, String)>,
-    /// An optional per-request signer (RFC 0031): AWS SigV4 over the exact body,
-    /// added on every dial (like `aauth_headers`). `None` = the legacy path.
-    /// Shared across the sticky-primary endpoints of one client.
+    /// An optional per-request signer — AWS SigV4 over the exact body — added on
+    /// every dial alongside the AAuth headers. Shared across every endpoint of
+    /// one client, since the credential is a property of the caller and not of
+    /// the endpoint it happens to reach.
     pub(super) signer: Option<std::sync::Arc<dyn ::mcp::http::RequestSigner>>,
-    /// Live health + circuit breaker (RFC 0018 §4).
+    /// Live health and circuit-breaker state for this endpoint.
     pub health: HealthRecord,
 }
 
-/// The ordered endpoint list with the sticky-primary `active` cursor (§3.3).
+/// The ordered endpoint list with the sticky-primary `active` cursor.
 pub struct EndpointList {
     eps: Vec<Endpoint>,
-    /// The index currently preferred (sticky-primary, §3.3). Plain `usize`
-    /// behind the dialer's `&mut`/single-thread call path — the per-subagent
-    /// `IntelClient` is not shared across threads.
+    /// The index currently preferred. A plain `usize` is sound here because the
+    /// dialer reaches it through a single-threaded `&mut` call path: the
+    /// per-subagent `IntelClient` is never shared across threads.
     active: usize,
     breaker: BreakerConfig,
 }
@@ -75,10 +79,11 @@ fn env(name: &str) -> Option<String> {
 
 impl EndpointList {
     /// Parse the comma-list `uri` into an ordered `EndpointList`, resolving each
-    /// endpoint's credential. The single `default_token` is endpoint 1's value
-    /// when the env override is unset (it is the already-resolved
-    /// `--intelligence-token`/`_FILE`, RFC 0006). Per-endpoint env overrides
-    /// (`AGENTD_INTELLIGENCE_TOKEN_<N>` / `_FILE`) win when present.
+    /// endpoint's credential. `default_token` — the already-resolved
+    /// `--intelligence-token` or its `_FILE` form — supplies endpoint 1's value
+    /// when its env override is unset, and applies to endpoint 1 only.
+    /// Per-endpoint env overrides (`AGENTD_INTELLIGENCE_TOKEN_<N>` / `_FILE`)
+    /// win when present.
     pub fn parse(uri: &str, default_token: Option<String>) -> Result<EndpointList, IntelError> {
         Self::parse_with_env(uri, default_token, &env)
     }
@@ -125,26 +130,27 @@ impl EndpointList {
         })
     }
 
-    /// Apply extra request headers (RFC 0031 `intelligence.headers`) to every
-    /// endpoint. Cheap; called once after construction.
+    /// Apply the configured `intelligence.headers` to every endpoint. Called
+    /// once after construction, before any dial.
     pub fn set_extra_headers(&mut self, headers: Vec<(String, String)>) {
         for e in &mut self.eps {
             e.extra_headers = headers.clone();
         }
     }
 
-    /// Attach a per-request signer (RFC 0031: AWS SigV4) to every endpoint.
+    /// Attach a per-request AWS SigV4 signer to every endpoint in the list.
     pub fn set_signer(&mut self, signer: std::sync::Arc<dyn ::mcp::http::RequestSigner>) {
         for e in &mut self.eps {
             e.signer = Some(signer.clone());
         }
     }
 
-    /// Select the wire dialect for every endpoint (RFC 0031 §8 —
-    /// `intelligence.dialect`). A host-only endpoint resolved its path with the
-    /// OpenAI default, so re-point a still-defaulted path to the new dialect's
-    /// default (Bedrock overrides the path per-request regardless; an explicit
-    /// non-default path is left untouched).
+    /// Select the wire dialect for every endpoint from `intelligence.dialect`.
+    /// A host-only endpoint resolved its path with the OpenAI default before the
+    /// dialect was known, so a still-defaulted path is re-pointed at the chosen
+    /// dialect's default. A path the operator wrote explicitly is left untouched,
+    /// because they may be routing through a gateway mount. Bedrock overrides the
+    /// path per request in any case.
     pub fn set_provider(&mut self, provider: Provider) {
         let default = provider.default_path();
         for e in &mut self.eps {
@@ -179,10 +185,11 @@ impl EndpointList {
         self.eps.iter()
     }
 
-    /// The failover attempt order (§3.3): the **active** index first, then the
+    /// The failover attempt order: the **active** index first, then the
     /// remaining endpoints in ascending list order, skipping any whose breaker is
-    /// OPEN-and-cooling (`available` promotes an elapsed-cooldown endpoint to
-    /// HALF-OPEN so it is probed). An empty result == all endpoints down (§6).
+    /// OPEN and still cooling. `available` promotes an endpoint whose cooldown
+    /// has elapsed to HALF-OPEN, so it is probed here rather than skipped
+    /// forever. An empty result means every endpoint is down.
     pub fn attempt_order(&self) -> Vec<usize> {
         let mut order = Vec::with_capacity(self.eps.len());
         if self.eps[self.active].health.available(&self.breaker) {
@@ -199,10 +206,11 @@ impl EndpointList {
         order
     }
 
-    /// Snap `active` back to the lowest-index endpoint whose breaker is not OPEN
-    /// (sticky-primary, §3.3) — so once the primary re-closes, the next call
-    /// returns to it and a fallback is temporary by construction. Returns the new
-    /// active index if it changed.
+    /// Snap `active` back to the lowest-index endpoint whose breaker is not OPEN.
+    /// This is what makes the primary sticky: once it re-closes, the next call
+    /// returns to it, so serving from a fallback is temporary by construction and
+    /// a list never silently drifts onto its last entry. Returns the new active
+    /// index if it changed.
     pub fn prefer_lowest_healthy(&mut self) -> Option<usize> {
         let target = (0..self.eps.len()).find(|&i| self.eps[i].health.is_up());
         if let Some(t) = target
@@ -225,24 +233,28 @@ impl EndpointList {
         }
     }
 
-    /// True when no endpoint is available — every breaker OPEN-and-cooling (§6).
+    /// True when no endpoint is available, i.e. every breaker is OPEN and still
+    /// cooling.
     pub fn all_down(&self) -> bool {
         self.attempt_order().is_empty()
     }
 
-    /// The active endpoint's bounded structural identity `(index, transport-scheme)`
-    /// for the child→supervisor [`crate::subagent::protocol::AgentMsg::IntelHealth`]
-    /// report — transport + index ONLY, NEVER the URL/cid/host or credential (RFC
-    /// 0012 §3.7, mirroring the §4.4 resource-body redaction).
+    /// The active endpoint's bounded structural identity `(index,
+    /// transport-scheme)` for the child→supervisor
+    /// [`crate::subagent::protocol::AgentMsg::IntelHealth`] report. Transport and
+    /// index ONLY — never the URL, host, cid or credential — matching the
+    /// redaction the served resource body applies, so neither route can leak
+    /// what the other withholds.
     pub fn active_identity(&self) -> (usize, &'static str) {
         (self.active, self.eps[self.active].scheme)
     }
 
-    /// The `agentd://intelligence` resource body (RFC 0018 §4.4): the endpoint
-    /// list (transport + index, NEVER the URL/creds), which is active, and each
-    /// one's health (state/latency/error-rate). No secret, no URL (RFC 0012
-    /// §3.7) — only the bounded structural `transport`+`addr` (cid:port / host,
-    /// no scheme-borne secret) and the live atomics.
+    /// The `agentd://intelligence` resource body: the endpoint list by transport
+    /// and index, which one is active, and each one's health — state, latency
+    /// and error rate. It must contain no secret and no URL: only the bounded
+    /// structural `transport` and `addr` (a bare `host[:port]`, which cannot
+    /// carry a scheme-borne credential) plus the live health atomics. Anything
+    /// added here becomes readable by every holder of the resource.
     pub fn body(&self, model: Option<&str>) -> serde_json::Value {
         use serde_json::json;
         let cfg = &self.breaker;
@@ -289,20 +301,21 @@ impl EndpointList {
     }
 }
 
-/// Resolve endpoint `idx` (0-based)'s credential. The per-endpoint env override
-/// is 1-indexed: endpoint 0 → `AGENTD_INTELLIGENCE_TOKEN` (or the
-/// already-resolved default), endpoint 1 → `AGENTD_INTELLIGENCE_TOKEN_2`, etc.
-/// A `…_FILE` variant is read through the secret-file reader (rotation-friendly,
-/// 0017-A). The override wins over the default; absent ⇒ no token for that
-/// endpoint (a public/unauthenticated gateway is legal).
+/// Resolve endpoint `idx`'s credential. `idx` is 0-based but the env override is
+/// 1-indexed: endpoint 0 reads `AGENTD_INTELLIGENCE_TOKEN` or falls back to the
+/// already-resolved default, endpoint 1 reads `AGENTD_INTELLIGENCE_TOKEN_2`, and
+/// so on. A `…_FILE` variant is read through the secret-file reader, which is
+/// what allows the credential to be rotated on disk. An env override wins over
+/// the default. Absence is not an error: an endpoint with no token dials
+/// unauthenticated, which a public gateway legitimately allows.
 fn resolve_token(
     idx: usize,
     default_token: Option<&str>,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<Option<String>, IntelError> {
     // Endpoint 1 (idx 0) uses the bare names; later endpoints are 1-indexed
-    // (`_2`, `_3`, …). Each branded `AGENTD_*` name has a neutral `AGENT_*` alias
-    // (ACC SPEC L4) accepted on input — branded never dropped.
+    // (`_2`, `_3`, …). Each branded `AGENTD_*` name has a neutral `AGENT_*`
+    // alias accepted on input; the branded spelling is always still honoured.
     let (inline_var, file_var, inline_var_n, file_var_n) = if idx == 0 {
         (
             TOKEN_ENV.to_string(),
@@ -335,10 +348,11 @@ fn resolve_token(
     Ok(None)
 }
 
-/// The structural `(scheme, addr)` for the §4.4 resource body — the bounded
-/// transport identity only, never the URL path or any secret (RFC 0012 §3.7).
-/// HTTPS-only (pivot Phase 1): `http` appears only for the loopback dev
-/// carve-out; [`resolve`](super::client) already rejected everything else.
+/// The structural `(scheme, addr)` published in the observable resource body:
+/// the bounded transport identity only, never the URL path or any secret.
+/// `http` appears only for the loopback dev carve-out, because
+/// [`resolve`](super::client) has already rejected every other non-HTTPS form
+/// before an endpoint reaches here.
 fn scheme_and_addr(uri: &str) -> (&'static str, String) {
     if let Some(rest) = uri.strip_prefix("https://") {
         ("https", host_only(rest))
@@ -372,13 +386,13 @@ fn wire_tool_name(name: &str) -> String {
 }
 
 impl Endpoint {
-    /// AAuth (RFC 0023; agentctl RFC 0024 §7.1 — the modelgateway inbound
-    /// posture): when a process AAuth identity is installed, **sign the
-    /// intelligence dial** (RFC 9421) so the gateway can attest the agent by
-    /// signature instead of source IP. Additive and identity-cover only — a
-    /// non-AAuth endpoint ignores the headers, and the bearer (if any) still
-    /// rides alongside. Empty without `--features aauth` or with no identity
-    /// configured, so the default path is byte-identical to before.
+    /// When a process AAuth identity is installed, sign the intelligence dial
+    /// with an RFC 9421 HTTP message signature so the gateway can attest the agent by
+    /// signature rather than by source IP. The headers only add identity cover:
+    /// a gateway that does not understand them ignores them, and the bearer
+    /// token, if any, still rides alongside. Returns empty without
+    /// `--features aauth` or with no identity configured, so an unsigned dial is
+    /// the no-identity default rather than a failure.
     #[cfg(feature = "aauth")]
     fn aauth_headers(&self, method: &str, path: &str, body: &[u8]) -> Vec<(String, String)> {
         match crate::aauth::signer() {
@@ -391,10 +405,11 @@ impl Endpoint {
         Vec::new()
     }
 
-    /// Build the request body + headers for this endpoint's dialect, then dial +
-    /// round-trip exactly as RFC 0006 (`complete_once`). Returns the parsed
-    /// response and the round-trip latency. The wire/adapter/JSON path is
-    /// UNCHANGED (§3.4) — only endpoint *selection* wraps it.
+    /// Build the request body and headers for this endpoint's dialect, then dial
+    /// and round-trip once. Returns the parsed response and the measured
+    /// round-trip latency, which the caller feeds into this endpoint's health
+    /// record. Endpoint selection happens above this call; nothing here consults
+    /// the list or the breaker.
     pub(super) fn complete_once(
         &self,
         req: &crate::wire::intel::Request,
@@ -454,10 +469,11 @@ impl Endpoint {
             Provider::Anthropic => anthropic::build_request(req, self.token.as_deref()),
             Provider::Bedrock => bedrock::build_request(req, self.token.as_deref()),
         };
-        // The effective request path (RFC 0031 §8): fixed for OpenAI/Anthropic;
-        // Bedrock derives `/model/{modelId}/converse` from the request. The SAME
-        // string is sent on the wire AND fed to the AAuth/SigV4 signers below, so
-        // the signature covers the exact request-target.
+        // The effective request path: fixed for OpenAI and Anthropic; Bedrock
+        // derives `/model/{modelId}/converse` from the request. The SAME string
+        // is sent on the wire AND fed to the AAuth/SigV4 signers below, so the
+        // signature covers the exact request-target. Recomputing it separately
+        // for either use would silently invalidate every signature.
         let path = self.provider.request_path(&self.http_path, req);
         if let Some(tid) = trace_id {
             headers.push((
@@ -465,9 +481,10 @@ impl Endpoint {
                 crate::obs::trace::outbound_traceparent(tid),
             ));
         }
-        // RFC 0031: the configured `intelligence.headers` ride every dial (e.g.
-        // a gateway routing header). Pushed before AAuth so a signature covers a
-        // stable header set; a header already set by the dialect is not removed.
+        // The configured `intelligence.headers` ride every dial — a gateway
+        // routing header, for instance. Pushed BEFORE the AAuth headers so the
+        // signature covers a header set that is already final; a header the
+        // dialect set is not removed.
         for (k, v) in &self.extra_headers {
             headers.push((k.clone(), v.clone()));
         }
@@ -476,9 +493,10 @@ impl Endpoint {
         for (k, v) in self.aauth_headers("POST", &path, &body) {
             headers.push((k, v));
         }
-        // RFC 0031: an AWS SigV4 signature over the exact body, when an `aws`
-        // intelligence auth is configured (native Bedrock, or a Bedrock/API-Gateway
-        // LLM endpoint). Signed over `path` — the dynamic Bedrock target included.
+        // An AWS SigV4 signature over the exact body, present when an `aws`
+        // intelligence auth is configured — native Bedrock, or a Bedrock or
+        // API-Gateway-fronted endpoint. Signed over `path`, so the dynamic
+        // Bedrock target is inside the signature rather than appended after it.
         if let Some(signer) = &self.signer {
             for (k, v) in signer.sign("POST", &self.host_header, &path, &body) {
                 headers.push((k, v));
@@ -489,15 +507,16 @@ impl Endpoint {
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
 
-        // Same-endpoint transient retry (RFC 0006 §7: every dial is fresh, so a
-        // re-dial is safe). A 429/5xx is often a momentary provider blip; retry it
-        // a bounded number of times with short backoff BEFORE the error escapes to
-        // failover (across endpoints) or — in `once` mode, which arms no
-        // higher-level retry loop — straight to exit 4. A non-transient 4xx (bad
-        // request, auth) is a caller error, identical on a re-dial, so it surfaces
-        // immediately; retrying it would only burn the run deadline. The body +
-        // headers (incl. the AAuth signature over the body) are already built and
-        // unchanged across attempts, so re-dialing re-sends the same bytes.
+        // Same-endpoint transient retry. Every dial opens a fresh connection, so
+        // a re-dial is safe. A 429 or 5xx is usually a momentary provider blip,
+        // so it is retried a bounded number of times with short backoff BEFORE
+        // the error escapes to cross-endpoint failover — or, in `once` mode
+        // which arms no higher-level retry loop, straight to exit 4. A
+        // non-transient 4xx (bad request, auth) is a caller error that would be
+        // identical on a re-dial, so it surfaces immediately rather than burning
+        // the run deadline. The body and headers, including the AAuth signature
+        // over that body, are built once above and unchanged across attempts, so
+        // every re-dial sends byte-identical bytes and the signature stays valid.
         const TRANSIENT_RETRIES: u32 = 2;
         let mut attempt: u32 = 0;
         let (resp, latency) = loop {
@@ -543,23 +562,27 @@ impl Endpoint {
         Ok((parsed, latency))
     }
 
-    /// RFC 0018 §5.4 model-discovery probe: one hand-rolled HTTP **GET** to the
-    /// `/v1/models` sibling of this endpoint's chat path, over the SAME transport
-    /// (tcp+tls) + the SAME bearer auth the chat call uses — no new client, no
-    /// streaming. Returns the discovered model `id`s.
+    /// Model-discovery probe: one hand-rolled HTTP **GET** to the `/v1/models`
+    /// sibling of this endpoint's chat path, over the SAME transport and the
+    /// SAME bearer auth the chat call uses — no second client, no streaming.
+    /// Returns the discovered model `id`s.
     ///
-    /// **Best-effort, silent-degrade (§5.4):** the `anthropic` dialect has no list
-    /// endpoint → `vec![]`; for OpenAI-compatible, a connection/transport failure,
-    /// a non-2xx (e.g. 404 — discovery unsupported), or a non-JSON/unexpected body
-    /// all yield `vec![]`. NEVER a failover-class error, NEVER fatal — the endpoint
-    /// is fully usable with discovery unsupported (the configured model is dialed
-    /// regardless). The caller bounds it with a SHORT timeout (off the hot path).
+    /// **Best-effort with silent degrade.** The `anthropic` dialect has no list
+    /// endpoint and returns `vec![]`. For an OpenAI-compatible endpoint, a
+    /// connection or transport failure, a non-2xx status (a 404 simply means
+    /// discovery is unsupported), or a body that is not the expected JSON all
+    /// yield `vec![]` too. None of these is a failover-class error and none is
+    /// fatal: the endpoint stays fully usable without discovery, since the
+    /// configured model is dialed regardless. Recording a probe failure against
+    /// the endpoint's health would let an optional feature open a breaker on a
+    /// perfectly healthy provider, which is why nothing here touches health. The
+    /// caller bounds this with a short timeout.
     pub(super) fn discover_models(&self, timeout: Duration) -> Vec<String> {
         use super::openai;
         use crate::net::http;
 
-        // Dialect detection is already known from the provider (§5.4 — reuse, don't
-        // re-detect). Anthropic has no list endpoint.
+        // The dialect is already settled by the configured provider, so there is
+        // nothing to sniff here. Anthropic has no list endpoint.
         if self.provider != Provider::OpenAiCompatible {
             return Vec::new();
         }
@@ -608,8 +631,9 @@ mod tests {
 
     #[test]
     fn extra_headers_apply_to_every_endpoint() {
-        // RFC 0031: `intelligence.headers` (and a device-login bearer) reach the
-        // wire via `set_extra_headers`, applied to all failover endpoints.
+        // `intelligence.headers` (and a device-login bearer) reach the wire via
+        // `set_extra_headers`, applied to every failover endpoint, not just the
+        // primary.
         let mut list = EndpointList::parse(
             "https://a.example/v1,https://b.example/v1",
             Some("tok".into()),
@@ -692,7 +716,7 @@ mod tests {
         let env = env_of(&[]);
         let r = EndpointList::parse_with_env("https://a.example,ftp://nope", None, &env);
         assert!(matches!(r, Err(IntelError::Unsupported(_))));
-        // The retired transports are rejected at the same chokepoint.
+        // Non-HTTPS transports are rejected at the same chokepoint.
         for uri in ["unix:/a", "vsock:3:8080", "http://not-loopback.example"] {
             let r = EndpointList::parse_with_env(uri, None, &env);
             assert!(matches!(r, Err(IntelError::Unsupported(_))), "{uri}");
@@ -736,8 +760,8 @@ mod tests {
 
     #[test]
     fn neutral_token_env_is_accepted_as_an_alias() {
-        // ACC SPEC L4: the neutral `AGENT_INTELLIGENCE_TOKEN[_N]` spelling is
-        // accepted on input (endpoint 1 bare; later endpoints 1-indexed).
+        // The neutral `AGENT_INTELLIGENCE_TOKEN[_N]` spelling is accepted on
+        // input (endpoint 1 bare; later endpoints 1-indexed).
         let env = env_of(&[
             ("AGENT_INTELLIGENCE_TOKEN", "neutral-a"),
             ("AGENT_INTELLIGENCE_TOKEN_2", "neutral-b"),
@@ -750,8 +774,8 @@ mod tests {
 
     #[test]
     fn branded_token_env_wins_over_neutral_on_conflict() {
-        // Both spellings set ⇒ neutral-first is read; the branded form is still
-        // accepted when the neutral one is absent (alias, never dropped).
+        // Both spellings set: the neutral name is read first. The branded form
+        // is still honoured whenever the neutral one is absent.
         let env = env_of(&[
             ("AGENT_INTELLIGENCE_TOKEN", "neutral"),
             ("AGENTD_INTELLIGENCE_TOKEN", "branded"),
@@ -759,7 +783,7 @@ mod tests {
         let list = EndpointList::parse_with_env("https://a.example", None, &env).unwrap();
         assert_eq!(list.ep(0).token.as_deref(), Some("neutral"));
 
-        // Branded-only still resolves (back-compat).
+        // The branded name alone resolves when no neutral one is set.
         let env = env_of(&[("AGENTD_INTELLIGENCE_TOKEN", "branded")]);
         let list = EndpointList::parse_with_env("https://a.example", None, &env).unwrap();
         assert_eq!(list.ep(0).token.as_deref(), Some("branded"));
@@ -779,11 +803,11 @@ mod tests {
     }
 
     #[test]
-    fn single_element_list_is_rfc_0006() {
+    fn single_element_list_has_inert_failover() {
         let env = env_of(&[]);
         let list = EndpointList::parse_with_env("https://intel.example", None, &env).unwrap();
         assert_eq!(list.len(), 1);
-        // the failover machinery is inert: attempt order is just [0].
+        // The failover machinery is inert: attempt order is just [0].
         assert_eq!(list.attempt_order(), vec![0]);
         assert!(!list.all_down());
     }
@@ -839,7 +863,8 @@ mod tests {
         assert_eq!(body["endpoints"][0]["ewma_latency_ms"], 41);
         assert_eq!(body["endpoints"][1]["state"], "open");
         assert_eq!(body["endpoints"][1]["last_err"], "refused");
-        // RFC 0012 §3.7: NEVER the token, NEVER a full URL (scheme prefix or path)
+        // The body must carry neither the token nor a full URL (no scheme
+        // prefix, no path).
         assert!(!text.contains("super-secret-tok"), "token leaked: {text}");
         assert!(!text.contains("https://"), "full URI leaked: {text}");
         assert!(!text.contains("secret-path"), "URL path leaked: {text}");

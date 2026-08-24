@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! RFC 0031 §8 (deferred follow-up): **outbound A2A SigV4**. A peer with
-//! `auth: { kind: aws }` is dialed with a per-request SigV4 signature over the
-//! exact JSON-RPC body — so an AWS-IAM-gated peer authenticates the caller by
-//! signature, not a bearer. The mock peer captures the request head and we assert
-//! the `Authorization: AWS4-HMAC-SHA256 …` + `X-Amz-Date`. [features: a2a, oauth]
+//! **Outbound A2A SigV4**: a peer with `auth: { kind: aws }` is dialed with a
+//! per-request SigV4 signature over the exact JSON-RPC body — so an
+//! AWS-IAM-gated peer authenticates the caller by signature, not a bearer. The
+//! mock peer captures the request head and we assert the
+//! `Authorization: AWS4-HMAC-SHA256 …` + `X-Amz-Date`. [features: a2a, oauth]
 #![cfg(all(feature = "a2a", feature = "oauth"))]
 
 use std::io::{BufRead, BufReader, Read, Write};

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The inbound **webhook** surface (RFC 0027). A dedicated HTTP listener turns a
+//! The inbound **webhook** surface. A dedicated HTTP listener turns a
 //! signed request into a workflow run: each `webhook` start node registers a
 //! route (`path`, `methods`, per-node `auth`, `parallelism`, `on_overflow`,
 //! `idempotency`), and an inbound request is

@@ -239,8 +239,8 @@ written in YAML you can diff.
   its own" buys.
 - [Workflows](workflows.md) and the [node registry](node-registry.md) — the
   full vocabulary the configs draw from.
-- [Events and streams](workflows.md) with [RFC 0035](/rfcs/0035) — the
-  durable event fabric the institutional memory rides on.
+- [Events and streams](workflows.md) — the durable event fabric the
+  institutional memory rides on.
 - [The hiring example](https://github.com/agentd-dev/source-code/tree/main/examples/hiring)
   — the same trifecta discipline at two instances instead of eleven, with
   mTLS between them.

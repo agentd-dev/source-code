@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! AAuth discovery (RFC 0023 §Step 3 + §7.1 G1): fetch a party's well-known
+//! AAuth discovery: fetch a party's well-known
 //! metadata document (AAuth protocol §12.10). Resource discovery
 //! (`/.well-known/aauth-resource.json`) learns a server's `access_mode` /
 //! `content-digest` requirement; Agent-Provider discovery
@@ -77,8 +77,8 @@ pub struct ProviderMeta {
     pub name: Option<String>,
 }
 
-/// Fetch + validate the Agent-Provider metadata document for `base_url` (RFC 0023
-/// §7.1 G1, protocol §12.10.1). Returns:
+/// Fetch + validate the Agent-Provider metadata document for `base_url`
+/// (protocol §12.10.1). Returns:
 ///   * `Ok(Some(meta))` — a document was served and its `issuer` matches (or it
 ///     carried no `issuer` to check);
 ///   * `Ok(None)` — no document / unreachable / unparseable (best-effort: the AP

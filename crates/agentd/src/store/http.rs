@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The **HTTP store** (RFC 0025 §4.2): the four operations as plain HTTP
+//! The **HTTP store**: the four store operations as plain HTTP
 //! requests built from `store.http.{get,put,list,delete}` templates —
 //! `GET/PUT/POST/DELETE {url}` with an optional JSON `body`, extraction from
 //! `body`/`status`/`headers`. HTTPS (loopback `http://` for dev), headers may

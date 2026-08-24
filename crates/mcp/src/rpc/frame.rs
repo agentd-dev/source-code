@@ -1,17 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Two framings over a byte stream, sharing the JSON-RPC codec in the parent
-//! module (`crate::json`).
+//! module ([`crate::rpc`]).
 //!
 //! - **NDJSON** (`read_line` / `write_line`): one JSON value per line,
-//!   no embedded newlines. The MCP stdio transport framing (RFC 0004).
+//!   no embedded newlines. The MCP stdio transport framing.
 //! - **Length-prefix** (`read_frame` / `write_frame`): a 4-byte big-endian
 //!   length followed by that many payload bytes. The private supervisor↔
-//!   subagent control channel (RFC 0005) — robust to payloads (instructions,
-//!   context seeds, distilled results) that legitimately contain newlines.
+//!   subagent control channel — robust to payloads (instructions, context
+//!   seeds, distilled results) that legitimately contain newlines.
 //!
 //! Both are generic over `Read`/`Write` so they drop onto pipes, unix
-//! sockets, TLS streams, and vsock alike. Lifted/adapted from the retired
-//! `intelligence/protocol.rs` length-framing (salvage list, PLAN.md).
+//! sockets, TLS streams, and vsock alike.
 
 use std::io::{self, BufRead, Read, Write};
 

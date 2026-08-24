@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! **The A2A wire, built from the specification's own types.**
 //!
-//! agentd used to hand-write this JSON, and the failures that produced were all
-//! silent: the wire is proto3 JSON, so `"agent"` where `ROLE_AGENT` belongs, or
-//! epoch milliseconds where a `google.protobuf.Timestamp` belongs, is valid JSON
-//! that a peer's generated types simply refuse — in the peer, in production,
-//! with no error we would ever see.
+//! Hand-writing this JSON fails silently. The wire is proto3 JSON, so `"agent"`
+//! where `ROLE_AGENT` belongs, or epoch milliseconds where a
+//! `google.protobuf.Timestamp` belongs, is valid JSON that a peer's generated
+//! types simply refuse — in the peer, in production, with no error agentd would
+//! ever see.
 //!
 //! So nothing here writes JSON. Every projection constructs an [`a2a_rs`] domain
 //! type — the same types a peer deserializes into, generated from the spec's

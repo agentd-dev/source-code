@@ -93,7 +93,8 @@ fn extend_with_extra_ca(roots: &mut RootCertStore) {
 pub type ServerTlsStream = StreamOwned<ServerConnection, TcpStream>;
 
 /// A resolved client identity for mutual TLS: a cert chain + private key, parsed
-/// from mounted PEM (never inline; RFC 0012 §3.7 secret-freedom).
+/// from mounted PEM. Key material is always read from a file, never inlined in
+/// configuration, so it cannot leak through a config dump or a rendered template.
 #[derive(Clone)]
 pub struct ClientIdentity {
     certs: Vec<CertificateDer<'static>>,
@@ -101,7 +102,8 @@ pub struct ClientIdentity {
 }
 
 impl std::fmt::Debug for ClientIdentity {
-    /// Never prints the private key (RFC 0012 §3.7 secret-freedom).
+    /// Renders the key as `<redacted>`: a `Debug` of this type reaches logs and
+    /// error reports, so the key must never be formattable.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -230,14 +232,16 @@ fn roots_from_pem(ca_pem: &[u8]) -> io::Result<RootCertStore> {
 }
 
 /// A server identity: the certificate chain + private key this listener
-/// presents, parsed from mounted PEM (never inline — RFC 0012 §3.7).
+/// presents, parsed from mounted PEM. Key material is always read from a file,
+/// never inlined in configuration.
 pub struct ServerIdentity {
     certs: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
 }
 
 impl std::fmt::Debug for ServerIdentity {
-    /// Never prints the private key (RFC 0012 §3.7 secret-freedom).
+    /// Renders the key as `<redacted>`: a `Debug` of this type reaches logs and
+    /// error reports, so the key must never be formattable.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -315,7 +319,8 @@ struct ReloadState {
 }
 
 impl std::fmt::Debug for TlsAcceptor {
-    /// Structural only — never key material (RFC 0012 §3.7).
+    /// Structural only — the loaded certificates and key are never formatted,
+    /// so a `Debug` of the acceptor is safe to log.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -525,10 +530,10 @@ pub fn peer_presented_cert(stream: &ServerTlsStream) -> bool {
 }
 
 /// The **verified** peer's identity fields (subject CN + SANs) from its mTLS leaf
-/// certificate, for surfacing to principal matching (RFC 0029 §10.3). `None` when
-/// no client cert was presented; rustls has already verified the chain, so this
-/// only *reads* fields (see [`crate::x509`]). A SPIFFE X.509-SVID's `spiffe://…`
-/// arrives as a URI SAN.
+/// certificate, so a policy can match the caller to a named principal. `None`
+/// when no client cert was presented; rustls has already verified the chain, so
+/// this only *reads* fields (see [`crate::x509`]) and the values are safe to
+/// compare against. A SPIFFE X.509-SVID's `spiffe://…` arrives as a URI SAN.
 pub fn peer_identity(stream: &ServerTlsStream) -> Option<crate::x509::PeerIdentity> {
     let certs = stream.conn.peer_certificates()?;
     let leaf = certs.first()?;

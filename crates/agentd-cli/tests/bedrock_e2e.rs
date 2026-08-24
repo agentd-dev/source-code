@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! RFC 0031 §8: **native Amazon Bedrock**. An `intelligence.dialect: bedrock`
-//! client dials the mock Bedrock runtime end-to-end and we assert the full
-//! contract:
+//! **Native Amazon Bedrock**: an `intelligence.dialect: bedrock` client dials
+//! the mock Bedrock runtime end-to-end and we assert the full contract:
 //!   * the request-target is the dynamic `/model/{modelId}/converse` with the
 //!     model id URI-encoded (`:` → `%3A`) — the SAME string that is SigV4-signed;
 //!   * the request is SigV4-signed (`Authorization: AWS4-HMAC-SHA256 …`), not a

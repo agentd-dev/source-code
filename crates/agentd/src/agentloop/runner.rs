@@ -1,18 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The ReAct agentic loop. RFC 0007.
+//! The ReAct agentic loop.
 //!
 //! A turn: assemble the request (system + instruction + transcript + the
 //! scoped tool catalogue) → call intelligence → if the model requested tools,
 //! run them via MCP and feed the results back as observations; otherwise the
 //! text is the final answer. Stopping is a disjunction of cheap checks, each
-//! with a distinct [`TerminalStatus`] (RFC 0007 §3.4); the loop enforces the
-//! step/token/deadline budget. `stalled`/`loop_detected` detectors and context
-//! compaction are deferred (v2); the `Stalled`/`LoopDetected` statuses are
-//! defined but not yet produced.
+//! with a distinct [`TerminalStatus`], and the loop enforces the
+//! step/token/deadline budget itself rather than trusting the model to stop.
+//! This loop produces neither `Stalled` nor `LoopDetected`: it has no
+//! no-progress or repeated-tool detector, so a spinning agent is bounded by the
+//! step and token budget instead.
 //!
-//! The root agent runs as a subagent process behind the control channel
-//! (spawned by `main::run_once` via `supervise_once`); the loop body here is
-//! identical whether driven by the root or a nested child.
+//! The root agent runs as a subagent process behind the control channel; the
+//! loop body here is identical whether driven by the root or a nested child, so
+//! there is one code path to reason about regardless of tree position.
 
 use crate::agentloop::action::{SelfHandler, ToolClass};
 use crate::agentloop::stop::{Outcome, TerminalStatus};
@@ -37,9 +38,10 @@ instruction by calling the available tools and reasoning over their results. Cal
 need information or need to act. When the task is complete, reply with your final answer and do \
 NOT call a tool. If the task cannot be done, say so plainly. Be concise and factual.";
 
-/// A fatal infrastructure failure that aborts the run (mapped to exit 4 / 6 by
-/// the caller, RFC 0011). Tool-domain errors are *not* aborts — they are fed
-/// back to the model as observations.
+/// A fatal infrastructure failure that aborts the run; the caller maps it to
+/// exit 4 or 6. Tool-domain errors are *not* aborts — a tool that returns an
+/// error is fed back to the model as an observation so it can adapt, because
+/// only the infrastructure being gone makes further progress impossible.
 #[derive(Debug)]
 pub enum LoopAbort {
     /// The intelligence endpoint is unreachable / erroring (exit 4).
@@ -80,8 +82,8 @@ pub struct LoopInput {
 /// resource-awareness map, and the **conversation transcript** — everything that
 /// persists *across turns*. A once-mode / per-event run is a session of exactly
 /// one turn ([`run_loop`]); a **warm** continue-session runs many turns over the
-/// same transcript (RFC 0008 §spawn-vs-continue), each new event appended via
-/// [`Session::deliver`] before another [`Session::run_turn`].
+/// same transcript, each new event appended via [`Session::deliver`] before
+/// another [`Session::run_turn`].
 pub struct Session<'a> {
     servers: &'a [McpClient],
     tools: Vec<ToolDef>,
@@ -89,9 +91,9 @@ pub struct Session<'a> {
     resources: ResourceCatalogue,
     model: String,
     messages: Vec<Message>,
-    /// The narrowed tool GRANTS this session runs under (RFC 0009 — a parent's
+    /// The narrowed tool GRANTS this session runs under: a parent's
     /// `subagent.run` `tools:` list, carried on the seed under
-    /// [`ALLOWED_TOOLS_ROLE`]). Each element is one grant's pattern list, and a
+    /// [`ALLOWED_TOOLS_ROLE`]. Each element is one grant's pattern list, and a
     /// tool must satisfy EVERY grant: a grant only ever narrows, so intersecting
     /// is the only safe way to combine two. Empty = ungranted = the full
     /// catalogue (a root / embedded run, which is nobody's subagent).
@@ -99,11 +101,12 @@ pub struct Session<'a> {
 }
 
 impl<'a> Session<'a> {
-    /// Assemble a session: the tool catalogue (MCP tools + self-tools +
-    /// `resource.read` when resources exist; resources: list = awareness,
-    /// read = on-demand attention, RFC 0007 §resources), the resource awareness
-    /// note, and the opening transcript (system prompt + seed + the instruction
-    /// as the first user turn).
+    /// Assemble a session: the tool catalogue (MCP tools + self-tools, plus
+    /// `resource.read` when resources exist), the resource awareness note, and
+    /// the opening transcript (system prompt + seed + the instruction as the
+    /// first user turn). Resources are split deliberately: listing them makes
+    /// the model aware of what exists, while reading one is an explicit tool
+    /// call, so a large resource enters the context only when actually wanted.
     pub fn prepare(
         servers: &'a [McpClient],
         input: &LoopInput,
@@ -111,9 +114,10 @@ impl<'a> Session<'a> {
     ) -> Result<Session<'a>, LoopAbort> {
         let allowed = seed_grants(&input.seed);
         let (mut tools, mut tool_to_server) = build_catalogue(servers)?;
-        // CODE-REGISTERED tools (RFC 0022 §4): first-party wins a name
-        // collision — drop the MCP entry so the catalogue offers ONE def per
-        // name and it is the one the dispatch will actually run.
+        // CODE-REGISTERED tools win a name collision: drop the MCP entry so the
+        // catalogue offers ONE def per name, and it is the one dispatch will
+        // actually run. Otherwise the model would be shown a schema it is not
+        // calling, and a server could shadow a first-party tool.
         let code = crate::tools::defs();
         if !code.is_empty() {
             tools.retain(|t| !crate::tools::is_registered(&t.name));
@@ -128,9 +132,9 @@ impl<'a> Session<'a> {
         }
         // The parent's narrowed grant lands LAST, over the whole assembled
         // catalogue (MCP + code + self-tools + `resource.read`) and over the
-        // routing map that governs dispatch — RFC 0009 scope narrows
-        // monotonically, so a grant of `["a"]` means `a` and nothing else, not
-        // "a, plus everything agentd merged in afterwards".
+        // routing map that governs dispatch. Scope narrows monotonically, so a
+        // grant of `["a"]` must mean `a` and nothing else — not "a, plus
+        // everything merged in after the grant was applied".
         narrow_catalogue(&allowed, &mut tools, &mut tool_to_server);
         let mut messages = vec![Message::system(system_prompt(
             input.output_contract.as_deref(),
@@ -159,15 +163,14 @@ impl<'a> Session<'a> {
     }
 
     /// Rebuild the MCP side of the tool catalogue from the servers' CURRENT
-    /// `tools/list` (the warm-session LIVE refresh, pivot Phase 7 follow-up):
-    /// called at a turn boundary after an inbound
+    /// `tools/list`. Called at a turn boundary after an inbound
     /// `notifications/tools/list_changed`, so a long-lived continue-session
     /// tracks a server whose tool set changed instead of holding a stale
     /// catalogue for its whole life. Self-tools and `resource.read` are
-    /// re-merged; the transcript is untouched.
+    /// re-merged and the transcript is untouched, so a refresh costs no context.
     pub fn refresh_tools(&mut self, self_handler: &mut dyn SelfHandler) -> Result<(), LoopAbort> {
         let (mut tools, mut tool_to_server) = build_catalogue(self.servers)?;
-        // Same code-tool precedence as `prepare` (RFC 0022 §4).
+        // Same code-tool precedence as `prepare`: first-party wins the name.
         let code = crate::tools::defs();
         if !code.is_empty() {
             tools.retain(|t| !crate::tools::is_registered(&t.name));
@@ -178,8 +181,9 @@ impl<'a> Session<'a> {
             tools.push(resource_read_tool_def());
         }
         // Re-narrow: a server that ADDS a tool mid-session must not widen a
-        // grant the parent already bounded (the refresh is a live catalogue
-        // rebuild, not a re-grant).
+        // grant the parent already bounded. A refresh rebuilds the catalogue; it
+        // is never a re-grant, so the child's scope can only stay the same or
+        // shrink across one.
         narrow_catalogue(&self.allowed, &mut tools, &mut tool_to_server);
         self.tools = tools;
         self.tool_to_server = tool_to_server;
@@ -191,22 +195,23 @@ impl<'a> Session<'a> {
         self.tools.len()
     }
 
-    /// Classify a catalogue tool by its seam (pivot Phase 5.1 — name the class): a
-    /// name routed to an MCP server is [`ToolClass::Mcp`] (dispatched back to that
-    /// server); every other catalogue entry is agentd's own
-    /// [`ToolClass::SelfControl`] surface (the self-tools + `resource.read`). The
-    /// routing map IS the MCP-tool set — the two classes are assembled by different
-    /// code paths ([`build_catalogue`] vs the [`SelfHandler`] merge) — so this is
-    /// the authoritative, testable boundary between "tools from a registered server"
-    /// and "agentd's own orchestration primitives". Callers pass a name from
-    /// [`Session::tools`]; a name absent from the catalogue still classifies as
-    /// `SelfControl` (it is, by definition, not a routed server tool), so classify
-    /// only names drawn from the catalogue.
+    /// Classify a catalogue tool by its seam: a name routed to an MCP server is
+    /// [`ToolClass::Mcp`], dispatched back to that server; every other catalogue
+    /// entry is agentd's own [`ToolClass::SelfControl`] surface — the self-tools
+    /// plus `resource.read`. The routing map IS the MCP-tool set, and the two
+    /// classes are assembled by different code paths ([`build_catalogue`] versus
+    /// the [`SelfHandler`] merge), which makes this an authoritative and testable
+    /// boundary between "tools from a registered server" and "agentd's own
+    /// orchestration primitives".
+    ///
+    /// Callers must pass a name drawn from [`Session::tools`]: a name absent from
+    /// the catalogue classifies as `SelfControl`, since it is by definition not a
+    /// routed server tool, so classifying an arbitrary string is meaningless.
     pub fn tool_class(&self, name: &str) -> ToolClass {
         // A code-registered name classifies `Code` even when an MCP server
-        // publishes the same name — matching the dispatch (code wins; a remote
-        // server cannot steal a registered tool's calls). Registration refuses
-        // self/control names, so `Code` never claims that class.
+        // publishes the same name, matching what dispatch does: code wins, so a
+        // remote server cannot steal a registered tool's calls. Registration
+        // refuses self/control names, so `Code` never claims that class.
         if crate::tools::is_registered(name) {
             ToolClass::Code
         } else if self.tool_to_server.contains_key(name) {
@@ -216,49 +221,51 @@ impl<'a> Session<'a> {
         }
     }
 
-    /// Whether this session's GRANT admits `name` (RFC 0009). Every grant must
-    /// admit it; an ungranted session (no parent narrowing) admits everything.
-    /// The catalogue is already filtered, so this is the second gate: it exists
-    /// for the model that names a tool anyway — hallucinated, or remembered from
-    /// a transcript written before a `refresh_tools` narrowed the set.
+    /// Whether this session's GRANT admits `name`. Every grant must admit it; an
+    /// ungranted session — one with no parent narrowing — admits everything.
+    /// The catalogue is already filtered, so this is a second gate at dispatch
+    /// time, for the model that names a tool anyway: a hallucinated name, or one
+    /// remembered from a transcript written when the catalogue was wider.
     pub fn tool_permitted(&self, name: &str) -> bool {
         grant_permits(&self.allowed, name)
     }
 
     /// Append the next event as a new user turn — the delivery point for a warm
-    /// continue-session (RFC 0008). The transcript (the model's memory of the
-    /// session) carries forward, so the next turn continues the conversation.
+    /// continue-session. The transcript, which is the model's memory of the
+    /// session, carries forward, so the next turn continues the conversation
+    /// rather than starting over.
     pub fn deliver(&mut self, content: &str) {
         self.messages.push(Message::user(content));
     }
 
-    /// Adopt a new model for subsequent turns (RFC 0018 §5.3 model hot-swap). The
-    /// transcript is UNTOUCHED — only the model dialed for the NEXT turn changes;
-    /// a turn already in flight completes on the old model (finish-on-old). The
-    /// `model` is what each request's `model` field carries.
+    /// Adopt a new model for subsequent turns. The transcript is UNTOUCHED —
+    /// only the model dialed for the NEXT turn changes, and a turn already in
+    /// flight runs to completion on the model it started with. The `model` is
+    /// what each request's `model` field carries.
     pub fn set_model(&mut self, model: &str) {
         self.model = model.to_string();
     }
 
-    /// The current model dialed for the next turn (RFC 0018 §5.3) — used to detect
-    /// whether a swap actually changed the model (a repoint with no model change is
-    /// always finish-on-old / invisible, §5.1).
+    /// The current model dialed for the next turn. Used to decide whether a
+    /// pending swap actually changes the model: an endpoint repoint that leaves
+    /// the model alone needs no turn restart, since the output would match.
     pub fn model(&self) -> &str {
         &self.model
     }
 
     /// The number of transcript messages so far — a cheap pre-turn marker for the
-    /// `restart-turn` policy (RFC 0018 §5.3): snapshot this before a turn, then
+    /// `restart-turn` policy: snapshot this before a turn, then
     /// [`truncate_transcript`](Session::truncate_transcript) back to it to discard
-    /// the swapped-turn's appended messages and re-run from the same pre-turn state.
+    /// the swapped turn's appended messages and re-run from the same pre-turn state.
     pub fn transcript_len(&self) -> usize {
         self.messages.len()
     }
 
-    /// Truncate the transcript back to `len` (RFC 0018 §5.3 `restart-turn`): drop
-    /// every message a discarded turn appended, restoring the exact pre-turn
-    /// transcript so the turn can be re-run on the new model. A no-op if `len`
-    /// already ≥ the current length (never grows the transcript).
+    /// Truncate the transcript back to `len` for a `restart-turn`: drop every
+    /// message a discarded turn appended, restoring the exact pre-turn
+    /// transcript so the turn can be re-run on the new model. A no-op when `len`
+    /// is already at or past the current length — this never grows the
+    /// transcript, so a stale marker cannot resurrect dropped messages.
     pub fn truncate_transcript(&mut self, len: usize) {
         if len < self.messages.len() {
             self.messages.truncate(len);
@@ -271,12 +278,13 @@ impl<'a> Session<'a> {
     /// appended to the transcript, so a subsequent turn continues the same
     /// conversation.
     ///
-    /// Returns the turn's [`Outcome`] together with the turn's token [`Usage`]
-    /// (the sum of every model call in this turn — `input_tokens`/`output_tokens`).
-    /// The control layer rolls this DELTA up to the supervisor as
-    /// [`crate::subagent::protocol::AgentMsg::Usage`] so hierarchical token
-    /// accounting (`agentd_tokens_total`) is non-zero — but the loop itself never
-    /// touches the control channel (the `up` handle stays in `control.rs`).
+    /// Returns the turn's [`Outcome`] together with the turn's token [`Usage`] —
+    /// the sum of every model call in this turn. The control layer rolls this
+    /// DELTA up to the supervisor as
+    /// [`crate::subagent::protocol::AgentMsg::Usage`], which is what makes
+    /// hierarchical token accounting (`agentd_tokens_total`) add up. The loop
+    /// itself never touches the control channel: the `up` handle stays in
+    /// `control.rs`, so the loop stays runnable in-process and in a child alike.
     pub fn run_turn(
         &mut self,
         intel: &IntelClient,
@@ -337,9 +345,9 @@ impl<'a> Session<'a> {
                 ));
             }
 
-            // Per-turn audit anchor (RFC 0010 §2.9 `loop.step`): the running
-            // budget snapshot at the head of each ReAct turn, distinct from the
-            // LLM-call event below.
+            // Per-turn audit anchor: the running budget snapshot at the head of
+            // each ReAct step, distinct from the LLM-call event below so the two
+            // can be counted separately when reading a trace.
             log.debug(
                 "loop.step",
                 json!({"step": budget.steps(), "tokens": budget.tokens(), "messages": self.messages.len()}),
@@ -389,9 +397,10 @@ impl<'a> Session<'a> {
 
                 for tc in &tool_calls {
                     let mut call = json!({"tool": tc.name, "id": tc.id});
-                    // Content capture is opt-in (RFC 0010 §2.9): default logs only
-                    // the tool name + length; `--log-content` adds the (truncated)
-                    // arguments/result body for debugging.
+                    // Content capture is opt-in: by default only the tool name
+                    // and body length are logged, because arguments routinely
+                    // carry sensitive data. `--log-content` adds the truncated
+                    // arguments and result body for debugging.
                     if log.content_capture() {
                         call["args"] = json!(truncate_for_log(&tc.arguments.to_string()));
                     }
@@ -429,8 +438,8 @@ impl<'a> Session<'a> {
                     } else {
                         match self_handler.handle(&tc.name, &tc.arguments) {
                             Some(r) => r, // a self-tool (e.g. subagent.spawn)
-                            // Code-registered tools next (RFC 0022 §4):
-                            // first-party beats a colliding remote name.
+                            // Code-registered tools next: first-party beats a
+                            // colliding remote name.
                             None => match crate::tools::dispatch(&tc.name, &tc.arguments) {
                                 Some(r) => r,
                                 None => dispatch_tool(
@@ -492,9 +501,10 @@ impl<'a> Session<'a> {
 /// [`Session`] directly across many turns.
 ///
 /// Returns the run's [`Outcome`] together with the run's total token [`Usage`].
-/// A one-shot run is exactly one turn, so the run total IS that turn's usage;
-/// the control layer emits it once per run as a single
-/// [`crate::subagent::protocol::AgentMsg::Usage`] (no double-count).
+/// A one-shot run is exactly one turn, so the run total IS that turn's usage,
+/// and the control layer emits it once per run as a single
+/// [`crate::subagent::protocol::AgentMsg::Usage`]. Emitting both a cumulative
+/// and a per-turn figure would double-count against the tree's token ceiling.
 pub fn run_loop(
     intel: &IntelClient,
     servers: &[McpClient],
@@ -527,8 +537,10 @@ fn truncate_for_log(s: &str) -> String {
 }
 
 /// Build the model's tool catalogue from every connected server, plus a
-/// name→server-index routing map. On a name collision the first server wins
-/// (logged at call time as "unknown" only if truly absent). RFC 0004.
+/// name→server-index routing map. On a name collision the FIRST server in
+/// configuration order wins, so routing is deterministic and a later server
+/// cannot capture a name an earlier one already publishes. A call to a name no
+/// server publishes is reported as unknown at dispatch time.
 fn build_catalogue(
     servers: &[McpClient],
 ) -> Result<(Vec<ToolDef>, HashMap<String, usize>), LoopAbort> {
@@ -550,9 +562,9 @@ fn build_catalogue(
     Ok((tools, routing))
 }
 
-/// The narrowed tool grants a spawn payload carried on its context seed (RFC
-/// 0009): one pattern list per [`ALLOWED_TOOLS_ROLE`] entry. Normally zero (no
-/// narrowing) or one (the supervisor mints exactly one per child).
+/// The narrowed tool grants a spawn payload carried on its context seed: one
+/// pattern list per [`ALLOWED_TOOLS_ROLE`] entry. Normally zero, meaning no
+/// narrowing, or one, since the supervisor mints exactly one grant per child.
 fn seed_grants(seed: &[(String, String)]) -> Vec<Vec<String>> {
     seed.iter()
         .filter(|(role, _)| role == ALLOWED_TOOLS_ROLE)
@@ -584,9 +596,10 @@ fn narrow_catalogue(
     routing.retain(|name, _| grant_permits(grants, name));
 }
 
-/// Route one tool call to its owning server. A transport error is returned as
-/// an error *observation* (is_error = true), not an abort — the model can
-/// adapt; a wedged server is caught by the budget (RFC 0004 §isError).
+/// Route one tool call to its owning server. A transport error comes back as an
+/// error *observation* (`is_error = true`) rather than an abort, so the model
+/// can adapt or try another route; a server that stays wedged is ultimately
+/// bounded by the step and deadline budget rather than by this call.
 fn dispatch_tool(
     servers: &[McpClient],
     routing: &HashMap<String, usize>,
@@ -595,8 +608,10 @@ fn dispatch_tool(
 ) -> (String, bool) {
     match routing.get(name) {
         Some(&i) => {
-            // RFC 0037 §4: a flat subagent paces its own calls too (its
-            // registry was seeded when it dialed its granted servers).
+            // A flat subagent paces its own calls against the per-server rate
+            // limit too, not just the reactor: its pacing registry was seeded
+            // when it dialed its granted servers, so a fan-out of children
+            // cannot collectively outrun a server's declared rate.
             if let Err(e) = crate::mcp::pace::take(servers[i].name()) {
                 return (e, true);
             }
@@ -609,8 +624,8 @@ fn dispatch_tool(
     }
 }
 
-/// The system prompt, optionally appended with the delegation output contract
-/// (RFC 0009 §spawn-payload).
+/// The system prompt, with the delegation output contract appended when the
+/// spawn payload carried one, so a child sees the shape its result must take.
 fn system_prompt(contract: Option<&str>) -> String {
     match contract {
         Some(c) if !c.is_empty() => format!("{SYSTEM_PROMPT}\n\nOutput contract:\n{c}"),
@@ -635,8 +650,9 @@ fn seed_message(role: &str, content: &str) -> Message {
 /// demand). A server exposing thousands is truncated with a note.
 const RESOURCE_CAP: usize = 50;
 
-/// The compact resource awareness catalogue + a uri→owning-server map for
-/// `resource.read`. RFC 0007 §resources.
+/// The compact resource awareness catalogue plus a uri→owning-server map for
+/// `resource.read`. Listing makes the model aware a resource exists; reading its
+/// body is a separate tool call, so nothing large enters the context unasked.
 struct ResourceCatalogue {
     owner: HashMap<String, usize>,
     entries: Vec<(String, String)>, // (uri, label)
@@ -788,9 +804,10 @@ mod tests {
 
     #[test]
     fn a_code_registered_tool_classifies_code_and_wins_a_name_collision() {
-        // RFC 0022 §4: first-party (code-registered) beats a remote MCP tool of
-        // the same name — in classification and therefore in dispatch. Unique
-        // tool names: the registry is process-global and tests share a process.
+        // A first-party (code-registered) tool beats a remote MCP tool of the
+        // same name, in classification and therefore in dispatch. Tool names
+        // here must be unique: the registry is process-global and tests share a
+        // process.
         let _guard = crate::tools::test_registry_guard();
         crate::tools::register(crate::tools::CodeTool::new(
             "runner.code_tool",
@@ -831,11 +848,11 @@ mod tests {
     #[test]
     fn catalogue_partitions_into_mcp_and_self_control_classes() {
         use crate::agentloop::action::SELF_CONTROL_TOOLS;
-        // A catalogue: two MCP-server tools (routed) + agentd's full self/control
-        // surface + resource.read. Every entry must classify into exactly one class
-        // (pivot Phase 5.1): the MCP side is precisely the routed set; the rest is
-        // agentd's own control surface — and no self/control tool is a local-exec
-        // primitive (principle 2).
+        // A catalogue: two MCP-server tools (routed) plus agentd's full
+        // self/control surface and resource.read. Every entry must classify into
+        // exactly one class — the MCP side is precisely the routed set, and the
+        // rest is agentd's own control surface — and no self/control tool is a
+        // local-execution primitive.
         let mcp = ["db.query", "http.get"];
         let mut tool_to_server = HashMap::new();
         let mut tools: Vec<ToolDef> = Vec::new();
@@ -897,7 +914,7 @@ mod tests {
             SELF_CONTROL_TOOLS.len(),
             "every self tool classified"
         );
-        // Principle 2: the self/control class holds NO local-exec primitive.
+        // The self/control class holds NO local-execution primitive.
         for bad in [
             "exec", "shell", "bash", "sh", "command", "system", "eval", "run",
         ] {
@@ -938,20 +955,10 @@ mod tests {
         let _ = truncate_for_log(&multi);
     }
 
-    // ---- the run_turn / run_loop token-usage producer (metrics-honesty) ----
-    //
-    // `run_turn`/`run_loop` now return the turn's/run's `Usage` so `control.rs`
-    // can roll it up to the supervisor as `AgentMsg::Usage` — the missing PRODUCER
-    // half of the producer→consumer→`agentd_tokens_total` chain. These drive the
-    // *real* loop against the built-in mock LLM (over a unix socket) and assert the
-    // returned `Usage` carries the model's reported tokens. The consumer→counter
-    // half is covered by the `obs::metrics` `record_tokens` tests and (end to end)
-    // by the reactive `/metrics` scrape in `reactive_e2e`.
     #[test]
     fn refresh_tools_picks_up_a_changed_handler_catalogue() {
         // A handler whose advertised tool set CHANGES between turns: refresh
-        // rebuilds the catalogue in place (the live warm-session refresh) and
-        // leaves the transcript untouched.
+        // rebuilds the catalogue in place and leaves the transcript untouched.
         // Hold the registry guard: `tools_len()` reads the process-global
         // code-tool registry, so a concurrent register/unregister in another
         // test must not perturb the exact +1 delta asserted below.
@@ -1003,10 +1010,10 @@ mod tests {
 
     #[test]
     fn a_seed_grant_narrows_the_catalogue_the_dispatch_and_nothing_else() {
-        // RFC 0009 (the `subagent.run` `tools:` grant): a child granted ["alpha"]
-        // sees ONLY alpha — the grant filters the assembled catalogue, and the
-        // dispatch refuses a name the model produces anyway. The grant itself is
-        // policy: it never lands in the transcript.
+        // With the `subagent.run` `tools:` grant, a child granted ["alpha"] sees
+        // ONLY alpha: the grant filters the assembled catalogue, and dispatch
+        // refuses a name the model produces anyway. The grant itself is policy,
+        // so it never lands in the transcript.
         let _guard = crate::tools::test_registry_guard();
         struct TwoTools;
         impl SelfHandler for TwoTools {
@@ -1060,6 +1067,16 @@ mod tests {
         assert!(wide.tool_permitted("beta"));
     }
 
+    // ---- the run_turn / run_loop token-usage producer ----
+    //
+    // `run_turn` and `run_loop` return the turn's / run's `Usage` so `control.rs`
+    // can roll it up to the supervisor as `AgentMsg::Usage`: they are the
+    // producer end of the producer → consumer → `agentd_tokens_total` chain, and
+    // a zero here silently zeroes the whole chain. These tests drive the *real*
+    // loop against the built-in mock LLM and assert the returned `Usage` carries
+    // the model's reported tokens. The consumer half is covered by the
+    // `obs::metrics` `record_tokens` tests, and end to end by the reactive
+    // `/metrics` scrape in `reactive_e2e`.
     #[cfg(unix)]
     mod usage_producer {
         use super::*;
@@ -1094,10 +1111,10 @@ mod tests {
             )
         }
 
-        /// Spawn the built-in mock LLM on `socket` with `script`, blocking until it
-        /// binds (so the first `complete()` connects, not races).
-        /// Run the in-process mock LLM, announcing through `addr_file`; returns
-        /// the `http://<addr>` intelligence URL once announced.
+        /// Run the built-in mock LLM with `script` on a background thread, and
+        /// return its `http://<addr>` intelligence URL. Blocks until the server
+        /// has announced its address through `addr_file`, so the first
+        /// `complete()` connects instead of racing the bind.
         fn start_mock_llm(addr_file: &std::path::Path, script: &'static str) -> String {
             let s = addr_file.to_str().unwrap().to_string();
             std::thread::spawn(move || {
@@ -1128,8 +1145,9 @@ mod tests {
         #[test]
         fn run_turn_returns_the_turns_token_usage() {
             // The `final` script answers in one model call reporting
-            // usage{prompt_tokens: 11, completion_tokens: 5} (intel::mock). The turn
-            // surfaces exactly that split, NON-zero — the value control.rs emits up.
+            // usage{prompt_tokens: 11, completion_tokens: 5} (intel::mock). The
+            // turn must surface exactly that split, non-zero, since it is the
+            // value control.rs emits upward.
             let dir = tempfile::tempdir().unwrap();
             let sock = dir.path().join("llm.addr");
             let url = start_mock_llm(&sock, "final");
@@ -1146,7 +1164,7 @@ mod tests {
 
             assert_eq!(outcome.status, TerminalStatus::Completed);
             // The producer half: the turn's reported tokens, non-zero, so the
-            // AgentMsg::Usage control.rs sends carries real tokens (not silent 0).
+            // AgentMsg::Usage control.rs sends carries real tokens.
             assert_eq!(
                 usage.input_tokens, 11,
                 "input tokens surfaced from the model"

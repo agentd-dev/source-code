@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! RFC 9421 HTTP Message Signatures — the signing core AAuth wraps around every
-//! MCP request (RFC 0023 §Step 4). We produce the three headers the guide
-//! specifies:
+//! MCP request. We produce the three headers AAuth specifies:
 //!
 //! ```text
 //! Signature-Input: sig=("@method" "@authority" "@path" "signature-key");created=<now>
@@ -10,7 +9,7 @@
 //! ```
 //!
 //! Only the derived components `@method`/`@authority`/`@path` plus the
-//! `signature-key` param are covered by default (the guide's minimum); a caller
+//! `signature-key` param are covered by default (AAuth's minimum); a caller
 //! that must cover `content-digest` adds it explicitly. The Ed25519 signing is
 //! delegated to [`AgentKey`](super::key::AgentKey), so this module is pure,
 //! deterministic string assembly (unit-tested against a hand-computed base).
@@ -18,9 +17,10 @@
 use super::b64;
 use super::key::AgentKey;
 
-/// What the `Signature-Key` presents — the guide's `sig=jwt;jwt="…"` for a
-/// request (the agent/auth token), or `sig=hwk` presenting the raw public key
-/// for the enroll/agent-token calls to the Agent Provider (§Step 1/2).
+/// What the `Signature-Key` presents — `sig=jwt;jwt="…"` for a request (the
+/// agent/auth token), or `sig=hwk` presenting the raw public key for the
+/// enroll/agent-token calls to the Agent Provider, which are the two calls made
+/// before the agent holds any token to name itself with.
 pub enum SigKey<'a> {
     /// Present a JWT (agent token or user-scoped auth token) as the key id.
     Jwt(&'a str),
@@ -36,9 +36,9 @@ impl SigKey<'_> {
             SigKey::Jwt(tok) => format!("sig=jwt;jwt=\"{tok}\""),
             // hwk: present the raw Ed25519 public key as INLINE structured-field
             // params (`kty`/`crv`/`x`) — the form draft-hardt-httpbis-signature-key
-            // defines and Agent Providers parse. (An earlier `jwk="<b64url JSON>"`
-            // encoding was non-conformant: a conformant AP reads kty/crv/x
-            // directly and rejects the blob with `invalid_key`.) No `alg` on hwk.
+            // defines and Agent Providers parse. A conformant AP reads kty/crv/x
+            // directly and answers `invalid_key` to a `jwk="<b64url JSON>"` blob,
+            // so the members must stay inline. No `alg` on hwk.
             SigKey::Hwk => {
                 format!(
                     "sig=hwk;kty=\"OKP\";crv=\"Ed25519\";x=\"{}\"",
@@ -49,19 +49,22 @@ impl SigKey<'_> {
     }
 }
 
-/// The signature headers for one request. `authority` is the `Host` value
-/// (host[:port]); `path` is the request-target path (with query, if any).
 /// The `Content-Digest` header value (RFC 9530) for a body:
 /// `sha-256=:<base64 sha256>:`. Covered by the signature when the server
-/// requires body integrity (RFC 0023 §content-digest).
+/// requires body integrity, which is what stops a proxy rewriting a signed
+/// request's JSON-RPC payload while the signature still verifies.
 pub fn content_digest(body: &[u8]) -> String {
     let d = ring::digest::digest(&ring::digest::SHA256, body);
     format!("sha-256=:{}:", b64::std_pad(d.as_ref()))
 }
 
-/// `created` is unix seconds (clock must be sane, ±60s of the verifier). When
-/// `digest` is `Some`, a `Content-Digest` header is added and covered (body
-/// integrity, RFC 0023 §content-digest). Returns the header pairs.
+/// The signature headers for one request. `authority` is the `Host` value
+/// (host[:port]); `path` is the request-target path (with query, if any) —
+/// both are covered, so they must be byte-identical to what the request
+/// actually sends or the verifier rebuilds a different base. `created` is unix
+/// seconds (the clock must be sane, ±60s of the verifier). When `digest` is
+/// `Some`, a `Content-Digest` header is added and covered. Returns the header
+/// pairs.
 pub fn sign_request(
     key: &AgentKey,
     method: &str,

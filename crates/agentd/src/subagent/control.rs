@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The subagent side of the control channel. RFC 0005, RFC 0003, RFC 0009.
+//! The subagent side of the control channel.
 //!
-//! Entered when `main` sees `AGENT_SUBAGENT` set. The child:
-//! 1. installs `PR_SET_PDEATHSIG` so a supervisor death collapses it (must be
-//!    here — `pre_exec`'s setting is cleared by `execve`);
+//! Entered when `main` sees `AGENT_SUBAGENT` set. The child, in order:
+//! 1. installs `PR_SET_PDEATHSIG` so a supervisor death collapses it. This must
+//!    happen here rather than in `pre_exec`, because `execve` clears the setting;
 //! 2. reads its [`SpawnPayload`] (first control frame) from stdin;
-//! 3. starts a **control reader thread** (separate from the agentic loop) that
-//!    answers `Ping` with `Pong` and flips a cancel flag on `Cancel` — so
-//!    liveness survives a long in-flight tool/model call (Detector C);
+//! 3. starts a **control reader thread**, separate from the agentic loop, that
+//!    answers `Ping` with `Pong` and flips a cancel flag on `Cancel`, so
+//!    liveness survives a long in-flight tool or model call;
 //! 4. emits `Ready`, connects intelligence + its scoped MCP servers, runs
 //!    `agentloop::run_loop`, and sends `Result`/`Failed` back up.
 //!
@@ -31,14 +31,15 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// The child-local LIVE intelligence handle (RFC 0018 §5.2, the process-boundary
-/// adaptation). A supervisor-side `RwLock<Arc<IntelConfig>>` cannot reach a child
-/// re-exec'd as its own PROCESS, so each child holds its own LIVE config: the
-/// control-reader thread parks a [`SwapIntel`] here on `ControlMsg::SwapIntel`,
-/// and the agentic loop drains it ONCE per turn at the turn boundary (the same
-/// boundary `pause_wait` sits at), rebuilds its [`IntelClient`] from the new
-/// endpoints (fresh health/breaker — §5.2 step 2), and adopts the new model. The
-/// `Mutex<Option<…>>` is the whole seam; the loop never holds it across a turn.
+/// The child-local LIVE intelligence handle. A supervisor-side shared config
+/// cannot reach a child that was re-exec'd as its own PROCESS, so each child
+/// holds its own live copy: the control-reader thread parks a [`SwapIntel`] here
+/// on `ControlMsg::SwapIntel`, and the agentic loop drains it ONCE per turn at
+/// the turn boundary — the same boundary `pause_wait` sits at — rebuilds its
+/// [`IntelClient`] from the new endpoints with fresh health and a closed
+/// breaker, and adopts the new model. The `Mutex<Option<…>>` is the whole seam;
+/// the loop never holds the lock across a turn, so a swap arriving mid-turn
+/// parks without blocking the control thread.
 type PendingSwap = Arc<Mutex<Option<SwapIntel>>>;
 
 pub(crate) type Up = Arc<Mutex<Stdout>>;
@@ -49,12 +50,13 @@ pub(crate) type Up = Arc<Mutex<Stdout>>;
 /// indefinitely waiting for someone to walk back to their desk.
 const ELICITATION_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// The in-child self-handler for an agentd subagent (RFC 0026 §6). A subagent
-/// is a **flat child of the reactor** — it runs a ReAct loop over its granted
-/// MCP + code tools and reports its result; it has **no** in-child orchestration
-/// self-tools (no nested `subagent.spawn`, `schedule`, `subscribe`, `workflow.*`,
-/// `a2a.delegate`). Delegation is the reactor's job, not a child's. (`finish` is
-/// handled by the loop itself, not the self-handler, so completion is unaffected.)
+/// The in-child self-handler for a subagent. A subagent is a **flat child of the
+/// reactor**: it runs a ReAct loop over its granted MCP + code tools and reports
+/// its result, and it has **no** in-child orchestration self-tools — no nested
+/// `subagent.spawn`, `schedule`, `subscribe`, `workflow.*` or `a2a.delegate`.
+/// Keeping delegation with the reactor is what makes the tree flat and its depth
+/// and concurrency caps enforceable from one place. `finish` is handled by the
+/// loop itself rather than the self-handler, so completion still works here.
 struct NoSelfTools;
 impl SelfHandler for NoSelfTools {
     fn tools(&self) -> Vec<crate::wire::intel::ToolDef> {
@@ -98,10 +100,10 @@ pub fn run() -> i32 {
         return crate::exit::USAGE;
     }
 
-    // AAuth [DRAFT] (RFC 0023): install the SAME agent identity the root has, so
-    // this child signs its MCP requests under one tree-wide identity. The key
-    // file is a shared-fs path resolved here (re-exec crossed the process
-    // boundary); a bad key/secret is a startup failure (exit 2).
+    // Install the SAME agent identity the root has, so this child signs its MCP
+    // requests under one tree-wide identity. The key file is a shared-fs path
+    // resolved here, because the re-exec crossed the process boundary; a bad
+    // key or secret is a startup failure (exit 2) rather than an unsigned run.
     #[cfg(feature = "aauth")]
     if let Some(settings) = &payload.aauth
         && let Err(e) = crate::aauth::setup(settings, std::time::Duration::from_secs(30))
@@ -113,22 +115,23 @@ pub fn run() -> i32 {
     let up: Up = Arc::new(Mutex::new(io::stdout()));
     let log = build_logger(&payload);
     let cancel = Arc::new(AtomicBool::new(false));
-    // Tree-wide turn-boundary suspension (RFC 0005 §4.3 / RFC 0015 §4.3): the
-    // control thread sets this on `Pause`, clears it on `Resume`; the loop waits
-    // between turns while it is set. `cancel` always wins (see `pause_wait`).
+    // Turn-boundary suspension: the control thread sets this on `Pause` and
+    // clears it on `Resume`; the loop waits between turns while it is set.
+    // `cancel` always wins over it, so a paused child can still be drained
+    // (see `pause_wait`).
     let paused = Arc::new(AtomicBool::new(false));
 
     // For a warm continue-session, the control thread forwards each `Inject`
     // event to the loop over this channel; a one-shot run never reads it.
     let (inject_tx, inject_rx) = std::sync::mpsc::channel::<String>();
 
-    // The child-local LIVE intel handle (RFC 0018 §5.2): the control thread parks
-    // a hot-swap here; the loop drains it at the turn boundary. `None` until the
-    // first swap arrives, so the no-swap path never touches the lock past one
-    // cheap empty check per turn.
+    // The child-local LIVE intel handle: the control thread parks a hot-swap
+    // here; the loop drains it at the turn boundary. `None` until the first swap
+    // arrives, so the common no-swap path costs one cheap empty check per turn
+    // and never contends on the lock.
     let pending_swap: PendingSwap = Arc::new(Mutex::new(None));
 
-    // agentd: the reply slots for ToolRequest/BudgetRequest round-trips.
+    // The reply slots for ToolRequest/BudgetRequest round-trips.
     let replies = Arc::new(crate::subagent::replies::Replies::new());
 
     // The control reader runs on its own thread and owns stdin from here on,
@@ -160,23 +163,23 @@ pub fn run() -> i32 {
         payload.intelligence.token.clone(),
     ) {
         Ok(c) => {
-            // RFC 0031: the resolved `intelligence.headers` ride every dial.
+            // The resolved `intelligence.headers` ride every dial.
             #[allow(unused_mut)]
             let mut c = c
                 .with_headers(payload.intelligence.headers.clone())
-                // RFC 0031 §8: select the wire dialect (bedrock ⇒ Converse).
+                // Select the wire dialect: `bedrock` speaks Converse.
                 .with_dialect(payload.intelligence.dialect.as_deref());
-            // RFC 0031: an `intelligence.auth: {kind: aws}` SigV4-signs the LLM dial.
+            // An `intelligence.auth: {kind: aws}` SigV4-signs the LLM dial.
             #[cfg(feature = "oauth")]
             if let Some(aws) = &payload.intelligence.aws_auth
                 && let Ok(s) = crate::auth::aws::SigV4Signer::from_spec(aws, "intelligence")
             {
                 c = c.with_signer(Some(s as std::sync::Arc<dyn ::mcp::http::RequestSigner>));
             }
-            // Outbound LLM calls join the run's distributed trace (RFC 0010).
+            // Outbound LLM calls join the run's distributed trace.
             c.set_trace_id(payload.telemetry.trace_id.clone());
-            // RFC 0018 §6: bridge this child's intel reachability UP to the
-            // supervisor (which has no LLM of its own) on each all-down transition.
+            // Bridge this child's intel reachability UP to the supervisor, which
+            // has no LLM of its own, on each all-down transition.
             install_intel_health_reporter(&mut c, &up);
             c
         }
@@ -209,8 +212,9 @@ pub fn run() -> i32 {
         match connected {
             Ok(mut c) => {
                 log.info("mcp.connect", serde_json::json!({"server": spec.name}));
-                // Stamp the run id (retry dedup, RFC 0011) + a W3C traceparent
-                // (distributed tracing, RFC 0010) on every tool call.
+                // Stamp the run id, so a server can deduplicate a retried call,
+                // and a W3C traceparent, so the call joins the run's trace, on
+                // every tool call.
                 let mut meta = serde_json::json!({"agent/run_id": payload.telemetry.run_id});
                 if let Some(tid) = &payload.telemetry.trace_id {
                     meta["traceparent"] = crate::obs::trace::outbound_traceparent(tid).into();
@@ -229,9 +233,9 @@ pub fn run() -> i32 {
         }
     }
 
-    // agentd (RFC 0026 §2): a TURN WORKER runs one turn over the supplied
-    // context slice; internal tools round-trip to the supervisor. Same
-    // connections + supervision as a subagent; a different loop.
+    // A TURN WORKER runs one turn over the supplied context slice, with internal
+    // tools round-tripping to the supervisor. It reuses the connections and
+    // supervision set up above; only the loop it runs differs.
     if payload.role == crate::subagent::protocol::Role::Turn {
         return crate::runtime::worker::run_turn_child(
             &payload, &intel, &servers, &up, &cancel, &replies, &log,
@@ -253,13 +257,13 @@ pub fn run() -> i32 {
         cancel: Some(Arc::clone(&cancel)),
     };
 
-    // A subagent has no in-child orchestration self-tools (RFC 0026 §6 flat tree).
+    // A subagent has no in-child orchestration self-tools: the tree is flat.
     let mut orch = NoSelfTools;
 
     // A warm continue-session lives across many events; a one-shot runs once.
-    // A warm session is the long-lived loop/reactive shape (RFC 0008), so it gets
-    // the all-down backoff (RFC 0018 §6): a transient host-model roll recovers
-    // without crashing the daemon, rather than exiting 4 like a `once` job.
+    // Only the warm shape gets the all-down backoff, because it is expected to
+    // outlive a transient outage: a host-model roll should let it wait and
+    // recover, where a one-shot job has nothing to wait for and exits 4.
     if payload.warm {
         intel.enable_alldown_backoff(crate::intel::client::AllDownPolicy::default());
         return run_warm(
@@ -282,10 +286,10 @@ pub fn run() -> i32 {
     // One-shot: a single turn. Suspend at the turn boundary (before the turn
     // starts) if paused; a turn already in progress is never interrupted.
     pause_wait(&paused, &cancel, &log);
-    // RFC 0018 §5.2 turn-boundary read: a swap that landed before this single
-    // turn started is applied here (rebuild client + adopt model). A swap that
-    // lands DURING the turn is finish-on-old and invisible — a one-shot has no
-    // next turn, so `restart-turn` is moot for it (the run ends after this turn).
+    // Turn-boundary read: a swap that landed before this single turn started is
+    // applied here, rebuilding the client and adopting the model. A swap that
+    // lands DURING the turn finishes on the old model and is invisible — a
+    // one-shot has no next turn, so `restart-turn` cannot apply to it.
     apply_pending_swap(&pending_swap, &mut intel, &mut input.model, &up, &log);
     match run_loop(&intel, &servers, &input, &mut orch, &log) {
         Ok((outcome, usage)) => {
@@ -313,8 +317,8 @@ pub fn run() -> i32 {
     }
 }
 
-/// Drive a **warm continue-session** (RFC 0008 §spawn-vs-continue): prepare the
-/// session once, then run one turn per delivered event over the *same*
+/// Drive a **warm continue-session**: prepare the session once, then run one
+/// turn per delivered event over the *same*
 /// transcript, emitting [`AgentMsg::Turn`] after each. The process and its
 /// conversation stay warm between events until the supervisor cancels it or
 /// closes the control channel, at which point a terminal [`AgentMsg::Result`]
@@ -350,28 +354,28 @@ fn run_warm(
     };
     let limits = &payload.limits;
     loop {
-        // Turn boundary: if paused (RFC 0005 §4.3 / RFC 0015 §4.3), suspend HERE,
-        // before starting the next turn — never mid-turn. A `Cancel` during pause
-        // wins and proceeds to wind-down (the loop falls through to the cancel
-        // check below). The control thread keeps running, so Resume/Cancel arrive
-        // while we wait. The supervisor reactor and its liveness heartbeat are not
-        // affected — only this child loop suspends.
+        // Turn boundary: if paused, suspend HERE, before starting the next turn
+        // — never mid-turn, so no turn is ever left half-finished. A `Cancel`
+        // during a pause wins and proceeds to wind-down, falling through to the
+        // cancel check below. The control thread keeps running, so Resume and
+        // Cancel still arrive while we wait. Only this child loop suspends: the
+        // supervisor reactor and its liveness heartbeat keep ticking.
         pause_wait(paused, cancel, log);
-        // Live tools refresh (pivot Phase 7 follow-up): an inbound
-        // `notifications/tools/list_changed` on any of THIS child's own MCP
-        // connections re-enumerates the catalogue at this turn boundary, so a
-        // warm session tracks a changing server instead of holding a stale tool
-        // set for its whole life. (Spawned one-shots already re-list per run.)
+        // Live tools refresh: an inbound `notifications/tools/list_changed` on
+        // any of THIS child's own MCP connections re-enumerates the catalogue at
+        // this turn boundary, so a warm session tracks a changing server instead
+        // of holding a stale tool set for its whole life. A spawned one-shot
+        // needs no equivalent — it re-lists once per run anyway.
         refresh_tools_if_changed(&mut session, orch, servers, log);
-        // RFC 0018 §5.2 turn-boundary read: a hot-swap parked by the control thread
-        // is drained + applied HERE, before the turn — the loop rebuilds its client
-        // (fresh health/breaker) and adopts the new model. The transcript is
-        // UNTOUCHED (§5.3 — no context reset); a turn already running was never
-        // torn (finish-on-old by construction — the swap only lands at this seam).
+        // Turn-boundary read: a hot-swap parked by the control thread is drained
+        // and applied HERE, before the turn — the loop rebuilds its client with
+        // fresh health and breaker state and adopts the new model. The
+        // transcript is UNTOUCHED, so a swap costs no context. A turn already
+        // running is never torn, because the swap can only land at this seam.
         apply_pending_swap_warm(pending_swap, &mut intel, &mut session, up, log);
-        // Snapshot the pre-turn transcript so `restart-turn` (RFC 0018 §5.3) can
-        // discard a turn that completed under a model swap and re-run it on the new
-        // model from this exact state. Cheap (a `usize`); unused under finish-on-old.
+        // Snapshot the pre-turn transcript so `restart-turn` can discard a turn
+        // that completed under a model swap and re-run it on the new model from
+        // this exact state. Cheap (a `usize`); unused under finish-on-old.
         let pre_turn = session.transcript_len();
         // One turn over the persistent transcript, bounded by a fresh per-event
         // budget (a new deadline each turn, so the session isn't globally capped).
@@ -397,14 +401,15 @@ fn run_warm(
         if outcome.status == TerminalStatus::Cancelled {
             break;
         }
-        // RFC 0018 §5.3 `restart-turn`: a model-changing swap that LANDED while this
-        // turn was in flight discards the turn's result and re-runs it on the new
-        // model from the pre-turn transcript. We never tore the `complete_once` —
-        // the turn finished; we drop its appended messages and loop WITHOUT
-        // consuming a new event. Bounded by the step budget like any turn. The swap
-        // is applied at the top of the loop (the turn-boundary seam), so we only
-        // decide here whether to re-run; an endpoint repoint (model unchanged) is
-        // never a restart (it is always invisible / finish-on-old, §5.1).
+        // `restart-turn`: a model-changing swap that LANDED while this turn was
+        // in flight discards the turn's result and re-runs it on the new model
+        // from the pre-turn transcript. The `complete_once` is never torn — the
+        // turn ran to completion, and only its appended messages are dropped
+        // before we loop WITHOUT consuming a new event, so no event is lost. The
+        // re-run is bounded by the step budget like any turn. The swap itself is
+        // applied at the top of the loop, so all we decide here is whether to
+        // re-run. An endpoint repoint that leaves the model unchanged is never a
+        // restart: it is invisible to the transcript.
         if restart_turn_pending(pending_swap, session.model()) {
             session.truncate_transcript(pre_turn);
             log.info(
@@ -475,13 +480,13 @@ fn wait_for_inject(rx: &Receiver<String>, cancel: &AtomicBool) -> Option<String>
     }
 }
 
-/// Suspend the loop at a turn boundary while `paused` is set (RFC 0005 §4.3 /
-/// RFC 0015 §4.3). Polls at the same cadence as `wait_for_inject` so a `Resume`
-/// (or `Cancel`) lands promptly. `cancel` always wins: a cancel during a pause
-/// returns immediately so the loop proceeds to wind-down. Logs once on enter and
-/// once on leave (debounced — never per poll). The supervisor reactor is NOT
-/// gated by this; only the child's agentic loop suspends, so the liveness
-/// heartbeat keeps ticking (RFC 0015 §4.3).
+/// Suspend the loop at a turn boundary while `paused` is set. Polls at the same
+/// cadence as `wait_for_inject` so a `Resume` or `Cancel` lands promptly.
+/// `cancel` always wins: a cancel during a pause returns immediately so the loop
+/// proceeds to wind-down, which is what keeps a paused child drainable. Logs
+/// once on enter and once on leave, never per poll, so a long pause does not
+/// flood the log. The supervisor reactor is NOT gated by this — only the child's
+/// agentic loop suspends, so the liveness heartbeat keeps ticking.
 fn pause_wait(paused: &AtomicBool, cancel: &AtomicBool, log: &Logger) {
     if !paused.load(Ordering::Relaxed) || cancel.load(Ordering::Relaxed) {
         return; // fast path: not paused (or cancel wins) → no log, no wait
@@ -493,20 +498,23 @@ fn pause_wait(paused: &AtomicBool, cancel: &AtomicBool, log: &Logger) {
     log.info("loop.resumed", serde_json::json!({}));
 }
 
-/// Rebuild an [`IntelClient`] from a hot-swap's endpoint list (RFC 0018 §5.2
-/// step 2). A repointed endpoint starts CLOSED — a fresh [`crate::intel::endpoints::EndpointList`]
-/// gives every endpoint a brand-new `HealthRecord`, so NO stale breaker state
-/// carries to a new CID. The run's trace id is re-stamped onto the new client so
-/// outbound calls keep joining the run's distributed trace. Returns `None` (and
-/// logs) if the new list is unparseable, in which case the caller keeps the old
-/// client (a bad swap never tears a working run).
+/// Rebuild an [`IntelClient`] from a hot-swap's endpoint list. A repointed
+/// endpoint starts with its breaker CLOSED: a fresh
+/// [`crate::intel::endpoints::EndpointList`] gives every endpoint a brand-new
+/// `HealthRecord`, so failures recorded against the endpoint that was just
+/// replaced cannot condemn the one that replaced it. The run's trace id is
+/// re-stamped onto the new client so outbound calls keep joining the run's
+/// distributed trace. Returns `None`, after logging, when the new list is
+/// unparseable; the caller then keeps the existing client, so a malformed swap
+/// never tears down a working run.
 fn rebuild_intel(swap: &SwapIntel, old: &IntelClient, log: &Logger) -> Option<IntelClient> {
     match IntelClient::from_parts(&swap.uri, swap.token.clone()) {
         Ok(mut c) => {
             c.set_trace_id(old.trace_id().map(str::to_string));
-            // A warm/long-lived loop keeps its all-down backoff across a swap (the
-            // daemon must not start crashing on a transient roll just because it was
-            // repointed). The one-shot path never enabled it, so this is a no-op there.
+            // A warm, long-lived loop keeps its all-down backoff across a swap:
+            // a daemon must not start crashing on a transient outage merely
+            // because it was repointed. The one-shot path never enables the
+            // backoff, so this carries nothing over there.
             if old.alldown_enabled() {
                 c.enable_alldown_backoff(crate::intel::client::AllDownPolicy::default());
             }
@@ -522,11 +530,12 @@ fn rebuild_intel(swap: &SwapIntel, old: &IntelClient, log: &Logger) -> Option<In
     }
 }
 
-/// Emit the `intel.swap` event (RFC 0018 §8 / §5) for an applied swap. NO secret
-/// and NO URL ever appear — only the swap KIND (`endpoint`/`model`), the model
-/// names (which are non-secret identifiers), the policy, and whether the endpoint
-/// list changed. The endpoint identity stays transport+index-only, surfaced by
-/// the `agentd://intelligence` resource, never here (RFC 0012 §3.7).
+/// Emit the `intel.swap` event for an applied swap. NO secret and NO URL ever
+/// appear — only the swap KIND (`endpoint` or `model`), the model names, which
+/// are non-secret identifiers, the policy, and whether the endpoint list
+/// changed. Endpoint identity stays transport-and-index only and is surfaced by
+/// the `agentd://intelligence` resource, never by this event, so an operator
+/// reading logs can see that a swap happened without learning where it points.
 fn log_swap(
     log: &Logger,
     from_model: &str,
@@ -551,11 +560,11 @@ fn log_swap(
     );
 }
 
-/// Apply a parked hot-swap at the ONE-SHOT turn boundary (RFC 0018 §5.2): drain
-/// the pending slot, rebuild the client (fresh health), and adopt the new model
-/// into `model`. A no-op (one cheap empty-lock check) when nothing is pending —
-/// the no-swap path is unchanged. `restart-turn` is moot for a one-shot (it has a
-/// single turn), so the policy only governs the event label here.
+/// Apply a parked hot-swap at the ONE-SHOT turn boundary: drain the pending
+/// slot, rebuild the client with fresh health, and adopt the new model into
+/// `model`. Costs one cheap empty-lock check when nothing is pending, so the
+/// common path is not penalised. `restart-turn` cannot apply to a one-shot,
+/// which has a single turn, so the policy only labels the event here.
 fn apply_pending_swap(
     pending: &PendingSwap,
     intel: &mut IntelClient,
@@ -570,8 +579,9 @@ fn apply_pending_swap(
     let to_model = swap.model.clone().unwrap_or_else(|| from_model.clone());
     let endpoint_change = match rebuild_intel(&swap, intel, log) {
         Some(mut c) => {
-            // The rebuilt client has fresh breakers + no reporter — re-install it
-            // so the child keeps bridging reachability up after a repoint (§6).
+            // The rebuilt client has fresh breakers and no reporter, so
+            // re-install one or the child stops bridging reachability up to the
+            // supervisor after a repoint.
             install_intel_health_reporter(&mut c, up);
             *intel = c;
             true
@@ -582,10 +592,10 @@ fn apply_pending_swap(
     log_swap(log, &from_model, &to_model, endpoint_change, swap.policy);
 }
 
-/// Apply a parked hot-swap at a WARM-session turn boundary (RFC 0018 §5.2): drain
-/// the pending slot, rebuild the client (fresh health), and adopt the new model
-/// onto the live [`Session`] (the transcript is UNTOUCHED — §5.3). A no-op when
-/// nothing is pending.
+/// Apply a parked hot-swap at a WARM-session turn boundary: drain the pending
+/// slot, rebuild the client with fresh health, and adopt the new model onto the
+/// live [`Session`]. The transcript is UNTOUCHED, so the session keeps its whole
+/// conversation across the swap. A no-op when nothing is pending.
 fn apply_pending_swap_warm(
     pending: &PendingSwap,
     intel: &mut IntelClient,
@@ -600,8 +610,9 @@ fn apply_pending_swap_warm(
     let to_model = swap.model.clone().unwrap_or_else(|| from_model.clone());
     let endpoint_change = match rebuild_intel(&swap, intel, log) {
         Some(mut c) => {
-            // The rebuilt client has fresh breakers + no reporter — re-install it
-            // so a warm session keeps bridging reachability up after a repoint (§6).
+            // The rebuilt client has fresh breakers and no reporter, so
+            // re-install one or the warm session stops bridging reachability up
+            // to the supervisor after a repoint.
             install_intel_health_reporter(&mut c, up);
             *intel = c;
             true
@@ -612,12 +623,14 @@ fn apply_pending_swap_warm(
     log_swap(log, &from_model, &to_model, endpoint_change, swap.policy);
 }
 
-/// Peek (without draining) whether a `restart-turn` swap is parked that would
-/// CHANGE the model from the session's current one (RFC 0018 §5.3). Only a
-/// model-changing `restart-turn` swap that landed WHILE the turn was in flight
-/// warrants discarding + re-running the just-completed turn; an endpoint repoint
-/// (model unchanged) is always finish-on-old / invisible (§5.1), and a
-/// finish-on-old swap is applied at the next boundary without a re-run.
+/// Peek, without draining, whether a `restart-turn` swap is parked that would
+/// CHANGE the model from the session's current one. Only a model-changing
+/// `restart-turn` swap that landed WHILE the turn was in flight justifies
+/// discarding and re-running the just-completed turn. An endpoint repoint that
+/// leaves the model unchanged produces identical output and so never warrants a
+/// re-run, and a finish-on-old swap is applied at the next boundary without one.
+/// Peeking rather than draining leaves the swap for the boundary code to apply,
+/// so the two paths cannot both consume it.
 fn restart_turn_pending(pending: &PendingSwap, current_model: &str) -> bool {
     let guard = pending.lock().unwrap_or_else(|e| e.into_inner());
     match guard.as_ref() {
@@ -636,9 +649,11 @@ fn fail(up: &Up, log: &Logger, error: String, code: i32) -> i32 {
 
 /// Drain this child's own MCP notification queues at a warm turn boundary; on an
 /// inbound `tools/list_changed`, rebuild the session's tool catalogue live. A
-/// failed re-list is a warning (the old catalogue stays — the next boundary
-/// retries); a warm child holds no subscriptions, so draining here eats nothing
-/// the daemon relies on (subscriptions live on the DAEMON's own connections).
+/// failed re-list is only a warning: the existing catalogue stays in place and
+/// the next boundary retries, so a momentarily unreachable server cannot strip a
+/// running session of its tools. Draining here is safe because a warm child
+/// holds no subscriptions of its own — those live on the DAEMON's connections —
+/// so nothing the daemon relies on is consumed.
 fn refresh_tools_if_changed(
     session: &mut Session,
     orch: &mut NoSelfTools,
@@ -725,13 +740,16 @@ pub(crate) fn send_up(up: &Up, msg: &AgentMsg) {
     }
 }
 
-/// Wire the child's intelligence reachability UP to the supervisor (RFC 0018 §6).
-/// The model loop runs in this CHILD process and owns the breaker/failover state;
-/// the supervisor has no LLM and no live view of it. The reporter is edge-triggered
-/// (fires only on an all-down ENTER/EXIT transition) and carries transport+index
-/// ONLY — NEVER a URL/cid/host or credential (RFC 0012 §3.7). Re-installed after a
-/// hot-swap rebuild (the rebuilt client has fresh breakers + no reporter). Cloning
-/// the `up` Arc lets the reporter outlive this fn (it is owned by the new client).
+/// Wire the child's intelligence reachability UP to the supervisor. The model
+/// loop runs in this CHILD process and owns the breaker and failover state,
+/// while the supervisor has no LLM and no live view of it, so this bridge is the
+/// only way that state reaches the readiness probe and metrics. The reporter is
+/// edge-triggered — it fires only on an all-down ENTER or EXIT transition, which
+/// keeps a wedged endpoint from flooding the control channel — and carries
+/// transport and index ONLY, never a URL, cid, host or credential. Must be
+/// re-installed after every hot-swap rebuild, since the rebuilt client has fresh
+/// breakers and no reporter. Cloning the `up` Arc lets the reporter outlive this
+/// call; it is owned by the new client.
 fn install_intel_health_reporter(intel: &mut IntelClient, up: &Up) {
     let up = Arc::clone(up);
     intel.set_health_reporter(Box::new(move |r: IntelHealthReport| {
@@ -752,10 +770,11 @@ fn install_intel_health_reporter(intel: &mut IntelClient, up: &Up) {
 /// The control reader thread. Owns stdin, answers `Ping` with `Pong`, flips the
 /// cancel flag on `Cancel`, toggles the `paused` flag on `Pause`/`Resume`, and
 /// forwards each `Inject` event to a warm session's loop over `inject_tx`. It
-/// keeps running while the loop is suspended (so `Resume`/`Cancel`/`Ping` still
-/// arrive — the whole point of a separate thread). Exits on EOF (the supervisor
-/// closed the channel) or a read error — which drops `inject_tx`, unblocking a
-/// warm session's wait.
+/// keeps running while the loop is suspended, which is the whole point of a
+/// separate thread: `Resume`, `Cancel` and `Ping` must still arrive at a paused
+/// or busy child. Exits on EOF, meaning the supervisor closed the channel, or on
+/// a read error. Either exit drops `inject_tx`, which unblocks a warm session's
+/// wait so it cannot hang forever on a supervisor that is gone.
 #[allow(clippy::too_many_arguments)]
 fn spawn_control_thread(
     mut stdin: BufReader<Stdin>,
@@ -774,8 +793,8 @@ fn spawn_control_thread(
             // Exits on Ok(None)/Err — the supervisor closed the channel.
             while let Ok(Some(bytes)) = frame::read_frame(&mut stdin) {
                 match serde_json::from_slice::<ControlMsg>(&bytes) {
-                    // agentd round-trip answers: park them in the reply slots
-                    // the turn worker blocks on (RFC 0026 §2).
+                    // Round-trip answers: park them in the reply slots the turn
+                    // worker blocks on.
                     Ok(ControlMsg::ToolResult {
                         id,
                         result,
@@ -808,9 +827,10 @@ fn spawn_control_thread(
                         log.info("subagent.cancel", serde_json::json!({"reason": reason}));
                         cancel.store(true, Ordering::Relaxed);
                     }
-                    // Turn-boundary suspension (RFC 0005 §4.3 / RFC 0015 §4.3): set
-                    // the flag here; the loop suspends at its next boundary. The
-                    // loop's `pause_wait` does the enter/leave logging (debounced).
+                    // Turn-boundary suspension: set the flag here and let the
+                    // loop suspend at its next boundary. The loop's `pause_wait`
+                    // does the enter/leave logging, debounced, so no log line is
+                    // written here.
                     Ok(ControlMsg::Pause) => paused.store(true, Ordering::Relaxed),
                     Ok(ControlMsg::Resume) => paused.store(false, Ordering::Relaxed),
                     // Deliver into the warm session; a one-shot run never reads
@@ -818,13 +838,14 @@ fn spawn_control_thread(
                     Ok(ControlMsg::Inject { message }) => {
                         let _ = inject_tx.send(message);
                     }
-                    // Intelligence hot-swap (RFC 0018 §5.2): park the new config in
-                    // the child-local LIVE handle. The loop drains + applies it at
-                    // its next turn boundary (rebuild client + adopt model); we
-                    // never touch the loop's in-flight `complete_once`. A swap that
-                    // supersedes a still-unread one simply overwrites it — the loop
-                    // only ever cares about the LATEST config (last-write-wins). The
-                    // token rides this frame (like Spawn) but is NEVER logged.
+                    // Intelligence hot-swap: park the new config in the
+                    // child-local LIVE handle. The loop drains and applies it at
+                    // its next turn boundary, rebuilding the client and adopting
+                    // the model; the loop's in-flight `complete_once` is never
+                    // touched from here. A swap that supersedes a still-unread
+                    // one simply overwrites it — last write wins, because only
+                    // the LATEST config is ever correct to dial. The token rides
+                    // this frame, as Spawn's does, and is NEVER logged.
                     Ok(ControlMsg::SwapIntel(swap)) => {
                         log.info(
                             "subagent.swap_intel",
@@ -842,8 +863,9 @@ fn spawn_control_thread(
 }
 
 /// `PR_SET_PDEATHSIG(SIGKILL)`: when the supervisor (our parent) dies, the
-/// kernel sends us SIGKILL — the leaf-up tree collapse (RFC 0003). Must be set
-/// after `execve` (it is cleared across exec), i.e. here in the child's `main`.
+/// kernel sends us SIGKILL, so a tree collapses leaf-up and leaves no orphaned
+/// agent processes behind. Must be set AFTER `execve`, which clears it — hence
+/// here in the child's `main` rather than in the parent's `pre_exec`.
 #[cfg(target_os = "linux")]
 fn install_pdeathsig() {
     unsafe {
@@ -859,8 +881,8 @@ fn install_pdeathsig() {
 
 #[cfg(not(target_os = "linux"))]
 fn install_pdeathsig() {
-    // PDEATHSIG is Linux-only; on other Unix the supervisor's kill ladder is
-    // the fallback. (agentd targets Linux for production.)
+    // PDEATHSIG is Linux-only; on other Unix the supervisor's kill ladder is the
+    // fallback that reaps orphans. Production targets Linux.
 }
 
 // The full control path is exercised end to end by the `subagent_spawn`
@@ -934,8 +956,8 @@ mod tests {
 
     #[test]
     fn pause_wait_breaks_out_on_cancel_during_pause() {
-        // A cancel that lands WHILE suspended unblocks the wait (cancel always
-        // wins), so a drain during a pause proceeds (RFC 0015 §4.3).
+        // A cancel that lands WHILE suspended unblocks the wait — cancel always
+        // wins — so a drain during a pause still proceeds.
         let paused = Arc::new(AtomicBool::new(true));
         let cancel = Arc::new(AtomicBool::new(false));
         let c2 = Arc::clone(&cancel);
@@ -960,10 +982,11 @@ mod tests {
 
     #[test]
     fn apply_pending_swap_rebuilds_client_and_adopts_model() {
-        // RFC 0018 §5.2: a parked swap is drained + applied at the one-shot turn
-        // boundary — the client points at the new endpoint list and the model is
-        // adopted. The new endpoint list starts with FRESH health (every endpoint
-        // CLOSED — `from_parts` builds a new HealthRecord, no stale breaker).
+        // A parked swap is drained and applied at the one-shot turn boundary:
+        // the client points at the new endpoint list and the model is adopted.
+        // The new endpoint list starts with FRESH health — every endpoint
+        // CLOSED, because `from_parts` builds a new HealthRecord and carries no
+        // breaker state over.
         let pending: PendingSwap = Arc::new(Mutex::new(None));
         let mut intel = IntelClient::from_parts("https://old.example", None).unwrap();
         let mut model = "old-model".to_string();
@@ -1008,8 +1031,8 @@ mod tests {
             SwapPolicy::FinishOnOld,
         ));
         assert!(!restart_turn_pending(&pending, "small"));
-        // A restart-turn swap that does NOT change the model (endpoint repoint) →
-        // never a restart (a repoint is always finish-on-old / invisible, §5.1).
+        // A restart-turn swap that does NOT change the model (an endpoint
+        // repoint) is never a restart: re-running would produce the same output.
         *pending.lock().unwrap() = Some(swap_to(
             "https://a.example",
             Some("small"),
@@ -1027,9 +1050,9 @@ mod tests {
 
     #[test]
     fn read_spawn_error_never_echoes_a_swap_intel_token() {
-        // Defense-in-depth (the info fold-in): a non-Spawn first frame must report
-        // only the variant LABEL — never `{other:?}`, which would Debug-print a
-        // plaintext token / injected instruction to stderr ("token NEVER logged").
+        // Defence in depth: a non-Spawn first frame must report only the variant
+        // LABEL, never `{other:?}`, which would Debug-print a plaintext token or
+        // an injected instruction to stderr.
         let swap = ControlMsg::SwapIntel(Box::new(SwapIntel {
             uri: "https://secret-host.example/secret-path".into(),
             token: Some("super-secret-token".into()),
@@ -1060,8 +1083,8 @@ mod tests {
 
     #[test]
     fn bad_swap_list_keeps_the_old_client() {
-        // RFC 0018 §5.2: an unparseable new list never tears a working run — the
-        // old client is kept; only the model (a plain string) is still adopted.
+        // An unparseable new list never tears down a working run: the existing
+        // client stays, and only the model, a plain string, is still adopted.
         let pending: PendingSwap = Arc::new(Mutex::new(None));
         let mut intel =
             IntelClient::from_parts("https://old.example,https://old2.example", None).unwrap();

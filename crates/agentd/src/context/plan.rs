@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The **context plan** (RFC 0026 §5.3, RFC 0028 §3 `plan.*`): a small ordered
-//! checklist the model owns for one context — created by the preflight or by
-//! `plan.create`, advanced by `plan.update`, cleared by `plan.clear`, rendered
-//! into every prompt, auto-advanced when a bound run/subagent/task reaches a
-//! terminal state. Temporary by intent (it belongs to the conversation, never
-//! to memory), durable by construction (part of the context record).
+//! The **context plan**: a small ordered checklist the model owns for one
+//! context — created by the preflight or by `plan.create`, advanced by
+//! `plan.update`, cleared by `plan.clear`, rendered into every prompt,
+//! auto-advanced when a bound run, subagent or task reaches a terminal state.
+//! Temporary by intent (it belongs to the conversation, never to memory) and
+//! durable by construction (it is part of the context record, so it is
+//! checkpointed and restored with everything else the conversation knows).
 
 use crate::state::now_ms;
 use serde::{Deserialize, Serialize};
@@ -238,9 +239,10 @@ impl Plan {
         }
     }
 
-    /// Auto-advance items bound to `binding` (RFC 0026 §5.3): a terminal
-    /// outcome marks the item done (success) or blocked (failure) with the
-    /// outcome as the note. Returns the ids advanced.
+    /// Auto-advance every item bound to `binding`: a terminal outcome marks
+    /// the item done (success) or blocked (failure), with the outcome kept as
+    /// the note. Items already in a terminal status are left alone, so a
+    /// replayed settle cannot un-finish work. Returns the ids advanced.
     pub fn settle_binding(&mut self, binding: &Binding, ok: bool, note: Option<&str>) -> Vec<u32> {
         let mut out = Vec::new();
         for it in self

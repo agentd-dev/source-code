@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The **`agentd tui` / `agentd ui` passthrough** (RFC 0032 §8): run the daemon
+//! The **`agentd tui` / `agentd ui` passthrough**: run the daemon
 //! AND its display client as one command. The daemon runs exactly as `agentd
 //! -c …` would — plus a forced `interface.enabled` (the subcommand IS the
 //! opt-in) — while a child process (`agentd-tui` / `agentd-ui`, separate

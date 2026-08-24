@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The process-global child reaper. RFC 0003 §pid1-orphan.
+//! The process-global child reaper.
 //!
 //! `waitpid(-1)` is process-global — it reaps *any* child (including
 //! `PR_SET_CHILD_SUBREAPER` orphans), so two threads each calling it would steal
 //! each other's children (the robbed one then waits forever for an exit another
-//! thread already collected). The old design serialized every supervised run
-//! behind a process-wide `SUPERVISE_LOCK` to keep a single `waitpid(-1)` caller.
+//! thread already collected).
 //!
-//! This module replaces that lock with **dispatch by pid**: one place drains
-//! `waitpid(-1)` and routes each reaped pid to the owning `Supervisor`'s
-//! channel, so any number of Supervisors run **concurrently** without stealing.
+//! The fix is **dispatch by pid**: exactly one place drains `waitpid(-1)` and
+//! routes each reaped pid to the owning `Supervisor`'s channel, so any number of
+//! Supervisors run **concurrently** without stealing from each other.
 //!
 //! Two operations, both under a global pid→route registry mutex:
 //!  * [`spawn_tracked`] forks the child **under the lock**, then registers its
@@ -64,11 +63,9 @@ fn routes() -> MutexGuard<'static, HashMap<i32, Sender<Reaped>>> {
 ///
 /// The lock is held across all of `spawn_fn` — the fork, the first-frame payload
 /// write, and the reader-thread spawn — so concurrent supervisors briefly
-/// serialize on each spawn (bounded by child startup; the child drains its stdin
-/// pipe within a few ms of `exec`). This is far cheaper than the retired
-/// `SUPERVISE_LOCK` (held for a whole *run*, possibly seconds); moving the payload
-/// write outside the lock is a possible follow-on if spawn contention is ever
-/// measured to matter.
+/// serialize on each spawn. The hold is bounded by child startup (the child
+/// drains its stdin pipe within a few ms of `exec`), never by the length of a
+/// run, so spawn contention stays in the millisecond range.
 pub fn spawn_tracked(
     reap_tx: &Sender<Reaped>,
     spawn_fn: impl FnOnce() -> io::Result<Subagent>,
@@ -79,10 +76,10 @@ pub fn spawn_tracked(
     Ok(sub)
 }
 
-/// [`spawn_tracked`] for a plain [`std::process::Child`] — an RFC 0036
-/// instance-tier child, which is a full daemon with no control channel. Same
-/// contract: the fork happens under the routes lock so the reaper can never
-/// `waitpid` the pid before it is registered.
+/// [`spawn_tracked`] for a plain [`std::process::Child`] — an instance-tier
+/// child, which is a full daemon with no control channel. Same contract: the
+/// fork happens under the routes lock so the reaper can never `waitpid` the pid
+/// before it is registered.
 pub fn spawn_tracked_pid(
     reap_tx: &Sender<Reaped>,
     spawn_fn: impl FnOnce() -> io::Result<std::process::Child>,

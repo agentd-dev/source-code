@@ -1,17 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The failover decision — sticky-primary with bounded sweep. RFC 0018 §3.3.
+//! The failover decision — sticky-primary with a bounded sweep.
 //!
 //! The client's `complete()` is wrapped: try the **active** endpoint; on a
-//! FAILOVER-CLASS error (connect refused/reset, timeout, HTTP 5xx, 429 after the
-//! endpoint's retry, or a circuit-open skip) advance to the next *available*
-//! endpoint in list order; a *non*-failover error (401/403 auth, 4xx request,
-//! malformed body) is returned immediately (it is the same on every endpoint).
-//! On success, snap `active` back to the lowest-index healthy endpoint
-//! (sticky-primary) so a fallback is temporary by construction.
+//! FAILOVER-CLASS error (connect refused or reset, timeout, HTTP 5xx, 429 that
+//! survived the endpoint's own retry, or a circuit-open skip) advance to the
+//! next *available* endpoint in list order. A *non*-failover error — 401/403
+//! auth, a 4xx request error, a malformed body — returns immediately, because
+//! it would be identical on every endpoint and trying the rest would only burn
+//! the run deadline while hiding the real cause. On success, `active` snaps back
+//! to the lowest-index healthy endpoint, so serving from a fallback is temporary
+//! by construction.
 //!
-//! §3.4: the wire/adapter/JSON path is UNCHANGED — this is the only net-new
-//! control flow. Each `complete_once` still dials fresh (RFC 0006 §7); the only
-//! state kept between calls is the cheap per-endpoint health/breaker record.
+//! This module holds the entire selection control flow; the wire, adapter and
+//! JSON path sit below it untouched. Each `complete_once` dials a fresh
+//! connection, which is what makes a re-dial safe to attempt at all. The only
+//! state kept between calls is the cheap per-endpoint health and breaker record.
 
 use std::time::Duration;
 
@@ -20,7 +23,7 @@ use super::endpoints::EndpointList;
 use super::health::{BreakerTransition, ErrKind};
 use crate::wire::intel::{Request, Response};
 
-/// How a single endpoint's outcome is classified for failover (RFC 0018 §3.3).
+/// How a single endpoint's outcome is classified for failover.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailoverClass {
     /// Try the next endpoint (connect refused/reset, timeout, 5xx, 429).
@@ -30,9 +33,10 @@ pub enum FailoverClass {
     Fatal,
 }
 
-/// Classify an [`IntelError`] for the failover sweep (RFC 0018 §3.3 table). This
-/// EXTENDS RFC 0006 §3 / RFC 0007 §3.6 — it does not redefine the per-call retry,
-/// which has already run inside `complete_once` before we get here.
+/// Classify an [`IntelError`] for the failover sweep. This decides only whether
+/// to try ANOTHER endpoint; the same-endpoint transient retry has already run
+/// inside `complete_once` before an error reaches here, so anything classified
+/// `Failover` has already survived that retry.
 pub fn classify(err: &IntelError) -> FailoverClass {
     match err {
         // Transport-layer failures are always failover-class: the endpoint is
@@ -65,24 +69,29 @@ pub fn classify(err: &IntelError) -> FailoverClass {
     }
 }
 
-/// Is this a fatal **auth** failure (401/403)? §6 distinguishes it from all-down:
-/// an auth failure on every endpoint is a misconfig (exit 4 immediately), NOT a
-/// backoff-loop — masking a credential error as a transient outage would hide it.
+/// Is this a fatal **auth** failure (401/403)? The all-down backoff needs to
+/// distinguish the two: an auth failure on every endpoint is a misconfiguration
+/// and exits 4 immediately rather than entering the backoff loop. Retrying a
+/// credential error would mask it as a transient outage and leave the operator
+/// with a daemon that looks alive but never works.
 pub fn is_auth(err: &IntelError) -> bool {
     matches!(err, IntelError::Http(401 | 403, _))
 }
 
-/// HTTP statuses a **same-endpoint** retry may clear (RFC 0006 §7): a 429
-/// rate-limit or an upstream 5xx blip. Mirrors the failover-class split in
-/// [`classify`] so the two never drift — a non-transient 4xx (bad request, auth)
-/// is a caller error, identical on a re-dial, and must surface immediately.
+/// HTTP statuses a **same-endpoint** retry may clear: a 429 rate-limit or an
+/// upstream 5xx blip. This set must stay identical to the failover-class HTTP
+/// split in [`classify`], or a status could be retried in place yet refuse to
+/// fail over (or the reverse). A non-transient 4xx — bad request, auth — is a
+/// caller error that is identical on a re-dial and must surface immediately.
 pub fn is_transient_status(code: u16) -> bool {
     code == 429 || (500..600).contains(&code)
 }
 
-/// The result of one failover sweep, plus the side-channel of breaker/active
-/// transitions the caller surfaces as metrics/events (§4.3/§8) and the
-/// `agentd://intelligence` emission (§4.4).
+/// The result of one failover sweep, plus the side-channel of breaker and
+/// active-endpoint transitions. The sweep observes these but emits nothing
+/// itself; the caller turns them into metrics, events and the
+/// `agentd://intelligence` body, which keeps this module free of observability
+/// dependencies.
 pub struct SweepResult {
     pub outcome: Result<Response, IntelError>,
     /// `(from, to)` if a failover advanced the endpoint within the sweep.
@@ -95,8 +104,9 @@ pub struct SweepResult {
     pub served_by: Option<usize>,
 }
 
-/// Drive one bounded failover sweep for a single logical `complete` (RFC 0018
-/// §3.3). Visits at most `eps.len()` distinct endpoints (each at most once).
+/// Drive one bounded failover sweep for a single logical `complete`. The sweep
+/// visits at most `eps.len()` distinct endpoints and each of them at most once,
+/// so one `complete` can never loop over the list.
 pub fn complete_resilient(
     list: &mut EndpointList,
     req: &Request,
@@ -110,8 +120,9 @@ pub fn complete_resilient(
     let mut last_err: Option<IntelError> = None;
     let mut prev_idx: Option<usize> = None;
 
-    // All endpoints down (every breaker OPEN-and-cooling): the documented §6
-    // terminal — surfaced by the caller as exit-4 (once) / backoff (loop).
+    // Every breaker is OPEN and still cooling, so there is nothing to dial. The
+    // caller turns this terminal into exit 4 in `once` mode, or into a backoff
+    // and re-arm for a long-lived daemon.
     if order.is_empty() {
         return SweepResult {
             outcome: Err(IntelError::AllEndpointsDown(None)),
@@ -123,7 +134,8 @@ pub fn complete_resilient(
     }
 
     for idx in order {
-        // A second-or-later attempt in the sweep IS a failover advance (§8 event).
+        // A second-or-later attempt within one sweep IS a failover advance, and
+        // is what the caller reports as such.
         if let Some(prev) = prev_idx
             && prev != idx
         {
@@ -171,7 +183,9 @@ pub fn complete_resilient(
         }
     }
 
-    // Every available endpoint failed over → all down (§6).
+    // Every available endpoint failed over, so the whole list is down. The last
+    // failover-class error is carried along as the cause, because the terminal
+    // on its own tells an operator nothing about why.
     SweepResult {
         outcome: Err(IntelError::AllEndpointsDown(last_err.map(Box::new))),
         failover,
@@ -253,8 +267,8 @@ mod tests {
 
     #[test]
     fn transient_status_matches_the_failover_class_split() {
-        // The same-endpoint retry set (429 + all 5xx) must mirror `classify`'s
-        // failover-class HTTP codes so the two never drift.
+        // The same-endpoint retry set (429 plus every 5xx) must match
+        // `classify`'s failover-class HTTP codes exactly.
         for c in [429, 500, 502, 503, 504, 599] {
             assert!(is_transient_status(c), "{c} should be transient");
         }
@@ -411,8 +425,9 @@ mod tests {
     #[test]
     fn all_endpoints_down_yields_all_endpoints_down_error() {
         let mut list = list_of(&[dead_endpoint(), dead_endpoint()]);
-        // One sweep over two dead endpoints exhausts the list (each failed-over)
-        // → the documented §6 terminal, mapped to exit 4 on `once`.
+        // One sweep over two dead endpoints exhausts the list, since each one
+        // failed over, giving the all-down terminal that maps to exit 4 in
+        // `once` mode.
         let r = complete_resilient(&mut list, &req(), Duration::from_secs(2), None);
         assert!(matches!(r.outcome, Err(IntelError::AllEndpointsDown(_))));
         // After enough sweeps the breakers open and `all_down()` (breaker-state)
@@ -427,9 +442,10 @@ mod tests {
     #[test]
     fn transient_5xx_is_retried_on_the_same_endpoint() {
         // One 503 then a 200 on a SINGLE endpoint: complete_once's same-endpoint
-        // retry rides out the blip and succeeds in place — no failover, no exit 4.
-        // (This is the once-mode gap the retry closes: with no higher-level loop,
-        // the bare 503 used to propagate straight to exit 4.)
+        // retry rides out the blip and succeeds in place, with no failover and
+        // no exit 4. This matters most in once-mode, which arms no higher-level
+        // retry loop, so without this retry a bare 503 would go straight to
+        // exit 4.
         let ep = serve_sequence(vec![503, 200]);
         let mut list = list_of(&[ep]);
         let r = complete_resilient(&mut list, &req(), Duration::from_secs(2), None);

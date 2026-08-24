@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Workflow engine v3 orchestration (RFC 0027 §5): start-node triggers
-//! (`loop`, `schedule`, `subscribe`, `signal`, `event`), the `workflow` child-run
-//! node with `sync`/`cascade`, `wait`/`join` on runs, `workflow.signal`/`wait`,
-//! step `cache`, and the `think` presets — driven by the 2.0 runtime. CEL is
-//! used throughout.
+//! Workflow engine v3 orchestration: start-node triggers (`loop`, `schedule`,
+//! `subscribe`, `signal`, `event`), the `workflow` child-run node with
+//! `sync`/`cascade`, `wait`/`join` on runs, `workflow.signal`/`wait`, step
+//! `cache`, and the `think` presets — all driven through the real binary. CEL
+//! is used throughout.
 #![cfg(all(feature = "cel", feature = "cron"))]
 
 mod common;

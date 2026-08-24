@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! **Live activity** (RFC 0032 §17): what each working unit is doing *right
-//! now*, for the display clients' working row.
+//! **Live activity**: what each working unit is doing *right now*, for the
+//! display clients' working row.
 //!
-//! The turn worker already reports coarse progress upward
-//! ([`AgentMsg::Event`] — `turn.think`, `turn.round`, `turn.tool`); the
-//! supervisor used to drop those frames on the floor. Here they fold into a
+//! The turn worker reports coarse progress upward as [`AgentMsg::Event`]
+//! frames — `turn.think`, `turn.round`, `turn.tool`. Here they fold into a
 //! per-unit [`Activity`] record — phase, current tool, round, tokens so far,
 //! start time — and publish as `activity` feed events.
 //!
@@ -12,9 +11,9 @@
 //! operator would notice CHANGES (phase, tool, round). Elapsed time is not
 //! streamed — the record carries `started_ms` and clients tick their own
 //! clock — so a long think emits nothing at all. That keeps the feed's replay
-//! ring meaningful (a handful of activity events per turn, not one per
-//! second), which is exactly the property token-level streaming would have
-//! broken.
+//! ring meaningful: a handful of activity events per turn rather than one per
+//! second, so a client that reconnects can still see the whole turn in the
+//! ring instead of a second's worth of noise.
 
 use super::children::ChildKind;
 use super::reactor::Runtime;

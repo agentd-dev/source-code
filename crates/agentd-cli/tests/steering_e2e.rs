@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! **Steering over A2A** end to end (RFC 0029 §5/§7, now dispatched): a client
-//! fires `workflow.signal` to resume a waiting run, pauses/resumes one run and
-//! the whole instance (`a2a.pause`/`a2a.resume`), and reads a conversation's
-//! plan — the control verbs a display client uses beyond cancel/drain.
+//! **Steering over A2A** end to end: a client fires `workflow.signal` to
+//! resume a waiting run, pauses/resumes one run and the whole instance
+//! (`a2a.pause`/`a2a.resume`), and reads a conversation's plan — the control
+//! verbs a display client uses beyond cancel/drain.
 #![cfg(all(unix, feature = "a2a"))]
 
 mod common;

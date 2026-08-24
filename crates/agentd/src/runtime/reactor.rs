@@ -1,8 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The **runtime state + event loop** (RFC 0026 §3, §8): one single-threaded
-//! reactor over child frames, reaped children, executor results, timers, the
-//! durable inbox and signals; state mutation happens only here (single
-//! writer); every mutation is followed by a checkpoint decision (RFC 0025 §5).
+//! The **runtime state + event loop**: one single-threaded reactor over child
+//! frames, reaped children, executor results, timers, the durable inbox and
+//! signals.
+//!
+//! State mutation happens only here. Being the single writer is what makes the
+//! rest of the runtime reasonable about: no lock ordering, no torn reads, and
+//! an answer computed for one caller is computed against one consistent view.
+//! Every mutation is followed by a checkpoint decision, so durable state never
+//! trails the in-memory state by more than one loop turn.
+//!
 //! The other `runtime::*` modules add `impl Runtime` blocks for turns, tools,
 //! steps and subagents; this file owns construction, the loop, lifecycle and
 //! the status view.
@@ -64,7 +70,7 @@ pub enum PendingKind {
     Run { run: String, deadline_ms: u64 },
     /// A CEL condition polled each tick (`await`).
     Await { condition: String, deadline_ms: u64 },
-    /// A human's answer (`ask_human` / the `human` node — RFC 0032 §16): the
+    /// A human's answer (`ask_human` / the `human` node): the
     /// A2A task `task` sits in `input-required`; a `SendMessage` carrying its
     /// `taskId` resolves this with the reply text. With no interface to answer
     /// on, `task` is a synthetic ask id (no A2A task exists).
@@ -79,16 +85,19 @@ pub enum PendingKind {
         auto_fired: bool,
         /// The answer's declared shape (`human.schema` / `ask_human.schema`).
         ///
-        /// It was accepted, forwarded to clients so they could render a form,
-        /// and then never applied to what came back — so a gate could declare
-        /// it wanted `{decision: "file"|"hold"}` and the run would proceed on
-        /// "maybe later". Carried here so the reply can be checked against it.
+        /// Carried on the pending ask so the reply can be validated against it
+        /// when it lands. Forwarding the schema to clients only makes them
+        /// render the right form; a gate that declares it wants
+        /// `{decision: "file"|"hold"}` must also refuse "maybe later", or the
+        /// run proceeds on an answer it never asked for.
         schema: Option<Value>,
     },
 }
 
-/// A queued root/conversation turn (RFC 0026 §3.2), waiting for a slot and
-/// for its context to be free.
+/// A queued root/conversation turn, waiting for a worker slot and for its
+/// context to be free. One context runs at most one turn at a time, so turns
+/// for the same conversation queue behind each other rather than interleaving
+/// into the same history.
 #[derive(Debug, Clone)]
 pub struct TurnJob {
     pub ctx: String,
@@ -133,7 +142,8 @@ impl TurnJob {
     }
 }
 
-/// A subagent registry record (RFC 0026 §6; durable `subagent/<handle>`).
+/// A subagent registry record, persisted as `subagent/<handle>` so a child's
+/// identity and result outlive both the child and this process.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SubagentRecord {
     pub handle: String,
@@ -157,8 +167,8 @@ pub struct SubagentRecord {
     /// The payload (secret-free) for restore re-spawn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload: Option<Value>,
-    /// RFC 0036: the template this child was instantiated from, and its tier
-    /// (`flat` | `instance`). Freeform spawns carry neither.
+    /// The template this child was instantiated from, and its tier
+    /// (`flat` | `instance`). A freeform spawn carries neither.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -192,7 +202,8 @@ fn record_durable_default() -> bool {
     true
 }
 
-/// The current instruction (RFC 0028 §3 `instruction.*`).
+/// The instruction in force. `version` increments on every change, so a
+/// consumer can tell a re-read from a genuinely new instruction.
 #[derive(Debug, Clone)]
 pub struct Instruction {
     pub text: String,
@@ -291,13 +302,14 @@ pub struct Runtime {
     pub(crate) idle_since: Option<Instant>,
     pub(crate) intel_uri: String,
     pub(crate) intel_token: Option<String>,
-    /// Resolved `intelligence.headers` (RFC 0031), pushed on every LLM dial and
-    /// threaded to subagents via the spawn payload.
+    /// Resolved `intelligence.headers`, pushed on every LLM dial and threaded
+    /// to subagents via the spawn payload so a child dials identically.
     pub(crate) intel_headers: Vec<(String, String)>,
-    /// An optional intelligence OAuth credential provider (RFC 0031): a closure
-    /// returning the current bearer (refreshing from the device-login cache). The
-    /// resolved bearer overrides `intel_token` and is threaded to subagents fresh
-    /// at each spawn. `None` when no `intelligence.auth` oauth2 block is set.
+    /// An optional intelligence credential provider: a closure returning the
+    /// current bearer, refreshed from the device-login cache. Its resolved
+    /// bearer overrides `intel_token`, and is threaded to subagents fresh at
+    /// each spawn so no child carries a stale one. `None` when no
+    /// `intelligence.auth` oauth2 block is configured.
     pub(crate) intel_bearer: Option<std::sync::Arc<dyn Fn() -> Option<String> + Send + Sync>>,
     pub(crate) model: String,
     pub(crate) trace_id: Option<String>,
@@ -312,7 +324,7 @@ pub struct Runtime {
     /// Unix-ms a goal LLM judge was dispatched (so overlapping checks don't spawn
     /// duplicate judges); `None` = none in flight.
     pub(crate) goal_judge_at: Option<u64>,
-    /// Durable A2A tasks (RFC 0029 §4), keyed by task id.
+    /// Durable A2A tasks, keyed by task id.
     #[cfg(feature = "a2a")]
     pub(crate) tasks: BTreeMap<String, crate::a2a::Task>,
     /// Inbox-event id → the A2A task it answers (a conversation turn).
@@ -320,10 +332,10 @@ pub struct Runtime {
     pub(crate) event_to_task: BTreeMap<String, String>,
     /// The task snapshot the A2A listener threads read (None ⇒ not serving).
     #[cfg(feature = "a2a")]
-    /// The interface event feed (RFC 0032; None ⇒ interface disabled).
+    /// The interface event feed. `None` means the interface is disabled.
     #[cfg(feature = "a2a")]
     pub(crate) a2a_feed: Option<std::sync::Arc<super::a2a_server::SharedFeed>>,
-    /// Pairing-code login (RFC 0032 §13; None ⇒ pairing disabled).
+    /// Pairing-code login state. `None` means pairing is disabled.
     #[cfg(feature = "a2a")]
     pub(crate) a2a_pairing: Option<std::sync::Arc<super::a2a_server::PairingState>>,
     /// The id the listener reserved for the task the request being served will
@@ -337,7 +349,7 @@ pub struct Runtime {
     /// The live listener. Held, not used: dropping it stops serving.
     #[cfg(feature = "a2a")]
     pub(crate) a2a_listener: Option<crate::a2a::serve::Listener>,
-    /// Live per-unit activity (RFC 0032 §17), keyed by child node id.
+    /// Live per-unit activity, keyed by child node id.
     pub(crate) activity: BTreeMap<u64, super::activity::Activity>,
     /// The newest root-context reply, so a `--prompt` job can print its answer
     /// (a prompt runs as a turn, not as a `once` run with an output).
@@ -471,10 +483,10 @@ impl Runtime {
             for (node, health) in self.children.tick() {
                 self.on_unhealthy_child(node, health);
             }
-            // 9b. Instance-tier children (RFC 0036): ttl retirement + the
+            // 9b. Instance-tier children: ttl retirement, plus the
             // SIGTERM→SIGKILL escalation for children that ignored the drain.
             self.instances_tick();
-            // 10. Checkpoints + the point-in-time observability gauges (§3.11).
+            // 10. Checkpoints + the point-in-time observability gauges.
             self.checkpoint(false);
             crate::obs::metrics::set_inbox_pending(self.inbox_queue.len() as u64);
             crate::obs::metrics::set_context_tokens(self.contexts.max_est_tokens());
@@ -495,7 +507,7 @@ impl Runtime {
                     self.turn_queue.len() as u64,
                 );
             }
-            // 10.5. The interface feed's section diff (RFC 0032 §4): publish
+            // 10.5. The interface feed's section diff: publish
             // run/conversation/subagent/child/status deltas to attached display
             // clients. A no-op unless `interface.enabled`; rate-limited inside.
             #[cfg(feature = "a2a")]
@@ -564,7 +576,10 @@ impl Runtime {
 
     // ---- inbox -------------------------------------------------------------
 
-    /// Accept a durable event: write-ahead, then queue (RFC 0025 §5).
+    /// Accept a durable event: write it to the store first, then queue it for
+    /// the loop. Write-ahead is the whole point — once acceptance is
+    /// acknowledged to the outside world, a crash before the event is acted on
+    /// must replay it rather than drop it.
     pub(crate) fn accept_event(
         &mut self,
         kind: &str,
@@ -621,7 +636,8 @@ impl Runtime {
                     }
                 }
                 kinds::A2A_MESSAGE => {
-                    // P5 wires the A2A server; a replayed message still becomes a turn.
+                    // Handled the same whether it arrived live or was replayed
+                    // from the inbox after a restart.
                     self.on_a2a_message_event(&ev);
                 }
                 kinds::SIGNAL => {
@@ -669,8 +685,9 @@ impl Runtime {
         }
     }
 
-    /// An A2A message event → a conversation turn (RFC 0026 §3.2). P5 adds
-    /// commands/authorization; here every message is natural language.
+    /// An A2A message event, routed to whichever reader owns it. Control-plane
+    /// ops are consumed first, then a waiting step, then a start node, and only
+    /// what is left becomes a conversation turn.
     fn on_a2a_message_event(&mut self, ev: &InboxEvent) {
         let ctx = ev.payload["context_id"]
             .as_str()
@@ -687,9 +704,10 @@ impl Runtime {
             self.event_to_task
                 .insert(ev.id.clone(), task_id.to_string());
         }
-        // RFC 0036 Phase B: `_instance.*` ops — a child reporting home. The
-        // runtime consumes them BEFORE any reader: never a wait's answer,
-        // never a start's request, never a conversational turn.
+        // `_instance.*` ops are a child reporting home. The runtime consumes
+        // them BEFORE any reader, so they can never be mistaken for a wait's
+        // answer, a start's request, or a conversational turn — control-plane
+        // traffic must not reach a model.
         #[cfg(feature = "a2a")]
         if self.handle_instance_op(ev) {
             return;
@@ -820,8 +838,8 @@ impl Runtime {
             | AgentMsg::Pong { .. }
             | AgentMsg::Gate { .. }
             | AgentMsg::GateClosed { .. } => {}
-            // Coarse progress from the child (RFC 0032 §17): what this unit is
-            // doing right now, for the display clients' working row.
+            // Coarse progress from the child: what this unit is doing right
+            // now, for the display clients' working row.
             AgentMsg::Event { event, fields } => self.on_child_progress(node, &event, &fields),
             AgentMsg::Usage(u) => {
                 self.counters.tokens_in += u.input_tokens;
@@ -868,8 +886,8 @@ impl Runtime {
             let _ = self.events_tx.send(Event::Reaped(r));
             return;
         }
-        // RFC 0036: an instance-tier daemon child has no control channel and
-        // no node — its exit closes the record directly.
+        // An instance-tier daemon child has no control channel and no node in
+        // the child table, so its exit closes the subagent record directly.
         if !self.children.has_pid(r.pid) && self.on_instance_reaped(&r) {
             return;
         }
@@ -880,14 +898,14 @@ impl Runtime {
         self.log.info("child.exit", json!({"node": node.0, "pid": r.pid, "kind": super::children::kind_label(&child.kind), "outcome": format!("{:?}", r.outcome)}));
         // A child that died without its terminal frame: fail its unit.
         match child.kind {
-            // The old guard asked `pending_turn_exists` — "is the child still in
-            // the table?" — which cannot answer this question from here: a
+            // Ask the STEP, not the child table, whether this worker died
+            // owing a result. The child table cannot answer it here: a
             // `TurnDone` settles the step but leaves the child in the table
             // until it is reaped, and `Children::on_reaped` above has already
-            // removed it, so the guard is false for settled and orphaned workers
-            // alike and the step stayed Running forever. The STEP can answer it:
-            // it is Running and still owned by THIS worker only when no terminal
-            // frame ever landed.
+            // removed the entry — so "is the child in the table?" reads the
+            // same for a settled worker and an orphaned one. The step is
+            // unambiguous: it is Running and still owned by THIS worker only
+            // when no terminal frame ever landed.
             ChildKind::StepTurn {
                 ref run,
                 ref step,
@@ -927,14 +945,14 @@ impl Runtime {
                     );
                 }
             }
-            // A root turn and a think expose no equivalent state to test here,
-            // so they ask `pending_turn_exists` — which now answers from the
-            // settled marker `on_turn_done`/`on_turn_failed` leave on the child
-            // record, not from the child's presence in the table. Presence
-            // cannot answer it: `on_reaped` has already removed the child by the
-            // time this runs, and a normally-settled worker also stays in the
-            // table until it is reaped, so the old form read false for settled
-            // and orphaned workers alike and this arm never fired.
+            // A root turn and a think expose no equivalent state to test
+            // here, so they ask `pending_turn_exists`, which answers from the
+            // settled marker `on_turn_done` / `on_turn_failed` leave on the
+            // child record rather than from the child's presence in the table.
+            // Presence cannot answer it: `on_reaped` has already removed the
+            // child by the time this runs, and a normally-settled worker also
+            // stays in the table until it is reaped, so presence reads the same
+            // for settled and orphaned workers alike.
             ChildKind::RootTurn { .. } | ChildKind::Think { .. } => {
                 if self.pending_turn_exists(node) {
                     self.on_turn_failed(
@@ -1015,7 +1033,8 @@ impl Runtime {
         crate::signals::set_lame_duck(true);
         self.log.info("drain.start", json!({"reason": reason, "children": self.children.len(), "runs": self.runs.values().filter(|r| !r.status.is_terminal()).count()}));
         crate::obs::metrics::record_drain("started");
-        // Tell every attached display client (RFC 0032 §4).
+        // Tell every attached display client, so a client can stop offering
+        // actions the daemon will now refuse.
         #[cfg(feature = "a2a")]
         self.feed_push(
             "lifecycle",
@@ -1144,8 +1163,10 @@ impl Runtime {
         None
     }
 
-    /// The exit code of a job-shaped instance: the once-started workflow's
-    /// finish status (RFC 0011 §5 mapping); a daemon drains to 0.
+    /// The exit code of a job-shaped instance, mapped from the `once`-started
+    /// workflow's finish status. With several such runs the worst outcome
+    /// wins, so a partial success is never reported as a clean exit. A daemon
+    /// is not job-shaped and drains to 0.
     fn job_exit_code(&self) -> i32 {
         let mut code = crate::exit::SUCCESS;
         for id in &self.job_runs {
@@ -1334,7 +1355,10 @@ pub(crate) fn is_terminal_status(s: &str) -> bool {
     )
 }
 
-/// RFC 0011 §5 exit mapping for a finished run.
+/// Map a finished run's status onto a process exit code, so a caller can tell
+/// *how* a job ended without parsing its output: refusal, budget exhaustion,
+/// a missed deadline and an unreachable model each get their own code, and
+/// anything still unfinished reports as partial.
 pub fn run_exit_code(r: &RunState) -> i32 {
     match r.status {
         RunStatus::Completed => crate::exit::SUCCESS,

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The durable-store contract (RFC 0025): agentd boots against a remote store
+//! The durable-store contract: agentd boots against a remote store
 //! reached over MCP, runs its `once` job, and persists the outcome — so a second
 //! life against the same store finds the run already complete and does not re-fire
 //! the `once` start. Driven black-box: the built-in mock MCP server (a store

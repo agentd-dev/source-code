@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! `agentd login` (RFC 0031 §12) end to end: the binary runs the OAuth 2.1
+//! `agentd login`, end to end: the binary runs the OAuth 2.1
 //! **device-authorization** flow against a mock authorization server — device
 //! request → poll (pending, then authorized) → cache the token in a per-user
 //! file the daemon would read. Proves the interactive login UX works headlessly.

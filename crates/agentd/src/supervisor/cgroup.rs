@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! cgroup v2 memory awareness (read-only). Assessment §4 M5.
+//! cgroup v2 memory awareness (read-only).
 //!
 //! Best-effort, **never required**: a cloud-native unit reports the memory
 //! budget its scheduler handed it so OOM risk is observable (logged at startup,
 //! and exposed as a `/metrics` gauge). Reads the unified cgroup v2 interface
 //! files directly under `/sys/fs/cgroup`; in a container with a cgroup
-//! namespace (the target
-//! shape) that path is the unit's *own* cgroup, so the direct read is correct.
+//! namespace (the target shape) that path is the unit's *own* cgroup, so the
+//! direct read is correct.
 //! On a bare host it reflects the root cgroup (whole-host) — still informative.
 //! Any missing file / cgroup v1 / parse failure degrades to `None`.
 //!
@@ -17,7 +17,8 @@
 //! placed in its own child cgroup so teardown can write **`cgroup.kill`** — the
 //! kernel then SIGKILLs the *entire* subtree atomically, catching processes that
 //! escaped the process group (`setsid`) which `killpg` + `PR_SET_PDEATHSIG`
-//! would miss (assessment §2.3 risk #3, the worst leak). And [`under_memory_pressure`]
+//! would miss — the worst leak agentd can suffer, since such a process outlives
+//! every other teardown mechanism. And [`under_memory_pressure`]
 //! lets the spawn-admission gates backpressure when the unit is at its
 //! `memory.high` soft limit. Every cgroup op is best-effort: if the tree isn't
 //! writable (no delegation, cgroup-v1, off-cgroup) the feature silently disables

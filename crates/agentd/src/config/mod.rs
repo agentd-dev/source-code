@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Configuration: precedence + validate-at-startup. RFC 0011 §2-§3.
+//! Configuration: precedence, then validate-at-startup.
 //!
-//! Precedence, top wins: `built-in default < config FILE < env var < CLI flag`
-//! (RFC 0017 §3.2). Everything is env-settable (12-factor). The optional
+//! Precedence, top wins: `built-in default < config FILE < env var < CLI flag`.
+//! Everything is env-settable (12-factor). The optional
 //! declarative file ([`file`] — YAML or JSON, `--config`/`AGENTD_CONFIG`)
 //! carries only verbose structural config (MCP-server inventory, declared
 //! subscriptions, A2A peers, limits, model/log knobs) and **never** secrets —
@@ -35,7 +35,8 @@ use std::fmt;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// Execution mode — one supervisor loop, four exit predicates (RFC 0008).
+/// Execution mode. There is one supervisor loop; the mode only chooses the
+/// predicate that decides when it is finished.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     /// Run the instruction once to a terminal status, then exit.
@@ -46,8 +47,8 @@ pub enum Mode {
     Reactive,
     /// Per-fire identical to `once`, driven by an internal interval/cron.
     Schedule,
-    /// Drive a pinned workflow (`--workflow <file>`) to a terminal graph status, then
-    /// exit — the operator entry for deterministic DAGs (pivot Phase 7 · P6).
+    /// Drive a pinned workflow (`--workflow <file>`) to a terminal graph
+    /// status, then exit — the operator entry for deterministic DAGs.
     #[cfg(feature = "workflow")]
     Workflow,
 }
@@ -76,24 +77,24 @@ impl Mode {
     }
 }
 
-/// Model hot-swap policy (RFC 0018 §5.3, `--model-swap` / `AGENTD_MODEL_SWAP`):
-/// what an in-flight run does when a reload changes the `model` under it. An
-/// endpoint repoint (model unchanged) is ALWAYS finish-on-old / invisible (§5.1),
-/// regardless of this policy. Default `FinishOnOld`. Serialized into the
-/// `ControlMsg::SwapIntel` frame so the child applies the same policy the
-/// supervisor was configured with.
+/// Model hot-swap policy (`--model-swap` / `AGENTD_MODEL_SWAP`): what an
+/// in-flight run does when a reload changes the `model` under it. An endpoint
+/// repoint that leaves the model unchanged is ALWAYS finish-on-old and
+/// invisible, whatever this policy says — nothing about the turn changed.
+/// Default `FinishOnOld`. Serialized into the `ControlMsg::SwapIntel` frame so
+/// the child applies the same policy the supervisor was configured with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SwapPolicy {
     /// The turn in flight when the reload lands completes on the OLD model; the
     /// NEXT turn uses the new model over the full existing transcript. The
-    /// natural turn-boundary behaviour — cheapest, no wasted work (§5.3).
+    /// natural turn-boundary behaviour — cheapest, and no work is thrown away.
     #[default]
     FinishOnOld,
     /// The turn in flight finishes (we never tear a `complete_once`) but its
     /// result is DISCARDED and the turn is RE-RUN on the new model from the same
-    /// pre-turn transcript state — costs one turn, bounded by the step budget
-    /// (§5.3). Opt-in.
+    /// pre-turn transcript state. Costs one turn, and the step budget bounds
+    /// how often it can happen. Opt-in.
     RestartTurn,
 }
 
@@ -113,8 +114,8 @@ impl SwapPolicy {
     }
 }
 
-/// Where `--serve-mcp` binds the served self-MCP (RFC 0015 §3.1). `Stdio` is the
-/// implicit default (no `--serve-mcp`). The sole transport is
+/// Where `--serve-mcp` binds the served self-MCP. `Stdio` is the implicit
+/// default (no `--serve-mcp`). The sole transport is
 /// [`Http`](ServeTarget::Http) — `https://HOST:PORT` (TLS, the control plane) or
 /// `http://LOOPBACK:PORT` (plaintext, loopback-only dev/tests).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,7 +135,7 @@ impl ServeTarget {
     /// `http://host:port` for dev). Returns a [`ConfigError::Usage`] (exit 2,
     /// before any side effect) on a bad scheme / missing port / a path.
     pub fn parse(spec: &str) -> Result<ServeTarget, ConfigError> {
-        // The target-vision transport: `https://HOST:PORT` (TLS control plane) or
+        // The transport: `https://HOST:PORT` (TLS control plane) or
         // `http://LOOPBACK:PORT` (plaintext, loopback-only dev/tests). The bind is
         // the `host:port` authority (path/query rejected — this is a listener, not
         // a URL to fetch).
@@ -189,12 +190,12 @@ impl ServeTarget {
 }
 
 impl Config {
-    /// Validate the TLS material + auth for a `--serve-mcp` target (pivot Phase 2).
-    /// The cert/key/CA/bearer fields apply ONLY to an `https://` target; TLS needs
+    /// Validate the TLS material + auth for a `--serve-mcp` target. The
+    /// cert/key/CA/bearer fields apply ONLY to an `https://` target; TLS needs
     /// `--serve-cert`+`--serve-key`; and a **non-loopback** listener MUST
-    /// authenticate (mTLS via `--serve-client-ca` and/or a `--serve-bearer` token)
-    /// — the pivot removes the "reached the listener = trusted" posture, so an
-    /// open control plane is refused at startup (exit 2).
+    /// authenticate, by mTLS (`--serve-client-ca`) and/or a `--serve-bearer`
+    /// token. Reaching the listener is never itself proof of trust, so an open
+    /// control plane is refused at startup (exit 2) rather than served.
     fn validate_serve_auth(
         &self,
         target: &ServeTarget,
@@ -269,21 +270,20 @@ fn serve_port_of(authority: &str) -> Option<u16> {
 }
 
 /// A declared **A2A peer**: a name and a client transport endpoint to reach a
-/// remote A2A agent (or the on-node gateway that forwards into the mesh). This
-/// is the delegation-backend axis of RFC 0020 §3 — `a2a.delegate` looks a peer
-/// up here and runs the A2A client against `endpoint`. The endpoint is an A2A
-/// client transport: `https://host[:port]` (the target-vision transport; loopback
-/// `http://` for dev) or the legacy `unix:/path` / `vsock:CID:PORT`. No secrets
-/// live here. Serializable so it travels in the spawn payload to subagents,
-/// exactly like `mcp_servers` (RFC 0009 §spawn-payload).
+/// remote A2A agent (or the on-node gateway that forwards into the mesh).
+/// `a2a.delegate` looks a peer up here and runs the A2A client against
+/// `endpoint`, which is `https://host[:port]` (loopback `http://` for dev) or
+/// `unix:/path` for a co-located peer. No secrets live here. Serializable so it
+/// travels in the spawn payload to subagents, exactly like `mcp_servers`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct A2aPeerSpec {
     pub name: String,
     pub endpoint: String,
     /// Secret-FREE auth header templates presented TO the peer (e.g.
     /// `("authorization", "Bearer {{secret:PEER_TOKEN}}")`), resolved at dial
-    /// time exactly like an MCP server's (RFC 0012 §3.7 — no credential in the
-    /// spec/manifest/payload/logs). This is the bearer leg of peer client-auth.
+    /// time exactly like an MCP server's, so no credential is ever present in
+    /// the spec, the manifest, the spawn payload or the logs. This is the
+    /// bearer leg of peer client-auth.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub headers: Vec<(String, String)>,
     /// Client-certificate PEM **file paths** for mutual TLS to the peer (the
@@ -311,7 +311,7 @@ impl A2aPeerSpec {
 /// peer, unlike the `--serve-mcp` listen form which may wildcard).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum A2aEndpoint {
-    /// Dial an A2A peer over HTTP(S) — the remote transport (pivot):
+    /// Dial an A2A peer over HTTP(S):
     /// `https://host[:port][/path]` (or loopback `http://` for dev/tests). The
     /// raw URL, parsed by the A2A client's HTTP dialer. A co-located peer may
     /// instead be dialled by `unix:///path` (same URL string, socket dial).
@@ -319,8 +319,8 @@ pub enum A2aEndpoint {
 }
 
 impl A2aEndpoint {
-    /// Parse an `--a2a-peer` endpoint. HTTPS-only (pivot Phase 3): an `https://`
-    /// peer URL, or a loopback `http://` for dev/tests. Returns a
+    /// Parse an `--a2a-peer` endpoint. HTTPS-only: an `https://` peer URL, or
+    /// a loopback `http://` for dev/tests. Returns a
     /// [`ConfigError::Usage`] (exit 2, before any side effect) on any problem.
     pub fn parse(spec: &str) -> Result<A2aEndpoint, ConfigError> {
         if spec.starts_with("https://") {
@@ -359,46 +359,48 @@ impl A2aEndpoint {
 }
 
 /// A declared MCP server. Serializable because it travels in the subagent spawn
-/// payload as the child's scoped server subset (RFC 0005, RFC 0009).
+/// payload as the child's scoped server subset.
 ///
-/// As of v2.0.0 the sole transport is a remote [`endpoint`](Self::endpoint)
-/// reached over Streamable HTTP (RFC 0004; RFC 0012 — no local process spawn).
+/// The sole transport is a remote [`endpoint`](Self::endpoint) reached over
+/// Streamable HTTP. There is no local process spawn, so no configuration path
+/// can turn an MCP server into command execution on this host.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct McpServerSpec {
     pub name: String,
     /// Remote MCP endpoint — `https://host[:port][/path]` (loopback `http://`
-    /// for dev), reached over RFC 0004 Streamable HTTP.
+    /// for dev), reached over Streamable HTTP.
     pub endpoint: String,
     /// Secret-FREE auth/framing header templates (e.g. `("Authorization", "Bearer
-    /// {{secret:MCP_TOKEN}}")`), resolved at connect time (RFC 0012 §3.7 — no
-    /// credential in the spec/manifest/payload/logs).
+    /// {{secret:MCP_TOKEN}}")`), resolved at connect time — no credential is
+    /// ever present in the spec, manifest, spawn payload or logs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub headers: Vec<(String, String)>,
     /// Operator-declared capability tags (`--mcp-tags`) for the Rule-of-Two
-    /// trifecta check (RFC 0012 §3.1). Travels in the spawn payload so a child's
-    /// narrowed grant carries the same tags. Empty = untagged (the check treats
-    /// an untagged server conservatively as `untrusted_input`).
+    /// trifecta check. Travels in the spawn payload so a child's narrowed grant
+    /// carries the same tags. Empty = untagged, and the check treats an
+    /// untagged server conservatively as `untrusted_input` — so forgetting to
+    /// tag a server can only tighten the gate, never loosen it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<TrifectaTag>,
-    /// Sign requests to THIS server with the AAuth agent identity (RFC 0023).
+    /// Sign requests to THIS server with the AAuth agent identity.
     /// Per-server opt-in: `None` inherits the global default (sign all when an
     /// `--aauth-provider` is configured); `Some(false)` opts out; `Some(true)`
     /// opts in even if the global default were off. Travels in the spawn payload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aauth: Option<bool>,
-    /// OAuth 2.1 client-credentials for an endpoint behind an OAuth gateway
-    /// (RFC 0031 §7): a refreshing `Authorization: Bearer …` fetched from the
+    /// OAuth 2.1 client-credentials for an endpoint behind an OAuth gateway:
+    /// a refreshing `Authorization: Bearer …` fetched from the
     /// token endpoint. Secret-free (`client_secret` is a `{{secret:…}}`
     /// template). Travels in the spawn payload; takes the request-signer seam
     /// when set (mutually exclusive with per-server AAuth signing).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth: Option<McpOauthSpec>,
-    /// The unified credential provider (RFC 0031 §5). Takes precedence over the
-    /// legacy `oauth`/`aauth` when set. Travels in the spawn payload.
+    /// The unified credential provider. When set it takes precedence over the
+    /// narrower `oauth` / `aauth` settings. Travels in the spawn payload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<AuthSpec>,
-    /// The `services:` catalog entry this server references (RFC 0037): the
-    /// credential cache key becomes `service:<name>` so every consumer of the
+    /// The `services:` catalog entry this server references. The credential
+    /// cache key becomes `service:<name>`, so every consumer of the
     /// entry shares one cached login, and the per-instance `rate:` bucket is
     /// keyed by it. Travels in the spawn payload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -410,10 +412,9 @@ pub struct McpServerSpec {
     pub rate: Option<String>,
 }
 
-/// The runtime shape of an MCP server's OAuth 2.1 client-credentials config
-/// (RFC 0031 §7 — the client-credentials grant). Serializable so it rides the
-/// spawn payload verbatim; `client_secret` is a secret-free `{{secret:…}}`
-/// template resolved only at token-fetch time.
+/// The runtime shape of an MCP server's OAuth 2.1 client-credentials config.
+/// Serializable so it rides the spawn payload verbatim; `client_secret` stays a
+/// `{{secret:…}}` template and is resolved only at token-fetch time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpOauthSpec {
     pub token_url: String,
@@ -424,9 +425,10 @@ pub struct McpOauthSpec {
     pub scope: Option<String>,
 }
 
-/// The runtime shape of a unified `auth:` credential provider (RFC 0031 §5).
-/// Secret-free (every credential input is a `{{secret:…}}` template), so it
-/// rides the spawn payload and logs safely. `kind` is `static`/`oauth2`.
+/// The runtime shape of a unified `auth:` credential provider. Every credential
+/// input stays a `{{secret:…}}` template, so this struct rides the spawn payload
+/// and appears in logs without ever carrying a live credential. `kind` is one of
+/// `static` / `oauth2` / `aws` / `spiffe`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct AuthSpec {
     pub kind: String,
@@ -458,7 +460,7 @@ pub struct AuthSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
     /// aws (SigV4): region, service (e.g. `bedrock`), and credential source
-    /// (`env`/`static`; `imds`/`irsa`/`sso` are follow-ups).
+    /// (`env` / `static` / `sso` / `imds` / `irsa`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -483,10 +485,11 @@ pub struct AuthSpec {
     pub key_file: Option<String>,
 }
 
-/// AAuth [DRAFT] agent-identity settings (RFC 0023). Serde-serializable so it
-/// rides the spawn payload verbatim (one identity per process tree). Always
-/// defined (not feature-gated) so payload plumbing is feature-clean; the CLI
-/// flags that populate it require `--features aauth` at validation.
+/// AAuth agent-identity settings. Serde-serializable so it rides the spawn
+/// payload verbatim, giving one identity per process tree. The struct is always
+/// defined rather than feature-gated, so the payload plumbing compiles the same
+/// either way; the CLI flags that populate it require `--features aauth` at
+/// validation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AAuthSettings {
     /// The Agent Provider base URL (`https://apd.example`) — enroll + agent-token.
@@ -498,36 +501,37 @@ pub struct AAuthSettings {
     /// in `token` mode. Secret-free (a reference, never an inline secret).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enrollment_token: Option<String>,
-    /// Path to an **enrollment assertion** file (RFC 0023 §5.1 federated gate) —
-    /// e.g. a Kubernetes projected ServiceAccount token whose audience is the
+    /// Path to an **enrollment assertion** file the provider federates against
+    /// — e.g. a Kubernetes projected ServiceAccount token whose audience is the
     /// provider. Re-read fresh on every enroll (projected tokens rotate), so this
     /// is a PATH, not the assertion itself; it rides the spawn payload like
     /// `key_file`. Presented in the `/enroll` body; never logged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enroll_assertion_file: Option<String>,
-    /// The user's Person Server (`ps` claim) for Case C (user-scoped identity).
-    /// Enrolled today; the interactive consent flow is a roadmap item.
+    /// The user's Person Server (`ps` claim), which scopes the identity to a
+    /// user. It is carried through enrollment; agentd does not run the
+    /// interactive consent flow itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub person_server: Option<String>,
 }
 
-/// Does `s` name a remote MCP endpoint? The four Streamable-HTTP transport
-/// schemes agentd dials (RFC 0004 / RFC 0006).
+/// Does `s` name a remote MCP endpoint? True for the Streamable HTTP schemes
+/// agentd dials.
 pub fn is_mcp_endpoint(s: &str) -> bool {
     let s = s.trim();
-    // HTTPS-only (pivot Phase 3): a remote Streamable HTTP endpoint. `http://` is
-    // admitted here (scheme shape only); the loopback carve-out + the retired
-    // unix:/vsock: rejection are enforced in `mcp_endpoint_scheme_ok`, the gate
-    // every server (CLI + config-file) flows through at validation.
+    // This is a SHAPE test only, so plain `http://` passes here. Whether a
+    // given `http://` host is admissible (loopback only) and whether socket
+    // schemes are refused is decided by `mcp_endpoint_scheme_ok`, the single
+    // gate every server — CLI or config file — flows through at validation.
     s.starts_with("https://") || s.starts_with("http://")
 }
 
-/// Whether an MCP-server endpoint scheme is admissible: `https://`, or a loopback
-/// `http://` (dev). The retired `unix:`/`vsock:` schemes and non-loopback
-/// plaintext are rejected. This is the agentd-side gate applied BEFORE the
-/// reusable crate's `McpEndpoint::parse` (which still accepts the sockets) so a
-/// config-file server — which bypasses `is_mcp_endpoint` / CLI parsing — is held
-/// to the same HTTPS-only rule.
+/// Whether an MCP-server endpoint scheme is admissible: `https://`, or a
+/// loopback `http://` for dev. Socket schemes (`unix:`, `vsock:`) and
+/// non-loopback plaintext are rejected. This gate runs BEFORE the reusable
+/// crate's `McpEndpoint::parse`, which is more permissive, so that a
+/// config-file server — which never goes through `is_mcp_endpoint` or CLI
+/// parsing — is held to the same HTTPS-only rule as a flag.
 pub fn mcp_endpoint_scheme_ok(endpoint: &str) -> Result<(), ConfigError> {
     let e = endpoint.trim();
     if e.starts_with("https://") {
@@ -559,35 +563,35 @@ pub struct Config {
     pub intelligence: Option<String>,
     pub intelligence_token: Option<String>,
     /// Path to a mounted file holding the intelligence credential
-    /// (`--intelligence-token-file` / `AGENTD_INTELLIGENCE_TOKEN_FILE`, RFC 0017
-    /// §6.1). The token is read+trimmed from this file at load (and re-readable
-    /// for rotation); the resolved value lands in `intelligence_token`, never in
-    /// a log. The `--intelligence-token` flag/env stays as the inline source.
+    /// (`--intelligence-token-file` / `AGENTD_INTELLIGENCE_TOKEN_FILE`). The
+    /// token is read and trimmed from this file at load, and re-readable so a
+    /// rotation is picked up; the resolved value lands in `intelligence_token`
+    /// and never in a log. `--intelligence-token` is the inline alternative.
     pub intelligence_token_file: Option<String>,
     pub model: Option<String>,
-    /// Model hot-swap policy (RFC 0018 §5.3, `--model-swap` / `AGENTD_MODEL_SWAP`):
-    /// what an in-flight run does when a reload changes `model` under it.
-    /// `finish-on-old` (default) | `restart-turn`. An endpoint repoint (model
-    /// unchanged) is always finish-on-old regardless (§5.1). Reloadable: the
-    /// reload fans the new policy down with the swap.
+    /// Model hot-swap policy (`--model-swap` / `AGENTD_MODEL_SWAP`): what an
+    /// in-flight run does when a reload changes `model` under it.
+    /// `finish-on-old` (default) | `restart-turn`. An endpoint repoint that
+    /// leaves the model unchanged is always finish-on-old regardless.
+    /// Reloadable: the reload fans the new policy down with the swap.
     pub model_swap: SwapPolicy,
     pub mcp_servers: Vec<McpServerSpec>,
-    /// Declared remote-A2A delegation peers (`--a2a-peer name=endpoint`). The
-    /// delegation-backend axis of RFC 0020 §3: `a2a.delegate` dials these. Only
-    /// honoured in `--features a2a` builds (validated at startup).
+    /// Declared remote-A2A delegation peers (`--a2a-peer name=endpoint`) —
+    /// what `a2a.delegate` dials. Only honoured in `--features a2a` builds,
+    /// which startup validation enforces.
     pub a2a_peers: Vec<A2aPeerSpec>,
     pub mode: Mode,
     pub subscribe: Vec<String>,
     /// Subscriptions routed to a **warm continue-session** rather than a fresh
     /// spawn per event: all events on the URI re-enter one live session, in
-    /// order (RFC 0008 §spawn-vs-continue). Repeatable `--continue <uri>`.
+    /// order. Repeatable `--continue <uri>`.
     pub continue_subscribe: Vec<String>,
     pub interval: Option<Duration>,
     pub max_steps: u32,
     pub max_tokens: u64,
     /// Per-**instance** cumulative token budget across ALL runs/reactions
-    /// (`--budget-tokens-lifetime` / `AGENT_BUDGET_TOKENS`; RFC 0025). `0` =
-    /// unbounded (today's behaviour). Distinct from `max_tokens`, which boxes a
+    /// (`--budget-tokens-lifetime` / `AGENT_BUDGET_TOKENS`). `0` = unbounded.
+    /// Distinct from `max_tokens`, which boxes a
     /// single run: a bounded run folds `min(max_tokens, lifetime)` and trips
     /// `EXIT_BUDGET(7)`; a reactive instance stops accepting new reactions and
     /// drains when the cumulative cap is reached.
@@ -597,24 +601,24 @@ pub struct Config {
     pub run_id: String,
     pub log_level: Level,
     pub drain_timeout: Duration,
-    /// Path to a pinned workflow JSON file (`--workflow`), driven by `--mode workflow`
-    /// (pivot Phase 7 · P6). `None` unless a workflow is pinned.
+    /// Path to a pinned workflow JSON file (`--workflow`), driven by
+    /// `--mode workflow`. `None` unless a workflow is pinned.
     #[cfg(feature = "workflow")]
     pub workflow_file: Option<String>,
-    /// Resume a pinned workflow from a checkpoint (RFC 0021 §8.4):
+    /// Resume a pinned workflow from a checkpoint:
     /// `--workflow-resume <server>:<key>[@seq]` (+ `--workflow-resume-force`).
-    /// The child fetches + verifies the envelope after connecting.
+    /// The child fetches and verifies the envelope after connecting.
     #[cfg(feature = "workflow")]
     pub workflow_resume: Option<crate::subagent::protocol::WorkflowResumeRef>,
     pub serve_mcp: Option<String>,
-    /// TLS server cert / key PEM **file paths** for an `https://` serve target
-    /// (pivot Phase 2). Required when serving TLS; the file *contents* (a private
-    /// key) are read at bind time and never logged (RFC 0012 §3.7).
+    /// TLS server cert / key PEM **file paths** for an `https://` serve target.
+    /// Required when serving TLS. Only the PATHS live here; the contents — one
+    /// of them a private key — are read at bind time and never logged.
     pub serve_cert: Option<String>,
     pub serve_key: Option<String>,
     /// Client-CA PEM **file path** enabling mutual TLS on the serve target: peers
-    /// must present a certificate chaining to it (the PRIMARY way the `Management`
-    /// trust domain is minted — RFC 0015 §3.4, pivot decision).
+    /// must present a certificate chaining to it. This is the primary way the
+    /// `Management` trust domain is minted.
     pub serve_client_ca: Option<String>,
     /// Bearer-token secret for the serve target — the ALTERNATIVE auth to mTLS
     /// (`Authorization: Bearer <token>` mints `Management`). A `sec::secret`
@@ -629,27 +633,28 @@ pub struct Config {
     /// and inherited by every subagent via the spawn payload. Set-once
     /// (restart-only): trust anchors must not move under a live run.
     pub tls_ca: Option<String>,
-    /// AAuth [DRAFT] agent-identity config (RFC 0023): when the provider URL is
-    /// set, agentd gets an Ed25519 identity + agent token and SIGNS every
+    /// AAuth agent-identity config: when the provider URL is set, agentd gets
+    /// an Ed25519 identity + agent token and SIGNS every
     /// outbound MCP request. `None` = no AAuth (the default). Rides the spawn
     /// payload to subagents (one identity per process tree). Needs
     /// `--features aauth`.
     pub aauth: Option<AAuthSettings>,
     pub health_file: Option<String>,
-    /// Inbound W3C `traceparent` to continue (else a trace is minted from the
-    /// run id). RFC 0010 §context-propagation.
+    /// Inbound W3C `traceparent` to continue; with none set, a trace is minted
+    /// from the run id so a run always has one.
     pub traceparent: Option<String>,
-    /// Opt-in content capture (RFC 0010 §2.9). Off by default: telemetry logs
-    /// hashes/lengths only; `--log-content` adds the actual tool args/results
-    /// (truncated). Propagates to children via the telemetry block.
+    /// Opt-in content capture. Off by default: telemetry logs hashes and
+    /// lengths only, so a trace backend never becomes an unreviewed copy of
+    /// every tool argument. `--log-content` adds the actual tool args/results,
+    /// truncated. Propagates to children via the telemetry block.
     pub log_content: bool,
     /// Opt-in HTTP probe/scrape surface (`/metrics` + `/healthz` + `/readyz`).
-    /// Off unless set; only honoured in `--features metrics` builds. RFC 0010.
+    /// Off unless set; only honoured in `--features metrics` builds.
     pub metrics_addr: Option<String>,
     /// Opt-in cgroup-v2 active enforcement: `auto` (derive `<own-cgroup>/agentd`)
     /// or an absolute path under `/sys/fs/cgroup`. Each run gets a child cgroup
     /// for atomic `cgroup.kill` teardown. Best-effort — disabled if not writable;
-    /// agentd stays cgroup-aware, never cgroup-requiring. RFC 0010, assessment §2.3.
+    /// agentd stays cgroup-aware, never cgroup-requiring.
     /// Note: if hard limits are requested and the path points at a shared/existing
     /// cgroup, delegating its controllers also enables them for its other children.
     pub cgroup: Option<String>,
@@ -662,21 +667,22 @@ pub struct Config {
     /// multi-threaded). Same delegation requirement as `cgroup_memory_max`.
     pub cgroup_pids_max: Option<String>,
     /// Allow a lethal-trifecta grant (all three capability legs in one agent)
-    /// instead of refusing at startup (RFC 0012 §3.2). Process-global operator
-    /// override — deliberately NOT carried in the spawn payload.
+    /// instead of refusing at startup. A process-global operator override,
+    /// deliberately NOT carried in the spawn payload — a child must be granted
+    /// the exception on its own terms rather than inheriting it silently.
     pub allow_trifecta: bool,
-    /// Optional 5-field UTC cron schedule for `--mode schedule` (RFC 0008).
+    /// Optional 5-field UTC cron schedule for `--mode schedule`.
     /// Only honoured in `--features cron` builds; the production path is an
     /// external CronJob → `--mode once`.
     pub cron: Option<String>,
     /// Where to write the run-outcome report at the terminal transition
-    /// (`--report-file PATH` / `AGENTD_REPORT_FILE`, RFC 0016 §6.3). Atomic write
-    /// (temp + rename). Off for a bare CLI run; inert for `--mode reactive`
-    /// (warned at startup — a reactive daemon has no single terminal outcome,
-    /// §6.4).
+    /// (`--report-file PATH` / `AGENTD_REPORT_FILE`). Written atomically via a
+    /// temp file and rename, so a reader never sees a half-written report. Off
+    /// for a bare CLI run, and inert for `--mode reactive` — a reactive daemon
+    /// has no single terminal outcome, which startup warns about.
     pub report_file: Option<String>,
-    /// Operator remap for the two *policy* budget exit codes (`--budget-exit-code
-    /// N`, RFC 0011 §5.2 / ACC exit-codes.table.json `x-budget-exit-code-remap`).
+    /// Operator remap for the two *policy* budget exit codes
+    /// (`--budget-exit-code N`).
     /// `None` ⇒ no remap (the canonical table applies). When set, a final process
     /// exit of `EXIT_PARTIAL` (3) **or** `EXIT_BUDGET` (7) — and ONLY those two,
     /// the operator-tunable `policy`-intent codes — is returned to the OS as `N`
@@ -687,24 +693,25 @@ pub struct Config {
     /// stays truthful (and schema-valid) regardless of the remap.
     pub budget_exit_code: Option<i32>,
     /// Capacity of the bounded `agentd://events` ring (`--events-ring N` /
-    /// `AGENTD_EVENTS_RING`, RFC 0016 §7.2/§11): the last N emitted lines held in
+    /// `AGENTD_EVENTS_RING`): the last N emitted lines held in
     /// memory for the live-tail resource. Default 1024. Only consumed when the
     /// `events` surface is served (`--serve-mcp` + the `events` feature).
     pub events_ring: usize,
-    /// Declared intelligence HTTP headers (RFC 0006 §3, settable only via the
-    /// config file's `intelligence_headers`, RFC 0017 §3.3). Values are
-    /// **templates** that may carry `{{secret:NAME}}` / `{{secret-file:PATH}}`
-    /// refs (§6) — the NAMES/refs are structural; the resolved secret is never
-    /// stored here or logged. An inline secret-shaped value is rejected at
-    /// validation (§3.1). A `BTreeMap` so the order is deterministic.
+    /// Declared intelligence HTTP headers, settable only via the config file's
+    /// `intelligence_headers`. Values are **templates** that may carry
+    /// `{{secret:NAME}}` / `{{secret-file:PATH}}` refs: the names and refs are
+    /// structural, while the resolved secret is never stored here or logged. An
+    /// inline secret-shaped value is rejected at validation. A `BTreeMap`, so
+    /// header order is deterministic.
     pub intelligence_headers: std::collections::BTreeMap<String, String>,
     /// Watch the config file for changes and reload (`--watch-config` /
-    /// `AGENTD_WATCH_CONFIG`, RFC 0017 §5.2). When set, the reactive supervisor
-    /// arms a raw `inotify` watch on the config file's PARENT DIRECTORY (so a
-    /// Kubernetes ConfigMap volume swap — an atomic directory-symlink rename —
-    /// is seen) and, on a change to the watched file, sets the SAME RELOAD latch
-    /// SIGHUP does (RFC 0017 §5.2 "both triggers funnel into the identical reload
-    /// routine"). Always-compiled (uniform `Config`); `true` needs the
+    /// `AGENTD_WATCH_CONFIG`). When set, the reactive supervisor arms a raw
+    /// `inotify` watch on the config file's PARENT DIRECTORY — a Kubernetes
+    /// ConfigMap volume swap is an atomic directory-symlink rename, which a
+    /// watch on the file itself would miss — and, on a change to the watched
+    /// file, sets the SAME RELOAD latch SIGHUP sets, so there is exactly one
+    /// reload routine to reason about. Always compiled (a uniform `Config`);
+    /// `true` needs the
     /// `config-watch` build feature (validated, exit 2) AND a config file to
     /// watch (`--config`/`AGENTD_CONFIG`, else exit 2 — watching nothing is a
     /// usage error). Off by default; SIGHUP is the portable, dependency-free
@@ -778,11 +785,11 @@ impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Config")
             .field("instruction", &self.instruction.as_deref().map(|_| "<set>"))
-            // The raw `--intelligence` URI can be a credential-bearing
-            // `http://user:pass@host` (RFC 0012 §3.7). Redact it to its transport
-            // SCHEME only — mirroring `effective_view()` / the `config.loaded`
-            // event, which already log scheme-only — so a Debug render can never
-            // leak an inline endpoint credential.
+            // The raw `--intelligence` URI can be credential-bearing
+            // (`http://user:pass@host`), so redact it to its transport SCHEME
+            // only — matching `effective_view()` and the `config.loaded` event,
+            // which are already scheme-only — and a Debug render can never leak
+            // an inline endpoint credential.
             .field(
                 "intelligence",
                 &self
@@ -812,8 +819,8 @@ impl fmt::Debug for Config {
             .field("log_level", &self.log_level)
             .field("drain_timeout", &self.drain_timeout)
             .field("serve_mcp", &self.serve_mcp)
-            // Cert/key/CA are file PATHS (not secrets), safe to show; the bearer
-            // is a credential — presence only, never the value (RFC 0012 §3.7).
+            // Cert/key/CA are file PATHS, not secrets, so they are safe to
+            // show; the bearer IS a credential, so only its presence appears.
             .field("serve_cert", &self.serve_cert)
             .field("serve_key", &self.serve_key)
             .field("serve_client_ca", &self.serve_client_ca)
@@ -833,8 +840,8 @@ impl fmt::Debug for Config {
             .field("cron", &self.cron)
             .field("report_file", &self.report_file)
             .field("events_ring", &self.events_ring)
-            // Header NAMES only — a value may carry a {{secret:…}} ref, so redact
-            // the values defensively (RFC 0012 §3.7: never log a secret).
+            // Header NAMES only: a value may carry a {{secret:…}} ref, and a
+            // rendered config is not a place a secret may reach.
             .field(
                 "intelligence_headers",
                 &self.intelligence_headers.keys().collect::<Vec<_>>(),
@@ -846,22 +853,22 @@ impl fmt::Debug for Config {
 }
 
 /// What `load()` can short-circuit with. `Help`/`Version`/`Capabilities` are
-/// *not* errors (exit 0); `Usage` is a validation/parse failure (exit 2,
-/// RFC 0011 §5). `Capabilities` carries the pretty-printed manifest JSON — the
-/// side-effect-free admission probe (`agentd --capabilities`, RFC 0015 §5.2),
-/// short-circuited before run-required validation so it succeeds even with no
-/// instruction (agentctl probes an image without a full run config).
+/// *not* errors (exit 0); `Usage` is a validation or parse failure (exit 2).
+/// `Capabilities` carries the pretty-printed manifest JSON — the
+/// side-effect-free admission probe (`agentd --capabilities`), short-circuited
+/// before run-required validation so it succeeds even with no instruction,
+/// which is what lets agentctl probe an image that has no run config yet.
 #[derive(Debug)]
 pub enum ConfigError {
     Help(String),
     Version(String),
     Capabilities(String),
     Usage(String),
-    /// `--config-schema` (RFC 0017 §4.2): the JSON Schema of the config file,
+    /// `--config-schema`: the JSON Schema of the config file,
     /// printed to **stdout**, exit 0 — a side-effect-free schema export so
     /// agentctl can validate a CR before applying it.
     Schema(String),
-    /// `--validate-config` (RFC 0017 §4.1): the admission verdict. `Ok(line)` is
+    /// `--validate-config`: the admission verdict. `Ok(line)` is
     /// a valid config (one `config.valid` line, exit 0); `Err(lines)` is one or
     /// more `config.invalid` diagnostics (exit 2). The caller prints to stderr.
     Validate(Result<String, String>),
@@ -882,13 +889,14 @@ impl fmt::Display for ConfigError {
     }
 }
 
-/// De-branding normalization (ACC SPEC L4 / management-profile.json
-/// `x-debranding`): accept the neutral `AGENT_*` env prefix as an input alias for
-/// the branded `AGENTD_*` one. Returns the env list with a synthesized
-/// `AGENTD_<X>` entry for every `AGENT_<X>` whose branded form is ABSENT — branded
-/// WINS when both are present (back-compat is preserved). Branded keys are never
-/// dropped, and a non-prefixed key (e.g. `INSTRUCTION`) is untouched. Done once so
-/// every downstream `AGENTD_*` read transparently also honours `AGENT_*`.
+/// De-branding normalization: accept the neutral `AGENT_*` env prefix as an
+/// input alias for the branded `AGENTD_*` one. Returns the env list with a
+/// synthesized `AGENTD_<X>` entry for every `AGENT_<X>` whose branded form is
+/// ABSENT — the branded spelling WINS when both are present, since it is the
+/// more specific of the two. Branded keys are never dropped, and a
+/// non-prefixed key (e.g. `INSTRUCTION`) is untouched. Done once, here, so
+/// every downstream `AGENTD_*` read transparently honours `AGENT_*` too
+/// without a per-read change.
 pub(crate) fn debrand_env(env: &[(String, String)]) -> Vec<(String, String)> {
     let have: std::collections::HashSet<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
     let mut out: Vec<(String, String)> = env.to_vec();
@@ -906,11 +914,11 @@ pub(crate) fn debrand_env(env: &[(String, String)]) -> Vec<(String, String)> {
 }
 
 impl Config {
-    /// Resolve config from CLI args (excluding the leading program name) and the
-    /// environment, applying precedence (`built-in default < FILE < env < flag`,
-    /// RFC 0011 §2.1 / RFC 0017 §3.2) and validating.
+    /// Resolve config from CLI args (excluding the leading program name) and
+    /// the environment, applying precedence — `built-in default < FILE < env <
+    /// flag` — and validating the result before any side effect.
     pub fn load(args: &[String], env: &[(String, String)]) -> Result<Config, ConfigError> {
-        // De-branding (ACC SPEC L4): every branded `AGENTD_*` env var also accepts
+        // De-branding: every branded `AGENTD_*` env var also accepts
         // its neutral `AGENT_*` spelling on input. Normalize ONCE here — for any
         // `AGENT_<X>` present, synthesize an `AGENTD_<X>` entry iff the branded form
         // is absent (branded WINS on conflict, preserving back-compat) — so every
@@ -920,7 +928,7 @@ impl Config {
         let envmap: HashMap<&str, &str> =
             env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
-        // `--config-schema` (RFC 0017 §4.2): a side-effect-free schema export.
+        // `--config-schema`: a side-effect-free schema export.
         // The schema is static (generated from the `ConfigFile` types), so it
         // short-circuits BEFORE the file is even read — exit 0, JSON to stdout.
         if args.iter().any(|a| a == "--config-schema") {
@@ -928,23 +936,24 @@ impl Config {
             let json = serde_json::to_string_pretty(&schema).unwrap_or_else(|_| "{}".to_string());
             return Err(ConfigError::Schema(format!("{json}\n")));
         }
-        // `--validate-config` (RFC 0017 §4.1): captured here, acted on at the end.
+        // `--validate-config`: captured here, acted on at the end.
         // It is the side-effect-free admission verdict — it validates whatever
         // config is given and never requires an --instruction to *validate*.
         let validate_config = args.iter().any(|a| a == "--validate-config");
 
         let mut c = Config::default();
 
-        // --- FILE layer (RFC 0017 §3, precedence layer 1) ---
-        // `--config <path>` / `AGENTD_CONFIG`. The file is the lowest non-default
-        // layer: env and flags below override it; repeatable list flags ADD to
-        // the file's lists (§3.2). A malformed/unreadable file is exit 2 BEFORE
-        // any side effect (it is parsed before the env/flag layers touch `c`).
-        // Several files compose into ONE document, in order — `AGENTD_CONFIG`
-        // (a `:`-separated list) first, then each `--config` — where a later
-        // file overrides the earlier ones with JSON-Merge-Patch semantics
-        // (objects merge, scalars/lists replace, `null` unsets; RFC 7396). Each
-        // file is YAML or JSON by extension, else sniffed (`file::Format`).
+        // --- FILE layer (precedence layer 1) ---
+        // `--config <path>` / `AGENTD_CONFIG`. The file is the lowest
+        // non-default layer: env and flags below override it, while repeatable
+        // list flags ADD to the file's lists. A malformed or unreadable file is
+        // exit 2 BEFORE any side effect — it is parsed before the env and flag
+        // layers touch `c`. Several files compose into ONE document, in order:
+        // `AGENTD_CONFIG` (a `:`-separated list) first, then each `--config`,
+        // with each later file merged over the earlier ones by RFC 7396 JSON
+        // Merge Patch rules (objects merge, scalars and lists replace, `null`
+        // unsets). Each file is YAML or JSON
+        // by extension, else sniffed (`file::Format`).
         let config_paths = config_paths_from_map(args, &envmap).paths;
         let file_present = !config_paths.is_empty();
         if file_present {
@@ -1003,8 +1012,9 @@ impl Config {
                 .parse()
                 .map_err(|_| usage(format!("invalid AGENTD_MAX_TOKENS: {v}")))?;
         }
-        // RFC 0025 per-instance lifetime budget. The neutral `AGENT_BUDGET_TOKENS`
-        // is auto-aliased to `AGENTD_BUDGET_TOKENS` by the debranding pass above.
+        // The per-instance lifetime budget. The neutral `AGENT_BUDGET_TOKENS`
+        // is auto-aliased to `AGENTD_BUDGET_TOKENS` by the debranding pass
+        // above, so only the branded name is read here.
         if let Some(v) = envmap.get("AGENTD_BUDGET_TOKENS") {
             c.budget_tokens_lifetime = v
                 .parse()
@@ -1063,7 +1073,7 @@ impl Config {
         if let Some(v) = envmap.get("AGENTD_SERVE_MCP") {
             c.serve_mcp = Some((*v).to_string());
         }
-        // TLS material + auth for an `https://` serve target (pivot Phase 2).
+        // TLS material + auth for an `https://` serve target.
         if let Some(v) = envmap.get("AGENTD_SERVE_CERT") {
             c.serve_cert = Some((*v).to_string());
         }
@@ -1076,14 +1086,14 @@ impl Config {
         if let Some(v) = envmap.get("AGENTD_SERVE_BEARER") {
             c.serve_bearer = Some((*v).to_string());
         }
-        // File-watch reload trigger (RFC 0017 §5.2). `AGENTD_WATCH_CONFIG` is a
-        // bool; a `--watch-config` flag below overrides it. Needs the
-        // `config-watch` build feature + a config file (validated, exit 2).
+        // File-watch reload trigger. `AGENTD_WATCH_CONFIG` is a bool; a
+        // `--watch-config` flag below overrides it. Needs the `config-watch`
+        // build feature and a config file to watch — both validated, exit 2.
         if let Some(v) = envmap.get("AGENTD_WATCH_CONFIG") {
             c.watch_config = truthy(v);
         }
-        // A single `AGENTD_A2A_PEER` env declares one peer (the env channel is
-        // one value; declare more with repeated `--a2a-peer` flags). RFC 0020 §3.
+        // A single `AGENTD_A2A_PEER` env declares one peer: the env channel
+        // carries one value, so more peers need repeated `--a2a-peer` flags.
         if let Some(v) = envmap.get("AGENTD_A2A_PEER") {
             c.a2a_peers.push(parse_a2a_peer_spec(v)?);
         }
@@ -1096,9 +1106,9 @@ impl Config {
         // / bare `<PATH>` (`.` → `_`, upper-cased): `limits.max_steps` ⇒
         // `AGENTD_LIMITS_MAX_STEPS`. The names derive from the schema, so a
         // re-defined parameter set needs no plumbing here. Applied AFTER the
-        // named env reads above, so where a legacy spelling and a path spelling
-        // both name one field, the path spelling (the canonical form) wins
-        // within the env layer; flags below still override both.
+        // named env reads above, so where a short spelling and a path spelling
+        // both name one field, the path spelling — the canonical form — wins
+        // within the env layer. Flags below still override both.
         {
             let (doc, applied) = paths::env_document(&envmap).map_err(usage)?;
             if !applied.is_empty() {
@@ -1112,12 +1122,12 @@ impl Config {
         // `--mcp-tags` may precede or follow its `--mcp`; collect and apply once
         // every server is known.
         let mut mcp_tags: Vec<(String, Vec<TrifectaTag>)> = Vec::new();
-        // `--capabilities` is the admission probe (RFC 0015 §5.2): captured here
-        // and resolved after the whole config is parsed but BEFORE run-required
-        // validation, so it reflects whatever config is present and succeeds with
-        // no instruction.
+        // `--capabilities` is the admission probe: captured here and resolved
+        // after the whole config is parsed but BEFORE run-required validation,
+        // so it reflects whatever config is present and still succeeds when
+        // there is no instruction to run.
         let mut capabilities = false;
-        // AAuth [DRAFT] sub-flags accumulate here (order-independent) and are
+        // AAuth sub-flags accumulate here (order-independent) and are
         // assembled into `c.aauth` after the loop.
         let mut aauth_provider: Option<String> = None;
         let mut aauth_key_file: Option<String> = None;
@@ -1264,9 +1274,9 @@ impl Config {
                 "--serve-client-ca" => c.serve_client_ca = Some(take("--serve-client-ca")?),
                 "--serve-bearer" => c.serve_bearer = Some(take("--serve-bearer")?),
                 "--tls-ca" => c.tls_ca = Some(take("--tls-ca")?),
-                // AAuth [DRAFT] (RFC 0023): --aauth-provider turns it on; the
-                // rest fill AAuthSettings. Gathered into `c.aauth` after the
-                // loop (so the sub-flags are order-independent).
+                // AAuth: --aauth-provider is what turns it on; the rest fill
+                // AAuthSettings. Gathered into `c.aauth` after the loop, so the
+                // sub-flags may appear in any order.
                 "--aauth-provider" => aauth_provider = Some(take("--aauth-provider")?),
                 "--aauth-key-file" => aauth_key_file = Some(take("--aauth-key-file")?),
                 "--aauth-enroll-token" => aauth_enroll_token = Some(take("--aauth-enroll-token")?),
@@ -1276,8 +1286,8 @@ impl Config {
                 "--aauth-person-server" => {
                     aauth_person_server = Some(take("--aauth-person-server")?)
                 }
-                // File-watch reload trigger (RFC 0017 §5.2): watch the config
-                // file's directory and reload on a change. Needs the
+                // File-watch reload trigger: watch the config file's
+                // directory and reload on a change. Needs the
                 // `config-watch` build feature + a `--config`/`AGENTD_CONFIG`
                 // file (both validated, exit 2). Off by default; SIGHUP is the
                 // portable default trigger.
@@ -1285,10 +1295,11 @@ impl Config {
                 "--health-file" => c.health_file = Some(take("--health-file")?),
                 "--traceparent" => c.traceparent = Some(take("--traceparent")?),
                 "--report-file" => c.report_file = Some(take("--report-file")?),
-                // RFC 0011 §5.2 / ACC exit-codes.table.json: remap the two
-                // operator-tunable `policy` budget codes (EXIT_PARTIAL 3 /
-                // EXIT_BUDGET 7) to N at the final process exit. N must be a valid
-                // POSIX exit byte (0..=255); only 3 and 7 are ever remapped.
+                // Remap the two operator-tunable `policy` budget codes
+                // (EXIT_PARTIAL 3 / EXIT_BUDGET 7) to N at the final process
+                // exit. N must be a valid POSIX exit byte (0..=255), and only
+                // 3 and 7 are ever remapped — every other code carries a
+                // meaning the operator does not get to redefine.
                 "--budget-exit-code" => {
                     let v = take("--budget-exit-code")?;
                     let n: i32 = v
@@ -1335,7 +1346,7 @@ impl Config {
             }
         }
 
-        // Assemble AAuth [DRAFT] settings (RFC 0023). The provider (flag or
+        // Assemble the AAuth settings. The provider (flag or
         // AGENT_AAUTH_PROVIDER env) is what turns it on; a key file defaults to
         // `./agent.key` in the process cwd (a durable, shared-fs identity).
         let aauth_provider =
@@ -1380,24 +1391,26 @@ impl Config {
             c.run_id = generate_run_id();
         }
 
-        // `--capabilities`: the v1 manifest was retired with the mode cut-over —
-        // the 2.0 loader (`config::v2` / `runtime::capabilities`) owns this probe
-        // now, so this v1 path is unreachable (the binary routes v2 first).
+        // `--capabilities` is owned by the settings loader
+        // (`config::v2` / `runtime::capabilities`), which the binary routes to
+        // first, so this branch is unreachable in the shipped binary and only
+        // exists so the flat path answers something coherent if it is called.
         if capabilities {
             return Err(ConfigError::Capabilities(
                 "{\"note\":\"--capabilities is served by the agentd loader\"}\n".to_string(),
             ));
         }
 
-        // Resolve `--intelligence-token-file` into the token (RFC 0017 §6.1). An
-        // inline `--intelligence-token`/env wins (it is the higher-precedence
-        // source); the file is the fallback. Read+trimmed here, but a missing
-        // file is reported through `validate()` so `--validate-config` collects it
-        // with the rest, and the resolved value never reaches a log.
+        // Resolve `--intelligence-token-file` into the token. An inline
+        // `--intelligence-token` or env wins, being the higher-precedence
+        // source; the file is the fallback. Read and trimmed here, but a
+        // missing file is reported through `validate()` so `--validate-config`
+        // collects it with the rest, and the resolved value never reaches a
+        // log.
         c.resolve_token_file()?;
 
-        // `--validate-config` (RFC 0017 §4.1): the side-effect-free admission
-        // verdict. Run the FULL validation pipeline, collecting EVERY diagnostic
+        // `--validate-config`: the side-effect-free admission verdict. Run the
+        // FULL validation pipeline, collecting EVERY diagnostic
         // (not fast-failing on the first, unlike startup) so an operator/CI sees
         // all problems in one pass, then short-circuit with the verdict. It does
         // NOT require an --instruction to *validate* — it validates whatever it is
@@ -1407,8 +1420,8 @@ impl Config {
         }
 
         c.validate()?;
-        // `--watch-config` requires a config FILE to watch (RFC 0017 §5.2):
-        // watching nothing is a usage error. This is the one check that needs the
+        // `--watch-config` requires a config FILE to watch: watching nothing
+        // is a usage error. This is the one check that needs the
         // resolved file-presence (not a `Config` field), so it lives here in
         // `load` (and is mirrored in `validate_collect_all` for the admission
         // gate). Checked after `validate()` so the feature-gate error (in
@@ -1434,9 +1447,9 @@ impl Config {
     }
 
     /// Resolve `--intelligence-token-file` into `intelligence_token` when no
-    /// inline token is set (RFC 0017 §6.1). A read failure is surfaced as a usage
-    /// error (exit 2 at startup; collected by `--validate-config`). The token is
-    /// never logged — the error carries only the path.
+    /// inline token is set. A read failure surfaces as a usage error (exit 2 at
+    /// startup; collected by `--validate-config`). The token is never logged —
+    /// the error carries only the path.
     fn resolve_token_file(&mut self) -> Result<(), ConfigError> {
         if self.intelligence_token.is_some() {
             return Ok(()); // inline source wins (higher precedence)
@@ -1448,22 +1461,22 @@ impl Config {
         Ok(())
     }
 
-    /// Run the full validation pipeline collecting EVERY diagnostic as one NDJSON
-    /// `config.{valid,invalid}` line set (RFC 0017 §4.1). `Ok(line)` ⇒ valid
-    /// (exit 0); `Err(lines)` ⇒ one-or-more `config.invalid` lines (exit 2).
+    /// Run the full validation pipeline, collecting EVERY diagnostic as one
+    /// NDJSON `config.{valid,invalid}` line set. `Ok(line)` ⇒ valid (exit 0);
+    /// `Err(lines)` ⇒ one or more `config.invalid` lines (exit 2).
     ///
     /// Each independent check is run and its message collected, so the operator
-    /// sees all problems at once. The check SET is exactly `validate()`'s — there
-    /// is one validation authority, so the admission gate and the startup path
-    /// can never disagree (RFC 0017 §7).
+    /// sees all problems at once. The check SET is exactly `validate()`'s: there
+    /// is one validation authority, so the admission gate can never accept a
+    /// config the startup path would refuse.
     fn validate_collect_all(&self, file_present: bool) -> Result<String, String> {
         let mut diags: Vec<String> = Vec::new();
-        // The single validate() pipeline is fast-fail; to collect ALL problems we
-        // re-run it after fixing each surfaced error would be O(n²) and brittle.
-        // Instead we run the independent declarative checks directly and append
-        // each failing one. The header/secret checks (this RFC) plus a final
-        // `validate()` pass (which catches anything not separately enumerated)
-        // give complete coverage with a single source of truth.
+        // `validate()` is fast-fail, so it cannot report everything on its own,
+        // and re-running it once per fixed error would be O(n²) and brittle.
+        // Instead the independent declarative checks run directly here and each
+        // failing one is appended; the header/secret checks plus one final
+        // `validate()` pass — which catches anything not separately enumerated
+        // — give complete coverage from a single source of truth.
         self.collect_header_diags(&mut diags);
         // Run the authoritative validate() and, if it fails, record its message
         // (it is fast-fail, so this is the first non-header structural problem).
@@ -1475,15 +1488,15 @@ impl Config {
                 diags.push(msg);
             }
         }
-        // `--watch-config` needs a config FILE to watch (RFC 0017 §5.2) — the one
-        // file-presence-dependent check, mirrored from `load`'s startup path so
+        // `--watch-config` needs a config FILE to watch — the one check that
+        // depends on file presence, mirrored from `load`'s startup path so
         // the admission gate (`--validate-config`) rejects it too.
         if self.watch_config && !file_present {
             diags.push("--watch-config requires a config file (--config / AGENTD_CONFIG)".into());
         }
-        // RFC 0017 §5.4: the reload-coherence check (no running config at the
-        // admission gate — `running = None`), so this reports the restart-only-
-        // field-in-file WARNINGS and the reloadable-subset consistency ERRORS. An
+        // The reload-coherence check, with no running config at the admission
+        // gate (`running = None`), so this reports the restart-only-field-in-
+        // file WARNINGS and the reloadable-subset consistency ERRORS. An
         // admission webhook sees both; a coherence ERROR makes the verdict invalid.
         // (Internal-consistency errors here largely overlap with `validate()`'s
         // own checks, so dedup by message suffix to avoid a double line.)
@@ -1509,17 +1522,17 @@ impl Config {
         }
     }
 
-    /// Validate the declared `intelligence_headers` (RFC 0017 §3.1/§6): a value
-    /// may be a plain scalar or carry `{{secret:NAME}}` / `{{secret-file:PATH}}`
-    /// refs, but an **inline secret-shaped value** (a header named like a
-    /// credential whose value is NOT a ref) is rejected — a secret must be a
-    /// reference, never a literal in the file. Every ref must also resolve
-    /// (the env var is set; the file exists), else exit 2 (§6.2).
+    /// Validate the declared `intelligence_headers`: a value may be a plain
+    /// scalar or carry `{{secret:NAME}}` / `{{secret-file:PATH}}` refs, but an
+    /// **inline secret-shaped value** — a header named like a credential whose
+    /// value is NOT a ref — is rejected, because a secret must be a reference
+    /// rather than a literal in the file. Every ref must also resolve (the env
+    /// var is set, the file exists), else exit 2.
     fn collect_header_diags(&self, diags: &mut Vec<String>) {
         let env = |k: &str| std::env::var(k).ok();
         for (name, value) in &self.intelligence_headers {
-            // A credential-shaped header carrying a literal (non-ref) value is the
-            // "inline secret in the file" footgun — reject it (RFC 0017 §3.1).
+            // A credential-shaped header carrying a literal (non-ref) value
+            // is the "inline secret in the file" footgun — reject it.
             if is_secret_shaped_key(name) && !crate::sec::secret::has_secret_ref(value) {
                 diags.push(format!(
                     "intelligence_headers['{name}'] looks like a credential but has an inline value; \
@@ -1527,8 +1540,9 @@ impl Config {
                 ));
                 continue;
             }
-            // Every secret ref must resolve at startup (§6.2): a missing env var
-            // or an unreadable file is exit 2 before any side effect.
+            // Every secret ref must resolve at startup: a missing env var or
+            // an unreadable file is exit 2 before any side effect, because a
+            // ref that does not resolve means the header is simply not sent.
             if crate::sec::secret::has_secret_ref(value)
                 && let Err(e) = crate::sec::secret::refs_resolvable(value, &env)
             {
@@ -1538,10 +1552,10 @@ impl Config {
     }
 
     /// The capability-tag union of the root agent's grant, for the Rule-of-Two
-    /// trifecta check (RFC 0012 §3.1). An untagged MCP server contributes
-    /// `untrusted_input` (the conservative default). Because scope narrows
-    /// monotonically (RFC 0009), enforcing on this root union bounds the whole
-    /// subagent tree.
+    /// trifecta check. An untagged MCP server contributes `untrusted_input`,
+    /// the conservative default. Because a subagent's scope can only narrow,
+    /// never widen, enforcing on this root union bounds the whole subagent
+    /// tree.
     pub fn trifecta_grant_tags(&self) -> Vec<TrifectaTag> {
         let mut tags = Vec::new();
         for s in &self.mcp_servers {
@@ -1554,7 +1568,7 @@ impl Config {
         tags
     }
 
-    /// Reject inconsistent config before any side effect (RFC 0011 §2).
+    /// Reject inconsistent config before any side effect runs.
     pub fn validate(&self) -> Result<(), ConfigError> {
         // A pinned workflow run (`--mode workflow`) carries its instructions in the
         // graph nodes, so it needs no top-level `--instruction` — and neither does
@@ -1589,9 +1603,10 @@ impl Config {
             ));
         }
         validate_intelligence_uri(self.intelligence.as_deref().unwrap())?;
-        // Per-endpoint credential probe (RFC 0018 §3.1/§3.2): a named-but-unset
-        // per-endpoint token *file* on any listed endpoint is exit 2 — we fail
-        // fast at startup rather than discover an unreadable secret on failover.
+        // Per-endpoint credential probe: a named-but-unset per-endpoint token
+        // *file* on ANY listed endpoint is exit 2. Failing fast at startup
+        // beats discovering an unreadable secret at the moment of failover,
+        // when the primary endpoint is already down.
         validate_endpoint_token_files(self.intelligence.as_deref().unwrap())?;
         for s in &self.mcp_servers {
             if s.name.is_empty() {
@@ -1600,20 +1615,20 @@ impl Config {
             if s.endpoint.trim().is_empty() {
                 return Err(usage(format!("mcp server '{}' has no endpoint", s.name)));
             }
-            // HTTPS-only gate FIRST (pivot Phase 3): the reusable crate parser
-            // still accepts unix:/vsock:, so hold every server — CLI and
-            // config-file alike — to http(s) before delegating to it.
+            // The HTTPS-only gate runs FIRST: the reusable crate's parser also
+            // accepts unix:/vsock:, so every server — CLI and config-file alike
+            // — is held to http(s) here before it is delegated to.
             mcp_endpoint_scheme_ok(&s.endpoint)
                 .map_err(|e| usage(format!("mcp server '{}': {e}", s.name)))?;
-            // Validate the endpoint parses and its auth header templates resolve at
-            // startup (RFC 0012 §3.7 — fail fast, don't discover an unreadable
-            // secret on first use).
+            // Validate that the endpoint parses and its auth header templates
+            // resolve at startup, so an unreadable secret is a startup failure
+            // rather than a surprise on first use.
             ::mcp::http::McpEndpoint::parse(&s.endpoint)
                 .map_err(|e| usage(format!("mcp server '{}': {e}", s.name)))?;
             for (name, value) in &s.headers {
                 if is_secret_shaped_key(name) && !crate::sec::secret::has_secret_ref(value) {
                     return Err(usage(format!(
-                        "mcp server '{}' header '{name}' looks like a credential but has an                          inline value; use {{{{secret:NAME}}}} or {{{{secret-file:PATH}}}}",
+                        "mcp server '{}' header '{name}' looks like a credential but has an inline value; use {{{{secret:NAME}}}} or {{{{secret-file:PATH}}}}",
                         s.name
                     )));
                 }
@@ -1626,14 +1641,14 @@ impl Config {
         }
         // A zero events ring would hold nothing (every push instantly evicts) —
         // reject it so an operator who wants the live-tail surface gets a usable
-        // window (RFC 0016 §7.2). Off-by-default; only consumed when serving.
+        // window. Off by default; only consumed when serving.
         if self.events_ring == 0 {
             return Err(usage("--events-ring must be > 0".into()));
         }
-        // File-watch reload trigger (`--watch-config`, RFC 0017 §5.2) needs the
-        // `config-watch` build feature — mirroring the `--shard`/`--standby`
-        // gates. A silently-ignored `--watch-config` would leave the operator
-        // believing a ConfigMap swap reloads when it does not (only SIGHUP would).
+        // The file-watch reload trigger (`--watch-config`) needs the
+        // `config-watch` build feature. A silently-ignored `--watch-config`
+        // would leave the operator believing a ConfigMap swap reloads the
+        // daemon when in fact only SIGHUP does.
         if self.watch_config && !cfg!(feature = "config-watch") {
             return Err(usage(
                 "--watch-config requires the 'config-watch' build feature".into(),
@@ -1669,16 +1684,17 @@ impl Config {
         if self.cron.is_some() && self.mode != Mode::Schedule {
             return Err(usage("--cron is only valid with --mode schedule".into()));
         }
-        // A pinned workflow run needs a workflow file, and the file needs workflow mode (pivot Phase
-        // 7 · P6) — the two are inseparable, like --cron ⟺ --mode schedule.
+        // A pinned workflow run needs a workflow file, and the file needs
+        // workflow mode: the two are inseparable, like --cron ⟺ --mode
+        // schedule.
         #[cfg(feature = "workflow")]
         {
             if self.mode == Mode::Workflow && self.workflow_file.is_none() {
                 return Err(usage("--mode workflow requires --workflow <file>".into()));
             }
-            // Checkpoint resume (RFC 0021 §8.4): only meaningful for a pinned
-            // workflow run, and the named checkpointer must be a configured
-            // server — both misconfigs fail here, in ms, pre-network.
+            // Checkpoint resume is only meaningful for a pinned workflow run,
+            // and the named checkpointer must be a configured server. Both
+            // mistakes fail here, in milliseconds, before any network call.
             if let Some(r) = &self.workflow_resume {
                 if r.server.is_empty() {
                     return Err(usage(
@@ -1729,8 +1745,8 @@ impl Config {
         if self.cgroup_memory_max.as_deref().map(str::trim) == Some("0") {
             return Err(usage("--cgroup-memory-max must be > 0 or 'max'".into()));
         }
-        // AAuth [DRAFT] (RFC 0023): the feature-gated flag must be in the build,
-        // and the provider must be a real http(s) URL — both exit 2 before any
+        // AAuth: the feature-gated flag must be present in the build, and the
+        // provider must be a real http(s) URL — both exit 2 before any
         // network I/O (like every other feature/URL check).
         if let Some(a) = &self.aauth {
             if !cfg!(feature = "aauth") {
@@ -1752,8 +1768,8 @@ impl Config {
                 )));
             }
         }
-        // Validate the served-MCP target up front (RFC 0015 §3.1): a bad scheme,
-        // a missing port, or a non-loopback plaintext bind exits 2 before any
+        // Validate the served-MCP target up front: a bad scheme, a missing
+        // port, or a non-loopback plaintext bind exits 2 before any
         // listener is bound — mirroring the intelligence-URI check.
         if let Some(spec) = &self.serve_mcp {
             let target = ServeTarget::parse(spec)?;
@@ -1787,8 +1803,8 @@ impl Config {
                     .map_err(|e| usage(format!("--tls-ca {ca}: {e}")))?;
             }
         }
-        // Declared A2A delegation peers (RFC 0020 §3) need the `a2a` build
-        // feature, and each endpoint scheme is validated up front (exit 2 before
+        // Declared A2A delegation peers need the `a2a` build feature, and each
+        // endpoint scheme is validated up front (exit 2 before
         // any side effect) — mirroring the served-MCP target check.
         if !self.a2a_peers.is_empty() && !cfg!(feature = "a2a") {
             return Err(usage("--a2a-peer requires the 'a2a' build feature".into()));
@@ -1815,7 +1831,7 @@ impl Config {
             for (name, value) in &peer.headers {
                 if is_secret_shaped_key(name) && !crate::sec::secret::has_secret_ref(value) {
                     return Err(usage(format!(
-                        "a2a peer '{}' header '{name}' looks like a credential but has an                          inline value; use {{{{secret:NAME}}}} or {{{{secret-file:PATH}}}}",
+                        "a2a peer '{}' header '{name}' looks like a credential but has an inline value; use {{{{secret:NAME}}}} or {{{{secret-file:PATH}}}}",
                         peer.name
                     )));
                 }
@@ -1842,24 +1858,24 @@ impl Config {
                 (None, None) => {}
             }
         }
-        // Declared intelligence headers (RFC 0017 §3.1/§6): reject an inline
-        // secret-shaped value, and require every {{secret…}} ref to resolve. The
-        // `--validate-config` path runs the same check via `collect_header_diags`
-        // (collecting all), so the admission gate and startup never disagree.
+        // Declared intelligence headers: reject an inline secret-shaped value,
+        // and require every {{secret…}} ref to resolve. The `--validate-config`
+        // path runs this same check through `collect_header_diags`, collecting
+        // all of them, so the admission gate and startup never disagree.
         let mut header_diags = Vec::new();
         self.collect_header_diags(&mut header_diags);
         if let Some(first) = header_diags.into_iter().next() {
             return Err(usage(first));
         }
-        // Rule of Two — the lethal-trifecta gate (RFC 0012 §3.2). This lives in
-        // `validate()` so it is THE single validation authority (RFC 0017 §7):
-        // startup and `--validate-config` share it and can never disagree. A grant
-        // co-locating all three legs (untrusted input + sensitive data + egress)
-        // with no `--allow-trifecta` is refused as a config error (exit 2). The
-        // allowed-with-`--allow-trifecta` case is NOT an error — it passes here, and
-        // the supervisor (`main.rs`) emits the auditable `scope.trifecta_grant`
-        // warn. Scope narrows monotonically (RFC 0009), so the root union bounds
-        // the whole subagent tree.
+        // Rule of Two — the lethal-trifecta gate. It lives in `validate()` so
+        // there is ONE validation authority: startup and `--validate-config`
+        // share it and can never disagree. A grant co-locating all three legs
+        // (untrusted input + sensitive data + egress) without `--allow-trifecta`
+        // is refused as a config error (exit 2). The allowed-with-
+        // `--allow-trifecta` case is NOT an error — it passes here, and the
+        // supervisor (`main.rs`) emits the auditable `scope.trifecta_grant`
+        // warning instead. A subagent's scope can only narrow, so the root
+        // union bounds the whole subagent tree.
         if crate::sec::scope::check_trifecta(self.trifecta_grant_tags(), self.allow_trifecta)
             .is_refused()
         {
@@ -1874,17 +1890,17 @@ impl Config {
     }
 }
 
-// ───────────────────────── RFC 0017 §5 — hot reload ─────────────────────────
+// ──────────────────────────────  hot reload  ────────────────────────────────
 //
-// The reloadable-vs-restart-only partition (§5.1, BINDING) + the coherence check
-// (§5.4) the reload path and `--validate-config` both run. This block is pure
-// data + pure-CPU checks — no side effect, no subsystem touched (the apply step
-// lives in `triggers::mode`). It compiles in every feature combo (the SIGHUP
-// trigger + the reactive apply are `hot-reload`-gated; the partition itself is
-// always available so `--validate-config` reports restart-only warnings on any
-// build).
+// The reloadable-vs-restart-only partition plus the coherence check that both
+// the reload path and `--validate-config` run. This block is pure data and
+// pure-CPU checks — no side effect, no subsystem touched; the apply step lives
+// in `triggers::mode`. It compiles in every feature combination: the SIGHUP
+// trigger and the reactive apply are `hot-reload`-gated, while the partition
+// itself is always available, so `--validate-config` reports restart-only
+// warnings on any build.
 
-/// A reload diagnostic (RFC 0017 §5.4). `Warn` is advisory (a restart-only field
+/// A reload diagnostic. `Warn` is advisory (a restart-only field
 /// merely present in the file — it works, it just pins you to restart-to-change);
 /// `Error` is fatal to the reload (it differs on a live reload, or the reloadable
 /// subset is internally inconsistent). `--validate-config` reports both; the
@@ -1906,13 +1922,12 @@ pub enum DiagLevel {
 }
 
 impl Diag {
-    // The warn-vs-reject distinction is part of the RFC 0017 §5.4 coherence-check
-    // contract: a restart-only field merely *present in the file* is a Warn (it
-    // works, it just pins restart-to-change), distinct from a differing-on-reload
-    // Error. No restart-only field is file-settable in today's schema (mcp_servers,
-    // the one that was, is now reloadable), so the Warn path has no live caller —
-    // but the constructor stays so a future widened file schema (§5.4 check 1) is
-    // covered without re-introducing the API.
+    // The warn-vs-reject distinction is part of the coherence-check contract:
+    // a restart-only field merely *present in the file* is a Warn — it works,
+    // it just pins you to restart-to-change — which is a different thing from a
+    // field that DIFFERS on a live reload, an Error. The file schema exposes no
+    // restart-only key at all, so the Warn path has no live caller; the
+    // constructor stays so widening the file schema needs no new API.
     #[allow(dead_code)]
     fn warn(field: &str, msg: impl Into<String>) -> Diag {
         Diag {
@@ -1939,26 +1954,24 @@ impl Diag {
     }
 }
 
-/// The names of the **restart-only** fields (RFC 0017 §5.1, BINDING). A live
-/// reload whose new-vs-running diff touches ANY of these is rejected with
-/// `reason="restart_required"` (agentctl rolls a pod restart — its policy). They
-/// also drive the "restart-only field set in the file" warning (§5.4 check 1).
-/// Sharding (`--shard`) and claim routes are restart-only (RFC 0019 §4.3 — shard
-/// identity is immutable).
+/// The names of the **restart-only** fields. A live reload whose new-vs-running
+/// diff touches ANY of these is rejected with `reason="restart_required"`;
+/// whether that becomes a pod restart is agentctl's policy. They also drive the
+/// "restart-only field set in the file" warning.
 ///
-/// NB: `mcp_servers` is **reloadable** (RFC 0017 §5.1 / §5.3 step 4): a validated
-/// reload re-handshakes the MCP server set at the quiesce boundary. The name-keyed
-/// `servers`/`owner`/claim wiring (`triggers::mode`) makes the live re-handshake
-/// safe — a remove/add never shifts another server's identity — so it is
-/// deliberately ABSENT from this list (it used to be scoped restart-only).
+/// NB: `mcp_servers` is deliberately ABSENT because it is **reloadable**: a
+/// validated reload re-handshakes the MCP server set at the quiesce boundary.
+/// The name-keyed `servers`/`owner`/claim wiring in `triggers::mode` is what
+/// makes that live re-handshake safe — a remove or add never shifts another
+/// server's identity.
 pub const RESTART_ONLY_FIELDS: &[&str] = &[
     "mode",
     // NB: `intelligence` (the endpoint list) and `model`/`model_swap` are
-    // RELOADABLE via RFC 0018 §5 — the runtime hot-swap primitive. A reload whose
-    // diff repoints the endpoint list or changes the model is APPLIED at a turn
-    // boundary (the supervisor fans `ctrl/swap_intel` to in-flight children), not
-    // rejected. They are deliberately absent from this list. `mcp_servers` is
-    // likewise reloadable (RFC 0017 §5.1) — re-handshaked, not rejected.
+    // RELOADABLE through the runtime hot-swap primitive. A reload whose diff
+    // repoints the endpoint list or changes the model is APPLIED at a turn
+    // boundary — the supervisor fans `ctrl/swap_intel` to in-flight children —
+    // rather than rejected, so they are deliberately absent from this list.
+    // `mcp_servers` is likewise reloadable: re-handshaked, not rejected.
     "run_id",             // instance identity / idempotency key
     "serve_mcp",          // a live control socket must not rebind mid-flight
     "drain_timeout",      // validated against the pod grace at startup
@@ -1966,8 +1979,8 @@ pub const RESTART_ONLY_FIELDS: &[&str] = &[
 ];
 
 impl Config {
-    /// Re-resolve config for a hot reload (RFC 0017 §5.3 step 1): re-read ONLY the
-    /// file and re-merge built-in<file<env<flag. `args`/`env` are the process's
+    /// Re-resolve config for a hot reload: re-read ONLY the file and re-merge
+    /// built-in<file<env<flag. `args`/`env` are the process's
     /// original, fixed inputs — only the FILE can change between loads, so this
     /// keeps precedence correct (a flag still overrides the new file). Pure-CPU,
     /// no side effect. The returned `Config` is the fully-validated candidate; an
@@ -1980,25 +1993,24 @@ impl Config {
         Config::load(args, env)
     }
 
-    /// Advisory: a restart-only field set in the config FILE (§5.4 check 1) —
-    /// "this field belongs in env/flag" — pushed as a `Warn`. Today the file
-    /// schema (RFC 0017 §3.3) exposes NO restart-only key: `mode`/`run_id`/
-    /// `serve_mcp`/`shard`/`claim` are env/flag-only, and the one
-    /// structural field that USED to be restart-only — `mcp_servers` — is now
-    /// RELOADABLE (RFC 0017 §5.1: live re-handshake at the quiesce boundary). So
-    /// there is nothing file-settable to warn about; the hook stays (consulting
-    /// `file_present`, the gate a future widened schema would use) so re-arming a
+    /// Advisory: a restart-only field set in the config FILE — "this field
+    /// belongs in env/flag" — pushed as a `Warn`. The file schema exposes NO
+    /// restart-only key: `mode`, `run_id` and `serve_mcp` are env/flag-only,
+    /// and `mcp_servers`, the one structural field that could be mistaken for
+    /// one, is RELOADABLE (a live re-handshake at the quiesce boundary). So
+    /// there is nothing file-settable to warn about. The hook stays, consulting
+    /// `file_present` — the gate a widened schema would use — so re-arming a
     /// warning needs no plumbing change.
     fn restart_only_file_warnings(&self, file_present: bool, _diags: &mut Vec<Diag>) {
-        let _ = file_present; // gate retained for a future widened file schema (§5.4)
+        let _ = file_present; // the gate a widened file schema would use
     }
 
-    /// The reload-coherence check (RFC 0017 §5.4), run by BOTH `--validate-config`
-    /// and the reload path. Pure-CPU, no side effect.
+    /// The reload-coherence check, run by BOTH `--validate-config` and the
+    /// reload path. Pure-CPU, no side effect.
     ///
     /// 1. (advisory) a restart-only field set in the FILE → `Warn` (`file_present`).
     /// 2. (live reload only) any restart-only field that DIFFERS between `new` and
-    ///    `running` → `Error` naming the field (→ §5.3 step-2 ABORT, restart req'd).
+    ///    `running` → `Error` naming the field, which aborts the reload.
     /// 3. the reloadable subset is internally consistent: every subscription/claim
     ///    references a declared server where required, and server names are unique.
     ///
@@ -2020,7 +2032,7 @@ impl Config {
                         f,
                         format!(
                             "restart-only field '{f}' changed on a live reload; reload refused, \
-                             a pod restart is required (RFC 0017 §5.1)"
+                             a pod restart is required"
                         ),
                     ));
                 }
@@ -2058,10 +2070,10 @@ impl Config {
     }
 
     /// The reloadable, **redacted** view of the running config for
-    /// `agentd://config/effective` (RFC 0017 §4.2). Carries ONLY the reloadable
-    /// structural fields — NO token, NO URL, NO secret, NO `{{secret:…}}` values
-    /// (header NAMES only). Management-readable. Mirrors the manifest's no-secret
-    /// discipline (RFC 0012 §3.7): nothing here can embed a credential.
+    /// `agentd://config/effective`. Carries ONLY the reloadable structural
+    /// fields — no token, no URL, no secret, and header NAMES rather than
+    /// values. Management-readable, and held to the same no-secret discipline
+    /// as the manifest: nothing here can embed a credential.
     pub fn effective_view(&self) -> serde_json::Value {
         serde_json::json!({
             "model": self.model,
@@ -2071,7 +2083,7 @@ impl Config {
                 "max_steps": self.max_steps,
                 "max_depth": self.max_depth,
                 "deadline_secs": self.deadline.map(|d| d.as_secs()),
-                // RFC 0025 per-instance lifetime budget; omitted when unbounded (0).
+                // The per-instance lifetime budget; omitted when unbounded (0).
                 "lifetime_tokens": (self.budget_tokens_lifetime > 0)
                     .then_some(self.budget_tokens_lifetime),
             },
@@ -2082,15 +2094,15 @@ impl Config {
             }).collect::<Vec<_>>(),
             "subscribe": self.subscribe,
             "log_level": self.log_level.as_str(),
-            // Header NAMES only — a value may be a {{secret:…}} ref, so the
-            // resolved value is NEVER exposed here (RFC 0012 §3.7).
+            // Header NAMES only: a value may be a {{secret:…}} ref, and the
+            // resolved value is never exposed on a readable surface.
             "intelligence_headers": self.intelligence_headers.keys().collect::<Vec<_>>(),
         })
     }
 }
 
-/// Check that declared MCP server names are unique (§5.4 check 3). A duplicate
-/// would make the positional owner/claim map ambiguous, so it is an error.
+/// Check that declared MCP server names are unique. A duplicate would make the
+/// name-keyed owner/claim map ambiguous, so it is an error.
 fn check_unique_server_names(cfg: &Config, diags: &mut Vec<Diag>) {
     let mut seen = std::collections::HashSet::new();
     for s in &cfg.mcp_servers {
@@ -2103,23 +2115,23 @@ fn check_unique_server_names(cfg: &Config, diags: &mut Vec<Diag>) {
     }
 }
 
-/// Check that every claim route (and standby assignment channel) references a
-/// declared MCP server (§5.4 check 3). This is the reload-time mirror of the
-/// startup `validate()` check; on a reload the candidate must be self-consistent
-/// before any subsystem is touched. (Plain `--subscribe` URIs need no declared
-/// server — they bind to whichever connected server supports them — so only the
-/// claim/assignment subset is checked, exactly as `validate()` does.)
+/// Check that every route that names an MCP server references a declared one.
+/// This is the reload-time mirror of the startup `validate()` check: on a
+/// reload the candidate must be self-consistent before any subsystem is
+/// touched. Plain `--subscribe` URIs need no declared server — they bind to
+/// whichever connected server supports them — so they are not checked here,
+/// exactly as in `validate()`.
 fn check_subscriptions_reference_declared_servers(cfg: &Config, diags: &mut Vec<Diag>) {
-    // Plain `--subscribe` URIs bind to whichever connected server supports them,
-    // so there is no server reference here to resolve. The hook stays because
-    // §5.4 check 3 is about the reloadable subset being self-consistent, and a
-    // future field that DOES name a server would belong here.
+    // Plain `--subscribe` URIs bind to whichever connected server supports
+    // them, so there is no server reference here to resolve. The hook stays
+    // because this check is about the reloadable subset being self-consistent,
+    // and a field that DOES name a server would belong here.
     let _ = (cfg, diags);
 }
 
-/// Heuristic: is this header name credential-shaped (RFC 0011 §3.2 / RFC 0017
-/// §3.1)? A header so named must carry a `{{secret:…}}` *reference*, not an
-/// inline literal — so a secret can never be smuggled into the config file.
+/// Heuristic: is this header name credential-shaped? A header so named must
+/// carry a `{{secret:…}}` *reference*, never an inline literal, so a secret
+/// cannot be smuggled into a config file under a plausible header name.
 pub(crate) fn is_secret_shaped_key(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
     n == "authorization"
@@ -2134,23 +2146,22 @@ pub(crate) fn is_secret_shaped_key(name: &str) -> bool {
         || n.ends_with("_key")
 }
 
-/// The single-line `config.valid` verdict (RFC 0017 §4.1), to stderr, exit 0.
+/// The single-line `config.valid` verdict, to stderr, exit 0.
 fn config_valid_line() -> String {
     serde_json::json!({"event": "config.valid"}).to_string()
 }
 
-/// One machine-actionable `config.invalid` diagnostic line (RFC 0017 §4.1),
-/// to stderr, exit 2. `msg` is the human-readable reason.
+/// One machine-actionable `config.invalid` diagnostic line, to stderr, exit 2.
+/// `msg` is the human-readable reason.
 fn config_invalid_line(msg: &str) -> String {
     serde_json::json!({"event": "config.invalid", "msg": msg}).to_string()
 }
 
 /// Validate the `--intelligence` value as an ORDERED, comma-separated endpoint
-/// list (RFC 0018 §3.1). At least one non-empty element is required; every
-/// element's scheme is validated (exit 2 with the bad element), and a transport
-/// this build can't dial (`https:` without `tls`, `vsock:` without `vsock`)
-/// fails fast per element rather than being discovered on failover. A
-/// single-element list is exactly the RFC 0006 check.
+/// list. At least one non-empty element is required, and every element's scheme
+/// is validated — exit 2 naming the bad element. Checking every element, not
+/// just the first, is the point: a transport this build cannot dial would
+/// otherwise only be discovered at the moment of failover.
 pub(crate) fn validate_intelligence_uri(uri: &str) -> Result<(), ConfigError> {
     let elements: Vec<&str> = uri
         .split(',')
@@ -2168,14 +2179,14 @@ pub(crate) fn validate_intelligence_uri(uri: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
-/// Validate one endpoint URI's scheme (RFC 0018 §3.1). Intelligence is
-/// **HTTPS-only** (target-vision pivot, Phase 1): `https://host[:port][/path]`,
-/// with plaintext `http://` admitted only for a loopback host (the dev/test
-/// carve-out — the built-in mock LLM). The *scheme shape* is the startup gate
-/// (a bad scheme on any element is exit 2); a transport this build can't dial
-/// (`https:` without `tls`) is surfaced by the client as `Unsupported` at dial
-/// time — so a manifest/validate-config probe of an https endpoint on a no-tls
-/// build still passes, as before.
+/// Validate one endpoint URI's scheme. Intelligence is **HTTPS-only**:
+/// `https://host[:port][/path]`, with plaintext `http://` admitted only for a
+/// loopback host — the dev/test carve-out for the built-in mock LLM. Only the
+/// *scheme shape* is the startup gate, and a bad scheme on any element is exit
+/// 2. Whether this build can actually dial the transport (`https:` needs
+/// `tls`) is left to the client, which reports `Unsupported` at dial time, so
+/// a `--capabilities` or `--validate-config` probe of an https endpoint still
+/// passes on a no-tls build.
 fn validate_one_intelligence_uri(uri: &str) -> Result<(), ConfigError> {
     if uri.starts_with("https://") {
         return Ok(());
@@ -2212,13 +2223,13 @@ fn validate_one_intelligence_uri(uri: &str) -> Result<(), ConfigError> {
     )))
 }
 
-/// Probe each listed endpoint's per-endpoint token *file* env var (RFC 0018
-/// §3.2): a `AGENTD_INTELLIGENCE_TOKEN[_N]_FILE` that is set but unreadable is
+/// Probe each listed endpoint's per-endpoint token *file* env var: a
+/// `AGENTD_INTELLIGENCE_TOKEN[_N]_FILE` that is set but unreadable is
 /// exit 2 before any side effect — we fail fast rather than discover a missing
 /// secret on failover. Endpoint 1 (index 0) uses the bare name; later endpoints
 /// are 1-indexed (`_2`, `_3`, …). The inline env wins over the file (so a set
 /// inline var means the file is not consulted), matching the resolver. The
-/// resolved bytes are dropped immediately — never logged (RFC 0012 §3.7).
+/// resolved bytes are dropped immediately and never logged.
 fn validate_endpoint_token_files(uri: &str) -> Result<(), ConfigError> {
     let count = uri
         .split(',')
@@ -2250,8 +2261,8 @@ fn validate_endpoint_token_files(uri: &str) -> Result<(), ConfigError> {
 }
 
 /// Parse `--mcp name=<endpoint>`. The value is a remote MCP endpoint
-/// (`https://`/`http://`/`unix:`/`vsock:`, RFC 0004 Streamable HTTP) — the sole
-/// transport (RFC 0012: no local process spawn). A non-endpoint value is rejected.
+/// (`https://` / `http://`, Streamable HTTP) — the sole transport, since there
+/// is no local process spawn. A non-endpoint value is rejected.
 fn parse_mcp_spec(spec: &str) -> Result<McpServerSpec, ConfigError> {
     let (name, rhs) = spec
         .split_once('=')
@@ -2260,12 +2271,12 @@ fn parse_mcp_spec(spec: &str) -> Result<McpServerSpec, ConfigError> {
     if name.is_empty() || endpoint.is_empty() {
         return Err(usage(format!("--mcp '{spec}' has empty name or endpoint")));
     }
-    // `code` is RESERVED (RFC 0022 §4): workflow `tool` nodes address
-    // code-registered (in-process, embedder-native) tools as server `code`, so
-    // a remote server may not claim the name.
+    // `code` is RESERVED: workflow `tool` nodes address code-registered
+    // (in-process, embedder-native) tools as server `code`, so a remote server
+    // claiming the name would silently shadow them.
     if name == "code" {
         return Err(usage(
-            "--mcp: the server name 'code' is reserved for code-registered tools (RFC 0022)".into(),
+            "--mcp: the server name 'code' is reserved for code-registered tools".into(),
         ));
     }
     if !is_mcp_endpoint(endpoint) {
@@ -2281,10 +2292,10 @@ fn parse_mcp_spec(spec: &str) -> Result<McpServerSpec, ConfigError> {
     })
 }
 
-/// Parse `--a2a-peer name=endpoint` into an [`A2aPeerSpec`] (RFC 0020 §3). The
-/// endpoint is the remainder after the FIRST `=` (so `unix:`/`vsock:` schemes —
-/// which contain no `=` — pass through verbatim); the scheme itself is validated
-/// later in [`Config::validate`] via [`A2aEndpoint::parse`].
+/// Parse `--a2a-peer name=endpoint` into an [`A2aPeerSpec`]. The endpoint is
+/// the remainder after the FIRST `=`, so a URL containing `=` in a query string
+/// survives intact; the scheme itself is validated later in
+/// [`Config::validate`] via [`A2aEndpoint::parse`].
 fn parse_a2a_peer_spec(spec: &str) -> Result<A2aPeerSpec, ConfigError> {
     let (name, endpoint) = spec
         .split_once('=')
@@ -2304,7 +2315,7 @@ fn parse_a2a_peer_spec(spec: &str) -> Result<A2aPeerSpec, ConfigError> {
 }
 
 /// Parse `--mcp-tags name=tag,tag` into (server-name, tags). Tags are the
-/// snake-case capability legs (RFC 0012 §3.1).
+/// snake-case capability legs of the lethal trifecta.
 pub(crate) fn parse_mcp_tags(spec: &str) -> Result<(String, Vec<TrifectaTag>), ConfigError> {
     let (name, list) = spec
         .split_once('=')
@@ -2331,10 +2342,6 @@ pub(crate) fn read_file(path: &str) -> Result<String, ConfigError> {
         .map_err(|e| usage(format!("cannot read instruction file {path}: {e}")))
 }
 
-/// Scan `args` for the value following the first occurrence of `flag` (a
-/// `--flag VALUE` pair). Used to resolve `--config` BEFORE the main arg loop so
-/// the file can seed the lowest layer. Returns `None` if absent or value-less.
-/// Every value of a repeatable `flag`, in argument order.
 /// How one argument spells the config-file flag. `--config` is the canonical
 /// form; `-c` is the short alias, and either may attach its value with `=`
 /// (`-c=a.yaml`, `--config=a.yaml`) as well as separate it with a space.
@@ -2492,8 +2499,8 @@ fn apply_document(
 }
 
 /// Overlay a typed [`file::ConfigFile`] onto `c` — the ONE overlay operation
-/// every document layer uses: the config FILE (RFC 0017 §3.2, precedence layer
-/// 1), the path-derived env layer, and each generic `--<path>` flag. Only keys
+/// every document layer uses: the config FILE (precedence layer 1), the
+/// path-derived env layer, and each generic `--<path>` flag. Only keys
 /// the document actually sets are written (field-wise); later layers override
 /// them. List-valued keys (`mcp_servers`, `subscribe`, `a2a_peers`, the header
 /// maps) **add to** the list — repeatable-flag semantics for every layer. Maps
@@ -2505,10 +2512,10 @@ fn apply_config_file(
     cf: file::ConfigFile,
     source: &str,
 ) -> Result<(), ConfigError> {
-    // RFC 0018 §5.1: the intelligence endpoint LIST is file-settable + reloadable
-    // (a ConfigMap repoint is a hot-swap). The transport scheme is data; the
-    // credential is NEVER inline here (env/`_FILE` only — the validate pass rejects
-    // a secret-shaped value just as for headers, RFC 0012 §3.7).
+    // The intelligence endpoint LIST is file-settable and reloadable, so a
+    // ConfigMap repoint is a hot swap. The transport scheme is data; the
+    // credential is NEVER inline here — env or `_FILE` only — and the validate
+    // pass rejects a secret-shaped value just as it does for headers.
     if let Some(intelligence) = cf.intelligence {
         c.intelligence = Some(intelligence);
     }
@@ -2543,9 +2550,9 @@ fn apply_config_file(
         c.log_level = Level::parse(&level)
             .ok_or_else(|| usage(format!("{source}: invalid log_level: {level}")))?;
     }
-    // mcp_servers: each file object → one McpServerSpec over the v2.0.0 HTTP
-    // transport (a remote `endpoint` + secret-free header templates; RFC 0012 — no
-    // local process spawn). The glob→tags map flattens to the union of declared
+    // mcp_servers: each file object → one McpServerSpec over the HTTP
+    // transport: a remote `endpoint` plus secret-free header templates, with no
+    // local process spawn. The glob→tags map flattens to the union of declared
     // tags. Seeds the list.
     for s in cf.mcp_servers {
         if s.name.is_empty() {
@@ -2556,7 +2563,7 @@ fn apply_config_file(
             _ => {
                 return Err(usage(format!(
                     "{source}: mcp server '{}' has no endpoint \
-                     (stdio MCP servers were removed in v2.0.0)",
+                     (an MCP server is always a remote endpoint)",
                     s.name
                 )));
             }
@@ -2584,8 +2591,8 @@ fn apply_config_file(
             tags,
             aauth: s.aauth,
             // OAuth client-credentials + the unified `auth:` block + the
-            // service catalog are v2-only surfaces (RFC 0031/0037); the legacy
-            // v1 path never carried them.
+            // service catalog are settings-document-only surfaces; this flat
+            // config path does not carry them.
             oauth: None,
             auth: None,
             service: None,
@@ -2613,7 +2620,7 @@ fn apply_config_file(
     Ok(())
 }
 
-/// Parse `--workflow-resume <server>:<key>[@seq]` (RFC 0021 §8.4). The server
+/// Parse `--workflow-resume <server>:<key>[@seq]`. The server
 /// is the configured `--mcp` name of the checkpointer; the key identifies the
 /// state lineage (`{run_id}` interpolates later); `@seq` pins a specific
 /// envelope (fork/time-travel) — latest when absent.
@@ -2682,9 +2689,10 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
     Ok(d)
 }
 
-/// A unique-enough run id for the default case (time + pid). The operator can
-/// override with `--run-id`/`AGENTD_RUN_ID` for idempotent retries (RFC 0011
-/// §idempotency). A proper ULID can replace this without changing the surface.
+/// A unique-enough run id for the default case (time + pid). The operator
+/// overrides it with `--run-id` / `AGENTD_RUN_ID` when a retry must be
+/// idempotent — the run id is the idempotency key, so a retry that wants to be
+/// recognised as the same run must reuse it.
 fn generate_run_id() -> String {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2738,7 +2746,7 @@ fn help_text() -> String {
          LIMITS:\n\
          \x20 --max-steps <N>             per-run step cap (default 50)\n\
          \x20 --max-tokens <N>            per-run token budget (default 200000)\n\
-         \x20 --budget-tokens-lifetime <N>  per-INSTANCE cumulative token cap across all runs/reactions (RFC 0025; 0/unset = unbounded; or AGENT_BUDGET_TOKENS)\n\
+         \x20 --budget-tokens-lifetime <N>  per-INSTANCE cumulative token cap across all runs/reactions (0/unset = unbounded; or AGENT_BUDGET_TOKENS)\n\
          \x20 --deadline <dur>            wall-clock deadline (default 600s)\n\
          \x20 --max-depth <N>             subagent tree depth cap (default 4)\n\
          \n\
@@ -2758,7 +2766,7 @@ fn help_text() -> String {
          \x20 --events-ring <N>           agent://events ring size (default 1024; needs --serve-mcp + --features events)\n\
          \x20 --capabilities             print the capabilities manifest (JSON) and exit\n\
          \n\
-         CONFIG FILE (RFC 0017):\n\
+         CONFIG FILE:\n\
          \x20 --config <PATH>             load a config file, YAML or JSON; repeatable — later files override earlier ones (or AGENT_CONFIG=a.yaml:b.yaml)\n\
          \x20 --validate-config          load+validate (file+env+flags), print the verdict, exit 0/2\n\
          \x20 --config-schema            print the config-file JSON Schema and exit\n\
@@ -2994,7 +3002,7 @@ mod tests {
 
     #[cfg(feature = "workflow")]
     #[test]
-    fn workflow_resume_parses_and_validates(/* RFC 0021 §8.4 */) {
+    fn workflow_resume_parses_and_validates() {
         let intel_only = vec![(
             "AGENTD_INTELLIGENCE".to_string(),
             "https://intel.example".to_string(),
@@ -3099,8 +3107,8 @@ mod tests {
 
     #[test]
     fn neutral_agent_env_prefix_is_accepted_as_an_alias() {
-        // ACC SPEC L4: the neutral `AGENT_*` prefix is accepted on input wherever
-        // the branded `AGENTD_*` one is — fed through the single envmap normalization.
+        // The neutral `AGENT_*` prefix is accepted on input wherever the
+        // branded `AGENTD_*` one is, through one envmap normalization.
         let env = vec![
             ("INSTRUCTION".into(), "x".into()),
             (
@@ -3149,10 +3157,9 @@ mod tests {
 
     #[test]
     fn prefixed_env_wins_over_the_bare_spelling() {
-        // Specificity order within the env layer: branded > neutral > bare. The
-        // neutral AGENT_* forms (debranded to AGENTD_*) beat the bare aliases,
-        // for BOTH required inputs — including AGENT_INSTRUCTION, which used to
-        // be silently ignored (debranded to an unread AGENTD_INSTRUCTION).
+        // Specificity order within the env layer: branded > neutral > bare.
+        // The neutral AGENT_* forms (debranded to AGENTD_*) beat the bare
+        // aliases, for BOTH required inputs — AGENT_INSTRUCTION included.
         let env = vec![
             ("INSTRUCTION".into(), "bare-task".into()),
             ("AGENT_INSTRUCTION".into(), "neutral-task".into()),
@@ -3194,7 +3201,7 @@ mod tests {
 
     #[test]
     fn report_file_and_events_ring_parse_from_flag_and_env() {
-        // Default: off / the 1024 ring (RFC 0016 §11).
+        // Default: off, with the 1024-entry ring.
         let c = Config::load(&args(&[]), &base_env()).unwrap();
         assert_eq!(c.report_file, None);
         assert_eq!(c.events_ring, crate::obs::log::EVENTS_RING_DEFAULT);
@@ -3350,12 +3357,6 @@ mod tests {
         assert!(matches!(e2, ConfigError::Usage(_)));
     }
 
-    // ───────────────────────── RFC 0019 — sharding (§4) ───────────────────────
-
-    // ───────────────────── RFC 0019 — work-claim leases (§3) ──────────────────
-
-    // ───────────────────── RFC 0019 — standby / assignment (§7) ───────────────
-
     #[test]
     fn trifecta_grant_tags_defaults_untagged_to_untrusted() {
         let c = Config::load(&args(&["--mcp", "fs=https://fs.example"]), &base_env()).unwrap();
@@ -3409,10 +3410,10 @@ mod tests {
 
     #[test]
     fn mcp_endpoint_spec_parsing() {
-        // HTTPS-only (pivot Phase 3): remote Streamable HTTP endpoints.
+        // HTTPS-only: remote Streamable HTTP endpoints.
         assert!(is_mcp_endpoint("https://mcp.example.com/mcp"));
         assert!(is_mcp_endpoint("http://localhost:8080/mcp"));
-        // The retired socket schemes and a stdio argv command are NOT endpoints.
+        // Socket schemes and a stdio argv command are NOT endpoints.
         assert!(!is_mcp_endpoint("unix:/run/mcp.sock"));
         assert!(!is_mcp_endpoint("vsock:3:5000"));
         assert!(!is_mcp_endpoint("mcp-server-fs --root /data"));
@@ -3483,7 +3484,7 @@ mod tests {
 
     #[test]
     fn multi_endpoint_list_accepts_ordered_comma_list() {
-        // RFC 0018 §3.1: --intelligence is an ORDERED comma-list.
+        // --intelligence is an ORDERED comma-separated list.
         let env = vec![("INSTRUCTION".into(), "x".into())];
         let c = Config::load(
             &args(&[
@@ -3502,7 +3503,7 @@ mod tests {
 
     #[test]
     fn multi_endpoint_bad_element_scheme_is_exit_2() {
-        // A bad scheme on ANY element rejects the whole list (RFC 0018 §3.1).
+        // A bad scheme on ANY element rejects the whole list.
         let env = vec![("INSTRUCTION".into(), "x".into())];
         let e = Config::load(
             &args(&[
@@ -3517,7 +3518,7 @@ mod tests {
 
     #[test]
     fn empty_endpoint_list_is_exit_2() {
-        // An all-empty/whitespace list is "missing endpoint" (RFC 0018 §3.1).
+        // An all-empty/whitespace list is "missing endpoint".
         let env = vec![("INSTRUCTION".into(), "x".into())];
         let e = Config::load(&args(&["--intelligence", " , , "]), &env).unwrap_err();
         assert!(matches!(e, ConfigError::Usage(_)));
@@ -3580,9 +3581,9 @@ mod tests {
     }
 
     #[test]
-    fn serve_target_retired_socket_schemes_are_rejected() {
-        // `unix:` returned for co-located peers (kernel-authenticated fast
-        // lane); vsock:/tcp: stay retired — exit 2.
+    fn serve_target_rejects_unsupported_socket_schemes() {
+        // `unix:` is accepted for co-located peers — the kernel authenticates
+        // them by uid — while `vsock:` and `tcp:` are not served at all: exit 2.
         assert!(matches!(
             ServeTarget::parse("unix:/run/agentd.sock"),
             Ok(ServeTarget::Unix { ref path }) if path == "/run/agentd.sock"
@@ -3608,7 +3609,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(c.serve_mcp.as_deref(), Some("http://127.0.0.1:9000"));
-        // a retired/foreign scheme is rejected at load (exit 2) before any side effect.
+        // A foreign scheme is rejected at load (exit 2) before any side effect.
         let e = Config::load(&args(&["--serve-mcp", "tcp:9000"]), &base_env()).unwrap_err();
         assert!(matches!(e, ConfigError::Usage(_)));
     }
@@ -3701,8 +3702,8 @@ mod tests {
     #[cfg(feature = "a2a")]
     #[test]
     fn a2a_peer_client_auth_is_validated_at_startup() {
-        // A secret-shaped INLINE header value on a peer is rejected (RFC 0012
-        // §3.7 — templates only), same rule as MCP servers.
+        // A secret-shaped INLINE header value on a peer is rejected —
+        // templates only, the same rule as MCP servers.
         let file = write_tmp(
             r#"{ "a2a_peers": [{ "name": "mesh", "endpoint": "https://peer.example/a2a",
                  "headers": { "authorization": "Bearer sk-live-inline-oops" } }] }"#,
@@ -3793,7 +3794,7 @@ mod tests {
     fn debug_redacts_credential_bearing_intelligence_uri() {
         // The raw `--intelligence` URI can carry inline creds
         // (`https://user:pass@host`). The Debug impl must show the SCHEME only,
-        // never the userinfo/host/path (RFC 0012 §3.7 — mirror effective_view).
+        // never the userinfo/host/path, mirroring effective_view.
         let env = vec![
             ("INSTRUCTION".into(), "x".into()),
             (
@@ -3819,7 +3820,7 @@ mod tests {
         assert!(h.contains("finish-on-old|restart-turn"));
     }
 
-    // ───────────────────────── RFC 0017 — config file ─────────────────────────
+    // ──────────────────────────── config file ────────────────────────────────
 
     use std::io::Write as _;
 
@@ -3863,7 +3864,7 @@ mod tests {
 
     #[test]
     fn budget_tokens_lifetime_parses_from_flag_env_and_file() {
-        // RFC 0025 — the per-instance lifetime cap. Unbounded (0) by default.
+        // The per-instance lifetime cap. Unbounded (0) by default.
         assert_eq!(
             Config::load(&args(&[]), &base_env())
                 .unwrap()
@@ -3904,7 +3905,7 @@ mod tests {
 
     #[test]
     fn env_and_flag_override_file_per_precedence() {
-        // built-in < FILE < env < flag (RFC 0011 §2.1 / RFC 0017 §3.2).
+        // built-in < FILE < env < flag.
         let file = write_tmp(r#"{ "model": "from-file", "max_tokens": 100 }"#);
         let mut env = base_env();
         env.push(("AGENTD_MODEL".into(), "from-env".into()));
@@ -4338,7 +4339,7 @@ intelligence_headers:
     #[test]
     fn flag_mcp_and_subscribe_add_to_the_file_list() {
         // Repeatable list flags ADD to the file's lists (the one documented
-        // deviation from pure last-writer-wins, RFC 0017 §3.2).
+        // deviation from pure last-writer-wins).
         let file = write_tmp(
             r#"{ "mcp_servers": [{ "name": "web", "endpoint": "https://web.example.com/mcp" }],
                 "subscribe": ["fs:file:///a"] }"#,
@@ -4399,7 +4400,7 @@ intelligence_headers:
         assert!(matches!(e, ConfigError::Usage(_)));
     }
 
-    // ──────────────────── RFC 0017 §5.2 — --watch-config ──────────────────────
+    // ─────────────────────────── --watch-config ──────────────────────────────
 
     /// Without the `config-watch` build feature, `--watch-config` (even WITH a
     /// config file) is a usage error — never silently ignored (the operator would
@@ -4449,7 +4450,7 @@ intelligence_headers:
     }
 
     /// `--watch-config` with NO config file is a usage error — watching nothing is
-    /// meaningless (RFC 0017 §5.2). (Only exercised on a `config-watch` build; off
+    /// meaningless. (Only exercised on a `config-watch` build; off
     /// the feature the feature-gate error fires first.)
     #[cfg(feature = "config-watch")]
     #[test]
@@ -4477,7 +4478,7 @@ intelligence_headers:
         );
     }
 
-    // ───────────────────────── RFC 0017 — --validate-config ───────────────────
+    // ───────────────────────────  --validate-config  ─────────────────────────
 
     fn validate_verdict(args_: &[&str], env: &[(String, String)]) -> Result<String, String> {
         match Config::load(&args(args_), env).unwrap_err() {
@@ -4498,7 +4499,7 @@ intelligence_headers:
 
     #[test]
     fn validate_config_invalid_returns_err_exit2_shape() {
-        // reactive with no subscribe → invalid (RFC 0011 §3.3). Verdict is Err.
+        // reactive with no subscribe → invalid. Verdict is Err.
         let v = validate_verdict(&["--validate-config", "--mode", "reactive"], &base_env());
         let lines = v.unwrap_err();
         assert!(lines.contains("config.invalid"));
@@ -4510,10 +4511,11 @@ intelligence_headers:
 
     #[test]
     fn validate_config_refuses_a_trifecta_only_config_exit2() {
-        // RFC 0017 §7 / RFC 0012 §3.2: the trifecta gate lives in `validate()`, the
+        // The trifecta gate lives in `validate()`, the
         // ONE validation authority, so `--validate-config` must REFUSE a complete
-        // trifecta exactly as startup does (it used to pass valid while startup
-        // refused — the bug). One server tagged with all three legs, no override.
+        // trifecta exactly as startup does: a verdict that says "valid" for a
+        // config the daemon would refuse is worse than no verdict at all. One
+        // server tagged with all three legs, no override.
         let v = validate_verdict(
             &[
                 "--validate-config",
@@ -4577,7 +4579,7 @@ intelligence_headers:
         assert!(v.unwrap_err().contains("config.invalid"));
     }
 
-    // ───────────────────────── RFC 0017 — --config-schema ─────────────────────
+    // ────────────────────────────  --config-schema  ──────────────────────────
 
     #[test]
     fn config_schema_emits_parseable_json_schema() {
@@ -4594,7 +4596,7 @@ intelligence_headers:
         // It short-circuits with NO instruction and NO config (static export).
     }
 
-    // ───────────────────────── RFC 0017 — secret refs (§6) ────────────────────
+    // ──────────────────────────────  secret refs  ────────────────────────────
 
     #[test]
     fn intelligence_token_file_reads_and_trims() {
@@ -4627,7 +4629,7 @@ intelligence_headers:
 
     #[test]
     #[cfg(feature = "aauth")]
-    fn aauth_flags_and_validation(/* RFC 0023 */) {
+    fn aauth_flags_and_validation() {
         // Provider + all sub-flags parse into AAuthSettings (order-independent).
         let c = Config::load(
             &args(&[
@@ -4788,7 +4790,7 @@ intelligence_headers:
     #[test]
     fn inline_secret_shaped_header_is_rejected() {
         // A credential-shaped header with an inline (non-ref) value is the
-        // "secret in the file" footgun — exit 2 (RFC 0017 §3.1).
+        // The "secret in the file" footgun — exit 2.
         let file = write_tmp(r#"{ "intelligence_headers": { "x-api-key": "sk-inline-literal" } }"#);
         let e = Config::load(
             &args(&["--config", file.path().to_str().unwrap()]),
@@ -4819,7 +4821,7 @@ intelligence_headers:
 
     #[test]
     fn unresolvable_secret_ref_in_header_is_rejected_at_validation() {
-        // A {{secret:NAME}} whose env var is unset → exit 2 at startup (§6.2).
+        // A {{secret:NAME}} whose env var is unset → exit 2 at startup.
         let file = write_tmp(
             r#"{ "intelligence_headers": { "x-api-key": "{{secret:DEFINITELY_UNSET_VAR_XYZ}}" } }"#,
         );
@@ -4831,7 +4833,7 @@ intelligence_headers:
         assert!(matches!(e, ConfigError::Usage(_)));
     }
 
-    // ─────────────────── RFC 0017 §5 — hot-reload coherence ───────────────────
+    // ───────────────────────  hot-reload coherence  ──────────────────────────
 
     /// A valid reactive baseline config to diff reloads against.
     fn reactive_base() -> Config {
@@ -4844,7 +4846,7 @@ intelligence_headers:
 
     #[test]
     fn coherence_rejects_a_differing_restart_only_field() {
-        // RFC 0017 §5.4 check 2: a restart-only field that DIFFERS on a live
+        // A restart-only field that DIFFERS on a live
         // reload is a hard reject naming the field.
         let running = reactive_base();
         for mutate in [
@@ -4868,9 +4870,9 @@ intelligence_headers:
 
     #[test]
     fn coherence_accepts_a_reloadable_diff() {
-        // RFC 0017 §5.1 + RFC 0018 §5.1: log_level / model / subscribe / mcp_servers
-        // and the intelligence endpoint list + model-swap policy are reloadable — a
-        // diff in them passes the coherence check (no restart-only field touched).
+        // log_level / model / subscribe / mcp_servers, the intelligence
+        // endpoint list and the model-swap policy are all reloadable, so a diff
+        // in any of them passes the coherence check untouched.
         let running = reactive_base();
         for mutate in [
             (|c: &mut Config| c.log_level = Level::Debug) as fn(&mut Config),
@@ -4878,7 +4880,7 @@ intelligence_headers:
             |c: &mut Config| c.max_tokens = 999_999,
             |c: &mut Config| c.max_steps = 123,
             |c: &mut Config| c.subscribe = vec!["file:///in.json".into(), "file:///b.json".into()],
-            // RFC 0017 §5.1: the MCP server inventory is reloadable (re-handshake).
+            // The MCP server inventory is reloadable via a re-handshake.
             |c: &mut Config| {
                 c.mcp_servers = vec![McpServerSpec {
                     name: "added".into(),
@@ -4886,7 +4888,7 @@ intelligence_headers:
                     ..Default::default()
                 }]
             },
-            // RFC 0018 §5.1: an endpoint repoint is a reloadable hot-swap.
+            // An endpoint repoint is a reloadable hot swap.
             |c: &mut Config| c.intelligence = Some("https://other.example".into()),
             |c: &mut Config| c.model_swap = SwapPolicy::RestartTurn,
         ] {
@@ -4901,12 +4903,12 @@ intelligence_headers:
 
     #[test]
     fn mcp_servers_is_reloadable_not_restart_only() {
-        // RFC 0017 §5.1: `mcp_servers` was lifted out of the restart-only set — a
-        // live re-handshake is now implemented (`triggers::mode`), so an add/remove/
-        // edit of a server is APPLIED at the quiesce boundary, not rejected.
+        // `mcp_servers` is not restart-only: `triggers::mode` performs a live
+        // re-handshake, so adding, removing or editing a server is APPLIED at
+        // the quiesce boundary rather than rejected.
         assert!(
             !RESTART_ONLY_FIELDS.contains(&"mcp_servers"),
-            "mcp_servers must NOT be restart-only (RFC 0017 §5.1)"
+            "mcp_servers must NOT be restart-only"
         );
         let running = reactive_base();
         // ADD a server.
@@ -4937,8 +4939,8 @@ intelligence_headers:
 
     #[test]
     fn model_swap_flag_and_env_parse_and_default() {
-        // RFC 0018 §5.3: `--model-swap` / `AGENTD_MODEL_SWAP` selects the policy;
-        // the default is finish-on-old.
+        // `--model-swap` / `AGENTD_MODEL_SWAP` selects the policy; the default
+        // is finish-on-old.
         let def = Config::load(&args(&[]), &base_env()).unwrap();
         assert_eq!(def.model_swap, SwapPolicy::FinishOnOld);
         let flag = Config::load(&args(&["--model-swap", "restart-turn"]), &base_env()).unwrap();
@@ -4956,11 +4958,11 @@ intelligence_headers:
 
     #[test]
     fn intelligence_is_reloadable_not_restart_only() {
-        // RFC 0018 §5.1: `intelligence` (the endpoint list) was lifted out of the
-        // restart-only set — a repoint is APPLIED as a hot-swap, not rejected.
+        // `intelligence` (the endpoint list) is not restart-only: a repoint is
+        // APPLIED as a hot swap rather than rejected.
         assert!(
             !RESTART_ONLY_FIELDS.contains(&"intelligence"),
-            "intelligence must NOT be restart-only (RFC 0018 §5.1)"
+            "intelligence must NOT be restart-only"
         );
         let running = reactive_base();
         let mut new = running.clone();
@@ -4997,8 +4999,8 @@ intelligence_headers:
 
     #[test]
     fn restart_only_set_pins_the_immutable_fields() {
-        // The BINDING partition (RFC 0017 §5.1): mode/identity/transport/
-        // each named field is diff-detected
+        // The partition pins mode / identity / transport, and each named field
+        // is diff-detected
         // by `restart_only_field_differs` (a field listed but not compared would
         // silently reload — guard against that regression).
         for &f in RESTART_ONLY_FIELDS {
@@ -5022,8 +5024,8 @@ intelligence_headers:
 
     #[test]
     fn effective_view_carries_no_secret_or_url() {
-        // RFC 0017 §4.2: the effective view is reloadable + REDACTED — no token,
-        // no endpoint URL, no resolved {{secret:…}} value, header NAMES only.
+        // The effective view is reloadable and REDACTED — no token, no endpoint
+        // URL, no resolved {{secret:…}} value, header NAMES only.
         const TOKEN: &str = "super-secret-effective-token";
         let mut env = base_env();
         env.push(("AGENTD_INTELLIGENCE_TOKEN".into(), TOKEN.into()));

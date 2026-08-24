@@ -3,20 +3,19 @@
 //! drain what is in flight.**
 //!
 //! The failure this exists for is disk. The file store writes until `ENOSPC`,
-//! and a checkpoint failure is a halting condition — so before this module a
-//! full disk stopped the agent *after* the fact, with no warning before it and
-//! nothing between "fine" and "dead". Now there are two thresholds: below
-//! `warn` the operator is told; below `shed` the daemon stops **admitting**
-//! work — no new runs fired, webhooks answered `429 Retry-After`, no new turns
-//! dispatched — while everything already running drains normally. An agent
-//! that finishes its current job but takes no more degrades; one that dies
-//! mid-checkpoint corrupts the next restart's starting point.
+//! and a checkpoint failure is a halting condition, so a full disk would
+//! otherwise stop the agent *after* the fact with nothing between "fine" and
+//! "dead". Two thresholds give it a middle: below `warn` the operator is told;
+//! below `shed` the daemon stops **admitting** work — no new runs fired,
+//! webhooks answered `429 Retry-After`, no new turns dispatched — while
+//! everything already running drains normally. An agent that finishes its
+//! current job but takes no more degrades; one that dies mid-checkpoint
+//! corrupts the next restart's starting point.
 //!
 //! Memory pressure (the cgroup's `memory.high`, when armed) sheds through the
-//! same gate: before this it was consulted at exactly ONE admission point of
-//! four — subagent spawn — so a daemon at its soft limit refused to spawn a
-//! child and then cheerfully accepted a webhook, fired a schedule and
-//! dispatched a turn.
+//! same gate. Every admission point must consult the same verdict: a daemon
+//! that refuses to spawn a child at its soft limit while still accepting a
+//! webhook, firing a schedule and dispatching a turn has not shed anything.
 //!
 //! Assessment is cached (~2s) and lock-free to read: the gates sit on hot
 //! paths and a `statvfs` per webhook would be its own kind of pressure.

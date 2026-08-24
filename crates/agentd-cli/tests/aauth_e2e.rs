@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! End-to-end AAuth [DRAFT] (RFC 0023): the agent-side chain against a LIVE mock
-//! Agent Provider socket — load key → enroll (signed) → agent-token (signed,
-//! cached) → produce RFC 9421 request-signature headers that a verifier
-//! reconstructs and checks against the enrolled public key. Case A, the common
-//! path. [feature: aauth]
+//! End-to-end AAuth [DRAFT]: the agent-side chain against a LIVE mock Agent
+//! Provider socket — load key → enroll (signed) → agent-token (signed, cached)
+//! → produce RFC 9421 request-signature headers that a verifier reconstructs
+//! and checks against the enrolled public key. Case A, the common path.
+//! [feature: aauth]
 #![cfg(feature = "aauth")]
 
 use agentd::aauth::{AAuthClient, AgentKey, ApdConfig, RequestSigner};
@@ -12,7 +12,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc;
 use std::time::Duration;
 
-/// A minimal mock apd: serves the G1 provider-metadata GET, then POST /enroll and
+/// A minimal mock apd: serves the provider-metadata GET, then POST /enroll and
 /// /agent-token. It records that each *enroll/token* request arrived signed (a
 /// `Signature` header present) and returns canned JSON. Runs until it has served
 /// `serve` requests, then stops.
@@ -26,7 +26,7 @@ fn spawn_mock_apd(serve: usize) -> (String, mpsc::Receiver<bool>) {
                 break;
             };
             let (path, signed) = read_request(&mut s);
-            // G1: prime() first validates /.well-known/aauth-agent.json. Serve a
+            // prime() first validates /.well-known/aauth-agent.json. Serve a
             // document whose `issuer` == our own origin (the match case), and
             // don't count it as a signed enroll/token call.
             if path.contains(".well-known") {
@@ -150,8 +150,9 @@ fn enroll_token_and_sign_end_to_end() {
     agentd::aauth::verify_ed25519(&pubkey, base.as_bytes(), &sig)
         .expect("request signature verifies against the enrolled public key");
 
-    // A second sign() reuses the CACHED token — no more apd calls (the mock was
-    // told to serve only 2; a third connect would block/fail).
+    // A second sign() reuses the CACHED token — no more apd calls (the mock
+    // serves exactly the three priming requests; a further connect would
+    // block/fail).
     let again = client.sign("POST", "mcp.example", "/mcp", b"{}");
     assert_eq!(again.len(), 3);
 }

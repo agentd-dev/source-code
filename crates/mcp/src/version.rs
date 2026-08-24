@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! MCP protocol version + **era** model, and version negotiation for both eras.
 //!
-//! MCP versions are `YYYY-MM-DD` date strings marking the last backward-incompatible
-//! change; they sort chronologically as plain strings. Two eras
-//! (modelcontextprotocol.io/specification/draft/basic/versioning §terminology):
+//! MCP versions are `YYYY-MM-DD` date strings marking the last
+//! backward-incompatible change. They sort chronologically as plain strings,
+//! which is what lets a lexical `>=` decide the era. Two eras exist:
 //!
 //! * **Legacy** — an `initialize` handshake + session (`2025-11-25` and earlier).
 //!   The client advertises its latest version in `initialize`; the server echoes
@@ -48,14 +48,15 @@ pub const LATEST_MODERN_VERSION: &str = "2026-07-28";
 /// The latest legacy revision — what the `initialize` handshake advertises.
 pub const LATEST_LEGACY_VERSION: &str = "2025-11-25";
 
-/// The version advertised in a **legacy** `initialize` handshake. Kept as the
-/// latest legacy revision: the handshake path speaks legacy until the modern
-/// (stateless) dialect is wired into the client (a later phase). A modern client
-/// declares its version per-request instead ([`LATEST_MODERN_VERSION`]).
+/// The version advertised in a **legacy** `initialize` handshake — necessarily a
+/// legacy revision, since a modern server has no handshake to advertise into. A
+/// modern peer is told the version per request instead
+/// ([`LATEST_MODERN_VERSION`]).
 pub const PROTOCOL_VERSION: &str = LATEST_LEGACY_VERSION;
 
 /// The version a legacy Streamable HTTP server assumes when a request carries no
-/// `MCP-Protocol-Version` header (transports §protocol-version-header).
+/// `MCP-Protocol-Version` header. A header-less request is therefore not an
+/// error — it is a request for this revision.
 pub const DEFAULT_NEGOTIATED_VERSION: &str = "2025-03-26";
 
 /// The MCP-reserved JSON-RPC error code for an unsupported protocol version
@@ -99,9 +100,9 @@ pub fn era_of(version: &str) -> Era {
     }
 }
 
-/// Negotiate the session version from a **legacy** server's `initialize` response
-/// (lifecycle §version-negotiation). The server echoes our advertised version if
-/// it supports it, else returns another it supports.
+/// Negotiate the session version from a **legacy** server's `initialize`
+/// response. The server echoes our advertised version if it supports it, else
+/// returns another it supports; this decides whether that answer is usable.
 ///
 /// * A version we **know** → adopt it.
 /// * An **unknown but newer** well-formed date → adopt it optimistically
@@ -121,7 +122,8 @@ pub fn negotiate_version(server_version: &str) -> Option<String> {
 }
 
 /// The payload of an [`UNSUPPORTED_PROTOCOL_VERSION_CODE`] error's `data` — the
-/// modern era's version-negotiation signal (versioning §protocol-version-negotiation).
+/// modern era's whole version-negotiation signal, since there is no handshake in
+/// which to agree a version up front.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct UnsupportedProtocolVersion {
     /// The versions the server supports.
@@ -143,7 +145,7 @@ pub fn best_mutual_version(server_supported: &[String]) -> Option<String> {
 }
 
 /// Is `code` a JSON-RPC error code only a **modern** server emits? Used for era
-/// detection (versioning §backward-compatibility): a `-32022`
+/// detection: a `-32022`
 /// (UnsupportedProtocolVersion) or `-32020` (HeaderMismatch) in the body of a
 /// failed modern probe identifies a modern server, so the client retries rather
 /// than falling back to `initialize`. Generic codes (e.g. `-32601` method-not-

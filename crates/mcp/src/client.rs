@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! MCP client over the **Streamable HTTP** transport. RFC 0004; RFC 0012 (no local
-//! process spawn).
+//! MCP client over the **Streamable HTTP** transport. No local process is ever
+//! spawned: a server is reached over a socket or not at all.
 //!
 //! One client connects one remote server (`https`/`http`/`unix`/`vsock`) and
-//! implements the client subset from RFC 0004: initialize + capability store,
-//! tools (list+call), resources (list+read), subscribe/unsubscribe, ping. We
-//! declare **no** client capabilities.
+//! covers the client subset agentd needs: initialize + capability store, tools
+//! (list+call), resources (list+read), subscribe/unsubscribe, ping. Client
+//! capabilities are declared only when a host handler can actually answer them.
 //!
 //! Each request is one POST of a JSON-RPC frame over a fresh connection (the
 //! per-request socket timeout is the per-call bound); the response is
@@ -61,9 +61,9 @@ type NotifQueue = Arc<Mutex<VecDeque<rpc::Notification>>>;
 /// Routes an inbound JSON-RPC frame: a notification is queued for the reactor,
 /// a **request** is answered and the response POSTed back.
 ///
-/// MCP is bidirectional and this client used to be deaf in one direction —
-/// every server→client request was dropped, including `ping`, which the spec
-/// says both sides MUST answer. The router is shared by every path that can
+/// MCP is bidirectional, and a dropped server→client request is a real failure:
+/// `ping` in particular MUST be answered by both sides, or the peer is entitled
+/// to treat the connection as dead. The router is shared by every path that can
 /// receive a frame (the SSE event stream, the modern listen stream, and the
 /// interleaved frames on any request's own response stream) so there is one
 /// place that decides what an inbound frame means.
@@ -103,12 +103,10 @@ pub struct McpClient {
     /// subscribe (the reactive push channel — a `GET` stream on legacy, a
     /// `subscriptions/listen` POST stream on modern).
     events: Mutex<Option<EventStreamHandle>>,
-    /// The resource URIs subscribed to. On modern this is the filter the
-    /// `subscriptions/listen` stream is (re)opened with; legacy subscribes
     /// Cached tool `inputSchema`s (name → schema) from the last `tools/list`, so a
     /// modern `tools/call` can mirror `x-mcp-header`-annotated params into
-    /// `Mcp-Param-*` headers (transports §custom-headers). Populated only with
-    /// tools whose annotations validate.
+    /// `Mcp-Param-*` headers. Populated only with tools whose annotations
+    /// validate, so an unvalidated schema can never shape an outbound header.
     tool_schemas: Mutex<HashMap<String, Value>>,
     next_id: AtomicI64,
     caps: ServerCapabilities,
@@ -133,8 +131,9 @@ pub struct McpClient {
     inbound_caps: inbound::Capabilities,
     inbound_handler: Option<Arc<dyn inbound::Handler>>,
     /// Stamped into every `tools/call` request's `params._meta` (e.g.
-    /// `{"agent/run_id": …}`) so backing services can dedupe retries
-    /// (RFC 0011 §idempotency).
+    /// `{"agent/run_id": …}`) so a backing service can recognize a retried call
+    /// as the same logical operation and dedupe it rather than repeating a side
+    /// effect.
     tool_meta: Option<Value>,
     /// The client identity sent in `initialize` (legacy) / every request's `_meta`
     /// (modern). Defaults to this crate's identity; the host overrides it via
@@ -145,17 +144,19 @@ pub struct McpClient {
     client_capabilities: Value,
 }
 
-/// The background notification-stream thread + its stop flag (RFC 0004 §GET SSE).
+/// The background notification-stream thread + its stop flag. The flag is the
+/// only way to end the thread: its read is bounded so it can observe the stop
+/// between events rather than blocking forever on a quiet server.
 struct EventStreamHandle {
     stop: Arc<AtomicBool>,
     handle: JoinHandle<()>,
 }
 
 impl McpClient {
-    /// Connect to a remote MCP server over Streamable HTTP (RFC 0004). `endpoint`
-    /// is `https://…` / `http://…` / `unix:/path` / `vsock:cid:port`. `headers`
-    /// are caller-owned request headers (auth/framing — resolved secret values,
-    /// never templates or logs). No process is spawned (RFC 0012). Call
+    /// Connect to a remote MCP server over Streamable HTTP. `endpoint` is
+    /// `https://…` / `http://…` / `unix:/path` / `vsock:cid:port`. `headers`
+    /// are caller-owned request headers (auth/framing — already-resolved secret
+    /// values, never templates, and never logged). No process is spawned. Call
     /// [`Self::initialize`] before any tool/resource call.
     pub fn connect(
         name: &str,
@@ -166,9 +167,9 @@ impl McpClient {
         Self::connect_signed(name, endpoint, headers, timeout, None)
     }
 
-    /// [`Self::connect`] with an optional per-request AAuth signer (RFC 0023) —
-    /// every outbound request to this server is signed. `None` = unsigned (the
-    /// `connect` default).
+    /// [`Self::connect`] with an optional per-request AAuth signer — every
+    /// outbound request to this server is then signed, including the long-lived
+    /// notification stream. `None` = unsigned (the `connect` default).
     pub fn connect_signed(
         name: &str,
         endpoint: &str,
@@ -270,8 +271,9 @@ impl McpClient {
 
     /// Attach a mutual-TLS client identity (a mounted cert chain + key) for a
     /// `https://` endpoint. A no-op on non-TLS endpoints (the identity is only
-    /// presented during the TLS handshake). RFC 0012 §3.7: the key never leaves
-    /// the process (see [`net::tls`]).
+    /// presented during the TLS handshake). The private key is read from a
+    /// mounted file and never leaves the process — it is not logged, rendered
+    /// into an error, or copied onto the wire (see [`net::tls`]).
     #[cfg(feature = "tls")]
     pub fn with_identity(mut self, identity: net::tls::ClientIdentity) -> Self {
         // The Arc is unshared here (called right after connect, before the event
@@ -289,8 +291,9 @@ impl McpClient {
         &self.caps
     }
 
-    /// Set the `_meta` stamped onto every `tools/call` (e.g. the run id, for
-    /// retry dedup). Call after `initialize`. RFC 0011 §idempotency.
+    /// Set the `_meta` stamped onto every `tools/call` (e.g. the run id), so a
+    /// server can recognize a retried call and dedupe its side effect. Call
+    /// after `initialize`.
     pub fn set_tool_meta(&mut self, meta: Value) {
         self.tool_meta = Some(meta);
     }
@@ -302,11 +305,12 @@ impl McpClient {
     }
 
     /// [`Self::initialize`] with a caller-supplied timeout for the `initialize`
-    /// round-trip (the SHORT management bound, RFC 0016 §10). Used by the
-    /// hot-reload re-handshake, which adds a server ON the reactor thread mid-loop:
-    /// a slow-but-alive added server must not block the reactor (and starve the
-    /// liveness heartbeat) for the full ~60s — a timeout is a contained
-    /// `mcp.connect.fail` (the server is simply absent, RFC 0007 / RFC 0017 §5.3).
+    /// round-trip — the SHORT management bound. Used by the hot-reload
+    /// re-handshake, which adds a server ON the reactor thread mid-loop: a
+    /// slow-but-alive added server must not block the reactor (and starve the
+    /// liveness heartbeat) for the full default bound. A timeout is contained,
+    /// reported as `mcp.connect.fail`, and the server is simply treated as
+    /// absent rather than failing the reload.
     pub fn initialize_within(&mut self, timeout: Duration) -> Result<(), McpError> {
         // The SDK owns the handshake and every operation after it — over *this*
         // connection's transport, so a request signer (AAuth's challenge loop,
@@ -359,14 +363,13 @@ impl McpClient {
         self.list_tools_within(self.timeout)
     }
 
-    /// `tools/list` with a caller-supplied per-request timeout (the SHORT
-    /// management bound, RFC 0016 §10) instead of the default ~60s. Used by the
-    /// reactor-thread management path (hot-reload re-handshake, claim coordination
-    /// re-validation) so a slow-but-alive coordination server cannot outrun the
-    /// liveness heartbeat. A timeout surfaces as the usual [`McpError::Timeout`],
-    /// which the callers already treat as a best-effort failure. The timeout is
-    /// applied to EACH page (each pagination round-trip is bounded), matching the
-    /// per-request contract of [`Self::request_with_timeout`].
+    /// `tools/list` for the reactor-thread management path (hot-reload
+    /// re-handshake, claim coordination re-validation), which wants a shorter
+    /// bound than the data path so a slow-but-alive coordination server cannot
+    /// outrun the liveness heartbeat. A timeout surfaces as the usual
+    /// [`McpError::Timeout`], which those callers treat as a best-effort
+    /// failure. The listing is served by the SDK connection, whose own
+    /// request bound applies; `timeout` is accepted for call-site symmetry.
     pub fn list_tools_within(&self, _timeout: Duration) -> Result<Vec<Tool>, McpError> {
         let Some(c) = &self.rmcp else {
             return Err(McpError::Transport(
@@ -377,8 +380,8 @@ impl McpClient {
     }
 
     /// `tools/call`. The returned [`CallToolResult`] carries `isError` (a
-    /// tool-domain failure observation) — distinct from an `Err` here, which
-    /// is a transport/protocol failure (RFC 0004 §isError).
+    /// tool-domain failure the model sees as an observation) — distinct from an
+    /// `Err` here, which is a transport/protocol failure and fails the call.
     pub fn call_tool(
         &self,
         name: &str,
@@ -399,9 +402,10 @@ impl McpClient {
 
     /// `tools/call` with **per-call** `_meta` merged on top of the persistent
     /// [`Self::set_tool_meta`] for this one call only — without mutating the
-    /// stored meta. Used by the work-claim client (RFC 0019 §3 / RFC 0015 §5.6),
-    /// where `agent/claim_key` is per-item and must ride the individual call,
-    /// never the persistent stamp. `extra_meta` (an object) wins key-by-key over
+    /// stored meta. Used by the work-claim client, where `agent/claim_key`
+    /// identifies one work item and must ride only that call — stamping it
+    /// persistently would attach one item's key to every later call.
+    /// `extra_meta` (an object) wins key-by-key over
     /// the persistent meta; a non-object `extra_meta` replaces it. The persistent
     /// meta is left untouched.
     pub fn call_tool_with_meta(
@@ -414,8 +418,8 @@ impl McpClient {
     }
 
     /// `tools/call` with per-call `_meta` AND a caller-supplied per-request
-    /// timeout (the SHORT management bound, RFC 0016 §10) instead of the default
-    /// ~60s. Used by the reactor-thread lease management path (claim
+    /// timeout — the SHORT management bound rather than the long data-path
+    /// default. Used by the reactor-thread lease management path (claim
     /// renew/ack/release) — a slow coordination server must not block the reactor
     /// past the liveness staleness window. Behaviour is otherwise identical to
     /// [`Self::call_tool_with_meta`]; a timeout surfaces as [`McpError::Timeout`],
@@ -518,8 +522,8 @@ impl McpClient {
         Ok(templates)
     }
 
-    /// `ping` — a liveness round-trip (RFC 0004 §utilities). Returns `Ok(())` if
-    /// the server answers within the default timeout.
+    /// `ping` — a liveness round-trip both sides of MCP must answer. Returns
+    /// `Ok(())` if the server answers within the default timeout.
     pub fn ping(&self) -> Result<(), McpError> {
         self.request_with_timeout(method::PING, None, self.timeout)?;
         Ok(())
@@ -591,13 +595,15 @@ impl McpClient {
         self.read_resource_within(uri, self.timeout)
     }
 
-    /// `resources/read` with a caller-supplied per-request timeout (the SHORT
-    /// management bound, RFC 0016 §10) instead of the default ~60s. The reactor
-    /// thread's notify-then-read (`read_current`) blocks on this; a slow-but-alive
-    /// resource server must not outrun the liveness heartbeat. A timeout surfaces
-    /// as [`McpError::Timeout`]; the level-triggered reactor treats a timed-out
-    /// read exactly like any read failure (act on empty / skip), so a transient
-    /// slow read is recovered on the next `updated` notification or re-read.
+    /// `resources/read` for the reactor thread's notify-then-read
+    /// (`read_current`), which blocks on it and therefore wants a shorter bound
+    /// than the data path: a slow-but-alive resource server must not outrun the
+    /// liveness heartbeat. A timeout surfaces as [`McpError::Timeout`]; because
+    /// the reactor is level-triggered it treats a timed-out read exactly like
+    /// any read failure (act on empty / skip), so a transient slow read is
+    /// recovered on the next `updated` notification or re-read. The read is
+    /// served by the SDK connection, whose own request bound applies;
+    /// `timeout` is accepted for call-site symmetry.
     pub fn read_resource_within(
         &self,
         uri: &str,
@@ -611,14 +617,16 @@ impl McpClient {
         c.read_resource(uri)
     }
 
-    /// `resources/subscribe` — gated on the server advertising it (RFC 0004).
+    /// `resources/subscribe`, gated on the server advertising `resources.subscribe`
+    /// — subscribing to a server that never pushes would leave the reactor idle.
     pub fn subscribe(&self, uri: &str) -> Result<(), McpError> {
         self.subscribe_within(uri, self.timeout)
     }
 
-    /// [`Self::subscribe`] with a caller-supplied timeout (the SHORT management
-    /// bound, RFC 0016 §10) — for the reactor-thread reload re-handshake, where a
+    /// [`Self::subscribe`] for the reactor-thread reload re-handshake, where a
     /// slow-but-alive server arming a subscription must not block the reactor.
+    /// The call is served by the SDK connection, whose own request bound
+    /// applies; `timeout` is accepted for call-site symmetry.
     pub fn subscribe_within(&self, uri: &str, _timeout: Duration) -> Result<(), McpError> {
         let Some(c) = &self.rmcp else {
             return Err(McpError::Transport(
@@ -632,10 +640,11 @@ impl McpClient {
         self.unsubscribe_within(uri, self.timeout)
     }
 
-    /// [`Self::unsubscribe`] with a caller-supplied timeout (the SHORT management
-    /// bound, RFC 0016 §10) — for the reactor-thread reload reconcile + the drain
-    /// unsubscribe, both best-effort: a slow server here must not block the reactor
-    /// or the drain past the liveness window / drain budget.
+    /// [`Self::unsubscribe`] for the reactor-thread reload reconcile and the
+    /// drain unsubscribe, both best-effort: a slow server here must not block
+    /// the reactor past the liveness window or overrun the drain budget. The
+    /// call is served by the SDK connection, whose own request bound applies;
+    /// `timeout` is accepted for call-site symmetry.
     pub fn unsubscribe_within(&self, uri: &str, _timeout: Duration) -> Result<(), McpError> {
         let Some(c) = &self.rmcp else {
             return Err(McpError::Transport(
@@ -679,8 +688,8 @@ impl McpClient {
     /// Send one JSON-RPC request over a fresh HTTP connection and return the
     /// matching response (`timeout` is the socket connect+read bound). The
     /// default-timeout callers delegate here with `self.timeout`; the reactor-
-    /// thread management path passes the SHORT bound (RFC 0016 §10) so a slow-but-
-    /// alive server cannot block the reactor past the liveness window.
+    /// thread management path passes a shorter bound so a slow-but-alive server
+    /// cannot block the reactor past the liveness window.
     fn request_with_timeout(
         &self,
         method: &str,
@@ -706,8 +715,9 @@ impl McpClient {
                 .into_iter()
                 .map(|(k, v)| (k.to_string(), v))
                 .collect();
-            // x-mcp-header (transports §custom-headers): mirror `tools/call` params
-            // annotated in the tool's cached inputSchema into `Mcp-Param-*` headers.
+            // Mirror `tools/call` params annotated `x-mcp-header` in the tool's
+            // cached inputSchema into `Mcp-Param-*` headers, so an intermediary
+            // can route on them without parsing the body.
             if method == method::TOOLS_CALL
                 && let Some(name) = p.get("name").and_then(Value::as_str)
             {
@@ -791,9 +801,10 @@ fn http_err(name: &str, method: &str, e: HttpError) -> McpError {
 }
 
 /// Queue a raw notification Value captured off an HTTP response or the GET SSE
-/// stream (a JSON-RPC message with no matching request id). Non-notification
-/// frames (e.g. a server→client request) that don't deserialize are dropped — v1
-/// declares no client capabilities, so there is nothing to answer.
+/// stream (a JSON-RPC message with no matching request id). Only well-formed
+/// notifications are queued; anything else is dropped here. Server→client
+/// *requests* never reach this function — [`InboundRouter`] intercepts and
+/// answers them first, so a drop here cannot swallow something owed a reply.
 fn queue_notification(queue: &Mutex<VecDeque<rpc::Notification>>, n: Value) {
     if let Ok(note) = serde_json::from_value::<rpc::Notification>(n) {
         queue

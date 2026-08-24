@@ -26,8 +26,8 @@
 //!   A `:::workflow` body joins `workflows:` exactly as an inline entry —
 //!   same vars folding, validation, hashing, pinning, reload diffing and
 //!   retirement. A `:::skill` joins the skills catalogue like a discovered
-//!   one. Nothing here can drift from the real thing, because it IS the real
-//!   thing.
+//!   one. Nothing here can diverge from the real thing, because it IS the
+//!   real thing.
 //! - **Unknown names fail closed.** `:::worfklow` silently becoming prose is
 //!   a trap; the known set is enumerated in the error. Text that legitimately
 //!   needs a literal `:::` at column 0 can indent it.

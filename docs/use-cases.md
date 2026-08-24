@@ -71,9 +71,7 @@ agentd \
 attributed). A crisp contract gives the supervisor a crisp terminal state:
 `completed → 0`, `refused → 5`, exhausted (steps / tokens / the run's own
 `--deadline`) `→ 7` — and the supervisor's hard wall-clock backstop, when a
-child won't self-terminate, kills with `124`
-([RFC 0007](../rfcs/0007-agentic-loop-and-terminal-status.md),
-[RFC 0011](../rfcs/0011-cloud-native-contract.md)).
+child won't self-terminate, kills with `124`.
 
 **Why agentd.** A bad config exits `2` in milliseconds, before any token is
 spent. Setting `--run-id` makes a retried Job idempotent. The whole thing is one
@@ -102,7 +100,7 @@ mcp:
     - { name: inbox,   endpoint: https://mcp-inbox.internal/mcp }
     - { name: tickets, endpoint: https://mcp-tickets.internal/mcp }
     - { name: state,   endpoint: https://mcp-state.internal/mcp }
-store: { kind: mcp, mcp: { server: state } }   # a daemon must be durable (RFC 0025)
+store: { kind: mcp, mcp: { server: state } }   # a daemon must be durable
 limits: { run: { steps: 25, tokens: 2000000 } }
 observability: { metrics_addr: ":9090" }
 workflows:
@@ -161,7 +159,7 @@ node (`interval: 0` re-enters immediately, a drain-a-backlog worker):
 ```yaml
 # audit.yaml
 lifecycle: { run_until: drained }
-store: { kind: mcp, mcp: { server: state } }   # a daemon must be durable (RFC 0025)
+store: { kind: mcp, mcp: { server: state } }   # a daemon must be durable
 mcp: { servers: [ { name: state, endpoint: https://mcp-state.internal/mcp } ] }
 workflows:
   - name: audit
@@ -192,8 +190,7 @@ runaway loop gets refusals, never a fork bomb. The
 [Rule-of-Two](security.md) trifecta check is enforced once, at startup, over the
 root's whole grant; because scope only ever narrows as you descend, no subtree
 can re-acquire a capability the root was refused
-([`subagents.md`](subagents.md),
-[RFC 0009](../rfcs/0009-subagent-process-model.md)).
+(see [`subagents.md`](subagents.md)).
 
 ## 4. Parallel fan-out / map-reduce
 
@@ -245,7 +242,7 @@ structurally. You tag each MCP server's capabilities, and at **startup** the
 supervisor refuses any root grant that gives one agent all three of
 `untrusted_input` + `sensitive` + `egress` — the
 [Rule-of-Two](security.md) (at most 2 of the 3 legs), overridable only with an
-explicit `--allow-trifecta` ([RFC 0012](../rfcs/0012-security-posture.md)). A
+explicit `--allow-trifecta` (see [`security.md`](security.md)). A
 dangerous topology can't even start by accident.
 
 Within one tree you partition the (≤2-leg) work with subagents — read the
@@ -260,7 +257,7 @@ mcp:
     - { name: tickets, endpoint: https://mcp-tickets.internal/mcp, tags: { "*": [untrusted_input] } }
     - { name: crm,     endpoint: https://mcp-crm.internal/mcp,     tags: { "*": [sensitive] } }
     - { name: state,   endpoint: https://mcp-state.internal/mcp }
-store: { kind: mcp, mcp: { server: state } }   # a daemon must be durable (RFC 0025)
+store: { kind: mcp, mcp: { server: state } }   # a daemon must be durable
 workflows:
   - name: handle-ticket
     steps:
@@ -299,7 +296,7 @@ the actor side of a partition like this one.
 ## 6. A served worker an orchestrator drives and steers
 
 **Pattern:** run agentd as a long-lived **A2A endpoint** (`a2a.listen`, mTLS/bearer
-auth, RFC 0029). Any A2A client — a control plane, a workflow engine, **or another
+auth). Any A2A client — a control plane, a workflow engine, **or another
 agent** — drives it: a **natural-language** `SendMessage` becomes a durable
 conversation turn whose answer comes back as the task's artifact, and a
 **command** DataPart (`workflow.run` / `status` / `cancel`) pokes the daemon.
@@ -309,7 +306,7 @@ declares the worker (a separately-deployed HTTPS service) as one more
 
 ```yaml
 # reviewer.yaml — a reusable reviewer, an A2A endpoint (build with --features a2a).
-# The listener makes it a daemon, so it needs a durable store (RFC 0025) and TLS.
+# The listener makes it a daemon, so it needs a durable store and TLS.
 agent: { instruction: "Be a reusable code-review worker" }
 intelligence: { endpoints: https://gw.example/v1 }
 store: { kind: mcp, mcp: { server: state } }
@@ -350,7 +347,7 @@ mind.
 **Why agentd.** The orchestrator gets supervision for free: every served run is a
 real, reaped process with a hard deadline, a no-progress watchdog, and active
 ping/pong liveness; `GetTask` / `ListTasks` give the driver an honest, durable
-view of each task — which **survives a worker restart** (RFC 0025) — without
+view of each task — which **survives a worker restart** — without
 parsing logs.
 
 ---
@@ -416,6 +413,6 @@ is the instruction, the `--mcp` wiring, and the trigger.
 
 - [`modes-and-triggers.md`](modes-and-triggers.md) — the lifecycle + the `once` / `loop` / `schedule` / `subscribe` / `signal` / `event` start-node triggers in depth, and the reactive router.
 - [`subagents.md`](subagents.md) — the spawn payload, scope intersection, dispositions, caps, and supervision.
-- [`mcp.md`](mcp.md) — agentd as an MCP **client**, plus the A2A endpoint (RFC 0029) it exposes for composition.
+- [`mcp.md`](mcp.md) — agentd as an MCP **client**, plus the A2A endpoint it exposes for composition.
 - [`security.md`](security.md) — the Rule-of-Two trifecta, secret redaction, and tool scoping.
 - [`deployment.md`](deployment.md) and [`examples/`](../examples/SAMPLES.md) — k8s `Job` / `CronJob` / `Deployment` manifests and runnable skeletons.

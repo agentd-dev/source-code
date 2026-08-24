@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! OTLP span export with the GenAI semantic conventions. RFC 0010. [feature: otel]
+//! OTLP span export with the GenAI semantic conventions. [feature: otel]
 //!
 //! Hand-rolled OTLP-over-HTTP/**JSON** — no `opentelemetry` crate, no protobuf.
 //! It reuses what agentd already has: the W3C trace/span ids on every run
@@ -90,7 +90,7 @@ impl RunSpan {
     }
 }
 
-/// Buffer one log record for OTLP export (plan §3.11). A no-op unless
+/// Buffer one log record for OTLP export. A no-op unless
 /// [`arm_logs`] installed the exporter (and always a no-op without `otel`).
 pub fn capture_log(unix_nanos: u128, level: &str, event: &str, fields: &serde_json::Value) {
     #[cfg(feature = "otel")]
@@ -304,7 +304,7 @@ mod imp {
         }
     }
 
-    // ---- OTLP logs (plan §3.11, optional) ----------------------------------
+    // ---- OTLP logs (optional) ----------------------------------------------
     // A bounded buffer drained by a background thread to `<endpoint>/v1/logs`.
     // The JSON-lines log surface is the primary one; this is the OTLP mirror.
 

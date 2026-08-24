@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The supervisor contract (agentd): the documented exit-code table (the
-//! `once` job maps its outcome to an exit code) and the v1→v2 migration gate.
-//! Driven by running the real binary and observing the exit code.
+//! The supervisor contract: the documented exit-code table (a `once` job maps
+//! its outcome to an exit code) and the migration gate that refuses a
+//! configuration written against the flat schema.
 //!
-//! (The graceful-drain, required-MCP-down, and spawn-rate checks move to the P7
-//! v2 conformance rebuild; SIGTERM drain is exercised by the v2 reload/a2a e2e.)
+//! Every check here drives the real binary and judges it by its exit code, so
+//! the contract is proven the way an operator's supervisor observes it — not
+//! through agentd's own types.
 
 use crate::{Category, Check, Harness, Outcome};
 
@@ -25,7 +26,7 @@ pub fn checks() -> Vec<Check> {
         Check {
             id: "supervisor/exit-2-on-retired-v1-flag",
             category: Category::Supervisor,
-            desc: "a retired 1.x flag (--mode) is rejected with a migration hint → exit 2",
+            desc: "an unsupported --mode flag is rejected with a migration hint → exit 2",
             run: exit_retired_flag,
         },
         Check {
@@ -61,7 +62,9 @@ fn exit_bad_flag(h: &Harness) -> Outcome {
 }
 
 fn exit_retired_flag(h: &Harness) -> Outcome {
-    // agentd removed the mode drivers; `--mode` is a retired flag.
+    // `--mode` is not a flag agentd accepts. It must fail as a usage error AND
+    // name itself in the diagnostic: a bare "unknown flag" leaves an operator
+    // migrating an old configuration with nothing to act on.
     let r = h.run(&[
         "--mode",
         "reactive",
@@ -77,7 +80,7 @@ fn exit_retired_flag(h: &Harness) -> Outcome {
     .and(|| {
         Outcome::require(
             r.stderr.contains("--mode"),
-            format!("stderr should name the retired flag:\n{}", r.stderr),
+            format!("stderr should name the rejected flag:\n{}", r.stderr),
         )
     })
 }

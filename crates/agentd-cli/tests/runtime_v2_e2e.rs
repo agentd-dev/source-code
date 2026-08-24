@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! agentd runtime (RFC 0026) end to end: a v2 configuration drives the new
-//! event loop — the `--instruction` sugar workflow (`once → agent → finish`)
-//! runs a turn worker against the built-in mock LLM, internal tools round-trip
-//! to the supervisor, tool overrides map onto the mock MCP server, and a
-//! SIGKILLed instance restores its durable state from the mock MCP store and
-//! finishes the job on restart.
+//! agentd runtime end to end: a configuration drives the event loop — the
+//! `--instruction` sugar workflow (`once → agent → finish`) runs a turn worker
+//! against the built-in mock LLM, internal tools round-trip to the supervisor,
+//! tool overrides map onto the mock MCP server, and a SIGKILLed instance
+//! restores its durable state from the mock MCP store and finishes the job on
+//! restart.
 
 mod common;
 
@@ -113,7 +113,8 @@ fn the_instruction_job_runs_a_turn_with_tool_round_trips_through_the_new_loop() 
             .any(|e| e["op"] == "create")
     );
     assert!(events(&stderr, "proc.exit").iter().any(|e| e["code"] == 0));
-    // No secret-shaped content and no v1 mode driver ran.
+    // No secret-shaped content, and the event loop drove the job: no per-mode
+    // driver line in the log.
     assert!(
         !stderr.contains("\"mode\":\"once\""),
         "the 2.0 runtime, not the 1.x once driver"
@@ -251,8 +252,9 @@ fn write_inbox(events: &serde_json::Value) -> String {
     path
 }
 
-/// A v2 document with a `manual` workflow (so no `--instruction` sugar fires)
-/// and `run_until: idle` — the conversation-turn harness until P5's A2A server.
+/// A document with a `manual` workflow (so no `--instruction` sugar fires) and
+/// `run_until: idle` — the harness for driving conversation turns from a
+/// seeded inbox.
 fn conversation_config(llm: &str, mock: &str, extra: &str) -> String {
     write_config(&format!(
         "config_version: \"1\"\nagent:\n  name: convo\n  instruction: You help the team.\n  preflight: always\nintelligence:\n  endpoints: {llm}\n  model: mock\nmcp:\n  servers:\n    - name: mock\n      endpoint: {mock}\nknowledge:\n  server: mock\n  auto_context:\n    on: turn\n    top_k: 3\nskills:\n  sources:\n    - server: mock\n      discover: auto\nworkflows:\n  - name: idle\n    steps:\n      s: {{kind: manual}}\n      f: {{kind: finish, depends_on: [s]}}\nlifecycle:\n  run_until: idle\n  idle_grace: 1s\nobservability:\n  log_level: info\n  log_content: true\n{extra}"

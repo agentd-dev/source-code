@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The **tool registry** (RFC 0028): one registry serving the root agent,
+//! The **tool registry**: one registry serving the root agent,
 //! workflow steps and subagents, with three tiers and dispatch precedence
 //! **internal > code > MCP**. Every tool carries JSON Schemas for input and
 //! output and a **grant** (who may call it). Internal tools are contracts with
@@ -33,7 +33,10 @@ pub enum ToolClass {
     Mcp,
 }
 
-/// An override mapping (RFC 0028 §4).
+/// An override mapping: which server's tool stands in for an internal
+/// contract, plus the optional argument and result transforms that reconcile
+/// the two shapes. Both transforms are compiled at startup, so a mapping that
+/// cannot be applied is a config error rather than a call-time surprise.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Mapping {
     pub server: String,
@@ -54,13 +57,17 @@ pub enum Impl {
     MappingOnly,
     /// An internal contract implemented by a mapped MCP tool.
     Mapped(Mapping),
-    /// A code-registered tool (RFC 0022 §4).
+    /// A tool registered from Rust by an embedding application.
     Code,
     /// An MCP server tool.
     Mcp { server: String, tool: String },
 }
 
-/// Who may call (RFC 0028 §3).
+/// Who may call a tool. These flags gate the INTERNAL tools — the ones that
+/// reach agentd's own state — so a caller they do not name is refused. Code
+/// and MCP tools are not gated by them: an operator who wired a server in has
+/// already made that decision, and a subagent narrowed by an explicit `allow`
+/// list is held to that list instead.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Grant {
     pub root: bool,
@@ -167,18 +174,25 @@ pub struct Registry {
 }
 
 impl Registry {
-    /// Build from settings + the connected servers' tool lists. Errors are the
-    /// RFC 0028 §4 startup validation failures (unknown override target,
-    /// server not declared, tool not advertised, mapping does not compile,
-    /// disabled ∩ overrides ≠ ∅, disabling an unknown tool).
+    /// Build from settings and the connected servers' tool lists.
+    ///
+    /// Every override is resolved here, at startup, so a misconfiguration
+    /// fails to boot rather than failing on the call that needed the tool.
+    /// The errors returned are: an override naming an unknown internal tool,
+    /// a server that is not declared, a tool the server does not advertise, a
+    /// mapping expression that does not compile, a tool that is both disabled
+    /// and overridden, and disabling a tool that does not exist.
     pub fn build(settings: &Settings, servers: &[ServerTools]) -> Result<Registry, Vec<String>> {
         let mut reg = Registry::default();
         let mut errors = Vec::new();
         // 1. Internal contracts.
         for c in internal::contracts() {
-            // `exec` (RFC 0028 §exec): a LOCAL runner only when the binary is built
-            // `--features exec` AND `security.exec.enabled` is set; otherwise it is
-            // mapping-only (delegate off-box via `tools.overrides`). It is always
+            // `exec` runs LOCAL commands, so it is off at two independent
+            // layers: the binary must be built `--features exec` AND
+            // `security.exec.enabled` must be set. Failing either, it is
+            // mapping-only, so execution can still be delegated off-box
+            // through `tools.overrides` without agentd ever running code
+            // itself. It is always
             // tagged `sensitive` + `egress` so the Rule-of-Two gate refuses to
             // combine it with untrusted input.
             let (imp, tags) = if c.name == "exec" {
@@ -456,7 +470,13 @@ impl Registry {
         self.tools.values()
     }
 
-    /// Whether `caller` may call `name` (RFC 0028 §3 grants + RFC 0029 §2).
+    /// Whether `caller` may call `name`.
+    ///
+    /// Fails closed at every step: an unknown tool, or one that is disabled or
+    /// still unmapped, is refused before any grant is consulted; an anonymous
+    /// A2A principal is refused outright; and a subagent carrying an explicit
+    /// `allow` list is held to it alone, so narrowing a child can only ever
+    /// remove reach, never restore it through a default.
     pub fn allowed(&self, caller: &Caller, name: &str) -> bool {
         let Some(t) = self.tools.get(name) else {
             return false;

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The **durable state model** (RFC 0025 §3, §5–§7): entity kinds, the
-//! manifest, the write-ahead inbox, timers, the checkpoint policy and the
-//! restore protocol — one façade ([`Durable`]) over a [`crate::store::Store`]
-//! that the runtime (RFC 0026) is the single writer of.
+//! The **durable state model**: entity kinds, the manifest, the write-ahead
+//! inbox, timers, the checkpoint policy and the restore protocol — one façade
+//! ([`Durable`]) over a [`crate::store::Store`] that the runtime is the single
+//! writer of.
 //!
 //! Every entity is a versioned [`Envelope`] under `<prefix>/<instance>/<kind>/<id>`;
 //! `Durable::put` allocates the next `seq` per key and treats a CAS conflict
@@ -24,7 +24,8 @@ use std::time::{Duration, Instant};
 
 pub(crate) use crate::store::now_ms;
 
-/// The entity kinds (RFC 0025 §3.3).
+/// The entity kinds a durable record can carry. The kind is a key segment, so
+/// adding one changes what a restore can enumerate by prefix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Kind {
     Manifest,
@@ -36,12 +37,12 @@ pub enum Kind {
     Memory,
     Artifact,
     Timer,
-    /// One event on a named stream (RFC 0035), keyed `<stream>/e<seq>`.
+    /// One event on a named stream, keyed `<stream>/e<seq>`.
     /// Not manifest-indexed: streams keep their own head/tail counters in
     /// [`Manifest::streams`], and events are walked by sequence, never listed.
     Event,
     Audit,
-    /// A cached endpoint credential (RFC 0031): an OAuth/OIDC/AWS/SPIFFE access +
+    /// A cached endpoint credential: an OAuth/OIDC/AWS/SPIFFE access +
     /// refresh token with its expiry, keyed by a hash of (endpoint, provider,
     /// principal). Redaction-excluded — never logged, audited, or read-surfaced.
     Cred,
@@ -100,7 +101,7 @@ pub struct EntityRef {
     pub seq: u64,
 }
 
-/// A stream's durable counters (RFC 0035).
+/// A stream's durable counters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct StreamMeta {
     /// Last appended sequence (0 = empty).
@@ -109,7 +110,8 @@ pub struct StreamMeta {
     pub first: u64,
 }
 
-/// The instance manifest (RFC 0025 §3.3 `manifest`).
+/// The instance manifest: the index of everything a restore must find, stored
+/// as one record under the `manifest` kind.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct Manifest {
     #[serde(default)]
@@ -123,8 +125,9 @@ pub struct Manifest {
     /// Start-node state per `<workflow>.<node>` (last fired, iteration, missed).
     #[serde(default)]
     pub starts: BTreeMap<String, Value>,
-    /// Per-stream head/tail (RFC 0035): `seq` = last appended sequence,
-    /// `first` = oldest retained. Consumers walk `first..=seq` by key.
+    /// Per-stream head/tail: `seq` = last appended sequence, `first` = oldest
+    /// retained. Consumers walk `first..=seq` by key, so events never need a
+    /// `list` and a trimmed prefix simply falls out of the walk.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub streams: BTreeMap<String, StreamMeta>,
     /// Circuit-breaker state per `<workflow>/<step>` (`runtime::breaker`):
@@ -133,20 +136,21 @@ pub struct Manifest {
     /// the dependency — the opposite of its job.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub breakers: BTreeMap<String, Value>,
-    /// Budget counters per window/scope (RFC 0026 §7).
+    /// Budget counters per window/scope, so a spend limit survives a restart
+    /// rather than resetting the window every boot.
     #[serde(default)]
     pub budget: Value,
     #[serde(default)]
     pub lifecycle: Value,
-    /// The digest of the settings that shaped this state (RFC 0033 §3.3),
-    /// section name -> hex. A **signal, not a key**: a mismatch is reported at
-    /// restore and the state is resumed anyway. Empty on a manifest written
-    /// before this existed, which is why an empty side never compares (an
-    /// upgrade must not announce that everything moved).
+    /// The digest of the settings that shaped this state, section name -> hex.
+    /// A **signal, not a key**: a mismatch is reported at restore and the state
+    /// is resumed anyway. An empty map on either side skips the comparison
+    /// entirely, because an absent digest is not evidence that anything moved
+    /// and reporting one would drown the real signal in noise.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub config_digest: BTreeMap<String, String>,
-    /// Records an earlier `--fresh` abandoned (RFC 0033 §3.2). They are still in
-    /// the store — `--fresh` deletes nothing — but they belong to a superseded
+    /// Records an earlier `--fresh` abandoned. They are still in the store —
+    /// `--fresh` deletes nothing — but they belong to a superseded
     /// generation, so the `list` reconciliation in [`Durable::restore`] must not
     /// re-adopt them and undo the flag one boot later.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -173,7 +177,8 @@ impl Manifest {
     }
 }
 
-/// A write-ahead inbox event (RFC 0025 §5).
+/// A write-ahead inbox event: durably recorded before it is acted on, so a
+/// crash between arrival and handling replays it instead of dropping it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InboxEvent {
     pub id: String,
@@ -207,7 +212,9 @@ impl InboxEvent {
     }
 }
 
-/// A durable timer (RFC 0025 §3.3 `timer`): an absolute deadline + who owns it.
+/// A durable timer: an absolute deadline plus who owns it. The deadline is
+/// absolute rather than a remaining duration so that time spent down still
+/// counts, and a timer that came due while the process was gone fires at once.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TimerRecord {
     pub id: String,
@@ -246,7 +253,7 @@ impl Policy {
     }
 }
 
-// ---- startup intent (RFC 0033 §3.2–§3.3) ------------------------------------
+// ---- startup intent ---------------------------------------------------------
 //
 // Two facts belong to *this process's life* rather than to the settings
 // document: "do not resume prior state" (`--fresh`) and "here is the
@@ -264,7 +271,7 @@ static FRESH: AtomicBool = AtomicBool::new(false);
 static CONFIG_DIGEST: OnceLock<BTreeMap<String, String>> = OnceLock::new();
 
 /// `--fresh` was given: the next [`Durable`] opened in this process starts a new
-/// generation instead of resuming (RFC 0033 §3.2).
+/// generation instead of resuming.
 pub fn request_fresh() {
     FRESH.store(true, Ordering::Relaxed);
 }
@@ -275,7 +282,7 @@ pub fn fresh_requested() -> bool {
 }
 
 /// Record the digest of the configuration this process runs under, for
-/// [`Durable::restore`] to compare against the manifest's (RFC 0033 §3.3).
+/// [`Durable::restore`] to compare against the manifest's.
 /// First call wins — the configuration is loaded once, before any side effect.
 pub fn record_config_digest(settings: &crate::config::v2::Settings) {
     let _ = CONFIG_DIGEST.set(config_digest(settings));
@@ -285,8 +292,8 @@ fn recorded_config_digest() -> BTreeMap<String, String> {
     CONFIG_DIGEST.get().cloned().unwrap_or_default()
 }
 
-/// The digest of the settings that **shaped the durable state** (RFC 0033 §3.3):
-/// section name → SHA-256 hex of that section's canonical JSON.
+/// The digest of the settings that **shaped the durable state**: section name →
+/// SHA-256 hex of that section's canonical JSON.
 ///
 /// Deliberately *not* the whole document. Only the three sections whose meaning
 /// the stored records depend on are digested — a different `intelligence.model`
@@ -331,8 +338,8 @@ fn store_shape(s: &crate::config::v2::Store) -> Value {
         "durability": format!("{:?}", s.durability),
         "timeout_ms": s.timeout.map(|d| d.0.as_millis() as u64),
         // The MCP server *name* is a config-local label, never a credential; the
-        // HTTP adapter contributes only its presence (base_url and headers are
-        // auth surface, §7).
+        // HTTP adapter contributes only its presence, because `base_url` and
+        // `headers` are auth surface rather than layout.
         "mcp_server": s.mcp.as_ref().map(|m| m.server.clone()),
         "http": s.http.is_some(),
     })
@@ -355,10 +362,10 @@ fn limits_shape(s: &crate::config::v2::Limits) -> Value {
 
 /// Which digested sections moved between the manifest's record and this run.
 ///
-/// An empty side never compares: a manifest written before the digest existed
-/// carries none, and a `Durable` built without settings (an embedder, a test)
-/// computes none — reporting "everything changed" in either case would train
-/// the operator to ignore the one event that matters.
+/// An empty side never compares: a manifest may carry no digest at all, and a
+/// `Durable` built without settings (an embedder, a test) computes none —
+/// reporting "everything changed" in either case would train the operator to
+/// ignore the one event that matters.
 fn changed_sections(
     recorded: &BTreeMap<String, String>,
     current: &BTreeMap<String, String>,
@@ -394,7 +401,7 @@ const RECONCILED: [Kind; 7] = [
     Kind::Artifact,
 ];
 
-/// What a restore found (RFC 0025 §6).
+/// What a restore found.
 #[derive(Debug, Default)]
 pub struct Restored {
     /// `None` ⇒ a fresh instance (no manifest).
@@ -458,10 +465,10 @@ pub struct Durable {
     last_flush: Mutex<Instant>,
     degraded: AtomicBool,
     log: Option<Logger>,
-    /// `--fresh`: open a new generation instead of resuming (RFC 0033 §3.2).
+    /// `--fresh`: open a new generation instead of resuming.
     fresh: bool,
-    /// The digest of the configuration this life runs under (RFC 0033 §3.3);
-    /// empty when nothing recorded one, which disables the comparison.
+    /// The digest of the configuration this life runs under; empty when nothing
+    /// recorded one, which disables the comparison.
     config_digest: BTreeMap<String, String>,
 }
 
@@ -752,12 +759,12 @@ impl Durable {
 
     // ---- restore ------------------------------------------------------------
 
-    /// The restore protocol (RFC 0025 §6): read the manifest, then every indexed
-    /// entity (verifying envelopes), reconcile with `list` where supported, warm
-    /// the seq map, bump the generation. A fresh instance (no manifest) writes
+    /// The restore protocol: read the manifest, then every indexed entity
+    /// (verifying envelopes), reconcile with `list` where supported, warm the
+    /// seq map, bump the generation. A fresh instance (no manifest) writes
     /// generation 1.
     ///
-    /// Under `--fresh` (RFC 0033 §3.2) the middle is skipped: see
+    /// Under `--fresh` the middle is skipped: see
     /// [`restore_fresh`](Durable::restore_fresh).
     pub fn restore(&self) -> Result<Restored, StoreError> {
         let mut out = Restored::default();
@@ -784,12 +791,12 @@ impl Durable {
         if self.fresh {
             return self.restore_fresh(manifest, fresh);
         }
-        // The configuration digest (RFC 0033 §3.3) is a **signal, not a gate**.
-        // Identity is `agent.name` (§3.1): keying it on a config hash would start
-        // the agent fresh and orphan its in-flight workflows the first time
-        // someone raised a limit or fixed a typo — silently, which is exactly the
-        // outcome durability exists to prevent. So a difference is reported and
-        // the state is resumed regardless; the operator decides.
+        // The configuration digest is a **signal, not a gate**. Instance identity
+        // is `agent.name` alone: keying it on a config hash would start the agent
+        // fresh and orphan its in-flight workflows the first time someone raised
+        // a limit or fixed a typo — silently, which is exactly the outcome
+        // durability exists to prevent. So a difference is reported and the state
+        // is resumed regardless; the operator decides what to do about it.
         let moved = changed_sections(&manifest.config_digest, &self.config_digest);
         if !moved.is_empty() {
             self.log_event(
@@ -834,10 +841,10 @@ impl Durable {
                         if indexed {
                             continue;
                         }
-                        // A record a previous `--fresh` retired (RFC 0033 §3.2):
-                        // still on the store because nothing was deleted, but it
-                        // belongs to an abandoned generation. Adopting it here
-                        // would undo the flag on the next ordinary start.
+                        // A record a previous `--fresh` retired: still on the
+                        // store because nothing was deleted, but it belongs to
+                        // an abandoned generation. Adopting it here would undo
+                        // the flag on the next ordinary start.
                         if manifest
                             .retired
                             .iter()
@@ -908,7 +915,7 @@ impl Durable {
         Ok(out)
     }
 
-    /// `--fresh` (RFC 0033 §3.2): open the NEXT generation without resuming.
+    /// `--fresh`: open the NEXT generation without resuming.
     ///
     /// Nothing is unlinked. A flag that silently destroys durable state is a
     /// footgun — the operator who types `--fresh` to get past a wedged run is
@@ -1022,9 +1029,11 @@ impl Durable {
     }
 }
 
-/// A test **kill point** (RFC test strategy §2): with `AGENTD_TEST_KILL_AT=<name>`
-/// set (debug / `internal-mocks` builds only), the process SIGKILLs itself
-/// here — the chaos suite's way of dying between two durable writes.
+/// A test **kill point**: with `AGENTD_TEST_KILL_AT=<name>` set (debug /
+/// `internal-mocks` builds only), the process SIGKILLs itself here — the chaos
+/// suite's way of dying at an exact instant between two durable writes. It
+/// compiles to nothing in a release build without `internal-mocks`, so a
+/// production binary carries no self-kill path.
 pub fn kill_point(name: &str) {
     #[cfg(any(feature = "internal-mocks", debug_assertions))]
     {
@@ -1203,7 +1212,7 @@ mod tests {
             .unwrap(),
             2
         );
-        // And the re-indexed manifest no longer lists the lost entity.
+        // And the re-indexed manifest drops the lost entity.
         assert!(!d2.manifest().entities.iter().any(|e| e.id == "gone"));
     }
 
@@ -1243,9 +1252,9 @@ mod tests {
         ));
     }
 
-    /// RFC 0033 §3.2: `--fresh` opens the NEXT generation without resuming, and
-    /// destroys nothing — the abandoned records stay readable, the outgoing index
-    /// is preserved, and a later ordinary start does not quietly re-adopt them
+    /// `--fresh` opens the NEXT generation without resuming, and destroys
+    /// nothing — the abandoned records stay readable, the outgoing index is
+    /// preserved, and a later ordinary start does not quietly re-adopt them
     /// through the `list` reconciliation.
     #[test]
     fn fresh_opens_a_new_generation_without_resuming_and_deletes_nothing() {
@@ -1296,9 +1305,9 @@ mod tests {
         assert_eq!(d3.manifest().generation, 3);
     }
 
-    /// RFC 0033 §3.3: the configuration digest is a **signal, not a key** — a
-    /// difference is reported and the state is resumed anyway (§3.1: keying
-    /// identity on a config hash would orphan a live workflow on a typo fix).
+    /// The configuration digest is a **signal, not a key** — a difference is
+    /// reported and the state is resumed anyway, because keying instance
+    /// identity on a config hash would orphan a live workflow on a typo fix.
     #[test]
     fn a_moved_config_digest_reports_but_never_gates_the_resume() {
         let before: BTreeMap<String, String> = [
@@ -1310,8 +1319,8 @@ mod tests {
         let mut after = before.clone();
         after.insert("workflows".to_string(), "bbb".to_string());
         assert_eq!(changed_sections(&before, &after), vec!["workflows"]);
-        // An empty side never compares: a pre-digest manifest, or a `Durable`
-        // built without settings, must not announce that everything moved.
+        // An empty side never compares: a manifest carrying no digest, or a
+        // `Durable` built without settings, must not announce that all moved.
         assert!(changed_sections(&BTreeMap::new(), &after).is_empty());
         assert!(changed_sections(&before, &BTreeMap::new()).is_empty());
 
@@ -1334,7 +1343,7 @@ mod tests {
     }
 
     /// The digest covers only the sections whose meaning the stored records
-    /// depend on (RFC 0033 §3.3) — an edit anywhere else must not fire it.
+    /// depend on — an edit anywhere else must not fire it.
     #[test]
     fn the_digest_covers_workflows_store_and_limits_only() {
         let doc = json!({

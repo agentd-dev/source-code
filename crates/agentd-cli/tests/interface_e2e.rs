@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The **interface surface** end to end (RFC 0032): a v2 daemon with
-//! `interface.enabled` (+ `debug`) serves the display-client contract over its
-//! real A2A listener — `interface.info` discovery, the global
-//! `SubscribeToEvents` SSE feed (cross-client transcript sync + cursor
-//! resume), the taskless debug reads (`conversation.get` with message bodies,
-//! `run.get` with per-step detail, `debug.events` log-ring tail), the
-//! browser-origin CORS path, the disabled-by-default gate, and the
-//! `agentd tui` passthrough (client spawn + tied lifetimes) with a stub
-//! client binary.
+//! The **interface surface** end to end: a daemon with `interface.enabled`
+//! (+ `debug`) serves the display-client contract over its real A2A listener —
+//! `interface.info` discovery, the global `SubscribeToEvents` SSE feed
+//! (cross-client transcript sync + cursor resume), the taskless debug reads
+//! (`conversation.get` with message bodies, `run.get` with per-step detail,
+//! `debug.events` log-ring tail), the browser-origin CORS path, the
+//! disabled-by-default gate, and the `agentd tui` passthrough (client spawn +
+//! tied lifetimes) with a stub client binary.
 #![cfg(all(unix, feature = "a2a"))]
 
 mod common;
@@ -806,9 +805,9 @@ fn a_live_subagent_is_observable_and_drillable() {
         .as_str()
         .expect("a subagent exists")
         .to_string();
-    // Drill in and wait for the terminal state — the daemon now answers
-    // status queries faster than a subagent completes, so "already completed
-    // by the time we ask" is a timing artifact, not a contract.
+    // Drill in and wait for the terminal state — the daemon can answer status
+    // queries faster than a subagent completes, so "already completed by the
+    // time we ask" is a timing artifact, not a contract.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let got = loop {
         let got = command(&addr, 4, "subagent.get", json!({"handle": handle}));
@@ -843,7 +842,7 @@ fn a_live_subagent_is_observable_and_drillable() {
 fn live_activity_reports_phase_tool_and_tokens_on_the_feed() {
     // A turn that calls a tool then answers: the feed must carry `activity`
     // events naming the phase and the TOOL, with tokens accruing — the data
-    // behind the clients' working row (RFC 0032 §17).
+    // behind the clients' working row.
     let llm = spawn_mock_llm(&json!({
         "turns": [
             {"tool_calls": [{"name": "memory.set", "arguments": {"key": "k", "value": 1}}]},

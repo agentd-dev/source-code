@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Shared helpers for the v2 conformance families: write config/playbook files
+//! Shared helpers for the conformance families: write config/playbook files
 //! into a check-scoped temp dir, and drive the built-in mock LLM from a JSON
-//! playbook (the `{"turns":[…]}` format the runtime e2e uses).
+//! playbook (the `{"turns":[…]}` format the runtime e2e uses). Scoping every
+//! file to the check's own temp dir is what lets checks run concurrently
+//! without one clobbering another's config.
 
 use crate::harness::{Harness, MockLlm, TempDir};
 use serde_json::Value;

@@ -1,19 +1,24 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Capability scoping — the granted MCP subset, interpreted as a Rule-of-Two
-//! trust budget. RFC 0012 §capability-scoping.
+//! trust budget.
 //!
 //! agentd has no policy engine; a subagent's authority *is* the subset of MCP
-//! servers/tools its parent grants. Two invariants this module enforces:
+//! servers/tools its parent grants. Two invariants this module encodes:
 //!
 //! 1. **Monotonic narrowing.** A child's scope is the *intersection* with its
-//!    parent's — a child can never widen beyond what its parent holds.
-//! 2. **Rule of Two.** Tools are tagged `untrusted_input` / `sensitive` /
-//!    `egress`; granting one subagent all three legs of the lethal trifecta is
-//!    refused unless explicitly overridden (`--allow-trifecta`).
+//!    parent's — a child can never widen beyond what its parent holds. Because
+//!    narrowing only ever shrinks, a check made over the root grant bounds
+//!    every descendant, which is what lets the trifecta gate run once at
+//!    startup rather than at every spawn.
+//! 2. **Rule of Two.** Servers and tools are tagged `untrusted_input` /
+//!    `sensitive` / `egress`; granting one agent all three legs of the lethal
+//!    trifecta is refused unless the operator overrides it
+//!    (`security.allow_trifecta`).
 //!
-//! This is pure logic; the trifecta check (`check_trifecta`) runs at the root
-//! grant in `main.rs` and scope narrowing runs at the `subagent.spawn`
-//! chokepoint in `subagent/orchestrator.rs`.
+//! Everything here is pure logic with no I/O; callers apply it. Config
+//! validation folds the whole root grant, so startup and `--validate-config`
+//! can never reach different verdicts, and the `subagent.run` tool folds the
+//! child's requested server subset before minting the child.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -92,9 +97,10 @@ impl ToolScope {
     }
 }
 
-/// The three legs of the "lethal trifecta". A subagent holding all three —
-/// it reads untrusted content, can touch sensitive data, and can exfiltrate —
-/// is the dangerous combination (RFC 0012).
+/// The three legs of the "lethal trifecta". An agent holding all three — it
+/// reads untrusted content, can touch sensitive data, and can send data out —
+/// is the dangerous combination: one injected instruction in the content it
+/// reads is enough to make it fetch a secret and forward it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Trifecta {
     pub untrusted_input: bool,
@@ -128,7 +134,7 @@ pub enum RuleOfTwo {
 
 /// Evaluate a grant's trifecta exposure. The Rule of Two is satisfied at ≤2
 /// legs; 3 legs violates it — refused unless `allow_trifecta` downgrades the
-/// refusal to a loud warning (RFC 0012).
+/// refusal to a loud warning.
 pub fn evaluate(tags: Trifecta, allow_trifecta: bool) -> RuleOfTwo {
     if tags.legs() < 3 {
         RuleOfTwo::Ok
@@ -140,26 +146,27 @@ pub fn evaluate(tags: Trifecta, allow_trifecta: bool) -> RuleOfTwo {
 }
 
 // ---------------------------------------------------------------------------
-// Rule-of-Two tag check (RFC 0012 §3.1, §3.2 — M6, assessment §4 M6)
+// Rule-of-Two tag check
 // ---------------------------------------------------------------------------
 //
 // [`Trifecta`] above is the *accumulated* budget (the OR across a granted
 // set). [`TrifectaTag`] below is the per-leg label an operator attaches to a
-// tool; [`check_trifecta`] folds a tag stream into the budget and returns a
-// verdict whose variant names match the spawn-chokepoint observation it
-// produces (RFC 0012 §3.2). The two layers share one source of truth — a tag
-// is just a single-leg [`Trifecta`] — so there is no second definition of
-// "which combination is lethal" to drift out of sync.
+// server or tool; [`check_trifecta`] folds a tag stream into the budget and
+// returns the verdict the caller acts on. The two layers share one source of
+// truth — a tag is just a single-leg [`Trifecta`] — so "which combination is
+// lethal" is defined in exactly one place.
 
 /// One leg of the lethal trifecta — an operator-declared risk capability a
-/// tool carries (RFC 0012 §3.1). Tags come from MCP server config, never from
-/// model- or server-supplied metadata (§3.4: server metadata is untrusted).
+/// tool carries. Tags come from the operator's own config and nowhere else:
+/// never from a tool description, a model's claim about itself, or anything
+/// an MCP server advertises, because a server able to tag itself could simply
+/// declare itself harmless and buy back the leg it was meant to be charged.
 ///
-/// The three legs map one-to-one onto the risk capabilities RFC 0012 names:
-/// access to private/sensitive data, exposure to untrusted input/content, and
-/// the ability to communicate/act externally with side effects. Holding any
-/// two is fine; holding all three is the one-injected-prompt exfiltration
-/// shape the Rule of Two refuses to co-locate in a single subagent process.
+/// The three legs are access to private data, exposure to untrusted content,
+/// and the ability to act or send data outward. Holding any two is fine;
+/// holding all three is the shape where one injected instruction suffices to
+/// read a secret and forward it, which is what the Rule of Two refuses to
+/// co-locate in a single agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TrifectaTag {
@@ -206,22 +213,19 @@ impl TrifectaTag {
     }
 }
 
-/// The spawn-chokepoint verdict on a grant's trifecta exposure (RFC 0012
-/// §3.2). The variants name the observation the chokepoint emits — never a
-/// crash, always a tool result the parent's model adapts to (RFC 0007):
+/// The verdict on a grant's trifecta exposure. A refusal is never a crash —
+/// each caller turns it into an outcome its layer can act on:
 ///
-/// - [`TrifectaVerdict::Ok`] — ≤2 legs; the grant proceeds silently.
-/// - [`TrifectaVerdict::RefusedTrifecta`] — all three legs, no override; the
-///   `subagent.spawn` chokepoint returns `isError:true` and the child is never
-///   re-exec'd. The integrator surfaces the "split into reader/actor
-///   subagents, or relaunch with `--allow-trifecta`" guidance text here.
-/// - [`TrifectaVerdict::AllowedWithWarning`] — all three legs, but
-///   `--allow-trifecta` is set; the spawn proceeds and the supervisor emits a
-///   `scope.trifecta_grant` warn event so the override is auditable.
+/// - [`TrifectaVerdict::Ok`] — two legs or fewer; the grant proceeds silently.
+/// - [`TrifectaVerdict::RefusedTrifecta`] — all three legs and no override.
+///   Config validation reports it as a startup error; the `subagent.run` tool
+///   returns an error result the parent's model can act on by splitting the
+///   work across two narrower children.
+/// - [`TrifectaVerdict::AllowedWithWarning`] — all three legs, but the
+///   operator set `security.allow_trifecta`, so the grant proceeds.
 ///
-/// This mirrors [`RuleOfTwo`] (`Ok`/`Warn`/`Refuse`) with the longer,
-/// self-describing names the task's grant-path API asked for; both sit on the
-/// same [`Trifecta`] budget.
+/// This mirrors [`RuleOfTwo`] (`Ok`/`Warn`/`Refuse`) with self-describing
+/// names for the grant path; both sit on the same [`Trifecta`] budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrifectaVerdict {
     /// ≤2 legs — the Rule of Two holds; grant silently.
@@ -241,17 +245,17 @@ impl TrifectaVerdict {
     }
 }
 
-/// PURE Rule-of-Two check (RFC 0012 §3.2). Folds the tags of a granted tool
-/// set (`OR` across legs) and judges the accumulated budget:
+/// Pure Rule-of-Two check. Folds the tags of a granted tool set (`OR` across
+/// legs) and judges the accumulated budget:
 ///
 /// - fewer than three legs → [`TrifectaVerdict::Ok`] (any *two* is fine);
 /// - all three legs → [`TrifectaVerdict::RefusedTrifecta`], unless
 ///   `allow_trifecta` downgrades it to [`TrifectaVerdict::AllowedWithWarning`].
 ///
-/// Structural only — it never inspects tool *content* or asks the model to
-/// judge; it is a budget on co-located capability. Call it at the
-/// `subagent.spawn` chokepoint (`subagent/orchestrator.rs`) over the tags of
-/// the narrowed grant, *before* minting the child `SpawnPayload`.
+/// Structural only — it never inspects tool *content* and never asks the
+/// model to judge; it is a budget on co-located capability. Call it over the
+/// tags of the already-narrowed grant and *before* the grant is handed out:
+/// refusing once a child already holds the capability is too late.
 pub fn check_trifecta<I>(tags: I, allow_trifecta: bool) -> TrifectaVerdict
 where
     I: IntoIterator<Item = TrifectaTag>,
@@ -352,7 +356,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Rule-of-Two tag check (RFC 0012 §3.2)
+    // Rule-of-Two tag check
     // -----------------------------------------------------------------
 
     use TrifectaTag::{Egress, Sensitive, UntrustedInput};
@@ -437,7 +441,7 @@ mod tests {
 
     #[test]
     fn tag_serde_roundtrips_snake_case() {
-        // Tags arrive from MCP server config (RFC 0012 §3.1) as snake_case.
+        // Tags arrive from MCP server config as snake_case.
         let json = serde_json::to_string(&UntrustedInput).unwrap();
         assert_eq!(json, "\"untrusted_input\"");
         let back: TrifectaTag = serde_json::from_str("\"egress\"").unwrap();

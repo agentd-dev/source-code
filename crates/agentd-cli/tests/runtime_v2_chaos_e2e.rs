@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! agentd **chaos matrix** (RFC 0025 §5–§7, the durability contract): a
-//! workflow run is SIGKILLed at each of the runtime's durable-write kill points
+//! agentd **chaos matrix** (the durability contract): a workflow run is
+//! SIGKILLed at each of the runtime's durable-write kill points
 //! (`AGENTD_TEST_KILL_AT`), and the next life must **restore and complete it
 //! exactly once** — never a lost run, never a double-executed effect. The store
 //! is a mock MCP server that outlives both agentd lives (the durable backing).

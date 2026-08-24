@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! **Internal tool execution** (RFC 0028 §3): the runtime is the single place
+//! **Internal tool execution**: the runtime is the single place
 //! internal tools run — for a turn worker's `ToolRequest` (answered with
 //! `ToolResult`), for a workflow step (`tool` / `memory.*` / … kinds) and for
-//! A2A commands (P5). Arguments are validated against the contract's input
+//! A2A commands. Keeping them here means every state change is made by the
+//! state owner. Arguments are validated against the contract's input
 //! schema before dispatch and results against the output schema after
 //! (schema failure ⇒ a tool error, never a panic). Some tools are **deferred**
 //! (`sleep`, `subagent.run sync`, `subagent.await`, `await`, `think`,
@@ -101,7 +102,8 @@ impl Runtime {
         match self.execute_tool(&caller, name, args) {
             ToolOutcome::Ready(v, err) => self.reply_tool(node, id, v, err),
             ToolOutcome::Deferred(kind) => {
-                // The unit is parked on a wait, not thinking (RFC 0032 §17).
+                // Report the unit as parked on a wait, not thinking, so the
+                // live-activity feed does not show it burning a model call.
                 self.activity_park(node, name);
                 self.push_pending(PendingTool {
                     target: Target::Child(node, id),
@@ -292,8 +294,8 @@ impl Runtime {
         tool: &str,
         args: Value,
     ) -> ToolOutcome {
-        // RFC 0037 §4: pace calls toward a rated catalog service — a dry
-        // bucket is a tool error the model can absorb, never a hang.
+        // Pace calls toward a rated catalog service. A dry bucket answers with
+        // a tool error the model can absorb and retry, never a hang.
         if let Err(e) = self.service_rate_take(server) {
             return ToolOutcome::Ready(Value::String(e), true);
         }
@@ -655,12 +657,14 @@ impl Runtime {
             },
             // ---- lifecycle ----
             "finish" => {
-                // The turn worker records the finish itself (RFC 0026 §3.2); the
-                // runtime acknowledges. Steps: the `finish` kind.
+                // The turn worker records the finish itself and reports it in
+                // its `TurnDone`, so the runtime only acknowledges here. A
+                // workflow step finishes through the `finish` kind instead.
                 ok(json!({"ok": true}))
             }
-            // Human-in-the-loop (RFC 0032 §16): gate through the interface, or
-            // apply the configured fallback (fail | wait | auto judge).
+            // Human-in-the-loop: gate through the interface, or apply the
+            // configured fallback (fail | wait | auto judge) when no human is
+            // attached.
             "ask_human" => self.ask_human_tool(caller, args),
             // ---- subagents ----
             "subagent.run" | "subagent.send" | "subagent.kill" | "subagent.status"
@@ -673,7 +677,7 @@ impl Runtime {
             | "workflow.pause" | "workflow.resume" | "workflow.signal" => {
                 self.workflow_tool(caller, name, args)
             }
-            // ---- guarded local command runner (RFC 0028 §exec; default-OFF) ----
+            // ---- guarded local command runner (default-OFF) ----
             #[cfg(feature = "exec")]
             "exec" => self.exec_tool(caller, args),
             other => err(format!(
@@ -888,10 +892,11 @@ impl Runtime {
                     None => done.push((t.clone(), Value::String(format!("run {run:?} does not exist")), true)),
                 },
                 PendingKind::Subagent { handle } => {
-                    // Terminal resolves as always; an instance child in
-                    // `mode: sync` ALSO resolves when its reporter delivered
-                    // the declared workflow's first result (RFC 0036 Phase B)
-                    // — the child keeps running under its own lifecycle.
+                    // A terminal child always resolves the wait; an instance
+                    // child in `mode: sync` ALSO resolves as soon as its
+                    // reporter delivers the declared workflow's first result,
+                    // because the child then keeps running under its own
+                    // lifecycle and would never reach a terminal status.
                     if let Some(s) = self.subagents.get(handle)
                         && (super::reactor::is_terminal_status(&s.status)
                             || (s.tier.as_deref() == Some("instance")
@@ -909,8 +914,9 @@ impl Runtime {
         }
         for (target, v, e) in done {
             // A reentrant prune may already have removed (and cancelled) this
-            // entry while we were replying to an earlier one — it is no longer
-            // waiting, so answering it would resurrect a cancelled branch.
+            // entry while we were replying to an earlier one. Such an entry is
+            // not waiting on anything, so answering it would resurrect a
+            // cancelled branch — skip it when the retain took nothing out.
             let len = self.pending.len();
             self.pending.retain(|p| p.target != target);
             if self.pending.len() == len {
@@ -979,7 +985,8 @@ impl Runtime {
         self.reply_tool(node, req, result, is_error);
     }
 
-    /// RFC 0037 §4 `rate:` — the pacing bucket toward a catalogued service.
+    /// Take one token from a catalogued service's `rate:` pacing bucket,
+    /// erroring when the bucket is dry.
     /// Thin wrapper over the process-global registry [`crate::mcp::pace`],
     /// seeded at client construction — one mechanism for the reactor's step
     /// path, the mapped-tool path, and (in their own processes) the turn

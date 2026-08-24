@@ -12,8 +12,8 @@
 //! | env    | `AGENTD_LIMITS_MAX_STEPS` > `AGENT_LIMITS_MAX_STEPS` > `LIMITS_MAX_STEPS` |
 //! | flag   | `--limits.max_steps 5` / `--limits.max-steps 5` / `--limits-max-steps 5` |
 //!
-//! The env candidates are the branded, the neutral (ACC de-branding), and the
-//! bare spelling of the upper-cased path with `.` → `_`; the first present wins.
+//! The env candidates are the branded, the neutral, and the bare spelling of
+//! the upper-cased path with `.` → `_`; the first present wins.
 //! A flag is the path with `.`/`_` → `-` (any of the three spellings above
 //! canonicalizes to the same flag). Values are typed by the schema's declared
 //! type ([`Kind`]): integers/numbers/booleans parse, enums are checked against
@@ -36,8 +36,9 @@ use super::yaml;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 
-/// The env-name prefixes tried for every path, most-specific first. Branded
-/// (`AGENTD_`), neutral (`AGENT_`, ACC de-branding), then the bare path.
+/// The env-name prefixes tried for every path, most-specific first: branded
+/// (`AGENTD_`), neutral (`AGENT_`), then the bare path. Most-specific-first is
+/// what makes a branded name beat a neutral one that happens to collide.
 pub const ENV_PREFIXES: [&str; 3] = ["AGENTD_", "AGENT_", ""];
 
 /// The value type a config path takes, per its JSON Schema.

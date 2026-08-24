@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! agentd entry point.
 //!
-//! Dispatches between three roles of the one binary: the **supervisor** (the
-//! agentd runtime — parse + validate a v2 configuration, then run the
-//! durable event loop, RFC 0026), the **subagent** re-exec, and the early-exit
-//! asks (`--help` / `--version` / `--config-schema` / `--validate-config` /
-//! `--capabilities`). agentd removed the 1.x mode drivers and the flat v1
-//! schema: a 1.x configuration is rejected with a migration hint.
+//! Dispatches between three roles of the one binary: the **supervisor** (parse
+//! and validate the configuration, then run the durable event loop), the
+//! **subagent** re-exec, and the early-exit asks (`--help` / `--version` /
+//! `--config-schema` / `--validate-config` / `--capabilities`). Which role runs
+//! is decided entirely from argv and the environment, before any config is read.
 
 use agentd::config::ConfigError;
 use agentd::exit;
@@ -22,9 +21,9 @@ fn main() {
 fn run() -> i32 {
     let argv: Vec<String> = std::env::args().collect();
 
-    // `agentd tui …` / `agentd ui …` (RFC 0032 §8): run the daemon with the
-    // interface forced on AND spawn its display client (`agentd-tui` /
-    // `agentd-ui`) beside it, lifetimes tied.
+    // `agentd tui …` / `agentd ui …`: run the daemon with the interface forced
+    // on AND spawn its display client (`agentd-tui` / `agentd-ui`) beside it,
+    // lifetimes tied so neither survives the other.
     if let Some(sub @ ("tui" | "ui")) = argv.get(1).map(String::as_str) {
         #[cfg(unix)]
         {
@@ -73,9 +72,9 @@ fn run() -> i32 {
         return agentd::subagent::control::run();
     }
 
-    // An RFC 0036 instance-tier child is a NORMAL daemon (`--config` composed
-    // by its parent) — the only difference is that a parent death should retire
-    // it gracefully rather than orphan it.
+    // An instance-tier child is a NORMAL daemon (`--config` composed by its
+    // parent) — the only difference is that a parent death should retire it
+    // gracefully rather than leave it orphaned and running.
     if std::env::var_os(agentd::supervisor::reap::INSTANCE_CHILD_ENV).is_some() {
         agentd::supervisor::reap::install_instance_pdeathsig();
     }
@@ -84,13 +83,13 @@ fn run() -> i32 {
     run_v2(&argv[1..], &env)
 }
 
-/// The agentd supervisor: load + validate a v2 configuration and run it (or
-/// answer an early-exit ask). A 1.x configuration — the flat schema or a `--mode`
-/// invocation — is rejected with a migration hint (`v2::load` also emits the
-/// precise v1/mixed/removed-flag diagnostics).
+/// The agentd supervisor: load + validate the configuration and run it (or
+/// answer an early-exit ask). A flat-schema (or `--mode`) configuration is
+/// rejected with a migration hint; `v2::load` emits the precise per-key
+/// diagnostics that say which entries are unrecognized.
 fn run_v2(args: &[String], env: &[(String, String)]) -> i32 {
     use agentd::config::v2::{self, Ask, Detected};
-    // `--fresh` (RFC 0033 §3.2) is an intent for *this* process's life, not a
+    // `--fresh` is an intent for *this* process's life, not a
     // setting: it has no document path, and a file or env var that pinned an
     // instance to never resuming would be a footgun. So it is consumed here,
     // before the settings model ever sees the argv (which would reject it as an
@@ -178,8 +177,8 @@ fn run_v2(args: &[String], env: &[(String, String)]) -> i32 {
     };
     if detected == Detected::V1 {
         eprintln!(
-            "agentd: this configuration speaks the 1.x schema, which agentd removed. \
-Migrate to `config_version: \"1\"` with v2 sections (agent / intelligence / a2a / workflows); \
+            "agentd: this configuration uses the flat schema, which agentd does not accept. \
+Migrate to `config_version: \"1\"` with sections (agent / intelligence / a2a / workflows); \
 see docs/configuration.md."
         );
         return exit::USAGE;
@@ -230,8 +229,9 @@ see docs/configuration.md."
             exit::SUCCESS
         }
         Ask::ContextTemplate => {
-            // The built-in system-prompt template — an override starts as a
-            // copy of this (RFC 0038).
+            // The built-in system-prompt template. Printing it is how an
+            // operator writing an override starts from the real thing rather
+            // than an approximation of it.
             println!("{}", agentd::runtime::env::DEFAULT_TEMPLATE);
             exit::SUCCESS
         }
@@ -247,8 +247,9 @@ see docs/configuration.md."
             for w in &loaded.warnings {
                 eprintln!("{}", json!({"event": "config.warning", "msg": w}));
             }
-            // RFC 0037 §6: review reads the OUTCOME — the effective tool
-            // surface and tag set per consumer, post catalog resolution.
+            // Review reads the OUTCOME, not the input: report the effective
+            // tool surface and tag set per consumer AFTER catalog resolution,
+            // since that is what actually governs at run time.
             for s in &loaded.settings.mcp.servers {
                 if s.service.is_some() || !loaded.settings.services.is_empty() {
                     eprintln!(
@@ -273,7 +274,7 @@ see docs/configuration.md."
             );
             exit::SUCCESS
         }
-        // `--login <target>` (RFC 0031): the interactive OAuth device flow.
+        // `--login <target>`: the interactive OAuth device flow.
         Ask::Login(target) => {
             #[cfg(feature = "oauth")]
             {
@@ -301,8 +302,9 @@ see docs/configuration.md."
         }
         // `--logout <target>`: evict a cached credential (no feature needed).
         Ask::Logout(target) => {
-            // RFC 0037: `mcp:<name>` on a catalog-referencing server stores
-            // under `service:<entry>` — evict the key logins actually use.
+            // A server that references a catalog entry caches its credential
+            // under `service:<entry>`, not `mcp:<name>` — canonicalize first, or
+            // logout would report success while leaving the real key in place.
             let target = agentd::auth::canonical_target(&loaded.settings, &target);
             let dir = agentd::auth::cache::default_dir();
             match agentd::auth::cache::evict_file(&dir, &target) {
@@ -317,11 +319,11 @@ see docs/configuration.md."
             }
         }
         Ask::Run => {
-            // Record what shaped the durable state (RFC 0033 §3.3) before the
-            // runtime opens the store. `restore()` compares this with the digest
-            // the manifest carries and *reports* a difference — it never gates on
-            // it: identity is `agent.name`, and keying it on a config hash would
-            // orphan a live workflow on the most ordinary edit (§3.1).
+            // Record what shaped the durable state before the runtime opens the
+            // store. `restore()` compares this with the digest the manifest
+            // carries and *reports* a difference — it never gates on it.
+            // Durable identity is `agent.name`; keying it on a config hash
+            // would orphan a live workflow on the most ordinary edit.
             agentd::state::record_config_digest(&loaded.settings);
             agentd::runtime::run(&loaded, args, env)
         }

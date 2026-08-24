@@ -68,7 +68,8 @@ are bookkeeping the supervisor mints, never values a child asserts about itself.
 A child creates children only by calling back into the supervisor-owned
 `subagent` tool, the single chokepoint where depth, breadth and spawn-rate caps
 are enforced. A fork bomb comes back as a refused tool result, not a crash; the
-limiter is a lazy-refill token bucket, 8 burst and 2 per second.
+limiter is a lazy-refill token bucket sized by `limits.subagents.rate`, which
+defaults to `8/2s` — a burst of 8, refilling four tokens a second.
 
 | Component | Lives in | Owns |
 |---|---|---|
@@ -93,10 +94,10 @@ them.
 
 | Crate | Library | Size | Owns |
 |---|---|---|---|
-| `agentd-net` | `net` | 2,093 lines | HTTP/1.1 + SSE client, TLS, SSRF classifier, X.509 extraction |
-| `agentd-mcp` | `mcp` | 5,601 lines | MCP wire types, protocol eras, client, Streamable-HTTP server |
-| `agentd-core` | `agentd` | 65,170 lines | the engine: loop, supervisor, workflows, registry, config, state |
-| `agentd-cli` | bin `agentd` | 586 lines | argv dispatch and exit codes, nothing else |
+| `agentd-net` | `net` | 2,310 lines | HTTP/1.1 + SSE client, TLS, SSRF classifier, X.509 extraction |
+| `agentd-mcp` | `mcp` | 6,564 lines | MCP wire types, protocol eras, client, Streamable-HTTP server |
+| `agentd-core` | `agentd` | ~81,000 lines | the engine: loop, supervisor, workflows, registry, config, state |
+| `agentd-cli` | bin `agentd` | 717 lines | argv dispatch and exit codes, nothing else |
 | `agentd-conformance` | — | — | black-box checks that drive the real binary |
 
 The name mismatch is not aesthetic: `agentd` on crates.io belongs to an unrelated
@@ -109,8 +110,10 @@ its `tls` feature, `vsock` behind `vsock` — and `mcp` adds only serde on top.
 Beyond its own three (`serde`, `serde_json`, `libc`), the engine names two
 further external crates, both optional and both off by default: `ring` for
 `aauth` and `cel-interpreter` for `cel`. `net` and `mcp` also contain
-**zero** `unsafe`; every unsafe block in the tree is libc FFI, concentrated in
-about nine runtime files plus the CLI's terminal plumbing.
+**zero** `unsafe`; in the engine every `unsafe` block outside `#[cfg(test)]` is
+libc FFI, spread across about a dozen runtime files plus the terminal plumbing.
+(The test-only ones are `std::env::set_var` calls, which edition 2024 made
+unsafe.)
 
 **The CLI is a shell**, and that is enforced by the mechanism that makes
 embedding work: subagents are the **same binary re-exec'd** via `current_exe()`,
@@ -163,14 +166,15 @@ The wait at phase 12 is `next_wake().min(TICK)`, not `TICK`. A timer due in 3 ms
 fires in 3 ms; the 200 ms tick is a ceiling on how long the loop sleeps with
 nothing armed, not a scheduling granularity. Two details make that claim true
 rather than aspirational. Child frames ride the SAME channel the loop parks on,
-so a subagent's answer *wakes* the loop instead of waiting out the tick — this
-was once worth ~200 ms per delegation round-trip (measured: 214 ms → 18 ms) —
-with each reap re-queued once behind its child's already-flushed frames so
-"exited without a result" cannot be a race. And after the scheduling pass, the
-loop re-schedules to a fixpoint while inline data steps (`assign`, `map`,
-`template`, `switch`…) keep completing synchronously, so a pure data pipeline
-advances at execution speed (measured: a 200-step chain, 42 s → 2.3 s in a
-debug build) instead of one step per tick. A daemon built with the shipped
+so a subagent's answer *wakes* the loop instead of waiting out the tick: a
+delegation round-trip measures ~18 ms, where parking until the next tick would
+add most of a 200 ms tick to every one. Each reap is re-queued once behind its
+child's already-flushed frames, so "exited without a result" cannot be a race.
+And after the scheduling pass, the loop re-schedules to a fixpoint while inline
+data steps (`assign`, `map`, `template`, `switch`…) keep completing
+synchronously, so a pure data pipeline advances at execution speed — a 200-step
+chain finishes in ~2.3 s in a debug build, against the ~42 s one step per tick
+would cost. A daemon built with the shipped
 feature set, idling on a schedule workflow, reports `Threads: 1`, `VmRSS`
 around 5.5 MiB, and one accumulated CPU jiffy per ~6 s.
 
@@ -312,14 +316,14 @@ MCP and A2A are not in it.
 
 | Layer | Where | Instead of |
 |---|---|---|
-| HTTP/1.1 client + SSE reader | `net/http.rs`, 644 lines | `ureq` + `url` → IDNA → ICU |
+| HTTP/1.1 client + SSE reader | `net/http.rs`, 690 lines | `ureq` + `url` → IDNA → ICU |
 | YAML subset reader | `config/yaml.rs`, 1,307 lines | `serde_yaml`, itself unmaintained |
 | JSON Schema subset | `jsonschema.rs`, 803 lines | a schema crate and a regex engine |
 | Cron | `triggers/timer.rs` | `croner` |
 | Prometheus text | `obs/metrics.rs` | `prometheus` / `metrics` |
 | OTLP export | `obs/otel.rs` | `opentelemetry` + protobuf + gRPC |
 | inotify config watch | `config/watch.rs` | `notify` / `inotify` |
-| NDJSON logging | `obs/log.rs`, 518 lines | `tracing` |
+| NDJSON logging | `obs/log.rs`, 519 lines | `tracing` |
 | SHA-256, HMAC, ULID, base64, SigV4, DER walk, token bucket, FNV-1a | various | six or seven crates |
 
 The reasoning is per-row but rhymes. Cron is five UTC fields as `u64` bitsets,
@@ -350,7 +354,7 @@ that talk to other people's software:
 | | Implementation | Why not ours |
 |---|---|---|
 | MCP | [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk) — the official Rust SDK | a live specification, and a misreading fails in the *peer* |
-| A2A | [`a2a-rs`](https://github.com/emillindfors/a2a-rs) — generated from the spec's protobufs | same, and proven: an independent reading found four faults in ours |
+| A2A | [`a2a-rs`](https://github.com/emillindfors/a2a-rs) — generated from the spec's protobufs | same, and demonstrable: checking agentd's output against an independent reading of the spec turns up faults that are valid JSON |
 
 Both plug into agentd's own HTTP transport, so the credentials only agentd knows
 about — AAuth signatures, SigV4, mTLS identities, refreshed OAuth tokens — and
@@ -364,14 +368,11 @@ The resolved graph is what it is:
 | default (`tls` + MCP) | 91 |
 | the full shipped feature set (adds A2A) | 187 |
 
-An earlier version of this document said "exactly three direct external
-dependencies" and pointed at a CI job that enforced it. That job is gone. The
-claim it protected — *you can hold the whole trust boundary in your head* — is no
-longer one agentd can make, and pretending otherwise would be worse than
-retiring it. What replaced it is a gate on the thing a user actually receives:
-the release binary must still be a statically linked musl artifact that runs on
-`scratch` — about 8.5 MiB for the shipped feature set, with no shell, no libc
-and no package manager.
+A graph that size is not one you can hold in your head, so agentd does not
+claim you can. What CI enforces instead is a property of the thing a user
+actually receives: the release binary must be a statically linked musl artifact
+that runs on `scratch` — about 8.5 MiB for the shipped feature set, with no
+shell, no libc and no package manager.
 
 The build stays pure Rust. The SDKs pull `rustls` with its default features,
 which selects the C/assembly `aws-lc-rs` provider; because feature unification
@@ -389,8 +390,8 @@ and carries a hand-maintained permissive-only licence allow-list.
 
 ## Feature flags are the capability surface
 
-Capability is decided at compile time. Of the fourteen features besides
-`default`, nine are literally empty arrays — they gate hand-rolled code, not
+Capability is decided at compile time. Of the thirteen features besides
+`default`, eight are literally empty arrays — they gate hand-rolled code, not
 dependencies.
 
 | Feature | Adds crates | Gates |
@@ -413,8 +414,10 @@ Read that table twice, because the naive model — "features control dependency
 cost" — mispredicts two rows.
 
 `aauth` adds Ed25519 signing with **zero new crates**, reusing the `ring` that
-rustls already resolved. That is why it ships in the release artifact while `cel`
-cannot: `cel` costs 28 extra crates, more than the entire rest of the tree.
+rustls already resolved — a capability that costs nothing to carry. `cel` is the
+opposite trade and is carried anyway: 28 extra crates, more than the rest of the
+default tree put together, in exchange for expressions being available to every
+`when`, `until` and `filter` in a shipped binary.
 
 `exec` costs **nothing** in dependencies and is still absent from every shipped
 binary. It is gated on *posture*: agentd's default position is that it runs no
@@ -548,14 +551,14 @@ why mutex locks there recover from poisoning rather than aborting on it.
 - **Sandbox anything.** The container, VM or enclave around agentd is the
   sandbox. Capability scoping is the granted tool subset, narrowing monotonically
   down the agent tree.
-- **Evaluate CEL or run a local command in a shipped binary.** Both require
-  building from source.
+- **Run a local command in a shipped binary.** The `exec` runner requires
+  building from source, and then enabling `security.exec.enabled` as well.
 
 ---
 
 ## Where to go next
 
-- [`rfcs/0002-supervisor-reactor-and-concurrency.md`](../rfcs/0002-supervisor-reactor-and-concurrency.md) — the reactor and concurrency model
-- [`rfcs/0003-process-supervision-and-recovery.md`](../rfcs/0003-process-supervision-and-recovery.md) — supervision, stuck detection, recovery
-- [`rfcs/0025-durable-state-and-store-adapters.md`](../rfcs/0025-durable-state-and-store-adapters.md) — durable state and store adapters
+- [`harness.md`](harness.md) — the reactor, supervision, stuck detection and recovery
+- [`agent-loop.md`](agent-loop.md) — what the child loop does on each turn
+- [`configuration.md`](configuration.md) — durable state and the store adapters
 - [`workflows.md`](workflows.md) · [`deployment.md`](deployment.md) · [`security.md`](security.md) · [`embedding.md`](embedding.md)

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The **A2A v2 surface** (RFC 0029): agentd's only external channel.
+//! The **A2A surface**: agentd's only external channel.
 //! Principals + roles + authorization ([`principals`]) and durable tasks +
-//! conversations ([`tasks`]). The transport binding (the HTTPS listener + the
-//! command/NL/gate routing into the runtime) is wired in the runtime at the
-//! P5 cut-over.
+//! conversations ([`tasks`]). The transport binding — the HTTPS listener and
+//! the command/NL/gate routing into the runtime — lives in the runtime, so
+//! this module stays a pure model of who may call what and what a task is.
 
 /// Talking to another agent: the outbound half, in the spec's types.
 #[cfg(feature = "a2a")]

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! RFC 0036/0037 Phase B end to end: a sync-mode instance child resolving the
-//! spawn with its declared workflow's first result; child streams mirrored
-//! into the parent's; the catalog's per-entry breaker default opening on an
-//! unreachable service; and the `http` step's method ceiling.
+//! Instance children and the service catalog end to end: a sync-mode instance
+//! child resolving the spawn with its declared workflow's first result; child
+//! streams mirrored into the parent's; the catalog's per-entry breaker default
+//! opening on an unreachable service; and the `http` step's method ceiling.
 #![cfg(all(unix, feature = "workflow", feature = "a2a"))]
 
 mod common;

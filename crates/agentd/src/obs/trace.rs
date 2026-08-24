@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! W3C Trace Context propagation. RFC 0010 §context-propagation.
+//! W3C Trace Context propagation.
 //!
 //! **Propagation is default-on and dependency-free** — a `trace_id` shared
 //! across the whole agent tree (ingested from an upstream `traceparent` or
@@ -31,7 +31,7 @@ impl TraceContext {
 
 /// An outbound `traceparent` for a given trace id with a fresh child span —
 /// for stamping onto MCP `_meta` / the LLM header so downstream services see
-/// this agent as their parent (W3C-correct). RFC 0010.
+/// this agent as their parent (W3C-correct).
 pub fn outbound_traceparent(trace_id: &str) -> String {
     format!("00-{}-{}-01", trace_id, new_span_id())
 }

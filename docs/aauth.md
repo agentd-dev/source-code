@@ -5,8 +5,7 @@
 > `aauth` feature is in the release binary and the published container image —
 > its crypto (`ring`) is already linked by the default `tls` (rustls) transport,
 > so enabling it costs **zero** marginal dependency. It is a compile-time
-> feature, so a `--no-default-features` / trimmed build can omit it. The
-> normative contract is [RFC 0023](../rfcs/0023-aauth-agent-identity.md).
+> feature, so a `--no-default-features` / trimmed build can omit it.
 
 Some MCP servers replace the shared API key with **AAuth**: your agent holds an
 **Ed25519 key**, gets a short-lived **agent token** from an **Agent Provider**,
@@ -114,8 +113,9 @@ Servers that want the *human's* identity (user-scoped, "Case C") route through a
 `401 requirement=auth-token`, agentd exchanges the server's resource token at the
 configured `--aauth-person-server` (carrying a justification the human sees),
 receives the user-scoped auth-token, and presents it on the retry — the human
-consents *at their PS*, not in agentd. See RFC 0023 §2 for the full
-user-responsibility breakdown per case.
+consents *at their PS*, not in agentd. agentd never renders a consent screen and
+never caches a decision on the human's behalf: the approval lives with the
+Person Server, and agentd only carries the token it hands back.
 
 ## Embedding
 
@@ -123,7 +123,7 @@ An embedder building on `agentd-core` can drive AAuth directly:
 `agentd::aauth::{AgentKey, ApdConfig, AAuthClient}` — construct a client, install
 it (`agentd::aauth::install`), and every MCP connection agentd makes signs. The
 signer is the `agentd::aauth::RequestSigner` trait; `verify_ed25519` is exposed
-for the server side of a test. See [embedding.md](embedding.md) and RFC 0023 §3.
+for the server side of a test. See [embedding.md](embedding.md).
 
 ## What's covered (and what isn't)
 
@@ -143,6 +143,6 @@ requires body integrity, **per-server opt-out** (`aauth: false` on an
 `mcp.servers[]` entry), **federated enrollment**
 (`--aauth-enroll-assertion-file`), and **signing the intelligence dial**.
 
-Still on the [roadmap](../rfcs/0023-aauth-agent-identity.md#7-deferred-roadmap):
-a server's own `202 requirement=interaction` (HITL elicitation) and AAuth Events
-(`/inbox`) for async results.
+Two parts of the draft are not implemented: a server's own
+`202 requirement=interaction` (HITL elicitation) and AAuth Events (`/inbox`) for
+async results. A server that needs either will not work with agentd today.

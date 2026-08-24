@@ -1,18 +1,21 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The **JSON Schema (Draft 2020-12) of the v2 settings document** (RFC 0030
-//! §3) — hand-written (no `schemars`, the moat) and kept faithful to
-//! [`super::Settings`] by the drift tests in `super::tests`. It is the single
-//! source for the path bindings (env `AGENTD_<PATH>` names, `--<path>` flags,
-//! `--help`), for `--config-schema=2`, and for agentctl's admission validation.
+//! The **JSON Schema (Draft 2020-12) of the settings document** — hand-written
+//! (no `schemars`, the moat) and held faithful to [`super::Settings`] by the
+//! tests in `super::tests`, which walk both shapes object by object. It is the
+//! single source for the path bindings (env `AGENTD_<PATH>` names, `--<path>`
+//! flags, `--help`), for `--config-schema=2`, and for agentctl's admission
+//! validation, so a section added here reaches all of them at once.
 //!
 //! Conventions: every object is `additionalProperties: false` (mirrors
 //! `deny_unknown_fields`); durations are strings (`10m`, `500ms`, bare seconds
 //! also accepted); secrets are strings that MUST be `{{secret:…}}` /
-//! `{{secret-file:…}}` references when they come from a file (§5).
+//! `{{secret-file:…}}` references when they come from a file, so a config
+//! document is always safe to commit.
 
 use serde_json::{Map, Value, json};
 
-/// The schema's `x-agentd-contract-version` — the 2.0 config contract.
+/// The schema's `x-agentd-contract-version` — the config contract this
+/// document describes, matched against the capabilities manifest.
 pub const SCHEMA_CONTRACT_VERSION: &str = "1.0";
 
 /// The document version this schema describes (`config_version`).
@@ -164,7 +167,7 @@ fn top_level_properties(
                 "keep_last": { "type": "integer", "minimum": 0 },
                 "model_window": { "type": "integer", "minimum": 1, "description": "the model's context window in tokens (overrides the value inferred from intelligence.model)" },
                 "plan": { "type": "object", "additionalProperties": false, "properties": { "max_items": { "type": "integer", "minimum": 1 } } },
-                "template": { "type": "string", "description": "the system-prompt template (RFC 0038); unset = the built-in default, printed by `agentd --context-template`" },
+                "template": { "type": "string", "description": "the system-prompt template; unset = the built-in default, printed by `agentd --context-template`" },
                 "templates": { "type": "object", "additionalProperties": { "type": "string" }, "description": "named alternates a node selects with context: {template: <name>}" },
                 "summarize": { "type": "object", "additionalProperties": false, "description": "compaction's model-facing half", "properties": {
                     "prompt": { "type": "string", "description": "override the summarizer guidance; the JSON schema it must satisfy is fixed" },
@@ -193,11 +196,11 @@ fn top_level_properties(
     m.insert(
         "services".to_string(),
         json!({ "type": "object", "additionalProperties": { "$ref": "#/$defs/Service" },
-                "description": "the service catalog (RFC 0037): the named external services this deployment may use; mcp.servers entries reference entries via `service:` and may only narrow them" }),
+                "description": "the service catalog: the named external services this deployment may use; mcp.servers entries reference entries via `service:` and may only narrow them" }),
     );
     m.insert("vars".to_string(), json!({ "type": "object", "additionalProperties": true,
                 "description": "operator-defined constants; reference anywhere (and in workflows) as {{config.NAME}} — dotted paths reach nested values, unresolved references refuse startup" }));
-    m.insert("workflows".to_string(), json!({ "type": "array", "items": { "$ref": "#/$defs/WorkflowRef" }, "description": "inline dialect-3 definitions or {name, file|uri} references" }));
+    m.insert("workflows".to_string(), json!({ "type": "array", "items": { "$ref": "#/$defs/WorkflowRef" }, "description": "inline workflow definitions or {name, file|uri} references" }));
     m.insert("limits".to_string(), json!({ "type": "object", "additionalProperties": false, "properties": {
                 "max_runs": { "type": "integer", "minimum": 1 },
                 "run": { "type": "object", "additionalProperties": false, "properties": {
@@ -205,7 +208,7 @@ fn top_level_properties(
                 "subagents": { "type": "object", "additionalProperties": false, "properties": {
                     "depth": { "type": "integer", "minimum": 0 }, "breadth": { "type": "integer", "minimum": 1 },
                     "total": { "type": "integer", "minimum": 1 }, "rate": { "type": "string", "description": "`<burst>/<per>s`, e.g. `8/2s`" },
-                    "instances": { "type": "object", "additionalProperties": false, "description": "instance-tier children (RFC 0036): defaults 2 live / 8 lifetime / 4/1h", "properties": {
+                    "instances": { "type": "object", "additionalProperties": false, "description": "instance-tier children: defaults 2 live / 8 lifetime / 4/1h", "properties": {
                         "breadth": { "type": "integer", "minimum": 1 }, "total": { "type": "integer", "minimum": 1 }, "rate": { "type": "string" } } } } },
                 "inline_max_bytes": { "type": "integer", "minimum": 1 },
                 "step_timeout": duration,
@@ -218,9 +221,9 @@ fn top_level_properties(
                 "run_id": { "type": "string" },
                 "exit_code_map": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0, "maximum": 255 }, "description": "remap the policy exit codes (3/7 only): {\"3\": N, \"7\": N}" },
                 "watch_config": { "type": "boolean" },
-                "until_signal": { "type": "string", "description": "delivery of this signal begins graceful shutdown — the RFC 0036 instance-child retirement trigger" } } }));
+                "until_signal": { "type": "string", "description": "delivery of this signal begins graceful shutdown — the retirement trigger a parent composes into an instance-tier child" } } }));
     m.insert("subagents".to_string(), json!({ "type": "object", "additionalProperties": false,
-                "description": "subagent templates + spawn policy (RFC 0036): operator-declared definitions the model may instantiate, filling declared params only",
+                "description": "subagent templates + spawn policy: operator-declared definitions the model may instantiate, filling declared params only",
                 "properties": {
                 "allow_freeform": { "type": "boolean", "description": "false = templates are the ONLY spawn path (freeform flat-tier instruction spawns are refused); default true" },
                 "defaults": { "type": "object", "additionalProperties": false, "description": "applied to every spawn unless overridden at the template or call site", "properties": {
@@ -243,7 +246,7 @@ fn top_level_properties(
                     "enabled": { "type": "boolean", "description": "accept CreateTaskPushNotificationConfig and deliver on transitions" },
                     "allow_private": { "type": "boolean", "description": "permit webhook targets on private / loopback addresses (a separate and larger decision — a peer could otherwise reach agentd's own surfaces or a cloud metadata endpoint)" } } } } }));
     m.insert("interface".to_string(), json!({ "type": "object", "additionalProperties": false,
-                "description": "The display-client (TUI/web-UI) surface (RFC 0032), served on the A2A listener. Default-OFF.",
+                "description": "The display-client (TUI/web-UI) surface, served on the A2A listener. Default-OFF.",
                 "properties": {
                 "enabled": { "type": "boolean", "description": "serve the interface methods (SubscribeToEvents, interface.info, …)" },
                 "debug": { "type": "boolean", "description": "expose extra debug information (transcripts, run step detail, the log ring, audit feed events); runtime-togglable via the config.set op" },
@@ -298,7 +301,7 @@ fn top_level_properties(
                     "workdir": { "type": "string" }, "timeout": duration,
                     "max_output": { "type": "integer" },
                     "env": { "type": "array", "items": { "type": "string" }, "description": "env var names passed through" } } },
-                "egress": { "enum": ["open", "closed"], "description": "closed = an outbound MCP dial whose URL matches no services: catalog entry is refused (RFC 0037 §5); default open" } } }));
+                "egress": { "enum": ["open", "closed"], "description": "closed = an outbound MCP dial whose URL matches no services: catalog entry is refused; default open" } } }));
 }
 
 fn defs_properties(
@@ -320,7 +323,7 @@ fn defs_properties(
                 "properties": {
                 "name": { "type": "string", "pattern": "^[a-zA-Z0-9_-]+$" },
                 "endpoint": { "type": "string" },
-                "service": { "type": "string", "description": "reference a services: catalog entry — inherit its connection settings (restating endpoint/auth/headers is refused) and narrow its tool ceiling (RFC 0037)" },
+                "service": { "type": "string", "description": "reference a services: catalog entry — inherit its connection settings (restating endpoint/auth/headers is refused) and narrow its tool ceiling" },
                 "ns": { "type": "string", "pattern": "^[a-zA-Z0-9_-]+$", "description": "tool namespace prefix (`ns.tool`)" },
                 "headers": string_map,
                 "tags": { "type": "object", "additionalProperties": { "type": "array", "items": { "enum": ["untrusted_input", "sensitive", "egress"] } } },
@@ -332,7 +335,7 @@ fn defs_properties(
                 "auth": { "$ref": "#/$defs/Auth" },
                 "timeout": duration } }));
     m.insert("Auth".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["kind"],
-                "description": "A unified credential provider (RFC 0031).", "properties": {
+                "description": "A unified credential provider.", "properties": {
                 "kind": { "enum": ["static", "oauth2", "aws", "spiffe"] },
                 "issuer": { "type": "string" }, "token_url": { "type": "string" },
                 "device_authorization_url": { "type": "string" }, "authorization_url": { "type": "string" },
@@ -372,8 +375,9 @@ fn defs_properties(
                 "base_url": { "type": "string" }, "headers": string_map,
                 "get": { "$ref": "#/$defs/HttpOp" }, "put": { "$ref": "#/$defs/HttpOp" },
                 "list": { "$ref": "#/$defs/HttpOp" }, "delete": { "$ref": "#/$defs/HttpOp" } } }));
-    // RFC 0033 §4: the only knob is where the state lives, and it is optional —
-    // an omitted `path` resolves through $AGENTD_STATE_DIR / $XDG_STATE_HOME.
+    // The file store deliberately exposes one knob — where the state lives —
+    // and even that is optional: an omitted `path` resolves through
+    // $AGENTD_STATE_DIR / $XDG_STATE_HOME, so durability needs no config.
     m.insert("StoreFile".to_string(), json!({ "type": "object", "additionalProperties": false, "properties": {
                 "min_free": { "type": "string", "description": "shed new work below this much free disk (256MB, 1.5GiB, bytes; 0 disables); warn at twice it" },
                 "path": { "type": "string", "description": "the state root; default $AGENTD_STATE_DIR, else $XDG_STATE_HOME/agentd/state, else $HOME/.local/state/agentd/state, else the OS temp dir" } } }));
@@ -390,7 +394,7 @@ fn defs_properties(
                 "dir": { "type": "string", "description": "load every matching file in a directory" },
                 "glob": { "type": "string", "description": "comma-separated globs relative to `dir` (default `*.yaml,*.yml,*.json`); `**` recurses" } },
                 "additionalProperties": true,
-                "description": "a {name, file|uri|url} reference, a {dir, glob} directory, or an inline dialect-3 definition (RFC 0027)" }));
+                "description": "a {name, file|uri|url} reference, a {dir, glob} directory, or an inline workflow definition" }));
     m.insert("Principal".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["match", "role"], "properties": {
                 "match": { "type": "object", "additionalProperties": false, "properties": {
                     "san": { "type": "string" }, "sub": { "type": "string" }, "bearer_ref": { "type": "string" }, "aauth_agent": { "type": "string" }, "any": { "type": "boolean" } } },
@@ -399,7 +403,7 @@ fn defs_properties(
                 "quotas": { "type": "object", "additionalProperties": false, "properties": {
                     "rate": { "type": "string" }, "budget": budget } } } }));
     m.insert("SubagentTemplate".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["instruction"],
-                "description": "an operator-declared subagent definition (RFC 0036): `instruction` is a full RFC 0034 document — no config-defining directives = the flat worker; machinery (:::workflow/:::mcp/:::stream/:::config/:::tools) = an instance-tier child",
+                "description": "an operator-declared subagent definition: `instruction` is a full instruction document — no config-defining directives = the flat worker; machinery (:::workflow/:::mcp/:::stream/:::config/:::tools) = an instance-tier child",
                 "properties": {
                 "instruction": { "type": "string", "description": "the definition; {{params.X}} holes fold in at spawn as data, never re-parsed for directives" },
                 "params": { "type": "object", "additionalProperties": { "$ref": "#/$defs/ParamSpec" }, "description": "the ONLY holes the model may fill, schema-validated at spawn" },
@@ -430,7 +434,7 @@ fn defs_properties(
                 "description": { "type": "string" } } }),
     );
     m.insert("Service".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["endpoint"],
-                "description": "a service-catalog entry (RFC 0037 §4): connection settings, one shared credential, authoritative trifecta tags (a floor for any matching endpoint), and a tool-surface ceiling consumers can only narrow",
+                "description": "a service-catalog entry: connection settings, one shared credential, authoritative trifecta tags (a floor for any matching endpoint), and a tool-surface ceiling consumers can only narrow",
                 "properties": {
                 "kind": { "enum": ["mcp"], "description": "phase A: mcp only (intelligence/peer/http reserved)" },
                 "endpoint": { "type": "string", "description": "the connection URL and the dial-time match base (scheme + authority + path prefix)" },

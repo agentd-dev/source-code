@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! 5-field UTC cron schedule — a standalone-mode convenience. RFC 0008. [feature: cron]
+//! 5-field UTC cron schedule — a standalone-mode convenience. [feature: cron]
 //!
-//! Hand-rolled (no `croner` dep — the minimalism moat, rfcs/0002): a tiny parser
-//! over `min hour dom month dow` plus a minute-stepping next-fire search, UTC
-//! only. The recommended *production* schedule is still an external CronJob →
-//! `agentd --mode once` (RFC 0008 §time-is-an-event-source, robust to clock skew
-//! / missed ticks); this feature exists for a self-contained standalone agentd.
+//! Hand-rolled (no `croner` dep — the minimalism moat): a tiny parser over
+//! `min hour dom month dow` plus a minute-stepping next-fire search, UTC only.
+//! An external scheduler firing one-shot runs remains the more robust production
+//! shape, because it survives clock skew and a missed tick that an in-process
+//! timer silently drops; this feature exists for a self-contained agentd with no
+//! scheduler around it.
 
 /// A parsed 5-field cron expression (UTC). Each field is a 64-bit set: bit `v`
 /// is set when value `v` matches. `dom`/`dow` carry a `*`-vs-restricted flag for

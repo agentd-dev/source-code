@@ -10,8 +10,8 @@ state. Scaling it goes in two directions, and they are not interchangeable —
 agentd never changes its own replica count, and it has no coordination protocol
 of its own (§4). It bounds the work it is pointed at, exposes the state a control
 plane (an HPA, KEDA, an operator) scales on, and leaves ownership to the systems
-that can actually arbitrate it. Everything below is verified against the shipped
-binary.
+that can actually arbitrate it. Everything below describes what the binary
+does.
 
 ---
 
@@ -250,19 +250,20 @@ to someone else when the lease expires.
 ## 4. agentd has no cluster-coordination surface
 
 There is no shard flag, no claim route, no standby pool, and no `cluster` build
-feature. A version of agentd carried declarations for all of them — parsed,
-validated, and read by nothing — and they were removed rather than finished.
+feature.
 
 That is a deliberate boundary, not a gap waiting to be filled. Coordination
 needs a shared source of truth, and agentd already talks to two: the MCP server
 the work comes from, and the store. Both are better placed to own it than a
 replica is — the queue can hand an item to somebody else when a lease expires,
 and no agentd-side hash can do that. §2 is the whole answer, and every mechanism
-in it exists today.
+it uses is an ordinary part of the runtime: subscriptions, A2A peers, and MCP
+tool calls.
 
 If you want partitioned timers across a fleet, give each replica a different
 config: replica 0 arms the nightly `schedule`, the others do not. That is one
-line of Helm values, and it is legible in a way `timer_shard: keyed` never was.
+line of Helm values, and it stays legible in the place an operator already
+looks — the config the replica actually runs.
 
 ---
 
@@ -291,10 +292,11 @@ scales **in** on a sustained-empty backlog, then relies on the drain contract fo
 safety: `SIGTERM` finishes in-flight runs within `lifecycle.drain_timeout` and
 exits `0`.
 
-A few reserved names remain in the `/metrics` output that this build never
-writes to — `agent_pending_events`, `agent_inflight_reactions`,
-`agent_reaction_lag_ms`, `agent_subscriptions_active`, `agent_active_subagents`.
-They are present and flat at zero. Do not target an HPA at them.
+A few names in the `/metrics` output are reserved and never written:
+`agent_pending_events`, `agent_inflight_reactions`, `agent_reaction_lag_ms`,
+`agent_subscriptions_active`, `agent_active_subagents`, `agent_tree_depth`,
+`agent_tree_breadth`. They are present and flat at zero, so a scaler that
+targets one sees a signal that never moves. Do not target an HPA at them.
 
 ---
 
@@ -319,7 +321,7 @@ spec:
       terminationGracePeriodSeconds: 30   # > lifecycle.drain_timeout
       containers:
         - name: agent
-          image: ghcr.io/agentd-dev/agentd:2.0.0
+          image: ghcr.io/agentd-dev/agentd:1.1.0
           args:
             - --config=/etc/agentd/worker.yaml     # the shared §2a config
             - --config=/etc/agentd/partition.yaml  # per-replica overlay: agent.name + this replica's workflow

@@ -1,20 +1,23 @@
 import fs from "node:fs";
 import path from "node:path";
 
-// The site renders the repo's authoritative markdown directly — the docs/ and
-// rfcs/ directories are the single source of truth; the site never forks them.
+// The site renders the repo's authoritative markdown directly out of docs/ —
+// that directory is the single source of truth and the site never forks it.
+// Paths in DOCS are resolved against the repository root, one level above the
+// Next.js project.
 const ROOT = path.join(process.cwd(), "..");
 
-// Ordered navigation groups. Each doc names its `group`; the sidebar and the
-// docs index render groups in this order. Specs are split so the ones that
-// describe the current design lead, with the foundations behind them.
+// Ordered navigation groups. Each doc names its `group`; the sidebar, the docs
+// index and the prev/next reading order all render groups in this order, so a
+// group listed here with no docs simply renders nothing. A doc whose `group`
+// is NOT listed here still gets a page and a sitemap entry, but is reachable
+// only by its URL — keep every group a doc names in this list.
 export const GROUPS = [
   { id: "start", title: "Start here" },
   { id: "concepts", title: "How it works" },
   { id: "operate", title: "Build & operate" },
   { id: "extend", title: "Extend & embed" },
-  { id: "rfc-core", title: "Specifications" },
-  { id: "rfc-foundation", title: "Specifications · foundations" },
+  { id: "reference", title: "Reference" },
 ];
 
 export const DOCS = [
@@ -124,7 +127,7 @@ export const DOCS = [
     file: "docs/workflows.md",
     title: "Workflows",
     group: "concepts",
-    blurb: "The durable DAG engine (RFC 0027) — the graph model, every node kind, durability, and worked examples.",
+    blurb: "The durable DAG engine — the graph model, every node kind, durability, and worked examples.",
   },
   {
     slug: "directives",
@@ -184,7 +187,7 @@ export const DOCS = [
     file: "docs/hosting-the-ui.md",
     title: "Hosting the web UI",
     group: "operate",
-    blurb: "Running the thin client on a public domain — what agentd had to change, what a user configures, and why Safari cannot do it.",
+    blurb: "Running the thin client on a public domain — the daemon-side settings it needs, what a user configures, and why Safari cannot do it.",
   },
   {
     slug: "operations",
@@ -238,74 +241,17 @@ export const DOCS = [
     tag: "draft",
     blurb: "Signed agent identity for AAuth-protected MCP servers.",
   },
-
-  // ── the specs behind the current design ───────────────────────
-  { slug: "rfc-0026", file: "rfcs/0026-agent-loop-and-lifecycle.md", title: "0026 · Agent loop & lifecycle", group: "rfc-core" },
-  { slug: "rfc-0027", file: "rfcs/0027-workflow-dialect-3.md", title: "0027 · Workflow dialect v3", group: "rfc-core" },
-  { slug: "rfc-0029", file: "rfcs/0029-a2a-conversations-principals-commands.md", title: "0029 · A2A conversations & principals", group: "rfc-core" },
-  { slug: "rfc-0025", file: "rfcs/0025-durable-state-and-store-adapters.md", title: "0025 · Durable state & store", group: "rfc-core" },
-  { slug: "rfc-0028", file: "rfcs/0028-tools-registry-and-internal-tools.md", title: "0028 · Tools registry", group: "rfc-core" },
-  { slug: "rfc-0030", file: "rfcs/0030-config-schema-v2.md", title: "0030 · Config schema v2", group: "rfc-core" },
-  { slug: "rfc-0031", file: "rfcs/0031-endpoint-authentication.md", title: "0031 · Endpoint authentication", group: "rfc-core" },
-  { slug: "rfc-0032", file: "rfcs/0032-interface-and-observation-plane.md", title: "0032 · Interface & observation plane", group: "rfc-core" },
-  { slug: "rfc-0033", file: "rfcs/0033-file-store-and-instance-identity.md", title: "0033 · File store & instance identity", group: "rfc-core" },
-  { slug: "rfc-0034", file: "rfcs/0034-instruction-documents-and-directives.md", title: "0034 · Instruction documents & directives", group: "rfc-core" },
-  { slug: "rfc-0035", file: "rfcs/0035-event-streams.md", title: "0035 · Event streams", group: "rfc-core", tag: "draft" },
-  {
-    slug: "rfc-0036",
-    file: "rfcs/0036-subagent-templates.md",
-    title: "0036 · Subagent templates & instance children",
-    group: "rfc-core",
-    tag: "draft",
-    blurb:
-      "Operator-declared subagent templates whose instruction is a full instance definition — spawn a supervised child desk with its own workflows, signals and streams; the model fills declared params only.",
-  },
-  {
-    slug: "rfc-0038",
-    file: "rfcs/0038-system-prompt-template.md",
-    title: "0038 · The system-prompt template",
-    group: "rfc-core",
-    blurb:
-      "The system prompt becomes data plus a template — loops, conditions and limits over the agent's environment, ordered so provider prefix caching actually hits.",
-  },
-  {
-    slug: "rfc-0037",
-    file: "rfcs/0037-service-catalog-and-egress-policy.md",
-    title: "0037 · Service catalog & egress policy",
-    group: "rfc-core",
-    tag: "draft",
-    blurb:
-      "A services: catalog of the external services a deployment may use — shared credentials, authoritative trifecta tags, tool ceilings — with security.egress: closed enforcing it at dial time.",
-  },
-  { slug: "rfc-0022", file: "rfcs/0022-embedding-and-code-tools.md", title: "0022 · Embedding & code tools", group: "rfc-core" },
-  { slug: "rfc-0023", file: "rfcs/0023-aauth-agent-identity.md", title: "0023 · AAuth agent identity", group: "rfc-core", tag: "draft" },
-  { slug: "rfc-0024", file: "rfcs/0024-evaluation-harness.md", title: "0024 · Evaluation harness", group: "rfc-core" },
-
-  // ── RFCs · foundations ────────────────────────────────────────
-  { slug: "rfc-0001", file: "rfcs/0001-mcp-native-agent-runtime.md", title: "0001 · MCP-native runtime", group: "rfc-foundation" },
-  { slug: "rfc-0002", file: "rfcs/0002-supervisor-reactor-and-concurrency.md", title: "0002 · Supervisor & concurrency", group: "rfc-foundation" },
-  { slug: "rfc-0003", file: "rfcs/0003-process-supervision-and-recovery.md", title: "0003 · Supervision & recovery", group: "rfc-foundation" },
-  { slug: "rfc-0004", file: "rfcs/0004-mcp-client-subset-and-codec.md", title: "0004 · MCP client & codec", group: "rfc-foundation" },
-  { slug: "rfc-0006", file: "rfcs/0006-intelligence-transport-and-wire.md", title: "0006 · Intelligence transport", group: "rfc-foundation" },
-  { slug: "rfc-0007", file: "rfcs/0007-agentic-loop-and-terminal-status.md", title: "0007 · Agentic loop", group: "rfc-foundation" },
-  { slug: "rfc-0009", file: "rfcs/0009-subagent-process-model.md", title: "0009 · Subagent model", group: "rfc-foundation" },
-  { slug: "rfc-0010", file: "rfcs/0010-observability-health-telemetry.md", title: "0010 · Observability", group: "rfc-foundation" },
-  { slug: "rfc-0011", file: "rfcs/0011-cloud-native-contract.md", title: "0011 · Cloud-native contract", group: "rfc-foundation" },
-  { slug: "rfc-0012", file: "rfcs/0012-security-posture.md", title: "0012 · Security posture", group: "rfc-foundation" },
-  { slug: "rfc-0014", file: "rfcs/0014-control-plane-contract.md", title: "0014 · Control-plane contract", group: "rfc-foundation" },
-  { slug: "rfc-0015", file: "rfcs/0015-management-and-control-surface.md", title: "0015 · Management surface", group: "rfc-foundation" },
-  { slug: "rfc-0016", file: "rfcs/0016-telemetry-and-lifecycle-contract.md", title: "0016 · Telemetry contract", group: "rfc-foundation" },
-  { slug: "rfc-0017", file: "rfcs/0017-declarative-config-and-hot-reload.md", title: "0017 · Config & hot reload", group: "rfc-foundation" },
-  { slug: "rfc-0018", file: "rfcs/0018-intelligence-transport-resilience.md", title: "0018 · Intelligence resilience", group: "rfc-foundation" },
-  { slug: "rfc-0013", file: "rfcs/0013-deferred-v2-surface.md", title: "0013 · Deferred v2 surface", group: "rfc-foundation" },
 ];
 
 export function docsInGroup(groupId) {
   return DOCS.filter((d) => d.group === groupId);
 }
 
-// docs file path (e.g. "configuration.md" or "rfcs/0011-….md") → its slug, so
-// inter-doc markdown links can be rewritten to on-site routes.
+// Markdown basename (e.g. "configuration.md") → its slug, so a link between two
+// docs can be rewritten to an on-site route. Keyed by BASENAME, not full path,
+// because the source markdown links relatively ("./mcp.md", "../docs/mcp.md")
+// and the basename is the only stable part. A basename the site does not host
+// returns null, and the renderer falls back to a link into the repository.
 const FILE_TO_SLUG = Object.fromEntries(DOCS.map((d) => [d.file.split("/").pop(), d.slug]));
 
 export function slugForFile(name) {

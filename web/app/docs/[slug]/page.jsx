@@ -277,40 +277,28 @@ function Tag({ tag }) {
   return <span className={`doc-tag doc-tag-${tag.replace(/\W/g, "")}`}>{tag}</span>;
 }
 
+/** The grouped sidebar. A group holding no docs renders nothing at all. */
 function NavList({ activeSlug }) {
   return GROUPS.map((g) => {
     const items = docsInGroup(g.id);
     if (!items.length) return null;
-    const isRfc = g.id.startsWith("rfc");
-    const activeHere = items.some((d) => d.slug === activeSlug);
-    const list = (
-      <ul className="doc-nav-list">
-        {items.map((d) => (
-          <li key={d.slug}>
-            <Link
-              href={`/docs/${d.slug}/`}
-              aria-current={d.slug === activeSlug ? "page" : undefined}
-              className={d.slug === activeSlug ? "doc-nav-link is-active" : "doc-nav-link"}
-            >
-              <span className="truncate">{d.title}</span>
-              <Tag tag={d.tag} />
-            </Link>
-          </li>
-        ))}
-      </ul>
-    );
-    if (isRfc) {
-      return (
-        <details key={g.id} className="doc-nav-group" open={activeHere}>
-          <summary className="doc-nav-title">{g.title}</summary>
-          {list}
-        </details>
-      );
-    }
     return (
       <div key={g.id} className="doc-nav-group">
         <div className="doc-nav-title">{g.title}</div>
-        {list}
+        <ul className="doc-nav-list">
+          {items.map((d) => (
+            <li key={d.slug}>
+              <Link
+                href={`/docs/${d.slug}/`}
+                aria-current={d.slug === activeSlug ? "page" : undefined}
+                className={d.slug === activeSlug ? "doc-nav-link is-active" : "doc-nav-link"}
+              >
+                <span className="truncate">{d.title}</span>
+                <Tag tag={d.tag} />
+              </Link>
+            </li>
+          ))}
+        </ul>
       </div>
     );
   });

@@ -49,13 +49,14 @@ fn parse(resp: &str) -> io::Result<Response> {
     send(&mut stream, "peer", "POST", "/mcp", &[], b"{}")
 }
 
-/// The abort: a chunk header declaring a size near `usize::MAX`. The old
-/// accumulated-length check computed `body.len() + size`, which wraps — so this
-/// panicked "attempt to add with overflow" under the debug overflow-checks this
-/// test runs with, and in a release daemon wrapped below the cap and aborted on
-/// the multi-exabyte `vec![0u8; size]` that followed. A panic here fails the
-/// test outright, which is the assertion: reaching the `unwrap_err` at all
-/// proves the parser survived and merely rejected the response.
+/// The abort: a chunk header declaring a size near `usize::MAX`. An
+/// accumulated-length check that computes `body.len() + size` wraps on this
+/// input — panicking "attempt to add with overflow" under the debug
+/// overflow-checks this test runs with, and in a release daemon wrapping below
+/// the cap and aborting on the multi-exabyte `vec![0u8; size]` that follows. A
+/// panic here fails the test outright, which is the assertion: reaching the
+/// `unwrap_err` at all proves the parser survived and merely rejected the
+/// response.
 #[test]
 fn chunk_size_near_usize_max_is_rejected_not_overflowed() {
     // The wrap needs `body.len() + size` to exceed `usize::MAX`, so the size has
@@ -73,8 +74,8 @@ fn chunk_size_near_usize_max_is_rejected_not_overflowed() {
 }
 
 /// The same header with no preceding chunk — `usize::MAX` does not wrap against
-/// an empty body, so this always reached the cap check, but it MUST still never
-/// reach an allocation sized from the peer's claim.
+/// an empty body, so this reaches the cap check either way, but it MUST still
+/// never reach an allocation sized from the peer's claim.
 #[test]
 fn lone_usize_max_chunk_size_is_rejected() {
     let huge = format!("{:x}", usize::MAX);
@@ -84,8 +85,8 @@ fn lone_usize_max_chunk_size_is_rejected() {
 }
 
 /// An ordinary over-cap claim (9 MiB against the 8 MiB `MAX_RESPONSE`): no
-/// arithmetic hazard, but it pins the cap itself so the overflow fix cannot be
-/// "fixed" into letting large bodies through.
+/// arithmetic hazard, but it pins the cap itself so the overflow guard cannot
+/// be loosened into letting large bodies through.
 #[test]
 fn chunk_size_over_the_cap_is_rejected() {
     let resp = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n900000\r\n";
@@ -95,7 +96,7 @@ fn chunk_size_over_the_cap_is_rejected() {
 
 /// A chunk header that lies *small* — under the cap, so it passes every size
 /// check, but the bytes never arrive. Reading incrementally means a short read
-/// no longer errors on its own, so the length is re-checked after the fact:
+/// does not error on its own, so the length is re-checked after the fact:
 /// a truncated response must not parse as a successful shorter one.
 #[test]
 fn chunk_shorter_than_its_declared_size_is_rejected() {

@@ -1,19 +1,21 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Intelligence wire types — the **provider-neutral** representation the
-//! agentic loop reasons over. RFC 0006.
+//! agentic loop reasons over.
 //!
 //! The loop builds a [`Request`] and consumes a [`Response`] without knowing
 //! which provider answered. The `intel/openai.rs` and `intel/anthropic.rs`
 //! adapters translate to/from the on-the-wire JSON dialects; a model lacking
 //! native tool-calling falls back to the JSON-action shape parsed in
-//! `agentloop/action.rs`. Keeping the neutral model here (not a provider
-//! struct) is what holds the two-adapters-and-no-more line (RFC 0006 §wire).
+//! `agentloop/action.rs`. Because the neutral model lives here rather than in
+//! one provider's struct, supporting another provider costs one adapter and no
+//! change to the loop — that is what keeps the adapter count from growing into
+//! the rest of the runtime.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// One conversation message. `Assistant` may carry tool calls; `ToolResult`
-/// feeds a tool's output back as the next observation (RFC 0007 §loop).
+/// feeds a tool's output back into the conversation as the next observation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Message {
     System(String),
@@ -23,8 +25,9 @@ pub enum Message {
         tool_calls: Vec<ToolCall>,
     },
     /// A tool/exec result fed back into the loop. `is_error` carries the MCP
-    /// `isError: true` signal (a tool-domain failure observation, distinct
-    /// from a transport error — RFC 0004 §isError).
+    /// `isError: true` signal: the tool ran and reported a domain failure the
+    /// model should see and react to. A transport error never reaches here —
+    /// it fails the call instead of becoming an observation.
     ToolResult {
         id: String,
         content: String,
@@ -61,7 +64,7 @@ pub struct ToolCall {
 }
 
 /// A tool advertised to the model in the request `tools` field. Sourced from
-/// the scoped MCP `tools/list` (RFC 0004) plus agentd's self-tools (RFC 0005).
+/// the scoped MCP `tools/list` plus agentd's own self-tools.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolDef {
     pub name: String,
@@ -82,7 +85,7 @@ pub struct Request {
 }
 
 /// Why the model stopped — drives the loop's branch (tool-use vs final) and
-/// the `exhausted_tokens` terminal status (RFC 0007 §3.4).
+/// the `exhausted_tokens` terminal status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StopReason {
@@ -96,8 +99,8 @@ pub enum StopReason {
     Other,
 }
 
-/// Token accounting from one model call. Summed into the run budget by the
-/// supervisor (RFC 0003 §hierarchical-accounting).
+/// Token accounting from one model call. The supervisor sums these into the
+/// run's budget, and a child's usage also counts against its parent's.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     #[serde(default)]

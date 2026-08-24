@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! AWS **Signature Version 4** request signing (RFC 0031 §8) — the `kind: aws`
-//! credential provider. Signs each outbound request with AWS credentials so an
-//! endpoint behind AWS IAM (an API-Gateway MCP server, Bedrock behind a gateway)
-//! authenticates the agent by SigV4 rather than a bearer.
+//! AWS **Signature Version 4** request signing — the `kind: aws` credential
+//! provider. Signs each outbound request with AWS credentials so an endpoint
+//! behind AWS IAM (an API-Gateway MCP server, Bedrock behind a gateway)
+//! authenticates the agent by SigV4 rather than by a bearer token.
 //!
-//! Dependency-free (the minimalism moat): the whole algorithm is HMAC-SHA256 +
-//! SHA-256, both already in `crate::sha`; UTC date decomposition reuses the
-//! logger's `civil_from_days`. Credential **sources**: `env`/`static` (the
-//! standard `AWS_*` variables), `sso` (IAM Identity Center login → temporary
-//! creds, see [`super::aws_sso`]), `imds` (EC2 instance role, IMDSv2), and `irsa`
-//! (EKS web identity via STS). Temporary-credential sources are refetched as they
-//! near expiry; a session token is signed via `x-amz-security-token`.
+//! Dependency-free by design: the whole algorithm is HMAC-SHA256 + SHA-256,
+//! both already in `crate::sha`, and UTC date decomposition reuses the logger's
+//! `civil_from_days`. Credential **sources**: `env`/`static` (the standard
+//! `AWS_*` variables), `sso` (IAM Identity Center login → temporary creds, see
+//! [`super::aws_sso`]), `imds` (EC2 instance role, IMDSv2), and `irsa` (EKS web
+//! identity via STS). Temporary-credential sources are refetched as they near
+//! expiry; a session token is signed via `x-amz-security-token`.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -84,14 +84,14 @@ pub fn sigv4_headers(
     let canonical_query = canonical_query(query);
     let payload_hash = sha256_hex(body);
 
-    // Canonical + signed headers. host;x-amz-date always; x-amz-security-token
-    // is signed when a session token is present (a MUST for temporary creds).
+    // Canonical + signed headers. `host` and `x-amz-date` are always signed;
+    // `x-amz-security-token` must also be signed whenever a session token is
+    // present, or AWS rejects the signature for temporary credentials.
     let mut canonical_headers = format!("host:{host}\nx-amz-date:{amz_date}\n");
     let mut signed_headers = String::from("host;x-amz-date");
     if creds.session_token.is_some() {
-        // Header names sort lexically: security-token < x-amz-date? No — all are
-        // `x-amz-*`; the canonical order is host, x-amz-date, x-amz-security-token
-        // (d < s). Append after x-amz-date.
+        // Canonical headers must be sorted by lowercase name, and appending
+        // here keeps that order: host < x-amz-date < x-amz-security-token.
         let tok = creds.session_token.as_deref().unwrap_or("");
         canonical_headers.push_str(&format!("x-amz-security-token:{tok}\n"));
         signed_headers.push_str(";x-amz-security-token");
@@ -167,7 +167,7 @@ fn uri_encode(s: &str, keep_slash: bool) -> String {
     out
 }
 
-/// Where a signer's credentials come from (RFC 0031 §8).
+/// Where a signer's credentials come from.
 enum CredProvider {
     /// Long-term keys from the environment (`env`/`static`).
     Fixed(AwsCreds),
@@ -179,9 +179,10 @@ enum CredProvider {
     Irsa(Mutex<Option<(AwsCreds, u64)>>),
 }
 
-/// A transport signer (RFC 0031) that SigV4-signs each request. Temporary
-/// credentials (SSO / IMDS / IRSA) are reloaded/refetched as they near expiry, so
-/// a long-lived daemon keeps signing with live keys.
+/// A transport signer that SigV4-signs each request. Temporary credentials
+/// (SSO / IMDS / IRSA) are reloaded or refetched as they near expiry, so a
+/// long-lived daemon keeps signing with live keys instead of failing hours
+/// into a run when the original credential lapses.
 pub struct SigV4Signer {
     provider: CredProvider,
     region: String,
@@ -231,8 +232,10 @@ impl SigV4Signer {
         }))
     }
 
-    /// The credentials to sign with now — fixed, or reloaded/refetched for the
-    /// temporary-credential sources (cached until ~1 min before expiry).
+    /// The credentials to sign with right now: the fixed pair, the SSO record
+    /// re-read from the login cache on every call (so a fresh login is picked
+    /// up without a restart), or the IMDS/IRSA pair held in memory until it is
+    /// within a minute of expiry.
     fn current_creds(&self) -> Option<AwsCreds> {
         match &self.provider {
             CredProvider::Fixed(c) => Some(c.clone()),
@@ -244,8 +247,12 @@ impl SigV4Signer {
         }
     }
 
-    /// Serve a cached temporary credential, refetching when it's within a minute
-    /// of expiry. Fail-closed: a fetch error yields `None` (no signature).
+    /// Serve a cached temporary credential, refetching when it is within a
+    /// minute of expiry — the headroom covers the round-trip so a request never
+    /// rides a credential that expires in flight. An expiry of `0` means
+    /// "unknown" and is treated as non-expiring. Fail-closed: a fetch error
+    /// yields `None`, and the caller then signs nothing rather than signing
+    /// with a credential it knows to be stale.
     fn cached_or_fetch(
         &self,
         cache: &Mutex<Option<(AwsCreds, u64)>>,
@@ -271,8 +278,9 @@ impl SigV4Signer {
 }
 
 /// EC2 instance metadata credentials (IMDSv2). `AGENTD_IMDS_ENDPOINT` overrides
-/// the link-local base for testing. Connects directly (a fixed metadata address,
-/// intentionally outside the SSRF guard).
+/// the link-local base for testing. This connects directly, bypassing the SSRF
+/// guard: the address is a compile-time constant no request body or config can
+/// steer, which is exactly the property the guard exists to check for.
 fn fetch_imds(timeout: Duration) -> Result<(AwsCreds, u64), String> {
     let base = std::env::var("AGENTD_IMDS_ENDPOINT")
         .unwrap_or_else(|_| "http://169.254.169.254".to_string());
@@ -313,7 +321,9 @@ fn fetch_imds(timeout: Duration) -> Result<(AwsCreds, u64), String> {
             secret_key: c.secret_access_key,
             session_token: Some(c.token),
         },
-        // Refetch well before the ~6h IMDS lifetime; a fixed 50-min horizon.
+        // IMDS credentials live around six hours, but the horizon here is a
+        // fixed 50 minutes: refetching early is cheap and local, while riding a
+        // credential to its true expiry costs a failed outbound request.
         crate::auth::cache::now_ms() + 50 * 60_000,
     ))
 }
@@ -346,6 +356,10 @@ fn fetch_irsa(region: &str, timeout: Duration) -> Result<(AwsCreds, u64), String
             secret_key: sk,
             session_token: st,
         },
+        // STS reports the real `Expiration`, but the cache horizon here is a
+        // fixed 50 minutes, which assumes the default one-hour session: a role
+        // configured with a shorter `DurationSeconds` would be signed with past
+        // its expiry until the next refetch.
         crate::auth::cache::now_ms() + 50 * 60_000,
     ))
 }
@@ -422,8 +436,9 @@ impl ::mcp::http::RequestSigner for SigV4Signer {
         path: &str,
         body: &[u8],
     ) -> Vec<(String, String)> {
-        // Fail-closed: no creds (SSO not logged in / expired) → no header, the
-        // server answers 403 surfacing "run agentd login".
+        // Fail-closed: with no credentials (an SSO session never started or
+        // long expired) the request goes out unsigned and AWS answers 403,
+        // which names the problem, rather than the daemon blocking here.
         let Some(creds) = self.current_creds() else {
             return Vec::new();
         };

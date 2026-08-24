@@ -15,7 +15,9 @@
 //!   header-safe.
 //!
 //! Header/body mismatch or a missing required header is a `-32020`
-//! ([`crate::version::HEADER_MISMATCH_CODE`]) `400`.
+//! ([`crate::version::HEADER_MISMATCH_CODE`]) `400`: the mirrored fields must
+//! agree with the body, or a router and the server would act on different
+//! values for the same request.
 
 use crate::version::META_NS;
 use crate::wire::Implementation;
@@ -75,8 +77,8 @@ pub fn routing_headers(method: &str, params: &Value) -> Vec<(&'static str, Strin
     headers
 }
 
-/// Encode a value for an `Mcp-Name` / `Mcp-Param-*` HTTP header (transports
-/// §value-encoding). A plain, header-safe value passes through; anything else —
+/// Encode a value for an `Mcp-Name` / `Mcp-Param-*` HTTP header.
+/// A plain, header-safe value passes through; anything else —
 /// non-visible-ASCII, whitespace, or a string that itself looks like the base64
 /// sentinel — is carried as `=?base64?<standard-base64>?=` so it survives on the
 /// wire unambiguously and cannot be used for header injection.
@@ -98,8 +100,9 @@ fn is_header_safe(s: &str) -> bool {
 }
 
 /// Extract the `Mcp-Param-*` headers for a `tools/call` from a tool's
-/// `input_schema` + the call `arguments` (transports §custom-headers-from-tool-
-/// parameters). Walks the schema's `properties` chains (the only statically-
+/// `input_schema` + the call `arguments`, so an intermediary can route on a
+/// parameter without parsing the body. Walks the schema's `properties` chains
+/// (the only statically-
 /// reachable path); for each property annotated with `x-mcp-header`, reads the
 /// value at that path from `arguments` (omitting when absent), stringifies the
 /// primitive, and value-encodes it. Assumes the schema passed
@@ -131,9 +134,10 @@ fn collect_param_headers(schema: &Value, instance: &Value, out: &mut Vec<(String
     }
 }
 
-/// Stringify a primitive JSON value for a header (transports §value-encoding):
-/// string as-is, integer as decimal, boolean lowercase. A `number` (float),
-/// null, array, or object yields `None` — `number` is not header-permitted.
+/// Stringify a primitive JSON value for a header: string as-is, integer as
+/// decimal, boolean lowercase. A `number` (float), null, array, or object
+/// yields `None`. Floats are excluded deliberately — their text form is not
+/// round-trippable, so a header and its body value could disagree.
 fn primitive_to_string(v: &Value) -> Option<String> {
     match v {
         Value::String(s) => Some(s.clone()),
@@ -143,9 +147,11 @@ fn primitive_to_string(v: &Value) -> Option<String> {
     }
 }
 
-/// Validate every `x-mcp-header` annotation in a tool `input_schema` (transports
-/// §schema-extension). `Err(reason)` if any is invalid — the client then excludes
-/// the tool from `tools/list`. Enforces: non-empty; HTTP token syntax (no CR/LF/
+/// Validate every `x-mcp-header` annotation in a tool `input_schema`.
+/// `Err(reason)` if any is invalid — the client then excludes
+/// the tool from `tools/list` entirely, because a tool whose annotations cannot
+/// be honoured would otherwise be callable with headers silently dropped.
+/// Enforces: non-empty; HTTP token syntax (no CR/LF/
 /// controls); case-insensitively unique; a primitive type (string/integer/boolean,
 /// NOT number); and statically reachable (a chain of `properties` keys only — an
 /// annotation under items/composition/conditional/`$ref` is invalid).

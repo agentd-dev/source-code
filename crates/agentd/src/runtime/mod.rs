@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The **agentd runtime** (RFC 0026): the supervisor's event loop over
-//! durable state, the turn workers it spawns, and the lifecycle policy. Built
-//! beside the 1.x mode drivers and selected by a v2 configuration document;
-//! the 1.x drivers are removed at the P5 cut-over.
+//! The **agentd runtime**: the supervisor's event loop over durable state, the
+//! turn workers it spawns, and the lifecycle policy.
 //!
-//! Startup (RFC 0026 §8): parse+validate config → connect MCP servers
-//! (contained failures) → connect the store or refuse → restore → build the
-//! registry (validate overrides) → discover skills → resolve the instruction
-//! → load workflows → arm start nodes (`once` fires unless a live run was
-//! restored) → re-spawn pending subagents → `proc.ready` → the loop.
+//! Startup is strictly ordered, because each step depends on the last:
+//! parse+validate config → connect MCP servers (a failed server is contained,
+//! not fatal) → connect the store or refuse to start → restore → build the
+//! registry, validating overrides against the servers that actually answered →
+//! discover skills → resolve the instruction → load workflows → arm start
+//! nodes (`once` fires unless a live run was restored, so a restart does not
+//! re-fire it) → re-spawn pending subagents → announce `proc.ready` → enter
+//! the loop. Nothing accepts outside work before `proc.ready`.
 
 #[cfg(feature = "a2a")]
 pub mod a2a_server;
@@ -17,16 +18,16 @@ pub mod artifacts;
 pub mod audit;
 pub mod breaker;
 pub mod children;
-pub mod env; // system-prompt data + the default template (RFC 0038)
+pub mod env; // system-prompt data + the default template
 pub mod events;
 #[cfg(feature = "exec")]
-pub mod exec; // guarded local command runner behind the `exec` tool (RFC 0028; default-OFF)
+pub mod exec; // guarded local command runner behind the `exec` tool (default-OFF)
 pub mod goal;
 pub mod http_node;
-pub mod human; // human-in-the-loop: ask_human gates + fallbacks (RFC 0032 §16)
-pub(crate) mod instances; // instance-tier template children (RFC 0036 §6)
+pub mod human; // human-in-the-loop: ask_human gates + fallbacks
+pub(crate) mod instances; // instance-tier template children (a full daemon each)
 pub mod nested;
-pub mod pressure; // live per-turn activity for the display clients (RFC 0032 §17)
+pub mod pressure; // disk/memory pressure: shed new work, drain what is in flight
 pub mod reactor;
 pub mod reload;
 pub(crate) mod retire;
@@ -58,7 +59,6 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Run the 2.0 runtime for a loaded v2 configuration. Returns the exit code.
 /// Check every secret reference in `doc`; prompt for the promptable ones when
 /// `--prompt-missing` was given and a controlling terminal exists; report
 /// whatever is still missing — all of it, together — and return the exit code
@@ -112,6 +112,10 @@ fn reference_preflight(
     Some(crate::exit::USAGE)
 }
 
+/// Start the runtime for a loaded configuration and block until it stops.
+/// Returns the process exit code: startup failures report before the loop is
+/// entered, so a non-zero return here is always a refusal to run rather than a
+/// partially started daemon.
 pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
     let settings = loaded.settings.clone();
     let instance = settings.instance_name();
@@ -165,7 +169,8 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
         );
         return crate::exit::USAGE;
     }
-    // AAuth identity (RFC 0023) — signs outbound MCP requests tree-wide.
+    // AAuth identity — signs outbound MCP requests tree-wide. Set up before
+    // any server is dialed, so no request can leave unsigned.
     #[cfg(feature = "aauth")]
     if let Some(a) = &settings.security.aauth {
         let v1 = crate::config::AAuthSettings {
@@ -187,7 +192,7 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
         }
     }
 
-    // Resource containment (RFC 0009 §cgroup): arm the process-tree cgroup so
+    // Resource containment: arm the process-tree cgroup so
     // each spawned child (turn workers + subagents) is placed in its own leaf
     // with the configured `memory.max`/`pids.max`, and gets `cgroup.kill` atomic
     // teardown. A no-op unless `security.cgroup.spec` is set.
@@ -213,8 +218,10 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
         }
     };
     let model = settings.intelligence.model.clone().unwrap_or_default();
-    // RFC 0031: resolved `intelligence.headers` (per-dial) + an optional OAuth
-    // credential provider (device-login bearer, refreshing).
+    // Resolve `intelligence.headers` once here — they are applied per dial —
+    // plus an optional OAuth credential provider that refreshes its bearer.
+    // A header whose secret cannot be resolved is dropped rather than sent
+    // with an unresolved placeholder in it.
     let intel_headers: Vec<(String, String)> = settings
         .intelligence
         .headers
@@ -238,8 +245,9 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
         .map(|d| d.0)
         .unwrap_or(Duration::from_secs(60));
     for s in &settings.mcp.servers {
-        // RFC 0037 §5: the dial-time backstop behind boot validation — an
-        // uncatalogued endpoint under `closed` never reaches the socket.
+        // The dial-time backstop behind boot validation: under `closed`
+        // egress an endpoint with no service-catalog entry must never reach
+        // the socket, whichever path assembled it.
         if let Err(e) = crate::config::v2::egress_allows(
             &settings.services,
             settings.security.egress,
@@ -288,9 +296,10 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
         mcp_specs.insert(s.name.clone(), spec);
     }
 
-    // The store (RFC 0025). `none` ⇒ an in-process store for a job-shaped
-    // instance: a long-lived one either defaulted to `file` (RFC 0033 §5) or
-    // asked for `none` in writing, which validation already refused.
+    // The store. `none` means an in-process store, which is only ever the
+    // right answer for a job-shaped instance: a long-lived one either
+    // defaults to `file` or asks for `none` in writing, and validation
+    // refuses that combination before startup gets here.
     let store = match settings.store.kind {
         StoreKind::None => {
             log.warn(
@@ -323,7 +332,9 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
         Some(log.clone()),
     );
 
-    // Restore (RFC 0025 §6).
+    // Restore. A store that cannot be read is fatal: starting with an empty
+    // view of state a previous life already wrote would silently re-run
+    // finished work.
     let restored = match durable.restore() {
         Ok(r) => r,
         Err(e) => {
@@ -334,14 +345,14 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
             return crate::exit::MCP_REQUIRED_DOWN;
         }
     };
-    // The file store, named out loud (RFC 0033 §5.1). Durability is a property
-    // of the DIRECTORY, not of agentd: on a mounted volume this survives
-    // anything, on a container's writable layer it survives a restart of this
-    // process and not a reschedule. A store that implies more than it delivers
-    // is worse than the exit 2 it replaced, so the path, the life we are in and
-    // whether it was chosen or defaulted are all on one line. Logged after
-    // `restore` because that is where the manifest's `generation` becomes known
-    // (RFC 0025 §6) — a fresh instance has no manifest and is generation 1.
+    // The file store, named out loud. Durability is a property of the
+    // DIRECTORY, not of agentd: on a mounted volume this survives anything, on
+    // a container's writable layer it survives a restart of this process and
+    // not a reschedule. A store that implies more durability than it delivers
+    // is the dangerous case, so the path, the life we are in and whether it was
+    // chosen or defaulted all go on one line. Logged after `restore` because
+    // that is where the manifest's `generation` becomes known — a fresh
+    // instance has no manifest and is generation 1.
     if settings.store.kind == StoreKind::File {
         let root = crate::config::v2::file_store_root(&settings.store);
         log.info(
@@ -357,7 +368,9 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
         );
     }
 
-    // Registry (RFC 0028): overrides validated against the connected servers.
+    // The tool registry. Overrides are validated against the servers that
+    // actually connected, so an override naming a tool nothing offers is a
+    // startup error rather than a silent no-op.
     let registry = match Registry::build(&settings, &server_tools) {
         Ok(r) => r,
         Err(errs) => {
@@ -375,7 +388,7 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
         log.warn("registry.warning", json!({"warning": w}));
     }
 
-    // Skills (RFC 0028 §7).
+    // The skills catalogue, discovered from the connected MCP servers.
     let mut catalogue = skills::Catalogue::new(
         settings
             .skills
@@ -412,13 +425,16 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
     // Channels.
     let (events_tx, events_rx) = std::sync::mpsc::channel();
     // Child frames ride the SAME channel the loop parks on: a frame arriving
-    // while the reactor is in `recv_timeout` must WAKE it, not wait for the
-    // tick — a subagent's 5 ms answer used to cost 200 ms of latency exactly
-    // here (measured). The readers send DIRECTLY — no forwarder thread — so
+    // while the reactor is in `recv_timeout` must WAKE it rather than wait for
+    // the next tick, or a subagent's 5 ms answer costs a full tick of latency.
+    //
+    // The readers send DIRECTLY into this channel — no forwarder thread — so
     // that joining a child's reader is a real ordering guarantee: everything
-    // it wrote is IN the queue when join returns, and the reap requeued after
-    // it lands behind. (A hop thread broke exactly that on loaded machines:
-    // the requeued reap overtook frames still sitting in the hop's queue.)
+    // the child wrote is IN the queue when join returns, and a reap requeued
+    // after it necessarily lands behind those frames. An intermediate hop
+    // would break that, letting the requeued reap overtake frames still
+    // sitting in the hop's own queue and settle a child before its last
+    // words were read.
     let child_tx: crate::supervisor::spawn::FrameSink = {
         let events_tx = events_tx.clone();
         std::sync::Arc::new(move |node, msg| {
@@ -574,8 +590,10 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
             Ok(mut r) => {
                 r.dirty = false;
                 if !r.status.is_terminal() {
-                    // Replay policy (RFC 0027 §7): a `running` step is re-executed
-                    // (same idempotency key); a suspended step keeps its wait.
+                    // Replay policy: a step left `running` by the crash is
+                    // re-executed under the SAME idempotency key, so a remote
+                    // that already saw the first attempt can deduplicate it;
+                    // a suspended step keeps the wait it was parked on.
                     for (id, st) in r.steps.iter_mut() {
                         if st.status == StepStatus::Running {
                             log.info(
@@ -623,8 +641,9 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
     if restored.manifest.is_some() {
         log.info("restore.adopted", json!({"runs": rt.runs.len(), "contexts": rt.contexts.len(), "subagents": rt.subagents.len(), "timers": rt.timers.len(), "artifacts": rt.artifacts.len(), "inbox_pending": rt.inbox_queue.len(), "lost": restored.lost.len()}));
         rt.restore_pins();
-        // Audit the restore — a durable-state generation adoption (plan §3.11:
-        // restore is audited; `lost` entities are recorded).
+        // Audit the restore: adopting a previous life's durable state is a
+        // trust event, and any entity that could not be read back is recorded
+        // as `lost` so the gap is visible rather than inferred from silence.
         rt.audit(audit::AuditEvent {
             action: "restore",
             target: json!({"runs": rt.runs.len(), "subagents": rt.subagents.len(), "inbox_pending": rt.inbox_queue.len(), "lost": restored.lost.len()}),
@@ -635,7 +654,8 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
         });
     }
 
-    // The instruction (RFC 0028 §3): static text or a resource (read + subscribe).
+    // The instruction: either static text, or a resource URI that is read
+    // now and subscribed to so later updates reach the agent.
     if let Some(text) = rt.settings.agent.instruction.clone() {
         if crate::config::v2::looks_like_resource_uri(&text) {
             match rt.subscribe_instruction(&text) {
@@ -660,7 +680,8 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
         );
         return crate::exit::USAGE;
     }
-    // Workflows (RFC 0027) — refused definitions are a config error.
+    // Workflows — a definition that fails to load is a config error, not a
+    // warning: a daemon must not run with a workflow it silently dropped.
     // Phase 2 of the reference preflight: the workflows are loaded now, so the
     // ones that arrived from files, URLs and directories are visible. A secret
     // that only a fetched definition mentions is found HERE, before any start
@@ -731,8 +752,10 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
             }
         }
     }
-    // RFC 0026 §8: `auto` ⇒ the job shape when there is no A2A listener and no
-    // long-lived start node; `idle` ⇒ job shape; `drained` ⇒ a daemon.
+    // `lifecycle.run_until` decides whether this process is a job or a daemon:
+    // `idle` is the job shape, `drained` is a daemon, and `auto` infers the job
+    // shape when nothing can bring in outside work — no A2A listener and no
+    // long-lived start node.
     rt.job_shape = match rt.settings.lifecycle.run_until {
         crate::config::v2::RunUntil::Drained => false,
         crate::config::v2::RunUntil::Idle => true,
@@ -762,7 +785,8 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
             ));
         }
     }
-    // `lifecycle.watch_config`: a file change reloads like SIGHUP (RFC 0017 §5.2).
+    // `lifecycle.watch_config`: a file change reloads exactly like SIGHUP,
+    // through the same validate-then-apply path.
     #[cfg(all(unix, feature = "config-watch"))]
     if rt.settings.lifecycle.watch_config {
         for (path, _) in &loaded.files {
@@ -774,7 +798,7 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
     rt.arm_goal();
     rt.respawn_restored_subagents();
     rt.respawn_restored_instances();
-    // The A2A v2 transport (RFC 0029): the HTTPS listener for conversations,
+    // The A2A transport: the HTTPS listener for conversations,
     // command DataParts, and durable tasks. A bind/TLS/principals failure at
     // startup is fatal — the daemon cannot serve its only external channel.
     #[cfg(feature = "a2a")]
@@ -806,9 +830,9 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
                 // The listener stops the moment it is dropped, so the runtime
                 // holds it for as long as it is serving.
                 rt.a2a_listener = Some(serving.listener);
-                // The interface debug reads tail the live log ring (RFC 0016
-                // §7.2 / RFC 0032 §5) — install it only when debug is on, so
-                // the default build keeps its zero-cost logging hot path.
+                // The interface debug reads tail the live log ring. Install
+                // the ring only when debug is on, so the ordinary build keeps
+                // its zero-cost logging hot path.
                 if rt.settings.interface.enabled && rt.settings.interface.debug {
                     let cap = rt
                         .settings
@@ -833,7 +857,7 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
             }
         }
     }
-    // The inbound webhook surface (RFC 0027): a dedicated HTTP listener that turns
+    // The inbound webhook surface: a dedicated HTTP listener that turns
     // signed requests into workflow runs. A bind/TLS failure at startup is fatal —
     // a daemon that can't serve its declared webhooks is misconfigured.
     #[cfg(feature = "a2a")]
@@ -873,8 +897,8 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
             return crate::exit::USAGE;
         }
     }
-    // Observability serving (plan §3.11): the Prometheus `/metrics` surface and
-    // the health-file heartbeat (RFC 0016 §10 fleet liveness), when configured.
+    // Observability serving: the Prometheus `/metrics` surface and the
+    // health-file heartbeat a fleet supervisor watches, when configured.
     #[cfg(feature = "metrics")]
     if let Some(addr) = rt.settings.observability.metrics_addr.clone()
         && let Err(e) = crate::obs::serve::spawn(&addr, log.clone())
@@ -892,7 +916,7 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
             std::time::Duration::from_secs(10),
         );
     }
-    // OTLP logs export (plan §3.11, optional): mirror the JSON-lines log surface
+    // OTLP logs export (optional): mirror the JSON-lines log surface
     // to `<endpoint>/v1/logs` when `observability.otel.logs` is on.
     #[cfg(feature = "otel")]
     if rt.settings.observability.otel.logs == Some(true)
@@ -924,7 +948,8 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
         log.warn("prompt.reject", json!({"err": err}));
     }
     // A debug-only seam (`AGENTD_TEST_INBOX_FILE`): inject inbox events from a
-    // JSON file — the e2e suite's stand-in for the A2A server until P5.
+    // JSON file, so the e2e suite can drive the runtime without standing up an
+    // A2A listener. Compiled out of a release build without `internal-mocks`.
     #[cfg(any(feature = "internal-mocks", debug_assertions))]
     if let Ok(path) = std::env::var("AGENTD_TEST_INBOX_FILE") {
         match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|t| serde_json::from_str::<Value>(&t).map_err(|e| e.to_string())) {
@@ -945,7 +970,8 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
     rt.checkpoint(true);
     let code = rt.run_loop();
     let _ = &rt.last_manifest_flush;
-    // A job-shaped run prints its result on stdout (the 1.x `once` contract).
+    // A job-shaped run prints its result on stdout, so it composes with a
+    // shell pipeline the way any other one-shot command does.
     if rt.job_shape
         && let Some(out) = rt.job_output()
     {
@@ -961,10 +987,11 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
     code
 }
 
-/// A static **capability document** for `--capabilities` (RFC 0015 §5.2):
-/// describes the configured 2.0 surface with **no side effects** — it does not
-/// connect to MCP servers, read secrets, or start the loop. It reflects the
-/// configuration (what the agent is set up to do), not live state.
+/// A static **capability document** for `--capabilities`: describes the
+/// configured surface with **no side effects** — it does not connect to MCP
+/// servers, read secrets, or start the loop, so it is safe to run against a
+/// production configuration. It reflects the configuration (what the agent is
+/// set up to do), not live state.
 pub fn capabilities(loaded: &Loaded) -> Value {
     const START_KINDS: &[&str] = &[
         "once",
@@ -1052,9 +1079,9 @@ pub fn capabilities(loaded: &Loaded) -> Value {
         "store": format!("{:?}", s.store.kind).to_lowercase(),
         // For the file adapter the kind alone under-reports: what an operator
         // actually gets depends on the directory it lands in, and on whether
-        // they chose it or the long-lived default did (RFC 0033 §5.1). Additive
-        // and `null` for every other adapter, so the `store` string above stays
-        // the stable answer to "which adapter".
+        // they chose it or the long-lived default did. Additive, and `null`
+        // for every other adapter, so the `store` string above stays the
+        // stable answer to "which adapter".
         "store_file": (s.store.kind == StoreKind::File).then(|| json!({
             "path": crate::config::v2::file_store_root(&s.store).display().to_string(),
             "defaulted": loaded.doc.pointer("/store/kind").is_none(),
@@ -1080,11 +1107,12 @@ fn principal_match_desc(m: &crate::config::v2::PrincipalMatch) -> Value {
     }
 }
 
-/// Build the intelligence OAuth credential provider (RFC 0031 §7): a closure
-/// returning the current bearer (refreshing from the `agentd login intelligence`
-/// device-login cache). `None` when no oauth2 `intelligence.auth` is set (or
-/// without `--features oauth`), so the static `intelligence.token` path is
-/// byte-identical.
+/// Build the intelligence credential provider: a closure returning the current
+/// bearer, refreshed from the `agentd login intelligence` device-login cache.
+///
+/// Returns `None` when no bearer-style `intelligence.auth` is configured (and
+/// always without `--features oauth`), which leaves the static
+/// `intelligence.token` path untouched.
 fn intel_bearer_provider(
     settings: &crate::config::v2::Settings,
 ) -> Option<std::sync::Arc<dyn Fn() -> Option<String> + Send + Sync>> {
@@ -1092,8 +1120,10 @@ fn intel_bearer_provider(
     {
         let auth = settings.intelligence.auth.as_ref()?;
         let spec = auth.to_spec();
-        // SigV4 (`kind: aws`) is a per-request signature, not a bearer — the intel
-        // path has no generic signer hook yet, so it is a follow-up for LLM auth.
+        // SigV4 (`kind: aws`) signs each request over its own method, path
+        // and body, so there is no reusable bearer to hand back. That case is
+        // carried separately as an `AuthSpec` (see `Runtime::intel_aws_auth`)
+        // and turned into a per-dial signer at the call site.
         if spec.kind == "aws" {
             return None;
         }
@@ -1122,10 +1152,12 @@ fn intel_bearer_provider(
 }
 
 impl Runtime {
-    /// The current intelligence bearer (RFC 0031): the OAuth provider's token
-    /// (refreshing) when an `intelligence.auth` oauth2 block is configured, else
-    /// the static `intelligence.token`. Resolved fresh at each subagent spawn so
-    /// a child rides a live token without its own refresh machinery.
+    /// The current intelligence bearer: the credential provider's refreshing
+    /// token when an `intelligence.auth` oauth2 block is configured, else the
+    /// static `intelligence.token`. Resolved fresh at each subagent spawn so a
+    /// child rides a live token without carrying refresh machinery of its own,
+    /// and so a child spawned late in a long life does not inherit an expired
+    /// one.
     pub(crate) fn current_intel_bearer(&self) -> Option<String> {
         self.intel_bearer
             .as_ref()
@@ -1133,17 +1165,18 @@ impl Runtime {
             .or_else(|| self.intel_token.clone())
     }
 
-    /// The AWS SigV4 intelligence-auth spec (RFC 0031), when `intelligence.auth`
-    /// selects `kind: aws`. Threaded to subagents (which build the signer) and
-    /// used by the goal judge to SigV4-sign the LLM dial.
+    /// The AWS SigV4 intelligence-auth spec, when `intelligence.auth` selects
+    /// `kind: aws`. Threaded to subagents (which build the signer themselves)
+    /// and used by the goal judge to sign its own LLM dial, so every path that
+    /// dials intelligence carries the same credential.
     pub(crate) fn intel_aws_auth(&self) -> Option<crate::config::AuthSpec> {
         let a = self.settings.intelligence.auth.as_ref()?;
         (a.kind == crate::config::v2::AuthKind::Aws).then(|| a.to_spec())
     }
 
-    /// The configured `intelligence.dialect` (RFC 0031 §8), threaded into a
-    /// child's spawn payload so it selects the same wire adapter. `None` ⇒
-    /// OpenAI-compatible.
+    /// The configured `intelligence.dialect`, threaded into a child's spawn
+    /// payload so the child selects the same wire adapter as its parent.
+    /// `None` means the OpenAI-compatible dialect.
     pub(crate) fn intel_dialect(&self) -> Option<String> {
         self.settings.intelligence.dialect.clone()
     }
@@ -1164,12 +1197,14 @@ fn resolve_intel_token(
             .map(Some)
             .map_err(|e| format!("intelligence.token_file: {e}"));
     }
-    // The v1 env conventions still apply inside the intel client (AGENT_INTELLIGENCE_TOKEN…).
+    // No token in the configuration: the intel client falls back to its own
+    // environment conventions (`AGENT_INTELLIGENCE_TOKEN`…).
     Ok(None)
 }
 
 impl Runtime {
-    /// Read + subscribe the instruction resource (RFC 0028 §3).
+    /// Read the instruction resource and subscribe to it, so an update at the
+    /// server reaches this agent without a reload.
     pub(crate) fn subscribe_instruction(&mut self, uri: &str) -> Result<(), String> {
         let (server, res) = match uri.strip_prefix("mcp://").and_then(|r| r.split_once('/')) {
             Some((s, r)) => (Some(s.to_string()), r.to_string()),
@@ -1218,9 +1253,11 @@ impl Runtime {
         Err(last_err)
     }
 
-    /// Drain MCP notifications: an updated instruction resource re-reads it
-    /// and wakes the root (`instruction_updated`); `tools/list_changed` is
-    /// noted (registry rebuild lands with the P5 reload choreography).
+    /// Drain MCP notifications. An updated instruction resource is re-read and
+    /// wakes the root (`instruction_updated`). A `tools/list_changed` is only
+    /// recorded: the tool catalogue is rebuilt from a fresh `tools/list` at the
+    /// next config reload, so a server cannot change what this agent may call
+    /// without an operator-initiated reload.
     pub(crate) fn poll_mcp_notifications(&mut self) {
         let mut updated_instruction = false;
         let mut tools_changed = Vec::new();
@@ -1275,7 +1312,7 @@ impl Runtime {
             self.on_subscribe_resource(&server, &uri); // `subscribe` start nodes
         }
         for s in tools_changed {
-            self.log.info("mcp.tools_changed", json!({"server": s, "note": "registry rebuild lands with the P5 reload choreography"}));
+            self.log.info("mcp.tools_changed", json!({"server": s, "note": "recorded only; the tool catalogue is rebuilt at the next config reload"}));
         }
     }
 }

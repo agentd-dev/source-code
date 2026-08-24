@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Unix-domain-socket transport. RFC 0006 §transports.
+//! Unix-domain-socket transport.
 //!
 //! The common same-pod case: a model gateway (or an MCP server) listening on
 //! a unix socket, spoken to with the same hand-rolled HTTP/1.1 client as TCP

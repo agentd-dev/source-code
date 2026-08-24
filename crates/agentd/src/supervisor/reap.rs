@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Child reaping + orphan discipline. RFC 0003 §pid1-orphan.
+//! Child reaping + orphan discipline.
 //!
 //! Two responsibilities:
 //! 1. **Subreaper / PID-1 discipline.** `PR_SET_CHILD_SUBREAPER` makes
@@ -115,8 +115,8 @@ mod imp {
 
 pub use imp::{classify_status, is_init, set_child_subreaper};
 
-/// Set in an RFC 0036 instance-tier child's environment by the spawning
-/// parent. The child daemon sees it at startup and installs
+/// Set in an instance-tier child's environment by the spawning parent.
+/// The child daemon sees it at startup and installs
 /// [`install_instance_pdeathsig`] so a parent crash retires the child
 /// gracefully (SIGTERM → its own drain) instead of orphaning a daemon.
 pub const INSTANCE_CHILD_ENV: &str = "AGENTD_INSTANCE_CHILD";

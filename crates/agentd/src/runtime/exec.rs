@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The **guarded local command runner** behind the `exec` internal tool
-//! (RFC 0028 §exec) — compiled only under `--features exec`.
+//! The **guarded local command runner** behind the `exec` internal tool —
+//! compiled only under `--features exec`.
 //!
-//! agentd's posture is **no local execution** (RFC 0012); this runner exists only
-//! for operators who explicitly opt in, and it is defensive by construction:
+//! agentd's default posture is **no local execution**: a compromised model must
+//! not be able to reach the host it runs on. This runner exists only for
+//! operators who explicitly opt in at two layers (the `exec` cargo feature and
+//! `security.exec.enabled`), and it is defensive by construction:
 //!
 //! * **argv, never a shell** — `cmd` + `args` are passed to `execve` directly, so
 //!   there is no shell metacharacter interpretation and no injection surface.

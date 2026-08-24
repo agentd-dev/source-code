@@ -36,8 +36,8 @@ agentd --capabilities              # what THIS binary was built with
 curl -fsSL https://agentd.dev/install.sh | sh      # Linux amd64/arm64, checksum-verified
 ```
 
-Release binaries deliberately **omit `exec`** (the local command runner) and
-`cel`. Anything needing those is a source build:
+Release binaries deliberately **omit `exec`**, the local command runner.
+Anything needing it is a source build:
 
 ```sh
 cargo build -p agentd-cli --release --features a2a,exec
@@ -208,7 +208,7 @@ if the session should survive a restart.
 - [reference/coding-agent.md](reference/coding-agent.md) — the full
   coding-agent recipe.
 - Full docs: <https://agentd.dev/docs/> · configuration, security, interface,
-  workflows, MCP, and the RFCs behind them.
+  workflows, MCP and the node registry.
 
 ## Working on the agentd repo itself
 

@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! **Instance-tier children** (RFC 0036 §6): a template whose instruction
-//! defines machinery spawns a FULL DAEMON — the same binary, `-c` a composed
-//! config — under the supervisor's reaper, wired to the parent as an A2A peer
-//! over a unix socket, retired by `ttl`/`until`/`subagent.retire` through the
-//! child's own graceful drain. The composed document is structured data: RFC
-//! 0034 extraction ran once at boot (`config::templates`), params folded in as
-//! data, and the §8.2 guard refused any spawn whose params introduced
-//! machinery — so the child's own re-extraction at boot finds only prose.
+//! **Instance-tier children**: a template whose instruction defines machinery
+//! spawns a FULL DAEMON — the same binary, `-c` a composed config — under the
+//! supervisor's reaper, wired to the parent as an A2A peer over a unix socket,
+//! retired by `ttl`/`until`/`subagent.retire` through the child's own graceful
+//! drain.
+//!
+//! The composed document is structured data, never prose the child re-parses
+//! into configuration. Directive extraction runs once at boot in
+//! `config::templates`; params are folded in as data; and a spawn whose folded
+//! params reintroduce directive machinery is refused outright. Together those
+//! keep the child's own boot-time extraction from finding anything but prose,
+//! so a caller cannot smuggle configuration into a child through a param.
 
 use super::reactor::{Runtime, SubagentRecord, is_terminal_status};
 use super::tools::ToolOutcome;
@@ -23,7 +27,7 @@ use std::path::PathBuf;
 const KILL_GRACE_MS: u64 = 5_000;
 
 impl Runtime {
-    /// `subagent.run` with an instance-tier template (RFC 0036 §6).
+    /// `subagent.run` with an instance-tier template: spawn a full daemon.
     pub(crate) fn instance_run(
         &mut self,
         caller: &super::tools::ToolCaller,
@@ -31,7 +35,9 @@ impl Runtime {
         args: &Value,
     ) -> ToolOutcome {
         let err = |e: String| ToolOutcome::Ready(Value::String(e), true);
-        // Caps (Decision 10) — heavier than flat workers, so their own family.
+        // An instance child is a whole daemon, far heavier than a flat worker,
+        // so it is capped under its own `limits.subagents.instances` family
+        // rather than sharing the worker budget.
         let live = self
             .subagents
             .values()
@@ -94,7 +100,7 @@ impl Runtime {
         let prose = fold_params(&t.cleaned, &params);
         if params_introduced_machinery(&prose) {
             return err(format!(
-                "subagent.run refused: params for template '{tname}' introduced directive machinery (RFC 0036 §8.2)"
+                "subagent.run refused: params for template '{tname}' introduced directive machinery"
             ));
         }
         let handle = self.next_id("inst");
@@ -122,8 +128,9 @@ impl Runtime {
             .and_then(Value::as_bool)
             .or(t.spec.durable)
             .unwrap_or_else(|| self.work_durable_default());
-        // Phase B `mode: sync`: the spawn resolves when the child's declared
-        // result workflow first completes (the composed reporter dials home).
+        // `mode: sync` resolves the spawn when the child's declared result
+        // workflow first completes — the composed reporter dials home.
+        // `detached` returns as soon as the daemon is up.
         let mode = args
             .get("mode")
             .and_then(Value::as_str)
@@ -236,9 +243,10 @@ impl Runtime {
         }
     }
 
-    /// Compose the child's settings document (RFC 0036 §6): frozen machinery +
-    /// folded prose + inherited intelligence/catalog + parent-owned store,
-    /// listener and lifecycle. Structured data end to end.
+    /// Compose the child's settings document from four sources: the template's
+    /// frozen machinery, the folded prose, the parent's inherited intelligence
+    /// and service catalog, and the parent-owned store, listener and lifecycle.
+    /// Structured data end to end — the child never re-parses prose as config.
     #[allow(clippy::too_many_arguments)]
     fn compose_instance_doc(
         &self,
@@ -276,10 +284,13 @@ impl Runtime {
             .or_insert_with(|| json!([]));
         if let Some(a) = list.as_array_mut() {
             a.extend(wfs);
-            // Phase B `mode: sync`: a composed REPORTER — pure existing nodes
-            // (event start → switch pick → workflow.wait → typed a2a.send) —
-            // dials the parent's `_instance.result` op when the declared
-            // workflow first completes. The op never reaches a model.
+            // `mode: sync` needs the child to tell the parent when it is done,
+            // so compose a REPORTER workflow out of ordinary nodes — event
+            // start → switch pick → workflow.wait → typed a2a.send. It dials
+            // the parent's `_instance.result` op when the declared workflow
+            // first completes. Building it from existing node kinds means the
+            // reporting path has no privileged machinery of its own; the op
+            // itself is control plane and never reaches a model.
             if let Some(rw) = t
                 .spec
                 .result
@@ -305,9 +316,10 @@ impl Runtime {
                     }
                 }));
             }
-            // Phase B `mirror_streams`: one composed forwarder per stream —
-            // every child event rides the socket into the parent's same-named
-            // stream (appended there with source `instance:<handle>`).
+            // `mirror_streams`: one composed forwarder per stream — every child
+            // event rides the socket into the parent's same-named stream,
+            // appended there with source `instance:<handle>` so the parent can
+            // tell a mirrored event from one of its own.
             for m in t.spec.mirror_streams.iter().flatten() {
                 a.push(json!({
                     "name": format!("_agentd_mirror_{m}"), "version": 3, "steps": {
@@ -338,9 +350,10 @@ impl Runtime {
             lifecycle["until_signal"] = json!(u);
         }
         doc["lifecycle"] = lifecycle;
-        // The child inherits the parent's catalog and egress posture (RFC 0037
-        // Decision 5) and its trifecta override; a template cannot set these
-        // (REFUSED_FRAGMENT_KEYS).
+        // The child inherits the parent's service catalog, egress posture and
+        // trifecta override. A template cannot set these (they are in
+        // REFUSED_FRAGMENT_KEYS): a child must never be able to grant itself a
+        // wider trust budget than the parent that spawned it.
         if let Some(services) = self.settings_doc.get("services") {
             doc["services"] = services.clone();
         }
@@ -606,9 +619,11 @@ impl Runtime {
         true
     }
 
-    /// Restore-time respawn (RFC 0036 §6): live instance records whose config
-    /// still exists come back — their state is durable and their identity is
-    /// the handle. PDEATHSIG killed them with the old parent.
+    /// Restore-time respawn: live instance records whose composed config still
+    /// exists come back. PDEATHSIG takes a child down with its parent, so no
+    /// process from the previous life is still running; the record's handle is
+    /// the child's identity and its state is durable, so the respawned daemon
+    /// picks up where the dead one stopped.
     pub(crate) fn respawn_restored_instances(&mut self) {
         let candidates: Vec<(String, String, Option<Value>)> = self
             .subagents
@@ -652,8 +667,8 @@ impl Runtime {
         }
     }
 
-    /// `subagent.send` to an instance child (RFC 0036 §5): the message rides
-    /// A2A over the child's unix socket and lands in its conversation surface.
+    /// `subagent.send` to an instance child: the message rides A2A over the
+    /// child's unix socket and lands in its conversation surface.
     /// Fire-and-forget from the reactor's view (a thread does the dial).
     pub(crate) fn instance_send(&mut self, handle: &str, message: &str) -> ToolOutcome {
         let err = |e: String| ToolOutcome::Ready(Value::String(e), true);
@@ -706,10 +721,10 @@ impl Runtime {
         }
     }
 
-    /// The A2A peer view of live instance children (RFC 0036 Decision 6): the
-    /// handle is the peer name; a `singleton: true` template's name is an
-    /// alias. Consulted by `a2a_peer_conn` after configured peers (its only
-    /// caller, hence the gate).
+    /// The A2A peer view of live instance children: the handle is the peer
+    /// name, and a `singleton: true` template's name is an alias for its one
+    /// live child. Consulted by `a2a_peer_conn` only after the configured
+    /// peers, so a configured peer name always wins over a child's.
     #[cfg(feature = "a2a")]
     pub(crate) fn instance_peer_endpoint(&self, name: &str) -> Option<String> {
         self.subagents
@@ -728,9 +743,9 @@ impl Runtime {
             .and_then(|s| s.socket.as_ref().map(|sock| format!("unix://{sock}")))
     }
 
-    /// RFC 0036 Phase B: consume a child's `_instance.*` report. Returns true
-    /// when the event was an internal op (consumed either way — a malformed
-    /// one is logged, never surfaced to a model).
+    /// Consume a child's `_instance.*` report. Returns true when the event was
+    /// an internal op — consumed either way, because a malformed report is
+    /// control-plane plumbing and is logged rather than surfaced to a model.
     #[cfg(feature = "a2a")]
     pub(crate) fn handle_instance_op(&mut self, ev: &crate::state::InboxEvent) -> bool {
         let message = json!({"parts": ev.payload.get("parts").cloned().unwrap_or(Value::Null)});
@@ -765,8 +780,9 @@ impl Runtime {
         match op.as_str() {
             "_instance.result" => {
                 if let Some(s) = self.subagents.get_mut(&handle) {
-                    // First completion wins (RFC 0036 §9 Phase B: "the first
-                    // completed run"); later reports are ignored.
+                    // First completion wins: a child may report more than once
+                    // (a retry, a second run), and the handle's result must
+                    // stay the answer the parent already observed.
                     if s.result.is_none() {
                         s.result = Some(json!({
                             "status": args.get("status").cloned().unwrap_or(Value::Null),
@@ -816,11 +832,13 @@ impl Runtime {
         true
     }
 
-    /// RFC 0036 Phase B budget metering: a DURABLE child's manifest carries
-    /// its governor counters — read the lifetime total every few seconds and
-    /// charge the DELTA against the parent's windows, so a spawned desk draws
-    /// down its sponsor. (A non-durable child has no manifest; its usage is
-    /// invisible by construction and documented as such.)
+    /// Budget metering for instance children: a DURABLE child's manifest
+    /// carries its governor counters, so read the lifetime total every few
+    /// seconds and charge the DELTA against the parent's windows. Charging the
+    /// delta rather than the total is what keeps repeated polls from
+    /// double-billing, and it makes a spawned desk draw down its sponsor's
+    /// budget instead of spending off the books. A non-durable child has no
+    /// manifest, so its usage is invisible by construction.
     fn meter_instances(&mut self) {
         let now = now_ms();
         {

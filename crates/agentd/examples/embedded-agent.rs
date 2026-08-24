@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The AGENTIC LOOP embedded in a host application (RFC 0022) — not a CLI:
+//! The AGENTIC LOOP embedded in a host application — not a CLI:
 //! your program calls `run_loop` directly and gets `(Outcome, Usage)` back as
 //! ordinary Rust values. A CODE-REGISTERED tool rides along, so the model can
 //! call into YOUR functions mid-reasoning. Compiled by CI; running it needs a
@@ -13,7 +13,7 @@
 //!
 //! Optionally add remote MCP tools too: `AGENT_MCP=fs=https://mcp-fs.internal/mcp`.
 //!
-//! Trade-off to understand (RFC 0022 §3): this runs the reasoning IN YOUR
+//! Trade-off to understand: this runs the reasoning IN YOUR
 //! PROCESS — simplest integration, no process isolation. When you want the
 //! supervisor's kill-ladder/limits around the model (the stock posture), spawn
 //! the run as a supervised subtree instead: build a `SpawnPayload` and call

@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The **data steps** (RFC 0027 §5 "Data"): array and text operations without
-//! a model — `map`, `filter`, `reduce`, `sort`, `dedupe`, `chunk`, `parse` —
-//! as pure functions over JSON values. Element expressions are CEL (`item`,
-//! `index`, `acc`, plus the run data) or `{{template}}` strings; `by` keys are
-//! dotted paths.
+//! The **data steps**: array and text operations that need no model —
+//! `map`, `filter`, `reduce`, `sort`, `dedupe`, `chunk`, `parse` — as pure
+//! functions over JSON values. Element expressions are CEL (`item`, `index`,
+//! `acc`, plus the run data) or `{{template}}` strings; `by` keys are dotted
+//! paths. Being pure and model-free, these steps cost nothing to replay, so
+//! the runtime may re-run them after a crash instead of checkpointing each one.
 
 use super::template::{self, Data};
 use serde_json::{Map, Value, json};
@@ -259,7 +260,13 @@ pub fn parse(text: &str, format: Option<&str>) -> Result<Value, String> {
     }
 }
 
-/// A minimal CSV reader (RFC 4180 quoting; header row → objects).
+/// A minimal CSV reader with RFC 4180 quoting: the first non-blank line is the
+/// header, every later
+/// row becomes an object keyed by it, and a short row pads with nulls rather
+/// than dropping columns. Quoting is the usual convention — a `"` toggles the
+/// quoted state, `""` inside it is a literal quote, and a comma inside quotes
+/// is data. Rows are read line by line, so an embedded newline inside a quoted
+/// field is not supported.
 fn parse_csv(text: &str) -> Value {
     let rows: Vec<Vec<String>> = text
         .lines()

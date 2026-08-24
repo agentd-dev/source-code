@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The public exit-code contract. RFC 0011 §5 — this is a stable,
-//! machine-actionable API (e.g. for a Kubernetes `podFailurePolicy`); treat
-//! changes as breaking.
+//! The public exit-code contract: a stable, machine-actionable API (e.g. for a
+//! Kubernetes `podFailurePolicy`). Schedulers branch on these numbers, so treat
+//! any change to a code's meaning as breaking.
 //!
 //! | Code | Meaning                                             | Scheduler hint |
 //! |------|-----------------------------------------------------|----------------|
@@ -17,24 +17,26 @@
 //! | 137  | killed by SIGKILL (128+9, OS-set) — often OOM       | raise memory   |
 //! | 143  | killed by SIGTERM (128+15, OS-set) — ungraceful     | —              |
 //!
-//! A clean SIGTERM drain returns **0, not 143** (RFC 0011 §5.1). 137/143 are
-//! set by the OS when the kernel kills us; we never `exit(137)` ourselves.
+//! A clean SIGTERM drain returns **0, not 143**: draining on request is a
+//! success, not a kill. 137/143 only ever appear because the OS sets them when
+//! the kernel kills the process; agentd never calls `exit(137)` itself.
 //!
-//! RFC 0016 §5 freezes the *contract* around this table: it pins a version
-//! ([`EXIT_CODES`], surfaced at `surfaces.exit_codes`) and maps each code to a
-//! `podFailurePolicy` *intent* ([`pod_failure_intent`]) agentctl compiles into
-//! `onExitCodes` rules. This module owns neither the table values (RFC 0011 §5)
-//! nor the policy (agentctl) — only the frozen, versioned intent mapping.
+//! Around the table this module freezes two things a control plane depends on:
+//! a contract version ([`EXIT_CODES`], surfaced at `surfaces.exit_codes`) and a
+//! per-code `podFailurePolicy` *intent* ([`pod_failure_intent`]) that agentctl
+//! compiles into `onExitCodes` rules. agentd emits codes and intents only; the
+//! policy decision itself belongs to agentctl.
 
 use crate::agentloop::stop::TerminalStatus;
 
 /// The exit-code *contract* version (major.minor), surfaced in the manifest at
-/// `surfaces.exit_codes` (RFC 0016 §5.1 / §8.1). RFC 0011 §5 owns the table of
-/// code→meaning; this const freezes that mapping as a versioned public API a
-/// control plane authors `podFailurePolicy` rules against. Additive within a
-/// major; **any** change to a code's meaning or to the [`pod_failure_intent`]
-/// mapping is breaking and bumps the major (RFC 0016 §8.2). agentctl refuses to
-/// compile rules for an `exit_codes` major it does not understand (§8.3).
+/// `surfaces.exit_codes`. It freezes the code->meaning table plus the
+/// [`pod_failure_intent`] mapping as a versioned public API that a control plane
+/// authors `podFailurePolicy` rules against. New codes may be added within a
+/// major; **any** change to an existing code's meaning or intent is breaking and
+/// bumps the major, because a reader compiled against the old major would
+/// otherwise silently author the wrong policy. agentctl refuses to compile rules
+/// for an `exit_codes` major it does not understand.
 pub const EXIT_CODES: &str = "1.0";
 
 pub const SUCCESS: i32 = 0;
@@ -47,7 +49,7 @@ pub const MCP_REQUIRED_DOWN: i32 = 6;
 pub const BUDGET: i32 = 7;
 pub const DEADLINE: i32 = 124;
 
-/// Map a one-shot root subagent's outcome to an exit code (RFC 0011 §5.2).
+/// Map a one-shot root subagent's outcome to an exit code.
 /// `partial` is the result-body property, not a status: a `Completed` run
 /// that only partially satisfied the objective exits `3`. A budget-bounded
 /// run that nonetheless produced usable output is still reported under its
@@ -71,25 +73,26 @@ pub fn once_exit(status: TerminalStatus, partial: bool) -> i32 {
 }
 
 /// The OS-set codes (`128 + signo`). agentd never returns these itself
-/// ([`once_exit`] tops out at `DEADLINE` = 124, RFC 0011 §5.1); the kernel sets
-/// them when it kills us. We name them so [`pod_failure_intent`] can classify
-/// the kernel exit code an agentctl reader observes (RFC 0016 §5.3).
+/// ([`once_exit`] tops out at `DEADLINE` = 124); the kernel sets them when it
+/// kills the process. They are named here so [`pod_failure_intent`] can classify
+/// the kernel-set code a reader actually observes.
 pub const SIGKILL_EXIT: i32 = 137; // 128 + 9 — OOM / kubelet hard-kill
 pub const SIGTERM_EXIT: i32 = 143; // 128 + 15 — ungraceful SIGTERM (drain forced past budget)
 
-/// The `podFailurePolicy` *intent* a control plane compiles each exit code into
-/// (RFC 0016 §5.2). agentd emits the **code**; agentctl owns the actual
-/// `FailJob`/`Ignore`/`Count` choice and any operator override — this is the
-/// frozen hint it branches on, not a policy.
+/// The `podFailurePolicy` *intent* a control plane compiles each exit code into.
+/// agentd emits the **code**; agentctl owns the actual `FailJob`/`Ignore`/`Count`
+/// choice and any operator override — this is the frozen hint it branches on,
+/// not a policy.
 ///
-/// The five intents (RFC 0016 §5.2):
+/// The five intents:
 /// - `complete`  — `0`: not a failure; never retry.
 /// - `terminal`  — config/semantic error; a retry never helps ⇒ `FailJob`.
 /// - `retriable` — usually transient ⇒ left to `backoffLimit` (`Count`).
 /// - `policy`    — default `Count`, but the operator's `--budget-exit-code`
-///   remap (RFC 0011 §5.2) is honoured when present.
-/// - `infra`     — kernel-set kill (OOM / ungraceful SIGTERM); a *resource/config*
-///   fix (memory, grace period), never authored as a retry rule (§5.3).
+///   remap is honoured when present.
+/// - `infra`     — kernel-set kill (OOM / ungraceful SIGTERM); the fix is a
+///   resource or config change (memory, grace period), so it is never authored
+///   as a retry rule — retrying reproduces the same kill.
 ///
 /// An unrecognised code defaults to `retriable` — the conservative posture: an
 /// unknown failure is treated like a generic one and left to the backoff limit,
@@ -107,8 +110,7 @@ pub fn pod_failure_intent(code: i32) -> &'static str {
     }
 }
 
-/// Apply the operator's `--budget-exit-code` remap (RFC 0011 §5.2; ACC
-/// exit-codes.table.json `x-budget-exit-code-remap`). ONLY the two
+/// Apply the operator's `--budget-exit-code` remap. ONLY the two
 /// operator-tunable `policy`-intent budget codes are remappable — `EXIT_PARTIAL`
 /// (3) and `EXIT_BUDGET` (7); every other code (a clean `0`, a terminal refusal
 /// `5`, the `policy` deadline `124`, a kernel `137`) is returned UNCHANGED. With
@@ -196,7 +198,7 @@ mod tests {
 
     #[test]
     fn pod_failure_intent_matches_the_contract_table() {
-        // RFC 0016 §5.2 — the exact code→intent mapping agentctl compiles.
+        // The exact code->intent mapping agentctl compiles.
         assert_eq!(pod_failure_intent(SUCCESS), "complete");
         assert_eq!(pod_failure_intent(GENERIC), "retriable");
         assert_eq!(pod_failure_intent(USAGE), "terminal");
@@ -206,14 +208,14 @@ mod tests {
         assert_eq!(pod_failure_intent(MCP_REQUIRED_DOWN), "retriable");
         assert_eq!(pod_failure_intent(BUDGET), "policy");
         assert_eq!(pod_failure_intent(DEADLINE), "policy");
-        // Kernel-set codes are infra fixes, never retry rules (§5.3).
+        // Kernel-set codes are infra fixes, never retry rules.
         assert_eq!(pod_failure_intent(SIGKILL_EXIT), "infra");
         assert_eq!(pod_failure_intent(SIGTERM_EXIT), "infra");
     }
 
     #[test]
     fn pod_failure_intent_is_total_over_the_contract_and_defaults_safely() {
-        // Every code the table defines maps to one of the five §5.2 intents.
+        // Every code the table defines maps to one of the five intents.
         let intents = ["complete", "terminal", "retriable", "policy", "infra"];
         for code in [
             SUCCESS,
@@ -230,7 +232,7 @@ mod tests {
         ] {
             assert!(
                 intents.contains(&pod_failure_intent(code)),
-                "code {code} mapped outside the §5.2 intent set"
+                "code {code} mapped outside the documented intent set"
             );
         }
         // An unknown code is treated conservatively — retriable, never a silent
@@ -242,8 +244,8 @@ mod tests {
     #[test]
     fn intent_never_authors_a_retry_rule_for_a_terminal_or_infra_code() {
         // The control-plane invariant: a `terminal` config/semantic error and an
-        // `infra` kernel-kill must never be classified `retriable` (RFC 0016
-        // §5.2/§5.3) — retrying either is the wrong fix.
+        // `infra` kernel-kill must never be classified `retriable` — retrying
+        // either burns the backoff limit and reproduces the same failure.
         for code in [USAGE, REFUSED, SIGKILL_EXIT, SIGTERM_EXIT] {
             assert_ne!(
                 pod_failure_intent(code),
@@ -255,7 +257,7 @@ mod tests {
 
     #[test]
     fn exit_codes_contract_version_is_frozen_at_one_zero() {
-        // The manifest's surfaces.exit_codes value (RFC 0016 §5.1/§8.1).
+        // The manifest's surfaces.exit_codes value.
         assert_eq!(EXIT_CODES, "1.0");
     }
 

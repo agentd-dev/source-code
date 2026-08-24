@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! AWS **IAM Identity Center (SSO)** interactive login (RFC 0031 §8) — the
-//! `aws` provider's `source: sso`. This is the "enterprise login for Bedrock"
-//! flow: an OIDC **device authorization** grant against AWS SSO-OIDC yields an
-//! SSO access token, which the SSO portal exchanges for **temporary AWS
-//! credentials** (access key / secret / session token). Those are cached and
-//! SigV4-sign requests (see [`super::aws`]).
+//! AWS **IAM Identity Center (SSO)** interactive login — the `aws` provider's
+//! `source: sso`. This is the "enterprise login for Bedrock" flow: an OIDC
+//! **device authorization** grant against AWS SSO-OIDC yields an SSO access
+//! token, which the SSO portal exchanges for **temporary AWS credentials**
+//! (access key / secret / session token). Those are cached and SigV4-sign
+//! requests (see [`super::aws`]).
 //!
 //! AWS SSO-OIDC speaks JSON (camelCase), not form-encoding, so this has its own
 //! tiny HTTP helpers. Endpoints are the public `oidc.{region}.amazonaws.com` and
@@ -77,7 +77,10 @@ struct RoleCreds {
 /// Run the SSO login: register a public client, drive the device flow (printing
 /// the prompt), then exchange the SSO token for temporary AWS credentials. The
 /// result is a [`CachedCred`] whose `extra` holds the AWS keys and whose
-/// `expires_at_ms` is the credentials' expiry.
+/// `expires_at_ms` is the credentials' expiry — the SSO access token itself is
+/// deliberately not kept, since only the derived AWS keys sign requests. When
+/// the portal reports no expiry, the record falls back to one hour so a stale
+/// credential cannot be cached indefinitely.
 pub fn sso_login(
     p: &SsoParams,
     timeout: Duration,
@@ -86,7 +89,9 @@ pub fn sso_login(
 ) -> Result<CachedCred, String> {
     let oidc = oidc_base(&p.region);
 
-    // 1. Register a public client (RFC 8628 §3.1 precursor for AWS SSO-OIDC).
+    // 1. Register a public client — the AWS SSO-OIDC precursor to the RFC 8628
+    //    device grant. AWS SSO-OIDC issues a short-lived client
+    //    id/secret pair per login; there is no long-lived client to configure.
     let reg: RegisterClientResp = post_json(
         &format!("{oidc}/client/register"),
         &json!({"clientName": "agentd", "clientType": "public"}),
@@ -170,8 +175,10 @@ pub fn sso_login(
     })
 }
 
-/// Load the cached temporary AWS credentials for `target` (written by an SSO
-/// `agentd login`), if present and unexpired.
+/// Load the cached temporary AWS credentials for `target`, written there by an
+/// SSO login. The record's `expires_at_ms` is not consulted: an expired SSO
+/// session yields keys that AWS rejects at the endpoint rather than an early
+/// local failure, and the fix in both cases is to log in again.
 pub fn cached_creds(target: &str) -> Option<super::aws::AwsCreds> {
     let c = cache::load_file(&cache::default_dir(), target)?;
     let ak = c.extra.get("aws_access_key_id")?.as_str()?.to_string();

@@ -620,7 +620,7 @@ fn every_method_we_answer_is_spelled_the_way_the_spec_spells_it() {
         m::GET_EXTENDED_AGENT_CARD,
     ];
     for name in agentd::runtime::a2a_server::METHODS {
-        // `SubscribeToEvents` is agentd's own RFC 0032 interface feed, declared
+        // `SubscribeToEvents` is agentd's own interface feed for display clients, declared
         // as an extension rather than claimed as A2A.
         if *name == "SubscribeToEvents" {
             continue;

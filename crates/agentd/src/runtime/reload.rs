@@ -1,13 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! **Hot reload** of the v2 configuration (RFC 0030 §6, RFC 0017 semantics):
-//! SIGHUP or `lifecycle.watch_config` re-merges the files and re-validates; the
-//! restart-only paths must be unchanged (else `restart_required`, the running
-//! configuration stays); the reloadable partition applies at the loop's
-//! quiesce boundary — the flat tree makes most of it trivial: every turn worker
-//! is spawned fresh from the live settings, so a new intelligence endpoint,
-//! model, instruction, budget, tool override or workflow definition takes
-//! effect for the next unit of work. Live runs keep the definition they
-//! started with (pinned by hash).
+//! **Hot reload** of the configuration: SIGHUP or `lifecycle.watch_config`
+//! re-merges the files and re-validates. The reload is all-or-nothing — if any
+//! restart-only path changed the whole reload is refused as
+//! `restart_required` and the running configuration stays, so the daemon never
+//! ends up half on one configuration and half on another.
+//!
+//! The reloadable partition applies at the loop's quiesce boundary. The flat
+//! child tree makes most of it trivial: every turn worker is spawned fresh
+//! from the live settings, so a new intelligence endpoint, model, instruction,
+//! budget, tool override or workflow definition takes effect for the next unit
+//! of work without touching the units already in flight. Live workflow runs
+//! keep the definition they started with, pinned by hash, so a run cannot
+//! change shape halfway through.
 
 use super::reactor::Runtime;
 use crate::config::v2 as cfg;
@@ -29,7 +33,8 @@ impl Runtime {
         crate::signals::set_reloading(true);
         let outcome = self.reload_inner();
         crate::signals::set_reloading(false);
-        // Audit the reload — an operator/system reconfiguration (plan §3.11).
+        // Audit the reload: reconfiguring a running daemon is an operator
+        // action, and a refused reload is as worth recording as an applied one.
         let (label, atarget) = match &outcome {
             Ok(changed) => ("applied", json!({"trigger": trigger, "changed": changed})),
             Err(ReloadRefused::Invalid(errs)) => {
@@ -97,7 +102,8 @@ impl Runtime {
         self.settings_doc = loaded.doc;
         let mut changed = Vec::new();
 
-        // Intelligence (RFC 0018: hot-swap — the next spawned worker uses it).
+        // Intelligence is hot-swappable: workers in flight keep dialing the
+        // endpoint they were spawned with, the next spawned worker uses this.
         if old.intelligence.endpoints != new.intelligence.endpoints
             || old.intelligence.model != new.intelligence.model
             || old.intelligence.token != new.intelligence.token
@@ -256,7 +262,10 @@ impl Runtime {
                     changed.push("tools");
                 }
                 Err(errs) => {
-                    // Keep the old registry + old tools settings.
+                    // The rebuild failed, so the daemon stays on the tool
+                    // configuration it is already running: put back the tools
+                    // settings to match the registry that is still installed,
+                    // or the two would disagree about what is callable.
                     self.settings.tools = old.tools.clone();
                     return Err(ReloadRefused::Invalid(errs));
                 }

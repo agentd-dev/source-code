@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The runtime's **flat child tree** (RFC 0026 §2, D3): every turn worker and
-//! subagent is a direct child of the supervisor, spawned through the 1.x
-//! machinery (`supervisor::spawn` + the reaper + PDEATHSIG + process groups),
-//! tracked here with its purpose, liveness and cancellation, and torn down
-//! by the kill ladder on drain.
+//! The runtime's **flat child tree**: every turn worker and subagent is a
+//! direct child of the supervisor — the tree is one level deep, so there is
+//! exactly one process that can orphan work and exactly one place that reaps.
+//! Children are spawned through `supervisor::spawn` (the reaper + PDEATHSIG +
+//! process groups), tracked here with their purpose, liveness and
+//! cancellation, and torn down by the kill ladder on drain.
 
 use crate::subagent::protocol::{AgentMsg, ControlMsg, SpawnPayload};
 use crate::supervisor::kill::{Ladder, LadderAction, kill_group, term_group};
@@ -42,7 +43,8 @@ pub enum ChildKind {
         extra: Value,
         reservation: Option<u64>,
     },
-    /// A subagent (RFC 0009 payload) with a registry handle.
+    /// A subagent, addressed by its registry handle rather than its node id so
+    /// callers can keep referring to it across a restore.
     Subagent { handle: String },
 }
 
@@ -132,8 +134,8 @@ impl Children {
         self.pid_to_node.contains_key(&pid)
     }
     /// The reap channel — for supervised children spawned OUTSIDE this
-    /// registry (RFC 0036 instance-tier daemons, which have no control
-    /// channel) whose exits must still route to this reactor.
+    /// registry (instance-tier daemons, which have no control channel) whose
+    /// exits must still route to this reactor.
     pub fn reap_sender(&self) -> Sender<Reaped> {
         self.reap_tx.clone()
     }

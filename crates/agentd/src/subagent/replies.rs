@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The child-side **reply slots** for the agentd round-trips (RFC 0026 §2):
-//! a turn worker sends `ToolRequest`/`BudgetRequest` frames up and blocks until
-//! the control-reader thread delivers the matching `ToolResult`/`BudgetGrant`
-//! here (by `id`). One mutex + condvar; a closed channel or a cancel wakes
-//! every waiter with `None`.
+//! The child-side **reply slots** for supervisor round-trips: a turn worker
+//! sends `ToolRequest`/`BudgetRequest` frames up and blocks until the
+//! control-reader thread delivers the matching `ToolResult`/`BudgetGrant` here,
+//! matched by `id`. One mutex plus one condvar guards the whole map, and a
+//! closed channel or a set cancel flag wakes every waiter with `None` so no
+//! worker can outlive the supervisor that was going to answer it.
 
 use serde_json::Value;
 use std::collections::HashMap;
@@ -66,8 +67,12 @@ impl Replies {
         self.closed.load(Ordering::Relaxed)
     }
 
-    /// Block until the reply for `id` arrives, the deadline passes, the
-    /// channel closes, or `cancel` is set (polled every 100 ms).
+    /// Block until the reply for `id` arrives, the deadline passes, the channel
+    /// closes, or `cancel` is set. Cancel is not signalled through the condvar,
+    /// so the wait is capped at 100 ms per iteration to keep polling it.
+    /// Returns `None` for every non-delivery ending. An already-delivered reply
+    /// is claimed before any of those checks run, so a reply that landed before
+    /// the call wins even against an expired deadline.
     pub fn wait(&self, id: u64, deadline: Instant, cancel: &AtomicBool) -> Option<Reply> {
         let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
         loop {

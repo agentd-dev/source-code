@@ -3,14 +3,11 @@
 agentd has no opinions about *what* it can do — it ships almost no task tools of
 its own. Everything an agent can touch arrives over the **Model Context Protocol**
 (MCP, target spec **2025-11-25**): agentd is an MCP **client**, and the tools and
-resources of the servers you declare become the agent's entire action space
-([RFC 0004](../rfcs/0004-mcp-client-subset-and-codec.md)).
+resources of the servers you declare become the agent's entire action space.
 
 The other direction — a parent agent, a peer, or an operator driving *this*
-agent — is **A2A** over HTTPS
-([RFC 0029](../rfcs/0029-a2a-conversations-principals-commands.md), §2). One
-protocol out, one protocol in: agents nest and drive each other with no
-special-case wire.
+agent — is **A2A** over HTTPS. One protocol out, one protocol in: agents nest and
+drive each other with no special-case wire.
 
 ---
 
@@ -24,7 +21,7 @@ server you declare. agentd discovers them with `tools/list` and invokes them wit
 `tools/call`. If you declare zero servers, agentd's task toolbox is empty (its only
 built-in tools are its own control primitives — `subagent.*`, `workflow.*`,
 `memory.*`, `plan.*`, `skills.*`, `instruction.*` — which act on the agent itself,
-never on the world; [RFC 0028](../rfcs/0028-tools-registry-and-internal-tools.md)).
+never on the world).
 
 This is deliberate: the action space is configuration, not code. Swapping what
 an agent can do never means rebuilding agentd.
@@ -80,7 +77,7 @@ On connect, before anything else, agentd runs the MCP lifecycle. It pins
 { "jsonrpc":"2.0","id":1,"method":"initialize","params":{
     "protocolVersion":"2025-11-25",
     "capabilities":{},                                   // empty, deliberately
-    "clientInfo":{"name":"agentd","version":"2.0.0"}     // the binary's version; title omitted
+    "clientInfo":{"name":"agentd","version":"1.0.0"}     // the client's version; title omitted
 }}
 // server → agentd
 { "jsonrpc":"2.0","id":1,"result":{
@@ -155,8 +152,8 @@ classic agent bug; agentd keeps them strictly separate.
 
 > **Tool descriptions and annotations are untrusted.** They are
 > server-controlled text (the "tool poisoning" surface). agentd surfaces and
-> logs them for operator audit but never auto-trusts them. See the security
-> notes in [RFC 0012](../rfcs/0012-security-posture.md).
+> logs them for operator audit but never auto-trusts them. See
+> [security.md](security.md) for how untrusted text is contained.
 
 On `notifications/tools/list_changed` (only if the server advertised
 `tools.listChanged`) agentd records the change as `mcp.tools_changed`. The tool
@@ -215,7 +212,7 @@ content. So agentd does **notify-then-read**: on wake it issues a fresh
    state** — redelivery is harmless because you always act on what the resource
    *is now*, not on a stale diff. (Debounce, coalescing and filtering of these
    wakes are options on the `subscribe` start node — `debounce_ms`, `coalesce`,
-   `filter`; [RFC 0027](../rfcs/0027-workflow-dialect-3.md).)
+   `filter`; see [workflows.md](workflows.md).)
 2. Subscriptions are (re-)armed whenever the workflow that owns them is armed —
    at startup, and again after a config reload — so a restart restores every
    watched URI. Underneath, the notification stream reconnects on its own after
@@ -275,10 +272,11 @@ notification types, capability negotiation, the streaming rules, the error
 mapping and the version table. agentd tracks MCP by upgrading a dependency
 rather than by re-reading a document.
 
-That was not always true. agentd used to implement the protocol itself, and the
-argument against continuing is not that it was buggy — it is that a protocol
-implemented from your own reading of a specification fails *silently, in the
-peer*. Your tests encode the same reading as your code, so they agree with it.
+The argument for depending on the SDK rather than hand-rolling the wire is not
+that hand-rolled code is buggier in general — it is that a protocol implemented
+from your own reading of a specification fails *silently, in the peer*. Your
+tests encode the same reading as your code, so they agree with it, and the
+disagreement only shows up against someone else's server.
 
 ### The socket stays agentd's
 
@@ -302,7 +300,7 @@ newer constant exists — that is upstream saying what it is ready to speak, and
 overriding it would mean asking servers for a dialect the SDK may not fully
 implement. agentd gains the stateless revision on the release that promotes it,
 with no change here. The subscription mechanism follows the same rule:
-`resources/subscribe` at a legacy revision, `subscriptions/listen` at a stateless
+`resources/subscribe` at an older revision, `subscriptions/listen` at a stateless
 one, chosen from what was actually negotiated.
 
 ### What agentd still owns
@@ -324,10 +322,12 @@ stranger you authenticate.
 
 ## See also
 
-- [RFC 0004 — MCP client subset & wire codec](../rfcs/0004-mcp-client-subset-and-codec.md)
-- [RFC 0029 — A2A conversations, principals & commands](../rfcs/0029-a2a-conversations-principals-commands.md) — the external channel
-- [RFC 0026 — Agent loop & lifecycle](../rfcs/0026-agent-loop-and-lifecycle.md) · [RFC 0027 — Workflow dialect v3](../rfcs/0027-workflow-dialect-3.md)
-- [RFC 0028 — Tools registry & internal tools](../rfcs/0028-tools-registry-and-internal-tools.md)
-- [RFC 0009 — Subagent process model](../rfcs/0009-subagent-process-model.md)
-- [RFC 0025 — Durable state & store adapters](../rfcs/0025-durable-state-and-store-adapters.md)
-- [RFC 0012 — Security posture](../rfcs/0012-security-posture.md)
+- [`a2a.md`](a2a.md) — the external channel: conversations, principals, commands.
+- [`agent-loop.md`](agent-loop.md) — who calls these tools, and when a run ends.
+- [`workflows.md`](workflows.md) and [`node-registry.md`](node-registry.md) — the
+  `subscribe` start node and every other trigger and step.
+- [`subagents.md`](subagents.md) — how a child process inherits a narrowed slice
+  of this tool catalogue.
+- [`configuration.md`](configuration.md) — the full `mcp:` block, headers, auth
+  and the durable store.
+- [`security.md`](security.md) — SSRF, tool poisoning and the trifecta gate.

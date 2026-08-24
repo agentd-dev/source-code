@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! agentd **A2A v2 transport** end to end (RFC 0029): a v2 daemon binds the
-//! real HTTPS listener (plaintext loopback here, so the wiring is exercised
-//! through the actual binary without cert plumbing — mTLS is covered by net's
-//! tls_server tests and the resolver unit tests). A JSON-RPC peer drives the
-//! surface: a `status` command DataPart completes deterministically; a natural
-//! language message runs a turn worker (mock LLM) and the answer lands as the
-//! task artifact; `GetTask`/`ListTasks` read it back; `workflow.run` starts a
-//! run and the task tracks it to completion.
+//! agentd **A2A transport** end to end: the daemon binds the real HTTPS
+//! listener (plaintext loopback here, so the wiring is exercised through the
+//! actual binary without cert plumbing — mTLS is covered by net's tls_server
+//! tests and the resolver unit tests). A JSON-RPC peer drives the surface: a
+//! `status` command DataPart completes deterministically; a natural language
+//! message runs a turn worker (mock LLM) and the answer lands as the task
+//! artifact; `GetTask`/`ListTasks` read it back; `workflow.run` starts a run
+//! and the task tracks it to completion.
 #![cfg(all(unix, feature = "a2a"))]
 
 mod common;
@@ -77,9 +77,9 @@ fn rpc(addr: &str, id: i64, method: &str, params: Value) -> Value {
 /// socket accepting. The A2A listener binds before the workflow registry is
 /// populated, so a `workflow.run` that arrives in between is answered
 /// `-32602 no such workflow` — a real failure of the test's setup, not of the
-/// product. On an unloaded machine the two happen within the same millisecond
-/// and this never showed; on a loaded CI runner it did. `proc.ready` is logged
-/// after the workflows load, so that is the signal worth waiting for.
+/// product. On an unloaded machine the two happen within the same millisecond,
+/// so the window only opens on a loaded runner. `proc.ready` is logged after
+/// the workflows load, so that is the signal worth waiting for.
 fn wait_ready(addr: &str, daemon: &Daemon) {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
@@ -353,8 +353,8 @@ fn capabilities_describes_the_v2_a2a_surface_without_side_effects() {
 
 #[test]
 fn a2a_calls_are_audited_when_the_audit_log_sink_is_on() {
-    // The audit stream (plan §3.11): every A2A call is recorded as an `audit`
-    // event carrying the principal, action (method:op), and outcome.
+    // The audit stream: every A2A call is recorded as an `audit` event
+    // carrying the principal, action (method:op), and outcome.
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");

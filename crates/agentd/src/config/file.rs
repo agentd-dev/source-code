@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The declarative config **file** (RFC 0017 §3) + its JSON Schema (§4.2).
+//! The declarative config **file** + its JSON Schema.
 //!
 //! One document, two syntaxes: **YAML** (`.yaml`/`.yml`, read by the
 //! hand-rolled [`super::yaml`] subset reader — no `serde_yaml`, the minimalism
@@ -15,12 +15,12 @@
 //! knobs. It **never** carries secrets or per-environment scalars (those stay
 //! env/flag).
 //!
-//! Precedence (RFC 0011 §2.1 / RFC 0017 §3.2): `built-in default < FILE < env <
-//! flag`. The file is loaded first, then `Config::load` applies env
-//! and flags over it; a flag/env for the same key wins. List-valued keys
-//! (`mcp_servers`, `subscribe`, `a2a_peers`) *seed* the list — repeatable
-//! `--mcp`/`--subscribe`/`--a2a-peer` flags **add to** the file's list (the
-//! repeatable-flag semantics operators already expect, §3.2).
+//! Precedence: `built-in default < FILE < env < flag`. The file is loaded
+//! first, then `Config::load` applies env and flags over it; a flag/env for the
+//! same key wins. List-valued keys (`mcp_servers`, `subscribe`, `a2a_peers`)
+//! *seed* the list — repeatable `--mcp`/`--subscribe`/`--a2a-peer` flags **add
+//! to** the file's list rather than replacing it, matching the repeatable-flag
+//! semantics operators already expect.
 //!
 //! `deny_unknown_fields` makes a typo'd key (`max_token` vs `max_tokens`) a hard
 //! config error (exit 2) instead of a silently-ignored value — the single most
@@ -28,7 +28,7 @@
 //!
 //! The schema is **hand-written** (no `schemars` — a forbidden dependency) and
 //! kept faithful to this struct by a unit test asserting the schema's top-level
-//! properties match the struct's fields (so they can't silently drift, §4.2).
+//! properties match the struct's fields, so the two cannot diverge unnoticed.
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -206,9 +206,10 @@ fn kind_name(v: &Value) -> &'static str {
     }
 }
 
-/// The `x-agentd-contract-version` the schema carries (ties to the capabilities
-/// manifest's `contract_version`, RFC 0014 §5 / RFC 0017 §4.2). Kept equal to the
-/// manifest's contract version by `tests::schema_contract_version_matches_manifest`.
+/// The `x-agentd-contract-version` the schema carries. It is the same value as
+/// the capabilities manifest's `contract_version` — a tool that validated a
+/// document against this schema knows exactly which runtime contract it targets
+/// — and `tests::schema_contract_version_matches_manifest` holds the two equal.
 pub const SCHEMA_CONTRACT_VERSION: &str = "1.0";
 
 /// The deserialized config-file shape — one source of truth for the loader, the
@@ -222,14 +223,16 @@ pub struct ConfigFile {
     /// Optional; pins the file to a schema major agentctl validated against.
     pub config_version: Option<String>,
     /// `--intelligence` / `AGENTD_INTELLIGENCE` — the ordered intelligence
-    /// endpoint *list* URI (RFC 0018 §3.1). File-settable + **reloadable** so a
-    /// ConfigMap update can repoint the endpoint list as a hot-swap (RFC 0018 §5):
-    /// the reload fans `ctrl/swap_intel` to in-flight work and re-points new
-    /// spawns. The transport SCHEME is data, not a secret; the per-endpoint
-    /// credential is NEVER inline here (env/`_FILE` only, RFC 0012 §3.7).
+    /// endpoint *list* URI. File-settable and **reloadable** so a ConfigMap
+    /// update can repoint the endpoint list as a hot swap: the reload fans
+    /// `ctrl/swap_intel` to in-flight work and re-points new spawns. The
+    /// transport SCHEME is data, not a secret; the per-endpoint credential is
+    /// NEVER inline here — it comes from env or a `_FILE` path, so a config
+    /// document can be committed and mounted without carrying a credential.
     pub intelligence: Option<String>,
-    /// `--model-swap` / `AGENTD_MODEL_SWAP` (RFC 0018 §5.3): the model hot-swap
-    /// policy (`finish-on-old` | `restart-turn`). Reloadable. Validated against
+    /// `--model-swap` / `AGENTD_MODEL_SWAP` — the model hot-swap policy
+    /// (`finish-on-old` | `restart-turn`), deciding what an in-flight turn does
+    /// when the model changes under it. Reloadable. Validated against
     /// [`crate::config::SwapPolicy`].
     pub model_swap: Option<String>,
     /// `--model` / `AGENTD_MODEL` (reloadable param, never the transport).
@@ -249,9 +252,11 @@ pub struct ConfigFile {
     pub a2a_peers: Vec<A2aPeerFile>,
     /// `--log-level` / `AGENTD_LOG_LEVEL` (a string; validated against `Level`).
     pub log_level: Option<String>,
-    /// Declared intelligence HTTP headers (RFC 0006 §3). Values MAY interpolate
-    /// `{{secret:NAME}}` / `{{secret-file:PATH}}` (§6); the resolved secret never
-    /// lands here or in a log. An inline secret-shaped value is rejected (§3.1).
+    /// Declared intelligence HTTP headers. Values MAY interpolate
+    /// `{{secret:NAME}}` / `{{secret-file:PATH}}`; the resolved secret never
+    /// lands in this struct or in a log — only the reference does. A value that
+    /// looks like an inline secret is rejected outright, so a credential cannot
+    /// be committed to a config file by accident.
     #[serde(default)]
     pub intelligence_headers: BTreeMap<String, String>,
 }
@@ -266,38 +271,41 @@ pub struct LimitsFile {
     pub max_depth: Option<u32>,
     /// `--deadline` in whole seconds.
     pub deadline_secs: Option<u64>,
-    /// `--budget-tokens-lifetime` — the RFC 0025 per-instance cumulative token
-    /// cap across all runs/reactions (the CRD's `limits.lifetimeTokens`). `0` or
-    /// absent = unbounded.
+    /// `--budget-tokens-lifetime` — the per-instance cumulative token cap
+    /// across all runs and reactions, not per run (the CRD's
+    /// `limits.lifetimeTokens`). `0` or absent = unbounded.
     pub lifetime_tokens: Option<u64>,
 }
 
-/// One MCP server, reached over the v2.0.0 Streamable HTTP transport: a remote
-/// `endpoint` (`https://host[:port][/path]`, loopback `http://` for dev; RFC 0004) with optional
-/// secret-free auth `headers` (RFC 0012 — no local process spawn). `tags` is the
-/// RFC 0012 §3.1 glob→tags wire (the loader flattens a `{"*": ["sensitive"]}` map
-/// to the server's tag set).
+/// One MCP server, reached over the Streamable HTTP transport: a remote
+/// `endpoint` (`https://host[:port][/path]`, loopback `http://` for dev) with
+/// optional secret-free auth `headers`. There is no local process spawn — every
+/// server is a network peer, so config can never turn into command execution.
+/// `tags` is the glob→tags wire (the loader flattens a `{"*": ["sensitive"]}`
+/// map to the server's tag set).
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct McpServerFile {
     pub name: String,
-    /// Remote MCP endpoint (the v2.0.0 transport).
+    /// Remote MCP endpoint.
     pub endpoint: Option<String>,
     /// Auth/framing header templates — values MAY interpolate `{{secret:NAME}}` /
-    /// `{{secret-file:PATH}}`, never inline secrets (RFC 0012 §3.7).
+    /// `{{secret-file:PATH}}`, never inline secrets.
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
-    /// Glob→trifecta-tags (RFC 0012 §3.1). An untagged server ⇒ `untrusted_input`.
+    /// Glob→trifecta-tags. A server with no tags is treated as
+    /// `untrusted_input`, so forgetting to tag one narrows the trust budget
+    /// rather than widening it.
     #[serde(default)]
     pub tags: BTreeMap<String, Vec<String>>,
-    /// Sign requests to this server with the AAuth agent identity (RFC 0023).
+    /// Sign requests to this server with the AAuth agent identity.
     /// `None` inherits the global default (sign all when an identity is
     /// configured); `false` opts out; `true` opts in. Needs `--features aauth`.
     #[serde(default)]
     pub aauth: Option<bool>,
 }
 
-/// One A2A peer — maps to `--a2a-peer name=endpoint` (RFC 0020 §3).
+/// One A2A peer — maps to `--a2a-peer name=endpoint`.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct A2aPeerFile {
@@ -316,8 +324,8 @@ pub struct A2aPeerFile {
 }
 
 /// The list of `ConfigFile` field names, in declaration order — the single
-/// source the schema generator and the drift test both read, so the schema's
-/// `properties` can never silently diverge from the struct (§4.2).
+/// source both the schema generator and its unit test read, so the schema's
+/// `properties` can never silently diverge from the struct.
 pub const CONFIG_FILE_FIELDS: &[&str] = &[
     "config_version",
     "intelligence",
@@ -430,9 +438,9 @@ fn strip_jsonc(src: &str) -> String {
     out
 }
 
-/// Emit the hand-written **JSON Schema (Draft 2020-12)** of the config file
-/// (RFC 0017 §4.2). No `schemars` — a schema *library* is binary weight the moat
-/// forbids. Kept faithful to [`ConfigFile`] by `tests::schema_properties_match_struct_fields`.
+/// Emit the hand-written **JSON Schema (Draft 2020-12)** of the config file.
+/// No `schemars` — a schema *library* is binary weight the moat forbids. Kept
+/// faithful to [`ConfigFile`] by `tests::schema_properties_match_struct_fields`.
 ///
 /// `additionalProperties:false` mirrors `deny_unknown_fields`; `$id` pins the
 /// major; `x-agentd-contract-version` ties it to the manifest. agentctl
@@ -492,7 +500,7 @@ pub fn config_schema() -> Value {
                     },
                     "aauth": {
                         "type": "boolean",
-                        "description": "sign requests to this server with the AAuth agent identity (RFC 0023); omit to inherit the global default"
+                        "description": "sign requests to this server with the AAuth agent identity; omit to inherit the global default"
                     }
                 }
             },
@@ -797,7 +805,7 @@ intelligence_headers:
 
     #[test]
     fn schema_properties_match_struct_fields() {
-        // The hand-written schema cannot silently drift from the struct: its
+        // The hand-written schema cannot silently diverge from the struct: its
         // top-level `properties` keys must be EXACTLY the struct's fields.
         let s = config_schema();
         let props = s["properties"].as_object().unwrap();

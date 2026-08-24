@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! agentd **inbound webhook** surface (RFC 0027) end to end: a daemon binds a
-//! dedicated webhook listener; a signed HTTP POST fires a workflow run, an
+//! agentd **inbound webhook** surface end to end: a daemon binds a dedicated
+//! webhook listener; a signed HTTP POST fires a workflow run, an
 //! unsigned/badly-signed request is rejected 401, and a replay of the same
 //! idempotency key is deduplicated (no second run).
 #![cfg(all(unix, feature = "a2a"))]

@@ -3,14 +3,15 @@
 //! store (so "durable" means a second process, not a second function call):
 //!
 //!   1. a `schedule` start with `at:` — a ONE-SHOT instant — fires **exactly
-//!      once**. It used to re-arm itself on every tick past the instant
-//!      (`next_schedule_ms` handed back `now + at` forever), so a workflow the
-//!      operator asked to run once at 03:00 ran continuously from 03:00 on; and
-//!      because the re-arm was recomputed at boot, a restart started it again.
+//!      once**. An `at` that re-arms on every tick past the instant
+//!      (`next_schedule_ms` handing back `now + at` forever) turns a workflow
+//!      the operator asked to run once at 03:00 into one that runs continuously
+//!      from 03:00 on; and a re-arm recomputed at boot fires it afresh on every
+//!      restart.
 //!   2. a run restored with a `Suspended` step whose durable timer is GONE is
 //!      repaired at restore — re-armed (or failed) rather than left wedged.
-//!      Nothing but `on_timer` wakes a `sleep`, so a lost timer used to mean a
-//!      run that never moves again while the reactor ticks around it forever.
+//!      Nothing but `on_timer` wakes a `sleep`, so a lost timer means a run
+//!      that never moves again while the reactor ticks around it forever.
 //!
 //! Both tests are bounded: a wedged daemon must surface as a failing assertion,
 //! never as a hung CI job.
@@ -139,8 +140,8 @@ fn a_schedule_with_at_fires_exactly_once_and_not_again_after_a_restart() {
     let cfg = at_config(&dir);
 
     // Life 1: the instant has passed, so the run fires and completes — and then
-    // the daemon keeps ticking for the best part of a second. Every one of
-    // those ticks used to fire it again.
+    // the daemon keeps ticking for the best part of a second. A one-shot that
+    // re-arms would fire again on every one of those ticks.
     let (code, first) = run_daemon_until(&cfg, &dir, "run.done", 700);
     assert_eq!(code, Some(0), "life 1 drains; stderr:\n{first}");
     let fired = events(&first, "start.fired");
@@ -252,7 +253,7 @@ fn a_suspended_step_whose_timer_is_gone_is_repaired_at_restore() {
 
     // The crash window this simulates: the timer row was deleted, the effect it
     // was carrying was not yet durable. What restore sees is a `Suspended` step
-    // pointing at a timer that no longer exists.
+    // pointing at a timer that is not there.
     for row in &rows {
         std::fs::remove_file(row).expect("delete the timer row");
     }

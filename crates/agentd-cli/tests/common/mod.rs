@@ -66,8 +66,6 @@ pub fn spawn_mock_mcp(uri: &str, emit: bool) -> MockMcp {
     }
 }
 
-/// A unique path under the temp dir (per-process + per-call), for addr-files
-/// and other per-test artifacts.
 /// A free loopback TCP port (bind :0, read it back, release).
 #[allow(dead_code)]
 pub fn free_port() -> u16 {
@@ -78,6 +76,8 @@ pub fn free_port() -> u16 {
         .port()
 }
 
+/// A unique path under the temp dir (per-process + per-call), for addr-files
+/// and other per-test artifacts.
 pub fn unique_path(tag: &str, ext: &str) -> String {
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);

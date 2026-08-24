@@ -103,9 +103,9 @@ fn client_credentials_fetches_then_caches() {
 
 #[test]
 fn oauth_bearer_signer_injects_a_refreshing_authorization_header() {
-    // The RFC 0031 wiring: an `mcp.servers[].oauth` block becomes a transport
+    // The wiring: an `mcp.servers[].oauth` block becomes a transport
     // `RequestSigner` that fetches + injects `Authorization: Bearer <token>` on
-    // every request — proving OAuth client-credentials is now *live*, not inert.
+    // every request — a configured oauth block reaches the wire, once per token.
     use agentd::mcp::http::RequestSigner;
     // SAFETY: single-threaded test; unique var name.
     unsafe { std::env::set_var("MCP_OAUTH_SIGNER_SECRET", "sec") };

@@ -2,10 +2,10 @@
 //! The **environment data** a system-prompt template renders, and the built-in
 //! default template that renders it.
 //!
-//! Before this module the prompt's sections were formatted in Rust and gated
-//! by a fixed list of names. Now the runtime exposes what it knows as *data*
-//! and the shape lives in a template — so the same knobs an operator has
-//! (loops, conditions, limits, field access) are the ones the default uses.
+//! The runtime exposes what it knows as *data* and the shape lives in a
+//! template, so the same knobs an operator has (loops, conditions, limits,
+//! field access) are the ones the built-in default uses. Nothing the default
+//! renders is reachable only from Rust.
 //!
 //! ## The ordering is a cache decision, not a taste one
 //!
@@ -254,9 +254,9 @@ impl Runtime {
 
     /// The internal tools this instance ACTUALLY grants, as tool-name families.
     ///
-    /// The persona line used to recite a hardcoded list, so an instance that
-    /// narrowed `agent.tools.internal` still told the model it had
-    /// `subagent.*` — briefing it on tools it would then be refused.
+    /// Derived from the live registry rather than a fixed list, so an instance
+    /// that narrows `agent.tools.internal` is never briefed on a family it
+    /// would then be refused — the persona and the gate agree by construction.
     fn granted_internal_tools(&self) -> Vec<String> {
         let mut families: Vec<String> = Vec::new();
         for t in self.registry.iter() {

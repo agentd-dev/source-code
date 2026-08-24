@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! **Event streams** (RFC 0035, Phase A): named, durable, append-only
+//! **Event streams**: named, durable, append-only
 //! sequences workflows publish to (`emit`) and consume from (`stream`
 //! starts) — including each other's, which is the point: streams are
 //! instance-shared, so one workflow's `emit` is another's trigger.
 //!
-//! The Phase-A property no existing edge has: a **durable consumer offset**.
+//! The property no other edge has: a **durable consumer offset**.
 //! `subscribe` collapses history to the latest value, `webhook` and `signal`
 //! drop what nobody was ready for; a `stream` consumer that was down for an
 //! hour processes the hour's events after restart, in order. Delivery is

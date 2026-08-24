@@ -1,20 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The three A2A workflow nodes that used to be refused at parse time:
-//! the `a2a` START node, `a2a.send` and `a2a.wait` (RFC 0027 §5).
+//! The three A2A workflow nodes, from parse through dispatch: the `a2a` START
+//! node, `a2a.send` and `a2a.wait`.
 //!
 //! What they add is the ASYNCHRONOUS half of an A2A conversation.
-//! `a2a.delegate` was the only implemented one, and it is request/response: it
-//! blocks a step until the peer produces a result. That cannot express "a peer
-//! asked me to do something" (inbound became a conversational turn, never a
-//! run) or "tell a peer and carry on, the answer comes later".
+//! `a2a.delegate` is request/response: it blocks a step until the peer produces
+//! a result. That cannot express "a peer asked me to do something" (which would
+//! otherwise be only a conversational turn, never a run) or "tell a peer and
+//! carry on, the answer comes later".
 //!
 //! These tests drive a real daemon over a real A2A listener.
 
 // Both features are load-bearing, not incidental: without `a2a` there is no
 // listener to receive a message, and without `workflow` the configs below do
-// not load at all. Ungated, this file compiled into every feature combination
-// the CI matrix builds and failed each one at `wait_ready` — a daemon that
-// never becomes ready because the surface under test was never built.
+// not load at all. Ungated, this file compiles into every feature combination
+// the CI matrix builds and fails each one at `wait_ready` — a daemon that never
+// becomes ready because the surface under test was never built.
 #![cfg(all(unix, feature = "a2a", feature = "workflow"))]
 
 mod common;
@@ -126,9 +126,9 @@ fn wait_for(d: &Daemon, needle: &str, secs: u64) -> bool {
 }
 
 /// An inbound COMMAND fires a workflow run instead of becoming a conversational
-/// turn. This is the whole point of the `a2a` start node: before it, a peer
-/// could only ever talk to the agent, never ask it to run something (short of
-/// the built-in `workflow.run` command).
+/// turn. This is the whole point of the `a2a` start node: without one, a peer
+/// can only ever talk to the agent, never ask it to run something (short of the
+/// built-in `workflow.run` command).
 #[test]
 fn an_a2a_start_node_turns_an_inbound_command_into_a_run() {
     let port = free_port();
@@ -179,10 +179,9 @@ fn an_a2a_start_node_turns_an_inbound_command_into_a_run() {
     let _ = std::fs::remove_file(&cfg);
 }
 
-/// A message whose command does NOT match any start node keeps its old
-/// behaviour — it is a conversation, not a trigger. The router must narrow, not
-/// swallow: a start node that matched everything would silently stop the agent
-/// answering anyone.
+/// A message whose command does NOT match any start node is still a
+/// conversation, not a trigger. The router must narrow, not swallow: a start
+/// node that matched everything would silently stop the agent answering anyone.
 #[test]
 fn a_non_matching_message_is_still_a_conversation() {
     let port = free_port();
@@ -226,10 +225,10 @@ fn a_non_matching_message_is_still_a_conversation() {
 
 /// `a2a.wait` is woken by an arriving message rather than only by its timeout.
 ///
-/// This is the half that did not exist: `wait {on: message}` suspended on a
-/// conversation and nothing ever resolved it, so it could only ever time out.
-/// The workflow below suspends immediately and must complete as soon as a
-/// message lands on its conversation — well inside the generous timeout.
+/// The failure this guards against: a `wait {on: message}` that suspends on a
+/// conversation with nothing to resolve it can only ever time out. The workflow
+/// below suspends immediately and must complete as soon as a message lands on
+/// its conversation — well inside the generous timeout.
 #[test]
 fn an_a2a_wait_is_woken_by_the_message_it_waits_for() {
     let port = free_port();

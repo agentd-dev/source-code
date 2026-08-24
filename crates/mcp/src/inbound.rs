@@ -7,9 +7,9 @@
 //! matching client capability may call `elicitation/create` (ask the human) or
 //! `roots/list` (what may I operate on?).
 //!
-//! Until now this client dropped every inbound request on the floor. A server
-//! that pinged us saw silence and was entitled to consider the connection dead;
-//! a server that wanted to ask the operator a question had no way to.
+//! Dropping an inbound request on the floor is not a neutral act: a server that
+//! pings and hears silence is entitled to consider the connection dead, and a
+//! server that wants to ask the operator a question is left with no channel.
 //!
 //! The rules this module encodes:
 //!
@@ -87,9 +87,9 @@ impl Capabilities {
             caps.insert("elicitation".into(), json!({}));
         }
         if self.roots {
-            // `listChanged` stays false: we have no notification path for root
-            // changes yet, and advertising one we do not send is worse than not
-            // advertising it.
+            // `listChanged` stays false: there is no notification path for root
+            // changes, and advertising a notification we never send leaves a
+            // server waiting on an update that cannot arrive.
             caps.insert("roots".into(), json!({"listChanged": false}));
         }
         Value::Object(caps)
@@ -205,8 +205,8 @@ mod tests {
 
     #[test]
     fn ping_is_answered_even_with_no_handler_or_capabilities() {
-        // The liveness probe must not depend on what the host implements —
-        // this is the gap that let a server consider us dead.
+        // The liveness probe must not depend on what the host implements:
+        // silence here lets a server conclude the connection is dead.
         let r = answer(&req("ping", json!({})), Capabilities::default(), None);
         assert_eq!(r.result, Some(json!({})));
         assert!(r.error.is_none());

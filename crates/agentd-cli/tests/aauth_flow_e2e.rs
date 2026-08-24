@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! FULL end-to-end AAuth [RFC 0023] over the REAL MCP transport — Case C
-//! (Person-Server / user-scoped identity) and Case B (resource-managed access
-//! token). Drives an actual `McpClient` (with the AAuth `RequestSigner`
-//! installed) against live mock sockets: an Agent Provider, a Person Server,
-//! and an AAuth-verifying MCP server. Proves the reaction loop:
+//! FULL end-to-end AAuth over the REAL MCP transport — Case C (Person-Server /
+//! user-scoped identity) and Case B (resource-managed access token). Drives an
+//! actual `McpClient` (with the AAuth `RequestSigner` installed) against live
+//! mock sockets: an Agent Provider, a Person Server, and an AAuth-verifying MCP
+//! server. Proves the reaction loop:
 //! sign → 401 requirement → satisfy (PS exchange / adopt) → re-sign → 200.
 //! [feature: aauth]
 #![cfg(feature = "aauth")]

@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! **AAuth [DRAFT]** — agent-side auth for calling AAuth-protected MCP servers
-//! (RFC 0023). The agent holds an Ed25519 key, gets a short-lived agent token
-//! from an Agent Provider, and **signs every MCP request** (RFC 9421); the MCP
-//! server verifies the signature against the provider's keys and knows exactly
-//! which agent is calling — no API key, no shared secret. [feature: aauth]
+//! **AAuth** (a draft agent-identity protocol) — agent-side auth for calling
+//! AAuth-protected MCP servers. The agent holds an Ed25519 key, gets a
+//! short-lived agent token from an Agent Provider, and **signs every MCP
+//! request** (RFC 9421); the MCP server verifies the signature against the
+//! provider's keys and knows exactly which agent is calling — no API key, no
+//! shared secret. [feature: aauth]
 //!
-//! ## What ships
+//! ## The three access modes
 //!
-//! All three access modes, end to end (RFC 0023 §5, the request loop):
+//! A server decides how it wants to be reached; this client covers all three:
 //! - **Case A (identity-based):** keygen/persist, enroll, agent-token
 //!   cache+refresh, and per-request RFC 9421 signing on every MCP request.
 //! - **Case B (resource-managed):** an `AAuth-Access` token a server returns is
@@ -49,7 +50,7 @@ pub fn verify_ed25519(public_key: &[u8], msg: &[u8], signature: &[u8]) -> Result
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-/// The process-global AAuth client (RFC 0023). Installed once — in the root and,
+/// The process-global AAuth client. Installed once — in the root and,
 /// across the re-exec boundary, in each subagent from its spawn payload (the
 /// agent has ONE identity for its whole process tree). The MCP connect
 /// chokepoint (`mcp::from_spec`) reads it to sign outbound requests. Empty in a
@@ -74,7 +75,7 @@ pub fn installed() -> Option<&'static AAuthClient> {
     INSTALLED.get()
 }
 
-/// Build + install the process AAuth client from settings (RFC 0023): load or
+/// Build + install the process AAuth client from settings: load or
 /// create the durable key, resolve a `{{secret:…}}` enrollment token, and
 /// install the request signer. Called once by the root and by each subagent
 /// (from its spawn payload). Idempotent; a bad key file / secret is a clear
@@ -128,7 +129,7 @@ pub struct AAuthClient {
 impl AAuthClient {
     /// Build from a key + provider config. The key is loaded/created by the
     /// caller (`AgentKey::load_or_create`), so a self-hosted agent controls
-    /// where its durable identity lives (RFC 0023 §Step 0).
+    /// where its durable identity lives.
     pub fn new(key: AgentKey, apd: ApdConfig, timeout: Duration) -> AAuthClient {
         let person_server = apd.person_server.clone();
         AAuthClient {
@@ -142,8 +143,9 @@ impl AAuthClient {
     /// Enroll + fetch the first token now, so a misconfig (unreachable apd, bad
     /// enrollment token) fails at startup rather than on the first MCP call.
     /// Returns the resolved agent identity. First validates the Agent-Provider
-    /// metadata document (RFC 0023 §7.1 G1): a host-poisoned `aauth-agent.json`
-    /// (issuer ≠ the configured provider) aborts here rather than after enroll.
+    /// metadata document: a host-poisoned `aauth-agent.json` (issuer ≠ the
+    /// configured provider) aborts here rather than after we have already
+    /// enrolled our durable public key with the wrong party.
     pub fn prime(&self) -> Result<String, String> {
         self.apd.verify_provider_metadata()?;
         self.apd.token()?;
@@ -155,9 +157,9 @@ impl AAuthClient {
         self.apd.agent_id()
     }
 
-    /// Learn a server's discovery metadata (RFC 0023 §Step 3): record whether it
-    /// requires a `content-digest` cover. Best-effort; called by `from_spec` at
-    /// connect. `endpoint` is the MCP server URL.
+    /// Learn a server's discovery metadata: record whether it requires a
+    /// `content-digest` cover. Best-effort; called by `from_spec` at connect.
+    /// `endpoint` is the MCP server URL.
     pub fn discover(&self, authority: &str, endpoint: &str) {
         if let Some(meta) = discover::fetch(endpoint, self.timeout) {
             self.state
@@ -179,8 +181,9 @@ impl AAuthClient {
     }
 }
 
-/// The [`::mcp::http::RequestSigner`] impl (RFC 0023 §5) — sign every request,
-/// and react to the server's `AAuth-Requirement`.
+/// The [`::mcp::http::RequestSigner`] impl — sign every request, and react to
+/// the server's `AAuth-Requirement` so a 401 that names a satisfiable
+/// requirement becomes one retry rather than a hard failure.
 impl ::mcp::http::RequestSigner for AAuthClient {
     fn sign(
         &self,

@@ -1,14 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The durable endpoint-credential cache (RFC 0031 §11). Access + refresh tokens
-//! with expiry, persisted in the durable store under [`Kind::Cred`], keyed by a
-//! hash of the login target (e.g. `mcp:github`, `intelligence`). Written by
-//! `agentd login` and read at daemon startup to seed a provider; refreshed
-//! in-memory during a run, re-loaded (and re-refreshed from the refresh token) on
-//! restart.
+//! The endpoint-credential cache: access + refresh tokens with their expiry,
+//! keyed by a hash of the login target (e.g. `mcp:github`, `intelligence`).
 //!
-//! **Redaction (RFC 0031 §13):** a cred record holds live tokens — it is
-//! excluded from all logs, audit, and the `agent://` read surface. The `Kind::Cred`
-//! class is non-indexed and never appears in the manifest.
+//! Two backings share one record shape. The **file** cache is the path the
+//! daemon uses: an interactive login writes a per-user `0600` file, the daemon
+//! reads it at startup to seed a provider, refreshes in memory during a run,
+//! and re-reads it (re-refreshing from the refresh token) after a restart. The
+//! **durable** helpers ([`load`] / [`store`] / [`evict`]) hold the same record
+//! in the durable store under [`Kind::Cred`] — the store-backed equivalent for
+//! an embedder that keeps credentials alongside the rest of its state.
+//!
+//! **Redaction:** a cred record holds live tokens, so it is excluded from all
+//! logs, audit records, and the `agent://` read surface. [`Kind::Cred`] is also
+//! deliberately non-indexed — it never appears in the manifest, so nothing that
+//! walks the manifest to enumerate or replicate state can reach a credential.
 
 use crate::sha::sha256_hex;
 use crate::state::{Durable, Kind};
@@ -24,7 +29,7 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// A cached credential for one endpoint (RFC 0031 §11). Never logged.
+/// A cached credential for one endpoint. Never logged.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CachedCred {
     #[serde(default)]
@@ -80,13 +85,16 @@ pub fn evict(durable: &Durable, target: &str) -> Result<(), String> {
 // --- file-backed cache (the interactive `agentd login` handoff) --------------
 //
 // `agentd login` runs on a human's machine, where the configured durable store
-// may be a remote backend the login has no business touching. The obtained token
-// is cached in a per-user file (0600), the same path the daemon reads at startup
-// to seed a provider — the pattern `aws`/`gcloud`/`kubectl` use for OAuth tokens.
+// may be a remote backend the login has no business opening a connection to.
+// The obtained token is cached in a per-user file (0600), the same path the
+// daemon reads at startup to seed a provider — the pattern `aws`, `gcloud` and
+// `kubectl` use for OAuth tokens.
 
-/// The default per-user credential directory (RFC 0031 §11):
+/// The default per-user credential directory, in precedence order:
 /// `$AGENTD_CRED_DIR`, else `$XDG_STATE_HOME/agentd/creds`, else
-/// `$HOME/.local/state/agentd/creds`, else the OS temp dir.
+/// `$HOME/.local/state/agentd/creds`, else the OS temp dir. The temp-dir
+/// fallback only applies to an environment with no `HOME` at all; the files
+/// written there are still `0600`.
 pub fn default_dir() -> PathBuf {
     if let Some(d) = std::env::var_os("AGENTD_CRED_DIR") {
         return PathBuf::from(d);
@@ -120,7 +128,8 @@ pub fn store_file(dir: &std::path::Path, target: &str, cred: &CachedCred) -> Res
     let path = file_path(dir, target);
     let json = serde_json::to_vec_pretty(cred).map_err(|e| e.to_string())?;
     std::fs::write(&path, &json).map_err(|e| format!("write {}: {e}", path.display()))?;
-    // Owner-only (0600) — the file holds live tokens.
+    // Owner-only (0600) — the file holds live tokens. The mode is applied
+    // after the write, so the create itself still honours the process umask.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

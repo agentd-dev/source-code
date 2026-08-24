@@ -2,7 +2,7 @@
 
 agentd talks to three kinds of outbound endpoint that may require credentials:
 **intelligence** (the LLM), **MCP** servers, and **A2A** peers. Each takes an
-optional `auth:` block — a unified credential provider (RFC 0031) — so you can
+optional `auth:` block — one credential provider shared by all three — so you can
 use a static secret, an **interactive OAuth login**, **AWS SigV4**, or a
 **SPIFFE** workload identity, with one consistent shape.
 
@@ -255,7 +255,6 @@ token needs a fresh `agentd --login`.
 
 ## See also
 
-- [RFC 0031 — Endpoint authentication](../rfcs/0031-endpoint-authentication.md) — the design.
 - [Configuration](configuration.md) — every key, precedence, `{{secret:…}}`, `--validate-config`.
 - [Security](security.md) — secret handling, the Rule-of-Two, no local execution.
 - [Intelligence](intelligence.md) — the LLM wire.

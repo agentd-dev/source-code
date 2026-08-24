@@ -1,21 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! **Configuration schema v2** (RFC 0030) — the agentd settings document.
+//! The **agentd settings document** — one nested document (YAML or JSON;
+//! several files merge in order) whose every path is also `AGENTD_<PATH>` /
+//! `AGENT_<PATH>` / `<PATH>` and `--<path>`. This module holds the typed
+//! [`Settings`], its JSON Schema ([`schema::schema`]), the load pipeline
+//! (files → env → flags → typed → validated), the flat **alias** table
+//! (`--instruction`, `--intelligence`, `--model`, `--mcp`, …), the
+//! `agentd --instruction X` **sugar**, schema **detection**, and the reload
+//! partition (which paths only a restart can change).
 //!
-//! One nested document (YAML or JSON; several files merge in order) whose
-//! every path is also `AGENTD_<PATH>` / `AGENT_<PATH>` / `<PATH>` and
-//! `--<path>`. This module holds the typed [`Settings`], its JSON Schema
-//! ([`schema::schema`]), the load pipeline (files → env → flags → typed →
-//! validated), the legacy **alias** table (`--instruction`, `--intelligence`,
-//! `--model`, `--mcp`, …), the `agentd --instruction X` **sugar**, v1/v2
-//! **detection**, and the reload partition (restart-only paths).
-//!
-//! Layering (RFC 0011 §2.1 / RFC 0017 §3.2, unchanged): `built-in < files <
-//! env < flags`. Files compose with JSON-Merge-Patch semantics; env sets a
-//! path (lists/maps replaced); flags apply in argument order — a generic
-//! `--<path>` SETS, a named repeatable alias (`--mcp`, `--a2a-peer`) ADDS.
-//!
-//! The 2.0 runtime consumes [`Settings`]; the v1 [`super::Config`] keeps
-//! serving the v1 runtime until the cut-over (plan §6 P5).
+//! Layering: `built-in < files < env < flags`. Files compose with
+//! JSON-Merge-Patch semantics; env sets a path (lists and maps are replaced,
+//! never merged); flags apply in argument order — a generic `--<path>` SETS,
+//! while a named repeatable alias (`--mcp`, `--a2a-peer`) ADDS to its list.
 
 pub mod schema;
 
@@ -60,9 +56,10 @@ impl<'de> Deserialize<'de> for Dur {
     }
 }
 
-/// A credential-bearing string: from a FILE it must be a `{{secret:…}}` /
-/// `{{secret-file:…}}` reference (§5 validation over the file document); from
-/// env/flags it may be inline. `Debug` never shows it.
+/// A credential-bearing string. From a FILE it must be a `{{secret:…}}` /
+/// `{{secret-file:…}}` reference — validation over the file document enforces
+/// that, so a config document never carries a live credential — while an
+/// env/flag value may be inline. `Debug` never shows the contents.
 #[derive(Clone, PartialEq, Eq, Deserialize, Default)]
 pub struct Secret(pub String);
 
@@ -132,6 +129,19 @@ fn string_or_list<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>,
 #[serde(deny_unknown_fields, default)]
 pub struct Settings {
     pub config_version: Option<String>,
+    /// Named durable event streams: `{name: {retention: {max_events,
+    /// max_age}}}`. A stream must be declared before an `emit` or `stream` node
+    /// may reference it — an undeclared name is refused at startup rather than
+    /// silently creating a stream nothing retains.
+    #[serde(default)]
+    pub streams: BTreeMap<String, StreamCfg>,
+    /// The **service catalog**: the named external services this deployment may
+    /// use. Entries carry connection settings, one shared credential,
+    /// authoritative trifecta tags and a tool-surface ceiling; `mcp.servers`
+    /// entries reference them via `service:`. An absent catalog imposes no
+    /// constraints at all.
+    #[serde(default)]
+    pub services: BTreeMap<String, Service>,
     /// Operator-defined constants, referenced anywhere in this document and in
     /// workflow definitions as `{{config.NAME}}` (dotted paths reach into
     /// nested values). The template prefix is `config.` and NOT `vars.`
@@ -143,18 +153,6 @@ pub struct Settings {
     /// values fold in at LOAD time, so they participate in the definition hash
     /// — a var change is a definition change, and in-flight runs stay pinned
     /// to the definition they started with.
-    /// Named durable event streams (RFC 0035 Phase A): `{name: {retention:
-    /// {max_events, max_age}}}`. A stream must be declared before an `emit`
-    /// or `stream` node may reference it — fail-closed at startup.
-    #[serde(default)]
-    pub streams: BTreeMap<String, StreamCfg>,
-    /// The **service catalog** (RFC 0037): the named external services this
-    /// deployment may use. Entries carry connection settings, one shared
-    /// credential, authoritative trifecta tags and a tool-surface ceiling;
-    /// `mcp.servers` entries reference them via `service:`. Absent ⇒ no
-    /// catalog, today's behavior exactly.
-    #[serde(default)]
-    pub services: BTreeMap<String, Service>,
     pub vars: BTreeMap<String, Value>,
     pub agent: Agent,
     pub intelligence: Intelligence,
@@ -166,24 +164,25 @@ pub struct Settings {
     pub knowledge: Knowledge,
     pub search: Search,
     pub skills: Skills,
-    /// Inline dialect-3 definitions or `{name, file|uri}` references — kept as
-    /// raw documents here; the workflow engine (RFC 0027) types them.
+    /// Inline workflow definitions or `{name, file|uri}` references — kept as
+    /// raw documents here and typed by the workflow engine, so config loading
+    /// never has to know the node registry.
     pub workflows: Vec<Value>,
     pub limits: Limits,
     pub lifecycle: Lifecycle,
-    /// Subagent templates + spawn policy (RFC 0036): operator-declared
-    /// definitions the model may instantiate (filling declared `params` only),
-    /// section-wide defaults, and the freeform-spawn switch.
+    /// Subagent templates + spawn policy: operator-declared definitions the
+    /// model may instantiate (filling declared `params` only), section-wide
+    /// defaults, and the freeform-spawn switch.
     pub subagents: Subagents,
     pub a2a: A2a,
-    /// The display-client surface (RFC 0032): opt-in TUI/web-UI methods on the
-    /// A2A listener (the global `SubscribeToEvents` feed + interface read ops).
+    /// The display-client surface: opt-in TUI/web-UI methods on the A2A
+    /// listener (the global `SubscribeToEvents` feed + interface read ops).
     pub interface: Interface,
-    /// The inbound webhook HTTP surface (RFC 0027): a dedicated listener for
-    /// `webhook` start nodes and `wait: {on: webhook}` callbacks.
+    /// The inbound webhook HTTP surface: a dedicated listener for `webhook`
+    /// start nodes and `wait: {on: webhook}` callbacks.
     pub webhooks: Webhooks,
-    /// The self-correcting goal watchdog (RFC 0026): a periodic check of whether
-    /// the configured goal is achieved (or the agent is stuck).
+    /// The self-correcting goal watchdog: a periodic check of whether the
+    /// configured goal is achieved (or the agent is stuck).
     pub goal: Option<Goal>,
     pub observability: Observability,
     pub security: Security,
@@ -194,7 +193,7 @@ pub struct Settings {
 pub struct Agent {
     pub name: Option<String>,
     /// Static text, or a single-token URI a configured MCP server serves
-    /// (read + subscribed) — one field, parsed (RFC 0028 §3).
+    /// (read + subscribed) — one field, with the shape deciding which.
     pub instruction: Option<String>,
     /// A **one-shot task** (`--prompt`). With no workflows configured this is
     /// what the generated run executes, while `instruction` stays the standing
@@ -216,11 +215,11 @@ pub struct Agent {
     pub conversation_budget: Option<Budget>,
     /// What `ask_human` does when NO human channel can answer — the interface
     /// is disabled — and, for `auto`, when a gate times out unanswered
-    /// (RFC 0032 §16): `fail` (default; the ask errors immediately), `wait`
-    /// (park until the ask timeout), or `auto` (an LLM judge answers on the
-    /// operator's behalf, conservatively, marked as auto).
+    /// `fail` (default; the ask errors immediately), `wait` (park until the
+    /// ask timeout), or `auto` (an LLM judge answers on the operator's behalf,
+    /// conservatively, marked as auto).
     pub ask_human_fallback: AskHumanFallback,
-    /// What a gate does when a human COULD answer (RFC 0032 §16).
+    /// What a gate does when a human COULD answer.
     ///
     /// `ask_human_fallback` governs the case where nobody can answer;
     /// this governs whether to ask at all. They are separate because they are
@@ -229,7 +228,7 @@ pub struct Agent {
     pub approval: Approval,
 }
 
-/// How much a person wants to be asked (RFC 0032 §16).
+/// How much a person wants to be asked.
 ///
 /// Runtime-settable, because the right answer changes with what the agent is
 /// doing: you supervise closely while it is somewhere unfamiliar and stop
@@ -256,7 +255,7 @@ pub enum Approval {
     Accept,
 }
 
-/// The `ask_human` fallback disposition (RFC 0032 §16).
+/// The `ask_human` fallback disposition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum AskHumanFallback {
@@ -273,7 +272,9 @@ pub enum AskHumanFallback {
 }
 
 impl Agent {
-    /// The default wake set (RFC 0026 §3.1).
+    /// The wake set used when the operator declares none: the events that
+    /// carry information the agent cannot get any other way. A finished
+    /// workflow is deliberately absent — success needs no attention.
     pub fn wake_on(&self) -> Vec<WakeEvent> {
         self.wake_on.clone().unwrap_or_else(|| {
             vec![
@@ -297,7 +298,7 @@ impl Agent {
 
 /// `scheme://…` with no whitespace, and a scheme that is not a bare `http(s)`
 /// URL to a web page… — any `<alpha><alnum+.->://` single token counts; the
-/// registry decides which server serves it (RFC 0028 §3).
+/// registry decides which server serves it.
 pub fn looks_like_resource_uri(s: &str) -> bool {
     let t = s.trim();
     if t.contains(char::is_whitespace) {
@@ -361,15 +362,15 @@ pub struct Intelligence {
     #[serde(deserialize_with = "string_or_list")]
     pub endpoints: Vec<String>,
     pub model: Option<String>,
-    /// The wire dialect (RFC 0031 §8): `openai` (default), `anthropic`, or
+    /// The wire dialect: `openai` (default), `anthropic`, or
     /// `bedrock` (native Amazon Bedrock Converse — pair with `auth: {kind: aws,
     /// service: bedrock}`). Unset ⇒ OpenAI-compatible.
     pub dialect: Option<String>,
     pub token: Option<Secret>,
     pub token_file: Option<String>,
     pub headers: BTreeMap<String, String>,
-    /// A unified credential provider (RFC 0031 §5) for the LLM endpoint — e.g.
-    /// `oauth2` device-login for an enterprise gateway. Obtained via
+    /// A unified credential provider for the LLM endpoint — e.g. `oauth2`
+    /// device-login for an enterprise gateway. Obtained via
     /// `agentd login intelligence`; the resolved bearer overrides `token`.
     pub auth: Option<Auth>,
     pub swap_policy: Option<String>,
@@ -516,11 +517,11 @@ pub struct Mcp {
     pub default_timeout: Option<Dur>,
 }
 
-/// A **service catalog entry** (RFC 0037 §4): a named external service this
-/// deployment may use — connection settings, one shared credential,
-/// authoritative trifecta tags (a floor for any matching endpoint, §3
-/// Decision 3), and a tool-surface ceiling consumers can only narrow.
-/// The catalog dials nothing; `mcp.servers` entries reference it.
+/// A **service catalog entry**: a named external service this deployment may
+/// use — connection settings, one shared credential, authoritative trifecta
+/// tags (a floor for any matching endpoint, not just referencing ones), and a
+/// tool-surface ceiling consumers can only narrow. The catalog itself dials
+/// nothing; `mcp.servers` entries reference it.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Service {
@@ -558,10 +559,10 @@ pub struct Service {
     pub breaker: Option<Value>,
 }
 
-/// What a catalog entry describes (RFC 0037 Phase B: all four outbound
-/// surfaces). Matching is KIND-FILTERED: an MCP dial only matches `mcp`
-/// entries, an `http` step only `http` entries, and so on — one host may
-/// legitimately serve several kinds.
+/// Which outbound surface a catalog entry describes. Matching is
+/// KIND-FILTERED: an MCP dial only matches `mcp` entries, an `http` step only
+/// `http` entries, and so on, because one host may legitimately serve several
+/// kinds under different trust budgets.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ServiceKind {
@@ -583,12 +584,13 @@ impl ServiceKind {
     }
 }
 
-/// RFC 0037 §4: resolve `service:` references against the catalog and apply
-/// the unconditional tag floor (Decision 3). Mutates `mcp.servers` in place —
-/// after this, every server carries its effective endpoint, auth, headers,
-/// admission lists and tag set, so validation, the trifecta gate and the
-/// runtime all see the *outcome*. Returns the resolution errors (aggregated
-/// with validation's).
+/// Resolve `service:` references against the catalog and apply the
+/// unconditional tag floor. Mutates `mcp.servers` in place — after this, every
+/// server carries its effective endpoint, auth, headers, admission lists and
+/// tag set, so validation, the trifecta gate and the runtime all judge the
+/// *outcome* rather than each re-deriving it. Must therefore run BEFORE
+/// validation. Returns the resolution errors, for aggregation with
+/// validation's.
 pub fn resolve_services(s: &mut Settings) -> Vec<String> {
     let services = s.services.clone();
     let mut errs = Vec::new();
@@ -603,8 +605,9 @@ pub fn resolve_services(s: &mut Settings) -> Vec<String> {
             ));
             continue;
         };
-        // Consumers reference, never restate (Decision 2): connection settings
-        // live in the catalog only.
+        // Consumers reference, never restate: connection settings live in the
+        // catalog only, so there is exactly one place to rotate a credential
+        // or repoint a host.
         for (restated, what) in [
             (!srv.endpoint.is_empty(), "endpoint"),
             (srv.auth.is_some(), "auth"),
@@ -649,10 +652,12 @@ pub fn resolve_services(s: &mut Settings) -> Vec<String> {
         union_tags(&mut srv.tags, &entry.tags);
         srv.service_rate = entry.rate.clone();
     }
-    // Decision 3 — the unconditional tag floor: ANY server whose endpoint
-    // matches a catalog entry gets the entry's tags unioned in, referencing or
-    // inline, open or closed. This is the tag-laundering fix. (The entry's
-    // pacing applies to matched inline consumers too.)
+    // The unconditional tag floor: ANY server whose endpoint matches a catalog
+    // entry gets that entry's tags unioned in — whether it referenced the entry
+    // or spelled the URL out inline, and in either egress mode. Without this,
+    // restating a catalogued endpoint inline with weaker tags would launder
+    // away the trifecta tags the catalog declares. (The entry's pacing applies
+    // to matched inline consumers too, for the same reason.)
     for srv in &mut s.mcp.servers {
         if srv.endpoint.is_empty() {
             continue;
@@ -665,8 +670,8 @@ pub fn resolve_services(s: &mut Settings) -> Vec<String> {
             }
         }
     }
-    // RFC 0037 Phase B: `a2a.peers[].service` references resolve the same way
-    // against `kind: peer` entries — inherit, never restate.
+    // `a2a.peers[].service` references resolve the same way against
+    // `kind: peer` entries — inherit, never restate.
     for peer in &mut s.a2a.peers {
         let Some(name) = peer.service.clone() else {
             continue;
@@ -730,11 +735,11 @@ fn union_tags(into: &mut BTreeMap<String, Vec<String>>, from: &BTreeMap<String, 
     }
 }
 
-/// Match a URL against the catalog's entries OF ONE KIND (RFC 0037 §4):
-/// scheme + authority equal (host case-insensitive), and the URL's path
-/// extends the entry's path on a segment boundary. Returns the matching
-/// entry, refusing nothing — the caller decides what a non-match means
-/// (`Egress::Closed` refuses it).
+/// Match a URL against the catalog's entries OF ONE KIND: scheme and authority
+/// must be equal (host case-insensitively), and the URL's path must extend the
+/// entry's path on a segment boundary — so `/v1` never matches `/v1betaX`.
+/// Returns the matching entry and refuses nothing; the caller decides what a
+/// non-match means (`Egress::Closed` refuses it).
 pub fn service_match<'a>(
     services: &'a BTreeMap<String, Service>,
     kind: ServiceKind,
@@ -775,8 +780,9 @@ fn split_url(url: &str) -> Option<(String, String, String)> {
     Some((scheme.to_string(), authority.to_string(), path))
 }
 
-/// RFC 0037 §5: the dial-time egress check. `Open` always passes; `Closed`
-/// requires the URL to match a catalog entry of the surface's kind.
+/// The dial-time egress check. `Open` always passes; `Closed` requires the URL
+/// to match a catalog entry of the surface's kind, so an uncatalogued host
+/// cannot be reached even if some other config path names it.
 pub fn egress_allows(
     services: &BTreeMap<String, Service>,
     egress: Egress,
@@ -797,7 +803,7 @@ pub fn egress_allows(
 pub struct McpServer {
     pub name: String,
     /// Either a literal URL, or empty when `service:` references a catalog
-    /// entry (RFC 0037 §4) — resolution fills it before anything dials.
+    /// entry — resolution fills it in before anything dials.
     #[serde(default)]
     pub endpoint: String,
     /// Reference a `services:` catalog entry: inherit its connection settings
@@ -827,10 +833,11 @@ pub struct McpServer {
     pub aauth: Option<bool>,
     #[serde(default)]
     pub oauth: Option<McpOauth>,
-    /// A unified credential provider (RFC 0031 §5) — `static` / `oauth2` (device
-    /// login, refresh). Interactive providers obtain their token via
-    /// `agentd login mcp:<name>`; the daemon reads the cached token. Coexists
-    /// with the legacy `oauth` shortcut (client-credentials).
+    /// A unified credential provider — `static` / `oauth2` (device login,
+    /// refresh) / `aws` / `spiffe`. Interactive providers obtain their token
+    /// via `agentd login mcp:<name>` and the daemon only reads the cached
+    /// token, so an unattended process never has to run a browser flow.
+    /// Coexists with the narrower `oauth` client-credentials shortcut.
     #[serde(default)]
     pub auth: Option<Auth>,
     #[serde(default)]
@@ -838,7 +845,9 @@ pub struct McpServer {
 }
 
 impl McpServer {
-    /// The flattened, deduplicated trifecta tag set (RFC 0012 §3.1).
+    /// The flattened, deduplicated trifecta tag set across every tool-pattern
+    /// key. An unknown tag name is an error rather than a silent drop, since
+    /// a typo'd tag would otherwise read as "this server is untagged".
     pub fn tag_set(&self) -> Result<Vec<crate::sec::scope::TrifectaTag>, String> {
         let mut out = Vec::new();
         for list in self.tags.values() {
@@ -854,7 +863,7 @@ impl McpServer {
         Ok(out)
     }
 
-    /// The v1 runtime spec (the MCP client / spawn payload shape).
+    /// Lower to the runtime spec the MCP client and the spawn payload carry.
     pub fn to_spec(&self) -> Result<super::McpServerSpec, String> {
         Ok(super::McpServerSpec {
             name: self.name.clone(),
@@ -866,8 +875,9 @@ impl McpServer {
                 .collect(),
             tags: self.tag_set()?,
             aauth: self.aauth,
-            // RFC 0031: carry the OAuth client-credentials config to the runtime
-            // spec (previously dropped here, leaving `mcp.servers[].oauth` inert).
+            // The OAuth client-credentials config must be carried into the
+            // runtime spec: dropping it here would leave `mcp.servers[].oauth`
+            // configured but inert, and the dial would go out unauthenticated.
             oauth: self.oauth.as_ref().map(|o| super::McpOauthSpec {
                 token_url: o.token_url.clone(),
                 client_id: o.client_id.clone(),
@@ -891,17 +901,18 @@ pub struct McpOauth {
     pub scope: Option<String>,
 }
 
-/// A unified per-endpoint authentication provider (RFC 0031 §5). A flat,
-/// `kind`-discriminated record: only the fields relevant to the chosen `kind`
-/// are set; semantic validation (§14) enforces which are required. The provider
-/// kinds land incrementally — `static`/`oauth2` first, then `aws`/`spiffe`.
+/// A unified per-endpoint authentication provider. A flat, `kind`-discriminated
+/// record: only the fields relevant to the chosen `kind` are set, and semantic
+/// validation is what enforces which of them are required — the type itself
+/// cannot, because every field is optional for some other kind.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Auth {
     pub kind: AuthKind,
-    // --- oauth2 / oidc (RFC 0031 §7) ---
-    /// Issuer base URL for `.well-known` metadata discovery (RFC 8414 / OIDC),
-    /// used to fill the token / device-authorization endpoints when unset.
+    // --- oauth2 / oidc ---
+    /// Issuer base URL for `.well-known` metadata discovery (RFC 8414 / OIDC).
+    /// When set, it fills in whichever of the token / device-authorization /
+    /// authorization endpoints the document leaves unset.
     #[serde(default)]
     pub issuer: Option<String>,
     #[serde(default)]
@@ -924,7 +935,7 @@ pub struct Auth {
     pub scopes: Vec<String>,
     #[serde(default)]
     pub audience: Option<String>,
-    // --- static (RFC 0031 §6) ---
+    // --- static ---
     /// A static bearer (`{{secret:…}}`) → `Authorization: Bearer …`.
     #[serde(default)]
     pub token: Option<Secret>,
@@ -933,14 +944,16 @@ pub struct Auth {
     pub header: Option<String>,
     #[serde(default)]
     pub value: Option<Secret>,
-    // --- aws (SigV4, RFC 0031 §8) ---
+    // --- aws (SigV4) ---
     #[serde(default)]
     pub region: Option<String>,
     /// The AWS service to sign for (e.g. `bedrock`, `execute-api`).
     #[serde(default)]
     pub service: Option<String>,
-    /// The credential source: `env` / `static` / `sso` (IAM Identity Center
-    /// interactive login → temporary credentials). (`imds`/`irsa` are follow-ups.)
+    /// The credential source: `env` / `static`, `sso` (IAM Identity Center
+    /// interactive login → temporary credentials), `imds` (the EC2 instance
+    /// role) or `irsa` (the Kubernetes projected service-account token).
+    /// Unset behaves as `env`.
     #[serde(default)]
     pub source: Option<String>,
     /// aws `source: sso` — the IAM Identity Center portal start URL, the account,
@@ -951,9 +964,9 @@ pub struct Auth {
     pub account_id: Option<String>,
     #[serde(default)]
     pub role_name: Option<String>,
-    // --- spiffe (workload identity, RFC 0031 §9) ---
-    /// The SVID type: `jwt` (a rotating JWT-SVID bearer, the file-SVID MVP) or
-    /// `x509` (mTLS — a follow-up).
+    // --- spiffe (workload identity) ---
+    /// The SVID type: `jwt` (a rotating JWT-SVID bearer read from a file) or
+    /// `x509` (an mTLS client identity rather than a request signer).
     #[serde(default)]
     pub svid: Option<String>,
     /// Path to the SPIRE-written JWT-SVID token file (re-read per request, so a
@@ -1012,22 +1025,21 @@ impl Auth {
     }
 }
 
-/// The authentication provider family (RFC 0031 §5).
+/// The authentication provider family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthKind {
-    /// A static bearer/header credential (today's behavior, made explicit).
+    /// A static bearer or named-header credential.
     Static,
     /// OAuth 2.1 / OIDC — device grant, authorization-code, or client-credentials.
     Oauth2,
-    /// AWS Signature Version 4 (RFC 0031 §8) — SigV4-signed requests.
+    /// AWS Signature Version 4 — every request is SigV4-signed.
     Aws,
-    /// SPIFFE/SPIRE workload identity (RFC 0031 §9) — a JWT-SVID bearer (or
-    /// X.509-SVID mTLS).
+    /// SPIFFE/SPIRE workload identity — a JWT-SVID bearer, or X.509-SVID mTLS.
     Spiffe,
 }
 
-/// The OAuth 2.1 grant type (RFC 0031 §7).
+/// The OAuth 2.1 grant type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OAuthGrant {
@@ -1084,17 +1096,17 @@ impl Store {
 pub enum StoreKind {
     Mcp,
     Http,
-    /// The local filesystem (RFC 0033): one file per key under a root
-    /// directory, single-writer, durable to whatever the filesystem is.
+    /// The local filesystem: one file per key under a root directory,
+    /// single-writer, and durable to whatever the filesystem is.
     File,
     Memory,
     #[default]
     None,
 }
 
-/// `store.file` (RFC 0033 §4). The only setting is where the state lives; the
-/// adapter needs nothing else, so the block itself is optional — `kind: file`
-/// with no block resolves the root from the environment ([`file_store_root`]).
+/// `store.file`. The only setting is where the state lives; the adapter needs
+/// nothing else, so the block itself is optional — `kind: file` with no block
+/// resolves the root from the environment ([`file_store_root`]).
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct StoreFile {
@@ -1110,7 +1122,7 @@ pub struct StoreFile {
     pub min_free: Option<String>,
 }
 
-/// One declared event stream (RFC 0035).
+/// One declared event stream.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct StreamCfg {
@@ -1136,7 +1148,7 @@ impl StreamCfg {
     }
 }
 
-/// The `file` store's root directory (RFC 0033 §4), first that applies:
+/// The `file` store's root directory, first that applies:
 /// `store.file.path`, `$AGENTD_STATE_DIR`, `$XDG_STATE_HOME/agentd/state`,
 /// `$HOME/.local/state/agentd/state`, else the OS temp dir.
 ///
@@ -1150,8 +1162,8 @@ impl StreamCfg {
 ///
 /// The last resort is the OS temp dir: a store that is *there* survives a
 /// process restart but not a reboot, which is why the runtime logs the
-/// resolved path and whether it was defaulted (RFC 0033 §5.1) rather than
-/// letting a user believe more than the filesystem delivers.
+/// resolved path and whether it was defaulted, rather than letting a user
+/// believe more durability than the filesystem actually delivers.
 pub fn file_store_root(store: &Store) -> std::path::PathBuf {
     file_store_root_in(store, &|k| std::env::var_os(k))
 }
@@ -1324,7 +1336,7 @@ pub struct Context {
     /// from `intelligence.model`) — the base of the compaction threshold.
     pub model_window: Option<u64>,
     pub plan: Plan,
-    /// The system-prompt template (RFC 0038). Unset = the built-in default,
+    /// The system-prompt template. Unset = the built-in default,
     /// which `agentd --context-template` prints. Written in the small
     /// `{{#if}}` / `{{#each}}` language over the environment data; expressions
     /// are a path first and CEL second.
@@ -1466,8 +1478,9 @@ pub struct SubagentLimits {
     pub breadth: Option<u32>,
     pub total: Option<u32>,
     pub rate: Option<String>,
-    /// Instance-tier children (RFC 0036 §4): heavier than flat workers, so
-    /// they carry their own caps. Defaults 2 live / 8 lifetime / `4/1h`.
+    /// Instance-tier children are far heavier than flat workers, so they carry
+    /// their own, much tighter caps rather than sharing the ones above.
+    /// Defaults: 2 live, 8 over the parent's lifetime, `4/1h`.
     pub instances: InstanceLimits,
 }
 
@@ -1479,7 +1492,7 @@ pub struct InstanceLimits {
     pub rate: Option<String>,
 }
 
-/// The `subagents:` section (RFC 0036 §4).
+/// The `subagents:` section: what the model may spawn, and how.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct Subagents {
@@ -1492,9 +1505,10 @@ pub struct Subagents {
     /// template or call site.
     pub defaults: SubagentDefaults,
     /// Named, operator-authored definitions. A template whose `instruction`
-    /// carries no config-defining directives spawns the flat RFC 0009 worker;
-    /// one that defines machinery (`:::workflow`/`:::mcp`/`:::stream`/
-    /// `:::config`/`:::tools`) spawns an instance-tier child.
+    /// carries no config-defining directives spawns a flat worker; one that
+    /// defines machinery (`:::workflow`/`:::mcp`/`:::stream`/`:::config`/
+    /// `:::tools`) spawns an instance-tier child. The tier follows from the
+    /// text, so it is never declared twice and cannot disagree with itself.
     pub templates: BTreeMap<String, SubagentTemplate>,
 }
 
@@ -1515,9 +1529,10 @@ pub struct SubagentDefaults {
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct SubagentTemplate {
-    /// A full RFC 0034 instruction document. Directive extraction runs ONCE,
-    /// at boot, on this operator-authored text; `params` fold in at spawn as
-    /// data and are never re-parsed for directives (RFC 0036 §8.2).
+    /// A full instruction document. Directive extraction runs ONCE, at boot,
+    /// on this operator-authored text; `params` fold in later at spawn as data
+    /// and are never re-parsed for directives, so a param value cannot
+    /// introduce machinery the operator never wrote.
     pub instruction: String,
     /// The ONLY holes the model may fill, schema-validated at spawn.
     #[serde(default)]
@@ -1545,11 +1560,12 @@ pub struct SubagentTemplate {
     pub output_contract: Option<String>,
     #[serde(default)]
     pub output_schema: Option<Value>,
-    /// Instance tier only: the child's own budget (the RFC 0030 `Budget`
-    /// shape), enforced in-child with `on_exhausted: refuse`.
+    /// Instance tier only: the child's own budget (a `Budget` document),
+    /// enforced in-child with `on_exhausted: refuse`.
     #[serde(default)]
     pub budget: Option<Value>,
-    /// Instance tier only: graceful retirement triggers (RFC 0034 §7 path).
+    /// Instance tier only: a lifetime after which the child retires
+    /// gracefully rather than being killed.
     #[serde(default)]
     pub ttl: Option<Dur>,
     /// A signal name (templated over params) whose delivery IN THE CHILD
@@ -1564,21 +1580,21 @@ pub struct SubagentTemplate {
     /// the deployment default (`store.durability.work`).
     #[serde(default)]
     pub durable: Option<bool>,
-    /// Instance tier, `mode: sync` (RFC 0036 Phase B): `{workflow: <name>}` —
-    /// the spawn resolves when the CHILD's named workflow first completes,
+    /// Instance tier, `mode: sync`: `{workflow: <name>}` — the spawn
+    /// resolves when the CHILD's named workflow first completes,
     /// returning that run's output. Composed as a reporter workflow in the
     /// child; requires the parent to have an A2A listener.
     #[serde(default)]
     pub result: Option<Value>,
-    /// Instance tier (RFC 0036 Phase B): child streams mirrored into the
-    /// PARENT's same-named streams — each event forwarded over the socket and
+    /// Instance tier: child streams mirrored into the PARENT's same-named
+    /// streams — each event forwarded over the socket and
     /// appended with source `instance:<handle>`. Requires the stream declared
     /// on BOTH sides and a parent A2A listener.
     #[serde(default)]
     pub mirror_streams: Option<Vec<String>>,
 }
 
-/// One declared template parameter (RFC 0036 §5).
+/// One declared template parameter — the only hole a spawn may fill.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ParamSpec {
@@ -1604,8 +1620,8 @@ pub struct Lifecycle {
     pub run_id: Option<String>,
     pub exit_code_map: BTreeMap<String, i32>,
     pub watch_config: bool,
-    /// RFC 0036 §6: delivery of this signal begins graceful shutdown — the
-    /// retirement trigger a parent composes into an instance-tier child
+    /// Delivery of this signal begins graceful shutdown — the retirement
+    /// trigger a parent composes into an instance-tier child
     /// (`until:` on the template), and available to any daemon that should
     /// drain when a named signal arrives.
     pub until_signal: Option<String>,
@@ -1671,8 +1687,8 @@ pub struct A2aTls {
     pub client_ca: Option<String>,
 }
 
-/// The **display-client interface** (RFC 0032): the opt-in surface a thin
-/// TUI/web-UI client rides — the global `SubscribeToEvents` feed and the
+/// The **display-client interface**: the opt-in surface a thin TUI/web-UI
+/// client rides — the global `SubscribeToEvents` feed and the
 /// `interface.*`/debug read ops, served on the existing A2A listener (no new
 /// socket). Default-OFF: with `enabled: false` those methods answer
 /// UNSUPPORTED_OPERATION and the core A2A surface is byte-identical. `debug`
@@ -1693,19 +1709,20 @@ pub struct Interface {
     /// Extra allowed browser origins (`scheme://host[:port]`, exact match) for
     /// a hosted web UI. Loopback origins never need listing.
     pub origins: Vec<String>,
-    /// What the display clients render in their chrome (RFC 0032 §12) — the
-    /// daemon decides; every attached client renders the same layout.
+    /// What the display clients render in their chrome. The daemon decides,
+    /// so every attached client renders the same layout.
     pub display: Display,
-    /// Pairing-code login (RFC 0032 §13): a rotating short code shown to the
-    /// operator that a client exchanges for a session token — the low-friction
-    /// alternative to copying a bearer.
+    /// Pairing-code login: a rotating short code shown to the operator that a
+    /// client exchanges for a session token — the low-friction alternative to
+    /// copying a bearer around.
     pub pairing: Pairing,
 }
 
-/// The client-chrome layout (RFC 0032 §12): ordered item lists for the top
-/// (header) and bottom (status bar) edges. `None` ⇒ the built-in default;
-/// unknown items are skipped by clients (forward compatibility). The item
-/// vocabulary lives in [`DISPLAY_ITEMS`].
+/// The client-chrome layout: ordered item lists for the top (header) and
+/// bottom (status bar) edges. `None` ⇒ the built-in default. Clients skip an
+/// item they do not recognise instead of erroring, so a newer daemon can name
+/// items an older client has never heard of. The vocabulary is
+/// [`DISPLAY_ITEMS`].
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct Display {
@@ -1713,7 +1730,7 @@ pub struct Display {
     pub bottom: Option<Vec<String>>,
 }
 
-/// The display items a client knows how to render (RFC 0032 §12).
+/// The display items a client knows how to render.
 pub const DISPLAY_ITEMS: &[&str] = &[
     "name",     // agent name (card)
     "version",  // agentd version
@@ -1735,7 +1752,7 @@ pub const DISPLAY_ITEMS: &[&str] = &[
     "clock",         // local time
 ];
 
-/// Pairing-code login (RFC 0032 §13). The code is a 6-digit value derived
+/// Pairing-code login. The code is a 6-digit value derived
 /// from a per-process random seed and the current 60-second window — shown
 /// only to operators (`pairing.code`), verified with the previous window's
 /// grace, rate-limited, and exchanged (`Pair`) for a high-entropy session
@@ -1751,10 +1768,11 @@ pub struct Pairing {
     pub ttl: Option<Dur>,
 }
 
-/// The webhook inbound HTTP surface (RFC 0027): a dedicated listener serving the
+/// The webhook inbound HTTP surface: a dedicated listener serving the
 /// `webhook` start nodes and `wait: {on: webhook}` callbacks. Auth is **per
-/// node** (each `webhook` declares its own verification); a listener-wide default
-/// may be set here and is used by nodes that declare no `auth`.
+/// node** — each `webhook` declares its own verification — so one permissive
+/// route cannot weaken the others; the listener-wide default set here applies
+/// only to nodes that declare no `auth` of their own.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct Webhooks {
@@ -1801,9 +1819,10 @@ pub struct HeaderMatch {
     pub equals: Option<Secret>,
 }
 
-/// The self-correcting goal watchdog (RFC 0026). A supervisor-level periodic
-/// check of whether the configured `statement` is achieved (or the agent is
-/// stuck), with a configurable disposition. It never blocks the agent loop.
+/// The self-correcting goal watchdog. A supervisor-level periodic check of
+/// whether the configured `statement` is achieved (or the agent is stuck),
+/// with a configurable disposition. It runs beside the agent loop and never
+/// blocks it, so a slow judge cannot stall real work.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct Goal {
@@ -1908,8 +1927,8 @@ pub struct Quotas {
 #[serde(deny_unknown_fields)]
 pub struct A2aPeer {
     pub name: String,
-    /// Either a literal URL, or empty when `service:` references a `kind:
-    /// peer` catalog entry (RFC 0037 Phase B) — resolution fills it.
+    /// Either a literal URL, or empty when `service:` references a
+    /// `kind: peer` catalog entry — resolution fills it in before any dial.
     #[serde(default)]
     pub endpoint: String,
     /// Reference a `services:` entry of `kind: peer`: inherit its connection
@@ -1922,9 +1941,9 @@ pub struct A2aPeer {
     pub client_cert: Option<String>,
     #[serde(default)]
     pub client_key: Option<String>,
-    /// A unified credential provider (RFC 0031 §5) for the peer — `static` /
-    /// `oauth2` (device-login) / `spiffe` (jwt). Resolved to a bearer at dial
-    /// time. (`aws` SigV4 for A2A is a follow-up — it needs per-request signing.)
+    /// A unified credential provider for the peer — `static` / `oauth2`
+    /// (device-login) / `spiffe` (jwt), each resolved to a bearer at dial
+    /// time, or `aws`, which instead signs every request body individually.
     #[serde(default)]
     pub auth: Option<Auth>,
 }
@@ -1974,13 +1993,14 @@ pub struct Security {
     pub cgroup: Cgroup,
     pub exec: Exec,
     pub workflows: WorkflowSecurity,
-    /// RFC 0037 §5: `closed` ⇒ an outbound MCP dial whose URL matches no
-    /// `services:` catalog entry is refused (boot-time for configured servers,
-    /// dial-time for everything else). Default `open`.
+    /// `closed` ⇒ an outbound MCP dial whose URL matches no `services:`
+    /// catalog entry is refused: at boot for configured servers, and at dial
+    /// time for everything else, so a URL assembled at runtime is caught too.
+    /// Default `open`.
     pub egress: Egress,
 }
 
-/// The egress policy (RFC 0037 §5).
+/// Whether outbound dials are confined to the service catalog.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Egress {
@@ -2010,12 +2030,15 @@ pub struct WorkflowSecurity {
     pub immutable: bool,
 }
 
-/// The local command-runner controls (RFC 0028 §exec). agentd's default posture
-/// is **no local execution** (RFC 0012); this is off unless an operator both
-/// builds with `--features exec` AND sets `enabled: true` — and even then runs
-/// only allow-listed commands, in a confined directory, with a minimal env. The
-/// `exec` tool is otherwise **mapping-only** (delegate off-box via
-/// `tools.overrides`). It carries the `sensitive` + `egress` trifecta tags.
+/// The local command-runner controls. agentd's default posture is **no local
+/// execution**, so this stays off unless an operator both builds with
+/// `--features exec` AND sets `enabled: true` — two independent switches, so
+/// neither a config mistake nor a stock binary can turn it on alone. Even then
+/// it runs only allow-listed commands, in a confined directory, with a minimal
+/// env. Without the local runner the `exec` tool is **mapping-only**: it can
+/// be delegated off-box via `tools.overrides`. It carries the `sensitive` +
+/// `egress` trifecta tags, so enabling it narrows what else the agent may
+/// compose with.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct Exec {
@@ -2335,12 +2358,12 @@ impl Settings {
     /// watches a goal, or owns a workflow with a long-lived start node
     /// (`loop`/`schedule`/`subscribe`/`signal`/`event`/`a2a`/`webhook`).
     ///
-    /// This is the durability predicate (RFC 0025 §durability, RFC 0033 §5): a
-    /// job-shaped run can lose its state and simply be re-run, an instance that
-    /// keeps running cannot. Two callers need the same answer — [`load`], which
-    /// defaults such an instance to the file store, and [`validate`], which
-    /// refuses an EXPLICIT `store.kind: none` here — so the predicate lives in
-    /// one place rather than being spelled twice and drifting.
+    /// This is the durability predicate: a job-shaped run can lose its state
+    /// and simply be re-run, while an instance that keeps running cannot. Two
+    /// callers need exactly the same answer — [`load`], which defaults such an
+    /// instance to the file store, and [`validate`], which refuses an EXPLICIT
+    /// `store.kind: none` here — so the predicate lives in one place instead of
+    /// being spelled out twice and diverging.
     pub fn is_long_lived(&self) -> bool {
         self.a2a.listen.is_some()
             || self.webhooks.listen.is_some()
@@ -2353,9 +2376,10 @@ impl Settings {
 // Detection
 // ---------------------------------------------------------------------------
 
-/// v2-only top-level keys (RFC 0030 §2). `limits` exists in both schemas
-/// (neutral); `intelligence` is a v1 STRING (the endpoint list) but a v2
-/// OBJECT — decided by shape in [`detect`].
+/// Top-level keys only the settings document has. `limits` is deliberately
+/// absent: it exists in both schemas, so it decides nothing. `intelligence`
+/// is absent for a different reason — it is a STRING (the endpoint list) in
+/// the flat schema but an OBJECT here, so [`detect`] judges it by shape.
 pub const V2_KEYS: &[&str] = &[
     "agent",
     "store",
@@ -2427,10 +2451,10 @@ pub fn detect(doc: &Value) -> Detected {
 }
 
 // ---------------------------------------------------------------------------
-// Aliases (RFC 0030 §3 alias column + §7)
+// Aliases
 // ---------------------------------------------------------------------------
 
-/// How a legacy flag maps onto the document.
+/// How a named flag maps onto the document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AliasKind {
     /// `--flag <value>` sets `path` (typed by the schema binding of `path`).
@@ -2445,7 +2469,7 @@ pub enum AliasKind {
     Special,
 }
 
-/// A legacy flag → v2 path alias.
+/// A named flag → document-path alias.
 #[derive(Debug, Clone, Copy)]
 pub struct Alias {
     pub flag: &'static str,
@@ -2453,8 +2477,9 @@ pub struct Alias {
     pub kind: AliasKind,
 }
 
-/// The alias table (RFC 0030 §3). Order irrelevant; flags apply in argument
-/// order.
+/// The alias table. The order of entries is irrelevant — flags take effect in
+/// the order they appear on the command line, not the order they are listed
+/// here.
 pub const ALIASES: &[Alias] = &[
     Alias {
         flag: "--instruction",
@@ -2683,9 +2708,10 @@ pub const ALIASES: &[Alias] = &[
     },
 ];
 
-/// Legacy env names → v2 paths (the derived `AGENTD_<PATH>` names are the
-/// primary surface; these keep the quickstart and the 1.x k8s manifests
-/// working). Branded (`AGENTD_`) and neutral (`AGENT_`) prefixes both apply.
+/// Short env names → document paths. The derived `AGENTD_<PATH>` names are the
+/// primary surface; these are the shorter spellings a quickstart or a k8s
+/// manifest can use instead. Branded (`AGENTD_`) and neutral (`AGENT_`)
+/// prefixes both apply, as does the bare name.
 pub const ENV_ALIASES: &[(&str, &str)] = &[
     ("INSTRUCTION", "agent.instruction"),
     ("PROMPT", "agent.prompt"),
@@ -2711,7 +2737,9 @@ pub const ENV_ALIASES: &[(&str, &str)] = &[
     ("WATCH_CONFIG", "lifecycle.watch_config"),
 ];
 
-/// Flags removed in 2.0 with the migration hint (RFC 0030 §7).
+/// Flags agentd does not accept, each paired with the hint that replaces it.
+/// Naming one fails the load with its hint, so a stale command line is a loud
+/// error rather than a flag that is silently ignored.
 pub const REMOVED_FLAGS: &[(&str, &str)] = &[
     (
         "--mode",
@@ -2730,16 +2758,17 @@ pub const REMOVED_FLAGS: &[(&str, &str)] = &[
         "use a `loop` start node with `interval`, or a `schedule` start node with `every`",
     ),
     ("--cron", "use a `schedule` start node with `cron`"),
-    // Clustering was removed, not migrated: agentd has no coordination protocol
-    // of its own. A fleet partitions upstream — one subscription per replica, or
-    // the queue's own lease semantics from a workflow step (docs/scaling.md).
+    // Clustering has no replacement flag, deliberately: agentd owns no
+    // coordination protocol. A fleet partitions upstream instead — one
+    // subscription per replica, or the queue's own lease semantics called from
+    // a workflow step (docs/scaling.md).
     (
         "--shard",
         "agentd does not partition work; give each replica its own subscription (docs/scaling.md)",
     ),
     (
         "--claim",
-        "call the queue's own claim/lease tools from a workflow step (docs/scaling.md §2c)",
+        "call the queue's own claim/lease tools from a workflow step (docs/scaling.md)",
     ),
     ("--claim-ttl", "it went with --claim"),
     ("--claim-renew-fraction", "it went with --claim"),
@@ -2787,13 +2816,13 @@ pub enum Ask {
     Version,
     Schema,
     WorkflowSchema,
-    /// `--context-template`: print the built-in system-prompt template
-    /// (RFC 0038) so an override starts from a copy, not a guess.
+    /// `--context-template`: print the built-in system-prompt template, so an
+    /// override starts from a copy rather than a guess.
     ContextTemplate,
     Validate,
     Capabilities,
-    /// `--login <target>` (RFC 0031 §12): complete the interactive OAuth device
-    /// flow for a configured endpoint and cache the token.
+    /// `--login <target>`: complete the interactive OAuth device flow for a
+    /// configured endpoint and cache the token.
     Login(String),
     /// `--logout <target>`: evict a cached credential.
     Logout(String),
@@ -2923,7 +2952,9 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
     }
     let mut doc = file_doc.clone();
 
-    // --- ENV layer: derived path names, then legacy aliases (path names win) ---
+    // --- ENV layer: derived path names, then the short aliases. A path name
+    // wins over an alias for the same field, since it names the field exactly
+    // and cannot be a coincidence. ---
     let mut env_doc = Value::Object(Map::new());
     for (name, path) in ENV_ALIASES {
         let candidates = [
@@ -3047,12 +3078,13 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
 
     // --- type + validate ---
     let mut settings = Settings::from_document(doc.clone(), "config").map_err(usage)?;
-    // --- RFC 0033 §5: durability a laptop already satisfies ---
+    // --- durability a laptop already satisfies ---
     //
-    // A long-lived instance that names no store used to exit 2 and ask for a
-    // coordination backend before the operator had run anything. It now gets the
-    // FILE adapter: durable to whatever filesystem it lands on, and the runtime
-    // says so at startup (`store.file`) rather than implying more (§5.1).
+    // A long-lived instance that names no store gets the FILE adapter: durable
+    // to whatever filesystem it lands on, with the runtime logging exactly that
+    // at startup (`store.file`) rather than implying more. Demanding a
+    // coordination backend before the operator has run anything would make the
+    // first honest deployment the hardest one.
     //
     // "Absent" is read off the effective DOCUMENT, not off `settings.store.kind`
     // — `StoreKind` derives `Default = None`, so the typed value cannot tell a
@@ -3069,8 +3101,9 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
     if doc.pointer("/store/kind").is_none() && settings.is_long_lived() {
         settings.store.kind = StoreKind::File;
     }
-    // RFC 0037: resolve `service:` references + apply the tag floor BEFORE
-    // validation and the trifecta gate, so both see effective servers.
+    // Resolve `service:` references and apply the tag floor BEFORE validation
+    // and the trifecta gate, so both judge the effective servers rather than
+    // the pre-resolution shorthand.
     let service_errors = resolve_services(&mut settings);
     let mut loaded = Loaded {
         settings,
@@ -3143,11 +3176,12 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
 }
 
 /// The security controls a config file can **relax** — the two booleans that
-/// widen what this process may do (lift the lethal-trifecta refusal, RFC 0012
-/// §3.2; turn on the local command runner, RFC 0028 §exec). A file the operator
-/// NAMED may set them; a file merely discovered in the working directory may
-/// not. Narrowing settings are deliberately absent: a dotfile that takes power
-/// away needs no ceremony.
+/// widen what this process may do: lifting the lethal-trifecta refusal, and
+/// turning on the local command runner. A file the operator NAMED may set
+/// them; a file merely discovered in the working directory may not, so
+/// stepping into a repository cannot silently grant its dotfile more power
+/// than the operator asked for. Narrowing settings are deliberately absent:
+/// a dotfile that takes power away needs no ceremony.
 const DISCOVERY_FORBIDDEN_RELAXATIONS: [(&str, &str); 2] = [
     ("/security/allow_trifecta", "security.allow_trifecta"),
     ("/security/exec/enabled", "security.exec.enabled"),
@@ -3157,8 +3191,8 @@ const DISCOVERY_FORBIDDEN_RELAXATIONS: [(&str, &str); 2] = [
 /// it, and what it may call. A DISCOVERED config that sets any of them has them
 /// named in a startup `config.warning`, so adopting a dotfile is visible in the
 /// log rather than inferred from behaviour. Pointer + the dotted label to print:
-/// NAMES only, never values (a value may be a `{{secret:…}}` template — RFC 0012
-/// §3.7).
+/// NAMES only, never values — a value may be a `{{secret:…}}` template, and
+/// the log is not the place to widen a credential's blast radius.
 const DISCOVERY_SECURITY_SETTINGS: [(&str, &str); 12] = [
     ("/intelligence/endpoints", "intelligence.endpoints"),
     ("/intelligence/token", "intelligence.token"),
@@ -3175,7 +3209,8 @@ const DISCOVERY_SECURITY_SETTINGS: [(&str, &str); 12] = [
 ];
 
 /// Which of [`DISCOVERY_SECURITY_SETTINGS`] the file layer actually set, in
-/// declaration order. `null` counts as unset (RFC 7396 unsets with `null`).
+/// declaration order. An explicit `null` counts as unset, matching the merge
+/// semantics where `null` removes a key.
 fn discovered_security_settings(file_doc: &Value) -> Vec<&'static str> {
     DISCOVERY_SECURITY_SETTINGS
         .iter()
@@ -3308,7 +3343,7 @@ fn append_at(doc: &mut Value, path: &str, element: Value) {
 }
 
 /// `agentd --instruction X` (or `agent.instruction` alone) with no workflows ⇒
-/// the one-node workflow `once → agent → finish` (RFC 0030 §7).
+/// the one-node workflow `once → agent → finish`.
 ///
 /// A `--prompt` deliberately does NOT come here: a prompt is a **message to
 /// the agent**, delivered into its root context at startup, not a canned
@@ -3443,7 +3478,7 @@ fn expand_env_str(s: &str, env: &HashMap<&str, &str>) -> Result<String, String> 
 }
 
 // ---------------------------------------------------------------------------
-// Validation (RFC 0030 §5)
+// Validation
 // ---------------------------------------------------------------------------
 
 /// Collected diagnostics: `errors` fail the load (exit 2); `warnings` are
@@ -3456,9 +3491,9 @@ pub struct Diagnostics {
 
 /// Every check, collected (never fast-fails) so `--validate-config` reports
 /// all problems at once. Pure.
-/// Validate a unified `auth:` block (RFC 0031 §5) — the required fields per
-/// `kind`/`grant`, and secret-freedom for credential fields. Returns error
-/// strings prefixed with `ctx` (e.g. `mcp server 'github'`).
+/// Validate a unified `auth:` block — the fields each `kind`/`grant` requires,
+/// and secret-freedom for credential fields. Returns error strings prefixed
+/// with `ctx` (e.g. `mcp server 'github'`).
 fn validate_auth_block(auth: &Auth, ctx: &str) -> Vec<String> {
     let mut out = Vec::new();
     // Credential fields must be `{{secret:…}}` references, never inline.
@@ -3574,10 +3609,10 @@ fn validate_auth_block(auth: &Auth, ctx: &str) -> Vec<String> {
 /// This is the security half of header validation, and it is not cosmetic: a
 /// header whose ref does not resolve is a header that is **not sent**, so
 /// without this check the process starts and dials the endpoint with no
-/// credential at all. Validate-before-side-effect (RFC 0011 §2) means that is
-/// exit 2 at startup, naming the ref — the same rule, and the same resolver, the
-/// runtime uses at the moment of use. The message names the ref, never the
-/// resolved value (RFC 0012 §3.7).
+/// credential at all. Validating before any side effect makes that exit 2 at
+/// startup, naming the ref — the same rule, and the same resolver, the runtime
+/// applies at the moment of use. The message names the ref and never the
+/// resolved value, so a diagnostic cannot leak the credential.
 fn unresolved_secret_ref(value: &str) -> Option<String> {
     if !crate::sec::secret::has_secret_ref(value) {
         return None;
@@ -3731,7 +3766,7 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             }
         }
     }
-    // services catalog (RFC 0037 §6)
+    // services catalog
     for (name, svc) in &s.services {
         if name.is_empty()
             || !name
@@ -3871,8 +3906,8 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             }
         }
     }
-    // Egress policy (RFC 0037 §5, Phase B: all four outbound surfaces):
-    // closed ⇒ every configured dial must match a catalog entry of its kind.
+    // Egress policy, over all four outbound surfaces: closed ⇒ every
+    // configured dial must match a catalog entry of its own kind.
     if s.security.egress == Egress::Closed {
         let closed = |d: &mut Diagnostics, kind: ServiceKind, what: &str, url: &str| {
             if service_match(&s.services, kind, url).is_none() {
@@ -3966,8 +4001,9 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             );
         }
     }
-    // context templates (RFC 0038): parsed at LOAD so a malformed block or a
-    // typo'd reference is a startup error, never a mis-rendered prompt.
+    // Context templates are parsed at LOAD, so a malformed block or a typo'd
+    // reference is a startup error rather than a prompt that renders wrong
+    // once the agent is already running unattended.
     {
         let known: &[&str] = &[
             "instance",
@@ -4024,9 +4060,10 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             check(format!("context.templates.{name}"), src, false);
         }
     }
-    // subagent templates (RFC 0036): extraction, tier resolution and the
+    // Subagent templates: extraction, tier resolution and the
     // instance-machinery checks all run here, so a bad template refuses the
-    // PARENT's startup with the template named.
+    // PARENT's startup — naming the template — instead of failing at the first
+    // spawn, long after the deploy.
     if let Err(errs) = crate::config::templates::compile_templates(s) {
         for e in errs {
             err(&mut d, e);
@@ -4141,8 +4178,8 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             }
         },
         StoreKind::File => {
-            // No block is required: `kind: file` alone resolves a root from the
-            // environment (RFC 0033 §4). The one thing that cannot work is an
+            // No block is required: `kind: file` alone resolves a root from
+            // the environment. The one thing that cannot work is an
             // explicit empty path — it would resolve to the process's working
             // directory, so it is refused here rather than discovered as a
             // state directory nobody meant to create.
@@ -4162,13 +4199,13 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
         }
         StoreKind::None => {
             // A job-shaped instance (one-shot workflows, no listener) may run
-            // without a store — a crash re-runs it. Anything long-lived MUST
-            // be durable (RFC 0025): an A2A listener or a long-lived start node.
+            // without a store — a crash simply re-runs it. Anything long-lived
+            // MUST be durable: an A2A listener or a long-lived start node.
             //
-            // Reaching here with a long-lived instance now means the operator
-            // WROTE `none` (RFC 0033 §5): the absent case was defaulted to the
-            // file store back in `load`. So the message says how to take the
-            // default back, not just which backends exist.
+            // Reaching here with a long-lived instance means the operator
+            // WROTE `none`, because `load` defaults the absent case to the file
+            // store. So the message says how to take that default back, not
+            // just which backends exist.
             if s.is_long_lived() {
                 err(&mut d, "store.kind is none but the instance is long-lived (serves A2A / webhooks / a goal watchdog / has a loop|schedule|subscribe|signal|event|a2a|webhook start node) — configure a durable store (store.kind: file | mcp | http), or drop store.kind to get the local file store by default".into());
             } else if !s.workflows.is_empty() {
@@ -4235,7 +4272,7 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
         );
     }
 
-    // workflows (structural minimum here; RFC 0027 validation lives in the engine)
+    // workflows (the structural minimum only; full validation is the engine's)
     let mut wf_names = std::collections::HashSet::new();
     for (i, w) in s.workflows.iter().enumerate() {
         let Some(obj) = w.as_object() else {
@@ -4350,7 +4387,7 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
         }
     }
 
-    // interface (RFC 0032 display-client surface — rides the A2A listener)
+    // interface (the display-client surface — it rides the A2A listener)
     if s.interface.enabled && s.a2a.listen.is_none() {
         err(
             &mut d,
@@ -4411,7 +4448,7 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             }
         }
     }
-    // Pairing (RFC 0032 §13).
+    // Pairing-code login.
     if s.interface.pairing.enabled {
         if !s.interface.enabled {
             err(
@@ -4429,7 +4466,7 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
         }
     }
 
-    // webhooks (RFC 0027 inbound HTTP surface)
+    // webhooks (the inbound HTTP surface)
     let uses_webhook = s.workflows.iter().any(workflow_uses_webhook);
     if uses_webhook && s.webhooks.listen.is_none() {
         err(&mut d, "a `webhook` node (start or wait) is used but webhooks.listen is not set — configure webhooks.listen (https://host:port)".into());
@@ -4500,7 +4537,7 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
         }
     }
 
-    // goal watchdog (RFC 0026)
+    // goal watchdog
     if let Some(g) = &s.goal {
         let via = g.check.via.as_deref().unwrap_or("both");
         if via == "condition" && g.check.condition.is_none() {
@@ -4567,7 +4604,7 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                 err(
                     &mut d,
                     format!(
-                        "a2a peer '{}': SigV4 (auth kind aws) is a follow-up",
+                        "a2a peer '{}': auth kind `aws` is not accepted for peers — use static, oauth2 or spiffe",
                         p.name
                     ),
                 );
@@ -4633,7 +4670,7 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
         }
     }
 
-    // trifecta over the root grant (RFC 0012 §3.2)
+    // trifecta over the root grant
     let mut tags = Vec::new();
     for srv in &s.mcp.servers {
         match srv.tag_set() {
@@ -4753,8 +4790,9 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
     d
 }
 
-/// Long-lived start-node kinds (RFC 0027 §4) — an instance running one needs a
-/// durable store (RFC 0026 §8 lifecycle: `run_until: drained`).
+/// Start-node kinds that keep an instance alive indefinitely. An instance
+/// running one drains rather than finishing, so it needs a durable store: its
+/// state has no re-run to fall back on.
 pub const LONG_LIVED_STARTS: &[&str] = &[
     "loop",
     "schedule",
@@ -4898,7 +4936,7 @@ const FILE_SECRET_PATHS: &[&str] = &[
     "/security/aauth/enroll_token",
 ];
 
-/// Inline (non-reference) credentials in the FILE document (RFC 0030 §5).
+/// Inline (non-reference) credentials found in the FILE document.
 fn secret_violations(file_doc: &Value) -> Vec<String> {
     let mut out = Vec::new();
     for p in FILE_SECRET_PATHS {
@@ -4927,7 +4965,7 @@ fn secret_violations(file_doc: &Value) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Reload partition (RFC 0030 §6)
+// Reload partition
 // ---------------------------------------------------------------------------
 
 /// Restart-only path prefixes: a live reload whose effective document differs
@@ -4990,7 +5028,7 @@ pub fn help_text() -> String {
          Every setting is a document path (YAML/JSON file, AGENTD_<PATH> env, --<path> flag);\n\
          several files merge in order (later wins). Precedence: built-in < files < env < flags.\n\
          \n\
-         ALIASES (legacy spellings of paths):\n",
+         ALIASES (short spellings of paths):\n",
         ver = crate::VERSION
     );
     for a in ALIASES {
@@ -5003,7 +5041,7 @@ pub fn help_text() -> String {
         out.push_str(&format!("  {:<32} {} → {}\n", a.flag, shape, a.path));
     }
     out.push_str(
-        "\nSUBCOMMANDS (run the daemon with a display client attached; RFC 0032):\n\
+        "\nSUBCOMMANDS (run the daemon with a display client attached):\n\
          \x20 tui                        + the terminal UI (fullscreen; --inline for in-place)\n\
          \x20 ui                         + the web UI, opened in a browser\n\
          \x20                            both need `interface.enabled: true`, which the\n\
@@ -5015,14 +5053,14 @@ pub fn help_text() -> String {
          \x20 --validate-config          load+validate everything, print the verdict, exit 0/2\n\
          \x20 --config-schema            print the settings JSON Schema and exit\n\
          \x20 --context-template        print the built-in system-prompt template and exit\n\
-     \x20 --workflow-schema          print the workflow (dialect 3) JSON Schema + node registry and exit\n\
+     \x20 --workflow-schema          print the workflow JSON Schema + node registry and exit\n\
          \x20 --capabilities             print the capabilities manifest and exit\n\
          \x20 --login <target>           complete an OAuth device-login for an endpoint (e.g. mcp:<name>) and cache the token\n\
          \x20 --logout <target>          evict a cached credential\n\
          \x20 --prompt-missing           ask interactively (echo off, on /dev/tty) for each {{secret:NAME}} the startup preflight finds missing; refused without a controlling terminal\n\
          \x20 --env <FILE>               load a dotenv file into this process's environment (repeatable; real env wins, later files win)\n\
          \x20 -h, --help / -V, --version\n\
-         \nREMOVED IN 2.0:\n",
+         \nREMOVED FLAGS:\n",
     );
     for (flag, hint) in REMOVED_FLAGS {
         out.push_str(&format!("  {flag:<32} {hint}\n"));
@@ -5058,11 +5096,11 @@ mod tests {
         )]
     }
 
-    // ---- schema ↔ struct drift ---------------------------------------------
+    // ---- schema ↔ struct agreement -----------------------------------------
 
     /// serde's `deny_unknown_fields` error names the expected fields; that
     /// list IS the struct's field set — compare it with the schema properties
-    /// at every object, so neither can drift from the other.
+    /// at every object, so neither can diverge from the other unnoticed.
     fn struct_fields_at(doc_path: &str) -> Vec<String> {
         // Build a document that is empty except for a probe key at `doc_path`.
         let mut probe = Value::Object(Map::new());
@@ -5378,9 +5416,9 @@ mod tests {
 
     #[test]
     fn validate_config_catches_workflow_body_errors_the_runtime_would_refuse() {
-        // The pre-flight check must not pass a config that then exits 2 on the
-        // first real start. A typo'd step field used to validate clean and be
-        // refused by `load_workflows` at startup — the worst possible split.
+        // The pre-flight check must not pass a config that then exits 2 on
+        // the first real start: a validator that accepts what startup refuses
+        // is worse than no validator, because it certifies the broken config.
         let f = write_tmp(
             "config_version: \"1\"\nstore: {kind: memory}\nworkflows:\n  - name: w\n    version: 3\n    steps:\n      s: {kind: once}\n      a: {kind: agent, depends_on: [s], prompt: \"typo — agent steps take `instruction`\"}\n      f: {kind: finish, depends_on: [a], status: completed}\n",
             "yaml",
@@ -5471,7 +5509,7 @@ mod tests {
 
     #[test]
     fn a_long_lived_instance_defaults_to_the_file_store_but_an_explicit_none_is_refused() {
-        // An A2A listener is long-lived ⇒ the file store, not the old exit 2.
+        // An A2A listener makes the instance long-lived ⇒ the file store.
         let (l, _) = load(
             &args(&[
                 "--instruction",
@@ -5494,8 +5532,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(l.settings.store.kind, StoreKind::File);
-        // …but a STATED `none` is still refused: the default fills a silence, it
-        // does not overrule an operator (RFC 0033 §5).
+        // …but a STATED `none` is still refused: the default fills a silence,
+        // it does not overrule an operator.
         let e = load(
             &args(&[
                 "--config",
@@ -5694,9 +5732,9 @@ mod tests {
 
     #[test]
     fn mcp_server_oauth_is_carried_to_the_runtime_spec() {
-        // RFC 0031: `mcp.servers[].oauth` was silently dropped by `to_spec()`,
-        // leaving OAuth client-credentials inert. It must reach the runtime spec
-        // (as a secret-free template) so the connect path can build the signer.
+        // `mcp.servers[].oauth` must reach the runtime spec as a secret-free
+        // template, or the connect path has nothing to build a signer from and
+        // the configured client-credentials grant is inert.
         let s = McpServer {
             name: "gh".into(),
             endpoint: "https://mcp.example".into(),
@@ -5736,8 +5774,8 @@ mod tests {
         let mut env = base_env();
         env.clear();
         env.push(("AGENTD_LIMITS_RUN_STEPS".into(), "20".into())); // derived path name
-        env.push(("AGENT_MODEL".into(), "env-model".into())); // legacy alias
-        env.push(("INSTRUCTION".into(), "env-instruction".into())); // bare legacy alias
+        env.push(("AGENT_MODEL".into(), "env-model".into())); // short alias
+        env.push(("INSTRUCTION".into(), "env-instruction".into())); // bare alias
         let (l, _) = load(
             &args(&[
                 "--config",
@@ -5776,7 +5814,7 @@ mod tests {
             Some("ops")
         );
         assert_eq!(l.files.len(), 2);
-        // Path env beats the legacy alias for the same field.
+        // A derived path name beats the short alias for the same field.
         let env2: Vec<(String, String)> = vec![
             ("AGENT_MODEL".into(), "legacy".into()),
             ("AGENTD_INTELLIGENCE_MODEL".into(), "path".into()),
@@ -5849,7 +5887,7 @@ mod tests {
     }
 
     #[test]
-    fn validation_collects_the_rfc_0030_rules() {
+    fn validation_collects_the_document_rules() {
         // A file with an inline credential is refused; the same value from env is fine.
         let e = load_doc(
             "config_version: \"1\"\nintelligence:\n  endpoints: [https://i]\n  token: sk-inline\n",
@@ -6006,7 +6044,7 @@ mod tests {
         );
     }
 
-    // ---- the file store (RFC 0033) --------------------------------------------
+    // ---- the file store ------------------------------------------------------
 
     #[test]
     fn file_store_root_walks_the_chain_in_order() {
@@ -6150,7 +6188,7 @@ mod tests {
         assert!(help_section().contains("intelligence.model"));
     }
 
-    // ---- RFC 0037: service catalog & egress policy -------------------------
+    // ---- service catalog & egress policy -----------------------------------
 
     const CATALOG: &str = "config_version: \"1\"\nstore: {kind: memory}\nservices:\n  billing:\n    endpoint: https://billing.example/mcp\n    auth: {kind: static, token: \"{{secret:BILLING}}\"}\n    headers: {X-Env: prod}\n    tags: {\"*\": [sensitive]}\n    allow: [charge_lookup, invoice_*]\n    exclude: [invoice_purge]\n  brain:\n    kind: intelligence\n    endpoint: https://intel.example/v1\n";
 
@@ -6250,9 +6288,9 @@ mod tests {
 
     #[test]
     fn tag_floor_applies_to_inline_matching_servers() {
-        // Decision 3: an INLINE server pointing under a catalogued endpoint
-        // gets the entry's tags unioned in — under-tagging cannot launder a
-        // sensitive endpoint past the trifecta gate.
+        // An INLINE server pointing under a catalogued endpoint gets the
+        // entry's tags unioned in — under-tagging cannot launder a sensitive
+        // endpoint past the trifecta gate.
         let f = write_tmp(
             &format!(
                 "{CATALOG}mcp:\n  servers:\n    - {{name: sneaky, endpoint: \"https://billing.example/mcp/sub\"}}\n"
@@ -6356,8 +6394,8 @@ mod tests {
 
     #[test]
     fn peer_references_resolve_and_all_four_kinds_gate_closed_egress() {
-        // Phase B: a `kind: peer` entry feeds a2a.peers[].service; closed mode
-        // covers intelligence endpoints, peers, and http-step literals too.
+        // A `kind: peer` entry feeds a2a.peers[].service, and closed mode
+        // covers intelligence endpoints, peers and http-step literals too.
         let f = write_tmp(
             "config_version: \"1\"\nstore: {kind: memory}\nsecurity: {egress: closed}\nservices:\n  brain: {kind: intelligence, endpoint: \"https://intel.example/v1\"}\n  buddy: {kind: peer, endpoint: \"https://peer.example\", auth: {kind: static, token: \"{{secret:PEER}}\"}}\n  hooks: {kind: http, endpoint: \"https://hooks.example\", methods: [POST]}\na2a:\n  peers:\n    - {name: pal, service: buddy}\nworkflows:\n  - name: w\n    steps:\n      s: {kind: once}\n      h: {kind: http, depends_on: [s], method: POST, url: \"https://hooks.example/x\"}\n      f: {kind: finish, depends_on: [h], status: completed}\n",
             "yaml",

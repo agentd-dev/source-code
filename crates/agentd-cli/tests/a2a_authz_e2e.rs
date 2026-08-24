@@ -1,19 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! **A task belongs to a principal, and so does its event stream.**
 //!
-//! Two defects, one surface — the A2A listener's authorization — and both are
-//! only visible from outside the process, which is why they are tested here
+//! Two failure modes, one surface — the A2A listener's authorization — and both
+//! are only visible from outside the process, which is why they are tested here
 //! against the real binary rather than in a unit.
 //!
 //! ## Ownership does not stop at the task read
 //!
 //! Every task-facing port asks the reactor, and the reactor answers with the
 //! ownership matrix already applied: another principal's task is "not found",
-//! so its existence is not even disclosed. The *streaming* port had no such
-//! answer — a2a-rs's fan-out is keyed by task id alone — so naming somebody
-//! else's task id was enough to attach to it, and with a `Last-Event-ID` to
-//! replay what it had already emitted: every transition, and the result
-//! artifact that carries the agent's answer.
+//! so its existence is not even disclosed. The *streaming* port must apply it
+//! too — a2a-rs's fan-out is keyed by task id alone, so without an ownership
+//! check naming somebody else's task id is enough to attach to it, and with a
+//! `Last-Event-ID` to replay what it has already emitted: every transition, and
+//! the result artifact that carries the agent's answer.
 //!
 //! The test therefore drives two *different* principals through the real
 //! listener. The first assertion is that the subscribe is refused with the same
@@ -22,10 +22,10 @@
 //! that matters: nothing is delivered. A refusal that still opened the stream
 //! would pass a status-code check and leak the events anyway.
 //!
-//! ## A method name is remote input, and it was leaked
+//! ## A method name is remote input, and must never be leaked
 //!
-//! `principals::bare` lowercased the JSON-RPC `method` and `leak()`ed the copy
-//! to hand back a `&'static str`. The name is attacker-chosen, unbounded in
+//! `principals::bare` must not lowercase the JSON-RPC `method` and `leak()` the
+//! copy to hand back a `&'static str`. The name is attacker-chosen, unbounded in
 //! length, and reached *before* the caller is known to be anybody: an
 //! `Authorization: Bearer <junk>` header resolves to the anonymous principal
 //! rather than a 401, and every request passes the admin check on its way to
@@ -69,7 +69,7 @@ fn free_port() -> u16 {
 /// body kept apart.
 ///
 /// `budget` bounds the read rather than the connection: a refused subscribe
-/// closes at once, but the *unfixed* one answers with an SSE stream that stays
+/// closes at once, but an *unguarded* one answers with an SSE stream that stays
 /// open, and the test has to be able to say what it received from a stream that
 /// never ends. Reading stops early once a frame has arrived, so the budget is
 /// only ever spent when nothing does.
@@ -306,10 +306,10 @@ fn one_principals_task_stream_is_not_readable_by_another() {
         "B's cancel: {cancelled}"
     );
 
-    // The defect. `Last-Event-ID: 0` asks for everything the task has ever
-    // emitted, which is what makes this deterministic: a live subscription
-    // would depend on catching a transition, but a replay is owed the whole
-    // buffer the moment it attaches.
+    // The surface under test. `Last-Event-ID: 0` asks for everything the task
+    // has ever emitted, which is what makes this deterministic: a live
+    // subscription would depend on catching a transition, but a replay is owed
+    // the whole buffer the moment it attaches.
     let subscribe = json!({"jsonrpc": "2.0", "id": 4, "method": "SubscribeToTask",
                            "params": {"id": task_id}})
     .to_string();
@@ -321,9 +321,9 @@ fn one_principals_task_stream_is_not_readable_by_another() {
         Duration::from_secs(10),
     );
 
-    // Nothing was delivered. This is the assertion the defect is about: a
-    // refusal that still opened the stream would satisfy every other check here
-    // and hand B the events anyway.
+    // Nothing was delivered. This is the assertion that matters: a refusal that
+    // still opened the stream would satisfy every other check here and hand B
+    // the events anyway.
     assert!(
         !body.contains("data:"),
         "B received stream frames for A's task: {status} / {body}"
@@ -384,8 +384,8 @@ fn rss_kb(pid: u32) -> u64 {
 
 /// A daemon with no principals at all: loopback is the operator, so a request
 /// with an unknown method is answered rather than logged as a denial. The admin
-/// check that used to leak runs either way — this only keeps the measurement
-/// from being about the size of the log file.
+/// check that handles the method name runs either way — this only keeps the
+/// measurement from being about the size of the log file.
 fn loopback_config(port: u16) -> String {
     format!(
         "config_version: \"1\"\n\
@@ -403,9 +403,9 @@ fn a_flood_of_distinct_method_names_does_not_grow_the_daemon() {
     /// Long enough that a leaked copy is unmistakable against allocator noise,
     /// short enough to stay well inside the request-body limit.
     const NAME: usize = 64_000;
-    /// Each one leaked a copy, so the difference between the two answers is
-    /// ~15 MiB against the ~0.2 MiB a steady-state daemon actually moves — two
-    /// orders of magnitude, which is why a threshold works here at all.
+    /// A leaked copy of every name would put ~15 MiB between the two readings,
+    /// against the ~0.2 MiB a steady-state daemon actually moves — two orders of
+    /// magnitude, which is why a threshold works here at all.
     const FLOOD: u64 = 250;
 
     let port = free_port();
@@ -449,8 +449,8 @@ fn a_flood_of_distinct_method_names_does_not_grow_the_daemon() {
     std::fs::remove_file(&cfg).ok();
 }
 
-/// The leak is reached *before* the caller is anybody: a junk bearer is not a
-/// 401, it is an anonymous principal that will be refused several checks later
+/// The leak-prone path is reached *before* the caller is anybody: a junk bearer
+/// is not a 401, it is an anonymous principal refused several checks later
 /// — after the admin check has already run. Asserted separately because the
 /// flood above measures the daemon that treats its caller as the operator, and
 /// the claim that matters for exposure is about the caller who has no

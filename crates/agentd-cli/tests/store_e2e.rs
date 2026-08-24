@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! agentd durable state (RFC 0025) over the REAL wire: the `Durable` façade
+//! agentd durable state over the REAL wire: the `Durable` façade
 //! → `McpStore` (default checkpointer profile) → `McpClient` (Streamable HTTP)
 //! → the built-in mock MCP server (`--internal-mock-mcp-http`) as a subprocess.
 //! Proves: entities/inbox/timers/manifest round-trip through `state.put/get/

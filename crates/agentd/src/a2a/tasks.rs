@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! **A2A tasks** (RFC 0029 §4, RFC 0025 §3.3 `task`): a durable unit of work a
-//! principal started — a root-turn answer, a workflow run, or a subagent —
-//! projected as an A2A `Task` (spec shape, `TASK_STATE_*`). Tasks survive
-//! restarts (`GetTask` works across lives), stream status/artifact frames from
-//! run/turn events, and cascade-cancel per RFC 0027 §6.
+//! **A2A tasks**: a durable unit of work a principal started — a root-turn
+//! answer, a workflow run, or a subagent — projected as an A2A `Task` (spec
+//! shape, `TASK_STATE_*`). Tasks are persisted, so `GetTask` answers across a
+//! restart; they stream status/artifact frames from run and turn events; and
+//! cancelling one cancels the work it links to, which in turn cancels that
+//! work's own children, so no orphan keeps running behind a cancelled task.
 
 use crate::state::now_ms;
 use serde::{Deserialize, Serialize};

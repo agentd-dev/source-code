@@ -1,7 +1,9 @@
 "use client";
 
-// A visual editor for agentd workflows (RFC 0027 dialect 3). Nodes are steps;
-// edges are `depends_on`. The palette and property forms are driven by the node
+// A visual editor for agentd workflows. Nodes are steps; edges are the
+// `depends_on` relation, so the graph on screen IS the dependency graph the
+// runtime walks — an edge drawn here is a `depends_on` entry written out, and a
+// cycle is therefore not expressible. The palette and property forms are driven by the node
 // registry generated from `agentd --workflow-schema`. Import a YAML config to
 // edit it, export the whole document back out. Multi-workflow: a config can hold
 // several workflows, switched by the tabs.

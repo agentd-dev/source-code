@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! **Agent memory** (RFC 0028 §3 `memory.*`, RFC 0025 §3.3 `memory`): a durable
-//! JSON key/value space in the instance's store namespace — `memory/<key>` —
-//! with optional TTL, size caps, and prefix listing. Listing uses the store's
-//! `list` when it has one, else the `memory/_index` record this module keeps
-//! (RFC 0025 §3.3). Overridable by an MCP memory server through the registry.
+//! **Agent memory**: a durable JSON key/value space in the instance's store
+//! namespace — `memory/<key>` — with optional TTL, size caps, and prefix
+//! listing. Listing uses the store's own `list` when it has one; a store
+//! without one is served from the `memory/_index` record this module
+//! maintains, so listing works on every backend rather than only the ones that
+//! can enumerate. Overridable by an MCP memory server through the registry.
 
 use crate::state::{Durable, Kind, now_ms};
 use crate::store::StoreError;

@@ -3,9 +3,9 @@
 An agentd instruction is prose: what the agent is for, how it should behave.
 But most agents are prose *plus* machinery — a workflow the prose keeps
 referring to, a house style the model should pull in when relevant, reference
-material that is context rather than command. Before directives, that
-machinery lived in a different part of the config (or on a different server)
-from the words describing it, and the two drifted.
+material that is context rather than command. When that machinery lives in a
+different part of the config, or on a different server, from the words
+describing it, nothing keeps the two in step.
 
 A **directive** embeds the machinery in the instruction itself, using the
 colon-fence container syntax that MyST, ChatGPT and the wider Markdown
@@ -17,7 +17,7 @@ ecosystem already converged on:
 :::
 ```
 
-One document is now the whole agent — reviewable in one diff, deployable as
+One document is the whole agent — reviewable in one diff, deployable as
 one file, reloadable as one unit:
 
 ```yaml
@@ -54,7 +54,7 @@ says. That single rule carries the whole security story:
 |---|---|
 | `agent.instruction` — inline, `--instruction-file`, a config file | **executed** — this is operator-authored config |
 | conversation / A2A messages / tool results | **never** — executing definitions out of untrusted text would be prompt injection as a feature; this is not configurable, on purpose |
-| URI-fetched instructions, skill bodies from MCP servers | **inert in this version** — they render as prose; an opt-in trust gate is the planned path |
+| URI-fetched instructions, skill bodies from MCP servers | **inert** — the operator did not write them in place, so their fences render as prose; an opt-in trust gate is the planned path |
 
 Everything is **fail-closed**: an unknown directive name, an unclosed fence,
 or a body that does not parse is a startup refusal (exit `2`) naming the line
@@ -88,9 +88,9 @@ directive-carrying instruction: it declared its machinery explicitly.
 
 ### `:::skill{name, description, when}` — an inline skill
 
-Skills (RFC 0028 §7) are named instruction bundles, discovered from MCP
-servers and preloaded on `@skill:<name>` references. Before this, a skill
-*required* a server. An inline skill is defined where it is used:
+Skills are named instruction bundles, discovered from MCP servers and
+preloaded on `@skill:<name>` references. An inline skill needs no server at
+all — it is defined where it is used:
 
 ```text
 :::skill{name=review description="how we review" when="reviewing PRs"}
@@ -148,7 +148,7 @@ steps:
 :::
 ```
 
-- **`:::config`** — any v2 config fragment (a YAML mapping of sections:
+- **`:::config`** — any config fragment (a YAML mapping of sections:
   `store`, `lifecycle`, `limits`, `intelligence`, …). Several blocks merge in
   document order, later winning.
 - **`:::mcp{name=…}`** — one `mcp.servers[]` entry; attributes merge over the
@@ -213,8 +213,8 @@ through one path:
 1. Starts are disarmed; the definition's MCP resource subscriptions are
    released (unless another armed workflow still wants the same
    `(server, uri)`).
-2. The old definition is **pinned** for its live runs, which keep executing
-   against the hash they started with.
+2. The outgoing definition is **pinned** for its live runs, which keep
+   executing against the hash they started with.
 3. New runs stop being admitted.
 4. The workflow's own policy applies:
 
@@ -230,7 +230,7 @@ unload: { policy: drain, timeout: 120s }   # drain (default) | cancel | detach
    live-run count) and `workflow.unloaded`.
 
 Replacement is retirement plus arrival: the new hash takes new runs
-immediately while the old hash's runs finish under their pin. Pins are
+immediately while the outgoing hash's runs finish under their pin. Pins are
 **durable**: even a SIGKILL followed by a restart with a changed or removed
 definition resumes the run under the definition it started with — edit the
 instruction as freely as you like; work in flight finishes as authored.
@@ -241,7 +241,7 @@ instruction as freely as you like; work in flight finishes as authored.
   `{{config.*}}` folding and CEL live where they already live.
 - **Not full MyST.** No roles, no `:key:` option lines, no nested-directive
   semantics — the container-fence subset is the whole grammar, parsed by a
-  dependency-free ~150-line module.
+  couple of hundred lines of dependency-free code.
 - **Not an escape from review.** A directive-carried workflow is config: it
   ships in the same file, diffs in the same review, and answers to the same
   immutability lock as everything else the operator deploys.
@@ -254,11 +254,9 @@ a schedule-start workflow).
 
 ## See also
 
-- [Configuration](configuration.md) — §6 for the other workflow sources
+- [Configuration](configuration.md) — §6.1 for the other workflow sources
   (inline, file, URL, directory) directives sit beside.
-- [Workflows](workflows.md) — the dialect the `:::workflow` body is written
+- [Workflows](workflows.md) — the language the `:::workflow` body is written
   in, and the full retirement contract.
 - [The agent loop](agent-loop.md) — where skills and context land in a turn.
 - [Security](security.md) — why conversation text never executes anything.
-- [RFC 0034](../rfcs/0034-instruction-documents-and-directives.md) — the
-  normative contract: grammar, surfaces, registry, retirement.

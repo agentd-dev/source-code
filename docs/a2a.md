@@ -226,9 +226,7 @@ why several surfaces can watch one session at once, and why a client can be
 attached from another machine with a rotating pairing code instead of a copied
 bearer.
 
-See [interface.md](interface.md) for the client surface, and
-[RFC 0029](../rfcs/0029-a2a-conversations-principals-commands.md) for the
-normative contract.
+See [interface.md](interface.md) for the client surface.
 
 ## See also
 

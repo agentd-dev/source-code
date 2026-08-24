@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! **Start nodes** as the triggers (RFC 0027 §4, plan §3.6.6): beyond `once`
+//! **Start nodes** are a workflow's triggers: beyond `once`
 //! and `manual`, the long-lived start kinds fire runs while the instance lives
 //! — `loop` (re-run on completion, `interval`/`until`/`max_iterations`/
 //! `backoff`), `schedule` (cron / `every`, `catch_up`), `subscribe` (an MCP
 //! resource update, notify-then-read, `debounce`/`coalesce`/`filter`,
 //! `claim`/`shard` for exactly-one-owner in a cluster), `signal` (a named
 //! signal), `event` (an internal lifecycle event), and `a2a` (a principal's
-//! message routed here — P5). Start-node state (last fired, iteration, missed,
-//! next deadline, debounce) is durable in the manifest.
+//! message routed here). Start-node state (last fired, iteration, missed,
+//! next deadline, debounce) is durable in the manifest, so a restart resumes
+//! the schedule rather than restarting it.
 
 use super::events::kinds;
 use super::reactor::Runtime;
@@ -113,8 +114,8 @@ impl Runtime {
                 json!({"workflow": workflow, "node": node, "next_ms": next}),
             );
         } else if at_fired {
-            // The one-shot `at` was consumed in an earlier life: nothing to arm,
-            // and nothing wrong either.
+            // The one-shot `at` was consumed in an earlier process lifetime:
+            // there is nothing to arm, and nothing wrong either.
             self.log.info(
                 "start.schedule.done",
                 json!({"workflow": workflow, "node": node, "note": "one-shot `at` already fired"}),
@@ -210,11 +211,11 @@ impl Runtime {
                         // A one-shot `at:` is CONSUMED by this firing. The flag
                         // is durable in the start state (not an in-memory one)
                         // because a restart re-arms from that state: without it
-                        // every tick past the instant re-armed `now + at`, so a
-                        // workflow the operator asked to run once at 03:00 ran
-                        // continuously from 03:00 on. A `cron` alongside `at`
-                        // still takes over from here — `at` is then just the
-                        // first occurrence.
+                        // every tick past the instant would re-arm `now + at`,
+                        // and a workflow the operator asked to run once at
+                        // 03:00 would run continuously from 03:00 on. A `cron`
+                        // alongside `at` still takes over from here — `at` is
+                        // then just the first occurrence.
                         let at_fired =
                             st["at_fired"].as_bool().unwrap_or(false) || spec.contains_key("at");
                         self.fire_start(
@@ -345,10 +346,11 @@ impl Runtime {
                 match crate::engine::template::render(mapping, &data) {
                     Ok(v) => v,
                     Err(e) => {
-                        // Fail closed, loudly. This used to fall back to `{}`,
-                        // which fired the run with silently-empty inputs — a
-                        // typo in the mapping became a mystery three steps
-                        // later instead of one line here.
+                        // Fail closed, loudly: an inputs mapping that will not
+                        // render cancels the firing rather than starting the
+                        // run with silently-empty inputs, so a typo in the
+                        // mapping surfaces as one line here instead of as a
+                        // mystery three steps later.
                         self.log.warn(
                             "start.inputs.invalid",
                             json!({"workflow": workflow, "node": node, "kind": kind, "err": e}),

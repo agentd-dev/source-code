@@ -83,10 +83,10 @@ retrieved documents are data, not orders.
 
 ## Building the snapshot
 
-The system prompt is assembled fresh every turn by **rendering a template
-over the runtime's environment data** (RFC 0038) — `agentd
---context-template` prints the built-in one, and `context.template`
-replaces it. The default renders, in order:
+The system prompt is assembled fresh every turn by **rendering a template over
+the runtime's environment data** — `agentd --context-template` prints the
+built-in one, and `context.template` replaces it. The default renders, in
+order:
 
 1. A persona line naming the instance and the internal tools this instance
    actually grants (derived from the registry, so it cannot claim a tool a

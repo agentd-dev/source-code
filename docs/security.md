@@ -9,8 +9,6 @@ declared, bounded by one structural rule about which kinds of tool may sit toget
 process. This page says what is enforced, where in the code, and — in a final section that
 is not an afterthought — what agentd does not defend against at all.
 
-Specification: [RFC 0012 — Security posture](../rfcs/0012-security-posture.md).
-
 ## The threat model
 
 **The model is untrusted input holding credentials.** Under a successful prompt injection,
@@ -148,21 +146,22 @@ running with `security.exec.enabled` contributes `sensitive` + `egress` to this 
 (`config/v2/mod.rs:3055`), so enabling the local runner beside an untrusted-input server
 refuses startup like any other trifecta.
 
-**Two gaps to know.** The `scope.trifecta_grant` warn event described in RFC 0012 does not
-exist in the code — an override-allowed trifecta proceeds silently, and the only trace is
-the config value. And code-registered (embedder) tools sit outside the accounting: they are
+**Two gaps to know.** No warn event is emitted when the override is exercised: a
+`scope.trifecta_grant` event name is reserved but never written, so an allowed trifecta
+proceeds silently and the only trace is the config value. And code-registered (embedder)
+tools sit outside the accounting: they are
 inserted with `Grant::all()` and an empty tag vector (`registry/mod.rs:244`), so an
 embedder whose native tool does egress or reads secrets defeats the budget silently.
 
-### The tag floor and closed egress (RFC 0037)
+### The tag floor and closed egress
 
-Tags being config-only leaves one hole: the *author* of a config (or of an RFC
-0036 template) could point a server at the billing system and simply not write
+Tags being config-only leaves one hole: the *author* of a config (or of a
+subagent template) could point a server at the billing system and simply not write
 `sensitive` — the gate then reasons soundly from a false premise. The
 `services:` catalog closes it: an entry binds an endpoint to authoritative
 tags, and any MCP declaration whose endpoint matches the entry gets those tags
 **unioned in before the gate runs** — referencing or inline, unconditionally.
-Under-tagging a catalogued endpoint is now impossible rather than undetected.
+Under-tagging a catalogued endpoint is therefore impossible rather than undetected.
 `security.egress: closed` extends the catalog from authority to allow-list
 across **every outbound surface**: MCP dials, intelligence endpoints, A2A
 peers, the `http` step (with per-entry `methods:` ceilings), the HTTP store,

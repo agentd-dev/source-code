@@ -1,4 +1,4 @@
-# agentd config reference (schema v2)
+# agentd config reference
 
 Authoritative and complete: `agentd --config-schema`. This is the map — which
 section owns what, and the keys worth knowing in each.
@@ -7,11 +7,14 @@ Every path here is also a flag (`--agent-instruction`) and an env var
 (`AGENTD_AGENT_INSTRUCTION`). Precedence: **built-in < file < env < flag**.
 Repeat `-c` to merge overlays in order (later wins).
 
-## The 21 sections
+## The sections
+
+Every section rejects unknown keys, so a misspelled name is exit `2` naming the
+key rather than a setting that silently does nothing.
 
 | section | owns |
 |---|---|
-| `config_version` | `"2"`. Required. |
+| `config_version` | `"1"`. |
 | `agent` | identity, standing instruction, preflight, wake-ups, ask-human fallback |
 | `intelligence` | the model endpoints, auth, budgets, failover/swap policy |
 | `limits` | per-run bounds: steps, tokens, deadline, subagent depth |
@@ -28,7 +31,10 @@ Repeat `-c` to merge overlays in order (later wins).
 | `observability` | log level, metrics, OTLP, health/report files |
 | `memory` `knowledge` `search` `skills` | agent-side state and retrieval surfaces |
 | `goal` | goal statement + stuck/achieved policy |
-| `cluster` | sharding across instances |
+| `services` | the external-service catalog: shared credentials, authoritative tags, tool ceilings |
+| `subagents` | spawn policy and the templates the model may instantiate |
+| `streams` | named durable event streams (declare before `emit`/`stream` may use one) |
+| `vars` | operator constants, referenced as `{{config.NAME}}` |
 
 ## agent
 
@@ -139,5 +145,5 @@ security:
 ```sh
 agentd --validate-config -c agent.yaml   # 0 or 2, before any LLM call
 agentd --capabilities                    # what this binary actually supports
-agentd --workflow-schema                 # workflow dialect 3 + node registry
+agentd --workflow-schema                 # the workflow schema + node registry
 ```

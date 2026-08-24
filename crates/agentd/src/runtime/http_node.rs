@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The **`http` workflow node** (RFC 0027): make an outbound REST call from a
-//! workflow — `GET`/`POST`/`PUT`/`PATCH`/`DELETE` with `headers`, `query`, and a
+//! The **`http` workflow node**: make an outbound REST call from a workflow —
+//! `GET`/`POST`/`PUT`/`PATCH`/`DELETE` with `headers`, `query`, and a
 //! `json`/`body` payload — and observe `{status, ok, headers, body, json}`. This
 //! is also how a workflow **emits a webhook** (a `POST` to a URL). It runs on an
-//! executor thread over the one SSRF-guarded HTTP client (RFC 0012); the URL and
-//! body are already template-rendered (`render_spec`) against the run's data.
+//! executor thread over the one SSRF-guarded HTTP client, so every outbound dial
+//! in the daemon passes the same guard; the URL and body are already
+//! template-rendered (`render_spec`) against the run's data.
 //!
 //! Security: the SSRF classifier guards the resolved host — private/loopback/
 //! link-local targets are refused unless the node sets `allow_private: true`
@@ -44,10 +45,12 @@ impl crate::runtime::reactor::Runtime {
             .and_then(Value::as_str)
             .unwrap_or("GET")
             .to_ascii_uppercase();
-        // RFC 0037 Phase B: the `http` step is a covered egress surface —
-        // `closed` mode requires a `kind: http` catalog entry (templated URLs
-        // are judged HERE, literals already at load), and a matching entry's
-        // `methods:` is a ceiling either mode.
+        // The `http` step is a covered egress surface. In `closed` mode the URL
+        // must match a `kind: http` service-catalog entry; a literal URL is
+        // judged at config load, but a templated one only resolves here, so the
+        // check has to run again at dial time. A matching entry's `methods:`
+        // list is a ceiling in either mode — declaring an endpoint for reads
+        // must not silently authorize writes to it.
         {
             use crate::config::v2 as cfgv2;
             if let Err(e) = cfgv2::egress_allows(
@@ -362,7 +365,10 @@ fn do_http(
     }))
 }
 
-/// Minimal percent-encoding for query components (RFC 3986 unreserved kept).
+/// Percent-encode one query component. Only the RFC 3986 unreserved characters —
+/// ASCII letters, digits and `-` `_` `.` `~` — pass through untouched;
+/// every other byte becomes `%XX`, so `&`, `=` and `?` in a value cannot
+/// break out and forge extra query parameters.
 fn pct(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {

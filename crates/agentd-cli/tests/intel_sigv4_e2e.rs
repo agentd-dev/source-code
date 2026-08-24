@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! RFC 0031: an `intelligence.auth: { kind: aws }` **SigV4-signs the LLM dial**.
+//! An `intelligence.auth: { kind: aws }` block **SigV4-signs the LLM dial**.
 //! A real `IntelClient` with an AWS SigV4 signer dials a mock endpoint that
 //! captures the request headers; the `Authorization` is an `AWS4-HMAC-SHA256`
 //! signature (Bedrock / an AWS-IAM-gated gateway authenticates by SigV4, not a

@@ -1,19 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The supervision tree — the in-memory record of the subagent process tree.
-//! RFC 0002 §supervision-record, RFC 0003 §accounting, RFC 0009 §caps.
 //!
 //! This module owns the *bookkeeping*: who spawned whom, each node's depth and
 //! `agent_path`, hierarchical token accounting to the root, the tree-wide
 //! `draining` flag, and the **spawn chokepoint** that enforces the fork-bomb
 //! caps. It is pure logic — no processes, pipes, or signals (those are
 //! `spawn.rs`/`reap.rs`/`kill.rs`). Depth is **minted here** from the parent's
-//! record, never trusted from a child's request (RFC 0009).
+//! record, never trusted from a child's request: a child that could name its own
+//! depth could name `0` forever and defeat the recursion cap.
 
 use std::collections::HashMap;
 use std::time::Instant;
 
-/// A std-only token bucket for the tree-wide **spawn-rate** cap (RFC 0009 §3.6:
-/// 8 burst, 2 tokens/s refill). Hand-rolled — a rate limiter is `Instant` +
+/// A std-only token bucket for the tree-wide **spawn-rate** cap (8 burst,
+/// 2 tokens/s by default). Hand-rolled — a rate limiter is `Instant` +
 /// arithmetic, never a crate. Refill is **lazy**: every `try_take` first credits
 /// the tokens that have accrued since the last call, then spends one if it can.
 /// This catches a *fast churn loop* that stays under the absolute subagent count
@@ -127,18 +127,19 @@ pub struct Node {
     pub children: Vec<NodeId>,
 }
 
-/// Fork-bomb / runaway-recursion caps, enforced at the one spawn chokepoint
-/// (RFC 0009). Conservative defaults; a spawn exceeding any of these is
-/// **refused as a tool result**, never a crash.
+/// Fork-bomb / runaway-recursion caps, enforced at the one spawn chokepoint.
+/// Conservative defaults; a spawn exceeding any of these is **refused as a tool
+/// result**, never a crash — the requesting agent gets to adapt, and one greedy
+/// branch cannot take the tree down.
 #[derive(Debug, Clone, Copy)]
 pub struct Caps {
     pub max_depth: u32,
     pub max_children: u32,
     pub max_total: u32,
     pub tree_token_ceiling: u64,
-    /// Spawn-rate token bucket burst (RFC 0009 §3.6).
+    /// Spawn-rate token bucket burst.
     pub spawn_rate_burst: u32,
-    /// Spawn-rate token bucket refill, tokens per second (RFC 0009 §3.6).
+    /// Spawn-rate token bucket refill, tokens per second.
     pub spawn_rate_per_sec: f64,
 }
 
@@ -156,7 +157,7 @@ impl Default for Caps {
 }
 
 /// Why a spawn was refused. Surfaced to the requesting agent as a tool result
-/// so its model can adapt (RFC 0009) — not an error that crashes the tree.
+/// so its model can adapt — not an error that crashes the tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpawnRefused {
     Draining,
@@ -189,7 +190,7 @@ pub struct Tree {
     draining: bool,
     /// Tree-wide token total (source of truth for the ceiling).
     total_tokens: u64,
-    /// Tree-wide spawn-rate limiter (RFC 0009 §3.6), enforced in `mint_child`.
+    /// Tree-wide spawn-rate limiter, enforced in `mint_child`.
     spawn_bucket: TokenBucket,
     caps: Caps,
 }
@@ -240,8 +241,9 @@ impl Tree {
     }
 
     /// Mint a child of `parent`, enforcing every cap. **Depth and path are
-    /// derived from the parent here** — the chokepoint (RFC 0009). The caller
-    /// then attaches the OS handle to the returned node.
+    /// derived from the parent here** — this is the single chokepoint, so no
+    /// caller can bypass a cap by supplying its own depth. The caller then
+    /// attaches the OS handle to the returned node.
     pub fn mint_child(&mut self, parent: NodeId) -> Result<NodeId, SpawnRefused> {
         if self.draining {
             return Err(SpawnRefused::Draining);
@@ -262,7 +264,7 @@ impl Tree {
             }
             (p.depth + 1, p.children.len(), p.agent_path.clone())
         };
-        // Spawn-rate cap (RFC 0009 §3.6): catches a fast churn loop that stays
+        // Spawn-rate cap: catches a fast churn loop that stays
         // under the absolute depth/breadth/total counts. Last gate before the
         // node is minted, so a refused spawn costs no token and no id.
         if !self.spawn_bucket.try_take() {
@@ -311,14 +313,15 @@ impl Tree {
     }
 
     /// Flip the one-way draining flag (SIGTERM / tree-budget breach). After
-    /// this, `mint_*` refuses — a parent can't spawn replacements mid-teardown
-    /// (RFC 0003 §kill-ladder).
+    /// this, `mint_*` refuses, so a parent cannot spawn replacements mid-teardown
+    /// and the kill ladder always terminates.
     pub fn set_draining(&mut self) {
         self.draining = true;
     }
 
-    /// Node ids ordered **deepest-first** — the kill-ladder teardown order so
-    /// children die before parents (RFC 0003).
+    /// Node ids ordered **deepest-first** — the kill-ladder teardown order.
+    /// Children must die before parents, otherwise a killed parent's children are
+    /// reparented to pid 1 and escape the tree's accounting entirely.
     pub fn deepest_first(&self) -> Vec<NodeId> {
         let mut ids: Vec<NodeId> = self.nodes.keys().copied().collect();
         ids.sort_by(|a, b| {
@@ -421,7 +424,7 @@ mod tests {
     #[test]
     fn token_bucket_burst_then_refill() {
         use std::time::Duration;
-        // 8 burst, 2/s refill (the RFC 0009 §3.6 spawn-rate defaults).
+        // 8 burst, 2/s refill (the default spawn-rate settings).
         let mut b = TokenBucket::new(8, 2.0);
         let t0 = Instant::now();
         // The full burst of 8 is spendable without any time passing…

@@ -4,7 +4,7 @@ import { GROUPS, docsInGroup } from "../../lib/docs";
 export const metadata = {
   title: "Documentation — agentd",
   description:
-    "Guides, concepts, operations and the full RFC set for agentd — the minimal, MCP-native agent runtime.",
+    "Guides, concepts, operations and reference for agentd — the minimal, MCP-native agent runtime.",
   alternates: { canonical: "/docs/" },
 };
 
@@ -36,8 +36,9 @@ const PATHS = [
 ];
 
 export default function DocsIndex() {
-  const guideGroups = GROUPS.filter((g) => !g.id.startsWith("rfc"));
-  const rfcGroups = GROUPS.filter((g) => g.id.startsWith("rfc"));
+  // Only groups that actually hold a doc get a heading — an empty group would
+  // otherwise render a title over nothing.
+  const groups = GROUPS.filter((g) => docsInGroup(g.id).length > 0);
 
   return (
     <main className="mx-auto max-w-[70rem] px-4 py-14">
@@ -46,8 +47,8 @@ export default function DocsIndex() {
         Everything about running an agent you own
       </h1>
       <p className="mt-4 max-w-2xl text-lg text-[var(--dim)]">
-        Guides, concept articles and the normative specifications — rendered straight from the
-        repository&apos;s markdown, so what you read is what the runtime ships with.
+        Guides, concept articles and reference — rendered straight from the repository&apos;s
+        markdown, so what you read is what the runtime ships with.
       </p>
 
       <div className="mt-10 grid gap-4 md:grid-cols-3">
@@ -60,7 +61,7 @@ export default function DocsIndex() {
         ))}
       </div>
 
-      {guideGroups.map((g) => (
+      {groups.map((g) => (
         <section key={g.id} className="mt-14">
           <h2 className="mb-4 text-sm font-semibold uppercase tracking-[0.12em] text-[var(--green)]">
             {g.title}
@@ -81,38 +82,6 @@ export default function DocsIndex() {
         </section>
       ))}
 
-      <section className="mt-16">
-        <h2 className="mb-1 text-sm font-semibold uppercase tracking-[0.12em] text-[var(--green)]">
-          Specifications
-        </h2>
-        <p className="mb-5 max-w-2xl text-sm text-[var(--dim)]">
-          The normative specs behind the implementation. Read these when you need the exact contract
-          — the guides above explain the same material for people who need to use it rather than
-          re-implement it.
-        </p>
-        <div className="grid gap-8 sm:grid-cols-2">
-          {rfcGroups.map((g) => (
-            <div key={g.id}>
-              <div className="mb-2 font-mono text-xs uppercase tracking-wider text-[var(--dim)]">
-                {g.title}
-              </div>
-              <ul className="space-y-1.5">
-                {docsInGroup(g.id).map((d) => (
-                  <li key={d.slug}>
-                    <Link
-                      href={`/docs/${d.slug}/`}
-                      className="inline-flex items-center gap-2 text-sm text-[var(--fg)] hover:text-[var(--green)]"
-                    >
-                      <span className="text-[var(--dimmer)]">→</span> {d.title}
-                      <Tag tag={d.tag} />
-                    </Link>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          ))}
-        </div>
-      </section>
     </main>
   );
 }

@@ -18,8 +18,7 @@ jobs:
 
 The default build ships exactly two things: a hand-rolled JSON-lines logger to
 stderr (no `tracing`, no metrics SDK, no OTLP) and a tiny health surface (exit
-code + an optional `--health-file`). Everything heavier is feature-gated. Full
-rationale is in [RFC 0010](../rfcs/0010-observability-health-telemetry.md).
+code + an optional `--health-file`). Everything heavier is feature-gated.
 
 ---
 
@@ -33,8 +32,8 @@ The split is absolute:
   self-identifies (`run_id`, `agent_path`, `pid`, …), so the container
   runtime/collector captures stderr and you reassemble the tree later.
 
-In subagent mode stdout is the control channel back to the parent (RFC 0005),
-so telemetry still goes to **stderr** — never mixed into the channel.
+In subagent mode stdout is the control channel back to the parent, so telemetry
+still goes to **stderr** — never mixed into the channel.
 
 ```sh
 # result on stdout, telemetry on stderr — cleanly separable
@@ -112,9 +111,9 @@ the core set; build-gated surfaces add a few more, noted inline.
 | `subagent.drain` / `subagent.sigterm` / `subagent.sigkill` / `subagent.teardown` | the bounded kill ladder (`reason`, `live`) |
 | `drain.start` / `drain.done` / `drain.abandon` | `live`, `drain_ms` — the SIGTERM drain began, completed, or exceeded its budget (the ladder is forced) |
 | `limit.exceeded` | `limit` (`tree_tokens`/…) — a tree budget tripped |
-| `scope.trifecta_refused` / `scope.trifecta_grant` | `legs` — the Rule-of-Two refused the grant (exit 2) or `--allow-trifecta` overrode it with a warning (RFC 0012) |
+| `scope.trifecta_refused` / `scope.trifecta_grant` | `legs` — the Rule-of-Two refused the grant (exit 2) or `--allow-trifecta` overrode it with a warning |
 | `cgroup.armed` | `memory_max`, `memory_current`, `memory_high` — cgroup-v2 awareness (best-effort, quiet off-cgroup) |
-| `a2a.connect` / `a2a.send` / `a2a.delegate` | `peer`/`principal`/`method` — a peer connected, an A2A message/command was served, or a peer delegated a run (RFC 0029, `--features a2a`) |
+| `a2a.connect` / `a2a.send` / `a2a.delegate` | `peer`/`principal`/`method` — a peer connected, an A2A message/command was served, or a peer delegated a run (`--features a2a`) |
 | `a2a.drain` / `a2a.lameduck` / `a2a.pause` / `a2a.resume` / `a2a.cancel` / `a2a.denied` | an operator admin-command outcome, or an authorization refusal |
 | `run.start` · `run.done` / `run.deadline` / `run.refused` / `run.stalled` / `run.dropped` | a workflow run's start + its terminal outcome |
 | `workflow.finished` / `workflow.failed` · `workflow.run` / `define` / `loaded` / `deleted` | workflow lifecycle |
@@ -132,7 +131,7 @@ the core set; build-gated surfaces add a few more, noted inline.
 | `intel.result` | `model`, `tokens_in`, `tokens_out`, `finish_reason`, `dur_ms` |
 | `tool.call` | `tool`, `id`, (`args` only with content capture on) |
 | `tool.result` | `tool`, `is_error`, `bytes` (`content` only with content capture on) |
-| `self.schedule` | `after_s`, `queued` — the agentd scheduled a future self-wake-up (RFC 0008) |
+| `self.schedule` | `after_s`, `queued` — the agentd scheduled a future self-wake-up |
 | `self.subscribe` | `action` (`subscribe`/`unsubscribe`), `uri` — the agentd changed its own subscriptions |
 
 `comp:"mcp"` is used for transport-level lines folded from MCP
@@ -322,7 +321,7 @@ the pod is not "ready", so an orchestrator won't route work to it.
 ### The health surface — a minimal ladder
 
 1. **Exit code (always, free).** Primary for one-shot, final for daemons. The
-   stable table (owned by RFC 0011):
+   table is stable — a scheduler may branch on these values:
 
    | Code | Meaning | Scheduler hint |
    |---|---|---|
@@ -389,7 +388,7 @@ surfaces are opt-in and never on for a one-shot.
 
 ## Live state reads (the A2A surface)
 
-A control plane reads live state over **A2A** (`a2a.listen`, RFC 0029), on the
+A control plane reads live state over **A2A** (`a2a.listen`), on the
 same HTTPS listener that carries everything else. Every read resolves to a
 **principal** and is authorized against the role matrix — an anonymous caller is
 refused — so there is no unauthenticated status port. These reads answer "what is
@@ -424,7 +423,7 @@ lossy-by-design ring outran it:
 ```jsonc
 // SendMessage part: {"data":{"agentd":{"op":"debug.events","after":4821,"level":"warn","prefix":"run."}}}
 { "oldest_seq":4700, "newest_seq":4990, "dropped":0,
-  "events":[ /* the RFC 0010 JSON log lines, filtered */ ] }
+  "events":[ /* the JSON log lines, filtered */ ] }
 ```
 
 The cursor and filters are command arguments: `after` (advance to the last `seq`
@@ -470,9 +469,9 @@ the features below):
 > **What the `metrics` build actually renders.** The list above is what an
 > agentctl dashboard counts; under `--features metrics` the **emitted** series are
 > exactly those in [`obs/metrics.rs::render`](../crates/agentd/src/obs/metrics.rs)
-> and the frozen RFC 0016 §4.3 set below. Three §4.3 names are **reserved**, not
-> emitted in this build (rendered as a `# HELP`/`# TYPE` marker with no sample, the
-> same honest-absence shape as `agent_mcp_up`):
+> and the frozen set below. Four frozen names are **reserved**, not emitted in this
+> build (rendered as a `# HELP`/`# TYPE` marker with no sample, the same
+> honest-absence shape as `agent_mcp_up`):
 > `agent_tool_calls_total{server,tool,ok}` (the tool-call boundary runs in the
 > child loop, so a supervisor scrape can't reflect it — derive from `tool.result`
 > log lines), and the three latency **histograms** `agent_run_duration_ms`,
@@ -491,7 +490,7 @@ the features below):
 `agent_path`, `call_id`, or resource URIs into metric labels — they are unbounded
 and live in logs/traces only. Labels use bounded values only: `server`, `tool`,
 `kind`, `route`, `status`, `limit`, `signal`, `reason`, `type` (the `model` label
-is reserved by RFC 0016 §4.3 but not yet emitted — see the note above).
+is reserved in the frozen schema but never emitted — see the note above).
 
 ### `metrics` feature — Prometheus text (`--features metrics`)
 
@@ -519,8 +518,8 @@ The A2A/hot-reload surfaces add these to the frozen set:
   `0` after `a2a.resume`. **Pause is not readiness** — `agent_ready` ignores it
   (it tracks only drain / lame-duck), so a paused instance can still read
   `agent_ready 1`. Read the `paused` field of the A2A `status` command for the
-  authoritative answer: the gauge is rendered but the v2 runtime does not yet
-  write it, so it reads `0` even while a hold is on.
+  authoritative answer: the gauge is rendered but never written, so it reads `0`
+  even while a hold is on.
 - **`agent_config_reload_total{result}`** *(counter)* — hot reloads by result.
   The label domain is bounded to `applied` | `rejected` | `other`; a refused
   reload (invalid candidate, or a restart-only diff) currently lands in `other`,
@@ -530,14 +529,14 @@ The A2A/hot-reload surfaces add these to the frozen set:
 - **`agent_config_generation`** *(gauge)* — the count of successfully-applied
   reloads, monotonic in practice, so a scraper can detect "this instance has
   picked up generation N" against the controller's desired generation. Like
-  `agent_paused` it is rendered but not yet written by the v2 runtime; the
-  durable manifest's `lifecycle.config_generation` and the `config.reloaded` log
-  line are the reliable signals today.
+  `agent_paused` it is rendered but never written; the durable manifest's
+  `lifecycle.config_generation` and the `config.reloaded` log line are the
+  reliable signals.
 - **`agent_drains_total{phase}`** *(counter)* — drain phase transitions; the
   closed domain is `started` | `completed` | `forced` | `other` (so `completed`
   vs `forced` distinguishes a clean drain from one that overran its budget).
-- **`agent_runs_total{status}`** *(counter)* — runs by the RFC 0007 §3.4
-  terminal-status vocabulary (`completed`, `refused`, `exhausted_steps`,
+- **`agent_runs_total{status}`** *(counter)* — runs by the closed terminal-status
+  vocabulary (`completed`, `refused`, `exhausted_steps`,
   `exhausted_tokens`, `deadline`, `stalled`, `loop_detected`, `cancelled`,
   `crashed`, `other`).
 - **`agent_refusals_total{reason}`** *(counter; **process-local**)* — guard trips
@@ -549,7 +548,7 @@ The A2A/hot-reload surfaces add these to the frozen set:
   reachability + error breakdown.
 - **`agent_intel_all_down`** *(gauge, 0/1)* — `1` while **every** model endpoint
   is down (the latched last-child-experience truth that also flips `/readyz`
-  NotReady, RFC 0018 §6); distinct from `agent_intel_up` (the active endpoint's
+  NotReady); distinct from `agent_intel_up` (the active endpoint's
   reachability).
 - **`agent_restarts_total`**, **`agent_reactor_stalls_total`** *(counters;
   **reserved** in `metrics_schema 1.0`)* — supervisor process restarts observed
@@ -586,10 +585,10 @@ Point-in-time gauges a horizontal scaler reads:
 - **`agent_turns_queued`** — conversation turns waiting for a dispatch slot
   (parallelism, pause, drain, or shed — the event stream says which).
 
-(The legacy bare series — `agent_runs_started_total`, `agent_tokens_input_total`,
-`agent_reactions_total`, etc. — are retained alongside the frozen set, additive
-within the major. `agent_mcp_up{server}` is **not** emitted in this build — only
-the connect-failure counter is.)
+(The unlabelled bare series — `agent_runs_started_total`, `agent_tokens_input_total`,
+`agent_reactions_total`, etc. — are emitted alongside the frozen set, so a scrape
+carries both spellings. `agent_mcp_up{server}` is **not** emitted in this build —
+only the connect-failure counter is.)
 
 ### `otel` feature — OTLP export + GenAI semconv (`--features otel`)
 
@@ -628,6 +627,3 @@ collector / sidecar so agentd stays thin (no batching/retry sophistication).
   container runtime / collector owns capture and rotation.
 - **HTTP `/healthz` / `/readyz` / `/metrics` are opt-in**, never on for a
   one-shot CLI run.
-
-See [RFC 0010](../rfcs/0010-observability-health-telemetry.md) for the full
-specification and rationale.

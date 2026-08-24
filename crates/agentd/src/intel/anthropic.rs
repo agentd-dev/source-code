@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Anthropic Messages API adapter. RFC 0006 §two-adapters.
+//! Anthropic Messages API adapter. Pure translation, no I/O — every dial goes
+//! through `intel::client`, so this module stays testable without a network.
 //!
-//! The second (and last) in-binary dialect. Pure translation, no I/O. Differs
-//! from OpenAI in three ways the loop never sees: `system` is a top-level
-//! field (not a message), tool calls/results are content *blocks*, and tool
-//! arguments are a JSON object (not a stringified one).
+//! Three differences from the OpenAI dialect are absorbed here and never
+//! surface to the loop: `system` is a top-level field rather than a message,
+//! tool calls and results are content *blocks* rather than message fields, and
+//! tool arguments arrive as a JSON object rather than a stringified one.
 
 use crate::wire::intel::{Message, Request, Response, StopReason, ToolCall, Usage};
 use serde_json::{Map, Value, json};

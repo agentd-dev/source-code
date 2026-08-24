@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The guarded `exec` tool (RFC 0028 §exec) end to end: a workflow `tool` node
-//! runs an allow-listed local command and observes `{stdout, exit_code, …}`; a
-//! command that is NOT allow-listed is refused. Runs only with `--features exec`
+//! The guarded `exec` tool, end to end: a workflow `tool` node runs an
+//! allow-listed local command and observes `{stdout, exit_code, …}`; a command
+//! that is NOT allow-listed is refused. Runs only with `--features exec`
 //! AND `security.exec.enabled` — agentd's default is no local execution.
 #![cfg(all(unix, feature = "exec"))]
 

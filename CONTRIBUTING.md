@@ -5,8 +5,8 @@ Contract (ACC) that the agentctl control plane consumes.
 
 ## Licensing & DCO sign-off
 
-agentd is **Apache-2.0** (see [`LICENSE`](LICENSE)) — contributions are accepted
-**inbound = outbound** under Apache-2.0 (Apache-2.0 §5); no CLA is required.
+agentd is **AGPL-3.0-only** (see [`LICENSE`](LICENSE)) — contributions are
+accepted **inbound = outbound** under the same licence; no CLA is required.
 Instead, sign off every commit with the **Developer Certificate of Origin**
 (certifying you wrote it / may submit it):
 
@@ -41,12 +41,19 @@ env, report):
 ## Dev workflow
 
 ```sh
-cargo build -p agentd
-cargo test  -p agentd --features "serve-mcp,a2a,events,metrics,cluster,hot-reload"
-cargo clippy --all-targets -- -D warnings
+cargo build -p agentd-core                     # the engine, default features
+cargo test --workspace --all-features
+cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --all
-cargo run -p agentd-conformance        # the black-box behavioral suite
+cargo run -p agentd-conformance                # the black-box behavioural suite
 ```
 
-By submitting a contribution you agree it is licensed under Apache-2.0 and that
-you have signed off the DCO.
+Build with **default** features too, not only `--all-features`: the default
+build carries a three-dependency moat (`libc`, `serde`, `serde_json`) that a
+full-feature build hides, and a new dependency that lands there is a decision,
+not an accident. Features are compile-time and each one is a 1:1 forward from
+`agentd-cli` to `agentd-core`, so a feature-solo build is the only way to catch
+a `cfg` that only compiles when a neighbour is also on.
+
+By submitting a contribution you agree it is licensed under AGPL-3.0-only and
+that you have signed off the DCO.

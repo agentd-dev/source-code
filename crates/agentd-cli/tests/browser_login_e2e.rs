@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! OAuth 2.1 **authorization-code + PKCE** browser flow (RFC 0031 §7) end to end:
+//! OAuth 2.1 **authorization-code + PKCE** browser flow, end to end:
 //! `browser_login` prints the authorization URL, runs a loopback callback server,
 //! verifies `state`, and exchanges the code (+ PKCE verifier) at the token
 //! endpoint. The test plays the browser — it reads the printed URL, extracts the

@@ -1,18 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Intelligence client — endpoint *list* selection + one round-trip. RFC 0006 + RFC 0018.
+//! Intelligence client — endpoint *list* selection plus one round-trip.
 //!
-//! The transport is **HTTPS** (target-vision pivot; plaintext `http://` is a
-//! loopback-only dev carve-out) — each `AGENTD_INTELLIGENCE` list element is an
-//! `https://` URL; the wire is HTTP/1.1 (the gateway/provider speaks
-//! OpenAI-compatible `/chat/completions`). One request opens one connection
-//! (`Connection: close`) — simple and robust; pooling is a non-goal (RFC 0018 §10).
+//! The transport is **HTTPS**: each `AGENTD_INTELLIGENCE` list element is an
+//! `https://` URL, and plaintext `http://` is admitted only for a loopback host
+//! as a dev carve-out. The wire is HTTP/1.1, with the gateway or provider
+//! speaking an OpenAI-compatible `/chat/completions`. Each request opens its own
+//! connection and sends `Connection: close`: model calls are seconds apart and
+//! minutes long, so a connection pool would buy nothing and cost a whole class
+//! of stale-socket failures.
 //!
-//! RFC 0018 makes the channel **resilient**: `--intelligence` is an ordered list
-//! (primary + fallbacks); `complete()` drives the list through the sticky-primary
-//! failover policy ([`super::failover`]) with a per-endpoint health record +
-//! circuit breaker ([`super::health`]). A single-element list is byte-for-byte RFC
-//! 0006 behaviour — the failover machinery is inert with one endpoint. The
-//! wire/adapter/JSON path is UNCHANGED; only endpoint *selection* wraps it.
+//! `--intelligence` is an ordered list — a primary plus fallbacks — and
+//! `complete()` drives it through the sticky-primary failover policy
+//! ([`super::failover`]) with a per-endpoint health record and circuit breaker
+//! ([`super::health`]). Selection is the only layer the list adds: the
+//! wire/adapter/JSON path underneath is identical either way, and with a single
+//! endpoint the failover machinery is inert, so one endpoint costs nothing.
 
 use crate::net::http::{Stream, Url};
 use crate::wire::intel::{Request, Response};
@@ -24,9 +26,9 @@ use super::endpoints::EndpointList;
 use super::{anthropic, bedrock, failover, openai};
 
 /// Which in-binary adapter speaks to the endpoint. OpenAI-compatible is the
-/// canonical default; anthropic and Bedrock Converse (RFC 0031 §8 — native
-/// Bedrock) are the other in-binary dialects. Anything else lives behind a
-/// gateway (RFC 0006 §two-adapters).
+/// default; Anthropic Messages and Bedrock Converse are the other two dialects
+/// compiled in. The set stops here deliberately: any other provider is reached
+/// through a gateway, which keeps provider quirks out of the binary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
     OpenAiCompatible,
@@ -57,10 +59,11 @@ impl Provider {
         }
     }
 
-    /// The effective request path for THIS request. Fixed for OpenAI/Anthropic
-    /// (the configured/default path); Bedrock puts the URI-encoded model id in
-    /// the path — `/model/{modelId}/converse` — so the signer and the wire share
-    /// one dynamic target (RFC 0031 §8).
+    /// The effective request path for THIS request. Fixed for OpenAI and
+    /// Anthropic (the configured or default path); Bedrock puts the URI-encoded
+    /// model id in the path — `/model/{modelId}/converse` — so the path must be
+    /// computed per request and the signer and the wire must be handed the same
+    /// dynamic target, or the signature will not cover what is sent.
     pub(super) fn request_path(self, configured: &str, req: &Request) -> String {
         match self {
             Provider::Bedrock => bedrock::converse_path(&req.model),
@@ -71,7 +74,8 @@ impl Provider {
 
 #[derive(Debug)]
 pub enum IntelError {
-    /// Transport / connection failure (fatal infra → exit 4, RFC 0011).
+    /// Transport / connection failure. Classed as fatal infrastructure, so a
+    /// one-shot run exits 4 rather than reporting a model-level failure.
     Transport(std::io::Error),
     /// Non-2xx HTTP status from the endpoint.
     Http(u16, String),
@@ -79,10 +83,10 @@ pub enum IntelError {
     Parse(String),
     /// A transport this build doesn't support (e.g. https without `tls`).
     Unsupported(String),
-    /// Every endpoint in the list is down/broken after the bounded failover
-    /// sweep (RFC 0018 §6). The boxed cause is the last failover-class error
-    /// seen. Maps to the same fatal-infra class as `Transport` → exit 4 on
-    /// `once`; a loop/reactive daemon backs off rather than crashing.
+    /// Every endpoint in the list is down or broken after the bounded failover
+    /// sweep. The boxed cause is the last failover-class error seen. Maps to the
+    /// same fatal-infrastructure class as `Transport`, so a `once` run exits 4;
+    /// a loop or reactive daemon backs off and retries rather than crashing.
     AllEndpointsDown(Option<Box<IntelError>>),
 }
 
@@ -108,52 +112,58 @@ impl From<std::io::Error> for IntelError {
     }
 }
 
-/// A resolved intelligence client over an ordered endpoint list (RFC 0018 §3).
+/// A resolved intelligence client over an ordered endpoint list.
 pub struct IntelClient {
-    /// The endpoint list + sticky-primary cursor + per-endpoint health/breaker.
-    /// Behind a `RefCell` so `complete(&self)` can advance the cursor / record
-    /// health without forcing a `&mut` through the loop's call sites (the
-    /// per-subagent client is single-threaded; this is interior mutability, not
-    /// sharing). RFC 0018 §5.2 will swap the whole `IntelClient` on hot reload.
+    /// The endpoint list, the sticky-primary cursor, and the per-endpoint
+    /// health/breaker state. Behind a `RefCell` so `complete(&self)` can advance
+    /// the cursor and record health without forcing a `&mut` through every call
+    /// site in the loop. This is interior mutability, not sharing: the
+    /// per-subagent client is single-threaded. A hot reload replaces the whole
+    /// `IntelClient` rather than mutating this list in place.
     list: RefCell<EndpointList>,
     timeout: Duration,
     /// The run's trace id; when set, every completion carries a `traceparent`
-    /// header so the LLM call joins the run's distributed trace (RFC 0010).
+    /// header so the model call joins the run's distributed trace.
     trace_id: Option<String>,
-    /// All-endpoints-down backoff policy (RFC 0018 §6). `None` (the default,
-    /// `once`-mode) means a single sweep: all-down returns immediately and the
-    /// caller maps it to exit 4. `Some(policy)` (loop/reactive daemons) re-runs
-    /// the sweep with bounded jittered backoff so a transient host-model roll
-    /// recovers without the daemon crashing — it resumes the instant any endpoint
-    /// half-opens healthy.
+    /// All-endpoints-down backoff policy. `None` — the default, used by
+    /// `once`-mode — means a single sweep: all-down returns immediately and the
+    /// caller maps it to exit 4. `Some(policy)`, used by loop and reactive
+    /// daemons, re-runs the sweep with bounded jittered backoff so a transient
+    /// host-model roll recovers without the daemon dying; it resumes the instant
+    /// any endpoint half-opens healthy.
     alldown: Option<AllDownPolicy>,
-    /// Edge-triggered all-down reachability reporter (RFC 0018 §6). The model loop
-    /// runs in a CHILD process that owns this breaker state; the supervisor has no
-    /// LLM and no live view of it. When set, `complete()` invokes this ONCE on each
-    /// transition of the list's all-down state — on **entering** all-down (every
-    /// breaker open / sweep exhausted) and on **recovering** (any endpoint usable)
-    /// — so the child can report `AgentMsg::IntelHealth` upward. Edge-triggered (a
-    /// cheap `Cell<bool>` compare), so the no-transition steady state pays nothing
-    /// past one bool check. `IntelHealthReport` carries transport+index ONLY (no
-    /// URL/secret). The data path (selection/failover/wire) is UNCHANGED — this is
-    /// a pure additive upward report. Default `None` (one-shot / no supervisor).
+    /// Edge-triggered all-down reachability reporter. The model loop runs in a
+    /// CHILD process that owns this breaker state, and the supervisor has no
+    /// model of its own and no live view of it — this callback is the only way
+    /// the reachability reaches the supervisor. When set, `complete()` invokes
+    /// it exactly ONCE per transition of the list's all-down state: on
+    /// **entering** all-down (every breaker open, or the sweep exhausted) and on
+    /// **recovering** (any endpoint usable again). The child turns that into an
+    /// `AgentMsg::IntelHealth` sent upward. Firing on the edge rather than per
+    /// call means the steady state costs one bool compare. The report carries
+    /// transport and index ONLY — never a URL or credential. Nothing here
+    /// touches the data path; it is a pure upward report. Defaults to `None`
+    /// for a one-shot run with no supervisor listening.
     health_reporter: Option<Box<dyn Fn(IntelHealthReport)>>,
     /// Last all-down state observed by the reporter, so we only fire on a change.
     last_all_down: std::cell::Cell<bool>,
 }
 
-/// The edge-triggered intelligence-reachability report a child emits upward (RFC
-/// 0018 §6). `active` is the bounded `(index, transport-scheme)` of the serving
-/// endpoint — transport + index ONLY, NEVER a URL/cid/host or credential (RFC 0012
-/// §3.7). `None` on entering all-down (nothing is serving).
+/// The edge-triggered intelligence-reachability report a child emits upward.
+/// `active` is the bounded `(index, transport-scheme)` of the serving endpoint:
+/// transport and index ONLY, never a URL, host, cid or credential, because this
+/// crosses a process boundary into the supervisor's observable surface. It is
+/// `None` on entering all-down, when nothing is serving.
 pub struct IntelHealthReport {
     pub all_down: bool,
     pub active: Option<(usize, &'static str)>,
 }
 
-/// Bounded, jittered all-down backoff (RFC 0018 §6 / §4.2). A daemon re-arms the
-/// sweep up to `max_retries` times, sleeping `base × 2^n` (capped at `max`) with
-/// per-attempt jitter, before surfacing the terminal all-down.
+/// Bounded, jittered all-down backoff. A daemon re-arms the sweep up to
+/// `max_retries` times, sleeping `base × 2^n` capped at `max` with per-attempt
+/// jitter, before surfacing the terminal all-down. The bound matters: without
+/// `max_retries` a permanently misconfigured endpoint would keep a daemon alive
+/// and silent forever instead of failing visibly.
 #[derive(Debug, Clone, Copy)]
 pub struct AllDownPolicy {
     pub max_retries: u32,
@@ -163,7 +173,8 @@ pub struct AllDownPolicy {
 
 impl Default for AllDownPolicy {
     fn default() -> AllDownPolicy {
-        // The §4.2 default: 1s..30s jittered.
+        // 1s..30s jittered: fast enough to ride out a rolling model deploy,
+        // slow enough that eight attempts do not hammer a dead provider.
         AllDownPolicy {
             max_retries: 8,
             base: Duration::from_secs(1),
@@ -173,20 +184,22 @@ impl Default for AllDownPolicy {
 }
 
 /// Per-endpoint dial transport, owned by [`super::endpoints`]. Intelligence is
-/// **HTTPS-only** (target-vision pivot, Phase 1): one TCP shape, `tls: true` in
-/// production; `tls: false` exists solely for the loopback dev/test carve-out
-/// (the built-in mock LLM) and is rejected for non-loopback hosts at
-/// [`resolve`] — so the enum-of-transports (unix/vsock) is gone, not gated.
+/// **HTTPS-only**, so there is exactly one TCP shape: `tls: true` in production.
+/// `tls: false` exists solely for the loopback dev/test carve-out that backs the
+/// built-in mock LLM, and [`resolve`] rejects it for any non-loopback host —
+/// the variant cannot be reached with a real remote address.
 #[derive(Debug)]
 pub enum Transport {
     Tcp { host: String, port: u16, tls: bool },
 }
 
 impl IntelClient {
-    /// Build from explicit parts (the subagent path — the spawn payload, not CLI
-    /// `Config`). `uri` is the RFC 0018 endpoint *list* (a single element is RFC
-    /// 0006). `default_token` is endpoint 1's resolved credential when its env
-    /// override is unset; later endpoints resolve their own `_<N>` token.
+    /// Build from explicit parts — the subagent path, driven by the spawn
+    /// payload rather than the CLI `Config`. `uri` is the endpoint *list*, which
+    /// may hold a single element. `default_token` is endpoint 1's resolved
+    /// credential, used only when its own env override is unset; every later
+    /// endpoint resolves its own `_<N>`-suffixed token instead of inheriting
+    /// this one, so a fallback never dials with the primary's credential.
     pub fn from_parts(uri: &str, default_token: Option<String>) -> Result<IntelClient, IntelError> {
         let list = EndpointList::parse(uri, default_token)?;
         Ok(IntelClient {
@@ -200,8 +213,9 @@ impl IntelClient {
         })
     }
 
-    /// Attach the configured `intelligence.headers` (RFC 0031), applied to every
-    /// endpoint dial. Builder-style; call before use. Empty = the legacy path.
+    /// Attach the configured `intelligence.headers`, applied to every endpoint
+    /// dial. Builder-style; call before use. An empty list leaves every endpoint
+    /// with only the dialect's own headers.
     pub fn with_headers(self, headers: Vec<(String, String)>) -> IntelClient {
         if !headers.is_empty() {
             self.list.borrow_mut().set_extra_headers(headers);
@@ -209,8 +223,11 @@ impl IntelClient {
         self
     }
 
-    /// Attach a per-request signer (RFC 0031: AWS SigV4), applied to every dial.
-    /// Builder-style; call before use.
+    /// Attach a per-request signer — AWS SigV4 — applied to every dial. The
+    /// signature covers the method, host, request-target and body of the dial
+    /// that is about to go out, so it is computed after the effective path is
+    /// resolved rather than from the configured path. Builder-style; call before
+    /// use.
     pub fn with_signer(
         self,
         signer: Option<std::sync::Arc<dyn ::mcp::http::RequestSigner>>,
@@ -221,9 +238,11 @@ impl IntelClient {
         self
     }
 
-    /// Select the wire dialect (RFC 0031 §8 — `intelligence.dialect`), applied to
-    /// every endpoint. `None` keeps the OpenAI-compatible default. Builder-style;
-    /// call before use.
+    /// Select the wire dialect from `intelligence.dialect`, applied to every
+    /// endpoint in the list. `None` or an unrecognised value keeps the
+    /// OpenAI-compatible default; config validation rejects unknown dialects
+    /// earlier, so reaching here with one is not a user-visible path.
+    /// Builder-style; call before use.
     pub fn with_dialect(self, dialect: Option<&str>) -> IntelClient {
         if let Some(p) = Provider::from_dialect(dialect)
             && p != Provider::OpenAiCompatible
@@ -233,60 +252,64 @@ impl IntelClient {
         self
     }
 
-    /// Install the edge-triggered all-down reachability reporter (RFC 0018 §6): the
-    /// child wires this to send an `AgentMsg::IntelHealth` up to the supervisor on
-    /// each all-down ENTER/EXIT transition. Idempotent on the steady state — the
-    /// callback fires only on a change of the list's all-down state, never per call.
-    /// Adds NOTHING to the data path; a client without it behaves exactly as before.
+    /// Install the edge-triggered all-down reachability reporter: the child
+    /// wires this to send an `AgentMsg::IntelHealth` up to the supervisor on
+    /// each all-down ENTER/EXIT transition. The callback fires only when the
+    /// list's all-down state changes, never once per call, so a steady state
+    /// emits nothing. It sits off the data path entirely — a client with no
+    /// reporter selects and dials identically.
     pub fn set_health_reporter(&mut self, reporter: Box<dyn Fn(IntelHealthReport)>) {
         self.health_reporter = Some(reporter);
     }
 
     /// Stamp the run's trace id so each completion carries a `traceparent`
-    /// header (the LLM call joins the run's distributed trace, RFC 0010).
+    /// header and the model call joins the run's distributed trace.
     pub fn set_trace_id(&mut self, trace_id: Option<String>) {
         self.trace_id = trace_id;
     }
 
-    /// Enable the all-endpoints-down backoff (RFC 0018 §6) for a long-lived
-    /// `loop`/`reactive` daemon: on all-down, re-arm the failover sweep with
-    /// bounded jittered backoff instead of surfacing the terminal immediately.
-    /// `once`-mode leaves this unset (a single sweep → exit 4). The run deadline
-    /// still bounds the total wait (RFC 0011 §5 — backoff does not extend it).
+    /// Enable the all-endpoints-down backoff for a long-lived `loop` or
+    /// `reactive` daemon: on all-down, re-arm the failover sweep with bounded
+    /// jittered backoff instead of surfacing the terminal immediately.
+    /// `once`-mode leaves this unset, so a single sweep leads to exit 4. The run
+    /// deadline still bounds the total wait — backoff never extends it, so a
+    /// daemon cannot outlive its deadline by retrying.
     pub fn enable_alldown_backoff(&mut self, policy: AllDownPolicy) {
         self.alldown = Some(policy);
     }
 
-    /// The number of configured endpoints (1 == RFC 0006).
+    /// The number of configured endpoints; one means no fallback exists.
     pub fn endpoint_count(&self) -> usize {
         self.list.borrow().len()
     }
 
-    /// The run's trace id, if stamped (RFC 0010). Read on a hot-swap (RFC 0018
-    /// §5.2) to re-stamp the rebuilt client so it keeps joining the run's trace.
+    /// The run's trace id, if stamped. A hot-swap reads it to re-stamp the
+    /// rebuilt client, so the run's trace survives a repoint unbroken.
     pub fn trace_id(&self) -> Option<&str> {
         self.trace_id.as_deref()
     }
 
-    /// Whether the all-endpoints-down backoff is enabled (a long-lived
-    /// loop/reactive daemon). Read on a hot-swap (RFC 0018 §5.2) so the rebuilt
-    /// client preserves the daemon's resilience posture across a repoint.
+    /// Whether the all-endpoints-down backoff is enabled, which it is for a
+    /// long-lived loop or reactive daemon. A hot-swap reads it so the rebuilt
+    /// client preserves the daemon's resilience posture across a repoint rather
+    /// than silently reverting to one-shot semantics.
     pub fn alldown_enabled(&self) -> bool {
         self.alldown.is_some()
     }
 
-    /// One completion round-trip, driven through the failover policy (RFC 0018
-    /// §3.3). The call-site signature is unchanged from RFC 0006, so the whole
-    /// exit-code path (`IntelError` → `LoopAbort::Intel` → exit 4) is intact.
+    /// One completion round-trip, driven through the failover policy. Every
+    /// error returned here feeds the exit-code path
+    /// (`IntelError` → `LoopAbort::Intel` → exit 4).
     ///
-    /// When all endpoints are down (§6) and the all-down backoff is enabled
-    /// (loop/reactive daemons), the sweep is re-armed with bounded jittered
-    /// backoff so a transient host-model roll recovers without crashing the
-    /// daemon; `once`-mode surfaces the terminal immediately (→ exit 4). A fatal
-    /// auth failure (401/403) is NEVER backed off — it is a misconfiguration, not
-    /// a transient outage (§6).
+    /// When all endpoints are down and the all-down backoff is enabled (loop and
+    /// reactive daemons), the sweep is re-armed with bounded jittered backoff so
+    /// a transient host-model roll recovers without killing the daemon;
+    /// `once`-mode surfaces the terminal immediately and exits 4. A fatal auth
+    /// failure (401/403) is NEVER backed off: it is a misconfiguration that
+    /// retrying cannot repair, and retrying it would only delay the operator's
+    /// signal.
     pub fn complete(&self, req: &Request) -> Result<Response, IntelError> {
-        // --- RFC 0018 §4.3 metric call site: one model call (no-op without metrics).
+        // One model call. A no-op when metrics are not enabled.
         crate::obs::metrics::record_intel_call();
 
         let mut attempt: u32 = 0;
@@ -302,10 +325,10 @@ impl IntelClient {
                 let all_down = list.all_down();
                 let active_up = list.ep(list.active()).health.is_up();
                 crate::obs::metrics::set_intel_up(active_up && !all_down);
-                // RFC 0018 §6 upward report: fire ONLY on an all-down transition so
-                // the supervisor latches the child's reachability (edge-triggered —
-                // the steady state pays just this bool compare). transport+index
-                // only; no URL/secret. The data path above is untouched.
+                // Upward report: fire ONLY on an all-down transition, so the
+                // supervisor latches the child's reachability and the steady
+                // state pays just this bool compare. Carries transport and index
+                // only — never a URL or secret.
                 if let Some(report) = &self.health_reporter
                     && self.last_all_down.replace(all_down) != all_down
                 {
@@ -318,9 +341,11 @@ impl IntelClient {
                 Ok(resp) => return Ok(resp),
                 Err(e) => {
                     crate::obs::metrics::record_intel_error(error_reason(&e));
-                    // All-down + a daemon backoff policy + an auth-free cause →
-                    // back off and re-arm (§6). Anything else (a fatal class, no
-                    // policy, or an exhausted budget) surfaces now.
+                    // Back off and re-arm only when all three hold: the list is
+                    // all-down, a daemon backoff policy is installed, and the
+                    // cause is not an auth failure. Anything else — a fatal
+                    // class, no policy, or an exhausted retry budget — surfaces
+                    // to the caller now.
                     let backoff = match (&self.alldown, &e) {
                         (Some(p), IntelError::AllEndpointsDown(cause))
                             if !cause.as_deref().is_some_and(failover::is_auth)
@@ -341,21 +366,25 @@ impl IntelClient {
     }
 
     /// Borrow the endpoint list for the read-only `agentd://intelligence`
-    /// resource body (§4.4). The caller serializes transport/index/health only —
-    /// NEVER the URL or any credential (RFC 0012 §3.7).
+    /// resource body. The caller serializes transport, index and health only —
+    /// never the URL or any credential, since that body is exposed to whoever
+    /// can read the resource.
     pub fn with_list<R>(&self, f: impl FnOnce(&EndpointList) -> R) -> R {
         f(&self.list.borrow())
     }
 }
 
-/// The jittered backoff delay for all-down retry `attempt` (RFC 0018 §6): the
-/// exponential `base × 2^attempt` capped at `max`, then ±25% jitter from a cheap
-/// clock-seeded PRNG (no `rand` dependency — the minimalism moat).
+/// The jittered backoff delay for all-down retry `attempt`: the exponential
+/// `base × 2^attempt` capped at `max`, then ±25% jitter. Jitter keeps a fleet of
+/// agents that lost the same provider from re-dialling in lockstep. The PRNG is
+/// a clock-seeded splitmix64 step rather than a `rand` dependency, because the
+/// crate's dependency count is a deliberate constraint and backoff jitter has no
+/// cryptographic requirement.
 fn backoff_delay(policy: &AllDownPolicy, attempt: u32) -> Duration {
     let shift = attempt.min(20);
     let scaled = policy.base.saturating_mul(1u32 << shift).min(policy.max);
     let ms = scaled.as_millis() as u64;
-    // ±25% jitter, drawn from a clock-seeded splitmix64 step (no `rand` dep).
+    // ±25% jitter, drawn from a clock-seeded splitmix64 step.
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
@@ -371,8 +400,10 @@ fn backoff_delay(policy: &AllDownPolicy, attempt: u32) -> Duration {
     Duration::from_millis(lo + z % window)
 }
 
-/// Map an [`IntelError`] to the frozen `agentd_intel_errors_total{reason}` label
-/// domain (RFC 0016 §4.3: `unreachable`|`auth`|`timeout`|`5xx`|`other`).
+/// Map an [`IntelError`] to the `agentd_intel_errors_total{reason}` label
+/// domain. That domain is frozen at `unreachable`, `auth`, `timeout`, `5xx` and
+/// `other`: adding a label value would silently break every dashboard and alert
+/// built on it, so a new error class must fold into one of these five.
 fn error_reason(e: &IntelError) -> &'static str {
     match e {
         IntelError::Transport(io) => match io.kind() {
@@ -390,20 +421,21 @@ fn error_reason(e: &IntelError) -> &'static str {
 }
 
 /// Parse one intelligence URI element into (transport, http-path, host-header).
-/// Shared by [`super::endpoints`] (the list parser). HTTPS-only (target-vision
-/// pivot): `https://host[:port][/path]` is the transport; plaintext `http://`
-/// is admitted ONLY for a loopback host (the dev/test carve-out — the built-in
-/// mock LLM). Everything else — `unix:`, `vsock:`, non-loopback `http://` — is
-/// rejected here, the single chokepoint every construction path (CLI config,
-/// spawn payload, hot reload) flows through.
+/// Shared by [`super::endpoints`], the list parser. The transport is HTTPS-only:
+/// `https://host[:port][/path]`. Plaintext `http://` is admitted ONLY for a
+/// loopback host, the dev/test carve-out that lets the built-in mock LLM be
+/// dialled. Everything else — `unix:`, `vsock:`, non-loopback `http://` — is
+/// rejected. This function is the single chokepoint that every construction
+/// path flows through (CLI config, spawn payload, hot reload), which is what
+/// makes the HTTPS rule impossible to bypass by picking another entry point.
 pub(super) fn resolve(
     uri: &str,
     provider: Provider,
 ) -> Result<(Transport, String, String), IntelError> {
     // `mock:<script>` — the offline dev endpoint: spawns the built-in mock
-    // LLM in-process and dials it over loopback. Debug builds always have
-    // it; release only under `--features internal-mocks` (production
-    // binaries stay free of test scaffolding).
+    // LLM in-process and dials it over loopback. Debug builds always carry it;
+    // release only under `--features internal-mocks`, so a production binary
+    // has no way to be pointed at fake intelligence.
     #[cfg(any(feature = "internal-mocks", debug_assertions))]
     if let Some(script) = uri.strip_prefix("mock:") {
         let addr = super::mock::inprocess(script).map_err(IntelError::Unsupported)?;
@@ -465,8 +497,9 @@ impl Transport {
 fn connect_tls(host: &str, port: u16, timeout: Duration) -> Result<Box<dyn Stream>, IntelError> {
     let tcp = crate::net::http::connect_tcp(host, port, timeout)?;
     Ok(Box::new(
-        // Server-auth TLS today; an optional client identity (mTLS) is threaded
-        // through in the auth chunk (Phase E).
+        // Server-authenticated TLS: the endpoint's certificate is verified, but
+        // no client identity is presented. Intelligence endpoints authenticate
+        // agentd by bearer token or SigV4, not by client certificate.
         crate::net::tls::connect(tcp, host, None).map_err(IntelError::Transport)?,
     ))
 }
@@ -484,8 +517,8 @@ mod tests {
 
     #[test]
     fn resolve_rejects_non_https_transports() {
-        // HTTPS-only (pivot Phase 1): the old unix:/vsock: transports are gone —
-        // rejected at the single resolve() chokepoint, not feature-gated away.
+        // HTTPS-only: unix: and vsock: targets are rejected at the single
+        // resolve() chokepoint rather than being feature-gated away.
         for uri in ["unix:/run/intel.sock", "vsock:2:8080", "not-a-url"] {
             let err = resolve(uri, Provider::OpenAiCompatible).unwrap_err();
             assert!(
@@ -557,7 +590,7 @@ mod tests {
 
     #[test]
     fn all_endpoints_down_maps_to_unreachable_reason() {
-        // exercises the §4.3 reason mapping for the §6 terminal.
+        // The all-down terminal classifies by its underlying cause.
         let cause = Box::new(IntelError::Http(503, "x".into()));
         assert_eq!(
             error_reason(&IntelError::AllEndpointsDown(Some(cause))),

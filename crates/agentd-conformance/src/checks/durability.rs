@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The crash-durability contract (RFC 0025 / RFC 0026 §4.4): a SIGKILL at a kill
+//! The crash-durability contract: a SIGKILL at a kill
 //! point loses no progress. Life 1 dies right after the inbox event is durable
 //! (before the run); life 2 restores that event, starts the run, and dies mid-
 //! step; life 3 restores the running run and finishes the job. The durable state

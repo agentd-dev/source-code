@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! CODE-REGISTERED tools (RFC 0022 §4) — the embedder seam.
+//! CODE-REGISTERED tools — the embedder seam.
 //!
 //! An embedder building its own binary on the `agentd-core` library can
 //! register **native Rust tools** the agent calls alongside MCP tools:
@@ -42,10 +42,8 @@
 //!   concurrently. Keep them reentrant; hold no lock across a call into agentd.
 //! - **Trust:** a code tool is the embedder's own compiled code — it is
 //!   first-party by definition, like the binary itself. It sits OUTSIDE the
-//!   `--mcp-tags` trifecta accounting (RFC 0012 §3); an embedder whose tool
-//!   does egress or touches secrets owns that risk the way it owns the rest of
-//!   its binary. (Tagging code tools into the trifecta gate is deferred —
-//!   RFC 0022 §7.)
+//!   `--mcp-tags` trifecta accounting; an embedder whose tool does egress or
+//!   touches secrets owns that risk the way it owns the rest of its binary.
 
 use crate::wire::intel::ToolDef;
 use serde_json::Value;
@@ -202,9 +200,9 @@ pub(crate) fn test_registry_guard() -> std::sync::MutexGuard<'static, ()> {
 mod tests {
     use super::*;
 
-    /// A `(value, is_error)` shim over [`call`] — the shape the retired
-    /// `call_for_workflow` had; kept here so the code-tool dispatch tests read the
-    /// same regardless of the (now-removed) v1 workflow driver.
+    /// A `(value, is_error)` shim over [`call`]: an unknown tool name and a
+    /// handler `Err` both surface as `(message, true)`, which is the shape a
+    /// workflow `tool` node's error edge sees.
     fn call_for_workflow(name: &str, args: &Value) -> (Value, bool) {
         match call(name, args) {
             None => (Value::String(format!("no such code tool {name:?}")), true),

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! End-to-end test of the supervisor↔subagent process plumbing (M2).
+//! End-to-end test of the supervisor↔subagent process plumbing.
 //!
 //! Launches a *real* `agentd` subagent process (re-exec of the built binary),
 //! delivers a `SpawnPayload`, and asserts the round trip over the merged

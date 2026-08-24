@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! **Turn dispatch** (RFC 0026 §3.2): building a turn worker's input (system
+//! **Turn dispatch**: building a turn worker's input (system
 //! prompt, context slice, tool definitions by grant, skills, memory hints),
 //! budget admission at dispatch, spawning the worker, and folding `TurnDone`
 //! back into the durable state (context delta, replies, `finish`, compaction).
 
 use super::children::ChildKind;
 use super::reactor::{Runtime, TurnJob};
-use crate::config::v2::Role as PrincipalRole;
 use crate::context::compact::{self, CompactionRequest};
 use crate::context::{ContextState, Msg, ROOT, skills};
 use crate::governor::Admission;
@@ -52,9 +51,9 @@ impl Runtime {
 
     /// [`Runtime::system_prompt`] with an explicit template selection: a
     /// node's `context: {template: <name>}` wins, else `context.template`,
-    /// else the built-in default. The prompt is DATA rendered by a template
-    /// (RFC 0038) — the loops, conditions and limits an operator gets are the
-    /// ones the default itself uses.
+    /// else the built-in default. The prompt is DATA rendered by a template,
+    /// so the loops, conditions and limits an operator gets are exactly the
+    /// ones the built-in default itself uses.
     pub(crate) fn system_prompt_named(
         &self,
         ctx: Option<&ContextState>,
@@ -241,9 +240,9 @@ impl Runtime {
 
     /// Start one root/conversation turn (or defer it on budget wait). A turn
     /// with a user message first passes the **preflight** stage
-    /// (`agent.preflight`, RFC 0026 §3.2 step 1) and the **knowledge**
-    /// auto-context stage (RFC 0028 §5) — both asynchronous; the job is parked
-    /// in `staged_turns` and re-queued when they finish.
+    /// (`agent.preflight`) and the **knowledge** auto-context stage — both
+    /// asynchronous, so the job is parked in `staged_turns` and re-queued when
+    /// they finish.
     fn start_root_turn(&mut self, mut job: TurnJob) -> Result<(), TurnDefer> {
         let ctx_id = job.ctx.clone();
         // Append the message + preload skills (once).
@@ -290,7 +289,9 @@ impl Runtime {
             let est = c.est_tokens + crate::context::tokens::estimate(&sys) + COMPLETION_ALLOWANCE;
             (sys, slice, est)
         };
-        // Budget admission (RFC 0026 §7).
+        // Budget admission: reserve the estimated tokens against every scope
+        // this conversation charges before a worker is spawned, so an
+        // over-budget turn waits or is refused rather than half-running.
         let scopes = self.conversation_scopes(&ctx_id);
         let reservation = match self.governor.admit(est, &scopes, now_ms()) {
             Admission::Ok { reservation, model } => {
@@ -325,19 +326,11 @@ impl Runtime {
             }
         };
         self.governor.waiting.remove(&format!("turn:{ctx_id}"));
-        let caller = if ctx_id == ROOT {
-            Caller::Root
-        } else {
-            // A conversation principal: P5 resolves roles; until then a user.
-            Caller::Principal {
-                role: PrincipalRole::User,
-                grants: &[],
-            }
-        };
-        let (tools, internal, routes) = match caller {
-            Caller::Root => self.tool_plan(&Caller::Root, None),
-            _ => self.tool_plan(&Caller::Root, None), // conversations get the root's tools until P5 (single-operator instance)
-        };
+        // Every turn — the root context and each conversation alike — is served
+        // the root tool plan. An instance has one operator, so there is no
+        // narrower per-conversation grant to apply; per-principal narrowing
+        // happens at the A2A boundary, not here.
+        let (tools, internal, routes) = self.tool_plan(&Caller::Root, None);
         let servers: Vec<String> = routes
             .values()
             .map(|(s, _)| s.clone())
@@ -398,7 +391,7 @@ impl Runtime {
         }
     }
 
-    // ---- preflight (RFC 0026 §3.2 step 1) ----------------------------------------
+    // ---- preflight: classify the request before the turn proper ------------------
 
     /// `agent.preflight`: `always`; `auto` = a long message, a work verb, or
     /// an open plan; `never`.
@@ -443,7 +436,8 @@ impl Runtime {
         }
     }
 
-    /// The preflight verdict schema (RFC 0026 §3.2).
+    /// The schema a preflight verdict must satisfy. `additionalProperties` is
+    /// open so a model volunteering extra fields is not rejected outright.
     pub fn preflight_schema() -> Value {
         json!({
             "type": "object",
@@ -665,7 +659,7 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
         }
     }
 
-    // ---- knowledge auto-context (RFC 0028 §5) ----------------------------------
+    // ---- knowledge auto-context: retrieve before the turn ----------------------
 
     fn knowledge_wanted(&self) -> bool {
         self.settings.knowledge.auto_context.on == crate::config::v2::AutoContextOn::Turn
@@ -830,8 +824,9 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
             intelligence: IntelConfig {
                 uri: self.intel_uri.clone(),
                 token: self.current_intel_bearer(),
-                // RFC 0038: a compaction turn may run on `context.summarize.model`
-                // — the cheap-model lane for a recurring fixed cost.
+                // A compaction turn runs on `context.summarize.model` when one
+                // is configured: summarising is a recurring fixed cost that
+                // does not need the agent's main model.
                 model: Some(
                     match (&launch.kind, &self.settings.context.summarize.model) {
                         (ChildKind::Think { purpose, .. }, Some(m)) if purpose == "compaction" => {
@@ -1080,7 +1075,8 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
         {
             // The one-shot (`--prompt`) contract: this is the job's answer.
             self.last_root_reply = Some(t.clone());
-            // P5 delivers over A2A; the reply is recorded + logged here.
+            // Recorded and logged here; a caller waiting over A2A gets it
+            // through the task transition below.
             self.log.info("turn.reply", json!({"ctx": ctx_id, "chars": t.chars().count(), "text": if self.log.content_capture() { Value::String(t.clone()) } else { Value::Null }}));
         }
         // An A2A task (if this turn answers one) transitions to match the turn.
@@ -1105,8 +1101,9 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
         }
     }
 
-    /// The root called `finish` (RFC 0026 §8): job shape ⇒ exit; daemon ⇒ a
-    /// note + continue unless `exit: true`.
+    /// The root called `finish`. In job shape that ends the process with an
+    /// exit code derived from the reported status; a daemon only records a
+    /// note and keeps running unless the call asked for `exit: true`.
     fn on_root_finish(&mut self, ctx_id: &str, f: &Value) {
         let status = f
             .get("status")
@@ -1172,10 +1169,9 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
             }
             return;
         }
-        // RFC 0038: the operator may replace the summarizer's guidance (the
-        // JSON schema it must satisfy stays fixed) and run it on a cheaper
-        // model — compaction is a recurring cost that rarely needs the
-        // frontier one.
+        // An operator may replace the summarizer's guidance; the JSON schema it
+        // must satisfy stays fixed, so a custom prompt cannot change the shape
+        // the caller parses back.
         let system = self
             .settings
             .context
@@ -1289,7 +1285,9 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
                     match out {
                         Some(Ok(o)) => {
                             self.log.info("context.compacted", json!({"ctx": ctx_id, "folded": o.folded, "version": o.version, "before": o.before_tokens, "after": o.after_tokens}));
-                            // Evict skill bodies no longer loaded anywhere.
+                            // Evict skill bodies that no context still holds:
+                            // compaction can drop the last reference to one,
+                            // and the cache is keyed by hash across contexts.
                             let keep: Vec<String> = self
                                 .contexts
                                 .ids()

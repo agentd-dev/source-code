@@ -4,7 +4,7 @@ Every workflow node agentd implements, what it needs, and what it does. The
 tables are generated from the binary's own registry (`agentd --workflow-schema`),
 so the required-field columns are what the parser actually enforces.
 
-**67 kinds — 9 start nodes and 58 steps. All are implemented.** If this page and
+**71 kinds — 10 start nodes and 61 steps. All are implemented.** If this page and
 the binary ever disagree, the binary is right; regenerate from
 `agentd --workflow-schema`.
 
@@ -32,9 +32,9 @@ path is not a config error — it is a step failure at the moment the step runs.
 `--validate-config` will not catch it.
 
 **2. `switch` cases name ONE step, as a string.** `cases: {select: prepare}`,
-not `cases: {select: [prepare]}`. A list used to validate and then silently
-match nothing at runtime; it is now refused at load time with a message saying
-what to write.
+not `cases: {select: [prepare]}`. A case value is compared against a step id, so
+a list can never match anything; the loader refuses it outright, with a message
+saying what to write instead of leaving a branch that is silently unreachable.
 
 **3. A step's status can be `pruned`.** A branch nobody chose is `pruned`, not
 `skipped`, and the difference is load-bearing: a *skipped* step satisfies its
@@ -49,8 +49,9 @@ race with no ordering primitive to fix it; signal across runs, or from a tool or
 an operator, where the waiter is demonstrably parked first.
 
 **5. CEL is a build feature.** `when`, `until`, `filter` and the `expr` of
-`map`/`filter`/`reduce` need it. It ships in the release binaries from 2.3.0; on
-an older binary a config using them **exits 2** rather than ignoring them.
+`map`/`filter`/`reduce` need it. The release binaries ship with it enabled; a
+binary built without it **exits 2** on a config that uses those fields rather
+than ignoring the expression and running the step anyway.
 
 **6. Nested steps are scoped.** A step inside a `foreach`/`parallel`/`race`/
 `subgraph` gets a compound id — `each[0].work`, `par{branch}.work`,
@@ -70,7 +71,7 @@ matches on.
 | `subscribe` | `server` `uri` | `debounce_ms` `coalesce` `filter` `deliver` `on_no_listener` `window` `inputs` | Fires when an MCP resource changes (notify-then-read). `debounce_ms`/`coalesce` collapse bursts; `filter` drops uninteresting reads; `window: {samples: N}` delivers the last N read values (`output.window`) — the trend, not just the reading. |
 | `signal` | `name` | `filter` `deliver` `inputs` | Fires on a named signal from another run, a tool, or an operator. |
 | `event` | `on` | `filter` `inputs` | Fires on an internal event — `workflow.finished|failed`, `subagent.finished`, `budget.exhausted`, `config.reloaded`, `restore.done`, `human.asked`, `human.answered`, `human.timeout`, `lifecycle.shutdown` (the deinit hook: the drain waits for its runs). Output is `{event, payload: {…}}` — read `…output.payload.*`; the CEL `filter` sees the inner payload. |
-| `stream` | `stream` | `subject` `filter` `from` `rate` `inputs` | Fires once per event on a declared stream (RFC 0035) — including events another workflow `emit`ted. `subject` matches exactly or by `prefix.*` glob; `from: earliest` replays the backlog into a consumer that did not exist when the events were published; the offset is durable, so a restart resumes where it left off, exactly once. A workflow never fires on its own emits; `rate: "<burst>/<per>"` paces consumption (events queue durably — `rate: "1/1d"` turns a stream into a worked-off daily queue). Output is the event: `…output.subject`, `…output.data.*`, `…output.correlation`. |
+| `stream` | `stream` | `subject` `filter` `from` `rate` `inputs` | Fires once per event on a declared stream — including events another workflow `emit`ted. `subject` matches exactly or by `prefix.*` glob; `from: earliest` replays the backlog into a consumer that did not exist when the events were published; the offset is durable, so a restart resumes where it left off, exactly once. A workflow never fires on its own emits; `rate: "<burst>/<per>"` paces consumption (events queue durably — `rate: "1/1d"` turns a stream into a worked-off daily queue). Output is the event: `…output.subject`, `…output.data.*`, `…output.correlation`. |
 | `a2a` | — | `command` `roles` `schema` `inputs` | Fires when a principal sends a message whose command matches. Declaring `command` REGISTERS it as an A2A command the listener accepts; `schema` is the payload CONTRACT — a non-conforming command is refused at the listener, synchronously, naming the mismatch. `roles` narrows who may fire it. Output: `…output.args.*` (the typed payload), plus `parts`/`text`/`principal`. |
 | `webhook` | `path` | `methods` `auth` `parallelism` `on_overflow` `rate` `idempotency` `respond` `filter` `signal` `inputs` | Fires on an inbound HTTP request at `path`. Needs `webhooks.listen`; a non-loopback listener must authenticate every route. `rate: "<burst>/<per>s"` throttles arrivals (429 + Retry-After past it). `signal: "name/{{ body.field }}"` also fires that signal with the payload — the webhook→signal relay as one field. |
 
@@ -148,21 +149,22 @@ matches on.
 | `workflow.signal` | `name` | `payload` `run` | Sends a named signal. Edge-triggered: the waiter must already be suspended. |
 | `workflow.wait` | `run` | `timeout` | Blocks until another `run` reaches a terminal status. |
 | `workflow.cancel` | `run` | `reason` | Cancels another `run` with a `reason`. |
-| `emit` | — | `stream` `subject` `data` `correlation` `note` `audit` `metric` `value` | With `stream`/`subject`: publishes an event to a declared stream (RFC 0035) that any workflow's `stream` start can consume — durable, replayable, exactly-once downstream (the event id is the step's idempotency key, so a crash-replayed emit dedups). Without: the older note/audit emitter. |
+| `emit` | — | `stream` `subject` `data` `correlation` `note` `audit` `metric` `value` | With `stream`/`subject` (they travel together, or a load error): publishes an event to a declared stream that any workflow's `stream` start can consume — durable, replayable, exactly-once downstream (the event id is the step's idempotency key, so a crash-replayed emit lands under the same id and consumers drop the copy). Without them: writes `note` to the root transcript, logs `audit` as an audit record, and returns `value` as the step output. |
 
 ### Intelligence — the steps that cost tokens
 
 | Kind | Required | Other fields | What it does |
 |---|---|---|---|
 | `think` | `prompt` | `output_schema` `reads` `check` `retries` `skills` `system` | One model call. `output_schema` shapes the answer; `check`/`retries` re-ask until it conforms. |
-| `agent` | `instruction` | `output_contract` `output_schema` `tools` `servers` `limits` `context` `skills` `system` | A full agentic loop with tools — think, call, observe, repeat. `tools`/`servers` narrow what it may reach. `context` is a seed-message array, or the object form `{template: <name>, seed: […]}` — `template` names an entry in `context.templates` to render this step's system prompt with (RFC 0038), instead of the instance default. |
-| `subagent` | `instruction` *or* `template` | `params` `mode` `tools` `servers` `limits` `priority` `context` `output_contract` `output_schema` `skills` `durable` | A child PROCESS running its own loop, with narrowed tools and trust. The supervisor can always kill it. `template` (RFC 0036) instantiates a `subagents.templates` entry — `params` fill its declared holes (schema-checked), `tools`/`servers` are refused (the template defines the grant), and an instance-tier template spawns a full child daemon whose handle is an A2A peer name. `limits` adds OS caps — `memory` (RLIMIT_AS), `cpu` (RLIMIT_CPU) — beside `steps`/`tokens`/`deadline`; `priority: low\|normal\|high` maps to niceness and sheds low first under pressure. |
+| `agent` | `instruction` | `output_contract` `output_schema` `tools` `servers` `limits` `context` `skills` `system` | A full agentic loop with tools — think, call, observe, repeat. `tools`/`servers` narrow what it may reach. `context` is a seed-message array, or the object form `{template: <name>, seed: […]}` — `template` names an entry in `context.templates` to render this step's system prompt with, in place of the instance default. |
+| `subagent` | `instruction` *or* `template` | `params` `mode` `tools` `servers` `limits` `priority` `context` `output_contract` `output_schema` `skills` `durable` | A child PROCESS running its own loop, with narrowed tools and trust. The supervisor can always kill it. `template` instantiates a `subagents.templates` entry — `params` fill its declared holes (schema-checked), `tools`/`servers` are refused (the template defines the grant), and an instance-tier template spawns a full child daemon whose handle is an A2A peer name. `limits` adds OS caps — `memory` (RLIMIT_AS), `cpu` (RLIMIT_CPU) — beside `steps`/`tokens`/`deadline`; `priority: low\|normal\|high` maps to niceness and sheds low first under pressure. |
 | `classify` | `input` `classes` | `prompt` `skills` | Puts `input` into one of `classes`. |
 | `extract` | `input` `output_schema` | `prompt` `skills` | Pulls `input` into the shape of `output_schema`. No tools — the safest way to read untrusted text. |
 | `summarize` | `input` | `length` `prompt` `skills` | Shortens `input` to `length`. |
 | `judge` | `input` `rubric` | `prompt` `skills` | Scores `input` against a `rubric`. |
 | `route` | `input` `choices` | `prompt` `skills` | Picks one of `choices` for `input`. The model-driven alternative to `switch`. |
 | `human` | `question` | `schema` `to` `timeout` `reply_uri` | Asks a person `question` and suspends durably until they answer. `to` targets a channel; the answer can arrive after a restart. |
+
 ---
 
 ## Cross-cutting fields
@@ -182,7 +184,8 @@ Every step accepts these regardless of kind:
 | `cache` | `{key, ttl}` — reuse a previous result |
 | `budget` | a per-step token/step allowance |
 | `skills` | skills to load for a model step |
-| `idempotent`, `on_replay` | how a replayed step behaves after a crash (`retry`\|`skip`\|`fail`) |
+| `on_replay` | what restore does with a step caught in flight by a crash: `retry` (default), `skip`, or `fail` |
+| `idempotent` | parsed and validated, but nothing reads it — use `on_replay` to control a replay |
 | `description`, `otel` | documentation and trace attributes |
 
 ## Durability, and what a restart does
@@ -198,8 +201,9 @@ restore:
 - A **timer** whose durable record went missing is repaired at restore rather
   than leaving the step unreachable.
 
-Effects can therefore run twice. Mark the ones that must not with `idempotent`,
-or make the underlying tool idempotent.
+Effects can therefore run twice. Give a step whose effect must not repeat
+`on_replay: fail` (or `skip`), or make the underlying tool idempotent — every
+remote-effect step already carries a retry-stable idempotency key for that.
 
 ## Choosing between near-neighbours
 

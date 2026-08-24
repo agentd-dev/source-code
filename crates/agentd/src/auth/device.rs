@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Daemon-side consumption of a unified `auth:` provider (RFC 0031 §4/§11):
-//! build the transport [`RequestSigner`](::mcp::http::RequestSigner) for an
-//! endpoint from its [`AuthSpec`] plus the cached token.
+//! Daemon-side consumption of an `auth:` provider: build the transport
+//! [`RequestSigner`](::mcp::http::RequestSigner) for an endpoint from its
+//! [`AuthSpec`] plus the cached token.
 //!
 //! An **interactive** (device / authorization-code) token comes from the file
 //! cache written by `agentd login`; it is held in memory and refreshed with the
 //! cached refresh token when it nears expiry — so a long-lived daemon keeps a
-//! live bearer without re-prompting. A **client-credentials** provider reuses the
-//! M2M fetcher; a **static** provider resolves a `{{secret:…}}` per request.
+//! live bearer without re-prompting a human. A **client-credentials** provider
+//! reuses the machine-to-machine fetcher; a **static** provider resolves a
+//! `{{secret:…}}` per request.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -58,8 +59,9 @@ impl TokenSource {
 }
 
 /// A transport signer that injects a refreshing `Authorization: Bearer …`.
-/// A token-source failure yields no header (the server answers `401`, surfacing
-/// "not logged in" instead of hanging — fail-closed, RFC 0031 §2).
+/// A token-source failure yields no header at all rather than a stale or empty
+/// one: the request goes out unauthenticated, the server answers `401`, and the
+/// operator sees "not logged in" instead of a hang or a silently wrong token.
 pub struct BearerSigner {
     source: Arc<TokenSource>,
 }
@@ -73,7 +75,10 @@ impl ::mcp::http::RequestSigner for BearerSigner {
 }
 
 /// A static-credential signer (`kind: static`): resolves a `{{secret:…}}` value
-/// per request, so a rotated `{{secret-file:…}}` is picked up on the next call.
+/// per request rather than once at build time, so a rotated `{{secret-file:…}}`
+/// is picked up on the next call without restarting the daemon. A resolution
+/// failure yields no header, so the request fails at the server as a `401`
+/// instead of going out with a half-formed credential.
 pub struct StaticSigner {
     header: String,
     value_template: String,
@@ -117,9 +122,10 @@ fn params_from_spec(auth: &AuthSpec, timeout: Duration) -> Result<OAuth2Params, 
 
 /// Build a refreshing [`TokenSource`] for an interactive (device /
 /// authorization-code) oauth2 `auth:` block, seeded from the file cache under
-/// `target`. Returns `Ok(None)` for a non-oauth2 or client-credentials block
-/// (those aren't cache-backed refreshing sources). Used by the intelligence path
-/// (RFC 0031), which consumes the bearer directly rather than via a signer.
+/// `target`. Returns `Ok(None)` for a non-oauth2 or client-credentials block,
+/// since neither is a cache-backed refreshing source. The intelligence path
+/// uses this instead of [`signer_for`]: it builds its own request and wants the
+/// bearer string, not a signer bound to the MCP transport.
 pub fn token_source_for(
     auth: &AuthSpec,
     target: &str,

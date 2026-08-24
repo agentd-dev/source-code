@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Black-box CLI test of the agentd supervisor (RFC 0026): the binary loads
-//! a v2 configuration, validates it, and — for a bare `once` job — spawns a root
+//! Black-box CLI test of the agentd supervisor: the binary loads a v2
+//! configuration, validates it, and — for a bare `once` job — spawns a root
 //! turn worker and maps the outcome to an exit code. With an unreachable
 //! intelligence endpoint the run fails fast with exit 4 (intel unavailable) and
 //! must not hang or leak. The validation gate (exit 2) fires before any side
-//! effect. A 1.x (`--mode`) invocation is rejected with a migration hint.
+//! effect. A retired `--mode` invocation is rejected with a migration hint.
 
 use std::process::Command;
 
@@ -140,7 +140,8 @@ fn bad_flag_exits_2() {
 
 #[test]
 fn a_v1_mode_invocation_is_rejected_with_a_migration_hint() {
-    // agentd removed the mode drivers; `--mode` is a retired flag (exit 2).
+    // There is no mode driver to select: `--mode` is a retired flag, refused at
+    // the gate (exit 2) with an error that names it so the call can be migrated.
     let exe = env!("CARGO_BIN_EXE_agentd");
     let out = Command::new(exe)
         .args([

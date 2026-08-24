@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! A **minimal, defensive X.509 field extractor** (RFC 0031 §7 / RFC 0029 §10.3).
-//! Under mutual TLS the peer's *verified* leaf certificate carries the client
-//! identity — its subject CN and its Subject Alternative Names (DNS, URI, IP).
-//! The URI SAN is where a SPIFFE X.509-SVID puts `spiffe://…`. The serve
-//! framework surfaces these so `a2a.principals` can match a caller by `san`/`sub`
-//! (RFC 0029 §2), not just "a cert was presented".
+//! A **minimal, defensive X.509 field extractor**. Under mutual TLS the peer's
+//! *verified* leaf certificate carries the client identity — its subject CN and
+//! its Subject Alternative Names (DNS, URI, IP). The URI SAN is where a SPIFFE
+//! X.509-SVID puts `spiffe://…`. The serve framework surfaces these so a policy
+//! can match a caller by `san`/`sub` — an authorization decision needs to know
+//! *which* peer this is, not merely that some cert was presented.
 //!
 //! rustls verifies the chain; this only *reads* fields from an already-trusted
-//! cert. It is a hand-rolled DER walk (the 3-dependency moat — no `x509-parser`):
+//! cert, and must never be used to decide trust on its own. It is a hand-rolled
+//! DER walk rather than a parser dependency:
 //! every read is length-checked, DER long-form lengths are bounded to 4 bytes,
 //! nothing recurses without shrinking the slice, and any malformed input yields
 //! an empty/partial result rather than a panic. It parses ONLY the two fields we

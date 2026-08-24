@@ -4,7 +4,7 @@
 //! workflow runs it; editing the instruction hot-swaps the definition; and a
 //! definition that leaves the config lets its live runs finish (or cancels
 //! them, when its `unload:` policy says so) instead of stranding them —
-//! which is exactly what the old reload/delete paths did not guarantee.
+//! a run whose definition vanishes underneath it can never reach a verdict.
 #![cfg(all(unix, feature = "workflow"))]
 
 mod common;
@@ -222,7 +222,7 @@ fn editing_the_instruction_hot_swaps_the_embedded_workflow() {
         "a v2 run after SIGHUP",
         10,
     );
-    // The old definition left through the retirement path, named as replaced.
+    // The superseded definition left through the retirement path, by name.
     assert!(
         events(&log, "workflow.retiring")
             .iter()

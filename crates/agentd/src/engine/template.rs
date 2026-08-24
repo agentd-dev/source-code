@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Workflow **templates** (RFC 0027 §3): `{{path}}` interpolation with dotted /
+//! Workflow **templates**: `{{path}}` interpolation with dotted /
 //! JSON-pointer paths and `{{path | default}}` over the run data (`inputs`,
 //! `run`, `steps.<id>.output`, `vars`, `memory.<key>`, `item`, `index`,
 //! `batch`, `env`), plus `CEL:` expressions over the same names (feature
@@ -14,7 +14,9 @@
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
-/// The named inputs of a render (RFC 0027 §3 data model).
+/// The named inputs of a render: the root names a template may reference,
+/// mapped to their values. A name absent from this map is a missing path, so
+/// what the caller puts here is exactly the vocabulary a template may use.
 pub type Data = BTreeMap<String, Value>;
 
 /// Render `template` over `data`.

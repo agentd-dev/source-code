@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! AAuth [RFC 0023; agentctl RFC 0024 §7.1] — the **intelligence dial is
-//! signed**. When a process AAuth identity is installed, agentd's LLM client
-//! carries RFC 9421 signature headers on every model call, so a modelgateway can
-//! attest the agent by signature instead of source IP. Proven end to end: a real
-//! `IntelClient` (with the process signer installed) dials a mock LLM that
-//! captures and inspects the request headers. [feature: aauth]
+//! AAuth — the **intelligence dial is signed**. When a process AAuth identity is
+//! installed, agentd's LLM client carries RFC 9421 signature headers on every
+//! model call, so a modelgateway can attest the agent by signature instead of
+//! source IP. Proven end to end: a real `IntelClient` (with the process signer
+//! installed) dials a mock LLM that captures and inspects the request headers.
+//! [feature: aauth]
 #![cfg(feature = "aauth")]
 
 use agentd::aauth::{AAuthClient, AgentKey, ApdConfig};

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! **Runs and steps** (RFC 0027 §6–§7, RFC 0026 §3): arming start nodes,
+//! **Runs and steps**: arming start nodes,
 //! turning start events into durable runs, scheduling ready steps every tick,
-//! executing the P3 step kinds (data steps in-loop, MCP calls on executor
+//! executing the step kinds (data steps in-loop, MCP calls on executor
 //! threads, `agent`/`think` in turn workers, `sleep` on durable timers,
 //! `finish` closing the run), retries + `on_error` routing, and the
 //! `workflow.*` tools.
@@ -30,12 +30,11 @@ const WORKFLOW_DEF_PREFIX: &str = "_workflows/";
 impl Runtime {
     // ---- definitions -----------------------------------------------------------
 
-    /// Load the configured workflows (inline / file / uri) + runtime-created
-    /// ones from the store. Errors are collected (a bad definition is refused).
-    /// The breaker policy a step actually runs under (RFC 0037 Phase B): its
-    /// own `breaker:` wins; an `mcp.tool` step against a catalog-referencing
-    /// server otherwise inherits the entry's `breaker:` default. Gate and
-    /// recorder both use this, so they can never disagree.
+    /// The breaker policy a step actually runs under: its own `breaker:` wins;
+    /// an `mcp.tool` step against a server that names a catalog `service:`
+    /// otherwise inherits that entry's `breaker:` default. The admission gate
+    /// and the outcome recorder both call this, so they can never disagree
+    /// about which policy a given step is being judged by.
     pub(crate) fn effective_breaker(
         &self,
         step: &crate::engine::model::Step,
@@ -66,11 +65,15 @@ impl Runtime {
         }
     }
 
+    /// Load the configured workflows (inline / file / uri) plus the
+    /// runtime-created ones from the store. Errors are collected rather than
+    /// returned on the first failure, so one bad definition is refused with a
+    /// message instead of hiding the rest.
     pub(crate) fn load_workflows(&mut self) -> Result<(), Vec<String>> {
         let mut errs = Vec::new();
         // A `{dir}` entry expands into one entry per matching file BEFORE
         // resolution, so everything downstream — parsing, naming, the duplicate
-        // check — sees the same shape it always did.
+        // check — sees a plain list of documents and needs no directory case.
         let mut docs: Vec<Value> = Vec::new();
         for doc in self.settings.workflows.clone() {
             match doc.get("dir").and_then(Value::as_str) {
@@ -378,8 +381,10 @@ impl Runtime {
         Err(last)
     }
 
-    /// Arm start nodes (RFC 0027 §4): `once` fires now unless a live run of the
-    /// workflow was restored (`policy: ensure`, default) — `always` fires anyway.
+    /// Arm start nodes. `once` fires immediately unless a live run of the
+    /// workflow came back from the store (`policy: ensure`, the default), which
+    /// keeps a restart from starting a second copy of work already in flight;
+    /// `policy: always` fires regardless.
     pub(crate) fn arm_workflows(&mut self) {
         let names: Vec<String> = self.workflows.keys().cloned().collect();
         for name in names {
@@ -444,7 +449,9 @@ impl Runtime {
             .as_str()
             .map(str::to_string)
             .unwrap_or_else(|| default_start(&w).unwrap_or_default());
-        // Concurrency (RFC 0027 §2).
+        // Concurrency: a new run must fit both the workflow's own `max_runs`
+        // and the instance-wide `limits.max_runs`; whichever binds first
+        // decides the `on_overflow` outcome.
         let live = self
             .runs
             .values()
@@ -636,12 +643,8 @@ impl Runtime {
         }
     }
 
-    /// The definition a run executes against: the one it started with (by
-    /// hash) — the current definition when unchanged, else the pinned copy a
-    /// reload kept. A restored run whose definition changed underneath it has
-    /// no match (`resume_policy: refuse`, RFC 0027 §9).
-    /// [`Self::definition_for_run`] by (name, hash) — for callers that hold
-    /// the run record already.
+    /// [`Self::definition_for_run`] addressed by `(name, hash)` — for callers
+    /// that already hold the run record.
     pub(crate) fn definition_for_run_ref(&self, workflow: &str, hash: &str) -> Option<&Workflow> {
         if let Some(w) = self.workflows.get(workflow)
             && w.hash == hash
@@ -651,6 +654,11 @@ impl Runtime {
         self.pinned.get(hash).map(|w| w.as_ref())
     }
 
+    /// The definition a run executes against: the one it started with,
+    /// identified by hash — the current definition while it is unchanged, else
+    /// the copy a reload pinned. A restored run whose definition changed
+    /// underneath it matches neither, and `resume_policy: refuse` then stops
+    /// it rather than silently running it against a different graph.
     pub(crate) fn definition_for_run(&self, run_id: &str) -> Option<std::sync::Arc<Workflow>> {
         let run = self.runs.get(run_id)?;
         if let Some(w) = self.workflows.get(&run.workflow)
@@ -703,10 +711,10 @@ impl Runtime {
             return;
         }
         // A workflow that declares no budget inherits the instance's
-        // `limits.run.*`. Previously a definition that was silent about limits
-        // ran unbounded — the one shape where a single mistake can spend the
-        // whole day's tokens, and the instance-wide knob that exists to prevent
-        // it was documented as if it already applied.
+        // `limits.run.*`, so a definition silent about limits is still bounded.
+        // An unbounded run is the one shape where a single mistake can spend
+        // the whole day's tokens, and the instance-wide knob exists precisely
+        // to cap that.
         let step_cap = wf.limits.steps.or(self.settings.limits.run.steps);
         let token_cap = wf.limits.tokens.or(self.settings.limits.run.tokens);
         if let Some(cap) = step_cap
@@ -848,9 +856,9 @@ impl Runtime {
 
     /// The earliest step of a run that failed, with its error.
     ///
-    /// Used to explain a stall: a run with no ready step is usually a run whose
-    /// dependency chain is blocked behind a failure that was routed away from
-    /// `on_error: fail`, and the failure is what a person needs to see.
+    /// This is what explains a stall: a run with no ready step is usually a run
+    /// whose dependency chain is blocked behind a failure that was routed away
+    /// from `on_error: fail`, and that failure is what a person needs to see.
     fn first_failed_step(&self, run_id: &str) -> Option<(String, String)> {
         let run = self.runs.get(run_id)?;
         run.steps
@@ -872,9 +880,9 @@ impl Runtime {
             })
     }
 
-    /// The template data of a run (RFC 0027 §3): memory is a read-through map
-    /// of the keys the workflow references would be nicer; here the whole
-    /// (bounded) memory listing is offered lazily as `{key: value}`.
+    /// The template data a run's specs render against: the `env` view, the
+    /// run's own fields, and `memory` as a read-through `{key: value}` map
+    /// holding exactly the `memory.<key>` references the definition names.
     pub(crate) fn run_data(&mut self, run_id: &str) -> template::Data {
         let env = env_view(
             &self.instance,
@@ -885,7 +893,7 @@ impl Runtime {
         // Memory read-through: resolve every `memory.<key>` the definition
         // names. The key scan walks the whole definition, so it is memoized
         // per content hash — this runs per STEP, and re-walking an unchanged
-        // definition every time was measured on the hot path.
+        // definition on every one of them lands squarely on the hot path.
         let mut memory = Map::new();
         let hash = self
             .runs
@@ -921,7 +929,8 @@ impl Runtime {
             .map(|r| r.data(env, Value::Object(memory)))
             .unwrap_or_default();
         // Artifact-backed values (`{"$artifact": id}`) dereference transparently
-        // for templates (RFC 0027 §3).
+        // so a template sees the content, not the reference — a step never has
+        // to know whether an upstream output was spilled to an artifact.
         for key in ["steps", "vars", "inputs"] {
             if let Some(v) = data.get_mut(key) {
                 self.deref_artifacts(v);
@@ -1060,10 +1069,12 @@ impl Runtime {
             self.checkpoint(true);
             return;
         }
-        // Durable `running` BEFORE the effect (RFC 0025 §7). A pure data
-        // step has no effect to guard — a crash replays it deterministically
-        // from the last checkpoint — so an inline chain batches into the
-        // tick's single checkpoint instead of a serialize+write per step.
+        // Mark the step durably `running` BEFORE its effect leaves the process,
+        // so a crash replays an effect that may already have happened rather
+        // than losing one entirely. A pure data step has no effect to guard —
+        // a crash replays it deterministically from the last checkpoint — so an
+        // inline chain batches into the tick's single checkpoint instead of
+        // paying a serialize+write per step.
         crate::state::kill_point("step.running");
         if !crate::engine::model::pure_data_kind(&step.kind) {
             self.checkpoint(false);
@@ -1072,12 +1083,11 @@ impl Runtime {
             "step.start",
             json!({"run": run_id, "step": step_id, "kind": step.kind, "attempt": attempt}),
         );
-        // The observation feed carried run-level counts only — "3 done, 1
-        // running" — so a display client could see that a run was moving but
-        // never WHAT was moving. One event per transition turns that into a
-        // usable inner loop. Operator-scoped, because a step id and its kind
-        // describe the workflow's internals. The feed itself is the A2A
-        // interface surface, so there is nothing to push to without it.
+        // One feed event per step transition: run-level counts alone ("3 done,
+        // 1 running") tell a display client that a run is moving but never WHAT
+        // is moving. Operator-scoped, because a step id and its kind describe
+        // the workflow's internals. The feed is the A2A interface surface, so
+        // without that feature there is nothing to push to.
         #[cfg(feature = "a2a")]
         self.feed_push(
             "step",
@@ -1335,8 +1345,9 @@ impl Runtime {
                 );
             }
             "emit" => {
-                // With `stream:` this is an event publish (RFC 0035); without,
-                // the older note/audit emitter. One name, addressed by fields.
+                // With `stream:` this publishes an event to that stream;
+                // without one it emits a note/audit record. One step name,
+                // addressed by which fields are present.
                 if let Some(stream) = spec.get("stream").and_then(Value::as_str) {
                     let stream = stream.to_string();
                     let subject = spec
@@ -1350,8 +1361,9 @@ impl Runtime {
                         .map(str::to_string);
                     let data = spec.get("data").cloned().unwrap_or(Value::Null);
                     // The event id IS the step's derived idempotency key: a
-                    // crash-replayed emit appends under the same id and
-                    // consumers dedup — at-least-once, house discipline.
+                    // crash-replayed emit appends a second copy under the same
+                    // id, and consumers drop it from their recent-id ring, so
+                    // delivery is at-least-once without a duplicate surviving.
                     let id = crate::engine::run::idempotency_key(run_id, step_id);
                     let source = self
                         .runs
@@ -1524,9 +1536,9 @@ impl Runtime {
                     .unwrap_or("")
                     .to_string();
                 let args = spec.get("args").cloned().unwrap_or(json!({}));
-                // RFC 0037 §4: pace calls toward a rated catalog service. A dry
-                // bucket is a step failure (a refusal the workflow's `retry:`
-                // can absorb), never a hang.
+                // Pace calls toward a rated catalog service. A dry bucket fails
+                // the step — a refusal the workflow's `retry:` can absorb —
+                // rather than blocking the single-writer loop.
                 if let Err(e) = self.service_rate_take(&server) {
                     self.finish_step(run_id, step_id, StepStatus::Failed, None, Some(e), 0);
                     return;
@@ -1542,10 +1554,10 @@ impl Runtime {
                     );
                     return;
                 };
-                // The key must NOT vary by attempt — a retry that presents a
+                // The key must NOT vary by attempt: a retry that presents a
                 // fresh key is exactly the duplicate the key exists to prevent,
-                // so the old `…#{attempt}` suffix defeated the field's own
-                // name. The attempt rides separately for servers that want to
+                // so nothing per-attempt may enter it.
+                // The attempt rides separately for servers that want to
                 // OBSERVE retries without keying on them, and `idempotency:
                 // {value: …}` substitutes an application-level key (an order
                 // id) when one exists — which beats any run-derived key, since
@@ -1776,7 +1788,7 @@ impl Runtime {
                 StepStatus::Failed,
                 None,
                 Some(format!(
-                    "step kind {other:?} is not executable in this build (P4)"
+                    "step kind {other:?} is not executable in this build"
                 )),
                 0,
             ),
@@ -2005,7 +2017,8 @@ impl Runtime {
                 .into_iter()
                 .collect(),
         };
-        // Budget admission (RFC 0026 §7): the run's scope + the instance.
+        // Budget admission: the estimate is charged against every scope this
+        // run belongs to as well as the instance, so the tightest one binds.
         let est: u64 = messages.iter().map(Msg::est_tokens).sum::<u64>()
             + crate::context::tokens::estimate(&system)
             + 4096;
@@ -2340,7 +2353,10 @@ impl Runtime {
             StepStatus::Failed => "failed",
             _ => "other",
         });
-        // Large outputs become artifacts (`limits.inline_max_bytes`, RFC 0027 §3).
+        // An output past `limits.inline_max_bytes` is stored as an artifact and
+        // replaced by a reference, keeping the run record (and every checkpoint
+        // that serializes it) bounded. A failed artifact write keeps the inline
+        // value rather than losing the output.
         let output = match output {
             Some(v) if !v.is_null() => {
                 let cap = self.settings.limits.inline_max_bytes.unwrap_or(65_536) as usize;
@@ -2374,7 +2390,8 @@ impl Runtime {
             }
             other => other,
         };
-        // Output schema (RFC 0027 §6 structured I/O).
+        // A declared `output_schema` is enforced here: a step that completed
+        // but produced a shape its consumers cannot parse fails instead.
         let (status, error) = match (&status, &step.output_schema, &output) {
             (StepStatus::Done, Some(schema), Some(out)) => {
                 match crate::jsonschema::validate(schema, out) {
@@ -2865,7 +2882,8 @@ impl Runtime {
 
     /// Cancel a run: cancel its children, fail suspended waits, mark cancelled.
     pub(crate) fn cancel_run(&mut self, run_id: &str, reason: &str) {
-        // Cascade to child runs started with `cascade: true` (RFC 0027 §6).
+        // Cascade to child runs started with `cascade: true` — a cancelled
+        // parent must not leave its children running unattended.
         let kids: Vec<String> = self
             .runs
             .values()
@@ -3170,11 +3188,10 @@ impl Runtime {
                 let _ = self
                     .durable
                     .delete(Kind::Memory, &format!("{WORKFLOW_DEF_PREFIX}{wname}"));
-                // Delete used to vanish the definition out from under its own
-                // live runs, which then lost `definition_for_run` mid-flight.
-                // Retirement pins it and applies the workflow's `unload:`
-                // policy, so delete means "stop being a workflow", not "strand
-                // whatever you were doing".
+                // Retire rather than drop: retirement pins the definition so
+                // live runs keep resolving `definition_for_run` mid-flight, and
+                // applies the workflow's `unload:` policy to them. Delete means
+                // "stop being a workflow", not "strand whatever is in flight".
                 self.retire_workflow(&wf, "deleted");
                 self.log.info("workflow.deleted", json!({"name": wname}));
                 ToolOutcome::Ready(json!({"ok": true}), false)
@@ -3182,9 +3199,11 @@ impl Runtime {
             "workflow.signal" => {
                 let sname = args["name"].as_str().unwrap_or("").to_string();
                 let _ = self.accept_event(kinds::SIGNAL, caller.principal.clone(), json!({"name": sname, "payload": args.get("payload").cloned().unwrap_or(Value::Null), "run": args.get("run"), "from": caller.label_pub()}));
-                // Signal start nodes / waits land with P4; the signal is recorded.
+                // The signal goes on the durable inbox; waits and `signal`
+                // start nodes are woken when the loop drains it, so no
+                // delivery count is available at this point.
                 ToolOutcome::Ready(
-                    json!({"delivered": 0, "note": "signal recorded; signal start nodes and waits land with the P4 engine"}),
+                    json!({"delivered": 0, "note": "signal recorded; waits and signal start nodes are woken when the loop drains the inbox"}),
                     false,
                 )
             }

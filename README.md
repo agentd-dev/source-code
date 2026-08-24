@@ -61,7 +61,7 @@ idle daemon 5.5 MiB RSS · protocols from their own SDKs · HTTPS everywhere · 
    the supervisor can always `SIGKILL`. A runaway or crashing model is contained
    by construction; limits are enforced by a process that cannot be prompted.
 5. **Composability, three ways.** An agentd **serves an A2A endpoint**
-   (`a2a.listen`, RFC 0029), so one agent is just another agent a second one
+   (`a2a.listen`), so one agent is just another agent a second one
    sends messages/commands to. It **delegates over A2A** (`a2a.peers`) to remote
    agents as spec-conformant Tasks. And it **nests subagents** as an OS process tree
    with narrowed, per-child context and trust. Agents compose like Unix
@@ -201,11 +201,11 @@ $ agentd --instruction "…" --intelligence https://gw.example/v1
 ```
 
 Recurring / reactive shapes are **workflow start nodes** in a
-`config_version: "2"` document (see
+`config_version: "1"` document (see
 [docs/modes-and-triggers.md](docs/modes-and-triggers.md)):
 
 ```yaml
-config_version: "2"
+config_version: "1"
 intelligence: { endpoints: https://gw.example/v1, model: gpt-… }
 store: { kind: mcp, mcp: { server: state } }         # a daemon needs a durable store
 a2a:   { listen: https://0.0.0.0:8443, tls: { cert: …, key: … } }   # the external channel
@@ -222,8 +222,8 @@ lifecycle: { run_until: drained }                    # a daemon
 
 ## Workflows
 
-agentd runs **durable DAG workflows** (RFC 0027, always compiled — no feature
-flag): a declarative graph of `steps` in the `config_version: "2"` document,
+agentd runs **durable DAG workflows** (always compiled — no feature
+flag): a declarative graph of `steps` in the `config_version: "1"` document,
 driven by the same reactor over durable state, so a run survives a restart and
 resumes exactly where it died. Deterministic steps (`assign` / `map` / `filter` /
 `switch` / …) cost **zero model tokens**; `agent` / `think` steps run turn
@@ -243,7 +243,7 @@ workflows:
       done:  { kind: finish, depends_on: [work] }
 ```
 
-- **A rich node catalogue** (RFC 0027 §5): `agent` / `think` (turn workers),
+- **A rich node catalogue**: `agent` / `think` (turn workers),
   `mcp.tool` (direct MCP), data steps (`assign` / `map` / `filter` / `reduce` /
   `sort` / `parse`), `switch` routing, nested bodies (`foreach` / `batch` with
   bounded parallelism + `rate` pacing, `iterate`, `parallel`, `race`, `subgraph`),
@@ -253,9 +253,9 @@ workflows:
 - **Variables + templates** thread data between steps (`writes` /
   `{{vars.…}}` / `{{steps.x.output}}` / `CEL:` expressions); large step outputs
   spill to durable artifacts and dereference transparently.
-- **Durable + crash-resumable:** every step's progress is a durable envelope in
-  the remote store (RFC 0025) — a run restores and resumes exactly where it died
-  (proven by the chaos-matrix e2e), with idempotency keys so at-least-once
+- **Durable + crash-resumable:** every step checkpoints its progress to the
+  configured store *before* its effect runs — a run restores and resumes exactly
+  where it died (proven by the chaos-matrix e2e), with idempotency keys so at-least-once
   effects run once. No database is linked — the store is behind MCP tools or HTTP.
 - **Triggers are start nodes** (`once` / `loop` / `schedule` / `subscribe` /
   `signal` / `event` / `manual` / `a2a`) — the recurring/reactive shapes,
@@ -295,7 +295,7 @@ let (outcome, usage) = run_loop(&intel, &mcp_servers, &LoopInput {
 }, &mut NoSelfTools, &log)?;
 ```
 
-Workflows embed the same way — author a dialect-2 graph as data, `drive()` it
+Workflows embed the same way — author a workflow graph as data, `drive()` it
 with your own executor, and code tools are addressable from `tool` nodes as the
 reserved server **`code`**. A compile-guaranteed example ships in-tree:
 [`embedded-agent.rs`](crates/agentd/examples/embedded-agent.rs) — the loop
@@ -304,11 +304,11 @@ into mid-reasoning. The **stock CLI registers nothing**
 — its no-local-code posture holds by construction. Reusable on their own:
 `agentd-mcp` (MCP client/server + wire) and `agentd-net` (transports). Recipes,
 the embedder obligations (the re-exec dispatch!), and the API-stability tiers:
-[docs/embedding.md](docs/embedding.md) + RFC 0022.
+[docs/embedding.md](docs/embedding.md).
 
 ## Composition: serving, subagents, A2A
 
-**Serve your agent over A2A** (RFC 0029, `--features a2a`) — set `a2a.listen` and
+**Serve your agent over A2A** (`--features a2a`) — set `a2a.listen` and
 peers call `SendMessage` (natural language → a conversation turn, or a command
 DataPart → a registry action like `status` / `workflow.run` / `config`),
 `GetTask` / `ListTasks` / `CancelTask`, and `SendStreamingMessage` (SSE) on the
@@ -363,7 +363,7 @@ every child is one `SIGKILL` from gone.
   optional per-run cgroups (`--cgroup`, `--cgroup-memory-max`,
   `--cgroup-pids-max`) with atomic `cgroup.kill` teardown.
 
-See [docs/security.md](docs/security.md) and [rfcs/0012](rfcs/0012-security-posture.md).
+See [docs/security.md](docs/security.md).
 
 ### AAuth [draft] — signed agent identity
 
@@ -380,11 +380,11 @@ $ agentd --instruction "…" --intelligence https://gw.example/v1 \
 
 The token is fetched, cached, and refreshed automatically; the whole subagent
 tree signs under one identity. Draft support (Case A end-to-end); ships
-build-from-source, like CEL. See [docs/aauth.md](docs/aauth.md) + RFC 0023.
+build-from-source, like CEL. See [docs/aauth.md](docs/aauth.md).
 
 ## Operating it
 
-**Exit codes are the contract** (RFC 0011): `0` completed · `1` crash · `2`
+**Exit codes are the contract**: `0` completed · `1` crash · `2`
 config/usage (fails in ms, pre-LLM) · `3` stalled/partial · `4` intelligence
 unavailable · `5` refused · `6` required MCP server down · `7` budget/deadline
 exhausted · `124` supervisor hard-kill backstop · `137`/`143` external kills. A
@@ -434,21 +434,22 @@ time. A flag whose feature is absent exits `2` loudly — never a silent no-op.
 | Feature | What it adds | Extra deps |
 |---|---|---|
 | `tls` *(default)* | rustls + ring + bundled roots — direct `https://` everywhere | rustls stack |
-| `a2a` | the A2A v2 HTTPS listener + outbound delegation peers (RFC 0029) | — |
+| `a2a` | the A2A HTTPS listener + outbound delegation peers | — |
 | `cel` | CEL step conditions / computed values / data-step expressions | `cel-interpreter` (the one exception) |
-| `otel` | OTLP traces + logs export (hand-rolled JSON) | — |
+| `otel` | hand-rolled OTLP/HTTP trace + log export, GenAI semconv | — |
 | `metrics` | hand-written Prometheus text + health endpoints | — |
-| `otel` | hand-rolled OTLP/HTTP span export, GenAI semconv | — |
+| `aauth` | an Ed25519 agent identity that signs outbound MCP requests | `ring` (already in-tree) |
+| `exec` | the guarded local command runner (never in a release binary) | — |
 | `cron` | 5-field UTC cron scheduling (hand-rolled parser) | — |
 | `oauth` | OAuth 2.1 client-credentials for remote endpoints | — |
 | `hot-reload` / `config-watch` | SIGHUP / inotify restart-free reconfig | — |
 
 Shipped release feature set:
-`a2a,metrics,cron,otel,oauth,aauth,hot-reload,config-watch,workflow`.
+`a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel`.
 
 ## Footprint (measured)
 
-Measured on the v2.1.0 release build (x86_64, musl, stripped, the shipped
+Measured on the 1.1.0 release build (x86_64, musl, stripped, the shipped
 feature set):
 
 | Metric | Value |
@@ -475,8 +476,6 @@ feature set):
   [observability](docs/observability.md) · [operations](docs/operations.md) ·
   [deployment](docs/deployment.md) · [scaling](docs/scaling.md) ·
   [use cases](docs/use-cases.md)
-- **[rfcs/README.md](rfcs/README.md)** — the normative specifications
-  (RFC 0001–0022; RFC 0001 is the narrative front door).
 - **[examples/SAMPLES.md](examples/SAMPLES.md)** — runnable samples: a coding
   agent (`coding-agent.yaml`), Docker Compose, Kubernetes
   `Job`/`CronJob`/`Deployment` manifests, a systemd unit.
@@ -486,7 +485,7 @@ feature set):
   to report one privately.
 - **[CONTRIBUTING.md](CONTRIBUTING.md)** — build, test and review expectations.
 - **[CHANGELOG.md](CHANGELOG.md)** — release history.
-- **Website:** [agentd.dev](https://agentd.dev) — rendered docs + RFCs.
+- **Website:** [agentd.dev](https://agentd.dev) — the rendered documentation.
 
 ## License
 

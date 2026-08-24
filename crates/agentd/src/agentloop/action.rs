@@ -1,21 +1,24 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Self-tool dispatch. RFC 0005 §self-tools, RFC 0007.
+//! Self-tool dispatch.
 //!
 //! The agentic loop's tools come from connected MCP servers *plus* agentd's own
 //! self-tools (`subagent.spawn`, …). A [`SelfHandler`] supplies those tool
 //! definitions and handles their calls in-process — distinct from the MCP
 //! dispatch path. This is the seam through which the model **self-orchestrates**:
 //! it calls `subagent.spawn` to split its instruction into delegated child
-//! agents (the supervisor enforces the caps + scope). RFC 0001 §self-orchestration.
+//! agents. The model only *asks*; the supervisor is what enforces the depth and
+//! concurrency caps and narrows the child's scope, so a compromised model
+//! cannot widen its own budget through this seam.
 
 use crate::wire::intel::ToolDef;
 use serde_json::Value;
 
-/// The two classes of tool the agentic loop offers the model — the boundary that
-/// keeps agentd honest to target principle 1 (tools come ONLY from registered MCP
-/// servers) and principle 2 (no local code/command execution). EVERY tool in the
-/// loop's catalogue is exactly one of these; there is no third "general capability
-/// library".
+/// The classes of tool the agentic loop offers the model. This boundary is what
+/// keeps two invariants true: a task tool reaches the model ONLY by being
+/// exported from a registered MCP server or registered in code by the embedder,
+/// and nothing in the catalogue shells out to a local command. EVERY tool the
+/// loop advertises is exactly one of these classes; there is no third "general
+/// capability library" that could smuggle in an unaudited capability.
 ///   * [`Mcp`](ToolClass::Mcp) — a tool discovered from a connected MCP server
 ///     (`tools/list`). Dispatched by routing the call BACK to its owning server
 ///     ([`dispatch_tool`](crate::agentloop::runner)); agentd never runs it locally.
@@ -32,10 +35,10 @@ pub enum ToolClass {
     Mcp,
     /// One of agentd's own self/control orchestration primitives; handled in-process.
     SelfControl,
-    /// A CODE-REGISTERED tool (RFC 0022 §4): native Rust the embedder
-    /// registered via [`crate::tools::register`] — first-party by definition,
-    /// dispatched in-process, and it WINS a name collision with a remote MCP
-    /// tool (a server cannot steal a registered tool's calls).
+    /// A CODE-REGISTERED tool: native Rust the embedder registered via
+    /// [`crate::tools::register`] — first-party by definition, dispatched
+    /// in-process, and it WINS a name collision with a remote MCP tool, so a
+    /// server cannot steal a registered tool's calls by claiming its name.
     Code,
 }
 
@@ -44,10 +47,10 @@ pub enum ToolClass {
 /// [`SelfHandler`] advertises a depth-/feature-conditioned SUBSET of this set
 /// (`a2a.delegate` only with peers; `schedule`/`subscribe`/`unsubscribe` only at
 /// the root; the `subagent.*` delegation tools only within the depth budget), and
-/// the runner adds `resource.read` when any resource is readable. A drift-guard
-/// test asserts everything a handler can advertise is listed here — so a new
-/// self-tool cannot silently escape the class boundary (and, by construction, this
-/// set contains NO local-exec primitive: principle 2).
+/// the runner adds `resource.read` when any resource is readable. A test asserts
+/// that everything a handler can advertise appears in this list, so a new
+/// self-tool cannot silently escape the class boundary. By construction the set
+/// contains no local-execution primitive.
 pub const SELF_CONTROL_TOOLS: &[&str] = &[
     "subagent.spawn",
     "subagent.status",
@@ -77,8 +80,9 @@ pub trait SelfHandler {
 
     /// Read an `agentd://` self-resource (e.g. `agentd://subagent/<handle>` — an
     /// async child's completion). A `resource.read` for an `agentd://` URI routes
-    /// here instead of to MCP. `Some((content, is_error))` if this handler serves
-    /// the URI; `None` (the default) means it does not. RFC 0009 §async.
+    /// here instead of to MCP. Returns `Some((content, is_error))` if this handler
+    /// serves the URI; `None` (the default) means it does not, and the read falls
+    /// through to MCP.
     fn read_resource(&mut self, _uri: &str) -> Option<(String, bool)> {
         None
     }
@@ -90,16 +94,16 @@ pub trait SelfHandler {
         false
     }
 
-    /// Drain any future wake-ups the agent scheduled for itself this run
-    /// (RFC 0008 §self-scheduling). Default: none. The loop attaches these to
-    /// the run's [`Outcome`](crate::agentloop::stop::Outcome) so a daemon
-    /// supervisor can arm them.
+    /// Drain any future wake-ups the agent scheduled for itself this run.
+    /// Default: none. The loop attaches these to the run's
+    /// [`Outcome`](crate::agentloop::stop::Outcome) so a daemon supervisor can
+    /// arm them.
     fn take_scheduled(&mut self) -> Vec<crate::agentloop::stop::ScheduleRequest> {
         Vec::new()
     }
 
     /// Drain any resource (un)subscriptions the agent requested for itself this
-    /// run (RFC 0008). Default: none. Attached to the run's `Outcome`.
+    /// run. Default: none. Attached to the run's `Outcome`.
     fn take_subscriptions(&mut self) -> Vec<crate::agentloop::stop::SubscriptionRequest> {
         Vec::new()
     }

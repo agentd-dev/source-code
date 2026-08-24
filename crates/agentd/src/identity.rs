@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Instance identity from the Kubernetes downward API (RFC 0015 §6, RFC 0014 §6.4).
+//! Instance identity from the Kubernetes downward API.
 //!
 //! agentd surfaces pod identity by reading **operator-injected environment
 //! variables** (set from `valueFrom.fieldRef`) — never by calling the kube API.
@@ -9,14 +9,14 @@
 //!
 //! Every k8s field is optional and descriptive, never load-bearing: outside
 //! Kubernetes the vars are simply unset and the fields are `None`. Their absence
-//! is never a config error. `run_id` is always present (minted by config if
-//! unset, RFC 0011 §6).
+//! is never a config error. `run_id` is always present (minted by config when
+//! unset), because every log line and durable record correlates on it.
 
 /// The instance's correlation identity. `run_id` is always present; the k8s
 /// fields are populated from the downward-API env when injected, else `None`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Identity {
-    /// AGENTD_RUN_ID / the minted run id (RFC 0011 §6). Always present.
+    /// `AGENTD_RUN_ID`, or the run id minted at startup. Always present.
     pub run_id: String,
     /// `metadata.name` via `AGENTD_POD_NAME`.
     pub instance: Option<String>,
@@ -34,10 +34,10 @@ impl Identity {
     /// resolved config; the k8s fields each read their downward-API var and
     /// resolve to `None` when absent.
     pub fn from_env(run_id: &str) -> Identity {
-        // De-branding (ACC SPEC L4 / env-convention.json): the neutral `AGENT_*`
-        // downward-API vars are read FIRST, falling back to the branded `AGENTD_*`
-        // spelling (still accepted, never dropped). `var()` keeps the empty⇒unset
-        // coercion, so an empty neutral var also falls through to the branded one.
+        // The neutral `AGENT_*` downward-API vars are read FIRST, with the
+        // branded `AGENTD_*` spelling as a fallback, so a manifest may inject
+        // either. `var()` coerces empty to unset, so an empty neutral var also
+        // falls through to the branded one rather than masking it.
         Identity {
             run_id: run_id.to_string(),
             instance: var("AGENT_POD_NAME").or_else(|| var("AGENTD_POD_NAME")),
@@ -85,8 +85,8 @@ mod tests {
         assert_eq!(id.namespace, None);
         assert_eq!(id.node, None);
 
-        // Branded present (the back-compat path): each `AGENTD_*` var maps to its
-        // field via the branded fallback (no neutral var set).
+        // Branded present: each `AGENTD_*` var maps to its field via the
+        // branded fallback (no neutral var set).
         unsafe {
             std::env::set_var("AGENTD_POD_NAME", "agent-pod-abc");
             std::env::set_var("AGENTD_POD_UID", "f3c1-uid");
@@ -100,8 +100,8 @@ mod tests {
         assert_eq!(id.namespace.as_deref(), Some("agents"));
         assert_eq!(id.node.as_deref(), Some("node-3"));
 
-        // Neutral present, branded cleared (ACC SPEC L4): the `AGENT_*` spelling is
-        // accepted on its own.
+        // Neutral present, branded cleared: the `AGENT_*` spelling is accepted
+        // on its own.
         for k in [
             "AGENTD_POD_NAME",
             "AGENTD_POD_UID",

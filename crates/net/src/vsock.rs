@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! AF_VSOCK transport for enclave/microVM intelligence. RFC 0006 §transports.
+//! AF_VSOCK transport for enclave/microVM intelligence.
 //! [feature: vsock]
 //!
 //! For agentd running inside a microVM / confidential enclave, reaching a model

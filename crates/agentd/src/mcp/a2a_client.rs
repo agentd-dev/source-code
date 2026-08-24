@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The A2A (Agent2Agent) **client** — agentd-as-A2A-client, the remote-A2A-agent
-//! delegation backend. RFC 0020 §3. [feature: a2a]
+//! delegation backend. [feature: a2a]
 //!
-//! This is the third A2A layer (RFC 0020 §3): a coordinator can delegate an
-//! objective to a LOCAL supervised subagent (`subagent.spawn`, unchanged) OR to a
-//! REMOTE A2A agent. Same abstraction (objective → distilled result); this module
-//! is the remote backend. It connects to a declared peer (an [`A2aEndpoint`] —
+//! A coordinator can delegate an objective either to a LOCAL supervised subagent
+//! (`subagent.spawn`) or to a REMOTE A2A agent. Both wear the same abstraction
+//! (objective → distilled result); this module is the remote backend. It connects
+//! to a declared peer (an [`A2aEndpoint`] —
 //! `https://host[:port]`, or loopback `http://` for dev) and drives the A2A unary
 //! surface as a client with one `POST` per call (the [`HttpConn`] caller), through
 //! the streaming consumer / recovery loop:
@@ -26,10 +26,10 @@
 //! over agentd's authenticated transport.
 //!
 //! Trust: agentd dials the peer over HTTP(S), presenting the peer client-auth
-//! material on every request (RFC 0031 §7) — a resolved **bearer/framing header**
-//! (static / oauth2 device-login / SPIFFE JWT-SVID), an **mTLS** client identity
-//! (SPIFFE X.509-SVID), a per-request **AWS SigV4** signature (`kind: aws`), and
-//! an ambient **AAuth** signature (RFC 0023) when a process identity is installed.
+//! material on every request — a resolved **bearer/framing header** (static /
+//! oauth2 device-login / SPIFFE JWT-SVID), an **mTLS** client identity (SPIFFE
+//! X.509-SVID), a per-request **AWS SigV4** signature (`kind: aws`), and an
+//! ambient **AAuth** signature when a process identity is installed.
 
 use crate::a2a::peer::{self as a2a};
 use crate::config::A2aEndpoint;
@@ -38,9 +38,10 @@ use a2a_rs::domain::TaskState;
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 
-/// Poll cadence between `GetTask` reads while a remote Task is in flight
-/// (RFC 0020 §3: "sleep ~100ms between polls"). Bounded above by the
-/// per-delegation deadline the caller passes in.
+/// Poll cadence between `GetTask` reads while a remote Task is in flight: short
+/// enough that a finished task is picked up promptly, long enough that a long
+/// run does not hammer the peer. Bounded above by the per-delegation deadline
+/// the caller passes in.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Per-request read/write timeout on the peer socket — bounds a single
@@ -65,7 +66,7 @@ pub enum DelegateOutcome {
 /// `deadline`. Connects, `SendMessage`s, then polls `GetTask` to a terminal
 /// state. Every failure path (connect, write, read, RPC error, non-completed
 /// terminal, deadline) returns [`DelegateOutcome::Error`] — never panics, never
-/// hangs (the deadline is the hard backstop). RFC 0020 §3.
+/// hangs (the deadline is the hard backstop).
 pub fn delegate(
     endpoint: &A2aEndpoint,
     auth: PeerAuth,
@@ -83,9 +84,10 @@ pub fn delegate(
     // The sole transport is HTTP(S), presenting the peer client-auth material
     // (bearer headers and/or an mTLS identity) on every request. STREAMING
     // FIRST: one `SendStreamingMessage` SSE round trip carries the whole
-    // lifecycle (working → artifact → final) with no polling; an older peer
-    // that degrades it to a unary final frame is recovered via `GetTask`
-    // (the run happened either way — never re-sent).
+    // lifecycle (working → artifact → final) with no polling. A peer that does
+    // not stream, and answers with a single unary final frame instead, is
+    // recovered via `GetTask`: the run started on the peer either way, so it is
+    // polled to its conclusion and NEVER re-sent.
     match endpoint {
         A2aEndpoint::Https(url) => match HttpEp::parse(url) {
             Ok(ep) => {
@@ -102,7 +104,7 @@ pub fn delegate(
     }
 }
 
-/// **Fire-and-forget**: one `SendMessage`, no task await (RFC 0027 `a2a.send`).
+/// **Fire-and-forget**: one `SendMessage`, no task await — the `a2a.send` step.
 ///
 /// The distinction from [`delegate`] is the whole point of having both. A
 /// delegation is a request/response — it opens a stream, follows the task to a
@@ -168,9 +170,10 @@ pub fn send(
 }
 
 /// How a streaming attempt resolved: a terminal outcome, or a task id whose
-/// terminal state must be RECOVERED over unary `GetTask` (an older peer's
-/// unary-final degradation, or a stream that broke after the run started —
-/// the run exists server-side either way, so it is polled, never re-sent).
+/// terminal state must be RECOVERED over unary `GetTask` (a peer that answered
+/// with one unary final frame rather than a stream, or a stream that broke after
+/// the run had started). In both cases the run exists on the peer already, so it
+/// is polled to a conclusion and never re-sent.
 enum StreamOutcome {
     Done(DelegateOutcome),
     Recover(String),
@@ -197,10 +200,11 @@ fn poll_task<C: Caller>(conn: &mut C, task_id: &str, deadline: Instant) -> Deleg
     }
 }
 
-/// The client credential presented TO a peer (RFC 0020 §auth): resolved bearer/
-/// framing headers (secrets ALREADY materialized — never logged; this struct has
-/// no Debug) and/or an mTLS client identity. All empty = anonymous dial (a
-/// loopback dev peer).
+/// The client credential presented TO a peer: resolved bearer/framing headers
+/// (secrets ALREADY materialized — never logged; this struct deliberately has no
+/// `Debug` impl so a stray `{:?}` cannot print one) and/or an mTLS client
+/// identity. All empty means an anonymous dial, which is only appropriate for a
+/// loopback dev peer.
 #[derive(Default)]
 pub struct PeerAuth {
     /// Resolved header (name, value) pairs sent on every request. These are
@@ -209,11 +213,11 @@ pub struct PeerAuth {
     /// The mutual-TLS client identity presented during the handshake.
     #[cfg(feature = "tls")]
     pub identity: Option<crate::net::tls::ClientIdentity>,
-    /// A per-request signer (RFC 0031 §8: AWS SigV4) for an AWS-IAM-gated peer.
-    /// Unlike [`PeerAuth::headers`], its signature covers the exact request body,
-    /// so it is re-run on every POST. `None` = no SigV4 (bearer/mTLS/AAuth still
-    /// apply). Alongside it, an ambient process AAuth identity (RFC 0023) signs
-    /// every outbound A2A dial when configured.
+    /// A per-request AWS SigV4 signer for an AWS-IAM-gated peer. Unlike
+    /// [`PeerAuth::headers`], its signature covers the exact request body, so it
+    /// must be re-run on every POST. `None` means no SigV4 (bearer, mTLS and
+    /// AAuth still apply). Alongside it, an ambient process AAuth identity signs
+    /// every outbound A2A dial when one is configured.
     pub signer: Option<std::sync::Arc<dyn ::mcp::http::RequestSigner>>,
 }
 
@@ -314,20 +318,21 @@ impl HttpConn {
         }
     }
 
-    /// Per-request signature headers (RFC 0023 AAuth + RFC 0031 SigV4) over the
-    /// exact `body` + request path — mirroring the intelligence dial. The static
-    /// bearer/framing headers ([`PeerAuth::headers`]) and the mTLS identity ride
-    /// separately; this covers only the signatures that depend on the payload.
-    /// Empty in the default (no-AAuth, no-SigV4) build, so the wire is unchanged.
+    /// Per-request AAuth and AWS SigV4 signature headers over the exact `body`
+    /// and request path — mirroring the intelligence dial. The static bearer /
+    /// framing headers ([`PeerAuth::headers`]) and the mTLS identity ride
+    /// separately; this covers only the signatures that depend on the payload,
+    /// which is why it must be recomputed per request rather than cached. Empty
+    /// when neither AAuth nor SigV4 is configured, so no extra headers ride.
     fn signature_headers(&self, body: &[u8]) -> Vec<(String, String)> {
         let mut out = Vec::new();
-        // AAuth: sign the outbound A2A dial (RFC 0023) so the peer attests the
-        // agent by signature — additive, identity-cover only (like the intel dial).
+        // AAuth: sign the outbound A2A dial so the peer can attest the agent by
+        // signature — additive, identity-cover only (like the intel dial).
         #[cfg(feature = "aauth")]
         if let Some(signer) = crate::aauth::signer() {
             out.extend(signer.sign("POST", &self.ep.host_header, &self.ep.path, body));
         }
-        // SigV4 (RFC 0031 §8): an AWS-IAM-gated peer, signed over the exact body.
+        // SigV4: an AWS-IAM-gated peer, signed over the exact body.
         if let Some(signer) = &self.auth.signer {
             out.extend(signer.sign("POST", &self.ep.host_header, &self.ep.path, body));
         }
@@ -363,11 +368,11 @@ impl HttpConn {
     /// One `SendStreamingMessage` round trip: POST with
     /// `Accept: text/event-stream`, then consume the SSE frames — working →
     /// (artifact) → final — to a terminal outcome. Returns `Recover(task_id)`
-    /// when the terminal state must be fetched over unary GetTask instead: an
-    /// older peer answered `application/json` (its unary-final degradation —
-    /// the final frame names the task, the artifact rode a discarded frame), or
-    /// the stream broke after the run started. `Err` only when nothing was
-    /// started (safe for the caller to surface — the run is NOT duplicated).
+    /// when the terminal state must instead be fetched over unary GetTask: the
+    /// peer answered `application/json` rather than a stream (that reply names
+    /// the task but its artifact rode a frame we never saw), or the stream broke
+    /// after the run had started. `Err` is returned ONLY when nothing was
+    /// started, so a caller surfacing it can never duplicate a running task.
     fn call_streaming(
         &mut self,
         objective: &str,
@@ -420,9 +425,9 @@ impl HttpConn {
             .header("content-type")
             .is_some_and(|ct| ct.to_ascii_lowercase().contains("text/event-stream"));
         if !sse {
-            // An older peer's unary-final degradation: the whole body is ONE
-            // JSON-RPC response whose result is the final status frame. The run
-            // already happened — recover its artifacts via GetTask.
+            // A peer that does not stream: the whole body is ONE JSON-RPC
+            // response whose result is the final status frame. The run already
+            // happened, so recover its artifacts via GetTask rather than resend.
             use std::io::Read as _;
             let mut text = String::new();
             let _ = resp.into_reader().take(1 << 20).read_to_string(&mut text);
@@ -504,9 +509,10 @@ impl HttpConn {
                     .pointer("/status/state")
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                // Terminate on a terminal task STATE (A2A spec §3.5.2 — the stream
-                // closes on terminal). agentd emits no non-spec `final` flag, and a
-                // conformant peer signals termination by the state + closing.
+                // Terminate on a terminal task STATE: an A2A stream closes once
+                // the task is terminal. agentd emits no `final` flag of its own,
+                // and a conformant peer signals termination by the state plus
+                // closing the stream, so the state is the only signal to trust.
                 if a2a::is_terminal(
                     serde_json::from_value(json!(state))
                         .unwrap_or(TaskState::TASK_STATE_UNSPECIFIED),
@@ -770,9 +776,9 @@ mod tests {
     }
 
     fn status_frame(id: &str, state: &str, _is_final: bool) -> Value {
-        // agentd emits no `final` flag (not in the A2A proto); the client
-        // terminates on the terminal task STATE. The bool arg is retained only so
-        // the existing call sites read naturally.
+        // agentd emits no `final` flag (the A2A proto has none); the client
+        // terminates on the terminal task STATE. The bool argument is ignored —
+        // it only makes the call sites below read as the lifecycle they describe.
         json!({"statusUpdate": {"taskId": id, "contextId": "ctx", "status": {"state": state}}})
     }
 

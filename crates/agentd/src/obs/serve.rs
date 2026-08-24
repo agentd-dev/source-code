@@ -1,18 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Opt-in HTTP probe/scrape surface: `/metrics` + `/healthz` + `/readyz`.
-//! RFC 0010 §health + §metrics; RFC 0016 §10 (fleet liveness). [feature: metrics]
+//! [feature: metrics]
 //!
 //! One blocking-accept thread, one thread-per-connection — no async, matching
 //! the supervisor's processes-plus-threads model. GET-only, unauthenticated,
 //! read-only; bound only when `--metrics-addr` is set (default off).
 //!
-//! `/healthz` (the k8s `livenessProbe` target, RFC 0016 §10) reuses the
-//! **supervisor reactor heartbeat** (`obs::health::tick_age_ms`): a wedged
-//! reactor reads unhealthy and k8s restarts the pod, while a healthy tree with
-//! one *stuck subagent* keeps reading healthy (the reactor is the one detecting
-//! and killing that child — RFC 0003 — so it is still ticking). `/readyz` (the
-//! `readinessProbe` target) is the orthogonal lame-duck/drain gate and is left
-//! intact below.
+//! `/healthz` (the k8s `livenessProbe` target) reuses the **supervisor reactor
+//! heartbeat** (`obs::health::tick_age_ms`): a wedged reactor reads unhealthy
+//! and k8s restarts the pod, while a healthy tree with one *stuck subagent*
+//! keeps reading healthy (the reactor is the one detecting and killing that
+//! child, so it is still ticking). `/readyz` (the `readinessProbe` target) is
+//! the orthogonal lame-duck/drain gate.
 
 use crate::obs::log::Logger;
 use serde_json::json;
@@ -25,13 +24,13 @@ use std::time::Duration;
 /// Liveness window for `/healthz`: a supervisor tick older than this — i.e. the
 /// reactor loop has not made progress recently — reads unhealthy. The single
 /// source of truth lives in `obs::health` (shared with the `--health-file` writer
-/// and asserted to exceed the reactor-thread management-call timeout, RFC 0016
-/// §10), so a reactor management call can never outrun this window.
+/// and asserted to exceed the reactor-thread management-call timeout), so a
+/// reactor management call can never outrun this window.
 const STALE_AFTER_MS: u64 = crate::obs::health::LIVENESS_STALE_AFTER_MS;
 
 /// Bind `addr` and serve probes on a background thread. Returns the bind error
 /// (so the caller decides whether a failed bind is fatal). Accepts the bare
-/// `:port` form (all interfaces) as well as an explicit `host:port`. RFC 0010.
+/// `:port` form (all interfaces) as well as an explicit `host:port`.
 pub fn spawn(addr: &str, log: Logger) -> std::io::Result<()> {
     let listener = TcpListener::bind(normalize_bind_addr(addr).as_ref())?;
     let local = listener.local_addr().ok();
@@ -106,14 +105,13 @@ fn route(path: &str) -> (&'static str, &'static str, String) {
     }
 }
 
-/// Readiness (RFC 0010 §3.7 / RFC 0015 §4.2 / RFC 0018 §6). The surface is bound
-/// only after the daemon has initialized, so reaching it means the process is up.
-/// Readiness is then overridden NotReady when the operator has lame-ducked the
-/// instance (`lame-duck{ready:false}`), a drain is in progress, OR the intelligence
-/// channel is all-endpoints-down (RFC 0018 §6) — all three advertise "don't route
-/// new work here" without the process necessarily exiting. The override is toward
-/// NotReady only: clearing the held condition restores Ready iff nothing else holds
-/// it down.
+/// Readiness. The surface is bound only after the daemon has initialized, so
+/// reaching it means the process is up. Readiness is then overridden NotReady
+/// when the operator has lame-ducked the instance (`lame-duck{ready:false}`), a
+/// drain is in progress, OR the intelligence channel is all-endpoints-down — all
+/// three advertise "don't route new work here" without the process necessarily
+/// exiting. The override is toward NotReady only: clearing the held condition
+/// restores Ready iff nothing else holds it down.
 ///
 /// `intel_all_down` is the EVENTUALLY-CONSISTENT, last-child-experience latch a
 /// subagent reports up via `AgentMsg::IntelHealth` (the supervisor has no LLM of
@@ -137,14 +135,14 @@ fn readiness_response() -> (&'static str, &'static str, String) {
     }
 }
 
-/// Liveness (RFC 0010 §3.7 / RFC 0016 §10). The verdict is a function of the
-/// **supervisor reactor heartbeat** alone (`obs::health::tick_age_ms`) — a fresh
-/// tick means the reactor loop is making progress, so the pod is live. It does
-/// **not** consult any per-subagent stuck state: a wedged child is detected and
-/// killed by the reactor itself (RFC 0003), which keeps ticking while it does,
-/// so a stuck subagent never flips liveness and never costs a healthy tree its
-/// pod. Only the *reactor* wedging (ticks stop, age grows past `STALE_AFTER_MS`)
-/// — or a drain in progress — reads unhealthy so k8s restarts the pod.
+/// Liveness. The verdict is a function of the **supervisor reactor heartbeat**
+/// alone (`obs::health::tick_age_ms`) — a fresh tick means the reactor loop is
+/// making progress, so the pod is live. It does **not** consult any per-subagent
+/// stuck state: a wedged child is detected and killed by the reactor itself,
+/// which keeps ticking while it does, so a stuck subagent never flips liveness
+/// and never costs a healthy tree its pod. Only the *reactor* wedging (ticks
+/// stop, age grows past `STALE_AFTER_MS`) — or a drain in progress — reads
+/// unhealthy so k8s restarts the pod.
 fn health_response() -> (&'static str, &'static str, String) {
     let draining = crate::signals::draining();
     let age = crate::obs::health::tick_age_ms();
@@ -211,10 +209,10 @@ mod tests {
 
     #[test]
     fn readyz_flips_503_under_intel_all_down_then_clears() {
-        // RFC 0018 §6: a pod whose only model endpoint is down stops advertising
-        // Ready (the readiness flip the §6 promise requires), and recovers when a
-        // child reports an endpoint usable again. The latch is the same one a child's
-        // `AgentMsg::IntelHealth` sets through the supervisor.
+        // A pod whose only model endpoint is down stops advertising Ready, so the
+        // fleet routes elsewhere, and recovers when a child reports an endpoint
+        // usable again. The latch is the same one a child's `AgentMsg::IntelHealth`
+        // sets through the supervisor.
         let _g = crate::signals::test_guard();
         if crate::signals::draining() {
             return; // a SIGTERM in the test process would dominate the verdict
@@ -247,7 +245,7 @@ mod tests {
 
     #[test]
     fn bare_port_actually_binds() {
-        // The regression: TcpListener::bind(":0") fails to resolve, but the
+        // `TcpListener::bind(":0")` fails to resolve on its own; only the
         // normalized form binds. Port 0 → an ephemeral port, so the test is
         // self-contained and never collides.
         let l = TcpListener::bind(normalize_bind_addr(":0").as_ref());
@@ -260,8 +258,8 @@ mod tests {
         assert!(s.starts_with("200"));
     }
 
-    // The `/healthz` reactor-heartbeat contract (RFC 0016 §10). One test drives
-    // the whole fresh→wedged→fresh transition sequentially: `LAST_TICK_MS` is a
+    // The `/healthz` reactor-heartbeat contract. One test drives the whole
+    // fresh→wedged→fresh transition sequentially: `LAST_TICK_MS` is a
     // single process-global the supervisor heartbeat shares, so the stale and
     // fresh phases must not be split across two `#[test]`s that the harness may
     // interleave in the same process (one's stale-stamp would race the other's

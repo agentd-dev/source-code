@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! AAuth [RFC 0023 §5.1] federated enrollment — the agent presents an
-//! `enrollment_assertion` (e.g. a Kubernetes projected ServiceAccount token) in
-//! the `/enroll` body, read **fresh from the file on every enroll** so a rotated
-//! projected token is always current. Proven against a live mock Agent Provider
-//! that captures the enroll body. [feature: aauth]
+//! AAuth federated enrollment — the agent presents an `enrollment_assertion`
+//! (e.g. a Kubernetes projected ServiceAccount token) in the `/enroll` body,
+//! read **fresh from the file on every enroll** so a rotated projected token is
+//! always current. Proven against a live mock Agent Provider that captures the
+//! enroll body. [feature: aauth]
 #![cfg(feature = "aauth")]
 
 use agentd::aauth::{ApdClient, ApdConfig};

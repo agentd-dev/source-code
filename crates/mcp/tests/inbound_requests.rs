@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! **The other direction**: a server sending the client a request.
 //!
-//! MCP is bidirectional, and this client used to be deaf that way — every
-//! server→client request was dropped, including `ping`, which the spec says
-//! both sides MUST answer. A server was entitled to read that silence as a dead
-//! connection.
+//! MCP is bidirectional, and a client that is deaf that way drops every
+//! server→client request, including `ping`, which the spec says both sides MUST
+//! answer. A server is entitled to read that silence as a dead connection.
 //!
 //! These tests stand up a real HTTP MCP server on a socket, drive a real
 //! `McpClient` at it, and assert on what comes back over the wire: that the
@@ -12,9 +11,9 @@
 //! unconditionally, and that an `elicitation/create` reaches the host handler
 //! and its decision reaches the server.
 //!
-//! The SDK answers these now, so what is really being asserted is that adopting
-//! it did not lose the behaviour: the wire is checked from the server's side,
-//! which is the only side that can tell.
+//! The SDK answers these, so what is really being asserted is that the
+//! behaviour survives all the way out to the wire: it is checked from the
+//! server's side, which is the only side that can tell.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -228,8 +227,8 @@ fn the_handshake_advertises_only_what_the_host_can_answer() {
 
 #[test]
 fn a_server_ping_is_answered_over_the_event_stream() {
-    // The regression this whole module exists for: a server pinging the client
-    // used to get silence and could rightly treat the session as dead.
+    // The failure this whole module guards against: a server pinging the client
+    // gets silence and can rightly treat the session as dead.
     let seen: Shared = Arc::default();
     let ping = json!({"jsonrpc": "2.0", "id": 77, "method": "ping"});
     let ep = spawn_server(Arc::clone(&seen), Some(ping));

@@ -86,10 +86,10 @@ fn rebinding_second_answer_never_reaches_the_private_address() {
 
     // The hostile server re-arms. This is the point of the test: it serves the
     // truth to whoever asks *first* — the delivery's own guard — and the
-    // honeypot to whoever asks *next*, which pre-fix was the connect
-    // re-resolving the name. Post-fix there is no next lookup, because the dial
-    // takes the addresses the guard vetted and never touches DNS again. Without
-    // this re-arm the test would pass for the wrong reason (the delivery guard
+    // honeypot to whoever asks *next*, which in a leaky guard is the connect
+    // re-resolving the name. There must be no next lookup: the dial takes the
+    // addresses the guard vetted and never touches DNS again. Without this
+    // re-arm the test would pass for the wrong reason (the delivery guard
     // itself would see loopback), and would not distinguish the two worlds.
     REBIND_CALLS.store(0, Ordering::SeqCst);
 
@@ -114,7 +114,7 @@ fn rebinding_second_answer_never_reaches_the_private_address() {
 
 #[test]
 fn dialling_the_vetted_addresses_ignores_a_later_answer() {
-    // The fix's whole point: what the guard approved is what gets dialled. Here
+    // The whole invariant: what the guard approved is what gets dialled. Here
     // the approved list is public and unreachable, so the connect fails on the
     // network — but it fails aimed at 93.184.216.34, never at the honeypot the
     // resolver would now hand out.
@@ -177,7 +177,7 @@ fn allow_private_still_reaches_a_loopback_listener() {
     let (listener, addr) = honeypot();
     let stream = connect_addrs("localhost", &[addr], T, true).expect("escape hatch must connect");
     assert_eq!(stream.peer_addr().expect("peer addr"), addr);
-    // Timeouts are set on the returned stream, as `http::connect_tcp` did.
+    // Timeouts are set on the returned stream, as `http::connect_tcp` does.
     assert_eq!(stream.read_timeout().expect("read timeout"), Some(T));
     assert_eq!(stream.write_timeout().expect("write timeout"), Some(T));
     // And the connection did arrive.
@@ -218,7 +218,7 @@ fn public_ip_literals_resolve_without_dns() {
 }
 
 // ---------------------------------------------------------------------------
-// The pre-existing refusals must not have regressed.
+// The flat refusals the guard owes on every call, rebinding aside.
 // ---------------------------------------------------------------------------
 
 #[test]

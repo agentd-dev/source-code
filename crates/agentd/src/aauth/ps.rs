@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The Person Server (PS) flow (RFC 0023 §Case C) — user-scoped identity. When
+//! The Person Server (PS) flow (Case C) — user-scoped identity. When
 //! an MCP server answers `401 requirement=auth-token; resource-token="…"`, the
 //! agent exchanges that resource token at the user's Person Server for a
 //! **user-scoped auth token** (the human consents at the PS), then presents that
@@ -50,9 +50,11 @@ struct PollResp {
 
 /// Exchange `resource_token` at the Person Server for a user-scoped auth token,
 /// signing with the current `agent_token` (the agent authenticates itself; the
-/// PS then brings in the human). Polls a pending interaction up to `deadline`.
-/// Returns the auth token on approval, or a clear error (denied / expired /
-/// unreachable). RFC 0023 §6.
+/// PS then brings in the human). A pending interaction is polled for up to five
+/// minutes; `timeout` bounds each individual HTTP call, not the human's think
+/// time. Returns the auth token on approval, or a clear error (denied /
+/// expired / unreachable). Blocking: the caller is a 401 retry that cannot
+/// proceed until the human answers.
 pub fn exchange(
     ps_url: &str,
     key: &AgentKey,

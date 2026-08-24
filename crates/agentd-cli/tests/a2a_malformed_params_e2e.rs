@@ -2,17 +2,17 @@
 //! **Malformed `SendMessage` params must not be able to kill the daemon.**
 //!
 //! `params` is remote input, and the listener rewrites it before handing it to
-//! the protocol layer (a task id for a send that names none). That rewrite used
-//! to index into the value with serde_json's `IndexMut`, which *panics* — not
+//! the protocol layer (a task id for a send that names none). That rewrite must
+//! not index into the value with serde_json's `IndexMut`, which *panics* — not
 //! errors — when what is underneath is an array, a string or a number. The
-//! release profile is `panic = "abort"`, so a single `curl` with
-//! `"params": []` was a remote kill switch for the whole daemon.
+//! release profile is `panic = "abort"`, so such a panic makes a single `curl`
+//! with `"params": []` a remote kill switch for the whole daemon.
 //!
 //! Two things are asserted for each malformed shape: the caller gets a
 //! JSON-RPC error, and — the half that matters — the daemon is still running and
 //! still answering afterwards. In a debug build `panic = "unwind"` confines the
 //! panic to the hyper task, so a test that only read the response would pass
-//! against the bug it exists to catch.
+//! against the very failure it exists to catch.
 #![cfg(all(unix, feature = "a2a"))]
 
 mod common;
@@ -102,7 +102,7 @@ struct Daemon {
 impl Daemon {
     /// Whether the process is still running. `panic = "abort"` in the release
     /// profile turns the listener's panic into a dead process, so this is the
-    /// assertion the defect is really about.
+    /// assertion that really matters here.
     fn alive(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
     }
@@ -198,9 +198,9 @@ fn malformed_send_params_are_refused_and_the_daemon_keeps_serving() {
     wait_ready(&addr);
 
     // Every shape a `params` field can take that is not "an object with an
-    // object `message`". The first three reached the `IndexMut` rewrite and
-    // panicked the listener; `null` and the rest are here because the guard has
-    // to hold for the whole space, not for the reported reproducer.
+    // object `message`". The first three reach the `IndexMut` rewrite, where an
+    // unguarded index panics the listener; `null` and the rest are here because
+    // the guard has to hold for the whole space, not just for one reproducer.
     let shapes = [
         json!([]),
         json!({"message": "hi"}),
@@ -259,12 +259,12 @@ fn a_feed_cursor_ahead_of_the_feed_is_told_to_resync() {
     let fresh = hello_frame(&addr, 0);
     assert_eq!(fresh["resync"], false, "a zero cursor is honoured: {fresh}");
 
-    // The regression: the feed is in memory, so every attached display client
-    // reconnecting across a daemon restart presents a cursor from the *previous*
-    // process — one far ahead of this feed's seq. Honouring it silently kills
-    // the subscription (`since` only yields `seq > cursor`), so the client waits
-    // out a whole restart's worth of events showing nothing. `resync` is how it
-    // is told to re-bootstrap instead.
+    // The failure this guards against: the feed is in memory, so every attached
+    // display client reconnecting across a daemon restart presents a cursor from
+    // the *previous* process — one far ahead of this feed's seq. Honouring it
+    // silently kills the subscription (`since` only yields `seq > cursor`), so
+    // the client waits out a whole restart's worth of events showing nothing.
+    // `resync` is how it is told to re-bootstrap instead.
     let stale = hello_frame(&addr, 9_000_000);
     assert_eq!(
         stale["resync"], true,

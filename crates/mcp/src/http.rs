@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The MCP **Streamable HTTP** client transport (v2.0.0). RFC 0004 §transport.
+//! The MCP **Streamable HTTP** client transport.
 //!
 //! A conformant remote MCP server is reached by `POST`ing a JSON-RPC message to a
 //! single endpoint; the server replies with either a `application/json` body (one
@@ -11,7 +11,8 @@
 //! The transport is stream-agnostic (it reuses the hand-rolled [`net::http`]
 //! client): `https://` runs over TCP+TLS (optionally mutual TLS), `http://` over
 //! plain TCP (a local sidecar), `unix:` over a unix socket, and `vsock:` over
-//! AF_VSOCK — none of which spawns a process (RFC 0012: no local exec surface).
+//! AF_VSOCK. None of these spawns a process: the transport has no local exec
+//! surface, so a hostile server config cannot turn into command execution here.
 
 use net::http::{self, SseEvent, Url};
 #[cfg(feature = "tls")]
@@ -148,9 +149,9 @@ enum SendOutcome {
     RetryAuth,
 }
 
-/// The AAuth-relevant fields of a server response (RFC 0023 §5 — the request
-/// loop). Handed to [`RequestSigner::on_response`] so the signer can satisfy a
-/// runtime `AAuth-Requirement` and decide whether a retry would now succeed.
+/// The AAuth-relevant fields of a server response. Handed to
+/// [`RequestSigner::on_response`] so the signer can satisfy a runtime
+/// `AAuth-Requirement` and decide whether a retry would now succeed.
 #[derive(Debug, Clone, Default)]
 pub struct AuthResponse {
     pub status: u16,
@@ -165,13 +166,13 @@ pub struct AuthResponse {
     pub error: Option<String>,
 }
 
-/// A per-request signer (RFC 0023 — AAuth). The transport calls [`sign`] just
-/// before each POST (the returned `(name, value)` pairs become request headers —
-/// the RFC 9421 `Signature-Input`/`Signature`/`Signature-Key`), and
-/// [`on_response`] after, to react to the server's `AAuth-Requirement` (adopt an
-/// access token, run the Person-Server flow) and re-sign+retry. Kept
-/// dependency-free here — the CRYPTO lives in the caller (agentd's `aauth`
-/// module); this crate only owns the seam, so `agentd-mcp` gains no crypto dep.
+/// A per-request AAuth signer. The transport calls [`sign`] just before each
+/// POST (the returned `(name, value)` pairs become request headers — the
+/// RFC 9421 `Signature-Input`/`Signature`/`Signature-Key`), and [`on_response`]
+/// after, to react to the server's `AAuth-Requirement` (adopt an access token,
+/// run the Person-Server flow) and re-sign+retry. Deliberately a trait, not an
+/// implementation: the crypto lives in the caller, so this crate stays free of
+/// any crypto dependency.
 pub trait RequestSigner: Send + Sync {
     /// Sign one request. `authority` is the `Host` value (host[:port]); `path`
     /// is the request-target. `body` is the JSON-RPC bytes (for a
@@ -180,7 +181,7 @@ pub trait RequestSigner: Send + Sync {
     /// requirement).
     fn sign(&self, method: &str, authority: &str, path: &str, body: &[u8])
     -> Vec<(String, String)>;
-    /// React to a response (RFC 0023 §5): adopt an `AAuth-Access` token, satisfy
+    /// React to a response: adopt an `AAuth-Access` token, satisfy
     /// an `AAuth-Requirement` (e.g. run the Person-Server exchange), and return
     /// `true` iff the request should be RE-SIGNED and retried (a requirement was
     /// newly satisfied). The default reacts to nothing. May do network I/O
@@ -207,20 +208,20 @@ pub trait RequestSigner: Send + Sync {
 pub struct HttpTransport {
     endpoint: McpEndpoint,
     /// Caller-owned auth + framing headers (e.g. `Authorization`, `x-api-key`).
-    /// Values may be secrets — never logged; this transport only writes them onto
-    /// the wire (RFC 0012 §3.7).
+    /// Values may be secrets. They are never logged and never rendered into an
+    /// error: this transport only writes them onto the wire.
     headers: Vec<(String, String)>,
     /// A client identity for mutual TLS (TCP+TLS endpoints only).
     #[cfg(feature = "tls")]
     identity: Option<ClientIdentity>,
     session: Mutex<Option<String>>,
     /// The protocol version negotiated at `initialize`, echoed on every later
-    /// request as `MCP-Protocol-Version` (RFC transports §protocol-version-header
-    /// — a MUST for Streamable HTTP). `None` until the client sets it, so the
-    /// `initialize` request itself carries no header (no version agreed yet).
+    /// request as `MCP-Protocol-Version`, which Streamable HTTP requires. `None`
+    /// until the client sets it, so the `initialize` request itself carries no
+    /// header — there is no agreed version to declare before the handshake.
     protocol_version: Mutex<Option<String>>,
-    /// An optional per-request signer (AAuth, RFC 0023). `None` = the endpoint
-    /// is called unsigned (the default; static-bearer/mTLS auth is unaffected).
+    /// An optional per-request AAuth signer. `None` = the endpoint is called
+    /// unsigned (the default; static-bearer/mTLS auth is unaffected).
     signer: Option<std::sync::Arc<dyn RequestSigner>>,
 }
 
@@ -322,7 +323,7 @@ impl HttpTransport {
         }
     }
 
-    /// The AAuth headers for ONE dial (RFC 0023): the signature over
+    /// The AAuth headers for ONE dial: the signature over
     /// `@method`/`@authority`/`@path` (over `body` too when the server requires a
     /// content-digest cover), plus the optional `AAuth-Capabilities` advert.
     /// Empty without a signer — the endpoint is then called unsigned.
@@ -359,7 +360,7 @@ impl HttpTransport {
         extra_headers: &[(&str, &str)],
         mut on_notification: F,
     ) -> Result<Option<Value>, HttpError> {
-        // AAuth request loop (RFC 0023 §5): send signed; if the server answers
+        // AAuth request loop: send signed; if the server answers
         // with an `AAuth-Requirement` the signer can satisfy (adopt an access
         // token, run the Person-Server exchange), re-sign and retry — bounded,
         // so a mis-satisfied requirement cannot spin. Without a signer this is
@@ -439,8 +440,8 @@ impl HttpTransport {
         for (k, v) in &self.headers {
             headers.push((k.as_str(), v.as_str()));
         }
-        // AAuth request signing (RFC 0023). Owned strings kept alive in `signed`
-        // for the borrow.
+        // AAuth request signing. The owned strings must outlive the borrowed
+        // header slice, so `signed` stays in scope until the request is sent.
         let signed = self.auth_headers("POST", body);
         for (k, v) in &signed {
             headers.push((k.as_str(), v.as_str()));
@@ -461,7 +462,7 @@ impl HttpTransport {
             *self.session.lock().unwrap_or_else(|e| e.into_inner()) = Some(sid.to_string());
         }
 
-        // AAuth response reaction (RFC 0023 §5): let the signer adopt an access
+        // AAuth response reaction: let the signer adopt an access
         // token / satisfy a requirement. `on_response` returns whether a retry
         // would now differ. Only consulted when a signer is present AND the
         // response carries an AAuth signal (a requirement, an access token, or a
@@ -517,12 +518,6 @@ impl HttpTransport {
         }
     }
 
-    /// Open the long-lived server→client notification stream: a `GET` that the
-    /// server answers with `text/event-stream`, carrying JSON-RPC notifications
-    /// (e.g. `resources/updated`). Returns an owning SSE reader. `read_timeout`
-    /// bounds each read so the caller's loop can poll a stop flag between events
-    /// (clean shutdown). Errors if the server has no push channel (non-2xx or a
-    /// non-SSE response) — the caller then runs without server-initiated pushes.
     /// The session id the server assigned, if this connection has one.
     pub fn session_id(&self) -> Option<String> {
         self.session
@@ -531,6 +526,12 @@ impl HttpTransport {
             .clone()
     }
 
+    /// Open the long-lived server→client notification stream: a `GET` that the
+    /// server answers with `text/event-stream`, carrying JSON-RPC notifications
+    /// (e.g. `resources/updated`). Returns an owning SSE reader. `read_timeout`
+    /// bounds each read so the caller's loop can poll a stop flag between events
+    /// (clean shutdown). Errors if the server has no push channel (non-2xx or a
+    /// non-SSE response) — the caller then runs without server-initiated pushes.
     pub fn open_events(&self, read_timeout: Duration) -> Result<EventStream, HttpError> {
         let stream = self.connect(read_timeout)?;
         let mut headers: Vec<(&str, &str)> = vec![("Accept", "text/event-stream")];
@@ -588,8 +589,9 @@ impl HttpTransport {
     }
 
     /// Open the MODERN long-lived notification stream via a `subscriptions/listen`
-    /// POST (the stateless replacement for the removed GET stream). `body` is the
-    /// full pre-built JSON-RPC request (its `_meta` already injected); `routing`
+    /// POST. The modern era has no GET stream, so this response IS the push
+    /// channel. `body` is the full pre-built JSON-RPC request (its `_meta`
+    /// already injected); `routing`
     /// are the Mcp-Method/Mcp-Name headers. The server answers with an SSE stream
     /// that stays open, carrying the opted-in notifications; returns its reader.
     pub fn open_listen(

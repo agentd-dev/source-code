@@ -2,7 +2,7 @@
 
 agentd ships two **display clients** — a terminal UI and a web UI — built as
 separate Node projects under [`interface/`](../interface). They are *thin* by
-design (RFC 0032): **agentd hosts all state, tools and secrets; the clients
+design: **agentd hosts all state, tools and secrets; the clients
 only render daemon state and forward your intent.** Open both at once — plus a
 colleague's browser — and every surface shows the same conversation, tasks and
 runs, live, because each one watches the same daemon feed. None of them holds
@@ -31,7 +31,7 @@ With `enabled: false` the daemon serves no interface surface at all — the even
 feed and the interface reads answer with a clear "the interface surface is
 disabled" error, and nothing is buffered for them.
 
-Auth is the A2A listener's (RFC 0029): on a plaintext loopback listener with no
+Auth is the A2A listener's: on a plaintext loopback listener with no
 principals a local client is the **operator** with zero setup; a remote client
 presents `a2a.bearer` / an mTLS identity and sees only what its role and
 ownership allow.
@@ -108,7 +108,7 @@ Four screens, cycled with `Tab` (or jumped to with `/chat`, `/tasks`,
 Every frame below is **the real program** — rendered by the shipped TUI against
 a mirror driven with daemon-shaped events, captured by
 `interface/tools/frames.mjs`. They regenerate from the code, so they cannot
-drift into describing something agentd no longer does.
+describe a screen the shipped client does not draw.
 
 ### Chat — talking to the agent
 
@@ -250,7 +250,10 @@ Both clients speak the same surface:
   live: `⣾ thinking · 12s · 1.2k tok · round 2`, `⣾ read_file · 3s · 1.2k tok`,
   `⣾ waiting · subagent · 40s`. The daemon reports phase/tool/round/tokens on
   change; elapsed ticks in the client, so a long think costs no traffic. (This
-  is deliberately not token-by-token streaming — see RFC 0032 §17/§19.)
+  is deliberately not token-by-token streaming: one small event per phase
+  change keeps every attached surface in sync for a fixed cost, where a token
+  stream would multiply the daemon's outbound traffic by the number of
+  watchers.)
 - **Tasks** — every task your principal may see, live states, cancel.
 - **Approvals & questions (human-in-the-loop)** — when the agent (or a
   workflow's `human` step) needs you, the transcript shows the question as an
@@ -398,7 +401,7 @@ unless you need it.
 
 ## 7. The protocol (for other clients)
 
-Everything above is plain A2A JSON-RPC (RFC 0029) plus the RFC 0032 additions —
+Everything above is plain A2A JSON-RPC plus the interface additions below —
 any program can be a display client:
 
 - `SubscribeToEvents {fromSeq}` — the SSE feed: `hello` → `event`* → `goodbye`;

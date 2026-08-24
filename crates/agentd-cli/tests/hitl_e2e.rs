@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! **Human-in-the-loop** end to end (RFC 0032 §16): the `ask_human` tool and
-//! the workflow `human` node gate through the interface as `input-required`
-//! A2A tasks; a `SendMessage` carrying the `taskId` resolves the suspended
-//! asker with the reply text. With no interface, the configured fallback
-//! applies — `fail` errors the ask immediately (the model carries on), `auto`
-//! has an LLM judge answer on the operator's behalf (marked as auto). A
-//! cancelled gate unblocks its asker with an error.
+//! **Human-in-the-loop** end to end: the `ask_human` tool and the workflow
+//! `human` node gate through the interface as `input-required` A2A tasks; a
+//! `SendMessage` carrying the `taskId` resolves the suspended asker with the
+//! reply text. With no interface, the configured fallback applies — `fail`
+//! errors the ask immediately (the model carries on), `auto` has an LLM judge
+//! answer on the operator's behalf (marked as auto). A cancelled gate unblocks
+//! its asker with an error.
 #![cfg(all(unix, feature = "a2a"))]
 
 mod common;

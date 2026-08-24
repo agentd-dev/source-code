@@ -12,12 +12,11 @@ none of it. The exceptions are the three side-effect-free probes
 (`--capabilities`, `--config-schema`, `--validate-config`), which need no
 listener, no network, and no config beyond the files you point them at.
 
-The control-plane contracts are owned by RFCs
-[0029](../rfcs/0029-a2a-conversations-principals-commands.md) (the A2A method
-and command surface), [0030](../rfcs/0030-config-schema-v2.md) (the settings
-document), [0017](../rfcs/0017-declarative-config-and-hot-reload.md) (hot
-reload), and [0016](../rfcs/0016-telemetry-and-lifecycle-contract.md) (the
-frozen telemetry/lifecycle contract).
+Every surface here is self-describing: `--capabilities` reports the methods,
+admin family and command ops this instance actually serves, `--config-schema`
+reports the settings document it accepts, and the telemetry event and metric
+names are stable. A controller drives an instance from what the instance
+declares, never from an assumption about the build it is talking to.
 
 ---
 
@@ -40,9 +39,12 @@ Trust is never derived from the transport alone. Validation refuses to start if:
   `interface.pairing` is configured — there is no open control plane;
 - the bind is non-loopback and the scheme is plaintext `http://`.
 
-Arming the listener makes the instance a **daemon**, which requires a durable
-store (`store.kind: mcp | http`) — a long-lived agent that cannot checkpoint is
-a configuration error, not a warning.
+Arming the listener makes the instance a **daemon**, and a daemon must be
+durable: naming no `store` section gets it `kind: file` on the local
+filesystem, while a fleet that shares one backend needs `kind: mcp` or
+`kind: http`. An explicit `store.kind: none` on a long-lived instance is a
+configuration error, not a warning — a long-lived agent that cannot checkpoint
+loses every in-flight run to the next restart.
 
 ```yaml
 # /etc/agentd/ops.yaml
@@ -245,7 +247,7 @@ credential.
 **`debug.events`** is a cursor read of the live log ring — the operator live-tail,
 without a collector round-trip. It takes `{after?, limit?, level?, prefix?}` and
 returns `{events, oldest_seq, newest_seq, dropped}`; the ring is bounded
-(`observability.events_ring`, default capacity otherwise), lossy by design, and
+(`observability.events_ring`, 1024 lines by default), lossy by design, and
 never blocks the loop — a slow reader loses old lines and sees it in `dropped`.
 It requires `interface.debug`, which also installs the ring.
 
@@ -265,7 +267,7 @@ configuration — what this binary is set up to do — not live state.
 
 ```console
 $ agentd --capabilities -c /etc/agentd/ops.yaml
-{ "runtime":"2.0", "version":"2.0.0",
+{ "runtime":"1", "version":"1.1.0",
   "agent":{ "name":"agentd", "instruction":true, "preflight":"auto" },
   "intelligence":{ "model":null, "endpoints":1 },
   "mcp_servers":["state"], "internal_tools":[…], "tools":{ "overrides":[], "disabled":[] },
@@ -348,13 +350,13 @@ Both funnel into one identical routine:
 ### 5.2 What is reloadable vs restart-only
 
 Only the **files** are re-read; the env and flag layers are the process's fixed
-inputs, so a flag still overrides the new file. The partition is owned by
-`RESTART_ONLY_PATHS` in `config/v2`:
+inputs, so a flag still overrides the new file. `RESTART_ONLY_PATHS` in
+`config/v2` is the authoritative partition:
 
 | Reloadable (applied in place) | Restart-only (a diff is refused) |
 |---|---|
 | `intelligence` (endpoints, model, token) | `config_version`, `agent.name` |
-| `intelligence.budget` (windows; counters carry over) | `store.kind`, `store.prefix`, `store.mcp`, `store.http` |
+| `intelligence.budget` (windows; counters carry over) | `store.kind`, `store.prefix`, `store.mcp`, `store.http`, `store.file` |
 | `agent.instruction` (static text or a resource URI) | `lifecycle.run_until`, `.drain_timeout`, `.run_id`, `.exit_code_map`, `.watch_config` |
 | `agent` (preflight, wake_on, tools, parallelism, budget) | `a2a.listen`, `a2a.tls`, `a2a.bearer` |
 | `mcp` (live re-handshake) | `observability.otel`, `.metrics_addr`, `.health_file`, `.events_ring`, `.traceparent` |
@@ -379,8 +381,9 @@ no-op, naming the paths, so a controller reads them and rolls a restart instead.
 The routine is, in order:
 
 1. **Re-merge + re-validate** the candidate through the same `load` pipeline
-   startup uses (built-in < files < env < flags) — a now-invalid document is the
-   same error startup would raise, and the running config is kept.
+   startup uses (built-in < files < env < flags) — a candidate that fails
+   validation raises exactly the error startup would, and the running config is
+   kept.
 2. **Restart-only diff** — any changed restart-only path refuses the reload
    before anything is applied.
 3. **Apply** the reloadable diff, lowest-risk first: value swaps, the MCP

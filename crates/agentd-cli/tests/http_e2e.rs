@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! agentd **outbound `http` node** (RFC 0027) end to end: a workflow makes a
-//! real `POST` to a loopback REST endpoint (`allow_private: true`), the SSRF-
-//! guarded client sends the templated JSON body + headers, and the structured
-//! response `{status, ok, headers, body, json}` flows into the next step's data
-//! and out through the run's captured output.
+//! agentd **outbound `http` node**, end to end: a workflow makes a real `POST`
+//! to a loopback REST endpoint (`allow_private: true`), the SSRF-guarded client
+//! sends the templated JSON body + headers, and the structured response
+//! `{status, ok, headers, body, json}` flows into the next step's data and out
+//! through the run's captured output.
 #![cfg(unix)]
 
 mod common;

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The in-process store (RFC 0025 §4.3) — `store.kind: memory`. Keeps per-key
+//! The in-process store — `store.kind: memory`. Keeps per-key
 //! history (so `get(key, seq)` works like a history-keeping server), enforces
 //! the seq CAS, supports `list`/`delete`, and offers **fault injection** for
 //! tests: fail the next N operations, add latency, or refuse a specific key.

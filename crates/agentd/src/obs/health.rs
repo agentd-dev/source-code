@@ -1,18 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Health / liveness. RFC 0010 §health; RFC 0016 §10 (the fleet-liveness
-//! contract reading).
+//! Health / liveness.
 //!
-//! Mode-aware (RFC 0010): one-shot uses the exit code; the long-lived daemon
-//! modes (loop / reactive / schedule) expose **supervisor-heartbeat liveness**.
-//! The key decision (RFC 0016 §10): *a live PID is not a live agent* — liveness
+//! Mode-aware: one-shot uses the exit code; the long-lived daemon modes
+//! (loop / reactive / schedule) expose **supervisor-heartbeat liveness**.
+//! The key rule: *a live PID is not a live agent* — liveness
 //! tracks whether the **supervisor reactor loop** is making progress, not
 //! whether the process exists. **Idle is healthy** (the reactor wakes on every
 //! `recv_timeout` expiry and [`tick`]s, so a daemon idling for hours stays
 //! live), and a **stuck *subagent* must NOT fail the daemon's liveness**: the
-//! reactor is the thing that *detects and kills* a wedged child (RFC 0003's
-//! 3-detector model, `supervisor::liveness` + the kill ladder), so while it does
-//! so it is by definition still ticking — failing pod liveness there would
-//! destroy a whole healthy tree for one wedged leaf.
+//! reactor is the thing that *detects and kills* a wedged child (the
+//! three-detector model in `supervisor::liveness` plus the kill ladder), so
+//! while it does so it is by definition still ticking — failing pod liveness
+//! there would destroy a whole healthy tree for one wedged leaf.
 //!
 //! Concretely: every reactor hot loop (the daemon driver, the per-run reactor,
 //! the interval sleep) calls [`tick`], bumping a process-global timestamp. The
@@ -22,7 +21,7 @@
 //! the `--health-file` once a second; a K8s `exec` probe reads it. If the
 //! reactor itself wedges, ticks stop, the age grows past the threshold, and
 //! `alive` flips to false — even though the writer keeps writing — so k8s
-//! restarts the pod (RFC 0016 §10).
+//! restarts the pod.
 //!
 //! Default surface = exit code + `--health-file`. The opt-in `/healthz`+`/readyz`
 //! HTTP surface (feature `metrics`, `obs::serve`) reuses this same heartbeat
@@ -37,21 +36,22 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// The liveness staleness window (ms): a supervisor tick older than this reads
 /// unhealthy on `/healthz` and in the `--health-file` (`alive:false`), so k8s
-/// SIGKILLs the pod (RFC 0016 §10). The single source of truth for the window —
+/// SIGKILLs the pod. The single source of truth for the window —
 /// `obs::serve`'s `/healthz` and the `--health-file` writer both read it, and the
 /// reactor-thread MANAGEMENT timeout below is sized strictly under it.
 pub const LIVENESS_STALE_AFTER_MS: u64 = 5_000;
 
 /// The SHORT per-request timeout (ms) for reactor-thread MANAGEMENT calls — the
 /// hot-reload re-handshake (`list_tools`), the claim lease calls (renew / ack /
-/// release / the coordination re-validation), the drain step-1.5 release, and the
-/// reactor's notify-then-read (`read_resource`). It is deliberately FAR under the
-/// liveness window ([`LIVENESS_STALE_AFTER_MS`]): a slow-but-alive coordination /
-/// resource server blocks the single reactor thread for at most this long, so a
-/// management call can never starve the heartbeat past the staleness window and
-/// get a healthy daemon SIGKILLed (audit Finding 1), nor blow the drain budget
-/// (audit Finding 2). The data path (subagent tool calls, `resources/read` on the
-/// agentloop) keeps the default ~60s — only the reactor MANAGEMENT path is bounded.
+/// release / the coordination re-validation), the claim release a drain performs,
+/// and the reactor's notify-then-read (`read_resource`). It is deliberately FAR
+/// under the liveness window ([`LIVENESS_STALE_AFTER_MS`]): a slow-but-alive
+/// coordination / resource server blocks the single reactor thread for at most
+/// this long, so a management call can never starve the heartbeat past the
+/// staleness window and get a healthy daemon SIGKILLed, nor overrun the drain
+/// deadline while shutdown waits on one unresponsive server. The data path
+/// (subagent tool calls, `resources/read` on the agentloop) keeps the default
+/// ~60s — only the reactor MANAGEMENT path is bounded.
 pub const MANAGEMENT_TIMEOUT_MS: u64 = 2_000;
 
 /// The reactor-thread management-call timeout as a [`Duration`].
@@ -61,7 +61,7 @@ pub const fn management_timeout() -> Duration {
 
 // The management timeout MUST stay strictly under the liveness window, or a single
 // management call could itself age the heartbeat past the staleness threshold —
-// the exact starvation the short bound exists to prevent (RFC 0016 §10). Pin the
+// the exact starvation the short bound exists to prevent. Pin the
 // invariant at compile time so a later edit to either constant can't silently
 // break it (a generous 2x margin leaves room for a couple of back-to-back calls
 // between ticks; the per-block `health::tick()` insurance covers longer runs).
@@ -86,9 +86,9 @@ pub fn tick() {
     LAST_TICK_MS.store(now_ms(), Ordering::Relaxed);
 }
 
-/// Age of the last tick (ms). Large ⇒ the supervisor reactor loop is wedged
-/// (RFC 0016 §10). This is the sole input to the `/healthz` liveness verdict;
-/// no per-subagent state feeds it.
+/// Age of the last tick (ms). Large ⇒ the supervisor reactor loop is wedged.
+/// This is the sole input to the `/healthz` liveness verdict; no per-subagent
+/// state feeds it.
 pub fn tick_age_ms() -> u64 {
     now_ms().saturating_sub(LAST_TICK_MS.load(Ordering::Relaxed))
 }

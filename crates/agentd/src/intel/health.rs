@@ -1,17 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Per-endpoint health record + circuit breaker. RFC 0018 §4.1/§4.2.
+//! Per-endpoint health record and circuit breaker.
 //!
-//! Core (always compiled, dependency-free): the failover policy (§3.3) consults
-//! these to skip a dead endpoint and snap back to the primary. All state is
-//! integers/atomics — no histogram library, no SDK, no background timer thread.
-//! The breaker is decided **synchronously** against a wall clock when an endpoint
-//! is consulted (RFC 0018 §4.2 / §7 — no async runtime, no prober thread).
+//! Always compiled and dependency-free. The failover policy consults these
+//! records to skip a dead endpoint and to snap back to the primary. All state is
+//! plain integers and atomics — no histogram library, no SDK, no background
+//! timer thread. The breaker is decided **synchronously** against the wall clock
+//! at the moment an endpoint is consulted, so there is no async runtime and no
+//! prober thread: an idle agent runs no code here at all, and a breaker can
+//! never be reopened by a timer racing a live request.
 
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
-/// Three-state circuit breaker (RFC 0018 §4.2). Stored as a `u8` in the health
-/// record so the whole record is lock-free.
+/// Three-state circuit breaker. Stored as a `u8` in the health record so the
+/// whole record stays lock-free and shareable behind `&self`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BreakerState {
     /// Normal — in rotation.
@@ -30,7 +32,7 @@ impl BreakerState {
             _ => BreakerState::Closed,
         }
     }
-    /// The §4.4 resource-body string.
+    /// The wire spelling published in the `agentd://intelligence` resource body.
     pub fn as_str(self) -> &'static str {
         match self {
             BreakerState::Closed => "closed",
@@ -40,8 +42,10 @@ impl BreakerState {
     }
 }
 
-/// The last-observed failure class for an endpoint (a small bounded enum so the
-/// §4.4 resource body and §8 events can name it without a string allocation).
+/// The last-observed failure class for an endpoint. A small bounded enum rather
+/// than a message string, so the resource body and the emitted events can name
+/// the failure without allocating and without ever echoing provider text into an
+/// observable surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrKind {
     None = 0,
@@ -78,8 +82,9 @@ impl ErrKind {
     }
 }
 
-/// Breaker tuning (RFC 0018 §4.2). All overridable via env/flag in a later
-/// integration; the defaults are the public contract.
+/// Breaker tuning. Every list is constructed with [`BreakerConfig::default`],
+/// so these defaults are the operative values and the tuning is not currently
+/// exposed to operators.
 #[derive(Debug, Clone, Copy)]
 pub struct BreakerConfig {
     /// Consecutive failover-class failures that open the breaker.
@@ -100,8 +105,10 @@ impl Default for BreakerConfig {
     }
 }
 
-/// Per-endpoint health + breaker state (RFC 0018 §4.1). Every field is an atomic
-/// so the record is shared (`&self`) across the call path without a lock.
+/// Per-endpoint health and breaker state. Every field is an atomic so the
+/// record can be updated through a shared `&self` on the dial path without a
+/// lock, which is what lets `EndpointList::iter` hand out `&Endpoint` while a
+/// call in flight records its outcome.
 #[derive(Debug)]
 pub struct HealthRecord {
     state: AtomicU8,        // BreakerState
@@ -156,8 +163,10 @@ impl HealthRecord {
         self.total_fail.load(Ordering::Relaxed)
     }
 
-    /// Process-lifetime error rate (`total_fail / total_calls`); a windowed rate
-    /// is computed by the collector from the scraped counters (RFC 0018 §4.1).
+    /// Process-lifetime error rate, `total_fail / total_calls`. It is a lifetime
+    /// figure and never decays, so a long-lived agent's value lags a recent
+    /// recovery; a windowed rate is the collector's job, derived from the
+    /// scraped counters rather than kept here.
     pub fn error_rate(&self) -> f64 {
         let calls = self.total_calls();
         if calls == 0 {
@@ -193,7 +202,10 @@ impl HealthRecord {
         }
     }
 
-    /// The current cooldown for this endpoint (initial × 2^open_count, capped).
+    /// The current cooldown for this endpoint: the initial cooldown doubled once
+    /// per consecutive open, capped at `cooldown_max`. A repeatedly failing
+    /// endpoint is therefore probed less and less often, while one that closes
+    /// again resets to the initial cooldown.
     pub fn cooldown(&self, cfg: &BreakerConfig) -> Duration {
         let n = self.open_count.load(Ordering::Relaxed).saturating_sub(1);
         let shift = n.min(20); // avoid overflow; 2^20 already past the cap
@@ -201,15 +213,19 @@ impl HealthRecord {
         scaled.min(cfg.cooldown_max)
     }
 
-    /// True if this endpoint is currently usable (not OPEN-and-cooling). Called
-    /// by `attempt_order()` (§3.3): an endpoint whose cooldown elapsed is
-    /// promoted to HALF-OPEN here so the next call probes it.
+    /// True if this endpoint is currently usable, i.e. not OPEN and still
+    /// cooling. Called by `attempt_order()`. **This is not a pure read**: an
+    /// endpoint whose cooldown has elapsed is promoted to HALF-OPEN here, so the
+    /// next call probes it. Use [`is_up`](Self::is_up) where a side-effect-free
+    /// answer is required.
     pub fn available(&self, cfg: &BreakerConfig) -> bool {
         match self.state() {
             BreakerState::Closed | BreakerState::HalfOpen => true,
             BreakerState::Open => {
-                // Promote to HALF-OPEN if the cooldown elapsed (§4.2: "the next
-                // consult promotes it"). The promotion is the consult.
+                // Promote to HALF-OPEN once the cooldown has elapsed. There is
+                // no timer thread, so the consult itself is the promotion —
+                // which also means an endpoint nobody consults never recovers,
+                // and never needs to.
                 if self.opened_ms_ago().unwrap_or(0) >= self.cooldown(cfg).as_millis() as u64 {
                     self.state
                         .store(BreakerState::HalfOpen as u8, Ordering::Relaxed);
@@ -221,15 +237,19 @@ impl HealthRecord {
         }
     }
 
-    /// `1` if the breaker is not OPEN (in rotation) — the `agentd_intel_endpoint_up`
-    /// gauge meaning (§4.3). Read-only (no promotion side effect).
+    /// True if the breaker is not OPEN, i.e. the endpoint is in rotation. This
+    /// is the meaning of the `agentd_intel_endpoint_up` gauge. Unlike
+    /// [`available`](Self::available) it is a pure read and never promotes a
+    /// cooled-down breaker, so observing an endpoint cannot change its state.
     pub fn is_up(&self) -> bool {
         self.state() != BreakerState::Open
     }
 
-    /// Record a successful round-trip: reset the failure run, re-close the
-    /// breaker, and fold the latency into the EWMA (alpha = 1/8). Returns the
-    /// breaker transition that happened (for the §8 event / §4.4 emission).
+    /// Record a successful round-trip: reset the consecutive-failure run,
+    /// re-close the breaker, and fold the latency into the EWMA (alpha = 1/8).
+    /// Returns the breaker transition if one happened, which the caller emits as
+    /// an event and reflects in the served resource body; `None` means the
+    /// breaker was already CLOSED and nothing is worth reporting.
     pub fn record_success(&self, latency: Duration) -> Option<BreakerTransition> {
         self.total_calls.fetch_add(1, Ordering::Relaxed);
         self.consec_fail.store(0, Ordering::Relaxed);
@@ -246,9 +266,12 @@ impl HealthRecord {
         None
     }
 
-    /// Record a failover-class failure: bump the run, stamp the error kind, and
-    /// open the breaker if we crossed the threshold (or a HALF-OPEN probe
-    /// failed). Returns the breaker transition (for the §8 event / §4.4 emission).
+    /// Record a failover-class failure: bump the consecutive-failure run, stamp
+    /// the error kind, and open the breaker if the run crossed the threshold or
+    /// a HALF-OPEN probe failed. Only failover-class failures belong here — an
+    /// auth or bad-request error is identical on every endpoint, so counting it
+    /// would open breakers across a perfectly healthy list. Returns the breaker
+    /// transition if one happened, for the caller to emit.
     pub fn record_failure(&self, kind: ErrKind, cfg: &BreakerConfig) -> Option<BreakerTransition> {
         self.total_calls.fetch_add(1, Ordering::Relaxed);
         self.total_fail.fetch_add(1, Ordering::Relaxed);
@@ -258,7 +281,8 @@ impl HealthRecord {
         self.last_err_kind.store(kind as u8, Ordering::Relaxed);
         let prev = self.state();
         // A HALF-OPEN probe failure, or crossing the threshold from CLOSED,
-        // opens the breaker (and bumps the cooldown backoff).
+        // opens the breaker and bumps the cooldown backoff. A single failed
+        // probe is enough: the endpoint has already proved itself unhealthy.
         if prev == BreakerState::HalfOpen || run >= cfg.open_threshold {
             self.open_breaker();
             return Some(BreakerTransition::Opened);
@@ -289,15 +313,16 @@ impl HealthRecord {
     }
 }
 
-/// A breaker state transition worth surfacing (RFC 0018 §4.4/§8).
+/// A breaker state transition worth surfacing to an operator as an event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BreakerTransition {
     Opened,
     Closed,
 }
 
-/// Wall-clock now in unix milliseconds (saturating; `0` only on a pre-epoch
-/// clock, which we treat as "unknown").
+/// Wall-clock now in unix milliseconds. Saturating, and `0` only on a pre-epoch
+/// clock; every reader treats `0` as "unknown" rather than as a real timestamp,
+/// so a broken clock degrades to no-information instead of a bogus age.
 fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)

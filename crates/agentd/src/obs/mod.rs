@@ -2,7 +2,7 @@
 //! Observability. The default build ships three dependency-free things: a
 //! hand-rolled JSON-lines logger to stderr, a tiny health surface, and W3C
 //! trace-context propagation. Only the heavier surfaces (metrics, OTLP export)
-//! are feature-gated. RFC 0010.
+//! are feature-gated.
 //!
 //! Invariant: **stdout is the agent's result; stderr is all telemetry.**
 
@@ -10,13 +10,13 @@ pub mod health;
 pub mod log;
 // W3C trace-context *propagation* is default-on and dependency-free (a few
 // formatted fields). Only span *export* (OTLP) is gated behind `otel` (added
-// inside `trace.rs`). RFC 0010 §context-propagation.
+// inside `trace.rs`).
 pub mod trace;
 
 // The metrics *module* is always compiled, but its `record_*` fns are no-ops
 // unless built `--features metrics` (the atomic registry + Prometheus render +
 // `/metrics` surface are gated). This keeps call sites clean and the default
-// build cost-free. RFC 0010 §metrics.
+// build cost-free.
 pub mod metrics;
 
 // The opt-in HTTP probe/scrape surface (/metrics + /healthz + /readyz) is the

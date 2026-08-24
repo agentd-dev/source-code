@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! **Human-in-the-loop** (RFC 0032 §16): the `ask_human` internal tool and the
-//! workflow `human` node, wired to the interface.
+//! **Human-in-the-loop**: the `ask_human` internal tool and the workflow
+//! `human` node, wired to the interface.
 //!
 //! The flow: an ask flips (or creates) an A2A task to `input-required` with
 //! the question as its status message — every attached display client renders
@@ -8,9 +8,10 @@
 //! [`PendingKind::Human`]. A `SendMessage` carrying that `taskId` resolves the
 //! pending with the reply text: a turn's tool call returns it to the model, a
 //! workflow `human` step completes with it as output. Tasks are durable, so a
-//! run's gate survives a restart (rebuilt from the suspended step); a turn's
-//! gate degrades to conversation continuation (the asking child died with the
-//! old process — the answer starts a fresh turn instead).
+//! run's gate survives a restart (rebuilt from the suspended step). A turn's
+//! gate degrades to conversation continuation instead: the asking child does
+//! not outlive the process, so there is no tool call left to return into, and
+//! the answer starts a fresh turn carrying it.
 //!
 //! **Fallback** (`agent.ask_human_fallback`) when NO human channel exists
 //! (`interface.enabled` off): `fail` (default — error immediately), `wait`
@@ -35,7 +36,7 @@ const AUTO_GRACE_MS: u64 = 10 * 60 * 1000;
 const UNDECIDED: &str = "UNDECIDED";
 
 impl Runtime {
-    /// The `ask_human` internal tool (RFC 0028; RFC 0032 §16).
+    /// The `ask_human` internal tool.
     pub(crate) fn ask_human_tool(
         &mut self,
         caller: &super::tools::ToolCaller,
@@ -143,7 +144,7 @@ impl Runtime {
             return self.human_gate(caller, question, deadline_ms, schema);
         }
         let _ = caller;
-        // No channel: the configured fallback (RFC 0032 §16).
+        // No channel to ask on: take the configured fallback.
         match self.settings.agent.ask_human_fallback {
             AskHumanFallback::Fail => ToolOutcome::Ready(
                 Value::String(
@@ -426,16 +427,16 @@ impl Runtime {
             role: None,
             request_id: None,
         });
-        // A tool result must be `ask_human`'s DECLARED output shape
-        // (`{reply, timed_out}` — `registry/internal.rs`). It was a bare string,
-        // which every consumer reading the contract missed: the MCP elicitation
-        // bridge pulls `reply` out of the tool result to build the spec's
-        // `accept` content, found nothing, and turned every `elicitation/create`
-        // into a `cancel`. `via` rides along so the asker cannot mistake a
-        // judge's guess for a human decision either (RFC 0032 §16).
+        // A tool result must match `ask_human`'s DECLARED output shape,
+        // `{reply, timed_out}` (see `registry/internal.rs`). Consumers read
+        // that contract literally: the MCP elicitation bridge pulls `reply` out
+        // of the tool result to build the `accept` content, and a bare string
+        // would leave it with nothing, turning every `elicitation/create` into
+        // a `cancel`. `via` rides along so the asker can tell an auto judge's
+        // guess from a human decision.
         //
-        // A workflow `human` step is NOT a tool result: RFC 0032 §16 defines the
-        // answer itself as the step's output, and later steps template on
+        // A workflow `human` step is NOT a tool result: the answer itself is
+        // the step's output, and later steps template on
         // `steps.<gate>.output`, so a step keeps the bare reply.
         let result = match &p.target {
             Target::Child(..) => json!({"reply": text, "timed_out": false, "via": via}),
@@ -526,7 +527,7 @@ impl Runtime {
                 // whose answer goes nowhere, for the rest of the 24 h ask
                 // timeout. Fail it explicitly: the task leaves `input-required`,
                 // and a later reply on it continues the conversation as a fresh
-                // turn — RFC 0032 §16's documented degrade for a turn's gate.
+                // turn — the documented degrade for a turn's gate.
                 Target::Child(node, _) if self.children.get(*node).is_none() => {
                     ends.push((
                         p.target.clone(),
@@ -578,8 +579,10 @@ impl Runtime {
             self.spawn_human_judge(&task, &question);
         }
         for (target, end) in ends {
-            // A reentrant prune may already have removed this entry while we
-            // were ending an earlier one — it is no longer waiting.
+            // Re-find the entry by target on every iteration: ending an earlier
+            // gate can reenter and remove entries, so any index captured before
+            // the loop would be stale. A missing entry means that gate is
+            // already settled, so skip it.
             let Some(i) = self
                 .pending
                 .iter()
@@ -649,11 +652,11 @@ impl Runtime {
         }
     }
 
-    /// Rebuild run-linked gates after a restore (RFC 0032 §16): a durable task
-    /// in `input-required` whose run has a suspended `human` step re-arms the
+    /// Rebuild run-linked gates after a restore: a durable task in
+    /// `input-required` whose run has a suspended `human` step re-arms the
     /// pending ask, so the answer path works across restarts. Turn-linked
-    /// gates are NOT re-armed — the asking child died with the old process, so
-    /// an answer simply continues the conversation as a fresh turn.
+    /// gates are NOT re-armed — no child survives the restart to receive the
+    /// answer, so an answer simply continues the conversation as a fresh turn.
     #[cfg(feature = "a2a")]
     pub(crate) fn rebuild_human_asks(&mut self) {
         use crate::a2a::tasks::{Link, State};

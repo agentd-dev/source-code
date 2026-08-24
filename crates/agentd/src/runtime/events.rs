@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The runtime's **event vocabulary** (RFC 0026 §3): everything the loop reacts
-//! to arrives here — child frames, reaped children, executor results, timers,
-//! signals, and the durable inbox events (A2A messages, start-node firings,
-//! signals) that are written ahead before being acted on.
+//! The runtime's **event vocabulary**: everything the loop reacts to arrives
+//! here — child frames, reaped children, executor results, timers, signals,
+//! and the durable inbox events (A2A messages, start-node firings, signals).
+//!
+//! Inbox events are written to the store *before* they are handed to the loop,
+//! so an event that has been accepted from the outside world survives a crash
+//! and is replayed on restart rather than being lost between accept and act.
 
 use crate::state::InboxEvent;
 use crate::subagent::protocol::AgentMsg;
@@ -36,8 +39,9 @@ pub enum Event {
     },
     /// Knowledge auto-context retrieval finished for a staged turn.
     KnowledgeDone { job: u64, block: Option<String> },
-    /// A background think/summarize finished (unused in P3; reserved).
-    #[allow(dead_code)]
+    /// A background intelligence call finished. `id` names the caller
+    /// (`goal.judge`, `human.judge:<gate>`) so the loop can route the result
+    /// back to whoever asked without blocking on the call itself.
     Background { id: String, result: Value },
     /// A durable timer fired.
     TimerFired {
@@ -47,10 +51,12 @@ pub enum Event {
     },
     /// A durable event was accepted (already in the inbox).
     Inbox(InboxEvent),
-    /// An A2A transport request awaiting a loop-computed reply (RFC 0029).
+    /// An A2A transport request awaiting a loop-computed reply. The transport
+    /// thread parks on a channel until the loop answers, so every reply is
+    /// computed against a single consistent view of runtime state.
     #[cfg(feature = "a2a")]
     A2a(Box<super::a2a_server::A2aRequest>),
-    /// An inbound webhook awaiting a loop-computed reply (RFC 0027).
+    /// An inbound webhook awaiting a loop-computed reply.
     #[cfg(feature = "a2a")]
     Webhook(Box<super::webhooks::WebhookRequest>),
     /// A `subscribe` start node's notify-then-read finished off-loop.

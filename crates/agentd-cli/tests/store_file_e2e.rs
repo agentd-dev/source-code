@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The local-filesystem store (RFC 0033 §8, items 1–4) against the real
-//! adapter and a real directory — no mocks, no temp-file shims: every
-//! assertion here is about bytes that actually landed on disk.
+//! The local-filesystem store against the real adapter and a real directory —
+//! no mocks, no temp-file shims: every assertion here is about bytes that
+//! actually landed on disk.
 //!
 //! The adapter is constructed directly (`FileStore::open`) rather than through
 //! `store::open`, because what is under test is the ADAPTER's contract — the
@@ -96,7 +96,7 @@ fn tmp() -> tempfile::TempDir {
 }
 
 // ---------------------------------------------------------------------------
-// 1. Round trip (RFC 0033 §8.1)
+// 1. Round trip
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -189,7 +189,7 @@ fn round_trip_put_get_list_delete_cas_and_tombstone() {
 
     // A tombstone (state: null) is a WRITE, not a delete: it advances the seq,
     // reads back as absent, and stays visible to `list` so a restore can tell
-    // "deleted at seq 3" from "never existed" (RFC 0025 §3).
+    // "deleted at seq 3" from "never existed".
     assert_eq!(
         s.put(&k, 3, &env("run", "01M06", 3, Value::Null)).unwrap(),
         PutOutcome::Ok
@@ -253,7 +253,7 @@ fn round_trip_put_get_list_delete_cas_and_tombstone() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. Atomicity (RFC 0033 §8.2)
+// 2. Atomicity
 // ---------------------------------------------------------------------------
 
 /// A reader hammering the target path while a writer publishes envelopes whose
@@ -371,11 +371,11 @@ fn a_reader_racing_a_writer_never_sees_a_partial_file() {
 /// and `rename` leaves — a complete previous envelope plus a truncated temp
 /// file beside it — and assert the store reads through it unharmed.
 ///
-/// Honest scope: this asserts the RECOVERY property (the previous envelope
-/// survives, the residue is invisible and is not mistaken for a key), which is
-/// what §8.2 is actually about. It does not prove the kernel never publishes a
-/// half-renamed file; `rename(2)` within one directory is what guarantees that,
-/// and the test above is the evidence that the adapter uses it.
+/// Honest scope: this asserts the RECOVERY property — the previous envelope
+/// survives, and the residue is invisible and is not mistaken for a key. It
+/// does not prove the kernel never publishes a half-renamed file; `rename(2)`
+/// within one directory is what guarantees that, and the test above is the
+/// evidence that the adapter uses it.
 #[test]
 fn a_crash_between_tmp_and_rename_leaves_the_previous_envelope_intact() {
     // Reopens the root after a drop, so it needs the same fork-free window the
@@ -431,7 +431,7 @@ fn a_crash_between_tmp_and_rename_leaves_the_previous_envelope_intact() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Traversal (RFC 0033 §8.3) — the security case
+// 3. Traversal — the security case
 // ---------------------------------------------------------------------------
 
 /// Ids reach this adapter from run ids, task ids and A2A context ids — values
@@ -583,7 +583,7 @@ fn hostile_ids_never_write_outside_the_root() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. The instance lock (RFC 0033 §8.4)
+// 4. The instance lock
 // ---------------------------------------------------------------------------
 
 /// Serialises the two tests that care when a lock is *released* against the one
@@ -746,10 +746,10 @@ fn a_contended_open_fails_fast_rather_than_blocking() {
     );
 }
 
-/// Not a §8 item, but the property the atomicity test leans on: `list` reports
-/// what is on disk after a fresh `open`, so a restart really does find its
-/// state again. (RFC 0033 §3: identity is `agent.name`, so the SAME root plus
-/// the SAME instance segment is all a restart needs.)
+/// The property the atomicity test leans on: `list` reports what is on disk
+/// after a fresh `open`, so a restart really does find its state again.
+/// (Identity is `agent.name`, so the SAME root plus the SAME instance segment
+/// is all a restart needs.)
 #[test]
 fn a_restart_finds_its_state_under_the_same_instance_segment() {
     // Same reason as above: this test closes a store and reopens the root.
@@ -766,7 +766,7 @@ fn a_restart_finds_its_state_under_the_same_instance_segment() {
             want.push((k, seq));
         }
         // A different instance shares the root only if an operator points two
-        // instances at it; the keys stay apart regardless (RFC 0025 §3.1).
+        // instances at it; the keys stay apart regardless.
         s.put(
             &agentd::store::key("agentd", "other", "run", "r1"),
             1,

@@ -18,29 +18,28 @@ pub mod report;
 pub use harness::Harness;
 pub use report::Report;
 
-/// The conformance families. agentd: the v1-only families (`mcp-server`,
-/// `mcp-client`, `work-claim`) were retired with the mode cut-over and rebuilt as
-/// the v2 families below (P7): the durable-store contract, the crash/restore
-/// durability contract, the internal tool registry, and A2A conversations.
+/// The conformance families. Each names one externally-observable contract, so
+/// a failure points at the promise that broke rather than at an implementation
+/// detail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Category {
     /// The supervisor contract: the exit-code table, drain, fail-fast.
     Supervisor,
     /// Security posture: trifecta refusal, secret redaction, tool scoping.
     Security,
-    /// The durable-store contract (RFC 0025): boot against a store, persist the
+    /// The durable-store contract: boot against a store, persist the
     /// manifest/runs, and resume a completed `once` start after restart.
     Store,
-    /// The crash-durability contract (RFC 0025/0026 §4.4): a SIGKILL at a kill
-    /// point is recovered — the pending inbox event and running step replay.
+    /// The crash-durability contract: a SIGKILL at a kill point is recovered —
+    /// the pending inbox event and running step replay.
     Durability,
-    /// The tool registry (RFC 0028): internal tools round-trip to the supervisor,
+    /// The tool registry: internal tools round-trip to the supervisor,
     /// an unknown tool is answered as an error, and the introspected surface.
     Tools,
-    /// A2A conversations (RFC 0029): the JSON-RPC surface — command DataParts,
+    /// A2A conversations: the JSON-RPC surface — command DataParts,
     /// natural-language turns landing as task artifacts, GetTask/ListTasks, card.
     A2aConversation,
-    /// The display-client interface (RFC 0032): the default-OFF gate, the
+    /// The display-client interface: the default-OFF gate, the
     /// SubscribeToEvents feed (hello + ring replay), and the human-in-the-loop
     /// gate round-trip.
     Interface,

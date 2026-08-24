@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! OpenAI-compatible `/chat/completions` adapter with native tool-calling.
-//! RFC 0006 §canonical-wire.
 //!
-//! Canonical because it covers vLLM / Ollama / LM Studio / most hosted
-//! gateways and gives the model first-class `tools` + `tool_calls`. This
-//! module is pure translation: neutral [`Request`] → OpenAI JSON, and OpenAI
-//! JSON → neutral [`Response`]. No I/O (that's `intel/client.rs`).
+//! This is the default dialect because it covers vLLM, Ollama, LM Studio and
+//! most hosted gateways, and because it gives the model first-class `tools` and
+//! `tool_calls` instead of prompt-parsed actions. The module is pure
+//! translation — neutral [`Request`] → OpenAI JSON, OpenAI JSON → neutral
+//! [`Response`] — and performs no I/O; `intel/client.rs` owns the socket.
 
 use crate::wire::intel::{Message, Request, Response, StopReason, ToolCall, Usage};
 use serde_json::{Map, Value, json};
@@ -14,15 +14,16 @@ use serde_json::{Map, Value, json};
 /// path (`https://host[:port]` with path `/`).
 pub const DEFAULT_PATH: &str = "/v1/chat/completions";
 
-/// The OpenAI-compatible model-list path (RFC 0018 §5.4 discovery probe). The
-/// `/v1` API root has a sibling `/models` next to `/chat/completions`.
+/// The OpenAI-compatible model-list path used by the discovery probe. The `/v1`
+/// API root has a sibling `/models` next to `/chat/completions`.
 pub const MODELS_PATH: &str = "/v1/models";
 
-/// Derive the model-discovery `GET` path (RFC 0018 §5.4) as the **sibling** of
-/// the configured chat path: swap the trailing `…/chat/completions` segment for
-/// `…/models` so a non-default API root (e.g. a gateway mounted at `/proxy/v1`)
-/// keeps its prefix. Anything that isn't the canonical chat suffix falls back to
-/// the absolute `MODELS_PATH` — discovery is best-effort, never a hard failure.
+/// Derive the model-discovery `GET` path as the **sibling** of the configured
+/// chat path: swap the trailing `…/chat/completions` segment for `…/models` so
+/// a non-default API root (e.g. a gateway mounted at `/proxy/v1`) keeps its
+/// prefix. Anything that isn't the canonical chat suffix falls back to the
+/// absolute `MODELS_PATH` — discovery is best-effort, never a hard failure, so
+/// guessing a plausible path beats refusing to probe.
 pub fn models_path(chat_path: &str) -> String {
     match chat_path.strip_suffix("/chat/completions") {
         Some(prefix) => format!("{prefix}/models"),
@@ -31,9 +32,10 @@ pub fn models_path(chat_path: &str) -> String {
 }
 
 /// Parse an OpenAI-compatible `/v1/models` response body into the list of model
-/// `id`s (RFC 0018 §5.4). The shape is `{ "data": [ { "id": "…" }, … ] }`. Any
-/// missing/empty/non-array `data`, or a non-JSON body, yields an empty list —
-/// discovery degrades silently (it is never a failover-class failure, §5.4).
+/// `id`s. The expected shape is `{ "data": [ { "id": "…" }, … ] }`. A missing,
+/// empty or non-array `data`, or a body that is not JSON at all, yields an empty
+/// list: discovery degrades silently and never counts as a failover-class
+/// failure, so a provider without the endpoint must not mark itself unhealthy.
 pub fn parse_models(body: &[u8]) -> Vec<String> {
     let Ok(v) = serde_json::from_slice::<Value>(body) else {
         return Vec::new();
@@ -300,7 +302,7 @@ mod tests {
         );
     }
 
-    // --- RFC 0018 §5.4 model discovery -------------------------------------
+    // --- model discovery ---------------------------------------------------
 
     #[test]
     fn models_path_is_sibling_of_chat_path() {

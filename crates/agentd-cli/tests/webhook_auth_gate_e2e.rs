@@ -2,12 +2,12 @@
 //! The inbound **webhook** listener's auth gate, end to end.
 //!
 //! `webhooks.listen` and `a2a.listen` are the same kind of thing: an inbound
-//! HTTP surface that TRIGGERS work. A2A has always refused a non-loopback bind
-//! with no client auth (exit 2). The webhook surface only *warned* — so a
-//! `webhooks.listen: https://0.0.0.0:8099` with no auth started, and anyone who
-//! could reach the port could fire the agent's workflows. There is no principled
-//! reason one listener refuses and the other shrugs; these tests hold the line
-//! at the same place for both.
+//! HTTP surface that TRIGGERS work. A2A refuses a non-loopback bind with no
+//! client auth (exit 2), and the webhook surface must refuse it too: were a
+//! `webhooks.listen: https://0.0.0.0:8099` with no auth allowed to start,
+//! anyone who could reach the port could fire the agent's workflows. There is
+//! no principled reason one listener refuses and the other shrugs; these tests
+//! hold the line at the same place for both.
 //!
 //! The gate is deliberately about the ROUTE, not the listener: the runtime
 //! resolves a webhook's verifier per node (`webhooks::build_verify` — the node's
@@ -77,9 +77,9 @@ fn config(listen: &str, listener_auth: &str, node_auth: &str) -> String {
 
 const HMAC: &str = ", auth: {hmac: {secret: \"{{secret:HOOK_SECRET}}\"}}";
 
-/// (a) THE DEFECT: a public bind with no auth anywhere — not on the listener,
-/// not on the node — is exit 2, and the message names what to set. This used to
-/// be a `config.warning` followed by `config.valid` and exit 0: an
+/// (a) THE HOLE: a public bind with no auth anywhere — not on the listener, not
+/// on the node — is exit 2, and the message names what to set. Anything softer
+/// — a `config.warning` followed by `config.valid` and exit 0 — would start an
 /// internet-reachable, unauthenticated workflow trigger.
 #[test]
 fn a_non_loopback_listener_with_no_auth_anywhere_is_refused_naming_what_to_set() {
@@ -113,9 +113,9 @@ fn a_listener_default_auth_satisfies_the_gate() {
     assert!(err.contains("config.valid"), "{err}");
 }
 
-/// (c) Per-node `auth` is the documented shape (RFC 0027 auth is per node), and
-/// it must be enough on its own: the check is about routes, not about whether a
-/// listener-wide default happens to exist.
+/// (c) Per-node `auth` is the documented shape — auth is declared per node —
+/// and it must be enough on its own: the check is about routes, not about
+/// whether a listener-wide default happens to exist.
 #[test]
 fn every_node_carrying_its_own_auth_satisfies_the_gate() {
     let dir = workdir("wh-gate-node");

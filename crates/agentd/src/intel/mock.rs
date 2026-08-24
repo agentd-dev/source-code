@@ -1,29 +1,29 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! A minimal built-in mock LLM for the observe-to-validate E2E suite (M7).
+//! A minimal built-in mock LLM for the observe-to-validate E2E suite.
 //! Hidden mode: `agentd --internal-mock-llm <addr-file> [script]`.
 //!
 //! Binds a **loopback TCP** listener on `127.0.0.1:0` and writes the bound
-//! `host:port` into `<addr-file>` (atomically: tmp + rename) so the launching
-//! harness discovers the endpoint by waiting for the file — the same
-//! wait-for-path handshake the old unix-socket form had, except the file now
-//! *carries* the address instead of being the socket. The harness then hands
-//! agentd `--intelligence http://<addr>` (loopback plaintext is the dev/test
-//! carve-out; production intelligence is HTTPS-only).
+//! `host:port` into `<addr-file>` atomically, via tmp-plus-rename, so the
+//! launching harness can discover the endpoint by waiting for the file to
+//! appear and is never able to read a half-written address. The harness then
+//! hands agentd `--intelligence http://<addr>`; loopback plaintext is the
+//! dev/test carve-out, since production intelligence is HTTPS-only.
 //!
 //! Speaks just enough OpenAI-compatible `/chat/completions` over that listener
 //! to drive a *real* agentic loop without a live model: it reads the request and
 //! returns a scripted assistant turn — a final answer or a tool call — switching
-//! to a final answer once a tool result appears in the transcript (so the ReAct
-//! cycle closes). Scripts: `final` (answer at once), `read` (call `resource.read`
-//! then answer), `schedule` (call the `schedule` self-tool then answer),
-//! `subscribe` (call the `subscribe` self-tool then answer), `spawn-churn`
-//! (call `subagent.spawn` on *every* turn — never converging — so a run issues
-//! a rapid burst of spawns that trips the spawn-rate limiter, RFC 0009 §3.6);
+//! to a final answer once a tool result appears in the transcript, so the ReAct
+//! cycle closes instead of spinning. Scripts: `final` (answer at once), `read`
+//! (call `resource.read` then answer), `schedule` (call the `schedule` self-tool
+//! then answer), `subscribe` (call the `subscribe` self-tool then answer),
+//! `spawn-churn` (call `subagent.spawn` on *every* turn, never converging, so a
+//! run issues a rapid burst of spawns and trips the spawn-rate limiter);
 //! `slow`/`hang` hold the response to exercise the stuck/deadline detectors.
-//! Small enough to ship; it makes the loop + self-* tools observable end to end.
+//! Small enough to ship, and it makes the loop and the self-* tools observable
+//! end to end.
 //!
-//! **Programmable scripts** (agentd e2e): `file:<path>` loads a JSON
-//! playbook so a test scripts any conversation without a new built-in:
+//! **Programmable scripts:** `file:<path>` loads a JSON playbook, so a test can
+//! script any conversation without adding a new built-in:
 //!
 //! ```json
 //! { "turns": [ {"tool_calls": [{"name": "memory.set", "arguments": {"key": "k", "value": 1}}]},
@@ -40,10 +40,12 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 
-/// Start the mock IN-PROCESS (once per script) and return its loopback
-/// address — the `intelligence.endpoints: mock:<script>` convenience, so a
-/// config runs fully offline in ONE process: no key, no network, no second
-/// terminal. Scripts are the same as the hidden mode's
+/// Start the mock IN-PROCESS and return its loopback address. This backs the
+/// `intelligence.endpoints: mock:<script>` convenience, so a config runs fully
+/// offline in ONE process: no key, no network, no second terminal. At most one
+/// server is started per distinct script string and the address is memoised, so
+/// repeated resolves of the same script share a listener instead of leaking a
+/// thread per call. Scripts are the same as the hidden mode's
 /// (`final` | `read` | `schedule` | `file:<playbook.json>`).
 pub fn inprocess(script: &str) -> Result<String, String> {
     use std::collections::HashMap;
@@ -99,12 +101,12 @@ pub fn run(addr_file: &str, script: &str) -> i32 {
         eprintln!("mock-llm: write {addr_file}: {e}");
         return crate::exit::GENERIC;
     }
-    // One request per connection (the intel client uses Connection: close) —
-    // handled on its OWN thread, so a `slow`/`hang` script sleeps only its own
-    // request. A sequential accept loop serialized every caller behind the
-    // slowest in-flight one, which coupled concurrent tests' timing (the warm-
-    // session flake) and would make two runs sharing one mock queue behind a
-    // 12s hang.
+    // One request per connection, since the intel client sends
+    // `Connection: close`. Each is handled on its OWN thread so that a
+    // `slow`/`hang` script sleeps only its own request: a sequential accept loop
+    // would serialize every caller behind the slowest in-flight one, coupling
+    // concurrent tests' timing and queueing two runs that share one mock behind
+    // a 12s hang.
     for stream in listener.incoming().flatten() {
         let script = script.to_string();
         std::thread::spawn(move || handle(stream, &script));
@@ -133,10 +135,10 @@ fn handle(mut stream: TcpStream, script: &str) {
         let _ = stream.flush();
         return;
     }
-    // `echo-system`: answer with the SYSTEM message verbatim. The system
-    // prompt is what an operator's `context.template` produces (RFC 0038), so
-    // this makes it observable end to end — a test asserts on what a model
-    // actually receives instead of on an internal function's return value.
+    // `echo-system`: answer with the SYSTEM message verbatim. The system prompt
+    // is whatever an operator's `context.template` produced, so echoing it makes
+    // that observable end to end — a test asserts on what a model actually
+    // receives rather than on an internal function's return value.
     if script == "echo-system" {
         let sys = serde_json::from_str::<serde_json::Value>(&body)
             .ok()
@@ -182,8 +184,8 @@ fn handle(mut stream: TcpStream, script: &str) {
         }
         other => other,
     };
-    // RFC 0021 §7 e2e: the model AUTHORS a workflow with a `human` gate, runs
-    // it (the run blocks while the gate awaits the A2A reply), then answers.
+    // `gate`: the model AUTHORS a workflow containing a `human` gate, runs it —
+    // the run blocks while the gate awaits the A2A reply — and then answers.
     let payload = if script == "gate" {
         match tool_results {
             0 => tool_call(
@@ -241,14 +243,14 @@ fn response_json(script: &str, saw_tool_result: bool) -> String {
     match (script, saw_tool_result) {
         ("read", false) => tool_call("resource.read", r#"{"uri":"file:///in.json"}"#),
         ("read", true) => final_answer("read complete"),
-        // Call an MCP *server* tool by its (unprefixed) catalogue name — the
-        // bench harness (RFC 0024) points a stub MCP server that serves
-        // `bench_echo` so the eval rig exercises a real tools/call round-trip
-        // end to end (offline). Turn 2 answers once the tool result is seen.
+        // Call an MCP *server* tool by its unprefixed catalogue name. The bench
+        // harness points agentd at a stub MCP server serving `bench_echo`, so
+        // the eval rig exercises a real tools/call round-trip end to end while
+        // staying offline. Turn 2 answers once the tool result is seen.
         ("mcp-call", false) => tool_call("bench_echo", r#"{"query":"ping"}"#),
         ("mcp-call", true) => final_answer("bench tool called"),
-        // Call a sandboxed `bash` tool the bench shell-bridge serves (RFC 0024
-        // Phase 2, the SWE-bench / Terminal-Bench environment shape), then answer.
+        // Call a sandboxed `bash` tool served by the bench shell-bridge — the
+        // SWE-bench / Terminal-Bench environment shape — then answer.
         ("shell-call", false) => tool_call("bash", r#"{"command":"echo pong > out.txt"}"#),
         ("shell-call", true) => final_answer("ran the command"),
         ("schedule", false) => tool_call(
@@ -258,25 +260,26 @@ fn response_json(script: &str, saw_tool_result: bool) -> String {
         ("schedule", true) => final_answer("scheduled a follow-up"),
         ("subscribe", false) => tool_call("subscribe", r#"{"uri":"file:///watch.json"}"#),
         ("subscribe", true) => final_answer("now watching the resource"),
-        // Delegate an objective to a declared remote A2A peer named "peer"
-        // (RFC 0020 §3), then — once the distillate comes back as a tool result —
-        // answer. Drives the agentd-as-A2A-client path end to end.
+        // Delegate an objective to a declared remote A2A peer named "peer" and
+        // then answer once the distillate comes back as a tool result. Drives
+        // the agentd-as-A2A-client path end to end.
         ("a2a-delegate", false) => tool_call(
             "a2a.delegate",
             r#"{"peer":"peer","objective":"summarize the mesh","output_contract":"one line"}"#,
         ),
         ("a2a-delegate", true) => final_answer("delegated over a2a"),
-        // Unlike read/schedule (which answer once a tool result is seen),
-        // spawn-churn ignores `saw_tool_result` and keeps emitting a
-        // `subagent.spawn` call every turn — so an in-loop run fires many rapid,
-        // detached spawns and exercises the spawn-rate limiter end to end. detach
-        // keeps each accepted spawn fire-and-forget so the burst stays rapid.
+        // Unlike read/schedule, which answer once a tool result is seen,
+        // spawn-churn ignores `saw_tool_result` and emits another
+        // `subagent.spawn` on every turn, so an in-loop run fires many rapid
+        // detached spawns and exercises the spawn-rate limiter end to end.
+        // `detach` keeps each accepted spawn fire-and-forget, which is what
+        // keeps the burst fast enough to reach the limiter.
         ("spawn-churn", _) => tool_call(
             "subagent.spawn",
             r#"{"instruction":"do a trivial subtask","detach":true}"#,
         ),
-        // A structured JSON answer for the workflow `infer` node tests: the exec
-        // parses + schema-checks this object.
+        // A structured JSON answer for the workflow `infer` node tests: the
+        // executor parses and schema-checks this object.
         ("json", _) => final_answer(r#"{"verdict":"approve","score":9}"#),
         _ => final_answer("mock-llm done"),
     }

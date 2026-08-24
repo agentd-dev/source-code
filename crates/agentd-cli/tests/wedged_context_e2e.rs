@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The durable context stays **self-consistent** when a turn ends inside the
-//! tool-call loop (RFC 0026 §3.2).
+//! tool-call loop.
 //!
 //! Every provider dialect requires one tool result per `tool_calls` id on the
 //! preceding assistant message. The turn worker pushes the assistant message
 //! first and the results one by one, so an exit taken between them (loop
-//! detection here; cancellation is the other) used to persist an assistant
+//! detection here; cancellation is the other) must never leave an assistant
 //! message with unanswered call ids. That context is DURABLE: it is replayed by
 //! every later turn and by every restart, and the provider rejects it with a
 //! fatal 400 forever — surfaced as a retryable `intel:` failure, so an external

@@ -14,9 +14,9 @@
 //!   long-lived notifications ride a `subscriptions/listen` response stream.
 //!
 //! This crate keeps that era logic in one place so a client or server built on it
-//! can be **dual-era** without branching everywhere. Phase 1 provides the
-//! [`wire`] types and the [`version`] model; the [`client`], [`http`] transport,
-//! and [`server`] base build on them.
+//! can be **dual-era** without branching everywhere. [`wire`] holds the message
+//! types and [`version`] the era model; the [`client`], [`http`] transport, and
+//! [`server`] base build on them.
 //!
 //! Dependency budget: `serde` + `serde_json` only (the agentd minimalism moat).
 

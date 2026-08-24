@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! **Generations and the configuration digest** (RFC 0033 §3.2–§3.3) over the
-//! real binary: a durable store that outlives several agentd lives (the mock MCP
-//! server), and the two operator-facing behaviours the RFC exposes.
+//! **Generations and the configuration digest** over the real binary: a durable
+//! store that outlives several agentd lives (the mock MCP server), and the two
+//! operator-facing behaviours built on it.
 //!
 //! * `--fresh` opens the NEXT generation without resuming — the counter is
 //!   inherited (an operator can see which life they are in), the prior records
 //!   are not adopted, and nothing is deleted.
 //! * A settings edit that touches the state-shaping sections logs
 //!   `store.config_changed` naming what moved, and the state is **still
-//!   resumed**. Identity is `agent.name` (§3.1): keying it on a config hash
-//!   would orphan a live workflow the first time somebody raised a limit, so the
+//!   resumed**. Identity is `agent.name`: keying it on a config hash would
+//!   orphan a live workflow the first time somebody raised a limit, so the
 //!   digest is a signal and never a gate.
 #![cfg(all(unix, any(feature = "internal-mocks", debug_assertions)))]
 
@@ -44,7 +44,7 @@ fn config(mock_uri: &str, extra_step: &str, finish_after: &str) -> String {
     path
 }
 
-/// One agentd life. Returns its parsed stderr log lines (RFC 0010 §3.2 objects).
+/// One agentd life. Returns its parsed stderr log lines (JSON telemetry objects).
 fn life(cfg: &str, extra_args: &[&str]) -> Vec<Value> {
     let out = Command::new(env!("CARGO_BIN_EXE_agentd"))
         .args(["--config", cfg])
@@ -142,7 +142,7 @@ fn an_edited_workflow_reports_config_changed_and_still_resumes() {
         changed["msg"],
         "state was written under a different configuration — resuming anyway; --fresh to start a new generation"
     );
-    // The whole point of §3.1: a signal, not a gate.
+    // The whole point of keying identity on `agent.name`: a signal, not a gate.
     let after = expect(&lines, "restore.done");
     assert_eq!(after["generation"], 3);
     assert_eq!(after["entities"], 1, "state is resumed anyway: {after}");

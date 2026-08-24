@@ -1,18 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! **Graceful workflow retirement** — the one exit path for every way a
 //! definition leaves the daemon: removed on a config reload, replaced by a
-//! new version, or `workflow.delete`d.
+//! new version, or `workflow.delete`d. Routing all three through one path is
+//! the point: each exit otherwise has to remember the same four obligations,
+//! and a run in flight must not be able to tell which exit its definition took.
 //!
-//! Before this, the three exits behaved three different ways: reload pinned
-//! live runs but leaked the definition forever and never unsubscribed its
-//! MCP resources; delete unsubscribed nothing AND pinned nothing, so a live
-//! run of a deleted workflow lost its definition mid-flight and was refused.
-//! Now retirement always: disarms starts and unsubscribes resources no other
-//! armed workflow still wants; pins the definition for live runs; stops
-//! admitting new ones; then applies the workflow's own `unload:` policy —
-//! `drain` (default; bounded by `timeout`, then cancel), `cancel`, or
-//! `detach`. The pin is garbage-collected when its last run reaches a
-//! terminal status, which also closes the old reload leak.
+//! Retirement always: disarms starts and unsubscribes MCP resources no other
+//! armed workflow still wants; pins the definition so live runs keep something
+//! to execute against; stops admitting new runs; then applies the workflow's
+//! own `unload:` policy — `drain` (the default, bounded by `timeout` and then
+//! cancelling), `cancel`, or `detach`. The pin is garbage-collected once its
+//! last run reaches a terminal status, so a long-lived daemon does not
+//! accumulate a definition per reload.
 
 use crate::engine::model::{UnloadPolicy, Workflow};
 use crate::state::{Kind, now_ms};
@@ -20,14 +19,15 @@ use serde_json::json;
 
 /// Durable definition pins, keyed by content hash (`Kind::Memory`). Written
 /// once per definition version when its first run starts; read back at
-/// restore for any non-terminal run whose definition is no longer in the
+/// restore for any non-terminal run whose definition is absent from the
 /// registry — which is what lets a run **survive a restart that also changed
 /// or removed its workflow**, instead of being refused. Deleted when the last
 /// run of that hash reaches a terminal status.
 pub(crate) const PIN_PREFIX: &str = "_pins/";
 
-/// A retired definition still owning live runs. The policy was applied at
-/// retirement; what remains to track is only the drain bound.
+/// A retired definition still owning live runs. The `unload:` policy is
+/// applied once, at retirement; the only thing left to track afterwards is the
+/// drain bound.
 #[derive(Debug, Clone)]
 pub(crate) struct Retiring {
     pub hash: String,
@@ -93,8 +93,10 @@ impl super::reactor::Runtime {
                     self.pinned.insert(hash, std::sync::Arc::new(wf));
                 }
                 other => {
-                    // No pin (a pre-pin store) or a corrupt one: the run meets
-                    // the resume policy exactly as before this feature.
+                    // No durable pin, or a corrupt one. The run has no
+                    // definition to execute against, so it falls back to the
+                    // ordinary resume policy for a run whose workflow is
+                    // unknown rather than executing against a mismatched one.
                     self.log.warn(
                         "workflow.pin_missing",
                         json!({"workflow": name, "hash": &hash[..12.min(hash.len())],
@@ -106,8 +108,8 @@ impl super::reactor::Runtime {
     }
 
     /// Retire `wf` (already removed — or about to be — from the live
-    /// registry). `reason` names the exit for the log: "reload" / "replaced" /
-    /// "deleted".
+    /// registry). `reason` names the exit for the log: `removed` or `replaced`
+    /// on a config reload, `deleted` for `workflow.delete`.
     pub(crate) fn retire_workflow(&mut self, wf: &Workflow, reason: &str) {
         // 1. Unsubscribe the MCP resources this definition armed — unless
         //    another still-armed workflow subscribes the same (server, uri),
@@ -231,8 +233,9 @@ impl super::reactor::Runtime {
     }
 
     /// Run-terminal half: when the last live run of a pinned hash finishes,
-    /// the pin and the retiring record are released — the definition is gone
-    /// for real, and the reload-era leak with it.
+    /// the pin and the retiring record are released — both in memory and in
+    /// the store — so the definition is gone for real and nothing accumulates
+    /// across reloads.
     pub(crate) fn retire_sweep(&mut self) {
         if self.pinned.is_empty() && self.retiring.is_empty() {
             return;

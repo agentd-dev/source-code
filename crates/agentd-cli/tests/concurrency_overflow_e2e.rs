@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Workflow **concurrency overflow** (RFC 0027 §2) end to end: more start
-//! events than `concurrency.max_runs` allows, with `on_overflow: queue` — the
-//! default — must park the surplus for a LATER reactor tick and then run it,
-//! not re-offer it to the inbox drain that is popping it.
+//! Workflow **concurrency overflow** end to end: more start events than
+//! `concurrency.max_runs` allows, with `on_overflow: queue` — the default —
+//! must park the surplus for a LATER reactor tick and then run it, not re-offer
+//! it to the inbox drain that is popping it.
 //!
-//! The regression these tests exist for: the overflowed event was pushed back
-//! onto the very deque `process_inbox` was draining, so the drain popped it
-//! again immediately, forever. Nothing inside that loop can relieve the cap —
-//! only `schedule_runs`, a later step of the same tick, retires a live run — so
-//! the single-writer reactor spun at 100% CPU and never reached its timers,
+//! The failure these tests guard against: an overflowed event pushed back onto
+//! the very deque `process_inbox` is draining, so the drain pops it again
+//! immediately, forever. Nothing inside that loop can relieve the cap — only
+//! `schedule_runs`, a later step of the same tick, retires a live run — so the
+//! single-writer reactor spins at 100% CPU and never reaches its timers,
 //! checkpoints or signal handling. Both cases below therefore assert that the
-//! process EXITS, under a hard timeout, so the regression fails fast instead of
+//! process EXITS, under a hard timeout, so that livelock fails fast instead of
 //! hanging CI.
 
 mod common;
@@ -159,7 +159,8 @@ fn a_start_event_over_an_explicit_max_runs_cap_runs_on_a_later_tick() {
 fn start_events_over_the_default_cap_run_on_later_ticks() {
     // No `concurrency:` block at all — pure defaults (max_runs 4, on_overflow
     // queue). Five events: four run, the fifth overflows. This is the shape any
-    // workflow gets for free, which is why the livelock was ship-blocking.
+    // workflow gets for free, so a livelock here reaches every deployment that
+    // never tunes concurrency at all.
     let cfg = capped_config("");
     let (code, stderr) = run_agentd_bounded(&cfg, &inbox_for(5));
     assert_all_runs_completed(code, &stderr, 5);

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! RFC 0038 end to end: the system-prompt template — loops, conditions and
-//! limits over the environment data, a per-node named template, the built-in
-//! default's KV-cache ordering, and the fail-closed guards at config load.
+//! The system-prompt template, end to end — loops, conditions and limits over
+//! the environment data, a per-node named template, the built-in default's
+//! KV-cache ordering, and the fail-closed guards at config load.
 //!
 //! The daemon runs against the in-process mock intelligence, which echoes the
 //! system prompt it was given, so these assert on what a model ACTUALLY

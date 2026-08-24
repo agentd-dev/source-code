@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! OAuth 2.1 **client-credentials** (M2M) token acquisition for remote
-//! intelligence / MCP endpoints. RFC 0006 §auth. [feature: oauth]
+//! intelligence / MCP endpoints. [feature: oauth]
 //!
 //! For a service-to-service grant (no user, no browser), agentd exchanges a
 //! `client_id` + `client_secret` at the provider's **token endpoint** for a
@@ -9,13 +9,14 @@
 //! MCP server behind an OAuth gateway is reached with a rotating credential
 //! rather than a static long-lived token.
 //!
-//! Secret-freedom (RFC 0012 §3.7): the `client_secret` is a `{{secret:…}}` /
+//! Secret-freedom: the `client_secret` is a `{{secret:…}}` /
 //! `{{secret-file:…}}` template resolved at fetch time; it is form-posted to the
 //! token endpoint and never logged. The access token lives only in memory.
 //!
 //! Dependency-free: the hand-rolled HTTP client (`net::http` + `net::tls`), the
 //! `sec::secret` resolver, `serde_json`, and a tiny hand-rolled form encoder —
-//! no `oauth2`/`url`/`form_urlencoded` crate (the minimalism moat, RFC 0002).
+//! no `oauth2`/`url`/`form_urlencoded` crate. The dependency surface stays
+//! deliberately minimal, so auth code cannot pull a supply chain in behind it.
 
 use crate::net::http::{self, Url};
 use crate::sec::secret;
@@ -144,10 +145,11 @@ impl OAuthClient {
 }
 
 /// Adapts an [`OAuthClient`] (client-credentials) to the transport's
-/// [`::mcp::http::RequestSigner`] seam (RFC 0031 §4): injects a refreshing
+/// [`::mcp::http::RequestSigner`] seam: injects a refreshing
 /// `Authorization: Bearer …` on every request. A token-fetch failure yields no
-/// header, so the request rides unauthenticated and the server answers `401` —
-/// surfacing the real error rather than hanging (fail-closed, RFC 0031 §2).
+/// header at all, so the request rides unauthenticated and the server answers
+/// `401`. That is deliberate: a visible auth failure at the call site beats
+/// blocking the caller inside the signer while a broken token endpoint hangs.
 pub struct OAuthBearerSigner {
     client: OAuthClient,
 }
@@ -184,7 +186,8 @@ impl ::mcp::http::RequestSigner for OAuthBearerSigner {
     }
 }
 
-/// The subset of an RFC 6749 §5.1 token response we consume.
+/// The subset of an RFC 6749 §5.1 token-endpoint success response this client
+/// consumes.
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
     access_token: String,

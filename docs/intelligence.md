@@ -11,8 +11,8 @@ credential, and the list + model are **hot-swappable without a restart** — but
 stays one model-facing channel. That is the whole surface.
 
 This is the **intelligence wire** — the model-facing channel. It is
-**categorically not MCP.** Tools come from MCP servers (RFC 0004); this channel
-only carries the LLM request/response. Do not conflate the two.
+**categorically not MCP.** Tools come from MCP servers; this channel only carries
+the LLM request/response. Do not conflate the two.
 
 > **One wire, many endpoints.** `AGENT_INTELLIGENCE` takes an **ordered list**
 > of endpoints for failover (see
@@ -115,8 +115,9 @@ adapter builds, with one round of tool-calling in the transcript:
 
 Auth header: `Authorization: Bearer <token>`. The key is **optional** — a local
 keyless vLLM/Ollama needs no token. Each `tools[]` entry's `parameters` is the
-MCP `tools/list` `inputSchema` passed through verbatim (RFC 0004 owns
-discovery). The adapter reads back `choices[0].message.content`,
+MCP `tools/list` `inputSchema` passed through verbatim — discovery belongs to the
+MCP client, and this wire never rewrites a schema. The adapter reads back
+`choices[0].message.content`,
 `choices[0].message.tool_calls[]` (parsing each `function.arguments` string into
 a JSON object), `finish_reason`, and `usage.{prompt_tokens,completion_tokens}`.
 
@@ -225,7 +226,7 @@ Example of the redaction (the token is set but never echoed):
 // proc.start — note: no token field exists anywhere in the log stream
 {"ts":"2026-06-25T12:00:00Z","level":"info","event":"proc.start","run_id":"r-…",
  "agent_id":"sup","agent_path":"0","comp":"supervisor","pid":1,
- "version":"2.0.0","runtime":"2.0","instance":"agentd",
+ "version":"1.1.0","runtime":"1","instance":"agentd",
  "config_files":["settings.yaml"]}
 ```
 
@@ -238,8 +239,8 @@ Example of the redaction (the token is set but never echoed):
 - **Synchronous and blocking** for the subagent's turn — the agentic loop is
   single-threaded per subagent. The supervisor never blocks on the LLM call.
 - **Non-streaming** (`stream:false`). A timeout surfaces as a transient
-  transport error and is retried with bounded backoff (RFC 0007).
-- **HTTP status taxonomy** (RFC 0007 / RFC 0011):
+  transport error and is retried with bounded backoff.
+- **HTTP status taxonomy** — which status is retried and which is fatal:
   - `429` / `5xx` → bounded retry with backoff + jitter.
   - `401` / `403` → fatal auth → **exit 4**.
   - connection refused/reset → fatal intelligence-unreachable → **exit 4**.
@@ -312,8 +313,8 @@ These transitions feed the metrics (`agent_intel_up`,
 
 Each subagent keeps a live view of every intelligence endpoint's health. It is
 what the failover sweep and the breakers read, and it never holds a URL, cid, or
-credential (RFC 0012 §3.7) — only the bounded structural `transport` + `addr` and
-the live counters:
+credential — a health snapshot is read by operators and shipped in logs, so it
+carries only the bounded structural `transport` + `addr` and the live counters:
 
 ```jsonc
 {
@@ -420,8 +421,6 @@ Every one of these is a `config_version: "1"` document path as well —
 - [Authentication](authentication.md) (the `auth:` block — OAuth, AWS SigV4, SPIFFE — on this endpoint)
 - [Observability](observability.md) (the `intel.*` events, `agent_intel_*` metrics, the breaker signals)
 - [Deployment](deployment.md) and [Scaling](scaling.md) (multiple daemon replicas coordinate through the durable store)
-- [RFC 0006 — Intelligence transport & wire](../rfcs/0006-intelligence-transport-and-wire.md) (this channel, in full)
-- [RFC 0018 — Intelligence transport resilience](../rfcs/0018-intelligence-transport-resilience.md) (failover, the breaker, swap)
-- [RFC 0004 — MCP client subset & codec](../rfcs/0004-mcp-client-subset-and-codec.md) (where tools come from)
-- [RFC 0007 — Agentic loop & terminal status](../rfcs/0007-agentic-loop-and-terminal-status.md) (who calls `complete`)
-- [RFC 0012 — Security posture](../rfcs/0012-security-posture.md) (SSRF, header injection, secret handling)
+- [MCP](mcp.md) (where the tools on this wire come from)
+- [The agent loop](agent-loop.md) (who calls `complete`, and how a turn ends)
+- [Security](security.md) (SSRF, header injection, secret handling)

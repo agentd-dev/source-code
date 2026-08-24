@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The self-correcting **goal watchdog** (RFC 0026). A supervisor-level periodic
+//! The self-correcting **goal watchdog**. A supervisor-level periodic
 //! check — it never blocks the agent loop — of whether the configured `goal` is
 //! achieved, or the agent is **stuck** (no progress across `stuck_after` checks):
 //!
@@ -324,9 +324,12 @@ fn goal_judge_call(
             #[allow(unused_mut)]
             let mut c = c
                 .with_headers(headers.to_vec())
-                // RFC 0031 §8: the goal-judge dial uses the same wire dialect.
+                // The judge dials the same endpoint a turn does, so it must
+                // speak the configured wire dialect and carry the configured
+                // headers — otherwise a working agent has a broken watchdog.
                 .with_dialect(dialect.as_deref());
-            // RFC 0031: SigV4-sign the goal-judge LLM dial when aws auth is set.
+            // Sign the judge's dial when the endpoint uses AWS auth, for the
+            // same reason: the credential path cannot differ from a turn's.
             #[cfg(feature = "oauth")]
             if let Some(aws) = &aws_auth
                 && let Ok(s) = crate::auth::aws::SigV4Signer::from_spec(aws, "intelligence")

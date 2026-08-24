@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The bounded teardown ladder. RFC 0003 §kill-ladder.
+//! The bounded teardown ladder.
 //!
 //! When a subtree must die (SIGTERM-to-agentd, a deadline/stuck verdict, or a
 //! tree-budget breach), the reactor tears it down **deepest-first** (children
@@ -8,8 +8,9 @@
 //! escalates per the ladder: graceful `Cancel` → `killpg(SIGTERM)` after a
 //! grace → `killpg(SIGKILL)` after a kill-grace → reap. A second SIGTERM/SIGINT
 //! (`force`) collapses straight to SIGKILL. The whole budget is bounded and
-//! must stay **< the orchestrator's `terminationGracePeriodSeconds`** (RFC
-//! 0011) — the reactor enforces that ceiling.
+//! must stay **< the orchestrator's `terminationGracePeriodSeconds`**, or the
+//! orchestrator SIGKILLs agentd mid-teardown and the tree leaks; the reactor
+//! enforces that ceiling.
 //!
 //! The `killpg` calls are thin libc; the **escalation timing** is the pure,
 //! unit-tested [`Ladder`] state machine.

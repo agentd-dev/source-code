@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! agentd **goal watchdog** (RFC 0026) end to end: a periodic supervisor-level
-//! check with a CEL condition. When the goal is achieved the daemon self-finishes
-//! (drains, exits 0); when no progress is made for `stuck_after` checks it
-//! self-corrects by firing the configured recovery workflow.
+//! agentd **goal watchdog** end to end: a periodic supervisor-level check with
+//! a CEL condition. When the goal is achieved the daemon self-finishes (drains,
+//! exits 0); when no progress is made for `stuck_after` checks it self-corrects
+//! by firing the configured recovery workflow.
 //!
 //! The CEL condition path needs `--features cel`.
 #![cfg(all(unix, feature = "cel"))]

@@ -10,7 +10,7 @@
 //!
 //! It serves one resource at `<uri>` — `initialize` (advertising
 //! `resources.subscribe`), `resources/list`, `resources/read`,
-//! `resources/subscribe` — over the RFC 0004 Streamable HTTP transport
+//! `resources/subscribe` — over the Streamable HTTP transport
 //! (thread-per-connection, blocking, no dep). After a subscribe it pushes one
 //! `notifications/resources/updated` on the long-lived `GET` SSE stream (unless
 //! `emit` is off), so a reactive agent reached over HTTP has something to react
@@ -26,13 +26,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// Cross-connection server state: a subscribe (on a POST) arms a one-shot push
-/// that the open `GET` SSE stream delivers. The mock also implements the RFC
-/// 0021 §8.3 / RFC 0025 §4.1 **checkpointer tool profile** (`state.put` /
-/// `state.get` / `state.list` / `state.delete` over an in-memory per-key history
-/// with the monotonic-seq guard) plus a `flaky` tool (fails on its first call,
-/// succeeds after) and a `mock.fault` control tool (fail the next N state calls)
-/// — together they let the e2e + chaos suites prove crash → restore → complete
-/// with no external infrastructure.
+/// that the open `GET` SSE stream delivers. The mock also implements the
+/// **checkpointer tool profile** (`state.put` / `state.get` / `state.list` /
+/// `state.delete` over an in-memory per-key history with the monotonic-seq
+/// guard) plus a `flaky` tool (fails on its first call, succeeds after) and a
+/// `mock.fault` control tool (fail the next N state calls) — together they let
+/// the e2e + chaos suites prove crash → restore → complete with no external
+/// infrastructure.
 struct State {
     uri: String,
     emit: bool,
@@ -178,7 +178,7 @@ fn handle_request(req: Request, state: &State) -> (Response, bool) {
                 false,
             )
         }
-        // Skills as prompts (RFC 0028 §7): the catalogue + a body per skill.
+        // Skills as prompts: the catalogue, then a body per skill.
         "prompts/list" => (
             Response::ok(
                 req.id,
@@ -246,11 +246,11 @@ fn handle_request(req: Request, state: &State) -> (Response, bool) {
     }
 }
 
-/// One MCP `tools/call`: the RFC 0021 §8.3 / RFC 0025 §4.1 checkpointer profile
-/// plus `flaky` and the `mock.*` controls. A tool result is standard MCP content:
-/// one text part carrying the JSON **and** the same JSON as `structuredContent`
-/// (the modern shape — the store adapter's default mapping reads
-/// `result.structuredContent.*`, falling back to the text part).
+/// One MCP `tools/call`: the checkpointer profile plus `flaky` and the `mock.*`
+/// controls. A tool result is standard MCP content: one text part carrying the
+/// JSON **and** the same JSON as `structuredContent`. Both are emitted because
+/// the store adapter's default mapping reads `result.structuredContent.*` and
+/// falls back to the text part, so serving both exercises either path.
 fn handle_tool_call(req: Request, state: &State) -> Response {
     fn tool_ok(id: json::Id, v: serde_json::Value) -> Response {
         Response::ok(
@@ -337,8 +337,9 @@ fn handle_tool_call(req: Request, state: &State) -> Response {
         Some("state.list") => {
             let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(prefix) = args.get("prefix").and_then(serde_json::Value::as_str) {
-                // RFC 0025 §4.1: every live key under `prefix` with its latest
-                // seq (a tombstone — latest state null — is not listed).
+                // A prefix listing returns every LIVE key under `prefix` with
+                // its latest seq; a tombstone (latest state null) is omitted,
+                // because a deleted key must read as absent to the restorer.
                 let keys: Vec<serde_json::Value> = store
                     .iter()
                     .filter(|(k, h)| {
@@ -351,7 +352,7 @@ fn handle_tool_call(req: Request, state: &State) -> Response {
                     .collect();
                 return tool_ok(req.id, json!({"keys": keys}));
             }
-            // RFC 0021 §8.3 (v1 checkpointer): the seqs of ONE key.
+            // Without a `prefix`, a list reports the seqs held for ONE key.
             let seqs: Vec<u64> = store
                 .get(&key())
                 .map(|h| h.keys().copied().collect())
@@ -364,7 +365,7 @@ fn handle_tool_call(req: Request, state: &State) -> Response {
             tool_ok(req.id, json!({"ok": true, "existed": existed}))
         }
         Some("flaky") => {
-            // The crash-recovery shape (RFC 0021 §8.4 e2e): the FIRST call hangs
+            // The crash-recovery shape: the FIRST call hangs
             // (long enough for the harness to SIGKILL the agent mid-node — the
             // checkpoint cursor then sits AT this node); every later call
             // returns instantly. A resumed run re-enters the in-flight node
@@ -377,8 +378,8 @@ fn handle_tool_call(req: Request, state: &State) -> Response {
                 tool_ok(req.id, json!({"ok": true, "attempt": n + 1}))
             }
         }
-        // RFC 0028 §5/§6 profiles: a canned corpus for the knowledge and search
-        // contracts (auto-context + tool e2e).
+        // A canned corpus standing in for the knowledge and search tool
+        // contracts, so auto-context and tool e2e need no external service.
         Some("knowledge.search") => {
             let q = args
                 .get("query")

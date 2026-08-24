@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The **durable timer wheel** (RFC 0025 §3.3 `timer`, RFC 0026 §3): absolute
+//! The **durable timer wheel**: absolute
 //! deadlines owned by a step, a tool request, a start node or the lifecycle;
 //! armed through the store, fired by the loop's tick (`fire`), re-armed from
 //! the restored records at startup (past deadlines fire immediately).
@@ -83,8 +83,8 @@ impl Timers {
     /// nothing left to wake it — `poll_waits` does not look at the timer-backed
     /// wait kinds — so the run wedges forever while the reactor keeps spinning
     /// at its 5 ms floor around a step that can never advance. Effects are
-    /// at-least-once by design (RFC 0025 §7: every effect carries an
-    /// idempotency key and a replay is expected), so the survivable direction
+    /// at-least-once by design — every effect carries an idempotency key and a
+    /// replay is expected — so the survivable direction
     /// is the other one — keep the row until the consequence is durable and let
     /// a crash inside the window re-fire the timer on restore.
     pub fn fire(&mut self, d: &Durable, now: u64) -> Vec<TimerRecord> {
@@ -153,7 +153,7 @@ impl Default for Timers {
 }
 
 impl Runtime {
-    /// **Restore-time repair** (RFC 0025 §6, step 3 — "re-arm timers"): a
+    /// **Restore-time repair** — the startup pass that re-arms timers: a
     /// `Suspended` step whose durable timer did not come back is unreachable.
     /// `poll_waits` only resolves the wait kinds it can evaluate itself
     /// (`condition`, `run`, `join`, deadlines…); the timer-backed ones —
@@ -165,7 +165,7 @@ impl Runtime {
     /// died in the window between a firing and its checkpoint (which `fire`
     /// narrows but cannot close). Either way the repair is the same — re-arm at
     /// the recorded deadline, which fires immediately when that instant has
-    /// passed. Re-running the effect is safe (RFC 0025 §7); leaving the step
+    /// passed. Re-running an idempotency-keyed effect is safe; leaving the step
     /// wedged is not. If the store refuses the re-arm, the step is failed
     /// explicitly so the operator sees a failure instead of a hang.
     pub(crate) fn repair_orphaned_timer_waits(&mut self) {
@@ -293,7 +293,7 @@ mod tests {
         assert_eq!(fired[0].id, b);
         assert_eq!(t.owned_by(|o| o["kind"] == json!("step")), vec![a.clone()]);
         // `b`'s effect has not been checkpointed yet, so its row is still in the
-        // store: a crash here re-fires it rather than losing it (RFC 0025 §7).
+        // store: a crash here re-fires it rather than losing it.
         assert_eq!(d.restore().unwrap().timers().len(), 2);
         // The next tick settles it — one firing, one deletion.
         assert!(t.fire(&d, now).is_empty());

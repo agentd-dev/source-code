@@ -4,10 +4,10 @@
 //! instance behind instead of exiting out from under it.
 //!
 //! The second case is the interesting one. `lifecycle.run_until: auto` decides
-//! "job or daemon" — and it used to decide it once, at startup, from the
-//! CONFIGURED workflows. An agent that answered a prompt by calling
-//! `workflow.create` with a `loop` start node therefore armed a workflow and
-//! was then idle-exited a moment later. `auto` now re-reads the live set.
+//! "job or daemon", and it must decide from the LIVE workflow set rather than
+//! once, at startup, from the CONFIGURED one. An agent that answers a prompt by
+//! calling `workflow.create` with a `loop` start node has armed recurring work;
+//! idle-exiting a moment later throws away the very thing it was asked for.
 #![cfg(unix)]
 
 mod common;

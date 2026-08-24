@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Workflow engine v3 (RFC 0027) end to end through the 2.0 runtime: data
-//! pipelines with nested bodies (`foreach`/`batch`, `iterate`, `parallel`,
-//! `race`, `subgraph`), `switch` routing, `on_error` policies, `mcp.tool`
-//! steps against the mock MCP, artifact-backed large outputs, concurrent
-//! runs, and a SIGKILL mid-batch that resumes at the next batch. CEL is used
-//! throughout, so the suite needs the `cel` feature.
+//! Workflow engine v3 end to end through the real binary: data pipelines with
+//! nested bodies (`foreach`/`batch`, `iterate`, `parallel`, `race`,
+//! `subgraph`), `switch` routing, `on_error` policies, `mcp.tool` steps against
+//! the mock MCP, artifact-backed large outputs, concurrent runs, and a SIGKILL
+//! mid-batch that resumes at the next batch. CEL is used throughout, so the
+//! suite needs the `cel` feature.
 #![cfg(feature = "cel")]
 
 mod common;
@@ -156,10 +156,10 @@ fn parallel_race_switch_subgraph_and_error_policies() {
     assert_eq!(v["race"], "fast");
     assert_eq!(v["sub"], "sub saw fast path");
     assert_eq!(v["guard"], "guard ran");
-    // A false guard now reports `pruned`, not `skipped`: the distinction is
-    // what stops the tail of an untaken branch from running. Note `goto_src`
-    // depends on this step AND on `guarded`, and still ran — one live parent is
-    // enough, which is the property that keeps uneven joins working.
+    // A false guard reports `pruned`, not `skipped`: the distinction is what
+    // stops the tail of an untaken branch from running. Note `goto_src` depends
+    // on this step AND on `guarded`, and still ran — one live parent is enough,
+    // which is the property that keeps uneven joins working.
     assert_eq!(v["skipped"], "pruned");
     assert_eq!(v["rec"], "recovered");
     // The slow race branch was cancelled (its sleep timer disarmed; the step marked cancelled).
@@ -336,7 +336,7 @@ fn a_workflow_referencing_an_undefined_config_var_is_refused_at_startup() {
 fn a_start_whose_inputs_cannot_render_refuses_loudly_instead_of_firing_empty() {
     // `trigger` completes, raising workflow.finished; `watcher`'s inputs
     // mapping names a payload path that does not exist. It must NOT fire with
-    // silently-empty inputs (the old behavior) — it logs and stays quiet.
+    // silently-empty inputs — it logs the refusal and stays quiet.
     let steps_trigger = r#"{
         "s": {"kind": "once"},
         "f": {"kind": "finish", "depends_on": ["s"], "status": "completed"}
@@ -365,8 +365,8 @@ fn a_start_whose_inputs_cannot_render_refuses_loudly_instead_of_firing_empty() {
 
 #[test]
 fn an_unfiltered_event_watcher_never_triggers_itself() {
-    // A watcher on workflow.finished with NO filter used to fire on its own
-    // completion — an infinite loop of runs. Self-trigger suppression: an
+    // A watcher on workflow.finished with NO filter would otherwise fire on its
+    // own completion — an infinite loop of runs. Self-trigger suppression: an
     // event about workflow W never fires W's own event start.
     let cfg = write_config(
         "config_version: \"1\"\nagent:\n  name: nolooper\nstore:\n  kind: memory\nworkflows:\n  - name: seed\n    steps:\n      s: {kind: once}\n      f: {kind: finish, depends_on: [s], status: completed}\n  - name: watcher\n    steps:\n      hit: {kind: event, on: workflow.finished}\n      f: {kind: finish, depends_on: [hit], status: completed}\nlifecycle:\n  run_until: idle\n  idle_grace: 800ms\nobservability:\n  log_level: info\n",

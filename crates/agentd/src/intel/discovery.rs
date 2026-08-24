@@ -1,35 +1,37 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Optional model discovery (capability-negotiated). RFC 0018 §5.4.
-//!
-//! agentd may learn what an endpoint serves via a tiny handshake — **off unless
-//! an endpoint looks discovery-capable, silent on failure, never fatal, never on
-//! the hot path, never at startup before a side effect** (RFC 0018 decision 5).
+//! Optional, capability-negotiated model discovery: agentd learns what an
+//! endpoint serves via a tiny handshake. The rules that keep it harmless are
+//! absolute — it runs only when an endpoint looks discovery-capable, stays
+//! silent on failure, is never fatal, never sits on the hot path, and never
+//! runs at startup ahead of a side effect.
 //!
 //! The probe is one hand-rolled HTTP `GET /v1/models` over the EXISTING intel
-//! transport ([`super::endpoints::Endpoint::discover_models`]) — no new client,
-//! no streaming, zero new deps. For an OpenAI-compatible endpoint it parses
-//! `{ "data": [ { "id": "…" } ] }`; the `anthropic` dialect has no list endpoint
-//! → it contributes nothing (the configured `model` is dialed regardless).
+//! transport ([`super::endpoints::Endpoint::discover_models`]) — no second
+//! client, no streaming, no added dependencies. For an OpenAI-compatible
+//! endpoint it parses `{ "data": [ { "id": "…" } ] }`. The `anthropic` dialect
+//! has no list endpoint, so it contributes nothing; the configured `model` is
+//! dialed regardless, which is why discovery can be absent without breaking a
+//! run.
 //!
-//! The SURFACE that consumes this — `agentd://intelligence` + the capabilities
-//! manifest `intelligence.models` — is supervisor-side (RFC 0018 §4.4 / RFC 0015
-//! §capabilities). The architecture adaptation of the RFC's "lazy on first
-//! `complete_once`" (a child-side hook) is to probe **supervisor-side, lazily +
-//! cached, on read of the served surface**: those reads are infrequent and
-//! operator-driven, so a cached probe there is the right seam, and it keeps the
-//! additive discovery field off the control protocol. The cache + TTL live in
-//! [`crate::mcp::server::ServeCtx`]; this module is the pure probe.
+//! The surfaces that consume the result — `agentd://intelligence` and the
+//! capabilities manifest's `intelligence.models` — are served supervisor-side,
+//! which is where a caller is expected to fire the probe: lazily, on a read of
+//! the served surface, and behind its own cache. Those reads are infrequent and
+//! operator-driven, so a cached probe at that seam costs a run nothing and keeps
+//! the discovery field off the control protocol entirely. This module is the
+//! pure probe: it holds no cache, no TTL and no state of its own, so every
+//! caller is responsible for not re-probing on every read.
 
 use std::time::Duration;
 
 use super::endpoints::EndpointList;
 
-/// The default per-probe timeout (RFC 0018 §5.4 — "a SHORT timeout, it's
-/// best-effort"). Discovery is off the hot path; a slow/wedged endpoint must not
-/// stall the operator-driven read that triggered the probe.
+/// The default per-probe timeout, deliberately short because the probe is
+/// best-effort. A slow or wedged endpoint must not stall the operator-driven
+/// read that triggered it.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// The discovery outcome for the served surface (RFC 0018 §5.4):
+/// The discovery outcome for the served surface:
 /// - `discovery`: at least one endpoint answered `/v1/models`.
 /// - `models`: the union of discovered ids across endpoints **+** the configured
 ///   `model`, de-duplicated, order-stable (`[]` if none discovered AND no model).
@@ -40,15 +42,17 @@ pub struct DiscoveryResult {
 }
 
 /// Probe every OpenAI-compatible endpoint in `list` for its served models and
-/// fold the result into a [`DiscoveryResult`] (RFC 0018 §5.4). `model` is the
-/// configured model id, always unioned in (it is usable regardless of whether
-/// any endpoint answered discovery). Best-effort + silent: a per-endpoint probe
-/// that fails (404 / connection / non-JSON) simply contributes no models and does
-/// not flip `discovery` — it is NEVER fatal, NEVER a failover-class error (§5.4).
+/// fold the results into a [`DiscoveryResult`]. `model` is the configured model
+/// id and is always unioned in, because it is dialable whether or not any
+/// endpoint answered the probe. Every failure mode is silent: a probe that 404s,
+/// cannot connect, or returns non-JSON contributes no models and leaves
+/// `discovery` false. It is never fatal and never counts as a failover-class
+/// error, so a probe must not be able to trip an endpoint's circuit breaker.
 ///
-/// Not called on the hot path or at startup — only when the served
-/// `agentd://intelligence` / live `agentd://capabilities` surface is actually
-/// read (the supervisor caches it; [`crate::mcp::server::ServeCtx`]).
+/// Must not be called on the hot path or at startup — only when the served
+/// `agentd://intelligence` or live `agentd://capabilities` surface is actually
+/// read. It probes every endpoint on every call, so the caller must cache the
+/// result rather than re-running it per read.
 pub fn discover(list: &EndpointList, model: Option<&str>, timeout: Duration) -> DiscoveryResult {
     let mut models: Vec<String> = Vec::new();
     let mut any = false;
@@ -65,9 +69,10 @@ pub fn discover(list: &EndpointList, model: Option<&str>, timeout: Duration) -> 
         }
     }
 
-    // §5.4: union of discovered + the configured model. The configured model is
-    // always usable, so it joins the set — but its presence alone does NOT set
-    // `discovery` (which means "an endpoint answered the probe").
+    // Union of the discovered ids and the configured model. The configured
+    // model is always usable, so it joins the set — but its presence alone must
+    // NOT set `discovery`, which means strictly "an endpoint answered the
+    // probe" and is what callers use to tell a real list from a fallback.
     if let Some(m) = model
         && !m.is_empty()
         && !models.contains(&m.to_string())

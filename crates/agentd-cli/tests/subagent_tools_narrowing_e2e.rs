@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! `subagent.run`'s `tools:` narrowing is a GRANT the child ENFORCES (RFC 0009:
-//! scope narrows monotonically down the subagent tree).
+//! `subagent.run`'s `tools:` narrowing is a GRANT the child ENFORCES (scope
+//! narrows monotonically down the subagent tree).
 //!
-//! The regression this pins: the argument used to be accepted, written into the
-//! durable record as `allowed_tools`, and never read back — a parent bounding an
-//! untrusted sub-task to one tool silently got a child holding the whole
-//! catalogue. Here a real reactor delegates to a real subagent PROCESS with
-//! `tools: ["knowledge.search"]` while the granted MCP server publishes a dozen,
-//! and we assert both halves of enforcement: the child's catalogue carries only
-//! the granted tool, and a model that names an excluded one anyway is refused
-//! rather than served.
+//! The failure this pins: the argument must not be silently accepted, written
+//! into the durable record as `allowed_tools`, and never read back — a parent
+//! bounding an untrusted sub-task to one tool must not end up with a child
+//! holding the whole catalogue. Here a real reactor delegates to a real subagent
+//! PROCESS with `tools: ["knowledge.search"]` while the granted MCP server
+//! publishes a dozen, and we assert both halves of enforcement: the child's
+//! catalogue carries only the granted tool, and a model that names an excluded
+//! one anyway is refused rather than served.
 
 mod common;
 
@@ -68,7 +68,7 @@ fn events(stderr: &str, name: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// Only the lines a SUBAGENT wrote (`agent_path` = `sub/<handle>`, RFC 0010).
+/// Only the lines a SUBAGENT wrote (`agent_path` = `sub/<handle>`).
 fn subagent_events(stderr: &str, name: &str) -> Vec<serde_json::Value> {
     events(stderr, name)
         .into_iter()
@@ -130,7 +130,7 @@ fn a_subagent_granted_one_tool_gets_only_that_tool_and_is_refused_the_rest() {
 
     // (1) THE CATALOGUE. The child's `loop.start` reports the tool count it
     // offered the model: exactly the one granted tool. Ungranted it would be the
-    // mock's whole tools/list plus `resource.read` (13) — the pre-fix behaviour.
+    // mock's whole tools/list plus `resource.read` (13).
     let start = subagent_events(&stderr, "loop.start");
     assert!(
         start.iter().any(|e| e["tools"] == 1),

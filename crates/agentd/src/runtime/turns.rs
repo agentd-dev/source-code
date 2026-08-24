@@ -47,261 +47,114 @@ impl Runtime {
 
     /// The base persona + instruction block.
     pub(crate) fn system_prompt(&self, ctx: Option<&ContextState>, extra: Option<&str>) -> String {
-        self.system_prompt_cards(ctx, extra, None)
+        self.system_prompt_named(ctx, extra, None)
     }
 
-    /// [`Runtime::system_prompt`] with an explicit card selection: `cards`
-    /// (a step-level `context: {cards: [...]}`) wins, else `context.cards`
-    /// from the config, else every card. The persona line and the instruction
-    /// are not cards — they are always present; cards are the *environment*
-    /// sections (workflows, skills, memory, services, streams, signals,
-    /// peers, templates) whose token cost is the operator's/node's to spend.
-    pub(crate) fn system_prompt_cards(
+    /// [`Runtime::system_prompt`] with an explicit template selection: a
+    /// node's `context: {template: <name>}` wins, else `context.template`,
+    /// else the built-in default. The prompt is DATA rendered by a template
+    /// (RFC 0038) — the loops, conditions and limits an operator gets are the
+    /// ones the default itself uses.
+    pub(crate) fn system_prompt_named(
         &self,
         ctx: Option<&ContextState>,
         extra: Option<&str>,
-        cards: Option<&[String]>,
+        template: Option<&str>,
     ) -> String {
-        let config_cards = self.settings.context.cards.as_deref();
-        let on = |name: &str| -> bool {
-            match cards.or(config_cards) {
-                Some(list) => list.iter().any(|c| c == name),
-                None => true,
+        let data = self.prompt_data(ctx, extra);
+        match self.resolve_prompt_template(template) {
+            Ok(t) => match t.render(&data) {
+                Ok(s) => s,
+                Err(e) => {
+                    // A render failure must not silently ship an empty system
+                    // prompt: fall back to the built-in and say so loudly.
+                    self.log.error(
+                        "prompt.render.fail",
+                        json!({"template": template, "err": e}),
+                    );
+                    self.builtin_prompt(&data)
+                }
+            },
+            Err(e) => {
+                self.log.error(
+                    "prompt.template.missing",
+                    json!({"template": template, "err": e}),
+                );
+                self.builtin_prompt(&data)
             }
-        };
-        let mut s = String::new();
-        s.push_str(&format!(
-            "You are {}, an autonomous, durable agent (agentd). You act by calling tools and reply when done. \
-Internal tools (memory.*, plan.*, artifact.*, subagent.*, workflow.*, sleep, think, finish, status, skills.*) are executed by your runtime and are durable; \
-other tools come from connected MCP servers. Be concise and factual; never invent tool results.\n",
+        }
+    }
+
+    /// The fallback when a custom template fails. It must never return an
+    /// empty string: an agent whose system prompt silently vanished still
+    /// looks like it is working, and answers without its standing policy. If
+    /// even the built-in fails to render, fall back further — to the persona
+    /// line and the instruction, assembled without the template engine.
+    fn builtin_prompt(&self, data: &crate::engine::template::Data) -> String {
+        let rendered = crate::context::prompt::Template::parse(super::env::DEFAULT_TEMPLATE)
+            .and_then(|t| t.render(data))
+            .unwrap_or_default();
+        if !rendered.trim().is_empty() {
+            return rendered;
+        }
+        self.log.error(
+            "prompt.builtin.fail",
+            json!({"note": "the built-in template did not render; falling back to persona + instruction"}),
+        );
+        let mut s = format!(
+            "You are {}, an autonomous, durable agent (agentd). You act by calling tools and reply when done. Be concise and factual; never invent tool results.\n",
             self.instance
-        ));
+        );
         if !self.instruction.text.trim().is_empty() {
             s.push_str("\n## Instruction\n");
             s.push_str(self.instruction.text.trim());
             s.push('\n');
         }
-        if let Some(e) = extra {
-            s.push('\n');
-            s.push_str(e);
-            s.push('\n');
-        }
-        // Workflows the agent can start.
-        if on("workflows") && !self.workflows.is_empty() {
-            s.push_str("\n## Workflows\n");
-            for w in self.workflows.values() {
-                s.push_str(&format!(
-                    "- {}{}\n",
-                    w.name,
-                    w.description
-                        .as_deref()
-                        .map(|d| format!(": {d}"))
-                        .unwrap_or_default()
-                ));
-            }
-        }
-        // Skills catalogue + loaded bodies.
-        if on("skills") {
-            if let Some(cat) = self.skills.render_catalogue() {
-                s.push('\n');
-                s.push_str(&cat);
-            }
-            if let Some(c) = ctx {
-                let bodies: Vec<&skills::SkillBody> = c
-                    .skills
-                    .iter()
-                    .filter_map(|r| self.skills.body(&r.hash))
-                    .collect();
-                if let Some(b) = skills::render_bodies(&bodies) {
-                    s.push('\n');
-                    s.push_str(&b);
-                }
-            }
-        }
-        // The environment cards (RFC 0036/0037 + the durable-event fabric):
-        // what this instance can reach, emit, park on and spawn — so the model
-        // reasons over its ACTUAL surroundings instead of guessing at them.
-        if on("services") {
-            s.push_str(&self.services_card());
-        }
-        if on("streams") {
-            s.push_str(&self.streams_card());
-        }
-        if on("signals") {
-            s.push_str(&self.signals_card());
-        }
-        if on("peers") {
-            s.push_str(&self.peers_card());
-        }
-        if on("templates") {
-            s.push_str(&self.templates_card());
-        }
-        // Memory hint.
-        if on("memory")
-            && let Ok(list) = self.memory_keys_hint()
-            && !list.is_empty()
-        {
-            s.push_str(&format!(
-                "\n## Memory\nKeys you can read with memory.get: {}\n",
-                list.join(", ")
-            ));
-        }
         s
     }
 
-    /// `## Services` — the catalog (RFC 0037): names, tags and ceilings; never
-    /// credentials. Empty string when there is no catalog.
-    fn services_card(&self) -> String {
-        if self.settings.services.is_empty() {
-            return String::new();
-        }
-        let mut s = String::from("\n## Services (the external services this deployment may use)\n");
-        for (name, e) in self.settings.services.iter().take(16) {
-            let tags: Vec<&str> = e
-                .tags
-                .values()
-                .flatten()
+    /// The compiled template for this turn. Compilation is memoized per source
+    /// text — a turn must not re-parse the prompt every time.
+    fn resolve_prompt_template(
+        &self,
+        name: Option<&str>,
+    ) -> Result<std::sync::Arc<crate::context::prompt::Template>, String> {
+        let src: &str = match name {
+            Some(n) => self
+                .settings
+                .context
+                .templates
+                .get(n)
                 .map(String::as_str)
-                .collect::<std::collections::BTreeSet<_>>()
-                .into_iter()
-                .collect();
-            let mut line = format!("- {name}");
-            if !tags.is_empty() {
-                line.push_str(&format!(" [{}]", tags.join(", ")));
-            }
-            if let Some(allow) = &e.allow {
-                line.push_str(&format!(" — tools: {}", allow.join(", ")));
-            }
-            if let Some(r) = &e.rate {
-                line.push_str(&format!(" (rate {r})"));
-            }
-            s.push_str(&line);
-            s.push('\n');
+                .ok_or_else(|| format!("no context template named {n:?}"))?,
+            None => self
+                .settings
+                .context
+                .template
+                .as_deref()
+                .unwrap_or(super::env::DEFAULT_TEMPLATE),
+        };
+        use std::cell::RefCell;
+        use std::collections::HashMap;
+        thread_local! {
+            static CACHE: RefCell<HashMap<String, std::sync::Arc<crate::context::prompt::Template>>> =
+                RefCell::new(HashMap::new());
         }
-        if self.settings.security.egress == crate::config::v2::Egress::Closed {
-            s.push_str("Egress is CLOSED: only these services are reachable.\n");
-        }
-        s
+        CACHE.with(|c| {
+            if let Some(t) = c.borrow().get(src) {
+                return Ok(t.clone());
+            }
+            let t = std::sync::Arc::new(crate::context::prompt::Template::parse(src)?);
+            let mut m = c.borrow_mut();
+            if m.len() >= 64 {
+                m.clear();
+            }
+            m.insert(src.to_string(), t.clone());
+            Ok(t)
+        })
     }
 
-    /// `## Streams` — the durable event streams (RFC 0035) with live depths.
-    fn streams_card(&self) -> String {
-        if self.settings.streams.is_empty() {
-            return String::new();
-        }
-        let mut s = String::from(
-            "\n## Streams (durable events; publish with an emit step, consume with a stream start)\n",
-        );
-        for name in self.settings.streams.keys().take(16) {
-            s.push_str(&format!("- {name}\n"));
-        }
-        s
-    }
-
-    /// `## Signals` — what runs are parked on right now, and what fired
-    /// recently: the instance's live coordination state.
-    fn signals_card(&self) -> String {
-        let mut waiting: Vec<String> = Vec::new();
-        for (rid, run) in &self.runs {
-            for (sid, st) in &run.steps {
-                if st.status == crate::engine::run::StepStatus::Suspended
-                    && let Some(w) = &st.wait
-                    && w["kind"] == "signal"
-                    && let Some(name) = w["signal"].as_str()
-                {
-                    waiting.push(format!("- waiting: {name} (run {rid}, step {sid})"));
-                }
-            }
-        }
-        waiting.truncate(16);
-        let recent: Vec<String> = self
-            .recent_signals
-            .keys()
-            .rev()
-            .take(8)
-            .map(|k| format!("- fired recently: {k}"))
-            .collect();
-        if waiting.is_empty() && recent.is_empty() {
-            return String::new();
-        }
-        let mut s =
-            String::from("\n## Signals (durable coordination; deliver with workflow.signal)\n");
-        for l in waiting.into_iter().chain(recent) {
-            s.push_str(&l);
-            s.push('\n');
-        }
-        s
-    }
-
-    /// `## Peers` — configured A2A peers plus live instance children.
-    fn peers_card(&self) -> String {
-        let mut lines: Vec<String> = self
-            .settings
-            .a2a
-            .peers
-            .iter()
-            .take(16)
-            .map(|p| format!("- {}", p.name))
-            .collect();
-        for rec in self.subagents.values() {
-            if rec.tier.as_deref() == Some("instance")
-                && !super::reactor::is_terminal_status(&rec.status)
-            {
-                lines.push(format!(
-                    "- {} (instance child of template '{}', {})",
-                    rec.handle,
-                    rec.template.as_deref().unwrap_or("?"),
-                    rec.status
-                ));
-            }
-        }
-        if lines.is_empty() {
-            return String::new();
-        }
-        let mut s = String::from("\n## Peers (agents reachable with a2a.send / a2a.delegate)\n");
-        for l in lines.into_iter().take(24) {
-            s.push_str(&l);
-            s.push('\n');
-        }
-        s
-    }
-
-    /// `## Subagent templates` — what this agent may instantiate (RFC 0036),
-    /// with the declared params (the only holes it may fill).
-    fn templates_card(&self) -> String {
-        if self.settings.subagents.templates.is_empty() {
-            return String::new();
-        }
-        let mut s =
-            String::from("\n## Subagent templates (spawn with subagent.run {template, params})\n");
-        for (name, t) in self.settings.subagents.templates.iter().take(16) {
-            let machinery = t
-                .instruction
-                .lines()
-                .any(|l| l.trim_start().starts_with(":::"));
-            let tier = if machinery { "instance" } else { "flat" };
-            let params: Vec<String> = t
-                .params
-                .iter()
-                .map(|(p, spec)| {
-                    if spec.required {
-                        format!("{p} (required)")
-                    } else {
-                        p.clone()
-                    }
-                })
-                .collect();
-            let mut line = format!("- {name} ({tier})");
-            if !params.is_empty() {
-                line.push_str(&format!(" — params: {}", params.join(", ")));
-            }
-            s.push_str(&line);
-            s.push('\n');
-        }
-        s
-    }
-
-    fn memory_keys_hint(&self) -> Result<Vec<String>, String> {
+    pub(crate) fn memory_keys_hint(&self) -> Result<Vec<String>, String> {
         // A cheap read of the index/list (bounded).
         let mut m = crate::context::memory::Memory::new(1, 32);
         let v = m.list(&self.durable, None, Some(32))?;
@@ -977,7 +830,16 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
             intelligence: IntelConfig {
                 uri: self.intel_uri.clone(),
                 token: self.current_intel_bearer(),
-                model: Some(self.model.clone()),
+                // RFC 0038: a compaction turn may run on `context.summarize.model`
+                // — the cheap-model lane for a recurring fixed cost.
+                model: Some(
+                    match (&launch.kind, &self.settings.context.summarize.model) {
+                        (ChildKind::Think { purpose, .. }, Some(m)) if purpose == "compaction" => {
+                            m.clone()
+                        }
+                        _ => self.model.clone(),
+                    },
+                ),
                 headers: self.intel_headers.clone(),
                 aws_auth: self.intel_aws_auth(),
                 dialect: self.intel_dialect(),
@@ -1310,9 +1172,20 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
             }
             return;
         }
+        // RFC 0038: the operator may replace the summarizer's guidance (the
+        // JSON schema it must satisfy stays fixed) and run it on a cheaper
+        // model — compaction is a recurring cost that rarely needs the
+        // frontier one.
+        let system = self
+            .settings
+            .context
+            .summarize
+            .prompt
+            .clone()
+            .unwrap_or_else(|| req.system.clone());
         let spec = TurnSpec {
             kind: TurnKind::Think,
-            system: req.system.clone(),
+            system,
             messages: vec![Msg::user(req.input.clone(), None)],
             tools: Vec::new(),
             internal: Vec::new(),

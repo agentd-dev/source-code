@@ -407,6 +407,69 @@ is `mcp.servers[]: a server has an empty name`; a repeated name is
 code-registered tools; and a non-`https`/non-loopback-`http` endpoint is rejected
 at startup. All exit `2`.
 
+### The system prompt — `context.template:` (RFC 0038)
+
+The system prompt is **data plus a template**. The runtime exposes what it
+knows — `instance`, `instruction`, `workflows`, `services`, `streams`,
+`templates`, `skills`, `peers`, `signals`, `memory`, `tools.internal` — and a
+small language renders it:
+
+```text
+{{ expr }}                                interpolate
+{{#if expr}} … {{else}} … {{/if}}         emptiness counts as false
+{{#each expr}} … {{/each}}                `this` is the element, `@index` its position
+{{! comment }}
+```
+
+Expressions resolve as a **path first, CEL second**. `{{instance}}` and
+`{{#each services}}` are bare lookups that work in any build; anything more
+(`take(services, 16)`, `size(peers) > 0`) is CEL and needs `--features cel`,
+refused at config load on a build without it. Two helpers exist because CEL
+lacks them: `take(list, n)` (no slicing in CEL) and `join(list, sep)`.
+
+The built-in default deliberately uses **bare paths only**, so it renders on
+every build. That is why the data carries both a list and its joined text
+(`tags` / `tags_text`, `params` / `params_text`) and caps lists at 16 (peers
+at 24): the default needs no expressions, and CEL is there when you want
+different caps or filters.
+
+```yaml
+context:
+  template: |
+    You are {{instance}}. {{#if egress_closed}}Egress is closed.{{/if}}
+    ## Instruction
+    {{instruction}}
+    {{#if services}}
+    ## Services
+    {{#each take(services, 16)}}- {{this.name}}{{#if this.tags}} [{{join(this.tags, ", ")}}]{{/if}}
+    {{/each}}{{/if}}
+  templates:
+    minimal: "You are {{instance}}: {{instruction}}"    # a node picks this
+```
+
+Start from the built-in rather than from scratch — `agentd
+--context-template` prints it, and it is written in this same language.
+
+**Order it stable-to-volatile.** Providers cache on the literal prefix of a
+request, so a section that changes between turns invalidates the cache for
+everything after it. The built-in default puts persona and instruction first,
+then configuration-derived sections (workflows, services, streams, subagent
+templates), then live state (peers, parked signals, memory keys). A template
+that leads with `{{#each signals.waiting}}` works fine and quietly misses the
+cache on most turns.
+
+Malformed blocks, unknown block tags and references to names the runtime does
+not export refuse startup. A template that never mentions `{{instruction}}`
+is legal but warns on every boot, because an agent that silently lost its
+standing policy still looks like a working agent. A step selects an
+alternate with `context: {template: minimal, seed: [...]}`.
+
+Compaction has the same treatment at its own scale: `context.summarize.prompt`
+replaces the summarizer's guidance and `context.summarize.model` runs it on a
+cheaper model. The summary's JSON schema is **not** overridable — it is parsed
+back into the context, so a prompt asking for another shape produces a refusal
+rather than a nicer summary.
+
 ### The service catalog — `services:` (RFC 0037)
 
 For deployments past a handful of servers, the catalog names the external
@@ -880,6 +943,7 @@ each path is equally reachable from env and flags (§1.1), so
 | `intelligence` | `endpoints[]`, `model`, `dialect`, `swap_policy`, `timeout`, `headers{}`, `token`/`token_file`, `auth{}` (OAuth 2.1 / AWS SigV4 / SPIFFE), `budget{}`, `pricing`, `structured_output`. |
 | `mcp` | `servers[]` — `{name, endpoint, headers{}, tags{glob:[…]}, ns, allow[], exclude[], timeout, auth{}, oauth{}, aauth}` — and `default_timeout`. `allow`/`exclude` gate the server's advertised tool names by glob (exclude beats allow; a gated-out tool never registers). |
 | `tools` | `disabled[]`, `overrides{}` (retarget a tool at a declared server, optionally rewriting `args`/`result`). |
+| `context` | `template` (the system-prompt template — RFC 0038; unset = the built-in, printed by `agentd --context-template`), `templates{}` (named alternates a node picks with `context: {template: <name>}`), `summarize{prompt, model}` (the compaction guidance and a cheaper model to run it on), `compact_at`, `keep_last`, `model_window`, `plan{}`. |
 | `store` | `kind` (`file`\|`mcp`\|`http`\|`memory`\|`none`), the matching `file{path, min_free}` / `mcp{}` / `http{}` block, `prefix`, `timeout`, `on_error`, `durability{a2a, steps, work}`, `checkpoint{}`, `audit`. Defaults per instance shape — see below. `durability.work: ephemeral` flips the deployment's durability CLASS: runs and subagent records are memory-only unless a workflow says `durable: true` (docs/workflows.md §durability) — the fast path when all work is recomputable. |
 | `workflows` | Inline dialect-3 definitions, or `{name, file}` / `{name, uri}` / `{name, url, headers, timeout, allow_private}` references, or a `{dir, glob}` scan (§6). `security.workflows.immutable: true` locks the loaded set. |
 | `streams` | Declared event streams (RFC 0035): `streams: {orders: {retention: {max_events: 10000, max_age: 7d}}}`. An `emit` step or `stream` start naming an undeclared stream is exit `2`. Events are durable in the store; retention trims from the head (`max_events` defaults to 10000). |

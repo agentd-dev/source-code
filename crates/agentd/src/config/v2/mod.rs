@@ -1324,11 +1324,31 @@ pub struct Context {
     /// from `intelligence.model`) — the base of the compaction threshold.
     pub model_window: Option<u64>,
     pub plan: Plan,
-    /// Which environment cards the system prompt carries (`workflows`,
-    /// `skills`, `memory`, `services`, `streams`, `signals`, `peers`,
-    /// `templates`). Unset = all. A node overrides per step with
-    /// `context: {cards: [...]}`.
-    pub cards: Option<Vec<String>>,
+    /// The system-prompt template (RFC 0038). Unset = the built-in default,
+    /// which `agentd --context-template` prints. Written in the small
+    /// `{{#if}}` / `{{#each}}` language over the environment data; expressions
+    /// are a path first and CEL second.
+    pub template: Option<String>,
+    /// Named alternates a node selects with `context: {template: <name>}` —
+    /// e.g. a `minimal` template for extraction steps that need no
+    /// environment.
+    pub templates: BTreeMap<String, String>,
+    /// Compaction's model-facing half: the summarizer prompt and (optionally)
+    /// a cheaper model to run it on.
+    pub summarize: Summarize,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct Summarize {
+    /// Override the summarizer's guidance. The JSON schema it must satisfy
+    /// (`goals`/`decisions`/`open`/`facts`/`narrative`) is NOT yours to
+    /// change — the summary is parsed back into the context, so a prompt that
+    /// asks for another shape produces a refusal, not a nicer summary.
+    pub prompt: Option<String>,
+    /// Summarize on this model instead of the instance's. Compaction is a
+    /// recurring fixed cost that rarely needs the frontier model.
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -2767,6 +2787,9 @@ pub enum Ask {
     Version,
     Schema,
     WorkflowSchema,
+    /// `--context-template`: print the built-in system-prompt template
+    /// (RFC 0038) so an override starts from a copy, not a guess.
+    ContextTemplate,
     Validate,
     Capabilities,
     /// `--login <target>` (RFC 0031 §12): complete the interactive OAuth device
@@ -2932,6 +2955,7 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
             "-V" | "--version" => ask = Ask::Version,
             "--config-schema" | "--config-schema=1" => ask = Ask::Schema,
             "--workflow-schema" => ask = Ask::WorkflowSchema,
+            "--context-template" => ask = Ask::ContextTemplate,
             "--validate-config" => ask = Ask::Validate,
             "--capabilities" => ask = Ask::Capabilities,
             "--login" => {
@@ -3088,6 +3112,7 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
         && ask != Ask::Version
         && ask != Ask::Schema
         && ask != Ask::WorkflowSchema
+        && ask != Ask::ContextTemplate
         && !matches!(ask, Ask::Login(_) | Ask::Logout(_))
         && let Some(first) = diags.errors.first()
     {
@@ -3939,6 +3964,64 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             d.warnings.push(
                 "security.egress: closed does not cover observability.otel.endpoint (telemetry export is operator plumbing, not agent egress)".into(),
             );
+        }
+    }
+    // context templates (RFC 0038): parsed at LOAD so a malformed block or a
+    // typo'd reference is a startup error, never a mis-rendered prompt.
+    {
+        let known: &[&str] = &[
+            "instance",
+            "instruction",
+            "extra",
+            "tools",
+            "workflows",
+            "services",
+            "egress_closed",
+            "streams",
+            "templates",
+            "skills",
+            "peers",
+            "signals",
+            "memory",
+        ];
+        let mut check = |what: String, src: &str, is_default_slot: bool| {
+            match crate::context::prompt::Template::parse(src) {
+                Err(e) => err(&mut d, format!("{what}: {e}")),
+                Ok(t) => {
+                    for r in &t.roots {
+                        if !known.contains(&r.as_str()) {
+                            err(
+                                &mut d,
+                                format!(
+                                    "{what}: unknown reference {{{{{r}}}}} (available: {})",
+                                    known.join(", ")
+                                ),
+                            );
+                        }
+                    }
+                    if t.needs_cel && !cfg!(feature = "cel") {
+                        err(
+                            &mut d,
+                            format!(
+                                "{what}: uses an expression, which needs the 'cel' build feature (bare paths work without it)"
+                            ),
+                        );
+                    }
+                    // Losing the standing policy is the failure that still
+                    // looks like a working agent — say so, loudly.
+                    if is_default_slot && !t.reads("instruction") {
+                        d.warnings.push(format!(
+                            "{what} never references {{{{instruction}}}} — this agent's standing policy will not reach the model"
+                        ));
+                    }
+                }
+            }
+        };
+        if let Some(src) = &s.context.template {
+            check("context.template".into(), src, true);
+        }
+        for (name, src) in &s.context.templates {
+            check(format!("context.templates.{name}"), src, false);
         }
     }
     // subagent templates (RFC 0036): extraction, tier resolution and the
@@ -4931,7 +5014,8 @@ pub fn help_text() -> String {
          \x20 -c, --config <PATH>        a settings file (repeatable; `=` form too; or AGENT_CONFIG=a.yaml:b.yaml)\n\
          \x20 --validate-config          load+validate everything, print the verdict, exit 0/2\n\
          \x20 --config-schema            print the settings JSON Schema and exit\n\
-         \x20 --workflow-schema          print the workflow (dialect 3) JSON Schema + node registry and exit\n\
+         \x20 --context-template        print the built-in system-prompt template and exit\n\
+     \x20 --workflow-schema          print the workflow (dialect 3) JSON Schema + node registry and exit\n\
          \x20 --capabilities             print the capabilities manifest and exit\n\
          \x20 --login <target>           complete an OAuth device-login for an endpoint (e.g. mcp:<name>) and cache the token\n\
          \x20 --logout <target>          evict a cached credential\n\
@@ -5044,6 +5128,7 @@ mod tests {
             "memory",
             "context",
             "context.plan",
+            "context.summarize",
             "knowledge",
             "knowledge.auto_context",
             "search",

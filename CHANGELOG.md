@@ -5,6 +5,46 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## Unreleased
+
+### Added
+
+- **The system prompt becomes data plus a template (RFC 0038).** The runtime
+  exposes its environment — instance, instruction, workflows, services,
+  streams, subagent templates, skills, peers, parked signals, memory keys,
+  granted internal tools — and a two-block language renders it: `{{#if}}`,
+  `{{#each}}` (with `this` and `@index`), interpolation and comments.
+  Expressions resolve as a **path first, CEL second**, so bare lookups work
+  in any build and only real expressions need `--features cel` (refused at
+  config load otherwise, never mis-rendered at turn time). Two helpers fill
+  CEL's gaps and are available to workflow expressions too: `take(list, n)`
+  and `join(list, sep)`.
+- **`agentd --context-template`** prints the built-in template, which is
+  written in that same language — an override starts as a copy.
+- **Named templates, selectable per node.** `context.template` is the
+  instance default; `context.templates.<name>` are alternates a step picks
+  with `context: {template: <name>}` — an extraction step can drop the whole
+  environment without inlining one.
+- **The default is ordered for prefix caching.** Providers cache on the
+  literal prefix, so the shipped template runs stable-to-volatile: persona
+  and instruction, then configuration-derived sections, then live state.
+  Previously parked signals rendered *before* configuration, so ordinary
+  coordination traffic invalidated the cache for everything after it.
+- **`context.summarize.prompt` / `.model`** — override the compaction
+  summarizer's guidance, and run it on a cheaper model. The summary's JSON
+  schema stays fixed (it is parsed back into the context).
+
+### Changed
+
+- The persona line now names the internal tools this instance **actually
+  grants**, derived from the registry. It previously recited a hardcoded
+  list, so an instance that narrowed `agent.tools.internal` still told the
+  model it had `subagent.*` — briefing it on tools it would be refused.
+- **`context.cards` is removed** (shipped in v1.0.0, no users): the template
+  supersedes it, and carrying two selection mechanisms would be worse than
+  the break. A step's `context: {cards: […]}` becomes
+  `context: {template: <name>}`.
+
 ## v1.0.0 — the relicense reset
 
 **agentd restarts its public numbering at v1.0.0 under a new license.** The

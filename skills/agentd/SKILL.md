@@ -129,6 +129,16 @@ only spawn path). A template whose instruction embeds machinery
 workflows and store, an A2A peer over a unix socket, retired by
 `ttl`/`until`/`subagent.retire`.
 
+**The system prompt is a template** — `agentd --context-template` prints the
+built-in one, written in a two-block language (`{{#if}}`, `{{#each}}`,
+interpolation) over the agent's environment (services, workflows, peers,
+signals, memory, granted tools). Override it with `context.template`, name
+alternates in `context.templates` for a node to pick with
+`context: {template: <name>}`. Expressions are a path first and CEL second,
+so bare lookups need no build feature. Order it stable-to-volatile: providers
+cache on the literal prefix, so a section that changes every turn invalidates
+everything after it.
+
 ### The trifecta refusal is a feature
 
 If a config combines **untrusted input** + **sensitive powers** + an **egress

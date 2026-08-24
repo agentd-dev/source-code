@@ -1895,17 +1895,12 @@ impl Runtime {
         // `{cards: [...], seed: [...]}` where `cards` controls which
         // environment sections THIS step's system prompt carries (node-level
         // context control; the config's `context.cards` is the default).
-        let step_cards: Option<Vec<String>> = spec
+        let step_template: Option<String> = spec
             .get("context")
             .and_then(Value::as_object)
-            .and_then(|o| o.get("cards"))
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect()
-            });
+            .and_then(|o| o.get("template"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
         let seed_list = spec.get("context").and_then(Value::as_array).or_else(|| {
             spec.get("context")
                 .and_then(Value::as_object)
@@ -1984,7 +1979,7 @@ impl Runtime {
                     "your conclusion"
                 }
             ),
-            None => self.system_prompt_cards(None, extra.as_deref(), step_cards.as_deref()),
+            None => self.system_prompt_named(None, extra.as_deref(), step_template.as_deref()),
         };
         let (tools, internal, routes) = if is_think {
             (Vec::new(), Vec::new(), BTreeMap::new())

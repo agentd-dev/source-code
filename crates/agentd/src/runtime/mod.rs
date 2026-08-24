@@ -17,6 +17,7 @@ pub mod artifacts;
 pub mod audit;
 pub mod breaker;
 pub mod children;
+pub mod env; // system-prompt data + the default template (RFC 0038)
 pub mod events;
 #[cfg(feature = "exec")]
 pub mod exec; // guarded local command runner behind the `exec` tool (RFC 0028; default-OFF)

@@ -261,6 +261,14 @@ export const DOCS = [
       "Operator-declared subagent templates whose instruction is a full instance definition — spawn a supervised child desk with its own workflows, signals and streams; the model fills declared params only.",
   },
   {
+    slug: "rfc-0038",
+    file: "rfcs/0038-system-prompt-template.md",
+    title: "0038 · The system-prompt template",
+    group: "rfc-core",
+    blurb:
+      "The system prompt becomes data plus a template — loops, conditions and limits over the agent's environment, ordered so provider prefix caching actually hits.",
+  },
+  {
     slug: "rfc-0037",
     file: "rfcs/0037-service-catalog-and-egress-policy.md",
     title: "0037 · Service catalog & egress policy",

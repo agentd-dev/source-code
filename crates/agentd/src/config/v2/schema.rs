@@ -164,8 +164,11 @@ fn top_level_properties(
                 "keep_last": { "type": "integer", "minimum": 0 },
                 "model_window": { "type": "integer", "minimum": 1, "description": "the model's context window in tokens (overrides the value inferred from intelligence.model)" },
                 "plan": { "type": "object", "additionalProperties": false, "properties": { "max_items": { "type": "integer", "minimum": 1 } } },
-                "cards": { "type": "array", "items": { "enum": ["workflows", "skills", "memory", "services", "streams", "signals", "peers", "templates"] },
-                           "description": "which environment cards the system prompt carries; unset = all — a node overrides per step with context: {cards: [...]}" } } }));
+                "template": { "type": "string", "description": "the system-prompt template (RFC 0038); unset = the built-in default, printed by `agentd --context-template`" },
+                "templates": { "type": "object", "additionalProperties": { "type": "string" }, "description": "named alternates a node selects with context: {template: <name>}" },
+                "summarize": { "type": "object", "additionalProperties": false, "description": "compaction's model-facing half", "properties": {
+                    "prompt": { "type": "string", "description": "override the summarizer guidance; the JSON schema it must satisfy is fixed" },
+                    "model": { "type": "string", "description": "summarize on a cheaper model than the instance's" } } } } }));
     m.insert("knowledge".to_string(), json!({ "type": "object", "additionalProperties": false, "properties": {
                 "server": { "type": "string" },
                 "auto_context": { "type": "object", "additionalProperties": false, "properties": {

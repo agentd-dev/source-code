@@ -229,6 +229,12 @@ see docs/configuration.md."
             );
             exit::SUCCESS
         }
+        Ask::ContextTemplate => {
+            // The built-in system-prompt template — an override starts as a
+            // copy of this (RFC 0038).
+            println!("{}", agentd::runtime::env::DEFAULT_TEMPLATE);
+            exit::SUCCESS
+        }
         Ask::WorkflowSchema => {
             println!(
                 "{}",

@@ -15,6 +15,7 @@
 pub mod compact;
 pub mod memory;
 pub mod plan;
+pub mod prompt;
 pub mod skills;
 pub mod tokens;
 

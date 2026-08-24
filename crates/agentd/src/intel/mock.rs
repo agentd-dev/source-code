@@ -133,6 +133,31 @@ fn handle(mut stream: TcpStream, script: &str) {
         let _ = stream.flush();
         return;
     }
+    // `echo-system`: answer with the SYSTEM message verbatim. The system
+    // prompt is what an operator's `context.template` produces (RFC 0038), so
+    // this makes it observable end to end — a test asserts on what a model
+    // actually receives instead of on an internal function's return value.
+    if script == "echo-system" {
+        let sys = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| {
+                v["messages"].as_array().and_then(|ms| {
+                    ms.iter()
+                        .find(|m| m["role"] == "system")
+                        .and_then(|m| m["content"].as_str().map(str::to_string))
+                })
+            })
+            .unwrap_or_else(|| "(no system message)".to_string());
+        let payload = final_answer(&sys);
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            payload.len(),
+            payload
+        );
+        let _ = stream.write_all(resp.as_bytes());
+        let _ = stream.flush();
+        return;
+    }
     // A `role:tool` message means the model already called a tool, so the next
     // turn is a final answer. The `gate` script needs the COUNT (define → run →
     // final is a three-phase conversation).

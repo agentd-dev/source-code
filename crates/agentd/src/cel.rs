@@ -136,6 +136,56 @@ mod imp {
         }
     }
 
+    /// The two list operations CEL's standard library lacks and every real
+    /// template wants: a bounded slice and a string join. Registered on every
+    /// evaluation context, so they work in workflow expressions too — a `take`
+    /// in a `filter:` is the same idea as a `take` in a prompt template.
+    fn register_helpers(ctx: &mut cel_interpreter::Context) {
+        use cel_interpreter::Value as C;
+        use cel_interpreter::extractors::This;
+        use std::sync::Arc;
+
+        /// `take(list, n)` / `list.take(n)` — the first `n` elements. CEL has
+        /// no slicing, so "the top 16 services" is otherwise inexpressible.
+        fn take(This(this): This<C>, n: i64) -> Result<C, cel_interpreter::ExecutionError> {
+            let n = n.max(0) as usize;
+            match this {
+                C::List(items) => Ok(C::List(Arc::new(
+                    items.iter().take(n).cloned().collect::<Vec<_>>(),
+                ))),
+                C::String(s) => Ok(C::String(Arc::new(s.chars().take(n).collect::<String>()))),
+                other => Ok(other),
+            }
+        }
+
+        /// `join(list, sep)` / `list.join(sep)` — non-strings are rendered the
+        /// way the prompt renderer would render them.
+        fn join(
+            This(this): This<C>,
+            sep: Arc<String>,
+        ) -> Result<C, cel_interpreter::ExecutionError> {
+            let C::List(items) = this else {
+                return Ok(this);
+            };
+            let parts: Vec<String> = items
+                .iter()
+                .map(|v| match v {
+                    C::String(s) => s.to_string(),
+                    C::Int(i) => i.to_string(),
+                    C::UInt(u) => u.to_string(),
+                    C::Float(f) => f.to_string(),
+                    C::Bool(b) => b.to_string(),
+                    C::Null => String::new(),
+                    other => format!("{other:?}"),
+                })
+                .collect();
+            Ok(C::String(Arc::new(parts.join(sep.as_str()))))
+        }
+
+        ctx.add_function("take", take);
+        ctx.add_function("join", join);
+    }
+
     pub fn eval(expr: &str, vars: &[(&str, &Value)]) -> Result<cel_interpreter::Value, String> {
         // Programs are memoized per expression text: workflows evaluate the
         // same `when:`/value expressions once per step per run, and the ANTLR
@@ -163,6 +213,7 @@ mod imp {
             Ok(p)
         })?;
         let mut ctx = cel_interpreter::Context::default();
+        register_helpers(&mut ctx);
         for (name, value) in vars {
             ctx.add_variable_from_value(name.to_string(), to_cel(value));
         }
@@ -209,6 +260,26 @@ mod tests {
             assert!(eval_bool("a.count", &vars).is_err());
             // An undeclared reference is an eval error (callers fail closed).
             assert!(eval_bool("ghost > 1", &vars).is_err());
+        }
+
+        #[test]
+        fn take_and_join_fill_cels_list_gaps() {
+            // The two helpers a prompt template needs and CEL lacks.
+            let svc = json!([{"name":"billing"},{"name":"docs"},{"name":"crm"}]);
+            let vars = vec![("services", &svc)];
+            assert_eq!(
+                eval_value("services.map(s, s.name).take(2).join(\", \")", &vars).unwrap(),
+                json!("billing, docs")
+            );
+            assert_eq!(
+                eval_value("take(services, 1).map(s, s.name)", &vars).unwrap(),
+                json!(["billing"])
+            );
+            // take() past the end is the whole list, never an error.
+            assert_eq!(
+                eval_value("services.take(99).size()", &vars).unwrap(),
+                json!(3)
+            );
         }
 
         #[test]

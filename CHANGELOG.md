@@ -5,7 +5,17 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
-## Unreleased
+## v1.1.0 — the prompt you can write
+
+The system prompt stops being Rust and becomes **data plus a template** you
+can override — with loops, conditions and limits over the agent's own
+environment. The built-in default is written in that same language and
+printed by `agentd --context-template`, and it is now ordered for provider
+prefix caching, which the previous fixed order quietly defeated.
+
+Crates: `agentd-core` / `agentd-cli` **1.1.0**; `agentd-mcp` / `agentd-net`
+1.0.0 unchanged. `@agentd-dev/cli` **1.1.0**;
+`ghcr.io/agentd-dev/agentd:1.1.0`.
 
 ### Added
 

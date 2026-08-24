@@ -83,16 +83,27 @@ retrieved documents are data, not orders.
 
 ## Building the snapshot
 
-The system prompt is assembled fresh every turn, in a fixed order:
+The system prompt is assembled fresh every turn by **rendering a template
+over the runtime's environment data** (RFC 0038) — `agentd
+--context-template` prints the built-in one, and `context.template`
+replaces it. The default renders, in order:
 
-1. A persona line naming the instance and saying that internal tools
-   (`memory.*`, `plan.*`, `subagent.*`, `workflow.*`, `finish`, …) are run by the
-   runtime and are durable, while everything else comes from MCP servers.
+1. A persona line naming the instance and the internal tools this instance
+   actually grants (derived from the registry, so it cannot claim a tool a
+   narrowed `agent.tools.internal` would refuse).
 2. `## Instruction` — the standing policy from `agent.instruction`.
-3. The knowledge block, if this turn retrieved one.
-4. `## Workflows` — the workflows this agent can start.
+3. The per-turn slot: the knowledge block, or a step's loaded skills.
+4. `## Workflows`, `## Services`, `## Streams`, `## Subagent templates` —
+   everything derived from configuration.
 5. The skills catalogue, then the bodies of the skills loaded on this context.
-6. `## Memory` — at most 32 memory keys, as a hint that `memory.get` exists.
+6. `## Peers`, `## Signals`, `## Memory` — live state.
+
+That order is a **cache contract**, not a preference. Providers cache on the
+literal prefix of a request, so a section that changes between turns
+invalidates the cache for everything after it; the default therefore runs
+from most stable (persona, instruction) to most volatile (peers, parked
+signals, memory keys). A custom template may order however it likes and pays
+its own cache cost.
 
 The transcript is not stored the way it is sent. The context holds messages plus
 a structured summary block and a plan object; the slice renders summary and plan

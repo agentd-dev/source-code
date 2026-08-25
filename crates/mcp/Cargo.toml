@@ -5,7 +5,7 @@
 # place. Dependency budget mirrors agentd: serde + serde_json only.
 [package]
 name = "agentd-mcp"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 rust-version = "1.96"
 description = "Model Context Protocol base library: wire types, version/era negotiation, transports"

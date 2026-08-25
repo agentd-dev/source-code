@@ -5,6 +5,33 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## v1.1.1 — comments that describe the code
+
+Comments and documentation now explain the current logic — the rules,
+invariants and failure modes — rather than citing the spec documents behind
+them. Roughly 1,660 internal spec references and a layer of development
+history ("used to", "no longer", "the old path", plan-phase markers,
+version-era branding) are gone from code and prose; each was replaced with
+the reasoning it stood in for. External IETF citations (message signatures,
+device grant, PKCE, merge patch, resource metadata) are preserved, since
+they are load-bearing for anyone reading the auth and MCP paths.
+
+The specifications remain in `rfcs/` for the formal contract but are no
+longer published as documentation, so the docs site is current product
+only.
+
+Reading every comment surfaced places where the documentation and the code
+disagreed, all corrected: the budget governor documented "tightest window
+wins" when the code stops at the first refusing scope; a doc comment
+described parameters its function does not take; the person-server consent
+flow was called unimplemented while it ships; six doc comments sat on the
+wrong function; a conversation-turn caller distinction was built and then
+ignored by both branches; and the README still declared the previous
+`config_version`.
+
+Crates: `agentd-core` / `agentd-cli` **1.1.1**; `agentd-mcp` / `agentd-net`
+**1.0.1**. `@agentd-dev/cli` **1.1.1**; `ghcr.io/agentd-dev/agentd:1.1.1`.
+
 ## v1.1.0 — the prompt you can write
 
 The system prompt stops being Rust and becomes **data plus a template** you

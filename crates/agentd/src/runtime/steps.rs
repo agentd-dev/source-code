@@ -425,7 +425,10 @@ impl Runtime {
                             continue;
                         }
                         let inputs = spec.get("inputs").cloned().unwrap_or(json!({}));
-                        let _ = self.accept_event(kinds::START_FIRED, None, json!({"workflow": name, "node": id, "payload": {"fired_at": now_ms()}, "inputs": inputs}));
+                        // A `once` start is autonomous work like any other
+                        // trigger, so it is attributed the same way.
+                        let acting = self.settings.identity.autonomous_id().to_string();
+                        let _ = self.accept_event(kinds::START_FIRED, Some(acting), json!({"workflow": name, "node": id, "payload": {"fired_at": now_ms()}, "inputs": inputs}));
                     }
                     "manual" => {}
                     // Long-lived starts are armed by arm_long_lived_starts.
@@ -564,9 +567,12 @@ impl Runtime {
             return false;
         }
         run.dirty = false;
+        // The actor is on the line: "every effect names the human or the
+        // schedule that caused it" is only true if you can read it back.
         self.log.info(
             "run.start",
-            json!({"run": run_id, "workflow": name, "node": node, "inbox_event": ev.id}),
+            json!({"run": run_id, "workflow": name, "node": node, "inbox_event": ev.id,
+                   "acting_for": run.principal}),
         );
         self.counters.runs_started += 1;
         crate::obs::metrics::record_run_started();
@@ -2161,22 +2167,29 @@ impl Runtime {
 
     /// The governor scopes a run's turns are charged to (workflow budget → run scope).
     fn run_scopes(&mut self, run_id: &str) -> Vec<String> {
+        // A run's model spend is charged to the principal it is being done for
+        // as well as to the run itself, so a per-person ceiling covers the
+        // work someone STARTED, not only the turns they typed.
+        let mut scopes = self.principal_scopes(
+            self.runs
+                .get(run_id)
+                .and_then(|r| r.principal.clone())
+                .as_deref(),
+        );
         let Some(wf) = self.definition_for_run(run_id) else {
-            return Vec::new();
+            return scopes;
         };
-        match wf
+        if let Some(b) = wf
             .limits
             .budget
             .as_ref()
             .and_then(|b| serde_json::from_value::<crate::config::v2::Budget>(b.clone()).ok())
         {
-            Some(b) => {
-                let key = format!("run:{run_id}");
-                self.governor.ensure_scope(&key, &b);
-                vec![key]
-            }
-            None => Vec::new(),
+            let key = format!("run:{run_id}");
+            self.governor.ensure_scope(&key, &b);
+            scopes.push(key);
         }
+        scopes
     }
 
     // ---- outcomes --------------------------------------------------------------

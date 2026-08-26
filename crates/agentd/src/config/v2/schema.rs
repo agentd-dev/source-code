@@ -293,6 +293,11 @@ fn top_level_properties(
                     "sampled": { "type": "array", "items": { "type": "string" }, "description": "event families taken at 1-in-16 — for high-rate families that arrive in storms" },
                     "queue": { "type": "integer", "minimum": 1, "description": "how many events may queue between ticks before the tap drops and counts (default 512)" } } },
                 "traceparent": { "type": "string" } } }));
+    m.insert("identity".to_string(), json!({ "type": "object", "additionalProperties": false,
+                "description": "who work is done ON BEHALF OF — including work nobody typed",
+                "properties": {
+                "autonomous_as": { "type": "string", "description": "the actor a schedule/webhook/stream firing is attributed to (default `system`); without it the attribution chain is dropped at its first hop" },
+                "labels": { "type": "object", "additionalProperties": { "type": "string" }, "description": "labels stamped on autonomous work" } } }));
     m.insert("security".to_string(), json!({ "type": "object", "additionalProperties": false, "properties": {
                 "allow_trifecta": { "type": "boolean" },
                 "policies": { "type": "array", "description": "ordered verdicts on a tool call; first match wins, no match is allow", "items": {
@@ -420,7 +425,8 @@ fn defs_properties(
                 "role": { "enum": ["operator", "user", "agent", "anonymous"] },
                 "grants": { "type": "array", "items": { "type": "string" } },
                 "quotas": { "type": "object", "additionalProperties": false, "properties": {
-                    "rate": { "type": "string" }, "budget": budget } } } }));
+                    "rate": { "type": "string", "description": "`<burst>/<per>s` arrival quota; operators are exempt" }, "budget": budget } },
+                "labels": { "type": "object", "additionalProperties": { "type": "string" }, "description": "operator-declared attributes carried into the run, the MCP `_meta` and the audit line" } } }));
     m.insert("SubagentTemplate".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["instruction"],
                 "description": "an operator-declared subagent definition: `instruction` is a full instruction document — no config-defining directives = the flat worker; machinery (:::workflow/:::mcp/:::stream/:::config/:::tools) = an instance-tier child",
                 "properties": {

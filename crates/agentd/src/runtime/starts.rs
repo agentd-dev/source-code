@@ -384,7 +384,23 @@ impl Runtime {
         if let Some(rid) = run_id {
             ev["run_id"] = json!(rid);
         }
-        let _ = self.accept_event(kinds::START_FIRED, None, ev);
+        // A trigger firing is work done on SOMEBODY's behalf, even when nobody
+        // typed anything: a schedule, a webhook, a stream. Passing no principal
+        // dropped the attribution chain at its very first hop, which made
+        // "every effect names the human or the schedule that caused it" false
+        // by construction. `identity.autonomous_as` names the actor instead —
+        // one that shows up in the audit line, the MCP `_meta` and the budget
+        // scope like any other.
+        //
+        // An inbound A2A message is the exception: it already carries the
+        // principal who sent it, and that is who the work is for.
+        let acting = ev
+            .get("payload")
+            .and_then(|p| p.get("principal"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| self.settings.identity.autonomous_id().to_string());
+        let _ = self.accept_event(kinds::START_FIRED, Some(acting), ev);
     }
 
     /// A `loop`'s run finished: re-arm the next iteration (interval / backoff /

@@ -445,6 +445,7 @@ pub fn paired_principal(role: crate::config::v2::Role) -> Principal {
             grants: vec!["*".into()],
             rate: None,
             budget: None,
+            labels: Default::default(),
         },
         other => Principal {
             id: "user:paired".into(),
@@ -452,6 +453,7 @@ pub fn paired_principal(role: crate::config::v2::Role) -> Principal {
             grants: Vec::new(),
             rate: None,
             budget: None,
+            labels: Default::default(),
         },
     }
 }
@@ -719,6 +721,29 @@ impl Runtime {
             principal,
             reply,
         } = req;
+        // Index this caller's declared quotas and labels the first time they
+        // appear, so everything downstream can find them by id alone — the run
+        // record, the MCP `_meta` and the audit line all carry the id, never
+        // the whole principal.
+        self.note_principal(&principal);
+        // The per-principal arrival quota. `a2a.principals[].quotas.rate` was
+        // parsed, validated and read by nothing, which made a per-caller limit
+        // a setting that did not do what it said.
+        if let Some(retry_after) = self.principal_rate_refusal(&principal) {
+            self.audit_a2a(
+                &method,
+                None,
+                &principal,
+                "rate_limited",
+                json!({"retry_after_s": retry_after}),
+                None,
+            );
+            let _ = reply.send(json!({"error": {
+                "code": -32029,
+                "message": format!("rate limit for {}: retry in about {retry_after}s", principal.id),
+            }}));
+            return;
+        }
         // The listener pre-mints the id of the task this request will create,
         // because the protocol layer subscribes to a task's updates before the
         // work starts. Whichever path creates it — a conversation turn or a

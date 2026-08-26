@@ -23,6 +23,9 @@ pub struct Principal {
     /// The rate quota (`"<burst>/<per>s"`) and budget scope key, if any.
     pub rate: Option<String>,
     pub budget: Option<v2::Budget>,
+    /// Operator-declared attributes that travel with everything this
+    /// principal causes (the run, the MCP `_meta`, the audit line).
+    pub labels: std::collections::BTreeMap<String, String>,
 }
 
 impl Principal {
@@ -33,6 +36,7 @@ impl Principal {
             grants: Vec::new(),
             rate: None,
             budget: None,
+            labels: Default::default(),
         }
     }
 
@@ -213,6 +217,7 @@ struct Compiled {
     grants: Vec<String>,
     rate: Option<String>,
     budget: Option<v2::Budget>,
+    labels: std::collections::BTreeMap<String, String>,
     bearer_secret: Option<String>,
 }
 
@@ -234,6 +239,7 @@ impl Resolver {
                 grants: p.grants.clone(),
                 rate: p.quotas.as_ref().and_then(|q| q.rate.clone()),
                 budget: p.quotas.as_ref().and_then(|q| q.budget.clone()),
+                labels: p.labels.clone(),
                 bearer_secret,
             });
         }
@@ -304,6 +310,7 @@ impl Compiled {
             grants: self.grants.clone(),
             rate: self.rate.clone(),
             budget: self.budget.clone(),
+            labels: self.labels.clone(),
         })
     }
 }
@@ -315,6 +322,7 @@ fn operator() -> Principal {
         grants: vec!["*".into()],
         rate: None,
         budget: None,
+        labels: Default::default(),
     }
 }
 

@@ -186,6 +186,8 @@ pub struct Settings {
     pub goal: Option<Goal>,
     pub observability: Observability,
     pub security: Security,
+    /// Who work is done ON BEHALF OF, and what travels with it.
+    pub identity: Identity,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -1668,6 +1670,25 @@ pub enum RunUntil {
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
+pub struct Identity {
+    /// Who autonomous work is done as. A schedule, webhook, stream or timer
+    /// firing carries no principal, so "every effect names the human or the
+    /// schedule that caused it" was false by construction — the attribution
+    /// chain was dropped at the very first hop. Default `system`.
+    pub autonomous_as: Option<String>,
+    /// Labels stamped on autonomous work, the same way a principal's are.
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+}
+
+impl Identity {
+    pub fn autonomous_id(&self) -> &str {
+        self.autonomous_as.as_deref().unwrap_or("system")
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
 pub struct A2a {
     pub listen: Option<String>,
     pub tls: A2aTls,
@@ -1912,6 +1933,15 @@ pub struct Principal {
     pub grants: Vec<String>,
     #[serde(default)]
     pub quotas: Option<Quotas>,
+    /// Operator-declared attributes carried with everything this principal
+    /// causes — into the run, the MCP `_meta` and the audit line.
+    ///
+    /// A CLOSED domain on purpose: these become durable governor scope keys
+    /// and audit fields, and minting them from values arriving off the box is
+    /// the same unbounded-cardinality hazard the metrics layer already bans
+    /// for labels, relocated into the manifest.
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -3830,6 +3860,21 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                 ),
             ),
             Some(_) => {}
+        }
+    }
+
+    // a2a.principals[].quotas — a limit that parses and is never checked for
+    // shape is the same failure as one that is never enforced: the operator
+    // believes they set a ceiling.
+    for (i, p) in s.a2a.principals.iter().enumerate() {
+        let Some(q) = &p.quotas else { continue };
+        if let Some(r) = &q.rate
+            && let Err(e) = crate::supervisor::tree::parse_rate(r)
+        {
+            err(&mut d, format!("a2a.principals[{i}].quotas.rate: {e}"));
+        }
+        if let Some(b) = &q.budget {
+            validate_budget(b, &format!("a2a.principals[{i}].quotas.budget"), &mut d);
         }
     }
 

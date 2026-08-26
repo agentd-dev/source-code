@@ -773,19 +773,95 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
         self.turn_queue.push_back(job);
     }
 
-    /// The budget scopes a conversation turn is charged to.
+    /// The budget scopes a conversation turn is charged to: the conversation's
+    /// own, and the acting principal's.
     pub(crate) fn conversation_scopes(&mut self, ctx_id: &str) -> Vec<String> {
+        let mut scopes = self.principal_scopes(
+            self.contexts
+                .get(ctx_id)
+                .and_then(|c| c.principal.clone())
+                .as_deref(),
+        );
         if ctx_id == ROOT {
+            return scopes;
+        }
+        if let Some(b) = &self.settings.agent.conversation_budget {
+            let key = format!("conversation:{ctx_id}");
+            let b = b.clone();
+            self.governor.ensure_scope(&key, &b);
+            scopes.push(key);
+        }
+        scopes
+    }
+
+    /// Record a resolved caller's declared quotas and labels under their id.
+    ///
+    /// A principal's id is minted when the caller is resolved, not written in
+    /// config, so this is the only moment the operator's declaration and the
+    /// id it applies to are both in hand. Everything downstream — the run
+    /// record, the MCP `_meta`, the audit line — carries the id alone.
+    #[cfg_attr(not(feature = "a2a"), allow(dead_code))]
+    pub(crate) fn note_principal(&mut self, p: &crate::a2a::Principal) {
+        if let Some(b) = &p.budget
+            && !self.principal_budgets.contains_key(&p.id)
+        {
+            self.principal_budgets.insert(p.id.clone(), b.clone());
+        }
+        if !p.labels.is_empty() && !self.principal_labels.contains_key(&p.id) {
+            self.principal_labels.insert(p.id.clone(), p.labels.clone());
+        }
+        if let Some(rate) = &p.rate
+            && !self.principal_rates.contains_key(&p.id)
+            && let Ok((burst, per_sec)) = crate::supervisor::tree::parse_rate(rate)
+        {
+            self.principal_rates.insert(
+                p.id.clone(),
+                crate::supervisor::tree::TokenBucket::new(burst, burst as f64 / per_sec),
+            );
+        }
+    }
+
+    /// `Some(retry_after_seconds)` when this caller has spent their arrival
+    /// quota. Operators are never rate-limited: locking the person who
+    /// administers the daemon out of it during an incident is worse than the
+    /// load they could generate.
+    #[cfg_attr(not(feature = "a2a"), allow(dead_code))]
+    pub(crate) fn principal_rate_refusal(&mut self, p: &crate::a2a::Principal) -> Option<u64> {
+        if p.is_operator() {
+            return None;
+        }
+        let bucket = self.principal_rates.get_mut(&p.id)?;
+        if bucket.try_take() {
+            return None;
+        }
+        Some(1)
+    }
+
+    /// The labels an id acts under (empty when none were declared).
+    pub(crate) fn labels_of(&self, principal: Option<&str>) -> BTreeMap<String, String> {
+        match principal {
+            Some(id) => self.principal_labels.get(id).cloned().unwrap_or_default(),
+            None => self.settings.identity.labels.clone(),
+        }
+    }
+
+    /// The budget scope for the principal work is being done for.
+    ///
+    /// `a2a.principals[].quotas.budget` parsed, validated and landed on the
+    /// `Principal` — and was read by nothing, so a per-person ceiling was a
+    /// setting that did not do what it said. The governor already keeps
+    /// per-scope windowed counters durably and restores them, so charging a
+    /// third key is a lookup rather than an accounting subsystem.
+    pub(crate) fn principal_scopes(&mut self, principal: Option<&str>) -> Vec<String> {
+        let Some(id) = principal else {
             return Vec::new();
-        }
-        match &self.settings.agent.conversation_budget {
-            Some(b) => {
-                let key = format!("conversation:{ctx_id}");
-                self.governor.ensure_scope(&key, b);
-                vec![key]
-            }
-            None => Vec::new(),
-        }
+        };
+        let Some(budget) = self.principal_budgets.get(id).cloned() else {
+            return Vec::new();
+        };
+        let key = format!("principal:{id}");
+        self.governor.ensure_scope(&key, &budget);
+        vec![key]
     }
 
     /// Resolve `@skill:` references: load bodies + record them on the context.

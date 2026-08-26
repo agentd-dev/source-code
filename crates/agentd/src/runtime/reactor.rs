@@ -287,6 +287,16 @@ pub struct Runtime {
     pub(crate) artifacts: Artifacts,
     pub(crate) skills: skills::Catalogue,
     pub(crate) governor: Governor,
+    /// Per-principal budgets and rate quotas, indexed by principal id when one
+    /// is first seen. `a2a.principals[].quotas` parsed and validated for a
+    /// long time without anything reading it; these are its readers.
+    pub(crate) principal_budgets: BTreeMap<String, crate::config::v2::Budget>,
+    /// Only the A2A listener admits callers, so a build without it has
+    /// nowhere to spend an arrival quota.
+    #[cfg_attr(not(feature = "a2a"), allow(dead_code))]
+    pub(crate) principal_rates: BTreeMap<String, crate::supervisor::tree::TokenBucket>,
+    /// Labels an id acts under, for `_meta` and audit.
+    pub(crate) principal_labels: BTreeMap<String, BTreeMap<String, String>>,
     pub(crate) workflows: BTreeMap<String, std::sync::Arc<Workflow>>,
     pub(crate) runs: BTreeMap<String, RunState>,
     pub(crate) children: Children,

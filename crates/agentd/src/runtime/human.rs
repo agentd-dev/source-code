@@ -250,6 +250,7 @@ impl Runtime {
                     grants: Vec::new(),
                     rate: None,
                     budget: None,
+                    labels: Default::default(),
                 };
                 if let Some(run) = &caller.run {
                     let run = run.clone();

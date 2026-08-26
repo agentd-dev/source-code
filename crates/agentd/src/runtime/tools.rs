@@ -259,7 +259,21 @@ impl Runtime {
         };
         let mapping = m.clone();
         let tool_name = name.to_string();
-        let meta = json!({"agent/idempotency_key": format!("{}/{}#{}", self.instance, caller.label(), caller.req), "agent/instance": self.instance});
+        // `_meta` carried run, step, instance, idempotency key and attempt —
+        // and nothing about WHO the work is for, so a server could neither
+        // authorize nor attribute per person.
+        let mut meta = json!({"agent/idempotency_key": format!("{}/{}#{}", self.instance, caller.label(), caller.req), "agent/instance": self.instance});
+        meta["agent/acting_for"] = json!(
+            caller.principal.clone().unwrap_or_else(|| self
+                .settings
+                .identity
+                .autonomous_id()
+                .to_string())
+        );
+        let labels = self.labels_of(caller.principal.as_deref());
+        if !labels.is_empty() {
+            meta["agent/labels"] = json!(labels);
+        }
         let timeout = self
             .settings
             .mcp
@@ -321,7 +335,21 @@ impl Runtime {
             );
         };
         let tool = tool.to_string();
-        let meta = json!({"agent/idempotency_key": format!("{}/{}#{}", self.instance, caller.label(), caller.req), "agent/instance": self.instance});
+        // `_meta` carried run, step, instance, idempotency key and attempt —
+        // and nothing about WHO the work is for, so a server could neither
+        // authorize nor attribute per person.
+        let mut meta = json!({"agent/idempotency_key": format!("{}/{}#{}", self.instance, caller.label(), caller.req), "agent/instance": self.instance});
+        meta["agent/acting_for"] = json!(
+            caller.principal.clone().unwrap_or_else(|| self
+                .settings
+                .identity
+                .autonomous_id()
+                .to_string())
+        );
+        let labels = self.labels_of(caller.principal.as_deref());
+        if !labels.is_empty() {
+            meta["agent/labels"] = json!(labels);
+        }
         let timeout = self
             .settings
             .mcp

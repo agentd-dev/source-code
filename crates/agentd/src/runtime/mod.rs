@@ -513,6 +513,12 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
             version: 1,
         },
         job_shape: false,
+        // Populated lazily: a principal's ID is derived when the caller is
+        // resolved (`user:<sub>`), not declared in config, so the quotas an
+        // operator wrote can only be indexed once someone presents them.
+        principal_budgets: BTreeMap::new(),
+        principal_rates: BTreeMap::new(),
+        principal_labels: BTreeMap::new(),
         exit: None,
         draining: false,
         paused: false,

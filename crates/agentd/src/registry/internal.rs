@@ -628,12 +628,28 @@ pub fn contracts() -> Vec<Contract> {
     );
 
     // ---- misc ----
+    // The contract states exactly what the implementation does, in both
+    // directions. It previously advertised `to` — which nothing read, so a
+    // model could believe it had addressed a question that went to whoever was
+    // watching — and omitted `recommend`, which the `approval: accept` path
+    // reads: with `additionalProperties: false` a model that tried to supply
+    // one was refused, leaving that mode reachable only through a `default`
+    // buried in the schema.
+    //
+    // There is deliberately no addressee. A gate is answered by whoever holds
+    // the task, and routing to a named person is a different feature (an
+    // addressee, a quorum, a decider) rather than an argument.
     c(
         "ask_human",
         "human",
-        "Ask the human (the conversation's principal) a question and wait for the answer.",
+        "Ask a person a question and wait for the answer. The question reaches whoever is watching this agent's tasks — there is no addressee — and the answer is CHECKED against `schema`, so a reply that does not match is rejected and the person is asked again with the reason.",
         obj(
-            json!({"question": s("The question"), "schema": {"type": "object", "description": "Expected answer shape"}, "to": s("Principal or conversation to ask (default: the current one)"), "timeout": s("Duration")}),
+            json!({
+                "question": s("The question"),
+                "schema": {"type": "object", "description": "The answer's shape, as a JSON Schema. Enforced on the reply, not merely advertised: build it for the decision you actually need. A single-property schema also lets a person answer in plain language (\"yes\" for {approved: boolean})."},
+                "recommend": {"description": "The answer you would choose if nobody replies. Used only when the operator set `agent.approval: accept`; otherwise a person still decides."},
+                "timeout": s("Duration"),
+            }),
             &["question"],
         ),
         open_obj(
@@ -884,6 +900,49 @@ pub fn names() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `ask_human`'s contract has to say what the implementation does, in both
+    /// directions. It drifted apart in both at once: `to` was advertised and
+    /// read by nothing, so a model could believe it had addressed a question
+    /// that in fact went to whoever was watching; and `recommend` was read by
+    /// the `approval: accept` path but not advertised, so — under
+    /// `additionalProperties: false` — a model supplying one was REFUSED, and
+    /// that mode was reachable only through a `default` buried in the schema.
+    ///
+    /// A field that silently does nothing and a field that silently cannot be
+    /// used are the same defect pointing in opposite directions.
+    #[test]
+    fn ask_human_advertises_exactly_what_it_reads() {
+        let c = contracts()
+            .into_iter()
+            .find(|c| c.name == "ask_human")
+            .expect("ask_human exists");
+        let props = c.input["properties"].as_object().expect("properties");
+        assert!(
+            !props.contains_key("to"),
+            "a gate is answered by whoever holds the task; advertising an              addressee promises routing that does not happen"
+        );
+        assert!(
+            props.contains_key("recommend"),
+            "the approval: accept path reads `recommend`, so a model must be              able to supply one"
+        );
+        // And the schema really is strict, which is what makes an unadvertised
+        // field unusable rather than merely undocumented.
+        assert_eq!(c.input["additionalProperties"], serde_json::json!(false));
+        assert!(
+            crate::jsonschema::validate(
+                &c.input,
+                &json!({"question": "ship it?", "recommend": {"approved": true}})
+            )
+            .is_ok(),
+            "a recommendation must validate"
+        );
+        assert!(
+            crate::jsonschema::validate(&c.input, &json!({"question": "x", "to": "user:alice"}))
+                .is_err(),
+            "an addressee must be refused, not accepted and dropped"
+        );
+    }
 
     #[test]
     fn contracts_are_unique_well_formed_and_cover_the_catalogue() {

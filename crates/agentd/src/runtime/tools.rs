@@ -187,6 +187,15 @@ impl Runtime {
         if let Err(e) = self.registry.validate_args(name, &args) {
             return ToolOutcome::Ready(Value::String(e), true);
         }
+        // The policy verdict, at the one chokepoint every call passes — and
+        // deliberately AFTER `validate_args`, so an argument guard judges
+        // arguments that already conform to the tool's schema rather than
+        // whatever the model happened to emit.
+        if !self.settings.security.policies.is_empty()
+            && let Some(outcome) = self.apply_policy(caller, name, &args)
+        {
+            return outcome;
+        }
         let route = self.registry.route(name).map(|r| match r {
             Route::Internal => RouteKind::Internal,
             Route::Mapped(m) => RouteKind::Mapped(m.clone()),
@@ -692,6 +701,160 @@ impl Runtime {
                 "internal tool {other:?} has no built-in implementation"
             )),
         }
+    }
+
+    /// Which policy caller this invocation counts as.
+    pub(crate) fn policy_caller(caller: &ToolCaller) -> crate::config::v2::PolicyCaller {
+        use crate::config::v2::PolicyCaller;
+        match (&caller.subagent, &caller.run) {
+            (Some(_), _) => PolicyCaller::Subagent,
+            (None, Some(_)) => PolicyCaller::Workflow,
+            _ => PolicyCaller::Root,
+        }
+    }
+
+    /// Apply the policy list to one call. `None` means proceed.
+    fn apply_policy(
+        &mut self,
+        caller: &ToolCaller,
+        name: &str,
+        args: &Value,
+    ) -> Option<ToolOutcome> {
+        use crate::config::v2::PolicyAction;
+        let tags = self
+            .registry
+            .tags_of(std::slice::from_ref(&name.to_string()));
+        let who = Self::policy_caller(caller);
+        let call = crate::sec::policy::Call {
+            tool: name,
+            tags: &tags,
+            caller: who,
+            principal: caller.principal.as_deref(),
+            args,
+        };
+        let verdict = match crate::sec::policy::evaluate(&self.settings.security.policies, &call) {
+            Ok(None) => return None,
+            Ok(Some(v)) => v,
+            Err(rule) => {
+                // Fail closed and say which rule could not be judged.
+                self.log.error(
+                    "tool.policy.error",
+                    json!({"tool": name, "rule": rule, "caller": caller.label()}),
+                );
+                return Some(ToolOutcome::Ready(
+                    Value::String(format!(
+                        "refused: security.policies[{rule}] has an argument guard that could not be evaluated"
+                    )),
+                    true,
+                ));
+            }
+        };
+        match verdict.action {
+            PolicyAction::Allow => None,
+            PolicyAction::Deny | PolicyAction::Shadow => {
+                let held = verdict.action == PolicyAction::Shadow;
+                self.log.info(
+                    "tool.policy.refused",
+                    json!({"tool": name, "rule": verdict.rule, "caller": caller.label(),
+                           "action": if held { "shadow" } else { "deny" }}),
+                );
+                self.audit(super::audit::AuditEvent {
+                    action: "tool.policy",
+                    target: json!({"tool": name, "rule": verdict.rule}),
+                    outcome: if held { "shadow" } else { "deny" },
+                    principal: caller.principal.as_deref(),
+                    role: None,
+                    request_id: None,
+                });
+                // Shadow mode says plainly that the call was HELD, never
+                // returning a synthetic success. A schema-conformant fake is
+                // reasoned over as real, and every later decision is then
+                // built on a fabricated observation — which is a strange thing
+                // for a fail-closed runtime to ship, and worse than refusing.
+                let msg = if held {
+                    format!(
+                        "held by security.policies[{}]: this call was NOT executed and no result exists. \
+                         Treat it as not done — do not assume an outcome.",
+                        verdict.rule
+                    )
+                } else {
+                    format!("denied by security.policies[{}]", verdict.rule)
+                };
+                Some(ToolOutcome::Ready(Value::String(msg), true))
+            }
+            PolicyAction::Ask => Some(self.policy_gate(caller, name, args, &verdict)),
+        }
+    }
+
+    /// An `action: ask` verdict: put it to a person.
+    ///
+    /// Deliberately NOT routed through `agent.approval`. That setting decides
+    /// how asks the MODEL requested are handled, and its `auto` mode answers
+    /// them with a model judge — letting the agent approve the operator's own
+    /// security gate. An operator-declared gate goes to a human or it does not
+    /// pass.
+    fn policy_gate(
+        &mut self,
+        caller: &ToolCaller,
+        name: &str,
+        args: &Value,
+        verdict: &crate::sec::policy::Verdict,
+    ) -> ToolOutcome {
+        use crate::config::v2::PolicyAction;
+        let question = verdict
+            .question
+            .clone()
+            .unwrap_or_else(|| {
+                format!(
+                    "{} wants to call {name} — allow?",
+                    crate::sec::policy::caller_name(Self::policy_caller(caller))
+                )
+            })
+            .replace("{{tool}}", name)
+            .replace(
+                "{{caller}}",
+                crate::sec::policy::caller_name(Self::policy_caller(caller)),
+            )
+            .replace("{{args}}", &args.to_string());
+        #[cfg(feature = "a2a")]
+        let available = self.settings.interface.enabled && self.a2a_sink.is_some();
+        #[cfg(not(feature = "a2a"))]
+        let available = false;
+        if available {
+            self.log.info(
+                "tool.policy.ask",
+                json!({"tool": name, "rule": verdict.rule, "caller": caller.label()}),
+            );
+            #[cfg(feature = "a2a")]
+            {
+                let deadline =
+                    now_ms() + verdict.timeout_ms.unwrap_or(super::human::ASK_TIMEOUT_MS);
+                return self.human_gate(caller, question, deadline, None);
+            }
+        }
+        // Nobody to ask. `on_timeout` decides, and it defaults to deny: a gate
+        // that cannot be answered has not been approved, and quietly running
+        // the call because no interface happens to be attached would make the
+        // policy a suggestion.
+        let fallback = verdict.on_timeout;
+        // The question goes in the log even though nobody can answer it: an
+        // operator reading this needs to know what they were not asked.
+        self.log.warn(
+            "tool.policy.unanswerable",
+            json!({"tool": name, "rule": verdict.rule, "question": question,
+                   "fallback": format!("{fallback:?}").to_lowercase(),
+                   "note": "no human channel (interface.enabled is off)"}),
+        );
+        if fallback == PolicyAction::Allow {
+            return ToolOutcome::Ready(Value::Null, false);
+        }
+        ToolOutcome::Ready(
+            Value::String(format!(
+                "denied by security.policies[{}]: a person had to approve this call and no human channel is attached",
+                verdict.rule
+            )),
+            true,
+        )
     }
 
     /// `message.send`: deliver into one of this instance's own conversations.

@@ -320,10 +320,32 @@ impl Runtime {
                     format!("Reply with ONLY one JSON object matching this JSON Schema: {s}")
                 })
             });
+        // Which of this child's tools a policy rule might touch. It calls its
+        // MCP servers directly, so anything named here has to come back to the
+        // supervisor or the rule silently never applies to the caller an
+        // operator is most likely narrowing.
+        let gated_tools: Vec<String> = if self.settings.security.policies.is_empty() {
+            Vec::new()
+        } else {
+            self.registry
+                .defs_for(&crate::registry::Caller::Subagent { allow: None }, None)
+                .iter()
+                .map(|d| d.name.clone())
+                .filter(|n| {
+                    crate::sec::policy::could_apply(
+                        &self.settings.security.policies,
+                        n,
+                        &self.registry.tags_of(std::slice::from_ref(n)),
+                        crate::config::v2::PolicyCaller::Subagent,
+                    )
+                })
+                .collect()
+        };
         let mut payload = SpawnPayload {
             instruction: instruction.clone(),
             output_contract,
             context_seed,
+            gated_tools,
             intelligence: IntelConfig {
                 uri: self.intel_uri.clone(),
                 token: self.current_intel_bearer(),

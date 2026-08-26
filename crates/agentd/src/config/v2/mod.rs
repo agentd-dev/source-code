@@ -2055,6 +2055,74 @@ pub struct Security {
     /// time for everything else, so a URL assembled at runtime is caught too.
     /// Default `open`.
     pub egress: Egress,
+    /// Ordered verdicts on the tool CALL — by name, tag, caller, principal or
+    /// arguments. First match wins; no match is allow.
+    ///
+    /// This is the only place an argument can be judged: grants are name
+    /// patterns, so "delete anything outside /tmp" has no expression in them,
+    /// and `agent.approval` only decides whether to honour a gate the MODEL
+    /// asked for. It is also where the trifecta tags finally do work at
+    /// runtime rather than only folding at startup.
+    pub policies: Vec<Policy>,
+}
+
+/// One rule: what it matches, and what happens.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct Policy {
+    #[serde(rename = "match")]
+    pub matcher: PolicyMatch,
+    pub action: PolicyAction,
+    /// The question put to a person for `action: ask`. Templated with
+    /// `{{tool}}`, `{{caller}}` and `{{args}}`.
+    pub question: Option<String>,
+    /// What an unanswered `ask` becomes. Default `deny` — a gate nobody
+    /// answered has not been approved.
+    pub on_timeout: Option<PolicyAction>,
+    pub timeout: Option<Dur>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct PolicyMatch {
+    /// Tool-name glob (`fs.*`). Absent matches every tool.
+    pub tool: Option<String>,
+    /// Every listed trifecta tag must be present on the tool.
+    pub tags: Vec<String>,
+    /// Which callers this applies to: `root`, `workflow`, `subagent`.
+    pub caller: Vec<PolicyCaller>,
+    /// Principal-id glob, for calls carrying one.
+    pub principal: Option<String>,
+    /// A CEL predicate over `args`, `tool` and `caller`. Needs the `cel`
+    /// feature; a build without it refuses the config rather than evaluating
+    /// an argument guard to "no match".
+    pub args: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PolicyCaller {
+    Root,
+    Workflow,
+    Subagent,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PolicyAction {
+    #[default]
+    Allow,
+    Deny,
+    /// Suspend on a human gate; the answer decides. Rides the same deferred
+    /// path `ask_human` and the `human` node already use, so a policy gate
+    /// renders as an answerable row in every attached client and survives a
+    /// restart.
+    Ask,
+    /// Refuse, but say plainly that the call was held rather than run. NOT a
+    /// synthetic success: a schema-conformant fake result is reasoned over as
+    /// real, and every later decision is then built on a fabricated
+    /// observation — a strange thing for a fail-closed runtime to ship.
+    Shadow,
 }
 
 /// Whether outbound dials are confined to the service catalog.
@@ -3765,6 +3833,48 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
         }
     }
 
+    // security.policies — a security control has to fail loudly when it cannot
+    // do what it says.
+    for (i, p) in s.security.policies.iter().enumerate() {
+        let at = format!("security.policies[{i}]");
+        if let Some(expr) = &p.matcher.args {
+            if !cfg!(feature = "cel") {
+                err(
+                    &mut d,
+                    format!(
+                        "{at}: `match.args` needs the `cel` feature; this build cannot evaluate an \
+                         argument guard, and silently treating it as no-match would turn a deny \
+                         into an allow"
+                    ),
+                );
+            } else if let Err(e) =
+                crate::cel::compile_check(expr.trim().trim_start_matches("CEL:").trim())
+            {
+                err(&mut d, format!("{at}: match.args: {e}"));
+            }
+        }
+        for t in &p.matcher.tags {
+            if !["untrusted_input", "sensitive", "egress"].contains(&t.as_str()) {
+                err(
+                    &mut d,
+                    format!("{at}: unknown tag {t:?} (want untrusted_input|sensitive|egress)"),
+                );
+            }
+        }
+        if p.action != PolicyAction::Ask && (p.question.is_some() || p.on_timeout.is_some()) {
+            err(
+                &mut d,
+                format!("{at}: `question`/`on_timeout` apply to `action: ask`"),
+            );
+        }
+        if p.on_timeout == Some(PolicyAction::Ask) {
+            err(
+                &mut d,
+                format!("{at}: `on_timeout: ask` would ask again forever"),
+            );
+        }
+    }
+
     // intelligence
     for e in &s.intelligence.endpoints {
         if let Err(e) = super::validate_intelligence_uri(e) {
@@ -5339,6 +5449,9 @@ mod tests {
                         "a2a.principals" => json!([{"match": {"any": true}, "role": "user"}]),
                         "a2a.peers" => json!([{"name": "p", "endpoint": "https://p.example"}]),
                         "skills.sources" => json!([{"server": "s"}]),
+                        "security.policies" => {
+                            json!([{"match": {"tool": "fs.*"}, "action": "deny"}])
+                        }
                         "intelligence.budget.windows" | "agent.conversation_budget.windows" => {
                             json!([{"per": "hour", "tokens": 1}])
                         }

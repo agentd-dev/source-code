@@ -246,6 +246,24 @@ pub struct SpawnPayload {
     /// `#[serde(default)]` so a frame that omits it parses as "no identity".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aauth: Option<crate::config::AAuthSettings>,
+    /// Tool names this child must NOT call directly, routing them up to the
+    /// supervisor instead.
+    ///
+    /// A subagent connects to its granted MCP servers itself and calls their
+    /// tools without the supervisor ever seeing the call, which would put
+    /// every `security.policies` rule out of reach for exactly the caller the
+    /// operator is most likely to be narrowing. A policy table that covered
+    /// root turns but not subagent turns would be worse than none, because the
+    /// operator would believe they were covered — so the supervisor names the
+    /// tools a rule might touch and the child round-trips those through the
+    /// existing `ToolRequest` channel. Everything else keeps its direct
+    /// connection.
+    ///
+    /// This is a grant the supervisor makes, not a promise the child keeps: a
+    /// gated tool is still refused parent-side if the child ignores the list,
+    /// because the parent evaluates the policy when the request arrives.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gated_tools: Vec<String>,
     pub limits: Limits,
     pub telemetry: Telemetry,
     /// Supervisor-minted tree depth (0 = root).
@@ -529,6 +547,7 @@ mod tests {
                 role: "user".into(),
                 content: "prior note".into(),
             }],
+            gated_tools: Vec::new(),
             intelligence: IntelConfig {
                 uri: "https://intel.example".into(),
                 token: Some("secret".into()),

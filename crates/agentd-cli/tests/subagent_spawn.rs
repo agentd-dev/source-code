@@ -22,6 +22,7 @@ fn bogus_payload() -> SpawnPayload {
         instruction: "summarize the situation".into(),
         output_contract: None,
         context_seed: Vec::new(),
+        gated_tools: Vec::new(),
         intelligence: IntelConfig {
             uri: "http://127.0.0.1:9".into(),
             token: None,

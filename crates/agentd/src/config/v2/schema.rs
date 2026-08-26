@@ -295,6 +295,18 @@ fn top_level_properties(
                 "traceparent": { "type": "string" } } }));
     m.insert("security".to_string(), json!({ "type": "object", "additionalProperties": false, "properties": {
                 "allow_trifecta": { "type": "boolean" },
+                "policies": { "type": "array", "description": "ordered verdicts on a tool call; first match wins, no match is allow", "items": {
+                    "type": "object", "additionalProperties": false, "properties": {
+                        "match": { "type": "object", "additionalProperties": false, "properties": {
+                            "tool": { "type": "string", "description": "tool-name glob; absent matches every tool" },
+                            "tags": { "type": "array", "items": { "enum": ["untrusted_input", "sensitive", "egress"] }, "description": "every listed trifecta tag must be present on the tool" },
+                            "caller": { "type": "array", "items": { "enum": ["root", "workflow", "subagent"] } },
+                            "principal": { "type": "string", "description": "principal-id glob, for calls carrying one" },
+                            "args": { "type": "string", "description": "CEL over `args`, `tool` and `caller` — the only place an ARGUMENT can be judged, since grants are name patterns" } } },
+                        "action": { "enum": ["allow", "deny", "ask", "shadow"], "description": "shadow refuses and says the call was held; it never fabricates a result" },
+                        "question": { "type": "string", "description": "the question put to a person for `ask`; {{tool}}, {{caller}} and {{args}} are substituted" },
+                        "on_timeout": { "enum": ["allow", "deny", "ask", "shadow"], "description": "what an unanswered `ask` becomes (default deny)" },
+                        "timeout": { "type": "string" } } } },
                 "workflows": { "type": "object", "additionalProperties": false, "properties": {
                     "immutable": { "type": "boolean", "description": "refuse workflow.create/update/delete at runtime — definitions become read-only for the model, subagents and operators alike; loading from config/file/url/dir is unaffected" } } },
                 "tls_ca": { "type": "string" },

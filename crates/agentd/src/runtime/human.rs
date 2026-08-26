@@ -30,6 +30,10 @@ use std::time::Duration;
 
 /// The default patience for a human answer.
 const ASK_TIMEOUT: Duration = Duration::from_secs(24 * 3600);
+/// The same default in milliseconds, for callers that already work in ms
+/// (a `security.policies` gate with no explicit `timeout`).
+#[cfg(feature = "a2a")]
+pub(crate) const ASK_TIMEOUT_MS: u64 = 24 * 3600 * 1000;
 /// How long the auto judge gets once fired.
 const AUTO_GRACE_MS: u64 = 10 * 60 * 1000;
 /// The judge's "cannot decide" sentinel.
@@ -187,7 +191,7 @@ impl Runtime {
     /// The interface-served gate: flip (or create) the owning A2A task to
     /// `input-required` and suspend the asker.
     #[cfg(feature = "a2a")]
-    fn human_gate(
+    pub(crate) fn human_gate(
         &mut self,
         caller: &super::tools::ToolCaller,
         question: String,

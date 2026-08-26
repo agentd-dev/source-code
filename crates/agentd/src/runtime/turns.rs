@@ -180,13 +180,38 @@ impl Runtime {
                     .any(|p| crate::registry::pattern_matches(p, &d.name))
             });
         }
+        // Which policy caller this plan is being built for. A plan is per
+        // turn, so this is fixed for every call the child will make.
+        let who = match caller {
+            Caller::Subagent { .. } => crate::config::v2::PolicyCaller::Subagent,
+            Caller::Workflow => crate::config::v2::PolicyCaller::Workflow,
+            // A principal's calls arrive over A2A and reach `execute_tool`
+            // directly; for plan purposes they are served like a root turn.
+            Caller::Root | Caller::Principal { .. } => crate::config::v2::PolicyCaller::Root,
+        };
+        let policies = &self.settings.security.policies;
         let mut internal = Vec::new();
         let mut routes = BTreeMap::new();
         for d in &defs {
             match self.registry.get(&d.name).map(|t| (t.class, &t.imp)) {
                 Some((ToolClass::Internal, _)) => internal.push(d.name.clone()),
                 Some((ToolClass::Mcp, crate::registry::Impl::Mcp { server, tool })) => {
-                    routes.insert(d.name.clone(), (server.clone(), tool.clone()));
+                    // A turn worker dials its MCP tools ITSELF, straight from
+                    // this route map, so a call routed here never reaches
+                    // `execute_tool` and never meets the policy list. A policy
+                    // table that covered root turns but not subagent turns
+                    // would be worse than none, because the operator would
+                    // believe they were covered — so anything a rule might
+                    // touch is served by the runtime instead. Gated tools pay
+                    // one round-trip; everything else keeps the fast path.
+                    let tags = self.registry.tags_of(std::slice::from_ref(&d.name));
+                    if !policies.is_empty()
+                        && crate::sec::policy::could_apply(policies, &d.name, &tags, who)
+                    {
+                        internal.push(d.name.clone());
+                    } else {
+                        routes.insert(d.name.clone(), (server.clone(), tool.clone()));
+                    }
                 }
                 _ => {}
             }
@@ -822,6 +847,10 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
             instruction: String::new(),
             output_contract: None,
             context_seed: Vec::new(),
+            // A turn worker's gating already happened when its plan was built:
+            // anything a policy might touch was left out of `mcp_routes` and
+            // put in `internal`, so there is nothing more to name here.
+            gated_tools: Vec::new(),
             intelligence: IntelConfig {
                 uri: self.intel_uri.clone(),
                 token: self.current_intel_bearer(),

@@ -50,6 +50,11 @@ pub(crate) type Up = Arc<Mutex<Stdout>>;
 /// indefinitely waiting for someone to walk back to their desk.
 const ELICITATION_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// How long a child waits for the supervisor's verdict on a gated tool call.
+/// Long, because the verdict may be a person deciding; bounded, because a
+/// child blocked forever is indistinguishable from a hung one.
+const GATED_TOOL_TIMEOUT: Duration = Duration::from_secs(24 * 3600);
+
 /// The in-child self-handler for a subagent. A subagent is a **flat child of the
 /// reactor**: it runs a ReAct loop over its granted MCP + code tools and reports
 /// its result, and it has **no** in-child orchestration self-tools — no nested
@@ -57,13 +62,64 @@ const ELICITATION_TIMEOUT: Duration = Duration::from_secs(300);
 /// Keeping delegation with the reactor is what makes the tree flat and its depth
 /// and concurrency caps enforceable from one place. `finish` is handled by the
 /// loop itself rather than the self-handler, so completion still works here.
-struct NoSelfTools;
+///
+/// It does hold one responsibility beyond that: the tools the supervisor
+/// GATED. A subagent dials its MCP servers itself, so a `security.policies`
+/// rule would never see those calls; the supervisor names the tools a rule
+/// might touch and this handler sends exactly those back up the existing
+/// `ToolRequest` channel instead of calling them locally. The supervisor
+/// re-evaluates the policy when the request arrives, so this is a routing
+/// decision, not a trust boundary — a child that ignored the list would still
+/// be refused, it would just fail later and less clearly.
+struct NoSelfTools {
+    /// Tool names to route up rather than call directly.
+    gated: Vec<String>,
+    /// The round-trip channel, when there is anything to route.
+    bridge: Option<GatedBridge>,
+}
+
+/// The pieces needed to send a `ToolRequest` and wait for its answer.
+struct GatedBridge {
+    up: Up,
+    replies: Arc<crate::subagent::replies::Replies>,
+    cancel: Arc<AtomicBool>,
+    timeout: Duration,
+}
+
 impl SelfHandler for NoSelfTools {
     fn tools(&self) -> Vec<crate::wire::intel::ToolDef> {
         Vec::new()
     }
-    fn handle(&mut self, _name: &str, _args: &serde_json::Value) -> Option<(String, bool)> {
-        None
+    fn handle(&mut self, name: &str, args: &serde_json::Value) -> Option<(String, bool)> {
+        if !self.gated.iter().any(|g| g == name) {
+            return None;
+        }
+        let b = self.bridge.as_ref()?;
+        let id = b.replies.next_id();
+        send_up(
+            &b.up,
+            &AgentMsg::ToolRequest {
+                id,
+                name: name.to_string(),
+                args: args.clone(),
+            },
+        );
+        let deadline = std::time::Instant::now() + b.timeout;
+        match b.replies.wait(id, deadline, &b.cancel) {
+            Some(crate::subagent::replies::Reply::Tool { result, is_error }) => {
+                let text = match &result {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                Some((text, is_error))
+            }
+            // No answer is not permission. A gated call whose verdict never
+            // arrived has not been approved.
+            _ => Some((
+                format!("tool {name:?} is gated by policy and the supervisor did not answer"),
+                true,
+            )),
+        }
     }
 }
 
@@ -258,7 +314,17 @@ pub fn run() -> i32 {
     };
 
     // A subagent has no in-child orchestration self-tools: the tree is flat.
-    let mut orch = NoSelfTools;
+    // Gated tools go back up; everything else the child calls itself. The
+    // timeout is generous because a gate may be waiting on a person.
+    let mut orch = NoSelfTools {
+        gated: payload.gated_tools.clone(),
+        bridge: (!payload.gated_tools.is_empty()).then(|| GatedBridge {
+            up: Arc::clone(&up),
+            replies: Arc::clone(&replies),
+            cancel: Arc::clone(&cancel),
+            timeout: GATED_TOOL_TIMEOUT,
+        }),
+    };
 
     // A warm continue-session lives across many events; a one-shot runs once.
     // Only the warm shape gets the all-down backoff, because it is expected to

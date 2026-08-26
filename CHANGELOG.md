@@ -5,6 +5,96 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## Unreleased — the runtime can address itself
+
+Eight primitives, each closing a gap that turned out to be a missing *edge*
+between two mechanisms agentd already had rather than a missing feature.
+
+### Anything inside the daemon can start a turn
+
+`message` (node) and `message.send` (tool) deliver into one of this instance's
+own conversations. Ten trigger kinds could start a run; nothing could start a
+turn, so the accumulated context — plan, loaded skills, compaction history —
+was addressable only from outside the process, over HTTP, by someone else.
+This adds a third producer of an event that already existed, so the delivery
+inherits durability, crash replay, the per-context lock and pressure shedding
+unchanged.
+
+The loop guard is hop depth, not volume: a run inherits the depth of the work
+that caused it and `limits.max_message_depth` (default 8) refuses a chain
+*before* the delivery is durable. `agent.on_workflow_finished: think` now
+delivers, so it finally differs from `note`.
+
+### The durable log is a wait condition
+
+`wait {on: event}` parks a run on a declared stream until an event matching a
+subject and a CEL `match` arrives — and `match` sees the run's own `inputs`
+beside the `event`, which is what makes correlation expressible at all. A
+timeout makes *absence* a declared branch. Waiters are grouped by stream so
+each event is read once per tick however many runs are parked, and waits are
+anchored at arm time with no `from: earliest`.
+
+### The daemon can react to itself
+
+`observability.runtime_events` mirrors selected event families onto a declared
+stream; `observability.audit.sink: [stream]` gives the audit trail its first
+supported path off the box. Families are a closed vocabulary, a family may be
+sampled, the queue is bounded and counts drops, and appends shed under
+pressure like any other admission.
+
+### A verdict on the tool call
+
+`security.policies` matches a call by name, tag, caller, principal or
+*arguments* — the only place an argument can be judged, since grants are name
+patterns — with verdicts allow / deny / ask / shadow. It covers subagents and
+turn workers as well as root, because a table that held for one and not the
+others would be worse than none. `shadow` refuses and says the call was held
+rather than fabricating a result; an unanswerable `ask` denies; an argument
+guard that will not compile is exit 2. This is also where the trifecta tags
+finally do work at runtime.
+
+### Attribution that travels
+
+`identity.autonomous_as` names who autonomous work is done as, so a trigger no
+longer drops the chain at its first hop. `a2a.principals[].labels` travels into
+the run, the MCP `_meta` (`agent/acting_for`, `agent/labels`) and the audit
+line, and `principals[].quotas.{rate,budget}` are enforced rather than merely
+parsed. Deliberately not multi-tenancy.
+
+### A run's logical identity
+
+`key:` names the thing a run is about and `concurrency.scope: key` counts
+against it — the difference between a queue and a per-entity lock.
+
+### The model as a named tier
+
+`intelligence.models` names each tier once, and `model:` on `agent`/`think`
+selects one. A tier points at a `services:` entry and may only narrow,
+inheriting its trifecta tags. Declared windows replace the guess from the model
+name; unknown tiers and fallback cycles are exit 2.
+
+### Workflows as tools
+
+A `tool:` block registers a workflow as a first-class contract, so a caller
+gets retry, breaker, idempotency and a human gate inside one apparent call.
+Startup config only, and tags are derived from what the steps reach rather than
+declared by the workflow author.
+
+### Fixed
+
+- the step cache parked its key in the slot every suspending kind overwrites,
+  so it never wrote for `agent`, `think`, `subagent`, `human`, `foreach` or
+  `wait` — the kinds expensive enough to need it;
+- `webhook.filter` was accepted by config and read by nothing; it now selects
+  deliveries, answering 202 for a drop rather than a 4xx that would earn
+  retries or a disabled endpoint;
+- `on_workflow_finished: think` was byte-identical to `note`;
+- `Registry::tags_of` had no callers, so trifecta tags gated at startup and
+  never at dispatch;
+- `a2a.principals[].quotas` were never enforced, and never checked for shape;
+- `Principal::as_caller` was scaffolding for per-caller tool surfaces on one
+  daemon — a design this project declined — and is removed.
+
 ## v1.1.1 — comments that describe the code
 
 Comments and documentation now explain the current logic — the rules,

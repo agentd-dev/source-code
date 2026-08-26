@@ -37,10 +37,16 @@ agentd --prompt "Summarize yesterday's failed deploys and open a ticket" \
 So a one-shot prompt runs with the **full root tool surface** — it can create a
 workflow, spawn a subagent, or write memory.
 
-`agent.wake_on` is a misnomer and deserves a warning. A subagent result or a
-failed workflow does not dispatch a turn — it appends a `[note]` to the root
-context, which the *next* turn happens to read. If nothing messages the agent
-afterwards, nobody ever reads the note.
+`agent.wake_on` selects *which* events are worth telling the agent about;
+`agent.on_workflow_finished` decides what telling means. `note` (the default)
+appends a `[note]` to the root context, which the *next* turn happens to read
+— so if nothing messages the agent afterwards, nobody reads it. `think`
+**delivers**, which starts a turn: the difference between leaving a message and
+making the call. A one-shot job deliberately does neither, since there is no
+standing agent to notify.
+
+Anything else that wants to start a turn uses the same door — the `message`
+node or the `message.send` tool. See [Waking the agent](#waking-the-agent).
 
 ### The dispatch gate
 
@@ -53,6 +59,39 @@ Every reactor iteration drains the turn queue under two independent limits:
   transcript a single-writer append log.
 
 A blocked job keeps its place in the queue.
+
+## Waking the agent
+
+For a long time an `a2a_message` had exactly two producers: the A2A listener
+and boot `--prompt`. That meant ten trigger kinds could start a *run*, and
+nothing inside the process could start a *turn* — the accumulated conversation,
+with its plan, its loaded skills and its compaction history, was addressable
+only from outside the daemon, over HTTP, by someone else.
+
+`message` (a workflow node) and `message.send` (a tool) are a third producer of
+the same event:
+
+```yaml
+brief:
+  kind: message
+  to: root                          # root | <context id> | new
+  text: "Overnight: {{ steps.gather.output.count }} open. Decide what matters."
+  wait: {for: reply, timeout: 30m}  # omit for fire-and-forget
+```
+
+Because it is the same event, the delivery takes the same three readers in the
+same order — a step suspended on the conversation, then a matching `a2a` start,
+then a turn — and inherits write-ahead durability, crash replay, the
+per-context lock, pressure shedding and the governor without any of them
+learning about this node. `wait: reply` parks on the existing message wait.
+
+The tool form is fire-and-forget by design: a subagent reporting something
+worth thinking about should not block on the agent it just woke. It also
+refuses to deliver into the conversation its own caller is running in, which is
+a turn talking to itself whichever way the reply goes.
+
+The chain is bounded by hop depth rather than volume — see
+[Message loops](node-registry.md#message-loops).
 
 ## Two staging passes before the model sees anything
 

@@ -181,6 +181,69 @@ each lives in [`docs/operations.md`](operations.md).
 
 ---
 
+## The runtime as a stream
+
+agentd emits a large dotted event vocabulary and, until now, exposed almost
+none of it to *itself*. "The breaker tripped" was a log line, not something a
+workflow could act on; audit records were written and then unreadable, since
+their kind is deliberately excluded from the manifest index. Remediation,
+paging, SLO accounting and compliance evidence all had to live outside the
+process.
+
+`observability.runtime_events` mirrors selected event families onto a declared
+stream, so they become ordinary `{kind: stream}` start nodes with the
+retention, subject globbing, CEL filters and exactly-once dedup those already
+have:
+
+```yaml
+streams:
+  _runtime:    {retention: {max_events: 5000,   max_age: 24h}}
+  _governance: {retention: {max_events: 200000, max_age: 400d}}
+
+observability:
+  runtime_events:
+    stream: _runtime
+    include: [breaker, intel, store, child]   # taken in full
+    sampled: [pressure]                       # 1-in-16
+  audit: {sink: [log, stream], stream: _governance}
+```
+
+The subject is the event name, so a consumer globs `breaker.*` the way it would
+any other stream. `audit.sink: [stream]` gives the audit trail its first
+supported path off the box — and makes compliance evidence a *scheduled
+workflow* that reads a window and ships it, rather than a subsystem in the
+binary.
+
+Families are a **closed vocabulary**: `include: [pressur]` is a startup error,
+not a filter that silently matches nothing.
+
+### Why not the event ring
+
+The obvious implementation would tee the in-memory `agentd://events` ring. That
+ring is explicitly lossy oldest-evicted and installed only under `--serve-mcp`
+with the `events` feature, so teeing it would produce silent gaps in exactly
+the consumer being sold, and in the default deployment would do nothing at all.
+This taps the emission itself, beside the existing ring and OTLP taps.
+
+### Budgeting its own volume
+
+An event system that does not budget itself becomes its own pressure source,
+and the refusals that matter most arrive in storms precisely when the
+constrained resource is what would be written to. Four bounds:
+
+- the queue between ticks is **fixed** and counts what it drops, keeping the
+  oldest — so the start of a storm survives and the count says how big it got;
+- a family may be **sampled** at 1-in-16, so `pressure.shed` need not share a
+  list with a once-a-week `config.reloaded`;
+- appends go through the ordinary admission path, so they **shed under
+  pressure** like everything else;
+- a refused append is dropped, never retried — telemetry queued behind a full
+  disk is a second outage, not a record.
+
+Capture is suspended while draining, because a stream at its retention ceiling
+logs a trim on *every* append: without that, one appended event would produce
+the next one forever, fastest exactly when the stream is already full.
+
 ## Tree correlation
 
 This is the whole trick: lineage is encoded *in the values*, so collectors

@@ -175,6 +175,74 @@ complementary — the entry list is what makes those rules derivable), and
 `observability.otel.endpoint` (telemetry export is operator plumbing;
 validation says so rather than implying coverage).
 
+## Policies: a verdict on the call
+
+Grants answer *may this caller reach this tool at all*, and they are name
+patterns. They cannot express "delete anything outside `/tmp`", or "a person
+signs off before any egress-tagged call" — and `agent.approval` only decides
+whether to honour a gate the *model* asked for. `security.policies` is the
+layer in between: an ordered list matched against the call itself, first match
+wins, no match is allow.
+
+```yaml
+security:
+  policies:
+    - match: {tool: "fs.delete*", args: "CEL: !args.path.startsWith('/tmp/')"}
+      action: deny
+    - match: {tags: [egress], caller: [subagent]}
+      action: ask
+      question: "{{caller}} wants {{tool}} with {{args}} — allow?"
+      on_timeout: deny
+    - match: {tool: "billing.*", principal: {role: user}}
+      action: deny
+```
+
+It hooks `execute_tool` — one chokepoint every call passes — deliberately
+*after* argument validation, so a guard judges arguments that already conform
+to the tool's schema rather than whatever the model emitted. It composes with
+the machinery either side rather than duplicating it: `tools.overrides` says
+**where** a call goes, this says **whether**, and `action: ask` suspends on the
+same deferred-human path `ask_human` and the `human` node already use. This is
+also where the trifecta tags finally do work at runtime rather than only
+folding at startup.
+
+An empty list is exactly the previous behaviour, for the cost of one
+`is_empty` check.
+
+### Every caller, or it is worse than nothing
+
+A policy table that held for root turns but not subagent turns would be worse
+than none, because the operator would believe they were covered. Two different
+bypasses exist and both are closed:
+
+- a **turn worker** dials its MCP tools from its own route map, so any tool a
+  rule might touch is left out of that map and served by the runtime instead;
+- a **subagent** is a separate process that connects to MCP servers itself, so
+  the supervisor names its gated tools in the spawn payload and the child
+  routes exactly those back up the existing tool-request channel.
+
+Gated tools pay one round-trip; everything else keeps the fast path. It is a
+routing decision, not a trust boundary — the parent re-evaluates the policy
+when the request arrives, so a child that ignored the list is still refused.
+
+### Three deliberate refusals
+
+**`shadow` never fabricates a result.** It says plainly that the call was held
+and no result exists. A schema-conformant fake would be reasoned over as real,
+and every later decision built on an observation that never happened — a
+strange thing for a fail-closed runtime to ship, and worse than refusing.
+
+**An `ask` with no interface attached denies.** A gate nobody could answer has
+not been approved, and running the call because no client happens to be
+connected would make the policy a suggestion. A policy `ask` also does *not*
+route through `agent.approval`, whose `auto` mode answers with a model judge —
+letting the agent approve the operator's own security gate.
+
+**An argument guard that will not compile is exit 2.** Silently treating it as
+no-match turns a `deny` into an allow at exactly the moment it was meant to
+bite, so a build without the `cel` feature refuses the config rather than
+evaluating the guard to nothing.
+
 ## The injection firewall
 
 The defense that does the real work is process isolation plus a distilled return. A

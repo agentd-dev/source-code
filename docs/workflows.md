@@ -47,7 +47,9 @@ file. The top-level keys are a closed set — anything else is a parse error.
 | `armed` | default `true`; `false` loads the definition without arming its triggers |
 | `inputs` | `{schema: <JSON Schema>}` — enforced when a run is created |
 | `outputs` | `{schema: …}` — the shape the run promises its caller; a `finish` that would complete the run with an output that does not match it fails the step instead |
-| `concurrency` | `{max_runs, on_overflow}` — default 4 runs, `queue` |
+| `concurrency` | `{max_runs, on_overflow, scope}` — default 4 runs, `queue`, `scope: workflow`. `scope: key` counts against `key` instead, which is the difference between a queue and a per-entity lock (see §keys). |
+| `key` | the logical thing a run is ABOUT, rendered from the trigger payload: `key: "{{ payload.account_id }}"`. Required by `concurrency.scope: key`. |
+| `tool` | `{name, mode, grant}` — register this workflow as a callable tool (see §workflow tools). Startup config only. |
 | `limits` | `{steps, tokens, deadline, budget}` for the whole run |
 | `priority` | `low\|normal\|high` (default `normal`) — contention weight: `low` admissions shed one pressure level early (at *warn*), and each tick schedules ready steps of higher-priority runs first. A tiebreak under scarcity, not a reservation. |
 | `unload` | `{policy: drain\|cancel\|detach, timeout}` — what happens to LIVE runs when this definition is retired (removed, replaced, or deleted). Default `drain`: they finish. See §retirement below. |
@@ -229,7 +231,7 @@ Invalid inputs are not an error you can catch: the event is logged as
 
 ## The node catalogue
 
-There are 71 kinds, and all of them are wired. The four A2A ones split by
+There are 72 kinds, and all of them are wired. The four A2A ones split by
 direction and by whether they block: `a2a` is a START node (an inbound message
 whose command matches begins a run), `a2a.send` notifies a peer without waiting,
 `a2a.wait` suspends until a message lands on a conversation, and `a2a.delegate`
@@ -396,7 +398,8 @@ variable named after the step id when `writes` is absent. `mode` is
 
 | Kind | Fields (**required** in bold) |
 |---|---|
-| `wait` | **`on`**, `server`, `uri`, `condition`, `signal`, `run`, `subagent`, `conversation`, `webhook`, `timeout`, `on_timeout` |
+| `wait` | **`on`**, `server`, `uri`, `condition`, `signal`, `run`, `subagent`, `conversation`, `webhook`, `stream`, `subject`, `match`, `timeout`, `on_timeout` |
+| `message` | **`to`**, `text`, `parts`, `wait`, `timeout`, `on_timeout` |
 | `sleep` | **`duration`** |
 | `join` | **`handles`**, `timeout`, `min`, `partials` |
 | `human` | **`question`**, `schema`, `to`, `timeout`, `reply_uri` |
@@ -531,8 +534,30 @@ A step that cannot complete now writes a durable
 `{kind, since_ms, deadline_ms?, …}` record into its state, goes `Suspended` and
 is checkpointed; a per-tick sweep resolves it. Nothing about a wait lives only in
 memory. `wait.on` accepts `resource`, `condition`, `signal`, `run`, `subagent`,
-`message`, `webhook` and `deadline` — `webhook` needs the `a2a` build feature, as
-does `a2a.delegate`.
+`message`, `event`, `webhook` and `deadline` — `webhook` needs the `a2a` build
+feature, as does `a2a.delegate`.
+
+`on: event` is the one that parks on the durable log:
+
+```yaml
+      await_ship:
+        kind: wait
+        on: event
+        stream: orders
+        subject: "order.shipped"
+        match: "CEL: event.data.id == inputs.order_id"
+        timeout: 24h
+        on_timeout: escalate          # absence IS the branch
+```
+
+A `stream` START's filter sees only the event, so there was nowhere to say
+"the one for the order *this* run is about" — which is why every correlation
+pattern needed two workflows plus hand-rolled bookkeeping. `match` sees
+`event`, `inputs` and `vars` together. The wait is anchored where the log stood
+when it armed, and there is deliberately no `from: earliest`: resolving on an
+event that predates the run would let the step succeed on work nobody had asked
+for, under an idempotency key covering a different world. Durable offsets
+belong to consumers.
 
 ```yaml
       approve:
@@ -795,6 +820,83 @@ and a key with a declared reducer is exempt from the race check entirely.
 
 Both parts are optional, and so is the block: a workflow with no `state`
 declaration gets untyped run vars and the heuristic concurrent-write check.
+
+## Keys: what a run is about
+
+Everything else in the runtime is keyed. Breakers are keyed, rate buckets are
+keyed, start state is keyed, webhook dedup is keyed, step idempotency is keyed.
+The run had only an id — no name for the *thing* it was about — which is why
+"never two runs for the same customer at once" had no expression: `max_runs`
+could count runs, but not runs about the same account.
+
+```yaml
+workflows:
+  - name: sync-account
+    key: "{{ payload.account_id }}"
+    concurrency: {scope: key, max_runs: 1, on_overflow: queue}
+```
+
+The distinction is the difference between a **queue** and a **lock**. Under the
+default `scope: workflow`, `max_runs: 1` serialises every account behind one
+run, so per-entity ordering meant one workflow definition per entity. Under
+`scope: key`, each account is serialised against itself and different accounts
+run in parallel.
+
+Two things are refused rather than guessed, because both would collapse
+silently into one bucket — the opposite of what was asked, and invisible until
+two entities collided in production:
+
+- `scope: key` with no `key:` template is a load error.
+- a firing whose key fails to render counts under the workflow scope, rather
+  than joining a shared "unkeyed" bucket that would serialise unrelated work.
+
+The rendered key is durable and appears on the `run.start` line, so a restart
+still knows which runs are about the same entity.
+
+## Workflow tools
+
+A workflow already carries a description, an input schema, an output schema and
+a definition hash — which is exactly a tool contract. `tool:` registers it as
+one:
+
+```yaml
+workflows:
+  - name: issue-refund
+    description: Refund an order. Above $100 the finance lead approves first.
+    inputs:  {schema: {type: object, required: [order_id, amount_cents], properties: {…}}}
+    outputs: {schema: {type: object, required: [refund_id]}}
+    tool:
+      name: billing.refund       # may not shadow an internal contract
+      mode: sync                 # sync parks the caller on the run; async returns a handle
+      grant: {root: true, workflows: true, subagents: true}
+    steps: {…}
+```
+
+What this adds over an MCP tool is everything the engine already has: a call
+that takes thirty minutes, survives a restart, and has retry, breaker,
+idempotency and a human gate *inside* it. It is also better for the
+lethal-trifecta fold — a subagent handed `billing.refund` spends its legs on
+one reviewed procedure instead of a whole server's tool surface — and the
+workflow's declared inputs become the tool's arguments, so a model sees the
+shape of what it is starting rather than the free-form object `workflow.run`
+could only offer.
+
+Two constraints keep it safe:
+
+**Startup config only.** The registry is built once and validated fail-closed.
+`workflow.create`/`update` are root-callable, so a root turn could otherwise
+mint itself a new tool name — or shadow one — with no operator in the loop. A
+`tool:` block from either is refused; the startup document is the only door. A
+name that shadows an internal contract, or that two workflows both claim, is
+exit 2.
+
+**Tags are derived, never declared.** A workflow author writing
+`tags: [sensitive, egress]` would make the one static instance-wide security
+gate something the agent-editable half of the config asserts about itself.
+Instead a workflow tool inherits the union of the tags of the tools its steps
+actually reach, plus `egress` for steps that reach outside by construction
+(`http`, `a2a.send`, `a2a.delegate`). What was derived is logged at startup, so
+an operator can inspect the conclusion.
 
 ## See also
 

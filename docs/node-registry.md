@@ -4,7 +4,7 @@ Every workflow node agentd implements, what it needs, and what it does. The
 tables are generated from the binary's own registry (`agentd --workflow-schema`),
 so the required-field columns are what the parser actually enforces.
 
-**71 kinds — 10 start nodes and 61 steps. All are implemented.** If this page and
+**72 kinds — 10 start nodes and 62 steps. All are implemented.** If this page and
 the binary ever disagree, the binary is right; regenerate from
 `agentd --workflow-schema`.
 
@@ -88,7 +88,7 @@ matches on.
 | `join` | `handles` | `timeout` `min` `partials` | Awaits async `handles` (from `workflow {mode: async}` or `subagent`). `min` and `partials` decide what "enough" means. |
 | `subgraph` | `body` | — | An inline nested graph. Scopes ids, so the same step names can repeat in different subgraphs. |
 | `workflow` | `name` | `inputs` `mode` `start` `version` `cascade` | Starts another workflow as a child run. `mode: sync` blocks, `async` returns a handle for `join`, `detached` forgets it. `cascade` propagates cancellation. |
-| `wait` | `on` | `server` `uri` `condition` `signal` `run` `subagent` `conversation` `webhook` `timeout` `on_timeout` | Suspends until `on` resolves: `resource | condition | signal | run | subagent | message | webhook`. Durable — a restart resumes the wait. `on_timeout: <step>` makes the deadline an EXPECTED branch: the named step runs (forced), the wait's dependents stay unfired, the run continues. A signal wait's output is `{signal, payload, from}`. |
+| `wait` | `on` | `server` `uri` `condition` `signal` `run` `subagent` `conversation` `webhook` `stream` `subject` `match` `timeout` `on_timeout` | Suspends until `on` resolves: `resource | condition | signal | run | subagent | message | event | webhook`. Durable — a restart resumes the wait. `on_timeout: <step>` makes the deadline an EXPECTED branch: the named step runs (forced), the wait's dependents stay unfired, the run continues. A signal wait's output is `{signal, payload, from}`. `on: event` parks on a declared `stream`, anchored where the log stood when it armed: `subject` globs, and the CEL `match` sees `event`, `inputs` and `vars` together — which is how a run waits for the reply about *its own* order rather than the first one to arrive. There is no `from: earliest`: resolving on an event that predates the run would break at-least-once for everything downstream. Its output is the event. |
 | `sleep` | `duration` | — | Suspends for `duration`. Durable: the timer survives a restart. |
 | `assert` | `condition` | `message` | Fails the run unless `condition` holds. A guard you want loud. |
 | `fail` | — | `message` `code` | Ends the run as failed with `message`/`code`. |
@@ -146,6 +146,7 @@ matches on.
 | `a2a.send` | `to` | `parts` `command` `args` `context` `timeout` `idempotency` `breaker` `rate` | Notifies a peer and continues — fire-and-forget. Completes when the peer ACCEPTS the message. `idempotency: true` pins the A2A `messageId` across retries so the peer can deduplicate. `command` + `args` send the TYPED DataPart the peer's `a2a` start matches on — deterministic dispatch, not prose the peer's model interprets. |
 | `a2a.delegate` | `peer` | `objective` `command` `args` `output_contract` `timeout` `idempotency` `breaker` `rate` | Delegates an objective to a peer and BLOCKS for the result. Request/response, where `a2a.send` is a notification. With `command` + `args` the payload is TYPED (and checked against the command's declared `schema` at the peer); the delegate blocks until the command's run finishes and returns its output. `idempotency: true` pins the `messageId` across retries. |
 | `a2a.wait` | — | `conversation` `timeout` | Suspends until a message arrives on a `conversation`. The reply half of `a2a.send`. |
+| `message` | `to` | `text` `parts` `wait` `timeout` `on_timeout` | Delivers into one of THIS instance's own conversations, so a run can hand work to the agent rather than only the reverse. `to` is a context id, `root`, or `new` (a fresh conversation). The delivery takes the same readers, durability and per-context lock as an inbound A2A message. `wait: reply` parks on the answer; without it the step completes once the delivery is durable and the turn happens on its own schedule. Chained deliveries are capped by `limits.max_message_depth` (default 8) — see [Loops](#message-loops). |
 | `workflow.signal` | `name` | `payload` `run` | Sends a named signal. Edge-triggered: the waiter must already be suspended. |
 | `workflow.wait` | `run` | `timeout` | Blocks until another `run` reaches a terminal status. |
 | `workflow.cancel` | `run` | `reason` | Cancels another `run` with a `reason`. |
@@ -204,6 +205,25 @@ restore:
 Effects can therefore run twice. Give a step whose effect must not repeat
 `on_replay: fail` (or `skip`), or make the underlying tool idempotent — every
 remote-effect step already carries a retry-stable idempotency key for that.
+
+## Message loops
+
+`message` closes a cycle the runtime did not previously have: a run can start a
+turn, and a turn can start a run. Left alone that re-arms forever —
+message → turn → `workflow.run` → finish → message — and it is not something
+pressure shedding can hold, because shedding queues new turns while the chain
+keeps adding more.
+
+The guard is **hop depth**, not volume. Twenty unrelated workflows greeting the
+operator are not a loop; one workflow greeting itself is. A run inherits the
+depth of the work that caused it, each delivery adds one, and a delivery past
+`limits.max_message_depth` (default 8) is refused **before it becomes durable**.
+The step fails and names the limit, so a chain that would have spun silently is
+a visibly broken workflow instead.
+
+Two refusals fall out of the same rule: `message.send` will not deliver into the
+conversation its own caller is running in, and `on_workflow_finished: think`
+continues the run's chain rather than starting a fresh one.
 
 ## Choosing between near-neighbours
 

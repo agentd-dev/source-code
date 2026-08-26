@@ -946,14 +946,15 @@ each path is equally reachable from env and flags (§1.1), so
 | `workflows` | Inline definitions, or `{name, file}` / `{name, uri}` / `{name, url, headers, timeout, allow_private}` references, or a `{dir, glob}` scan (§6). `security.workflows.immutable: true` locks the loaded set. |
 | `streams` | Declared event streams: `streams: {orders: {retention: {max_events: 10000, max_age: 7d}}}`. An `emit` step or `stream` start naming an undeclared stream is exit `2`. Events are durable in the store; retention trims from the head (`max_events` defaults to 10000). |
 | `goal` | The goal watchdog: `statement`, `check{via,condition,every}`, `stuck_after`, `on_achieved`, `on_stuck`. |
-| `limits` | `max_runs`, `run{steps,tokens,deadline}`, `step_timeout`, `inline_max_bytes`, `subagents{depth,breadth,total,rate}`. |
+| `limits` | `max_message_depth` (chained `message` deliveries; default 8), `max_runs`, `run{steps,tokens,deadline}`, `step_timeout`, `inline_max_bytes`, `subagents{depth,breadth,total,rate}`. |
 | `lifecycle` | `run_until`, `idle_grace`, `drain_timeout`, `run_id`, `exit_code_map`, `watch_config` (§6, §9). |
 | `a2a` | `listen` (`https://host:port`, loopback `http://`, or `unix:///path` for co-located peers — kernel-authenticated, no TLS), `tls{cert,key,client_ca}`, `bearer`, `principals[]`, `peers[]` (endpoints may also be `unix:///path`), `conversation_ttl`. |
 | `webhooks` | `listen`, `tls{}`, `default_auth{}` for `webhook` nodes. |
 | `interface` | The TUI/web-UI surface served on the A2A listener: `enabled`, `origins[]`, `display{}`, `pairing{}`, `debug`. |
 | `memory`, `context`, `knowledge`, `search`, `skills` | Working-memory caps, context window/compaction, and the MCP servers backing knowledge, search, and the skill catalogue. |
 | `observability` | `log_level`, `log_content`, `metrics_addr`, `health_file`, `events_ring`, `traceparent`, `report_file`, `otel{}`, `audit{sink}`. |
-| `security` | `allow_trifecta`, `tls_ca`, `cgroup{}`, `aauth{}`, `exec{}`, `workflows{immutable}`. |
+| `security` | `allow_trifecta`, `tls_ca`, `cgroup{}`, `aauth{}`, `exec{}`, `egress`, `workflows{immutable}`, `policies[]` (ordered verdicts on a tool call — see [security.md](security.md#policies-a-verdict-on-the-call)). |
+| `identity` | `autonomous_as` (who a schedule/webhook/stream firing is attributed to; default `system`) and `labels{}` carried with that work — see §15. |
 
 **The `store` section, and the default each instance shape gets.** `store.kind`
 picks the adapter: `mcp` (a coordination MCP server's `state.*` tools), `http` (a
@@ -1257,3 +1258,49 @@ to a `once → agent → finish` workflow, runs one turn, and exits:
 $ agentd --instruction "Summarise the incident." \
     --intelligence https://llm.internal/v1 --model my-model
 ```
+
+## 15. Identity — who work is done for
+
+A schedule, webhook, stream or `once` start carries no caller, so autonomous
+work used to pass no principal at all: "every effect names the human or the
+schedule that caused it" was false by construction, because the attribution
+chain was dropped at its very first hop.
+
+```yaml
+identity:
+  autonomous_as: "system:scheduler"       # default: system
+  labels: {tenant: internal}
+
+a2a:
+  principals:
+    - match: {sub: "*@acme.example"}
+      role: user
+      labels: {tenant: acme, cost_center: CC-42}
+      quotas:
+        rate: "30/1m"
+        budget: {windows: [{per: day, tokens: 200000}]}
+```
+
+What travels: the acting id and its labels reach the run record (`run.start`
+carries `acting_for`), the MCP `_meta` as `agent/acting_for` and
+`agent/labels` — so a server can finally authorize or attribute per user — and
+the audit line.
+
+**The quotas now bite.** `quotas.budget` becomes a governor scope beside
+`conversation:` and `run:`, and a run is charged to the principal it is *for*,
+not only to itself, so a per-person ceiling covers work someone started rather
+than only the turns they typed. `quotas.rate` is a real arrival limit, with
+operators exempt — locking out the person who administers the daemon during an
+incident is worse than the load they could generate. Both are also checked for
+*shape* at startup, so a typo is exit 2 rather than a ceiling that silently
+does nothing.
+
+**Labels are a closed, operator-declared domain.** They become durable governor
+scope keys and audit fields, and minting them from values arriving off the box
+would be the same unbounded-cardinality hazard the metrics layer already bans
+for labels, relocated into the manifest.
+
+This is an audit field plus quota enforcement — deliberately **not**
+multi-tenancy. agentd's answer to "a different caller needs a different
+surface" remains a different process, which gives isolation a registry filter
+sharing an address space with a prompt-injected turn cannot.

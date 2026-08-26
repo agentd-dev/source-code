@@ -167,6 +167,13 @@ pub enum Caller<'a> {
         allow: Option<&'a [String]>,
     },
     /// An A2A principal with a role and its explicit grants (patterns).
+    ///
+    /// Used to compute what a principal may SEE (`defs_for`). Inbound A2A
+    /// calls are authorized by the role matrix in `a2a::principals` rather
+    /// than through this arm, because a principal's reach is decided at the
+    /// protocol boundary before any tool is chosen; narrowing per principal
+    /// WITHIN one daemon is `security.policies`, whose `match: {principal}`
+    /// judges the call itself.
     Principal {
         role: Role,
         grants: &'a [String],

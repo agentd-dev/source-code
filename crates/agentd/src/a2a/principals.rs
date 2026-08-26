@@ -47,14 +47,6 @@ impl Principal {
         self.role == Role::Anonymous
     }
 
-    /// The registry `Caller` this principal presents.
-    pub fn as_caller(&self) -> crate::registry::Caller<'_> {
-        crate::registry::Caller::Principal {
-            role: self.role,
-            grants: &self.grants,
-        }
-    }
-
     /// May this principal invoke A2A method `method`?
     /// `op` is the command tool name for a command DataPart (else `None`).
     ///
@@ -141,9 +133,17 @@ impl Principal {
         }
     }
 
+    /// The governor scope this principal's spend is charged to.
     pub fn scope_key(&self) -> String {
-        format!("principal:{}", self.id)
+        scope_key_for(&self.id)
     }
+}
+
+/// The governor scope key for a principal id. One source for the format,
+/// because the runtime carries only the id once work is under way while the
+/// A2A layer still holds the whole `Principal`.
+pub fn scope_key_for(id: &str) -> String {
+    format!("principal:{id}")
 }
 
 /// The admin methods (operator-only).

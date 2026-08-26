@@ -866,7 +866,7 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
         let Some(budget) = self.principal_budgets.get(id).cloned() else {
             return Vec::new();
         };
-        let key = format!("principal:{id}");
+        let key = crate::a2a::principals::scope_key_for(id);
         self.governor.ensure_scope(&key, &budget);
         vec![key]
     }

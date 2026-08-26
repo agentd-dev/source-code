@@ -249,6 +249,65 @@ Example of the redaction (the token is set but never echoed):
 
 ---
 
+## Model tiers
+
+The model used to be one instance-global string. Choosing a cheap model for a
+classify step and a frontier one for a judgement call meant forking a subagent
+process purely to change it — `model` appeared in no node's field list, so
+writing it on a step was exit 2. The breaker was per *endpoint*, so a frontier
+and a cheap model behind one gateway shared one breaker and one spend pool.
+
+`intelligence.models` names each tier once:
+
+```yaml
+services:
+  frontier:
+    kind: intelligence
+    endpoint: https://api.example.com/v1
+    auth: {kind: oauth2, issuer: "https://id.example.com", grant: client_credentials}
+    tags: {"*": [sensitive]}            # the trifecta floor lives HERE, once
+    rate: "60/1m"
+    breaker: {failures: 3, cooldown: 30s}
+
+intelligence:
+  models:
+    big:   {service: frontier, model: big-model-1,   window: 200000, fallback: small,
+            pricing: {input_per_1k: 3.00, output_per_1k: 15.00}}
+    small: {service: frontier, model: small-model-3, window: 128000,
+            pricing: {input_per_1k: 0.25, output_per_1k: 1.25}}
+  default: big
+  preflight_model: small
+
+context: {summarize: {model: small}}
+
+workflows:
+  - name: triage
+    steps:
+      classify: {kind: think, model: small, prompt: "…"}
+      decide:   {kind: agent, model: big,   instruction: "…"}
+```
+
+A tier is **not** a second service catalogue. `services:` already names
+endpoints, auth, tags, rate and breaker; restating those here would be a
+parallel mechanism. A tier points *at* a `kind: intelligence` service and may
+only **narrow** — it inherits that service's trifecta tags and can never
+declare its own floor, so "make it cheaper" cannot quietly become a different
+security decision.
+
+A tier's declared `window` also replaces the compaction threshold's guess from
+the model *name*, which is a substring match and simply wrong for any provider
+whose naming does not happen to match.
+
+References resolve to the wire model at the edges, so a tier name never reaches
+a provider, and every reference is checked at startup: an unknown tier on a
+step, in `default`, in `preflight_model` or in `summarize.model` is exit 2
+rather than a run quietly asking for a model called `smal`. A `fallback` cycle
+is refused too — a degradation ladder that loops is a hang under exactly the
+conditions it exists to survive.
+
+`turn.model` puts the resolved model on the log line, because "how much did
+that cost, and on what" now has a per-turn answer.
+
 ## Resilience: multi-endpoint failover & the circuit breaker
 
 `AGENT_INTELLIGENCE` (or `--intelligence`) accepts an **ordered,

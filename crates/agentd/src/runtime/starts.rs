@@ -398,7 +398,10 @@ impl Runtime {
         // An A2A message carries its conversation and its tracking TASK; the
         // run must link to both (the task completes with the run's outcome —
         // that is what a peer's `a2a.delegate {command}` blocks on).
-        for k in ["conversation", "task"] {
+        // Fields the TRIGGER payload carries that belong on the run itself.
+        // `msg_depth` is here because a run started by a delivered message
+        // continues that chain; a trigger that carries none starts at zero.
+        for k in ["conversation", "task", "msg_depth"] {
             if let Some(v) = ev["payload"].get(k).filter(|v| !v.is_null()).cloned() {
                 ev[k] = v;
             }

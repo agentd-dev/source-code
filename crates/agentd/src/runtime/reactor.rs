@@ -851,6 +851,11 @@ impl Runtime {
                 "parts": ev.payload.get("parts").cloned().unwrap_or(Value::Null),
                 "text": ev.payload.get("text").cloned().unwrap_or(Value::Null),
                 "message_id": ev.payload.get("message_id").cloned().unwrap_or(Value::Null),
+                // The message-hop depth rides through this reader too. Without
+                // it a chain routed through an `a2a` start would reset to zero
+                // on every hop, and the cap would never bite — the run this
+                // fires can `message` again, and that is the same loop.
+                "msg_depth": ev.payload.get("msg_depth").cloned().unwrap_or(json!(0)),
             });
             self.log.info(
                 "start.a2a.fired",

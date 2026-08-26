@@ -167,6 +167,41 @@ fn each_hop_inherits_the_last_ones_depth() {
     );
 }
 
+/// The hop cap has to survive every READER a delivered message can take, not
+/// just the turn. A message that matches an `a2a` start fires a run, and that
+/// run can message again — so if the depth reset at that hop the chain would
+/// be unbounded through a path the cap never sees.
+#[test]
+fn the_depth_survives_a_delivery_that_fires_a_workflow() {
+    let (_code, log) = run(&format!(
+        "{BASE}agent: {{ name: m }}\n\
+         intelligence: {{ endpoints: \"mock:final\", model: mock }}\n\
+         limits: {{ max_message_depth: 2 }}\n\
+         lifecycle: {{ run_until: idle, idle_grace: 4s }}\n\
+         a2a: {{ }}\n\
+         workflows:\n\
+        \x20 - name: relay\n    steps:\n\
+        \x20     s: {{ kind: a2a }}\n\
+        \x20     m: {{ kind: message, to: relayed, text: \"round\", depends_on: [s] }}\n\
+        \x20     f: {{ kind: finish, depends_on: [m], status: completed }}\n\
+        \x20 - name: kick\n    steps:\n\
+        \x20     s: {{ kind: once }}\n\
+        \x20     m: {{ kind: message, to: relayed, text: \"start\", depends_on: [s] }}\n\
+        \x20     f: {{ kind: finish, depends_on: [m], status: completed }}\n"
+    ));
+    // The chain really does route through the `a2a` reader...
+    assert!(
+        log.contains("\"event\":\"start.a2a.fired\""),
+        "the delivery should have fired the a2a start\n{log}"
+    );
+    // ...and the depth kept counting across it. Depth 3 against a cap of 2 is
+    // the proof: a reset at that hop would have looped at depth 1 forever.
+    assert!(
+        log.contains("\"event\":\"message.too_deep\"") && log.contains("\"depth\":3"),
+        "the hop depth must survive the a2a reader\n{log}"
+    );
+}
+
 /// A message with neither text nor parts is a configuration mistake, and the
 /// step says so instead of delivering an empty turn.
 #[test]

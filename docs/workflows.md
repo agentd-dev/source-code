@@ -565,6 +565,7 @@ belong to consumers.
         depends_on: [draft]
         question: "Ship this release note?"
         schema: { type: object, properties: { approved: { type: boolean } } }
+        to: "*@release.example"        # who must answer; anyone else is refused
         timeout: 12h
       window:
         kind: wait
@@ -573,6 +574,14 @@ belong to consumers.
         signal: deploy-window-open
         timeout: 6h
 ```
+
+A gate's `schema` is **enforced**, not merely advertised to clients: a reply
+that does not match re-asks the person with the reason, so a gate that wants
+`{approved: boolean}` never lets the run proceed on "maybe later". `to` narrows
+*who* may answer — see [Addressed gates](node-registry.md#addressed-gates) for
+the matching forms, the operator-override rule and why an addressed gate is
+never auto-answered. Both live in the durable wait record, so a restart
+rebuilds the gate exactly as declared rather than a weaker one.
 
 Two sharp edges. `wait on: condition` evaluates its CEL against a much smaller
 namespace than the rest of the workflow — only `runs`, `subagents`, `now_ms` and

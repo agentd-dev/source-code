@@ -259,7 +259,11 @@ Both clients speak the same surface:
   workflow's `human` step) needs you, the transcript shows the question as an
   answerable row (`[reply to continue]`); just type your answer (it targets
   the newest gate; `#task-…` targets a specific one). Gates on workflow runs
-  survive daemon restarts. Configure what happens when NOBODY can answer with
+  survive daemon restarts, addressee and answer schema included. A gate
+  declaring `to:` is for a named decider: a reply from anyone else is refused
+  with an explanation and the gate stays open, and an operator answering one
+  is recorded as an override rather than as the addressee deciding. Configure
+  what happens when NOBODY can answer with
   `agent.ask_human_fallback`: `fail` (default), `wait` (park until the ask
   timeout), or `auto` — an LLM judge answers on the operator's behalf,
   conservatively, always marked as auto (it also fires when a rendered gate

@@ -93,7 +93,19 @@ declared by the workflow author.
   never at dispatch;
 - `a2a.principals[].quotas` were never enforced, and never checked for shape;
 - `Principal::as_caller` was scaffolding for per-caller tool surfaces on one
-  daemon — a design this project declined — and is removed.
+  daemon — a design this project declined — and is removed;
+- a human gate's enforcement lived only in the in-memory pending ask: the
+  durable wait record stored an empty detail while a comment claimed "the
+  definition's schema is reapplied by the step". Nothing reapplied it, so a
+  restart rebuilt a gate that accepted any shape — and, once addressees
+  existed, would have accepted any answerer. Both ride the wait record now;
+- `ask_human`'s contract disagreed with its implementation in both directions
+  at once. `to` was advertised and read by nothing, so a model could believe
+  it had addressed a question that in fact went to whoever was watching.
+  `recommend` was the inverse — read by the `approval: accept` path and
+  advertised nowhere, so under `additionalProperties: false` a model supplying
+  one was REFUSED, leaving that mode reachable only through a `default` buried
+  in the caller's schema. Both are advertised and read now.
 
 ## v1.1.1 — comments that describe the code
 

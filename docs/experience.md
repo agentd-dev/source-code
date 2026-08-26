@@ -403,9 +403,27 @@ terminal can delegate with nobody watching. Auto answers are marked as such in
 the task, log and audit stream.
 
 Gates on workflow **runs** survive a daemon restart, rebuilt from the durable
-task and the suspended step. A gate inside a **turn** does not: the asking child
-died with the process, so a late answer continues the conversation as a fresh
-turn rather than resuming the suspended tool call.
+task and the suspended step — including their `schema` and their addressee, so
+a restart never rebuilds a weaker gate than the one that was declared. A gate
+inside a **turn** does not: the asking child died with the process, so a late
+answer continues the conversation as a fresh turn rather than resuming the
+suspended tool call.
+
+### Who may answer
+
+By default, whoever holds the task. `to` narrows it to a named decider — a
+principal-id glob like `*@finance.example`, or `{role, labels}` — and a reply
+from anyone else is refused with an explanation while the gate stays open. That
+is what makes a gate's record worth keeping: "the finance lead approved this"
+means something only if someone else could not have satisfied it.
+
+Two consequences follow. An addressed gate is **never auto-answered**, whatever
+`agent.ask_human_fallback` or `agent.approval` say — a judge standing in for
+the named decider makes the record a lie. And an operator *can* still answer,
+because refusing them would be theatre when they can already rewrite the config
+or the store; instead the override is marked `operator_override` in the task,
+the log and the audit stream, and the audit line names the person who actually
+replied.
 
 Steering is a small closed verb set over the same surface: `/signal <name> [run]`
 fires a workflow signal, `/send <handle> <text>` messages a warm subagent,

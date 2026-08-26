@@ -206,6 +206,12 @@ same deferred-human path `ask_human` and the `human` node already use. This is
 also where the trifecta tags finally do work at runtime rather than only
 folding at startup.
 
+A policy gate has **no addressee**: it asks whoever is watching. Naming a
+decider for an operator-declared tool gate is the same feature the `human`
+node's `to` provides (see
+[Addressed gates](node-registry.md#addressed-gates)), but it belongs on the
+policy rule rather than being invented per call — so it is not there yet.
+
 An empty list is exactly the previous behaviour, for the cost of one
 `is_empty` check.
 

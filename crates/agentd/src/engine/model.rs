@@ -881,6 +881,25 @@ pub enum OnOverflow {
 pub struct Concurrency {
     pub max_runs: u32,
     pub on_overflow: OnOverflow,
+    /// What `max_runs` counts: every run of this workflow (`workflow`, the
+    /// default and today's behaviour), or every run ABOUT THE SAME THING
+    /// (`key`, using the workflow's `key:` template).
+    ///
+    /// The distinction is the difference between a queue and a lock. With
+    /// `scope: workflow`, `max_runs: 1` serialises every customer behind one
+    /// run, so per-entity ordering means one workflow definition per entity.
+    /// With `scope: key` each entity is serialised against itself and the
+    /// entities run in parallel.
+    #[serde(default)]
+    pub scope: ConcurrencyScope,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConcurrencyScope {
+    #[default]
+    Workflow,
+    Key,
 }
 
 impl Default for Concurrency {
@@ -888,6 +907,7 @@ impl Default for Concurrency {
         Concurrency {
             max_runs: 4,
             on_overflow: OnOverflow::Queue,
+            scope: ConcurrencyScope::Workflow,
         }
     }
 }
@@ -953,6 +973,16 @@ pub struct Workflow {
     pub inputs_schema: Option<Value>,
     #[serde(default)]
     pub concurrency: Concurrency,
+    /// The logical thing a run is ABOUT, rendered from the trigger payload
+    /// (`"{{payload.account_id}}"`).
+    ///
+    /// Everything else in the runtime is keyed — breakers, rate buckets, start
+    /// state, webhook dedup, step idempotency — but the run itself had no
+    /// logical name, only an id. That is why per-entity serialization was not
+    /// expressible: `max_runs` could count runs but not runs *about the same
+    /// account*.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
     #[serde(default)]
     pub limits: WorkflowLimits,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1140,6 +1170,7 @@ pub fn parse_workflow(doc: &Value) -> Result<Workflow, Vec<String>> {
         "priority",
         "unload",
         "durable",
+        "key",
     ];
     for key in obj.keys() {
         if !TOP.contains(&key.as_str()) {
@@ -1265,8 +1296,31 @@ pub fn parse_workflow(doc: &Value) -> Result<Workflow, Vec<String>> {
                     OnOverflow::Queue
                 }
             },
+            scope: match v.get("scope").and_then(Value::as_str) {
+                None | Some("workflow") => ConcurrencyScope::Workflow,
+                Some("key") => ConcurrencyScope::Key,
+                Some(o) => {
+                    errs.push(format!(
+                        "workflow {name:?}: concurrency.scope {o:?} must be workflow|key"
+                    ));
+                    ConcurrencyScope::Workflow
+                }
+            },
         },
     };
+    // `scope: key` without a `key:` template would silently collapse every run
+    // into one bucket — the opposite of what the operator asked for, and
+    // invisible until two entities collided in production.
+    let key = obj
+        .get("key")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|k| !k.trim().is_empty());
+    if concurrency.scope == ConcurrencyScope::Key && key.is_none() {
+        errs.push(format!(
+            "workflow {name:?}: concurrency.scope: key needs a `key:` template naming what a run is about"
+        ));
+    }
     let limits = match obj.get("limits") {
         None => WorkflowLimits::default(),
         Some(v) => WorkflowLimits {
@@ -1367,6 +1421,7 @@ pub fn parse_workflow(doc: &Value) -> Result<Workflow, Vec<String>> {
         armed,
         inputs_schema,
         concurrency,
+        key,
         limits,
         outputs_schema,
         steps,
@@ -2315,7 +2370,8 @@ pub fn workflow_schema() -> Value {
                     "reducer": {"enum": ["overwrite", "append", "merge", "union"],
                                 "description": "how concurrent writes to this key combine; declaring it makes concurrency a policy rather than a race"}}},
                 "description": "declared run variables — {key: {schema, reducer}}"},
-            "concurrency": {"type": "object", "properties": {"max_runs": {"type": "integer", "minimum": 1}, "on_overflow": {"enum": ["queue", "drop", "replace"]}}},
+            "concurrency": {"type": "object", "properties": {"max_runs": {"type": "integer", "minimum": 1}, "on_overflow": {"enum": ["queue", "drop", "replace"]}, "scope": {"enum": ["workflow", "key"], "description": "what max_runs counts: every run of this workflow (default), or every run about the same `key` — the difference between a queue and a per-entity lock"}}},
+            "key": {"type": "string", "description": "the logical thing a run is ABOUT, rendered from the trigger payload (e.g. \"{{payload.account_id}}\"); required by concurrency.scope: key"},
             "limits": {"type": "object", "properties": {"steps": {"type": "integer"}, "tokens": {"type": "integer"}, "deadline": {"type": "string"}, "budget": {"type": "object"}}},
             "steps": {"type": "object", "additionalProperties": {"$ref": "#/$defs/step"}, "minProperties": 1}
         },

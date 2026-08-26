@@ -1169,6 +1169,8 @@ fn unreachable_wf() -> std::sync::Arc<Workflow> {
     // Only reached if the definition vanished mid-scheduling; an empty
     // workflow makes `resolve_step` return None and the guard skips.
     std::sync::Arc::new(Workflow {
+        // A synthetic body workflow is never triggered, so it is about nothing.
+        key: None,
         state: Default::default(),
         name: String::new(),
         version: 3,

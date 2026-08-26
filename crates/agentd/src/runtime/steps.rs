@@ -455,10 +455,22 @@ impl Runtime {
         // Concurrency: a new run must fit both the workflow's own `max_runs`
         // and the instance-wide `limits.max_runs`; whichever binds first
         // decides the `on_overflow` outcome.
+        //
+        // `scope: key` counts only the runs about the SAME THING, which is the
+        // difference between a queue and a lock: `max_runs: 1` under
+        // `scope: workflow` serialises every customer behind one run, so
+        // per-entity ordering used to mean one workflow definition per entity.
+        // A firing whose key did not render counts under the workflow scope —
+        // sharing an "unkeyed" bucket with every other such firing would
+        // silently serialise unrelated work.
+        let this_key = ev.payload["key"].as_str();
+        let keyed = w.concurrency.scope == crate::engine::model::ConcurrencyScope::Key
+            && this_key.is_some();
         let live = self
             .runs
             .values()
             .filter(|r| r.workflow == name && !r.status.is_terminal())
+            .filter(|r| !keyed || r.key.as_deref() == this_key)
             .count() as u32;
         let global_live = self
             .runs
@@ -544,6 +556,7 @@ impl Runtime {
         // `message` inside it extends that chain rather than starting a fresh
         // one. Triggers carry nothing and so start at 0.
         run.msg_depth = ev.payload["msg_depth"].as_u64().unwrap_or(0) as u32;
+        run.key = ev.payload["key"].as_str().map(str::to_string);
         // Durable before anything runs — unless the workflow opted out of the
         // class entirely (`durable: false`): a memory-only run writes nothing,
         // here or at any checkpoint.
@@ -572,7 +585,7 @@ impl Runtime {
         self.log.info(
             "run.start",
             json!({"run": run_id, "workflow": name, "node": node, "inbox_event": ev.id,
-                   "acting_for": run.principal}),
+                   "acting_for": run.principal, "key": run.key}),
         );
         self.counters.runs_started += 1;
         crate::obs::metrics::record_run_started();

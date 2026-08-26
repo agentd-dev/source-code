@@ -198,6 +198,11 @@ pub struct RunState {
     /// operator are not a loop, and one workflow greeting itself is.
     #[serde(default)]
     pub msg_depth: u32,
+    /// The logical thing this run is about (the workflow's `key:`, rendered
+    /// against the trigger payload). Durable, so a restart still knows which
+    /// runs are about the same entity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
     #[serde(default)]
     pub attempt: u32,
     #[serde(default)]
@@ -263,6 +268,7 @@ impl RunState {
             children: Vec::new(),
             parent: None,
             msg_depth: 0,
+            key: None,
             attempt: 1,
             created: now,
             updated: now,

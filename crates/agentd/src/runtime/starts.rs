@@ -373,6 +373,28 @@ impl Runtime {
         self.set_start_state(workflow, node, st);
         let mut ev =
             json!({"workflow": workflow, "node": node, "payload": payload, "inputs": inputs});
+        // The logical thing this run is ABOUT, rendered here because this is
+        // the one moment the trigger payload exists and the run does not yet.
+        // A key that will not render is left absent rather than guessed: a run
+        // silently sharing the empty key with every other run is the opposite
+        // of per-entity serialization.
+        if let Some(tpl) = self.workflows.get(workflow).and_then(|w| w.key.clone()) {
+            let mut data = crate::engine::template::Data::new();
+            data.insert("payload".into(), ev["payload"].clone());
+            data.insert("inputs".into(), ev["inputs"].clone());
+            match crate::engine::template::render_str(&tpl, &data) {
+                Ok(Value::String(k)) if !k.trim().is_empty() => ev["key"] = json!(k),
+                Ok(other) if !other.is_null() => ev["key"] = json!(other.to_string()),
+                Ok(_) => self.log.warn(
+                    "start.key.empty",
+                    json!({"workflow": workflow, "node": node, "template": tpl}),
+                ),
+                Err(e) => self.log.warn(
+                    "start.key.invalid",
+                    json!({"workflow": workflow, "node": node, "err": e}),
+                ),
+            }
+        }
         // An A2A message carries its conversation and its tracking TASK; the
         // run must link to both (the task completes with the run's outcome —
         // that is what a peer's `a2a.delegate {command}` blocks on).

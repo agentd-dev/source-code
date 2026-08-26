@@ -449,6 +449,11 @@ impl Runtime {
             for t in self.timers.fire(&self.durable, now) {
                 self.on_timer(t);
             }
+            // 4.9. The daemon's own events, queued by the tap since the last
+            // tick, become appends — so a tripped breaker or a shed admission
+            // can start a run. Done BEFORE the inbox and the start poll so
+            // this tick's consumers see this tick's telemetry.
+            self.drain_runtime_events();
             // 5. The inbox.
             self.process_inbox();
             // 6. Start nodes + runs (+ suspended waits).

@@ -128,6 +128,63 @@ impl super::reactor::Runtime {
         Ok(seq)
     }
 
+    /// Append everything the runtime-events tap queued since the last tick.
+    ///
+    /// The tap runs on the logging hot path with no access to the state owner,
+    /// so it queues and this drains. That indirection is also what puts the
+    /// daemon's own telemetry behind the same pressure gate as every other
+    /// admission: under shedding these appends are refused like anything else,
+    /// which is the only reason a `pressure.shed` storm cannot amplify itself
+    /// into writes on the disk that caused it.
+    ///
+    /// A refused or failed append is dropped, never retried. Telemetry that
+    /// queues behind a full disk is a second outage, not a record.
+    pub(crate) fn drain_runtime_events(&mut self) {
+        let (events, dropped) = crate::obs::log::drain_runtime_tap();
+        if dropped > 0 {
+            // Say so rather than losing it silently: a gap the consumer cannot
+            // see is worse than no stream at all.
+            self.log
+                .warn("stream.tap.dropped", json!({"events": dropped}));
+        }
+        if events.is_empty() {
+            return;
+        }
+        // Everything below logs, and those logs must not become more events to
+        // append — see `tap_drain_guard`.
+        let _guard = crate::obs::log::tap_drain_guard();
+        let mut appended = 0usize;
+        let mut refused = 0usize;
+        for ev in events {
+            if ev.stream.is_empty() {
+                continue;
+            }
+            // `source` must name whoever CAUSED the event, not the tap, or the
+            // self-trigger rule cannot see a workflow watching its own
+            // completions — and `run.done` is exactly the event a watcher
+            // wants, so it would re-fire on its own run forever. Runtime
+            // events about a workflow already carry its name; everything else
+            // is attributed to the daemon.
+            let source = ev
+                .data
+                .get("workflow")
+                .and_then(Value::as_str)
+                .unwrap_or("_runtime")
+                .to_string();
+            let id = crate::state::ulid::new();
+            match self.append_event(&ev.stream, &ev.subject, None, ev.data, &id, &source) {
+                Ok(_) => appended += 1,
+                Err(_) => refused += 1,
+            }
+        }
+        if refused > 0 {
+            self.log.warn(
+                "stream.tap.refused",
+                json!({"events": refused, "appended": appended}),
+            );
+        }
+    }
+
     /// Advance every armed `stream` consumer: walk `offset+1..=seq`, fire a
     /// run per matching event, one durable start-state write per batch.
     /// Consumers hear EVERY producer on the stream — other workflows

@@ -1977,6 +1977,37 @@ pub struct Observability {
     pub events_ring: Option<u32>,
     pub audit: Audit,
     pub traceparent: Option<String>,
+    /// Mirror a selected subset of the daemon's own event vocabulary onto a
+    /// declared stream, so the runtime can react to itself: a tripped breaker,
+    /// a shed admission or an unhealthy child becomes an ordinary start node.
+    pub runtime_events: Option<RuntimeEvents>,
+}
+
+/// Which of the daemon's own events reach a stream, and at what rate.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct RuntimeEvents {
+    /// The declared stream events land on. Required.
+    pub stream: Option<String>,
+    /// Families taken in full (the segment before the first dot in an event
+    /// name). Validated against the closed vocabulary at startup.
+    pub include: Vec<String>,
+    /// Families taken at a sampled rate. A high-rate family cannot share a
+    /// list with a once-a-week one: `pressure.shed` arrives in storms exactly
+    /// when the disk it would be written to is the thing under pressure.
+    pub sampled: Vec<String>,
+    /// How many events may queue between ticks before the tap starts dropping
+    /// (and counting). Default [`DEFAULT_TAP_QUEUE`].
+    pub queue: Option<u32>,
+}
+
+/// The default bound on the runtime-event queue.
+pub const DEFAULT_TAP_QUEUE: u32 = 512;
+
+impl RuntimeEvents {
+    pub fn queue_cap(&self) -> usize {
+        self.queue.unwrap_or(DEFAULT_TAP_QUEUE) as usize
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -1992,6 +2023,10 @@ pub struct Otel {
 #[serde(deny_unknown_fields, default)]
 pub struct Audit {
     pub sink: Option<Vec<AuditSink>>,
+    /// The declared stream `sink: [stream]` appends to. Required with that
+    /// sink; audit records are otherwise written and then unreadable, since
+    /// `Kind::Audit` is deliberately not manifest-indexed.
+    pub stream: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -1999,6 +2034,11 @@ pub struct Audit {
 pub enum AuditSink {
     Log,
     Store,
+    /// Append to a declared stream — the supported path off the box, and the
+    /// one sink a workflow can consume: compliance evidence becomes a
+    /// scheduled run that reads a window and ships it, with no evidence
+    /// subsystem in the binary.
+    Stream,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -3658,6 +3698,71 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                 schema::CONFIG_VERSION
             ),
         );
+    }
+
+    // observability.runtime_events / audit.stream — both name a stream, and a
+    // stream that is not declared can never be appended to. Refusing here
+    // rather than at the first append keeps the failure at boot, where an
+    // operator is looking, instead of inside a storm.
+    if let Some(re) = &s.observability.runtime_events {
+        match re.stream.as_deref() {
+            None => err(
+                &mut d,
+                "observability.runtime_events: `stream` is required".into(),
+            ),
+            Some(name) if !s.streams.contains_key(name) => err(
+                &mut d,
+                format!(
+                    "observability.runtime_events.stream: {name:?} is not declared (add it under `streams:`)"
+                ),
+            ),
+            Some(_) => {}
+        }
+        if re.include.is_empty() && re.sampled.is_empty() {
+            err(
+                &mut d,
+                "observability.runtime_events: name at least one family in `include` or `sampled`"
+                    .into(),
+            );
+        }
+        for f in re.include.iter().chain(re.sampled.iter()) {
+            if !crate::obs::log::EVENT_FAMILIES.contains(&f.as_str()) {
+                err(
+                    &mut d,
+                    format!(
+                        "observability.runtime_events: unknown event family {f:?} (known: {})",
+                        crate::obs::log::EVENT_FAMILIES.join(", ")
+                    ),
+                );
+            }
+        }
+        for f in &re.sampled {
+            if re.include.contains(f) {
+                err(
+                    &mut d,
+                    format!(
+                        "observability.runtime_events: family {f:?} is in both `include` and `sampled` — pick one"
+                    ),
+                );
+            }
+        }
+    }
+    if let Some(sinks) = &s.observability.audit.sink
+        && sinks.iter().any(|x| matches!(x, AuditSink::Stream))
+    {
+        match s.observability.audit.stream.as_deref() {
+            None => err(
+                &mut d,
+                "observability.audit: `sink: [stream]` needs `stream: <name>`".into(),
+            ),
+            Some(name) if !s.streams.contains_key(name) => err(
+                &mut d,
+                format!(
+                    "observability.audit.stream: {name:?} is not declared (add it under `streams:`)"
+                ),
+            ),
+            Some(_) => {}
+        }
     }
 
     // intelligence

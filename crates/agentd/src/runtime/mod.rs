@@ -752,6 +752,46 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
             }
         }
     }
+    // Arm the runtime-events tap before the first tick, so the events of
+    // starting up are themselves observable. `audit.sink: [stream]` needs the
+    // tap too — it queues through the same drain — so arm it for that alone
+    // even when no families were selected.
+    {
+        let re = rt.settings.observability.runtime_events.clone();
+        let audit_stream = rt.settings.observability.audit.stream.clone();
+        let audit_wants_stream = rt
+            .settings
+            .observability
+            .audit
+            .sink
+            .as_ref()
+            .is_some_and(|s| {
+                s.iter()
+                    .any(|x| matches!(x, crate::config::v2::AuditSink::Stream))
+            });
+        if re.is_some() || (audit_wants_stream && audit_stream.is_some()) {
+            let (stream, include, sampled, cap) = match &re {
+                Some(r) => (
+                    r.stream.clone().unwrap_or_default(),
+                    r.include.clone(),
+                    r.sampled.clone(),
+                    r.queue_cap(),
+                ),
+                None => (
+                    String::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    crate::config::v2::DEFAULT_TAP_QUEUE as usize,
+                ),
+            };
+            crate::obs::log::install_runtime_tap(&stream, include.clone(), sampled.clone(), cap);
+            rt.log.info(
+                "stream.tap",
+                json!({"stream": stream, "include": include, "sampled": sampled,
+                       "queue": cap, "audit_stream": audit_stream}),
+            );
+        }
+    }
     // `lifecycle.run_until` decides whether this process is a job or a daemon:
     // `idle` is the job shape, `drained` is a daemon, and `auto` infers the job
     // shape when nothing can bring in outside work — no A2A listener and no

@@ -197,6 +197,223 @@ pub fn install_event_ring(cap: usize) {
     RING_INSTALLED.store(1, Ordering::Relaxed);
 }
 
+// ---------------------------------------------------------------------------
+// The runtime-events tap. The daemon emits a large dotted event vocabulary and
+// exposes almost none of it to ITSELF: "the breaker tripped" is a log line, not
+// something a workflow can react to. This tap turns a selected subset into
+// appends on a declared stream, so remediation, paging and SLO accounting
+// become ordinary `{kind: stream}` start nodes with the retention, subject
+// globbing, filters and dedup those already have.
+//
+// It is NOT the event ring. The ring is an explicitly lossy oldest-evicted
+// buffer installed only under `--serve-mcp` plus the `events` feature; teeing
+// it into a durable stream would produce silent gaps in exactly the consumer
+// being sold, and in the default deployment would do nothing at all. This taps
+// the emission itself — every `log.info`/`warn`/`error` call site — and is
+// opt-in per family, carrying metadata rather than payloads.
+//
+// Volume is the real hazard, because the refusals that matter most arrive in
+// storms precisely when the constrained resource is the thing being written
+// to. Three things bound it: the queue is FIXED and counts what it drops
+// (keeping the oldest, so the start of a storm survives and the count says how
+// big it got), a family may be marked `sampled` to contribute at 1/N, and the
+// drain goes through `append_event`, which sheds under pressure like every
+// other admission.
+
+/// The families a runtime event can belong to — the segment before the first
+/// dot in an event name. A closed vocabulary so `include: [pressur]` is a
+/// startup error rather than a filter that silently matches nothing.
+/// `families_cover_the_emitted_vocabulary` keeps this honest against the tree.
+pub const EVENT_FAMILIES: &[&str] = &[
+    "a2a",
+    "agent",
+    "audit",
+    "breaker",
+    "budget",
+    "cgroup",
+    "child",
+    "config",
+    "context",
+    "drain",
+    "goal",
+    "human",
+    "inbox",
+    "instance",
+    "instruction",
+    "intel",
+    "interface",
+    "knowledge",
+    "lifecycle",
+    "limit",
+    "loop",
+    "mcp",
+    "message",
+    "otel",
+    "plan",
+    "preflight",
+    "pressure",
+    "proc",
+    "prompt",
+    "registry",
+    "restore",
+    "run",
+    "skill",
+    "skills",
+    "start",
+    "step",
+    "store",
+    "stream",
+    "subagent",
+    "test",
+    "timer",
+    "tool",
+    "turn",
+    "wait",
+    "webhook",
+    "workflow",
+];
+
+/// One event awaiting its append: which stream, the subject (the event name),
+/// and the fields.
+pub struct TappedEvent {
+    pub stream: String,
+    pub subject: String,
+    pub data: Value,
+}
+
+/// How often a `sampled` family actually contributes.
+const SAMPLE_EVERY: u64 = 16;
+
+struct RuntimeTap {
+    /// Where selected runtime events land.
+    stream: String,
+    /// Families taken in full.
+    all: Vec<String>,
+    /// Families taken at 1-in-[`SAMPLE_EVERY`] — the high-rate ones, which
+    /// cannot share a list with a once-a-week `config.reloaded`.
+    sampled: Vec<String>,
+    queue: VecDeque<TappedEvent>,
+    cap: usize,
+    /// Dropped because the queue was full. Surfaced on the next drain, so a
+    /// storm is visible as a fact rather than as silence.
+    dropped: u64,
+    /// Per-family counters driving the sampling decision.
+    seen: u64,
+}
+
+static RUNTIME_TAP: Mutex<Option<RuntimeTap>> = Mutex::new(None);
+/// Cheap presence flag — the logging hot path avoids the mutex entirely when
+/// no tap is armed, which is the default.
+static TAP_ARMED: AtomicU64 = AtomicU64::new(0);
+
+/// Arm the tap. `all` and `sampled` are family names; `cap` bounds the queue.
+/// Idempotent — a second call replaces the selection and clears the queue.
+pub fn install_runtime_tap(stream: &str, all: Vec<String>, sampled: Vec<String>, cap: usize) {
+    let mut g = RUNTIME_TAP.lock().unwrap_or_else(|e| e.into_inner());
+    *g = Some(RuntimeTap {
+        stream: stream.to_string(),
+        all,
+        sampled,
+        queue: VecDeque::new(),
+        cap: cap.max(1),
+        dropped: 0,
+        seen: 0,
+    });
+    TAP_ARMED.store(1, Ordering::Relaxed);
+}
+
+/// Whether any tap is armed (the cheap check the audit sink also uses).
+pub fn runtime_tap_armed() -> bool {
+    TAP_ARMED.load(Ordering::Relaxed) != 0
+}
+
+/// Queue one event for a stream directly, bypassing family selection. The
+/// audit sink uses this: audit records are chosen by `audit.sink`, not by the
+/// runtime-event family list, and they go to their own stream.
+pub fn tap_direct(stream: &str, subject: &str, data: Value) {
+    if !runtime_tap_armed() {
+        return;
+    }
+    let mut g = RUNTIME_TAP.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(t) = g.as_mut() {
+        push_bounded(t, stream.to_string(), subject.to_string(), data);
+    }
+}
+
+fn push_bounded(t: &mut RuntimeTap, stream: String, subject: String, data: Value) {
+    if t.queue.len() >= t.cap {
+        // Drop the NEW one and keep the oldest: under a storm the first
+        // refusals say what started it, and the count says how bad it got.
+        t.dropped = t.dropped.saturating_add(1);
+        return;
+    }
+    t.queue.push_back(TappedEvent {
+        stream,
+        subject,
+        data,
+    });
+}
+
+/// Set while the drain is appending. The appends themselves log — a stream at
+/// its retention ceiling emits `stream.trimmed` on EVERY append — so without
+/// this the tap would feed itself: one appended event produces a log line that
+/// becomes the next tick's appended event, forever, and fastest exactly when
+/// the stream is already full. Telemetry must not observe its own plumbing.
+static TAP_DRAINING: AtomicU64 = AtomicU64::new(0);
+
+/// Suspend capture for the duration of the returned guard.
+pub fn tap_drain_guard() -> TapDrainGuard {
+    TAP_DRAINING.store(1, Ordering::Relaxed);
+    TapDrainGuard
+}
+
+pub struct TapDrainGuard;
+impl Drop for TapDrainGuard {
+    fn drop(&mut self) {
+        TAP_DRAINING.store(0, Ordering::Relaxed);
+    }
+}
+
+/// The capture hot path, called from [`Logger::event`] for every emission.
+fn capture_to_tap(event: &str, line: &Value) {
+    if !runtime_tap_armed() || TAP_DRAINING.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    let family = event.split('.').next().unwrap_or(event);
+    let mut g = RUNTIME_TAP.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(t) = g.as_mut() else { return };
+    let full = t.all.iter().any(|f| f == family);
+    let sampled = !full && t.sampled.iter().any(|f| f == family);
+    if !full && !sampled {
+        return;
+    }
+    if sampled {
+        t.seen = t.seen.wrapping_add(1);
+        if t.seen % SAMPLE_EVERY != 0 {
+            return;
+        }
+    }
+    let stream = t.stream.clone();
+    // Metadata, not payloads: the emitted line already excludes conversation
+    // content unless `log_content` is on, and this carries it as-is so a
+    // consumer reads the same fields an operator would see in the log.
+    push_bounded(t, stream, event.to_string(), line.clone());
+}
+
+/// Take everything queued since the last drain, plus how many were dropped.
+/// The reactor calls this once per tick and appends each to its stream.
+pub fn drain_runtime_tap() -> (Vec<TappedEvent>, u64) {
+    if !runtime_tap_armed() {
+        return (Vec::new(), 0);
+    }
+    let mut g = RUNTIME_TAP.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(t) = g.as_mut() else {
+        return (Vec::new(), 0);
+    };
+    let dropped = std::mem::take(&mut t.dropped);
+    (t.queue.drain(..).collect(), dropped)
+}
+
 /// A snapshot of the ring window an `agentd://events?after=<seq>` read returns:
 /// the entries with `seq > after` (after optional level/event-prefix filtering),
 /// plus the ring's current window bounds and cumulative `dropped`.
@@ -343,6 +560,9 @@ impl Logger {
         // load) unless a ring is installed. Best-effort: capture never blocks and
         // never fails the log write.
         capture_to_ring(level.as_str(), event, &value);
+        // Project the line onto the runtime-events stream when one is armed and
+        // this family was selected. A single relaxed atomic load otherwise.
+        capture_to_tap(event, &value);
         // Mirror to the OTLP logs exporter — a no-op (one atomic load) unless
         // `otel.logs` armed it. Best-effort, never blocks the write.
         crate::obs::otel::capture_log(
@@ -515,5 +735,70 @@ mod tests {
         // `limit` caps the slice oldest-first.
         let w = read_event_window(base, 1, None, &[]).expect("ring");
         assert_eq!(w.events.len(), 1);
+    }
+
+    /// The family list is a CLOSED vocabulary an operator's config is
+    /// validated against, so a family the tree emits but the list omits would
+    /// make `include: [that]` a startup error for an event that really exists.
+    /// Scanning the source keeps the list honest without anyone remembering
+    /// to: log an event under a family nobody has listed yet and this fails
+    /// until the family is added.
+    #[test]
+    fn families_cover_the_emitted_vocabulary() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        let mut missing: Vec<String> = Vec::new();
+        for f in files {
+            let src = std::fs::read_to_string(&f).unwrap_or_default();
+            for m in ["\n.info(\"", ".warn(\"", ".error(\"", ".debug(\""] {
+                let needle = m.trim_start_matches('\n');
+                let mut rest = src.as_str();
+                while let Some(i) = rest.find(needle) {
+                    rest = &rest[i + needle.len()..];
+                    let Some(end) = rest.find('"') else { break };
+                    let name = &rest[..end];
+                    // Event names are dotted lowercase identifiers; anything
+                    // else is a different call that happens to look similar.
+                    if name.is_empty()
+                        || !name.chars().all(|c| {
+                            c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '_'
+                        })
+                    {
+                        continue;
+                    }
+                    let family = name.split('.').next().unwrap_or(name);
+                    if !EVENT_FAMILIES.contains(&family) && !missing.contains(&family.to_string()) {
+                        missing.push(family.to_string());
+                    }
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "these event families are emitted but missing from EVENT_FAMILIES: {missing:?}"
+        );
+    }
+
+    /// Sorted and deduped, so the error message listing the known families
+    /// reads as a reference rather than as whatever order they were added in.
+    #[test]
+    fn the_family_list_is_sorted_and_unique() {
+        let mut sorted = EVENT_FAMILIES.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.as_slice(), EVENT_FAMILIES);
     }
 }

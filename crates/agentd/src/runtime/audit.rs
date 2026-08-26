@@ -79,6 +79,15 @@ impl Runtime {
             // an audit trail is metadata, not conversation content).
             self.log.info("audit", record.clone());
         }
+        if sinks.iter().any(|s| matches!(s, AuditSink::Stream))
+            && let Some(stream) = &self.settings.observability.audit.stream
+        {
+            // Queued, not appended: `audit` runs on `&self` from every
+            // authorization path, and the append needs the state owner. The
+            // tick drains it, which also puts these records behind the same
+            // pressure gate as every other admission.
+            crate::obs::log::tap_direct(stream, "audit", record.clone());
+        }
         if sinks.iter().any(|s| matches!(s, AuditSink::Store)) {
             // Append-only: a fresh ULID id per event (Kind::Audit is not indexed,
             // so this never conflicts and is never overwritten).

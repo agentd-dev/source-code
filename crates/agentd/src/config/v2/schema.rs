@@ -285,7 +285,13 @@ fn top_level_properties(
                 "report_file": { "type": "string" },
                 "events_ring": { "type": "integer", "minimum": 1 },
                 "audit": { "type": "object", "additionalProperties": false, "properties": {
-                    "sink": { "type": "array", "items": { "enum": ["log", "store"] } } } },
+                    "sink": { "type": "array", "items": { "enum": ["log", "store", "stream"] } },
+                    "stream": { "type": "string", "description": "the declared stream `sink: [stream]` appends to — the supported path off the box, and the only sink a workflow can consume" } } },
+                "runtime_events": { "type": "object", "additionalProperties": false, "properties": {
+                    "stream": { "type": "string", "description": "declared stream the selected events land on" },
+                    "include": { "type": "array", "items": { "type": "string" }, "description": "event families taken in full (the segment before the first dot); an unknown family is a startup error" },
+                    "sampled": { "type": "array", "items": { "type": "string" }, "description": "event families taken at 1-in-16 — for high-rate families that arrive in storms" },
+                    "queue": { "type": "integer", "minimum": 1, "description": "how many events may queue between ticks before the tap drops and counts (default 512)" } } },
                 "traceparent": { "type": "string" } } }));
     m.insert("security".to_string(), json!({ "type": "object", "additionalProperties": false, "properties": {
                 "allow_trifecta": { "type": "boolean" },

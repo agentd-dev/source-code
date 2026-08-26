@@ -260,10 +260,25 @@ impl Runtime {
                         );
                     }
                     ToolOutcome::Deferred(kind) => {
+                        // The gate's ENFORCEMENT travels in the durable wait
+                        // record, not just in the in-memory pending ask. A
+                        // restart rebuilds the pending from this record, so
+                        // anything omitted here is silently dropped on
+                        // restart — which for `schema` meant a gate that
+                        // demanded `{decision: "file"|"hold"}` would accept
+                        // "maybe later" after a restart, and for `to` would
+                        // let anyone holding the task answer a gate that
+                        // named a decider.
+                        let mut detail = json!({});
+                        for k in ["schema", "to"] {
+                            if let Some(v) = spec.get(k).filter(|v| !v.is_null()) {
+                                detail[k] = v.clone();
+                            }
+                        }
                         self.suspend_wait(
                             run_id,
                             step_id,
-                            wait_record("human", json!({}), step.timeout_ms),
+                            wait_record("human", detail, step.timeout_ms),
                         );
                         self.push_pending(super::reactor::PendingTool {
                             target: Target::Step(run_id.to_string(), step_id.to_string()),

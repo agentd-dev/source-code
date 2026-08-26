@@ -887,13 +887,59 @@ impl Runtime {
                 .iter()
                 .position(|p| matches!(&p.kind, PendingKind::Human { task, .. } if task == tid))
         {
+            // The ADDRESSEE, if the gate named one. Enforced here for the same
+            // reason the answer schema is enforced: a gate that names a decider
+            // and then accepts anyone records something that did not happen.
+            //
+            // An operator is not exempted silently — they are exempted VISIBLY.
+            // Refusing them outright would be theatre, since an operator can
+            // already rewrite the config, the store or the definition; what
+            // actually matters is that the record names who really answered,
+            // so an override is marked as one and audited as one.
+            let addressee = match &self.pending[i].kind {
+                PendingKind::Human { addressee, .. } => addressee.clone(),
+                _ => None,
+            };
+            let mut via = "human";
+            if let Some(a) = &addressee
+                && !a.matches(principal)
+            {
+                if !principal.is_operator() {
+                    let want = a.describe();
+                    self.log.info(
+                        "human.answer.not_addressed",
+                        json!({"task": tid, "from": principal.id, "addressee": want}),
+                    );
+                    self.audit_a2a(
+                        "SendMessage",
+                        None,
+                        principal,
+                        "not_addressed",
+                        json!({"task": tid, "addressee": want}),
+                        None,
+                    );
+                    // The gate stays OPEN and the answerer is told why, rather
+                    // than their reply vanishing into the conversation.
+                    return err_obj(
+                        ::mcp::rpc::INVALID_PARAMS,
+                        &format!(
+                            "this decision is for {want}; your answer was not recorded and the gate is still open"
+                        ),
+                    );
+                }
+                via = "operator_override";
+                self.log.warn(
+                    "human.answer.override",
+                    json!({"task": tid, "by": principal.id, "addressee": a.describe()}),
+                );
+            }
             // Every attached client sees the answer (the cross-client transcript).
             self.feed_push(
                 "message",
                 FeedVis::Owner(Some(principal.id.clone())),
                 json!({"contextId": ctx, "taskId": tid, "messageId": message_id, "principal": principal.id, "text": text}),
             );
-            self.human_answer(i, &text, "human");
+            self.human_answer(i, &text, via, Some(&principal.id.clone()));
             return json!({"task": self.tasks.get(tid).map(Task::to_a2a).unwrap_or(Value::Null)});
         }
         let (task_id, ctx_id) = match existing {

@@ -314,6 +314,85 @@ fn a_workflow_human_node_gates_the_run_task_and_the_reply_is_the_step_output() {
     std::fs::remove_file(&cfg).ok();
 }
 
+/// A gate that names a decider is only worth declaring if someone else cannot
+/// satisfy it. An OPERATOR can — refusing them would be theatre, since they
+/// can already rewrite the config, the store or the definition — but the
+/// override is marked and audited, so the record still names who really
+/// decided rather than implying the addressee did.
+#[test]
+fn an_operator_answering_someone_elses_gate_is_recorded_as_an_override() {
+    let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
+    let extra = "workflows:\n  - name: approve\n    steps:\n      s: {kind: manual}\n      gate: {kind: human, question: \"Approve the refund?\", to: \"*@finance.example\", depends_on: [s]}\n      f: {kind: finish, depends_on: [gate], output: \"refunded\"}\n";
+    let (daemon, addr, cfg) = spawn_bound(|port| base_config(&llm.uri, port, true, extra));
+
+    let started = command(&addr, 1, "workflow.run", json!({"name": "approve"}));
+    let task_id = started["task"]["id"].as_str().unwrap().to_string();
+    wait_task(&addr, &task_id, 10, "run gate", |t| {
+        t["status"]["state"] == "TASK_STATE_INPUT_REQUIRED"
+    });
+
+    // The loopback caller is an operator, and is NOT the addressee.
+    rpc(
+        &addr,
+        2,
+        "SendMessage",
+        json!({"message": {"messageId": "m2", "taskId": task_id, "parts": [{"text": "approved"}]},
+               "configuration": {"blocking": false}}),
+    );
+    wait_task(&addr, &task_id, 10, "run completion", |t| {
+        t["status"]["state"] == "TASK_STATE_COMPLETED"
+    });
+    let log = daemon.stderr();
+    assert!(
+        log.contains("\"event\":\"human.answer.override\""),
+        "an operator answering another's gate must be marked as an override\n{log}"
+    );
+    assert!(
+        log.contains("operator_override"),
+        "and the answer must be recorded as one, not as the addressee deciding\n{log}"
+    );
+    std::fs::remove_file(&cfg).ok();
+}
+
+/// The gate's enforcement lives in the DURABLE wait record, not only in the
+/// in-memory pending ask — a restart rebuilds the pending from that record, so
+/// anything missing from it is silently dropped on restart. That mattered
+/// before this was fixed: a gate demanding `{decision: …}` would accept
+/// anything after a restart, and one naming a decider would accept anyone.
+#[test]
+fn a_gates_addressee_and_schema_are_durable() {
+    let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
+    let extra = "workflows:\n  - name: approve\n    steps:\n      s: {kind: manual}\n      gate: {kind: human, question: \"Approve?\", to: \"*@finance.example\", schema: {type: object, properties: {ok: {type: boolean}}}, depends_on: [s]}\n      f: {kind: finish, depends_on: [gate], output: \"done\"}\n";
+    let (_daemon, addr, cfg) = spawn_bound(|port| base_config(&llm.uri, port, true, extra));
+
+    let started = command(&addr, 1, "workflow.run", json!({"name": "approve"}));
+    let task_id = started["task"]["id"].as_str().unwrap().to_string();
+    wait_task(&addr, &task_id, 10, "run gate", |t| {
+        t["status"]["state"] == "TASK_STATE_INPUT_REQUIRED"
+    });
+
+    // Read the run back: the suspended step's wait record must carry both, or
+    // a restart would rebuild a weaker gate than the one that was declared.
+    let ws = command(&addr, 2, "workflow.status", json!({}));
+    let run_id = ws["task"]["artifacts"][0]["parts"][0]["text"]
+        .as_str()
+        .and_then(|t| serde_json::from_str::<Value>(t).ok())
+        .and_then(|v| v["runs"][0]["run"].as_str().map(str::to_string))
+        .expect("run id");
+    let run = command(&addr, 3, "run.get", json!({"run": run_id}));
+    let wait = &run["run"]["steps"]["gate"]["wait"];
+    assert_eq!(wait["kind"], "human", "{run}");
+    assert_eq!(
+        wait["to"], "*@finance.example",
+        "the addressee must survive a restart\n{run}"
+    );
+    assert!(
+        wait["schema"]["properties"]["ok"].is_object(),
+        "the answer schema must survive a restart\n{run}"
+    );
+    std::fs::remove_file(&cfg).ok();
+}
+
 #[test]
 fn fallback_fail_errors_the_ask_immediately_and_the_model_carries_on() {
     // No interface block at all (fallback default = fail): the ask errors,

@@ -73,6 +73,18 @@ impl Runtime {
         // The declared answer shape, carried so the reply can be checked
         // against it rather than merely advertised to clients.
         let schema = args.get("schema").cloned().filter(|v| !v.is_null());
+        // Who must answer. A malformed `to` is refused rather than dropped: a
+        // gate that looks routed and is not is worse than one that never
+        // claimed to be.
+        let addressee = match args.get("to").filter(|v| !v.is_null()) {
+            None => None,
+            Some(v) => match crate::a2a::principals::Addressee::parse(v) {
+                Ok(a) => Some(a),
+                Err(e) => {
+                    return ToolOutcome::Ready(Value::String(format!("ask_human: {e}")), true);
+                }
+            },
+        };
 
         // The approval policy decides whether to ask AT ALL. It is checked
         // before availability, because "do not interrupt me" is a decision the
@@ -80,6 +92,13 @@ impl Runtime {
         // exist.
         match self.settings.agent.approval {
             crate::config::v2::Approval::Ask => {}
+            // An ADDRESSED gate is never auto-answered, whatever the approval
+            // policy says. The point of naming a decider is that the record is
+            // true; a model judge standing in for the finance lead makes it a
+            // lie, and the operator who set `approval: auto` was making a
+            // statement about the agent's own asks, not about a gate that
+            // names someone.
+            _ if addressee.is_some() => {}
             crate::config::v2::Approval::Accept => {
                 // Accept what the ask RECOMMENDS. With nothing recommended
                 // there is nothing to accept, and inventing an answer to a
@@ -121,6 +140,7 @@ impl Runtime {
                     standalone: false,
                     auto_fired: true,
                     schema,
+                    addressee: None,
                 });
             }
             crate::config::v2::Approval::Auto => {
@@ -133,6 +153,7 @@ impl Runtime {
                     standalone: false,
                     auto_fired: true,
                     schema,
+                    addressee: None,
                 });
             }
         }
@@ -145,7 +166,7 @@ impl Runtime {
 
         if available {
             #[cfg(feature = "a2a")]
-            return self.human_gate(caller, question, deadline_ms, schema);
+            return self.human_gate(caller, question, deadline_ms, schema, addressee);
         }
         let _ = caller;
         // No channel to ask on: take the configured fallback.
@@ -171,6 +192,7 @@ impl Runtime {
                     standalone: false,
                     auto_fired: false,
                     schema: schema.clone(),
+                    addressee: addressee.clone(),
                 })
             }
             AskHumanFallback::Auto => {
@@ -183,6 +205,7 @@ impl Runtime {
                     standalone: false,
                     auto_fired: true,
                     schema: schema.clone(),
+                    addressee: None,
                 })
             }
         }
@@ -197,6 +220,7 @@ impl Runtime {
         question: String,
         deadline_ms: u64,
         schema: Option<Value>,
+        addressee: Option<crate::a2a::principals::Addressee>,
     ) -> super::tools::ToolOutcome {
         use super::children::ChildKind;
         use super::tools::ToolOutcome;
@@ -299,6 +323,7 @@ impl Runtime {
             standalone,
             auto_fired: false,
             schema,
+            addressee,
         })
     }
 
@@ -326,7 +351,18 @@ impl Runtime {
 
     /// Resolve pending ask `i` with an answer. `via` marks who decided
     /// (`"human"` / `"auto"`) in the task, the log and the audit stream.
-    pub(crate) fn human_answer(&mut self, i: usize, text: &str, via: &str) {
+    /// `answered_by` is the principal who actually replied. The audit line
+    /// used to carry `via` — "human" or "auto" — in the principal field, which
+    /// says HOW a gate was answered and not by WHOM. An addressed gate makes
+    /// that load-bearing: "the finance lead approved" is only a record if the
+    /// record names them.
+    pub(crate) fn human_answer(
+        &mut self,
+        i: usize,
+        text: &str,
+        via: &str,
+        answered_by: Option<&str>,
+    ) {
         let p = self.pending.remove(i);
         let PendingKind::Human {
             task,
@@ -396,7 +432,7 @@ impl Runtime {
                 action: "ask_human.answered",
                 target: json!({"task": task}),
                 outcome: "undelivered",
-                principal: Some(via),
+                principal: answered_by.or(Some(via)),
                 role: None,
                 request_id: None,
             });
@@ -422,13 +458,18 @@ impl Runtime {
             self.task_sync(&task);
         }
         let _ = standalone;
-        self.log
-            .info("human.answered", json!({"task": task, "via": via}));
+        self.log.info(
+            "human.answered",
+            json!({"task": task, "via": via, "by": answered_by}),
+        );
+        // The record names WHO, not just how: an addressed gate is only worth
+        // declaring if the audit line can be read back as "this person decided
+        // this".
         self.audit(super::audit::AuditEvent {
             action: "ask_human.answered",
             target: json!({"task": task}),
             outcome: via,
-            principal: Some(via),
+            principal: answered_by.or(Some(via)),
             role: None,
             request_id: None,
         });
@@ -647,7 +688,7 @@ impl Runtime {
         match result["answer"].as_str() {
             Some(a) if !a.trim().is_empty() && a.trim() != UNDECIDED => {
                 let answer = a.trim().to_string();
-                self.human_answer(i, &answer, "auto");
+                self.human_answer(i, &answer, "auto", None);
             }
             Some(_) => self.human_fail(i, "ask_human: the auto judge could not decide (UNDECIDED)"),
             None => {
@@ -665,7 +706,17 @@ impl Runtime {
     #[cfg(feature = "a2a")]
     pub(crate) fn rebuild_human_asks(&mut self) {
         use crate::a2a::tasks::{Link, State};
-        let gates: Vec<(String, String, String, String, u64)> = self
+        // (task, run, step, question, deadline, schema, addressee)
+        type RestoredGate = (
+            String,
+            String,
+            String,
+            String,
+            u64,
+            Option<Value>,
+            Option<crate::a2a::principals::Addressee>,
+        );
+        let gates: Vec<RestoredGate> = self
             .tasks
             .values()
             .filter(|t| t.state == State::InputRequired)
@@ -682,12 +733,27 @@ impl Runtime {
                         .get("deadline_ms")
                         .and_then(Value::as_u64)
                         .unwrap_or_else(|| now_ms() + ASK_TIMEOUT.as_millis() as u64);
-                    Some((t.id.clone(), id.clone(), step_id, question, deadline_ms))
+                    // The gate's enforcement, read back from the durable wait
+                    // record: a restart must not weaken a gate.
+                    let schema = wait.get("schema").cloned().filter(|v| !v.is_null());
+                    let addressee = wait
+                        .get("to")
+                        .filter(|v| !v.is_null())
+                        .and_then(|v| crate::a2a::principals::Addressee::parse(v).ok());
+                    Some((
+                        t.id.clone(),
+                        id.clone(),
+                        step_id,
+                        question,
+                        deadline_ms,
+                        schema,
+                        addressee,
+                    ))
                 }
                 _ => None,
             })
             .collect();
-        for (task, run, step, question, deadline_ms) in gates {
+        for (task, run, step, question, deadline_ms, schema, addressee) in gates {
             self.log.info(
                 "human.ask.restored",
                 json!({"task": task, "run": run, "step": step}),
@@ -701,9 +767,8 @@ impl Runtime {
                     deadline_ms,
                     standalone: false,
                     auto_fired: false,
-                    // A gate re-armed on restore: the definition's schema is
-                    // reapplied by the step, not carried in the wait record.
-                    schema: None,
+                    schema,
+                    addressee,
                 },
                 started_ms: now_ms(),
             });

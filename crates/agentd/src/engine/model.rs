@@ -1950,18 +1950,23 @@ fn parse_step(
                 ));
             }
         }
-        // `human.to` and `human.reply_uri` are accepted and then ignored — the
-        // gate is answered over A2A by whoever holds the task. Rather than
-        // pretend to route, refuse them: a field that silently does nothing is
-        // worse than one that does not exist.
+        // `human.to` names WHO must answer, and is enforced when the reply
+        // lands. `reply_uri` is still refused: routing a reply to a URI is a
+        // different thing entirely and nothing implements it, and a field that
+        // silently does nothing is worse than one that does not exist.
         "human" => {
-            for f in ["to", "reply_uri"] {
-                if spec.contains_key(f) {
-                    errs.push(format!(
-                        "{at}: human.{f} is not implemented — a gate is answered over A2A by \
-                         whoever holds the task; remove it (see docs/node-registry.md)"
-                    ));
-                }
+            if spec.contains_key("reply_uri") {
+                errs.push(format!(
+                    "{at}: human.reply_uri is not implemented — a gate is answered over A2A; \
+                     use `to` to name who must answer (see docs/node-registry.md)"
+                ));
+            }
+            // A malformed addressee is a load error rather than a gate that
+            // looks routed and is not.
+            if let Some(v) = spec.get("to")
+                && let Err(e) = crate::a2a::principals::Addressee::parse(v)
+            {
+                errs.push(format!("{at}: human.to: {e}"));
             }
         }
         "finish" => {
@@ -2559,6 +2564,44 @@ mod tests {
 
     fn wf(doc: Value) -> Result<Workflow, Vec<String>> {
         parse_workflow(&doc)
+    }
+
+    /// `human.to` names who must answer and is enforced when the reply lands,
+    /// so a malformed one is a LOAD error: a gate that looks routed and is not
+    /// is exactly the failure the field exists to prevent. `reply_uri` stays
+    /// refused — nothing implements it.
+    #[test]
+    fn a_human_gates_addressee_is_checked_at_load() {
+        let gate = |to: Value| {
+            wf(json!({"name": "w", "steps": {
+                "s": {"kind": "manual"},
+                "g": {"kind": "human", "question": "ok?", "to": to, "depends_on": ["s"]},
+                "f": {"kind": "finish", "depends_on": ["g"]}}}))
+        };
+        assert!(gate(json!("*@finance.example")).is_ok());
+        assert!(gate(json!({"role": "user", "labels": {"team": "finance"}})).is_ok());
+        // Names nobody / names everybody / a typo that would widen it.
+        for bad in [
+            json!(""),
+            json!({}),
+            json!({"role": "anonymous"}),
+            json!({"role": "auditor"}),
+            json!({"rolle": "user"}),
+            json!(7),
+        ] {
+            let e = gate(bad.clone()).unwrap_err();
+            assert!(
+                e.iter().any(|m| m.contains("human.to")),
+                "{bad} should be refused at load, got {e:?}"
+            );
+        }
+        // `reply_uri` is a different thing and nothing implements it.
+        let e = wf(json!({"name": "w", "steps": {
+            "s": {"kind": "manual"},
+            "g": {"kind": "human", "question": "ok?", "reply_uri": "https://x", "depends_on": ["s"]},
+            "f": {"kind": "finish", "depends_on": ["g"]}}}))
+        .unwrap_err();
+        assert!(e.iter().any(|m| m.contains("reply_uri")), "{e:?}");
     }
 
     #[test]

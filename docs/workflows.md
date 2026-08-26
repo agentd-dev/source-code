@@ -402,7 +402,7 @@ variable named after the step id when `writes` is absent. `mode` is
 | `message` | **`to`**, `text`, `parts`, `wait`, `timeout`, `on_timeout` |
 | `sleep` | **`duration`** |
 | `join` | **`handles`**, `timeout`, `min`, `partials` |
-| `human` | **`question`**, `schema`, `to`, `timeout`, `reply_uri` |
+| `human` | **`question`**, `schema`, `to`, `timeout` |
 | `workflow` | **`name`**, `inputs`, `mode`, `start`, `version`, `cascade` |
 | `workflow.signal` | **`name`**, `payload`, `run` |
 | `workflow.wait` / `.cancel` | **`run`**, `timeout`, `reason` |

@@ -868,7 +868,11 @@ impl Runtime {
             {
                 let deadline =
                     now_ms() + verdict.timeout_ms.unwrap_or(super::human::ASK_TIMEOUT_MS);
-                return self.human_gate(caller, question, deadline, None);
+                // A policy gate has no addressee: it asks whoever is watching.
+                // Naming a decider for an operator-declared tool gate is the
+                // same feature, but it belongs on the policy rule rather than
+                // being invented here.
+                return self.human_gate(caller, question, deadline, None, None);
             }
         }
         // Nobody to ask. `on_timeout` decides, and it defaults to deny: a gate

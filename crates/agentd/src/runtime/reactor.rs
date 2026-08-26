@@ -91,6 +91,11 @@ pub enum PendingKind {
         /// `{decision: "file"|"hold"}` must also refuse "maybe later", or the
         /// run proceeds on an answer it never asked for.
         schema: Option<Value>,
+        /// Who must answer (`to:`). `None` ⇒ whoever holds the task, which is
+        /// the ordinary case. Enforced when the answer lands, for the same
+        /// reason the schema is: a gate that names a decider and then accepts
+        /// anyone records something that did not happen.
+        addressee: Option<crate::a2a::principals::Addressee>,
     },
 }
 

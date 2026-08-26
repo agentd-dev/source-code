@@ -642,10 +642,11 @@ pub fn contracts() -> Vec<Contract> {
     c(
         "ask_human",
         "human",
-        "Ask a person a question and wait for the answer. The question reaches whoever is watching this agent's tasks — there is no addressee — and the answer is CHECKED against `schema`, so a reply that does not match is rejected and the person is asked again with the reason.",
+        "Ask a person a question and wait for the answer. The answer is CHECKED against `schema`, so a reply that does not match is rejected and the person is asked again with the reason. By default the question reaches whoever is watching this agent's tasks; `to` names who must answer, and a reply from anyone else is refused.",
         obj(
             json!({
                 "question": s("The question"),
+                "to": {"description": "Who must answer: a principal-id glob (\"*@finance.example\"), or {id, role, labels} — all conditions must hold. Anyone else is refused and the gate stays open. Use it when the DECISION belongs to a particular person; omit it when any watcher will do."},
                 "schema": {"type": "object", "description": "The answer's shape, as a JSON Schema. Enforced on the reply, not merely advertised: build it for the decision you actually need. A single-property schema also lets a person answer in plain language (\"yes\" for {approved: boolean})."},
                 "recommend": {"description": "The answer you would choose if nobody replies. Used only when the operator set `agent.approval: accept`; otherwise a person still decides."},
                 "timeout": s("Duration"),
@@ -902,15 +903,17 @@ mod tests {
     use super::*;
 
     /// `ask_human`'s contract has to say what the implementation does, in both
-    /// directions. It drifted apart in both at once: `to` was advertised and
-    /// read by nothing, so a model could believe it had addressed a question
-    /// that in fact went to whoever was watching; and `recommend` was read by
-    /// the `approval: accept` path but not advertised, so — under
-    /// `additionalProperties: false` — a model supplying one was REFUSED, and
-    /// that mode was reachable only through a `default` buried in the schema.
+    /// directions. It once drifted apart in both at the same time: `to` was
+    /// advertised and read by nothing, so a model could believe it had
+    /// addressed a question that in fact went to whoever was watching; and
+    /// `recommend` was read by the `approval: accept` path but not advertised,
+    /// so — under `additionalProperties: false` — a model supplying one was
+    /// REFUSED, leaving that mode reachable only through a `default` buried in
+    /// the schema.
     ///
     /// A field that silently does nothing and a field that silently cannot be
-    /// used are the same defect pointing in opposite directions.
+    /// used are the same defect pointing in opposite directions. Both are now
+    /// advertised AND read; `to` is enforced when the answer lands.
     #[test]
     fn ask_human_advertises_exactly_what_it_reads() {
         let c = contracts()
@@ -918,29 +921,26 @@ mod tests {
             .find(|c| c.name == "ask_human")
             .expect("ask_human exists");
         let props = c.input["properties"].as_object().expect("properties");
-        assert!(
-            !props.contains_key("to"),
-            "a gate is answered by whoever holds the task; advertising an              addressee promises routing that does not happen"
-        );
-        assert!(
-            props.contains_key("recommend"),
-            "the approval: accept path reads `recommend`, so a model must be              able to supply one"
-        );
-        // And the schema really is strict, which is what makes an unadvertised
+        for f in ["question", "schema", "to", "recommend", "timeout"] {
+            assert!(props.contains_key(f), "ask_human must advertise {f:?}");
+        }
+        // The schema really is strict, which is what makes an unadvertised
         // field unusable rather than merely undocumented.
         assert_eq!(c.input["additionalProperties"], serde_json::json!(false));
+        for args in [
+            json!({"question": "ship it?", "recommend": {"approved": true}}),
+            json!({"question": "ship it?", "to": "*@finance.example"}),
+            json!({"question": "ship it?", "to": {"role": "user", "labels": {"team": "finance"}}}),
+        ] {
+            assert!(
+                crate::jsonschema::validate(&c.input, &args).is_ok(),
+                "must validate: {args}"
+            );
+        }
         assert!(
-            crate::jsonschema::validate(
-                &c.input,
-                &json!({"question": "ship it?", "recommend": {"approved": true}})
-            )
-            .is_ok(),
-            "a recommendation must validate"
-        );
-        assert!(
-            crate::jsonschema::validate(&c.input, &json!({"question": "x", "to": "user:alice"}))
+            crate::jsonschema::validate(&c.input, &json!({"question": "x", "nonsense": 1}))
                 .is_err(),
-            "an addressee must be refused, not accepted and dropped"
+            "an unknown field is still refused"
         );
     }
 

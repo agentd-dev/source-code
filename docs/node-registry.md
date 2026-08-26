@@ -164,7 +164,7 @@ matches on.
 | `summarize` | `input` | `length` `prompt` `skills` | Shortens `input` to `length`. |
 | `judge` | `input` `rubric` | `prompt` `skills` | Scores `input` against a `rubric`. |
 | `route` | `input` `choices` | `prompt` `skills` | Picks one of `choices` for `input`. The model-driven alternative to `switch`. |
-| `human` | `question` | `schema` `to` `timeout` `reply_uri` | Asks a person `question` and suspends durably until they answer. `to` targets a channel; the answer can arrive after a restart. |
+| `human` | `question` | `schema` `to` `timeout` | Asks a person `question` and suspends durably until they answer — the answer can arrive after a restart. `schema` is ENFORCED on the reply: a mismatch re-asks with the reason rather than being accepted. `to` names **who must answer** (see [Addressed gates](#addressed-gates)); omit it and any watcher may answer. `reply_uri` is refused at load — nothing implements it. |
 
 ---
 
@@ -205,6 +205,52 @@ restore:
 Effects can therefore run twice. Give a step whose effect must not repeat
 `on_replay: fail` (or `skip`), or make the underlying tool idempotent — every
 remote-effect step already carries a retry-stable idempotency key for that.
+
+## Addressed gates
+
+A `human` gate — and `ask_human` — normally reaches whoever is watching this
+agent's tasks. `to` narrows that to a named decider:
+
+```yaml
+approve:
+  kind: human
+  question: "Refund {{ inputs.order_id }} for {{ inputs.amount }}?"
+  schema: {type: object, required: [approved], properties: {approved: {type: boolean}}}
+  to: "*@finance.example"                      # a principal-id glob
+  # or, when identity is better described than enumerated:
+  # to: {role: user, labels: {team: finance}}
+  timeout: 24h
+  on_timeout: escalate
+```
+
+A reply from anyone else is **refused with an explanation** and the gate stays
+open, rather than the answer vanishing into the conversation. Conditions are
+ANDed, so adding one always narrows — an operator tightening a gate never
+widens it by accident. Labels are the durable form (people change, teams do
+not) and come from `a2a.principals[].labels`.
+
+Three declarations are load errors rather than accepted-and-ignored, because
+each produces a gate that *looks* routed and is not: one that names nobody
+(`to: {}`), one that names `role: anonymous` — precisely the identity nothing
+vouches for — and any typo in a field or role name.
+
+An addressed gate is **never auto-answered**, whatever `agent.approval` says. A
+model judge standing in for the finance lead makes the record a lie, and an
+operator who set `approval: auto` was making a statement about the agent's own
+asks, not about a gate that names someone.
+
+**An operator can still answer**, and this is deliberate. Refusing them would
+be theatre — an operator can already rewrite the config, the store or the
+definition — so what matters instead is that it is *visible*: the answer is
+recorded as `operator_override`, logged, and audited under the id of whoever
+actually replied. The audit line names the person rather than "human", which
+is what makes "the finance lead approved this refund" a record instead of a
+claim.
+
+Both the addressee and the answer schema live in the run's **durable wait
+record**, so a restart rebuilds the gate exactly as declared. That matters more
+than it sounds: a gate whose enforcement lived only in memory would quietly
+weaken on restart, accepting anyone and anything.
 
 ## Message loops
 

@@ -1,0 +1,33 @@
+{
+  "_comment": "Entries to add to SchemaStore's src/api/json/catalog.json (see contrib/README.md). Submitted as a PR to github.com/SchemaStore/schemastore; once merged, VS Code, JetBrains and yaml-language-server apply these by filename with no user configuration.",
+  "entries": [
+    {
+      "name": "agentd configuration",
+      "description": "Configuration for agentd, a durable MCP-native agent runtime",
+      "fileMatch": [
+        ".agentd.yml",
+        ".agentd.yaml",
+        "agentd.yml",
+        "agentd.yaml",
+        "*.agentd.yml",
+        "*.agentd.yaml"
+      ],
+      "url": "https://agentd.dev/schema/config.json",
+      "versions": {
+        "1": "https://agentd.dev/schema/config-1.json"
+      }
+    },
+    {
+      "name": "agentd workflow",
+      "description": "A standalone agentd workflow definition (the same document a config's `workflows:` entry carries inline)",
+      "fileMatch": [
+        "*.agentd-workflow.yml",
+        "*.agentd-workflow.yaml"
+      ],
+      "url": "https://agentd.dev/schema/workflow.json",
+      "versions": {
+        "3": "https://agentd.dev/schema/workflow-3.json"
+      }
+    }
+  ]
+}

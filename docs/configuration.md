@@ -53,6 +53,14 @@ with the YAML extension):
 JetBrains IDEs: *Settings → Languages & Frameworks → Schemas and DTDs → JSON
 Schema Mappings*. Neovim with `yamlls` takes the same `yaml.schemas` map.
 
+**By filename, with no setup at all.** VS Code's YAML extension, JetBrains and
+`yaml-language-server` all read the [SchemaStore](https://www.schemastore.org)
+catalog by default, so a registered schema applies from the filename alone. The
+entries to submit are in `contrib/schemastore-catalog-entry.json`, with the
+process and the review gotchas in `contrib/README.md`. Until that lands, use
+the modeline or `yaml.schemas` above — they work today and override the
+catalog anyway.
+
 **Inline workflows complete too.** A `workflows:` entry accepts either a
 reference (`file`/`uri`/`url`/`dir`) or a whole definition, and the config
 schema folds the workflow document's own properties in — so `steps`, every node
@@ -926,7 +934,7 @@ project config makes `agentd` work with no flags at all:
 ```console
 $ cd ~/work/triage     # contains .agentd.yml
 $ agentd --validate-config
-{"event":"config.valid","files":["./.agentd.yml"],"schema":"2"}
+{"event":"config.valid","files":["./.agentd.yml"],"schema":"1"}
 ```
 
 Three rules keep it from being surprising:

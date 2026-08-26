@@ -315,7 +315,7 @@ startup runs, so a bad file fails in CI instead of at rollout:
 
 ```console
 $ agentd --validate-config -c /etc/agentd/ops.yaml
-{"event":"config.valid","files":["/etc/agentd/ops.yaml"],"schema":"2"}
+{"event":"config.valid","files":["/etc/agentd/ops.yaml"],"schema":"1"}
 
 $ agentd --validate-config -c /etc/agentd/broken.yaml
 {"event":"config.invalid","msg":"a2a.listen on a non-loopback address needs client auth: a2a.tls.client_ca, a2a.bearer, and/or interface.pairing"}

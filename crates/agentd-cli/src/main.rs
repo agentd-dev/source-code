@@ -262,7 +262,13 @@ see docs/configuration.md."
             }
             eprintln!(
                 "{}",
-                json!({"event": "config.valid", "schema": "2", "files": loaded.files.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>()})
+                // The document version this config was validated against, from
+                // the one constant that defines it — it was hardcoded "2" and
+                // kept saying so after the reset to `config_version: "1"`,
+                // which is exactly the kind of drift a literal invites.
+                json!({"event": "config.valid",
+                       "schema": agentd::config::v2::schema::CONFIG_VERSION,
+                       "files": loaded.files.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>()})
             );
             exit::SUCCESS
         }

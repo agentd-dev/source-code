@@ -2089,6 +2089,14 @@ impl Runtime {
                 return;
             }
         };
+        // `model:` on an `agent`/`think` node: cost tiering inside one
+        // workflow, without forking a subagent process just to change a model
+        // string. Read here, because `spec` is shadowed by the `TurnSpec`
+        // below.
+        let node_model = spec
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         let limits = spec.get("limits").cloned().unwrap_or(json!({}));
         let max_steps = limits
             .get("steps")
@@ -2147,6 +2155,7 @@ impl Runtime {
             max_tokens,
             deadline_ms,
             agent_path: format!("run/{run_id}/{step_id}"),
+            model: node_model,
         };
         match self.spawn_turn(launch) {
             Ok(node) => {

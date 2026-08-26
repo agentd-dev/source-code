@@ -217,7 +217,15 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
             return crate::exit::USAGE;
         }
     };
-    let model = settings.intelligence.model.clone().unwrap_or_default();
+    // The instance's model, resolved through the tier catalogue: `default`
+    // names a tier, `model` may name a tier or be a literal. Resolving here
+    // means every downstream consumer sees the wire name a provider
+    // understands, and only the config surface deals in tier names.
+    let model = settings
+        .intelligence
+        .default_reference()
+        .map(|r| settings.intelligence.wire_model(&r))
+        .unwrap_or_default();
     // Resolve `intelligence.headers` once here — they are applied per dial —
     // plus an optional OAuth credential provider that refreshes its bearer.
     // A header whose secret cannot be resolved is dropped rather than sent
@@ -444,13 +452,25 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
     let (reap_tx, reap_rx) = std::sync::mpsc::channel();
     let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("agentd"));
 
-    let model_window = settings.context.model_window.unwrap_or_else(|| {
-        if model.is_empty() {
-            tokens::DEFAULT_MODEL_WINDOW
-        } else {
-            tokens::window_for_model(&model)
-        }
-    });
+    let model_window = settings
+        .context
+        .model_window
+        // A tier that declares its window replaces the guess from the model
+        // NAME, which is a substring match and simply wrong for any provider
+        // whose naming does not happen to match.
+        .or_else(|| {
+            settings
+                .intelligence
+                .default_reference()
+                .and_then(|r| settings.intelligence.tier(&r).and_then(|t| t.window))
+        })
+        .unwrap_or_else(|| {
+            if model.is_empty() {
+                tokens::DEFAULT_MODEL_WINDOW
+            } else {
+                tokens::window_for_model(&model)
+            }
+        });
     // Pressure watches the FILE store's filesystem (a memory/mcp/http store's
     // durability does not live on this disk). `min_free` defaults to 256MB:
     // a checkpoint failure at ENOSPC halts the daemon, so at that point

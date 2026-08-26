@@ -105,7 +105,16 @@ fn top_level_properties(
                 "type": "object", "additionalProperties": false,
                 "properties": {
                     "endpoints": { "oneOf": [ { "type": "array", "items": { "type": "string" } }, { "type": "string" } ], "description": "ordered endpoint list (failover); one comma-separated string is accepted" },
-                    "model": { "type": "string" },
+                    "model": { "type": "string", "description": "the default model — a declared `models:` tier name, or a literal model string" },
+                    "models": { "type": "object", "description": "named model tiers: cost/quality tiering inside one workflow without forking a process. A tier points AT a `services:` entry and may only narrow — it inherits that service's trifecta tags and can never declare its own floor.", "additionalProperties": {
+                        "type": "object", "additionalProperties": false, "required": ["model"], "properties": {
+                            "model": { "type": "string", "description": "the wire model name sent to the provider" },
+                            "service": { "type": "string", "description": "a `services:` entry of kind: intelligence supplying endpoint, auth and tags" },
+                            "window": { "type": "integer", "minimum": 1, "description": "this model's context window, so compaction stops guessing from the model NAME" },
+                            "fallback": { "type": "string", "description": "the tier to degrade to — a ladder that walks down instead of failing" },
+                            "pricing": { "type": "object", "additionalProperties": false, "properties": { "input_per_1k": { "type": "number" }, "output_per_1k": { "type": "number" } } } } } },
+                    "default": { "type": "string", "description": "the tier used when nothing names one" },
+                    "preflight_model": { "type": "string", "description": "the tier preflight runs on — a recurring fixed cost that does not need the answering model" },
                     "dialect": { "enum": ["openai", "anthropic", "bedrock"], "description": "wire dialect; bedrock = native Amazon Bedrock Converse (pair with auth.kind=aws)" },
                     "token": secret,
                     "token_file": { "type": "string" },

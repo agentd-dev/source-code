@@ -1107,6 +1107,7 @@ impl Runtime {
             max_tokens: self.settings.limits.run.tokens(),
             deadline_ms: 300_000,
             agent_path: format!("think/{ctx_id}"),
+            model: None,
         };
         self.spawn_turn(launch)
     }

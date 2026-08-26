@@ -39,6 +39,9 @@ pub(crate) struct TurnLaunch {
     pub max_tokens: u64,
     pub deadline_ms: u64,
     pub agent_path: String,
+    /// A model REFERENCE for this turn — a declared tier name or a literal
+    /// model string. `None` inherits the instance default.
+    pub model: Option<String>,
 }
 
 impl Runtime {
@@ -392,6 +395,7 @@ impl Runtime {
             max_tokens: self.settings.limits.run.tokens(),
             deadline_ms: self.settings.limits.run.deadline().as_millis() as u64,
             agent_path: format!("turn/{ctx_id}"),
+            model: None,
         };
         match self.spawn_turn(launch) {
             Ok(node) => {
@@ -536,6 +540,9 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
             max_tokens: 0,
             deadline_ms: 60_000,
             agent_path: format!("preflight/{ctx_id}"),
+            // Preflight is a recurring fixed cost like compaction, so it takes
+            // its own tier when one is declared.
+            model: self.settings.intelligence.preflight_model.clone(),
         };
         match self.spawn_turn(launch) {
             Ok(node) => {
@@ -933,14 +940,28 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
                 // A compaction turn runs on `context.summarize.model` when one
                 // is configured: summarising is a recurring fixed cost that
                 // does not need the agent's main model.
-                model: Some(
-                    match (&launch.kind, &self.settings.context.summarize.model) {
-                        (ChildKind::Think { purpose, .. }, Some(m)) if purpose == "compaction" => {
-                            m.clone()
+                // The model reference for this turn, resolved to the wire
+                // name a provider understands. An explicit `model:` on the
+                // node wins; then the compaction tier, since summarising is a
+                // recurring fixed cost that does not need the agent's main
+                // model; then the instance default. This used to be a
+                // hardcoded two-arm match with exactly one tier in it.
+                model: Some({
+                    let reference = launch.model.clone().or_else(|| {
+                        match (&launch.kind, &self.settings.context.summarize.model) {
+                            (ChildKind::Think { purpose, .. }, Some(m))
+                                if purpose == "compaction" =>
+                            {
+                                Some(m.clone())
+                            }
+                            _ => None,
                         }
-                        _ => self.model.clone(),
-                    },
-                ),
+                    });
+                    match reference {
+                        Some(r) => self.settings.intelligence.wire_model(&r),
+                        None => self.model.clone(),
+                    }
+                }),
                 headers: self.intel_headers.clone(),
                 aws_auth: self.intel_aws_auth(),
                 dialect: self.intel_dialect(),
@@ -976,6 +997,14 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
             role: Role::Turn,
             turn: Some(Box::new(launch.spec)),
         };
+        // The model is on the line. It used to be one instance-global string,
+        // so nobody had to ask which one a turn ran on; now a step can name a
+        // tier, and "how much did that cost and on what" is an operational
+        // question with a per-turn answer.
+        self.log.info(
+            "turn.model",
+            json!({"agent_path": launch.agent_path, "model": payload.intelligence.model}),
+        );
         self.children
             .spawn(
                 &payload,
@@ -1318,6 +1347,7 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
             max_tokens: 0,
             deadline_ms: 120_000,
             agent_path: format!("compact/{ctx_id}"),
+            model: None,
         };
         match self.spawn_turn(launch) {
             Ok(node) => self.log.info(

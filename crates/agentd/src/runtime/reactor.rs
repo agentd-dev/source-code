@@ -1376,11 +1376,25 @@ impl Runtime {
 
     /// The model window (compaction threshold base): `context.model_window`
     /// when set, else inferred from the model name.
+    /// The model window (compaction threshold base).
+    ///
+    /// `context.model_window` wins, then the active tier's declared `window`,
+    /// and only then the guess from the model NAME — a substring match that is
+    /// simply wrong for any provider whose naming does not happen to match.
+    /// A tier that declares its window replaces the guess with a fact.
     pub(crate) fn model_window(&self) -> u64 {
-        self.settings
-            .context
-            .model_window
-            .unwrap_or_else(|| tokens::window_for_model(&self.model))
+        if let Some(w) = self.settings.context.model_window {
+            return w;
+        }
+        if let Some(w) = self
+            .settings
+            .intelligence
+            .default_reference()
+            .and_then(|r| self.settings.intelligence.tier(&r).and_then(|t| t.window))
+        {
+            return w;
+        }
+        tokens::window_for_model(&self.model)
     }
 }
 

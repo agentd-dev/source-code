@@ -380,9 +380,92 @@ pub struct Intelligence {
     pub budget: Budget,
     pub pricing: BTreeMap<String, Pricing>,
     pub timeout: Option<Dur>,
+    /// Named model TIERS. The model was one instance-global string, so
+    /// choosing a cheap model for a classify step and a frontier one for a
+    /// judgement call meant forking a subagent process just to change it —
+    /// and the breaker was per ENDPOINT, so a frontier and a cheap model
+    /// behind one gateway shared one breaker and one spend pool.
+    ///
+    /// A tier is NOT a second service catalog: `services:` already names
+    /// endpoints, auth, tags, rate and breaker, and restating those here would
+    /// be a parallel mechanism. A tier points AT a service and may only
+    /// narrow — it inherits that service's trifecta tags and can never declare
+    /// its own floor, so "make it cheaper" cannot quietly become a different
+    /// security decision.
+    pub models: BTreeMap<String, ModelTier>,
+    /// Which tier is used when nothing names one. Falls back to `model`.
+    pub default: Option<String>,
+    /// The tier preflight runs on. Preflight is a recurring fixed cost on
+    /// every inbound message, like compaction — it does not need the model
+    /// that answers.
+    pub preflight_model: Option<String>,
+}
+
+/// One named model tier.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct ModelTier {
+    /// The wire model name sent to the provider. Required.
+    pub model: Option<String>,
+    /// A `services:` entry of `kind: intelligence` supplying the endpoint,
+    /// auth and tags. Absent ⇒ the top-level `intelligence` endpoint.
+    pub service: Option<String>,
+    /// This model's context window, so compaction stops guessing from the
+    /// model NAME (a substring match that is wrong for every provider whose
+    /// naming does not happen to match).
+    pub window: Option<u64>,
+    /// The tier to fall back to when this one is unavailable or the budget is
+    /// squeezed — a degradation ladder that walks DOWN instead of failing.
+    pub fallback: Option<String>,
+    pub pricing: Option<Pricing>,
 }
 
 impl Intelligence {
+    /// Resolve a model reference to the wire model name.
+    ///
+    /// A reference is either a declared TIER name or a literal model string,
+    /// with the tier winning. That ordering is what lets `models:` be adopted
+    /// without rewriting every place a model is already named — an existing
+    /// literal keeps working, and a tier name takes over the moment one is
+    /// declared under that name.
+    pub fn wire_model(&self, reference: &str) -> String {
+        match self.models.get(reference).and_then(|t| t.model.clone()) {
+            Some(m) => m,
+            None => reference.to_string(),
+        }
+    }
+
+    /// The tier a reference names, if it names one.
+    pub fn tier(&self, reference: &str) -> Option<&ModelTier> {
+        self.models.get(reference)
+    }
+
+    /// The model reference used when nothing names one: `default` (a tier),
+    /// else `model` (a literal or a tier name).
+    pub fn default_reference(&self) -> Option<String> {
+        self.default.clone().or_else(|| self.model.clone())
+    }
+
+    /// Walk the fallback chain from `reference`, stopping at the first tier
+    /// with no fallback. Cycles are impossible because validation refuses
+    /// them; the bound here is belt-and-braces for a config that reached the
+    /// runtime some other way.
+    pub fn fallback_chain(&self, reference: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut cur = reference.to_string();
+        for _ in 0..8 {
+            let Some(next) = self.models.get(&cur).and_then(|t| t.fallback.clone()) else {
+                break;
+            };
+            if out.contains(&next) || next == reference {
+                break;
+            }
+            out.push(next.clone());
+            cur = next;
+        }
+        out
+    }
+
     pub fn timeout(&self) -> Duration {
         self.timeout.map(|d| d.0).unwrap_or(Duration::from_secs(60))
     }
@@ -3863,6 +3946,99 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
         }
     }
 
+    // intelligence.models — a tier catalogue whose names are referenced from
+    // several places, so a typo has to be a startup error rather than a
+    // silent fall-through to "a literal model called `smal`".
+    for (name, t) in &s.intelligence.models {
+        let at = format!("intelligence.models.{name}");
+        if t.model.as_deref().unwrap_or("").trim().is_empty() {
+            err(&mut d, format!("{at}: `model` is required"));
+        }
+        if let Some(svc) = &t.service {
+            match s.services.get(svc) {
+                None => err(
+                    &mut d,
+                    format!("{at}.service: {svc:?} is not declared (add it under `services:`)"),
+                ),
+                Some(entry) if entry.kind != ServiceKind::Intelligence => err(
+                    &mut d,
+                    format!(
+                        "{at}.service: {svc:?} is `kind: {}` — a model tier needs `kind: intelligence`",
+                        entry.kind.as_str()
+                    ),
+                ),
+                Some(_) => {}
+            }
+        }
+        if let Some(f) = &t.fallback {
+            if !s.intelligence.models.contains_key(f) {
+                err(&mut d, format!("{at}.fallback: no model tier named {f:?}"));
+            } else if f == name {
+                err(
+                    &mut d,
+                    format!("{at}.fallback: a tier cannot fall back to itself"),
+                );
+            }
+        }
+    }
+    // A degradation ladder that loops is a hang under exactly the conditions
+    // it exists to survive.
+    for name in s.intelligence.models.keys() {
+        let mut seen = vec![name.clone()];
+        let mut cur = name.clone();
+        while let Some(next) = s
+            .intelligence
+            .models
+            .get(&cur)
+            .and_then(|t| t.fallback.clone())
+        {
+            if seen.contains(&next) {
+                err(
+                    &mut d,
+                    format!(
+                        "intelligence.models: fallback cycle {} -> {next}",
+                        seen.join(" -> ")
+                    ),
+                );
+                break;
+            }
+            seen.push(next.clone());
+            cur = next;
+        }
+    }
+    for (field, reference) in [
+        ("intelligence.default", s.intelligence.default.as_ref()),
+        (
+            "intelligence.preflight_model",
+            s.intelligence.preflight_model.as_ref(),
+        ),
+        (
+            "context.summarize.model",
+            s.context.summarize.model.as_ref(),
+        ),
+    ] {
+        // These name a TIER. A literal here would work by accident today and
+        // break the moment a tier of that name is declared, so require the
+        // tier when a catalogue exists at all.
+        if let Some(r) = reference
+            && !s.intelligence.models.is_empty()
+            && !s.intelligence.models.contains_key(r)
+        {
+            err(
+                &mut d,
+                format!(
+                    "{field}: {r:?} is not a declared model tier (known: {})",
+                    s.intelligence
+                        .models
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            );
+        }
+    }
+
     // a2a.principals[].quotas — a limit that parses and is never checked for
     // shape is the same failure as one that is never enforced: the operator
     // believes they set a ceiling.
@@ -4570,6 +4746,32 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                 &mut d,
                 format!("workflows[]: duplicate workflow name '{name}'"),
             );
+        }
+        // A `model:` on a node names a TIER once a catalogue exists. Catching
+        // the typo here keeps it a startup error instead of a run that
+        // silently asks the provider for a model called `smal`.
+        if !s.intelligence.models.is_empty()
+            && let Some(steps) = obj.get("steps").and_then(Value::as_object)
+        {
+            for (sid, st) in steps {
+                let Some(m) = st.get("model").and_then(Value::as_str) else {
+                    continue;
+                };
+                if !s.intelligence.models.contains_key(m) {
+                    err(
+                        &mut d,
+                        format!(
+                            "workflow '{name}' step '{sid}': model {m:?} is not a declared tier (known: {})",
+                            s.intelligence
+                                .models
+                                .keys()
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    );
+                }
+            }
         }
         // One entry, one source. `dir` is not in this list because a dir entry
         // returned above — it names a SET, and each file it expands to gets
@@ -5507,6 +5709,7 @@ mod tests {
                 },
                 paths::Kind::Object => match b.path.as_str() {
                     "intelligence.pricing" => json!({"m": {"input_per_1k": 1.0}}),
+                    "intelligence.models" => json!({"small": {"model": "m-1"}}),
                     "tools.overrides" => json!({"memory.get": {"server": "s", "tool": "t"}}),
                     "store.mcp" => json!({"server": "s"}),
                     "streams" => json!({"orders": {"retention": {"max_events": 1}}}),

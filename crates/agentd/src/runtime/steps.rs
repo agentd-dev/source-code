@@ -537,6 +537,10 @@ impl Runtime {
             .get("task")
             .and_then(Value::as_str)
             .map(str::to_string);
+        // A run inherits the message-hop depth of whatever asked for it, so a
+        // `message` inside it extends that chain rather than starting a fresh
+        // one. Triggers carry nothing and so start at 0.
+        run.msg_depth = ev.payload["msg_depth"].as_u64().unwrap_or(0) as u32;
         // Durable before anything runs — unless the workflow opted out of the
         // class entirely (`durable: false`): a memory-only run writes nothing,
         // here or at any checkpoint.
@@ -1122,6 +1126,7 @@ impl Runtime {
             req: attempt as u64,
             principal: self.runs.get(run_id).and_then(|r| r.principal.clone()),
             ctx: self.runs.get(run_id).and_then(|r| r.conversation.clone()),
+            msg_depth: self.runs.get(run_id).map(|r| r.msg_depth).unwrap_or(0),
             ..Default::default()
         };
         // `cache {key, ttl}`: a fresh memoized output skips the effect.
@@ -1141,7 +1146,7 @@ impl Runtime {
                 .get_mut(run_id)
                 .and_then(|r| r.steps.get_mut(step_id))
         {
-            st.wait = Some(json!({"cache_key": k}));
+            st.cache_key = Some(k);
         }
         // The circuit breaker (`breaker:` on a remote-effect kind): consulted
         // BEFORE the effect is dispatched, on the loop, so an open circuit
@@ -1618,7 +1623,7 @@ impl Runtime {
             "foreach" | "batch" | "iterate" | "parallel" | "race" | "subgraph" => {
                 self.nested_start(run_id, step_id, &step, &spec)
             }
-            "wait" | "join" | "workflow" | "workflow.signal" | "workflow.wait"
+            "wait" | "join" | "workflow" | "message" | "workflow.signal" | "workflow.wait"
             | "workflow.cancel" | "subagent" | "human" | "mcp.resource" | "a2a.delegate"
             | "a2a.send" | "a2a.wait" | "classify" | "extract" | "summarize" | "judge"
             | "route" => {
@@ -2649,10 +2654,7 @@ impl Runtime {
                     .runs
                     .get(run_id)
                     .and_then(|r| r.steps.get(step_id))
-                    .and_then(|st| st.wait.as_ref())
-                    .and_then(|w| w.get("cache_key"))
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
+                    .and_then(|st| st.cache_key.clone())
                 && let Some(out) = &output
             {
                 self.cache_store(&key, out);
@@ -2845,10 +2847,42 @@ impl Runtime {
             } else {
                 note.clone()
             };
-            self.note_root(format!(
+            let line = format!(
                 "workflow {workflow} run {run_id} {}: {short}",
                 status.as_str()
-            ));
+            );
+            match self.settings.agent.on_workflow_finished {
+                // `note` appends to the root transcript and waits for whatever
+                // happens next to read it. `think` delivers, which starts a
+                // turn: the difference between leaving a message and making
+                // the call. The hop depth continues this run's chain, so a
+                // workflow the agent started cannot wake it without bound.
+                crate::config::v2::OnWorkflowFinished::Think => {
+                    let depth = self.runs.get(run_id).map(|r| r.msg_depth).unwrap_or(0) + 1;
+                    let cap = self.settings.limits.message_depth();
+                    if depth > cap {
+                        self.log.warn(
+                            "message.too_deep",
+                            json!({"run": run_id, "reason": "on_workflow_finished",
+                                   "depth": depth, "max": cap}),
+                        );
+                        self.note_root(line);
+                    } else {
+                        let principal = self.runs.get(run_id).and_then(|r| r.principal.clone());
+                        if let Err(e) = self.accept_event(
+                            kinds::A2A_MESSAGE,
+                            principal,
+                            json!({"text": line.clone(), "context_id": crate::context::ROOT,
+                                   "msg_depth": depth}),
+                        ) {
+                            self.log
+                                .warn("workflow.think.fail", json!({"run": run_id, "err": e}));
+                            self.note_root(line);
+                        }
+                    }
+                }
+                _ => self.note_root(line),
+            }
         }
         // A `loop` start re-arms the next iteration; `event` start nodes fire on
         // workflow.finished/failed.
@@ -2974,7 +3008,7 @@ impl Runtime {
                     }
                     _ => Value::Null,
                 };
-                let payload = json!({"workflow": wname, "node": start, "payload": {"requested_by": caller.label_pub()}, "inputs": args.get("inputs").cloned().unwrap_or(json!({})), "request": request, "conversation": caller.ctx});
+                let payload = json!({"workflow": wname, "node": start, "payload": {"requested_by": caller.label_pub()}, "inputs": args.get("inputs").cloned().unwrap_or(json!({})), "request": request, "conversation": caller.ctx, "msg_depth": caller.msg_depth});
                 match self.accept_event(kinds::WORKFLOW_RUN, caller.principal.clone(), payload) {
                     Ok(_) => {
                         // Process it right away so the caller learns the run id.

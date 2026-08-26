@@ -14,6 +14,7 @@
 use super::events::kinds;
 use super::reactor::{PendingKind, Runtime, Target};
 use super::tools::{ToolCaller, ToolOutcome};
+use crate::context::ROOT;
 use crate::engine::model::Step;
 use crate::engine::run::StepStatus;
 use crate::engine::template::Data;
@@ -94,6 +95,7 @@ impl Runtime {
                 self.suspend_wait(run_id, step_id, wait_record("join", json!({"handles": handles, "min": min, "partials": spec.get("partials").and_then(Value::as_bool).unwrap_or(false)}), timeout));
             }
             "workflow" => self.step_child_workflow(run_id, step_id, spec, caller),
+            "message" => self.step_message(run_id, step_id, spec),
             "workflow.signal" => {
                 let name = spec
                     .get("name")
@@ -714,6 +716,133 @@ impl Runtime {
         delivered
     }
 
+    /// `message` step: deliver into one of this instance's own conversations,
+    /// so a run can hand work to the agent instead of only the reverse.
+    ///
+    /// The delivery is an ordinary inbound message event — the same one the A2A
+    /// listener produces — so it takes the same three readers in the same
+    /// order (a step waiting on the conversation, then a matching `a2a` start,
+    /// then a turn), and inherits write-ahead durability, crash replay, the
+    /// per-context lock and pressure shedding without any of them being taught
+    /// about this node.
+    ///
+    /// `wait: reply` parks on the answer using the `message` wait that already
+    /// exists; without it the step completes as soon as the delivery is durable
+    /// and the turn happens on its own schedule.
+    fn step_message(&mut self, run_id: &str, step_id: &str, spec: &Map<String, Value>) {
+        let to = spec
+            .get("to")
+            .and_then(Value::as_str)
+            .unwrap_or(ROOT)
+            .trim();
+        // `to: new` opens a fresh conversation, which is how a run gets a
+        // clean transcript without borrowing the operator's.
+        let ctx = if to.eq_ignore_ascii_case("new") {
+            format!("run-{}", crate::state::ulid::new())
+        } else if to.is_empty() {
+            ROOT.to_string()
+        } else {
+            to.to_string()
+        };
+        let text = spec
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let parts = spec.get("parts").cloned();
+        if text.trim().is_empty() && parts.is_none() {
+            self.finish_step_pub(
+                run_id,
+                step_id,
+                StepStatus::Failed,
+                None,
+                Some("message: one of text or parts is required".into()),
+                0,
+            );
+            return;
+        }
+        // The hop guard. A run inherits the depth of the work that caused it,
+        // so a chain that came back around to its own conversation is refused
+        // HERE — before the delivery is durable — rather than being noticed
+        // once the loop is already running.
+        let depth = self.runs.get(run_id).map(|r| r.msg_depth).unwrap_or(0) + 1;
+        let cap = self.settings.limits.message_depth();
+        if depth > cap {
+            self.log.warn(
+                "message.too_deep",
+                json!({"run": run_id, "step": step_id, "conversation": ctx,
+                       "depth": depth, "max": cap}),
+            );
+            self.finish_step_pub(
+                run_id,
+                step_id,
+                StepStatus::Failed,
+                None,
+                Some(format!(
+                    "message refused: {depth} chained deliveries exceeds limits.max_message_depth ({cap}) — \
+                     a message that causes a turn that causes this message is a loop, not a conversation"
+                )),
+                0,
+            );
+            return;
+        }
+        let mut payload = json!({"text": text, "context_id": ctx, "msg_depth": depth});
+        if let Some(p) = parts {
+            payload["parts"] = p;
+        }
+        let principal = self.runs.get(run_id).and_then(|r| r.principal.clone());
+        if let Err(e) = self.accept_event(
+            crate::runtime::events::kinds::A2A_MESSAGE,
+            principal,
+            payload,
+        ) {
+            self.finish_step_pub(
+                run_id,
+                step_id,
+                StepStatus::Failed,
+                None,
+                Some(format!("message: {e}")),
+                0,
+            );
+            return;
+        }
+        let wants_reply = match spec.get("wait") {
+            Some(Value::Bool(b)) => *b,
+            Some(Value::String(s)) => {
+                let s = s.trim();
+                !s.is_empty() && !s.eq_ignore_ascii_case("none") && !s.eq_ignore_ascii_case("false")
+            }
+            Some(Value::Object(o)) => o
+                .get("for")
+                .and_then(Value::as_str)
+                .is_some_and(|f| f.eq_ignore_ascii_case("reply")),
+            _ => false,
+        };
+        if !wants_reply {
+            self.finish_step_pub(
+                run_id,
+                step_id,
+                StepStatus::Done,
+                Some(json!({"delivered": true, "conversation": ctx, "depth": depth})),
+                None,
+                0,
+            );
+            return;
+        }
+        // Park on the answer. `timeout` may sit on the node or inside `wait`,
+        // and `on_timeout` routes an unanswered message the same way every
+        // other suspending kind routes one.
+        let timeout = spec
+            .get("timeout")
+            .or_else(|| spec.get("wait").and_then(|w| w.get("timeout")))
+            .and_then(crate::engine::model::duration_ms_opt);
+        self.suspend_wait(
+            run_id,
+            step_id,
+            wait_record("message", json!({"conversation": ctx}), timeout),
+        );
+    }
+
     /// `workflow` step: a child run (`mode: sync|async|detached`, `cascade`).
     fn step_child_workflow(
         &mut self,
@@ -790,7 +919,7 @@ impl Runtime {
             }
         };
         let cascade = spec.get("cascade").and_then(Value::as_bool).unwrap_or(true);
-        let payload = json!({"workflow": name, "node": start_node, "payload": {"requested_by": caller.label_pub()}, "inputs": inputs, "parent": {"run": run_id, "step": step_id, "cascade": cascade}, "conversation": self.runs.get(run_id).and_then(|r| r.conversation.clone()), "task": self.runs.get(run_id).and_then(|r| r.task.clone())});
+        let payload = json!({"workflow": name, "node": start_node, "payload": {"requested_by": caller.label_pub()}, "inputs": inputs, "parent": {"run": run_id, "step": step_id, "cascade": cascade}, "conversation": self.runs.get(run_id).and_then(|r| r.conversation.clone()), "task": self.runs.get(run_id).and_then(|r| r.task.clone()), "msg_depth": self.runs.get(run_id).map(|r| r.msg_depth).unwrap_or(0)});
         match self.accept_event(
             kinds::WORKFLOW_RUN,
             self.runs.get(run_id).and_then(|r| r.principal.clone()),

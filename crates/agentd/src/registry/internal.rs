@@ -404,6 +404,28 @@ pub fn contracts() -> Vec<Contract> {
         ALL,
     );
 
+    // ---- conversations ----
+    // Delivering into a context is how a subagent or a workflow hands work UP
+    // to the agent, rather than only receiving it. Granted to workflows and
+    // subagents as well as root: a child reporting something worth thinking
+    // about is the ordinary case, and the hop cap — not the grant — is what
+    // keeps it from looping.
+    c(
+        "message.send",
+        "message",
+        "Deliver a message into one of this agent's own conversations, starting a turn there. `to` is a context id, \"root\", or \"new\". Returns once the delivery is durable — the turn runs on its own schedule. To wait for the answer, use the `message` workflow node with `wait: reply`.",
+        obj(
+            json!({"to": s("Context id, \"root\", or \"new\" (default: root)"), "text": s("The message")}),
+            &["text"],
+        ),
+        open_obj(
+            json!({"delivered": {"type": "boolean"}, "conversation": {"type": "string"}, "depth": {"type": "integer"}}),
+            &["delivered", "conversation"],
+        ),
+        true,
+        ALL,
+    );
+
     // ---- workflows ----
     c(
         "workflow.run",

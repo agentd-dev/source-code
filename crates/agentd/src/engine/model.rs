@@ -497,6 +497,18 @@ pub const KINDS: &[KindInfo] = &[
         true,
         false,
     ),
+    // Deliver into one of THIS instance's own conversations, so a run can hand
+    // work to the agent rather than only the other way round. `wait: reply`
+    // parks the step on the answer; without it the step is fire-and-forget and
+    // the turn happens on its own schedule.
+    k(
+        "message",
+        false,
+        &["to", "text", "parts", "wait", "timeout", "on_timeout"],
+        &["to"],
+        true,
+        false,
+    ),
     k(
         "workflow.signal",
         false,

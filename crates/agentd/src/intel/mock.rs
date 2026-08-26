@@ -278,6 +278,14 @@ fn response_json(script: &str, saw_tool_result: bool) -> String {
             "subagent.spawn",
             r#"{"instruction":"do a trivial subtask","detach":true}"#,
         ),
+        // Starts one workflow per turn, then answers. Paired with a workflow
+        // whose only step messages the agent back, this is the
+        // message → turn → run → message cycle in its shortest form — the one
+        // the hop cap has to stop. Exactly one run per turn keeps the chain
+        // LINEAR: a script that called on every turn would fan out instead,
+        // and would be testing the step limiter rather than the hop cap.
+        ("wf-once", false) => tool_call("workflow.run", r#"{"name":"loop"}"#),
+        ("wf-once", true) => final_answer("started the workflow"),
         // A structured JSON answer for the workflow `infer` node tests: the
         // executor parses and schema-checks this object.
         ("json", _) => final_answer(r#"{"verdict":"approve","score":9}"#),

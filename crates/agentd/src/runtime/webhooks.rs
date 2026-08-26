@@ -708,6 +708,33 @@ impl crate::runtime::reactor::Runtime {
             .map(|s| s.spec.clone());
         match spec {
             Some(spec) => {
+                // `filter` (CEL over the delivery): selects which arrivals are
+                // interesting to this route. One endpoint typically receives a
+                // provider's whole event feed, so a drop is a successful
+                // delivery that started no run — NOT a 4xx, which senders read
+                // as a broken hook and answer with retries or by disabling it.
+                // The filter sees the payload's fields at the top level, the
+                // same shape the sibling `signal:` template renders against.
+                if let Some(filter) = spec.get("filter").and_then(Value::as_str) {
+                    let vars: Vec<(&str, &Value)> = payload
+                        .as_object()
+                        .map(|o| o.iter().map(|(k, v)| (k.as_str(), v)).collect())
+                        .unwrap_or_default();
+                    if crate::cel::eval_bool(filter.trim().trim_start_matches("CEL:").trim(), &vars)
+                        != Ok(true)
+                    {
+                        self.log.info(
+                            "webhook.filtered",
+                            json!({"workflow": workflow, "node": node}),
+                        );
+                        let _ = reply.send(WebhookReply::ok(
+                            202,
+                            "Accepted",
+                            json!({"status": "filtered", "workflow": workflow}),
+                        ));
+                        return;
+                    }
+                }
                 // Declarative webhook→signal: `signal: "resolved/{{ body.alert_id }}"`
                 // on the start node fires the named signal with the webhook
                 // payload — the hook→workflow.signal→finish boilerplate

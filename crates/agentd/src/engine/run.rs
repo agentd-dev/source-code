@@ -76,6 +76,16 @@ pub struct StepState {
     /// The suspension detail (`{kind, timer?, deadline_ms?, …}`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait: Option<Value>,
+    /// The memoization key for this attempt, held from dispatch (where the
+    /// `cache {key, ttl}` miss is detected) until the terminal outcome (where
+    /// the output is stored under it). It needs its own slot rather than
+    /// riding `wait`: a step that suspends — `agent`, `human`, `subagent`,
+    /// `foreach`, `wait` — overwrites `wait` with its suspension detail, so a
+    /// key parked there would survive only for the kinds cheap enough not to
+    /// need caching. Durable, because the suspension it spans can outlive the
+    /// process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_key: Option<String>,
     /// The turn worker / child handle executing this step (not durable).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker: Option<String>,
@@ -178,6 +188,16 @@ pub struct RunState {
     pub children: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<Value>,
+    /// How many `message` hops caused this run, counted from the last trigger
+    /// that was not itself a delivered message. A run started by a schedule,
+    /// webhook or stream is depth 0; one started by an agent that a `message`
+    /// woke inherits that message's depth. `message` refuses past
+    /// `limits.max_message_depth`, which is what stops
+    /// message → turn → run → message from re-arming itself forever. Volume
+    /// alone cannot be the test: twenty unrelated workflows greeting the
+    /// operator are not a loop, and one workflow greeting itself is.
+    #[serde(default)]
+    pub msg_depth: u32,
     #[serde(default)]
     pub attempt: u32,
     #[serde(default)]
@@ -242,6 +262,7 @@ impl RunState {
             conversation: None,
             children: Vec::new(),
             parent: None,
+            msg_depth: 0,
             attempt: 1,
             created: now,
             updated: now,
@@ -297,6 +318,7 @@ impl RunState {
             st.finished = None;
             st.error = None;
             st.wait = None;
+            st.cache_key = None;
             st.forced = false;
             st.attempt
         };
@@ -321,6 +343,7 @@ impl RunState {
         st.output = output;
         st.error = error;
         st.wait = None;
+        st.cache_key = None;
         st.worker = None;
         self.steps_run += 1;
         self.touch();

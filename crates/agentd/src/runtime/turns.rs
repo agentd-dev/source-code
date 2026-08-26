@@ -360,6 +360,7 @@ impl Runtime {
                 ctx: ctx_id.clone(),
                 event: job.event.clone(),
                 reservation,
+                msg_depth: job.msg_depth,
             },
             servers,
             max_steps: self.settings.limits.run.steps(),
@@ -948,6 +949,7 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
                 ctx,
                 event,
                 reservation,
+                ..
             } => {
                 if let Some(r) = reservation {
                     self.governor.settle(r, turn.usage);
@@ -1012,6 +1014,7 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
                 ctx,
                 event,
                 reservation,
+                ..
             } => {
                 if let Some(r) = reservation {
                     self.governor.release(r);

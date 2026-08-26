@@ -212,6 +212,7 @@ fn top_level_properties(
                         "breadth": { "type": "integer", "minimum": 1 }, "total": { "type": "integer", "minimum": 1 }, "rate": { "type": "string" } } } } },
                 "inline_max_bytes": { "type": "integer", "minimum": 1 },
                 "step_timeout": duration,
+                "max_message_depth": { "type": "integer", "minimum": 1, "description": "how many chained `message` deliveries may run before one is refused (default 8) — the loop guard on message → turn → run → message" },
                 "workflow": { "type": "object", "additionalProperties": false, "properties": {
                     "fan_out": { "type": "integer", "minimum": 1, "description": "max concurrent lanes a foreach/batch body may use; a definition asking for more is refused at load" } } } } }));
     m.insert("lifecycle".to_string(), json!({ "type": "object", "additionalProperties": false, "properties": {

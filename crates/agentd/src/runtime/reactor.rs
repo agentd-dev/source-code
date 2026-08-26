@@ -117,6 +117,10 @@ pub struct TurnJob {
     pub knowledge_done: bool,
     /// The retrieved knowledge block (system message) for this turn.
     pub knowledge: Option<String>,
+    /// The message-hop depth this turn inherits (see `RunState::msg_depth`).
+    /// A message from a person is depth 0; one a `message` step delivered
+    /// carries that step's depth, and anything this turn starts inherits it.
+    pub msg_depth: u32,
 }
 
 impl TurnJob {
@@ -138,7 +142,13 @@ impl TurnJob {
             preflight_done: false,
             knowledge_done: false,
             knowledge: None,
+            msg_depth: 0,
         }
+    }
+    /// The same job, carrying a delivered message's hop depth.
+    pub fn at_depth(mut self, depth: u32) -> TurnJob {
+        self.msg_depth = depth;
+        self
     }
 }
 
@@ -736,14 +746,18 @@ impl Runtime {
         // 3. Otherwise it is what it looks like: something to answer.
         #[allow(unused)]
         let skills = self.skills.references(&text);
-        self.turn_queue.push_back(TurnJob::new(
-            ctx,
-            Some(ev.id.clone()),
-            principal.clone(),
-            Some(crate::context::Msg::user(text.clone(), principal)),
-            skills,
-            text,
-        ));
+        let depth = ev.payload["msg_depth"].as_u64().unwrap_or(0) as u32;
+        self.turn_queue.push_back(
+            TurnJob::new(
+                ctx,
+                Some(ev.id.clone()),
+                principal.clone(),
+                Some(crate::context::Msg::user(text.clone(), principal)),
+                skills,
+                text,
+            )
+            .at_depth(depth),
+        );
     }
 
     /// Without the `a2a` feature there is no listener to deliver a message, so a

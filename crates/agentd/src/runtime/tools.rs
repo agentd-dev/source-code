@@ -34,6 +34,10 @@ pub(crate) struct ToolCaller {
     pub step: Option<String>,
     pub principal: Option<String>,
     pub subagent: Option<String>,
+    /// The message-hop depth of the work this call belongs to (see
+    /// `RunState::msg_depth`). Carried so `message.send` can refuse to extend a
+    /// chain that has already gone too deep.
+    pub msg_depth: u32,
 }
 
 impl ToolCaller {
@@ -68,11 +72,12 @@ impl Runtime {
     pub(crate) fn on_tool_request(&mut self, node: NodeId, id: u64, name: &str, args: Value) {
         self.counters.tool_calls += 1;
         let caller = match self.children.get(node).map(|c| c.kind.clone()) {
-            Some(ChildKind::RootTurn { ctx, .. }) => ToolCaller {
+            Some(ChildKind::RootTurn { ctx, msg_depth, .. }) => ToolCaller {
                 node: Some(node),
                 req: id,
                 ctx: Some(ctx.clone()),
                 principal: self.contexts.get(&ctx).and_then(|c| c.principal.clone()),
+                msg_depth,
                 ..Default::default()
             },
             Some(ChildKind::StepTurn { run, step, .. }) => ToolCaller {
@@ -82,6 +87,7 @@ impl Runtime {
                 step: Some(step),
                 ctx: self.runs.get(&run).and_then(|r| r.conversation.clone()),
                 principal: self.runs.get(&run).and_then(|r| r.principal.clone()),
+                msg_depth: self.runs.get(&run).map(|r| r.msg_depth).unwrap_or(0),
                 ..Default::default()
             },
             Some(ChildKind::Subagent { handle }) => ToolCaller {
@@ -671,6 +677,8 @@ impl Runtime {
             | "subagent.await" | "subagent.list" | "subagent.retire" => {
                 self.subagent_tool(caller, name, args)
             }
+            // ---- conversations ----
+            "message.send" => self.message_send_tool(caller, args),
             // ---- workflows ----
             "workflow.run" | "workflow.list" | "workflow.status" | "workflow.cancel"
             | "workflow.wait" | "workflow.create" | "workflow.update" | "workflow.delete"
@@ -683,6 +691,63 @@ impl Runtime {
             other => err(format!(
                 "internal tool {other:?} has no built-in implementation"
             )),
+        }
+    }
+
+    /// `message.send`: deliver into one of this instance's own conversations.
+    ///
+    /// The mirror of the `message` node, for callers that are not a workflow
+    /// step — a subagent reporting something worth thinking about, or a turn
+    /// handing work to another context. It returns as soon as the delivery is
+    /// durable; the turn it causes runs on its own schedule, so a caller never
+    /// blocks on the agent it just woke.
+    ///
+    /// Two refusals matter. A caller may not deliver into the conversation it
+    /// is itself running in — that is a turn talking to itself, and it is a
+    /// loop whichever way the reply goes. And the hop cap applies here exactly
+    /// as it does to the node, so a chain routed through a subagent is not a
+    /// way around it.
+    fn message_send_tool(&mut self, caller: &ToolCaller, args: Value) -> ToolOutcome {
+        let err = |e: String| ToolOutcome::Ready(Value::String(e), true);
+        let text = args["text"].as_str().unwrap_or("").trim().to_string();
+        if text.is_empty() {
+            return err("message.send: text is required".into());
+        }
+        let to = args["to"].as_str().unwrap_or(ROOT).trim();
+        let ctx = if to.eq_ignore_ascii_case("new") {
+            format!("msg-{}", crate::state::ulid::new())
+        } else if to.is_empty() {
+            ROOT.to_string()
+        } else {
+            to.to_string()
+        };
+        if caller.ctx.as_deref() == Some(ctx.as_str()) {
+            return err(format!(
+                "message.send: {ctx:?} is this caller's own conversation — a turn cannot message itself"
+            ));
+        }
+        let depth = caller.msg_depth + 1;
+        let cap = self.settings.limits.message_depth();
+        if depth > cap {
+            self.log.warn(
+                "message.too_deep",
+                json!({"caller": caller.label(), "conversation": ctx, "depth": depth, "max": cap}),
+            );
+            return err(format!(
+                "message.send refused: {depth} chained deliveries exceeds limits.max_message_depth ({cap})"
+            ));
+        }
+        let payload = json!({"text": text, "context_id": ctx, "msg_depth": depth});
+        match self.accept_event(
+            super::events::kinds::A2A_MESSAGE,
+            caller.principal.clone(),
+            payload,
+        ) {
+            Ok(_) => ToolOutcome::Ready(
+                json!({"delivered": true, "conversation": ctx, "depth": depth}),
+                false,
+            ),
+            Err(e) => err(format!("message.send: {e}")),
         }
     }
 

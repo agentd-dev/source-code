@@ -1435,6 +1435,23 @@ pub struct Limits {
     pub inline_max_bytes: Option<u64>,
     pub step_timeout: Option<Dur>,
     pub workflow: WorkflowLimits,
+    /// How many `message` hops may chain before a delivery is refused
+    /// (default [`DEFAULT_MESSAGE_DEPTH`]). This is the fail-closed gate on
+    /// message → turn → run → message, not a tuning knob: the loop it stops
+    /// re-arms itself faster than pressure shedding can hold it, because
+    /// shedding queues new turns while the chain keeps adding more.
+    pub max_message_depth: Option<u32>,
+}
+
+/// The default ceiling on chained `message` deliveries. Deep enough for real
+/// delegation — a schedule waking the agent, which runs a workflow, which asks
+/// a question back — and shallow enough that a runaway is caught in seconds.
+pub const DEFAULT_MESSAGE_DEPTH: u32 = 8;
+
+impl Limits {
+    pub fn message_depth(&self) -> u32 {
+        self.max_message_depth.unwrap_or(DEFAULT_MESSAGE_DEPTH)
+    }
 }
 
 /// Ceilings a workflow definition is checked against at load time.
@@ -6448,6 +6465,26 @@ mod tests {
         let msg = format!("{e}");
         assert!(msg.contains("`tags` applies to `kind: mcp`"), "{msg}");
         assert!(msg.contains("`methods` applies to `kind: http`"), "{msg}");
+    }
+
+    /// The message hop cap is a fail-closed gate, so it has to bind on a
+    /// config that never mentions it. An operator who has not heard of
+    /// `max_message_depth` is exactly the one a runaway chain would surprise.
+    #[test]
+    fn the_message_hop_cap_binds_without_being_configured() {
+        let l = Limits::default();
+        assert_eq!(l.max_message_depth, None, "unset by default");
+        assert_eq!(l.message_depth(), DEFAULT_MESSAGE_DEPTH);
+        assert!(
+            l.message_depth() > 0,
+            "a cap of 0 would refuse every message"
+        );
+        // An explicit setting still wins.
+        let tuned = Limits {
+            max_message_depth: Some(2),
+            ..Default::default()
+        };
+        assert_eq!(tuned.message_depth(), 2);
     }
 
     #[test]

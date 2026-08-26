@@ -26,6 +26,11 @@ pub enum ChildKind {
         ctx: String,
         event: Option<String>,
         reservation: Option<u64>,
+        /// The message-hop depth this turn inherited, so anything it starts —
+        /// a run, a nested message — continues the chain rather than resetting
+        /// it. Lives exactly as long as the turn, which is the window that
+        /// matters.
+        msg_depth: u32,
     },
     /// A workflow step turn (`agent` / `think`).
     StepTurn {

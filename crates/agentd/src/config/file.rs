@@ -448,7 +448,12 @@ fn strip_jsonc(src: &str) -> String {
 pub fn config_schema() -> Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "$id": format!("https://agentd.dev/schema/config/{SCHEMA_CONTRACT_VERSION}"),
+        // A DIFFERENT document from the settings schema `--config-schema`
+        // prints, so it gets its own `$id`: two schemas sharing one identity
+        // is a real hazard for any tool that caches by `$id`. This one is
+        // internal — it derives the env/flag path bindings — and is not
+        // served.
+        "$id": format!("https://agentd.dev/schema/internal/config-file-{SCHEMA_CONTRACT_VERSION}.json"),
         "x-agentd-contract-version": SCHEMA_CONTRACT_VERSION,
         "title": "agentd config file",
         "type": "object",

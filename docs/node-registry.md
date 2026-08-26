@@ -292,5 +292,9 @@ continues the run's chain rather than starting a fresh one.
 agentd --workflow-schema | jq '.["$defs"].kinds'
 ```
 
+The same schema is published at `https://agentd.dev/schema/workflow.json` for
+editor autocomplete — see
+[Editor autocomplete](workflows.md#editor-autocomplete).
+
 Each entry carries `fields`, `required`, `start` and `implemented`. That is the
 authority; this page is prose around it.

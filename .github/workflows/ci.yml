@@ -31,6 +31,18 @@ jobs:
       # (serve_mcp / otel_e2e / …) and the black-box agentd-conformance suite,
       # which builds + drives the real binary, both run here.
       - run: cargo test --workspace --all-features
+      # The published JSON Schemas are generated from the binary and committed,
+      # because the site build has no Rust toolchain. Regenerate and diff: a
+      # schema that has drifted from the loader is worse than none, since an
+      # editor then reports valid documents as broken.
+      - name: published schemas are current
+        run: |
+          cargo build -p agentd-cli --all-features
+          ./scripts/gen-schemas.sh
+          git diff --exit-code -- web/public/schema || {
+            echo "::error::web/public/schema is stale — run ./scripts/gen-schemas.sh and commit"
+            exit 1
+          }
 
   # The capability-pruning story, proven in CI: every feature combination an
   # operator is likely to ship must build + test clean on its own (feature

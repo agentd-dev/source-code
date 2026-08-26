@@ -1208,31 +1208,35 @@ fn json_kind(v: &Value) -> &'static str {
     }
 }
 
+/// The top-level fields a workflow document may carry. The parser and the
+/// JSON Schema both read this list, so an editor can never flag a field the
+/// loader accepts (or complete one it refuses) — they drifted apart once.
+pub const TOP: &[&str] = &[
+    "name",
+    "version",
+    "description",
+    "armed",
+    "inputs",
+    "concurrency",
+    "limits",
+    "outputs",
+    "state",
+    "steps",
+    "file",
+    "uri",
+    "priority",
+    "unload",
+    "durable",
+    "key",
+    "tool",
+];
+
 /// Parse + validate a dialect-3 document. Errors name every problem.
 pub fn parse_workflow(doc: &Value) -> Result<Workflow, Vec<String>> {
     let mut errs = Vec::new();
     let Some(obj) = doc.as_object() else {
         return Err(vec!["a workflow must be an object".into()]);
     };
-    const TOP: &[&str] = &[
-        "name",
-        "version",
-        "description",
-        "armed",
-        "inputs",
-        "concurrency",
-        "limits",
-        "outputs",
-        "state",
-        "steps",
-        "file",
-        "uri",
-        "priority",
-        "unload",
-        "durable",
-        "key",
-        "tool",
-    ];
     for key in obj.keys() {
         if !TOP.contains(&key.as_str()) {
             errs.push(format!("unknown workflow field {key:?}"));
@@ -2470,7 +2474,9 @@ pub fn workflow_schema() -> Value {
     let kinds: Vec<&str> = KINDS.iter().map(|k| k.name).collect();
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "$id": "https://agentd.dev/schemas/workflow-3.json",
+        // Served at this URL; `schema/` (singular) matches the config schema's
+        // path, which the previous `schemas/` did not.
+        "$id": "https://agentd.dev/schema/workflow-3.json",
         "title": "agentd workflow",
         "type": "object",
         "required": ["name", "steps"],
@@ -2480,6 +2486,12 @@ pub fn workflow_schema() -> Value {
             "description": {"type": "string"},
             "armed": {"type": "boolean", "default": true},
             "durable": {"type": "boolean", "description": "false = runs are memory-only (no checkpoints, gone after a restart) — the fast path for recomputable work; absent = the store.durability.work default (durable)"},
+            "priority": {"enum": ["low", "normal", "high"], "description": "contention weight: `low` sheds one pressure level earlier and is scheduled last; a tiebreak under scarcity, not a reservation"},
+            "unload": {"type": "object", "additionalProperties": false, "description": "what happens to LIVE runs when this definition is retired (removed, replaced or deleted)", "properties": {
+                "policy": {"enum": ["drain", "cancel", "detach"], "description": "drain (default) lets them finish"},
+                "timeout": {"type": "string", "description": "how long a drain may take"}}},
+            "file": {"type": "string", "description": "load the document from a path on disk instead of inline"},
+            "uri": {"type": "string", "description": "load the document from an MCP resource instead of inline"},
             "inputs": {"type": "object", "properties": {"schema": {"type": "object"}}},
             "outputs": {"type": "object", "properties": {"schema": {"type": "object"}}},
             "state": {"type": "object", "additionalProperties": {"type": "object",
@@ -2564,6 +2576,35 @@ mod tests {
 
     fn wf(doc: Value) -> Result<Workflow, Vec<String>> {
         parse_workflow(&doc)
+    }
+
+    /// The schema and the parser must accept the SAME workflow fields.
+    ///
+    /// They had drifted: `priority`, `unload`, `file` and `uri` were accepted
+    /// by the parser and absent from the schema. That was invisible while the
+    /// schema was advisory, and becomes a red squiggle in an editor the moment
+    /// the config schema folds this one in with `additionalProperties: false`
+    /// — a valid document reported as invalid is worse than no schema at all.
+    #[test]
+    fn the_workflow_schema_accepts_exactly_what_the_parser_does() {
+        let schema = workflow_schema();
+        let declared: std::collections::BTreeSet<&str> = schema["properties"]
+            .as_object()
+            .expect("properties")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let parsed: std::collections::BTreeSet<&str> = TOP.iter().copied().collect();
+        assert_eq!(
+            parsed.difference(&declared).collect::<Vec<_>>(),
+            Vec::<&&str>::new(),
+            "the parser accepts fields the schema does not declare — an editor would flag valid documents"
+        );
+        assert_eq!(
+            declared.difference(&parsed).collect::<Vec<_>>(),
+            Vec::<&&str>::new(),
+            "the schema declares fields the parser refuses — completion would suggest fields that fail at load"
+        );
     }
 
     /// `human.to` names who must answer and is enforced when the reply lands,

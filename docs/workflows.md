@@ -34,6 +34,23 @@ choose the sequence. A workflow fixes that sequence at authoring time: a step
 that turns out to need an unanticipated decision cannot invent one. The trade-off
 is rigidity in exchange for resumability.
 
+## Editor autocomplete
+
+A standalone workflow file gets completion from the published schema — every
+node `kind`, each kind's fields, and the enums:
+
+```yaml
+# yaml-language-server: $schema=https://agentd.dev/schema/workflow.json
+name: sync-account
+steps:
+  s: {kind: schedule, cron: "0 7 * * 1-5"}
+```
+
+Workflows written *inline* in a config file are covered by the config schema,
+which folds this one in — see
+[Editor autocomplete](configuration.md#0-editor-autocomplete). Cross-field
+rules still belong to `agentd --validate-config`.
+
 ## The anatomy of a workflow document
 
 A workflow is an object under `workflows:` in a `config_version: "1"` settings

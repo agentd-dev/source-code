@@ -64,9 +64,13 @@ pub fn schema() -> Value {
     defs_properties(&mut defs, &secret, &string_map, &budget, &duration);
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "$id": format!("https://agentd.dev/schema/config/{SCHEMA_CONTRACT_VERSION}"),
+        // The URL this document is SERVED at, so an editor that fetches the
+        // `$id` gets this schema and not a 404. Versioned by the config
+        // document version, so pinning `config_version: "1"` and pinning the
+        // schema are the same decision.
+        "$id": format!("https://agentd.dev/schema/config-{CONFIG_VERSION}.json"),
         "x-agentd-contract-version": SCHEMA_CONTRACT_VERSION,
-        "title": "agentd settings (v2)",
+        "title": format!("agentd configuration (config_version {CONFIG_VERSION})"),
         "description": "agentd configuration document (YAML or JSON; several files merge in order; every path is also AGENTD_<PATH> and --<path>)",
         "type": "object",
         "additionalProperties": false,
@@ -416,7 +420,21 @@ fn defs_properties(
                 "path": { "type": "string", "description": "the state root; default $AGENTD_STATE_DIR, else $XDG_STATE_HOME/agentd/state, else $HOME/.local/state/agentd/state, else the OS temp dir" } } }));
     m.insert("SkillSource".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["server"], "properties": {
                 "server": { "type": "string" }, "discover": { "enum": ["prompts", "resources", "auto"] }, "filter": { "type": "string" } } }));
-    m.insert("WorkflowRef".to_string(), json!({ "type": "object", "required": ["name"], "properties": {
+    // A `workflows[]` entry is either a REFERENCE (`file`/`uri`/`url`/`dir`) or
+    // an inline definition — and most people write them inline, which is where
+    // an editor's completion earns its keep. So the workflow document's own
+    // properties are folded in beside the reference fields, from the same
+    // `KINDS`-derived schema the validator uses. Without this an inline
+    // workflow was `additionalProperties: true`: no completion for `steps`, no
+    // node kinds, and a typo caught only at startup.
+    //
+    // Merged rather than expressed as a `oneOf` on purpose. A `oneOf` would
+    // let the schema also catch "you gave both `file` and `steps`" — which the
+    // loader already refuses with a better message ("one entry, one source") —
+    // at the cost of ambiguous completion in every editor, since neither
+    // branch matches a half-written entry. Completion is the job here.
+    let workflow_doc = crate::engine::model::workflow_schema();
+    let mut wf_ref = json!({ "type": "object", "required": ["name"], "properties": {
                 "name": { "type": "string" }, "armed": { "type": "boolean" },
                 "file": { "type": "string", "description": "a path on disk" },
                 "uri": { "type": "string", "description": "an MCP resource (mcp://<server>/<uri>, or one a connected server serves)" },
@@ -426,8 +444,26 @@ fn defs_properties(
                 "allow_private": { "type": "boolean", "description": "permit `url` to resolve to a private/loopback address" },
                 "dir": { "type": "string", "description": "load every matching file in a directory" },
                 "glob": { "type": "string", "description": "comma-separated globs relative to `dir` (default `*.yaml,*.yml,*.json`); `**` recurses" } },
-                "additionalProperties": true,
-                "description": "a {name, file|uri|url} reference, a {dir, glob} directory, or an inline workflow definition" }));
+                "additionalProperties": false,
+                "description": "a {name, file|uri|url} reference, a {dir, glob} directory, or an inline workflow definition" });
+    if let (Some(dst), Some(src)) = (
+        wf_ref["properties"].as_object_mut(),
+        workflow_doc.get("properties").and_then(Value::as_object),
+    ) {
+        for (k, v) in src {
+            // The reference fields win where the names collide (`name`,
+            // `armed`, `description`): those are the config layer's own.
+            dst.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+    }
+    m.insert("WorkflowRef".to_string(), wf_ref);
+    // The workflow document's own `$defs` (`step`, `kinds`) come along, so the
+    // `#/$defs/step` references inside the folded properties still resolve.
+    if let Some(src) = workflow_doc.get("$defs").and_then(Value::as_object) {
+        for (k, v) in src {
+            m.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+    }
     m.insert("Principal".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["match", "role"], "properties": {
                 "match": { "type": "object", "additionalProperties": false, "properties": {
                     "san": { "type": "string" }, "sub": { "type": "string" }, "bearer_ref": { "type": "string" }, "aauth_agent": { "type": "string" }, "any": { "type": "boolean" } } },

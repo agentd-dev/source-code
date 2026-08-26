@@ -21,6 +21,60 @@ side effects (exit `2` on error).
 
 ---
 
+## 0. Editor autocomplete
+
+The schemas are published, so an editor can complete keys, offer the valid
+values for every enum, and flag a typo as you type rather than at `exit 2`:
+
+| Document | URL |
+|---|---|
+| a config file | `https://agentd.dev/schema/config.json` (pinned: `config-1.json`) |
+| a standalone workflow file | `https://agentd.dev/schema/workflow.json` (pinned: `workflow-3.json`) |
+
+The one-line form, which needs no editor settings and travels with the file:
+
+```yaml
+# yaml-language-server: $schema=https://agentd.dev/schema/config.json
+config_version: "1"
+agent:
+  name: my-agent
+```
+
+Or register it once, for every config in a project — VS Code (`settings.json`,
+with the YAML extension):
+
+```jsonc
+"yaml.schemas": {
+  "https://agentd.dev/schema/config.json":   ["agentd.yaml", "agentd.yml", ".agentd.yml", "*.agentd.yaml"],
+  "https://agentd.dev/schema/workflow.json": ["workflows/*.yaml", "workflows/*.yml"]
+}
+```
+
+JetBrains IDEs: *Settings → Languages & Frameworks → Schemas and DTDs → JSON
+Schema Mappings*. Neovim with `yamlls` takes the same `yaml.schemas` map.
+
+**Inline workflows complete too.** A `workflows:` entry accepts either a
+reference (`file`/`uri`/`url`/`dir`) or a whole definition, and the config
+schema folds the workflow document's own properties in — so `steps`, every node
+`kind`, and each kind's fields complete inside a config file, and `kind:
+teleprot` is flagged where you typed it.
+
+Two things the schema deliberately does **not** do. It will not catch
+cross-field rules — `concurrency.scope: key` needing a `key:`, a `fallback`
+cycle, a tier name that is not declared — because those need the whole
+document; `agentd --validate-config` reports all of them at once, and that
+remains the authority. And it does not know your secrets exist: a
+`{{secret:NAME}}` reference is just a string until startup resolves it.
+
+Pin the versioned URL (`config-1.json`) when you want a config to keep
+validating against the version it was written for; the unversioned alias
+follows whatever the current major is.
+
+The files are generated from the binary — the same functions the loader uses —
+and CI regenerates and diffs them, so the published schema cannot drift from
+the code. Emit them yourself with `agentd --config-schema` and
+`agentd --workflow-schema`.
+
 ## 1. Precedence
 
 Configuration is resolved in layers, each overriding the previous **key by key**

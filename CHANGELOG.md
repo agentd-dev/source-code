@@ -99,6 +99,15 @@ declared by the workflow author.
   definition's schema is reapplied by the step". Nothing reapplied it, so a
   restart rebuilt a gate that accepted any shape — and, once addressees
   existed, would have accepted any answerer. Both ride the wait record now;
+- the two schemas shared one `$id`, and it pointed at a URL that 404ed — so
+  any tool caching by identity could serve the wrong document, and no editor
+  could fetch either. They have distinct ids now, matching where they are
+  actually served;
+- the workflow schema omitted `priority`, `unload`, `file` and `uri`, which the
+  parser accepts. Harmless while the schema was advisory; a red squiggle on a
+  valid document once an editor reads it. A test now holds the schema and the
+  parser to the same field list;
+- the config schema's title still said "(v2)" after the version reset;
 - `ask_human`'s contract disagreed with its implementation in both directions
   at once. `to` was advertised and read by nothing, so a model could believe
   it had addressed a question that in fact went to whoever was watching.

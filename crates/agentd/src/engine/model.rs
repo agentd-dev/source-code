@@ -926,6 +926,52 @@ pub struct WorkflowLimits {
     pub budget: Option<Value>,
 }
 
+/// A workflow's tool registration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct WorkflowTool {
+    /// The tool name callers see. Must not shadow an internal contract.
+    pub name: String,
+    /// `sync` parks the caller on the run and returns its output; `async`
+    /// returns a handle immediately.
+    #[serde(default)]
+    pub mode: WorkflowToolMode,
+    /// Who may call it, defaulting to root and workflows.
+    #[serde(default)]
+    pub grant: WorkflowToolGrant,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkflowToolMode {
+    #[default]
+    Sync,
+    Async,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowToolGrant {
+    pub root: bool,
+    pub workflows: bool,
+    pub subagents: bool,
+    pub user: bool,
+    pub agent: bool,
+}
+
+impl Default for WorkflowToolGrant {
+    fn default() -> Self {
+        // The same default an internal `workflow`-family contract gets: the
+        // operator and the graphs, not the children or the network. Handing a
+        // procedure to a subagent is a narrowing an operator opts into.
+        WorkflowToolGrant {
+            root: true,
+            workflows: true,
+            subagents: false,
+            user: false,
+            agent: false,
+        }
+    }
+}
+
 /// One declared run variable.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct StateDecl {
@@ -985,6 +1031,18 @@ pub struct Workflow {
     /// account*.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
+    /// Register this workflow in the tool registry as a first-class contract.
+    ///
+    /// The shapes already match: a workflow carries a description, an input
+    /// schema, an output schema and a definition hash, which is exactly a tool
+    /// contract. What it adds over an MCP tool is everything the engine
+    /// already has — a "tool call" that takes thirty minutes, survives a
+    /// restart, and has retry, breaker, idempotency and a human gate INSIDE
+    /// it. And it is strictly better for the trifecta fold: a subagent handed
+    /// `billing.refund` spends its legs on one reviewed procedure instead of a
+    /// whole server's tool surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<WorkflowTool>,
     #[serde(default)]
     pub limits: WorkflowLimits,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1173,6 +1231,7 @@ pub fn parse_workflow(doc: &Value) -> Result<Workflow, Vec<String>> {
         "unload",
         "durable",
         "key",
+        "tool",
     ];
     for key in obj.keys() {
         if !TOP.contains(&key.as_str()) {
@@ -1318,6 +1377,58 @@ pub fn parse_workflow(doc: &Value) -> Result<Workflow, Vec<String>> {
         .and_then(Value::as_str)
         .map(str::to_string)
         .filter(|k| !k.trim().is_empty());
+    let tool = match obj.get("tool") {
+        None => None,
+        Some(v) => {
+            let tname = v
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if tname.is_empty() {
+                errs.push(format!("workflow {name:?}: tool.name is required"));
+            } else if crate::registry::internal::contracts()
+                .iter()
+                .any(|c| c.name == tname)
+            {
+                // Shadowing an internal contract would silently reroute
+                // `memory.get` (or `finish`) to a workflow, which is the sort
+                // of surprise a fail-closed runtime exists to prevent.
+                errs.push(format!(
+                    "workflow {name:?}: tool.name {tname:?} shadows an internal contract"
+                ));
+            }
+            let mode = match v.get("mode").and_then(Value::as_str) {
+                None | Some("sync") => WorkflowToolMode::Sync,
+                Some("async") => WorkflowToolMode::Async,
+                Some(o) => {
+                    errs.push(format!(
+                        "workflow {name:?}: tool.mode {o:?} must be sync|async"
+                    ));
+                    WorkflowToolMode::Sync
+                }
+            };
+            let g = v.get("grant");
+            let flag = |k: &str, dflt: bool| {
+                g.and_then(|g| g.get(k))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(dflt)
+            };
+            let dflt = WorkflowToolGrant::default();
+            Some(WorkflowTool {
+                name: tname,
+                mode,
+                grant: WorkflowToolGrant {
+                    root: flag("root", dflt.root),
+                    workflows: flag("workflows", dflt.workflows),
+                    subagents: flag("subagents", dflt.subagents),
+                    user: flag("user", dflt.user),
+                    agent: flag("agent", dflt.agent),
+                },
+            })
+        }
+    };
     if concurrency.scope == ConcurrencyScope::Key && key.is_none() {
         errs.push(format!(
             "workflow {name:?}: concurrency.scope: key needs a `key:` template naming what a run is about"
@@ -1424,6 +1535,7 @@ pub fn parse_workflow(doc: &Value) -> Result<Workflow, Vec<String>> {
         inputs_schema,
         concurrency,
         key,
+        tool,
         limits,
         outputs_schema,
         steps,
@@ -2374,6 +2486,12 @@ pub fn workflow_schema() -> Value {
                 "description": "declared run variables — {key: {schema, reducer}}"},
             "concurrency": {"type": "object", "properties": {"max_runs": {"type": "integer", "minimum": 1}, "on_overflow": {"enum": ["queue", "drop", "replace"]}, "scope": {"enum": ["workflow", "key"], "description": "what max_runs counts: every run of this workflow (default), or every run about the same `key` — the difference between a queue and a per-entity lock"}}},
             "key": {"type": "string", "description": "the logical thing a run is ABOUT, rendered from the trigger payload (e.g. \"{{payload.account_id}}\"); required by concurrency.scope: key"},
+            "tool": {"type": "object", "required": ["name"], "additionalProperties": false, "description": "register this workflow as a first-class tool — a callable procedure with retry, breaker, idempotency and a human gate INSIDE one apparent call. Startup config only; tags are DERIVED from what the steps reach.", "properties": {
+                "name": {"type": "string", "description": "the tool name callers see; may not shadow an internal contract"},
+                "mode": {"enum": ["sync", "async"], "description": "sync parks the caller on the run and returns its output; async returns a handle"},
+                "grant": {"type": "object", "additionalProperties": false, "properties": {
+                    "root": {"type": "boolean"}, "workflows": {"type": "boolean"}, "subagents": {"type": "boolean"},
+                    "user": {"type": "boolean"}, "agent": {"type": "boolean"}}}}},
             "limits": {"type": "object", "properties": {"steps": {"type": "integer"}, "tokens": {"type": "integer"}, "deadline": {"type": "string"}, "budget": {"type": "object"}}},
             "steps": {"type": "object", "additionalProperties": {"$ref": "#/$defs/step"}, "minProperties": 1}
         },

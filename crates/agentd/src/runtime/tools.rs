@@ -201,6 +201,7 @@ impl Runtime {
             Route::Mapped(m) => RouteKind::Mapped(m.clone()),
             Route::Code => RouteKind::Code,
             Route::Mcp { server, tool } => RouteKind::Mcp(server.to_string(), tool.to_string()),
+            Route::Workflow { workflow, sync } => RouteKind::Workflow(workflow.to_string(), sync),
         });
         let out = match route {
             None => {
@@ -217,6 +218,16 @@ impl Runtime {
             },
             Some(RouteKind::Mcp(server, tool)) => {
                 self.run_mcp_call(caller, name, &server, &tool, args)
+            }
+            // A workflow tool IS `workflow.run`, which is the point: the
+            // caller sees one typed verb while the engine supplies retry,
+            // breaker, idempotency, a human gate and restart-survival.
+            Some(RouteKind::Workflow(workflow, sync)) => {
+                let mut wargs = json!({"name": workflow, "inputs": args});
+                if sync {
+                    wargs["wait"] = json!(true);
+                }
+                self.workflow_tool(caller, "workflow.run", wargs)
             }
         };
         // Output validation for ready results.
@@ -1259,6 +1270,8 @@ enum RouteKind {
     Mapped(crate::registry::Mapping),
     Code,
     Mcp(String, String),
+    /// A workflow run: `(workflow name, wait for it)`.
+    Workflow(String, bool),
 }
 
 /// Where an executor thread's result goes.

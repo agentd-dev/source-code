@@ -3198,6 +3198,10 @@ impl Runtime {
                 let def = args["definition"].clone();
                 match parse_workflow(&def) {
                     Err(e) => err(format!("{name}: {}", e.join("; "))),
+                    Ok(w) if w.tool.is_some() => err(format!(
+                        "{name}: a `tool:` block may only be declared in the startup config.                          The tool registry is built once and validated fail-closed; minting                          or shadowing a tool name at runtime would put no operator in the                          loop. (workflow {:?})",
+                        w.name
+                    )),
                     Ok(mut w) => {
                         self.fill_durable_default(&mut w);
                         if name == "workflow.create" && self.workflows.contains_key(&w.name) {

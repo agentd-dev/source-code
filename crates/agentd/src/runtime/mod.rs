@@ -706,6 +706,40 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
         );
         return crate::exit::USAGE;
     }
+    // Workflow tools: registered ONCE, here, from the startup document. This
+    // is the only door — `workflow.create`/`update` refuse a `tool:` block —
+    // because the registry is otherwise built once and validated fail-closed,
+    // and a root turn that could mint or shadow a tool name would make it a
+    // mutable index with no operator in the loop.
+    {
+        let defs: Vec<&crate::engine::Workflow> =
+            rt.workflows.values().map(|w| w.as_ref()).collect();
+        let errs = rt.registry.register_workflow_tools(&defs);
+        if !errs.is_empty() {
+            for e in &errs {
+                log.error("config.invalid", json!({"error": e}));
+            }
+            log.error(
+                "proc.exit",
+                json!({"code": crate::exit::USAGE, "err": "workflow tool registration"}),
+            );
+            return crate::exit::USAGE;
+        }
+        // One line per registered tool, carrying the tags that were DERIVED
+        // from what its steps reach. The derivation is the safety argument —
+        // a workflow author cannot declare its own trifecta floor — so an
+        // operator has to be able to see what it concluded.
+        for w in &defs {
+            let Some(t) = &w.tool else { continue };
+            log.info(
+                "registry.workflow_tools",
+                json!({"tool": t.name, "workflow": w.name,
+                       "mode": if t.mode == crate::engine::model::WorkflowToolMode::Sync { "sync" } else { "async" },
+                       "tags": rt.registry.get(&t.name).map(|s| s.tags.clone()).unwrap_or_default(),
+                       "arguments": rt.registry.get(&t.name).map(|s| s.input_schema.clone())}),
+            );
+        }
+    }
     // Workflows — a definition that fails to load is a config error, not a
     // warning: a daemon must not run with a workflow it silently dropped.
     // Phase 2 of the reference preflight: the workflows are loaded now, so the

@@ -31,6 +31,11 @@ pub enum ToolClass {
     Internal,
     Code,
     Mcp,
+    /// A workflow registered as a tool. Invocation is a run, so the caller
+    /// gets retry, breaker, idempotency, a human gate and restart-survival
+    /// inside what looks to a model like one call — none of which an MCP tool
+    /// can express.
+    Workflow,
 }
 
 /// An override mapping: which server's tool stands in for an internal
@@ -61,6 +66,8 @@ pub enum Impl {
     Code,
     /// An MCP server tool.
     Mcp { server: String, tool: String },
+    /// A workflow, started by name.
+    Workflow { workflow: String, sync: bool },
 }
 
 /// Who may call a tool. These flags gate the INTERNAL tools — the ones that
@@ -146,6 +153,8 @@ pub enum Route<'a> {
     Code,
     /// An MCP tool.
     Mcp { server: &'a str, tool: &'a str },
+    /// A workflow run.
+    Workflow { workflow: &'a str, sync: bool },
 }
 
 /// The caller asking for definitions / permission.
@@ -379,6 +388,130 @@ impl Registry {
         }
     }
 
+    /// Register every workflow carrying a `tool:` block as a first-class
+    /// contract. Called ONCE, after the startup workflow load.
+    ///
+    /// Startup-only is the whole safety argument. The registry is otherwise
+    /// built once from settings plus connected servers and validated
+    /// fail-closed; workflow tools would make it a mutable index if the model
+    /// could add to it, and `workflow.create` is root-callable — a root turn
+    /// could mint itself a new tool name, or shadow one, with no operator in
+    /// the loop. So `workflow.create`/`update` refuse a `tool:` block, and
+    /// this is the only door.
+    ///
+    /// Tags are DERIVED, never declared. A workflow author writing
+    /// `tags: [sensitive, egress]` would make the one static instance-wide
+    /// security gate something the agent-editable half of the config asserts
+    /// about itself; instead a workflow tool inherits the union of the tags of
+    /// the tools its steps actually reach, so the trifecta fold sees the truth
+    /// about what the procedure can do.
+    pub fn register_workflow_tools(
+        &mut self,
+        workflows: &[&crate::engine::Workflow],
+    ) -> Vec<String> {
+        let mut errors = Vec::new();
+        for w in workflows {
+            let Some(t) = &w.tool else { continue };
+            if let Some(existing) = self.tools.get(&t.name) {
+                errors.push(format!(
+                    "workflow {:?}: tool.name {:?} collides with an existing {} tool",
+                    w.name,
+                    t.name,
+                    match existing.class {
+                        ToolClass::Internal => "internal",
+                        ToolClass::Code => "code",
+                        ToolClass::Mcp => "MCP",
+                        ToolClass::Workflow => "workflow",
+                    }
+                ));
+                continue;
+            }
+            let tags = self.derived_tags(w);
+            self.tools.insert(
+                t.name.clone(),
+                ToolSpec {
+                    name: t.name.clone(),
+                    description: w
+                        .description
+                        .clone()
+                        .unwrap_or_else(|| format!("Run the {:?} workflow.", w.name)),
+                    // The workflow's declared inputs ARE the tool's arguments,
+                    // so a model finally sees the shape of what it is starting
+                    // — `workflow.run` could only offer a free-form object
+                    // whose contents the prompt never stated.
+                    input_schema: w
+                        .inputs_schema
+                        .clone()
+                        .unwrap_or_else(|| json!({"type": "object"})),
+                    output_schema: w.outputs_schema.clone(),
+                    class: ToolClass::Workflow,
+                    imp: Impl::Workflow {
+                        workflow: w.name.clone(),
+                        sync: t.mode == crate::engine::model::WorkflowToolMode::Sync,
+                    },
+                    grant: Grant {
+                        root: t.grant.root,
+                        workflows: t.grant.workflows,
+                        subagents: t.grant.subagents,
+                        roles: {
+                            let mut r = Vec::new();
+                            if t.grant.user {
+                                r.push(Role::User);
+                            }
+                            if t.grant.agent {
+                                r.push(Role::Agent);
+                            }
+                            r
+                        },
+                    },
+                    disabled: false,
+                    family: "workflow".into(),
+                    tags,
+                    server: None,
+                },
+            );
+        }
+        errors
+    }
+
+    /// The trifecta tags a workflow's steps actually reach — the union over
+    /// every tool its `mcp.tool` / `tool` steps name, plus the servers those
+    /// steps use.
+    fn derived_tags(&self, w: &crate::engine::Workflow) -> Vec<TrifectaTag> {
+        let mut out: Vec<TrifectaTag> = Vec::new();
+        let mut add = |tags: &[TrifectaTag]| {
+            for t in tags {
+                if !out.contains(t) {
+                    out.push(*t);
+                }
+            }
+        };
+        for step in w.steps.values() {
+            // A named tool: take that tool's tags.
+            if let Some(name) = step.spec.get("tool").and_then(Value::as_str)
+                && let Some(spec) = self.tools.get(name)
+            {
+                add(&spec.tags);
+            }
+            // A named server: take every tag any of its tools carries, since
+            // the step may reach any of them.
+            if let Some(server) = step.spec.get("server").and_then(Value::as_str) {
+                let server_tags: Vec<TrifectaTag> = self
+                    .tools
+                    .values()
+                    .filter(|t| t.server.as_deref() == Some(server))
+                    .flat_map(|t| t.tags.clone())
+                    .collect();
+                add(&server_tags);
+            }
+            // Steps that reach outside by construction.
+            if matches!(step.kind.as_str(), "http" | "a2a.send" | "a2a.delegate") {
+                add(&[TrifectaTag::Egress]);
+            }
+        }
+        out
+    }
+
     fn apply_override(
         &mut self,
         name: &str,
@@ -524,6 +657,11 @@ impl Registry {
                         sel.mcp.allows(&t.name)
                             || t.server.as_deref().is_some_and(|s| sel.mcp.allows(s))
                     }
+                    // A workflow tool is an operator-declared procedure, not a
+                    // surface discovered from a server, so it is not subject
+                    // to the discovery selectors — declaring it IS the
+                    // selection.
+                    ToolClass::Workflow => true,
                 },
             })
             .map(ToolSpec::def)
@@ -569,6 +707,10 @@ impl Registry {
             Impl::Mapped(m) => Route::Mapped(m),
             Impl::Code => Route::Code,
             Impl::Mcp { server, tool } => Route::Mcp { server, tool },
+            Impl::Workflow { workflow, sync } => Route::Workflow {
+                workflow,
+                sync: *sync,
+            },
         })
     }
 

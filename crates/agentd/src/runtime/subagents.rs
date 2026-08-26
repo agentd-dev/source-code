@@ -352,10 +352,13 @@ impl Runtime {
                 // An explicit `model:` (from the call, the template or the
                 // spawn defaults) overrides the parent's model; otherwise the
                 // child inherits it.
+                // Resolved through the tier catalogue like every other model
+                // reference, so a caller naming a TIER does not leak that name
+                // to the provider as if it were a model.
                 model: args
                     .get("model")
                     .and_then(Value::as_str)
-                    .map(str::to_string)
+                    .map(|m| self.settings.intelligence.wire_model(m))
                     .or_else(|| Some(self.model.clone())),
                 headers: self.intel_headers.clone(),
                 aws_auth: self.intel_aws_auth(),

@@ -284,6 +284,10 @@ fn response_json(script: &str, saw_tool_result: bool) -> String {
         // the hop cap has to stop. Exactly one run per turn keeps the chain
         // LINEAR: a script that called on every turn would fan out instead,
         // and would be testing the step limiter rather than the hop cap.
+        // Call a workflow REGISTERED AS A TOOL by its tool name, proving the
+        // registration is callable and not merely advertised.
+        ("wf-tool", false) => tool_call("billing.refund", r#"{"order_id":"A1"}"#),
+        ("wf-tool", true) => final_answer("refund started"),
         ("wf-once", false) => tool_call("workflow.run", r#"{"name":"loop"}"#),
         ("wf-once", true) => final_answer("started the workflow"),
         // A structured JSON answer for the workflow `infer` node tests: the

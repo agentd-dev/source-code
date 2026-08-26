@@ -197,7 +197,14 @@ impl Runtime {
         let mut routes = BTreeMap::new();
         for d in &defs {
             match self.registry.get(&d.name).map(|t| (t.class, &t.imp)) {
-                Some((ToolClass::Internal, _)) => internal.push(d.name.clone()),
+                // Internal contracts and workflow tools both round-trip: they
+                // mutate runtime state (a workflow tool STARTS A RUN), and only
+                // the state owner may do that. A workflow tool left out of both
+                // lists would be advertised to the model and then fail to
+                // dispatch in the child, which is the worst of both.
+                Some((ToolClass::Internal | ToolClass::Workflow, _)) => {
+                    internal.push(d.name.clone())
+                }
                 Some((ToolClass::Mcp, crate::registry::Impl::Mcp { server, tool })) => {
                     // A turn worker dials its MCP tools ITSELF, straight from
                     // this route map, so a call routed here never reaches

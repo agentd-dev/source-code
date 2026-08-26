@@ -59,6 +59,59 @@ fn a_workflow_with_a_tool_block_is_registered() {
     );
 }
 
+/// Registered is not the same as CALLABLE. A workflow tool mutates runtime
+/// state — it starts a run — so only the state owner may dispatch it; a turn
+/// worker has to round-trip. Left out of both the round-trip list and the MCP
+/// route map it would be advertised to the model and then fail to dispatch in
+/// the child, which is the worst of both.
+#[test]
+fn a_registered_workflow_tool_is_callable_from_a_turn() {
+    let dir = common::unique_path("wfcall", "d");
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = format!("{dir}/c.yaml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "config_version: \"1\"\n\
+             agent: {{ name: wt, prompt: \"refund order A1\" }}\n\
+             store: {{ kind: file, file: {{ path: {dir}/state }} }}\n\
+             observability: {{ log_level: info, log_content: true }}\n\
+             intelligence: {{ endpoints: \"mock:wf-tool\", model: mock }}\n\
+             lifecycle: {{ run_until: idle, idle_grace: 3s }}\n\
+             workflows:\n\
+            \x20 - name: issue-refund\n\
+            \x20   description: Refund an order.\n\
+            \x20   tool: {{ name: billing.refund, mode: async }}\n\
+            \x20   inputs: {{ schema: {{ type: object, required: [order_id], properties: {{ order_id: {{ type: string }} }} }} }}\n    steps:\n\
+            \x20     s: {{ kind: manual }}\n\
+            \x20     f: {{ kind: finish, depends_on: [s], status: completed, output: refunded }}\n"
+        ),
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .args(["--config", &cfg])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .output()
+        .expect("run");
+    let log = String::from_utf8_lossy(&out.stderr).to_string();
+    let _ = std::fs::remove_dir_all(&dir);
+    // The model called it by its TOOL name...
+    assert!(
+        log.contains("\"tool\":\"billing.refund\""),
+        "the model should have been able to call the tool\n{log}"
+    );
+    // ...and it started the workflow, which is what makes it a tool at all.
+    assert!(
+        log.contains("\"workflow\":\"issue-refund\"") && log.contains("\"event\":\"run.start\""),
+        "calling the tool should have started the workflow\n{log}"
+    );
+    assert!(
+        !log.contains("is unavailable") && !log.contains("no such tool"),
+        "the tool must not be advertised without being dispatchable\n{log}"
+    );
+}
+
 /// Shadowing an internal contract would silently reroute a built-in to a
 /// workflow — exactly the surprise a fail-closed runtime exists to prevent.
 #[test]

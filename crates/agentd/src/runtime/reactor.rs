@@ -454,6 +454,9 @@ impl Runtime {
             // 6. Start nodes + runs (+ suspended waits).
             self.poll_starts();
             self.poll_stream_starts();
+            // Runs parked on the log resolve in the same pass that advances
+            // consumers, so a produce→wait hop costs a tick, not a timeout.
+            self.poll_event_waits();
             self.poll_waits();
             self.schedule_runs();
             // Inline steps (assign/map/template/switch…) complete synchronously
@@ -476,6 +479,10 @@ impl Runtime {
             let mut stream_rounds = 0;
             while std::mem::take(&mut self.stream_dirty) && stream_rounds < 64 {
                 self.poll_stream_starts();
+                // A run parked on the log is a consumer too: without this, a
+                // saga whose awaited event was emitted by a step in this very
+                // iteration would park until the next tick.
+                self.poll_event_waits();
                 self.schedule_runs();
                 let mut passes = 0;
                 while std::mem::take(&mut self.resched) && passes < 1024 {

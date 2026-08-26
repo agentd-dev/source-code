@@ -62,6 +62,16 @@ pub(crate) fn wait_record(kind: &str, extra: Value, timeout_ms: Option<u64>) -> 
     w
 }
 
+/// How many events one stream's waiters advance through per tick. Bounds the
+/// single-writer loop's time on a busy stream; the anchor persists, so a
+/// backlog is worked off across ticks rather than dropped.
+const EVENT_SCAN: usize = 256;
+
+/// The durable key of one event — mirrors the stream module's layout.
+fn event_key(stream: &str, seq: u64) -> String {
+    format!("{stream}/e{seq:020}")
+}
+
 impl Runtime {
     /// Execute one of the orchestration kinds (called from `execute_step`).
     pub(crate) fn execute_orchestration_step(
@@ -394,12 +404,200 @@ impl Runtime {
                 let conv = spec.get("conversation").and_then(Value::as_str).map(str::to_string).or_else(|| self.runs.get(run_id).and_then(|r| r.conversation.clone()));
                 self.suspend_wait(run_id, step_id, wait_record("message", json!({"conversation": conv}), timeout));
             }
+            // Park on the durable log. This is the one edge in the system that
+            // is ordered, replayable and correlated, and until now it could
+            // only START a run — so every pattern past "one run per event"
+            // (sagas, absence, quorum) had to be two workflows plus hand-rolled
+            // bookkeeping. The reason is narrow and specific: a `stream` start's
+            // filter sees only `{event}`, and there was nowhere to match an
+            // event against THIS run's inputs. `match` closes that.
+            "event" => {
+                let Some(stream) = spec.get("stream").and_then(Value::as_str) else {
+                    self.finish_step_pub(run_id, step_id, StepStatus::Failed, None, Some("wait on: event requires `stream`".into()), 0);
+                    return;
+                };
+                if !self.settings.streams.contains_key(stream) {
+                    self.finish_step_pub(run_id, step_id, StepStatus::Failed, None, Some(format!("stream {stream:?} is not declared (add it under `streams:`)")), 0);
+                    return;
+                }
+                // Anchored at NOW, never earlier. A wait that could resolve on
+                // an event predating the run would break the at-least-once
+                // contract for everything downstream of it: the step would
+                // "succeed" on work that happened before anyone asked, and its
+                // idempotency key would cover a different world. There is
+                // deliberately no `from: earliest` here — that belongs to
+                // consumers, which own a durable offset.
+                let anchor = self.durable.manifest().streams.get(stream).map(|m| m.seq).unwrap_or(0);
+                let rec = json!({
+                    "stream": stream,
+                    "subject": spec.get("subject").and_then(Value::as_str),
+                    "match": spec.get("match").and_then(Value::as_str),
+                    "anchor": anchor,
+                });
+                self.suspend_wait(run_id, step_id, wait_record("event", rec, timeout));
+            }
             #[cfg(feature = "a2a")]
             "webhook" => self.webhook_wait(run_id, step_id, spec, timeout),
             "deadline" | "" if timeout.is_some() => {
                 self.suspend_wait(run_id, step_id, wait_record("deadline", json!({}), timeout));
             }
-            other => self.finish_step_pub(run_id, step_id, StepStatus::Failed, None, Some(format!("wait: on must be resource|condition|signal|run|subagent|message|webhook (got {other:?})")), 0),
+            other => self.finish_step_pub(run_id, step_id, StepStatus::Failed, None, Some(format!("wait: on must be resource|condition|signal|run|subagent|message|event|webhook (got {other:?})")), 0),
+        }
+    }
+
+    /// Every tick: resolve `wait {on: event}` steps against the durable log.
+    ///
+    /// **Inverted on purpose.** The obvious shape — each parked wait scanning
+    /// its own stream every tick — costs (waiters × events) durable reads on
+    /// the single-writer thread, for waits that may sit for days. A hundred
+    /// parked sagas would be a hundred independent walks per tick of a log the
+    /// consumer loop is already walking. So this groups waiters BY STREAM and
+    /// reads each event exactly once per tick no matter how many runs are
+    /// parked on it, the same way `poll_stream_starts` batches.
+    ///
+    /// Each waiter's anchor advances past what it scanned, so a quiet stream
+    /// costs one manifest lookup and a busy one never rescans. The advance is
+    /// an ordinary run mutation, so it rides the tick's checkpoint rather than
+    /// forcing a write of its own.
+    pub(crate) fn poll_event_waits(&mut self) {
+        // One waiter: where it is parked, what it is looking for, and the
+        // run-local data its `match` expression is allowed to see.
+        struct Waiter {
+            run: String,
+            step: String,
+            anchor: u64,
+            subject: Option<String>,
+            expr: Option<String>,
+            inputs: Value,
+            vars: Value,
+        }
+        let mut by_stream: std::collections::BTreeMap<String, Vec<Waiter>> =
+            std::collections::BTreeMap::new();
+        for (rid, run) in &self.runs {
+            if run.status.is_terminal() {
+                continue;
+            }
+            for (sid, st) in &run.steps {
+                if st.status != StepStatus::Suspended {
+                    continue;
+                }
+                let Some(w) = &st.wait else { continue };
+                if w["kind"].as_str() != Some("event") {
+                    continue;
+                }
+                let Some(stream) = w["stream"].as_str() else {
+                    continue;
+                };
+                by_stream
+                    .entry(stream.to_string())
+                    .or_default()
+                    .push(Waiter {
+                        run: rid.clone(),
+                        step: sid.clone(),
+                        anchor: w["anchor"].as_u64().unwrap_or(0),
+                        subject: w["subject"].as_str().map(str::to_string),
+                        expr: w["match"].as_str().map(str::to_string),
+                        inputs: run.inputs.clone(),
+                        vars: Value::Object(run.vars.clone()),
+                    });
+            }
+        }
+        if by_stream.is_empty() {
+            return;
+        }
+        // (run, step, event) for the ones that matched, and (run, step, seq)
+        // for every waiter's new anchor.
+        let mut resolved: Vec<(String, String, Value)> = Vec::new();
+        let mut advanced: Vec<(String, String, u64)> = Vec::new();
+        for (stream, waiters) in &by_stream {
+            let head = self
+                .durable
+                .manifest()
+                .streams
+                .get(stream)
+                .map(|m| m.seq)
+                .unwrap_or(0);
+            let first = self
+                .durable
+                .manifest()
+                .streams
+                .get(stream)
+                .map(|m| m.first)
+                .unwrap_or(1);
+            let Some(low) = waiters.iter().map(|w| w.anchor).min() else {
+                continue;
+            };
+            if low >= head {
+                continue; // nothing new on this stream since the earliest anchor
+            }
+            let mut pending: Vec<&Waiter> = waiters.iter().collect();
+            let mut seq = low.max(first.saturating_sub(1));
+            let mut scanned = 0usize;
+            while seq < head && scanned < EVENT_SCAN && !pending.is_empty() {
+                seq += 1;
+                scanned += 1;
+                // One read, shared by every waiter on this stream.
+                let Some(env) = self
+                    .durable
+                    .get(Kind::Event, &event_key(stream, seq))
+                    .ok()
+                    .flatten()
+                else {
+                    continue; // trimmed underneath us
+                };
+                let event = env.state;
+                let subject = event.get("subject").and_then(Value::as_str).unwrap_or("");
+                pending.retain(|w| {
+                    if w.anchor >= seq {
+                        return true; // this waiter armed after this event
+                    }
+                    if let Some(pat) = &w.subject
+                        && !super::streams::subject_matches(pat, subject)
+                    {
+                        return true;
+                    }
+                    if let Some(expr) = &w.expr {
+                        // The point of the whole node: the expression sees this
+                        // RUN's inputs beside the event, so "the shipment for
+                        // the order this run is about" is expressible.
+                        let vars: Vec<(&str, &Value)> =
+                            vec![("event", &event), ("inputs", &w.inputs), ("vars", &w.vars)];
+                        if crate::cel::eval_bool(
+                            expr.trim().trim_start_matches("CEL:").trim(),
+                            &vars,
+                        ) != Ok(true)
+                        {
+                            return true;
+                        }
+                    }
+                    resolved.push((w.run.clone(), w.step.clone(), event.clone()));
+                    false
+                });
+            }
+            // Everything still parked has now seen the log up to `seq`.
+            for w in pending {
+                if seq > w.anchor {
+                    advanced.push((w.run.clone(), w.step.clone(), seq));
+                }
+            }
+        }
+        for (rid, sid, seq) in advanced {
+            if let Some(w) = self
+                .runs
+                .get_mut(&rid)
+                .and_then(|r| r.steps.get_mut(&sid))
+                .and_then(|s| s.wait.as_mut())
+            {
+                w["anchor"] = json!(seq);
+            }
+        }
+        for (rid, sid, event) in resolved {
+            self.log.info(
+                "wait.resolved",
+                json!({"run": rid, "step": sid, "kind": "event",
+                       "stream": event.get("stream"), "subject": event.get("subject")}),
+            );
+            self.finish_step_pub(&rid, &sid, StepStatus::Done, Some(event), None, 0);
         }
     }
 
@@ -482,7 +680,11 @@ impl Runtime {
                         }
                     }
                     Some("deadline") if timed_out => resolve.push((rid.clone(), sid.clone(), StepStatus::Done, json!({"waited_ms": now.saturating_sub(w["since_ms"].as_u64().unwrap_or(now))}), None)),
-                    Some("resource") | Some("signal") | Some("message") | Some("human") | Some("child_run") if timed_out => {
+                    // Absence IS the branch: an event that never arrives routes
+                    // through `on_timeout` like any other deadline, which is
+                    // what makes "alert fired, no recovery in ten minutes"
+                    // expressible without a polling loop.
+                    Some("resource") | Some("signal") | Some("message") | Some("human") | Some("child_run") | Some("event") if timed_out => {
                         resolve.push((rid.clone(), sid.clone(), StepStatus::Timeout, json!({"timed_out": true}), Some("wait timed out".into())));
                     }
                     _ => {}

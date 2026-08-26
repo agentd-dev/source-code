@@ -254,6 +254,9 @@ pub const KINDS: &[KindInfo] = &[
             "subagent",
             "conversation",
             "webhook",
+            "stream",
+            "subject",
+            "match",
             "timeout",
             "on_timeout",
         ],
@@ -2247,6 +2250,10 @@ pub const RAW_FIELDS: &[(&str, &str)] = &[
     ("signal", "filter"),
     ("event", "filter"),
     ("wait", "condition"),
+    // Held raw for the same reason as `condition`: it is evaluated later,
+    // against each candidate event, so rendering it at dispatch would resolve
+    // `event` before any event exists.
+    ("wait", "match"),
     ("think", "check"),
     ("switch", "cases"),
     ("await", "condition"),

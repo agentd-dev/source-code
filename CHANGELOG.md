@@ -80,6 +80,50 @@ gets retry, breaker, idempotency and a human gate inside one apparent call.
 Startup config only, and tags are derived from what the steps reach rather than
 declared by the workflow author.
 
+### Gates that name a decider
+
+`to` on the `human` node and `ask_human` names **who must answer** — a
+principal-id glob, or `{id, role, labels}` with every condition ANDed so adding
+one always narrows. A reply from anyone else is refused with an explanation and
+the gate stays open, rather than the answer sliding into the conversation
+unnoticed.
+
+The point is that the record is true: "the finance lead approved this refund"
+is only worth keeping if someone else could not have satisfied it. So an
+addressed gate is **never auto-answered**, whatever `agent.approval` or
+`ask_human_fallback` say — a model judge standing in for the named decider
+makes the record a lie. An operator *can* still answer, because refusing them
+would be theatre when they can already rewrite the config or the store; the
+override is marked `operator_override` in the task, the log and the audit
+stream instead. And the audit line now names the person who replied: it
+previously carried `via` — "human" or "auto" — which says how a gate was
+answered and not by whom.
+
+Declarations that name nobody are load errors rather than accepted-and-ignored,
+since each produces a gate that *looks* routed and is not: an empty `to`, a
+`role: anonymous` (precisely the identity nothing vouches for), and any typo in
+a field or role name.
+
+
+### Published schemas, for editor autocomplete
+
+The config and workflow JSON Schemas are served at
+`https://agentd.dev/schema/config.json` and `.../workflow.json` (pinned:
+`config-1.json`, `workflow-3.json`), so a `# yaml-language-server: $schema=…`
+modeline or a `yaml.schemas` entry gives key completion, enum values and
+typo-flagging as you type rather than at `exit 2`.
+
+Inline workflows complete too: a `workflows:` entry accepts a reference or a
+whole definition, and the config schema now folds the workflow document's own
+properties in — `steps`, every node `kind` and each kind's fields — where it
+previously left them `additionalProperties: true` and offered nothing.
+
+The files are generated from the binary and CI regenerates and diffs them, so
+the published schema cannot drift from the loader. `contrib/` carries the
+SchemaStore catalog entries and the submission notes: once registered there,
+VS Code, JetBrains and `yaml-language-server` apply the schema from the
+filename alone, with no per-project setup.
+
 ### Fixed
 
 - the step cache parked its key in the slot every suspending kind overwrites,
@@ -107,7 +151,9 @@ declared by the workflow author.
   parser accepts. Harmless while the schema was advisory; a red squiggle on a
   valid document once an editor reads it. A test now holds the schema and the
   parser to the same field list;
-- the config schema's title still said "(v2)" after the version reset;
+- the config schema's title still said "(v2)" after the version reset, and
+  `config.valid` reported `"schema":"2"` from a hardcoded literal — it reads
+  the version constant now, so the two cannot disagree again;
 - `ask_human`'s contract disagreed with its implementation in both directions
   at once. `to` was advertised and read by nothing, so a model could believe
   it had addressed a question that in fact went to whoever was watching.

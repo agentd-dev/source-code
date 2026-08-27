@@ -3,10 +3,13 @@
 //! and `manual`, the long-lived start kinds fire runs while the instance lives
 //! — `loop` (re-run on completion, `interval`/`until`/`max_iterations`/
 //! `backoff`), `schedule` (cron / `every`, `catch_up`), `subscribe` (an MCP
-//! resource update, notify-then-read, `debounce`/`coalesce`/`filter`,
-//! `claim`/`shard` for exactly-one-owner in a cluster), `signal` (a named
-//! signal), `event` (an internal lifecycle event), and `a2a` (a principal's
-//! message routed here). Start-node state (last fired, iteration, missed,
+//! resource update, notify-then-read, `debounce`/`coalesce`/`filter`/`window`),
+//! `signal` (a named signal), `event` (an internal lifecycle event), and `a2a`
+//! (a principal's message routed here). A `subscribe` start has no `claim` or
+//! `shard`: agentd holds no lease and partitions no work — exactly-one-owner
+//! across a fleet belongs to whatever the work comes FROM, because only that
+//! can hand an item to somebody else when a holder dies (see
+//! `docs/scaling.md`). Start-node state (last fired, iteration, missed,
 //! next deadline, debounce) is durable in the manifest, so a restart resumes
 //! the schedule rather than restarting it.
 

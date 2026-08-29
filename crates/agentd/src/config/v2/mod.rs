@@ -4955,13 +4955,27 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                 ),
             );
         }
-        if let Some(f) = obj.get("file").and_then(Value::as_str)
-            && !std::path::Path::new(f).exists()
-        {
-            err(
-                &mut d,
-                format!("workflows['{name}'].file {f:?} does not exist"),
-            );
+        // The reference is folded against `vars` before the check, because a
+        // workflow entry's `{{config.*}}` is resolved at LOAD time (workflow
+        // documents are deliberately excluded from the settings-wide
+        // substitution so that inline, file, url and dir entries are all
+        // treated alike). Checking the raw token here rejected a perfectly
+        // good `file: "{{config.wf_file}}"` as "does not exist". An
+        // UNRESOLVABLE var is not reported here — the load-time fold names it
+        // once, and two messages for one typo is worse than one.
+        if let Some(f) = obj.get("file").and_then(Value::as_str) {
+            let mut folded = Value::String(f.to_string());
+            let mut ignored = Vec::new();
+            substitute_config_vars(&mut folded, &s.vars, "workflow entry", &mut ignored);
+            if ignored.is_empty()
+                && let Some(path) = folded.as_str()
+                && !std::path::Path::new(path).exists()
+            {
+                err(
+                    &mut d,
+                    format!("workflows['{name}'].file {path:?} does not exist"),
+                );
+            }
         }
     }
 

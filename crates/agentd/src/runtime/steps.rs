@@ -76,6 +76,17 @@ impl Runtime {
         // check — sees a plain list of documents and needs no directory case.
         let mut docs: Vec<Value> = Vec::new();
         for doc in self.settings.workflows.clone() {
+            // The ENTRY fold runs here, BEFORE the dir expansion, because a
+            // `dir:` is consumed by that expansion and would never reach the
+            // per-document fold below — `{{config.wf_dir}}` went to the
+            // filesystem verbatim and failed as "not a directory". `file:` and
+            // `url:` are folded again below (idempotent: a folded string has no
+            // tokens left), which keeps the inline case reporting an unresolved
+            // reference exactly once.
+            let mut doc = doc;
+            if doc.get("steps").is_none() {
+                substitute_config_vars(&mut doc, &self.settings.vars, "workflow entry", &mut errs);
+            }
             match doc.get("dir").and_then(Value::as_str) {
                 None => docs.push(doc),
                 Some(dir) => {

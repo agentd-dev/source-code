@@ -289,3 +289,91 @@ fn an_explicit_skills_dir_suppresses_the_convention() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// `{{config.*}}` in a workflow REFERENCE — `dir:` or `file:`.
+///
+/// Workflow documents are deliberately excluded from the settings-wide
+/// substitution so inline, file, url and dir entries are all folded alike at
+/// LOAD time. But `dir:` was consumed by the directory expansion before that
+/// fold ran, and validation checked `file:` existence before it too, so both
+/// went to the filesystem as the literal token `{{config.wf_dir}}`.
+///
+/// It matters because config layers REPLACE lists: var-indirection is the only
+/// way an overlay can redirect a workflow folder without restating every entry
+/// the base config declared.
+#[test]
+fn a_config_var_resolves_in_a_workflow_dir_and_file_reference() {
+    let (root, home, work) = project("wfvar");
+    std::fs::create_dir_all(work.join("default_wf")).unwrap();
+    std::fs::create_dir_all(work.join("site_wf")).unwrap();
+    std::fs::write(work.join("default_wf/a.yaml"), wf("default_extra")).unwrap();
+    std::fs::write(work.join("site_wf/a.yaml"), wf("site_extra")).unwrap();
+    std::fs::write(work.join("standalone.yaml"), wf("via_file_var")).unwrap();
+    // A raw string, because the shape of this YAML is the point and escaping
+    // it through format! is how the indentation went wrong the first time.
+    let cfg = r#"vars:
+  wf_dir: ./default_wf
+  wf_file: ./standalone.yaml
+workflows:
+  - name: from_base
+    steps:
+      s: { kind: manual }
+      f: { kind: finish, depends_on: [s], status: completed }
+  - dir: "{{config.wf_dir}}"
+    glob: "*.yaml"
+  - name: via_file
+    file: "{{config.wf_file}}"
+"#;
+    std::fs::write(work.join("agentd.yml"), format!("{BASE}{cfg}")).unwrap();
+
+    let (code, log) = run_in(&work, &home, &[]);
+    assert_eq!(code, Some(0), "{log}");
+    for name in ["from_base", "default_extra", "via_file_var"] {
+        assert!(
+            log.contains(&format!("\"name\":\"{name}\"")),
+            "{name} should have loaded\n{log}"
+        );
+    }
+
+    // The point of the fix: an overlay redirects the FOLDER by setting one var,
+    // without restating the list the base config declared. `vars` is a map, so
+    // it merges key by key where the `workflows` list would be replaced whole.
+    std::fs::write(
+        work.join("agentd.local.yml"),
+        "vars: { wf_dir: ./site_wf }\n",
+    )
+    .unwrap();
+    let (code, log) = run_in(&work, &home, &[]);
+    assert_eq!(code, Some(0), "{log}");
+    assert!(
+        log.contains("site_extra"),
+        "the overlay should redirect\n{log}"
+    );
+    assert!(
+        log.contains("from_base") && log.contains("via_file_var"),
+        "and must not drop what the base declared\n{log}"
+    );
+    assert!(
+        !log.contains("default_extra"),
+        "the old folder should no longer load\n{log}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// An UNDEFINED var in a reference is named once — not once by validation and
+/// again by the loader. Two messages for one typo is worse than one.
+#[test]
+fn an_undefined_var_in_a_reference_is_reported_once() {
+    let (root, home, work) = project("wfvarbad");
+    std::fs::create_dir_all(work.join("wfs")).unwrap();
+    std::fs::write(work.join("wfs/a.yaml"), wf("never_loads")).unwrap();
+    std::fs::write(
+        work.join("agentd.yml"),
+        format!("{BASE}workflows:\n  - dir: \"{{{{config.nope}}}}\"\n"),
+    )
+    .unwrap();
+    let (_code, log) = run_in(&work, &home, &[]);
+    let hits = log.matches("config.nope is not defined").count();
+    assert_eq!(hits, 1, "expected exactly one message\n{log}");
+    let _ = std::fs::remove_dir_all(&root);
+}

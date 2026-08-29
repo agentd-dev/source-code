@@ -50,15 +50,21 @@ frontmatter is optional — without it the file stem names the skill and its
 first paragraph describes it. Like `:::skill`, a local file wins a name
 collision with a discovered one.
 
-### Known
+### Fixed
 
-- `{{config.*}}` does not resolve in a workflow `file:`, `url:` or `dir:`
-  reference, though the comment above the fold says it does: `dir:` expansion
-  and the `file:` existence check both run BEFORE the fold, so the raw token
-  reaches the filesystem — `workflow dir {{config.wf_dir}}: not a directory`.
-  It matters because var-indirection is otherwise the way to redirect a
-  workflow folder from an overlay without restating the whole list, lists
-  being replaced rather than merged across config layers.
+- `{{config.*}}` now resolves in a workflow `dir:` and `file:` reference, which
+  the comment above the fold always claimed it did. Workflow documents are
+  deliberately excluded from the settings-wide substitution so inline, file,
+  url and dir entries are folded alike at LOAD time — but `dir:` was consumed
+  by the directory expansion before that fold ran, and validation checked
+  `file:` existence before it too, so both reached the filesystem as the
+  literal token (`workflow dir {{config.wf_dir}}: not a directory`).
+
+  It matters because config layers REPLACE lists: var-indirection is the only
+  way an overlay can redirect a workflow folder without restating every entry
+  the base config declared. An undefined var is still named exactly once — the
+  loader reports it, and validation stays quiet rather than adding a second
+  message for one typo.
 
 ## v1.2.0 — the runtime can address itself
 

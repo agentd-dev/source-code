@@ -115,6 +115,115 @@ jobs:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: cosign attest --yes --predicate sbom.spdx.json --type spdxjson "ghcr.io/${{ github.repository_owner }}/agentd@${DIGEST}"
 
+  # Publish the library crates to crates.io.
+  #
+  # `needs: [binaries]` on purpose: a crates.io publish is the ONE irreversible
+  # step in a release — a version can be yanked but never re-used or removed —
+  # so the reversible artifacts prove the build first. Everything else here can
+  # be deleted and re-cut from the same tag.
+  #
+  # Two properties this job needs that a naive `cargo publish` does not have:
+  #
+  #   1. Skip what is already published. `agentd-net` and `agentd-mcp` change
+  #      far more rarely than the runtime, so most releases must publish only
+  #      core + cli. Re-publishing an existing version is a hard error, which
+  #      would fail every release that did not touch all four crates.
+  #   2. Wait for the index between crates. `agentd-cli` depends on
+  #      `agentd-core = "<this version>"`; publishing them back to back fails
+  #      because the sparse index has not caught up. Order is net → mcp → core
+  #      → cli, each waiting for its predecessor to be resolvable.
+  crates:
+    needs: [binaries]
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # A tag that disagrees with the manifests would publish a version nobody
+      # can reproduce from the tag. Fail before the irreversible step, not after.
+      - name: the tag and the manifests must agree
+        run: |
+          set -euo pipefail
+          tag="${{ github.ref_name }}"
+          want="${tag#v}"
+          got=$(cargo metadata --no-deps --format-version 1 \
+                | jq -r '.packages[] | select(.name=="agentd-core") | .version')
+          if [ "$want" != "$got" ]; then
+            echo "::error::tag $tag says $want but agentd-core is $got"
+            exit 1
+          fi
+          echo "tag $tag matches agentd-core $got"
+
+      - name: publish in dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          on_index() {   # name version -> 0 when crates.io serves that version
+            [ "$(curl -sS -o /dev/null -w '%{http_code}' \
+                 -H 'user-agent: agentd-release (agent@agentd.dev)' \
+                 "https://crates.io/api/v1/crates/$1/$2")" = "200" ]
+          }
+
+          version_of() {
+            cargo metadata --no-deps --format-version 1 \
+              | jq -r ".packages[] | select(.name==\"$1\") | .version"
+          }
+
+          crates="agentd-net agentd-mcp agentd-core agentd-cli"
+
+          # What is actually missing from the index? Asked BEFORE credentials,
+          # because "nothing to publish" is the normal case for agentd-net and
+          # agentd-mcp — they change far more rarely than the runtime, and a
+          # release that only moves core + cli must not demand a token to
+          # decide it has nothing to do.
+          todo=""
+          for c in $crates; do
+            v=$(version_of "$c")
+            if on_index "$c" "$v"; then
+              echo "$c $v is already on crates.io"
+            else
+              echo "$c $v needs publishing"
+              todo="$todo $c"
+            fi
+          done
+          if [ -z "$todo" ]; then
+            echo "every crate at this tag is already on crates.io — nothing to publish"
+            exit 0
+          fi
+
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN is not set, and$todo still need publishing."
+            echo "::error::Add it with: gh secret set CARGO_REGISTRY_TOKEN --repo ${{ github.repository }}"
+            exit 1
+          fi
+
+          # Dependency order, not the order they were found missing:
+          # agentd-cli pins agentd-core at this exact version, so core must be
+          # resolvable on the sparse index before cli is uploaded.
+          for c in $crates; do
+            case " $todo " in *" $c "*) ;; *) continue ;; esac
+            v=$(version_of "$c")
+            echo "publishing $c $v"
+            cargo publish -p "$c" --locked
+            # The index lags the upload by seconds; ten minutes is far past
+            # normal and turns a stuck index into a named failure rather than
+            # a confusing resolution error on the next crate.
+            ok=""
+            for _ in $(seq 1 60); do
+              if on_index "$c" "$v"; then ok=1; echo "$c $v is resolvable"; break; fi
+              sleep 10
+            done
+            if [ -z "$ok" ]; then
+              echo "::error::$c $v never appeared on the index"
+              exit 1
+            fi
+          done
+
   # Aggregate SHA256 checksums over the released binaries, after they upload.
   checksums:
     needs: [binaries]

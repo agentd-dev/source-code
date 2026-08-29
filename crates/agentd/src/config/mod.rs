@@ -32,7 +32,7 @@ use crate::sec::scope::TrifectaTag;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Execution mode. There is one supervisor loop; the mode only chooses the
@@ -2379,10 +2379,14 @@ pub(crate) fn config_flag(arg: &str) -> ConfigFlag<'_> {
 pub(crate) struct ConfigPaths {
     /// The files to load, in merge order (earlier is overridden by later).
     pub paths: Vec<String>,
-    /// True when `paths` came from DISCOVERY — nothing named a config, so a
-    /// dotfile in the working directory was adopted. Never true alongside a
-    /// named path: discovery is a fallback for an empty list.
+    /// True when `paths` came from DISCOVERY — nothing named a config, so the
+    /// chain was walked. Never true alongside a named path: discovery is a
+    /// fallback for an empty list.
     pub discovered: bool,
+    /// Set when one RUNG of the chain had two spellings at once. Carried as
+    /// data rather than returned as an error so this stays pure and the file
+    /// watcher can call it; the loader turns it into a usage error.
+    pub ambiguous: Option<String>,
 }
 
 /// The ordered config-file list over an already-debranded env map: the
@@ -2412,37 +2416,107 @@ pub(crate) fn config_paths_from_map(args: &[String], envmap: &HashMap<&str, &str
             ConfigFlag::No => {}
         }
     }
-    // Nothing named a config, so look for the project's own: `.agentd.yml` in
-    // the working directory, the way a linter or a formatter picks up its
-    // dotfile. Only ever a fallback — an explicit `--config` or `AGENTD_CONFIG`
-    // means the caller has already decided.
+    // Nothing named a config, so walk the discovery chain — a user default, the
+    // project's own file, a machine-local overlay — the way a linter or a
+    // formatter picks up its dotfile. Only ever a fallback: an explicit
+    // `--config` or `AGENTD_CONFIG` means the caller has already decided, and
+    // silently merging a stray `agentd.local.yml` into a named production
+    // config would be the worst kind of surprise.
     let mut discovered = false;
+    let mut ambiguous = None;
     if paths.is_empty() && !is_informational(args) {
-        paths.extend(discovered_config_in(Path::new(".")));
-        discovered = !paths.is_empty();
+        match discovered_chain(Path::new("."), envmap) {
+            Ok(found) => {
+                discovered = !found.is_empty();
+                paths.extend(found);
+            }
+            Err(e) => ambiguous = Some(e),
+        }
     }
-    ConfigPaths { paths, discovered }
+    ConfigPaths {
+        paths,
+        discovered,
+        ambiguous,
+    }
 }
 
-/// The file names agentd looks for when an invocation names no config.
+/// One rung of the discovery chain: the spellings that name the SAME logical
+/// file. Two spellings because `.yml` and `.yaml` are both idiomatic and
+/// guessing wrong should not mean silence — a config file the tool ignores is
+/// the worst outcome of the three.
 ///
-/// Two spellings because `.yml` and `.yaml` are both idiomatic and guessing
-/// wrong should not mean silence — a config file the tool ignores is the worst
-/// outcome of the three.
-pub const DISCOVERED_CONFIG_NAMES: [&str; 2] = [".agentd.yml", ".agentd.yaml"];
+/// The user rung, under `$XDG_CONFIG_HOME` (else `~/.config`): defaults that
+/// follow the person, not the checkout.
+pub const USER_CONFIG_NAMES: [&str; 2] = ["config.yml", "config.yaml"];
 
-/// Which of [`DISCOVERED_CONFIG_NAMES`] exist in `dir`, in order.
+/// The project rung, in the working directory. The dotted spellings are the
+/// original discovery names and stay valid: they shipped, and silently
+/// ignoring one would break the setups that adopted it.
+pub const PROJECT_CONFIG_NAMES: [&str; 4] =
+    ["agentd.yml", "agentd.yaml", ".agentd.yml", ".agentd.yaml"];
+
+/// The local rung: a machine-specific overlay that is expected to be
+/// git-ignored, so a checkout can be pointed at a dev endpoint without the
+/// change ever being committable by accident.
+pub const LOCAL_CONFIG_NAMES: [&str; 2] = ["agentd.local.yml", "agentd.local.yaml"];
+
+/// The user rung's directory: `$XDG_CONFIG_HOME/agentd`, else `~/.config/agentd`.
+/// `None` when neither variable is set — a daemon with no HOME (a scratch
+/// container, a systemd unit without one) simply has no user rung rather than
+/// resolving a path relative to nothing.
+pub fn user_config_dir(envmap: &HashMap<&str, &str>) -> Option<PathBuf> {
+    if let Some(x) = envmap.get("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        return Some(Path::new(x).join("agentd"));
+    }
+    envmap
+        .get("HOME")
+        .filter(|v| !v.is_empty())
+        .map(|h| Path::new(h).join(".config").join("agentd"))
+}
+
+/// Which of `names` exist in `dir`, in order.
 ///
-/// Returns **all** matches rather than the first, so that two present at once
-/// surfaces as an error at load rather than a silent pick between them. Callers
-/// that get more than one refuse to start.
-pub fn discovered_config_in(dir: &Path) -> Vec<String> {
-    DISCOVERED_CONFIG_NAMES
+/// Returns **all** matches rather than the first, so that two spellings of one
+/// rung present at once surfaces as an error rather than a silent pick between
+/// them. Callers that get more than one refuse to start.
+pub fn present_in(dir: &Path, names: &[&str]) -> Vec<String> {
+    names
         .iter()
         .map(|n| dir.join(n))
         .filter(|p| p.is_file())
         .map(|p| p.to_string_lossy().into_owned())
         .collect()
+}
+
+/// The whole discovery chain, LOWEST precedence first: the user rung, then the
+/// project rung, then the local overlay. Every rung that has a file
+/// contributes one, and they merge in that order — so a user default is
+/// overridden by the project's config and that by a machine-local overlay,
+/// with flags and environment still on top of all three.
+///
+/// `Err` names the rung that is ambiguous. Ambiguity is per RUNG, not across
+/// the chain: `agentd.yml` beside `agentd.local.yml` is the design, while
+/// `agentd.yml` beside `agentd.yaml` is a coin toss nobody should have to
+/// debug.
+pub fn discovered_chain(cwd: &Path, envmap: &HashMap<&str, &str>) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    let mut rungs: Vec<(&str, PathBuf, &[&str])> = Vec::new();
+    if let Some(d) = user_config_dir(envmap) {
+        rungs.push(("user", d, &USER_CONFIG_NAMES));
+    }
+    rungs.push(("project", cwd.to_path_buf(), &PROJECT_CONFIG_NAMES));
+    rungs.push(("local", cwd.to_path_buf(), &LOCAL_CONFIG_NAMES));
+    for (label, dir, names) in rungs {
+        let found = present_in(&dir, names);
+        if found.len() > 1 {
+            return Err(format!(
+                "the {label} config is ambiguous: {} are both present; keep one (or name the file with --config)",
+                found.join(" and ")
+            ));
+        }
+        out.extend(found);
+    }
+    Ok(out)
 }
 
 /// Whether this invocation only wants to print something.
@@ -2824,7 +2898,59 @@ mod tests {
         assert!(Config::config_paths_from(&args(&["--cluster-shard", "a"]), &env).is_empty());
     }
 
-    /// `.agentd.yml` in the working directory, picked up when the invocation
+    /// The chain: a user default, the project's file, a machine-local overlay —
+    /// in that order, so each is overridden by the more specific one. Rungs
+    /// compose; SPELLINGS within one rung do not.
+    #[test]
+    fn the_discovery_chain_layers_user_then_project_then_local() {
+        let root = std::env::temp_dir().join(format!("agentd-chain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (home, cwd) = (root.join("home"), root.join("work"));
+        std::fs::create_dir_all(home.join(".config").join("agentd")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        let home_s = home.to_string_lossy().into_owned();
+        let envmap: HashMap<&str, &str> = [("HOME", home_s.as_str())].into_iter().collect();
+
+        // An empty chain is not an error: agentd runs on its built-in defaults.
+        assert!(discovered_chain(&cwd, &envmap).unwrap().is_empty());
+
+        std::fs::write(home.join(".config/agentd/config.yml"), "a: 1\n").unwrap();
+        std::fs::write(cwd.join("agentd.yml"), "b: 2\n").unwrap();
+        std::fs::write(cwd.join("agentd.local.yml"), "c: 3\n").unwrap();
+        let chain = discovered_chain(&cwd, &envmap).unwrap();
+        assert_eq!(chain.len(), 3, "{chain:?}");
+        assert!(chain[0].ends_with("config.yml"), "{chain:?}");
+        assert!(chain[1].ends_with("agentd.yml"), "{chain:?}");
+        assert!(chain[2].ends_with("agentd.local.yml"), "{chain:?}");
+
+        // Two spellings of ONE rung is the coin toss nobody should debug.
+        std::fs::write(cwd.join("agentd.yaml"), "b: 9\n").unwrap();
+        let e = discovered_chain(&cwd, &envmap).unwrap_err();
+        assert!(e.contains("project config is ambiguous"), "{e}");
+        std::fs::remove_file(cwd.join("agentd.yaml")).unwrap();
+
+        // XDG wins over HOME when both are set.
+        let xdg = root.join("xdg");
+        std::fs::create_dir_all(xdg.join("agentd")).unwrap();
+        std::fs::write(xdg.join("agentd/config.yml"), "a: 7\n").unwrap();
+        let xdg_s = xdg.to_string_lossy().into_owned();
+        let envmap2: HashMap<&str, &str> = [
+            ("HOME", home_s.as_str()),
+            ("XDG_CONFIG_HOME", xdg_s.as_str()),
+        ]
+        .into_iter()
+        .collect();
+        let chain = discovered_chain(&cwd, &envmap2).unwrap();
+        assert!(chain[0].starts_with(&xdg_s), "{chain:?}");
+
+        // No HOME at all: no user rung, and no panic reaching for one.
+        let bare: HashMap<&str, &str> = HashMap::new();
+        assert_eq!(discovered_chain(&cwd, &bare).unwrap().len(), 2);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A project config in the working directory, picked up when the invocation
     /// named no config — and never when it did.
     #[test]
     fn a_dotfile_is_discovered_only_when_nothing_else_named_a_config() {
@@ -2833,10 +2959,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         // Nothing there yet.
-        assert!(discovered_config_in(&dir).is_empty());
+        assert!(present_in(&dir, &PROJECT_CONFIG_NAMES).is_empty());
 
         std::fs::write(dir.join(".agentd.yml"), "config_version: \"1\"\n").unwrap();
-        let found = discovered_config_in(&dir);
+        let found = present_in(&dir, &PROJECT_CONFIG_NAMES);
         assert_eq!(found.len(), 1);
         assert!(found[0].ends_with(".agentd.yml"), "{found:?}");
 
@@ -2844,7 +2970,7 @@ mod tests {
         // silently pick one: whichever it chose, somebody would be editing the
         // other and wondering why nothing changed.
         std::fs::write(dir.join(".agentd.yaml"), "config_version: \"1\"\n").unwrap();
-        assert_eq!(discovered_config_in(&dir).len(), 2);
+        assert_eq!(present_in(&dir, &PROJECT_CONFIG_NAMES).len(), 2);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

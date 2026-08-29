@@ -3115,18 +3115,17 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
     let super::ConfigPaths {
         paths: config_paths,
         discovered,
+        ambiguous,
     } = super::config_paths_from_map(args, &envmap);
-    // Two discovered spellings at once: refuse rather than pick. Whichever one
+    // Two spellings of ONE rung at once: refuse rather than pick. Whichever
     // agentd chose, somebody would be editing the other and wondering why
     // nothing changed. Only DISCOVERY is ambiguous this way — naming two files
-    // that happen to be spelled `.agentd.yml` and `.agentd.yaml` (`--config a/.agentd.yml
-    // --config b/.agentd.yaml`) states an order, so layering them is legal.
-    if discovered && config_paths.len() > 1 {
-        return Err(usage(format!(
-            "both {} and {} are present; keep one (or name the file with --config)",
-            super::DISCOVERED_CONFIG_NAMES[0],
-            super::DISCOVERED_CONFIG_NAMES[1]
-        )));
+    // that happen to be spelled `agentd.yml` and `agentd.yaml` (`--config
+    // a/agentd.yml --config b/agentd.yaml`) states an order, so layering them
+    // is legal. Ambiguity is per rung: `agentd.yml` beside `agentd.local.yml`
+    // is the chain working as designed.
+    if let Some(e) = ambiguous {
+        return Err(usage(e));
     }
     let (file_doc, files) = if config_paths.is_empty() {
         (Value::Object(Map::new()), Vec::new())
@@ -3159,14 +3158,20 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
         _ => {}
     }
     // A DISCOVERED config governs an invocation that never named it: `cd` into a
-    // repo you cloned, type `agentd --prompt …`, and that repo's `.agentd.yml`
+    // repo you cloned, type `agentd --prompt …`, and that repo's `agentd.yml`
     // decides where your credentials go. Convenience is worth that only while the
     // file cannot RELAX a security control, so an unnamed file setting one is
     // exit 2 with the file and the setting named. An explicit `--config` keeps
     // its full power — naming the file IS the deliberate act, and that is the
     // whole distinction being drawn here.
+    //
+    // The rule covers the WHOLE chain, not its first rung: every file discovery
+    // adopted was unnamed, so a machine-local overlay must not be able to relax
+    // what the project file could not. The check reads the merged document for
+    // exactly that reason — wherever the relaxation entered, it is refused.
     if discovered {
-        let file = config_paths.first().map_or("", String::as_str);
+        let file = config_paths.join(", ");
+        let file = file.as_str();
         if let Some((_, label)) = DISCOVERY_FORBIDDEN_RELAXATIONS
             .iter()
             .find(|(ptr, _)| file_doc.pointer(ptr).and_then(Value::as_bool) == Some(true))

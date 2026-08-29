@@ -824,8 +824,11 @@ The failure modes that cost the most debugging time:
 - **A `finish` step is mandatory** even for a `loop` or `schedule` workflow that
   conceptually never ends: each iteration is a separate run, and each must reach
   it.
-- **Memory read-through is not free.** Populating `memory.<key>` re-scans every
-  step spec and re-fetches every referenced key on every tick, for every live run.
+- **Memory read-through is not free.** Populating `memory.<key>` re-fetches every
+  referenced key every time a step renders, for every live run. The *scan* that
+  finds those keys is memoized per definition hash (`runtime/steps.rs`), so it is
+  the fetches that cost — fine for a rotating token, wrong for a hot loop's
+  working set.
 
 ## Declared state
 

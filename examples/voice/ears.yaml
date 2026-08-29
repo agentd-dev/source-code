@@ -37,9 +37,14 @@ agent:
 
 # Voice is a latency game, and every model call on the hot path here is a small
 # shaping call — intent extraction and an injection check — not a judgement. So
-# the instance default IS the fast model; nothing in this instance needs a
-# frontier one. (`model:` selects a tier on `think`/`agent` steps; the shaping
-# kinds take the instance default.) The thinking happens in `hands`.
+# the instance default IS the fast model and no step overrides it; nothing in
+# this instance needs a frontier one. The thinking happens in `hands`, which
+# declares tiers because it has one step worth paying for.
+#
+# (`model:` would work on the `extract` and `judge` steps below — every kind
+# that makes a model call takes a tier. One model for one job needs no
+# catalogue, and config that exists to demonstrate a feature is still config
+# someone has to read.)
 intelligence:
   endpoints: https://api.openai.com/v1
   model: gpt-5.1-mini

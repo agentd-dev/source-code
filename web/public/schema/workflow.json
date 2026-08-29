@@ -178,7 +178,8 @@
           "input",
           "classes",
           "prompt",
-          "skills"
+          "skills",
+          "model"
         ],
         "implemented": true,
         "required": [
@@ -230,7 +231,8 @@
           "input",
           "output_schema",
           "prompt",
-          "skills"
+          "skills",
+          "model"
         ],
         "implemented": true,
         "required": [
@@ -355,7 +357,8 @@
           "input",
           "rubric",
           "prompt",
-          "skills"
+          "skills",
+          "model"
         ],
         "implemented": true,
         "required": [
@@ -610,7 +613,8 @@
           "input",
           "choices",
           "prompt",
-          "skills"
+          "skills",
+          "model"
         ],
         "implemented": true,
         "required": [
@@ -761,7 +765,8 @@
           "input",
           "length",
           "prompt",
-          "skills"
+          "skills",
+          "model"
         ],
         "implemented": true,
         "required": [

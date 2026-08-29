@@ -1669,14 +1669,23 @@ impl Runtime {
                 )
             }
         };
-        // Delegate to the think machinery with a synthesized spec.
+        // Delegate to the think machinery with a synthesized spec. Only the
+        // fields that survive the rewrite are carried: the preset OWNS the
+        // prompt and the schema (that is what makes it a preset), while
+        // `skills` and `model` are the author's, so they travel. Forgetting
+        // `model` here is what made the tier catalogue useless on exactly the
+        // cheap shaping kinds it was introduced for — the field was refused by
+        // the parser, so the omission read as a deliberate limit rather than a
+        // dropped line.
         let mut think = step.clone();
         think.kind = "think".into();
         let mut think_spec = Map::new();
         think_spec.insert("prompt".into(), Value::String(prompt));
         think_spec.insert("output_schema".into(), schema);
-        if let Some(sk) = spec.get("skills") {
-            think_spec.insert("skills".into(), sk.clone());
+        for carried in ["skills", "model"] {
+            if let Some(v) = spec.get(carried) {
+                think_spec.insert(carried.into(), v.clone());
+            }
         }
         self.step_turn_pub(run_id, step_id, &think, &think_spec, data);
     }

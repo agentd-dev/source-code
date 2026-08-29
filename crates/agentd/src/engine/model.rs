@@ -574,7 +574,7 @@ pub const KINDS: &[KindInfo] = &[
     k(
         "classify",
         false,
-        &["input", "classes", "prompt", "skills"],
+        &["input", "classes", "prompt", "skills", "model"],
         &["input", "classes"],
         true,
         false,
@@ -582,7 +582,7 @@ pub const KINDS: &[KindInfo] = &[
     k(
         "extract",
         false,
-        &["input", "output_schema", "prompt", "skills"],
+        &["input", "output_schema", "prompt", "skills", "model"],
         &["input", "output_schema"],
         true,
         false,
@@ -590,7 +590,7 @@ pub const KINDS: &[KindInfo] = &[
     k(
         "summarize",
         false,
-        &["input", "length", "prompt", "skills"],
+        &["input", "length", "prompt", "skills", "model"],
         &["input"],
         true,
         false,
@@ -598,7 +598,7 @@ pub const KINDS: &[KindInfo] = &[
     k(
         "judge",
         false,
-        &["input", "rubric", "prompt", "skills"],
+        &["input", "rubric", "prompt", "skills", "model"],
         &["input", "rubric"],
         true,
         false,
@@ -606,7 +606,7 @@ pub const KINDS: &[KindInfo] = &[
     k(
         "route",
         false,
-        &["input", "choices", "prompt", "skills"],
+        &["input", "choices", "prompt", "skills", "model"],
         &["input", "choices"],
         true,
         false,

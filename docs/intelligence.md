@@ -283,9 +283,15 @@ context: {summarize: {model: small}}
 workflows:
   - name: triage
     steps:
-      classify: {kind: think, model: small, prompt: "…"}
-      decide:   {kind: agent, model: big,   instruction: "…"}
+      sort:   {kind: classify, model: small, input: "…", classes: [a, b]}
+      decide: {kind: agent,    model: big,   instruction: "…"}
 ```
+
+`model` is accepted on every kind that makes a model call: `think`, `agent`,
+and the five shaping presets — `classify`, `extract`, `summarize`, `judge`,
+`route`. The presets are the point, not an afterthought: they are the cheap
+high-volume steps, and a catalogue that could not reach them left the only
+lever on the whole instance.
 
 A tier is **not** a second service catalogue. `services:` already names
 endpoints, auth, tags, rate and breaker; restating those here would be a

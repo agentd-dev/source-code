@@ -111,11 +111,17 @@ fn to_new_opens_its_own_conversation() {
 /// that workflow messages back, so the chain would re-arm forever. Each hop
 /// inherits the last one's depth, so the cap bites and the run FAILS loudly
 /// rather than the daemon quietly spinning.
+///
+/// The `once` workflow is the ONLY entry point on purpose. An `agent.prompt`
+/// here would be a second, independent chain starting at depth 0, and which of
+/// the two turns reached `workflow.run` first decided whether the cap tripped
+/// before the daemon idled out — a 1-in-12 flake serially and worse under a
+/// loaded test runner. One entry point, one chain, one outcome.
 #[test]
 fn a_message_loop_is_refused_once_it_runs_out_of_depth() {
     let (code, log) = run(&format!(
         "{BASE}intelligence: {{ endpoints: \"mock:wf-once\", model: mock }}\n\
-         agent: {{ name: m, prompt: \"start the loop\" }}\n\
+         agent: {{ name: m }}\n\
          limits: {{ max_message_depth: 1, run: {{ steps: 4 }} }}\n\
          lifecycle: {{ run_until: idle, idle_grace: 3s }}\n\
          workflows:\n\
@@ -151,7 +157,7 @@ fn a_message_loop_is_refused_once_it_runs_out_of_depth() {
 fn each_hop_inherits_the_last_ones_depth() {
     let (_code, log) = run(&format!(
         "{BASE}intelligence: {{ endpoints: \"mock:wf-once\", model: mock }}\n\
-         agent: {{ name: m, prompt: \"start the loop\" }}\n\
+         agent: {{ name: m }}\n\
          limits: {{ max_message_depth: 1, run: {{ steps: 4 }} }}\n\
          lifecycle: {{ run_until: idle, idle_grace: 3s }}\n\
          workflows:\n\
@@ -171,6 +177,13 @@ fn each_hop_inherits_the_last_ones_depth() {
 /// just the turn. A message that matches an `a2a` start fires a run, and that
 /// run can message again — so if the depth reset at that hop the chain would
 /// be unbounded through a path the cap never sees.
+///
+/// Gated on `a2a`: the chain routes through the `a2a` START reader, so the case
+/// only exists in a build that has that listener. Ungated it fails the solo
+/// `--features workflow` matrix row, where the reader is absent, no
+/// `start.a2a.fired` is ever logged, and the assertion reads as a broken hop
+/// cap rather than an absent feature.
+#[cfg(feature = "a2a")]
 #[test]
 fn the_depth_survives_a_delivery_that_fires_a_workflow() {
     let (_code, log) = run(&format!(

@@ -265,14 +265,14 @@ read at restore, where it decides what happens to a step caught in flight.
 
 | Kind | Fields (**required** in bold) |
 |---|---|
-| `agent` | **`instruction`**, `output_contract`, `output_schema`, `tools`, `servers`, `limits`, `context`, `skills`, `system` |
-| `think` | **`prompt`**, `output_schema`, `reads`, `check`, `retries`, `skills`, `system` |
+| `agent` | **`instruction`**, `output_contract`, `output_schema`, `tools`, `servers`, `limits`, `context`, `skills`, `system`, `model` |
+| `think` | **`prompt`**, `output_schema`, `reads`, `check`, `retries`, `skills`, `system`, `model` |
 | `subagent` | **`instruction`** *or* **`template`** (never both), `params` (only with `template`), `mode`, `tools`, `servers`, `limits`, `priority`, `context`, `output_contract`, `output_schema`, `skills`, `durable` |
-| `classify` | **`input`**, **`classes`**, `prompt`, `skills` |
-| `extract` | **`input`**, **`output_schema`**, `prompt`, `skills` |
-| `summarize` | **`input`**, `length`, `prompt`, `skills` |
-| `judge` | **`input`**, **`rubric`**, `prompt`, `skills` |
-| `route` | **`input`**, **`choices`**, `prompt`, `skills` |
+| `classify` | **`input`**, **`classes`**, `prompt`, `skills`, `model` |
+| `extract` | **`input`**, **`output_schema`**, `prompt`, `skills`, `model` |
+| `summarize` | **`input`**, `length`, `prompt`, `skills`, `model` |
+| `judge` | **`input`**, **`rubric`**, `prompt`, `skills`, `model` |
+| `route` | **`input`**, **`choices`**, `prompt`, `skills`, `model` |
 
 `agent` takes a full tool-using turn against the workflow caller's tool plan,
 with rounds bounded only by the step's budget and limits. `think` is the

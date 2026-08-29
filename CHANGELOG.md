@@ -68,10 +68,19 @@ against it — the difference between a queue and a per-entity lock.
 
 ### The model as a named tier
 
-`intelligence.models` names each tier once, and `model:` on `agent`/`think`
-selects one. A tier points at a `services:` entry and may only narrow,
-inheriting its trifecta tags. Declared windows replace the guess from the model
-name; unknown tiers and fallback cycles are exit 2.
+`intelligence.models` names each tier once, and `model:` selects one on every
+kind that makes a model call — `agent` and `think`, plus the five shaping
+presets (`classify`, `extract`, `summarize`, `judge`, `route`). A tier points
+at a `services:` entry and may only narrow, inheriting its trifecta tags.
+Declared windows replace the guess from the model name; unknown tiers and
+fallback cycles are exit 2.
+
+The presets reach the model by synthesizing a `think` spec, and that rewrite
+carried `prompt`, `output_schema` and `skills` but not `model` — so the field
+was refused by the parser on exactly the cheap high-volume kinds a tier
+catalogue exists for, and the omission read as a deliberate limit. The rewrite
+now carries `model` too, and a test per preset asserts the tier's wire model
+reached the provider rather than the instance default.
 
 ### Workflows as tools
 
@@ -144,6 +153,8 @@ policy rather than an edge setting. Runs with `--fake` and no hardware.
 
 ### Fixed
 
+- the node registry's `think` and `agent` rows had drifted from the binary they
+  claim to be generated from: both accept `model:` and neither said so.
 - `docs/node-registry.md` showed `on_timeout:` on a `human` gate, which the
   parser refuses (it is a `wait` field). A gate that outlives its deadline
   fails the step, so the example now routes it with `on_error` and branches on

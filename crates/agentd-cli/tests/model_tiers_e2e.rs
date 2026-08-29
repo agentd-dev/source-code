@@ -11,6 +11,13 @@
 //! A tier is NOT a second service catalogue: it points at a `services:` entry
 //! and may only narrow, inheriting that service's trifecta tags so "make it
 //! cheaper" cannot quietly become a different security decision.
+//!
+//! `model:` is accepted on every kind that makes a model call — `think` and
+//! `agent`, and the five shaping presets (`classify`, `extract`, `summarize`,
+//! `judge`, `route`), which are the cheap steps the catalogue exists for. The
+//! presets reach the model by synthesizing a `think` spec, so the field has to
+//! be carried across that rewrite as well as allowed by the parser; a test per
+//! kind is the only thing that tells those two failures apart.
 #![cfg(all(unix, feature = "workflow"))]
 
 mod common;
@@ -59,6 +66,81 @@ fn a_step_can_name_a_cheaper_tier_than_the_instance_default() {
     assert!(
         log.contains("\"model\":\"small-model-3\""),
         "the step should have run on the tier's wire model\n{log}"
+    );
+}
+
+/// Every shaping preset takes a tier too. These are the cheap, high-volume
+/// kinds — the ones a catalogue is FOR — and they reach the model through a
+/// synthesized `think` spec, so this asserts the wire model on each rather
+/// than trusting that one representative kind speaks for the rest.
+///
+/// The playbook answers by matching each preset's OWN prompt text, which is
+/// also a check that the rewrite still produces the prompt the kind promises:
+/// a preset that stopped saying "Classify the input" would fall through to the
+/// default turn and fail its schema here.
+#[test]
+fn every_shaping_preset_can_name_a_tier() {
+    let play = common::unique_path("tiers-play", "json");
+    std::fs::write(
+        &play,
+        r#"{"turns": [{"content": "{}"}], "match": [
+          {"when_contains": "Classify the input",  "content": "{\"class\": \"a\", \"confidence\": 0.9}"},
+          {"when_contains": "Extract the structured", "content": "{\"ok\": true}"},
+          {"when_contains": "Summarize the input",  "content": "{\"summary\": \"hi\"}"},
+          {"when_contains": "Judge the input",      "content": "{\"verdict\": \"pass\", \"score\": 8}"},
+          {"when_contains": "Route the input",      "content": "{\"choice\": \"a\"}"}]}"#,
+    )
+    .unwrap();
+    let tiers = format!(
+        "intelligence:\n  endpoints: \"mock:file:{play}\"\n\
+        \x20 models:\n\
+        \x20   big:   {{ model: big-model-1, window: 200000 }}\n\
+        \x20   small: {{ model: small-model-3, window: 128000 }}\n\
+        \x20 default: big\n"
+    );
+    let cases = [
+        ("classify", "input: hello, classes: [a, b]"),
+        ("extract", "input: hello, output_schema: { type: object }"),
+        ("summarize", "input: hello"),
+        ("judge", "input: hello, rubric: \"is it a greeting\""),
+        ("route", "input: hello, choices: [a, b]"),
+    ];
+    for (kind, fields) in cases {
+        let (code, log) = run(&format!(
+            "{BASE}{tiers}workflows:\n\
+            \x20 - name: w\n    steps:\n\
+            \x20     s: {{ kind: once }}\n\
+            \x20     t: {{ kind: {kind}, {fields}, model: small, depends_on: [s] }}\n\
+            \x20     f: {{ kind: finish, depends_on: [t], status: completed }}\n"
+        ));
+        assert_eq!(code, Some(0), "{kind} should complete\n{log}");
+        assert!(
+            log.contains("\"model\":\"small-model-3\""),
+            "{kind} should have run on the tier's wire model, not the default\n{log}"
+        );
+        assert!(
+            !log.contains("big-model-1"),
+            "{kind} named a tier, so the instance default must not have been used\n{log}"
+        );
+    }
+    let _ = std::fs::remove_file(&play);
+}
+
+/// A typo on a shaping kind is caught at startup like any other, rather than
+/// reaching the provider as a model name nobody serves.
+#[test]
+fn an_unknown_tier_on_a_shaping_kind_is_refused_at_startup() {
+    let (code, log) = run(&format!(
+        "{BASE}{TIERS}workflows:\n\
+        \x20 - name: w\n    steps:\n\
+        \x20     s: {{ kind: once }}\n\
+        \x20     t: {{ kind: classify, input: hi, classes: [a], model: smal, depends_on: [s] }}\n\
+        \x20     f: {{ kind: finish, depends_on: [t], status: completed }}\n"
+    ));
+    assert_eq!(code, Some(2), "{log}");
+    assert!(
+        log.contains("is not a declared tier"),
+        "the refusal should name the typo\n{log}"
     );
 }
 

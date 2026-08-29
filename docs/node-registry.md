@@ -156,15 +156,21 @@ matches on.
 
 | Kind | Required | Other fields | What it does |
 |---|---|---|---|
-| `think` | `prompt` | `output_schema` `reads` `check` `retries` `skills` `system` | One model call. `output_schema` shapes the answer; `check`/`retries` re-ask until it conforms. |
-| `agent` | `instruction` | `output_contract` `output_schema` `tools` `servers` `limits` `context` `skills` `system` | A full agentic loop with tools — think, call, observe, repeat. `tools`/`servers` narrow what it may reach. `context` is a seed-message array, or the object form `{template: <name>, seed: […]}` — `template` names an entry in `context.templates` to render this step's system prompt with, in place of the instance default. |
+| `think` | `prompt` | `output_schema` `reads` `check` `retries` `skills` `system` `model` | One model call. `output_schema` shapes the answer; `check`/`retries` re-ask until it conforms. |
+| `agent` | `instruction` | `output_contract` `output_schema` `tools` `servers` `limits` `context` `skills` `system` `model` | A full agentic loop with tools — think, call, observe, repeat. `tools`/`servers` narrow what it may reach. `context` is a seed-message array, or the object form `{template: <name>, seed: […]}` — `template` names an entry in `context.templates` to render this step's system prompt with, in place of the instance default. |
 | `subagent` | `instruction` *or* `template` | `params` `mode` `tools` `servers` `limits` `priority` `context` `output_contract` `output_schema` `skills` `durable` | A child PROCESS running its own loop, with narrowed tools and trust. The supervisor can always kill it. `template` instantiates a `subagents.templates` entry — `params` fill its declared holes (schema-checked), `tools`/`servers` are refused (the template defines the grant), and an instance-tier template spawns a full child daemon whose handle is an A2A peer name. `limits` adds OS caps — `memory` (RLIMIT_AS), `cpu` (RLIMIT_CPU) — beside `steps`/`tokens`/`deadline`; `priority: low\|normal\|high` maps to niceness and sheds low first under pressure. |
-| `classify` | `input` `classes` | `prompt` `skills` | Puts `input` into one of `classes`. |
-| `extract` | `input` `output_schema` | `prompt` `skills` | Pulls `input` into the shape of `output_schema`. No tools — the safest way to read untrusted text. |
-| `summarize` | `input` | `length` `prompt` `skills` | Shortens `input` to `length`. |
-| `judge` | `input` `rubric` | `prompt` `skills` | Scores `input` against a `rubric`. |
-| `route` | `input` `choices` | `prompt` `skills` | Picks one of `choices` for `input`. The model-driven alternative to `switch`. |
+| `classify` | `input` `classes` | `prompt` `skills` `model` | Puts `input` into one of `classes`. |
+| `extract` | `input` `output_schema` | `prompt` `skills` `model` | Pulls `input` into the shape of `output_schema`. No tools — the safest way to read untrusted text. |
+| `summarize` | `input` | `length` `prompt` `skills` `model` | Shortens `input` to `length`. |
+| `judge` | `input` `rubric` | `prompt` `skills` `model` | Scores `input` against a `rubric`. |
+| `route` | `input` `choices` | `prompt` `skills` `model` | Picks one of `choices` for `input`. The model-driven alternative to `switch`. |
 | `human` | `question` | `schema` `to` `timeout` | Asks a person `question` and suspends durably until they answer — the answer can arrive after a restart. `schema` is ENFORCED on the reply: a mismatch re-asks with the reason rather than being accepted. `to` names **who must answer** (see [Addressed gates](#addressed-gates)); omit it and any watcher may answer. `reply_uri` is refused at load — nothing implements it. |
+
+`model` names an `intelligence.models` tier on any kind that makes a model
+call — the five shaping presets included, since those are the cheap
+high-volume steps a tier catalogue exists for. It resolves to the wire model at
+the edge, so a tier name never reaches a provider, and an unknown one is exit 2
+rather than a run asking for a model nobody serves.
 
 ---
 

@@ -422,6 +422,18 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
             None => log.warn("skills.source.unavailable", json!({"server": src.server})),
         }
     }
+    if let Some(dir) = &settings.skills.dir {
+        let (names, errs) = catalogue.add_dir(std::path::Path::new(dir));
+        for e in errs {
+            log.warn("skills.file.unreadable", json!({"err": e}));
+        }
+        if !names.is_empty() {
+            log.info(
+                "skills.discovered",
+                json!({"server": "file", "dir": dir, "count": names.len(), "skills": names}),
+            );
+        }
+    }
     if !settings.agent.inline_skills.is_empty() {
         let names = catalogue.add_inline(&settings.agent.inline_skills);
         log.info(

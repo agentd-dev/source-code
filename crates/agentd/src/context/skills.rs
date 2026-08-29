@@ -386,6 +386,90 @@ impl Catalogue {
         names
     }
 
+    /// Register a LOCAL folder of skill files.
+    ///
+    /// Two layouts, because both are in the wild: `<dir>/<name>.md`, and the
+    /// Agent Skill directory form `<dir>/<name>/SKILL.md`. Either may carry
+    /// YAML frontmatter (`name`, `description`); without it the file stem is
+    /// the name and the first paragraph is the description, so a plain
+    /// markdown file is a usable skill with no ceremony.
+    ///
+    /// Registered as [`SkillSourceKind::Inline`] with the body already read:
+    /// a skill is prose, so there is nothing to fetch later and nothing that
+    /// can fail at load time. Like `:::skill`, a local file WINS a name
+    /// collision with a discovered one — the operator put it closer to this
+    /// agent than any server did.
+    pub fn add_dir(&mut self, dir: &std::path::Path) -> (Vec<String>, Vec<String>) {
+        let (mut names, mut errs) = (Vec::new(), Vec::new());
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return (names, errs);
+        };
+        let mut candidates: Vec<(String, std::path::PathBuf)> = Vec::new();
+        for ent in rd.flatten() {
+            let path = ent.path();
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_string();
+            if path.is_dir() {
+                let inner = path.join("SKILL.md");
+                if inner.is_file() {
+                    candidates.push((stem, inner));
+                }
+            } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
+                candidates.push((stem, path));
+            }
+        }
+        // Sorted so a folder's registration order is its filename order — the
+        // only ordering an operator can see without reading this function.
+        candidates.sort();
+        for (stem, path) in candidates {
+            let text = match std::fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(e) => {
+                    errs.push(format!("{}: {e}", path.display()));
+                    continue;
+                }
+            };
+            let (meta, body) = split_frontmatter(&text);
+            if body.trim().is_empty() {
+                errs.push(format!("{}: empty skill body", path.display()));
+                continue;
+            }
+            let name = meta
+                .as_ref()
+                .and_then(|m| m.get("name"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .unwrap_or(stem);
+            let raw_desc = meta
+                .as_ref()
+                .and_then(|m| m.get("description"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| first_paragraph(&body));
+            let (description, when_to_use) = split_when(&raw_desc);
+            self.skills.insert(
+                name.clone(),
+                SkillMeta {
+                    name: name.clone(),
+                    description,
+                    when_to_use,
+                    arguments: Vec::new(),
+                    source: SkillSourceRef {
+                        server: "file".into(),
+                        kind: SkillSourceKind::Inline,
+                        reference: path.to_string_lossy().into_owned(),
+                        body: Some(body),
+                    },
+                },
+            );
+            names.push(name);
+        }
+        (names, errs)
+    }
+
     pub fn body(&self, hash: &str) -> Option<&SkillBody> {
         self.bodies.get(hash)
     }
@@ -478,6 +562,36 @@ fn passes(filter: Option<&str>, name: &str) -> bool {
             }
         }
     }
+}
+
+/// Split `---\nyaml\n---\nbody` into its parts. No frontmatter is not an
+/// error: a plain markdown file is a perfectly good skill, and demanding a
+/// header would make the simplest case the annoying one.
+fn split_frontmatter(text: &str) -> (Option<serde_json::Value>, String) {
+    let rest = match text.strip_prefix("---\n") {
+        Some(r) => r,
+        None => return (None, text.to_string()),
+    };
+    let Some((head, body)) = rest.split_once("\n---\n") else {
+        return (None, text.to_string());
+    };
+    match crate::config::file::parse_document(head, crate::config::file::Format::Yaml) {
+        Ok(v) if v.is_object() => (Some(v), body.to_string()),
+        // Malformed frontmatter falls back to treating the whole file as body
+        // rather than failing: the skill still reads, and a wrong name is more
+        // recoverable than a daemon that will not start.
+        _ => (None, text.to_string()),
+    }
+}
+
+/// The first non-empty paragraph, minus a leading markdown heading — the
+/// description for a file that carries no frontmatter.
+fn first_paragraph(body: &str) -> String {
+    body.split("\n\n")
+        .map(str::trim)
+        .find(|p| !p.is_empty() && !p.starts_with('#'))
+        .unwrap_or("")
+        .replace('\n', " ")
 }
 
 /// Split a description of the form `"… When to use: …"` (or `"… Use when …"`).
@@ -688,5 +802,77 @@ mod tests {
             ]),
             "a\n\nb"
         );
+    }
+
+    /// A local folder: three layouts, one catalogue. The frontmatter `name`
+    /// wins over the filename, because a file can be renamed and a skill
+    /// reference should not break when it is.
+    #[test]
+    fn a_local_folder_registers_every_layout() {
+        let dir = std::env::temp_dir().join(format!("agentd-skilldir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("runbook")).unwrap();
+
+        std::fs::write(
+            dir.join("triage.md"),
+            "---\nname: triage\ndescription: Triage an issue. Use when: it has no labels\n---\n\nRead it, label it.\n",
+        )
+        .unwrap();
+        // The Agent Skill directory form, with a frontmatter name that differs
+        // from the directory it lives in.
+        std::fs::write(
+            dir.join("runbook/SKILL.md"),
+            "---\nname: incident\ndescription: Handle an incident. When to use: an alert fires\n---\n\nAcknowledge, then mitigate.\n",
+        )
+        .unwrap();
+        // No frontmatter at all: the stem names it and the first real
+        // paragraph describes it, so a plain note is a usable skill.
+        std::fs::write(
+            dir.join("deploy.md"),
+            "# Deploy safely\n\nAlways deploy behind a flag.\n",
+        )
+        .unwrap();
+
+        let mut cat = Catalogue::new(DEFAULT_PREFIX, 32_768);
+        let (names, errs) = cat.add_dir(&dir);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(
+            names,
+            ["deploy", "incident", "triage"],
+            "sorted by file stem"
+        );
+
+        let triage = cat.skills.get("triage").expect("triage");
+        assert_eq!(triage.description, "Triage an issue");
+        assert_eq!(triage.when_to_use.as_deref(), Some("it has no labels"));
+
+        let incident = cat.skills.get("incident").expect("frontmatter name wins");
+        assert_eq!(incident.when_to_use.as_deref(), Some("an alert fires"));
+
+        let deploy = cat.skills.get("deploy").expect("deploy");
+        assert_eq!(deploy.description, "Always deploy behind a flag.");
+        assert!(deploy.when_to_use.is_none());
+
+        // The body is already in hand — a skill is prose, so there is nothing
+        // to fetch later and no server that can be down when it is read.
+        let body = cat
+            .load("deploy", None, &|_| None)
+            .expect("an inline body needs no server");
+        assert!(body.body.contains("behind a flag"), "{}", body.body);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file that only LOOKS like it has frontmatter still reads as a skill.
+    /// Refusing to start over a stray `---` would be a poor trade.
+    #[test]
+    fn malformed_frontmatter_degrades_to_body() {
+        let (meta, body) = split_frontmatter("---\n: : not yaml\n---\nhello\n");
+        assert!(meta.is_none());
+        assert!(body.contains("hello"), "{body}");
+
+        let (meta, body) = split_frontmatter("no header here\n");
+        assert!(meta.is_none());
+        assert_eq!(body, "no header here\n");
     }
 }

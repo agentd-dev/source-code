@@ -225,3 +225,67 @@ fn subagent_and_context_templates_load_from_their_folders() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// `skills/` beside the config: prose the model reads, with no MCP server
+/// between it and the agent. Both layouts, and a bare markdown file too.
+#[test]
+fn a_skills_folder_is_adopted_without_a_server() {
+    let (root, home, work) = project("skdir");
+    std::fs::write(work.join("agentd.yml"), BASE).unwrap();
+    std::fs::create_dir_all(work.join("skills/runbook")).unwrap();
+    std::fs::write(
+        work.join("skills/triage.md"),
+        "---\nname: triage\ndescription: Triage an issue. Use when: it has no labels\n---\n\nRead it, label it.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        work.join("skills/runbook/SKILL.md"),
+        "---\nname: incident\ndescription: Handle an incident\n---\n\nAcknowledge, then mitigate.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        work.join("skills/deploy.md"),
+        "# Deploy safely\n\nAlways deploy behind a flag.\n",
+    )
+    .unwrap();
+
+    let (code, log) = run_in(&work, &home, &[]);
+    assert_eq!(code, Some(0), "{log}");
+    assert!(
+        log.contains("\"server\":\"file\"") && log.contains("\"count\":3"),
+        "all three layouts should register\n{log}"
+    );
+    for name in ["triage", "incident", "deploy"] {
+        assert!(log.contains(name), "{name} missing\n{log}");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// An explicit `skills.dir` is the operator's decision; the convention only
+/// fills in what nobody wrote.
+#[test]
+fn an_explicit_skills_dir_suppresses_the_convention() {
+    let (root, home, work) = project("skexplicit");
+    std::fs::create_dir_all(work.join("skills")).unwrap();
+    std::fs::create_dir_all(work.join("elsewhere")).unwrap();
+    std::fs::write(
+        work.join("skills/ignored.md"),
+        "# Ignored\n\nnot this one.\n",
+    )
+    .unwrap();
+    std::fs::write(work.join("elsewhere/chosen.md"), "# Chosen\n\nthis one.\n").unwrap();
+    std::fs::write(
+        work.join("agentd.yml"),
+        format!("{BASE}skills: {{ dir: ./elsewhere }}\n"),
+    )
+    .unwrap();
+
+    let (code, log) = run_in(&work, &home, &[]);
+    assert_eq!(code, Some(0), "{log}");
+    assert!(log.contains("chosen"), "{log}");
+    assert!(
+        !log.contains("ignored"),
+        "the convention must not override\n{log}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

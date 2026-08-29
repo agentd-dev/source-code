@@ -5,6 +5,61 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## Unreleased — a project is a directory
+
+### The config you did not name
+
+Discovery found exactly one file, `.agentd.yml` in the working directory. Three
+rungs now, merged lowest first, with flags and environment still on top:
+
+    $XDG_CONFIG_HOME/agentd/config.yml  (else ~/.config/agentd/config.yml)
+    ./agentd.yml
+    ./agentd.local.yml
+
+`agentd.yml` is the name to teach; the dotted spellings stay valid because they
+shipped. Discovery remains a fallback — naming a config means the caller
+decided, and no rung is layered underneath it. Ambiguity is per RUNG:
+`agentd.yml` beside `agentd.local.yml` is the design, `agentd.yml` beside
+`agentd.yaml` is a coin toss and still exit 2. The rule that a discovered file
+may not RELAX a security control now covers the whole chain rather than its
+first entry — a machine-local overlay must not widen what the project file
+could not.
+
+### Conventional folders beside the config
+
+`workflows/`, `skills/`, `subagents/` and `context/` fill in the settings
+nobody wrote, so a project can be a directory you read rather than one long
+YAML file. Injection happens on the merged document before typing, so
+validation, `{{config.*}}` folding, the definition hash and hot reload all see
+an ordinary explicit entry; the workflows folder becomes the `dir:` entry the
+loader already expands, keeping the glob and the sort as one implementation.
+
+Two rules make them conventions rather than declarations: they apply only when
+the setting is **absent** (an explicit empty list means none), and only when
+the folder **yields something** (a missing folder is silence, where a `dir:`
+you named with no match is still exit 2). Load order is filename order.
+
+### Skills without a server
+
+`skills.dir` — and the `skills/` folder that sets it — is the first local skill
+source. Skills previously reached agentd only through an MCP server or an
+inline `:::skill` directive, which is the one place the "capability comes from
+a server" rule bought nothing: a skill grants no tool, it is prose the model
+reads. Both `<name>.md` and the Agent Skill form `<name>/SKILL.md` work, and
+frontmatter is optional — without it the file stem names the skill and its
+first paragraph describes it. Like `:::skill`, a local file wins a name
+collision with a discovered one.
+
+### Known
+
+- `{{config.*}}` does not resolve in a workflow `file:`, `url:` or `dir:`
+  reference, though the comment above the fold says it does: `dir:` expansion
+  and the `file:` existence check both run BEFORE the fold, so the raw token
+  reaches the filesystem — `workflow dir {{config.wf_dir}}: not a directory`.
+  It matters because var-indirection is otherwise the way to redirect a
+  workflow folder from an overlay without restating the whole list, lists
+  being replaced rather than merged across config layers.
+
 ## v1.2.0 — the runtime can address itself
 
 Eight primitives, each closing a gap that turned out to be a missing *edge*

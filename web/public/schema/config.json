@@ -3432,6 +3432,10 @@
     "skills": {
       "additionalProperties": false,
       "properties": {
+        "dir": {
+          "description": "a local folder of skill files (frontmatter + body, or <name>/SKILL.md); `skills/` beside the config is adopted when this is unset",
+          "type": "string"
+        },
         "max_bytes": {
           "minimum": 1,
           "type": "integer"

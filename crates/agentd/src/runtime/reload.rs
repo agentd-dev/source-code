@@ -292,6 +292,9 @@ impl Runtime {
                     cat.discover(&**c, mode, src.filter.as_deref());
                 }
             }
+            if let Some(dir) = &new.skills.dir {
+                cat.add_dir(std::path::Path::new(dir));
+            }
             cat.add_inline(&new.agent.inline_skills);
             self.skills = cat;
             changed.push("skills");

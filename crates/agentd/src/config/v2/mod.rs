@@ -1488,6 +1488,13 @@ pub struct Search {
 #[serde(deny_unknown_fields, default)]
 pub struct Skills {
     pub sources: Vec<SkillSource>,
+    /// A LOCAL folder of skill files, beside the config rather than behind an
+    /// MCP server. Skills are documents; requiring a server to serve a
+    /// markdown file was the one place the "capability comes from a server"
+    /// rule bought nothing — a skill grants no tool, it is prose the model
+    /// reads. `skills/` beside the config is adopted automatically when this
+    /// is unset and the folder has files in it.
+    pub dir: Option<String>,
     pub reference_prefix: Option<String>,
     pub max_loaded: Option<u32>,
     pub max_bytes: Option<u64>,
@@ -3659,6 +3666,23 @@ fn apply_default_folders(doc: &mut Value, dir: &Path, warnings: &mut Vec<String>
                 "workflows".into(),
                 json!([{"dir": d.to_string_lossy(), "glob": "*.yaml,*.yml,*.json"}]),
             );
+        }
+    }
+
+    // skills/ — prose the model reads, so it needs no server. Either
+    // `<name>.md` or the Agent Skill directory form `<name>/SKILL.md`.
+    if obj.get("skills").and_then(|s| s.get("dir")).is_none() {
+        let d = dir.join("skills");
+        let has_skill = !folder_files(&d, &["md"]).is_empty()
+            || std::fs::read_dir(&d)
+                .is_ok_and(|rd| rd.flatten().any(|e| e.path().join("SKILL.md").is_file()));
+        if has_skill
+            && let Some(sk) = obj
+                .entry("skills")
+                .or_insert_with(|| json!({}))
+                .as_object_mut()
+        {
+            sk.insert("dir".into(), json!(d.to_string_lossy()));
         }
     }
 

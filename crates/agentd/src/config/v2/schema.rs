@@ -194,6 +194,7 @@ fn top_level_properties(
         "skills".to_string(),
         json!({ "type": "object", "additionalProperties": false, "properties": {
                 "sources": { "type": "array", "items": { "$ref": "#/$defs/SkillSource" } },
+                "dir": { "type": "string", "description": "a local folder of skill files (frontmatter + body, or <name>/SKILL.md); `skills/` beside the config is adopted when this is unset" },
                 "reference_prefix": { "type": "string" },
                 "max_loaded": { "type": "integer", "minimum": 1 },
                 "max_bytes": { "type": "integer", "minimum": 1 } } }),

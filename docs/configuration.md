@@ -924,36 +924,89 @@ the file and listing the fields that *are* allowed — the most common config ty
 closed at parse time. Print the schema with `--config-schema` (Draft 2020-12,
 exit `0`); validate a candidate with `--validate-config`.
 
-### 12.1 `.agentd.yml` — the project's own config
+### 12.1 The discovery chain — the config you did not name
 
 When an invocation names **no** config — no `--config`, no `AGENT_CONFIG` —
-agentd looks for `.agentd.yml` (or `.agentd.yaml`) in the working directory and
-loads it, the way a linter or a formatter picks up its dotfile. So a checked-in
-project config makes `agentd` work with no flags at all:
+agentd walks a three-rung chain and loads every rung that has a file, the way a
+linter or a formatter picks up its dotfile:
+
+| Rung | Looked for | For |
+|---|---|---|
+| user | `$XDG_CONFIG_HOME/agentd/config.yml`, else `~/.config/agentd/config.yml` | defaults that follow the person, not the checkout |
+| project | `./agentd.yml` (also `agentd.yaml`, `.agentd.yml`, `.agentd.yaml`) | the config a repository checks in |
+| local | `./agentd.local.yml` (also `.yaml`) | one machine's overrides, expected to be git-ignored |
+
+They merge in that order — user, then project, then local — with flags and
+environment still on top. So a checked-in project config makes `agentd` work
+with no flags at all, and pointing one checkout at a dev endpoint never means
+editing a tracked file:
 
 ```console
-$ cd ~/work/triage     # contains .agentd.yml
+$ cd ~/work/triage     # contains agentd.yml and agentd.local.yml
 $ agentd --validate-config
-{"event":"config.valid","files":["./.agentd.yml"],"schema":"1"}
+{"event":"config.valid","files":["/home/you/.config/agentd/config.yml","./agentd.yml","./agentd.local.yml"],"schema":"1"}
 ```
 
-Three rules keep it from being surprising:
+Four rules keep it from being surprising:
 
 - **It is only ever a fallback.** Naming a config — by flag or by env — means
-  you have already decided; the dotfile is not consulted, not merged, not
-  layered underneath. There is no way for a stray file to modify a run you
-  spelled out.
-- **Only the working directory.** No walk up to a parent, no `$HOME`, no
-  `/etc`. Where it applies is exactly where you can see it.
-- **Both spellings present is an error** (exit `2`), not a silent pick between
-  them — whichever agentd chose, somebody would be editing the other and
-  wondering why nothing changed.
+  you have already decided; no rung is consulted, merged, or layered
+  underneath. There is no way for a stray `agentd.local.yml` to modify a run
+  you spelled out.
+- **The project and local rungs are the working directory only.** No walk up to
+  a parent, no `/etc`. Where they apply is exactly where you can see them.
+- **Two spellings of ONE rung is an error** (exit `2`), not a silent pick
+  between them — whichever agentd chose, somebody would be editing the other
+  and wondering why nothing changed. Ambiguity is per rung: `agentd.yml` beside
+  `agentd.local.yml` is the design; `agentd.yml` beside `agentd.yaml` is a coin
+  toss.
+- **No rung may relax a security control.** Every discovered file is unnamed,
+  so `security.allow_trifecta` and its kind are exit `2` from any rung — a
+  machine-local overlay must not be able to widen what the project file could
+  not. Pass `--config` if you meant it.
+
+The dotted spellings (`.agentd.yml`, `.agentd.yaml`) are the original discovery
+names and stay valid; `agentd.yml` is the name to teach.
 
 `--help`, `--version`, `--config-schema` and `--workflow-schema` never discover
-a config, so a malformed dotfile cannot stop you from reading the help.
+a config, so a malformed file cannot stop you from reading the help.
 
-Once discovered it is an ordinary file layer: env and flags still override it,
-and `--watch-config` watches it like any other.
+Once discovered they are ordinary file layers: env and flags still override
+them, and `--watch-config` watches each like any other.
+
+### 12.1.1 Conventional folders beside the config
+
+Four folders beside the config fill in settings you did not write, so a project
+can be a directory you read rather than one long file:
+
+| Folder | Fills in | Files |
+|---|---|---|
+| `workflows/` | `workflows:` | `*.yaml`, `*.yml`, `*.json` — one workflow document each |
+| `skills/` | `skills.dir` | `<name>.md`, or the Agent Skill form `<name>/SKILL.md` |
+| `subagents/` | `subagents.templates` | `*.yaml` — one template each, named by file stem |
+| `context/` | `context.templates` | `*.md` — the whole body is the template, named by stem |
+
+They are looked for beside the **last** config file loaded (the most specific
+rung), or the working directory when none. Load order within a folder is
+filename order, so `10-`, `20-` prefixes work — though a workflow still needs a
+legal `name:` inside it, since names must match `[a-zA-Z_][a-zA-Z0-9_-]{0,63}`
+and cannot start with a digit.
+
+Two rules make these **conventions** rather than declarations:
+
+- **Only when the setting is absent.** Writing `workflows:` — including an
+  empty list, meaning *none* — is a decision, and the folder does not argue
+  with it.
+- **Only when the folder yields something.** A missing or empty folder is
+  silence. (A `dir:` you *named* with no match is still exit `2`: you asked for
+  it by name.)
+
+A `skills/` folder is the one that adds a capability rather than moving one:
+skills previously reached agentd only through an MCP server or an inline
+`:::skill` directive. A skill grants no tool — it is prose the model reads — so
+a local file needs no server. Frontmatter is optional: with none, the file stem
+names the skill and its first paragraph describes it. Like `:::skill`, a local
+file wins a name collision with a discovered one.
 
 ### 12.2 Several files — later overrides earlier
 

@@ -3601,7 +3601,7 @@ fn append_at(doc: &mut Value, path: &str, element: Value) {
 }
 
 /// Where conventional folders are looked for: beside each config file, MOST
-/// SPECIFIC FIRST, then the working directory.
+/// SPECIFIC FIRST.
 ///
 /// A single directory is not enough. `agentd -c ./agentd.yml -c /tmp/over.yml`
 /// is an ordinary shape — a thin overlay that lives nowhere near the project —
@@ -3610,22 +3610,32 @@ fn append_at(doc: &mut Value, path: &str, element: Value) {
 /// question. Keying on the FIRST is wrong too: the chain's first rung is
 /// `~/.config/agentd`, where nobody keeps a project's workflows.
 ///
-/// So: search, and let each setting take the first directory that actually has
-/// something for it. In the layout this is really for — `agentd.yml` and
-/// `agentd.local.yml` side by side — every candidate is the same directory and
-/// the question does not arise.
+/// The working directory is a candidate ONLY when no config file was loaded at
+/// all. Adding it unconditionally leaks: `agentd -c examples/voice/ears.yaml`
+/// run from a repository root adopted that repository's own `./skills`, which
+/// is exactly the "a stray file modified a run you spelled out" surprise the
+/// whole discovery design refuses. Naming a config means the caller decided,
+/// and that has to hold for the folders beside it too. Discovery does not lose
+/// anything here — a discovered `./agentd.yml` has `.` as its parent, so the
+/// working directory is already in the list when it should be.
 fn config_dirs(paths: &[String]) -> Vec<PathBuf> {
+    if paths.is_empty() {
+        return vec![PathBuf::from(".")];
+    }
     let mut out: Vec<PathBuf> = Vec::new();
     for p in paths.iter().rev() {
-        if let Some(d) = Path::new(p).parent().filter(|d| !d.as_os_str().is_empty())
-            && !out.contains(&d.to_path_buf())
-        {
-            out.push(d.to_path_buf());
+        // A path with no directory component — `-c agentd.yml` — names a file
+        // in the working directory, so its directory IS the working directory.
+        // Filtering the empty parent out instead dropped the project entirely
+        // whenever the config was named relatively, which is the common way to
+        // name it.
+        let d = match Path::new(p).parent() {
+            Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        if !out.contains(&d) {
+            out.push(d);
         }
-    }
-    let cwd = PathBuf::from(".");
-    if !out.contains(&cwd) {
-        out.push(cwd);
     }
     out
 }

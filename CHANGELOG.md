@@ -5,7 +5,7 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
-## Unreleased
+## v1.3.1 — folders found where the config is
 
 ### Conventional folders are searched, not assumed
 
@@ -15,10 +15,17 @@ right for `agentd.yml` + `agentd.local.yml`, and wrong for
 lives nowhere near the project. The search found nothing and fell through to
 the sugar `main` loop in silence, which is worse than any ordering question.
 
-Candidates are now every config file's directory, most specific first, then the
-working directory; each setting takes the first that has something for it.
-Keying on the FIRST would have been wrong too — the chain's first rung is
-`~/.config/agentd`, where nobody keeps a project's workflows.
+Candidates are now every config file's directory, most specific first; each
+setting takes the first that has something for it. Keying on the FIRST would
+have been wrong too — the chain's first rung is `~/.config/agentd`, where
+nobody keeps a project's workflows.
+
+The working directory is a candidate only when NO config file was loaded.
+Adding it unconditionally leaked: `agentd -c examples/voice/ears.yaml` run from
+a repository root adopted that repository's own `./skills`, which is exactly
+the "a stray file modified a run you spelled out" surprise discovery refuses.
+Naming a config decides the folders beside it too. Discovery loses nothing —
+a discovered `./agentd.yml` has `.` as its directory already.
 
 ### Processing lines as they arrive (`examples/tail/`)
 

@@ -415,3 +415,60 @@ fn an_overlay_elsewhere_does_not_hide_the_projects_folders() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// The working directory is NOT a candidate when a config was named.
+///
+/// `agentd -c some/where/agentd.yml` run from a directory that happens to have
+/// a `skills/` folder adopted THAT folder — a stray directory modifying a run
+/// the caller spelled out, which is the surprise the whole discovery design
+/// refuses. Naming a config decides the folders beside it too.
+#[test]
+fn the_working_directory_is_not_searched_for_a_named_config() {
+    let (root, home, work) = project("cwdleak");
+    // The project lives in a subdirectory; the config is named by path.
+    let proj = work.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(proj.join("agentd.yml"), BASE).unwrap();
+
+    // A `skills/` folder sits in the CWD, belonging to something else entirely.
+    std::fs::create_dir_all(work.join("skills")).unwrap();
+    std::fs::write(
+        work.join("skills/not-mine.md"),
+        "# Not mine\n\nbelongs to whatever lives in this directory.\n",
+    )
+    .unwrap();
+
+    let (code, log) = run_in(&work, &home, &["-c", "proj/agentd.yml"]);
+    assert_eq!(code, Some(0), "{log}");
+    assert!(
+        !log.contains("not-mine"),
+        "a named config must not adopt the working directory's folders\n{log}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// With NO config file at all, the working directory is the only sensible
+/// place to look — and it is still searched.
+#[test]
+fn the_working_directory_is_searched_when_no_config_exists() {
+    let (root, home, work) = project("cwdonly");
+    std::fs::create_dir_all(work.join("workflows")).unwrap();
+    std::fs::write(work.join("workflows/a.yaml"), wf("bare_cwd")).unwrap();
+
+    let (_code, log) = run_in(
+        &work,
+        &home,
+        &[
+            "--intelligence",
+            "mock:final",
+            "--model",
+            "mock",
+            "--validate-config",
+        ],
+    );
+    assert!(
+        log.contains("config.valid") || log.contains("bare_cwd"),
+        "a config-less run should still find ./workflows\n{log}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

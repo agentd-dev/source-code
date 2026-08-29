@@ -5,10 +5,19 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
-## Unreleased — the runtime can address itself
+## v1.2.0 — the runtime can address itself
 
 Eight primitives, each closing a gap that turned out to be a missing *edge*
-between two mechanisms agentd already had rather than a missing feature.
+between two mechanisms agentd already had rather than a missing feature. A
+run could be started ten ways but a turn could only be started from outside
+the process; the durable log could be consumed but not waited on; the daemon
+emitted events it could not itself react to. None of them needed a new
+subsystem — each needed one mechanism pointed at another.
+
+Alongside them: gates that name who must answer, published JSON Schemas so an
+editor completes a config as you type, and a worked voice-agent example whose
+point is that a microphone is an unauthenticated prompt channel and the
+lethal-trifecta gate treats it as one.
 
 ### Anything inside the daemon can start a turn
 

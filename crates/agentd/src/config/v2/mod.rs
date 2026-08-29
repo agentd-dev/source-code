@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -3307,6 +3308,13 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
         }
     }
 
+    // --- conventional folders beside the config ---
+    //
+    // Runs BEFORE the instruction sugar on purpose: a project with a
+    // `workflows/` folder has declared its machinery, and the sugar `main` loop
+    // is for the case where nothing did.
+    apply_default_folders(&mut doc, &config_dir(&config_paths), &mut warnings);
+
     // --- sugar: `agentd --instruction X` with no workflows ---
     if ask == Ask::Run || ask == Ask::Validate {
         apply_instruction_sugar(&mut doc);
@@ -3582,6 +3590,136 @@ fn append_at(doc: &mut Value, path: &str, element: Value) {
             *arr = Value::Array(Vec::new());
         }
         arr.as_array_mut().expect("array").push(element);
+    }
+}
+
+/// The directory conventional folders are looked for in: the one holding the
+/// LAST config file (the most specific rung of the chain), else the working
+/// directory. Last rather than first because `agentd.local.yml` sits beside
+/// `agentd.yml`, while the user rung lives under `~/.config` and nobody keeps
+/// a project's workflows there.
+fn config_dir(paths: &[String]) -> PathBuf {
+    paths
+        .last()
+        .map(Path::new)
+        .and_then(Path::parent)
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Files in `dir` with any of `exts`, sorted, empty when the directory is not
+/// there. Sorted so a folder's load order is its filename order — the only
+/// ordering an operator can see without reading the loader.
+fn folder_files(dir: &Path, exts: &[&str]) -> Vec<PathBuf> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .filter(|p| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| exts.contains(&e))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Adopt the conventional folders beside the config — `workflows/`,
+/// `subagents/`, `context/` — for the settings the operator did not write.
+///
+/// Two rules make these CONVENTIONS rather than declarations, and both matter:
+///
+/// 1. **Only when the setting is absent.** Someone who wrote `workflows:` has
+///    decided, including writing an empty list to mean "none". A default that
+///    appended to an explicit list would make the explicit one unreadable.
+/// 2. **Only when the folder yields something.** A named `dir:` with no match
+///    is exit 2, and rightly so — you asked for it by name. A default that did
+///    the same would make agentd unrunnable in any directory that happens to
+///    lack a `subagents/`, which is nearly all of them.
+///
+/// Injection happens on the merged DOCUMENT, so everything downstream —
+/// validation, `{{config.*}}` folding, the definition hash, hot reload — sees
+/// an ordinary explicit entry and needs no case for "came from a folder".
+fn apply_default_folders(doc: &mut Value, dir: &Path, warnings: &mut Vec<String>) {
+    let Some(obj) = doc.as_object_mut() else {
+        return;
+    };
+
+    // workflows/ — reuses the `dir:` entry the loader already expands, so the
+    // glob, the sort and the naming stay one implementation rather than two.
+    if !obj.contains_key("workflows") {
+        let d = dir.join("workflows");
+        if !folder_files(&d, &["yaml", "yml", "json"]).is_empty() {
+            obj.insert(
+                "workflows".into(),
+                json!([{"dir": d.to_string_lossy(), "glob": "*.yaml,*.yml,*.json"}]),
+            );
+        }
+    }
+
+    // subagents/ — one reviewed template per file, named by stem.
+    if obj
+        .get("subagents")
+        .and_then(|s| s.get("templates"))
+        .is_none()
+    {
+        let d = dir.join("subagents");
+        let mut templates = Map::new();
+        for path in folder_files(&d, &["yaml", "yml", "json"]) {
+            let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            match file::read_document(&path.to_string_lossy()) {
+                Ok((v, _)) => {
+                    templates.insert(name.to_string(), v);
+                }
+                Err(e) => warnings.push(format!("subagents template {}: {e}", path.display())),
+            }
+        }
+        if !templates.is_empty()
+            && let Some(sub) = obj
+                .entry("subagents")
+                .or_insert_with(|| json!({}))
+                .as_object_mut()
+        {
+            sub.insert("templates".into(), Value::Object(templates));
+        }
+    }
+
+    // context/ — a prompt template is prose, so it is a file whose whole body
+    // is the template and whose stem is the name a node selects with
+    // `context: {template: <name>}`.
+    if obj
+        .get("context")
+        .and_then(|c| c.get("templates"))
+        .is_none()
+    {
+        let d = dir.join("context");
+        let mut templates = Map::new();
+        for path in folder_files(&d, &["md", "txt", "hbs"]) {
+            let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            match std::fs::read_to_string(&path) {
+                Ok(text) => {
+                    templates.insert(name.to_string(), Value::String(text));
+                }
+                Err(e) => warnings.push(format!("context template {}: {e}", path.display())),
+            }
+        }
+        if !templates.is_empty()
+            && let Some(ctx) = obj
+                .entry("context")
+                .or_insert_with(|| json!({}))
+                .as_object_mut()
+        {
+            ctx.insert("templates".into(), Value::Object(templates));
+        }
     }
 }
 

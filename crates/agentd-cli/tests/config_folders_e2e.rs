@@ -1,0 +1,227 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//! Config discovery as a CHAIN, and the conventional folders beside it.
+//!
+//! Two mechanisms, both about the same thing: what agentd does when nobody
+//! told it anything. Discovery walks `~/.config/agentd/config.yml` →
+//! `./agentd.yml` → `./agentd.local.yml`, and the folders `workflows/`,
+//! `subagents/` and `context/` fill in settings the operator did not write.
+//!
+//! Every case here runs the REAL binary from a temp directory, because the
+//! whole feature is about filesystem layout and process environment — a unit
+//! test over the loader would assert the parts and miss the arrangement.
+#![cfg(unix)]
+
+mod common;
+
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+/// Run agentd in `cwd` with a controlled HOME and no inherited config env.
+fn run_in(cwd: &Path, home: &Path, args: &[&str]) -> (Option<i32>, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .args(args)
+        .current_dir(cwd)
+        .env_remove("AGENT_CONFIG")
+        .env_remove("AGENTD_CONFIG")
+        .env_remove("XDG_CONFIG_HOME")
+        .env("HOME", home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .output()
+        .expect("run");
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+/// A scratch project: `<root>/home` for the user rung, `<root>/work` for the
+/// project one.
+fn project(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let root = PathBuf::from(common::unique_path(tag, "d"));
+    let (home, work) = (root.join("home"), root.join("work"));
+    std::fs::create_dir_all(home.join(".config/agentd")).unwrap();
+    std::fs::create_dir_all(&work).unwrap();
+    (root, home, work)
+}
+
+const BASE: &str = "config_version: \"1\"\n\
+     agent: { name: conv, instruction: conventions }\n\
+     intelligence: { endpoints: \"mock:final\", model: mock }\n\
+     store: { kind: memory }\n\
+     observability: { log_level: info }\n\
+     lifecycle: { run_until: idle, idle_grace: 1s }\n";
+
+fn wf(name: &str) -> String {
+    format!(
+        "name: {name}\nsteps:\n  s: {{ kind: manual }}\n  \
+         f: {{ kind: finish, depends_on: [s], status: completed }}\n"
+    )
+}
+
+/// The chain layers user → project → local, and the most specific wins. The
+/// three rungs exist so a person's defaults, a checkout's settings and one
+/// machine's overrides can each live where they belong.
+#[test]
+fn the_chain_layers_and_the_most_specific_rung_wins() {
+    let (root, home, work) = project("chain");
+    std::fs::write(home.join(".config/agentd/config.yml"), BASE).unwrap();
+    let (code, log) = run_in(&work, &home, &["--validate-config"]);
+    assert_eq!(code, Some(0), "{log}");
+    assert!(
+        log.contains("config.yml"),
+        "the user rung should load\n{log}"
+    );
+
+    std::fs::write(work.join("agentd.yml"), "agent: { name: from_project }\n").unwrap();
+    std::fs::write(
+        work.join("agentd.local.yml"),
+        "agent: { name: from_local }\n",
+    )
+    .unwrap();
+    let (code, log) = run_in(&work, &home, &[]);
+    assert_eq!(code, Some(0), "{log}");
+    assert!(
+        log.contains("\"instance\":\"from_local\""),
+        "the local rung should win\n{log}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Two spellings of ONE rung is a coin toss; two DIFFERENT rungs is the design.
+#[test]
+fn ambiguity_is_per_rung_not_across_the_chain() {
+    let (root, home, work) = project("ambig");
+    std::fs::write(work.join("agentd.yml"), BASE).unwrap();
+    std::fs::write(work.join("agentd.local.yml"), "agent: { name: ok }\n").unwrap();
+    let (code, log) = run_in(&work, &home, &["--validate-config"]);
+    assert_eq!(code, Some(0), "project + local must compose\n{log}");
+
+    std::fs::write(work.join("agentd.yaml"), BASE).unwrap();
+    let (code, log) = run_in(&work, &home, &["--validate-config"]);
+    assert_eq!(code, Some(2), "{log}");
+    assert!(
+        log.contains("project config is ambiguous"),
+        "the refusal should name the rung\n{log}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Naming a config means the caller decided: no rung is merged underneath it.
+/// Silently folding a stray `agentd.local.yml` into a named production config
+/// is the surprise discovery must never spring.
+#[test]
+fn an_explicit_config_suppresses_the_whole_chain() {
+    let (root, home, work) = project("explicit");
+    std::fs::write(work.join("agentd.yml"), BASE).unwrap();
+    std::fs::write(
+        work.join("agentd.local.yml"),
+        "agent: { name: must_not_win }\n",
+    )
+    .unwrap();
+    let (code, log) = run_in(&work, &home, &["-c", "agentd.yml", "--validate-config"]);
+    assert_eq!(code, Some(0), "{log}");
+    assert!(
+        !log.contains("agentd.local.yml"),
+        "a named config must not adopt the local rung\n{log}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `workflows/` beside the config, loaded in FILENAME order — which is the
+/// only ordering an operator can see without reading the loader.
+#[test]
+fn a_workflows_folder_is_adopted_in_filename_order() {
+    let (root, home, work) = project("wfdir");
+    std::fs::write(work.join("agentd.yml"), BASE).unwrap();
+    std::fs::create_dir_all(work.join("workflows")).unwrap();
+    // Written out of order; the numeric prefixes decide.
+    std::fs::write(work.join("workflows/30-charlie.yaml"), wf("charlie")).unwrap();
+    std::fs::write(work.join("workflows/10-alpha.yaml"), wf("alpha")).unwrap();
+    std::fs::write(work.join("workflows/20-bravo.yaml"), wf("bravo")).unwrap();
+
+    let (code, log) = run_in(&work, &home, &[]);
+    assert_eq!(code, Some(0), "{log}");
+    let order: Vec<&str> = log
+        .lines()
+        .filter(|l| l.contains("\"workflow.loaded\""))
+        .filter_map(|l| {
+            ["alpha", "bravo", "charlie"]
+                .into_iter()
+                .find(|n| l.contains(&format!("\"name\":\"{n}\"")))
+        })
+        .collect();
+    assert_eq!(order, ["alpha", "bravo", "charlie"], "{log}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The folder is a CONVENTION: it fills in a setting nobody wrote, and never
+/// argues with one that was. An explicit `workflows:` — including an empty
+/// list meaning "none" — is the operator's decision.
+#[test]
+fn an_explicit_workflows_setting_suppresses_the_folder() {
+    let (root, home, work) = project("wfexplicit");
+    std::fs::write(work.join("agentd.yml"), format!("{BASE}workflows: []\n")).unwrap();
+    std::fs::create_dir_all(work.join("workflows")).unwrap();
+    std::fs::write(work.join("workflows/a.yaml"), wf("should_not_load")).unwrap();
+
+    let (code, log) = run_in(&work, &home, &[]);
+    assert_eq!(code, Some(0), "{log}");
+    assert!(
+        !log.contains("should_not_load"),
+        "an explicit empty list means none\n{log}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A missing or empty folder is silence, not exit 2. A NAMED `dir:` with no
+/// match is an error because you asked for it; a convention that did the same
+/// would make agentd unrunnable in any directory without a `subagents/`.
+#[test]
+fn absent_folders_are_silent() {
+    let (root, home, work) = project("empty");
+    std::fs::write(work.join("agentd.yml"), BASE).unwrap();
+    std::fs::create_dir_all(work.join("workflows")).unwrap(); // present but EMPTY
+    let (code, log) = run_in(&work, &home, &["--validate-config"]);
+    assert_eq!(
+        code,
+        Some(0),
+        "an empty conventional folder must not fail\n{log}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `subagents/` and `context/`: one reviewed template per file, named by stem,
+/// typed and validated exactly as an inline entry would be.
+#[test]
+fn subagent_and_context_templates_load_from_their_folders() {
+    let (root, home, work) = project("tpls");
+    std::fs::write(work.join("agentd.yml"), BASE).unwrap();
+    std::fs::create_dir_all(work.join("subagents")).unwrap();
+    std::fs::create_dir_all(work.join("context")).unwrap();
+    std::fs::write(
+        work.join("subagents/reviewer.yaml"),
+        "instruction: |\n  Review what you are given.\nparams:\n  target: { type: string }\n",
+    )
+    .unwrap();
+    std::fs::write(work.join("context/minimal.md"), "You are {{instance}}.\n").unwrap();
+
+    // The templates ARE loaded: this rule fires only when some exist.
+    let (code, log) = run_in(&work, &home, &["--validate-config"]);
+    assert_eq!(code, Some(0), "{log}");
+    assert!(
+        log.contains("subagents.templates are declared but a2a.listen is unset"),
+        "the subagents folder should have populated templates\n{log}"
+    );
+
+    // And a context template is validated like any other: a bad reference is
+    // caught at load, naming the template the folder supplied.
+    std::fs::write(work.join("context/minimal.md"), "You are {{nope}}.\n").unwrap();
+    let (code, log) = run_in(&work, &home, &["--validate-config"]);
+    assert_eq!(code, Some(2), "{log}");
+    assert!(
+        log.contains("context.templates.minimal"),
+        "the refusal should name the folder-loaded template\n{log}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

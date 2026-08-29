@@ -1,0 +1,287 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# hands — the ACTING side of the voice agent.
+#
+# Trust legs: sensitive (calendar, house state) + egress (lights, locks, media,
+# shopping). NOT untrusted_input — this instance never sees a transcript, only
+# the schema-checked command object `ears` extracted from one.
+#
+# Try collapsing the two: add the `mic` server from ears.yaml here and the
+# daemon refuses to start, before any side effect:
+#
+#   lethal-trifecta refused: the root grant wires untrusted_input + sensitive +
+#   egress into one agent; narrow the tags or set security.allow_trifecta
+#
+# That refusal is the design. A single instance that can hear a room AND unlock
+# a door is one convincing sentence away from unlocking the door.
+# ─────────────────────────────────────────────────────────────────────────────
+config_version: "1"
+
+agent:
+  name: hands
+  instruction: |
+    You operate one household. You receive typed commands, never prose from a
+    microphone, and you answer in one or two spoken sentences.
+
+    You never act on a lock, a purchase, or anything that spends money or opens
+    the house without an explicit confirmation from a signed-in person. That
+    confirmation cannot come from the room — a voice is not a principal.
+
+    When you cannot do something, say what you would need rather than
+    apologising at length. You are being read aloud to someone standing in a
+    kitchen.
+
+# Two tiers behind one gateway. The deep tier exists for exactly one step: the
+# open question a person asks out loud, where the agent has tools and has to
+# think. Everything else runs on the fast one.
+services:
+  gateway:
+    kind: intelligence
+    endpoint: https://api.openai.com/v1
+    auth: { kind: static, token: "{{secret:OPENAI_API_KEY}}" }
+    rate: "120/1m"
+
+intelligence:
+  models:
+    quick: { service: gateway, model: gpt-5.1-mini, window: 128000 }
+    deep:  { service: gateway, model: gpt-5.1,      window: 200000, fallback: quick }
+  default: quick
+  preflight_model: quick
+  budget:
+    windows: [{ per: day, tokens: 4000000 }]
+    on_exhausted: refuse
+
+mcp:
+  servers:
+    # Everything that changes the house. Egress: it moves state into the
+    # physical world, and some of it cannot be undone by asking nicely.
+    - name: home
+      endpoint: https://home.lan/mcp
+      tags: { "*": [egress] }
+      auth: { kind: static, token: "{{secret:HOME_TOKEN}}" }
+
+    # Private context: the calendar, who is home, the shopping list. Read-heavy
+    # and none of anyone else's business.
+    - name: personal
+      endpoint: https://home.lan/mcp/personal
+      tags: { "*": [sensitive] }
+      auth: { kind: static, token: "{{secret:PERSONAL_TOKEN}}" }
+
+store:
+  kind: file
+  file: { path: /var/lib/agentd/hands }
+
+# The unix-socket fast lane: `ears` is on this box, so there is no TLS
+# handshake, no TCP stack, and no certificate to rotate. The kernel does the
+# authenticating — the socket is 0600 and every connection's SO_PEERCRED uid
+# must be the daemon's own user. Moving `hands` to another machine later is a
+# one-line change back to https://.
+a2a:
+  listen: unix:///run/agentd/hands.sock
+  peers:
+    # For announcements nobody asked for: a finished wash cycle, a door left
+    # open. `ears` owns the only speaker in the house.
+    - name: ears
+      endpoint: http://127.0.0.1:8420
+
+limits:
+  max_runs: 8
+  run: { steps: 40, tokens: 120000, deadline: 10m }
+
+workflows:
+  # ── 1. A typed command arrived from `ears` ────────────────────────────────
+  - name: command
+    description: Act on one household command.
+    # `scope: key` makes max_runs a per-entity LOCK rather than a queue depth:
+    # two runs may act on two different rooms at once, but never two on the
+    # same one.
+    concurrency: { max_runs: 4, on_overflow: queue }
+    steps:
+      # Declaring `command` registers it as an A2A command this listener
+      # accepts, and `schema` is the CONTRACT. A payload that does not conform
+      # is refused at the listener, synchronously, naming the mismatch — the
+      # sender learns immediately, instead of a half-executed mystery.
+      cmd:
+        kind: a2a
+        command: home.command
+        roles: [agent, operator]
+        schema:
+          type: object
+          required: [action]
+          properties:
+            action:
+              type: string
+              enum: [none, ask, light, climate, media, timer, list, lock, purchase]
+            target:   { type: string, maxLength: 64 }
+            value:    { type: string, maxLength: 64 }
+            question: { type: string, maxLength: 400 }
+            # Carried for the audit trail only. Nothing below reads it into a
+            # prompt: the whole point of the boundary is that the raw sentence
+            # stops here.
+            heard:    { type: string, maxLength: 1000 }
+
+      route:
+        kind: switch
+        depends_on: cmd
+        on: "{{ steps.cmd.output.args.action }}"
+        cases:
+          light:    adjust
+          climate:  adjust
+          media:    adjust
+          timer:    adjust
+          list:     adjust
+          lock:     confirm
+          purchase: confirm
+          ask:      answer
+          none:     ignore
+        default: ignore
+
+      # ── The reversible half ───────────────────────────────────────────────
+      # A light, a thermostat, a timer, a song, a line on the shopping list.
+      # Getting one wrong costs you the effort of saying it again, so it runs
+      # without ceremony. This is a deliberate line, not an oversight: a system
+      # that confirms everything trains people to confirm without reading.
+      adjust:
+        kind: mcp.tool
+        depends_on: route
+        server: home
+        tool: apply
+        args:
+          domain: "{{ steps.cmd.output.args.action }}"
+          target: "{{ steps.cmd.output.args.target | \"\" }}"
+          value:  "{{ steps.cmd.output.args.value | \"\" }}"
+        # agentd attaches a retry-stable `agent/idempotency_key` derived from
+        # run + step, so a retried or crash-replayed call does not toggle twice.
+        retry: { max: 2, backoff: 500ms }
+        on_error: continue
+
+      # ── The irreversible half ─────────────────────────────────────────────
+      # `to` narrows WHO may answer. `role: operator` is an authenticated
+      # session on the A2A listener — the TUI, the web UI, a paired phone. The
+      # room cannot satisfy this gate, and that is the whole security story of a
+      # voice assistant allowed near a lock: sound is not identity.
+      #
+      # A reply from anyone else is refused with an explanation and the gate
+      # stays OPEN, rather than the answer disappearing into a conversation.
+      confirm:
+        kind: human
+        depends_on: route
+        question: |
+          Voice request: {{ steps.cmd.output.args.action }}
+          {{ steps.cmd.output.args.target | "" }} {{ steps.cmd.output.args.value | "" }}.
+          Approve?
+        schema:
+          type: object
+          required: [approved]
+          properties:
+            approved: { type: boolean }
+            note:     { type: string }
+        to: { role: operator }
+        # Long enough to walk to your phone, short enough that a stale approval
+        # is not still sitting there tomorrow.
+        timeout: 3m
+        # A gate nobody answers is a NO, not a crashed run. `on_error: continue`
+        # lets the switch below read the absence and route it.
+        on_error: continue
+
+      # No `when:` guard here on purpose. A CEL guard that references a path a
+      # lapsed gate never wrote fails the RUN (an unevaluatable guard is
+      # fail-closed, not false), so the branch is taken on a rendered value with
+      # an explicit default instead — the one construction that behaves the same
+      # whether the gate was answered, refused, or timed out.
+      decision:
+        kind: switch
+        depends_on: confirm
+        on: "{{ steps.confirm.output.approved | false }}"
+        cases:
+          "true": execute
+        default: declined
+
+      execute:
+        kind: mcp.tool
+        depends_on: decision
+        server: home
+        tool: apply
+        args:
+          domain: "{{ steps.cmd.output.args.action }}"
+          target: "{{ steps.cmd.output.args.target | \"\" }}"
+          value:  "{{ steps.cmd.output.args.value | \"\" }}"
+        # This one must not repeat. A crash mid-unlock replays the step by
+        # default; here we would rather fail loudly and let a person look.
+        on_replay: fail
+
+      declined:
+        kind: template
+        depends_on: decision
+        text: "I did not do that. It was not confirmed."
+
+      # ── The open question ─────────────────────────────────────────────────
+      # The only step in this example that gets an agentic loop and the deep
+      # tier. `servers` narrows what it may reach to the read-only side, so a
+      # question can never become an action by accident.
+      answer:
+        kind: agent
+        depends_on: route
+        model: deep
+        servers: [personal]
+        instruction: |
+          Answer this household question in one or two sentences that will be
+          read aloud. No lists, no markdown, no URLs.
+
+          {{ steps.cmd.output.args.question | "" }}
+        limits: { steps: 8, tokens: 20000 }
+        on_error: continue
+
+      ignore:
+        kind: template
+        depends_on: route
+        text: ""
+
+      # Whatever branch ran, the delegate blocking on this run gets one sentence
+      # back and `ears` speaks it. Every reference carries a default: exactly one
+      # of these branches ran, so the other four paths are unset by construction.
+      fin:
+        kind: finish
+        depends_on: [adjust, execute, declined, answer, ignore]
+        status: completed
+        output:
+          reply: >-
+            {{ steps.adjust.output.said | "" }}{{ steps.execute.output.said | "" }}{{ steps.declined.output | "" }}{{ steps.answer.output | "" }}{{ steps.ignore.output | "" }}
+
+  # ── 2. The house says something nobody asked about ────────────────────────
+  # The other direction: `hands` notices, `ears` speaks. Note the shape — this
+  # is `a2a.send`, a notification, not a delegate. Nothing here depends on the
+  # sentence having been spoken, and blocking a run on a text-to-speech engine
+  # would make a slow speaker look like a stuck house.
+  - name: announce
+    description: Speak an unprompted household event.
+    concurrency: { max_runs: 2, on_overflow: drop }
+    steps:
+      changed:
+        kind: subscribe
+        server: home
+        uri: "home://state/notable"
+        debounce_ms: 2000
+        coalesce: true
+        filter: "content.severity == 'notable'"
+
+      phrase:
+        kind: summarize
+        depends_on: changed
+        input: "{{ steps.changed.output.content }}"
+        length: one short spoken sentence
+        prompt: >-
+          Say what happened, the way a person would mention it in passing.
+          No preamble, no "I noticed that".
+
+      say:
+        kind: a2a.send
+        depends_on: phrase
+        to: ears
+        command: voice.say
+        args:
+          text: "{{ steps.phrase.output }}"
+          interrupt: false
+        idempotency: true
+        timeout: 30s
+
+      fin: { kind: finish, depends_on: [say], status: completed }

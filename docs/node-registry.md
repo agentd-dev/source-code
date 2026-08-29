@@ -220,8 +220,16 @@ approve:
   # or, when identity is better described than enumerated:
   # to: {role: user, labels: {team: finance}}
   timeout: 24h
-  on_timeout: escalate
+  on_error: continue                           # a lapsed gate is a "no", not a crash
 ```
+
+`on_timeout` is a `wait` field, not a `human` one — a gate has no
+expected-branch routing, so a deadline that passes **fails the step**. Route it
+with `on_error` (`continue`, or `goto:<step>`) and branch on the answer with a
+rendered default rather than a CEL `when`: an unevaluatable guard is fail-closed
+and fails the whole run, so `{{ steps.approve.output.approved | false }}` into a
+`switch` is the construction that behaves the same whether the gate was
+answered, refused, or timed out.
 
 A reply from anyone else is **refused with an explanation** and the gate stays
 open, rather than the answer vanishing into the conversation. Conditions are

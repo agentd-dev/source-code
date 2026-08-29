@@ -9,6 +9,7 @@
 > | **`coding-agent.yaml`** | **A coding agent you pair with** — the config behind [docs/coding-agent.md](../docs/coding-agent.md). `agentd tui --config examples/coding-agent.yaml` starts the daemon *and* a terminal UI. Validated against the binary. |
 > | **`startup/`** | **A software company with two employees** — eleven instances run every role except CEO/CTO: ticket + SMS/voice support, engineering with CI-signal gates, QA, SRE incident lifecycle, sales cadences, finance dunning, marketing calendar + outreach, an egress-choke-point outbox, and a chief of staff. Third-party webhooks, signals, durable streams, MCP trust tags, HITL gates, A2A mesh, conversational interface — all of it, validated against the binary. The reasoning is written up as [docs/two-person-company.md](../docs/two-person-company.md). |
 > | **`hiring/`** | **A hiring agent, end to end** — two instances split by the lethal-trifecta gate: the CV-reading intake and the mail-sending actions side. |
+> | **`voice/`** | **A voice agent, end to end** — wake word, speech, and a room full of people who are not authenticated. Two instances split by the lethal-trifecta gate (the ears that hear vs. the hands that unlock), plus a stdlib-only reference MCP server for the microphone and the speaker. Runs with `--fake` and no hardware. |
 >
 > **Legacy (agentd 1.x — superseded, kept for reference):** the `run-*.sh`
 > scripts, the k8s manifests and the flag tables below drive the **`--mode`**
@@ -28,6 +29,7 @@
 | File | What it is |
 |---|---|
 | `coding-agent.yaml` | **(2.0)** A pair-programming agent for a repository: the `exec` fence, approvals, budgets, and the display surface the TUI/web UI attach to. |
+| `voice/` | **(2.0)** A voice-controlled household agent: `subscribe` start on an MCP resource, `window` for conversational context, `on_overflow: replace` as barge-in, `event: human.asked` to speak every gate aloud, and an addressed gate a voice cannot answer. |
 | `instructions/triage.md` | An instruction file with an output contract — classify an inbox item, take one action, emit JSON. Used by the reactive and loop samples. |
 | `instructions/research.md` | An instruction file with an output contract — research a topic to a single sourced answer. Used by the once sample. |
 | `mcp-servers.json` | An illustrative MCP server config (name + remote `endpoint` + auth `headers` + `tags`), the shape a `--config` JSON file carries. |

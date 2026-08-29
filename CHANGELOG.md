@@ -124,8 +124,31 @@ SchemaStore catalog entries and the submission notes: once registered there,
 VS Code, JetBrains and `yaml-language-server` apply the schema from the
 filename alone, with no per-project setup.
 
+### A voice agent, as an example
+
+`examples/voice/` is a household voice assistant in two instances plus a
+stdlib-only reference MCP server for the microphone and the speaker. It exists
+because a room full of unauthenticated speakers is the sharpest case the
+lethal-trifecta gate has: the instance that can hear cannot unlock, the
+schema-checked command object is the only thing that crosses, and the
+confirmation gate carries `to: {role: operator}` so no answer spoken aloud can
+satisfy it.
+
+It also demonstrates four mechanisms that read as features when combined and
+are one config line each: `on_overflow: replace` is barge-in, `window:
+{samples: N}` on a `subscribe` start is conversational context, `event:
+human.asked` speaks every gate in the instance aloud (including MCP
+elicitations, which agentd bridges onto the same machinery), and a `schedule`
+calling the mic server's own `configure` tool makes the wake word durable
+policy rather than an edge setting. Runs with `--fake` and no hardware.
+
 ### Fixed
 
+- `docs/node-registry.md` showed `on_timeout:` on a `human` gate, which the
+  parser refuses (it is a `wait` field). A gate that outlives its deadline
+  fails the step, so the example now routes it with `on_error` and branches on
+  a rendered default — a CEL `when` over a path a lapsed gate never wrote is
+  fail-closed and takes the whole run with it.
 - the step cache parked its key in the slot every suspending kind overwrites,
   so it never wrote for `agent`, `think`, `subagent`, `human`, `foreach` or
   `wait` — the kinds expensive enough to need it;

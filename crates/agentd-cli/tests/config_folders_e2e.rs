@@ -377,3 +377,41 @@ fn an_undefined_var_in_a_reference_is_reported_once() {
     assert_eq!(hits, 1, "expected exactly one message\n{log}");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A thin overlay that lives somewhere else must not hide the project's
+/// folders.
+///
+/// `agentd -c ./agentd.yml -c /tmp/over.yml` is an ordinary shape, and keying
+/// the folder search on the LAST config file alone found nothing and fell
+/// through to the sugar `main` loop — in silence, which is worse than any
+/// ordering question. Candidates are searched most-specific-first, so the
+/// project's folders are still found when the overlay has none.
+#[test]
+fn an_overlay_elsewhere_does_not_hide_the_projects_folders() {
+    let (root, home, work) = project("overlaydir");
+    std::fs::write(work.join("agentd.yml"), BASE).unwrap();
+    std::fs::create_dir_all(work.join("workflows")).unwrap();
+    std::fs::write(work.join("workflows/a.yaml"), wf("from_folder")).unwrap();
+
+    // The overlay sits in a sibling directory with no folders of its own.
+    let over = root.join("elsewhere");
+    std::fs::create_dir_all(&over).unwrap();
+    let over_cfg = over.join("over.yml");
+    std::fs::write(&over_cfg, "agent: { name: overlaid }\n").unwrap();
+
+    let (code, log) = run_in(
+        &work,
+        &home,
+        &["-c", "agentd.yml", "-c", over_cfg.to_str().unwrap()],
+    );
+    assert_eq!(code, Some(0), "{log}");
+    assert!(
+        log.contains("from_folder"),
+        "the project's workflows folder should still be found\n{log}"
+    );
+    assert!(
+        log.contains("\"instance\":\"overlaid\""),
+        "and the overlay still wins on the keys it sets\n{log}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

@@ -5,6 +5,32 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## Unreleased
+
+### Conventional folders are searched, not assumed
+
+The four folders were looked for beside the LAST config file only. That is
+right for `agentd.yml` + `agentd.local.yml`, and wrong for
+`agentd -c ./agentd.yml -c /tmp/over.yml` — an ordinary shape where the overlay
+lives nowhere near the project. The search found nothing and fell through to
+the sugar `main` loop in silence, which is worse than any ordering question.
+
+Candidates are now every config file's directory, most specific first, then the
+working directory; each setting takes the first that has something for it.
+Keying on the FIRST would have been wrong too — the chain's first rung is
+`~/.config/agentd`, where nobody keeps a project's workflows.
+
+### Processing lines as they arrive (`examples/tail/`)
+
+A worked example for reacting to appended CSV/text lines, with the file's owner
+as an MCP server — the same edge/daemon split the voice example makes with
+audio. Tailing correctly is four problems, and the example is honest about all
+of them: a partial last line is held back until its newline lands, the cursor
+is a byte offset kept in durable memory (so it survives a restart of either
+process), rotation and truncation reset it rather than seeking past the end,
+and `advance`-after-`work` keeps the loop at-least-once rather than losing rows
+on a crash.
+
 ## v1.3.0 — a project is a directory
 
 ### The config you did not name

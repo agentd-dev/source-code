@@ -3320,7 +3320,7 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
     // Runs BEFORE the instruction sugar on purpose: a project with a
     // `workflows/` folder has declared its machinery, and the sugar `main` loop
     // is for the case where nothing did.
-    apply_default_folders(&mut doc, &config_dir(&config_paths), &mut warnings);
+    apply_default_folders(&mut doc, &config_dirs(&config_paths), &mut warnings);
 
     // --- sugar: `agentd --instruction X` with no workflows ---
     if ask == Ask::Run || ask == Ask::Validate {
@@ -3600,19 +3600,34 @@ fn append_at(doc: &mut Value, path: &str, element: Value) {
     }
 }
 
-/// The directory conventional folders are looked for in: the one holding the
-/// LAST config file (the most specific rung of the chain), else the working
-/// directory. Last rather than first because `agentd.local.yml` sits beside
-/// `agentd.yml`, while the user rung lives under `~/.config` and nobody keeps
-/// a project's workflows there.
-fn config_dir(paths: &[String]) -> PathBuf {
-    paths
-        .last()
-        .map(Path::new)
-        .and_then(Path::parent)
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."))
+/// Where conventional folders are looked for: beside each config file, MOST
+/// SPECIFIC FIRST, then the working directory.
+///
+/// A single directory is not enough. `agentd -c ./agentd.yml -c /tmp/over.yml`
+/// is an ordinary shape — a thin overlay that lives nowhere near the project —
+/// and keying on the last file alone finds no folders and falls back to the
+/// sugar `main` loop in silence, which is a worse outcome than any ordering
+/// question. Keying on the FIRST is wrong too: the chain's first rung is
+/// `~/.config/agentd`, where nobody keeps a project's workflows.
+///
+/// So: search, and let each setting take the first directory that actually has
+/// something for it. In the layout this is really for — `agentd.yml` and
+/// `agentd.local.yml` side by side — every candidate is the same directory and
+/// the question does not arise.
+fn config_dirs(paths: &[String]) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for p in paths.iter().rev() {
+        if let Some(d) = Path::new(p).parent().filter(|d| !d.as_os_str().is_empty())
+            && !out.contains(&d.to_path_buf())
+        {
+            out.push(d.to_path_buf());
+        }
+    }
+    let cwd = PathBuf::from(".");
+    if !out.contains(&cwd) {
+        out.push(cwd);
+    }
+    out
 }
 
 /// Files in `dir` with any of `exts`, sorted, empty when the directory is not
@@ -3652,38 +3667,43 @@ fn folder_files(dir: &Path, exts: &[&str]) -> Vec<PathBuf> {
 /// Injection happens on the merged DOCUMENT, so everything downstream —
 /// validation, `{{config.*}}` folding, the definition hash, hot reload — sees
 /// an ordinary explicit entry and needs no case for "came from a folder".
-fn apply_default_folders(doc: &mut Value, dir: &Path, warnings: &mut Vec<String>) {
+fn apply_default_folders(doc: &mut Value, dirs: &[PathBuf], warnings: &mut Vec<String>) {
     let Some(obj) = doc.as_object_mut() else {
         return;
     };
 
+    /// The first candidate directory whose `<dir>/<name>` satisfies `has`.
+    fn find(dirs: &[PathBuf], name: &str, has: impl Fn(&Path) -> bool) -> Option<PathBuf> {
+        dirs.iter().map(|d| d.join(name)).find(|p| has(p))
+    }
+
     // workflows/ — reuses the `dir:` entry the loader already expands, so the
     // glob, the sort and the naming stay one implementation rather than two.
-    if !obj.contains_key("workflows") {
-        let d = dir.join("workflows");
-        if !folder_files(&d, &["yaml", "yml", "json"]).is_empty() {
-            obj.insert(
-                "workflows".into(),
-                json!([{"dir": d.to_string_lossy(), "glob": "*.yaml,*.yml,*.json"}]),
-            );
-        }
+    if !obj.contains_key("workflows")
+        && let Some(d) = find(dirs, "workflows", |p| {
+            !folder_files(p, &["yaml", "yml", "json"]).is_empty()
+        })
+    {
+        obj.insert(
+            "workflows".into(),
+            json!([{"dir": d.to_string_lossy(), "glob": "*.yaml,*.yml,*.json"}]),
+        );
     }
 
     // skills/ — prose the model reads, so it needs no server. Either
     // `<name>.md` or the Agent Skill directory form `<name>/SKILL.md`.
-    if obj.get("skills").and_then(|s| s.get("dir")).is_none() {
-        let d = dir.join("skills");
-        let has_skill = !folder_files(&d, &["md"]).is_empty()
-            || std::fs::read_dir(&d)
-                .is_ok_and(|rd| rd.flatten().any(|e| e.path().join("SKILL.md").is_file()));
-        if has_skill
-            && let Some(sk) = obj
-                .entry("skills")
-                .or_insert_with(|| json!({}))
-                .as_object_mut()
-        {
-            sk.insert("dir".into(), json!(d.to_string_lossy()));
-        }
+    if obj.get("skills").and_then(|s| s.get("dir")).is_none()
+        && let Some(d) = find(dirs, "skills", |p| {
+            !folder_files(p, &["md"]).is_empty()
+                || std::fs::read_dir(p)
+                    .is_ok_and(|rd| rd.flatten().any(|e| e.path().join("SKILL.md").is_file()))
+        })
+        && let Some(sk) = obj
+            .entry("skills")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+    {
+        sk.insert("dir".into(), json!(d.to_string_lossy()));
     }
 
     // subagents/ — one reviewed template per file, named by stem.
@@ -3691,8 +3711,10 @@ fn apply_default_folders(doc: &mut Value, dir: &Path, warnings: &mut Vec<String>
         .get("subagents")
         .and_then(|s| s.get("templates"))
         .is_none()
+        && let Some(d) = find(dirs, "subagents", |p| {
+            !folder_files(p, &["yaml", "yml", "json"]).is_empty()
+        })
     {
-        let d = dir.join("subagents");
         let mut templates = Map::new();
         for path in folder_files(&d, &["yaml", "yml", "json"]) {
             let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
@@ -3722,8 +3744,10 @@ fn apply_default_folders(doc: &mut Value, dir: &Path, warnings: &mut Vec<String>
         .get("context")
         .and_then(|c| c.get("templates"))
         .is_none()
+        && let Some(d) = find(dirs, "context", |p| {
+            !folder_files(p, &["md", "txt", "hbs"]).is_empty()
+        })
     {
-        let d = dir.join("context");
         let mut templates = Map::new();
         for path in folder_files(&d, &["md", "txt", "hbs"]) {
             let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {

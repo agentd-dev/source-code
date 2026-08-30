@@ -1167,12 +1167,9 @@ impl Workflow {
     /// must not idle-exit, because the workflow's whole purpose is to still be
     /// there when its trigger arrives.
     pub fn is_long_lived(&self) -> bool {
-        self.start_steps().iter().any(|s| {
-            matches!(
-                s.kind.as_str(),
-                "loop" | "schedule" | "subscribe" | "signal" | "event" | "a2a" | "stream"
-            )
-        })
+        self.start_steps()
+            .iter()
+            .any(|s| is_long_lived_start(&s.kind))
     }
     /// The step ids in a deterministic topological order (deps first).
     pub fn topo_order(&self) -> Vec<String> {
@@ -1230,6 +1227,38 @@ pub const TOP: &[&str] = &[
     "key",
     "tool",
 ];
+
+/// The start kinds that do NOT keep an instance alive. `once` fires when armed
+/// and `manual` only on an explicit `workflow.run`; when either finishes there
+/// is nothing left waiting, so a job-shaped instance may exit.
+///
+/// Expressed as the EXCEPTIONS rather than as a list of long-lived kinds,
+/// because the exceptions are the stable half: every trigger added since has
+/// been something that waits (a stream, a webhook), and a new one is far more
+/// likely to belong in the long-lived set than out of it. A list of inclusions
+/// silently misclassifies whatever is added next; a list of exclusions makes
+/// the new kind long-lived by default, which is the safe direction — the cost
+/// of a wrong "keeps running" is a process that idles, and the cost of a wrong
+/// "may exit" is a listener that dies under its own traffic.
+pub const ONE_SHOT_STARTS: &[&str] = &["once", "manual"];
+
+/// Every start kind, derived from [`KINDS`] so it cannot drift from the table
+/// the parser uses.
+pub fn start_kinds() -> Vec<&'static str> {
+    KINDS.iter().filter(|k| k.start).map(|k| k.name).collect()
+}
+
+/// Whether a start kind keeps the instance alive.
+///
+/// THE authority. Three hand-maintained copies of this judgement used to exist
+/// — the workflow method, `config::v2::LONG_LIVED_STARTS`, and the
+/// capabilities manifest's own list — and all three disagreed: one had `stream`
+/// and not `webhook`, one the reverse, one neither. A webhook-only instance
+/// under the default `run_until: auto` therefore reported ready and immediately
+/// idle-exited out from under its own listener.
+pub fn is_long_lived_start(kind: &str) -> bool {
+    KINDS.iter().any(|k| k.start && k.name == kind) && !ONE_SHOT_STARTS.contains(&kind)
+}
 
 /// Parse + validate a dialect-3 document. Errors name every problem.
 pub fn parse_workflow(doc: &Value) -> Result<Workflow, Vec<String>> {
@@ -2768,6 +2797,35 @@ mod tests {
         let mut d = w.definition.clone();
         d["steps"]["work"]["instruction"] = json!("other");
         assert_ne!(wf(d).unwrap().hash, w.hash);
+    }
+
+    /// Every start kind is classified, and the classification is DERIVED — so a
+    /// new trigger cannot be added to the table and silently forgotten here.
+    ///
+    /// The three previously hand-maintained copies disagreed: the workflow
+    /// method had `stream` and not `webhook`, `LONG_LIVED_STARTS` had `webhook`
+    /// and not `stream`, and the capabilities manifest had neither. A
+    /// webhook-only instance under the default `run_until: auto` reported ready
+    /// and idle-exited out from under its own listener.
+    #[test]
+    fn every_start_kind_is_classified_and_only_once_manual_are_short() {
+        let starts = start_kinds();
+        assert_eq!(starts.len(), 10, "start kinds: {starts:?}");
+        for k in &starts {
+            assert_eq!(
+                is_long_lived_start(k),
+                !ONE_SHOT_STARTS.contains(k),
+                "{k} classified inconsistently"
+            );
+        }
+        // The two regressions, named so a revert is loud.
+        assert!(is_long_lived_start("webhook"), "a listener keeps us alive");
+        assert!(is_long_lived_start("stream"), "a consumer keeps us alive");
+        assert!(!is_long_lived_start("once"));
+        assert!(!is_long_lived_start("manual"));
+        // A step kind is not a start kind, however plausible it sounds.
+        assert!(!is_long_lived_start("wait"));
+        assert!(!is_long_lived_start("nonsense"));
     }
 
     // Asserts a `when: CEL parse` diagnostic, so it needs the `cel` feature.

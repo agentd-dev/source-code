@@ -3356,7 +3356,19 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
     // A one-shot instance is deliberately untouched and keeps `none`: a job that
     // suddenly began writing state to disk would surprise every existing user of
     // it, and re-running it is already the recovery story.
-    if doc.pointer("/store/kind").is_none() && settings.is_long_lived() {
+    //
+    // "Explicit" has to mean any layer INCLUDING an instruction directive. A
+    // `:::config` fragment declaring `store: {kind: memory}` is folded into
+    // `settings` during typing and never written back into `doc`, so reading
+    // the document alone judged it unstated and overrode it. That stayed hidden
+    // only because `stream` was missing from the long-lived list this check
+    // depends on: a stream-only agent was misclassified short-lived, so the
+    // branch never ran. Fixing the classification exposed it — an agent defined
+    // entirely in one markdown file, stating a memory store, silently got a
+    // file store instead and then collided on the shared state directory.
+    let store_stated =
+        doc.pointer("/store/kind").is_some() || settings.store.kind != StoreKind::default();
+    if !store_stated && settings.is_long_lived() {
         settings.store.kind = StoreKind::File;
     }
     // Resolve `service:` references and apply the tag floor BEFORE validation
@@ -4068,6 +4080,23 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
     let s = &loaded.settings;
     let mut d = Diagnostics::default();
     let err = |d: &mut Diagnostics, m: String| d.errors.push(m);
+
+    // Every `{{secret:…}}` / `{{secret-file:…}}` / `{{config.…}}` in the whole
+    // document, checked the way STARTUP checks it — the identical scan, so the
+    // two cannot disagree.
+    //
+    // They did disagree, and that is the bug this closes. The scan already
+    // existed and ran only at startup; validation checked credentials in
+    // exactly one place, `intelligence.headers`, because the check rode along
+    // with a lint that only header maps have. So `intelligence.token`,
+    // `mcp.servers[].auth.token` and `a2a.principals[].match.bearer_ref` — the
+    // idiomatic spellings — passed `--validate-config` and then exited 2 at
+    // startup. A validator that green-lights a config the daemon refuses is
+    // worse than no validator: it is the one tool whose whole purpose is to
+    // move that failure before any side effect.
+    for m in missing_references(&loaded.doc, "config", &s.vars) {
+        err(&mut d, m);
+    }
 
     // config_version
     if let Some(v) = &s.config_version
@@ -5487,15 +5516,9 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
 /// Start-node kinds that keep an instance alive indefinitely. An instance
 /// running one drains rather than finishing, so it needs a durable store: its
 /// state has no re-run to fall back on.
-pub const LONG_LIVED_STARTS: &[&str] = &[
-    "loop",
-    "schedule",
-    "subscribe",
-    "signal",
-    "event",
-    "a2a",
-    "webhook",
-];
+/// Re-exported so existing callers keep a name to use; the judgement itself
+/// lives in `engine::model` with the kind table, so it cannot drift from it.
+pub use crate::engine::model::is_long_lived_start;
 
 /// Whether a raw workflow document has a long-lived start node.
 pub fn workflow_is_long_lived(w: &Value) -> bool {
@@ -5505,7 +5528,7 @@ pub fn workflow_is_long_lived(w: &Value) -> bool {
             steps.values().any(|st| {
                 st.get("kind")
                     .and_then(Value::as_str)
-                    .is_some_and(|k| LONG_LIVED_STARTS.contains(&k))
+                    .is_some_and(is_long_lived_start)
             })
         })
 }
@@ -5783,7 +5806,22 @@ mod tests {
         f
     }
 
+    /// The environment a test config loads under.
+    ///
+    /// Also seeds the credential the shared `CATALOG` fixture references.
+    /// Validation now runs the SAME whole-document reference scan startup runs,
+    /// so a fixture naming `{{secret:BILLING}}` is refused unless that secret
+    /// resolves — which is the point of the change, and makes these fixtures
+    /// behave like a real deployment. Seeded through the prompted-values store
+    /// rather than `std::env::set_var`: it is additive and never removes, so
+    /// tests running in parallel cannot unset each other's secrets.
     fn base_env() -> Vec<(String, String)> {
+        // Only the two the loaded fixtures reference. `SUB_WINDOW_TEST_UNSET`
+        // is deliberately NOT seeded — a test asserts the missing case, and
+        // seeding it would quietly delete that coverage.
+        for name in ["BILLING", "PEER"] {
+            crate::sec::secret::set_prompted(name, "test-value".into());
+        }
         vec![(
             "AGENTD_INTELLIGENCE_ENDPOINTS".into(),
             "https://intel.example/v1".into(),

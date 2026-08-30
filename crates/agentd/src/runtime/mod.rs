@@ -1105,16 +1105,11 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
 /// production configuration. It reflects the configuration (what the agent is
 /// set up to do), not live state.
 pub fn capabilities(loaded: &Loaded) -> Value {
-    const START_KINDS: &[&str] = &[
-        "once",
-        "manual",
-        "loop",
-        "schedule",
-        "subscribe",
-        "signal",
-        "event",
-        "a2a",
-    ];
+    // Derived from the kind table, so the manifest reports every start kind
+    // agentd actually has — this list used to be hand-maintained and was
+    // missing `stream` and `webhook`, which made a webhook-only workflow
+    // report `start_kinds: []`.
+    let start_kinds = crate::engine::model::start_kinds();
     let s = &loaded.settings;
     let workflows: Vec<Value> = s
         .workflows
@@ -1122,7 +1117,7 @@ pub fn capabilities(loaded: &Loaded) -> Value {
         .map(|w| {
             let starts: Vec<String> = w["steps"]
                 .as_object()
-                .map(|steps| steps.values().filter_map(|st| st["kind"].as_str()).filter(|k| START_KINDS.contains(k)).map(str::to_string).collect())
+                .map(|steps| steps.values().filter_map(|st| st["kind"].as_str()).filter(|k| start_kinds.contains(k)).map(str::to_string).collect())
                 .unwrap_or_default();
             json!({"name": w["name"].as_str().unwrap_or(""), "description": w.get("description").and_then(Value::as_str), "start_kinds": starts, "inputs_schema": w.get("inputs").is_some()})
         })

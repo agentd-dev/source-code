@@ -39,11 +39,52 @@ use std::path::Path;
 /// projection, `IN_MOVED_FROM`/`IN_DELETE` of the old) and the plain in-place
 /// edit case (`IN_CLOSE_WRITE` when an editor writes the file directly).
 #[cfg(any(target_os = "linux", target_os = "android"))]
+/// The symlink a kubelet-projected volume swaps to publish an update. The
+/// rename of this name IS the atomic commit of a new ConfigMap/Secret
+/// revision — nothing else in the update touches a name we could watch for.
+const KUBE_DATA_LINK: &str = "..data";
+
 const WATCH_MASK: u32 = libc::IN_CLOSE_WRITE
     | libc::IN_MOVED_TO
     | libc::IN_CREATE
     | libc::IN_MOVED_FROM
     | libc::IN_DELETE;
+
+/// Decide what a batch of inotify records means for the watched config file:
+/// `(fire, rearm)`.
+///
+/// Extracted from the read loop so it can be TESTED. It previously lived inline
+/// where nothing without a real inotify fd could reach it, and the only test
+/// named for the ConfigMap case exercised the record PARSER instead — with a
+/// fixture carrying an `IN_CLOSE_WRITE` on the leaf file that a kubelet never
+/// emits. A false model of the writer, encoded in a passing test, is why the
+/// filter shipped unable to fire on Kubernetes at all.
+fn decide(events: &[(u32, Option<String>)], basename: &str) -> (bool, bool) {
+    let (mut fire, mut rearm) = (false, false);
+    for (mask, name) in events {
+        // The watch was dropped (the projected dir was swapped out from under
+        // us, or removed) — re-arm on the stable parent path so a SECOND
+        // ConfigMap update still fires.
+        if mask & libc::IN_IGNORED != 0 {
+            rearm = true;
+        }
+        // Fire on any event naming our config file's basename — an ordinary
+        // editor, a `cp`, a bind-mounted file rewritten in place.
+        //
+        // …or naming `..data`, which is how KUBERNETES publishes a mounted
+        // ConfigMap or Secret and the ONLY name a projected volume update ever
+        // produces. The kubelet writes a fresh timestamped directory, points
+        // `..data_tmp` at it, and renames that onto `..data`; the leaf is a
+        // symlink created once at mount time and never touched again, so
+        // nothing in the update names it. Matching the basename alone meant the
+        // watcher armed, received every event, and discarded all of them.
+        let named = name.as_deref();
+        if named == Some(basename) || named == Some(KUBE_DATA_LINK) {
+            fire = true;
+        }
+    }
+    (fire, rearm)
+}
 
 /// One parsed inotify record: the event `mask` and the optional `name` (the file
 /// within the watched directory the event is about; `None` when the record
@@ -199,21 +240,7 @@ fn watch_loop(dir: &Path, basename: &str, log: &Logger) {
         if n == 0 {
             continue;
         }
-        let mut fire = false;
-        let mut rearm = false;
-        for (mask, name) in parse_events(&buf[..n as usize]) {
-            // The watch was dropped (the projected dir was swapped out from under
-            // us, or removed) — re-arm on the stable parent path so a SECOND
-            // ConfigMap update still fires — the projected volume is swapped by
-            // symlink, so the inode we armed on disappears rather than changing.
-            if mask & libc::IN_IGNORED != 0 {
-                rearm = true;
-            }
-            // Fire on any event naming our config file's basename.
-            if name.as_deref() == Some(basename) {
-                fire = true;
-            }
-        }
+        let (mut fire, rearm) = decide(&parse_events(&buf[..n as usize]), basename);
         if rearm {
             // Re-`add_watch` the same parent path (idempotent: if the old watch
             // is still valid the kernel returns the same wd). A re-arm failure is
@@ -324,16 +351,69 @@ mod tests {
         push_record(
             &mut buf,
             1,
-            0x0000_0008, /*IN_CLOSE_WRITE*/
+            0x0000_0200, /*IN_DELETE*/
             0,
-            Some("config.json"),
+            Some("..2026_08_30_18_00_00.111"),
         );
         let ev = parse_events(&buf);
         assert_eq!(ev.len(), 3);
         assert_eq!(ev[0].1.as_deref(), Some("..data_tmp"));
         assert_eq!(ev[1].1.as_deref(), Some("..data"));
-        assert_eq!(ev[2].1.as_deref(), Some("config.json"));
-        assert_eq!(ev[2].0, 0x0000_0008);
+        // The old timestamped directory being removed. NOTE what is absent:
+        // no record names the leaf config file. This fixture previously ended
+        // with an `IN_CLOSE_WRITE` on `config.json`, which a kubelet never
+        // emits — it swaps `..data` and leaves the leaf symlink untouched. That
+        // fabricated record made a parser test read like coverage of the swap
+        // while the filter it implied was never exercised, and the filter could
+        // not in fact fire.
+        assert_eq!(ev[2].1.as_deref(), Some("..2026_08_30_18_00_00.111"));
+    }
+
+    /// The decision the read loop makes, against the event stream a REAL
+    /// kubelet produces — no record names the config file.
+    #[test]
+    fn a_kubelet_configmap_swap_fires_a_reload() {
+        let kubelet = [
+            (
+                0x0000_4000u32,
+                Some("..2026_08_30_18_08_34.157".to_string()),
+            ), // IN_CREATE|ISDIR
+            (0x0000_0100, Some("..data_tmp".to_string())), // IN_CREATE
+            (0x0000_0040, Some("..data_tmp".to_string())), // IN_MOVED_FROM
+            (0x0000_0080, Some("..data".to_string())),     // IN_MOVED_TO
+            (0x0000_0200, Some("..2026_08_30_18_00_00.111".to_string())), // IN_DELETE
+        ];
+        let (fire, rearm) = decide(&kubelet, "agentd.json");
+        assert!(
+            fire,
+            "the ..data rename IS the new revision being published"
+        );
+        assert!(!rearm, "the mount dir is never removed, so nothing re-arms");
+    }
+
+    /// The ordinary case still works: an editor rewriting the file in place.
+    #[test]
+    fn a_plain_write_to_the_watched_file_fires() {
+        let edit = [(0x0000_0008u32, Some("agentd.json".to_string()))];
+        assert_eq!(decide(&edit, "agentd.json"), (true, false));
+    }
+
+    /// And unrelated churn in the same directory does not.
+    #[test]
+    fn unrelated_names_in_the_watched_dir_do_not_fire() {
+        let noise = [
+            (0x0000_0100u32, Some("services.json.swp".to_string())),
+            (0x0000_0008, Some("other.json".to_string())),
+            (0x0000_0200, Some("..data-old".to_string())),
+        ];
+        assert_eq!(decide(&noise, "agentd.json"), (false, false));
+    }
+
+    /// A dropped watch still asks for a re-arm.
+    #[test]
+    fn in_ignored_requests_a_rearm() {
+        let dropped = [(0x0000_8000u32, None)]; // IN_IGNORED, no name
+        assert_eq!(decide(&dropped, "agentd.json"), (false, true));
     }
 
     #[test]

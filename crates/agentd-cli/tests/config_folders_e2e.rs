@@ -472,3 +472,80 @@ fn the_working_directory_is_searched_when_no_config_exists() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// `--validate-config` must refuse exactly what STARTUP refuses.
+///
+/// The credential check ran at startup over the whole document, but validation
+/// checked only `intelligence.headers` — the check rode along with a lint that
+/// only header maps have. So the idiomatic spellings passed validation and then
+/// exited 2 at startup: a validator green-lighting a config the daemon refuses,
+/// which is the one failure mode it exists to prevent.
+#[test]
+fn validate_refuses_every_credential_reference_startup_refuses() {
+    let (root, home, work) = project("credrefs");
+    let cases: [(&str, &str); 4] = [
+        (
+            "intelligence.token",
+            "intelligence: { endpoints: \"https://x/v1\", model: m, token: \"{{secret:ABSENT_ONE}}\" }\n",
+        ),
+        (
+            "intelligence.headers",
+            "intelligence: { endpoints: \"https://x/v1\", model: m, headers: { authorization: \"Bearer {{secret:ABSENT_ONE}}\" } }\n",
+        ),
+        (
+            "mcp auth.token",
+            "intelligence: { endpoints: \"https://x/v1\", model: m }\nmcp: { servers: [ { name: s, endpoint: \"https://x/mcp\", auth: { kind: static, token: \"{{secret:ABSENT_ONE}}\" } } ] }\n",
+        ),
+        (
+            "principal bearer_ref",
+            "intelligence: { endpoints: \"https://x/v1\", model: m }\na2a: { listen: \"http://127.0.0.1:8477\", principals: [ { match: { bearer_ref: \"{{secret:ABSENT_ONE}}\" }, role: user } ] }\n",
+        ),
+    ];
+    for (what, body) in cases {
+        let cfg = work.join("c.yml");
+        std::fs::write(
+            &cfg,
+            format!("config_version: \"1\"\nagent: {{ name: c, instruction: x }}\nstore: {{ kind: memory }}\n{body}"),
+        )
+        .unwrap();
+        let (code, log) = run_in(&work, &home, &["-c", "c.yml", "--validate-config"]);
+        assert_eq!(
+            code,
+            Some(2),
+            "{what} should be refused at validate time\n{log}"
+        );
+        assert!(
+            log.contains("ABSENT_ONE") && log.contains("is not set in the environment"),
+            "{what}: the refusal should name the reference\n{log}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// And a resolvable one still passes — the check is about resolution, not
+/// about the presence of a reference.
+#[test]
+fn a_resolvable_credential_reference_validates() {
+    let (root, home, work) = project("credok");
+    std::fs::write(
+        work.join("c.yml"),
+        "config_version: \"1\"\nagent: { name: c, instruction: x }\nstore: { kind: memory }\nintelligence: { endpoints: \"https://x/v1\", model: m, token: \"{{secret:PRESENT_ONE}}\" }\n",
+    )
+    .unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .args(["-c", "c.yml", "--validate-config"])
+        .current_dir(&work)
+        .env_remove("AGENT_CONFIG")
+        .env_remove("AGENTD_CONFIG")
+        .env("HOME", &home)
+        .env("PRESENT_ONE", "a-value")
+        .output()
+        .expect("run");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

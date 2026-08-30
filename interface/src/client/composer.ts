@@ -110,9 +110,22 @@ export function suggest(input: string, s: MirrorState, max = 6): Suggestion[] {
       return [...sys, ...wf].slice(0, max);
     }
     case '@':
+      // Inserts the FULL `@skill:` reference, not a bare `@name`. The daemon
+      // preloads a skill only when the text carries `skills.reference_prefix`
+      // (default `@skill:`), so a bare `@release-notes` autocompleted to text
+      // that silently preloaded nothing — the completion looked like it worked
+      // and did not. Bare `@name` is therefore left free for whatever a
+      // deployment means by it conversationally; agentd does not own the
+      // semantics of prose in a user's message.
+      //
+      // The prefix is hardcoded because the daemon sends clients skill NAMES
+      // only, never the configured prefix. An operator who overrides
+      // `skills.reference_prefix` gets completions that still say `@skill:`;
+      // that is a smaller wrong than today's, and fixing it properly means
+      // adding the prefix to the interface payload.
       return skillNames(s)
         .filter(starts)
-        .map((n) => ({ label: `@${n}`, insert: `@${n} `, hint: 'skill' }))
+        .map((n) => ({ label: `@skill:${n}`, insert: `@skill:${n} `, hint: 'skill' }))
         .slice(0, max);
     case '#': {
       const tasks = [...s.tasks.values()]

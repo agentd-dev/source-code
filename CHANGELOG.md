@@ -5,6 +5,24 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## Unreleased
+
+### Fixed
+
+- The `@` completion inserted a bare `@name`, which the daemon never preloads:
+  a skill is referenced by `skills.reference_prefix` (default `@skill:`), and
+  `find_references` matches that literal prefix. Accepting a completion
+  produced text that looked like a skill reference and loaded nothing.
+  `docs/interface.md` documented the broken form as working, which is how it
+  survived. The composer now inserts the full `@skill:<name>`, and the doc says
+  what the daemon does.
+
+  Choosing which side to move mattered: making `@` the default prefix instead
+  would have matched the UI, but broken every `@skill:` reference already
+  written into an instruction and claimed a prefix in ordinary prose. A bare
+  `@name` is now deliberately free — agentd does not own the semantics of text
+  in a user's message, so a deployment can mean whatever it likes by it.
+
 ## v1.3.1 — folders found where the config is
 
 ### Conventional folders are searched, not assumed

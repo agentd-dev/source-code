@@ -239,8 +239,11 @@ Both clients speak the same surface:
     /send <handle> <text> /pause [run] /resume [run] /plan /cancel [task]
     /conversations /pair /drain /quit` — **plus every workflow as a shortcut**
     (`/deploy` runs the `deploy` workflow; system names win).
-  - `@` — **skills**: `@release-notes` autocompletes from the daemon's
-    catalogue and stays in the text (agentd preloads referenced skills).
+  - `@` — **skills**: `@skill:release-notes` autocompletes from the daemon's
+    catalogue and stays in the text (agentd preloads referenced skills). The
+    completion inserts the full `@skill:` form because that is what the daemon
+    matches on — `skills.reference_prefix`, default `@skill:`. A bare `@name`
+    is ordinary prose and means whatever your deployment decides.
   - `#` — **targets**: start a message with `#task-…` to answer/continue that
     task (the way to answer a specific input-required question), or `#<ctx>`
     to address that conversation. Inline `#…` is plain text.

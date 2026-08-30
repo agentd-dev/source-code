@@ -30,7 +30,10 @@ test('slash suggests system commands first, then workflows', () => {
 
 test('@ suggests skills, # suggests tasks/conversations, $ suggests values', () => {
   const s = seeded().getState();
-  assert.deepEqual(suggest('use @rel', s).map((x) => x.label), ['@release-notes']);
+  // The FULL reference, because that is what the daemon preloads on: a bare
+  // `@release-notes` completes to text that silently loads no skill.
+  assert.deepEqual(suggest('use @rel', s).map((x) => x.label), ['@skill:release-notes']);
+  assert.deepEqual(suggest('use @rel', s).map((x) => x.insert), ['@skill:release-notes ']);
   const hash = suggest('#', s, 10);
   assert.ok(hash.some((x) => x.label === '#task-9' && x.hint === 'answer this task'), `${JSON.stringify(hash)}`);
   assert.ok(hash.some((x) => x.label === '#a2a-7' && x.hint === 'conversation'));
@@ -41,7 +44,9 @@ test('@ suggests skills, # suggests tasks/conversations, $ suggests values', () 
 test('applySuggestion replaces the trigger token', () => {
   const s = seeded().getState();
   const sug = suggest('please use @onc', s)[0];
-  assert.equal(applySuggestion('please use @onc', sug), 'please use @oncall ');
+  // The replacement swallows the whole trigger token, so a completion LONGER
+  // than what was typed (`@onc` -> `@skill:oncall`) does not leave a stray `@`.
+  assert.equal(applySuggestion('please use @onc', sug), 'please use @skill:oncall ');
   assert.equal(triggerToken('nothing here'), null);
 });
 

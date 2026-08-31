@@ -44,7 +44,7 @@ function boot(cols = 92, rows = 26) {
 }
 
 const INFO = {
-  enabled: true, debug: true, version: '1.3.2', instance: 'triage-1', model: 'gpt-5.1',
+  enabled: true, debug: true, version: '1.3.3', instance: 'triage-1', model: 'gpt-5.1',
   protocol: 1, feed: { ring: 1024, method: 'SubscribeToEvents' }, ops: [],
 };
 

@@ -24,6 +24,10 @@
         "name": {
           "pattern": "^[a-zA-Z0-9_-]+$",
           "type": "string"
+        },
+        "service": {
+          "description": "a `services:` entry of `kind: peer` supplying the endpoint, auth and tags",
+          "type": "string"
         }
       },
       "required": [
@@ -547,6 +551,24 @@
         "auth": {
           "$ref": "#/$defs/Auth"
         },
+        "breaker": {
+          "additionalProperties": false,
+          "description": "`kind: mcp` only — a default breaker policy for `mcp.tool` steps against this entry; a step's own `breaker:` wins",
+          "properties": {
+            "cooldown": {
+              "description": "a duration: `10m`, `90s`, `500ms`, or bare seconds",
+              "type": [
+                "string",
+                "integer"
+              ]
+            },
+            "failures": {
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
         "endpoint": {
           "description": "the connection URL and the dial-time match base (scheme + authority + path prefix)",
           "type": "string"
@@ -565,10 +587,20 @@
           "type": "object"
         },
         "kind": {
-          "description": "phase A: mcp only (intelligence/peer/http reserved)",
+          "description": "which surface this entry serves; one host may appear under several kinds with different trust budgets",
           "enum": [
-            "mcp"
+            "mcp",
+            "intelligence",
+            "peer",
+            "http"
           ]
+        },
+        "methods": {
+          "description": "`kind: http` only — the METHOD ceiling for `http` steps against this entry (e.g. [GET, POST]); absent = any method",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         },
         "rate": {
           "description": "per-instance pacing toward the service (`<burst>/<per>`, e.g. `60/1m`)",

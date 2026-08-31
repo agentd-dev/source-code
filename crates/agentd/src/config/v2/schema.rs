@@ -507,7 +507,8 @@ fn defs_properties(
     m.insert("Service".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["endpoint"],
                 "description": "a service-catalog entry: connection settings, one shared credential, authoritative trifecta tags (a floor for any matching endpoint), and a tool-surface ceiling consumers can only narrow",
                 "properties": {
-                "kind": { "enum": ["mcp"], "description": "phase A: mcp only (intelligence/peer/http reserved)" },
+                "kind": { "enum": ["mcp", "intelligence", "peer", "http"],
+                          "description": "which surface this entry serves; one host may appear under several kinds with different trust budgets" },
                 "endpoint": { "type": "string", "description": "the connection URL and the dial-time match base (scheme + authority + path prefix)" },
                 "headers": string_map,
                 "tags": { "type": "object", "additionalProperties": { "type": "array", "items": { "enum": ["untrusted_input", "sensitive", "egress"] } },
@@ -516,10 +517,16 @@ fn defs_properties(
                 "exclude": { "type": "array", "items": { "type": "string" }, "description": "never admitted, unioned into every consumer (beats allow)" },
                 "auth": { "$ref": "#/$defs/Auth" },
                 "rate": { "type": "string", "description": "per-instance pacing toward the service (`<burst>/<per>`, e.g. `60/1m`)" },
-                "timeout": duration } }));
+                "timeout": duration,
+                "methods": { "type": "array", "items": { "type": "string" },
+                             "description": "`kind: http` only — the METHOD ceiling for `http` steps against this entry (e.g. [GET, POST]); absent = any method" },
+                "breaker": { "type": "object", "additionalProperties": false,
+                             "properties": { "failures": { "type": "integer", "minimum": 1 }, "cooldown": duration },
+                             "description": "`kind: mcp` only — a default breaker policy for `mcp.tool` steps against this entry; a step's own `breaker:` wins" } } }));
     m.insert("A2aPeer".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["name", "endpoint"], "properties": {
                 "name": { "type": "string", "pattern": "^[a-zA-Z0-9_-]+$" }, "endpoint": { "type": "string" },
                 "headers": string_map, "client_cert": { "type": "string" }, "client_key": { "type": "string" },
+                "service": { "type": "string", "description": "a `services:` entry of `kind: peer` supplying the endpoint, auth and tags" },
                 "auth": { "$ref": "#/$defs/Auth" } } }));
     m.insert("AAuth".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["provider"], "properties": {
                 "provider": { "type": "string" }, "key_file": { "type": "string" }, "enroll_token": secret,

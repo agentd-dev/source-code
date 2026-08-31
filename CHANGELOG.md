@@ -5,6 +5,35 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## Unreleased
+
+### Fixed
+
+- `a2a.principals` and `webhooks` are restart-only. Neither is rebuilt by a
+  reload — principals compile into the `Resolver` at startup, webhook routes and
+  their auth into the listener — and neither was listed restart-only either, so
+  a change was APPLIED in name only: `config.reloaded` reported success and the
+  running daemon kept its boot snapshot. Rotating a webhook route's HMAC secret
+  through a reload kept verifying against the OLD secret. A reload touching
+  either is now refused as `restart_required` naming the path. Refusing is the
+  honest posture until the resolver and listener are rebuilt on reload; a
+  refusal an operator can see beats an apply that lied.
+
+- The published config schema's `Service` and `A2aPeer` `$defs` had drifted from
+  the loader: `Service.kind` offered `mcp` alone against four kinds in the code,
+  and `Service.methods`, `Service.breaker` and `A2aPeer.service` were absent.
+  With `additionalProperties: false` that made valid configs — including this
+  repo's own `examples/voice/hands.yaml` — read as invalid in any editor
+  honouring the schema.
+
+  The drift check could not have caught it: CI regenerates the published files
+  from the binary and diffs, which proves the FILE matches the GENERATOR and
+  says nothing about whether the generator matches the LOADER. The
+  struct/schema agreement test walks `properties` segment by segment, so it
+  could not reach a map value (`services.<name>`) or an array item
+  (`a2a.peers[]`) — exactly the two that drifted. It now covers both, and the
+  `kind` enum, which a field-name comparison cannot see.
+
 ## v1.3.2 — what an outside integrator found
 
 ### Fixed

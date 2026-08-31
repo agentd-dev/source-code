@@ -5753,6 +5753,21 @@ pub const RESTART_ONLY_PATHS: &[&str] = &[
     "a2a.listen",
     "a2a.tls",
     "a2a.bearer",
+    // Principals are compiled into the `Resolver` at startup (runtime/mod.rs)
+    // and the reload never rebuilds it, so a changed principal — a new
+    // subject, an edited label, a rotated `bearer_ref` — took effect only on
+    // restart. It was NOT listed here either, which is the part that made it
+    // dangerous: the reload was APPLIED, `config.reloaded` reported success,
+    // and the resolver kept its boot snapshot. Refusing is the honest posture
+    // until the resolver is rebuilt on reload; a refusal an operator can see
+    // beats an apply that lied.
+    "a2a.principals",
+    // Same shape: the webhook routes and their `auth` are compiled into the
+    // listener at startup and never rebuilt. Rotating a route's HMAC secret
+    // through a reload reported success and kept verifying against the OLD
+    // secret — a silent security regression for anyone who relaxed their
+    // restart policy on the strength of what agentd refuses.
+    "webhooks",
     "observability.otel",
     "observability.metrics_addr",
     "observability.health_file",
@@ -5923,6 +5938,74 @@ mod tests {
             .unwrap_or_default();
         out.sort();
         out
+    }
+
+    /// The same agreement check for types that live INSIDE a collection —
+    /// a map value (`services.<name>` → `Service`) and an array item
+    /// (`a2a.peers[]` → `A2aPeer`).
+    ///
+    /// `schema_matches_struct_at_every_object` walks `properties` segment by
+    /// segment, so it cannot reach through `additionalProperties` or `items`
+    /// and never covered these two. That gap is exactly where the published
+    /// schema drifted: `Service.kind` still said mcp-only against four kinds in
+    /// the loader, `Service.methods` and `A2aPeer.service` were absent, and
+    /// with `additionalProperties: false` that made our OWN shipped
+    /// examples/voice/hands.yaml red in any editor honouring the schema.
+    ///
+    /// Note what this could NOT have caught: CI regenerates the published files
+    /// from the binary and diffs, which proves the file matches the generator
+    /// and says nothing about whether the generator matches the loader.
+    #[test]
+    fn schema_matches_struct_for_collection_item_types() {
+        /// The struct's field set, via serde's `deny_unknown_fields` error on a
+        /// probe document that reaches into the collection.
+        fn fields_of(probe: Value) -> Vec<String> {
+            let err = Settings::from_document(probe, "t").expect_err("probe must be rejected");
+            let after = err.split("expected").nth(1).unwrap_or("");
+            let mut out: Vec<String> = after
+                .split('`')
+                .skip(1)
+                .step_by(2)
+                .map(str::to_string)
+                .collect();
+            out.sort();
+            out.dedup();
+            out
+        }
+        fn def_props(schema: &Value, name: &str) -> Vec<String> {
+            let mut out: Vec<String> = schema["$defs"][name]["properties"]
+                .as_object()
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default();
+            out.sort();
+            out
+        }
+
+        let schema = schema::schema();
+        for (def, probe) in [
+            (
+                "Service",
+                json!({"services": {"p": {"endpoint": "https://x", "__probe__": 1}}}),
+            ),
+            (
+                "A2aPeer",
+                json!({"a2a": {"peers": [{"name": "p", "endpoint": "https://x", "__probe__": 1}]}}),
+            ),
+        ] {
+            assert_eq!(
+                def_props(&schema, def),
+                fields_of(probe),
+                "schema/struct drift in $defs/{def}"
+            );
+        }
+
+        // And the enum, which a field-name comparison cannot see: every
+        // ServiceKind variant must be offered, or a valid config reads as
+        // invalid in an editor.
+        assert_eq!(
+            schema["$defs"]["Service"]["properties"]["kind"]["enum"],
+            json!(["mcp", "intelligence", "peer", "http"]),
+        );
     }
 
     #[test]
@@ -6383,6 +6466,40 @@ mod tests {
         // A malformed reference is rejected, not silently passed through.
         assert!(expand_env_str("${HOST", &env).is_err());
         assert!(expand_env_str("${bad-name}", &env).is_err());
+    }
+
+    /// The two paths that used to report a SUCCESSFUL reload and do nothing.
+    ///
+    /// Neither is rebuilt by `reload.rs` — principals are compiled into the
+    /// `Resolver` at startup, webhook routes and their auth into the listener —
+    /// and neither was listed restart-only, so a change was applied in name
+    /// only. Rotating a route's HMAC secret through a reload kept verifying
+    /// against the OLD secret while `config.reloaded` said success.
+    #[test]
+    fn principals_and_webhooks_refuse_a_reload_rather_than_no_op() {
+        let base = json!({
+            "a2a": {"listen": "http://127.0.0.1:1", "principals": [
+                {"match": {"any": true}, "role": "user", "labels": {"team": "alpha"}}]},
+            "webhooks": {"listen": "http://127.0.0.1:2",
+                         "default_auth": {"hmac": {"secret": "{{secret:S}}"}}},
+            "agent": {"instruction": "before"},
+        });
+
+        // A principal label edit: refused, and the refusal NAMES the path.
+        let mut changed = base.clone();
+        changed["a2a"]["principals"][0]["labels"]["team"] = json!("bravo");
+        assert_eq!(restart_only_diff(&base, &changed), ["a2a.principals"]);
+
+        // A rotated webhook secret: likewise.
+        let mut rotated = base.clone();
+        rotated["webhooks"]["default_auth"]["hmac"]["secret"] = json!("{{secret:S2}}");
+        assert_eq!(restart_only_diff(&base, &rotated), ["webhooks"]);
+
+        // And the reloadable half still reloads — this must not become a
+        // blanket "restart on anything", which would defeat hot reload.
+        let mut instr = base.clone();
+        instr["agent"]["instruction"] = json!("after");
+        assert!(restart_only_diff(&base, &instr).is_empty());
     }
 
     #[test]

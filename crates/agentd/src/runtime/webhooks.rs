@@ -97,6 +97,29 @@ pub enum Verify {
     },
 }
 
+/// Refuse an `algo` we do not implement.
+///
+/// The verifier calls `hmac_sha256` unconditionally, and `algo` was read by
+/// nobody: `algo: sha512` validated clean, computed SHA-256, and every external
+/// sender signing SHA-512 got a 401 with nothing anywhere explaining why. A
+/// silent downgrade in a security field is the worst of the three outcomes —
+/// worse than not offering the knob, and worse than refusing it — because the
+/// operator believes something stronger is in force and no signal contradicts
+/// them.
+///
+/// Refusing is the honest half of the choice. Implementing other digests would
+/// also be honest; this is the smaller change and it closes the misbelief.
+fn check_hmac_algo(algo: Option<&str>, at: &str) -> Result<(), String> {
+    match algo {
+        None => Ok(()),
+        Some(a) if a.eq_ignore_ascii_case("sha256") => Ok(()),
+        Some(a) => Err(format!(
+            "{at}.algo {a:?} is not implemented — agentd computes HMAC-SHA256 only; \
+             use `algo: sha256` (or omit it) and have senders sign SHA-256"
+        )),
+    }
+}
+
 impl Verify {
     fn check(&self, req: &::mcp::http_server::RawRequest) -> bool {
         match self {
@@ -401,6 +424,7 @@ fn build_verify(
                 .get("secret")
                 .and_then(Value::as_str)
                 .ok_or("webhook auth.hmac.secret is required")?;
+            check_hmac_algo(h.get("algo").and_then(Value::as_str), "webhook auth.hmac")?;
             let secret = crate::sec::secret::resolve(secret_ref, env)
                 .map_err(|e| format!("webhook auth.hmac.secret: {e}"))?;
             return Ok(Verify::Hmac {
@@ -459,6 +483,7 @@ fn build_verify_typed(
             .secret
             .as_ref()
             .ok_or("webhooks.default_auth.hmac.secret is required")?;
+        check_hmac_algo(h.algo.as_deref(), "webhooks.default_auth.hmac")?;
         let secret = crate::sec::secret::resolve(&secret_ref.0, env)
             .map_err(|e| format!("webhooks.default_auth.hmac.secret: {e}"))?;
         return Ok(Verify::Hmac {

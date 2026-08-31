@@ -2387,6 +2387,39 @@ pub fn scan_references(value: &Value, at: &str, out: &mut Vec<FoundRef>) {
     }
 }
 
+/// Every `hmac.algo` in a document, with where it sits.
+///
+/// A whole-document walk rather than a typed lookup, because the field appears
+/// in two unrelated places — `webhooks.default_auth.hmac` and each webhook
+/// node's own `auth.hmac` — and a workflow's steps are untyped `Value`s at this
+/// point. A definition arriving from `file:`/`url:` is not in the document and
+/// is caught at listener build instead.
+pub fn hmac_algos(value: &Value, at: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    fn walk(v: &Value, at: &str, out: &mut Vec<(String, String)>) {
+        match v {
+            Value::Object(o) => {
+                for (k, child) in o {
+                    if k == "hmac"
+                        && let Some(a) = child.get("algo").and_then(Value::as_str)
+                    {
+                        out.push((format!("{at}.hmac.algo"), a.to_string()));
+                    }
+                    walk(child, &format!("{at}.{k}"), out);
+                }
+            }
+            Value::Array(a) => {
+                for (i, child) in a.iter().enumerate() {
+                    walk(child, &format!("{at}[{i}]"), out);
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(value, at, &mut out);
+    out
+}
+
 /// The references in `value` that would NOT resolve right now — secrets against
 /// the environment (and any interactively-entered values), secret-files against
 /// the filesystem, `config.*` against `vars`. One message per missing
@@ -4096,6 +4129,21 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
     // move that failure before any side effect.
     for m in missing_references(&loaded.doc, "config", &s.vars) {
         err(&mut d, m);
+    }
+
+    // An `auth.hmac.algo` the verifier does not implement. Refused at listener
+    // build too, but catching it HERE is the point: this is the same
+    // validate/startup divergence the reference scan above closes, and adding a
+    // startup-only refusal would have re-opened it in a security field.
+    for (at, algo) in hmac_algos(&loaded.doc, "config") {
+        if !algo.eq_ignore_ascii_case("sha256") {
+            err(
+                &mut d,
+                format!(
+                    "{at} {algo:?} is not implemented — agentd computes HMAC-SHA256 only;                      use `algo: sha256` (or omit it) and have senders sign SHA-256"
+                ),
+            );
+        }
     }
 
     // config_version

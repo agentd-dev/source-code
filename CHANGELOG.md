@@ -23,6 +23,24 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   `@name` is now deliberately free — agentd does not own the semantics of text
   in a user's message, so a deployment can mean whatever it likes by it.
 
+## Unreleased
+
+### Fixed
+
+- `webhooks` HMAC `algo:` was parsed and ignored. `algo: sha512` validated
+  clean and then computed HMAC-SHA256, so every sender signing SHA-512 got a
+  401 with nothing anywhere explaining why — a silent downgrade in a security
+  field, which is worse than either implementing the digest or refusing the
+  knob. Anything but `sha256` is now refused, at `--validate-config` AND at
+  listener build: a startup-only refusal would have re-opened the very
+  validate/startup divergence the credential scan closes.
+
+- The `ask_human_fallback: wait` log said only "no human channel", where the
+  `fail` branch names the cause ("interface.enabled is off"). `wait` is the
+  branch operators actually configure, and the parked line is the one place
+  they look; the asymmetry cost an integrator an hour. It now names the key and
+  says the gate will park until its timeout.
+
 ## v1.3.1 — folders found where the config is
 
 ### Conventional folders are searched, not assumed

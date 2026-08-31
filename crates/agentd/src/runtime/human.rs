@@ -183,7 +183,17 @@ impl Runtime {
                 let ask = self.next_id("ask");
                 self.log.info(
                     "human.ask.parked",
-                    json!({"ask": ask, "deadline_ms": deadline_ms, "note": "no human channel; ask_human_fallback = wait"}),
+                    // The `fail` branch above names the cause; this one used to
+                    // say only "no human channel", and it is the branch people
+                    // actually configure. An integrator lost an hour to the
+                    // asymmetry — the condition is one config key, and the log
+                    // that fires is the one place they look.
+                    json!({
+                        "ask": ask,
+                        "deadline_ms": deadline_ms,
+                        "note": "no human channel (interface.enabled is off); \
+                                 ask_human_fallback = wait — this gate will park until its timeout"
+                    }),
                 );
                 ToolOutcome::Deferred(PendingKind::Human {
                     task: ask,

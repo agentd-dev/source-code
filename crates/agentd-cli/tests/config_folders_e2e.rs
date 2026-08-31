@@ -549,3 +549,66 @@ fn a_resolvable_credential_reference_validates() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// `auth.hmac.algo` is refused when it names a digest the verifier does not
+/// implement — and refused at VALIDATE time, not only at listener build.
+///
+/// It was previously parsed and ignored: `algo: sha512` validated clean and
+/// then computed HMAC-SHA256, so every sender signing SHA-512 got a 401 with
+/// nothing explaining why. A silent downgrade in a security field is worse than
+/// either offering the digest or refusing the knob.
+#[test]
+fn an_unimplemented_hmac_algo_is_refused_at_validate_time() {
+    let (root, home, work) = project("hmacalgo");
+    let cfg = r#"config_version: "1"
+agent: { name: c, instruction: x }
+store: { kind: memory }
+intelligence: { endpoints: "https://x/v1", model: m }
+webhooks:
+  listen: "http://127.0.0.1:8467"
+  default_auth: { hmac: { secret: "{{secret:HOOKSEC}}", header: X-Signature, algo: sha512, prefix: "sha512=" } }
+workflows:
+  - name: w
+    steps:
+      h: { kind: webhook, path: /h, methods: [POST] }
+      f: { kind: finish, depends_on: [h], status: completed }
+"#;
+    std::fs::write(work.join("c.yml"), cfg).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .args(["-c", "c.yml", "--validate-config"])
+        .current_dir(&work)
+        .env_remove("AGENT_CONFIG")
+        .env_remove("AGENTD_CONFIG")
+        .env("HOME", &home)
+        .env("HOOKSEC", "s")
+        .output()
+        .expect("run");
+    let log = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{log}");
+    assert!(
+        log.contains("hmac.algo") && log.contains("HMAC-SHA256 only"),
+        "the refusal should name the field and what IS computed\n{log}"
+    );
+
+    // sha256 (and omitting it) stay valid — the check refuses the unimplemented
+    // digest, it does not make the knob unusable.
+    for algo in ["sha256", "SHA256"] {
+        std::fs::write(work.join("c.yml"), cfg.replace("sha512", algo)).unwrap();
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_agentd"))
+            .args(["-c", "c.yml", "--validate-config"])
+            .current_dir(&work)
+            .env_remove("AGENT_CONFIG")
+            .env_remove("AGENTD_CONFIG")
+            .env("HOME", &home)
+            .env("HOOKSEC", "s")
+            .output()
+            .expect("run");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{algo} should validate\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}

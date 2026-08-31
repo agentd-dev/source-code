@@ -5,7 +5,7 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
-## Unreleased
+## v1.3.2 — what an outside integrator found
 
 ### Fixed
 
@@ -23,7 +23,7 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   `@name` is now deliberately free — agentd does not own the semantics of text
   in a user's message, so a deployment can mean whatever it likes by it.
 
-## Unreleased
+## v1.3.2 — what an outside integrator found
 
 ### Fixed
 

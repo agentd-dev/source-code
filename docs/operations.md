@@ -318,7 +318,7 @@ $ agentd --validate-config -c /etc/agentd/ops.yaml
 {"event":"config.valid","files":["/etc/agentd/ops.yaml"],"schema":"1"}
 
 $ agentd --validate-config -c /etc/agentd/broken.yaml
-{"event":"config.invalid","msg":"a2a.listen on a non-loopback address needs client auth: a2a.tls.client_ca, a2a.bearer, and/or interface.pairing"}
+{"event":"config.invalid","msg":"a2a.listen on a non-loopback address needs client auth: a2a.bearer, interface.pairing, or a2a.tls.client_ca (mTLS — then EVERY caller needs a client certificate, bearer-only and paired included)"}
 ```
 
 Both flags are in every build.

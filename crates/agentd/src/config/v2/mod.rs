@@ -5130,7 +5130,7 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                     && s.a2a.bearer.is_none()
                     && !s.interface.pairing.enabled
                 {
-                    err(&mut d, "a2a.listen on a non-loopback address needs client auth: a2a.tls.client_ca, a2a.bearer, and/or interface.pairing".into());
+                    err(&mut d, "a2a.listen on a non-loopback address needs client auth: a2a.bearer, interface.pairing, or a2a.tls.client_ca (mTLS — then EVERY caller needs a client certificate, bearer-only and paired included)".into());
                 }
                 if !tls && !loopback {
                     err(

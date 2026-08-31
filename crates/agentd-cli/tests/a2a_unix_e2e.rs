@@ -128,6 +128,21 @@ fn two_instances_connect_and_delegate_over_a_unix_socket() {
         std::thread::sleep(Duration::from_millis(25));
     }
 
+    // The socket is published by renaming it out of a 0700 staging directory,
+    // so it is never briefly world-accessible. Nothing of that staging may
+    // survive: a leaked 0700 directory would be a private hole in a shared
+    // runtime dir, and a leaked socket would be a second bindable endpoint.
+    let leftovers: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name())
+        .filter(|n| n.to_string_lossy().starts_with(".agentd-sock-"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "socket staging left something behind: {leftovers:?}"
+    );
+
     // A: declares B as a peer BY SOCKET PATH and delegates to it from a
     // workflow — no model of its own needed.
     let cfg_a = format!("{dir}/a.yaml");

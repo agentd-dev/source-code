@@ -78,6 +78,11 @@ worth stating, because getting them wrong fails silently in the *peer*:
   (minus the artifacts a listing does not resolve), so the state is always at
   `status.state`. The result carries `totalSize`, `pageSize` and
   `nextPageToken`; agentd answers in a single page.
+- **Field names are `lowerCamelCase`, not snake_case.** proto3 JSON renames
+  every field, so `historyLength` and `nextPageToken` — a snake_case key is not
+  an alias, it is an unknown field. The one that catches people is `GetTask`,
+  whose task identifier is plain **`id`** (agentd also accepts `taskId`;
+  `task_id` is not a field in the protocol at all).
 
 ### Being told instead of watching
 
@@ -133,14 +138,44 @@ reader before it reaches anyone.
 | `agent` | `workflow.run`, `workflow.status` |
 | `anonymous` | nothing — denied at every layer, and an explicit `grants: ["*"]` does not rescue it |
 
-Principals are matched in order, so the most specific rule wins:
+Principals are matched **first-match-wins**, in the order written. agentd does
+not rank rules by specificity — so the most specific rule wins only if you put
+it first, and a broad rule placed early shadows every rule after it:
 
 ```yaml
 a2a:
   principals:
-    - { match: { san: "spiffe://ops/*" },  role: operator }
-    - { match: { san: "spiffe://team/*" }, role: user, grants: [workflow.*] }
+    # Narrow first: this one identity is an operator...
+    - { match: { san: "spiffe://acme/ops/deployer" }, role: operator }
+    # ...everyone else holding an acme certificate is an ordinary user.
+    # Swap these two and the broad rule matches the deployer first, silently
+    # demoting it — no error, just a caller with fewer grants than intended.
+    - { match: { san: "spiffe://acme/*" }, role: user, grants: [workflow.*] }
 ```
+
+The ordering trap worth knowing before you hit it: if a gateway forwards calls
+under one control-plane client certificate and distinguishes the real caller by
+a bearer, then the `san` rule matching that certificate must come **last**,
+after the `bearer_ref` rules:
+
+```yaml
+a2a:
+  principals:
+    - { match: { bearer_ref: "{{secret:ALICE_TOKEN}}" }, role: user, grants: [workflow.*] }
+    - { match: { san: "spiffe://acme/gateway" }, role: agent, grants: [workflow.run] }
+```
+
+Put the `san` rule first and it matches every forwarded call — the gateway's
+certificate is on all of them — so the bearer rules below become unreachable and
+every user collapses into the gateway's identity.
+
+**`client_ca` makes mTLS mandatory for every caller.** Setting it builds a
+rustls verifier with no unauthenticated fallback, so a client without a
+CA-signed certificate cannot complete the handshake at all — bearer-only clients
+and the pairing flow included. The three client-auth mechanisms are not
+free-standing alternatives you can mix: `client_ca` gates the *transport*, and
+`a2a.bearer` / principals decide *who* an already-admitted connection is. If you
+want bearer-only clients on a non-loopback listener, do not set `client_ca`.
 
 ## The card is a promise
 

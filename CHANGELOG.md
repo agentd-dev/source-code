@@ -5,6 +5,60 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## v1.3.4 — the socket, the certificate, and the map
+
+### Fixed
+
+- **A unix socket was world-accessible for the width of one syscall pair.**
+  `bind()` applies the process umask, so the socket appeared at 0755 and was
+  chmod'ed to 0600 immediately after. Immediately is not atomically: any local
+  process that connected inside that window got a connection the `SO_PEERCRED`
+  uid gate had already been configured to refuse, and on a shared host that
+  window is reachable. The socket is now bound inside a 0700 staging directory
+  and published with `rename(2)`, so it is never visible at any mode but 0600.
+  The staging directory is removed on both the success and the bind-failure
+  path, and the e2e test asserts nothing is left behind.
+
+- **A2A TLS never picked up a renewed certificate.** The listener resolved
+  `ServerConfig` once at startup and moved it into a `TlsAcceptor` that lived
+  for the process, so a rotated certificate reached the reload machinery, was
+  accepted, and changed nothing on the wire — a daemon kept serving the old
+  chain until it was restarted, which for a 90-day ACME certificate is a
+  scheduled outage that looks like a mystery. The accept loop now consults a
+  provider closure per connection, so the next handshake after a rotation uses
+  the new chain.
+
+- **`--capabilities` under-reported the surface it exists to describe.** It
+  omitted webhooks entirely (an integrator could not discover the listener, its
+  routes, their methods or their auth without reading the config), omitted the
+  exit-code and config-schema versions, and computed `lifecycle.daemon` from a
+  hand-maintained list of long-lived start kinds that had fallen out of sync
+  with the registry — the fourth such list in the tree. Long-lived starts are
+  now derived from the node registry (`is_long_lived_start`), which is the same
+  source `start_kinds` reports from.
+
+- **The client-auth error recommended a combination that cannot exist.** A
+  non-loopback `a2a.listen` refusing to start said to set `a2a.tls.client_ca`,
+  `a2a.bearer`, "and/or" `interface.pairing`, which reads as three interchangeable
+  options. `client_ca` builds a verifier with no unauthenticated fallback: it
+  makes mTLS mandatory for *every* caller, so following the message by adding it
+  alongside a bearer locks out the bearer-only clients and the pairing flow. The
+  message now says so, and `docs/a2a.md` explains that `client_ca` gates the
+  transport while bearer and principals decide who an admitted connection is.
+
+### Documented
+
+- **Principal rules are first-match-wins**, which `docs/a2a.md` had described as
+  "the most specific rule wins" — true only if you order them that way. The
+  practical trap is now spelled out: where a gateway forwards under one client
+  certificate and distinguishes callers by bearer, the `san` rule matching that
+  certificate must come last, or it matches everything and the rules below it
+  are unreachable.
+
+- **proto3 JSON field naming**, including that `GetTask` takes plain `id`
+  (`taskId` is accepted; `task_id` is not a field in the protocol) — the shape
+  every integrator so far has had to find by trial.
+
 ## v1.3.3 — a reload that told the truth
 
 ### Fixed

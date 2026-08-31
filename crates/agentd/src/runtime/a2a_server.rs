@@ -2416,7 +2416,14 @@ pub(crate) fn spawn_a2a_listener(
             a2a.tls.client_ca.as_deref().map(Path::new),
         )
         .map_err(|e| format!("a2a tls: {e}"))?;
-        Some(acceptor.server_config())
+        // The ACCESSOR, not its current value: `server_config()` re-stats the
+        // mounted identity on a throttle, so handing the listener a closure
+        // means a rotated certificate is picked up by the next handshake.
+        // Calling it once here — which is what this did — captured the boot
+        // identity and made every cert-manager renewal a restart.
+        let acceptor = std::sync::Arc::new(acceptor);
+        Some(std::sync::Arc::new(move || acceptor.server_config())
+            as crate::a2a::serve::TlsConfigProvider)
     } else {
         None
     };

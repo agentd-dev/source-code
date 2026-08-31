@@ -1193,7 +1193,47 @@ pub fn capabilities(loaded: &Loaded) -> Value {
             "path": crate::config::v2::file_store_root(&s.store).display().to_string(),
             "defaulted": loaded.doc.pointer("/store/kind").is_none(),
         })),
-        "lifecycle": {"run_until": format!("{:?}", s.lifecycle.run_until).to_lowercase(), "daemon": s.a2a.listen.is_some() || s.workflows.iter().any(|w| w["steps"].as_object().is_some_and(|st| st.values().any(|n| n["kind"].as_str().is_some_and(|k| matches!(k, "loop" | "schedule" | "subscribe" | "signal" | "event")))))},
+        // A FOURTH copy of "which starts keep us alive" used to live here as an
+        // inline `matches!`, and like the other three it was wrong — missing
+        // `a2a`, `stream` and `webhook`, so a webhook-only instance reported
+        // `daemon: false`. Derived now, like the rest.
+        "lifecycle": {
+            "run_until": format!("{:?}", s.lifecycle.run_until).to_lowercase(),
+            "daemon": s.a2a.listen.is_some() || s.workflows.iter().any(|w| {
+                w["steps"].as_object().is_some_and(|st| {
+                    st.values().any(|n| {
+                        n["kind"].as_str().is_some_and(crate::engine::model::is_long_lived_start)
+                    })
+                })
+            }),
+        },
+        // The routes an operator actually exposed, and whether each is
+        // authenticated. Absent entirely before, so a configured listener and
+        // its routes were invisible to anything reading the manifest.
+        "webhooks": s.webhooks.listen.as_ref().map(|l| json!({
+            "listen": l,
+            "default_auth": s.webhooks.default_auth.is_some(),
+            "routes": s.workflows.iter().flat_map(|w| {
+                let wf = w["name"].as_str().unwrap_or("").to_string();
+                w["steps"].as_object().into_iter().flatten()
+                    .filter(|(_, n)| n["kind"] == "webhook")
+                    .map(move |(id, n)| json!({
+                        "workflow": wf, "node": id,
+                        "path": n["path"], "methods": n["methods"],
+                        // Whether THIS route carries its own auth; the default
+                        // above applies when it does not.
+                        "auth": n.get("auth").is_some(),
+                    })).collect::<Vec<_>>()
+            }).collect::<Vec<_>>(),
+        })),
+        // The contract versions a control plane negotiates against.
+        // `exit_codes` is referenced by name in exit.rs's own documentation as
+        // living here, and was never emitted — a surface promised to readers
+        // and absent from the thing they read.
+        "surfaces": {
+            "exit_codes": crate::exit::EXIT_CODES,
+            "config_schema": crate::config::v2::schema::CONFIG_VERSION,
+        },
     })
 }
 

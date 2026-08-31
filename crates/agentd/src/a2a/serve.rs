@@ -69,8 +69,16 @@ pub struct Opts {
     /// `Origin` is refused outright, which is what stops a page the operator
     /// never authorised from driving this endpoint through their browser.
     pub extra_origins: Vec<String>,
-    /// TLS, when the listen URL is `https://`.
-    pub tls: Option<Arc<tokio_rustls::rustls::ServerConfig>>,
+    /// TLS, when the listen URL is `https://` — a PROVIDER consulted per
+    /// connection, not a snapshot taken at spawn.
+    ///
+    /// The `TlsAcceptor` behind it re-stats the mounted identity on a throttle,
+    /// so a rotated certificate is picked up by the next handshake. Resolving
+    /// it once here defeated that entirely: the accept loop captured the first
+    /// `Arc<ServerConfig>` and every later connection reused it, so a
+    /// cert-manager renewal needed a restart even though the machinery to
+    /// avoid one already existed and was being called — once.
+    pub tls: Option<TlsConfigProvider>,
     /// How long a unary request may wait on the runtime.
     pub request_timeout: Duration,
     /// How long an observation-feed stream is held open before it hands the
@@ -171,13 +179,55 @@ pub fn spawn(
             // unlink it first — the flock on the state dir already guarantees
             // there is no OTHER live instance of this agent.
             let _ = std::fs::remove_file(path);
-            let listener = {
+            // Bind inside a 0700 staging directory, then rename into place.
+            //
+            // `bind` creates the socket with 0777 & ~umask — 0755 under the
+            // usual 022 — and narrowing it afterwards leaves a window in which
+            // any local user can connect to the DOCUMENTED path. The window is
+            // brief and `SO_PEERCRED` still refuses a different uid, so this
+            // was defence-in-depth only; but a security control that holds
+            // "almost always" is one its own test can lose a race to, and ours
+            // did. Staging removes the window instead of shortening it: the
+            // socket is unreachable while its directory is 0700, the chmod
+            // lands, and the rename publishes an already-correct inode
+            // atomically.
+            let sock = std::path::Path::new(path);
+            let stage = sock
+                .parent()
+                .unwrap_or(std::path::Path::new("."))
+                .join(format!(".agentd-sock-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&stage);
+            std::fs::create_dir(&stage)
+                .map_err(|e| format!("a2a stage {}: {e}", stage.display()))?;
+            std::fs::set_permissions(&stage, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+                .map_err(|e| format!("a2a stage perms: {e}"))?;
+            let staged = stage.join("s");
+            let bound_listener = {
                 let _guard = runtime.enter();
-                tokio::net::UnixListener::bind(path).map_err(|e| format!("a2a bind {path}: {e}"))?
+                tokio::net::UnixListener::bind(&staged)
+            };
+            // Clean up the staging directory on the FAILURE path too. A bind
+            // can fail for ordinary reasons — the commonest being a path over
+            // SUN_LEN (108 bytes, socket addresses are not PATH_MAX) — and
+            // leaving a 0700 directory behind on every failed start would
+            // litter the mount the operator chose for the socket.
+            let listener = match bound_listener {
+                Ok(l) => l,
+                Err(e) => {
+                    let _ = std::fs::remove_dir_all(&stage);
+                    return Err(format!("a2a bind {path}: {e}"));
+                }
             };
             // 0600: the filesystem is the outer gate (peer-cred is the inner).
-            let _ =
-                std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600));
+            // Applied while the socket is still behind the 0700 directory, so
+            // it is never world-connectable at any path.
+            let perms = std::fs::set_permissions(
+                &staged,
+                std::os::unix::fs::PermissionsExt::from_mode(0o600),
+            );
+            let published = perms.and_then(|()| std::fs::rename(&staged, sock));
+            let _ = std::fs::remove_dir_all(&stage);
+            published.map_err(|e| format!("a2a publish {path}: {e}"))?;
             bound = format!("unix:{path}");
             runtime.spawn(accept_loop_unix(listener, router, log));
         }
@@ -190,13 +240,19 @@ pub fn spawn(
     })
 }
 
+/// Supplies the current rustls configuration for each inbound connection.
+///
+/// A closure rather than the acceptor type so this module stays independent of
+/// how the identity is sourced (mounted files today, something else later).
+pub type TlsConfigProvider = Arc<dyn Fn() -> Arc<tokio_rustls::rustls::ServerConfig> + Send + Sync>;
+
 /// Accept connections forever, terminating TLS when configured, and serve each
 /// with the router. The verified peer identity is attached to every request on
 /// that connection, which is how a `san`/`sub` principal rule sees a client cert.
 async fn accept_loop(
     listener: tokio::net::TcpListener,
     router: Router,
-    tls: Option<Arc<tokio_rustls::rustls::ServerConfig>>,
+    tls: Option<TlsConfigProvider>,
     log: Logger,
 ) {
     loop {
@@ -208,8 +264,10 @@ async fn accept_loop(
         let log = log.clone();
         tokio::spawn(async move {
             match tls {
-                Some(cfg) => {
-                    let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
+                Some(provider) => {
+                    // Per connection: a rotated identity takes effect on the
+                    // next handshake rather than the next restart.
+                    let acceptor = tokio_rustls::TlsAcceptor::from(provider());
                     match acceptor.accept(sock).await {
                         Ok(stream) => {
                             let peer_id = peer_identity(stream.get_ref().1);

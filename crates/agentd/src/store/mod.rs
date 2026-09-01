@@ -130,11 +130,21 @@ pub enum StoreError {
     Corrupt(String),
     /// A `put` conflict surfaced as an error by a caller that treats it as fatal.
     Conflict(String),
+    /// The value exceeds `store.max_value_bytes` and was refused at write time.
+    ///
+    /// Refused rather than written, because a store can have a larger write
+    /// limit than read limit: writing here would strand the checkpoint, and
+    /// the failure would surface at the next boot restore instead of now.
+    TooLarge { key: String, bytes: u64, cap: u64 },
 }
 
 impl std::fmt::Display for StoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            StoreError::TooLarge { key, bytes, cap } => write!(
+                f,
+                "store: value for {key:?} is {bytes} bytes, over the {cap}-byte                  store.max_value_bytes cap — it was NOT written, because a value                  larger than the store can return would fail the next restore                  instead of failing now (compact the context, or raise the cap if                  the store can read it back)"
+            ),
             StoreError::Io(m) => write!(f, "store i/o: {m}"),
             StoreError::Unsupported(op) => {
                 write!(f, "store: {op} is not supported by this adapter")

@@ -3567,6 +3567,11 @@
             "none"
           ]
         },
+        "max_value_bytes": {
+          "description": "refuse a durable write larger than this; set it when the store's READ limit is lower than its write limit (an MCP store behind a broker often caps a tool RESULT well below its request body), so a checkpoint that could not be read back is refused at write time instead of failing the next restore",
+          "minimum": 1,
+          "type": "integer"
+        },
         "mcp": {
           "$ref": "#/$defs/StoreMcp"
         },

@@ -1169,6 +1169,16 @@ pub struct Store {
     pub on_error: StoreOnError,
     pub audit: bool,
     pub timeout: Option<Dur>,
+    /// Refuse a durable write whose serialized state exceeds this many bytes.
+    /// `None` (the default) is unbounded, which keeps today's behaviour for an
+    /// operator who has not thought about it.
+    ///
+    /// Set it when the store's READ limit is lower than its write limit — an
+    /// MCP store reached through a broker typically caps a tool RESULT well
+    /// below its request body. Without the cap, agentd can write a checkpoint
+    /// it cannot read back, and the failure lands on the next boot restore
+    /// rather than on the write that caused it.
+    pub max_value_bytes: Option<u64>,
 }
 
 impl Store {
@@ -5762,6 +5772,13 @@ pub const RESTART_ONLY_PATHS: &[&str] = &[
     // handed to the listener's `Auth`.
     "interface.enabled",
     "interface.pairing",
+    // `store.max_value_bytes` rides the `Policy` built once at startup and
+    // handed to the `Durable` layer, which the reload does not rebuild — the
+    // same shape as the rest of `store.*`. Listed rather than silently
+    // reloadable: a cap an operator believed they had raised, while writes
+    // were still being refused at the old one, is exactly the lie this
+    // partition exists to prevent.
+    "store.max_value_bytes",
     // The webhook listener's SOCKET, not its rules: rebinding an address or
     // swapping a TLS identity needs a restart, while `webhooks.default_auth`
     // and the routes themselves (which live in `workflows[].steps[]`) are

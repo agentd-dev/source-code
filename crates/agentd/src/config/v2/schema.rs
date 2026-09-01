@@ -166,7 +166,8 @@ fn top_level_properties(
                         "work": { "enum": ["durable", "ephemeral"], "description": "default durability CLASS for runs + subagent records: ephemeral = nothing persists unless a workflow/spawn says durable: true (the fast path); default durable" } } },
                     "on_error": { "enum": ["halt", "degrade"] },
                     "audit": { "type": "boolean" },
-                    "timeout": duration
+                    "timeout": duration,
+                    "max_value_bytes": { "type": "integer", "minimum": 1, "description": "refuse a durable write larger than this; set it when the store's READ limit is lower than its write limit (an MCP store behind a broker often caps a tool RESULT well below its request body), so a checkpoint that could not be read back is refused at write time instead of failing the next restore" }
                 }
             }));
     m.insert(

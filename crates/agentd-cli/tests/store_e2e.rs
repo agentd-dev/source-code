@@ -68,6 +68,7 @@ fn durable(store: SharedStore, on_error: cfg::StoreOnError) -> Durable {
             debounce: Duration::from_millis(0),
             on_error,
             retries: 3,
+            max_value_bytes: None,
         },
         None,
     )

@@ -5,6 +5,66 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## v1.6.0 — a write you cannot read back is refused
+
+### Added
+
+- **`store.max_value_bytes`** — refuse a durable write whose serialized state
+  exceeds N bytes, instead of writing it. Unbounded by default, so nothing
+  changes for anyone who does not set it.
+
+  The case it exists for: **a store's write limit and its read limit need not
+  be the same number.** An MCP-backed store reached through a broker typically
+  caps a tool RESULT well below its request body, so agentd could write a
+  checkpoint it could not read back. The write succeeded; the failure then
+  surfaced at the next **boot restore** — the moment the agent is least able to
+  do anything about it, because it cannot come back. Refusing at write time
+  keeps the failure where an operator is looking and where `store.on_error`
+  can act on it.
+
+  Enforced at the single durable-write chokepoint (`Durable::put`), measured on
+  the serialized state before the CAS loop, so the answer does not drift with a
+  seq that grows by a digit. Over the cap, `StoreError::TooLarge` names the key,
+  the size and the cap, says the value was NOT written, and points at the two
+  real remedies — compact the context, or raise the cap if the store can read
+  it back. Nothing is stored: a partial write would be the same stranded
+  checkpoint by another route.
+
+  Restart-only, because the value rides the `Policy` built at startup. A cap an
+  operator believed they had raised, while writes were still being refused at
+  the old one, is exactly the lie the reload partition exists to prevent.
+
+  Reported by the agentctl control-plane session, which hit it managing agents
+  that checkpoint through an MCP state gateway. Their control-plane paths
+  already handle any size via paginated + chunked reads; agentd's own runtime
+  I/O is single-call, which is what left the gap. A chunked-read op was
+  considered and declined: agentd's store profile means "any MCP server
+  exposing four tools is a store", and requiring a non-standard fifth would
+  break that for every other backend. If it is ever wanted it belongs as an
+  OPTIONAL mapping-driven op with the single-call `get` as fallback.
+
+### Fixed
+
+- **A load-sensitive flake in `spawn_rate_cap_refuses_after_burst`.** It minted
+  three children at `spawn_rate_burst: 3` / `spawn_rate_per_sec: 1000.0` and
+  asserted the fourth was refused — which only holds if three `mint_child`
+  calls finish inside the 1ms a token takes to refill at that rate. On a
+  machine running the feature matrix they do not, and the test failed claiming
+  the rate cap had not bitten when the cap was working and the clock had simply
+  moved. Split in two: a slow-refill tree proves the cap bites before any
+  refill can occur, a separate fast-refill tree proves a refill re-admits.
+  Verified 0 failures in 8 runs under deliberate 4-way CPU load.
+
+### Documented
+
+- `store.retention.runs.{keep_last, ttl}` in `docs/configuration.md`. The
+  mechanism has existed since 1.3.1 and reclaims terminal run records at
+  run-terminal time (nothing in flight is ever dropped), but the default is
+  unbounded — so a long-lived instance keeps one durable record per run for its
+  whole uptime unless an operator sets one of these. It was reachable only from
+  the schema, which is why a control plane looking for it concluded there was
+  no GC at all.
+
 ## v1.5.0 — events that join, batch, and cross the wire
 
 RFC 0035 phases B and C. Streams already carried events with durable

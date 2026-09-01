@@ -464,16 +464,23 @@ mod tests {
     #[test]
     fn spawn_rate_cap_refuses_after_burst() {
         // A wide breadth + a low burst isolates the rate cap as the binding one:
-        // the first 3 children mint, the 4th is refused for rate (not breadth),
-        // and once a token refills it is allowed again.
-        let caps = Caps {
+        // the first 3 children mint and the 4th is refused for RATE, not breadth.
+        //
+        // The refill rate is deliberately slow (1/s). It used to be 1000/s so
+        // that the re-admit half of this test could sleep 5ms — but that made
+        // the refusal depend on three `mint_child` calls finishing inside the
+        // 1ms it takes to refill one token, which is not true on a machine
+        // running the feature matrix. The test then failed claiming the rate
+        // cap did not bite, when the cap was working and the clock had simply
+        // moved. Timing that the test does not control belongs in neither half.
+        let slow = Caps {
             max_children: 100,
             max_total: 100,
             spawn_rate_burst: 3,
-            spawn_rate_per_sec: 1000.0, // fast refill so the wait below is tiny
+            spawn_rate_per_sec: 1.0,
             ..Caps::default()
         };
-        let mut t = Tree::new(caps);
+        let mut t = Tree::new(slow);
         let root = t.mint_root().unwrap();
         t.mint_child(root).unwrap();
         t.mint_child(root).unwrap();
@@ -483,8 +490,22 @@ mod tests {
             SpawnRefused::RateExceeded,
             "the 4th rapid spawn is rate-limited, not breadth-limited"
         );
-        // A whole token refills in ~1ms at 1000/s; after a short wait it allows again.
-        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        // Re-admission after a refill is the other half, and it gets its own
+        // tree with a fast refill so the sleep stays short. Separating them is
+        // what makes each half deterministic: one asserts the cap bites before
+        // any refill can occur, the other asserts a refill re-admits.
+        let fast = Caps {
+            max_children: 100,
+            max_total: 100,
+            spawn_rate_burst: 1,
+            spawn_rate_per_sec: 1000.0,
+            ..Caps::default()
+        };
+        let mut t = Tree::new(fast);
+        let root = t.mint_root().unwrap();
+        t.mint_child(root).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
         assert!(
             t.mint_child(root).is_ok(),
             "a refilled token re-admits a spawn"

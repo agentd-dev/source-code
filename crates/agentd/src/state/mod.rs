@@ -231,6 +231,17 @@ pub struct Policy {
     pub debounce: Duration,
     pub on_error: crate::config::v2::StoreOnError,
     pub retries: u32,
+    /// Refuse a durable write whose serialized envelope exceeds this many
+    /// bytes (`store.max_value_bytes`; `None` = unbounded, the default).
+    ///
+    /// This exists because a store's WRITE limit and its READ limit need not
+    /// be the same number. An MCP-backed store reached through a broker can
+    /// accept a value on the way in and be unable to return it on the way
+    /// out — at which point the checkpoint is stranded: the write succeeded,
+    /// and the next BOOT RESTORE is what fails, when the agent is least able
+    /// to do anything about it. Refusing at write time keeps the failure where
+    /// an operator is looking and where `store.on_error` can act on it.
+    pub max_value_bytes: Option<u64>,
 }
 
 impl Default for Policy {
@@ -239,6 +250,7 @@ impl Default for Policy {
             debounce: Duration::from_millis(250),
             on_error: crate::config::v2::StoreOnError::Halt,
             retries: 3,
+            max_value_bytes: None,
         }
     }
 }
@@ -249,6 +261,7 @@ impl Policy {
             debounce: Duration::from_millis(s.checkpoint.debounce_ms.unwrap_or(250)),
             on_error: s.on_error,
             retries: 3,
+            max_value_bytes: s.max_value_bytes,
         }
     }
 }
@@ -544,6 +557,19 @@ impl Durable {
         hash: Option<String>,
     ) -> Result<u64, StoreError> {
         let key = self.key(kind, id);
+        // Bound the value BEFORE the CAS loop: measured once, on the state
+        // rather than the envelope, so the answer does not drift with a seq
+        // that grows by a digit. The envelope adds a small fixed header.
+        if let Some(cap) = self.policy.max_value_bytes {
+            let bytes = serde_json::to_vec(&state).map(|v| v.len()).unwrap_or(0) as u64;
+            if bytes > cap {
+                return Err(StoreError::TooLarge {
+                    key: key.clone(),
+                    bytes,
+                    cap,
+                });
+            }
+        }
         let mut adopted = false;
         let started = std::time::Instant::now();
         loop {
@@ -1216,6 +1242,57 @@ mod tests {
         assert!(!d2.manifest().entities.iter().any(|e| e.id == "gone"));
     }
 
+    /// A value over `store.max_value_bytes` is refused AT WRITE TIME, and
+    /// nothing is stored.
+    ///
+    /// The case this exists for: a store whose write limit exceeds its read
+    /// limit — an MCP store reached through a broker typically caps a tool
+    /// RESULT well below its request body. Writing such a value succeeds and
+    /// strands the checkpoint; the failure then surfaces at the next BOOT
+    /// RESTORE, when the agent is least able to do anything about it. Refusing
+    /// here keeps it where `store.on_error` can act and an operator is looking.
+    #[test]
+    fn a_value_over_the_cap_is_refused_and_not_written() {
+        let mem = Arc::new(MemoryStore::new());
+        let d = Durable::new(
+            mem.clone(),
+            "agentd",
+            "inst",
+            Policy {
+                debounce: Duration::from_millis(0),
+                on_error: crate::config::v2::StoreOnError::Degrade,
+                retries: 1,
+                max_value_bytes: Some(512),
+            },
+            None,
+        );
+
+        // Under the cap: written normally.
+        let small = json!({"text": "x".repeat(100)});
+        assert!(d.put(Kind::Run, "small", small, None).is_ok());
+        assert!(d.get(Kind::Run, "small").unwrap().is_some());
+
+        // Over it: refused, naming the size and the cap.
+        let big = json!({"text": "x".repeat(4096)});
+        let err = d.put(Kind::Run, "big", big, None).unwrap_err();
+        match &err {
+            StoreError::TooLarge { key, bytes, cap } => {
+                assert!(key.contains("big"), "the error names the key: {key}");
+                assert!(*bytes > 4096 && *cap == 512, "{bytes} over {cap}");
+            }
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
+        // The message tells an operator what to DO, not just what happened.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("NOT written") && msg.contains("restore"),
+            "{msg}"
+        );
+        // And nothing was stored — a partial write here would be the same
+        // stranded checkpoint by another route.
+        assert!(d.get(Kind::Run, "big").unwrap().is_none());
+    }
+
     #[test]
     fn degrade_policy_keeps_going_and_flags_it() {
         let mem = Arc::new(MemoryStore::new());
@@ -1227,6 +1304,7 @@ mod tests {
                 debounce: Duration::from_millis(0),
                 on_error: crate::config::v2::StoreOnError::Degrade,
                 retries: 1,
+                max_value_bytes: None,
             },
             None,
         );

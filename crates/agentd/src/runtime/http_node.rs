@@ -303,7 +303,10 @@ pub(crate) fn fetch_text(
     }
 }
 
-fn do_http(
+/// One outbound request, SSRF-guarded. `pub(crate)` because the `http` node is
+/// not the only outbound dial: a stream `forward:` pushes through the same
+/// guard rather than opening a second, differently-checked path out.
+pub(crate) fn do_http(
     url: &str,
     method: &str,
     query: &str,

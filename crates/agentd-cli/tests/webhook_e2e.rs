@@ -702,3 +702,117 @@ fn a_reload_rotates_webhook_auth_and_the_old_secret_stops_working() {
     std::fs::remove_file(&cfg).ok();
     std::fs::remove_file(&secret_path).ok();
 }
+
+/// **`into: {stream, subject}` appends the request instead of firing a run.**
+///
+/// This is the binding that gives a webhook replay-after-downtime (RFC 0035
+/// §5). A run fired at request time is lost if nothing was ready for it; an
+/// appended event waits on a durable stream for whatever consumes it — including
+/// a consumer that did not exist when the request arrived, which is exactly what
+/// this test does: the events are appended by one life of the daemon and
+/// consumed by the NEXT, whose consumer replays them `from: earliest`.
+///
+/// The gate still runs first: an unsigned request is rejected before it can
+/// reach the stream, so `into` is not a way around webhook auth.
+#[test]
+fn a_webhook_into_a_stream_appends_and_replays_into_a_later_consumer() {
+    let secret = "into-secret";
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let dir = common::unique_path("wh-into", "d");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let cfg_for = |consumer: &str| {
+        format!(
+            "config_version: \"1\"\n\
+             agent:\n  name: ingest\n  instruction: You handle webhooks.\n  preflight: never\n\
+             intelligence:\n  endpoints: [\"http://127.0.0.1:1/v1\"]\n  model: mock\n\
+             store:\n  kind: file\n  file:\n    path: {dir}/state\n  checkpoint:\n    debounce_ms: 0\n\
+             streams:\n  inbox:\n    retention: {{ max_events: 100 }}\n\
+             webhooks:\n  listen: http://127.0.0.1:{port}\n\
+             workflows:\n  - name: catch\n    steps:\n\
+             \x20     h: {{kind: webhook, path: /hooks/in, methods: [POST],\n\
+             \x20         auth: {{hmac: {{secret: \"{{{{secret:INTO_SECRET}}}}\"}}}},\n\
+             \x20         into: {{stream: inbox, subject: \"webhook.received\"}}}}\n{consumer}\
+             lifecycle:\n  run_until: drained\n\
+             observability:\n  log_level: info\n  log_content: true\n"
+        )
+    };
+
+    // Life 1: no consumer at all — the requests are appended anyway.
+    let cfg = write_config(&cfg_for(""));
+    let daemon = spawn_daemon(&cfg, &[("INTO_SECRET", secret)]);
+    wait_ready(&addr);
+
+    let body = r#"{"order":"o-1"}"#;
+    let (code, resp) = post(
+        &addr,
+        "/hooks/in",
+        &[
+            ("X-Signature", &sign(secret, body)),
+            ("Idempotency-Key", "i-1"),
+        ],
+        body,
+    );
+    assert_eq!(code, 202, "the append is accepted: {resp}");
+    assert!(resp.contains("appended"), "and says what it did: {resp}");
+
+    // The auth gate still applies BEFORE the append.
+    let (code, _) = post(
+        &addr,
+        "/hooks/in",
+        &[("X-Signature", "sha256=wrong"), ("Idempotency-Key", "i-2")],
+        body,
+    );
+    assert_eq!(code, 401, "an unsigned request never reaches the stream");
+
+    let body2 = r#"{"order":"o-2"}"#;
+    let (code, _) = post(
+        &addr,
+        "/hooks/in",
+        &[
+            ("X-Signature", &sign(secret, body2)),
+            ("Idempotency-Key", "i-3"),
+        ],
+        body2,
+    );
+    assert_eq!(code, 202);
+    assert!(
+        wait_for(|| daemon.events("webhook.into").len() >= 2, 5),
+        "two appends are logged:\n{}",
+        daemon.stderr()
+    );
+    // Nothing ran: `into` appends, it does not fire.
+    assert!(
+        daemon.events("run.start").is_empty(),
+        "an `into` webhook fires no run:\n{}",
+        daemon.stderr()
+    );
+    drop(daemon);
+
+    // Life 2: a consumer arrives AFTER the fact and replays the backlog.
+    let consumer = "  - name: drain\n    steps:\n\
+         \x20     take: {kind: stream, stream: inbox, subject: \"webhook.*\", from: earliest}\n\
+         \x20     note: {kind: assign, depends_on: [take], value: \"got {{steps.take.output.data.body.order}}\"}\n\
+         \x20     f:    {kind: finish, depends_on: [note], status: completed, output: \"{{steps.note.output}}\"}\n";
+    let cfg2 = write_config(&cfg_for(consumer));
+    let daemon2 = spawn_daemon(&cfg2, &[("INTO_SECRET", secret)]);
+    assert!(
+        wait_for(|| daemon2.events("run.done").len() >= 2, 15),
+        "the backlog replays into the late consumer:\n{}",
+        daemon2.stderr()
+    );
+    let outputs: Vec<String> = daemon2
+        .events("run.done")
+        .iter()
+        .filter_map(|e| e["output"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        outputs.iter().any(|o| o.contains("o-1")) && outputs.iter().any(|o| o.contains("o-2")),
+        "both requests survived the downtime: {outputs:#?}"
+    );
+
+    std::fs::remove_file(&cfg).ok();
+    std::fs::remove_file(&cfg2).ok();
+    std::fs::remove_dir_all(&dir).ok();
+}

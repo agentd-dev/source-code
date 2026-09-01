@@ -903,6 +903,65 @@ impl crate::runtime::reactor::Runtime {
                         ),
                     }
                 }
+                // `into: {stream, subject}` — APPEND the request instead of
+                // firing a run (RFC 0035 §5). This is what gives a webhook
+                // replay-after-downtime: a run fired at request time is lost
+                // if nothing was ready for it, while an appended event waits
+                // on a durable stream for whatever consumes it, including a
+                // consumer that does not exist yet. Verification, filtering
+                // and rate limiting have all already happened above — the
+                // append is the last step, not a bypass of the gate.
+                if let Some(into) = spec.get("into") {
+                    let stream = into.get("stream").and_then(Value::as_str).unwrap_or("");
+                    let subject = into.get("subject").and_then(Value::as_str).unwrap_or("");
+                    // The idempotency key doubles as the event id, so a
+                    // retried delivery appends under the same id and the
+                    // consumer's dedup ring drops the copy.
+                    let id = idem_key
+                        .clone()
+                        .unwrap_or_else(|| crate::state::ulid::new().to_string());
+                    let correlation = idem_key.as_deref();
+                    let (status, body) = match self.append_event(
+                        stream,
+                        subject,
+                        correlation,
+                        payload,
+                        &id,
+                        &workflow,
+                    ) {
+                        Ok(seq) => {
+                            self.log.info(
+                                "webhook.into",
+                                json!({"workflow": workflow, "node": node,
+                                           "stream": stream, "subject": subject, "seq": seq}),
+                            );
+                            (
+                                202,
+                                json!({"status": "appended", "stream": stream, "seq": seq}),
+                            )
+                        }
+                        // A refused append (an undeclared stream, or
+                        // pressure) must be visible to the CALLER, not
+                        // just the log: a webhook that answers 202 while
+                        // dropping the event is the silent-loss shape this
+                        // whole feature exists to remove.
+                        Err(e) => {
+                            self.log.warn(
+                                "webhook.into.refused",
+                                json!({"workflow": workflow, "node": node,
+                                           "stream": stream, "err": e}),
+                            );
+                            (503, json!({"error": "stream append refused"}))
+                        }
+                    };
+                    let reason = if status == 202 {
+                        "Accepted"
+                    } else {
+                        "Service Unavailable"
+                    };
+                    let _ = reply.send(WebhookReply::ok(status, reason, body));
+                    return;
+                }
                 if respond_sync {
                     // Hold the response: fire with a known run id, and answer at
                     // `on_run_terminal` with the run's result.

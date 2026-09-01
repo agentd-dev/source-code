@@ -5,6 +5,83 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## v1.5.0 — events that join, batch, and cross the wire
+
+RFC 0035 phases B and C. Streams already carried events with durable
+per-consumer offsets; this is the half that lets a workflow wait for a *set* of
+them, work them in groups, and let one instance's events become another's.
+
+### Added
+
+- **`correlate` — the multi-event join.** `depends_on` joins steps; this joins
+  events. `on` lists two or more subject patterns, `by` names the correlation
+  (a dot path, defaulting to the envelope's own `correlation`, which `emit`
+  already sets), and the node fires once when every subject has arrived sharing
+  one value. Half-collected sets live in durable start-state, so a restart
+  resumes a join rather than losing it.
+
+  `window` is **required**, and that asymmetry with `batch` is deliberate: a
+  batch is bounded by `size`, while a join's pending map is keyed by
+  correlation value and is unbounded, so a pair whose partner never arrives
+  would be a permanent durable leak. `max_pending` (default 1000) is the second
+  bound and refuses the *newest* key loudly rather than evicting an older one
+  that might still complete. `on_incomplete: fire_partial` fires the partial
+  set when the window expires — "paid but never shipped" *is* the event — and
+  the payload carries `complete` and `missing` so a run can tell a partial
+  firing from a finished join. Without those two fields an escalation flow
+  would happily "reconcile" an order that was never shipped.
+
+  Spelled `on_incomplete`, not the RFC's original `on_timeout`: that field
+  already means "jump to this step" everywhere else and is validated as a step
+  id, so reusing it would make one field name mean two different things
+  depending on the node kind. The RFC was updated to match the code.
+
+- **`batch: {size, window}` on a `stream` consumer** — one run per group
+  instead of one per event, for anything that amortises (a bulk write, one LLM
+  call over a page). The payload becomes `events[]` / `count` / `full`, where
+  `full: false` means the window elapsed before the batch filled. `batch` and
+  `rate` are mutually exclusive: both pace consumption and compose confusingly.
+
+- **`into: {stream, subject}` on `webhook` and `a2a` starts** — the request or
+  message is APPENDED instead of firing a run. This is what gives a webhook
+  replay-after-downtime: a run fired at request time is lost if nothing was
+  ready for it, while an appended event waits on a durable stream for whatever
+  consumes it, including a consumer that does not exist yet. Verification,
+  filtering and rate limiting still run first, so it is a different destination
+  for an accepted request, not a way past the gate. A refused append answers
+  **503**, never a 202 over a dropped event, and `respond: sync` with `into` is
+  refused at load — there is no run to wait for.
+
+- **`forward: {webhook: URL}` / `{peer: name}` on a stream `emit`** — push the
+  event outward as it appends. The durable copy is the source of truth and the
+  push is only the notification, so a failed forward is logged and does not
+  fail the step; a consumer that missed it still reads the event from its
+  offset. A peer receives a `stream.forwarded` command, which its own `a2a`
+  start can bind straight back onto a stream with `into:` — one instance's
+  `emit` becoming another's stream event, each side keeping an independent
+  durable copy. Outbound dials go through the same SSRF/egress guard as the
+  `http` node: without that, appending an event on the way out would be a way
+  to reach a host the egress policy refuses.
+
+### Changed
+
+- A workflow whose every start APPENDS (`into:`) no longer requires a `finish`
+  step. Such a workflow is a route declaration, not a graph, and demanding a
+  step that can never execute would both be noise and mislead the next reader
+  into thinking a run happens.
+
+### Documented
+
+- RFC 0035 is now **Phases A–C implemented**; D (the MCP broker profile) stays
+  draft. Phase C's `_feed`/`_audit` sub-item is recorded as satisfied by a
+  deliberate substitution rather than built: the runtime's own events already
+  reach a stream the operator *declares*, through
+  `observability.runtime_events.include` (any event family, `interface` and
+  `audit` among them) and `observability.audit.sink: [stream]`. Explicit beats
+  magic — the stream is declared like any other, so its retention and consumers
+  are ordinary configuration, and "a stream that is not declared can never be
+  appended to" stays true.
+
 ## v1.4.0 — reloads that mean it
 
 Three config paths reported a successful reload and changed nothing. Two were

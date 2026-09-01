@@ -1419,6 +1419,45 @@ impl Runtime {
                                 json!({"run": run_id, "step": step_id, "stream": stream,
                                        "subject": subject, "seq": seq}),
                             );
+                            // `forward: {webhook: URL}` — push the event out as
+                            // it appends (RFC 0035 §5). The DURABLE COPY is the
+                            // source of truth and the push is only the
+                            // notification, so a failed forward is logged and
+                            // does not fail the step: the event is on the
+                            // stream either way, and a consumer that missed the
+                            // push still gets it from the offset.
+                            let fwd = crate::runtime::streams::Forwarded {
+                                stream: &stream,
+                                subject: &subject,
+                                id: &id,
+                                seq,
+                                run_id,
+                                step_id,
+                            };
+                            if let Some(url) = spec
+                                .get("forward")
+                                .and_then(|f| f.get("webhook"))
+                                .and_then(Value::as_str)
+                            {
+                                // Same posture as the `http` node: reaching a
+                                // private/loopback address is a per-node
+                                // opt-in, never a default.
+                                let allow_private = spec
+                                    .get("forward")
+                                    .and_then(|f| f.get("allow_private"))
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false);
+                                self.forward_event(url, &fwd, allow_private);
+                            }
+                            #[cfg(feature = "a2a")]
+                            if let Some(peer) = spec
+                                .get("forward")
+                                .and_then(|f| f.get("peer"))
+                                .and_then(Value::as_str)
+                            {
+                                let data = spec.get("data").cloned().unwrap_or(Value::Null);
+                                self.forward_event_peer(peer, &fwd, &data);
+                            }
                             self.finish_step(
                                 run_id,
                                 step_id,

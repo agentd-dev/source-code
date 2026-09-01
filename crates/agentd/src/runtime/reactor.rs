@@ -483,6 +483,11 @@ impl Runtime {
             // 6. Start nodes + runs (+ suspended waits).
             self.poll_starts();
             self.poll_stream_starts();
+            // Joins consume the same stream, so they advance in the same pass —
+            // and their window sweep runs every tick, which is what makes an
+            // `on_timeout: fire_partial` escalation fire on time rather than on
+            // the next event to arrive.
+            self.poll_correlate_starts();
             // Runs parked on the log resolve in the same pass that advances
             // consumers, so a produce→wait hop costs a tick, not a timeout.
             self.poll_event_waits();
@@ -508,6 +513,7 @@ impl Runtime {
             let mut stream_rounds = 0;
             while std::mem::take(&mut self.stream_dirty) && stream_rounds < 64 {
                 self.poll_stream_starts();
+                self.poll_correlate_starts();
                 // A run parked on the log is a consumer too: without this, a
                 // saga whose awaited event was emitted by a step in this very
                 // iteration would park until the next tick.
@@ -871,6 +877,35 @@ impl Runtime {
                 // fires can `message` again, and that is the same loop.
                 "msg_depth": ev.payload.get("msg_depth").cloned().unwrap_or(json!(0)),
             });
+            // `into: {stream, subject}` — APPEND the message instead of
+            // firing a run (RFC 0035 §5), so a fleet peer can feed a stream
+            // over mTLS (or the co-located unix-socket lane) and get the same
+            // replay-after-downtime a webhook `into` gives. Authorization has
+            // already happened: the principal was resolved and its `roles`
+            // filter applied above, so this is the last step, not a bypass.
+            if let Some(into) = spec.get("into") {
+                let stream = into.get("stream").and_then(Value::as_str).unwrap_or("");
+                let subject = into.get("subject").and_then(Value::as_str).unwrap_or("");
+                let id = ev
+                    .payload
+                    .get("message_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| crate::state::ulid::new().to_string());
+                match self.append_event(stream, subject, Some(ctx), payload, &id, &workflow) {
+                    Ok(seq) => self.log.info(
+                        "start.a2a.into",
+                        json!({"workflow": workflow, "node": node, "conversation": ctx,
+                               "stream": stream, "subject": subject, "seq": seq}),
+                    ),
+                    Err(e) => self.log.warn(
+                        "start.a2a.into.refused",
+                        json!({"workflow": workflow, "node": node, "stream": stream,
+                               "err": e}),
+                    ),
+                }
+                return true;
+            }
             self.log.info(
                 "start.a2a.fired",
                 json!({"workflow": workflow, "node": node, "conversation": ctx,

@@ -1265,6 +1265,18 @@ impl Runtime {
     /// Shared by `a2a.delegate` and `a2a.send`, which differ only in what they
     /// do once connected — everything up to the socket is identical, and it is
     /// ~140 lines of credential plumbing that must not diverge between the two.
+    /// [`Runtime::a2a_peer_conn`] for callers outside this module — a stream
+    /// `forward: {peer:}` resolves a peer exactly as a delegate does.
+    #[cfg(feature = "a2a")]
+    pub(crate) fn a2a_peer_conn_pub(
+        &self,
+        peer_name: &str,
+        timeout: Duration,
+        what: &str,
+    ) -> Result<(crate::config::A2aEndpoint, crate::mcp::a2a_client::PeerAuth), String> {
+        self.a2a_peer_conn(peer_name, timeout, what)
+    }
+
     #[cfg(feature = "a2a")]
     // `timeout` bounds only the interactive credential fetch, which lives behind
     // `oauth`; without that feature there is nothing to bound and the parameter

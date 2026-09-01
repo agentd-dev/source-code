@@ -1,6 +1,6 @@
 # RFC 0035: Event streams — agentd as an event-driven agent
 
-**Status:** Phase A implemented (`streams:` config, the `emit` step's stream form, the `stream` start with durable offsets and `from: earliest` replay); Phases B–D draft
+**Status:** Phases A–C implemented; D (the MCP broker profile) draft
 **Author:** Andrii Tsok (drafted with Claude)
 **Date:** 2026-08-23
 **Part of:** the durable runtime (RFC 0025 — a new store kind; RFC 0027 — new nodes); unifies the admission edges of RFC 0027 §5, RFC 0029, RFC 0032 §4.
@@ -139,14 +139,14 @@ same idea across *events*:
     both: { kind: correlate, stream: orders,
             on: ["order.paid", "order.shipped"],
             by: correlation, window: 24h,
-            on_timeout: fire_partial }    # or: discard
+            on_incomplete: fire_partial }  # or: discard
     fix:  { kind: agent, depends_on: [both],
             instruction: "reconcile {{steps.both.output.events}}" }
     done: { kind: finish, depends_on: [fix] }
 ```
 
 Fires one run when every subject in `on` has arrived sharing one
-correlation value inside the window; `on_timeout` decides whether a partial
+correlation value inside the window; `on_incomplete` decides whether a partial
 set fires (for escalation flows: "paid but not shipped in 24h" *is* the
 event) or is discarded. State is durable start-state — a restart resumes
 half-collected joins. This is deliberately CEP-lite: sets and windows, not a
@@ -296,10 +296,17 @@ Rules that keep this honest:
 ## 9. Phasing
 
 - **A (core):** `streams:` config + `Kind::Event` + `emit` + `stream` start
-  with durable offsets + retention + pressure. The system is useful here.
-- **B (join):** `correlate`, `wait {on: event}`, batching windows.
+  with durable offsets + retention + pressure. The system is useful here. *(done)*
+- **B (join):** `correlate`, `wait {on: event}`, batching windows. *(done)*
 - **C (edges):** webhook/A2A `into:`, `forward:` egress, `_feed`/`_audit`
-  as streams.
+  as streams. *(done — with one deliberate substitution: rather than
+  well-known `_feed`/`_audit` stream NAMES, the runtime's own events reach a
+  stream the operator declares, via `observability.runtime_events.include`
+  (any of the event families, `interface` and `audit` among them) and
+  `observability.audit.sink: [stream]`. Explicit beats magic here: the stream
+  is declared like any other, so its retention and consumers are ordinary
+  configuration, and "a stream that is not declared can never be appended to"
+  stays true.)*
 - **D (bridge):** the MCP broker profile + a reference NATS bridge server.
 
 ## 10. Open questions

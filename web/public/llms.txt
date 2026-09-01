@@ -5,7 +5,7 @@
 > a long-lived reactive daemon, or a durable DAG workflow. Tools come only from
 > remote **MCP** servers over HTTPS; it speaks **A2A** to other agents; it
 > executes nothing locally unless you compile *and* enable the guarded `exec`
-> runner. This file is the condensed reference for LLMs. Version 1.4.0.
+> runner. This file is the condensed reference for LLMs. Version 1.5.0.
 
 Canonical docs: https://agentd.dev/docs/ · Agent Skill: https://agentd.dev/SKILL.md · Source: https://github.com/agentd-dev/source-code
 

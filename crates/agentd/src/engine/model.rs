@@ -54,6 +54,35 @@ pub struct KindInfo {
     pub nested: bool,
 }
 
+/// Validate an `into: {stream, subject}` binding — the shared shape by which an
+/// edge (a `webhook` request, an `a2a` message) APPENDS to a stream instead of
+/// firing a run (RFC 0035 §5).
+///
+/// One definition for both node kinds: two copies of "what `into` accepts"
+/// would drift the way the long-lived-start lists did.
+fn check_into(spec: &Map<String, Value>, at: &str, errs: &mut Vec<String>) {
+    let Some(into) = spec.get("into") else {
+        return;
+    };
+    // Both addressing fields travel together for the same reason `emit`'s do:
+    // a stream without a subject has nowhere to land, a subject without a
+    // stream names nothing.
+    let ok = into.as_object().is_some_and(|o| {
+        o.keys().all(|k| k == "stream" || k == "subject")
+            && o.get("stream")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+            && o.get("subject")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+    });
+    if !ok {
+        errs.push(format!(
+            "{at}: into takes {{stream: <name>, subject: <subject>}}"
+        ));
+    }
+}
+
 const fn k(
     name: &'static str,
     start: bool,
@@ -124,8 +153,27 @@ pub const KINDS: &[KindInfo] = &[
     k(
         "stream",
         true,
-        &["stream", "subject", "filter", "from", "rate", "inputs"],
+        &[
+            "stream", "subject", "filter", "from", "rate", "batch", "inputs",
+        ],
         &["stream"],
+        true,
+        false,
+    ),
+    k(
+        "correlate",
+        true,
+        &[
+            "stream",
+            "on",
+            "by",
+            "window",
+            "on_incomplete",
+            "filter",
+            "max_pending",
+            "inputs",
+        ],
+        &["stream", "on"],
         true,
         false,
     ),
@@ -148,7 +196,7 @@ pub const KINDS: &[KindInfo] = &[
     k(
         "a2a",
         true,
-        &["command", "roles", "inputs", "schema"],
+        &["command", "roles", "inputs", "schema", "into"],
         &[],
         true,
         false,
@@ -168,6 +216,7 @@ pub const KINDS: &[KindInfo] = &[
             "filter",
             "inputs",
             "signal",
+            "into",
         ],
         &["path"],
         true,
@@ -548,6 +597,7 @@ pub const KINDS: &[KindInfo] = &[
             "subject",
             "data",
             "correlation",
+            "forward",
         ],
         &[],
         true,
@@ -1853,7 +1903,22 @@ fn parse_step(
                     ));
                 }
             }
+            check_into(&spec, &at, errs);
+            // `respond: sync` waits for a RUN's result, and `into` fires no
+            // run. Refused rather than silently ignored: a caller expecting a
+            // synchronous answer would otherwise get an append receipt and
+            // never learn the difference.
+            if spec.get("into").is_some()
+                && spec.get("respond").and_then(Value::as_str) == Some("sync")
+            {
+                errs.push(format!(
+                    "{at}: `respond: sync` cannot be combined with `into` — an appended \
+                     event fires no run to wait for"
+                ));
+            }
         }
+        // The A2A start takes the same `into:` binding as `webhook`.
+        "a2a" => check_into(&spec, &at, errs),
         // The typed A2A form: `command` carries the op, `args` its payload.
         "a2a.delegate" => {
             if spec.get("objective").is_none() && spec.get("command").is_none() {
@@ -1904,6 +1969,42 @@ fn parse_step(
                     "{at}: a stream emit needs both `stream` and `subject`"
                 ));
             }
+            // `forward: {webhook: URL}` pushes the appended event outward. It
+            // is a notification ON an append, so it only means anything on a
+            // stream emit — silently ignoring it on a `note`/`metric` emit
+            // would leave an operator believing something was being delivered.
+            if let Some(f) = spec.get("forward") {
+                if spec.get("stream").is_none() {
+                    errs.push(format!(
+                        "{at}: `forward` needs `stream` — it pushes the appended event, and a \
+                         non-stream emit appends nothing"
+                    ));
+                }
+                // Exactly one destination. Both at once is not a richer
+                // fan-out, it is two half-configured ones — and silently
+                // picking the first would make the other look delivered.
+                let has_webhook = f.get("webhook").is_some();
+                let has_peer = f.get("peer").is_some();
+                let ok = f.as_object().is_some_and(|o| {
+                    o.keys()
+                        .all(|k| k == "webhook" || k == "peer" || k == "allow_private")
+                        && has_webhook != has_peer
+                        && o.get("webhook").is_none_or(|u| {
+                            u.as_str().is_some_and(|u| {
+                                u.starts_with("http://") || u.starts_with("https://")
+                            })
+                        })
+                        && o.get("peer")
+                            .is_none_or(|p| p.as_str().is_some_and(|p| !p.is_empty()))
+                        && o.get("allow_private").is_none_or(Value::is_boolean)
+                });
+                if !ok {
+                    errs.push(format!(
+                        "{at}: forward takes {{webhook: <http(s) URL>, allow_private?: bool}} \
+                         or {{peer: <a2a.peers name>}} — one destination, not both"
+                    ));
+                }
+            }
         }
         // `stream` consumer: `from` picks the initial offset once, at arm.
         "stream" => {
@@ -1911,6 +2012,88 @@ fn parse_step(
                 && !matches!(f.as_str(), Some("new") | Some("earliest"))
             {
                 errs.push(format!("{at}: from must be \"new\" or \"earliest\""));
+            }
+            // `batch: {size: N, window: <dur>}` — one run per BATCH of events
+            // instead of one per event. `size` is capped for the same reason
+            // `subscribe`'s window is: the partial batch rides the durable
+            // start-state, so an unbounded one converts a fast stream into
+            // disk pressure. `window` bounds the latency of a batch that never
+            // fills — without it a quiet stream holds events indefinitely.
+            if let Some(b) = spec.get("batch") {
+                let ok = b.as_object().is_some_and(|o| {
+                    o.keys().all(|k| k == "size" || k == "window")
+                        && o.get("size")
+                            .and_then(Value::as_u64)
+                            .is_some_and(|n| (2..=1000).contains(&n))
+                        && o.get("window").is_none_or(|w| {
+                            w.as_str()
+                                .is_some_and(|d| crate::config::parse_duration(d).is_ok())
+                        })
+                });
+                if !ok {
+                    errs.push(format!(
+                        "{at}: batch takes {{size: 2..=1000, window?: <duration>}}"
+                    ));
+                }
+            }
+            if spec.get("batch").is_some() && spec.get("rate").is_some() {
+                errs.push(format!(
+                    "{at}: `batch` and `rate` both pace consumption and compose confusingly — \
+                     `rate` paces one run per event, `batch` makes one run per group; pick one"
+                ));
+            }
+        }
+        // `correlate` joins events that share a correlation value. Every knob
+        // here is refused rather than defaulted when it is nonsense, because a
+        // join that silently never fires is the hardest kind of workflow bug to
+        // see: nothing errors, a run simply never happens.
+        "correlate" => {
+            match spec.get("on").and_then(Value::as_array) {
+                Some(subjects) if subjects.len() >= 2 => {
+                    if !subjects.iter().all(|v| v.is_string()) {
+                        errs.push(format!("{at}: `on` must be a list of subject patterns"));
+                    }
+                }
+                Some(_) => errs.push(format!(
+                    "{at}: `on` needs at least two subjects — joining one subject with \
+                     itself is a `stream` start"
+                )),
+                None => errs.push(format!("{at}: `on` must be a list of subject patterns")),
+            }
+            // Spelled `on_incomplete`, not the RFC's original `on_timeout`:
+            // that field already means "jump to THIS step" everywhere else and
+            // is validated as a step id, so reusing it here would make one
+            // field name mean two different things depending on the node kind.
+            if let Some(t) = spec.get("on_incomplete").and_then(Value::as_str)
+                && !matches!(t, "fire_partial" | "discard")
+            {
+                errs.push(format!(
+                    "{at}: on_incomplete must be \"fire_partial\" or \"discard\""
+                ));
+            }
+            // A window is mandatory: without one, a half-collected join is kept
+            // for ever, and `pending` is durable state. There is no sensible
+            // default, because the right window is a property of the domain.
+            match spec.get("window") {
+                Some(w) => {
+                    if w.as_str()
+                        .is_none_or(|d| crate::config::parse_duration(d).is_err())
+                    {
+                        errs.push(format!(
+                            "{at}: window must be a duration (e.g. \"24h\") — it bounds how long \
+                             a half-collected join is kept"
+                        ));
+                    }
+                }
+                None => errs.push(format!(
+                    "{at}: `window` is required — it bounds how long a half-collected join is \
+                     kept in durable state"
+                )),
+            }
+            if let Some(n) = spec.get("max_pending")
+                && n.as_u64().is_none_or(|n| !(1..=100_000).contains(&n))
+            {
+                errs.push(format!("{at}: max_pending takes 1..=100000"));
             }
         }
         // `window: {samples: N}` — deliver the last N read values as an array
@@ -2422,7 +2605,15 @@ fn validate_graph(wf: &Workflow, errs: &mut Vec<String>) {
             ));
         }
     }
-    if !wf.steps.values().any(|s| s.kind == "finish") {
+    // A workflow whose every start APPENDS (`into:`) never produces a run, so
+    // requiring a `finish` would require a step that cannot execute. Such a
+    // workflow is a route declaration, not a graph — and demanding dead code
+    // in it would also mislead the next reader into thinking a run happens.
+    let all_starts_append = {
+        let starts: Vec<&Step> = wf.steps.values().filter(|s| s.is_start()).collect();
+        !starts.is_empty() && starts.iter().all(|s| s.spec.get("into").is_some())
+    };
+    if !all_starts_append && !wf.steps.values().any(|s| s.kind == "finish") {
         errs.push(format!("workflow {name:?}: a `finish` step is required"));
     }
 }
@@ -2810,7 +3001,7 @@ mod tests {
     #[test]
     fn every_start_kind_is_classified_and_only_once_manual_are_short() {
         let starts = start_kinds();
-        assert_eq!(starts.len(), 10, "start kinds: {starts:?}");
+        assert_eq!(starts.len(), 11, "start kinds: {starts:?}");
         for k in &starts {
             assert_eq!(
                 is_long_lived_start(k),
@@ -2821,6 +3012,9 @@ mod tests {
         // The two regressions, named so a revert is loud.
         assert!(is_long_lived_start("webhook"), "a listener keeps us alive");
         assert!(is_long_lived_start("stream"), "a consumer keeps us alive");
+        // A join polls a stream and sweeps its own window every tick, so it
+        // keeps the daemon alive exactly as its `stream` sibling does.
+        assert!(is_long_lived_start("correlate"), "a join keeps us alive");
         assert!(!is_long_lived_start("once"));
         assert!(!is_long_lived_start("manual"));
         // A step kind is not a start kind, however plausible it sounds.

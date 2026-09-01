@@ -6,7 +6,8 @@
           "command",
           "roles",
           "inputs",
-          "schema"
+          "schema",
+          "into"
         ],
         "implemented": true,
         "required": [],
@@ -188,6 +189,24 @@
         ],
         "start": false
       },
+      "correlate": {
+        "fields": [
+          "stream",
+          "on",
+          "by",
+          "window",
+          "on_incomplete",
+          "filter",
+          "max_pending",
+          "inputs"
+        ],
+        "implemented": true,
+        "required": [
+          "stream",
+          "on"
+        ],
+        "start": true
+      },
       "dedupe": {
         "fields": [
           "over",
@@ -208,7 +227,8 @@
           "stream",
           "subject",
           "data",
-          "correlation"
+          "correlation",
+          "forward"
         ],
         "implemented": true,
         "required": [],
@@ -703,6 +723,7 @@
           "filter",
           "from",
           "rate",
+          "batch",
           "inputs"
         ],
         "implemented": true,
@@ -884,7 +905,8 @@
           "respond",
           "filter",
           "inputs",
-          "signal"
+          "signal",
+          "into"
         ],
         "implemented": true,
         "required": [
@@ -970,6 +992,7 @@
             "schedule",
             "subscribe",
             "stream",
+            "correlate",
             "signal",
             "event",
             "a2a",

@@ -334,7 +334,11 @@ pub struct A2aBridge {
     events_tx: Sender<Event>,
     /// The interface event feed — `None` unless `interface.enabled`.
     feed: Option<Arc<SharedFeed>>,
-    resolver: Arc<Resolver>,
+    /// Swappable, so a reload can rebuild the principal rules without a
+    /// restart. Read once per inbound request and written only by a reload,
+    /// which is what an `RwLock` is for; the `Arc` inside keeps the read side
+    /// to a clone rather than holding the lock across `resolve`.
+    resolver: std::sync::RwLock<Arc<Resolver>>,
     pub request_timeout: Duration,
     pub stream_deadline: Duration,
 }
@@ -354,7 +358,7 @@ impl A2aBridge {
         Arc::new(A2aBridge {
             events_tx,
             feed,
-            resolver: Arc::new(resolver),
+            resolver: std::sync::RwLock::new(Arc::new(resolver)),
             request_timeout: Duration::from_secs(120),
             stream_deadline: Duration::from_secs(600),
         })
@@ -382,7 +386,25 @@ impl A2aBridge {
             sans,
             ..Default::default()
         };
-        self.resolver.resolve(&id, bearer)
+        let resolver = self.resolver().clone();
+        resolver.resolve(&id, bearer)
+    }
+
+    /// The current principal rules.
+    fn resolver(&self) -> Arc<Resolver> {
+        self.resolver
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Install rebuilt principal rules — a reload of `a2a.principals`.
+    ///
+    /// Requests already in flight keep the rules they were resolved under;
+    /// the next request uses these. That is the same "workers in flight keep
+    /// what they were spawned with" rule the intelligence reload follows.
+    pub fn set_resolver(&self, resolver: Resolver) {
+        *self.resolver.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(resolver);
     }
 
     /// The interface observation feed, when `interface.enabled` armed one.
@@ -2339,6 +2361,10 @@ pub(crate) struct A2aServing {
     pub feed: Option<Arc<SharedFeed>>,
     pub pairing: Option<Arc<PairingState>>,
     pub listener: crate::a2a::serve::Listener,
+    /// Kept so a reload can swap the principal rules into the live listener.
+    pub bridge: Arc<A2aBridge>,
+    /// The live CORS allowlist, revisable by a reload.
+    pub origins: crate::a2a::serve::OriginList,
 }
 
 /// Bind and start the A2A listener.
@@ -2432,6 +2458,9 @@ pub(crate) fn spawn_a2a_listener(
     let feed = interface
         .enabled
         .then(|| Arc::new(SharedFeed::new(interface.debug)));
+    // Shared with the listener so a reload can revise the CORS allowlist.
+    let origins: crate::a2a::serve::OriginList =
+        Arc::new(std::sync::RwLock::new(interface.origins.clone()));
     let bridge = A2aBridge::with_feed(events_tx, resolver, feed.clone());
 
     let listener = crate::a2a::serve::spawn(
@@ -2446,7 +2475,7 @@ pub(crate) fn spawn_a2a_listener(
                 server_bearer,
                 pairing: pairing.clone(),
             },
-            extra_origins: interface.origins.clone(),
+            extra_origins: Arc::clone(&origins),
             tls,
             request_timeout: bridge.request_timeout,
             stream_deadline: bridge.stream_deadline,
@@ -2461,6 +2490,8 @@ pub(crate) fn spawn_a2a_listener(
         feed,
         pairing,
         listener,
+        bridge,
+        origins,
     })
 }
 

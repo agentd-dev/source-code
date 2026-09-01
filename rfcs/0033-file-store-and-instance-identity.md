@@ -1,6 +1,6 @@
 # RFC 0033: The file store and instance identity
 
-**Status:** Proposed (2.2 track)
+**Status:** Implemented (2.2 track)
 **Author:** Andrii Tsok (drafted with Claude)
 **Date:** 2026-08-18
 **Part of:** the durable-agent design; adds an adapter to RFC 0025 §4 and a `store.kind` to RFC 0030 §3.5.

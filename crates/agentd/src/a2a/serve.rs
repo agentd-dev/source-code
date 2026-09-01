@@ -68,7 +68,10 @@ pub struct Opts {
     /// Origins a browser UI may be served from, beyond loopback. Any other
     /// `Origin` is refused outright, which is what stops a page the operator
     /// never authorised from driving this endpoint through their browser.
-    pub extra_origins: Vec<String>,
+    ///
+    /// Shared rather than owned so a reload can revise the list in place; see
+    /// [`OriginList`].
+    pub extra_origins: OriginList,
     /// TLS, when the listen URL is `https://` — a PROVIDER consulted per
     /// connection, not a snapshot taken at spawn.
     ///
@@ -96,12 +99,28 @@ pub struct Listener {
     _runtime: tokio::runtime::Runtime,
 }
 
+impl App {
+    /// The origin allowlist in force for this request.
+    fn origins(&self) -> Vec<String> {
+        self.extra_origins
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+}
+
 struct App {
     /// a2a-rs's JSON-RPC surface, delegated to for every spec method.
     protocol: Router,
     bridge: Arc<A2aBridge>,
     auth: Auth,
-    extra_origins: Vec<String>,
+    /// The browser CORS allowlist, shared so a reload can revise it.
+    ///
+    /// Frozen at spawn until v1.4.0: an operator who REMOVED an origin to
+    /// revoke a web client's access got a successful reload and a listener
+    /// that kept honouring the old list — the same shape as the webhook
+    /// secret that would not rotate.
+    extra_origins: OriginList,
     stream_deadline: Duration,
     log: Logger,
 }
@@ -239,6 +258,12 @@ pub fn spawn(
         _runtime: runtime,
     })
 }
+
+/// The live browser-origin allowlist, revisable by a reload.
+///
+/// A plain `Vec` behind a lock rather than a provider closure: the list has no
+/// source to re-consult, it is simply replaced.
+pub type OriginList = Arc<std::sync::RwLock<Vec<String>>>;
 
 /// Supplies the current rustls configuration for each inbound connection.
 ///
@@ -430,7 +455,7 @@ async fn preflight(State(app): State<Arc<App>>, headers: HeaderMap) -> Response 
         .get(header::ORIGIN)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if !origin_allowed(origin, &app.extra_origins) {
+    if !origin_allowed(origin, &app.origins()) {
         return (StatusCode::FORBIDDEN, "").into_response();
     }
     let wants_private_network = headers
@@ -524,7 +549,7 @@ async fn dispatch(
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
     if let Some(o) = &origin
-        && !origin_allowed(o, &app.extra_origins)
+        && !origin_allowed(o, &app.origins())
     {
         return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
     }

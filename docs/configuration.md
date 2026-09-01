@@ -884,6 +884,18 @@ unit of work picks the new values up):
   definition hash they started with
 - `limits`, `lifecycle.idle_grace`, `observability.log_level` /
   `log_content`, `memory`, `context`
+- `a2a.principals` — the rules are recompiled and swapped into the live
+  listener, so a demotion or a rotated `bearer_ref` takes effect on the next
+  request. A rebuild that fails (an unresolvable `{{secret:…}}`, a malformed
+  matcher) keeps the rules already in force rather than falling open
+- `webhooks.default_auth` and the `webhook` routes themselves (which live in
+  `workflows[]`) — the route table is rebuilt on every reload, so a
+  `{{secret-file:…}}` rotated by a remounted Kubernetes Secret is picked up
+  even though the config *document* did not change. Live per-route state (the
+  in-flight count, the rate-limit bucket) is carried across the rebuild, so
+  reloading does not hand a caller a fresh burst allowance
+- `interface.origins` — the browser CORS allowlist is replaced in the live
+  listener, so removing an origin actually revokes it
 
 **Restart-only paths** — a reload whose effective document differs under any of
 these is **refused** with `restart_required` (roll the pod instead):
@@ -891,9 +903,24 @@ these is **refused** with `restart_required` (roll the pod instead):
 `config_version`, `agent.name`, `store.kind`, `store.prefix`, `store.mcp`,
 `store.http`, `store.file`, `lifecycle.run_until`, `lifecycle.drain_timeout`,
 `lifecycle.run_id`, `lifecycle.exit_code_map`, `lifecycle.watch_config`,
-`a2a.listen`, `a2a.tls`, `a2a.bearer`, `observability.otel`,
+`a2a.listen`, `a2a.tls`, `a2a.bearer`, `interface.enabled`,
+`interface.pairing`, `webhooks.listen`, `webhooks.tls`, `observability.otel`,
 `observability.metrics_addr`, `observability.health_file`,
 `observability.events_ring`, `observability.traceparent`, `security`.
+
+The webhook and interface entries name the **socket**, not the rules: rebinding
+an address, swapping a TLS identity, arming the observation feed or the pairing
+flow are all startup decisions, while the auth and routing on top of them
+reload. `interface.enabled` is restart-only even though turning it *off* would
+work (those gates are read live) — a knob that reloads in one direction only is
+worse than one that plainly refuses.
+
+**Every configuration path is classified** as one or the other, and a test
+(`every_config_path_is_classified`) walks the generated schema to prove it. That
+matters because the failure this prevents is silent: a field captured into a
+long-lived structure at startup, listed in neither partition, reports a
+successful reload and changes nothing. `a2a.principals`, the webhook routes and
+`interface.origins` were each exactly that before v1.4.0.
 
 `store.file` is restart-only for the same reason as the rest of `store`: moving
 the state directory under a running instance would strand every key it has

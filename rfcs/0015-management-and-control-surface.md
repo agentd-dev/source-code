@@ -6,7 +6,7 @@
 > contracts (methods/resources/semantics) still hold — only the transport does not.
 > See [`../docs/design/00-target-vision-pivot.md`](../docs/design/00-target-vision-pivot.md).
 
-**Status:** Proposed (agentctl control-plane track)
+**Status:** Superseded by 0029 — A2A is the only external channel; `--serve-mcp` now aliases `a2a.listen`
 **Author:** Andrii Tsok
 **Date:** 2026-06-27
 **Part of:** the agentd rewrite — control-plane track (RFC 0014); extends the self-MCP server & control protocol (RFC 0005)

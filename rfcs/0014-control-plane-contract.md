@@ -6,7 +6,7 @@
 > contracts (methods/resources/semantics) still hold — only the transport does not.
 > See [`../docs/design/00-target-vision-pivot.md`](../docs/design/00-target-vision-pivot.md).
 
-**Status:** Proposed (agentctl control-plane track)
+**Status:** Partially implemented (via 0016–0018; agentctl control-plane track)
 **Author:** Andrii Tsok
 **Date:** 2026-06-27
 **Part of:** the agentd rewrite — extends the cloud-native contract (RFC 0011); umbrella for RFCs 0015–0019

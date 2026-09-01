@@ -169,12 +169,17 @@ struct Route {
     idem_header: Option<String>,
     /// `respond: sync` — hold the response for the run's terminal result.
     respond_sync: bool,
-    inflight: AtomicUsize,
+    /// Live state, shared rather than owned, so a reload that rebuilds this
+    /// route can CARRY IT OVER: resetting the counter under requests that are
+    /// still running would let the parallelism gate admit past its bound, and
+    /// resetting the bucket would hand a caller a fresh burst allowance every
+    /// time an unrelated config key changed.
+    inflight: Arc<AtomicUsize>,
     /// Per-route arrival rate (`rate: "<burst>/<per>s"`). `parallelism` bounds
     /// how many run at ONCE; this bounds how fast they ARRIVE — without it an
     /// inbound burst is written to the durable inbox as fast as the socket
     /// delivers it, which converts the burst straight into disk pressure.
-    rate: Option<std::sync::Mutex<crate::supervisor::tree::TokenBucket>>,
+    rate: Option<Arc<std::sync::Mutex<crate::supervisor::tree::TokenBucket>>>,
     /// `Retry-After` for a rate refusal: roughly when a token will exist.
     retry_after_s: u32,
     /// The owning workflow declared `priority: low` — its admissions shed one
@@ -183,15 +188,22 @@ struct Route {
 }
 
 /// Decrement the route's in-flight counter on drop.
-struct InflightGuard<'a>(&'a AtomicUsize);
-impl Drop for InflightGuard<'_> {
+///
+/// Holds an `Arc` rather than a borrow: a reload can swap the route map while
+/// a request is in flight, and the counter this guard decrements must be the
+/// one it incremented, not whichever route happens to sit at that path later.
+struct InflightGuard(Arc<AtomicUsize>);
+impl Drop for InflightGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
 pub struct WebhookHandler {
-    routes: HashMap<String, Route>,
+    /// Swappable: a reload rebuilds the table and installs it here, so a
+    /// rotated route secret or a workflow's new `webhook` node takes effect
+    /// without a restart. Read once per request; written only by a reload.
+    routes: std::sync::RwLock<Arc<RouteMap>>,
     /// Admission-gates inbound requests under disk/memory pressure (429).
     pressure: std::sync::Arc<super::pressure::Pressure>,
     /// The dynamic `wait: {on: webhook}` await callbacks (shared with the loop).
@@ -205,8 +217,11 @@ impl ::mcp::http_server::RawHandler for WebhookHandler {
     fn handle(&self, req: &::mcp::http_server::RawRequest) -> ::mcp::http_server::RawResponse {
         use ::mcp::http_server::RawResponse as R;
         let path = req.path().to_string();
-        // A static `webhook` start-node route.
-        if let Some(route) = self.routes.get(&path) {
+        // A static `webhook` start-node route. The table is cloned out of the
+        // lock so a concurrent reload never blocks (or is blocked by) a
+        // request in flight.
+        let routes = self.routes();
+        if let Some(route) = routes.get(&path) {
             return self.handle_start(req, route, &path);
         }
         // A dynamic `wait: {on: webhook}` await callback (registered by the loop).
@@ -248,6 +263,38 @@ impl ::mcp::http_server::RawHandler for WebhookHandler {
 }
 
 impl WebhookHandler {
+    /// The route table currently being served.
+    fn routes(&self) -> Arc<RouteMap> {
+        self.routes
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Install a rebuilt route table — a reload of `webhooks.default_auth` or
+    /// of the `workflows[]` the routes come from.
+    ///
+    /// Requests already dispatched keep the route they matched; the next
+    /// request matches against this table.
+    fn set_routes(&self, routes: RouteMap) {
+        *self.routes.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(routes);
+    }
+
+    /// Rebuild the table from the current configuration, carrying live state
+    /// across, and install it. Errors leave the serving table untouched.
+    pub(crate) fn reload_routes(
+        &self,
+        nodes: Vec<WebhookNode>,
+        webhooks: &Webhooks,
+        env: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<Vec<String>, String> {
+        let prev = self.routes();
+        let next = build_routes(nodes, webhooks, env, Some(&prev))?;
+        let paths: Vec<String> = next.keys().cloned().collect();
+        self.set_routes(next);
+        Ok(paths)
+    }
+
     /// The `{method, path, headers, body, raw_body}` payload handed to the workflow.
     fn payload(&self, req: &::mcp::http_server::RawRequest, path: &str) -> Value {
         let body_json = serde_json::from_slice::<Value>(&req.body).ok();
@@ -366,7 +413,7 @@ impl WebhookHandler {
                 }
             }
             route.inflight.fetch_add(1, Ordering::SeqCst);
-            _guard = InflightGuard(&route.inflight);
+            _guard = InflightGuard(Arc::clone(&route.inflight));
         }
         let idem_key = route
             .idem_header
@@ -531,19 +578,115 @@ fn overflow_of(spec: &Map<String, Value>) -> Overflow {
     }
 }
 
+/// The live route table, swapped wholesale by a reload.
+type RouteMap = HashMap<String, Route>;
+
+/// Compile the `webhook` start nodes into a route table.
+///
+/// `prev` is the table currently being served, when this is a REBUILD: live
+/// per-route state (the in-flight counter, the rate bucket) is carried across
+/// for paths whose shaping knobs are unchanged, so reloading an unrelated key
+/// neither resets a rate limiter nor loses count of requests still running.
+fn build_routes(
+    nodes: Vec<WebhookNode>,
+    webhooks: &Webhooks,
+    env: &dyn Fn(&str) -> Option<String>,
+    prev: Option<&RouteMap>,
+) -> Result<RouteMap, String> {
+    let mut routes: RouteMap = HashMap::new();
+    for (workflow, node, spec, low_priority) in nodes {
+        let path = spec
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("webhook node '{workflow}/{node}': path is required"))?
+            .to_string();
+        let methods = spec
+            .get("methods")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(|m| m.to_ascii_uppercase())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let verify = build_verify(spec.get("auth"), webhooks.default_auth.as_ref(), env)
+            .map_err(|e| format!("webhook node '{workflow}/{node}': {e}"))?;
+        let parallelism = spec
+            .get("parallelism")
+            .and_then(Value::as_u64)
+            .map(|n| n as usize);
+        let path_for_rate = path.clone();
+        let (rate, retry_after_s) = match spec.get("rate").and_then(Value::as_str) {
+            None => (None, 30),
+            Some(r) => {
+                let (burst, per_s) = crate::supervisor::tree::parse_rate(r)
+                    .map_err(|e| format!("webhook node '{workflow}/{node}': rate: {e}"))?;
+                let retry = (per_s / burst.max(1) as f64).ceil().max(1.0) as u32;
+                (
+                    Some(match prev.and_then(|m| m.get(&path_for_rate)) {
+                        // Same rate spec ⇒ same bucket, so a reload cannot be
+                        // used (accidentally or otherwise) to refill an
+                        // exhausted allowance.
+                        Some(r) if r.rate.is_some() && r.retry_after_s == retry => {
+                            Arc::clone(r.rate.as_ref().expect("is_some checked"))
+                        }
+                        _ => Arc::new(std::sync::Mutex::new(
+                            crate::supervisor::tree::TokenBucket::new(burst, burst as f64 / per_s),
+                        )),
+                    }),
+                    retry,
+                )
+            }
+        };
+        if let Some(prev) = routes.insert(
+            path.clone(),
+            Route {
+                workflow: workflow.clone(),
+                node: node.clone(),
+                methods,
+                verify,
+                parallelism,
+                on_overflow: overflow_of(&spec),
+                idem_header: idem_header(&spec),
+                respond_sync: spec.get("respond").and_then(Value::as_str) == Some("sync"),
+                // Carry the live counter and bucket over from the route
+                // that held this path before the rebuild, when the knob that
+                // shapes them is unchanged. A rebuilt route is the same route
+                // to a caller mid-request; only its rules changed.
+                inflight: prev
+                    .and_then(|m| m.get(&path))
+                    .filter(|r| r.parallelism == parallelism)
+                    .map(|r| Arc::clone(&r.inflight))
+                    .unwrap_or_default(),
+                rate,
+                retry_after_s,
+                low_priority,
+            },
+        ) {
+            return Err(format!(
+                "two webhook nodes bind the same path '{path}' ('{}/{}' and '{workflow}/{node}')",
+                prev.workflow, prev.node
+            ));
+        }
+    }
+
+    Ok(routes)
+}
+
 /// Spawn the webhook listener from the configured `webhook` start nodes. Each
 /// `nodes` entry is `(workflow, node, spec)`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_webhook_listener(
     webhooks: &Webhooks,
-    nodes: Vec<(String, String, Map<String, Value>, bool)>,
+    nodes: Vec<WebhookNode>,
     callbacks: SharedCallbacks,
     events_tx: Sender<Event>,
     env: &dyn Fn(&str) -> Option<String>,
     write_timeout: Duration,
     pressure: std::sync::Arc<super::pressure::Pressure>,
     log: Logger,
-) -> Result<(), String> {
+) -> Result<Arc<WebhookHandler>, String> {
     use std::path::Path;
     let listen = webhooks
         .listen
@@ -579,66 +722,7 @@ pub(crate) fn spawn_webhook_listener(
         ::mcp::http_server::HttpAcceptor::Plain
     };
 
-    let mut routes = HashMap::new();
-    for (workflow, node, spec, low_priority) in nodes {
-        let path = spec
-            .get("path")
-            .and_then(Value::as_str)
-            .ok_or_else(|| format!("webhook node '{workflow}/{node}': path is required"))?
-            .to_string();
-        let methods = spec
-            .get("methods")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .map(|m| m.to_ascii_uppercase())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let verify = build_verify(spec.get("auth"), webhooks.default_auth.as_ref(), env)
-            .map_err(|e| format!("webhook node '{workflow}/{node}': {e}"))?;
-        let parallelism = spec
-            .get("parallelism")
-            .and_then(Value::as_u64)
-            .map(|n| n as usize);
-        let (rate, retry_after_s) = match spec.get("rate").and_then(Value::as_str) {
-            None => (None, 30),
-            Some(r) => {
-                let (burst, per_s) = crate::supervisor::tree::parse_rate(r)
-                    .map_err(|e| format!("webhook node '{workflow}/{node}': rate: {e}"))?;
-                let retry = (per_s / burst.max(1) as f64).ceil().max(1.0) as u32;
-                (
-                    Some(std::sync::Mutex::new(
-                        crate::supervisor::tree::TokenBucket::new(burst, burst as f64 / per_s),
-                    )),
-                    retry,
-                )
-            }
-        };
-        if let Some(prev) = routes.insert(
-            path.clone(),
-            Route {
-                workflow: workflow.clone(),
-                node: node.clone(),
-                methods,
-                verify,
-                parallelism,
-                on_overflow: overflow_of(&spec),
-                idem_header: idem_header(&spec),
-                respond_sync: spec.get("respond").and_then(Value::as_str) == Some("sync"),
-                inflight: AtomicUsize::new(0),
-                rate,
-                retry_after_s,
-                low_priority,
-            },
-        ) {
-            return Err(format!(
-                "two webhook nodes bind the same path '{path}' ('{}/{}' and '{workflow}/{node}')",
-                prev.workflow, prev.node
-            ));
-        }
-    }
+    let routes = build_routes(nodes, webhooks, env, None)?;
 
     let listener =
         ::mcp::http_server::bind_tcp(&bind).map_err(|e| format!("webhooks bind {bind}: {e}"))?;
@@ -648,25 +732,53 @@ pub(crate) fn spawn_webhook_listener(
         .unwrap_or_else(|_| listen.to_string());
     let route_paths: Vec<String> = routes.keys().cloned().collect();
     let handler = Arc::new(WebhookHandler {
-        routes,
+        routes: std::sync::RwLock::new(Arc::new(routes)),
         pressure,
         callbacks,
         events_tx,
         timeout: write_timeout,
         log: log.clone(),
     });
-    ::mcp::http_server::spawn_accept_raw(listener, Arc::new(acceptor), handler, write_timeout)
-        .map_err(|e| format!("webhooks accept: {e}"))?;
+    ::mcp::http_server::spawn_accept_raw(
+        listener,
+        Arc::new(acceptor),
+        Arc::clone(&handler) as Arc<dyn ::mcp::http_server::RawHandler>,
+        write_timeout,
+    )
+    .map_err(|e| format!("webhooks accept: {e}"))?;
     log.info(
         "webhooks.listen",
         json!({"authority": listen, "bound": bound, "tls": tls_scheme, "routes": route_paths}),
     );
-    Ok(())
+    Ok(handler)
 }
 
 // ---- the loop side: idempotency + fire the run ------------------------------
 
+/// One `webhook` start node, as the route builder wants it:
+/// `(workflow, node, spec, low_priority)`.
+pub(crate) type WebhookNode = (String, String, Map<String, Value>, bool);
+
 impl crate::runtime::reactor::Runtime {
+    /// Every `webhook` start node across the armed workflows.
+    ///
+    /// One definition, used by both the startup bind and the reload rebuild —
+    /// two copies of "which nodes are routes" would drift the way the
+    /// long-lived-start lists did.
+    pub(crate) fn webhook_nodes(&self) -> Vec<WebhookNode> {
+        self.workflows
+            .values()
+            .flat_map(|wf| {
+                let low = wf.priority == crate::engine::model::Priority::Low;
+                wf.steps
+                    .values()
+                    .filter(|s| s.kind == "webhook")
+                    .map(|s| (wf.name.clone(), s.id.clone(), s.spec.clone(), low))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     /// Handle a webhook request on the single-writer loop: deduplicate durably by
     /// idempotency key, then fire the workflow's `webhook` start node.
     pub(crate) fn on_webhook_request(&mut self, req: WebhookRequest) {

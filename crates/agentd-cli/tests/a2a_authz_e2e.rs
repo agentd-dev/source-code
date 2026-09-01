@@ -485,3 +485,86 @@ fn an_unauthenticated_caller_still_reaches_the_admin_check() {
     assert!(daemon.alive(), "daemon still serving: {}", daemon.stderr());
     std::fs::remove_file(&cfg).ok();
 }
+
+/// A reload REBUILDS the principal rules — proven by revocation taking effect.
+///
+/// Principals compile into a `Resolver` at startup. Until v1.4.0 the listener
+/// held the one built at boot forever: an operator could demote a principal,
+/// reload, watch `config.reloaded` report success, and still be serving the
+/// old rules. v1.3.3 made that honest by refusing the reload; this makes it
+/// work. The demotion is the case worth testing, because a revocation that
+/// silently does not apply is the direction that costs you something.
+#[test]
+#[cfg(feature = "hot-reload")]
+fn a_reload_demotes_a_principal_and_the_revocation_takes_effect() {
+    let llm = spawn_mock_llm(&json!({"turns": [{"content": "ok"}]}));
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    // `plan.get` is a USER grant and not an AGENT one, so it is exactly the
+    // privilege a demotion is meant to remove.
+    let cfg_for = |role: &str| {
+        format!(
+            "config_version: \"1\"\n\
+             agent:\n  name: a2a-authz\n  instruction: You are a helpful test agent.\n  preflight: never\n\
+             intelligence:\n  endpoints: {llm}\n  model: mock\n\
+             store:\n  kind: memory\n\
+             a2a:\n  listen: http://127.0.0.1:{port}\n\
+             \x20 principals:\n\
+             \x20   - match: {{ bearer_ref: \"{{{{secret:AGENTD_AUTHZ_TOKEN_A}}}}\" }}\n\
+             \x20     role: {role}\n\
+             \x20   - match: {{ bearer_ref: \"{{{{secret:AGENTD_AUTHZ_TOKEN_B}}}}\" }}\n\
+             \x20     role: agent\n\
+             lifecycle:\n  run_until: drained\n\
+             observability:\n  log_level: info\n",
+            llm = llm.uri
+        )
+    };
+
+    let cfg = write_config(&cfg_for("user"));
+    let mut daemon = spawn_daemon(&cfg);
+    wait_ready(&addr);
+
+    let plan_get = || {
+        rpc_as(
+            &addr,
+            TOKEN_A,
+            1,
+            "SendMessage",
+            json!({"message": {"messageId": "m-plan", "parts": [
+                {"data": {"agentd": {"op": "plan.get"}}}]}}),
+        )
+    };
+
+    // As a user, the command is not refused for want of a grant.
+    let before = plan_get();
+    // The authorization refusal is code -32003, from whichever gate catches it
+    // first: the method-level `may(SendMessage, Some(op))` check rejects a
+    // command the role cannot run before `a2a_command` is ever reached, so
+    // matching on the inner "not granted" text would miss the real denial.
+    let refused = |r: &Value| r["error"]["code"].as_i64() == Some(-32003);
+    assert!(!refused(&before), "a user may plan.get: {before}");
+
+    // Demote A to `agent` and reload.
+    std::fs::write(&cfg, cfg_for("agent")).unwrap();
+    unsafe { libc::kill(daemon.pid() as i32, libc::SIGHUP) };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !daemon.stderr().contains("\"event\":\"config.reloaded\"") {
+        assert!(
+            Instant::now() < deadline,
+            "the daemon never reloaded:\n{}",
+            daemon.stderr()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // The revocation is live: the same bearer, the same method, now refused.
+    let after = plan_get();
+    assert!(
+        refused(&after),
+        "the demotion did not take effect — plan.get still granted: {after}"
+    );
+
+    assert!(daemon.alive(), "the daemon is still serving");
+    std::fs::remove_file(&cfg).ok();
+}

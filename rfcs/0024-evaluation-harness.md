@@ -1,6 +1,6 @@
 # RFC 0024: The agentd evaluation harness — benchmarking the runtime × its paired intelligence
 
-**Status:** Proposed (2026-07-10)
+**Status:** Implemented (`bench/`)
 **Author:** Andrii Tsok
 **Date:** 2026-07-10
 **Part of:** the quality/credibility track. agentd is an agentic **harness**; this RFC defines how we measure an `agentd × model` configuration against public agentic benchmarks, and how we prove agentd is a *good* harness. References the workflow dialect (RFC 0021), MCP client transport (RFC 0004), telemetry contract (RFC 0016), and the embedding/code-tools surface (RFC 0022).

@@ -5,7 +5,7 @@
 > loopback `http://` for dev); operator control is the `a2a.*` method family. The
 > contracts still hold — only the transport does not. See [`../docs/design/00-target-vision-pivot.md`](../docs/design/00-target-vision-pivot.md).
 
-**Status:** Proposed (agentctl control-plane track)
+**Status:** Implemented
 **Author:** Andrii Tsok
 **Date:** 2026-06-27
 **Part of:** the agentd rewrite — control-plane track (RFC 0014); extends the cloud-native contract (RFC 0011) — specifically its config-precedence, validate-at-startup, signal, and secrets-out-of-the-file rules.

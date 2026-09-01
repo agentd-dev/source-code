@@ -1,6 +1,6 @@
 # RFC 0028: The tool registry, internal tools, overrides, knowledge/search/skills
 
-**Status:** Proposed (agentd 2.0 track — implemented in phase P3, extended in P4)
+**Status:** Implemented (agentd 2.0 track, phase P3, extended in P4)
 **Author:** Andrii Tsok (drafted with Claude)
 **Date:** 2026-08-16
 **Part of:** the durable-agent design (`docs/design/01-durable-agent-plan.md` §3.7, §3.16); supersedes RFC 0005 §self-tools (`subagent.*`, `subscribe`, `resource.read`, `workflow.define/patch/run` as the self surface) and extends RFC 0022 §4 (code-registered tools, precedence).

@@ -1,6 +1,6 @@
 # RFC 0026: The agent loop, process model, contexts, budgets & lifecycle (no modes)
 
-**Status:** Proposed (agentd 2.0 track — implemented in phases P1, P3, P5)
+**Status:** Implemented (agentd 2.0 track, phases P1, P3, P5)
 **Author:** Andrii Tsok (drafted with Claude)
 **Date:** 2026-08-16
 **Part of:** the durable-agent design (`docs/design/01-durable-agent-plan.md` §3.1–3.3, §3.8, §3.13, §3.17); supersedes RFC 0008 (execution modes) and RFC 0009 §process model (nested tree); builds on RFC 0002/0003 (reactor, supervision), RFC 0007 (the ReAct turn), RFC 0025 (durable state).

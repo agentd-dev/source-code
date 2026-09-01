@@ -1,6 +1,6 @@
 # RFC 0030: Configuration schema v2
 
-**Status:** Proposed (agentd 2.0 track — implemented in phase P1; the parameter set is refined by P2–P6 as their features land)
+**Status:** Implemented (agentd 2.0 track, phase P1; the parameter set is refined by P2–P6 as their features land)
 **Author:** Andrii Tsok (drafted with Claude)
 **Date:** 2026-08-16
 **Part of:** the durable-agent design (`docs/design/01-durable-agent-plan.md` §3.12); supersedes the flag/env parameter set of RFC 0011 §2 / RFC 0017 §3 (docs/configuration.md §3); built on the config **mechanism** landed 2026-08-16 (`config::{file,yaml,paths}` — YAML/JSON, multi-file JSON-Merge-Patch, path-derived env `AGENTD_<PATH>`/`AGENT_<PATH>`/`<PATH>`, generic `--<path>` flags, hot reload).

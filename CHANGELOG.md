@@ -5,6 +5,76 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## v1.4.0 — reloads that mean it
+
+Three config paths reported a successful reload and changed nothing. Two were
+known (v1.3.3 made them refuse rather than lie); the third was found by
+classifying the whole surface, which is now the thing that stops a fourth.
+
+### Fixed
+
+- **`a2a.principals` reloads.** The rules compile into a `Resolver` the
+  listener held from startup, so a demoted principal, an edited label or a
+  rotated `bearer_ref` took effect only on restart. The bridge now holds the
+  resolver behind an `RwLock` and a reload recompiles and swaps it; requests in
+  flight keep the rules they were resolved under. A rebuild that fails keeps
+  the rules already in force rather than falling open on an empty rule set.
+
+- **Webhook routes and their auth reload.** Same shape: routes and `Verify`
+  were built once into the handler. The route table is now rebuilt on every
+  reload — deliberately unconditional, because a route's identity is spread
+  across two sections (its auth can come from `webhooks.default_auth` while the
+  node lives in `workflows[]`), and gating on either alone restores the silent
+  no-op. This is what makes a `{{secret-file:…}}` rotated by a remounted
+  Kubernetes Secret take effect, since that changes no config document at all.
+  Live per-route state — the in-flight counter and the rate-limit bucket — is
+  carried across the rebuild: resetting the counter under running requests
+  would let the parallelism gate admit past its bound, and resetting the bucket
+  would refill an exhausted allowance every time an unrelated key changed.
+
+- **`interface.origins` reloads** — the third instance, found while doing the
+  classification below rather than reported. The browser CORS allowlist was
+  moved into the listener's app state at spawn and never re-read, and it was
+  not restart-only either, so an operator removing an origin to revoke a web
+  client got a successful reload and a listener that kept granting it.
+
+- **`interface.debug` is applied in both places it lives.** It is also an
+  atomic on the observation feed (it is runtime-settable through `config.set`),
+  and a reload moved only the settings copy, so the two could disagree.
+
+### Changed
+
+- **`webhooks` is no longer restart-only as a whole**; `webhooks.listen` and
+  `webhooks.tls` are. The socket needs a restart, the rules do not. Likewise
+  `interface.enabled` and `interface.pairing` are now named restart-only —
+  arming the observation feed and the pairing flow are startup decisions.
+  `interface.enabled` refuses even though turning it *off* would work, because
+  a knob that reloads in one direction only is worse than one that refuses.
+
+### Added
+
+- **Every configuration path is classified** — `RELOADABLE_PATHS` joins
+  `RESTART_ONLY_PATHS`, and `every_config_path_is_classified` walks the
+  generated schema to prove the two cover all 142 of them. This is the forcing
+  function for the whole defect class: the failure mode is a field that is in
+  neither list, which is not "probably fine" but *unexamined*, and all three
+  defects above were exactly that. The existing reload e2e could not have
+  caught any of them, because it asserts what the reload REPORTED. Each fix
+  therefore ships with a test that asserts the **effect** — a retired webhook
+  secret returning 401, a demoted principal being refused, a revoked origin
+  losing its grant — and each was confirmed to fail without its fix.
+
+### Documented
+
+- **The RFC index had drifted from the code.** Fifteen rows still read
+  "Proposed" for work that ships (0016–0018, 0024–0031, 0033), one was
+  superseded (0015 — `--serve-mcp` now aliases `a2a.listen`, since A2A is the
+  only external channel), and RFC 0019 (horizontal scaling) had already been
+  **withdrawn** in its own file while the index still advertised it as planned.
+  agentd holds no lease and partitions no work by design; `docs/scaling.md` and
+  the removed-flag messages for `--shard`/`--claim` say so. Index and RFC
+  status lines now agree.
+
 ## v1.3.4 — the socket, the certificate, and the map
 
 ### Fixed

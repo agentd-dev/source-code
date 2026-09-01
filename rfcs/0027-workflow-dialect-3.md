@@ -1,6 +1,6 @@
 # RFC 0027: Workflow dialect 3 — durable DAGs with start nodes
 
-**Status:** Proposed (agentd 2.0 track — implemented in phase P4)
+**Status:** Implemented (agentd 2.0 track, phase P4)
 **Author:** Andrii Tsok (drafted with Claude)
 **Date:** 2026-08-16
 **Part of:** the durable-agent design (`docs/design/01-durable-agent-plan.md` §3.6, §4.3–4.4); supersedes RFC 0021 §4 (dialects 1/2: cyclic graphs, the blackboard, the twelve kinds) while keeping its reducers, human gate, and checkpoint ideas; builds on RFC 0025 (durability), RFC 0026 (loop), RFC 0028 (tools).

@@ -1,6 +1,6 @@
 # RFC 0029: A2A as the only external channel — principals, conversations, tasks, commands
 
-**Status:** Proposed (agentd 2.0 track — implemented in phase P5)
+**Status:** Implemented (agentd 2.0 track, phase P5)
 **Author:** Andrii Tsok (drafted with Claude)
 **Date:** 2026-08-16
 **Part of:** the durable-agent design (`docs/design/01-durable-agent-plan.md` §3.9, §3.15, §4.2, §4.5); supersedes RFC 0005 §served tools (the MCP peer-tool surface) and refines RFC 0020 (A2A serving) and RFC 0015 §4 (operator control stays the `a2a.*` admin family).

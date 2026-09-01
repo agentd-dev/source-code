@@ -374,6 +374,15 @@ pub struct Runtime {
     /// The live listener. Held, not used: dropping it stops serving.
     #[cfg(feature = "a2a")]
     pub(crate) a2a_listener: Option<crate::a2a::serve::Listener>,
+    /// The listener's bridge, so a reload can swap rebuilt principal rules in.
+    #[cfg(feature = "a2a")]
+    pub(crate) a2a_bridge: Option<std::sync::Arc<super::a2a_server::A2aBridge>>,
+    /// The webhook listener's handler, so a reload can swap rebuilt routes in.
+    #[cfg(feature = "a2a")]
+    pub(crate) webhook_handler: Option<std::sync::Arc<super::webhooks::WebhookHandler>>,
+    /// The listener's live CORS allowlist, so a reload can revise it.
+    #[cfg(feature = "a2a")]
+    pub(crate) a2a_origins: Option<crate::a2a::serve::OriginList>,
     /// Live per-unit activity, keyed by child node id.
     pub(crate) activity: BTreeMap<u64, super::activity::Activity>,
     /// The newest root-context reply, so a `--prompt` job can print its answer

@@ -1,6 +1,6 @@
 # RFC 0025: Durable state & store adapters
 
-**Status:** Proposed (agentd 2.0 track — implemented in phases P2–P4)
+**Status:** Implemented (agentd 2.0 track, phases P2–P4)
 **Author:** Andrii Tsok (drafted with Claude)
 **Date:** 2026-08-16
 **Part of:** the durable-agent design (`docs/design/01-durable-agent-plan.md` §3.4–3.5, §4.1, §4.4, §5); supersedes the checkpointer profile of RFC 0021 §8 as the store contract (that profile becomes the default `mcp` mapping) and the "lifetime budget" note formerly cited as "RFC 0025" (now RFC 0026 §7 / RFC 0030).

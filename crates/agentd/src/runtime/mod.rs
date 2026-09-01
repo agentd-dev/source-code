@@ -585,6 +585,12 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
         a2a_sink: None,
         #[cfg(feature = "a2a")]
         a2a_listener: None,
+        #[cfg(feature = "a2a")]
+        a2a_bridge: None,
+        #[cfg(feature = "a2a")]
+        webhook_handler: None,
+        #[cfg(feature = "a2a")]
+        a2a_origins: None,
         activity: BTreeMap::new(),
         last_root_reply: None,
         #[cfg(feature = "a2a")]
@@ -942,6 +948,8 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
                 // The listener stops the moment it is dropped, so the runtime
                 // holds it for as long as it is serving.
                 rt.a2a_listener = Some(serving.listener);
+                rt.a2a_bridge = Some(serving.bridge);
+                rt.a2a_origins = Some(serving.origins);
                 // The interface debug reads tail the live log ring. Install
                 // the ring only when debug is on, so the ordinary build keeps
                 // its zero-cost logging hot path.
@@ -974,25 +982,9 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
     // a daemon that can't serve its declared webhooks is misconfigured.
     #[cfg(feature = "a2a")]
     if rt.settings.webhooks.listen.is_some() {
-        let nodes: Vec<(
-            String,
-            String,
-            serde_json::Map<String, serde_json::Value>,
-            bool,
-        )> = rt
-            .workflows
-            .values()
-            .flat_map(|wf| {
-                let low = wf.priority == crate::engine::model::Priority::Low;
-                wf.steps
-                    .values()
-                    .filter(|s| s.kind == "webhook")
-                    .map(|s| (wf.name.clone(), s.id.clone(), s.spec.clone(), low))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
+        let nodes = rt.webhook_nodes();
         let write_timeout = rt.settings.lifecycle.drain_timeout();
-        if let Err(e) = webhooks::spawn_webhook_listener(
+        match webhooks::spawn_webhook_listener(
             &rt.settings.webhooks,
             nodes,
             rt.webhook_callbacks.clone(),
@@ -1002,11 +994,15 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
             rt.pressure.clone(),
             log.clone(),
         ) {
-            log.error(
-                "proc.exit",
-                json!({"code": crate::exit::USAGE, "err": format!("webhooks listen: {e}")}),
-            );
-            return crate::exit::USAGE;
+            // Held so a reload can rebuild the routes into the live handler.
+            Ok(h) => rt.webhook_handler = Some(h),
+            Err(e) => {
+                log.error(
+                    "proc.exit",
+                    json!({"code": crate::exit::USAGE, "err": format!("webhooks listen: {e}")}),
+                );
+                return crate::exit::USAGE;
+            }
         }
     }
     // Observability serving: the Prometheus `/metrics` surface and the

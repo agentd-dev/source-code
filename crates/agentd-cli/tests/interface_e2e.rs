@@ -1066,3 +1066,95 @@ fn an_immutable_daemon_refuses_the_model_rewriting_its_workflows() {
         "a locked daemon defined the workflow anyway:\n{log}"
     );
 }
+
+/// A reload REVISES the CORS allowlist — the third instance of the same defect.
+///
+/// `interface.origins` was captured into the listener's app state at spawn and
+/// never re-read, and it was not restart-only either: an operator who removed
+/// an origin to revoke a web client's access got `config.reloaded` success and
+/// a listener that kept granting the old origin. Found while classifying the
+/// config surface after fixing the same shape in `a2a.principals` and the
+/// webhook routes.
+///
+/// Revocation is the direction under test, for the same reason as the other
+/// two: a grant that fails to apply is an inconvenience, a revocation that
+/// fails to apply is a security hole that looks closed.
+#[test]
+#[cfg(feature = "hot-reload")]
+fn a_reload_revokes_a_web_origin_and_the_grant_stops() {
+    let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
+    fn with_origins(llm: &str, port: u16, origins: &str) -> String {
+        iface_config(llm, port, false, "").replace(
+            "interface:\n  enabled: true\n  debug: false\n",
+            &format!("interface:\n  enabled: true\n  debug: false\n  origins: [{origins}]\n"),
+        )
+    }
+    let (daemon, addr, cfg) =
+        spawn_bound(|port| with_origins(&llm.uri, port, "\"https://ui.example\""));
+
+    let preflight = |origin: &str| -> (u16, bool) {
+        let mut s = TcpStream::connect(&addr).unwrap();
+        s.write_all(format!(
+            "OPTIONS / HTTP/1.1\r\nHost: x\r\nOrigin: {origin}\r\nAccess-Control-Request-Method: POST\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        ).as_bytes()).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        let mut reader = BufReader::new(s);
+        let mut status = String::new();
+        reader.read_line(&mut status).unwrap();
+        let code = status
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0);
+        let mut granted = false;
+        loop {
+            let mut l = String::new();
+            if reader.read_line(&mut l).unwrap_or(0) == 0 || l.trim().is_empty() {
+                break;
+            }
+            if let Some((k, v)) = l.split_once(':')
+                && k.trim().eq_ignore_ascii_case("access-control-allow-origin")
+                && v.trim() == origin
+            {
+                granted = true;
+            }
+        }
+        (code, granted)
+    };
+
+    let (code, granted) = preflight("https://ui.example");
+    assert_eq!(code, 204);
+    assert!(
+        granted,
+        "the configured origin is granted before the reload"
+    );
+
+    // Revoke it: the allowlist now names a different origin entirely.
+    let port: u16 = addr.rsplit(':').next().unwrap().parse().unwrap();
+    std::fs::write(
+        &cfg,
+        with_origins(&llm.uri, port, "\"https://other.example\""),
+    )
+    .unwrap();
+    unsafe { libc::kill(daemon.child.id() as i32, libc::SIGHUP) };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let stderr = || std::fs::read_to_string(&daemon.stderr_path).unwrap_or_default();
+    while !stderr().contains("\"event\":\"config.reloaded\"") {
+        assert!(
+            Instant::now() < deadline,
+            "the daemon never reloaded:\n{}",
+            stderr()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // The revocation is live. Before the fix this still answered with the
+    // grant, because the listener held the list it was spawned with.
+    let (_, granted) = preflight("https://ui.example");
+    assert!(!granted, "the revoked origin is no longer granted");
+    // And the newly named one is.
+    let (_, granted) = preflight("https://other.example");
+    assert!(granted, "the newly allowed origin is granted");
+
+    std::fs::remove_file(&cfg).ok();
+}

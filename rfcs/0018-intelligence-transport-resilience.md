@@ -6,7 +6,7 @@
 > contracts (methods/resources/semantics) still hold — only the transport does not.
 > See [`../docs/design/00-target-vision-pivot.md`](../docs/design/00-target-vision-pivot.md).
 
-**Status:** Proposed (agentctl control-plane track)
+**Status:** Implemented
 **Author:** Andrii Tsok
 **Date:** 2026-06-27
 **Part of:** the agentd rewrite — control-plane track (RFC 0014); extends the intelligence transport & wire (RFC 0006)

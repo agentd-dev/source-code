@@ -1,6 +1,6 @@
 # RFC 0031: Endpoint Authentication — Interactive & Workload Credential Providers
 
-**Status:** Proposed
+**Status:** Implemented (behind the `oauth` / `tls` features)
 **Author:** agentd
 **Date:** 2026-08-16
 **Part of:** extends RFC 0023 (AAuth workload identity) and RFC 0012 (no local execution / secret handling); builds on RFC 0030 (config schema v2), RFC 0025 (durable state), RFC 0026 (reactor lifecycle).

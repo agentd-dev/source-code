@@ -609,3 +609,96 @@ fn at_warn_a_low_priority_route_sheds_while_normal_still_admits() {
     std::fs::remove_file(&cfg).ok();
     std::fs::remove_dir_all(&store_dir).ok();
 }
+
+/// A reload REBUILDS the webhook routes — proven by the effect, not the report.
+///
+/// This is the regression test for the defect that shipped as a refusal in
+/// v1.3.3: route auth was compiled into the listener at startup and never
+/// rebuilt, so rotating a secret and reloading reported `config.reloaded`
+/// success while the listener kept verifying against the OLD secret. A test
+/// asserting the reload *reported* the change (which is what the existing
+/// reload e2e does) passes in both worlds; only checking whether the old
+/// signature still opens the door tells them apart.
+///
+/// The secret lives in a FILE, so the rotation is a pure environment change —
+/// a Kubernetes Secret or ConfigMap being remounted, which is the shape an
+/// operator actually meets. The config document does not change at all, so
+/// this also pins the rebuild as unconditional: gating it on a document diff
+/// would restore the silent no-op for exactly this case.
+#[test]
+#[cfg(feature = "hot-reload")]
+fn a_reload_rotates_webhook_auth_and_the_old_secret_stops_working() {
+    let llm = spawn_mock_llm(&json!({"turns": [{"content": "handled"}]}));
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let secret_path = common::unique_path("hook-secret", "txt");
+    std::fs::write(&secret_path, "secret-one\n").unwrap();
+
+    let cfg = write_config(&format!(
+        "config_version: \"1\"\n\
+         agent:\n  name: rot\n  instruction: You handle webhooks.\n  preflight: never\n\
+         intelligence:\n  endpoints: {llm}\n  model: mock\n\
+         store:\n  kind: memory\n\
+         webhooks:\n  listen: http://127.0.0.1:{port}\n\
+         workflows:\n  - name: on-hook\n    steps:\n\
+         \x20     h: {{kind: webhook, path: /hooks/rot, methods: [POST], auth: {{hmac: {{secret: \"{{{{secret-file:{secret_path}}}}}\"}}}}}}\n\
+         \x20     f: {{kind: finish, depends_on: [h]}}\n\
+         lifecycle:\n  run_until: drained\n\
+         observability:\n  log_level: info\n",
+        llm = llm.uri
+    ));
+    let daemon = spawn_daemon(&cfg, &[]);
+    wait_ready(&addr);
+
+    let body = r#"{"n":1}"#;
+
+    // Before: the mounted secret opens the door.
+    let (code, _) = post(
+        &addr,
+        "/hooks/rot",
+        &[
+            ("X-Signature", &sign("secret-one", body)),
+            ("Idempotency-Key", "r-1"),
+        ],
+        body,
+    );
+    assert_eq!(code, 202, "the original secret is accepted");
+
+    // Rotate the mounted secret and reload. The config DOCUMENT is untouched.
+    std::fs::write(&secret_path, "secret-two\n").unwrap();
+    unsafe { libc::kill(daemon.child.id() as i32, libc::SIGHUP) };
+    assert!(
+        wait_for(|| !daemon.events("config.reloaded").is_empty(), 10),
+        "the daemon reloaded:\n{}",
+        daemon.stderr()
+    );
+
+    // The assertion that fails without the rebuild: the OLD signature is now
+    // rejected. Before this change it returned 202 — a rotated credential that
+    // never took effect, with a successful reload logged over it.
+    let (code, _) = post(
+        &addr,
+        "/hooks/rot",
+        &[
+            ("X-Signature", &sign("secret-one", body)),
+            ("Idempotency-Key", "r-2"),
+        ],
+        body,
+    );
+    assert_eq!(code, 401, "the retired secret no longer verifies");
+
+    // And the new one works.
+    let (code, _) = post(
+        &addr,
+        "/hooks/rot",
+        &[
+            ("X-Signature", &sign("secret-two", body)),
+            ("Idempotency-Key", "r-3"),
+        ],
+        body,
+    );
+    assert_eq!(code, 202, "the rotated secret is accepted");
+
+    std::fs::remove_file(&cfg).ok();
+    std::fs::remove_file(&secret_path).ok();
+}

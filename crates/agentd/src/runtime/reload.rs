@@ -336,6 +336,89 @@ impl Runtime {
         {
             changed.push("limits/lifecycle/observability/memory/context");
         }
+        // Principals: rebuild the rules and swap them into the live listener.
+        //
+        // The rules compile into a `Resolver` (glob patterns, resolved bearer
+        // secrets), which is why this was restart-only until now: the listener
+        // held one built at startup. A rebuild that FAILS — an unresolvable
+        // `{{secret:…}}`, a malformed matcher — must not take the listener's
+        // working rules away, so the old resolver stays and the reload says so
+        // rather than falling open on an empty rule set.
+        #[cfg(feature = "a2a")]
+        if old.a2a.principals != new.a2a.principals
+            && let Some(bridge) = &self.a2a_bridge
+        {
+            let env = self.env.clone();
+            let envmap = move |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+            match crate::a2a::Resolver::build(&new.a2a, &envmap) {
+                Ok(r) => {
+                    bridge.set_resolver(r);
+                    changed.push("a2a.principals");
+                }
+                Err(e) => {
+                    self.log.warn(
+                        "config.reload.principals",
+                        json!({"err": e, "kept": "the principal rules in force before this reload"}),
+                    );
+                }
+            }
+        }
+        // Webhook routes: rebuild from the (already reloaded) workflows and the
+        // current `default_auth`, and install them.
+        //
+        // This runs unconditionally rather than under a `webhooks != webhooks`
+        // guard, because a route's identity is spread across TWO sections: its
+        // auth can come from `webhooks.default_auth` while the node itself
+        // lives in `workflows[]`. Gating on either alone reintroduces exactly
+        // the silent no-op this replaces. Rebuilding is cheap and carries live
+        // per-route state across.
+        #[cfg(feature = "a2a")]
+        if let Some(handler) = self.webhook_handler.clone() {
+            let nodes = self.webhook_nodes();
+            let env = self.env.clone();
+            let envmap = move |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+            match handler.reload_routes(nodes, &self.settings.webhooks, &envmap) {
+                Ok(paths) => {
+                    if old.webhooks != new.webhooks || old.workflows != new.workflows {
+                        self.log.info(
+                            "webhooks.routes",
+                            json!({"routes": paths, "reason": "reload"}),
+                        );
+                        changed.push("webhooks");
+                    }
+                }
+                // A bad route definition leaves the SERVING table in place —
+                // the listener keeps working under the rules it had.
+                Err(e) => self.log.warn(
+                    "config.reload.webhooks",
+                    json!({"err": e, "kept": "the routes in force before this reload"}),
+                ),
+            }
+        }
+        // `interface.debug` also lives as an atomic on the feed (it is
+        // runtime-settable through `config.set`), so a reload has to move BOTH
+        // or the two disagree: the settings gate would pass while the feed
+        // still filtered debug frames out.
+        #[cfg(feature = "a2a")]
+        if old.interface.debug != new.interface.debug
+            && let Some(feed) = &self.a2a_feed
+        {
+            feed.set_debug(new.interface.debug);
+            changed.push("interface.debug");
+        }
+        // The browser CORS allowlist: replaced in the live listener.
+        //
+        // `interface.origins` was neither rebuilt nor restart-only, so removing
+        // an origin to revoke a web client reported success and revoked
+        // nothing. The list has no external source to re-read, so unlike the
+        // principals and the routes it is simply swapped.
+        #[cfg(feature = "a2a")]
+        if old.interface.origins != new.interface.origins
+            && let Some(origins) = &self.a2a_origins
+        {
+            *origins.write().unwrap_or_else(|e| e.into_inner()) = new.interface.origins.clone();
+            changed.push("interface.origins");
+        }
         if changed.is_empty() {
             changed.push("nothing");
         }

@@ -5753,27 +5753,159 @@ pub const RESTART_ONLY_PATHS: &[&str] = &[
     "a2a.listen",
     "a2a.tls",
     "a2a.bearer",
-    // Principals are compiled into the `Resolver` at startup (runtime/mod.rs)
-    // and the reload never rebuilds it, so a changed principal — a new
-    // subject, an edited label, a rotated `bearer_ref` — took effect only on
-    // restart. It was NOT listed here either, which is the part that made it
-    // dangerous: the reload was APPLIED, `config.reloaded` reported success,
-    // and the resolver kept its boot snapshot. Refusing is the honest posture
-    // until the resolver is rebuilt on reload; a refusal an operator can see
-    // beats an apply that lied.
-    "a2a.principals",
-    // Same shape: the webhook routes and their `auth` are compiled into the
-    // listener at startup and never rebuilt. Rotating a route's HMAC secret
-    // through a reload reported success and kept verifying against the OLD
-    // secret — a silent security regression for anyone who relaxed their
-    // restart policy on the strength of what agentd refuses.
-    "webhooks",
+    // Arming the observation feed is a startup decision: the `SharedFeed` is
+    // built only when `interface.enabled` was true at boot, so turning the
+    // interface ON at runtime would pass every settings gate and still have no
+    // feed to publish onto. (Turning it OFF does work, because those gates are
+    // read live — but a knob that reloads in one direction only is worse than
+    // one that plainly refuses.) Pairing state is likewise built at boot and
+    // handed to the listener's `Auth`.
+    "interface.enabled",
+    "interface.pairing",
+    // The webhook listener's SOCKET, not its rules: rebinding an address or
+    // swapping a TLS identity needs a restart, while `webhooks.default_auth`
+    // and the routes themselves (which live in `workflows[].steps[]`) are
+    // rebuilt into the live handler on reload.
+    "webhooks.listen",
+    "webhooks.tls",
     "observability.otel",
     "observability.metrics_addr",
     "observability.health_file",
     "observability.events_ring",
     "observability.traceparent",
     "security",
+];
+
+/// Every configuration path that a reload APPLIES, as the counterpart to
+/// [`RESTART_ONLY_PATHS`].
+///
+/// The two lists together must cover the whole configuration surface, which
+/// [`every_config_path_is_classified`] enforces against the generated schema.
+/// That test is the point of this list: a config field that is in neither list
+/// is not "probably fine", it is **unexamined** — and three shipped defects
+/// (`a2a.principals`, the webhook routes, `interface.origins`) were all fields
+/// nobody had classified. Each reported a successful reload and changed
+/// nothing, because the value was copied into a long-lived structure at
+/// startup that the reload never rebuilt.
+///
+/// Being listed here is a claim that the running daemon honours a change to
+/// the path without a restart — either because it is read live from
+/// `self.settings`, or because `reload.rs` rebuilds what caches it. It is NOT
+/// a claim that a test proves it; the paths whose effect is proven end to end
+/// are the ones a defect was found in. When you add a config field, add it to
+/// one of the two lists, and prefer [`RESTART_ONLY_PATHS`] when unsure: a
+/// refusal an operator can see beats an apply that lied.
+pub const RELOADABLE_PATHS: &[&str] = &[
+    "a2a.conversation_ttl",
+    "a2a.peers",
+    "a2a.principals",
+    "a2a.push",
+    "agent.approval",
+    "agent.ask_human_fallback",
+    "agent.conversation_budget",
+    "agent.instruction",
+    "agent.max_parallel_turns",
+    "agent.on_workflow_finished",
+    "agent.preflight",
+    "agent.prompt",
+    "agent.tools",
+    "agent.wake_on",
+    "context.compact_at",
+    "context.keep_last",
+    "context.model_window",
+    "context.plan",
+    "context.summarize",
+    "context.template",
+    "context.templates",
+    "goal.check",
+    "goal.on_achieved",
+    "goal.on_stuck",
+    "goal.statement",
+    "goal.stuck_after",
+    "identity.autonomous_as",
+    "identity.labels",
+    "intelligence.auth",
+    "intelligence.budget",
+    "intelligence.default",
+    "intelligence.dialect",
+    "intelligence.endpoints",
+    "intelligence.headers",
+    "intelligence.model",
+    "intelligence.models",
+    "intelligence.preflight_model",
+    "intelligence.pricing",
+    "intelligence.structured_output",
+    "intelligence.swap_policy",
+    "intelligence.timeout",
+    "intelligence.token",
+    "intelligence.token_file",
+    "interface.debug",
+    "interface.display",
+    "interface.origins",
+    "knowledge.auto_context",
+    "knowledge.server",
+    "lifecycle.idle_grace",
+    "lifecycle.until_signal",
+    "limits.inline_max_bytes",
+    "limits.max_message_depth",
+    "limits.max_runs",
+    "limits.run",
+    "limits.step_timeout",
+    "limits.subagents",
+    "limits.workflow",
+    "mcp.default_timeout",
+    "mcp.servers",
+    "memory.list_default_limit",
+    "memory.max_value_bytes",
+    "observability.audit",
+    "observability.log_content",
+    "observability.log_level",
+    "observability.report_file",
+    "observability.runtime_events",
+    "search.server",
+    "services",
+    "skills.dir",
+    "skills.max_bytes",
+    "skills.max_loaded",
+    "skills.reference_prefix",
+    "skills.sources",
+    "store.audit",
+    "store.checkpoint",
+    "store.durability",
+    "store.on_error",
+    "store.retention",
+    "store.timeout",
+    "streams",
+    "subagents.allow_freeform",
+    "subagents.defaults",
+    "subagents.templates",
+    "tools.disabled",
+    "tools.overrides",
+    "vars",
+    "webhooks.default_auth",
+    "workflows.allow_private",
+    "workflows.armed",
+    "workflows.concurrency",
+    "workflows.description",
+    "workflows.dir",
+    "workflows.durable",
+    "workflows.file",
+    "workflows.glob",
+    "workflows.headers",
+    "workflows.inputs",
+    "workflows.key",
+    "workflows.limits",
+    "workflows.name",
+    "workflows.outputs",
+    "workflows.priority",
+    "workflows.state",
+    "workflows.steps",
+    "workflows.timeout",
+    "workflows.tool",
+    "workflows.unload",
+    "workflows.uri",
+    "workflows.url",
+    "workflows.version",
 ];
 
 /// The restart-only paths whose values differ between two effective documents.
@@ -6468,15 +6600,108 @@ mod tests {
         assert!(expand_env_str("${bad-name}", &env).is_err());
     }
 
-    /// The two paths that used to report a SUCCESSFUL reload and do nothing.
+    /// **Every configuration path is classified: restart-only, or reloadable.**
     ///
-    /// Neither is rebuilt by `reload.rs` — principals are compiled into the
-    /// `Resolver` at startup, webhook routes and their auth into the listener —
-    /// and neither was listed restart-only, so a change was applied in name
-    /// only. Rotating a route's HMAC secret through a reload kept verifying
-    /// against the OLD secret while `config.reloaded` said success.
+    /// This is the forcing function for the defect class that produced
+    /// v1.3.3, v1.3.4 and v1.4.0: a config field whose value is captured into
+    /// a long-lived structure at startup, which the reload never rebuilds and
+    /// which nobody listed as restart-only either. The reload reports success;
+    /// the daemon keeps its boot snapshot. `a2a.principals`, the webhook
+    /// routes and `interface.origins` were all of exactly this shape, and the
+    /// existing reload test could not see any of them, because it asserts what
+    /// the reload REPORTED rather than what it did.
+    ///
+    /// What this proves is narrow and worth stating plainly: that a decision
+    /// was RECORDED for every path, not that the decision is correct. Proving
+    /// the effect needs an e2e per path (there are three, one per defect
+    /// found). What it buys is that the next field cannot be added without
+    /// someone answering the question — which is the step that was skipped
+    /// each of the three times.
+    ///
+    /// The surface comes from the generated schema rather than a hand-written
+    /// list, so it tracks the structs: `schema_matches_struct_for_collection_item_types`
+    /// already pins the schema to the loader.
     #[test]
-    fn principals_and_webhooks_refuse_a_reload_rather_than_no_op() {
+    fn every_config_path_is_classified() {
+        let schema: Value = schema::schema();
+        let defs = &schema["$defs"];
+
+        // `section` for a leaf/opaque section, `section.field` where the
+        // section has a struct behind it — the granularity the two lists use.
+        let mut paths: Vec<String> = Vec::new();
+        for (section, node) in schema["properties"]
+            .as_object()
+            .expect("the schema has properties")
+        {
+            let target = node
+                .get("$ref")
+                .or_else(|| node.get("items").and_then(|i| i.get("$ref")))
+                .and_then(Value::as_str)
+                .and_then(|r| r.rsplit('/').next())
+                .and_then(|name| defs.get(name))
+                .unwrap_or(node);
+            match target.get("properties").and_then(Value::as_object) {
+                Some(fields) if !fields.is_empty() => {
+                    paths.extend(fields.keys().map(|f| format!("{section}.{f}")));
+                }
+                _ => paths.push(section.clone()),
+            }
+        }
+        assert!(
+            paths.len() > 100,
+            "the schema walk found only {} paths — it stopped resolving $refs",
+            paths.len()
+        );
+
+        let covered = |p: &str, list: &[&str]| {
+            list.iter()
+                .any(|e| p == *e || p.starts_with(&format!("{e}.")))
+        };
+        let unclassified: Vec<&String> = paths
+            .iter()
+            .filter(|p| !covered(p, RESTART_ONLY_PATHS) && !covered(p, RELOADABLE_PATHS))
+            .collect();
+        assert!(
+            unclassified.is_empty(),
+            "these config paths are in neither RESTART_ONLY_PATHS nor \
+             RELOADABLE_PATHS, so nobody has said whether a reload applies them \
+             — add each to one list (prefer restart-only when unsure): {unclassified:#?}"
+        );
+
+        // And the reverse: a path listed as BOTH is a contradiction, and a
+        // stale entry in either list (a field that was renamed or removed)
+        // silently weakens the check above.
+        let both: Vec<&&str> = RELOADABLE_PATHS
+            .iter()
+            .filter(|p| covered(p, RESTART_ONLY_PATHS))
+            .collect();
+        assert!(both.is_empty(), "classified as both: {both:?}");
+        let stale: Vec<&&str> = RELOADABLE_PATHS
+            .iter()
+            .filter(|e| {
+                !paths
+                    .iter()
+                    .any(|p| p == *e || p.starts_with(&format!("{e}.")))
+            })
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "RELOADABLE_PATHS names paths the schema does not have — renamed or \
+             removed fields leave the coverage check weaker than it looks: {stale:?}"
+        );
+    }
+
+    /// The two paths that once reported a SUCCESSFUL reload and did nothing,
+    /// were then made restart-only (v1.3.3), and now genuinely reload.
+    ///
+    /// What stays restart-only is the SOCKET, not the rules: rebinding an
+    /// address or swapping a TLS identity still needs a restart. The rules —
+    /// principal matchers, `default_auth`, the routes themselves — are rebuilt
+    /// into the live listener. That the rebuild actually TAKES EFFECT is not
+    /// provable here (this function only compares documents); the e2e
+    /// `a_reload_rebuilds_principals_and_webhook_routes` proves the effect.
+    #[test]
+    fn principal_and_webhook_rules_reload_while_their_sockets_stay_restart_only() {
         let base = json!({
             "a2a": {"listen": "http://127.0.0.1:1", "principals": [
                 {"match": {"any": true}, "role": "user", "labels": {"team": "alpha"}}]},
@@ -6485,18 +6710,34 @@ mod tests {
             "agent": {"instruction": "before"},
         });
 
-        // A principal label edit: refused, and the refusal NAMES the path.
+        // A principal label edit reloads.
         let mut changed = base.clone();
         changed["a2a"]["principals"][0]["labels"]["team"] = json!("bravo");
-        assert_eq!(restart_only_diff(&base, &changed), ["a2a.principals"]);
+        assert!(
+            restart_only_diff(&base, &changed).is_empty(),
+            "principal rules are rebuilt into the live resolver"
+        );
 
-        // A rotated webhook secret: likewise.
+        // A rotated webhook secret reloads — the case that was a silent
+        // security regression before any of this.
         let mut rotated = base.clone();
         rotated["webhooks"]["default_auth"]["hmac"]["secret"] = json!("{{secret:S2}}");
-        assert_eq!(restart_only_diff(&base, &rotated), ["webhooks"]);
+        assert!(
+            restart_only_diff(&base, &rotated).is_empty(),
+            "webhook auth is rebuilt into the live handler"
+        );
 
-        // And the reloadable half still reloads — this must not become a
-        // blanket "restart on anything", which would defeat hot reload.
+        // But moving the listener itself still demands a restart: the socket
+        // is bound once, and a reload cannot rebind it.
+        let mut moved = base.clone();
+        moved["webhooks"]["listen"] = json!("http://127.0.0.1:3");
+        assert_eq!(restart_only_diff(&base, &moved), ["webhooks.listen"]);
+
+        let mut retls = base.clone();
+        retls["webhooks"]["tls"] = json!({"cert": "/c.pem", "key": "/k.pem"});
+        assert_eq!(restart_only_diff(&base, &retls), ["webhooks.tls"]);
+
+        // And the ordinary reloadable half still reloads.
         let mut instr = base.clone();
         instr["agent"]["instruction"] = json!("after");
         assert!(restart_only_diff(&base, &instr).is_empty());

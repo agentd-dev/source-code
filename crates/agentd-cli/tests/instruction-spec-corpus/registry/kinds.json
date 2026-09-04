@@ -48,7 +48,7 @@
       ],
       "structural": ["when", "include"],
       "sub_blocks": {
-        "$comment": "OPEN — enumerated in agentd RFC 0039 §1 as blocks valid only inside a parent, but not yet carried into SPEC.md §4. Listed here so the gap is visible, not to settle it.",
+        "$comment": "Valid only inside their parent, unsigiled, disposition inherited from the parent. Names are parent-scoped and EXEMPT from the per-kind uniqueness of SPEC.md §3.2 rule 9 — so they have no document-level identity and MUST NOT be @ref'd. Now carried into SPEC.md §4; the value is the required parent kind.",
         "case": "test",
         "signature": "function",
         "schema": "ui",

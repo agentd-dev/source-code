@@ -1,6 +1,6 @@
 [package]
 name = "agentd-core"
-version = "1.6.0"
+version = "1.7.0"
 edition = "2024"
 rust-version = "1.96"
 description = "Minimal, MCP-native agent runtime as a library: the agentic loop, supervisor, workflows, and code-registered tools (the agentd engine)"

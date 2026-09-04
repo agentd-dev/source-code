@@ -5,6 +5,47 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## v1.7.0 — the instruction document as an open spec
+
+The instruction-document surface (RFC 0034's `:::` directives) is now the
+reference implementation of an open specification —
+[the Instruction Document Specification](https://github.com/instruction-md/specification),
+owned by instruction.md, CC-BY-4.0 spec text with an Apache-2.0 conformance
+corpus. agentd runs that corpus in CI and its RFCs cite the spec as normative:
+where they differ, the spec governs.
+
+### Added
+
+- **RFC 0039** (Draft) — dialect 2 of the instruction document: semantic
+  nesting by fence length, block identity with `@refs`, 23 block kinds in seven
+  families, and a **trust ladder** gating each family behind an explicit
+  operator grant (fail-closed, restart-only), because a document that can
+  execute code is a supply-chain surface. Design rationale and implementation
+  record; the published spec is the normative text.
+
+- **The conformance corpus**, vendored and run against the real binary
+  (`instruction_spec_corpus.rs`). It pins dialect-1 behaviour as executable
+  contract — a change that fails a fixture is a spec change, not a refactor —
+  and asserts the spec's per-version registry equals the parser's own closed
+  set (`known_kinds()`), so the registry cannot drift from the code it
+  describes without CI noticing. A conformance run **names the binary** it was
+  made against and refuses to report per-fixture results for one that predates
+  directive extraction; the upstream drift check **fails** on an explicitly
+  configured but missing spec repo, and only skips when unconfigured.
+
+### Fixed
+
+- **A dialect-2 document was silently swallowed as prose.** `open_fence`
+  requires an alphanumeric after the colons, so a `:::!workflow` machinery
+  fence fell through to the prose accumulator and its configuration vanished
+  with no diagnostic — verified against 1.6.0: clean validation, zero
+  registrations. `extract()` now refuses any `:::!` fence and any front-matter
+  `spec:` of major version ≥ 2, naming the dialect-1 rewrite. The refusal keys
+  on evidence of a newer dialect, not on front matter's mere presence, so plain
+  prose files and dialect-1 documents are untouched. This is the forward-compat
+  guard that lets an older agentd fail loudly rather than mis-load a document
+  written for a newer one.
+
 ## v1.6.0 — a write you cannot read back is refused
 
 ### Added

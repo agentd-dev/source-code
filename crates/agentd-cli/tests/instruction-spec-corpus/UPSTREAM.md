@@ -1,13 +1,8 @@
 # Vendored from the Instruction Document Spec repo
 
-Upstream: `/root/instruction-md/spec` (local-first by the licensor's choice;
-public URL to follow) — vendored at commit `aa55b36` (history rewritten twice;
-`b547d404` and `a4a46f1` no longer exist — this file keys on content, the
-drift check always did). Upstream is uniformly author-, committer- and
-in-document-dated 2026-07-18 at the licensor's instruction. One ordering fact,
-recorded once in both sessions' logs and here: the spec cites agentd RFC 0034
-(dated 2026-08-23) and RFC 0039 (2026-09-04) as its sources and carries an
-earlier date than both; agentd's RFC dates are original and unchanged.
+Upstream: **https://github.com/instruction-md/spec** (published `main`, tip `f1f800d`; the org's `instruction-md/source-code` stays private — this repo is the open split). Vendored at `f1f800d`; history was rewritten several times pre-publication so hashes are unstable — this file and the drift check key on CONTENT, never the id. Raw base: https://raw.githubusercontent.com/instruction-md/spec/main/ .
+
+License provenance: the repo's root `LICENSE` is CC-BY-4.0 (spec text) and is what GitHub's repo badge reports; the conformance corpus vendored here is Apache-2.0, stated in `https://github.com/instruction-md/spec/blob/main/conformance/LICENSE` — cite that file, not the repo badge, for the corpus's license.
 
 - `core/*.instruction.md` — verbatim upstream fixtures.
 - `core/*.expected.json` — DERIVED locally from upstream's `*.expected.yaml`

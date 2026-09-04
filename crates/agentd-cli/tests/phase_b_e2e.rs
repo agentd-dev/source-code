@@ -53,7 +53,7 @@ fn a_sync_instance_resolves_the_spawn_with_its_workflows_first_result() {
         \x20   room:\n\
         \x20     instruction: |\n\
         \x20       The room.\n\
-        \x20       :::workflow\n\
+        \x20       :::!workflow\n\
         \x20       name: on-ping\n\
         \x20       version: 3\n\
         \x20       steps:\n\
@@ -104,10 +104,10 @@ fn a_mirrored_child_stream_lands_in_the_parents_stream() {
         \x20   desk:\n\
         \x20     instruction: |\n\
         \x20       The desk.\n\
-        \x20       :::stream{{name=orders}}\n\
+        \x20       :::!stream{{name=orders}}\n\
         \x20       retention: {{ max_events: 100 }}\n\
         \x20       :::\n\
-        \x20       :::workflow\n\
+        \x20       :::!workflow\n\
         \x20       name: on-add\n\
         \x20       version: 3\n\
         \x20       steps:\n\

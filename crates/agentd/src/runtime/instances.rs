@@ -272,7 +272,7 @@ impl Runtime {
             .or_insert_with(|| json!({}));
         agent["name"] = json!(format!("{}/{}", self.instance, t.name));
         agent["instruction"] = json!(prose);
-        // Machinery workflows join whatever a `:::config` block declared.
+        // Machinery workflows join whatever a `:::!config` block declared.
         let mut wfs = t.workflows.clone();
         for w in &mut wfs {
             fold_params_value(w, params);

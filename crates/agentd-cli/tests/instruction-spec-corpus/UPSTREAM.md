@@ -37,3 +37,14 @@ on the dev host was 2.2.0 (2026-08-18) — from the pre-1.x numbering, before
 extraction landed in the tree (2026-08-23) — which is why it fails every
 directive fixture for one reason. "The corpus is the arbiter" only holds when
 the arbiter's verdict names the thing it judged.
+
+
+## Sigiled-only migration (agentd leads)
+
+agentd now implements the SINGLE sigiled dialect as the only instruction format
+(the operator's decision: no legacy variant, breaking changes fine pre-1.0).
+This vendored corpus has been re-authored for it — machinery carries `!`, an
+unknown BARE name is inert prose, an unknown `:::!` is refused, and nesting
+recurses (see fixture 012). The published upstream corpus still encodes the
+two-dialect form; the byte drift check is `#[ignore]`d until the spec owner
+republishes the corpus for the sigiled-only format. Re-enable it then.

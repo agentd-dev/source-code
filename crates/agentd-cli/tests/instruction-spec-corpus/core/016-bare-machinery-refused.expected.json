@@ -1,7 +1,8 @@
 {
  "spec": "1",
  "errors": [
-  "duplicate workflow/dup"
+  "shadows a machinery name",
+  ":::!workflow"
  ],
  "registers": {},
  "valid": false

@@ -1,7 +1,7 @@
 {
  "spec": "1",
  "errors": [
-  "needs a name"
+  "mcp needs a name"
  ],
  "registers": {},
  "valid": false

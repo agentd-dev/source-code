@@ -204,12 +204,12 @@ pub struct Agent {
     /// the whole job — `agentd --prompt "…" --intelligence …` runs it once and
     /// exits with the answer on stdout.
     pub prompt: Option<String>,
-    /// Skills defined by `:::skill` directives in the instruction — DERIVED
+    /// Skills defined by `:::!skill` directives in the instruction — DERIVED
     /// (never a config key): `Settings::from_document` extracts them, the
     /// runtime feeds them to the catalogue. In the struct so a reload diff
     /// sees an edited inline skill as an agent change.
     #[serde(skip)]
-    pub inline_skills: Vec<crate::config::directives::InlineSkill>,
+    pub inline_skills: Vec<crate::config::idoc::InlineSkill>,
     pub preflight: Preflight,
     pub wake_on: Option<Vec<WakeEvent>>,
     pub on_workflow_finished: OnWorkflowFinished,
@@ -319,24 +319,6 @@ impl Agent {
 /// `scheme://…` with no whitespace, and a scheme that is not a bare `http(s)`
 /// URL to a web page… — any `<alpha><alnum+.->://` single token counts; the
 /// registry decides which server serves it.
-/// Whether an instruction document is dialect 2 (the current spec version):
-/// it declares `spec: 2` in leading YAML front matter, or carries a `:::!`
-/// machinery sigil. Everything else — bare `:::` blocks, no front matter — is
-/// read by the legacy dialect-1 extractor.
-pub fn is_dialect_2(instr: &str) -> bool {
-    if instr.lines().any(|l| l.trim_start().starts_with(":::!")) {
-        return true;
-    }
-    if let Some(rest) = instr.strip_prefix("---\n")
-        && let Some(end) = rest.find("\n---")
-    {
-        return rest[..end]
-            .lines()
-            .any(|l| l.trim_start().starts_with("spec:") && l.contains('2'));
-    }
-    false
-}
-
 pub fn looks_like_resource_uri(s: &str) -> bool {
     let t = s.trim();
     if t.contains(char::is_whitespace) {
@@ -1661,8 +1643,8 @@ pub struct Subagents {
     pub defaults: SubagentDefaults,
     /// Named, operator-authored definitions. A template whose `instruction`
     /// carries no config-defining directives spawns a flat worker; one that
-    /// defines machinery (`:::workflow`/`:::mcp`/`:::stream`/`:::config`/
-    /// `:::tools`) spawns an instance-tier child. The tier follows from the
+    /// defines machinery (`:::!workflow`/`:::!mcp`/`:::!stream`/`:::!config`/
+    /// `:::!tools`) spawns an instance-tier child. The tier follows from the
     /// text, so it is never declared twice and cannot disagree with itself.
     pub templates: BTreeMap<String, SubagentTemplate>,
 }
@@ -2607,15 +2589,14 @@ impl Settings {
         }
         // Colon-fence directives in the instruction (operator-authored text —
         // this is the ONLY surface extraction runs on; conversation text is
-        // never parsed). `:::workflow` bodies join `workflows:` exactly as
+        // never parsed). `:::!workflow` bodies join `workflows:` exactly as
         // inline entries — same folding, validation, hashing, retirement —
         // and the model reads the CLEANED text, where each block became a
         // one-line note instead of machinery it might paraphrase. Extraction
         // runs BEFORE deserialization because the config-defining blocks
-        // (`:::config`/`:::mcp`/`:::stream`/`:::tools`) contribute a fragment
+        // (`:::!config`/`:::!mcp`/`:::!stream`/`:::!tools`) contribute a fragment
         // that merges UNDER the explicit document — an instruction file alone
         // can define the whole agent, and an explicit key still wins.
-        let mut extraction = None;
         let mut idoc_extraction: Option<crate::config::idoc::Extraction> = None;
         if let Some(instr) = doc
             .get("agent")
@@ -2625,107 +2606,58 @@ impl Settings {
             && !looks_like_resource_uri(&instr)
             && instr.lines().any(|l| l.starts_with(":::"))
         {
-            // Dialect 2 (the current spec version) is chosen when the document
-            // declares `spec: 2` in front matter or carries a `:::!` machinery
-            // sigil. Everything else is the legacy dialect-1 reader. The grants
-            // are read from the raw document before it is deserialized.
-            if is_dialect_2(&instr) {
-                let granted: std::collections::BTreeSet<String> = doc
-                    .get("agent")
-                    .and_then(|a| a.get("document_capabilities"))
-                    .and_then(Value::as_array)
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(Value::as_str)
-                            .map(str::to_string)
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let parsed = crate::config::idoc::parse(&instr)
-                    .and_then(|d| crate::config::idoc::fold(&d, &granted).map(|e| (d, e)));
-                match parsed {
-                    Ok((_d, ex)) => {
-                        if let Some(a) = doc.get_mut("agent").and_then(Value::as_object_mut) {
-                            a.insert("instruction".into(), Value::String(ex.cleaned.clone()));
-                        }
-                        // Splice held root-level structures (workflows[]) and
-                        // fold the rest of the fragment under the document.
-                        let mut fragment = ex.config.clone();
-                        let held_workflows = fragment
-                            .remove("_workflows_hold")
-                            .and_then(|h| h.get("list").and_then(Value::as_array).cloned())
-                            .unwrap_or_default();
-                        fragment.remove("_endpoints_hold");
-                        if let Some(o) = doc.as_object_mut() {
-                            crate::config::directives::merge_missing(o, fragment, false);
-                            if !held_workflows.is_empty()
-                                && let Some(w) = o
-                                    .entry("workflows")
-                                    .or_insert_with(|| Value::Array(Vec::new()))
-                                    .as_array_mut()
-                            {
-                                w.extend(held_workflows);
-                            }
-                        }
-                        idoc_extraction = Some(ex);
+            // The instruction is an Instruction Document — the single dialect,
+            // and the ONLY surface extraction runs on (conversation text is
+            // never parsed). Machinery blocks (`:::!workflow`, `:::!mcp`, …)
+            // fold into configuration; prose (`:::note`, `:::must`, …) degrades
+            // into what the model reads; the extended families are gated by
+            // `agent.document_capabilities`, read raw here before the document
+            // is deserialized. The fragment merges UNDER the document, so an
+            // explicit config key still wins.
+            let granted: std::collections::BTreeSet<String> = doc
+                .get("agent")
+                .and_then(|a| a.get("document_capabilities"))
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            match crate::config::idoc::extract(&instr, &granted) {
+                Ok(ex) => {
+                    if let Some(a) = doc.get_mut("agent").and_then(Value::as_object_mut) {
+                        a.insert("instruction".into(), Value::String(ex.cleaned.clone()));
                     }
-                    Err(errs) => {
-                        return Err(format!(
-                            "{source}: agent.instruction (dialect 2):\n  {}",
-                            errs.join("\n  ")
-                        ));
-                    }
-                }
-            } else {
-                match crate::config::directives::extract(&instr) {
-                    Ok(ex) => {
-                        // (`{{config.*}}` inside a block already resolved: the doc
-                        // passed substitute_config_vars with the instruction in it.
-                        // A nameless block is refused by parse_workflow, the one
-                        // authority on that message.)
-                        if let Some(a) = doc.get_mut("agent").and_then(Value::as_object_mut) {
-                            a.insert("instruction".into(), Value::String(ex.cleaned.clone()));
-                        }
-                        if let (Some(o), Value::Object(fragment)) =
-                            (doc.as_object_mut(), ex.config.clone())
+                    if let Some(o) = doc.as_object_mut() {
+                        crate::config::idoc::merge_missing(o, ex.config.clone());
+                        if !ex.workflows.is_empty()
+                            && let Some(w) = o
+                                .entry("workflows")
+                                .or_insert_with(|| Value::Array(Vec::new()))
+                                .as_array_mut()
                         {
-                            crate::config::directives::merge_missing(o, fragment, false);
+                            w.extend(ex.workflows.clone());
                         }
-                        extraction = Some(ex);
                     }
-                    Err(errs) => {
-                        return Err(format!(
-                            "{source}: agent.instruction directives:
-  {}",
-                            errs.join(
-                                "
-  "
-                            )
-                        ));
-                    }
+                    idoc_extraction = Some(ex);
+                }
+                Err(errs) => {
+                    return Err(format!(
+                        "{source}: agent.instruction:\n  {}",
+                        errs.join("\n  ")
+                    ));
                 }
             }
         }
         let mut settings: Settings =
             serde_json::from_value(doc).map_err(|e| format!("{source} parse error: {e}"))?;
-        if let Some(ex) = extraction {
-            settings.agent.inline_skills = ex.skills;
-            settings.workflows.extend(ex.workflows);
-        }
-        // Dialect-2 extraction: workflows were spliced into the document before
-        // deserialization, so they are already in `settings`; carry the skills
-        // and the extended-family declarations across.
+        // Workflows were spliced into the document before deserialization, so
+        // they are already in `settings`; carry the skills and the extended-
+        // family declarations across.
         if let Some(ex) = idoc_extraction {
-            settings.agent.inline_skills = ex
-                .skills
-                .into_iter()
-                .map(|s| crate::config::directives::InlineSkill {
-                    name: s.name,
-                    description: s.description,
-                    when_to_use: s.when_to_use,
-                    body: s.body,
-                })
-                .collect();
+            settings.agent.inline_skills = ex.skills;
             settings.agent.document_declarations = ex.declarations;
         }
         Ok(settings)
@@ -3506,7 +3438,7 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
     // it, and re-running it is already the recovery story.
     //
     // "Explicit" has to mean any layer INCLUDING an instruction directive. A
-    // `:::config` fragment declaring `store: {kind: memory}` is folded into
+    // `:::!config` fragment declaring `store: {kind: memory}` is folded into
     // `settings` during typing and never written back into `doc`, so reading
     // the document alone judged it unstated and overrode it. That stayed hidden
     // only because `stream` was missing from the long-lived list this check
@@ -3961,14 +3893,14 @@ fn apply_instruction_sugar(doc: &mut Value) {
             .is_some_and(|s| !s.trim().is_empty())
     };
     let has_instruction = nonblank("/agent/instruction");
-    // An instruction that CARRIES a `:::workflow` directive has authored its
+    // An instruction that CARRIES a `:::!workflow` directive has authored its
     // machinery explicitly — extraction (from_document) will add it to
     // `workflows:`, so generating a sugar `main` here would bolt a model loop
     // onto a config that declared none.
     let carries_workflow = doc
         .pointer("/agent/instruction")
         .and_then(Value::as_str)
-        .is_some_and(|t| t.lines().any(|l| l.starts_with(":::workflow")));
+        .is_some_and(|t| t.lines().any(|l| l.starts_with(":::!workflow")));
     // A prompt runs as a root turn, so an instruction+prompt pair needs no
     // sugar workflow at all — the prompt IS the job.
     if has_workflows || carries_workflow || !has_instruction || nonblank("/agent/prompt") {
@@ -7269,9 +7201,9 @@ mod tests {
 
     #[test]
     fn instruction_config_directives_define_the_agent_and_explicit_keys_win() {
-        let instr = ":::config\nlimits: {max_runs: 9}\n:::\n\
-                     :::stream{name=orders}\nretention: {max_events: 50}\n:::\n\
-                     :::mcp{name=fs}\nendpoint: \"https://fs.internal/mcp\"\nexclude: [\"delete_*\"]\n:::\n\
+        let instr = ":::!config\nlimits: {max_runs: 9}\n:::\n\
+                     :::!stream{name=orders}\nretention: {max_events: 50}\n:::\n\
+                     :::!mcp{name=fs}\nendpoint: \"https://fs.internal/mcp\"\nexclude: [\"delete_*\"]\n:::\n\
                      Do the work.";
         let s = Settings::from_document(
             json!({"agent": {"instruction": instr}, "limits": {"max_runs": 3}}),
@@ -7306,7 +7238,7 @@ mod tests {
         // that guards the config file — no parallel, laxer path.
         assert!(
             Settings::from_document(
-                json!({"agent": {"instruction": ":::config\nnot_a_section: 1\n:::\nx"}}),
+                json!({"agent": {"instruction": ":::!config\nnot_a_section: 1\n:::\nx"}}),
                 "t"
             )
             .is_err()

@@ -1,2 +1,2 @@
-:::skill{name=oops}
+:::!skill{name=oops}
 this fence never closes

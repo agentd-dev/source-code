@@ -1,7 +1,7 @@
 {
  "spec": "1",
  "errors": [
-  "unknown directive",
+  "unknown machinery",
   "banana"
  ],
  "registers": {},

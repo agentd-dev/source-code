@@ -272,7 +272,7 @@ impl Runtime {
             }
         }
         // Skills sources — the config section, or the instruction's inline
-        // `:::skill` definitions (they live on `agent`, but they land in this
+        // `:::!skill` definitions (they live on `agent`, but they land in this
         // catalogue).
         if old.skills != new.skills || old.agent.inline_skills != new.agent.inline_skills {
             let mut cat = crate::context::skills::Catalogue::new(

@@ -51,7 +51,7 @@ pub struct SkillSourceRef {
 pub enum SkillSourceKind {
     Prompt,
     Resource,
-    /// Defined by a `:::skill` directive in the instruction; the body lives on
+    /// Defined by a `:::!skill` directive in the instruction; the body lives on
     /// the meta — no server round trip, no server at all.
     Inline,
 }
@@ -360,10 +360,10 @@ impl Catalogue {
     }
 
     /// A cached body by hash.
-    /// Register the instruction's `:::skill` definitions. Inline skills win a
+    /// Register the instruction's `:::!skill` definitions. Inline skills win a
     /// name collision with discovered ones — the operator wrote them CLOSER to
     /// this agent than any server did.
-    pub fn add_inline(&mut self, skills: &[crate::config::directives::InlineSkill]) -> Vec<String> {
+    pub fn add_inline(&mut self, skills: &[crate::config::idoc::InlineSkill]) -> Vec<String> {
         let mut names = Vec::new();
         for sk in skills {
             self.skills.insert(
@@ -396,7 +396,7 @@ impl Catalogue {
     ///
     /// Registered as [`SkillSourceKind::Inline`] with the body already read:
     /// a skill is prose, so there is nothing to fetch later and nothing that
-    /// can fail at load time. Like `:::skill`, a local file WINS a name
+    /// can fail at load time. Like `:::!skill`, a local file WINS a name
     /// collision with a discovered one — the operator put it closer to this
     /// agent than any server did.
     pub fn add_dir(&mut self, dir: &std::path::Path) -> (Vec<String>, Vec<String>) {

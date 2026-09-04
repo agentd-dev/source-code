@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Colon-fence directives in the instruction (`:::workflow` / `:::skill`) and
+//! Colon-fence directives in the instruction (`:::!workflow` / `:::!skill`) and
 //! graceful workflow retirement, end to end: an instruction that CARRIES its
 //! workflow runs it; editing the instruction hot-swaps the definition; and a
 //! definition that leaves the config lets its live runs finish (or cancels
@@ -99,7 +99,7 @@ agent:
   instruction: |
     You watch the queue and keep things tidy.
 
-    :::workflow
+    :::!workflow
     name: embedded
     steps:
       start: {kind: once}
@@ -107,7 +107,7 @@ agent:
       done:  {kind: finish, depends_on: [make], status: completed, output: "{{steps.make.output}}"}
     :::
 
-    :::skill{name=tidy description="how to tidy"}
+    :::!skill{name=tidy description="how to tidy"}
     Always sweep before you mop.
     :::
 
@@ -155,11 +155,14 @@ observability:
 }
 
 #[test]
-fn an_unknown_directive_is_refused_at_startup_naming_the_known_set() {
+fn an_unknown_machinery_directive_is_refused_naming_the_known_set() {
+    // A typo'd MACHINERY directive (`:::!workfow`) fails closed, naming the
+    // known machinery set. (A typo'd BARE name is inert prose by design — the
+    // sigil is what marks an intent that must be recognized.)
     let cfg = common::unique_path("dir-bad", "yaml");
     std::fs::write(
         &cfg,
-        "config_version: \"1\"\nagent:\n  name: x\n  instruction: |\n    :::workfow\n    name: typo\n    :::\nstore:\n  kind: none\n",
+        "config_version: \"1\"\nagent:\n  name: x\n  instruction: |\n    :::!workfow\n    name: typo\n    :::\nstore:\n  kind: none\n",
     )
     .unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_agentd"))
@@ -170,8 +173,7 @@ fn an_unknown_directive_is_refused_at_startup_naming_the_known_set() {
     assert_eq!(out.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("unknown directive")
-            && stderr.contains("workflow, skill, context, example"),
+        stderr.contains("unknown machinery") && stderr.contains("workflow"),
         "{stderr}"
     );
     let _ = std::fs::remove_file(&cfg);
@@ -186,7 +188,7 @@ agent:
   instruction: |
     Keep ticking.
 
-    :::workflow
+    :::!workflow
     name: tick
     steps:
       s: {{kind: schedule, every: 400ms}}

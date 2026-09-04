@@ -82,6 +82,24 @@ impl Family {
     }
 }
 
+/// The full grant set — every family. Used for operator-authored surfaces that
+/// are fully trusted (a subagent template's own instruction), where the trust
+/// ladder's per-family gate does not apply.
+pub fn all_families() -> BTreeSet<String> {
+    [
+        "material",
+        "knowledge",
+        "interface",
+        "identity",
+        "compute",
+        "infra",
+        "compose",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
 /// One kind's static metadata.
 pub struct Kind {
     pub name: &'static str,
@@ -216,17 +234,35 @@ impl Block {
     }
 }
 
-/// A parsed document: front matter, and the top-level blocks and prose in order.
+/// A top-level document node, in source order: a run of prose text, or a block.
+/// Delivery walks these so the words BETWEEN blocks are preserved.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Node {
+    Text(String),
+    Block(Block),
+}
+
+/// A parsed document: front matter, and the top-level nodes (prose and blocks)
+/// in source order.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Document {
     pub front: BTreeMap<String, Value>,
-    pub blocks: Vec<Block>,
-    /// The whole source with front matter stripped, blocks still in place —
-    /// delivery/degradation happens in a later pass.
+    pub nodes: Vec<Node>,
+    /// The whole source with front matter stripped.
     pub source: String,
 }
 
-/// Parse a document to its block tree, or return every problem found.
+impl Document {
+    /// The top-level blocks, in order — a view over the block nodes.
+    pub fn blocks(&self) -> impl Iterator<Item = &Block> {
+        self.nodes.iter().filter_map(|n| match n {
+            Node::Block(b) => Some(b),
+            Node::Text(_) => None,
+        })
+    }
+}
+
+/// Parse a document to its node tree, or return every problem found.
 ///
 /// Fail-closed and specific: each error names the line and what to write
 /// instead. Nothing is half-parsed — a document with any error yields no tree.
@@ -235,16 +271,49 @@ pub fn parse(text: &str) -> Result<Document, Vec<String>> {
     let (front, body_start) = parse_front_matter(text, &mut errs);
     let body = &text[body_start..];
     let lines: Vec<&str> = body.split('\n').collect();
-    let (blocks, _) = parse_blocks(&lines, 0, 0, body_start_line(text, body_start), &mut errs);
+    let base = body_start_line(text, body_start);
 
-    // Whole-document checks that need the finished tree.
+    // Top-level walk that interleaves text runs with blocks, so delivery keeps
+    // the prose between blocks. Nested blocks live inside their parent.
+    let mut nodes: Vec<Node> = Vec::new();
+    let mut pending = String::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if let Some(of) = open_fence(lines[i]) {
+            if !pending.is_empty() {
+                nodes.push(Node::Text(std::mem::take(&mut pending)));
+            }
+            let (block, next) = parse_one(&lines, i, of, base, &mut errs);
+            if let Some(b) = block {
+                nodes.push(Node::Block(b));
+            }
+            i = next;
+        } else {
+            if !pending.is_empty() {
+                pending.push('\n');
+            }
+            pending.push_str(lines[i]);
+            i += 1;
+        }
+    }
+    if !pending.is_empty() {
+        nodes.push(Node::Text(pending));
+    }
+
+    let blocks: Vec<&Block> = nodes
+        .iter()
+        .filter_map(|n| match n {
+            Node::Block(b) => Some(b),
+            Node::Text(_) => None,
+        })
+        .collect();
     check_identity(&blocks, &mut errs);
     check_refs(&blocks, &mut errs);
 
     if errs.is_empty() {
         Ok(Document {
             front,
-            blocks,
+            nodes,
             source: body.to_string(),
         })
     } else {
@@ -254,45 +323,6 @@ pub fn parse(text: &str) -> Result<Document, Vec<String>> {
 
 fn body_start_line(text: &str, body_start: usize) -> usize {
     text[..body_start].bytes().filter(|&b| b == b'\n').count()
-}
-
-/// Recursively parse blocks from `lines[from..]`, stopping at a fence of length
-/// `< min_close` (which belongs to an enclosing block). Returns the blocks and
-/// the index one past where parsing stopped.
-fn parse_blocks(
-    lines: &[&str],
-    from: usize,
-    min_close: usize,
-    line_base: usize,
-    errs: &mut Vec<String>,
-) -> (Vec<Block>, usize) {
-    let mut blocks = Vec::new();
-    let mut i = from;
-    while i < lines.len() {
-        let line = lines[i];
-        // A closing fence for an enclosing block ends this level.
-        if let Some(len) = fence_close_len(line)
-            && min_close > 0
-            && len >= min_close
-        {
-            return (blocks, i);
-        }
-        match open_fence(line) {
-            Some(of) => {
-                let block_line = line_base + i + 1;
-                let (block, next) = parse_one(lines, i, of, line_base, errs);
-                if let Some(b) = block {
-                    blocks.push(b);
-                } else {
-                    // parse_one already recorded the error; skip its span.
-                    let _ = block_line;
-                }
-                i = next;
-            }
-            None => i += 1,
-        }
-    }
-    (blocks, i)
 }
 
 struct OpenFence {
@@ -653,7 +683,7 @@ fn parse_front_matter(text: &str, errs: &mut Vec<String>) -> (BTreeMap<String, V
 
 /// Identity: `name` unique per kind (top-level only — sub-blocks are
 /// parent-scoped and exempt).
-fn check_identity(blocks: &[Block], errs: &mut Vec<String>) {
+fn check_identity(blocks: &[&Block], errs: &mut Vec<String>) {
     let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
     for b in blocks {
         if let Some(name) = &b.name
@@ -670,7 +700,7 @@ fn check_identity(blocks: &[Block], errs: &mut Vec<String>) {
 
 /// `@kind/name` references: every one must resolve to a declared block, and the
 /// graph must be acyclic. References live in attribute values.
-fn check_refs(blocks: &[Block], errs: &mut Vec<String>) {
+fn check_refs(blocks: &[&Block], errs: &mut Vec<String>) {
     let mut ids: BTreeSet<(String, String)> = BTreeSet::new();
     for b in blocks {
         if let Some(n) = &b.name {
@@ -748,38 +778,41 @@ fn has_cycle(
 
 /// The families a document actually uses (for grant checking and reporting).
 pub fn families_used(doc: &Document) -> BTreeSet<Family> {
-    fn walk(blocks: &[Block], out: &mut BTreeSet<Family>) {
-        for b in blocks {
-            let fam = b.family();
-            if fam != Family::Default {
-                out.insert(fam);
-            }
-            walk(&b.children, out);
+    let mut out = BTreeSet::new();
+    fn recur(b: &Block, out: &mut BTreeSet<Family>) {
+        if b.family() != Family::Default {
+            out.insert(b.family());
+        }
+        for c in &b.children {
+            recur(c, out);
         }
     }
-    let mut out = BTreeSet::new();
-    walk(&doc.blocks, &mut out);
+    for b in doc.blocks() {
+        recur(b, &mut out);
+    }
     out
 }
 
 /// Refuse any block whose family is not granted by `document_capabilities`.
 /// Fail-closed: names the block, the family, and the exact grant to add.
 pub fn check_grants(doc: &Document, granted: &BTreeSet<String>, errs: &mut Vec<String>) {
-    fn walk(blocks: &[Block], granted: &BTreeSet<String>, errs: &mut Vec<String>) {
-        for b in blocks {
-            if let Some(grant) = b.family().grant()
-                && !granted.contains(grant)
-            {
-                errs.push(format!(
-                    "line {}: `:::!{}` needs the `{grant}` capability — add it to \
-                     `agent.document_capabilities`",
-                    b.line, b.kind
-                ));
-            }
-            walk(&b.children, granted, errs);
+    fn recur(b: &Block, granted: &BTreeSet<String>, errs: &mut Vec<String>) {
+        if let Some(grant) = b.family().grant()
+            && !granted.contains(grant)
+        {
+            errs.push(format!(
+                "line {}: `:::!{}` needs the `{grant}` capability — add it to \
+                 `agent.document_capabilities`",
+                b.line, b.kind
+            ));
+        }
+        for c in &b.children {
+            recur(c, granted, errs);
         }
     }
-    walk(&doc.blocks, granted, errs);
+    for b in doc.blocks() {
+        recur(b, granted, errs);
+    }
 }
 
 // ── extraction: folding blocks into configuration + delivered prose ──────────
@@ -802,9 +835,44 @@ pub struct InlineSkill {
 pub struct Extraction {
     pub cleaned: String,
     pub config: serde_json::Map<String, Value>,
+    /// Root-level `workflows[]` entries — spliced into the document array, not
+    /// folded under a section.
+    pub workflows: Vec<Value>,
     pub skills: Vec<InlineSkill>,
     pub declarations: BTreeMap<String, Vec<Value>>,
     pub families: Vec<Family>,
+}
+
+/// Parse and fold an instruction document in one step — the entry point the
+/// config loader and the subagent-template compiler call. `granted` is the
+/// operator's `document_capabilities`; the trust ladder refuses any block whose
+/// family is not in it.
+pub fn extract(text: &str, granted: &BTreeSet<String>) -> Result<Extraction, Vec<String>> {
+    let doc = parse(text)?;
+    fold(&doc, granted)
+}
+
+/// Merge a fragment UNDER a document: a key already present in `into` wins, so
+/// an explicit config key always beats what a directive contributed. Arrays of
+/// the same key concatenate (fragment first) so a document's `!mcp` servers add
+/// to, rather than replace, any `mcp.servers` written explicitly.
+pub fn merge_missing(
+    into: &mut serde_json::Map<String, Value>,
+    add: serde_json::Map<String, Value>,
+) {
+    for (k, v) in add {
+        match (into.get_mut(&k), v) {
+            (Some(Value::Object(d)), Value::Object(s)) => merge_missing(d, s),
+            (Some(Value::Array(have)), Value::Array(mut more)) => {
+                more.extend(std::mem::take(have));
+                *have = more;
+            }
+            (Some(_), _) => {}
+            (None, v) => {
+                into.insert(k, v);
+            }
+        }
+    }
 }
 
 fn frag<'a>(
@@ -880,11 +948,20 @@ pub fn fold(doc: &Document, granted: &BTreeSet<String>) -> Result<Extraction, Ve
         ..Extraction::default()
     };
 
-    // Delivery: rebuild the prose the model reads, replacing each machinery
-    // block with a one-line acknowledgement and degrading each prose block into
-    // labelled text. Walk top-level blocks in document order over the source.
-    for b in &doc.blocks {
-        fold_block(b, &mut out, &mut errs);
+    // Delivery: rebuild the text the model reads, in source order. A prose text
+    // run is emitted verbatim (it is the instruction's own words); a machinery
+    // block becomes a one-line acknowledgement; a prose block degrades into
+    // labelled text; a structural block resolves away.
+    for node in &doc.nodes {
+        match node {
+            Node::Text(t) => {
+                out.cleaned.push_str(t);
+                if !t.ends_with('\n') {
+                    out.cleaned.push('\n');
+                }
+            }
+            Node::Block(b) => fold_block(b, &mut out, &mut errs),
+        }
     }
     if errs.is_empty() { Ok(out) } else { Err(errs) }
 }
@@ -945,8 +1022,7 @@ fn fold_machinery(b: &Block, out: &mut Extraction, errs: &mut Vec<String>) {
                     .and_then(Value::as_str)
                     .unwrap_or("?")
                     .to_string();
-                push_into(&mut out.config, "_workflows_hold", "list").push(Value::Object(m));
-                // workflows is an array at the document root; collect + splice at merge.
+                out.workflows.push(Value::Object(m));
                 ack(
                     out,
                     &format!("[workflow \"{name}\" is loaded and runs autonomously]"),
@@ -1012,9 +1088,17 @@ fn fold_machinery(b: &Block, out: &mut Extraction, errs: &mut Vec<String>) {
         },
         // ── extended families: cleanly map to real config where one exists ───
         "endpoint" => {
-            // A declarative webhook listener route (RFC 0035 §5 shape).
-            if let Some(m) = body_map(b, errs) {
-                push_into(&mut out.config, "_endpoints_hold", "list").push(Value::Object(m));
+            // A declarative listener route (RFC 0035 §5 shape). Recorded as an
+            // interface declaration; wiring it into the live webhook listener
+            // is the next runtime phase.
+            if let Some(mut m) = body_map(b, errs) {
+                if let Some(n) = &b.name {
+                    m.entry("name").or_insert_with(|| Value::String(n.clone()));
+                }
+                out.declarations
+                    .entry("endpoint".into())
+                    .or_default()
+                    .push(Value::Object(m));
                 let path = b.attrs.get("path").cloned().unwrap_or_default();
                 ack(out, &format!("[endpoint {path} is served]"));
             }
@@ -1109,13 +1193,13 @@ mod tests {
     use super::*;
 
     fn kinds_of(doc: &Document) -> Vec<&str> {
-        doc.blocks.iter().map(|b| b.kind.as_str()).collect()
+        doc.blocks().map(|b| b.kind.as_str()).collect()
     }
 
     #[test]
     fn plain_prose_is_a_valid_empty_document() {
         let d = parse("just guidance, no blocks").unwrap();
-        assert!(d.blocks.is_empty());
+        assert!(d.blocks().next().is_none());
     }
 
     #[test]
@@ -1123,7 +1207,10 @@ mod tests {
         // Correct sigiled machinery parses.
         let d = parse(":::!workflow{name=w}\nsteps: {}\n:::").unwrap();
         assert_eq!(kinds_of(&d), ["workflow"]);
-        assert_eq!(d.blocks[0].disposition, Disposition::Machinery);
+        assert_eq!(
+            d.blocks().next().unwrap().disposition,
+            Disposition::Machinery
+        );
         // Bare machinery name — the forgotten-sigil trap — is refused.
         let e = parse(":::workflow{name=w}\nsteps: {}\n:::").unwrap_err();
         assert!(
@@ -1141,10 +1228,10 @@ mod tests {
     #[test]
     fn prose_is_bare_and_unknown_bare_is_inert() {
         let d = parse(":::note\nremember this\n:::").unwrap();
-        assert_eq!(d.blocks[0].disposition, Disposition::Prose);
+        assert_eq!(d.blocks().next().unwrap().disposition, Disposition::Prose);
         // Unknown bare name fails OPEN — inert prose, still parses.
         let d = parse(":::whatever\nfree text\n:::").unwrap();
-        assert_eq!(d.blocks[0].disposition, Disposition::Prose);
+        assert_eq!(d.blocks().next().unwrap().disposition, Disposition::Prose);
         // Unknown MACHINERY fails closed.
         let e = parse(":::!whatever\nx\n:::").unwrap_err();
         assert!(e[0].contains("unknown machinery"), "{e:?}");
@@ -1160,8 +1247,8 @@ mod tests {
                    :::!function{name=f}\nsig\n:::";
         let d = parse(doc).unwrap();
         assert_eq!(kinds_of(&d), ["test", "function"]);
-        assert_eq!(d.blocks[0].children.len(), 1);
-        assert_eq!(d.blocks[0].children[0].kind, "case");
+        assert_eq!(d.blocks().next().unwrap().children.len(), 1);
+        assert_eq!(d.blocks().next().unwrap().children[0].kind, "case");
     }
 
     #[test]
@@ -1175,7 +1262,7 @@ mod tests {
         let d = parse(doc).unwrap();
         assert_eq!(kinds_of(&d), ["function"]);
         assert!(
-            d.blocks[0].body.contains(":::"),
+            d.blocks().next().unwrap().body.contains(":::"),
             "the inner colons stay in the body"
         );
     }
@@ -1234,14 +1321,8 @@ mod tests {
         let doc = "You triage tickets.\n\n                   :::note\nBe brief.\n:::\n\n                   :::!workflow{name=drain}\nsteps:\n  f: {kind: finish}\n:::\n\n                   :::!mcp{name=search}\nendpoint: https://x/mcp\n:::\n\n                   :::!stream{name=tickets}\nretention: {max_events: 100}\n:::\n\n                   :::!skill{name=esc description=\"escalate\" when=\"angry\"}\nAsk a human.\n:::\n\n                   :::context{title=\"SLA\"}\n1h for enterprise.\n:::";
         let d = parse(doc).unwrap();
         let e = fold(&d, &grants(&[])).unwrap();
-        // workflow held for the root-array splice; mcp + stream folded.
-        assert_eq!(
-            e.config["_workflows_hold"]["list"]
-                .as_array()
-                .unwrap()
-                .len(),
-            1
-        );
+        // workflow lifted for the root-array splice; mcp + stream folded.
+        assert_eq!(e.workflows.len(), 1);
         assert_eq!(e.config["mcp"]["servers"].as_array().unwrap().len(), 1);
         assert!(e.config["streams"]["tickets"].is_object());
         assert_eq!(e.skills.len(), 1);

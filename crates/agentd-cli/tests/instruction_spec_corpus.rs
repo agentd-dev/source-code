@@ -20,7 +20,13 @@ fn run_case(doc_path: &Path) -> (bool, String, Value) {
     let doc = std::fs::read_to_string(doc_path).unwrap();
     let cfg = serde_json::json!({
         "config_version": "1",
-        "agent": {"name": "conf", "preflight": "never", "instruction": doc},
+        "agent": {
+            "name": "conf", "preflight": "never", "instruction": doc,
+            // The corpus exercises the PARSER; grant every family so the trust
+            // ladder never masks a parse outcome (grant enforcement has its own
+            // dedicated e2e).
+            "document_capabilities": ["material","knowledge","interface","identity","compute","infra","compose"],
+        },
         "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
         "store": {"kind": "memory"},
     });
@@ -174,18 +180,24 @@ fn the_registry_spec_1_entry_matches_the_shipped_closed_set() {
         .unwrap(),
     )
     .unwrap();
-    let v1 = &reg["versions"]["1"];
-    let mut registry_set: Vec<&str> = ["machinery", "prose", "structural"]
-        .iter()
-        .flat_map(|k| v1[*k].as_array().into_iter().flatten())
+    // agentd implements the SIGILED format, which is the published registry's
+    // version 2 (29 machinery names). The spec owner is renumbering it to the
+    // sole version 1 (the sigiled format is the first and only dialect); until
+    // that republishes, agentd compares against the registry's `2` entry — its
+    // machinery set must equal the parser's own.
+    let v2 = &reg["versions"]["2"];
+    let mut registry_machinery: Vec<&str> = v2["machinery"]
+        .as_array()
+        .into_iter()
+        .flatten()
         .filter_map(serde_json::Value::as_str)
         .collect();
-    registry_set.sort_unstable();
-    let mut known: Vec<&str> = agentd::config::directives::known_kinds().to_vec();
+    registry_machinery.sort_unstable();
+    let mut known: Vec<&str> = agentd::config::idoc::machinery_names().collect();
     known.sort_unstable();
     assert_eq!(
-        registry_set, known,
-        "the spec registry's dialect-1 closed set drifted from the parser"
+        registry_machinery, known,
+        "the spec registry's machinery set drifted from the parser"
     );
 }
 
@@ -193,7 +205,15 @@ fn the_registry_spec_1_entry_matches_the_shipped_closed_set() {
 /// fixture document and the registry must be byte-identical to upstream.
 /// Skips cleanly where upstream is absent (CI, until the repo has a URL) —
 /// the behavioural fixtures above still run there.
+// PAUSED during the sigiled-only migration. agentd's vendored corpus has been
+// re-authored for the single sigiled dialect (machinery carries `!`, unknown
+// bare is inert prose, nesting recurses), which the published upstream has not
+// yet adopted — so a byte drift check would fail on an intended divergence, not
+// a real one. Re-enable (drop the ignore) once the spec owner republishes the
+// corpus for the sigiled format. Tracked in the message to the instruction.md
+// session; the behavioural fixtures and the registry check above still run.
 #[test]
+#[ignore = "re-enable after upstream republishes the sigiled corpus"]
 fn vendored_corpus_matches_upstream_when_present() {
     // An EXPLICIT `INSTRUCTION_SPEC_REPO` that does not exist is a
     // configuration error and MUST fail — a drift check that skips when

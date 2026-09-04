@@ -1,4 +1,4 @@
-:::workflow{name=renamed}
+:::!workflow{name=renamed}
 name: original
 steps:
   s: {kind: once}

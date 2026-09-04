@@ -1,0 +1,4 @@
+# Dialect recurses: the case sub-block is real structure inside the test, and
+# the whole document loads (compute family, granted in the runner wrapper).
+spec: "1"
+valid: true

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The whole agent from ONE markdown file, through the config-defining
 //! directives: `agentd --instruction-file agent.md`, no `--config` at all.
-//! The document declares its runtime (`:::config`), an event stream
-//! (`:::stream`), and two workflows (`:::workflow`) that talk to each other
+//! The document declares its runtime (`:::!config`), an event stream
+//! (`:::!stream`), and two workflows (`:::!workflow`) that talk to each other
 //! over that stream — and the process runs them and exits clean. Also: the
 //! precedence rule, end to end — an explicit flag beats the document's
 //! fragment.
@@ -24,18 +24,18 @@ fn events(stderr: &str, name: &str) -> Vec<Value> {
 
 const AGENT_MD: &str = r#"You are the order desk. Every paid order is fulfilled.
 
-:::config
+:::!config
 store: { kind: memory }
 lifecycle: { run_until: idle, idle_grace: 900ms }
 observability: { log_level: info, log_content: true }
 limits: { max_runs: 20 }
 :::
 
-:::stream{name=orders}
+:::!stream{name=orders}
 retention: { max_events: 100 }
 :::
 
-:::workflow
+:::!workflow
 name: producer
 steps:
   s:   { kind: once, policy: always }
@@ -43,7 +43,7 @@ steps:
   f:   { kind: finish, depends_on: [pub], status: completed }
 :::
 
-:::workflow
+:::!workflow
 name: fulfil
 steps:
   take: { kind: stream, stream: orders, subject: "order.*", from: earliest }

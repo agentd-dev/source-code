@@ -29,3 +29,16 @@ absence. Expected files carry `spec:` — the dialect a fixture is written
 against; the gate SKIPS fixtures declaring a dialect this implementation does
 not speak, which is what lets dialect-2 fixtures enter the shared corpus
 without failing dialect-1 runtimes.
+
+## A conformance claim carries its binary version
+
+Both runners print the agentd version they drove, and refuse to report
+per-fixture results for a binary that does not implement directive extraction
+(it is named and the run stops). This exists because a green here and a red
+elsewhere were both once true and neither named its binary: the gate builds
+from THIS tree (extraction present); a stale machine install can be an earlier
+era's binary that predates the feature. The installed `/usr/local/bin/agentd`
+on the dev host was 2.2.0 (2026-08-18) — from the pre-1.x numbering, before
+extraction landed in the tree (2026-08-23) — which is why it fails every
+directive fixture for one reason. "The corpus is the arbiter" only holds when
+the arbiter's verdict names the thing it judged.

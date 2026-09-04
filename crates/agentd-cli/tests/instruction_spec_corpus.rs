@@ -56,6 +56,22 @@ fn run_case(doc_path: &Path) -> (bool, String, Value) {
 #[test]
 fn the_conformance_corpus_passes_against_this_binary() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/instruction-spec-corpus");
+    // Name the binary this result is made against — a conformance claim without
+    // its version is an assertion, not evidence (the lesson of the two
+    // simultaneously-true green/red reports across implementations).
+    let ver = Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .arg("--version")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    eprintln!("conformance corpus vs {ver:?}");
+    // Extraction-presence probe: a fresh build implements it, so its absence is
+    // a regression, reported as one clear line rather than every fixture failing.
+    let (pv, _, pc) = run_case(&root.join("core/001-core-happy.instruction.md"));
+    assert!(
+        pv && !pc["workflows"].as_array().is_none_or(|a| a.is_empty()),
+        "{ver} validates the probe but extracts no directives — extraction regressed"
+    );
     let mut cases = 0usize;
     let mut failures: Vec<String> = Vec::new();
     let mut dirs: Vec<_> = std::fs::read_dir(&root)

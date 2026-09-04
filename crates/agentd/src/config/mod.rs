@@ -19,6 +19,7 @@
 pub mod directives;
 pub mod envfile;
 pub mod file;
+pub mod idoc;
 pub mod paths;
 pub mod prompt;
 pub mod templates;

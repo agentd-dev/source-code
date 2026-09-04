@@ -1,0 +1,926 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//! **The Instruction Document, dialect 2** — the reference implementation of
+//! the [Instruction Document Specification](https://github.com/instruction-md/specification).
+//!
+//! One Markdown file defines the whole agent. This module is the parser and the
+//! model: it turns the document into a tree of typed blocks, classifies each by
+//! disposition (prose degrades into what the model reads; machinery folds into
+//! configuration and is stripped; structural resolves away), enforces the
+//! lexical rules (`!` marks machinery; bare names are prose; a bare name that
+//! shadows a machinery name is refused), resolves `@kind/name` references, and
+//! gates each block family behind the operator's `document_capabilities` grant.
+//!
+//! Only the current spec version (2) is implemented. A document that declares an
+//! older version, or none in a shape this dialect cannot read, is refused rather
+//! than mis-parsed — the format is dialect-2-native.
+//!
+//! What this module does NOT do is execute anything. A `!function` becomes a
+//! code-registered tool bound to a runtime *service*; a `!git` names a git MCP
+//! server; a `!runtime` names an OCI service. agentd links no language runtime,
+//! container engine, or vector store — every executing block dispatches through
+//! the service catalogue, which is what keeps the dependency moat intact.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use serde_json::Value;
+
+/// How a block reaches (or does not reach) the model at delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Disposition {
+    /// Degrades into the delivered text the model reads (`note`, `must`, …).
+    Prose,
+    /// Stripped from delivery, folded into configuration, acknowledged by one
+    /// line (`!workflow`, `!mcp`, …). Carries the `!` sigil.
+    Machinery,
+    /// Resolved away at delivery, producing neither config nor prose (`when`,
+    /// `include`).
+    Structural,
+}
+
+/// The capability family a machinery block belongs to — the unit the trust
+/// ladder grants. Prose and structural blocks have no family (always allowed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Family {
+    /// The default rung: no grant required.
+    Default,
+    Material,
+    Knowledge,
+    Interface,
+    Identity,
+    Compute,
+    Infra,
+    Compose,
+}
+
+impl Family {
+    /// The `document_capabilities` token that grants this family, or `None` for
+    /// the default rung (never needs a grant).
+    pub fn grant(self) -> Option<&'static str> {
+        match self {
+            Family::Default => None,
+            Family::Material => Some("material"),
+            Family::Knowledge => Some("knowledge"),
+            Family::Interface => Some("interface"),
+            Family::Identity => Some("identity"),
+            Family::Compute => Some("compute"),
+            Family::Infra => Some("infra"),
+            Family::Compose => Some("compose"),
+        }
+    }
+
+    pub fn from_grant(s: &str) -> Option<Family> {
+        Some(match s {
+            "material" => Family::Material,
+            "knowledge" => Family::Knowledge,
+            "interface" => Family::Interface,
+            "identity" => Family::Identity,
+            "compute" => Family::Compute,
+            "infra" => Family::Infra,
+            "compose" => Family::Compose,
+            _ => return None,
+        })
+    }
+}
+
+/// One kind's static metadata.
+pub struct Kind {
+    pub name: &'static str,
+    pub disposition: Disposition,
+    pub family: Family,
+    /// For a sub-block, the parent kind it is valid inside; `None` for a
+    /// top-level block. A sub-block has no document-level identity and is
+    /// exempt from the uniqueness rule.
+    pub sub_of: Option<&'static str>,
+}
+
+const fn k(name: &'static str, d: Disposition, f: Family) -> Kind {
+    Kind {
+        name,
+        disposition: d,
+        family: f,
+        sub_of: None,
+    }
+}
+const fn sub(name: &'static str, parent: &'static str) -> Kind {
+    // Sub-blocks inherit their parent's disposition (machinery) and need no
+    // family of their own — the parent's grant governs them.
+    Kind {
+        name,
+        disposition: Disposition::Machinery,
+        family: Family::Default,
+        sub_of: Some(parent),
+    }
+}
+
+use Disposition::{Machinery as M, Prose as P, Structural as S};
+use Family::*;
+
+/// The kind registry — the single source of truth, matching the spec's
+/// per-version registry (`conformance/registry/kinds.json`, spec version 2).
+/// The conformance corpus asserts this agrees with the published registry.
+pub const KINDS: &[Kind] = &[
+    // ── prose (bare; degrade into delivery) ──────────────────────────────
+    k("must", P, Default),
+    k("should", P, Default),
+    k("never", P, Default),
+    k("guardrail", P, Default),
+    k("note", P, Default),
+    k("info", P, Default),
+    k("tip", P, Default),
+    k("important", P, Default),
+    k("warning", P, Default),
+    k("caution", P, Default),
+    k("example", P, Default),
+    k("form", P, Default),
+    k("tool", P, Default),
+    k("context", P, Default),
+    // ── structural (bare; resolved away) ─────────────────────────────────
+    k("when", S, Default),
+    k("include", S, Default),
+    // ── machinery: default rung ──────────────────────────────────────────
+    k("workflow", M, Default),
+    k("skill", M, Default),
+    k("config", M, Default),
+    k("mcp", M, Default),
+    k("stream", M, Default),
+    k("tools", M, Default),
+    k("data", M, Default),
+    k("override", M, Default),
+    // ── machinery: material ──────────────────────────────────────────────
+    k("file", M, Material),
+    k("media", M, Material),
+    k("asset", M, Material),
+    // ── machinery: knowledge ─────────────────────────────────────────────
+    k("knowledge", M, Knowledge),
+    k("retrieval", M, Knowledge),
+    k("source", M, Knowledge),
+    // ── machinery: interface ─────────────────────────────────────────────
+    k("endpoint", M, Interface),
+    k("ui", M, Interface),
+    k("human", M, Interface),
+    k("channel", M, Interface),
+    // ── machinery: identity ──────────────────────────────────────────────
+    k("peer", M, Identity),
+    k("policy", M, Identity),
+    k("secret-ref", M, Identity),
+    // ── machinery: compute ───────────────────────────────────────────────
+    k("runtime", M, Compute),
+    k("function", M, Compute),
+    k("test", M, Compute),
+    k("fixture", M, Compute),
+    // ── machinery: infra ─────────────────────────────────────────────────
+    k("git", M, Infra),
+    k("volume", M, Infra),
+    k("image", M, Infra),
+    // ── machinery: compose ───────────────────────────────────────────────
+    k("agent", M, Compose),
+    // ── sub-blocks (valid only inside a parent) ──────────────────────────
+    sub("case", "test"),
+    sub("signature", "function"),
+    sub("schema", "ui"),
+    sub("preview", "ui"),
+];
+
+pub fn lookup(name: &str) -> Option<&'static Kind> {
+    KINDS.iter().find(|k| k.name == name)
+}
+
+/// The machinery names — reserved in the bare namespace: a bare `:::workflow`
+/// (sigil forgotten) is refused rather than silently demoted to prose.
+pub fn machinery_names() -> impl Iterator<Item = &'static str> {
+    KINDS
+        .iter()
+        .filter(|k| k.disposition == Disposition::Machinery && k.sub_of.is_none())
+        .map(|k| k.name)
+}
+
+/// A parsed block: its kind, identity, attributes, body text, and — because
+/// dialect 2 nests — its child blocks.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Block {
+    pub kind: String,
+    pub disposition: Disposition,
+    pub name: Option<String>,
+    pub attrs: BTreeMap<String, String>,
+    /// Body text with child blocks removed (they live in `children`).
+    pub body: String,
+    pub children: Vec<Block>,
+    pub line: usize,
+}
+
+impl Block {
+    pub fn family(&self) -> Family {
+        lookup(&self.kind)
+            .map(|k| k.family)
+            .unwrap_or(Family::Default)
+    }
+}
+
+/// A parsed document: front matter, and the top-level blocks and prose in order.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Document {
+    pub front: BTreeMap<String, Value>,
+    pub blocks: Vec<Block>,
+    /// The whole source with front matter stripped, blocks still in place —
+    /// delivery/degradation happens in a later pass.
+    pub source: String,
+}
+
+/// Parse a document to its block tree, or return every problem found.
+///
+/// Fail-closed and specific: each error names the line and what to write
+/// instead. Nothing is half-parsed — a document with any error yields no tree.
+pub fn parse(text: &str) -> Result<Document, Vec<String>> {
+    let mut errs = Vec::new();
+    let (front, body_start) = parse_front_matter(text, &mut errs);
+    let body = &text[body_start..];
+    let lines: Vec<&str> = body.split('\n').collect();
+    let (blocks, _) = parse_blocks(&lines, 0, 0, body_start_line(text, body_start), &mut errs);
+
+    // Whole-document checks that need the finished tree.
+    check_identity(&blocks, &mut errs);
+    check_refs(&blocks, &mut errs);
+
+    if errs.is_empty() {
+        Ok(Document {
+            front,
+            blocks,
+            source: body.to_string(),
+        })
+    } else {
+        Err(errs)
+    }
+}
+
+fn body_start_line(text: &str, body_start: usize) -> usize {
+    text[..body_start].bytes().filter(|&b| b == b'\n').count()
+}
+
+/// Recursively parse blocks from `lines[from..]`, stopping at a fence of length
+/// `< min_close` (which belongs to an enclosing block). Returns the blocks and
+/// the index one past where parsing stopped.
+fn parse_blocks(
+    lines: &[&str],
+    from: usize,
+    min_close: usize,
+    line_base: usize,
+    errs: &mut Vec<String>,
+) -> (Vec<Block>, usize) {
+    let mut blocks = Vec::new();
+    let mut i = from;
+    while i < lines.len() {
+        let line = lines[i];
+        // A closing fence for an enclosing block ends this level.
+        if let Some(len) = fence_close_len(line)
+            && min_close > 0
+            && len >= min_close
+        {
+            return (blocks, i);
+        }
+        match open_fence(line) {
+            Some(of) => {
+                let block_line = line_base + i + 1;
+                let (block, next) = parse_one(lines, i, of, line_base, errs);
+                if let Some(b) = block {
+                    blocks.push(b);
+                } else {
+                    // parse_one already recorded the error; skip its span.
+                    let _ = block_line;
+                }
+                i = next;
+            }
+            None => i += 1,
+        }
+    }
+    (blocks, i)
+}
+
+struct OpenFence {
+    len: usize,
+    sigil: bool,
+    kind: String,
+    attr_src: String,
+}
+
+fn parse_one(
+    lines: &[&str],
+    open_idx: usize,
+    of: OpenFence,
+    line_base: usize,
+    errs: &mut Vec<String>,
+) -> (Option<Block>, usize) {
+    let line_no = line_base + open_idx + 1;
+    let disposition = classify(&of, line_no, errs);
+
+    let attrs = match parse_attrs(&of.attr_src) {
+        Ok(a) => a,
+        Err(e) => {
+            errs.push(format!("line {line_no}: :::{}: {e}", of.kind));
+            BTreeMap::new()
+        }
+    };
+
+    // Find the matching close: a fence of length >= this one, alone on its line.
+    // Everything between is body; nested blocks are recursed into.
+    let (children, body_lines, close_idx, closed) =
+        collect_body(lines, open_idx + 1, of.len, line_base, errs);
+    if !closed {
+        errs.push(format!(
+            "line {line_no}: :::{} is never closed (want a line of {}+ colons)",
+            of.kind, of.len
+        ));
+    }
+
+    let disposition = match disposition {
+        Some(d) => d,
+        None => return (None, close_idx + 1), // classify recorded the error
+    };
+    let name = attrs.get("name").cloned();
+    let body = body_lines.join("\n");
+    (
+        Some(Block {
+            kind: of.kind,
+            disposition,
+            name,
+            attrs,
+            body,
+            children,
+            line: line_no,
+        }),
+        close_idx + 1,
+    )
+}
+
+/// Collect a block's body: raw lines that are not part of a nested block, plus
+/// the recursively-parsed children. `open_len` is the opening fence length; the
+/// close is the first fence of `>= open_len` colons.
+fn collect_body(
+    lines: &[&str],
+    from: usize,
+    open_len: usize,
+    line_base: usize,
+    errs: &mut Vec<String>,
+) -> (Vec<Block>, Vec<String>, usize, bool) {
+    let mut children = Vec::new();
+    let mut body = Vec::new();
+    let mut i = from;
+    let mut in_code = None::<usize>; // fenced-code suppression (``` of some length)
+    while i < lines.len() {
+        let line = lines[i];
+        // Inside a fenced code block, colon scanning is suspended (a function
+        // body or an embedded example never terminates its container).
+        if let Some(tick_len) = in_code {
+            if code_fence_len(line) == Some(tick_len) {
+                in_code = None;
+            }
+            body.push(line.to_string());
+            i += 1;
+            continue;
+        }
+        if let Some(tl) = code_fence_len(line) {
+            in_code = Some(tl);
+            body.push(line.to_string());
+            i += 1;
+            continue;
+        }
+        // A close for THIS block.
+        if let Some(len) = fence_close_len(line)
+            && len >= open_len
+            && open_fence(line).is_none()
+        {
+            return (children, body, i, true);
+        }
+        // A nested block (shorter fence) — recurse.
+        if let Some(of) = open_fence(line) {
+            let (child, next) = parse_one(lines, i, of, line_base, errs);
+            if let Some(c) = child {
+                children.push(c);
+            }
+            i = next;
+            continue;
+        }
+        body.push(line.to_string());
+        i += 1;
+    }
+    (children, body, lines.len(), false)
+}
+
+/// Classify an opened fence into a disposition, enforcing the lexical rules.
+fn classify(of: &OpenFence, line_no: usize, errs: &mut Vec<String>) -> Option<Disposition> {
+    match lookup(&of.kind) {
+        // Sub-blocks (`case`, `signature`, `schema`, `preview`) are written
+        // UNSIGILED — the parent's fence and sigil govern them, and they have no
+        // document-level identity of their own. Placement (inside the right
+        // parent) is checked in a later pass; here they simply parse bare.
+        Some(kind) if kind.sub_of.is_some() => {
+            if of.sigil {
+                errs.push(format!(
+                    "line {line_no}: `:::!{}` is a sub-block — write it bare `:::{}`                      inside its parent",
+                    of.kind, of.kind
+                ));
+                return None;
+            }
+            Some(Disposition::Machinery)
+        }
+        Some(kind) => {
+            let want_sigil = kind.disposition == Disposition::Machinery;
+            if want_sigil && !of.sigil {
+                // A bare machinery name — the forgotten-sigil trap. Refuse.
+                errs.push(format!(
+                    "line {line_no}: `:::{}` shadows a machinery name — write `:::!{}` \
+                     (bare names are prose; machinery carries the `!` sigil)",
+                    of.kind, of.kind
+                ));
+                return None;
+            }
+            if !want_sigil && of.sigil {
+                // A sigiled prose/structural name — the symmetric error.
+                errs.push(format!(
+                    "line {line_no}: `:::!{}` is not machinery — write `:::{}` (it is {})",
+                    of.kind,
+                    of.kind,
+                    if kind.disposition == Disposition::Prose {
+                        "prose"
+                    } else {
+                        "structural"
+                    }
+                ));
+                return None;
+            }
+            Some(kind.disposition)
+        }
+        None => {
+            if of.sigil {
+                // Unknown machinery — fail closed, name the known set.
+                let mut known: Vec<&str> = machinery_names().collect();
+                known.sort_unstable();
+                errs.push(format!(
+                    "line {line_no}: unknown machinery directive `:::!{}` (known: {})",
+                    of.kind,
+                    known.join(", ")
+                ));
+                None
+            } else {
+                // Unknown bare name — fail OPEN: treat as inert prose so the
+                // degradation contract holds. Signalled by a Prose disposition
+                // with an unknown kind; the delivery pass renders it verbatim.
+                Some(Disposition::Prose)
+            }
+        }
+    }
+}
+
+/// Open-fence tokenizer: `:::[!]kind{attrs}`. Returns the fence length, whether
+/// the machinery sigil is present, the kind, and the raw attribute source.
+fn open_fence(line: &str) -> Option<OpenFence> {
+    let trimmed = line.trim_start();
+    if !trimmed.starts_with(":::") {
+        return None;
+    }
+    let len = trimmed.chars().take_while(|&c| c == ':').count();
+    let rest = &trimmed[len..];
+    // A line of only colons is a CLOSE, not an open.
+    if rest.trim().is_empty() {
+        return None;
+    }
+    let (sigil, rest) = match rest.strip_prefix('!') {
+        Some(r) => (true, r),
+        None => (false, rest),
+    };
+    let mut chars = rest.char_indices();
+    let mut kind_end = rest.len();
+    for (idx, c) in chars.by_ref() {
+        if c == '{' || c == ' ' || c == '\t' {
+            kind_end = idx;
+            break;
+        }
+        if !(c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
+            // Not a directive (e.g. a `::: ` divider in prose).
+            return None;
+        }
+    }
+    let kind = rest[..kind_end].to_string();
+    if kind.is_empty() {
+        return None;
+    }
+    let attr_src = rest[kind_end..].trim().to_string();
+    Some(OpenFence {
+        len,
+        sigil,
+        kind,
+        attr_src,
+    })
+}
+
+/// The length of a pure closing fence (a line of only colons, `>=3`), else None.
+fn fence_close_len(line: &str) -> Option<usize> {
+    let t = line.trim();
+    if t.len() >= 3 && t.chars().all(|c| c == ':') {
+        Some(t.len())
+    } else {
+        None
+    }
+}
+
+/// The backtick/tilde count of a fenced-code delimiter line, else None.
+fn code_fence_len(line: &str) -> Option<usize> {
+    let t = line.trim_start();
+    for delim in ['`', '~'] {
+        let n = t.chars().take_while(|&c| c == delim).count();
+        if n >= 3 {
+            return Some(n);
+        }
+    }
+    None
+}
+
+/// `{key=value key2="quoted"}` → map. Bare `{flag}` → `flag=""`.
+fn parse_attrs(src: &str) -> Result<BTreeMap<String, String>, String> {
+    let mut out = BTreeMap::new();
+    let src = src.trim();
+    if src.is_empty() {
+        return Ok(out);
+    }
+    let inner = src
+        .strip_prefix('{')
+        .and_then(|s| s.strip_suffix('}'))
+        .ok_or("attributes must be wrapped in { }")?;
+    let mut chars = inner.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() {
+            chars.next();
+            continue;
+        }
+        let mut key = String::new();
+        while let Some(&c) = chars.peek() {
+            if c == '=' || c.is_whitespace() {
+                break;
+            }
+            key.push(c);
+            chars.next();
+        }
+        if key.is_empty() {
+            return Err("empty attribute name".into());
+        }
+        // Bare flag.
+        if chars.peek() != Some(&'=') {
+            out.insert(key, String::new());
+            continue;
+        }
+        chars.next(); // '='
+        let mut val = String::new();
+        match chars.peek() {
+            Some(&'"') => {
+                chars.next();
+                while let Some(c) = chars.next() {
+                    match c {
+                        '"' => break,
+                        '\\' => {
+                            if let Some(n) = chars.next() {
+                                val.push(n);
+                            }
+                        }
+                        _ => val.push(c),
+                    }
+                }
+            }
+            _ => {
+                while let Some(&c) = chars.peek() {
+                    if c.is_whitespace() {
+                        break;
+                    }
+                    val.push(c);
+                    chars.next();
+                }
+            }
+        }
+        out.insert(key, val);
+    }
+    Ok(out)
+}
+
+/// Front matter: a leading `---\n … \n---`. Returns the parsed map and the byte
+/// offset where the body begins. Absent front matter is spec 1 by the spec's
+/// rule, but this dialect-2-native reader requires spec 2 — so a document that
+/// is going to use dialect-2 machinery must declare it, and one that does not
+/// is treated as spec 2 with no front matter (plain prose stays valid).
+fn parse_front_matter(text: &str, errs: &mut Vec<String>) -> (BTreeMap<String, Value>, usize) {
+    let mut map = BTreeMap::new();
+    let Some(rest) = text.strip_prefix("---\n") else {
+        return (map, 0);
+    };
+    let Some(end) = rest.find("\n---") else {
+        return (map, 0);
+    };
+    let block = &rest[..end];
+    match crate::config::yaml::parse(block) {
+        Ok(Value::Object(m)) => {
+            for (kk, v) in m {
+                map.insert(kk, v);
+            }
+        }
+        Ok(_) => errs.push("front matter must be a YAML mapping".into()),
+        Err(e) => errs.push(format!("front matter is not valid YAML: {e}")),
+    }
+    if let Some(spec) = map.get("spec") {
+        let s = spec
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| spec.to_string());
+        let major: u32 = s
+            .trim_matches('"')
+            .split('.')
+            .next()
+            .unwrap_or("")
+            .parse()
+            .unwrap_or(0);
+        if major != 0 && major != 2 {
+            errs.push(format!(
+                "front matter pins `spec: {s}`; this agentd implements the current \
+                 dialect (2) only"
+            ));
+        }
+    }
+    // Advance past the closing `---` line.
+    let after = end + "\n---".len();
+    let abs = "---\n".len() + after;
+    let nl = text[abs..]
+        .find('\n')
+        .map(|n| abs + n + 1)
+        .unwrap_or(text.len());
+    (map, nl)
+}
+
+/// Identity: `name` unique per kind (top-level only — sub-blocks are
+/// parent-scoped and exempt).
+fn check_identity(blocks: &[Block], errs: &mut Vec<String>) {
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+    for b in blocks {
+        if let Some(name) = &b.name
+            && lookup(&b.kind).is_some_and(|k| k.sub_of.is_none())
+            && !seen.insert((b.kind.clone(), name.clone()))
+        {
+            errs.push(format!(
+                "line {}: duplicate {}/{} — `name` is unique per kind",
+                b.line, b.kind, name
+            ));
+        }
+    }
+}
+
+/// `@kind/name` references: every one must resolve to a declared block, and the
+/// graph must be acyclic. References live in attribute values.
+fn check_refs(blocks: &[Block], errs: &mut Vec<String>) {
+    let mut ids: BTreeSet<(String, String)> = BTreeSet::new();
+    for b in blocks {
+        if let Some(n) = &b.name {
+            ids.insert((b.kind.clone(), n.clone()));
+        }
+    }
+    for b in blocks {
+        for (attr, val) in &b.attrs {
+            if let Some(target) = val.strip_prefix('@') {
+                let (kind, name) = match target.split_once('/') {
+                    Some((k, n)) => (k.to_string(), n.to_string()),
+                    None => {
+                        errs.push(format!(
+                            "line {}: {attr}=@{target} must be qualified as @kind/name",
+                            b.line
+                        ));
+                        continue;
+                    }
+                };
+                if !ids.contains(&(kind.clone(), name.clone())) {
+                    errs.push(format!(
+                        "line {}: {attr}=@{kind}/{name} references no declared block",
+                        b.line
+                    ));
+                }
+            }
+        }
+    }
+    // Acyclicity across attribute refs (a block that names itself, or a cycle).
+    let mut edges: BTreeMap<(String, String), Vec<(String, String)>> = BTreeMap::new();
+    for b in blocks {
+        let Some(n) = &b.name else { continue };
+        let from = (b.kind.clone(), n.clone());
+        for val in b.attrs.values() {
+            if let Some(t) = val.strip_prefix('@')
+                && let Some((k, nm)) = t.split_once('/')
+            {
+                edges
+                    .entry(from.clone())
+                    .or_default()
+                    .push((k.to_string(), nm.to_string()));
+            }
+        }
+    }
+    let mut state: BTreeMap<(String, String), u8> = BTreeMap::new();
+    for node in edges.keys() {
+        if has_cycle(node, &edges, &mut state) {
+            errs.push(format!("reference cycle through {}/{}", node.0, node.1));
+            break;
+        }
+    }
+}
+
+fn has_cycle(
+    node: &(String, String),
+    edges: &BTreeMap<(String, String), Vec<(String, String)>>,
+    state: &mut BTreeMap<(String, String), u8>,
+) -> bool {
+    match state.get(node) {
+        Some(1) => return true,  // on the current path
+        Some(2) => return false, // done
+        _ => {}
+    }
+    state.insert(node.clone(), 1);
+    if let Some(next) = edges.get(node) {
+        for n in next {
+            if has_cycle(n, edges, state) {
+                return true;
+            }
+        }
+    }
+    state.insert(node.clone(), 2);
+    false
+}
+
+/// The families a document actually uses (for grant checking and reporting).
+pub fn families_used(doc: &Document) -> BTreeSet<Family> {
+    fn walk(blocks: &[Block], out: &mut BTreeSet<Family>) {
+        for b in blocks {
+            let fam = b.family();
+            if fam != Family::Default {
+                out.insert(fam);
+            }
+            walk(&b.children, out);
+        }
+    }
+    let mut out = BTreeSet::new();
+    walk(&doc.blocks, &mut out);
+    out
+}
+
+/// Refuse any block whose family is not granted by `document_capabilities`.
+/// Fail-closed: names the block, the family, and the exact grant to add.
+pub fn check_grants(doc: &Document, granted: &BTreeSet<String>, errs: &mut Vec<String>) {
+    fn walk(blocks: &[Block], granted: &BTreeSet<String>, errs: &mut Vec<String>) {
+        for b in blocks {
+            if let Some(grant) = b.family().grant()
+                && !granted.contains(grant)
+            {
+                errs.push(format!(
+                    "line {}: `:::!{}` needs the `{grant}` capability — add it to \
+                     `agent.document_capabilities`",
+                    b.line, b.kind
+                ));
+            }
+            walk(&b.children, granted, errs);
+        }
+    }
+    walk(&doc.blocks, granted, errs);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn kinds_of(doc: &Document) -> Vec<&str> {
+        doc.blocks.iter().map(|b| b.kind.as_str()).collect()
+    }
+
+    #[test]
+    fn plain_prose_is_a_valid_empty_document() {
+        let d = parse("just guidance, no blocks").unwrap();
+        assert!(d.blocks.is_empty());
+    }
+
+    #[test]
+    fn machinery_needs_the_sigil_and_bare_shadow_is_refused() {
+        // Correct sigiled machinery parses.
+        let d = parse(":::!workflow{name=w}\nsteps: {}\n:::").unwrap();
+        assert_eq!(kinds_of(&d), ["workflow"]);
+        assert_eq!(d.blocks[0].disposition, Disposition::Machinery);
+        // Bare machinery name — the forgotten-sigil trap — is refused.
+        let e = parse(":::workflow{name=w}\nsteps: {}\n:::").unwrap_err();
+        assert!(
+            e[0].contains("shadows a machinery name") && e[0].contains(":::!workflow"),
+            "{e:?}"
+        );
+        // Sigiled prose — the symmetric error.
+        let e = parse(":::!note\nhi\n:::").unwrap_err();
+        assert!(
+            e[0].contains("is not machinery") && e[0].contains(":::note"),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn prose_is_bare_and_unknown_bare_is_inert() {
+        let d = parse(":::note\nremember this\n:::").unwrap();
+        assert_eq!(d.blocks[0].disposition, Disposition::Prose);
+        // Unknown bare name fails OPEN — inert prose, still parses.
+        let d = parse(":::whatever\nfree text\n:::").unwrap();
+        assert_eq!(d.blocks[0].disposition, Disposition::Prose);
+        // Unknown MACHINERY fails closed.
+        let e = parse(":::!whatever\nx\n:::").unwrap_err();
+        assert!(e[0].contains("unknown machinery"), "{e:?}");
+    }
+
+    #[test]
+    fn blocks_nest_by_fence_length() {
+        let doc = "::::!test{name=t target=@function/f}\n\
+                   :::case{name=one}\n\
+                   given: {x: 1}\n\
+                   :::\n\
+                   ::::\n\
+                   :::!function{name=f}\nsig\n:::";
+        let d = parse(doc).unwrap();
+        assert_eq!(kinds_of(&d), ["test", "function"]);
+        assert_eq!(d.blocks[0].children.len(), 1);
+        assert_eq!(d.blocks[0].children[0].kind, "case");
+    }
+
+    #[test]
+    fn code_fences_suspend_colon_scanning() {
+        let doc = "::::!function{name=f}\n\
+                   ```python\n\
+                   x = 1  # ::: not a fence\n\
+                   :::\n\
+                   ```\n\
+                   ::::";
+        let d = parse(doc).unwrap();
+        assert_eq!(kinds_of(&d), ["function"]);
+        assert!(
+            d.blocks[0].body.contains(":::"),
+            "the inner colons stay in the body"
+        );
+    }
+
+    #[test]
+    fn duplicate_names_per_kind_are_refused() {
+        let e = parse(":::!workflow{name=dup}\na: {}\n:::\n:::!workflow{name=dup}\nb: {}\n:::")
+            .unwrap_err();
+        assert!(e[0].contains("duplicate workflow/dup"), "{e:?}");
+        // Same name, DIFFERENT kinds is fine.
+        assert!(parse(":::!workflow{name=x}\na: {}\n:::\n:::!stream{name=x}\nr: {}\n:::").is_ok());
+    }
+
+    #[test]
+    fn refs_must_resolve_and_be_qualified_and_acyclic() {
+        // Unresolvable.
+        let e = parse(":::!function{name=f target=@runtime/missing}\nx\n:::").unwrap_err();
+        assert!(e[0].contains("references no declared block"), "{e:?}");
+        // Unqualified.
+        let e = parse(":::!function{name=f target=@bare}\nx\n:::").unwrap_err();
+        assert!(e.iter().any(|m| m.contains("must be qualified")), "{e:?}");
+        // Resolvable + qualified is fine.
+        assert!(parse(
+            ":::!runtime{name=r}\nimage: x\n:::\n:::!function{name=f runtime=@runtime/r}\nx\n:::"
+        ).is_ok());
+    }
+
+    #[test]
+    fn the_kind_table_matches_the_published_registry() {
+        // Every machinery/prose/structural name the spec registry lists must be
+        // present with the right disposition, and vice versa — the corpus test
+        // pins this against the file, this pins it against the code.
+        assert_eq!(machinery_names().count(), 29);
+        assert_eq!(
+            KINDS
+                .iter()
+                .filter(|k| k.disposition == Disposition::Prose && k.sub_of.is_none())
+                .count(),
+            14
+        );
+        assert_eq!(lookup("context").unwrap().disposition, Disposition::Prose);
+        assert_eq!(
+            lookup("workflow").unwrap().disposition,
+            Disposition::Machinery
+        );
+        assert_eq!(lookup("function").unwrap().family, Family::Compute);
+        assert_eq!(lookup("case").unwrap().sub_of, Some("test"));
+    }
+
+    #[test]
+    fn grants_gate_families_fail_closed() {
+        let d = parse(
+            ":::!function{name=f runtime=@runtime/r}\nx\n:::\n:::!runtime{name=r}\ni: y\n:::",
+        )
+        .unwrap();
+        let none = BTreeSet::new();
+        let mut errs = Vec::new();
+        check_grants(&d, &none, &mut errs);
+        assert!(
+            errs.iter().any(|e| e.contains("`compute` capability")),
+            "{errs:?}"
+        );
+        // Granted → clean.
+        let mut granted = BTreeSet::new();
+        granted.insert("compute".to_string());
+        let mut errs = Vec::new();
+        check_grants(&d, &granted, &mut errs);
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+}

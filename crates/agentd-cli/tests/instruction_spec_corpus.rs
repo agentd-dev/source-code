@@ -195,11 +195,24 @@ fn the_registry_spec_1_entry_matches_the_shipped_closed_set() {
 /// the behavioural fixtures above still run there.
 #[test]
 fn vendored_corpus_matches_upstream_when_present() {
-    let upstream = std::env::var("INSTRUCTION_SPEC_REPO")
-        .unwrap_or_else(|_| "/root/instruction-md/spec".into());
+    // An EXPLICIT `INSTRUCTION_SPEC_REPO` that does not exist is a
+    // configuration error and MUST fail — a drift check that skips when
+    // pointed at a missing path reports health it did not perform, the exact
+    // vacuous-pass trap this whole effort has been hunting (found here by the
+    // instruction.md session after a repo rename moved the path). Only the
+    // DEFAULT path (no env var — CI, before any clone) skips cleanly.
+    let explicit = std::env::var("INSTRUCTION_SPEC_REPO");
+    let upstream = explicit
+        .clone()
+        .unwrap_or_else(|_| "/root/instruction-md/specification".into());
     let up = Path::new(&upstream).join("conformance");
     if !up.exists() {
-        eprintln!("upstream spec repo not present; drift check skipped");
+        assert!(
+            explicit.is_err(),
+            "INSTRUCTION_SPEC_REPO={upstream:?} was set but has no conformance/ — \
+             a drift check pointed at a missing path must fail, not skip"
+        );
+        eprintln!("no upstream spec clone at the default path; drift check skipped");
         return;
     }
     let local = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/instruction-spec-corpus");

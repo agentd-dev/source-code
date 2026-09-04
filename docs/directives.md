@@ -1,5 +1,20 @@
 # Directives — instructions that carry their machinery
 
+> **This document describes dialect 1 (the original `:::type` form).** The
+> current instruction format is **dialect 2**, the reference implementation of
+> the open [Instruction Document Specification](https://github.com/instruction-md/specification).
+> In dialect 2 the machinery blocks below carry a `!` sigil (`:::!workflow`,
+> `:::!mcp`, …) so machinery can never be confused with the prose blocks
+> (`:::note`, `:::must`, …) that degrade into what the model reads, and the
+> extended families — code (`!function`/`!runtime`/`!test`), files (`!file`),
+> knowledge (`!knowledge`/`!source`), interface (`!endpoint`/`!ui`/`!human`),
+> identity (`!peer`/`!policy`), infra (`!git`/`!image`) and composition
+> (`!agent`) — are each gated behind an operator grant in
+> `agent.document_capabilities` (the trust ladder). A document is routed to
+> dialect 2 when it declares `spec: "2"` in YAML front matter or carries any
+> `:::!` block. See the spec for the full block reference; the shapes below
+> still apply, sigiled.
+
 An agentd instruction is prose: what the agent is for, how it should behave.
 But most agents are prose *plus* machinery — a workflow the prose keeps
 referring to, a house style the model should pull in when relevant, reference

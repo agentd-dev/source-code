@@ -337,7 +337,59 @@ pub fn merge_missing(
 
 /// Run extraction over an instruction-surface text: parse, interpret the
 /// known blocks, rebuild the text a model should see.
+/// Forward-compatibility guard: this implementation speaks dialect 1.
+///
+/// A document carrying dialect-2 lexical markers — a machinery-sigil fence
+/// (`:::!kind`) or a front-matter `spec:` pin of 2 or higher — is REFUSED
+/// rather than best-effort parsed. Parsing it is the dangerous option, and
+/// silently so: `open_fence` requires an alphanumeric after the colons, so
+/// every `:::!` block would fall through to the prose accumulator and the
+/// configuration it carried would vanish with no diagnostic. Found empirically
+/// by the instruction.md spec review (2026-09-04): such a document validated
+/// clean and registered nothing.
+///
+/// A document with NEITHER marker is a spec-1 document by definition (the
+/// format is a strict superset of prose), so plain prose files and dialect-1
+/// documents are untouched by this guard.
+fn refuse_future_dialect(text: &str) -> Result<(), Vec<String>> {
+    for (i, l) in text.lines().enumerate() {
+        if l.starts_with(":::") {
+            let after = l.trim_start_matches(':');
+            if let Some(kind) = after.strip_prefix('!') {
+                return Err(vec![format!(
+                    "line {}: `{}` is a dialect-2 machinery fence; this agentd implements \
+                     dialect 1 and refuses rather than silently reading the block as prose — \
+                     upgrade agentd, or write the dialect-1 form `:::{}`",
+                    i + 1,
+                    l.trim(),
+                    kind.split(['{', ' ']).next().unwrap_or(kind)
+                )]);
+            }
+        }
+    }
+    if let Some(rest) = text.strip_prefix("---\n")
+        && let Some(end) = rest.find("\n---")
+    {
+        for (j, l) in rest[..end].lines().enumerate() {
+            if let Some(v) = l.strip_prefix("spec:") {
+                let v = v.trim().trim_matches('"').trim_matches('\'');
+                let major: u32 = v.split('.').next().unwrap_or("").parse().unwrap_or(0);
+                if major >= 2 {
+                    return Err(vec![format!(
+                        "line {}: front matter pins `spec: {v}`; this agentd implements \
+                         dialect 1 and refuses a document it cannot version-check rather \
+                         than mis-parse it",
+                        j + 2
+                    )]);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn extract(text: &str) -> Result<Extraction, Vec<String>> {
+    refuse_future_dialect(text)?;
     // The cheap gate: most instructions carry no fences at all.
     if !text.lines().any(|l| l.starts_with(":::")) {
         return Ok(Extraction {
@@ -591,6 +643,27 @@ mod tests {
                 .contains("<reference title=\"API notes\">\nrate limit is 10/s\n</reference>")
         );
         assert!(e.cleaned.contains("<example>\nQ: hi\nA: hello\n</example>"));
+    }
+
+    #[test]
+    /// Dialect-2 markers are refused, never mis-parsed. Without this guard a
+    /// `:::!workflow` block silently became prose (verified against 1.6.0:
+    /// clean validation, zero registrations) — configuration loss with no
+    /// diagnostic, the worst failure mode this parser has.
+    #[test]
+    fn dialect_2_markers_are_refused_not_swallowed() {
+        let e = extract(":::!workflow{name=g}\nsteps: {}\n:::").unwrap_err();
+        assert!(
+            e[0].contains("dialect-2") && e[0].contains(":::workflow"),
+            "{e:?}"
+        );
+        let e = extract("---\nspec: \"2\"\n---\nprose").unwrap_err();
+        assert!(e[0].contains("spec: 2"), "{e:?}");
+        // Spec-1 shapes stay parseable: bare prose, front matter without a
+        // dialect-2 pin, and ordinary dialect-1 fences.
+        assert!(extract("just prose").is_ok());
+        assert!(extract("---\ntitle: notes\n---\nprose").is_ok());
+        assert!(extract("---\nspec: \"1\"\n---\nprose").is_ok());
     }
 
     #[test]

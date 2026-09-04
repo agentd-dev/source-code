@@ -1,0 +1,12 @@
+{
+ "errors": [],
+ "registers": {
+  "workflows": [
+   "drain"
+  ],
+  "mcp_servers": [
+   "search"
+  ]
+ },
+ "valid": true
+}

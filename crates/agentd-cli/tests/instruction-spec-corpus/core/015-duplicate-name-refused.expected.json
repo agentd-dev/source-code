@@ -1,5 +1,8 @@
 {
+ "spec": "1",
  "valid": false,
- "errors": ["duplicate workflow name"],
+ "errors": [
+  "duplicate workflow name"
+ ],
  "registers": {}
 }

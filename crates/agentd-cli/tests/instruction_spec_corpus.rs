@@ -86,6 +86,18 @@ fn the_conformance_corpus_passes_against_this_binary() {
             );
             let exp: Value =
                 serde_json::from_str(&std::fs::read_to_string(&exp_path).unwrap()).unwrap();
+            // A fixture pins the spec dialect it is written against; one
+            // declaring a dialect this implementation does not speak is
+            // SKIPPED, not failed — dialect-2 fixtures may enter the shared
+            // corpus without failing dialect-1 runtimes (the runtime's own
+            // refusal of dialect-2 DOCUMENTS is separately pinned by the
+            // forward-compat guard's tests).
+            if let Some(spec) = exp["spec"].as_str()
+                && spec != "1"
+            {
+                eprintln!("  skip {name} (spec {spec}; this implementation speaks 1)");
+                continue;
+            }
             let (valid, errtext, caps) = run_case(&doc);
             if Some(valid) != exp["valid"].as_bool() {
                 failures.push(format!(

@@ -229,6 +229,23 @@ pub struct Agent {
     /// separate questions: "there is no channel" is a fact about deployment,
     /// "do not interrupt me" is a policy about attention.
     pub approval: Approval,
+    /// The instruction-document families this agent's `instruction` may use
+    /// (the trust ladder, Instruction Document Spec §5). Empty (the default)
+    /// grants only the default rung — prose, structural, and the core machinery
+    /// (`!workflow`, `!mcp`, `!config`, `!stream`, `!tools`, `!skill`, `!data`,
+    /// `!override`). Naming a family — `material`, `knowledge`, `interface`,
+    /// `identity`, `compute`, `infra`, `compose` — admits its blocks. Fail-closed
+    /// and restart-only: a document that can execute code is a supply-chain
+    /// surface, so the capability is granted here by the operator, never claimed
+    /// by the document.
+    #[serde(default)]
+    pub document_capabilities: Vec<String>,
+    /// Declarations lifted from extended-family instruction blocks (`!file`,
+    /// `!function`, `!runtime`, …), keyed by kind — DERIVED, never a config key.
+    /// Recorded so `--capabilities` can report what a document reached for; the
+    /// runtime effect of each is delegated to a service per the spec.
+    #[serde(skip)]
+    pub document_declarations: std::collections::BTreeMap<String, Vec<Value>>,
 }
 
 /// How much a person wants to be asked.
@@ -302,6 +319,24 @@ impl Agent {
 /// `scheme://…` with no whitespace, and a scheme that is not a bare `http(s)`
 /// URL to a web page… — any `<alpha><alnum+.->://` single token counts; the
 /// registry decides which server serves it.
+/// Whether an instruction document is dialect 2 (the current spec version):
+/// it declares `spec: 2` in leading YAML front matter, or carries a `:::!`
+/// machinery sigil. Everything else — bare `:::` blocks, no front matter — is
+/// read by the legacy dialect-1 extractor.
+pub fn is_dialect_2(instr: &str) -> bool {
+    if instr.lines().any(|l| l.trim_start().starts_with(":::!")) {
+        return true;
+    }
+    if let Some(rest) = instr.strip_prefix("---\n")
+        && let Some(end) = rest.find("\n---")
+    {
+        return rest[..end]
+            .lines()
+            .any(|l| l.trim_start().starts_with("spec:") && l.contains('2'));
+    }
+    false
+}
+
 pub fn looks_like_resource_uri(s: &str) -> bool {
     let t = s.trim();
     if t.contains(char::is_whitespace) {
@@ -2581,6 +2616,7 @@ impl Settings {
         // that merges UNDER the explicit document — an instruction file alone
         // can define the whole agent, and an explicit key still wins.
         let mut extraction = None;
+        let mut idoc_extraction: Option<crate::config::idoc::Extraction> = None;
         if let Some(instr) = doc
             .get("agent")
             .and_then(|a| a.get("instruction"))
@@ -2589,31 +2625,84 @@ impl Settings {
             && !looks_like_resource_uri(&instr)
             && instr.lines().any(|l| l.starts_with(":::"))
         {
-            match crate::config::directives::extract(&instr) {
-                Ok(ex) => {
-                    // (`{{config.*}}` inside a block already resolved: the doc
-                    // passed substitute_config_vars with the instruction in it.
-                    // A nameless block is refused by parse_workflow, the one
-                    // authority on that message.)
-                    if let Some(a) = doc.get_mut("agent").and_then(Value::as_object_mut) {
-                        a.insert("instruction".into(), Value::String(ex.cleaned.clone()));
+            // Dialect 2 (the current spec version) is chosen when the document
+            // declares `spec: 2` in front matter or carries a `:::!` machinery
+            // sigil. Everything else is the legacy dialect-1 reader. The grants
+            // are read from the raw document before it is deserialized.
+            if is_dialect_2(&instr) {
+                let granted: std::collections::BTreeSet<String> = doc
+                    .get("agent")
+                    .and_then(|a| a.get("document_capabilities"))
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let parsed = crate::config::idoc::parse(&instr)
+                    .and_then(|d| crate::config::idoc::fold(&d, &granted).map(|e| (d, e)));
+                match parsed {
+                    Ok((_d, ex)) => {
+                        if let Some(a) = doc.get_mut("agent").and_then(Value::as_object_mut) {
+                            a.insert("instruction".into(), Value::String(ex.cleaned.clone()));
+                        }
+                        // Splice held root-level structures (workflows[]) and
+                        // fold the rest of the fragment under the document.
+                        let mut fragment = ex.config.clone();
+                        let held_workflows = fragment
+                            .remove("_workflows_hold")
+                            .and_then(|h| h.get("list").and_then(Value::as_array).cloned())
+                            .unwrap_or_default();
+                        fragment.remove("_endpoints_hold");
+                        if let Some(o) = doc.as_object_mut() {
+                            crate::config::directives::merge_missing(o, fragment, false);
+                            if !held_workflows.is_empty()
+                                && let Some(w) = o
+                                    .entry("workflows")
+                                    .or_insert_with(|| Value::Array(Vec::new()))
+                                    .as_array_mut()
+                            {
+                                w.extend(held_workflows);
+                            }
+                        }
+                        idoc_extraction = Some(ex);
                     }
-                    if let (Some(o), Value::Object(fragment)) =
-                        (doc.as_object_mut(), ex.config.clone())
-                    {
-                        crate::config::directives::merge_missing(o, fragment, false);
+                    Err(errs) => {
+                        return Err(format!(
+                            "{source}: agent.instruction (dialect 2):\n  {}",
+                            errs.join("\n  ")
+                        ));
                     }
-                    extraction = Some(ex);
                 }
-                Err(errs) => {
-                    return Err(format!(
-                        "{source}: agent.instruction directives:
+            } else {
+                match crate::config::directives::extract(&instr) {
+                    Ok(ex) => {
+                        // (`{{config.*}}` inside a block already resolved: the doc
+                        // passed substitute_config_vars with the instruction in it.
+                        // A nameless block is refused by parse_workflow, the one
+                        // authority on that message.)
+                        if let Some(a) = doc.get_mut("agent").and_then(Value::as_object_mut) {
+                            a.insert("instruction".into(), Value::String(ex.cleaned.clone()));
+                        }
+                        if let (Some(o), Value::Object(fragment)) =
+                            (doc.as_object_mut(), ex.config.clone())
+                        {
+                            crate::config::directives::merge_missing(o, fragment, false);
+                        }
+                        extraction = Some(ex);
+                    }
+                    Err(errs) => {
+                        return Err(format!(
+                            "{source}: agent.instruction directives:
   {}",
-                        errs.join(
-                            "
+                            errs.join(
+                                "
   "
-                        )
-                    ));
+                            )
+                        ));
+                    }
                 }
             }
         }
@@ -2622,6 +2711,22 @@ impl Settings {
         if let Some(ex) = extraction {
             settings.agent.inline_skills = ex.skills;
             settings.workflows.extend(ex.workflows);
+        }
+        // Dialect-2 extraction: workflows were spliced into the document before
+        // deserialization, so they are already in `settings`; carry the skills
+        // and the extended-family declarations across.
+        if let Some(ex) = idoc_extraction {
+            settings.agent.inline_skills = ex
+                .skills
+                .into_iter()
+                .map(|s| crate::config::directives::InlineSkill {
+                    name: s.name,
+                    description: s.description,
+                    when_to_use: s.when_to_use,
+                    body: s.body,
+                })
+                .collect();
+            settings.agent.document_declarations = ex.declarations;
         }
         Ok(settings)
     }
@@ -5779,6 +5884,11 @@ pub const RESTART_ONLY_PATHS: &[&str] = &[
     // were still being refused at the old one, is exactly the lie this
     // partition exists to prevent.
     "store.max_value_bytes",
+    // The instruction-document trust ladder. A capability an operator believes
+    // they revoked must not stay live in a running process (the same rule as
+    // interface.enabled), so widening or narrowing the grant set is a restart —
+    // the document is re-read against the new grants at boot.
+    "agent.document_capabilities",
     // The webhook listener's SOCKET, not its rules: rebinding an address or
     // swapping a TLS identity needs a restart, while `webhooks.default_auth`
     // and the routes themselves (which live in `workflows[].steps[]`) are

@@ -782,6 +782,328 @@ pub fn check_grants(doc: &Document, granted: &BTreeSet<String>, errs: &mut Vec<S
     walk(&doc.blocks, granted, errs);
 }
 
+// ── extraction: folding blocks into configuration + delivered prose ──────────
+
+/// A skill lifted from the document into the catalogue.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InlineSkill {
+    pub name: String,
+    pub description: String,
+    pub when_to_use: Option<String>,
+    pub body: String,
+}
+
+/// What a document yields once folded: the delivered prose the model reads, a
+/// configuration fragment to merge into the agent document, the skills lifted
+/// into the catalogue, and the extended-family declarations recorded by kind
+/// (parsed, grant-checked, and visible in `--capabilities`, with their runtime
+/// effect delegated to services per the spec).
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Extraction {
+    pub cleaned: String,
+    pub config: serde_json::Map<String, Value>,
+    pub skills: Vec<InlineSkill>,
+    pub declarations: BTreeMap<String, Vec<Value>>,
+    pub families: Vec<Family>,
+}
+
+fn frag<'a>(
+    cfg: &'a mut serde_json::Map<String, Value>,
+    key: &str,
+) -> &'a mut serde_json::Map<String, Value> {
+    cfg.entry(key)
+        .or_insert_with(|| Value::Object(serde_json::Map::new()))
+        .as_object_mut()
+        .expect("fragment section is an object")
+}
+
+fn push_into<'a>(
+    cfg: &'a mut serde_json::Map<String, Value>,
+    section: &str,
+    list: &str,
+) -> &'a mut Vec<Value> {
+    frag(cfg, section)
+        .entry(list)
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+        .expect("list is an array")
+}
+
+/// A machinery block's body parsed as a YAML mapping, with `{attr}` merged over
+/// it and a `name` guaranteed present when required.
+fn body_map(b: &Block, errs: &mut Vec<String>) -> Option<serde_json::Map<String, Value>> {
+    let mut m = if b.body.trim().is_empty() {
+        serde_json::Map::new()
+    } else {
+        match crate::config::yaml::parse(&b.body) {
+            Ok(Value::Object(m)) => m,
+            Ok(_) => {
+                errs.push(format!(
+                    "line {}: :::!{} body must be a YAML mapping",
+                    b.line, b.kind
+                ));
+                return None;
+            }
+            Err(e) => {
+                errs.push(format!(
+                    "line {}: :::!{} body is not valid YAML: {e}",
+                    b.line, b.kind
+                ));
+                return None;
+            }
+        }
+    };
+    for (k, v) in &b.attrs {
+        m.insert(k.clone(), attr_value(v));
+    }
+    Some(m)
+}
+
+fn attr_value(s: &str) -> Value {
+    match s {
+        "true" => Value::Bool(true),
+        "false" => Value::Bool(false),
+        _ => s
+            .parse::<i64>()
+            .map(Value::from)
+            .unwrap_or_else(|_| Value::String(s.to_string())),
+    }
+}
+
+/// Fold a parsed document into configuration + delivered prose, after checking
+/// grants. The whole document is refused if any block errors — no partial load.
+pub fn fold(doc: &Document, granted: &BTreeSet<String>) -> Result<Extraction, Vec<String>> {
+    let mut errs = Vec::new();
+    check_grants(doc, granted, &mut errs);
+    let mut out = Extraction {
+        families: families_used(doc).into_iter().collect(),
+        ..Extraction::default()
+    };
+
+    // Delivery: rebuild the prose the model reads, replacing each machinery
+    // block with a one-line acknowledgement and degrading each prose block into
+    // labelled text. Walk top-level blocks in document order over the source.
+    for b in &doc.blocks {
+        fold_block(b, &mut out, &mut errs);
+    }
+    if errs.is_empty() { Ok(out) } else { Err(errs) }
+}
+
+fn ack(out: &mut Extraction, line: &str) {
+    if !out.cleaned.is_empty() && !out.cleaned.ends_with('\n') {
+        out.cleaned.push('\n');
+    }
+    out.cleaned.push_str(line);
+    out.cleaned.push('\n');
+}
+
+fn fold_block(b: &Block, out: &mut Extraction, errs: &mut Vec<String>) {
+    match b.disposition {
+        Disposition::Prose => fold_prose(b, out),
+        Disposition::Structural => {} // when/include resolve at delivery; recorded, not folded
+        Disposition::Machinery => fold_machinery(b, out, errs),
+    }
+}
+
+/// Prose degrades INTO the delivered text — labelled, body preserved, so a dumb
+/// Markdown viewer still reads it as guidance.
+fn fold_prose(b: &Block, out: &mut Extraction) {
+    let label = match b.kind.as_str() {
+        "context" => b
+            .attrs
+            .get("title")
+            .map(|t| format!("<reference title=\"{t}\">"))
+            .unwrap_or_else(|| "<reference>".into()),
+        "example" => "<example>".into(),
+        k if lookup(k).is_some() => format!("**{}**", k.to_uppercase()),
+        // Unknown bare name — inert; render the fence verbatim so nothing is hidden.
+        _ => format!(":::{}", b.kind),
+    };
+    ack(out, &label);
+    out.cleaned.push_str(&b.body);
+    out.cleaned.push('\n');
+    match b.kind.as_str() {
+        "context" => out.cleaned.push_str("</reference>\n"),
+        "example" => out.cleaned.push_str("</example>\n"),
+        _ => {}
+    }
+}
+
+fn fold_machinery(b: &Block, out: &mut Extraction, errs: &mut Vec<String>) {
+    match b.kind.as_str() {
+        // ── core: fold into real agentd configuration ───────────────────────
+        "workflow" => {
+            if let Some(mut m) = body_map(b, errs) {
+                if let Some(armed) = b.attrs.get("armed") {
+                    m.insert(
+                        "armed".into(),
+                        Value::Bool(armed == "true" || armed.is_empty()),
+                    );
+                }
+                let name = m
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?")
+                    .to_string();
+                push_into(&mut out.config, "_workflows_hold", "list").push(Value::Object(m));
+                // workflows is an array at the document root; collect + splice at merge.
+                ack(
+                    out,
+                    &format!("[workflow \"{name}\" is loaded and runs autonomously]"),
+                );
+            }
+        }
+        "config" => {
+            if let Some(m) = body_map(b, errs) {
+                merge_into(&mut out.config, m);
+            }
+        }
+        "mcp" => {
+            if let Some(m) = body_map(b, errs) {
+                match m.get("name").and_then(Value::as_str) {
+                    Some(name) => {
+                        let name = name.to_string();
+                        push_into(&mut out.config, "mcp", "servers").push(Value::Object(m));
+                        ack(
+                            out,
+                            &format!(
+                                "[mcp server \"{name}\" is connected; its tools are available]"
+                            ),
+                        );
+                    }
+                    None => errs.push(format!("line {}: :::!mcp needs a name", b.line)),
+                }
+            }
+        }
+        "stream" => {
+            if let Some(mut m) = body_map(b, errs) {
+                match m
+                    .remove("name")
+                    .and_then(|v| v.as_str().map(str::to_string))
+                {
+                    Some(name) => {
+                        frag(&mut out.config, "streams").insert(name.clone(), Value::Object(m));
+                        ack(out, &format!("[event stream \"{name}\" is declared]"));
+                    }
+                    None => errs.push(format!("line {}: :::!stream needs a name", b.line)),
+                }
+            }
+        }
+        "tools" => {
+            if let Some(m) = body_map(b, errs) {
+                merge_map(frag(&mut out.config, "tools"), m);
+                ack(out, "[tool policy is applied]");
+            }
+        }
+        "skill" => match b.attrs.get("name") {
+            Some(name) => {
+                out.skills.push(InlineSkill {
+                    name: name.clone(),
+                    description: b.attrs.get("description").cloned().unwrap_or_default(),
+                    when_to_use: b.attrs.get("when").cloned(),
+                    body: b.body.clone(),
+                });
+                ack(
+                    out,
+                    &format!("[skill \"{name}\" is available; load it with skills.read]"),
+                );
+            }
+            None => errs.push(format!("line {}: :::!skill needs a name", b.line)),
+        },
+        // ── extended families: cleanly map to real config where one exists ───
+        "endpoint" => {
+            // A declarative webhook listener route (RFC 0035 §5 shape).
+            if let Some(m) = body_map(b, errs) {
+                push_into(&mut out.config, "_endpoints_hold", "list").push(Value::Object(m));
+                let path = b.attrs.get("path").cloned().unwrap_or_default();
+                ack(out, &format!("[endpoint {path} is served]"));
+            }
+        }
+        "peer" => {
+            if let Some(m) = body_map(b, errs) {
+                let name = m
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?")
+                    .to_string();
+                push_into(&mut out.config, "a2a", "peers").push(Value::Object(m));
+                ack(out, &format!("[peer \"{name}\" is reachable]"));
+            }
+        }
+        // ── content-bearing kinds: the body is literal, not config ──────────
+        // A file's body IS the file; a media/asset body is human description.
+        // Path/mode/src come from the fence attributes.
+        "file" | "media" | "asset" => {
+            let mut rec = serde_json::Map::new();
+            for (k, v) in &b.attrs {
+                rec.insert(k.clone(), attr_value(v));
+            }
+            rec.insert("content".into(), Value::String(b.body.clone()));
+            out.declarations
+                .entry(b.kind.clone())
+                .or_default()
+                .push(Value::Object(rec));
+            let what = b
+                .name
+                .as_deref()
+                .or_else(|| b.attrs.get("path").map(String::as_str))
+                .unwrap_or("");
+            ack(out, &format!("[{} {} is provided]", b.kind, what));
+        }
+        // ── everything else: parse, grant-checked, recorded as a declaration ─
+        // (visible in --capabilities; runtime effect delegated to a service).
+        other => {
+            if let Some(m) = body_map(b, errs) {
+                let mut rec = Value::Object(m);
+                if let Some(n) = &b.name {
+                    rec.as_object_mut()
+                        .unwrap()
+                        .entry("name")
+                        .or_insert_with(|| Value::String(n.clone()));
+                }
+                // Record sub-blocks (from children) under the declaration too.
+                if !b.children.is_empty() {
+                    let subs: Vec<Value> = b
+                        .children
+                        .iter()
+                        .map(
+                            |c| serde_json::json!({"kind": c.kind, "name": c.name, "body": c.body}),
+                        )
+                        .collect();
+                    rec.as_object_mut()
+                        .unwrap()
+                        .insert("_sub".into(), Value::Array(subs));
+                }
+                out.declarations
+                    .entry(other.to_string())
+                    .or_default()
+                    .push(rec);
+                ack(
+                    out,
+                    &format!("[{other} {} is declared]", b.name.as_deref().unwrap_or("")),
+                );
+            }
+        }
+    }
+}
+
+fn merge_into(cfg: &mut serde_json::Map<String, Value>, add: serde_json::Map<String, Value>) {
+    for (k, v) in add {
+        cfg.insert(k, v);
+    }
+}
+
+fn merge_map(dst: &mut serde_json::Map<String, Value>, src: serde_json::Map<String, Value>) {
+    for (k, v) in src {
+        match (dst.get_mut(&k), v) {
+            (Some(Value::Object(d)), Value::Object(s)) => merge_map(d, s),
+            (_, v) => {
+                dst.insert(k, v);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -901,6 +1223,98 @@ mod tests {
         );
         assert_eq!(lookup("function").unwrap().family, Family::Compute);
         assert_eq!(lookup("case").unwrap().sub_of, Some("test"));
+    }
+
+    fn grants(list: &[&str]) -> BTreeSet<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn core_machinery_folds_into_config_and_prose_degrades() {
+        let doc = "You triage tickets.\n\n                   :::note\nBe brief.\n:::\n\n                   :::!workflow{name=drain}\nsteps:\n  f: {kind: finish}\n:::\n\n                   :::!mcp{name=search}\nendpoint: https://x/mcp\n:::\n\n                   :::!stream{name=tickets}\nretention: {max_events: 100}\n:::\n\n                   :::!skill{name=esc description=\"escalate\" when=\"angry\"}\nAsk a human.\n:::\n\n                   :::context{title=\"SLA\"}\n1h for enterprise.\n:::";
+        let d = parse(doc).unwrap();
+        let e = fold(&d, &grants(&[])).unwrap();
+        // workflow held for the root-array splice; mcp + stream folded.
+        assert_eq!(
+            e.config["_workflows_hold"]["list"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(e.config["mcp"]["servers"].as_array().unwrap().len(), 1);
+        assert!(e.config["streams"]["tickets"].is_object());
+        assert_eq!(e.skills.len(), 1);
+        assert_eq!(e.skills[0].name, "esc");
+        // Prose degraded INTO the delivery; machinery acknowledged, body stripped.
+        assert!(e.cleaned.contains("Be brief."), "note body degrades in");
+        assert!(
+            e.cleaned.contains("<reference title=\"SLA\">"),
+            "context wraps"
+        );
+        assert!(
+            e.cleaned.contains("workflow \"drain\" is loaded"),
+            "machinery acknowledged"
+        );
+        assert!(
+            !e.cleaned.contains("kind: finish"),
+            "machinery body is NOT delivered"
+        );
+    }
+
+    #[test]
+    fn every_family_loads_with_its_grant() {
+        // One document exercising all seven grant-gated families plus the
+        // default rung — the "all elements load" proof.
+        let doc = "---\nspec: \"2\"\n---\n            :::!file{name=cfg path=pyproject.toml}\n[project]\nname='x'\n:::\n            :::!data{name=slo}\ntiers: [gold, silver]\n:::\n            :::!knowledge{name=kb}\nserver: kb\n:::\n            :::!source{name=docs}\nkind: git\n:::\n            :::!ui{name=card}\nkind: form\n:::\n            :::!human{name=oncall}\nrole: approver\n:::\n            :::!policy{name=egress}\nmode: closed\n:::\n            :::!secret-ref{name=tok}\nkind: file\npath: /run/tok\n:::\n            :::!runtime{name=py}\nimage: ghcr.io/x@sha256:abc\n:::\n            :::!function{name=lint runtime=@runtime/py}\ndoc: lint\n:::\n            :::!git{name=repo}\nurl: https://x\n:::\n            :::!image{name=img}\ndigest: sha256:abc\n:::\n            :::!agent{name=rev}\ntemplate: reviewer\n:::";
+        let d = parse(doc).unwrap();
+        let all = grants(&[
+            "material",
+            "knowledge",
+            "interface",
+            "identity",
+            "compute",
+            "infra",
+            "compose",
+        ]);
+        let e = fold(&d, &all).unwrap();
+        // Each extended kind is recorded as a loaded declaration.
+        for kind in [
+            "file",
+            "data",
+            "knowledge",
+            "source",
+            "ui",
+            "human",
+            "policy",
+            "secret-ref",
+            "runtime",
+            "function",
+            "git",
+            "image",
+            "agent",
+        ] {
+            assert!(e.declarations.contains_key(kind), "{kind} did not load");
+        }
+        // Without the grants, the same document is refused, naming each family.
+        let none = fold(&d, &grants(&[])).unwrap_err();
+        assert!(none.iter().any(|m| m.contains("compute")), "{none:?}");
+        assert!(none.iter().any(|m| m.contains("material")), "{none:?}");
+    }
+
+    #[test]
+    fn a_function_with_a_test_carries_its_case_sub_blocks() {
+        let doc = "---\nspec: \"2\"\n---\n            :::!runtime{name=py}\nimage: x@sha256:a\n:::\n            ::::!function{name=lint runtime=@runtime/py}\ndoc: lint\n::::\n            ::::!test{name=lint-works target=@function/lint}\n            :::case{name=one}\ngiven: {x: 1}\nexpect: {ok: true}\n:::\n            ::::";
+        let d = parse(doc).unwrap();
+        let e = fold(&d, &grants(&["compute"])).unwrap();
+        let tests = &e.declarations["test"];
+        assert_eq!(tests.len(), 1);
+        assert_eq!(
+            tests[0]["_sub"].as_array().unwrap().len(),
+            1,
+            "the case sub-block is recorded"
+        );
+        assert_eq!(tests[0]["_sub"][0]["kind"], "case");
     }
 
     #[test]

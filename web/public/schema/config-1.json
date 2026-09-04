@@ -2510,6 +2510,21 @@
           },
           "type": "object"
         },
+        "document_capabilities": {
+          "description": "instruction-document families this agent's instruction may use (the trust ladder). Empty grants only the default rung; naming a family admits its blocks. Fail-closed, restart-only.",
+          "items": {
+            "enum": [
+              "material",
+              "knowledge",
+              "interface",
+              "identity",
+              "compute",
+              "infra",
+              "compose"
+            ]
+          },
+          "type": "array"
+        },
         "instruction": {
           "description": "static text, or a single-token URI a configured MCP server serves (read + subscribed)",
           "type": "string"

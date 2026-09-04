@@ -1230,6 +1230,18 @@ pub fn capabilities(loaded: &Loaded) -> Value {
             "exit_codes": crate::exit::EXIT_CODES,
             "config_schema": crate::config::v2::schema::CONFIG_VERSION,
         },
+        // The instruction document as an agent: what the trust ladder granted,
+        // and every extended-family block that loaded (kind → count). Present
+        // only when the instruction is a dialect-2 document that declared any.
+        "document": (!s.agent.document_capabilities.is_empty()
+            || !s.agent.document_declarations.is_empty())
+            .then(|| json!({
+                "spec": "instruction-document/2",
+                "capabilities": s.agent.document_capabilities,
+                "declarations": s.agent.document_declarations.iter()
+                    .map(|(k, v)| (k.clone(), json!(v.len())))
+                    .collect::<serde_json::Map<_, _>>(),
+            })),
     })
 }
 

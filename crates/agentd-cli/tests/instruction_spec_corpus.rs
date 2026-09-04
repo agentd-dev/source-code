@@ -131,3 +131,76 @@ fn the_conformance_corpus_passes_against_this_binary() {
         failures.join("\n  ")
     );
 }
+
+/// The spec repo's per-version registry, checked AGAINST the reference
+/// implementation: its spec-1 entry must equal the parser's own closed set.
+/// A registry that drifts from the code it describes is the schema-vs-loader
+/// failure all over again, so the equality is asserted, not assumed.
+#[test]
+fn the_registry_spec_1_entry_matches_the_shipped_closed_set() {
+    let reg: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/instruction-spec-corpus/registry/kinds.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let v1 = &reg["versions"]["1"];
+    let mut registry_set: Vec<&str> = ["machinery", "prose", "structural"]
+        .iter()
+        .flat_map(|k| v1[*k].as_array().into_iter().flatten())
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    registry_set.sort_unstable();
+    let mut known: Vec<&str> = agentd::config::directives::known_kinds().to_vec();
+    known.sort_unstable();
+    assert_eq!(
+        registry_set, known,
+        "the spec registry's dialect-1 closed set drifted from the parser"
+    );
+}
+
+/// Drift check against the spec repo, when it is reachable: every vendored
+/// fixture document and the registry must be byte-identical to upstream.
+/// Skips cleanly where upstream is absent (CI, until the repo has a URL) —
+/// the behavioural fixtures above still run there.
+#[test]
+fn vendored_corpus_matches_upstream_when_present() {
+    let upstream = std::env::var("INSTRUCTION_SPEC_REPO")
+        .unwrap_or_else(|_| "/root/instruction-md/spec".into());
+    let up = Path::new(&upstream).join("conformance");
+    if !up.exists() {
+        eprintln!("upstream spec repo not present; drift check skipped");
+        return;
+    }
+    let local = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/instruction-spec-corpus");
+    let mut checked = 0usize;
+    for rel in std::fs::read_dir(up.join("core"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().ends_with(".instruction.md"))
+        })
+    {
+        let name = rel.file_name().unwrap();
+        let ours = local.join("core").join(name);
+        assert_eq!(
+            std::fs::read(&rel).unwrap(),
+            std::fs::read(&ours).unwrap_or_default(),
+            "vendored fixture {name:?} drifted from upstream"
+        );
+        checked += 1;
+    }
+    assert_eq!(
+        std::fs::read(up.join("registry/kinds.json")).unwrap(),
+        std::fs::read(local.join("registry/kinds.json")).unwrap(),
+        "vendored registry drifted from upstream"
+    );
+    assert!(
+        checked >= 6,
+        "upstream corpus present but near-empty ({checked})"
+    );
+}

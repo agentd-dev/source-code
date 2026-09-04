@@ -7,6 +7,12 @@
 
 ---
 
+**Normative home:** the **Instruction Document Specification**
+(`/root/instruction-md/spec`, local-first by the licensor's choice — public URL
+to follow; spec text CC-BY 4.0, conformance corpus Apache-2.0). agentd is the
+reference runtime implementation; this RFC remains its design rationale and
+implementation record. **Where the two differ, the spec governs.**
+
 ## 1. Summary
 
 `agent.instruction` stops being an opaque string and becomes a specified

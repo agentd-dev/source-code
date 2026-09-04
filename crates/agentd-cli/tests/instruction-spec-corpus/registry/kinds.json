@@ -1,0 +1,63 @@
+{
+  "$comment": [
+    "Per-version block-kind registry — the machine-readable artifact SPEC.md §3.2 rule 3",
+    "requires: 'the spec publishes its reserved machinery-name set per version, machine-readably,",
+    "in the corpus — otherwise \"known machinery name\" is checkable only by the reference",
+    "implementation.' Derived from SPEC.md §4 at draft-1-rc. NOT YET RATIFIED: this file becomes",
+    "normative when draft-1 is cut."
+  ],
+  "spec": "instruction-document",
+  "status": "draft-1-rc",
+  "versions": {
+    "1": {
+      "$comment": "Dialect 1 as shipped in agentd RFC 0034. Machinery is NOT sigiled. A document with no front matter IS a spec-1 document (SPEC.md §3.1), which preserves the 'plain Markdown is already a valid instruction document' superset property.",
+      "machinery_sigil": null,
+      "unknown_bare": "closed",
+      "machinery": ["workflow", "skill", "config", "mcp", "stream", "tools"],
+      "prose": ["context", "example"],
+      "structural": []
+    },
+    "2": {
+      "$comment": "Dialect 2. Machinery is sigiled with '!'. Unknown bare names fail OPEN (inert punctuation, prose preserved — the degradation contract); unknown sigiled names fail CLOSED. A bare occurrence of any name in `machinery` triggers the reserved-bare guard.",
+      "machinery_sigil": "!",
+      "unknown_bare": "open",
+      "unknown_sigiled": "closed",
+      "machinery": [
+        "workflow", "skill", "config", "mcp", "stream", "tools",
+        "file", "data", "media", "asset",
+        "knowledge", "retrieval", "source",
+        "endpoint", "ui", "human", "channel",
+        "peer", "policy", "secret-ref",
+        "runtime", "function", "test", "fixture",
+        "git", "volume", "image",
+        "agent", "override"
+      ],
+      "families": {
+        "default": ["workflow", "skill", "config", "mcp", "stream", "tools", "data", "override"],
+        "material": ["file", "media", "asset"],
+        "knowledge": ["knowledge", "retrieval", "source"],
+        "interface": ["endpoint", "ui", "human", "channel"],
+        "identity": ["peer", "policy", "secret-ref"],
+        "compute": ["runtime", "function", "test", "fixture"],
+        "infra": ["git", "volume", "image"],
+        "compose": ["agent"]
+      },
+      "prose": [
+        "must", "should", "never", "guardrail", "note", "info", "tip",
+        "important", "warning", "caution", "example", "form", "tool", "context"
+      ],
+      "structural": ["when", "include"],
+      "sub_blocks": {
+        "$comment": "OPEN — enumerated in agentd RFC 0039 §1 as blocks valid only inside a parent, but not yet carried into SPEC.md §4. Listed here so the gap is visible, not to settle it.",
+        "case": "test",
+        "signature": "function",
+        "schema": "ui",
+        "preview": "ui"
+      },
+      "reserved_future": {
+        "$comment": "Named in agentd RFC 0034 §5 as intended for future registration. They are NOT machinery at version 2, so a bare `:::memory` is legal prose in a spec-2.0 document and MUST stay legal there even after a later version registers them — that is the whole point of version-scoping the reserved set (SPEC.md §3.2 rule 3).",
+        "names": ["approval", "memory", "schedule"]
+      }
+    }
+  }
+}

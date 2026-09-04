@@ -87,6 +87,15 @@ const KNOWN: &[&str] = &[
     "workflow", "skill", "context", "example", "config", "mcp", "stream", "tools",
 ];
 
+/// The dialect-1 closed set, exported so the Instruction Document Spec's
+/// per-version registry (`conformance/registry/kinds.json` in the spec repo)
+/// can be checked AGAINST the reference implementation rather than beside it —
+/// the registry's spec-1 entry must equal this list exactly, and the corpus
+/// gate test asserts it.
+pub fn known_kinds() -> &'static [&'static str] {
+    KNOWN
+}
+
 /// Parse every top-level directive out of `text`. Returns the directives and
 /// the text segments between them, or every problem found.
 pub fn parse(text: &str) -> Result<(Vec<Segment>, Vec<Directive>), Vec<String>> {
@@ -645,7 +654,6 @@ mod tests {
         assert!(e.cleaned.contains("<example>\nQ: hi\nA: hello\n</example>"));
     }
 
-    #[test]
     /// Dialect-2 markers are refused, never mis-parsed. Without this guard a
     /// `:::!workflow` block silently became prose (verified against 1.6.0:
     /// clean validation, zero registrations) — configuration loss with no

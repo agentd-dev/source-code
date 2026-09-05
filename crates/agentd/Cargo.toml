@@ -132,6 +132,12 @@ aauth = ["tls", "dep:ring"]
 # so it rides `aauth`. OFF by default; a binary that never verifies signed
 # documents carries none of it.
 sign = ["aauth"]
+# Instruction documents from an OCI artifact registry (RFC 0040): pull
+# `oci://registry/repo:tag[@sha256:…]` over the Distribution API v2 — token
+# dance, manifest + blob digest verification, docker-config static creds.
+# Plain HTTPS + JSON on the existing client; SHA-256 is the `ring` rustls
+# already resolves — no OCI client crate (the minimalism moat). OFF by default.
+oci = ["tls", "dep:ring"]
 
 [dependencies]
 # The A2A protocol itself (feature `a2a`): domain types generated from the

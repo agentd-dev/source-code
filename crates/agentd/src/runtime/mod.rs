@@ -1365,10 +1365,62 @@ impl Runtime {
     /// Read the instruction resource and subscribe to it, so an update at the
     /// server reaches this agent without a reload.
     pub(crate) fn subscribe_instruction(&mut self, uri: &str) -> Result<(), String> {
+        // An OCI artifact reference (RFC 0040): pull over the Distribution API,
+        // digest-verified. Re-invoked by the §7.7 freshness watch, where a
+        // changed manifest digest on a `:tag` reference is a new version.
+        if uri.starts_with("oci://") {
+            #[cfg(feature = "oci")]
+            {
+                let pulled = crate::oci::pull(uri)?;
+                let text = self.decode_instruction_bytes(pulled.bytes)?;
+                let changed = self.instruction.text != text;
+                self.instruction = reactor::Instruction {
+                    text,
+                    source: "oci",
+                    uri: Some(uri.to_string()),
+                    server: None,
+                    version: self.instruction.version + u64::from(changed),
+                };
+                self.log.info(
+                    "instruction.loaded",
+                    json!({"uri": uri, "manifest_digest": pulled.manifest_digest,
+                           "layer_digest": pulled.layer_digest,
+                           "bytes": self.instruction.text.len(),
+                           "version": self.instruction.version}),
+                );
+                return Ok(());
+            }
+            #[cfg(not(feature = "oci"))]
+            return Err("an oci:// instruction requires building with --features oci".to_string());
+        }
         let (server, res) = match uri.strip_prefix("mcp://").and_then(|r| r.split_once('/')) {
             Some((s, r)) => (Some(s.to_string()), r.to_string()),
             None => (None, uri.to_string()),
         };
+        self.subscribe_instruction_mcp(uri, server, res)
+    }
+
+    /// Fetched instruction bytes → the plaintext document. When the `decrypt`
+    /// feature is built and the bytes are an encrypted envelope (RFC 0041),
+    /// they are decrypted with the operator's recipient keys first; otherwise
+    /// they must be UTF-8.
+    fn decode_instruction_bytes(&self, bytes: Vec<u8>) -> Result<String, String> {
+        if crate::config::envelope::looks_encrypted(&bytes) {
+            return Err(
+                "the instruction is an encrypted envelope; decrypting it requires building \
+                 with --features decrypt"
+                    .to_string(),
+            );
+        }
+        String::from_utf8(bytes).map_err(|_| "the instruction is not valid UTF-8".to_string())
+    }
+
+    fn subscribe_instruction_mcp(
+        &mut self,
+        _uri: &str,
+        server: Option<String>,
+        res: String,
+    ) -> Result<(), String> {
         // Find the serving client.
         let candidates: Vec<(String, Arc<McpClient>)> = match &server {
             Some(s) => self
@@ -1386,7 +1438,10 @@ impl Runtime {
         for (name, c) in candidates {
             match c.read_resource(&res) {
                 Ok(r) => {
-                    let text = r.text();
+                    // An encrypted envelope served as a resource decrypts (or
+                    // refuses) here — a decode failure is terminal, not a
+                    // reason to try another server for the same document.
+                    let text = self.decode_instruction_bytes(r.text().into_bytes())?;
                     if c.capabilities().supports_resources()
                         && let Err(e) = c.subscribe(&res)
                     {

@@ -35,6 +35,8 @@ pub mod mcp; // MCP client (to servers) + self-MCP server + registry/config
 // `crate::net::*` resolves across the runtime (MCP transport + intelligence).
 pub use ::net;
 pub mod obs; // logging, health, tracing, metrics
+#[cfg(feature = "oci")]
+pub mod oci; // instruction documents pulled from an OCI artifact registry (RFC 0040)
 pub mod registry; // tool registry: internal > code > MCP, contracts, overrides, grants
 pub mod runtime; // the runtime: event loop, turn workers, lifecycle
 pub mod sec; // secrets, tool-scope, gated exec

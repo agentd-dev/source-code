@@ -1,9 +1,10 @@
 {
- "spec": "1",
  "errors": [
   "unknown machinery",
   "banana"
  ],
  "registers": {},
+ "grants": [],
+ "spec": "1",
  "valid": false
 }

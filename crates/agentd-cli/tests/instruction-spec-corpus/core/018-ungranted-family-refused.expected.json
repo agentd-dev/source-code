@@ -1,6 +1,7 @@
 {
  "errors": [
-  "skill"
+  "compute",
+  "capability"
  ],
  "registers": {},
  "grants": [],

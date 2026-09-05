@@ -1,3 +1,5 @@
+# Unknown MACHINERY fails closed: a mistyped `:::!worfklow` silently becoming
+# prose would be configuration vanishing without a diagnostic.
 spec: "1"
 valid: false
 errors: ["unknown machinery", "banana"]

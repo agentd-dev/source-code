@@ -24,6 +24,15 @@ steps:
 Be brief.
 :::
 
+:::!tools
+disabled: [search.dangerous_tool]
+:::
+
 :::context{title="Facts"}
 The rate limit is 10/s.
+:::
+
+:::example
+Q: hi
+A: hello
 :::

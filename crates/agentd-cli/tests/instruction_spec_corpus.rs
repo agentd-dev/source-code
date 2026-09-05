@@ -16,16 +16,17 @@ use std::process::Command;
 
 use serde_json::Value;
 
-fn run_case(doc_path: &Path) -> (bool, String, Value) {
+fn run_case(doc_path: &Path, grants: &[Value]) -> (bool, String, Value) {
     let doc = std::fs::read_to_string(doc_path).unwrap();
     let cfg = serde_json::json!({
         "config_version": "1",
         "agent": {
             "name": "conf", "preflight": "never", "instruction": doc,
-            // The corpus exercises the PARSER; grant every family so the trust
-            // ladder never masks a parse outcome (grant enforcement has its own
-            // dedicated e2e).
-            "document_capabilities": ["material","knowledge","interface","identity","compute","infra","compose"],
+            // Grants are declared PER FIXTURE (the corpus's `grants:` key,
+            // default none). A runner that granted everything could not express
+            // the fail-closed fixtures at all, leaving the trust ladder's
+            // guarantee permanently untested — so the default is none.
+            "document_capabilities": grants,
         },
         "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
         "store": {"kind": "memory"},
@@ -73,7 +74,7 @@ fn the_conformance_corpus_passes_against_this_binary() {
     eprintln!("conformance corpus vs {ver:?}");
     // Extraction-presence probe: a fresh build implements it, so its absence is
     // a regression, reported as one clear line rather than every fixture failing.
-    let (pv, _, pc) = run_case(&root.join("core/001-core-happy.instruction.md"));
+    let (pv, _, pc) = run_case(&root.join("core/001-core-happy.instruction.md"), &[]);
     assert!(
         pv && !pc["workflows"].as_array().is_none_or(|a| a.is_empty()),
         "{ver} validates the probe but extracts no directives — extraction regressed"
@@ -120,7 +121,8 @@ fn the_conformance_corpus_passes_against_this_binary() {
                 eprintln!("  skip {name} (spec {spec}; this implementation speaks 1)");
                 continue;
             }
-            let (valid, errtext, caps) = run_case(&doc);
+            let grants: Vec<Value> = exp["grants"].as_array().cloned().unwrap_or_default();
+            let (valid, errtext, caps) = run_case(&doc, &grants);
             if Some(valid) != exp["valid"].as_bool() {
                 failures.push(format!(
                     "{name}: valid={valid}, expected {} — said: {}",
@@ -180,13 +182,12 @@ fn the_registry_spec_1_entry_matches_the_shipped_closed_set() {
         .unwrap(),
     )
     .unwrap();
-    // agentd implements the SIGILED format, which is the published registry's
-    // version 2 (29 machinery names). The spec owner is renumbering it to the
-    // sole version 1 (the sigiled format is the first and only dialect); until
-    // that republishes, agentd compares against the registry's `2` entry — its
-    // machinery set must equal the parser's own.
-    let v2 = &reg["versions"]["2"];
-    let mut registry_machinery: Vec<&str> = v2["machinery"]
+    // agentd implements the sigiled format, which is the published registry's
+    // sole version 1 (29 machinery names). Its machinery set must equal the
+    // parser's own — a registry that drifts from the code it describes is the
+    // schema-vs-loader failure again.
+    let v1 = &reg["versions"]["1"];
+    let mut registry_machinery: Vec<&str> = v1["machinery"]
         .as_array()
         .into_iter()
         .flatten()
@@ -205,15 +206,7 @@ fn the_registry_spec_1_entry_matches_the_shipped_closed_set() {
 /// fixture document and the registry must be byte-identical to upstream.
 /// Skips cleanly where upstream is absent (CI, until the repo has a URL) —
 /// the behavioural fixtures above still run there.
-// PAUSED during the sigiled-only migration. agentd's vendored corpus has been
-// re-authored for the single sigiled dialect (machinery carries `!`, unknown
-// bare is inert prose, nesting recurses), which the published upstream has not
-// yet adopted — so a byte drift check would fail on an intended divergence, not
-// a real one. Re-enable (drop the ignore) once the spec owner republishes the
-// corpus for the sigiled format. Tracked in the message to the instruction.md
-// session; the behavioural fixtures and the registry check above still run.
 #[test]
-#[ignore = "re-enable after upstream republishes the sigiled corpus"]
 fn vendored_corpus_matches_upstream_when_present() {
     // An EXPLICIT `INSTRUCTION_SPEC_REPO` that does not exist is a
     // configuration error and MUST fail — a drift check that skips when

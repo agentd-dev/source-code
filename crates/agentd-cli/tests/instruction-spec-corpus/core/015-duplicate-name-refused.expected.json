@@ -1,8 +1,10 @@
 {
- "spec": "1",
  "errors": [
-  "duplicate workflow/dup"
+  "duplicate workflow/dup",
+  "unique per kind"
  ],
  "registers": {},
+ "grants": [],
+ "spec": "1",
  "valid": false
 }

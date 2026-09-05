@@ -39,12 +39,11 @@ directive fixture for one reason. "The corpus is the arbiter" only holds when
 the arbiter's verdict names the thing it judged.
 
 
-## Sigiled-only migration (agentd leads)
+## One dialect, version 1 (sigiled)
 
-agentd now implements the SINGLE sigiled dialect as the only instruction format
-(the operator's decision: no legacy variant, breaking changes fine pre-1.0).
-This vendored corpus has been re-authored for it — machinery carries `!`, an
-unknown BARE name is inert prose, an unknown `:::!` is refused, and nesting
-recurses (see fixture 012). The published upstream corpus still encodes the
-two-dialect form; the byte drift check is `#[ignore]`d until the spec owner
-republishes the corpus for the sigiled-only format. Re-enable it then.
+The spec collapsed to a single format — the sigiled dialect, numbered 1 — at
+upstream `6c34bac`. This corpus is vendored from it: 10 fixtures, machinery
+sigiled, unknown-bare inert, nesting recursive, and each fixture declaring the
+`grants:` it needs (default none) so the trust ladder's fail-closed guarantee
+(fixture 018) is actually exercised. The registry check compares the parser to
+the sole version-1 machinery set; the byte drift check is live again.

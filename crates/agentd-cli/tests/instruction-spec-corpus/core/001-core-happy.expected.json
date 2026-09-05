@@ -1,5 +1,4 @@
 {
- "spec": "1",
  "errors": [],
  "registers": {
   "workflows": [
@@ -9,5 +8,7 @@
    "search"
   ]
  },
+ "grants": [],
+ "spec": "1",
  "valid": true
 }

@@ -1,0 +1,7 @@
+# The trust ladder is fail-closed (SPEC.md §5): a block whose family the
+# operator has not granted is refused, naming the family and what to add — not
+# warned, not skipped. Identical bytes to 012's first block; the only
+# difference is the absent `grants:`, which is the point.
+spec: "1"
+valid: false
+errors: ["compute", "capability"]

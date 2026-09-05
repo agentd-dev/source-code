@@ -1,9 +1,10 @@
 {
- "spec": "1",
  "errors": [
   "shadows a machinery name",
   ":::!workflow"
  ],
  "registers": {},
+ "grants": [],
+ "spec": "1",
  "valid": false
 }

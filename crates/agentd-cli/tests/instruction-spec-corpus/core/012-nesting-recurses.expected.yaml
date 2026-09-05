@@ -1,4 +1,5 @@
-# Dialect recurses: the case sub-block is real structure inside the test, and
-# the whole document loads (compute family, granted in the runner wrapper).
+# Nesting recurses: a longer outer fence contains shorter inner ones, and the
+# `case` sub-block is real structure inside its `test` parent — not body text.
 spec: "1"
+grants: [compute]
 valid: true

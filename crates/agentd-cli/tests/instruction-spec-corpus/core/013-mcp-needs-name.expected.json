@@ -1,8 +1,9 @@
 {
- "spec": "1",
  "errors": [
-  "mcp needs a name"
+  "needs a name"
  ],
  "registers": {},
+ "grants": [],
+ "spec": "1",
  "valid": false
 }

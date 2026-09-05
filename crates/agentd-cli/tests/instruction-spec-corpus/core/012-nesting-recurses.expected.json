@@ -1,6 +1,9 @@
 {
- "spec": "1",
- "valid": true,
  "errors": [],
- "registers": {}
+ "registers": {},
+ "grants": [
+  "compute"
+ ],
+ "spec": "1",
+ "valid": true
 }

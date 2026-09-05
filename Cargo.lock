@@ -42,7 +42,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agentd-cli"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "agentd-core",
  "libc",
@@ -60,7 +60,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-core"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "a2a-rs",
  "agentd-mcp",

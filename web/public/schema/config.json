@@ -2752,6 +2752,57 @@
       },
       "type": "object"
     },
+    "instruction_sources": {
+      "description": "pinned sources for SIGNED instruction documents (§7.5): publisher + author/delivery keys + a per-source capability ceiling + a freshness deadline. Pinning is by key and publisher, never by URI. Operator surface only.",
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "author_keys": {
+            "description": "author (offline) verification key PEM paths",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "delivery_keys": {
+            "description": "delivery (online) verification key PEM paths",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "freshness": {
+            "description": "the revocation re-check deadline (a duration, e.g. 15m)",
+            "type": "string"
+          },
+          "max_capabilities": {
+            "description": "the per-source ceiling; effective families never exceed it",
+            "items": {
+              "enum": [
+                "material",
+                "knowledge",
+                "interface",
+                "identity",
+                "compute",
+                "infra",
+                "compose"
+              ]
+            },
+            "type": "array"
+          },
+          "publisher": {
+            "description": "the publisher the author signature must claim",
+            "type": "string"
+          },
+          "uri": {
+            "description": "the document this pin applies to (instruction://…)",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "type": "array"
+    },
     "intelligence": {
       "additionalProperties": false,
       "properties": {

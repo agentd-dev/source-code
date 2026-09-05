@@ -1,19 +1,26 @@
 # Directives — instructions that carry their machinery
 
-> **This document describes dialect 1 (the original `:::type` form).** The
-> current instruction format is **dialect 2**, the reference implementation of
-> the open [Instruction Document Specification](https://github.com/instruction-md/specification).
-> In dialect 2 the machinery blocks below carry a `!` sigil (`:::!workflow`,
-> `:::!mcp`, …) so machinery can never be confused with the prose blocks
-> (`:::note`, `:::must`, …) that degrade into what the model reads, and the
-> extended families — code (`!function`/`!runtime`/`!test`), files (`!file`),
-> knowledge (`!knowledge`/`!source`), interface (`!endpoint`/`!ui`/`!human`),
-> identity (`!peer`/`!policy`), infra (`!git`/`!image`) and composition
-> (`!agent`) — are each gated behind an operator grant in
-> `agent.document_capabilities` (the trust ladder). A document is routed to
-> dialect 2 when it declares `spec: "2"` in YAML front matter or carries any
-> `:::!` block. See the spec for the full block reference; the shapes below
-> still apply, sigiled.
+> **agentd is the reference implementation of the open
+> [Instruction Specification](https://github.com/instruction-md/specification)**
+> (owned by instruction.md, CC BY 4.0), version **1**. Machinery blocks carry a
+> `!` sigil (`:::!workflow`, `:::!mcp`, …) so they can never be confused with
+> the prose blocks (`:::note`, `:::must`, …) that degrade into what the model
+> reads; a bare name that shadows a machinery kind is refused (`:::!workflow`
+> → "did you mean `:::!workflow`"). Every form is available for every kind that
+> takes it — the **container** (`:::!kind … :::`), the **leaf** (`::!kind{…}`),
+> the **set** (`:::!kind[]` with a table or definition list), and the
+> **section** (`## !kind name`) — plus the keyword (`MUST: …`) and alert
+> (`> [!NOTE]`) forms for prose. The extended families — material (`!file`
+> `!data` `!media` `!asset`), knowledge (`!knowledge` `!retrieval` `!source`),
+> interface (`!endpoint` `!ui` `!human` `!channel`), identity (`!peer`
+> `!policy` `!secret-ref`), compute (`!runtime` `!function` `!test` `!fixture`),
+> infra (`!git` `!volume` `!image`) and composition (`!agent`) — are each gated
+> behind an operator grant in `agent.document_capabilities` (the trust ladder;
+> fail-closed, restart-only). Any `:::`, `::`, or `## !kind` marker routes a
+> document to the parser; front matter may pin `spec: "1"` but need not. A
+> document may be **signed** (§7) and pinned in `instruction_sources` — see
+> [Signing and trust](#signing-and-trust) below. See the spec for the full
+> block reference and the delivery rules; the shapes here are the core kinds.
 
 An agentd instruction is prose: what the agent is for, how it should behave.
 But most agents are prose *plus* machinery — a workflow the prose keeps
@@ -77,7 +84,7 @@ and the known set — `:::worfklow` becomes an error, never silently prose.
 
 ## The content directives
 
-### `:::workflow` — a definition, where the prose that explains it lives
+### `:::!workflow` — a definition, where the prose that explains it lives
 
 The YAML body joins `workflows:` **exactly as an inline entry**. That phrase
 is load-bearing: directives are sugar over existing pipelines, never a
@@ -101,14 +108,14 @@ model paraphrasing a workflow definition it can also see verbatim is a bug
 factory). And the config generates **no sugar `main` loop** for a
 directive-carrying instruction: it declared its machinery explicitly.
 
-### `:::skill{name, description, when}` — an inline skill
+### `:::!skill{name, description, when}` — an inline skill
 
 Skills are named instruction bundles, discovered from MCP servers and
 preloaded on `@skill:<name>` references. An inline skill needs no server at
 all — it is defined where it is used:
 
 ```text
-:::skill{name=review description="how we review" when="reviewing PRs"}
+:::!skill{name=review description="how we review" when="reviewing PRs"}
 Check the tests before the diff. A missing test is a finding, not a nitpick.
 :::
 ```
@@ -134,27 +141,27 @@ deployment:
 ```markdown
 You are the order desk. Every paid order is fulfilled.
 
-:::config
+:::!config
 store: { kind: file }
 lifecycle: { run_until: drained }
 limits: { max_runs: 20 }
 :::
 
-:::mcp{name=fs}
+:::!mcp{name=fs}
 endpoint: "https://fs.internal/mcp"
 allow: ["read_*", "list_*"]     # only these tools register
 exclude: ["read_secrets"]       # …and this one never does (beats allow)
 :::
 
-:::stream{name=orders}
+:::!stream{name=orders}
 retention: { max_events: 10000 }
 :::
 
-:::tools
+:::!tools
 disabled: ["exec"]
 :::
 
-:::workflow
+:::!workflow
 name: fulfil
 steps:
   take: { kind: stream, stream: orders, subject: "order.*" }
@@ -163,16 +170,16 @@ steps:
 :::
 ```
 
-- **`:::config`** — any config fragment (a YAML mapping of sections:
+- **`:::!config`** — any config fragment (a YAML mapping of sections:
   `store`, `lifecycle`, `limits`, `intelligence`, …). Several blocks merge in
   document order, later winning.
-- **`:::mcp{name=…}`** — one `mcp.servers[]` entry; attributes merge over the
+- **`:::!mcp{name=…}`** — one `mcp.servers[]` entry; attributes merge over the
   body. The `allow`/`exclude` globs are real config (they work in the config
   file too): they gate the server's **advertised** tool names at the
   registry, and an excluded tool does not exist — not disabled, absent.
-- **`:::stream{name=…}`** — one `streams:` declaration (an empty body means
+- **`:::!stream{name=…}`** — one `streams:` declaration (an empty body means
   defaults).
-- **`:::tools`** — the `tools:` section (`disabled`, `overrides`).
+- **`:::!tools`** — the `tools:` section (`disabled`, `overrides`).
 
 **Precedence:** the document's fragment merges *under* the explicit
 configuration — at every leaf a config-file key, env var, or flag beats the
@@ -181,17 +188,17 @@ fragment. One exception in its favour: fragment `mcp.servers` entries
 exists (the instruction can add servers, never re-point a deployed one).
 There is no parallel pipeline: the merged document is deserialized,
 validated, and `--validate-config`-checked exactly as if every key had been
-written in the file — a bogus section in `:::config` is a startup error
+written in the file — a bogus section in `:::!config` is a startup error
 naming the line.
 
 ## Syntax, precisely
 
 - A fence opens at **column 0**: three-or-more colons, a name, optionally
-  `{attributes}` — `:::workflow`, `::::context{title="x"}`. A `:::`
+  `{attributes}` — `:::!workflow`, `::::context{title="x"}`. A `:::`
   mid-sentence, or an indented fence, is prose.
 - It closes at a line of **at least as many** colons and nothing else.
 - **Nest by giving the outer fence more colons** — a `::::context` block can
-  quote a literal `:::workflow` without it being parsed.
+  quote a literal `:::!workflow` without it being parsed.
 - Attributes: `key=value`, `key="quoted value with \" escapes"`, bare `flag`
   (→ `"true"`).
 - The body is verbatim — its meaning belongs to the directive.
@@ -271,7 +278,56 @@ a schedule-start workflow).
 
 - [Configuration](configuration.md) — §6.1 for the other workflow sources
   (inline, file, URL, directory) directives sit beside.
-- [Workflows](workflows.md) — the language the `:::workflow` body is written
+- [Workflows](workflows.md) — the language the `:::!workflow` body is written
   in, and the full retirement contract.
 - [The agent loop](agent-loop.md) — where skills and context land in a turn.
 - [Security](security.md) — why conversation text never executes anything.
+
+## Signing and trust
+
+A document that carries machinery is code, and a document delivered over a
+network is a supply chain. §7 of the specification defines what a signature
+attests and — separately — what keeps it authorized.
+
+**Attestation.** Signatures are JWS compact serializations over a claims
+object, Ed25519 (`alg: EdDSA`), digests `sha256:<hex>`. There are two: an
+offline **author** signature over the authored digest, and an online
+**delivery** signature over the delivered bytes, the audience, the resolution
+manifest, and the author signature it was resolved from. A signature *caps*, it
+never grants: effective families = operator grant ∩ per-source ceiling ∩
+author-attested ∩ delivery-attested. Compose and identity are never admissible
+over the wire, signed or not (the hard floor).
+
+Signing is built behind the default-off `sign` feature — the same `ring`
+already in the tree via rustls, no new dependency. The
+`sign_roundtrip` example produces and verifies an author + delivery round-trip:
+
+```console
+$ cargo run -p agentd-core --example sign_roundtrip --features sign -- <doc.md>
+```
+
+**Pinning.** Operators pin the sources they trust in `instruction_sources` —
+by key and publisher, never by URI, which the server controls:
+
+```yaml
+document_capabilities: [material, compute]
+instruction_sources:
+  - uri: "instruction://ins_42"
+    publisher: "https://instruction.md/pub/acme"
+    author_keys: [/etc/keys/acme-author.pem]
+    delivery_keys: [/etc/keys/delivery.pem]
+    max_capabilities: [material]      # this source's ceiling
+    freshness: 15m                    # re-check interval
+```
+
+This is operator surface: a served document's `:::!config` may not write
+`document_capabilities` or `instruction_sources` — a document is never a source
+of its own trust configuration.
+
+**Revocation.** A signature is valid forever; a document that can execute code
+must stop being usable the moment it stops being sanctioned. Authorization is
+current membership in the effective set, re-read on the source's `freshness`
+interval. agentd's freshness watch re-fetches the instruction on that cadence;
+a source unreachable past its deadline **refuses new work while live runs
+drain**, and a successful re-read clears the freeze. `compute` and `infra` must
+re-check; other classes should.

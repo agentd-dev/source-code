@@ -5,6 +5,59 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## v1.8.0 — the instruction runtime: forms, delivery, signing
+
+agentd is now a **conformant reference runtime for the
+[Instruction Specification](https://github.com/instruction-md/specification)**
+(instruction.md, version 1) across §3–§7 — verified against the spec's own
+sample documents and delivered text by the specification's maintainer. The
+registry is no longer transcribed into Rust: agentd vendors the spec's JSON
+Schema and reads kinds, forms, bodies, grants and acknowledgements from it, so
+they cannot drift from the specification by construction.
+
+### Added
+
+- **All §4 forms** for every kind that takes them: container (`:::!kind`), leaf
+  (`::!kind{…}`), set (`:::!kind[]` — a table or definition list, one instance
+  per entry) and section (`## !kind name`), plus the keyword (`MUST: …`) and
+  alert (`> [!NOTE]`) prose forms. Fences, leaves and section headings are
+  recognized at column 0 only; a section's region ends at its last non-blank
+  line.
+- **The §3.5 delivery pipeline**, byte-exact against the spec: prose degrades to
+  its Appendix A form, a set delivers one line (`[3 human roles are declared:
+  …]`), machinery acknowledges from the schema's templates (kinds with none
+  deliver nothing), `when` variants are selected against the reader's
+  parameters, `include` transcludes recursively (own parameters; cycles and
+  unavailable documents degrade to a visible note), inline references degrade to
+  their label, a `form` delivers its input list, and `${}` substitutes last.
+- **§7 signing** behind a default-off `sign` feature — **no new dependency** (the
+  `ring` already in the tree via rustls): author + delivery JWS/Ed25519
+  attestations, the resolution manifest (with required `variants.dropped`), the
+  §7.6 verification order (a signature caps, never grants), and the §7.8 hard
+  floor (`compose`/`identity` never over the wire). A `sign_roundtrip` example
+  produces and verifies a round-trip.
+- **`instruction_sources`** operator configuration (§7.5): pinned signed
+  sources — publisher, author/delivery keys, a per-source capability ceiling,
+  and a `freshness` deadline; pinning is by key and publisher, restart-only. A
+  served `:::!config` may not write it or `document_capabilities` (no
+  self-grant).
+- **The §7.7 freshness watch**: a durable periodic timer re-fetches a signed
+  instruction on its `freshness` interval and **refuses new work while live runs
+  drain** when the source is unreachable past its deadline; a successful re-read
+  clears the freeze.
+- Workflow-step reference resolution (`to: @human/x`, `schema: @ui/x`,
+  `template: @agent/x`), `@secret-ref/x` → `{{secret:NAME}}` / `{{secret-file:PATH}}`
+  by the declared kind, and the `!mcp` `deny`→`exclude` mapping.
+
+### Changed
+
+- The single sigiled format is spec **version 1** (`spec: "instruction/1"` in
+  `--capabilities`); the earlier bare `:::type` dialect is removed. A bare name
+  shadowing a machinery kind is refused, pointing at the sigiled form.
+- A document's `${parameter}` references are resolved by the instruction
+  resolver from their declared source (§5.2/§4.7) and are no longer expanded by
+  the config `${VAR}` env layer.
+
 ## v1.7.0 — the instruction document as an open spec
 
 The instruction-document surface (RFC 0034's `:::` directives) is now the

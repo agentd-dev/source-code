@@ -8,7 +8,7 @@
 # `-p agentd-core --features X` means.
 [package]
 name = "agentd-cli"
-version = "1.7.0"
+version = "1.8.0"
 edition = "2024"
 rust-version = "1.96"
 description = "agentd — a minimal, MCP-native, reactive agent runtime (the CLI binary over the agentd-core engine)"
@@ -41,13 +41,15 @@ otel = ["agentd/otel"]
 workflow = ["agentd/workflow"]
 cel = ["agentd/cel"]
 aauth = ["tls", "agentd/aauth"]
+# §7 instruction attestation (rides aauth; no new dependency).
+sign = ["aauth", "agentd/sign"]
 internal-mocks = ["agentd/internal-mocks"]
 
 [dependencies]
 # The engine. Dependency-renamed so the binary's code (and every embedder
 # following its shape) writes `use agentd::…` — the package name carries the
 # crates.io-unique `-core` suffix, the LIB name stays `agentd`.
-agentd = { package = "agentd-core", path = "../agentd", version = "1.7.0", default-features = false }
+agentd = { package = "agentd-core", path = "../agentd", version = "1.8.0", default-features = false }
 serde_json = "1"
 
 # The `agentd tui`/`agentd ui` passthrough: fd plumbing (hand the

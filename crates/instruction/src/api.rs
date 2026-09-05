@@ -18,6 +18,17 @@ pub struct Refusal {
     pub message: String,
 }
 
+impl Refusal {
+    /// The message WITHOUT its `line N: ` prefix — the fixture-corpus wire
+    /// form (`line` travels as its own field there).
+    pub fn message_body(&self) -> &str {
+        match (self.line, self.message.split_once(": ")) {
+            (Some(_), Some((head, rest))) if head.starts_with("line ") => rest,
+            _ => &self.message,
+        }
+    }
+}
+
 impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // The wire/display form is the full message (which already leads with
@@ -393,7 +404,7 @@ mod tests {
         // A refusal carries its line as data.
         let errs = parse(":::workflow{name=w}\nsteps: {}\n:::").unwrap_err();
         assert_eq!(errs[0].line, Some(1));
-        assert!(errs[0].message.contains("shadows a machinery name"));
+        assert!(errs[0].message.contains("is a machinery kind"));
     }
 
     #[test]
@@ -476,7 +487,7 @@ mod tests {
     #[test]
     fn the_tree_dump_matches_the_9_1_shape() {
         let d = parse(
-            "---\nspec: \"1\"\n---\n::!human{name=lead role=reviewer flagged}\n\n:::!human[]\n| name | role |\n|------|------|\n| a    | ops  |\n| b    | ops  |\n:::\n\n::::!mcp{name=t endpoint=https://x deny=\"a, b\"}\n:::override{target=x}\ndisabled: true\n:::\n::::\n",
+            "---\nspec: \"1\"\n---\n::!human{name=lead role=reviewer}\n::param{name=env required}\n\n:::!human[]\n| name | role |\n|------|------|\n| a    | ops  |\n| b    | ops  |\n:::\n\n::::!mcp{name=t endpoint=https://x deny=\"a, b\"}\n:::override{target=x}\ndisabled: true\n:::\n::::\n",
         )
         .unwrap();
         let t = tree_json(&d);
@@ -484,15 +495,16 @@ mod tests {
         // Leaf: sigil true, form leaf, flag normalized to true.
         assert_eq!(blocks[0]["form"], "leaf");
         assert_eq!(blocks[0]["sigil"], true);
-        assert_eq!(blocks[0]["attrs"]["flagged"], true);
+        // A schema-declared flag normalizes to true.
+        assert_eq!(blocks[1]["attrs"]["required"], true);
         // The set groups its members.
-        assert_eq!(blocks[1]["form"], "set");
-        assert_eq!(blocks[1]["members"].as_array().unwrap().len(), 2);
-        assert_eq!(blocks[1]["members"][0]["form"], "member");
+        assert_eq!(blocks[2]["form"], "set");
+        assert_eq!(blocks[2]["members"].as_array().unwrap().len(), 2);
+        assert_eq!(blocks[2]["members"][0]["form"], "member");
         // Container with a bare sub-block child; multi-valued attr is an array.
-        assert_eq!(blocks[2]["form"], "container");
-        assert_eq!(blocks[2]["attrs"]["deny"], json!(["a", "b"]));
-        assert_eq!(blocks[2]["children"][0]["kind"], "override");
-        assert_eq!(blocks[2]["children"][0]["sigil"], false);
+        assert_eq!(blocks[3]["form"], "container");
+        assert_eq!(blocks[3]["attrs"]["deny"], json!(["a", "b"]));
+        assert_eq!(blocks[3]["children"][0]["kind"], "override");
+        assert_eq!(blocks[3]["children"][0]["sigil"], false);
     }
 }

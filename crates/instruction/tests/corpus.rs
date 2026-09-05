@@ -15,7 +15,10 @@ use std::path::Path;
 
 use instruction_core::{Context, deliver, parse, tree_json};
 
-const DEFAULT: &str = "/root/instruction-md/source-code/packages/spec/fixtures/corpus";
+// The spec repo's conformance corpus is THE contract (proposals/S5); the
+// twin's packages/spec/fixtures mirrors it.
+const DEFAULT: &str = "/root/instruction-md/specification/conformance/corpus";
+const DEFAULT_REFUSALS: &str = "/root/instruction-md/specification/conformance/refusals";
 
 #[test]
 fn the_shared_corpus_delivers_byte_exactly() {
@@ -170,4 +173,78 @@ fn first_diff(want: &str, got: &str) -> String {
         want.lines().count(),
         got.lines().count()
     )
+}
+
+#[test]
+fn the_shared_refusal_corpus_matches() {
+    let explicit = std::env::var("INSTRUCTION_REFUSALS");
+    let root = explicit
+        .clone()
+        .unwrap_or_else(|_| DEFAULT_REFUSALS.to_string());
+    let root = Path::new(&root);
+    if !root.exists() {
+        assert!(
+            explicit.is_err(),
+            "INSTRUCTION_REFUSALS={root:?} was set but does not exist — fail, not skip"
+        );
+        eprintln!("refusal corpus not present; skipped");
+        return;
+    }
+    let mut cases: Vec<std::path::PathBuf> = std::fs::read_dir(root)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.join("doc.md").exists() && p.join("refusals.json").exists())
+        .collect();
+    cases.sort();
+    assert!(!cases.is_empty(), "refusal corpus present but empty");
+    let mut failures = Vec::new();
+    for dir in &cases {
+        let name = dir.file_name().unwrap().to_string_lossy().to_string();
+        let text = std::fs::read_to_string(dir.join("doc.md")).unwrap();
+        let want: Vec<serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("refusals.json")).unwrap())
+                .unwrap();
+        let got: Vec<instruction_core::Refusal> = match parse(&text) {
+            Err(errs) => errs,
+            Ok(d) => instruction_core::validate(
+                &d,
+                &Context {
+                    grants: instruction_core::doc::all_families(),
+                    ..Context::default()
+                },
+            ),
+        };
+        // The matching rule both runners use: message equality, and line
+        // equality when the fixture's line is not null.
+        let mut msgs = Vec::new();
+        for w in &want {
+            let wmsg = w["message"].as_str().unwrap_or("");
+            let wline = w["line"].as_u64();
+            let hit = got.iter().any(|g| {
+                g.message_body() == wmsg && (wline.is_none() || g.line.map(u64::from) == wline)
+            });
+            if !hit {
+                msgs.push(format!(
+                    "  want {:?} (line {:?}); got: {}",
+                    wmsg,
+                    wline,
+                    got.iter()
+                        .map(|g| format!("[{:?}] {:?}", g.line, g.message_body()))
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                ));
+            }
+        }
+        if !msgs.is_empty() {
+            failures.push(format!("{name}:\n{}", msgs.join("\n")));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} refusal-corpus failures:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+    eprintln!("refusal corpus: {} cases, all matched", cases.len());
 }

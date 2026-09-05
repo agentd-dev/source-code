@@ -214,7 +214,7 @@ fn a_forgotten_sigil_is_refused_not_silently_demoted() {
     );
     assert!(!valid);
     assert!(
-        err.contains("!workflow") && err.contains("shadows a machinery name"),
+        err.contains(":::!workflow") && err.contains("is a machinery kind"),
         "names the fix:\n{err}"
     );
 }

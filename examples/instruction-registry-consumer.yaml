@@ -1,0 +1,50 @@
+# The reference consumer for an instruction REGISTRY (C-02, RFC-0016 §6):
+# the agent's instruction is a versioned registry document, followed at a ref.
+#
+#   agentd -c examples/instruction-registry-consumer.yaml
+#
+# What it does, observable in the log:
+#  - reads `instruction://<id>@stable` from the gateway MCP server at startup
+#    (`instruction.loaded`, carrying `md.instruction/versionId`),
+#  - logs the APPLY boundary — `instruction.applied` with
+#    old_version_id → new_version_id and the delivered digest — every time the
+#    ref moves to a new version (measure publish→applied latency from the ts),
+#  - creates ONE consumer binding and reports each applied version
+#    (`instructions.bindings.create` / `.report`, RFC-0028 §3.3); every MCP
+#    session announces clientInfo {name: "agentd", version} plus the workload
+#    label (the instance name) in clientInfo.title,
+#  - exposes the current versionId in agentd's status
+#    (`instruction.version_id`).
+#
+# Update cadence: the gateway does not push resource-updated notifications for
+# template URIs yet, so the §7.7 freshness watch re-reads on the interval below
+# (subscribe stays on for when notifications land — both paths converge on the
+# same apply boundary). Pick the cadence from the registry's cache hint
+# (`md.instruction/cache.maxAge`, 30s on the dev gateway).
+config_version: "1"
+
+agent:
+  name: loop-demo
+  preflight: never
+  # Replace with your instruction id; `@stable` follows the ref.
+  instruction: "instruction://ins_01M1SSQR9NG8AYS34KWRMGY4E1@stable"
+
+mcp:
+  servers:
+    - name: gateway
+      endpoint: "http://127.0.0.1:8788/mcp"
+      # Dev-gateway identity is header-asserted; production uses `auth:`.
+      headers: { x-mcpg-subject-id: agentd-dev }
+
+instruction_sources:
+  - uri: "instruction://ins_01M1SSQR9NG8AYS34KWRMGY4E1@stable"
+    publisher: "https://instruction.md/pub/agentd-dev"
+    # The re-read cadence (and §7.7 staleness deadline): unreachable past this,
+    # NEW work is refused while live runs drain.
+    freshness: 60s
+
+intelligence:
+  endpoints: ["http://127.0.0.1:11434/v1"]
+  model: qwen3
+
+store: { kind: file }

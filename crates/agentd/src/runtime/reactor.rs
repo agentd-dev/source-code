@@ -226,6 +226,12 @@ pub struct Instruction {
     pub uri: Option<String>,
     pub server: Option<String>,
     pub version: u64,
+    /// The registry version this text came from (`md.instruction/versionId`,
+    /// RFC-0028 §3.3) — `None` for sources that are not a versioned registry.
+    pub version_id: Option<String>,
+    /// The delivered-content digest the registry attested
+    /// (`md.instruction/deliveredDigest`).
+    pub delivered_digest: Option<String>,
 }
 
 /// Counters for status/reports.
@@ -1395,7 +1401,7 @@ impl Runtime {
             "tools": self.registry.len(),
             "skills": self.skills.names(),
             "counters": {"turns": self.counters.turns, "tool_calls": self.counters.tool_calls, "runs_started": self.counters.runs_started, "runs_finished": self.counters.runs_finished, "tokens_in": self.counters.tokens_in, "tokens_out": self.counters.tokens_out},
-            "instruction": {"source": self.instruction.source, "uri": self.instruction.uri, "version": self.instruction.version, "bytes": self.instruction.text.len()},
+            "instruction": {"source": self.instruction.source, "uri": self.instruction.uri, "version": self.instruction.version, "version_id": self.instruction.version_id, "delivered_digest": self.instruction.delivered_digest, "bytes": self.instruction.text.len()},
             "model": self.model,
             "activity": self.activity_value(),
         })

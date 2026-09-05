@@ -63,6 +63,15 @@ pub mod pace {
 /// to the spec's remote `endpoint`, stamping agentd's client identity. The
 /// config/auth-coupled counterpart of the crate's transport-only
 /// [`client::McpClient::connect`]. Call `initialize` on the result before use.
+/// The workload label every MCP session carries in `clientInfo.title`
+/// (RFC-0028 §3.3 consumer presence) — the instance name, set once at startup.
+static WORKLOAD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Set the workload label sessions announce; first caller wins (idempotent).
+pub fn set_workload_label(label: &str) {
+    let _ = WORKLOAD.set(label.to_string());
+}
+
 pub fn from_spec(
     spec: &crate::config::McpServerSpec,
     timeout: std::time::Duration,
@@ -133,7 +142,7 @@ pub fn from_spec(
         .with_client_info(::mcp::wire::Implementation {
             name: "agentd".into(),
             version: crate::VERSION.into(),
-            title: None,
+            title: WORKLOAD.get().cloned(),
         });
     // SPIFFE X.509-SVID mTLS: set the transport client identity from the
     // SPIRE-written cert + key when the server declares `auth: {kind: spiffe,

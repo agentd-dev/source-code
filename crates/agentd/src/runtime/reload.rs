@@ -143,6 +143,8 @@ impl Runtime {
                         uri: None,
                         server: None,
                         version: self.instruction.version + 1,
+                        version_id: None,
+                        delivered_digest: None,
                     };
                 }
                 None => {
@@ -152,6 +154,8 @@ impl Runtime {
                         uri: None,
                         server: None,
                         version: self.instruction.version + 1,
+                        version_id: None,
+                        delivered_digest: None,
                     };
                 }
             }

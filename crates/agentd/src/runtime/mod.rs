@@ -149,6 +149,9 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
     }
     crate::signals::install();
     crate::supervisor::reap::set_child_subreaper();
+    // Consumer presence (RFC-0028 §3.3): every MCP session this process opens
+    // announces which workload it is, alongside name/version.
+    crate::mcp::set_workload_label(&instance);
 
     // The reference preflight, phase 1: every `{{secret:…}}` / `{{secret-file:…}}`
     // visible in the assembled document, checked BEFORE anything dials out —
@@ -539,6 +542,8 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
         inbox_queue: Default::default(),
         subagents: BTreeMap::new(),
         instruction: reactor::Instruction {
+            version_id: None,
+            delivered_digest: None,
             text: String::new(),
             source: "static",
             uri: None,
@@ -1458,6 +1463,109 @@ impl Runtime {
         String::from_utf8(bytes).map_err(|_| "the instruction is not valid UTF-8".to_string())
     }
 
+    /// Consumer-alignment reporting (RFC-0028 §3.3): ensure ONE binding on
+    /// the registry serving the instruction, then report each applied version.
+    /// Best-effort by design — a registry that cannot take the report must
+    /// never take the agent down with it; failures are one warn line each.
+    fn report_instruction_binding(
+        &mut self,
+        server: &str,
+        canonical: Option<&str>,
+        version_id: Option<&str>,
+        delivered_digest: Option<&str>,
+        uri: &str,
+    ) {
+        let (Some(canonical), Some(version_id)) = (canonical, version_id) else {
+            return; // not a versioned registry read
+        };
+        let instruction_id = canonical
+            .strip_prefix("instruction://")
+            .unwrap_or(canonical)
+            .to_string();
+        let Some(client) = self.mcp.get(server).cloned() else {
+            return;
+        };
+        const BINDING_KEY: &str = "_instruction/binding";
+        // One binding per (server, instruction), created once and kept in the
+        // durable store so a restart reuses it instead of minting another.
+        let mut binding_id = self
+            .durable
+            .get(Kind::Memory, BINDING_KEY)
+            .ok()
+            .flatten()
+            .map(|e| e.state)
+            .filter(|v| v["instruction_id"] == instruction_id)
+            .and_then(|v| v["binding_id"].as_str().map(str::to_string));
+        if binding_id.is_none() {
+            let target = uri
+                .rsplit_once('@')
+                .map(|(_, r)| format!("@{r}"))
+                .unwrap_or_else(|| "@latest".to_string());
+            let args = json!({
+                "instructionId": instruction_id,
+                "target": target,
+                "mode": "follow",
+                "consumer": {
+                    "label": self.settings.instance_name(),
+                    "kind": "agent",
+                    "workload": self.settings.agent.name.clone().unwrap_or_else(|| "agentd".into()),
+                },
+            });
+            match client.call_tool("instructions.bindings.create", Some(args)) {
+                Ok(r) if !r.is_error() => {
+                    binding_id = serde_json::from_str::<Value>(&r.text()).ok().and_then(|v| {
+                        v.get("bindingId")
+                            .or_else(|| v.get("id"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    });
+                    if let Some(id) = &binding_id {
+                        let _ = self.durable.put(
+                            Kind::Memory,
+                            BINDING_KEY,
+                            json!({"binding_id": id, "instruction_id": instruction_id, "server": server}),
+                            None,
+                        );
+                        self.log.info(
+                            "instruction.binding.created",
+                            json!({"server": server, "instruction_id": instruction_id, "binding_id": id}),
+                        );
+                    }
+                }
+                Ok(r) => self.log.warn(
+                    "instruction.binding.fail",
+                    json!({"op": "create", "server": server, "err": r.text()}),
+                ),
+                Err(e) => self.log.warn(
+                    "instruction.binding.fail",
+                    json!({"op": "create", "server": server, "err": e.to_string()}),
+                ),
+            }
+        }
+        let Some(binding_id) = binding_id else { return };
+        let args = json!({
+            "instructionId": instruction_id,
+            "bindingId": binding_id,
+            "versionId": version_id,
+            "deliveredDigest": delivered_digest,
+            "client": {"name": "agentd", "version": crate::VERSION},
+        });
+        match client.call_tool("instructions.bindings.report", Some(args)) {
+            Ok(r) if !r.is_error() => self.log.info(
+                "instruction.binding.reported",
+                json!({"binding_id": binding_id, "version_id": version_id}),
+            ),
+            Ok(r) => self.log.warn(
+                "instruction.binding.fail",
+                json!({"op": "report", "server": server, "err": r.text()}),
+            ),
+            Err(e) => self.log.warn(
+                "instruction.binding.fail",
+                json!({"op": "report", "server": server, "err": e.to_string()}),
+            ),
+        }
+    }
+
     fn subscribe_instruction_mcp(
         &mut self,
         _uri: &str,
@@ -1484,7 +1592,42 @@ impl Runtime {
                     // An encrypted envelope served as a resource decrypts (or
                     // refuses) here — a decode failure is terminal, not a
                     // reason to try another server for the same document.
-                    let text = self.decode_instruction_bytes(r.text().into_bytes())?;
+                    let raw = self.decode_instruction_bytes(r.text().into_bytes())?;
+                    // The registry's alignment metadata (`md.instruction/*`,
+                    // RFC-0028 §3.3), when the server is one.
+                    let meta = r.contents.first().and_then(|c| c.get("_meta")).cloned();
+                    let get_meta = |k: &str| -> Option<String> {
+                        meta.as_ref()
+                            .and_then(|m| m.get(format!("md.instruction/{k}")))
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    };
+                    // Delivered text is the CLEANED document when it carries
+                    // machinery (resolution "raw" = resolve locally); the
+                    // machinery itself applies on reload/restart. A document
+                    // that no longer folds keeps the running text.
+                    let text = if crate::config::idoc::contains_blocks(&raw) {
+                        let granted: std::collections::BTreeSet<String> = self
+                            .settings
+                            .agent
+                            .document_capabilities
+                            .iter()
+                            .cloned()
+                            .collect();
+                        let facts: BTreeMap<String, String> =
+                            [("agent".to_string(), "agentd".to_string())].into();
+                        match crate::config::idoc::extract_with_facts(&raw, &granted, &facts) {
+                            Ok(ex) => ex.cleaned,
+                            Err(errs) => {
+                                return Err(format!(
+                                    "instruction no longer folds: {}",
+                                    errs.join("; ")
+                                ));
+                            }
+                        }
+                    } else {
+                        raw
+                    };
                     if c.capabilities().supports_resources()
                         && let Err(e) = c.subscribe(&res)
                     {
@@ -1494,14 +1637,38 @@ impl Runtime {
                         );
                     }
                     let changed = self.instruction.text != text;
+                    let old_version_id = self.instruction.version_id.clone();
+                    let version_id = get_meta("versionId");
+                    let delivered_digest = get_meta("deliveredDigest");
+                    let canonical = get_meta("canonical");
                     self.instruction = reactor::Instruction {
                         text,
                         source: "resource",
                         uri: Some(res.clone()),
                         server: Some(name.clone()),
                         version: self.instruction.version + u64::from(changed),
+                        version_id: version_id.clone(),
+                        delivered_digest: delivered_digest.clone(),
                     };
-                    self.log.info("instruction.loaded", json!({"server": name, "uri": res, "bytes": self.instruction.text.len(), "version": self.instruction.version}));
+                    self.log.info("instruction.loaded", json!({"server": name, "uri": res, "bytes": self.instruction.text.len(), "version": self.instruction.version, "version_id": version_id}));
+                    // The APPLY boundary (RFC-0016 §6): a registry version
+                    // change is one log line, old → new, timestamped like
+                    // every line — the publish→applied latency measure.
+                    if version_id.is_some() && version_id != old_version_id {
+                        self.log.info(
+                            "instruction.applied",
+                            json!({"uri": res, "old_version_id": old_version_id,
+                                   "new_version_id": version_id,
+                                   "delivered_digest": delivered_digest}),
+                        );
+                        self.report_instruction_binding(
+                            &name,
+                            canonical.as_deref(),
+                            version_id.as_deref(),
+                            delivered_digest.as_deref(),
+                            &res,
+                        );
+                    }
                     return Ok(());
                 }
                 Err(e) => last_err = e.to_string(),

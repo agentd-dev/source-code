@@ -1926,6 +1926,9 @@ pub fn fold_with_params(
         families: families_used(doc).into_iter().collect(),
         ..Extraction::default()
     };
+    // The parameter context is needed during the walk to select `when`
+    // variants, and again at the end for `${}` substitution.
+    let params = param_values(doc, overrides);
 
     // Config + delivery in source order. Consecutive members of one set are
     // gathered so the set delivers a single acknowledgement line.
@@ -1960,7 +1963,7 @@ pub fn fold_with_params(
             }
             Node::Block(b) => {
                 fold_config(b, &mut out, &mut errs);
-                deliver_block(b, &mut out);
+                deliver_block(b, &mut out, &params);
                 i += 1;
             }
         }
@@ -1972,7 +1975,6 @@ pub fn fold_with_params(
     // §3.5 steps 4–6, finishing passes over the assembled text: keyword and
     // alert forms normalize to their bold delivered form, inline references
     // degrade to their label, then `${}` is substituted last.
-    let params = param_values(doc, overrides);
     out.cleaned = normalize_prose_lines(&out.cleaned);
     out.cleaned = degrade_inline_refs(&out.cleaned);
     out.cleaned = substitute_params(&out.cleaned, &params);
@@ -1996,13 +1998,14 @@ fn fold_config(b: &Block, out: &mut Extraction, errs: &mut Vec<String>) {
 }
 
 /// Deliver one block into the model-visible text (§3.5 steps 4–5).
-fn deliver_block(b: &Block, out: &mut Extraction) {
+fn deliver_block(b: &Block, out: &mut Extraction, params: &BTreeMap<String, String>) {
     match b.disposition {
         Disposition::Prose => deliver_prose(b, out),
         Disposition::Structural => {
-            // A kept `when` delivers its body unwrapped; `include`/`param`
+            // A KEPT `when` delivers its body unwrapped; a dropped one delivers
+            // nothing (and would be recorded in the manifest). `include`/`param`
             // deliver nothing (an include is inlined upstream of this reader).
-            if b.kind == "when" && !b.body.trim().is_empty() {
+            if b.kind == "when" && when_kept(b, params) && !b.body.trim().is_empty() {
                 ack(out, b.body.trim_end());
             }
         }
@@ -2012,6 +2015,17 @@ fn deliver_block(b: &Block, out: &mut Extraction) {
             }
         }
     }
+}
+
+/// Whether a `when` variant is kept for this reader: every `key="value"`
+/// attribute must equal the reader's parameter of that name. A condition
+/// referencing a parameter that is not in the context is not selected (its
+/// content is withheld rather than shown speculatively). A `when` with no
+/// simple attributes is always kept.
+fn when_kept(b: &Block, params: &BTreeMap<String, String>) -> bool {
+    b.attrs
+        .iter()
+        .all(|(k, v)| params.get(k).map(|pv| pv == v).unwrap_or(false))
 }
 
 /// A set of machinery delivers ONE line naming its members (§4.3 / Appendix A);
@@ -2081,7 +2095,19 @@ fn deliver_prose(b: &Block, out: &mut Extraction) {
         }
         "tool" => {
             let cap = b.attrs.get("cap").cloned().unwrap_or_default();
-            let label = b.attrs.get("label").or(b.name.as_ref()).cloned();
+            // The label is explicit, else the block's name, else the last path
+            // segment of the capability, title-cased (`server://…/ticketing`
+            // → `Ticketing`).
+            let label = b
+                .attrs
+                .get("label")
+                .or(b.name.as_ref())
+                .cloned()
+                .or_else(|| {
+                    cap.rsplit(['/', ':'])
+                        .find(|s| !s.is_empty())
+                        .map(title_case)
+                });
             let head = label
                 .map(|l| format!("**Tool — {l}** (`{cap}`)"))
                 .unwrap_or_else(|| format!("**Tool** (`{cap}`)"));
@@ -2113,6 +2139,15 @@ fn deliver_prose(b: &Block, out: &mut Extraction) {
         _ => {
             ack(out, b.body.trim_end());
         }
+    }
+}
+
+/// Upper-case the first character of a word (`ticketing` → `Ticketing`).
+fn title_case(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+        None => String::new(),
     }
 }
 

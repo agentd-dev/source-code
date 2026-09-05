@@ -41,8 +41,49 @@ pub fn digest(bytes: &[u8]) -> String {
     s
 }
 
+/// The author digest (§7.2): the stored document bytes with the front-matter
+/// `signature:` line excluded, so the author JWS can travel inside its own
+/// document. With no front matter there is nothing to exclude.
+pub fn author_digest(doc: &[u8]) -> String {
+    digest(&strip_front_matter_signature(doc))
+}
+
+/// Remove exactly the top-level front-matter `signature:` line, if present.
+fn strip_front_matter_signature(doc: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(doc) else {
+        return doc.to_vec();
+    };
+    let Some(rest) = text.strip_prefix("---\n") else {
+        return doc.to_vec();
+    };
+    let Some(end) = rest.find("\n---") else {
+        return doc.to_vec();
+    };
+    let (front, body) = rest.split_at(end);
+    let kept: Vec<&str> = front
+        .split('\n')
+        .filter(|l| !l.starts_with("signature:"))
+        .collect();
+    format!("---\n{}{}", kept.join("\n"), body).into_bytes()
+}
+
+/// The front-matter `id` of a document, if present — what `doc` must equal
+/// byte for byte (§3.1).
+pub fn front_matter_id(doc: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(doc).ok()?;
+    let rest = text.strip_prefix("---\n")?;
+    let end = rest.find("\n---")?;
+    rest[..end].split('\n').find_map(|l| {
+        l.strip_prefix("id:")
+            .map(|v| v.trim().trim_matches('"').to_string())
+    })
+}
+
 /// An attestation's claims (§7.2). `typ` domain-separates an author signature
-/// from a delivery one.
+/// from a delivery one. The three delivery-only fields (`aud`, `manifest`,
+/// `author`) are absent on an author attestation and REQUIRED on a delivery
+/// one: a delivery signature covers the delivered bytes, the audience, the
+/// resolution manifest, and the author signature it was resolved from (§7.3).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Claims {
     pub spec: String,
@@ -55,6 +96,15 @@ pub struct Claims {
     pub publisher: String,
     pub iat: u64,
     pub exp: u64,
+    /// Delivery only: the reader, as a `principal://` or `agent://` URI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aud: Option<String>,
+    /// Delivery only: the §7.4 manifest, embedded so the signature covers it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<Manifest>,
+    /// Delivery only: the author signature's JWS compact serialization, verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
 }
 
 /// Sign a claims object into a JWS compact serialization (Ed25519/EdDSA). The
@@ -193,24 +243,34 @@ pub struct Verified {
 /// steps 7–8, revocation freshness and the trifecta re-computation, against the
 /// running process). Failure at any step is a refusal.
 ///
-/// `bytes` is the delivered document; `delivery_jws`/`author_jws` its two
-/// signatures; `manifest_yaml` the manifest the delivery signature covers;
-/// `grant` the operator's `document_capabilities`; `src` the pinned trust
-/// config; `author_pub`/`delivery_pub` the pinned public keys.
+/// `bytes` is the delivered document as received; `delivery_jws` its delivery
+/// signature (which EMBEDS the manifest and the author JWS — §7.3); `reader`
+/// this reader's `principal://`/`agent://` audience; `now` unix seconds for the
+/// `exp` checks; `grant` the operator's `document_capabilities`; `src` the
+/// pinned trust config; `author_pub`/`delivery_pub` the pinned public keys.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_document(
     bytes: &[u8],
     delivery_jws: &str,
-    author_jws: &str,
-    manifest_yaml: &str,
+    reader: &str,
+    now: u64,
     grant: &[String],
     src: &InstructionSource,
     author_pub: &[u8],
     delivery_pub: &[u8],
 ) -> Result<Verified, String> {
-    // 2. Verify the delivery signature over the received bytes; recompute and
-    //    compare the digest. A mismatch means the bytes are not what was signed.
+    // 2. Verify the delivery signature; check typ, audience, expiry, and that
+    //    the delivered bytes hash to the delivery `digest`.
     let delivery = verify(delivery_jws, delivery_pub, "delivery")?;
+    if delivery.aud.as_deref() != Some(reader) {
+        return Err(format!(
+            "attestation: this delivery is for {:?}, not this reader {reader:?} (§7.6 step 2)",
+            delivery.aud.as_deref().unwrap_or("<none>")
+        ));
+    }
+    if delivery.exp < now {
+        return Err("attestation: the delivery signature has expired (§7.6 step 2)".into());
+    }
     let got = digest(bytes);
     if delivery.digest != got {
         return Err(format!(
@@ -219,11 +279,37 @@ pub fn verify_document(
             delivery.digest
         ));
     }
-    // 3. Extract the manifest; verify the author signature over authored.digest
-    //    against a pinned key for the CLAIMED publisher. An unpinned publisher
-    //    is a refusal, not a weaker trust level.
-    let manifest = parse_manifest(manifest_yaml)?;
-    let author = verify(author_jws, author_pub, "author")?;
+    // The `doc` claim MUST equal the delivered document's front-matter `id`.
+    if let Some(id) = front_matter_id(bytes)
+        && id != delivery.doc
+    {
+        return Err(format!(
+            "attestation: doc {:?} does not equal the document's front-matter id {id:?} (§3.1)",
+            delivery.doc
+        ));
+    }
+    // 3. Take the manifest and the author JWS FROM the delivery claims; verify
+    //    the author signature over authored.digest against a pinned key for the
+    //    claimed publisher. An unpinned publisher is a refusal.
+    let manifest = delivery
+        .manifest
+        .clone()
+        .ok_or("attestation: the delivery claims carry no manifest (§7.3)")?;
+    let author_jws = delivery
+        .author
+        .clone()
+        .ok_or("attestation: the delivery claims carry no author signature (§7.3)")?;
+    let author = verify(&author_jws, author_pub, "author")?;
+    if author.exp < now {
+        return Err("attestation: the author signature has expired (§7.6 step 3)".into());
+    }
+    if author.doc != delivery.doc || author.version != delivery.version {
+        return Err(
+            "attestation: the author and delivery attestations name different documents \
+             (§7.6 step 3)"
+                .into(),
+        );
+    }
     if author.digest != manifest.authored.digest {
         return Err(format!(
             "attestation: the author signature covers {} but the manifest's authored.digest \
@@ -236,6 +322,17 @@ pub fn verify_document(
             "attestation: the author claims publisher {:?}, not the pinned {:?} — refuse \
              (§7.6 step 3)",
             author.publisher, src.publisher
+        ));
+    }
+    // The delivery ceiling MUST be a subset of the author ceiling (§7.2).
+    if let Some(over) = delivery
+        .capabilities
+        .iter()
+        .find(|c| !author.capabilities.contains(c))
+    {
+        return Err(format!(
+            "delivery: capabilities [{over}] exceed the author attestation {:?}",
+            author.capabilities
         ));
     }
     // 4. Effective families = grant ∩ max_capabilities ∩ author ∩ delivery.
@@ -305,6 +402,37 @@ mod tests {
             publisher: "https://instruction.md/pub/acme".into(),
             iat: 1_757_000_000,
             exp: 1_788_536_000,
+            aud: None,
+            manifest: None,
+            author: None,
+        }
+    }
+
+    fn manifest(dig: &str) -> Manifest {
+        Manifest {
+            authored: Authored {
+                version: "ver_01K003".into(),
+                digest: dig.into(),
+            },
+            parameters: vec![],
+            facts: vec![],
+            variants: Variants {
+                kept: vec![],
+                dropped: vec![],
+            },
+            includes: vec![],
+            limits: Value::Null,
+        }
+    }
+
+    /// A full delivery attestation embedding the manifest + the author JWS.
+    fn delivery_claims(dig: &str, caps: &[&str], author_jws: &str) -> Claims {
+        Claims {
+            aud: Some("principal://usr_7".into()),
+            manifest: Some(manifest(dig)),
+            author: Some(author_jws.into()),
+            exp: 1_757_003_600,
+            ..claims("delivery", dig, caps)
         }
     }
 
@@ -359,36 +487,32 @@ mod tests {
         assert!(e.contains("variants.dropped is REQUIRED"), "{e}");
     }
 
+    fn src() -> InstructionSource {
+        InstructionSource {
+            uri: "instruction://ins_42".into(),
+            publisher: "https://instruction.md/pub/acme".into(),
+            author_keys: vec![],
+            delivery_keys: vec![],
+            max_capabilities: vec!["material".into()],
+            freshness: None,
+        }
+    }
+
     #[test]
     fn a_signature_caps_it_never_grants() {
         let dig = digest(b"doc");
         let author = key();
         let delivery = AgentKey::from_seed(&[8u8; 32]).unwrap();
         let a_jws = sign(&author, &claims("author", &dig, &["material", "compute"])).unwrap();
-        let manifest = format!(
-            "authored: {{ version: ver_01K003, digest: \"{dig}\" }}\nvariants: {{ kept: [], dropped: [] }}"
-        );
-        let d_jws = sign(
-            &delivery,
-            &claims("delivery", &dig, &["material", "compute"]),
-        )
-        .unwrap();
-        let src = InstructionSource {
-            uri: "instruction://ins_42".into(),
-            publisher: "https://instruction.md/pub/acme".into(),
-            author_keys: vec![],
-            delivery_keys: vec![],
-            // The operator's per-source ceiling grants only material.
-            max_capabilities: vec!["material".into()],
-            freshness: None,
-        };
+        // The delivery ceiling ⊆ author; it embeds the manifest + author JWS.
+        let d_jws = sign(&delivery, &delivery_claims(&dig, &["material"], &a_jws)).unwrap();
         let v = verify_document(
             b"doc",
             &d_jws,
-            &a_jws,
-            &manifest,
+            "principal://usr_7",
+            1_757_000_100,
             &["material".into(), "compute".into()],
-            &src,
+            &src(),
             author.public_bytes(),
             delivery.public_bytes(),
         )
@@ -401,33 +525,93 @@ mod tests {
     }
 
     #[test]
+    fn a_delivery_ceiling_exceeding_the_author_is_refused() {
+        let dig = digest(b"doc");
+        let author = key();
+        let delivery = AgentKey::from_seed(&[8u8; 32]).unwrap();
+        // Author attests only material; delivery claims compute too.
+        let a_jws = sign(&author, &claims("author", &dig, &["material"])).unwrap();
+        let d_jws = sign(
+            &delivery,
+            &delivery_claims(&dig, &["material", "compute"], &a_jws),
+        )
+        .unwrap();
+        let e = verify_document(
+            b"doc",
+            &d_jws,
+            "principal://usr_7",
+            1_757_000_100,
+            &["material".into(), "compute".into()],
+            &src(),
+            author.public_bytes(),
+            delivery.public_bytes(),
+        )
+        .unwrap_err();
+        assert!(e.contains("exceed the author attestation"), "{e}");
+    }
+
+    #[test]
     fn a_digest_mismatch_is_refused() {
+        let author = key();
         let delivery = key();
+        let a_jws = sign(&author, &claims("author", "sha256:deadbeef", &["material"])).unwrap();
         // The delivery claim covers a digest that is not the bytes'.
         let d_jws = sign(
             &delivery,
-            &claims("delivery", "sha256:deadbeef", &["material"]),
+            &delivery_claims("sha256:deadbeef", &["material"], &a_jws),
         )
         .unwrap();
         let e = verify_document(
             b"the real bytes",
             &d_jws,
-            "unused.unused.unused",
-            "authored: { version: v, digest: x }\nvariants: { dropped: [] }",
+            "principal://usr_7",
+            1_757_000_100,
             &["material".into()],
-            &InstructionSource {
-                uri: "u".into(),
-                publisher: "p".into(),
-                author_keys: vec![],
-                delivery_keys: vec![],
-                max_capabilities: vec![],
-                freshness: None,
-            },
-            delivery.public_bytes(),
+            &src(),
+            author.public_bytes(),
             delivery.public_bytes(),
         )
         .unwrap_err();
         assert!(e.contains("delivered bytes hash to"), "{e}");
+    }
+
+    #[test]
+    fn the_delivery_must_be_addressed_to_this_reader() {
+        let dig = digest(b"doc");
+        let author = key();
+        let delivery = AgentKey::from_seed(&[8u8; 32]).unwrap();
+        let a_jws = sign(&author, &claims("author", &dig, &["material"])).unwrap();
+        let d_jws = sign(&delivery, &delivery_claims(&dig, &["material"], &a_jws)).unwrap();
+        // aud is principal://usr_7; a different reader is refused.
+        let e = verify_document(
+            b"doc",
+            &d_jws,
+            "principal://someone_else",
+            1_757_000_100,
+            &["material".into()],
+            &src(),
+            author.public_bytes(),
+            delivery.public_bytes(),
+        )
+        .unwrap_err();
+        assert!(e.contains("not this reader"), "{e}");
+    }
+
+    #[test]
+    fn the_author_digest_excludes_the_front_matter_signature_line() {
+        let unsigned = "---\nspec: \"1\"\nid: instruction://ins_x\n---\nbody\n";
+        let signed =
+            "---\nspec: \"1\"\nid: instruction://ins_x\nsignature: eyJ.abc.def\n---\nbody\n";
+        // The signed document hashes the same as the unsigned one — the JWS can
+        // travel inside its own front matter.
+        assert_eq!(
+            author_digest(signed.as_bytes()),
+            author_digest(unsigned.as_bytes())
+        );
+        assert_eq!(
+            front_matter_id(signed.as_bytes()).as_deref(),
+            Some("instruction://ins_x")
+        );
     }
 
     #[test]

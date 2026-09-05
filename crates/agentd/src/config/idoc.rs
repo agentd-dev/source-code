@@ -1950,8 +1950,10 @@ pub fn fold_with_params(
         ..Extraction::default()
     };
     // The parameter context is needed during the walk to select `when`
-    // variants, and again at the end for `${}` substitution.
+    // variants, again at the end for `${}` substitution, and (as full
+    // declarations) to render a `form` block's input list.
     let params = param_values(doc, overrides);
+    let decls = param_decls(doc);
 
     // Pass 1: fold configuration, and record each TOP-LEVEL block's delivered
     // lines against the source region it occupies. Consecutive members of one
@@ -1982,7 +1984,11 @@ pub fn fold_with_params(
             }
             Node::Block(b) => {
                 fold_config(b, &mut out, &mut errs);
-                regions.push((b.region.0, b.region.1, deliver_block_lines(b, &params)));
+                regions.push((
+                    b.region.0,
+                    b.region.1,
+                    deliver_block_lines(b, &params, &decls),
+                ));
                 i += 1;
             }
         }
@@ -2016,7 +2022,13 @@ pub fn fold_with_params(
     let lines = normalize_lines(lines);
     let text = collapse_blanks(lines).join("\n");
     let text = degrade_inline_refs(&text);
-    out.cleaned = substitute_params(&text, &params);
+    let mut text = substitute_params(&text, &params);
+    // The delivered text ends with exactly one newline (§3.5) — part of the
+    // bytes the delivery digest covers.
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    out.cleaned = text;
     Ok(out)
 }
 
@@ -2029,9 +2041,13 @@ fn fold_config(b: &Block, out: &mut Extraction, errs: &mut Vec<String>) {
 }
 
 /// The lines a block delivers, replacing its source region (§3.5 steps 4–5).
-fn deliver_block_lines(b: &Block, params: &BTreeMap<String, String>) -> Vec<String> {
+fn deliver_block_lines(
+    b: &Block,
+    params: &BTreeMap<String, String>,
+    decls: &BTreeMap<String, BTreeMap<String, String>>,
+) -> Vec<String> {
     match b.disposition {
-        Disposition::Prose => deliver_prose_lines(b),
+        Disposition::Prose => deliver_prose_lines(b, decls),
         Disposition::Structural => {
             // A KEPT `when` delivers its body unwrapped; a dropped one delivers
             // nothing. `include`/`param` deliver nothing (an include is inlined
@@ -2112,7 +2128,10 @@ fn machinery_ack(b: &Block) -> Option<String> {
 /// becomes `**KEYWORD:** body` (label on the first body line only);
 /// `example`/`context`/`form`/`tool`/`glossary` take their own shapes; an
 /// unknown bare block delivers its body as prose.
-fn deliver_prose_lines(b: &Block) -> Vec<String> {
+fn deliver_prose_lines(
+    b: &Block,
+    decls: &BTreeMap<String, BTreeMap<String, String>>,
+) -> Vec<String> {
     let title = b.attrs.get("title").cloned();
     let body = body_lines(&b.body);
     match b.kind.as_str() {
@@ -2130,9 +2149,33 @@ fn deliver_prose_lines(b: &Block) -> Vec<String> {
             out
         }
         "form" => {
+            // The body is a capture TEMPLATE for an editor, not delivered
+            // (§5.1). The delivered text is a list of the parameters the body
+            // references, in first-reference order, with their metadata.
             let t = title.map(|t| format!(" — {t}")).unwrap_or_default();
             let mut out = vec![format!("**Inputs to collect{t}**")];
-            out.extend(body);
+            for name in extract_param_refs(&b.body) {
+                let mut line = format!("- **{name}**");
+                let mut segs: Vec<String> = Vec::new();
+                if let Some(d) = decls.get(&name) {
+                    if let Some(desc) = d.get("description").filter(|s| !s.is_empty()) {
+                        segs.push(desc.clone());
+                    }
+                    if d.get("required").map(|v| v != "false").unwrap_or(false) {
+                        segs.push("required".into());
+                    }
+                    if let Some(values) = d.get("values").filter(|s| !s.is_empty()) {
+                        segs.push(format!("one of: {values}"));
+                    }
+                    if let Some(def) = d.get("default").filter(|s| !s.is_empty()) {
+                        segs.push(format!("default: {def}"));
+                    }
+                }
+                if !segs.is_empty() {
+                    line.push_str(&format!(" — {}", segs.join("; ")));
+                }
+                out.push(line);
+            }
             out
         }
         "tool" => {
@@ -2243,6 +2286,59 @@ fn deflist_entries(body: &str) -> Vec<(String, String)> {
 
 /// The parameter values available for `${}` substitution: declared defaults
 /// (front-matter `parameters` and `param` blocks), with `overrides` winning.
+/// The full parameter declarations (name → attributes), from front-matter
+/// `parameters` and `param` blocks — used to render a `form` block's input
+/// list (description/required/values/default).
+fn param_decls(doc: &Document) -> BTreeMap<String, BTreeMap<String, String>> {
+    let mut out: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    if let Some(Value::Array(params)) = doc.front.get("parameters") {
+        for p in params {
+            if let Some(obj) = p.as_object()
+                && let Some(name) = obj.get("name").and_then(Value::as_str)
+            {
+                let m = obj
+                    .iter()
+                    .map(|(k, v)| {
+                        (
+                            k.clone(),
+                            v.as_str()
+                                .map(str::to_string)
+                                .unwrap_or_else(|| v.to_string()),
+                        )
+                    })
+                    .collect();
+                out.insert(name.to_string(), m);
+            }
+        }
+    }
+    for b in doc.blocks() {
+        if b.kind == "param"
+            && let Some(name) = b.name.clone().or_else(|| b.attrs.get("name").cloned())
+        {
+            out.insert(name, b.attrs.clone());
+        }
+    }
+    out
+}
+
+/// The `${name}` parameters a body references, in first-reference order,
+/// de-duplicated.
+fn extract_param_refs(body: &str) -> Vec<String> {
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut out = Vec::new();
+    let mut rest = body;
+    while let Some(pos) = rest.find("${") {
+        let after = &rest[pos + 2..];
+        let Some(end) = after.find('}') else { break };
+        let name = &after[..end];
+        if !name.is_empty() && seen.insert(name.to_string()) {
+            out.push(name.to_string());
+        }
+        rest = &after[end + 1..];
+    }
+    out
+}
+
 fn param_values(doc: &Document, overrides: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     let mut v = BTreeMap::new();
     if let Some(Value::Array(params)) = doc.front.get("parameters") {
@@ -3429,6 +3525,27 @@ into: {stream: s, subject: x.y}
     }
 
     #[test]
+    fn a_form_delivers_its_input_list_not_its_body() {
+        // §5.1: a `form` body is an editor template, NOT delivered; the model
+        // sees a list of the referenced parameters with their metadata.
+        let doc = "---\nspec: \"1\"\n---\n:::param[]\n| name      | required | description             |\n|-----------|----------|-------------------------|\n| ticket_id | true     | The ticket being worked |\n:::\n\n:::form{title=\"Before we start\"}\nWhich ticket are we working on? ${ticket_id}\n:::";
+        let e = fold(&parse(doc).unwrap(), &grants(&[])).unwrap();
+        assert!(
+            e.cleaned.contains("**Inputs to collect — Before we start**\n- **ticket_id** — The ticket being worked; required"),
+            "form delivers the input list:\n{}",
+            e.cleaned
+        );
+        assert!(
+            !e.cleaned.contains("Which ticket"),
+            "the template body is not delivered"
+        );
+        assert!(
+            !e.cleaned.contains("${ticket_id}"),
+            "the placeholder does not appear"
+        );
+    }
+
+    #[test]
     fn delivery_replaces_a_block_region_and_keeps_surrounding_blank_lines() {
         // §3.5 layout: a block's ack replaces exactly its fence region; the
         // blank lines around it are delivered unchanged; a section's region
@@ -3437,8 +3554,8 @@ into: {stream: s, subject: x.y}
         let doc = "Intro.\n\n:::!workflow{name=w}\nsteps: { f: { kind: manual } }\n:::\n\n::param{name=x default=1}\n\nOutro ${x}.";
         let e = fold(&parse(doc).unwrap(), &grants(&[])).unwrap();
         assert_eq!(
-            e.cleaned, "Intro.\n\n[workflow \"w\" is loaded and runs autonomously]\n\nOutro 1.",
-            "region replaced, blanks kept, dropped param collapsed:\n{:?}",
+            e.cleaned, "Intro.\n\n[workflow \"w\" is loaded and runs autonomously]\n\nOutro 1.\n",
+            "region replaced, blanks kept, dropped param collapsed, one trailing newline:\n{:?}",
             e.cleaned
         );
     }

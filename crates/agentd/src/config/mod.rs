@@ -16,6 +16,8 @@
 //! and `--<path>` flags for every config-file path), [`watch`] (the inotify
 //! reload trigger).
 
+#[cfg(feature = "sign")]
+pub mod attest; // §7 instruction attestation (JWS/Ed25519, resolution manifest)
 pub mod envfile;
 pub mod file;
 pub mod idoc;

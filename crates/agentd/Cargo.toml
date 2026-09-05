@@ -125,6 +125,13 @@ cel = ["dep:cel-interpreter"]
 # direct edge, not a new crate — the crypto exception, like `cel` is the
 # expression exception. OFF by default; a non-aauth binary carries none of it.
 aauth = ["tls", "dep:ring"]
+# Instruction attestation — §7 of the Instruction Specification: JWS compact
+# Ed25519 signatures over a document's authored/delivered digest, the
+# resolution manifest, and the trust-ladder ceiling. Reuses AAuth's Ed25519 +
+# base64url + SHA-256 — the SAME `ring` rustls already resolves, no new crate —
+# so it rides `aauth`. OFF by default; a binary that never verifies signed
+# documents carries none of it.
+sign = ["aauth"]
 
 [dependencies]
 # The A2A protocol itself (feature `a2a`): domain types generated from the

@@ -46,6 +46,16 @@ from THIS tree (extraction present); a stale machine install can be an earlier
 era's binary that predates the feature. "The corpus is the arbiter" only holds
 when the arbiter's verdict names the thing it judged.
 
+## agentd-authored forms probes (`019`–`022`)
+
+Fixtures `019`–`022` are authored here, not vendored — small black-box probes
+of the §4 forms against agentd's real config: a leaf-form `!mcp` (a document
+with no `:::` line at all, which the loader must still recognize), a table set,
+a section-form `!workflow`, and the section boundary (a YAML section ends at
+its code fence, so a leaf that follows is top-level, not swallowed). Their
+workflow bodies use agentd's own step shape, so they exercise the forms without
+depending on the spec's illustrative config vocabulary.
+
 ## One format, version 1 (sigiled)
 
 The spec is a single format — the sigiled dialect, numbered 1. Each fixture

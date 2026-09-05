@@ -1,0 +1,12 @@
+{
+  "spec": "1",
+  "valid": true,
+  "registers": {
+    "workflows": [
+      "nightly"
+    ],
+    "mcp_servers": [
+      "after"
+    ]
+  }
+}

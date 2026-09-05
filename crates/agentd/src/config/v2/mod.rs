@@ -2621,7 +2621,7 @@ impl Settings {
             .and_then(Value::as_str)
             .map(str::to_string)
             && !looks_like_resource_uri(&instr)
-            && instr.lines().any(|l| l.starts_with(":::"))
+            && crate::config::idoc::contains_blocks(&instr)
         {
             // The instruction is an Instruction Document — the single dialect,
             // and the ONLY surface extraction runs on (conversation text is

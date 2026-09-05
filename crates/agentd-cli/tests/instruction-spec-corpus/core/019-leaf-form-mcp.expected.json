@@ -1,0 +1,9 @@
+{
+  "spec": "1",
+  "valid": true,
+  "registers": {
+    "mcp_servers": [
+      "search"
+    ]
+  }
+}

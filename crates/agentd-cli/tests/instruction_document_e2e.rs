@@ -213,7 +213,10 @@ fn a_forgotten_sigil_is_refused_not_silently_demoted() {
         &[],
     );
     assert!(!valid);
-    assert!(err.contains(":::!workflow"), "names the fix:\n{err}");
+    assert!(
+        err.contains("!workflow") && err.contains("shadows a machinery name"),
+        "names the fix:\n{err}"
+    );
 }
 
 #[test]

@@ -1138,20 +1138,37 @@ fn fold_machinery(b: &Block, out: &mut Extraction, errs: &mut Vec<String>) {
         },
         // ── extended families: cleanly map to real config where one exists ───
         "endpoint" => {
-            // A declarative listener route (RFC 0035 §5 shape). Recorded as an
-            // interface declaration; wiring it into the live webhook listener
-            // is the next runtime phase.
-            if let Some(mut m) = body_map(b, errs) {
-                if let Some(n) = &b.name {
-                    m.entry("name").or_insert_with(|| Value::String(n.clone()));
-                }
-                out.declarations
-                    .entry("endpoint".into())
-                    .or_default()
-                    .push(Value::Object(m));
-                let path = b.attrs.get("path").cloned().unwrap_or_default();
-                ack(out, &format!("[endpoint {path} is served]"));
+            // A live listener route: folds into a real workflow with a single
+            // `webhook` start node. `into:` makes it append to a stream (no
+            // run); otherwise it fires the workflow. The listener address is
+            // `webhooks.listen` (agent-level); this block declares the ROUTE.
+            let Some(name) = b.name.clone().or_else(|| b.attrs.get("name").cloned()) else {
+                errs.push(format!("line {}: :::!endpoint needs a name", b.line));
+                return;
+            };
+            let body = body_map(b, errs).unwrap_or_default();
+            let mut node = serde_json::Map::new();
+            node.insert("kind".into(), Value::String("webhook".into()));
+            if let Some(p) = b.attrs.get("path") {
+                node.insert("path".into(), Value::String(p.clone()));
             }
+            for key in ["path", "methods", "auth", "into", "rate", "respond"] {
+                if let Some(v) = body.get(key) {
+                    node.insert(key.into(), v.clone());
+                }
+            }
+            let workflow = serde_json::json!({
+                "name": format!("endpoint-{name}"),
+                "steps": { "hook": Value::Object(node) },
+            });
+            out.workflows.push(workflow);
+            let path = b
+                .attrs
+                .get("path")
+                .cloned()
+                .or_else(|| body.get("path").and_then(Value::as_str).map(str::to_string))
+                .unwrap_or_default();
+            ack(out, &format!("[endpoint {path} is served]"));
         }
         "peer" => {
             if let Some(m) = body_map(b, errs) {
@@ -1460,6 +1477,20 @@ mod tests {
         assert_eq!(narrow["describe"], "ENG queue only");
         // override is default-rung (narrowing never needs a grant).
         assert!(fold(&parse(doc).unwrap(), &grants(&[])).is_ok());
+    }
+
+    #[test]
+    fn endpoint_folds_into_a_real_webhook_workflow() {
+        let doc = "---\nspec: \"1\"\n---\n            :::!endpoint{name=hook path=/hooks/x methods=[POST]}\n            into: {stream: s, subject: x.y}\n:::";
+        let e = fold(&parse(doc).unwrap(), &grants(&["interface"])).unwrap();
+        assert_eq!(e.workflows.len(), 1, "an endpoint is a real workflow");
+        let wf = &e.workflows[0];
+        assert_eq!(wf["name"], "endpoint-hook");
+        assert_eq!(wf["steps"]["hook"]["kind"], "webhook");
+        assert_eq!(wf["steps"]["hook"]["path"], "/hooks/x");
+        assert_eq!(wf["steps"]["hook"]["into"]["stream"], "s");
+        // interface-gated: no grant → refused.
+        assert!(fold(&parse(doc).unwrap(), &grants(&[])).is_err());
     }
 
     #[test]

@@ -270,6 +270,10 @@ pub struct Block {
     pub body: String,
     pub children: Vec<Block>,
     pub line: usize,
+    /// For a member expanded from a set (`:::kind[]`), an id shared by that
+    /// set's members, so delivery can acknowledge the whole set in one line.
+    /// `None` for a block written on its own.
+    pub set_group: Option<u64>,
 }
 
 impl Block {
@@ -473,6 +477,7 @@ fn parse_fence(
                 body,
                 children,
                 line: line_no,
+                set_group: None,
             }],
             close_idx + 1,
         )
@@ -492,6 +497,7 @@ fn parse_leaf(lf: LeafTok, line_no: usize, errs: &mut Vec<String>) -> Option<Blo
         body: String::new(),
         children: Vec::new(),
         line: line_no,
+        set_group: None,
     })
 }
 
@@ -543,6 +549,7 @@ fn parse_section(
                         body: lines[fo + 1..fc].join("\n"),
                         children,
                         line: line_no,
+                        set_group: None,
                     }),
                     fc + 1,
                 )
@@ -569,6 +576,7 @@ fn parse_section(
                 body: prose_lines.join("\n"),
                 children,
                 line: line_no,
+                set_group: None,
             }),
             end,
         )
@@ -1034,6 +1042,7 @@ fn parse_table_set(
             body: String::new(),
             children: Vec::new(),
             line: line_no,
+            set_group: Some(line_no as u64),
         });
     }
     out
@@ -1099,6 +1108,7 @@ fn parse_deflist_set(
             body: def.join("\n"),
             children: Vec::new(),
             line: line_no,
+            set_group: Some(line_no as u64),
         });
     }
     out
@@ -1897,6 +1907,19 @@ fn attr_scalar(key: &str, s: &str) -> Value {
 /// Fold a parsed document into configuration + delivered prose, after checking
 /// grants. The whole document is refused if any block errors — no partial load.
 pub fn fold(doc: &Document, granted: &BTreeSet<String>) -> Result<Extraction, Vec<String>> {
+    fold_with_params(doc, granted, &BTreeMap::new())
+}
+
+/// As [`fold`], with an explicit override map for `${parameter}` substitution
+/// (a value here wins over a declared default). The delivered text runs the
+/// §3.5 pipeline: prose degraded to its Appendix A form, machinery replaced by
+/// its acknowledgement line (a set as one line), inline references degraded,
+/// and `${}` substituted LAST so a value is never re-parsed as Markdown.
+pub fn fold_with_params(
+    doc: &Document,
+    granted: &BTreeSet<String>,
+    overrides: &BTreeMap<String, String>,
+) -> Result<Extraction, Vec<String>> {
     let mut errs = Vec::new();
     check_grants(doc, granted, &mut errs);
     let mut out = Extraction {
@@ -1904,22 +1927,56 @@ pub fn fold(doc: &Document, granted: &BTreeSet<String>) -> Result<Extraction, Ve
         ..Extraction::default()
     };
 
-    // Delivery: rebuild the text the model reads, in source order. A prose text
-    // run is emitted verbatim (it is the instruction's own words); a machinery
-    // block becomes a one-line acknowledgement; a prose block degrades into
-    // labelled text; a structural block resolves away.
-    for node in &doc.nodes {
-        match node {
+    // Config + delivery in source order. Consecutive members of one set are
+    // gathered so the set delivers a single acknowledgement line.
+    let nodes = &doc.nodes;
+    let mut i = 0;
+    while i < nodes.len() {
+        match &nodes[i] {
             Node::Text(t) => {
                 out.cleaned.push_str(t);
                 if !t.ends_with('\n') {
                     out.cleaned.push('\n');
                 }
+                i += 1;
             }
-            Node::Block(b) => fold_block(b, &mut out, &mut errs),
+            Node::Block(b) if b.set_group.is_some() => {
+                let g = b.set_group;
+                let mut members = vec![b];
+                let mut j = i + 1;
+                while let Some(Node::Block(bb)) = nodes.get(j) {
+                    if bb.set_group == g {
+                        members.push(bb);
+                        j += 1;
+                    } else {
+                        break;
+                    }
+                }
+                for m in &members {
+                    fold_config(m, &mut out, &mut errs);
+                }
+                deliver_set(&members, &mut out);
+                i = j;
+            }
+            Node::Block(b) => {
+                fold_config(b, &mut out, &mut errs);
+                deliver_block(b, &mut out);
+                i += 1;
+            }
         }
     }
-    if errs.is_empty() { Ok(out) } else { Err(errs) }
+    if !errs.is_empty() {
+        return Err(errs);
+    }
+
+    // §3.5 steps 4–6, finishing passes over the assembled text: keyword and
+    // alert forms normalize to their bold delivered form, inline references
+    // degrade to their label, then `${}` is substituted last.
+    let params = param_values(doc, overrides);
+    out.cleaned = normalize_prose_lines(&out.cleaned);
+    out.cleaned = degrade_inline_refs(&out.cleaned);
+    out.cleaned = substitute_params(&out.cleaned, &params);
+    Ok(out)
 }
 
 fn ack(out: &mut Extraction, line: &str) {
@@ -1930,36 +1987,425 @@ fn ack(out: &mut Extraction, line: &str) {
     out.cleaned.push('\n');
 }
 
-fn fold_block(b: &Block, out: &mut Extraction, errs: &mut Vec<String>) {
-    match b.disposition {
-        Disposition::Prose => fold_prose(b, out),
-        Disposition::Structural => {} // when/include resolve at delivery; recorded, not folded
-        Disposition::Machinery => fold_machinery(b, out, errs),
+/// Fold one block into CONFIGURATION only (delivery is separate). Prose and
+/// structural blocks contribute no configuration.
+fn fold_config(b: &Block, out: &mut Extraction, errs: &mut Vec<String>) {
+    if b.disposition == Disposition::Machinery {
+        fold_machinery(b, out, errs);
     }
 }
 
-/// Prose degrades INTO the delivered text — labelled, body preserved, so a dumb
-/// Markdown viewer still reads it as guidance.
-fn fold_prose(b: &Block, out: &mut Extraction) {
-    let label = match b.kind.as_str() {
-        "context" => b
-            .attrs
-            .get("title")
-            .map(|t| format!("<reference title=\"{t}\">"))
-            .unwrap_or_else(|| "<reference>".into()),
-        "example" => "<example>".into(),
-        k if lookup(k).is_some() => format!("**{}**", k.to_uppercase()),
-        // Unknown bare name — inert; render the fence verbatim so nothing is hidden.
-        _ => format!(":::{}", b.kind),
-    };
-    ack(out, &label);
-    out.cleaned.push_str(&b.body);
-    out.cleaned.push('\n');
-    match b.kind.as_str() {
-        "context" => out.cleaned.push_str("</reference>\n"),
-        "example" => out.cleaned.push_str("</example>\n"),
-        _ => {}
+/// Deliver one block into the model-visible text (§3.5 steps 4–5).
+fn deliver_block(b: &Block, out: &mut Extraction) {
+    match b.disposition {
+        Disposition::Prose => deliver_prose(b, out),
+        Disposition::Structural => {
+            // A kept `when` delivers its body unwrapped; `include`/`param`
+            // deliver nothing (an include is inlined upstream of this reader).
+            if b.kind == "when" && !b.body.trim().is_empty() {
+                ack(out, b.body.trim_end());
+            }
+        }
+        Disposition::Machinery => {
+            if let Some(line) = machinery_ack(b) {
+                ack(out, &line);
+            }
+        }
     }
+}
+
+/// A set of machinery delivers ONE line naming its members (§4.3 / Appendix A);
+/// a set of a kind that delivers nothing (no `x-acknowledgement`) is silent.
+fn deliver_set(members: &[&Block], out: &mut Extraction) {
+    let first = members[0];
+    let Some(k) = lookup(&first.kind) else { return };
+    if k.ack.is_none() {
+        return; // e.g. a `param[]` set, or a set of a non-delivering kind
+    }
+    let nouns = k
+        .nouns
+        .clone()
+        .unwrap_or_else(|| format!("{}s", first.kind));
+    let names: Vec<&str> = members.iter().filter_map(|m| m.name.as_deref()).collect();
+    ack(
+        out,
+        &format!(
+            "[{} {nouns} are declared: {}]",
+            names.len(),
+            names.join(", ")
+        ),
+    );
+}
+
+/// A machinery block's acknowledgement line from the schema's `x-acknowledgement`
+/// template, or `None` for a kind that delivers nothing (§3.5 step 5).
+fn machinery_ack(b: &Block) -> Option<String> {
+    let tmpl = lookup(&b.kind)?.ack.as_deref()?;
+    let name = b
+        .name
+        .clone()
+        .or_else(|| b.attrs.get("name").cloned())
+        .unwrap_or_default();
+    let path = b.attrs.get("path").cloned().unwrap_or_default();
+    let target = b.attrs.get("target").cloned().unwrap_or_default();
+    Some(
+        tmpl.replace("{name}", &name)
+            .replace("{path}", &path)
+            .replace("{target}", &target),
+    )
+}
+
+/// Prose degrades to its delivered form (Appendix A): a normativity keyword
+/// becomes `**KEYWORD:** body`; `example`/`context`/`form`/`tool`/`glossary`
+/// take their own shapes; an unknown bare block delivers its body as prose.
+fn deliver_prose(b: &Block, out: &mut Extraction) {
+    let title = b.attrs.get("title").cloned();
+    match b.kind.as_str() {
+        "context" => {
+            let t = title.map(|t| format!(" title=\"{t}\"")).unwrap_or_default();
+            ack(out, &format!("<reference{t}>"));
+            out.cleaned.push_str(b.body.trim_end());
+            out.cleaned.push_str("\n</reference>\n");
+        }
+        "example" => {
+            let t = title.map(|t| format!(" — {t}")).unwrap_or_default();
+            ack(out, &format!("**EXAMPLE{t}:**"));
+            out.cleaned.push_str(b.body.trim_end());
+            out.cleaned.push('\n');
+        }
+        "form" => {
+            let t = title.map(|t| format!(" — {t}")).unwrap_or_default();
+            ack(out, &format!("**Inputs to collect{t}**"));
+            out.cleaned.push_str(b.body.trim_end());
+            out.cleaned.push('\n');
+        }
+        "tool" => {
+            let cap = b.attrs.get("cap").cloned().unwrap_or_default();
+            let label = b.attrs.get("label").or(b.name.as_ref()).cloned();
+            let head = label
+                .map(|l| format!("**Tool — {l}** (`{cap}`)"))
+                .unwrap_or_else(|| format!("**Tool** (`{cap}`)"));
+            let allow = b.attrs.get("allow").cloned().unwrap_or_default();
+            let deny = b.attrs.get("deny").cloned().unwrap_or_default();
+            let mut line = head;
+            if !allow.is_empty() {
+                line.push_str(&format!(" — allowed: {allow}"));
+            }
+            if !deny.is_empty() {
+                line.push_str(&format!("; denied: {deny}"));
+            }
+            ack(out, &line);
+            out.cleaned.push_str(b.body.trim_end());
+            out.cleaned.push('\n');
+        }
+        "glossary" => {
+            for (term, def) in deflist_entries(&b.body) {
+                ack(out, &format!("**{term}** — {def}"));
+            }
+        }
+        k if NORMATIVITY.contains(&k) => {
+            ack(out, &format!("**{}:** {}", k.to_uppercase(), b.body.trim()));
+        }
+        k if lookup(k).is_some() => {
+            ack(out, &format!("**{}:** {}", k.to_uppercase(), b.body.trim()));
+        }
+        // Unknown bare name — inert: the body is delivered as prose, fences gone.
+        _ => {
+            ack(out, b.body.trim_end());
+        }
+    }
+}
+
+/// The normativity prose kinds, whose delivered form is `**KEYWORD:** body`.
+const NORMATIVITY: &[&str] = &[
+    "must",
+    "should",
+    "never",
+    "guardrail",
+    "note",
+    "tip",
+    "warning",
+    "caution",
+    "important",
+];
+
+/// Parse a definition-list body into `(term, definition)` pairs (for
+/// `glossary` delivery).
+fn deflist_entries(body: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut term: Option<String> = None;
+    let mut def: Vec<String> = Vec::new();
+    let flush =
+        |term: &mut Option<String>, def: &mut Vec<String>, out: &mut Vec<(String, String)>| {
+            if let Some(t) = term.take() {
+                out.push((t, def.join(" ").trim().to_string()));
+            }
+            def.clear();
+        };
+    for line in body.lines() {
+        if let Some(rest) = line.trim_start().strip_prefix(':') {
+            def.push(rest.trim().to_string());
+        } else if line.trim().is_empty() {
+            flush(&mut term, &mut def, &mut out);
+        } else if term.is_some() && line.starts_with([' ', '\t']) {
+            def.push(line.trim().to_string());
+        } else {
+            flush(&mut term, &mut def, &mut out);
+            let name = line.split('{').next().unwrap_or(line).trim().to_string();
+            if !name.is_empty() {
+                term = Some(name);
+            }
+        }
+    }
+    flush(&mut term, &mut def, &mut out);
+    out
+}
+
+/// The parameter values available for `${}` substitution: declared defaults
+/// (front-matter `parameters` and `param` blocks), with `overrides` winning.
+fn param_values(doc: &Document, overrides: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let mut v = BTreeMap::new();
+    if let Some(Value::Array(params)) = doc.front.get("parameters") {
+        for p in params {
+            if let (Some(name), Some(def)) = (
+                p.get("name").and_then(Value::as_str),
+                p.get("default").and_then(Value::as_str),
+            ) {
+                v.insert(name.to_string(), def.to_string());
+            }
+        }
+    }
+    for b in doc.blocks() {
+        if b.kind == "param"
+            && let Some(name) = b
+                .name
+                .as_deref()
+                .or_else(|| b.attrs.get("name").map(String::as_str))
+            && let Some(def) = b.attrs.get("default")
+        {
+            v.insert(name.to_string(), def.clone());
+        }
+    }
+    for (k, val) in overrides {
+        v.insert(k.clone(), val.clone());
+    }
+    v
+}
+
+/// Substitute `${name}` with its value (§3.5 step 6) — inserted as plain text,
+/// never re-parsed. An undeclared `${x}` is left verbatim for the resolver to
+/// report.
+fn substitute_params(text: &str, params: &BTreeMap<String, String>) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pos) = rest.find("${") {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + 2..];
+        if let Some(end) = after.find('}') {
+            let name = &after[..end];
+            match params.get(name) {
+                Some(val) => out.push_str(val),
+                None => {
+                    out.push_str("${");
+                    out.push_str(name);
+                    out.push('}');
+                }
+            }
+            rest = &after[end + 1..];
+        } else {
+            out.push_str("${");
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Degrade inline references in the delivered text (Appendix A): `[[kind/name]]`
+/// and `[[kind/name|Label]]` to the label (or `name`), and `[Label](#kind/name)`
+/// to `Label`. References inside fenced code are left untouched.
+fn degrade_inline_refs(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_code = None::<usize>;
+    for line in text.split_inclusive('\n') {
+        let bare = line.strip_suffix('\n').unwrap_or(line);
+        if let Some(tl) = in_code {
+            if code_fence_len(bare) == Some(tl) {
+                in_code = None;
+            }
+            out.push_str(line);
+            continue;
+        }
+        if let Some(tl) = code_fence_len(bare) {
+            in_code = Some(tl);
+            out.push_str(line);
+            continue;
+        }
+        out.push_str(&degrade_line_refs(line));
+    }
+    out
+}
+
+fn degrade_line_refs(line: &str) -> String {
+    // [[kind/name]] or [[kind/name|Label]] → Label or name.
+    let mut s = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(pos) = rest.find("[[") {
+        let after = &rest[pos + 2..];
+        let Some(end) = after.find("]]") else {
+            break;
+        };
+        let inner = &after[..end];
+        let shown = match inner.split_once('|') {
+            Some((target, label)) => {
+                if is_ref_target(target) {
+                    label.to_string()
+                } else {
+                    format!("[[{inner}]]")
+                }
+            }
+            None => match inner.split_once('/') {
+                Some((_, name)) if is_ref_target(inner) => name.to_string(),
+                _ => format!("[[{inner}]]"),
+            },
+        };
+        s.push_str(&rest[..pos]);
+        s.push_str(&shown);
+        rest = &after[end + 2..];
+    }
+    s.push_str(rest);
+    // [Label](#kind/name) → Label.
+    let mut t = String::with_capacity(s.len());
+    let mut rest = s.as_str();
+    while let Some(open) = rest.find('[') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find(']') else { break };
+        let label = &after[..close];
+        let tail = &after[close + 1..];
+        if let Some(frag) = tail.strip_prefix("(#")
+            && let Some(fend) = frag.find(')')
+            && is_ref_target(&frag[..fend])
+        {
+            t.push_str(&rest[..open]);
+            t.push_str(label);
+            rest = &frag[fend + 1..];
+            continue;
+        }
+        // Not a fragment reference — keep the `[` and continue past it.
+        t.push_str(&rest[..open + 1]);
+        rest = after;
+    }
+    t.push_str(rest);
+    t
+}
+
+/// Whether `kind/name` names a known kind (so it is a reference, not prose).
+fn is_ref_target(s: &str) -> bool {
+    matches!(s.split_once('/'), Some((k, n)) if is_kind_token(k) && is_name(n) && lookup(k).is_some())
+}
+
+/// Normalize keyword lines (`MUST: …`, `**NEVER:**`, list items) and blockquote
+/// alerts (`> [!TIP]`) to their delivered bold form (Appendix A), driven by the
+/// schema's keyword map. Fenced code is left untouched.
+fn normalize_prose_lines(text: &str) -> String {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut in_code = None::<usize>;
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        if let Some(tl) = in_code {
+            if code_fence_len(line) == Some(tl) {
+                in_code = None;
+            }
+            out.push(line.to_string());
+            i += 1;
+            continue;
+        }
+        if let Some(tl) = code_fence_len(line) {
+            in_code = Some(tl);
+            out.push(line.to_string());
+            i += 1;
+            continue;
+        }
+        // An alert: `> [!KIND]`, then the `>`-quoted body.
+        if let Some(kw) = alert_open_kind(line) {
+            let mut body = Vec::new();
+            i += 1;
+            while i < lines.len() {
+                let t = lines[i].trim_start();
+                if let Some(rest) = t.strip_prefix('>') {
+                    body.push(rest.trim().to_string());
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            out.push(format!("**{kw}:** {}", body.join(" ").trim()));
+            continue;
+        }
+        if let Some(norm) = normalize_keyword_line(line) {
+            out.push(norm);
+        } else {
+            out.push(line.to_string());
+        }
+        i += 1;
+    }
+    out.join("\n")
+}
+
+/// The canonical delivered keyword for a `> [!KIND]` alert opener, if the line
+/// is one and KIND is a known keyword.
+fn alert_open_kind(line: &str) -> Option<String> {
+    let t = line.trim_start().strip_prefix('>')?.trim();
+    let inner = t.strip_prefix("[!")?.strip_suffix(']')?;
+    canonical_keyword(&inner.to_uppercase())
+}
+
+/// Normalize one keyword line to `[- ]**KEYWORD:** rest`, preserving a leading
+/// list marker; `None` if the line is not a keyword line.
+fn normalize_keyword_line(line: &str) -> Option<String> {
+    let (marker, rest) = split_list_marker(line);
+    let rest = rest.strip_prefix("**").unwrap_or(rest);
+    // The keyword runs up to the first colon; check longest keywords first.
+    let colon = rest.find(':')?;
+    let kw_raw = rest[..colon].trim_end_matches("**").trim();
+    let canon = canonical_keyword(kw_raw)?;
+    let after = rest[colon + 1..].trim_start_matches("**");
+    let after = after.strip_prefix([' ', '\t'])?;
+    Some(format!("{marker}**{canon}:** {}", after.trim_start()))
+}
+
+/// Split a leading unordered/ordered list marker (`- `, `* `, `1. `) off a
+/// line, returning `(marker_including_trailing_space, remainder)`.
+fn split_list_marker(line: &str) -> (String, &str) {
+    let trimmed = line.trim_start();
+    let indent = &line[..line.len() - trimmed.len()];
+    if let Some(rest) = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+        .or_else(|| trimmed.strip_prefix("+ "))
+    {
+        return (format!("{indent}- "), rest);
+    }
+    // Ordered: digits then `.`/`)` then space.
+    let digits: String = trimmed.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if !digits.is_empty() {
+        let after = &trimmed[digits.len()..];
+        if let Some(rest) = after
+            .strip_prefix(". ")
+            .or_else(|| after.strip_prefix(") "))
+        {
+            return (format!("{indent}{digits}. "), rest);
+        }
+    }
+    (indent.to_string(), trimmed)
+}
+
+/// The canonical uppercase keyword a keyword token maps to (`MUST NOT` →
+/// `NEVER`, `INFO` → `NOTE`), from the schema's keyword table.
+fn canonical_keyword(kw: &str) -> Option<String> {
+    registry().keyword_kind(kw).map(|kind| kind.to_uppercase())
 }
 
 /// An `override` sub-block (inside `!mcp`) narrows one of the server's tools —
@@ -2022,16 +2468,7 @@ fn fold_machinery(b: &Block, out: &mut Extraction, errs: &mut Vec<String>) {
                         Value::Bool(armed == "true" || armed.is_empty()),
                     );
                 }
-                let name = m
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("?")
-                    .to_string();
                 out.workflows.push(Value::Object(m));
-                ack(
-                    out,
-                    &format!("[workflow \"{name}\" is loaded and runs autonomously]"),
-                );
             }
         }
         "config" => {
@@ -2048,15 +2485,8 @@ fn fold_machinery(b: &Block, out: &mut Extraction, errs: &mut Vec<String>) {
                     m.entry("exclude".to_string()).or_insert(deny);
                 }
                 match m.get("name").and_then(Value::as_str) {
-                    Some(name) => {
-                        let name = name.to_string();
+                    Some(_) => {
                         push_into(&mut out.config, "mcp", "servers").push(Value::Object(m));
-                        ack(
-                            out,
-                            &format!(
-                                "[mcp server \"{name}\" is connected; its tools are available]"
-                            ),
-                        );
                         // `override` sub-blocks (§5.3) adjust this server's
                         // tools — append-only: disable, add trifecta tags, or
                         // annotate. They deliver nothing of their own.
@@ -2078,7 +2508,6 @@ fn fold_machinery(b: &Block, out: &mut Extraction, errs: &mut Vec<String>) {
                 {
                     Some(name) => {
                         frag(&mut out.config, "streams").insert(name.clone(), Value::Object(m));
-                        ack(out, &format!("[event stream \"{name}\" is declared]"));
                     }
                     None => errs.push(format!("line {}: :::!stream needs a name", b.line)),
                 }
@@ -2087,7 +2516,6 @@ fn fold_machinery(b: &Block, out: &mut Extraction, errs: &mut Vec<String>) {
         "tools" => {
             if let Some(m) = body_map(b, errs) {
                 merge_map(frag(&mut out.config, "tools"), m);
-                ack(out, "[tool policy is applied]");
             }
         }
         "skill" => match b.attrs.get("name") {
@@ -2098,10 +2526,6 @@ fn fold_machinery(b: &Block, out: &mut Extraction, errs: &mut Vec<String>) {
                     when_to_use: b.attrs.get("when").cloned(),
                     body: b.body.clone(),
                 });
-                ack(
-                    out,
-                    &format!("[skill \"{name}\" is available; load it with skills.read]"),
-                );
             }
             None => errs.push(format!("line {}: :::!skill needs a name", b.line)),
         },
@@ -2131,23 +2555,10 @@ fn fold_machinery(b: &Block, out: &mut Extraction, errs: &mut Vec<String>) {
                 "steps": { "hook": Value::Object(node) },
             });
             out.workflows.push(workflow);
-            let path = b
-                .attrs
-                .get("path")
-                .cloned()
-                .or_else(|| body.get("path").and_then(Value::as_str).map(str::to_string))
-                .unwrap_or_default();
-            ack(out, &format!("[endpoint {path} is served]"));
         }
         "peer" => {
             if let Some(m) = body_map(b, errs) {
-                let name = m
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("?")
-                    .to_string();
                 push_into(&mut out.config, "a2a", "peers").push(Value::Object(m));
-                ack(out, &format!("[peer \"{name}\" is reachable]"));
             }
         }
         // ── content-bearing kinds: the body is literal, not config ──────────
@@ -2228,29 +2639,7 @@ fn fold_machinery(b: &Block, out: &mut Extraction, errs: &mut Vec<String>) {
                 .entry(other.to_string())
                 .or_default()
                 .push(Value::Object(rec));
-            ack(out, &ack_line(b));
         }
-    }
-}
-
-/// A machinery block's acknowledgement line — the spec's `x-acknowledgement`
-/// template with `{name}`/`{path}` filled in, or a generic line for kinds that
-/// declare none.
-fn ack_line(b: &Block) -> String {
-    if let Some(tmpl) = lookup(&b.kind).and_then(|k| k.ack.as_deref()) {
-        let name = b
-            .name
-            .clone()
-            .or_else(|| b.attrs.get("name").cloned())
-            .unwrap_or_default();
-        let path = b.attrs.get("path").cloned().unwrap_or_default();
-        tmpl.replace("{name}", &name).replace("{path}", &path)
-    } else {
-        format!(
-            "[{} {} is declared]",
-            b.kind,
-            b.name.as_deref().unwrap_or("")
-        )
     }
 }
 
@@ -2865,6 +3254,90 @@ into: {stream: s, subject: x.y}
         assert!(parse(frag).is_ok());
         // A `[[…]]` whose kind is not a kind is inert prose, not a reference.
         assert!(parse("See [[the/handbook]] for details.").is_ok());
+    }
+
+    // ── delivery pipeline (§3.5 / Appendix A) ────────────────────────────
+
+    #[test]
+    fn a_set_delivers_one_grouped_line() {
+        let doc = "---\nspec: \"1\"\n---\n:::!human[]\n| name   | role     |\n|--------|----------|\n| oncall | approver |\n| lead   | reviewer |\n| sre    | operator |\n:::";
+        let e = fold(&parse(doc).unwrap(), &grants(&["interface"])).unwrap();
+        assert!(
+            e.cleaned
+                .contains("[3 human roles are declared: oncall, lead, sre]"),
+            "one grouped line, x-nouns, names only:\n{}",
+            e.cleaned
+        );
+    }
+
+    #[test]
+    fn non_delivering_machinery_is_silent() {
+        // runtime/secret-ref have no x-acknowledgement — they deliver nothing.
+        let doc = "---\nspec: \"1\"\n---\n::!secret-ref{name=tok kind=file path=/run/tok}\n:::!runtime{name=py}\nimage: ghcr.io/x@sha256:abc\n:::";
+        let e = fold(&parse(doc).unwrap(), &grants(&["identity", "compute"])).unwrap();
+        assert!(
+            !e.cleaned.contains("secret-ref") && !e.cleaned.contains("runtime"),
+            "{}",
+            e.cleaned
+        );
+        assert!(
+            !e.cleaned.contains("[runtime"),
+            "runtime delivers nothing:\n{}",
+            e.cleaned
+        );
+    }
+
+    #[test]
+    fn normativity_delivers_as_a_keyword_line() {
+        let e = fold(
+            &parse(":::must\nRun the tests.\n:::").unwrap(),
+            &grants(&[]),
+        )
+        .unwrap();
+        assert!(
+            e.cleaned.contains("**MUST:** Run the tests."),
+            "{}",
+            e.cleaned
+        );
+    }
+
+    #[test]
+    fn parameters_substitute_last_and_inline_refs_degrade() {
+        let doc = "---\nspec: \"1\"\n---\n::param{name=env default=prod}\n::!human{name=oncall role=approver}\n\nDeploy to ${env}; ask [[human/oncall]] and [the approver](#human/oncall). ${missing} stays.";
+        let e = fold(&parse(doc).unwrap(), &grants(&["interface"])).unwrap();
+        assert!(
+            e.cleaned.contains("Deploy to prod;"),
+            "param substituted:\n{}",
+            e.cleaned
+        );
+        assert!(
+            e.cleaned.contains("ask oncall and the approver."),
+            "refs degraded:\n{}",
+            e.cleaned
+        );
+        assert!(
+            e.cleaned.contains("${missing} stays"),
+            "undeclared left verbatim:\n{}",
+            e.cleaned
+        );
+    }
+
+    #[test]
+    fn delivered_text_has_no_front_matter_fences_or_declared_placeholders() {
+        // The peer's guard: after delivery, no `---`, no `:::`, no declared `${`.
+        let doc = "---\nspec: \"1\"\n---\n# Title\n\n::param{name=env default=prod}\n\nGuidance for ${env}.\n\n:::!workflow{name=w}\nsteps: { f: { kind: manual } }\n:::";
+        let e = fold(&parse(doc).unwrap(), &grants(&[])).unwrap();
+        assert!(
+            !e.cleaned.contains("---"),
+            "no front matter:\n{}",
+            e.cleaned
+        );
+        assert!(!e.cleaned.contains(":::"), "no fences:\n{}", e.cleaned);
+        assert!(
+            !e.cleaned.contains("${env}"),
+            "declared param substituted:\n{}",
+            e.cleaned
+        );
     }
 
     #[test]

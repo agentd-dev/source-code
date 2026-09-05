@@ -575,14 +575,14 @@ fn parse_section(
     }
 }
 
-/// The exclusive end of a section body starting at `from`: the next same-or-
-/// higher-level heading, or any sigiled heading, whichever comes first. Colon
-/// fences and fenced code suspend heading recognition, so a heading inside a
-/// nested block or a code block belongs to the body.
+/// The exclusive end of a Markdown section's body starting at `from`
+/// (§4.4 rule 2), the EARLIEST of: the next same-or-shallower heading; any
+/// sigiled heading; or a **sigiled** fence, leaf or set at column 0. A BARE
+/// fence (a sub-block like `:::case`, or a `:::example`) belongs to the section
+/// and is skipped whole — machinery, being sigiled, is never a section's child.
 fn section_extent(lines: &[&str], from: usize, level: usize) -> usize {
     let mut i = from;
     let mut in_code = None::<usize>;
-    let mut fence_stack: Vec<usize> = Vec::new();
     while i < lines.len() {
         let line = lines[i];
         if let Some(tl) = in_code {
@@ -597,30 +597,61 @@ fn section_extent(lines: &[&str], from: usize, level: usize) -> usize {
             i += 1;
             continue;
         }
-        if let Some(&open) = fence_stack.last()
-            && let Some(len) = fence_close_len(line)
-            && len >= open
-        {
-            fence_stack.pop();
-            i += 1;
+        if section_open(line).is_some() {
+            return i; // (b) a sigiled heading
+        }
+        if let Some(l) = heading_level(line) {
+            if l <= level {
+                return i; // (a) a same-or-shallower heading
+            }
+            i += 1; // a deeper heading belongs to the body
             continue;
         }
         if let Some(of) = open_fence(line) {
-            fence_stack.push(of.len);
-            i += 1;
+            if of.sigil {
+                return i; // (c) a sigiled fence or set at column 0
+            }
+            i = skip_fence(lines, i, of.len); // a bare sub-block: skip it whole
             continue;
         }
-        if !fence_stack.is_empty() {
-            i += 1;
-            continue;
-        }
-        if section_open(line).is_some() {
-            return i;
-        }
-        if let Some(l) = heading_level(line)
-            && l <= level
+        if let Some(lf) = leaf_open(line)
+            && lf.sigil
         {
-            return i;
+            return i; // (c) a sigiled leaf at column 0
+        }
+        i += 1;
+    }
+    lines.len()
+}
+
+/// The index just past the closing fence of the bare block opened at
+/// `open_idx` (fence length `open_len`), honouring code and nested fences.
+fn skip_fence(lines: &[&str], open_idx: usize, open_len: usize) -> usize {
+    let mut i = open_idx + 1;
+    let mut in_code = None::<usize>;
+    while i < lines.len() {
+        let line = lines[i];
+        if let Some(tl) = in_code {
+            if code_fence_len(line) == Some(tl) {
+                in_code = None;
+            }
+            i += 1;
+            continue;
+        }
+        if let Some(tl) = code_fence_len(line) {
+            in_code = Some(tl);
+            i += 1;
+            continue;
+        }
+        if let Some(len) = fence_close_len(line)
+            && len >= open_len
+            && open_fence(line).is_none()
+        {
+            return i + 1;
+        }
+        if let Some(of) = open_fence(line) {
+            i = skip_fence(lines, i, of.len);
+            continue;
         }
         i += 1;
     }
@@ -1805,6 +1836,17 @@ fn attr_value(s: &str) -> Value {
     match s {
         "true" => Value::Bool(true),
         "false" => Value::Bool(false),
+        // A structured attribute/cell value is a YAML flow mapping or sequence
+        // written inline (§4.3.1) — parse it so a typed field (a stream's
+        // `retention`, a test case's `given`) receives a mapping, not a string.
+        _ if (s.starts_with('{') && s.ends_with('}'))
+            || (s.starts_with('[') && s.ends_with(']')) =>
+        {
+            match crate::config::yaml::parse(s) {
+                Ok(v @ (Value::Object(_) | Value::Array(_))) => v,
+                _ => Value::String(s.to_string()),
+            }
+        }
         _ => s
             .parse::<i64>()
             .map(Value::from)
@@ -1973,7 +2015,13 @@ fn fold_machinery(b: &Block, out: &mut Extraction, errs: &mut Vec<String>) {
             }
         }
         "mcp" => {
-            if let Some(m) = body_map(b, errs) {
+            if let Some(mut m) = body_map(b, errs) {
+                // `deny` is the spec-normative attribute (§5.3); agentd's field
+                // for the same thing is `exclude`. Map it here rather than
+                // asking authors to know the runtime's name.
+                if let Some(deny) = m.remove("deny") {
+                    m.entry("exclude".to_string()).or_insert(deny);
+                }
                 match m.get("name").and_then(Value::as_str) {
                     Some(name) => {
                         let name = name.to_string();
@@ -2713,6 +2761,41 @@ into: {stream: s, subject: x.y}
             e.workflows[0]["description"], "Runs at 02:00 and posts a summary.",
             "surrounding prose becomes the description"
         );
+    }
+
+    #[test]
+    fn a_sigiled_block_ends_a_markdown_section_never_its_child() {
+        // §4.4 boundary (c): a `## !skill` section is ended by the following
+        // sigiled `:::!mcp` — machinery is never a section's child. A BARE
+        // `:::example` before it belongs to the skill.
+        let doc = "## !skill tone\n\nBe warm.\n\n:::example\nHello!\n:::\n\n:::!mcp{name=srv}\nendpoint: https://x/mcp\n:::";
+        let d = parse(doc).unwrap();
+        let kinds: Vec<&str> = d.blocks().map(|b| b.kind.as_str()).collect();
+        assert_eq!(kinds, ["skill", "mcp"], "the mcp is top-level, not a child");
+        let e = fold(&d, &grants(&[])).unwrap();
+        assert_eq!(e.skills.len(), 1);
+        assert!(e.skills[0].body.contains("Be warm"));
+        assert_eq!(e.config["mcp"]["servers"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn mcp_deny_maps_to_exclude() {
+        // `deny` (the spec's normative attribute) folds to agentd's `exclude`.
+        let doc = "::!mcp{name=git endpoint=https://x/mcp deny=\"push:main, force-push\"}";
+        let e = fold(&parse(doc).unwrap(), &grants(&[])).unwrap();
+        let srv = &e.config["mcp"]["servers"][0];
+        assert!(srv.get("deny").is_none(), "deny is renamed");
+        assert_eq!(srv["exclude"][0], "push:main");
+        assert_eq!(srv["exclude"][1], "force-push");
+    }
+
+    #[test]
+    fn a_structured_table_cell_parses_as_a_yaml_flow_value() {
+        // §4.3.1: a cell carrying `{ … }` is a YAML flow mapping, so a typed
+        // field (a stream's `retention`) receives a mapping, not a string.
+        let doc = "---\nspec: \"1\"\n---\n:::!stream[]\n| name | retention             |\n|------|------------------------|\n| ev   | { max_events: 5000 }   |\n:::";
+        let e = fold(&parse(doc).unwrap(), &grants(&[])).unwrap();
+        assert_eq!(e.config["streams"]["ev"]["retention"]["max_events"], 5000);
     }
 
     #[test]

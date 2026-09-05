@@ -7216,9 +7216,14 @@
       "rule": "A leaf-form block of a kind whose x-body is not 'none' is refused unless the kind lists 'leaf' in x-forms."
     },
     {
+      "id": "section-extent",
+      "spec": "§4.4 rule 2",
+      "rule": "A section ends at the earliest of: the next heading of the same or a shallower level; any sigiled heading; a sigiled fence, leaf or set at column 0; and, for a kind whose x-body is yaml/code, the closing line of its single fenced code block. Bare fences inside the section belong to it; machinery is never a child of a section."
+    },
+    {
       "id": "section-fence",
       "spec": "§4.4 rule 6",
-      "rule": "A section-form block of a kind whose x-body is yaml/code contains exactly one fenced code block, which is the definition; surrounding prose becomes attrs.description."
+      "rule": "A section-form block of a kind whose x-body is yaml/code contains exactly one fenced code block, which is the definition and at whose closing fence the section ends; the prose before it becomes attrs.description."
     },
     {
       "id": "set-body-uniform",

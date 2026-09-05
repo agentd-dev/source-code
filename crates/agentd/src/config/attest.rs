@@ -383,6 +383,43 @@ fn intersect(lists: &[&[String]]) -> Vec<String> {
         .collect()
 }
 
+// ── §7.7 revocation: authorization is current membership, re-checked ─────────
+
+/// A signed source's re-check interval in seconds (§7.7): its `freshness`,
+/// parsed. `None` if the source declares none.
+pub fn freshness_secs(src: &InstructionSource) -> Option<u64> {
+    src.freshness
+        .as_deref()
+        .and_then(|s| crate::config::parse_duration(s).ok())
+        .map(|d| d.as_secs())
+}
+
+/// Whether authorization is STALE — the deadline (`last_ok + freshness`) has
+/// passed at `now` (§7.7 rule 2). Past it the runtime refuses NEW work and lets
+/// live work run out (§5.5); a successful re-read resets `last_ok`. A failed or
+/// unreachable read is staleness, never revocation.
+pub fn is_stale(last_ok: u64, freshness_secs: u64, now: u64) -> bool {
+    now.saturating_sub(last_ok) >= freshness_secs
+}
+
+/// The families whose class MUST re-check on the interval (§7.7 rule 1):
+/// `compute` and `infra` — code and mounted state. Other classes SHOULD.
+pub fn must_recheck(family: &str) -> bool {
+    matches!(family, "compute" | "infra")
+}
+
+/// The families that LEFT the effective set between two reconciles — the
+/// control plane revokes documents, and the runtime retracts the derived state
+/// of anything that left (§7.7 rule 3, §5.5). A full reconcile at reconnect
+/// honours offline revocations (§7.7 rule 4).
+pub fn families_retracted(before: &[String], after: &[String]) -> Vec<String> {
+    before
+        .iter()
+        .filter(|f| !after.contains(f))
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -611,6 +648,30 @@ mod tests {
         assert_eq!(
             front_matter_id(signed.as_bytes()).as_deref(),
             Some("instruction://ins_x")
+        );
+    }
+
+    #[test]
+    fn freshness_revocation_logic() {
+        let src = InstructionSource {
+            uri: "u".into(),
+            publisher: "p".into(),
+            author_keys: vec![],
+            delivery_keys: vec![],
+            max_capabilities: vec![],
+            freshness: Some("15m".into()),
+        };
+        assert_eq!(freshness_secs(&src), Some(900));
+        // Not yet due, then due at the deadline.
+        assert!(!is_stale(1000, 900, 1000 + 899));
+        assert!(is_stale(1000, 900, 1000 + 900));
+        // compute/infra MUST re-check; others SHOULD.
+        assert!(must_recheck("compute") && must_recheck("infra"));
+        assert!(!must_recheck("material"));
+        // A family that left the effective set is retracted.
+        assert_eq!(
+            families_retracted(&["compute".into(), "material".into()], &["material".into()]),
+            vec!["compute".to_string()]
         );
     }
 

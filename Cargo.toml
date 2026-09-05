@@ -6,7 +6,7 @@
 # the ReAct loop) and asserts each contract, never linking the agent library.
 [workspace]
 resolver = "3"
-members = ["crates/net", "crates/mcp", "crates/agentd", "crates/agentd-cli", "crates/agentd-conformance"]
+members = ["crates/net", "crates/mcp", "crates/instruction", "crates/agentd", "crates/agentd-cli", "crates/agentd-conformance"]
 # `crates/a2a-oracle` checks our A2A wire against an INDEPENDENT implementation
 # of the spec, and is deliberately NOT a member: that implementation brings ~179
 # crates, which is right for an on-demand check and wrong for every `cargo test`

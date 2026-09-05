@@ -1,0 +1,45 @@
+# instruction-core — the reference implementation of the Instruction
+# Specification (https://github.com/instruction-md/specification) as a
+# reusable library: parser → block tree, validator, the §3.5 delivery
+# pipeline (byte-exact), and §7 signature verification, all driven by the
+# spec's own vendored `instruction.schema.json`.
+#
+# Extracted from agentd (which remains its first consumer, via a re-export
+# shim, with zero behaviour change) so the platform — publish-time
+# validation, resolved reads, a TypeScript twin sharing one fixture corpus —
+# consumes the same code agentd runs. Dependency posture matches agentd's
+# moat: serde + serde_json only; `ring` (already resolved by any TLS
+# consumer) appears only behind the `sign` feature for digests + Ed25519
+# verification.
+#
+# `publish = false`: path-usable by design; publishing to crates.io (and the
+# license for a platform-consumable artifact — currently AGPL like the tree
+# it was extracted from) are the owner's calls, not defaults.
+[package]
+name = "instruction-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+description = "Reference implementation of the Instruction Specification: parser, validator, delivery pipeline, and signature verification"
+license = "AGPL-3.0-only"
+repository = "https://github.com/agentd-dev/source-code"
+publish = false
+
+[lib]
+name = "instruction_core"
+path = "src/lib.rs"
+
+[features]
+default = []
+# §7 digests (sha256:<hex>) + JWS/Ed25519 signature verification, and the
+# digest fields of the resolution manifest. Off = the manifest carries empty
+# digest strings and verify is unavailable.
+sign = ["dep:ring"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ring = { version = "0.17", optional = true }
+
+[dev-dependencies]
+tempfile = "3"

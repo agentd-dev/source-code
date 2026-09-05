@@ -131,7 +131,7 @@ aauth = ["tls", "dep:ring"]
 # base64url + SHA-256 — the SAME `ring` rustls already resolves, no new crate —
 # so it rides `aauth`. OFF by default; a binary that never verifies signed
 # documents carries none of it.
-sign = ["aauth"]
+sign = ["aauth", "instruction-core/sign"]
 # Instruction documents from an OCI artifact registry (RFC 0040): pull
 # `oci://registry/repo:tag[@sha256:…]` over the Distribution API v2 — token
 # dance, manifest + blob digest verification, docker-config static creds.
@@ -195,6 +195,10 @@ net = { package = "agentd-net", path = "../net", version = "1.0.1" }
 # stays mechanical (rfcs/0002).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The Instruction Specification reference implementation, extracted (C-01) so
+# the platform and agentd run the SAME parser/validator/delivery code.
+# `config::idoc` and `config::yaml` re-export it; behaviour is unchanged.
+instruction-core = { path = "../instruction", version = "0.1.0" }
 
 # The reusable `net`/`mcp` crates keep their `vsock` features (agentd no longer
 # enables them — the pivot removed agentd's unix/vsock use). No direct `vsock` dep.

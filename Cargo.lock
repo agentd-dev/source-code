@@ -74,6 +74,7 @@ dependencies = [
  "futures-util",
  "hyper",
  "hyper-util",
+ "instruction-core",
  "libc",
  "ring",
  "serde",
@@ -1064,6 +1065,16 @@ dependencies = [
  "hashbrown 0.17.1",
  "serde",
  "serde_core",
+]
+
+[[package]]
+name = "instruction-core"
+version = "0.1.0"
+dependencies = [
+ "ring",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

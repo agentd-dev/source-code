@@ -700,15 +700,14 @@ agent:
   instruction: |
     You watch the queue and keep things tidy.
 
-    :::workflow
-    name: triage
+    :::!workflow{name=triage}
     steps:
       wake: { kind: subscribe, server: queue, uri: "queue://inbox" }
       act:  { kind: agent, depends_on: [wake], instruction: "triage the item" }
       done: { kind: finish, depends_on: [act] }
     :::
 
-    :::skill{name=tidy description="how we tidy"}
+    :::!skill{name=tidy description="how we tidy"}
     Always sweep before you mop.
     :::
 
@@ -719,7 +718,7 @@ agent:
 
 Four directives, fail-closed (an unknown name is exit `2` naming this set):
 
-- **`:::workflow`** — the YAML body joins `workflows:` exactly as an inline
+- **`:::!workflow`** — the YAML body joins `workflows:` exactly as an inline
   entry: same `{{config.*}}` folding, validation, hashing, pinning, and
   retirement (§6.1, workflows doc §retirement). The model reads the *cleaned*
   instruction, where the block became a one-line note — prose and machinery

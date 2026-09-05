@@ -1857,16 +1857,7 @@ fn body_map(b: &Block, errs: &mut Vec<String>) -> Option<serde_json::Map<String,
         // The fence wins over a same-named body key.
         m.insert(k.clone(), attr_scalar(k, v));
     }
-    // `@secret-ref/name` is the spec's reference to a declared `!secret-ref`
-    // location (§3.4) — never a literal credential. Rewrite it to agentd's own
-    // secret-reference form so the inline-credential guard is satisfied and the
-    // value resolves at use, not read as a token.
-    let mut root = Value::Object(m);
-    resolve_secret_refs(&mut root);
-    match root {
-        Value::Object(m) => Some(m),
-        _ => None,
-    }
+    Some(m)
 }
 
 /// Resolve the `@kind/name` references a workflow step carries in its `to`,
@@ -1940,20 +1931,44 @@ fn resolve_workflow_refs(workflows: &mut [Value], doc: &Document) {
     }
 }
 
-/// Recursively rewrite `@secret-ref/NAME` string values to `{{secret:NAME}}`.
-fn resolve_secret_refs(v: &mut Value) {
+/// Rewrite `@secret-ref/NAME` string values (§3.4) to agentd's own secret
+/// reference form, chosen by the declared `!secret-ref`'s kind: a `kind=file`
+/// ref resolves from the mounted file at its `path` (`{{secret-file:PATH}}`);
+/// any other kind resolves the named value (`{{secret:NAME}}`). A reference to
+/// an undeclared secret-ref falls back to `{{secret:NAME}}`.
+fn resolve_secret_refs(v: &mut Value, refs: &BTreeMap<String, (String, String)>) {
     match v {
         Value::String(s) => {
             if let Some(name) = s.strip_prefix("@secret-ref/")
                 && !name.is_empty()
             {
-                *s = format!("{{{{secret:{name}}}}}");
+                *s = match refs.get(name) {
+                    Some((kind, path)) if kind == "file" && !path.is_empty() => {
+                        format!("{{{{secret-file:{path}}}}}")
+                    }
+                    _ => format!("{{{{secret:{name}}}}}"),
+                };
             }
         }
-        Value::Array(a) => a.iter_mut().for_each(resolve_secret_refs),
-        Value::Object(m) => m.values_mut().for_each(resolve_secret_refs),
+        Value::Array(a) => a.iter_mut().for_each(|x| resolve_secret_refs(x, refs)),
+        Value::Object(m) => m.values_mut().for_each(|x| resolve_secret_refs(x, refs)),
         _ => {}
     }
+}
+
+/// The declared `!secret-ref` blocks (name → (kind, path)).
+fn secret_ref_decls(doc: &Document) -> BTreeMap<String, (String, String)> {
+    let mut out = BTreeMap::new();
+    for b in doc.blocks() {
+        if b.kind == "secret-ref"
+            && let Some(name) = b.name.clone().or_else(|| b.attrs.get("name").cloned())
+        {
+            let kind = b.attrs.get("kind").cloned().unwrap_or_default();
+            let path = b.attrs.get("path").cloned().unwrap_or_default();
+            out.insert(name, (kind, path));
+        }
+    }
+    out
 }
 
 /// Attribute names the spec treats as multi-valued (comma-separated within one
@@ -2094,6 +2109,19 @@ pub fn fold_full(
     // `to: @human/x` → the human's channel, `schema: @ui/x` → the ui's schema
     // sub-block, `template: @agent/x` → the agent's template.
     resolve_workflow_refs(&mut out.workflows, doc);
+
+    // Rewrite `@secret-ref/name` references anywhere in the folded config and
+    // workflows to agentd's secret form, chosen by the secret-ref's kind — a
+    // post-pass, so the declaration is seen regardless of block order.
+    let secret_refs = secret_ref_decls(doc);
+    let mut cfg = Value::Object(std::mem::take(&mut out.config));
+    resolve_secret_refs(&mut cfg, &secret_refs);
+    if let Value::Object(m) = cfg {
+        out.config = m;
+    }
+    for wf in &mut out.workflows {
+        resolve_secret_refs(wf, &secret_refs);
+    }
 
     // Pass 2 (§3.5 layout): rebuild the delivered text line by line — each
     // block's region is REPLACED by its delivered form; every other line
@@ -3560,13 +3588,19 @@ into: {stream: s, subject: x.y}
 
     #[test]
     fn a_secret_ref_reference_is_not_read_as_a_literal_credential() {
-        // `@secret-ref/name` (§3.4) becomes agentd's `{{secret:name}}` form —
-        // a reference resolved at use, never an inline token.
-        let doc = "---\nspec: \"1\"\n---\n:::!mcp{name=t endpoint=https://x/mcp}\nauth: { kind: static, token: \"@secret-ref/tok\" }\n:::";
-        let e = fold(&parse(doc).unwrap(), &grants(&[])).unwrap();
+        // `@secret-ref/name` (§3.4) becomes agentd's secret form, chosen by the
+        // declared secret-ref's kind: a `kind=file` ref resolves from the file
+        // at its path; any other kind resolves the named value.
+        let doc = "---\nspec: \"1\"\n---\n::!secret-ref{name=deployer kind=file path=/run/secrets/deployer}\n::!secret-ref{name=tok kind=env}\n:::!mcp{name=t endpoint=https://x/mcp}\nauth: { kind: static, token: \"@secret-ref/tok\" }\nheaders: { X-Deploy: \"@secret-ref/deployer\" }\n:::";
+        let e = fold(&parse(doc).unwrap(), &grants(&["identity"])).unwrap();
+        let srv = &e.config["mcp"]["servers"][0];
         assert_eq!(
-            e.config["mcp"]["servers"][0]["auth"]["token"], "{{secret:tok}}",
-            "the secret reference is rewritten, not left literal"
+            srv["auth"]["token"], "{{secret:tok}}",
+            "kind=env → named value"
+        );
+        assert_eq!(
+            srv["headers"]["X-Deploy"], "{{secret-file:/run/secrets/deployer}}",
+            "kind=file → the mounted file at its path"
         );
     }
 

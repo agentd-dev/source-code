@@ -3452,8 +3452,24 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
     // --- env substitution: `${VAR}` / `${VAR:-default}` in any string value of
     //     the merged document (config + workflows), from the process env. Distinct
     //     from `{{secret:…}}` (which resolves a redacted credential). ---
+    //
+    // The INSTRUCTION text is exempt: a `${name}` in an instruction document is
+    // an instruction PARAMETER (§5.2/§4.7 rule 2), resolved by the instruction
+    // resolver from its declared source — never a process env var. Expanding it
+    // here would refuse startup on an unset "env var" and would silently corrupt
+    // a form's input list by substituting before the parser sees it. Lift it out,
+    // expand the rest, then restore it for the instruction pass.
+    let saved_instruction = doc
+        .get_mut("agent")
+        .and_then(Value::as_object_mut)
+        .and_then(|a| a.remove("instruction"));
     if let Err(e) = substitute_env(&mut doc, &envmap) {
         return Err(usage(e));
+    }
+    if let Some(instr) = saved_instruction
+        && let Some(a) = doc.get_mut("agent").and_then(Value::as_object_mut)
+    {
+        a.insert("instruction".into(), instr);
     }
 
     // --- type + validate ---

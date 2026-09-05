@@ -31,7 +31,42 @@ fn main() {
             std::process::exit(2);
         }
     };
-    match idoc::fold_with_params(&doc, &idoc::all_families(), &overrides) {
+
+    // Resolve `::include{id=…}` from sibling documents: a file in the same
+    // directory whose front-matter `id` ends with the requested id.
+    let dir = std::path::Path::new(&path)
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default();
+    let resolve = move |id: &str| -> Option<String> {
+        let want = format!("ins_{}", id.trim_start_matches("ins_"));
+        for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+            let p = entry.path();
+            if p.extension().is_some_and(|e| e == "md")
+                && let Ok(t) = std::fs::read_to_string(&p)
+                && idoc::parse(&t)
+                    .ok()
+                    .and_then(|d| {
+                        d.front
+                            .get("id")
+                            .and_then(|v| v.as_str().map(str::to_string))
+                    })
+                    .is_some_and(|fid| fid.ends_with(&want))
+            {
+                return Some(t);
+            }
+        }
+        None
+    };
+
+    match idoc::fold_full(
+        &doc,
+        &idoc::all_families(),
+        &overrides,
+        &resolve,
+        0,
+        &std::collections::BTreeSet::new(),
+    ) {
         Ok(ex) => print!("{}", ex.cleaned),
         Err(errs) => {
             eprintln!("refused:\n  {}", errs.join("\n  "));

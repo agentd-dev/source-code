@@ -1869,6 +1869,77 @@ fn body_map(b: &Block, errs: &mut Vec<String>) -> Option<serde_json::Map<String,
     }
 }
 
+/// Resolve the `@kind/name` references a workflow step carries in its `to`,
+/// `schema` and `template` fields (§3.4) to the concrete value the declared
+/// block provides: `@human/x` → the human's channel/principal, `@ui/x` → the
+/// ui's `schema` sub-block, `@agent/x` → the agent's `template`. A reference to
+/// an undeclared block is left as written for the runtime to report.
+fn resolve_workflow_refs(workflows: &mut [Value], doc: &Document) {
+    let mut human_to: BTreeMap<String, String> = BTreeMap::new();
+    let mut ui_schema: BTreeMap<String, Value> = BTreeMap::new();
+    let mut agent_template: BTreeMap<String, String> = BTreeMap::new();
+    for b in doc.blocks() {
+        let Some(name) = b.name.clone() else { continue };
+        match b.kind.as_str() {
+            "human" => {
+                if let Some(to) = b.attrs.get("channel").or_else(|| b.attrs.get("principal")) {
+                    human_to.insert(name, to.clone());
+                }
+            }
+            "ui" => {
+                if let Some(schema) = b.children.iter().find(|c| c.kind == "schema")
+                    && let Ok(v) = crate::config::yaml::parse(&schema.body)
+                {
+                    ui_schema.insert(name, v);
+                }
+            }
+            "agent" => {
+                if let Some(t) = b.attrs.get("template") {
+                    agent_template.insert(name, t.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    for wf in workflows {
+        let Some(steps) = wf.get_mut("steps").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        for step in steps.values_mut() {
+            let Some(obj) = step.as_object_mut() else {
+                continue;
+            };
+            if let Some(name) = obj
+                .get("to")
+                .and_then(Value::as_str)
+                .and_then(|s| s.strip_prefix("@human/"))
+                .map(str::to_string)
+                && let Some(to) = human_to.get(&name)
+            {
+                obj.insert("to".into(), Value::String(to.clone()));
+            }
+            if let Some(name) = obj
+                .get("schema")
+                .and_then(Value::as_str)
+                .and_then(|s| s.strip_prefix("@ui/"))
+                .map(str::to_string)
+                && let Some(schema) = ui_schema.get(&name)
+            {
+                obj.insert("schema".into(), schema.clone());
+            }
+            if let Some(name) = obj
+                .get("template")
+                .and_then(Value::as_str)
+                .and_then(|s| s.strip_prefix("@agent/"))
+                .map(str::to_string)
+                && let Some(t) = agent_template.get(&name)
+            {
+                obj.insert("template".into(), Value::String(t.clone()));
+            }
+        }
+    }
+}
+
 /// Recursively rewrite `@secret-ref/NAME` string values to `{{secret:NAME}}`.
 fn resolve_secret_refs(v: &mut Value) {
     match v {
@@ -1927,21 +1998,43 @@ fn attr_scalar(key: &str, s: &str) -> Value {
     }
 }
 
+/// Resolves an `include`'s id or uri to the included document's source, or
+/// `None` when the reader may not see it or it does not exist (§5.2 rule 2).
+pub type IncludeResolver<'a> = &'a dyn Fn(&str) -> Option<String>;
+
+/// The include depth cap (§5.2 rule 3); deeper transclusion degrades to a note.
+const INCLUDE_DEPTH_CAP: usize = 8;
+
 /// Fold a parsed document into configuration + delivered prose, after checking
 /// grants. The whole document is refused if any block errors — no partial load.
 pub fn fold(doc: &Document, granted: &BTreeSet<String>) -> Result<Extraction, Vec<String>> {
     fold_with_params(doc, granted, &BTreeMap::new())
 }
 
-/// As [`fold`], with an explicit override map for `${parameter}` substitution
-/// (a value here wins over a declared default). The delivered text runs the
-/// §3.5 pipeline: prose degraded to its Appendix A form, machinery replaced by
-/// its acknowledgement line (a set as one line), inline references degraded,
-/// and `${}` substituted LAST so a value is never re-parsed as Markdown.
+/// As [`fold`], with an explicit override map for `${parameter}` substitution.
+/// Includes are not resolved (they degrade to a note); use [`fold_full`] with a
+/// resolver to transclude.
 pub fn fold_with_params(
     doc: &Document,
     granted: &BTreeSet<String>,
     overrides: &BTreeMap<String, String>,
+) -> Result<Extraction, Vec<String>> {
+    fold_full(doc, granted, overrides, &|_| None, 0, &BTreeSet::new())
+}
+
+/// The full fold: `${parameter}` overrides, and an `include` resolver so a
+/// document can transclude others (§5.2), recursively, resolved with their own
+/// parameters. The delivered text runs the §3.5 pipeline: prose degraded to its
+/// Appendix A form, machinery replaced by its acknowledgement line (a set as
+/// one line), includes inlined, inline references degraded, and `${}`
+/// substituted LAST so a value is never re-parsed as Markdown.
+pub fn fold_full(
+    doc: &Document,
+    granted: &BTreeSet<String>,
+    overrides: &BTreeMap<String, String>,
+    resolve: IncludeResolver,
+    depth: usize,
+    seen: &BTreeSet<String>,
 ) -> Result<Extraction, Vec<String>> {
     let mut errs = Vec::new();
     check_grants(doc, granted, &mut errs);
@@ -1987,7 +2080,7 @@ pub fn fold_with_params(
                 regions.push((
                     b.region.0,
                     b.region.1,
-                    deliver_block_lines(b, &params, &decls),
+                    deliver_block_lines(b, &params, &decls, granted, resolve, depth, seen),
                 ));
                 i += 1;
             }
@@ -1996,6 +2089,11 @@ pub fn fold_with_params(
     if !errs.is_empty() {
         return Err(errs);
     }
+
+    // Resolve the workflow-step references that name a declared block (§3.4):
+    // `to: @human/x` → the human's channel, `schema: @ui/x` → the ui's schema
+    // sub-block, `template: @agent/x` → the agent's template.
+    resolve_workflow_refs(&mut out.workflows, doc);
 
     // Pass 2 (§3.5 layout): rebuild the delivered text line by line — each
     // block's region is REPLACED by its delivered form; every other line
@@ -2041,24 +2139,67 @@ fn fold_config(b: &Block, out: &mut Extraction, errs: &mut Vec<String>) {
 }
 
 /// The lines a block delivers, replacing its source region (§3.5 steps 4–5).
+#[allow(clippy::too_many_arguments)]
 fn deliver_block_lines(
     b: &Block,
     params: &BTreeMap<String, String>,
     decls: &BTreeMap<String, BTreeMap<String, String>>,
+    granted: &BTreeSet<String>,
+    resolve: IncludeResolver,
+    depth: usize,
+    seen: &BTreeSet<String>,
 ) -> Vec<String> {
     match b.disposition {
         Disposition::Prose => deliver_prose_lines(b, decls),
-        Disposition::Structural => {
-            // A KEPT `when` delivers its body unwrapped; a dropped one delivers
-            // nothing. `include`/`param` deliver nothing (an include is inlined
-            // upstream of this reader).
-            if b.kind == "when" && when_kept(b, params) {
+        Disposition::Structural if b.kind == "when" => {
+            // A KEPT `when` delivers its body unwrapped; a dropped one nothing.
+            if when_kept(b, params) {
                 body_lines(&b.body)
             } else {
                 Vec::new()
             }
         }
+        Disposition::Structural if b.kind == "include" => {
+            deliver_include(b, granted, resolve, depth, seen)
+        }
+        // `param` and any other structural block deliver nothing.
+        Disposition::Structural => Vec::new(),
         Disposition::Machinery => machinery_ack(b).into_iter().collect(),
+    }
+}
+
+/// Transclude an `include` (§5.2): resolve the referenced document, deliver it
+/// with its OWN parameters, and inline its lines. An unavailable document, a
+/// cycle, or a too-deep include degrades to a visible note rather than looping
+/// or revealing existence.
+fn deliver_include(
+    b: &Block,
+    granted: &BTreeSet<String>,
+    resolve: IncludeResolver,
+    depth: usize,
+    seen: &BTreeSet<String>,
+) -> Vec<String> {
+    let Some(id) = b.attrs.get("id").or_else(|| b.attrs.get("uri")).cloned() else {
+        return vec!["> _(included instruction not available)_".into()];
+    };
+    if depth >= INCLUDE_DEPTH_CAP || seen.contains(&id) {
+        return vec!["> _(included instruction not available: cycle or depth cap)_".into()];
+    }
+    let Some(text) = resolve(&id) else {
+        return vec!["> _(included instruction not available)_".into()];
+    };
+    let mut seen2 = seen.clone();
+    seen2.insert(id);
+    let inlined = parse(&text)
+        .and_then(|d| fold_full(&d, granted, &BTreeMap::new(), resolve, depth + 1, &seen2));
+    match inlined {
+        Ok(ex) => ex
+            .cleaned
+            .trim_end_matches('\n')
+            .split('\n')
+            .map(str::to_string)
+            .collect(),
+        Err(_) => vec!["> _(included instruction not available)_".into()],
     }
 }
 
@@ -3521,6 +3662,68 @@ into: {stream: s, subject: x.y}
             e.cleaned.contains("${missing} stays"),
             "undeclared left verbatim:\n{}",
             e.cleaned
+        );
+    }
+
+    #[test]
+    fn an_include_inlines_the_resolved_document_and_degrades_when_not() {
+        let base = "Before.\n\n::include{id=\"child\"}\n\nAfter.";
+        let child = "# Child\n\nchild body.";
+        let resolve = |id: &str| (id == "child").then(|| child.to_string());
+        let doc = parse(base).unwrap();
+        let e = fold_full(
+            &doc,
+            &all_families(),
+            &BTreeMap::new(),
+            &resolve,
+            0,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        assert!(
+            e.cleaned.contains("# Child") && e.cleaned.contains("child body."),
+            "the resolved document is inlined:\n{}",
+            e.cleaned
+        );
+        assert!(e.cleaned.contains("Before.") && e.cleaned.contains("After."));
+        // With no resolver the include degrades to a visible note (§5.2 rule 2).
+        let e2 = fold(&doc, &all_families()).unwrap();
+        assert!(
+            e2.cleaned.contains("included instruction not available"),
+            "{}",
+            e2.cleaned
+        );
+    }
+
+    #[test]
+    fn workflow_step_references_resolve_to_declared_blocks() {
+        // `to: @human/x`, `schema: @ui/x`, `template: @agent/x` in a workflow
+        // step resolve to the declared block's value (§3.4).
+        let doc = r#"---
+spec: "1"
+---
+::!human{name=oncall channel=#ops role=approver}
+::::!ui{name=card kind=card}
+:::schema
+type: object
+:::
+::::
+::!agent{name=rev template=reviewer}
+:::!workflow{name=w}
+steps:
+  ask:    { kind: human, question: "ok?", to: "@human/oncall", schema: "@ui/card" }
+  branch: { kind: subagent, template: "@agent/rev" }
+:::"#;
+        let e = fold(&parse(doc).unwrap(), &grants(&["interface", "compose"])).unwrap();
+        let wf = &e.workflows[0];
+        assert_eq!(wf["steps"]["ask"]["to"], "#ops", "human → channel");
+        assert_eq!(
+            wf["steps"]["ask"]["schema"]["type"], "object",
+            "ui → schema sub-block"
+        );
+        assert_eq!(
+            wf["steps"]["branch"]["template"], "reviewer",
+            "agent → template"
         );
     }
 

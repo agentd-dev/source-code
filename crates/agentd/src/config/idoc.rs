@@ -36,183 +36,209 @@ pub enum Disposition {
     Structural,
 }
 
-/// The capability family a machinery block belongs to — the unit the trust
-/// ladder grants. Prose and structural blocks have no family (always allowed).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Family {
-    /// The default rung: no grant required.
-    Default,
-    Material,
-    Knowledge,
-    Interface,
-    Identity,
-    Compute,
-    Infra,
-    Compose,
+/// A way of writing a block (§4). Every form maps to the same kind, with the
+/// same disposition, family, grant and identity rule — a form adds no meaning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Form {
+    Container,
+    Leaf,
+    Set,
+    Section,
+    Keyword,
+    Alert,
 }
 
-impl Family {
-    /// The `document_capabilities` token that grants this family, or `None` for
-    /// the default rung (never needs a grant).
-    pub fn grant(self) -> Option<&'static str> {
-        match self {
-            Family::Default => None,
-            Family::Material => Some("material"),
-            Family::Knowledge => Some("knowledge"),
-            Family::Interface => Some("interface"),
-            Family::Identity => Some("identity"),
-            Family::Compute => Some("compute"),
-            Family::Infra => Some("infra"),
-            Family::Compose => Some("compose"),
-        }
-    }
-
-    pub fn from_grant(s: &str) -> Option<Family> {
-        Some(match s {
-            "material" => Family::Material,
-            "knowledge" => Family::Knowledge,
-            "interface" => Family::Interface,
-            "identity" => Family::Identity,
-            "compute" => Family::Compute,
-            "infra" => Family::Infra,
-            "compose" => Family::Compose,
-            _ => return None,
-        })
-    }
+/// How a kind's body is interpreted (§4.1's body-interpretation table).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyKind {
+    None,
+    Markdown,
+    Yaml,
+    Code,
+    Table,
+    Deflist,
+    Text,
 }
 
-/// The full grant set — every family. Used for operator-authored surfaces that
-/// are fully trusted (a subagent template's own instruction), where the trust
-/// ladder's per-family gate does not apply.
-pub fn all_families() -> BTreeSet<String> {
-    [
-        "material",
-        "knowledge",
-        "interface",
-        "identity",
-        "compute",
-        "infra",
-        "compose",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect()
-}
-
-/// One kind's static metadata.
+/// One kind's metadata, read verbatim from the spec's own JSON Schema. The
+/// registry is not transcribed into Rust — it is the vendored schema, so a
+/// kind, form, body or grant cannot drift from the specification: there is one
+/// copy, and it is the normative one.
 pub struct Kind {
-    pub name: &'static str,
+    pub name: String,
     pub disposition: Disposition,
-    pub family: Family,
+    pub forms: Vec<Form>,
+    pub body: BodyKind,
+    pub identity: bool,
+    /// The capability family this machinery belongs to (`None` for prose and
+    /// structural). Presentational: the grant is `grant`, not this.
+    pub family: Option<String>,
+    /// The `document_capabilities` token that must be granted, or `None` for
+    /// the default rung (`x-grant: default`). Note `!data` and `!override`
+    /// carry a family but sit on the default rung — the grant, not the family,
+    /// governs. Preserved so grant-checking keys on the spec's own field.
+    pub grant: Option<String>,
     /// For a sub-block, the parent kind it is valid inside; `None` for a
     /// top-level block. A sub-block has no document-level identity and is
     /// exempt from the uniqueness rule.
-    pub sub_of: Option<&'static str>,
+    pub sub_of: Option<String>,
+    /// The one provenance line a machinery block delivers (spec `x-acknowledgement`).
+    pub ack: Option<String>,
 }
 
-const fn k(name: &'static str, d: Disposition, f: Family) -> Kind {
-    Kind {
-        name,
-        disposition: d,
-        family: f,
-        sub_of: None,
+/// The registry as loaded from the vendored JSON Schema — every kind, plus the
+/// document-level tables (default-grant set, keyword→kind map, spec version).
+pub struct Registry {
+    kinds: BTreeMap<String, Kind>,
+    grant_tokens: BTreeSet<String>,
+    keywords: BTreeMap<String, String>,
+    version: u32,
+}
+
+/// The Instruction Document Specification's registry and grammar, vendored
+/// verbatim from `github.com/instruction-md/specification`. It is the single
+/// source of truth: the parser reads kinds, forms, bodies and grants from it.
+const SCHEMA_JSON: &str = include_str!("instruction-document.schema.json");
+
+static REGISTRY: std::sync::LazyLock<Registry> = std::sync::LazyLock::new(Registry::load);
+
+/// The loaded registry (`&'static`, parsed once from the vendored schema).
+pub fn registry() -> &'static Registry {
+    &REGISTRY
+}
+
+/// The vendored Instruction Document JSON Schema, verbatim. The conformance
+/// suite compares this against upstream to prove the vendor is faithful.
+pub fn schema_json() -> &'static str {
+    SCHEMA_JSON
+}
+
+impl Registry {
+    fn load() -> Registry {
+        let schema: Value = serde_json::from_str(SCHEMA_JSON)
+            .expect("the vendored instruction-document schema is valid JSON");
+        let reg = &schema["x-registry"];
+        let version = reg["version"].as_u64().unwrap_or(1) as u32;
+        let grant_tokens: BTreeSet<String> = reg["grants"]
+            .as_object()
+            .into_iter()
+            .flat_map(|m| m.keys().cloned())
+            .filter(|g| g != "default")
+            .collect();
+        let mut keywords = BTreeMap::new();
+        if let Some(m) = reg["keywords"].as_object() {
+            for (kw, kind) in m {
+                if let Some(k) = kind.as_str() {
+                    keywords.insert(kw.clone(), k.to_string());
+                }
+            }
+        }
+        let mut kinds = BTreeMap::new();
+        let defs = schema["$defs"]["kinds"]
+            .as_object()
+            .expect("the schema carries $defs.kinds");
+        for (name, d) in defs {
+            let disposition = match d["x-disposition"].as_str() {
+                Some("machinery") => Disposition::Machinery,
+                Some("structural") => Disposition::Structural,
+                _ => Disposition::Prose,
+            };
+            let forms = d["x-forms"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|f| match f.as_str() {
+                    Some("container") => Some(Form::Container),
+                    Some("leaf") => Some(Form::Leaf),
+                    Some("set") => Some(Form::Set),
+                    Some("section") => Some(Form::Section),
+                    Some("keyword") => Some(Form::Keyword),
+                    Some("alert") => Some(Form::Alert),
+                    _ => None,
+                })
+                .collect();
+            let body = match d["x-body"].as_str() {
+                Some("yaml") => BodyKind::Yaml,
+                Some("code") => BodyKind::Code,
+                Some("table") => BodyKind::Table,
+                Some("deflist") => BodyKind::Deflist,
+                Some("text") => BodyKind::Text,
+                Some("none") => BodyKind::None,
+                _ => BodyKind::Markdown,
+            };
+            let grant = match d["x-grant"].as_str() {
+                Some("default") | None => None,
+                Some(g) => Some(g.to_string()),
+            };
+            kinds.insert(
+                name.clone(),
+                Kind {
+                    name: name.clone(),
+                    disposition,
+                    forms,
+                    body,
+                    identity: d["x-identity"].as_bool().unwrap_or(false),
+                    family: d["x-family"].as_str().map(str::to_string),
+                    grant,
+                    sub_of: d["x-parent"].as_str().map(str::to_string),
+                    ack: d["x-acknowledgement"].as_str().map(str::to_string),
+                },
+            );
+        }
+        Registry {
+            kinds,
+            grant_tokens,
+            keywords,
+            version,
+        }
+    }
+
+    /// The spec version this registry describes (currently 1).
+    pub fn version(&self) -> u32 {
+        self.version
+    }
+
+    /// The prose kind a keyword line introduces (`MUST` → `must`), if any.
+    pub fn keyword_kind(&self, kw: &str) -> Option<&str> {
+        self.keywords.get(kw).map(String::as_str)
     }
 }
-const fn sub(name: &'static str, parent: &'static str) -> Kind {
-    // Sub-blocks inherit their parent's disposition (machinery) and need no
-    // family of their own — the parent's grant governs them.
-    Kind {
-        name,
-        disposition: Disposition::Machinery,
-        family: Family::Default,
-        sub_of: Some(parent),
-    }
-}
 
-use Disposition::{Machinery as M, Prose as P, Structural as S};
-use Family::*;
-
-/// The kind registry — the single source of truth, matching the spec's
-/// per-version registry (`conformance/registry/kinds.json`, spec version 1).
-/// The conformance corpus asserts this agrees with the published registry.
-pub const KINDS: &[Kind] = &[
-    // ── prose (bare; degrade into delivery) ──────────────────────────────
-    k("must", P, Default),
-    k("should", P, Default),
-    k("never", P, Default),
-    k("guardrail", P, Default),
-    k("note", P, Default),
-    k("info", P, Default),
-    k("tip", P, Default),
-    k("important", P, Default),
-    k("warning", P, Default),
-    k("caution", P, Default),
-    k("example", P, Default),
-    k("form", P, Default),
-    k("tool", P, Default),
-    k("context", P, Default),
-    // ── structural (bare; resolved away) ─────────────────────────────────
-    k("when", S, Default),
-    k("include", S, Default),
-    // ── machinery: default rung ──────────────────────────────────────────
-    k("workflow", M, Default),
-    k("skill", M, Default),
-    k("config", M, Default),
-    k("mcp", M, Default),
-    k("stream", M, Default),
-    k("tools", M, Default),
-    k("data", M, Default),
-    k("override", M, Default),
-    // ── machinery: material ──────────────────────────────────────────────
-    k("file", M, Material),
-    k("media", M, Material),
-    k("asset", M, Material),
-    // ── machinery: knowledge ─────────────────────────────────────────────
-    k("knowledge", M, Knowledge),
-    k("retrieval", M, Knowledge),
-    k("source", M, Knowledge),
-    // ── machinery: interface ─────────────────────────────────────────────
-    k("endpoint", M, Interface),
-    k("ui", M, Interface),
-    k("human", M, Interface),
-    k("channel", M, Interface),
-    // ── machinery: identity ──────────────────────────────────────────────
-    k("peer", M, Identity),
-    k("policy", M, Identity),
-    k("secret-ref", M, Identity),
-    // ── machinery: compute ───────────────────────────────────────────────
-    k("runtime", M, Compute),
-    k("function", M, Compute),
-    k("test", M, Compute),
-    k("fixture", M, Compute),
-    // ── machinery: infra ─────────────────────────────────────────────────
-    k("git", M, Infra),
-    k("volume", M, Infra),
-    k("image", M, Infra),
-    // ── machinery: compose ───────────────────────────────────────────────
-    k("agent", M, Compose),
-    // ── sub-blocks (valid only inside a parent) ──────────────────────────
-    sub("case", "test"),
-    sub("signature", "function"),
-    sub("schema", "ui"),
-    sub("preview", "ui"),
-];
-
+/// One kind's metadata by name.
 pub fn lookup(name: &str) -> Option<&'static Kind> {
-    KINDS.iter().find(|k| k.name == name)
+    registry().kinds.get(name)
 }
 
 /// The machinery names — reserved in the bare namespace: a bare `:::workflow`
 /// (sigil forgotten) is refused rather than silently demoted to prose.
 pub fn machinery_names() -> impl Iterator<Item = &'static str> {
-    KINDS
-        .iter()
+    registry()
+        .kinds
+        .values()
         .filter(|k| k.disposition == Disposition::Machinery && k.sub_of.is_none())
-        .map(|k| k.name)
+        .map(|k| k.name.as_str())
+}
+
+/// The full grant set — every capability family. Used for operator-authored
+/// surfaces that are fully trusted (a subagent template's own instruction),
+/// where the trust ladder's per-family gate does not apply.
+pub fn all_families() -> BTreeSet<String> {
+    registry().grant_tokens.clone()
+}
+
+/// The grant a kind requires, or `None` for the default rung. Keys on the
+/// spec's `x-grant`, so `!data`/`!override` correctly need no grant.
+pub fn grant_of(kind: &str) -> Option<&'static str> {
+    lookup(kind).and_then(|k| k.grant.as_deref())
+}
+
+/// Whether a kind accepts a given form (§4; the schema's `x-forms`).
+pub fn accepts_form(kind: &str, form: Form) -> bool {
+    lookup(kind).is_some_and(|k| k.forms.contains(&form))
 }
 
 /// A parsed block: its kind, identity, attributes, body text, and — because
-/// dialect 2 nests — its child blocks.
+/// blocks nest by fence length — its child blocks.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Block {
     pub kind: String,
@@ -226,10 +252,15 @@ pub struct Block {
 }
 
 impl Block {
-    pub fn family(&self) -> Family {
-        lookup(&self.kind)
-            .map(|k| k.family)
-            .unwrap_or(Family::Default)
+    /// The capability family this block belongs to, or `None` for prose,
+    /// structural, and default-rung machinery.
+    pub fn family(&self) -> Option<&'static str> {
+        lookup(&self.kind).and_then(|k| k.family.as_deref())
+    }
+
+    /// The grant this block requires, or `None` for the default rung.
+    pub fn grant(&self) -> Option<&'static str> {
+        grant_of(&self.kind)
     }
 }
 
@@ -308,6 +339,7 @@ pub fn parse(text: &str) -> Result<Document, Vec<String>> {
         .collect();
     check_identity(&blocks, &mut errs);
     check_refs(&blocks, &mut errs);
+    check_placement(&blocks, &mut errs);
 
     if errs.is_empty() {
         Ok(Document {
@@ -629,10 +661,9 @@ fn parse_attrs(src: &str) -> Result<BTreeMap<String, String>, String> {
 }
 
 /// Front matter: a leading `---\n … \n---`. Returns the parsed map and the byte
-/// offset where the body begins. Absent front matter is spec 1 by the spec's
-/// rule, but this dialect-2-native reader requires spec 2 — so a document that
-/// is going to use dialect-2 machinery must declare it, and one that does not
-/// is treated as spec 2 with no front matter (plain prose stays valid).
+/// offset where the body begins. A document with no front matter, or one whose
+/// front matter lacks `spec`, is version 1 (spec rule `front-matter-absent`);
+/// a document pinning a higher version is refused rather than mis-read.
 fn parse_front_matter(text: &str, errs: &mut Vec<String>) -> (BTreeMap<String, Value>, usize) {
     let mut map = BTreeMap::new();
     let Some(rest) = text.strip_prefix("---\n") else {
@@ -778,12 +809,14 @@ fn has_cycle(
     false
 }
 
-/// The families a document actually uses (for grant checking and reporting).
-pub fn families_used(doc: &Document) -> BTreeSet<Family> {
+/// The grants a document actually requires (the non-default families it uses),
+/// for reporting. `!data`/`!override` carry a family but need no grant, so they
+/// do not appear here — this is the grant surface, not the family census.
+pub fn families_used(doc: &Document) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
-    fn recur(b: &Block, out: &mut BTreeSet<Family>) {
-        if b.family() != Family::Default {
-            out.insert(b.family());
+    fn recur(b: &Block, out: &mut BTreeSet<String>) {
+        if let Some(grant) = b.grant() {
+            out.insert(grant.to_string());
         }
         for c in &b.children {
             recur(c, out);
@@ -795,11 +828,12 @@ pub fn families_used(doc: &Document) -> BTreeSet<Family> {
     out
 }
 
-/// Refuse any block whose family is not granted by `document_capabilities`.
-/// Fail-closed: names the block, the family, and the exact grant to add.
+/// Refuse any block whose grant is not held by `document_capabilities`.
+/// Fail-closed: names the block, the grant, and the exact token to add. Keys on
+/// the spec's `x-grant`, so default-rung machinery (`!data`, `!override`) passes.
 pub fn check_grants(doc: &Document, granted: &BTreeSet<String>, errs: &mut Vec<String>) {
     fn recur(b: &Block, granted: &BTreeSet<String>, errs: &mut Vec<String>) {
-        if let Some(grant) = b.family().grant()
+        if let Some(grant) = b.grant()
             && !granted.contains(grant)
         {
             errs.push(format!(
@@ -814,6 +848,29 @@ pub fn check_grants(doc: &Document, granted: &BTreeSet<String>, errs: &mut Vec<S
     }
     for b in doc.blocks() {
         recur(b, granted, errs);
+    }
+}
+
+/// Sub-block placement (spec §5.4): a sub-block appears only inside its parent.
+/// A top-level sub-block, or one inside the wrong parent, is refused naming the
+/// parent it needs.
+fn check_placement(blocks: &[&Block], errs: &mut Vec<String>) {
+    fn walk(b: &Block, parent_kind: Option<&str>, errs: &mut Vec<String>) {
+        if let Some(want) = lookup(&b.kind).and_then(|k| k.sub_of.as_deref())
+            && parent_kind != Some(want)
+        {
+            errs.push(format!(
+                "line {}: `{}` is a sub-block of `!{want}` — it must sit inside a \
+                 `!{want}` block",
+                b.line, b.kind
+            ));
+        }
+        for c in &b.children {
+            walk(c, Some(b.kind.as_str()), errs);
+        }
+    }
+    for b in blocks {
+        walk(b, None, errs);
     }
 }
 
@@ -842,7 +899,8 @@ pub struct Extraction {
     pub workflows: Vec<Value>,
     pub skills: Vec<InlineSkill>,
     pub declarations: BTreeMap<String, Vec<Value>>,
-    pub families: Vec<Family>,
+    /// The grants this document actually required, for introspection.
+    pub families: Vec<String>,
 }
 
 /// Parse and fold an instruction document in one step — the entry point the
@@ -1008,6 +1066,55 @@ fn fold_prose(b: &Block, out: &mut Extraction) {
     }
 }
 
+/// An `override` sub-block (inside `!mcp`) narrows one of the server's tools —
+/// append-only, folded into real registry config: disable, add trifecta tags,
+/// append an operator annotation. It may only make a tool MORE careful, and it
+/// delivers nothing (the spec gives it no acknowledgement).
+fn fold_override(b: &Block, out: &mut Extraction, errs: &mut Vec<String>) {
+    let Some(target) = b.attrs.get("target").cloned() else {
+        errs.push(format!(
+            "line {}: `override` needs a target=<tool> (the server tool to narrow)",
+            b.line
+        ));
+        return;
+    };
+    let body = body_map(b, errs).unwrap_or_default();
+    let disabled = b
+        .attrs
+        .get("disabled")
+        .map(|v| v != "false")
+        .unwrap_or(false)
+        || body
+            .get("disabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    if disabled {
+        push_into(&mut out.config, "tools", "disabled").push(Value::String(target));
+        return;
+    }
+    let mut narrow = serde_json::Map::new();
+    if let Some(tags) = body.get("tags").and_then(Value::as_array) {
+        narrow.insert("tags".into(), Value::Array(tags.clone()));
+    }
+    // A description narrows to an operator annotation, appended beneath the
+    // server's own description — never a replacement (spec §5.3).
+    if let Some(desc) = body
+        .get("description")
+        .and_then(Value::as_str)
+        .or_else(|| b.attrs.get("description").map(String::as_str))
+    {
+        narrow.insert("describe".into(), Value::String(desc.trim().to_string()));
+    }
+    if !narrow.is_empty() {
+        frag(&mut out.config, "tools")
+            .entry("narrow")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()))
+            .as_object_mut()
+            .expect("narrow is an object")
+            .insert(target, Value::Object(narrow));
+    }
+}
+
 fn fold_machinery(b: &Block, out: &mut Extraction, errs: &mut Vec<String>) {
     match b.kind.as_str() {
         // ── core: fold into real agentd configuration ───────────────────────
@@ -1048,6 +1155,14 @@ fn fold_machinery(b: &Block, out: &mut Extraction, errs: &mut Vec<String>) {
                                 "[mcp server \"{name}\" is connected; its tools are available]"
                             ),
                         );
+                        // `override` sub-blocks (§5.3) adjust this server's
+                        // tools — append-only: disable, add trifecta tags, or
+                        // annotate. They deliver nothing of their own.
+                        for child in &b.children {
+                            if child.kind == "override" {
+                                fold_override(child, out, errs);
+                            }
+                        }
                     }
                     None => errs.push(format!("line {}: :::!mcp needs a name", b.line)),
                 }
@@ -1072,54 +1187,6 @@ fn fold_machinery(b: &Block, out: &mut Extraction, errs: &mut Vec<String>) {
                 merge_map(frag(&mut out.config, "tools"), m);
                 ack(out, "[tool policy is applied]");
             }
-        }
-        // `:::!override{target=tool ...}` narrows an existing tool — append-only,
-        // folded into real registry config: disable, add trifecta tags, append
-        // an operator annotation. It may only make a tool MORE careful.
-        "override" => {
-            let Some(target) = b.attrs.get("target").cloned() else {
-                errs.push(format!(
-                    "line {}: :::!override needs a target=<tool>",
-                    b.line
-                ));
-                return;
-            };
-            let body = body_map(b, errs).unwrap_or_default();
-            let disabled = b
-                .attrs
-                .get("disabled")
-                .map(|v| v != "false")
-                .unwrap_or(false)
-                || body
-                    .get("disabled")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-            if disabled {
-                push_into(&mut out.config, "tools", "disabled").push(Value::String(target.clone()));
-                ack(out, &format!("[tool \"{target}\" is disabled]"));
-                return;
-            }
-            let mut narrow = serde_json::Map::new();
-            if let Some(tags) = body.get("tags").and_then(Value::as_array) {
-                narrow.insert("tags".into(), Value::Array(tags.clone()));
-            }
-            // The description narrows to an operator annotation, appended.
-            if let Some(desc) = body
-                .get("description")
-                .and_then(Value::as_str)
-                .or_else(|| b.attrs.get("description").map(String::as_str))
-            {
-                narrow.insert("describe".into(), Value::String(desc.to_string()));
-            }
-            if !narrow.is_empty() {
-                frag(&mut out.config, "tools")
-                    .entry("narrow")
-                    .or_insert_with(|| Value::Object(serde_json::Map::new()))
-                    .as_object_mut()
-                    .expect("narrow is an object")
-                    .insert(target.clone(), Value::Object(narrow));
-            }
-            ack(out, &format!("[tool \"{target}\" is narrowed]"));
         }
         "skill" => match b.attrs.get("name") {
             Some(name) => {
@@ -1358,25 +1425,59 @@ mod tests {
     }
 
     #[test]
-    fn the_kind_table_matches_the_published_registry() {
-        // Every machinery/prose/structural name the spec registry lists must be
-        // present with the right disposition, and vice versa — the corpus test
-        // pins this against the file, this pins it against the code.
-        assert_eq!(machinery_names().count(), 29);
+    fn the_registry_loads_from_the_vendored_schema() {
+        // The registry IS the vendored JSON Schema — these counts (§5) are the
+        // spec's own, and a drift would fail here at load, not silently.
+        let r = registry();
+        assert_eq!(r.version(), 1);
         assert_eq!(
-            KINDS
-                .iter()
+            machinery_names().count(),
+            28,
+            "28 machinery kinds (override is a sub-block)"
+        );
+        assert_eq!(
+            r.kinds
+                .values()
                 .filter(|k| k.disposition == Disposition::Prose && k.sub_of.is_none())
                 .count(),
-            14
+            15,
+            "15 prose kinds (glossary added)"
+        );
+        assert_eq!(
+            r.kinds
+                .values()
+                .filter(|k| k.disposition == Disposition::Structural)
+                .count(),
+            3,
+            "3 structural kinds (param added)"
         );
         assert_eq!(lookup("context").unwrap().disposition, Disposition::Prose);
         assert_eq!(
             lookup("workflow").unwrap().disposition,
             Disposition::Machinery
         );
-        assert_eq!(lookup("function").unwrap().family, Family::Compute);
-        assert_eq!(lookup("case").unwrap().sub_of, Some("test"));
+        assert_eq!(
+            lookup("function").unwrap().family.as_deref(),
+            Some("compute")
+        );
+        assert_eq!(
+            lookup("function").unwrap().grant.as_deref(),
+            Some("compute")
+        );
+        // `!data` and `!override` carry a family but sit on the default rung.
+        assert_eq!(lookup("data").unwrap().family.as_deref(), Some("material"));
+        assert_eq!(grant_of("data"), None, "data needs no grant");
+        assert_eq!(lookup("override").unwrap().sub_of.as_deref(), Some("mcp"));
+        assert_eq!(grant_of("override"), None, "override needs no grant");
+        assert_eq!(lookup("case").unwrap().sub_of.as_deref(), Some("test"));
+        // The forms table is read from the schema (§4).
+        assert!(accepts_form("human", Form::Leaf) && accepts_form("human", Form::Set));
+        assert!(accepts_form("skill", Form::Section));
+        assert!(
+            !accepts_form("workflow", Form::Leaf),
+            "workflow needs a body"
+        );
+        assert_eq!(all_families().len(), 7, "seven grant tokens");
     }
 
     fn grants(list: &[&str]) -> BTreeSet<String> {
@@ -1466,17 +1567,35 @@ mod tests {
     }
 
     #[test]
-    fn override_folds_into_real_tool_config() {
-        // Disable folds into tools.disabled; narrowing folds into tools.narrow
-        // (append-only tags + an operator annotation).
-        let doc = "---\nspec: \"1\"\n---\n            :::!override{target=delete_ticket}\ndisabled: true\n:::\n            :::!override{target=create_ticket}\ntags: [sensitive]\ndescription: ENG queue only\n:::";
+    fn override_is_a_subblock_of_mcp_and_folds_into_real_tool_config() {
+        // `override` sits INSIDE `!mcp` (spec §5.3/§5.4): disable folds into
+        // tools.disabled; narrowing folds into tools.narrow (append-only tags +
+        // an operator annotation). override is default-rung — no grant needed.
+        let doc = r#"---
+spec: "1"
+---
+::::!mcp{name=ticketing endpoint=https://x/mcp}
+:::override{target=delete_ticket}
+disabled: true
+:::
+:::override{target=create_ticket}
+tags: [sensitive]
+description: ENG queue only
+:::
+::::"#;
         let e = fold(&parse(doc).unwrap(), &grants(&[])).unwrap();
+        assert_eq!(e.config["mcp"]["servers"].as_array().unwrap().len(), 1);
         assert_eq!(e.config["tools"]["disabled"][0], "delete_ticket");
         let narrow = &e.config["tools"]["narrow"]["create_ticket"];
         assert_eq!(narrow["tags"][0], "sensitive");
         assert_eq!(narrow["describe"], "ENG queue only");
-        // override is default-rung (narrowing never needs a grant).
-        assert!(fold(&parse(doc).unwrap(), &grants(&[])).is_ok());
+        // A top-level `override` (outside its parent) is refused, naming `!mcp`.
+        let orphan = "---\nspec: \"1\"\n---\n:::override{target=x}\ndisabled: true\n:::";
+        let e = parse(orphan).unwrap_err();
+        assert!(
+            e[0].contains("sub-block of `!mcp`"),
+            "orphan override names its parent: {e:?}"
+        );
     }
 
     #[test]

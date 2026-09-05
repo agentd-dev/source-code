@@ -1,29 +1,40 @@
 # Vendored from the Instruction Document Spec repo
 
-Upstream: **https://github.com/instruction-md/specification** (published `main`, tip `f1f800d`; the org's `instruction-md/source-code` stays private — this repo is the open split). Vendored at `f1f800d`; history was rewritten several times pre-publication so hashes are unstable — this file and the drift check key on CONTENT, never the id. Raw base: https://raw.githubusercontent.com/instruction-md/specification/main/ .
+Upstream: **https://github.com/instruction-md/specification** (published
+`main`). The org's `instruction-md/source-code` stays private — this repo is
+the open split. History was rewritten several times pre-publication so hashes
+are unstable — this file and the drift check key on CONTENT, never the id. Raw
+base: https://raw.githubusercontent.com/instruction-md/specification/main/ .
 
-License provenance: the repo's root `LICENSE` is CC-BY-4.0 (spec text) and is what GitHub's repo badge reports; the conformance corpus vendored here is Apache-2.0, stated in `https://github.com/instruction-md/specification/blob/main/conformance/LICENSE` — cite that file, not the repo badge, for the corpus's license.
+License provenance: the repo's root `LICENSE` is CC-BY-4.0 (spec text), which is
+what GitHub's repo badge reports. The behavioural fixtures vendored here are
+Apache-2.0 — cite the corpus's own license file, not the repo badge.
+
+## The registry is the vendored JSON Schema
+
+The reference implementation does not transcribe the registry into Rust. It
+**vendors the spec's own `instruction-document.schema.json`** (at
+`crates/agentd/src/config/instruction-document.schema.json`) and reads the
+kinds, forms, bodies and grants from its `x-registry` and `$defs.kinds`. A
+kind, form or grant therefore cannot drift from the specification: there is one
+copy of the registry, and it is the normative one.
 
 - `core/*.instruction.md` — verbatim upstream fixtures.
 - `core/*.expected.json` — DERIVED locally from upstream's `*.expected.yaml`
   (the Rust gate test reads JSON to stay dependency-free); upstream's YAML is
   canonical.
-- `registry/kinds.json` — verbatim upstream; the corpus gate test asserts its
-  spec-1 entry equals the parser's own closed set (`known_kinds()`), so the
-  registry is checked AGAINST the reference implementation, not beside it.
+- The vendored schema — verbatim upstream. Two gate tests guard it:
+  `the_schema_registry_agrees_with_the_parser` checks the schema's two views of
+  its machinery set agree (the flat `x-registry.machinery` list vs the per-kind
+  `$defs.kinds.*.x-disposition`), and `the_vendored_schema_matches_upstream_when_present`
+  compares the vendored schema's `x-registry`/`x-grammar`/`$defs` SEMANTICALLY
+  against upstream — a reformat is not a false alarm, a real registry change is.
 
-The gate test drift-checks vendored files against upstream whenever the
-upstream path exists (override with `INSTRUCTION_SPEC_REPO`); when it does not
-(CI, until the repo is published), the drift check skips and the behavioural
-fixtures still run.
-
-`core/015-duplicate-name-refused.*` (contributed from here, now upstream
-verbatim) pins the identity rule's dialect-1 half — added after the rule
-vanished from draft-1-rc through replace-editing with nothing failing in its
-absence. Expected files carry `spec:` — the dialect a fixture is written
-against; the gate SKIPS fixtures declaring a dialect this implementation does
-not speak, which is what lets dialect-2 fixtures enter the shared corpus
-without failing dialect-1 runtimes.
+The drift check runs whenever the upstream path exists (override with
+`INSTRUCTION_SPEC_REPO`); when it does not (CI), it skips and the behavioural
+fixtures still run. An EXPLICIT `INSTRUCTION_SPEC_REPO` that has no schema fails
+rather than skips — a drift check that skips on a bad path reports health it
+never performed.
 
 ## A conformance claim carries its binary version
 
@@ -32,18 +43,13 @@ per-fixture results for a binary that does not implement directive extraction
 (it is named and the run stops). This exists because a green here and a red
 elsewhere were both once true and neither named its binary: the gate builds
 from THIS tree (extraction present); a stale machine install can be an earlier
-era's binary that predates the feature. The installed `/usr/local/bin/agentd`
-on the dev host was 2.2.0 (2026-08-18) — from the pre-1.x numbering, before
-extraction landed in the tree (2026-08-23) — which is why it fails every
-directive fixture for one reason. "The corpus is the arbiter" only holds when
-the arbiter's verdict names the thing it judged.
+era's binary that predates the feature. "The corpus is the arbiter" only holds
+when the arbiter's verdict names the thing it judged.
 
+## One format, version 1 (sigiled)
 
-## One dialect, version 1 (sigiled)
-
-The spec collapsed to a single format — the sigiled dialect, numbered 1 — at
-upstream `6c34bac`. This corpus is vendored from it: 10 fixtures, machinery
-sigiled, unknown-bare inert, nesting recursive, and each fixture declaring the
-`grants:` it needs (default none) so the trust ladder's fail-closed guarantee
-(fixture 018) is actually exercised. The registry check compares the parser to
-the sole version-1 machinery set; the byte drift check is live again.
+The spec is a single format — the sigiled dialect, numbered 1. Each fixture
+declares the `grants:` it needs (default none) so the trust ladder's
+fail-closed guarantee (fixture 018) is actually exercised. Expected files carry
+`spec:` — the version a fixture is written against; the gate SKIPS fixtures
+declaring a version this implementation does not speak.

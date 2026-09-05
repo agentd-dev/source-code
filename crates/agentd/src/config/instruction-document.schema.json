@@ -1,0 +1,7217 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://instruction.md/specification/1/instruction-document.schema.json",
+  "title": "Instruction Document — block tree, version 1",
+  "description": "Validates the BLOCK TREE a parser produces from an instruction document, not the Markdown itself. Pipeline: parse Markdown with the grammar in x-grammar → emit this JSON shape → validate → apply the semantic rules in x-semantic-rules, which JSON Schema cannot express. Every kind's disposition, family, grant, forms, body type and acknowledgement template are carried as x- keywords so a validator in any language can be driven entirely from this file.",
+  "type": "object",
+  "required": [
+    "spec",
+    "blocks"
+  ],
+  "properties": {
+    "spec": {
+      "type": "string",
+      "pattern": "^[0-9]+$",
+      "const": "1"
+    },
+    "frontMatter": {
+      "$ref": "#/$defs/frontMatter"
+    },
+    "blocks": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/block"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "name": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "kindName": {
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9_-]*$"
+    },
+    "frontMatter": {
+      "type": "object",
+      "properties": {
+        "spec": {
+          "type": [
+            "string",
+            "integer"
+          ],
+          "pattern": "^[0-9]+$"
+        },
+        "id": {
+          "type": "string",
+          "format": "uri"
+        },
+        "version": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "parameters": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/attrs/param"
+          }
+        },
+        "signature": {
+          "type": "object"
+        }
+      },
+      "additionalProperties": true,
+      "$comment": "Unknown keys are preserved and ignored (§3.1 rule 2)."
+    },
+    "body": {
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "enum": [
+            "none",
+            "markdown",
+            "yaml",
+            "code",
+            "table",
+            "deflist",
+            "text"
+          ]
+        },
+        "text": {
+          "type": "string"
+        },
+        "lang": {
+          "type": "string",
+          "$comment": "code bodies: the fence info string"
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          },
+          "$comment": "table bodies, parsed: one object per row, keyed by header"
+        },
+        "entries": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "term"
+            ],
+            "properties": {
+              "term": {
+                "$ref": "#/$defs/name"
+              },
+              "attrs": {
+                "type": "object"
+              },
+              "definition": {
+                "type": "string"
+              }
+            }
+          },
+          "$comment": "definition-list bodies, parsed"
+        }
+      },
+      "additionalProperties": false
+    },
+    "block": {
+      "type": "object",
+      "required": [
+        "kind",
+        "sigil",
+        "form",
+        "line",
+        "attrs"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "must",
+            "should",
+            "never",
+            "guardrail",
+            "note",
+            "info",
+            "tip",
+            "important",
+            "warning",
+            "caution",
+            "example",
+            "context",
+            "form",
+            "tool",
+            "glossary",
+            "when",
+            "include",
+            "param",
+            "workflow",
+            "skill",
+            "config",
+            "mcp",
+            "stream",
+            "tools",
+            "file",
+            "data",
+            "media",
+            "asset",
+            "knowledge",
+            "retrieval",
+            "source",
+            "endpoint",
+            "ui",
+            "human",
+            "channel",
+            "peer",
+            "policy",
+            "secret-ref",
+            "runtime",
+            "function",
+            "test",
+            "fixture",
+            "git",
+            "volume",
+            "image",
+            "agent",
+            "override",
+            "case",
+            "signature",
+            "schema",
+            "preview"
+          ]
+        },
+        "sigil": {
+          "type": "boolean",
+          "$comment": "true iff written with the ! sigil"
+        },
+        "form": {
+          "enum": [
+            "container",
+            "leaf",
+            "set",
+            "member",
+            "section",
+            "keyword",
+            "alert"
+          ]
+        },
+        "line": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "attrs": {
+          "type": "object"
+        },
+        "body": {
+          "$ref": "#/$defs/body"
+        },
+        "children": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/block"
+          },
+          "$comment": "blocks nested inside this one, sub-blocks included"
+        },
+        "members": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/block"
+          },
+          "$comment": "set form only: one block per row / entry, form = member"
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "form": {
+                "const": "set"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "members"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "members"
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "must"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/must"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "should"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/should"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "never"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/never"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "guardrail"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/guardrail"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "note"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/note"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "info"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/info"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "tip"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/tip"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "important"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/important"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "warning"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/warning"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "caution"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/caution"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "example"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/example"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "context"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/context"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "form"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/form"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "tool"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/tool"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "glossary"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/glossary"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "when"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/when"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "include"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/include"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "param"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/param"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "workflow"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/workflow"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "skill"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/skill"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "config"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/config"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "mcp"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/mcp"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "stream"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/stream"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "tools"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/tools"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "file"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/file"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "data"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/data"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "media"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/media"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "asset"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/asset"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "knowledge"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/knowledge"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "retrieval"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/retrieval"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "source"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/source"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "endpoint"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/endpoint"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "ui"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/ui"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "human"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/human"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "channel"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/channel"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "peer"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/peer"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "policy"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/policy"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "secret-ref"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/secret-ref"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "runtime"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/runtime"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "function"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/function"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "test"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/test"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "fixture"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/fixture"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "git"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/git"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "volume"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/volume"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "image"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/image"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "agent"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/agent"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "override"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/override"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "case"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/case"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "signature"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/signature"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "schema"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/schema"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "preview"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/preview"
+          }
+        }
+      ]
+    },
+    "attrs": {
+      "must": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "should": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "never": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "guardrail": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "note": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "info": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "tip": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "important": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "warning": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "caution": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "example": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "context": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "form": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "tool": {
+        "type": "object",
+        "properties": {
+          "cap": {
+            "type": "string"
+          },
+          "allow": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "x-multivalued": true
+          },
+          "deny": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "x-multivalued": true
+          },
+          "name": {
+            "type": "string"
+          },
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "cap"
+        ]
+      },
+      "glossary": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "when": {
+        "type": "object",
+        "minProperties": 1,
+        "additionalProperties": {
+          "type": "string"
+        }
+      },
+      "include": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "uri": {
+            "type": "string"
+          },
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false,
+        "oneOf": [
+          {
+            "required": [
+              "id"
+            ]
+          },
+          {
+            "required": [
+              "uri"
+            ]
+          }
+        ]
+      },
+      "param": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "string",
+              "number",
+              "boolean",
+              "enum"
+            ]
+          },
+          "values": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "x-multivalued": true
+          },
+          "required": {
+            "type": "boolean"
+          },
+          "default": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "static",
+              "workspace",
+              "agent_attribute",
+              "prompt"
+            ]
+          },
+          "description": {
+            "type": "string"
+          },
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "workflow": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "armed": {
+            "type": "boolean"
+          },
+          "description": {
+            "type": "string"
+          },
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "skill": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "when": {
+            "type": "string"
+          },
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "config": {
+        "type": "object",
+        "properties": {
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "mcp": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "endpoint": {
+            "type": "string"
+          },
+          "allow": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "x-multivalued": true
+          },
+          "deny": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "x-multivalued": true
+          },
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "stream": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "retention": {
+            "type": "string"
+          },
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "tools": {
+        "type": "object",
+        "properties": {
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "file": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "mode": {
+            "type": "string"
+          },
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "path"
+        ]
+      },
+      "data": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "format": {
+            "type": "string",
+            "enum": [
+              "table",
+              "yaml",
+              "csv"
+            ]
+          },
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "media": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "src": {
+            "type": "string"
+          },
+          "sha256": {
+            "type": "string"
+          },
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "asset": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "src": {
+            "type": "string"
+          },
+          "sha256": {
+            "type": "string"
+          },
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "knowledge": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "server": {
+            "type": "string"
+          },
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "retrieval": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "knowledge": {
+            "type": "string"
+          },
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "source": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "server": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "x-multivalued": true
+          },
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "endpoint": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "methods": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "x-multivalued": true
+          },
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ui": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "human": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string"
+          },
+          "channel": {
+            "type": "string"
+          },
+          "escalate_after": {
+            "type": "string"
+          },
+          "may": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "x-multivalued": true
+          },
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "channel": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "server": {
+            "type": "string"
+          },
+          "target": {
+            "type": "string"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "x-multivalued": true
+          },
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "peer": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "endpoint": {
+            "type": "string"
+          },
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "policy": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "secret-ref": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "runtime": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "isolation": {
+            "type": "string",
+            "enum": [
+              "oci",
+              "process",
+              "none"
+            ]
+          },
+          "image": {
+            "type": "string"
+          },
+          "network": {
+            "type": "string"
+          },
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "function": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "runtime": {
+            "type": "string"
+          },
+          "lang": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "runtime"
+        ]
+      },
+      "test": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "target": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "target"
+        ]
+      },
+      "fixture": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "git": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          },
+          "ref": {
+            "type": "string"
+          },
+          "readonly": {
+            "type": "boolean"
+          },
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "volume": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "size": {
+            "type": "string"
+          },
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "image": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "digest": {
+            "type": "string"
+          },
+          "registry": {
+            "type": "string"
+          },
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "agent": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "template": {
+            "type": "string"
+          },
+          "ttl": {
+            "type": "string"
+          },
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "override": {
+        "type": "object",
+        "properties": {
+          "target": {
+            "type": "string"
+          },
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "target"
+        ]
+      },
+      "case": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "given": {
+            "type": "string"
+          },
+          "expect": {
+            "type": "string"
+          },
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "signature": {
+        "type": "object",
+        "properties": {
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "schema": {
+        "type": "object",
+        "properties": {
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "preview": {
+        "type": "object",
+        "properties": {
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "kinds": {
+      "must": {
+        "$comment": "must: prose",
+        "properties": {
+          "kind": {
+            "const": "must"
+          },
+          "sigil": {
+            "const": false
+          },
+          "form": {
+            "enum": [
+              "container",
+              "keyword",
+              "alert"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/must"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "prose",
+        "x-forms": [
+          "container",
+          "keyword",
+          "alert"
+        ],
+        "x-body": "markdown",
+        "x-identity": false,
+        "x-identity-scope": "document",
+        "x-grant": "default"
+      },
+      "should": {
+        "$comment": "should: prose",
+        "properties": {
+          "kind": {
+            "const": "should"
+          },
+          "sigil": {
+            "const": false
+          },
+          "form": {
+            "enum": [
+              "container",
+              "keyword",
+              "alert"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/should"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "prose",
+        "x-forms": [
+          "container",
+          "keyword",
+          "alert"
+        ],
+        "x-body": "markdown",
+        "x-identity": false,
+        "x-identity-scope": "document",
+        "x-grant": "default"
+      },
+      "never": {
+        "$comment": "never: prose",
+        "properties": {
+          "kind": {
+            "const": "never"
+          },
+          "sigil": {
+            "const": false
+          },
+          "form": {
+            "enum": [
+              "container",
+              "keyword",
+              "alert"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/never"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "prose",
+        "x-forms": [
+          "container",
+          "keyword",
+          "alert"
+        ],
+        "x-body": "markdown",
+        "x-identity": false,
+        "x-identity-scope": "document",
+        "x-grant": "default"
+      },
+      "guardrail": {
+        "$comment": "guardrail: prose",
+        "properties": {
+          "kind": {
+            "const": "guardrail"
+          },
+          "sigil": {
+            "const": false
+          },
+          "form": {
+            "enum": [
+              "container",
+              "keyword",
+              "alert"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/guardrail"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "prose",
+        "x-forms": [
+          "container",
+          "keyword",
+          "alert"
+        ],
+        "x-body": "markdown",
+        "x-identity": false,
+        "x-identity-scope": "document",
+        "x-grant": "default"
+      },
+      "note": {
+        "$comment": "note: prose",
+        "properties": {
+          "kind": {
+            "const": "note"
+          },
+          "sigil": {
+            "const": false
+          },
+          "form": {
+            "enum": [
+              "container",
+              "keyword",
+              "alert"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/note"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "prose",
+        "x-forms": [
+          "container",
+          "keyword",
+          "alert"
+        ],
+        "x-body": "markdown",
+        "x-identity": false,
+        "x-identity-scope": "document",
+        "x-grant": "default"
+      },
+      "info": {
+        "$comment": "info: prose",
+        "properties": {
+          "kind": {
+            "const": "info"
+          },
+          "sigil": {
+            "const": false
+          },
+          "form": {
+            "enum": [
+              "container",
+              "keyword",
+              "alert"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/info"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "prose",
+        "x-forms": [
+          "container",
+          "keyword",
+          "alert"
+        ],
+        "x-body": "markdown",
+        "x-identity": false,
+        "x-identity-scope": "document",
+        "x-grant": "default"
+      },
+      "tip": {
+        "$comment": "tip: prose",
+        "properties": {
+          "kind": {
+            "const": "tip"
+          },
+          "sigil": {
+            "const": false
+          },
+          "form": {
+            "enum": [
+              "container",
+              "keyword",
+              "alert"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/tip"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "prose",
+        "x-forms": [
+          "container",
+          "keyword",
+          "alert"
+        ],
+        "x-body": "markdown",
+        "x-identity": false,
+        "x-identity-scope": "document",
+        "x-grant": "default"
+      },
+      "important": {
+        "$comment": "important: prose",
+        "properties": {
+          "kind": {
+            "const": "important"
+          },
+          "sigil": {
+            "const": false
+          },
+          "form": {
+            "enum": [
+              "container",
+              "keyword",
+              "alert"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/important"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "prose",
+        "x-forms": [
+          "container",
+          "keyword",
+          "alert"
+        ],
+        "x-body": "markdown",
+        "x-identity": false,
+        "x-identity-scope": "document",
+        "x-grant": "default"
+      },
+      "warning": {
+        "$comment": "warning: prose",
+        "properties": {
+          "kind": {
+            "const": "warning"
+          },
+          "sigil": {
+            "const": false
+          },
+          "form": {
+            "enum": [
+              "container",
+              "keyword",
+              "alert"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/warning"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "prose",
+        "x-forms": [
+          "container",
+          "keyword",
+          "alert"
+        ],
+        "x-body": "markdown",
+        "x-identity": false,
+        "x-identity-scope": "document",
+        "x-grant": "default"
+      },
+      "caution": {
+        "$comment": "caution: prose",
+        "properties": {
+          "kind": {
+            "const": "caution"
+          },
+          "sigil": {
+            "const": false
+          },
+          "form": {
+            "enum": [
+              "container",
+              "keyword",
+              "alert"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/caution"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "prose",
+        "x-forms": [
+          "container",
+          "keyword",
+          "alert"
+        ],
+        "x-body": "markdown",
+        "x-identity": false,
+        "x-identity-scope": "document",
+        "x-grant": "default"
+      },
+      "example": {
+        "$comment": "example: prose",
+        "properties": {
+          "kind": {
+            "const": "example"
+          },
+          "sigil": {
+            "const": false
+          },
+          "form": {
+            "enum": [
+              "container",
+              "keyword",
+              "alert"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/example"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "prose",
+        "x-forms": [
+          "container",
+          "keyword",
+          "alert"
+        ],
+        "x-body": "markdown",
+        "x-identity": false,
+        "x-identity-scope": "document",
+        "x-grant": "default"
+      },
+      "context": {
+        "$comment": "context: prose",
+        "properties": {
+          "kind": {
+            "const": "context"
+          },
+          "sigil": {
+            "const": false
+          },
+          "form": {
+            "enum": [
+              "container"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/context"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "prose",
+        "x-forms": [
+          "container"
+        ],
+        "x-body": "markdown",
+        "x-identity": false,
+        "x-identity-scope": "document",
+        "x-grant": "default"
+      },
+      "form": {
+        "$comment": "form: prose",
+        "properties": {
+          "kind": {
+            "const": "form"
+          },
+          "sigil": {
+            "const": false
+          },
+          "form": {
+            "enum": [
+              "container"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/form"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "prose",
+        "x-forms": [
+          "container"
+        ],
+        "x-body": "markdown",
+        "x-identity": false,
+        "x-identity-scope": "document",
+        "x-grant": "default"
+      },
+      "tool": {
+        "$comment": "tool: prose",
+        "properties": {
+          "kind": {
+            "const": "tool"
+          },
+          "sigil": {
+            "const": false
+          },
+          "form": {
+            "enum": [
+              "container",
+              "leaf"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/tool"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "prose",
+        "x-forms": [
+          "container",
+          "leaf"
+        ],
+        "x-body": "markdown",
+        "x-identity": false,
+        "x-identity-scope": "document",
+        "x-grant": "default"
+      },
+      "glossary": {
+        "$comment": "glossary: prose",
+        "properties": {
+          "kind": {
+            "const": "glossary"
+          },
+          "sigil": {
+            "const": false
+          },
+          "form": {
+            "enum": [
+              "container"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/glossary"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "prose",
+        "x-forms": [
+          "container"
+        ],
+        "x-body": "deflist",
+        "x-identity": false,
+        "x-identity-scope": "document",
+        "x-grant": "default"
+      },
+      "when": {
+        "$comment": "when: structural",
+        "properties": {
+          "kind": {
+            "const": "when"
+          },
+          "sigil": {
+            "const": false
+          },
+          "form": {
+            "enum": [
+              "container"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/when"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "structural",
+        "x-forms": [
+          "container"
+        ],
+        "x-body": "markdown",
+        "x-identity": false,
+        "x-identity-scope": "document",
+        "x-grant": "default"
+      },
+      "include": {
+        "$comment": "include: structural",
+        "properties": {
+          "kind": {
+            "const": "include"
+          },
+          "sigil": {
+            "const": false
+          },
+          "form": {
+            "enum": [
+              "leaf"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/include"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "structural",
+        "x-forms": [
+          "leaf"
+        ],
+        "x-body": "none",
+        "x-identity": false,
+        "x-identity-scope": "document",
+        "x-grant": "default"
+      },
+      "param": {
+        "$comment": "param: structural",
+        "properties": {
+          "kind": {
+            "const": "param"
+          },
+          "sigil": {
+            "const": false
+          },
+          "form": {
+            "enum": [
+              "leaf",
+              "set",
+              "member"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/param"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "structural",
+        "x-forms": [
+          "leaf",
+          "set"
+        ],
+        "x-body": "none",
+        "x-identity": true,
+        "x-identity-scope": "document",
+        "x-grant": "default",
+        "if": {
+          "properties": {
+            "form": {
+              "not": {
+                "const": "set"
+              }
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "attrs": {
+              "required": [
+                "name"
+              ]
+            }
+          }
+        }
+      },
+      "workflow": {
+        "$comment": "workflow: machinery, family core",
+        "properties": {
+          "kind": {
+            "const": "workflow"
+          },
+          "sigil": {
+            "const": true
+          },
+          "form": {
+            "enum": [
+              "container",
+              "section"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/workflow"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "machinery",
+        "x-forms": [
+          "container",
+          "section"
+        ],
+        "x-body": "yaml",
+        "x-identity": true,
+        "x-identity-scope": "document",
+        "x-family": "core",
+        "x-grant": "default",
+        "x-acknowledgement": "[workflow \"{name}\" is loaded and runs autonomously]",
+        "if": {
+          "properties": {
+            "form": {
+              "not": {
+                "const": "set"
+              }
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "attrs": {
+              "required": [
+                "name"
+              ]
+            }
+          }
+        }
+      },
+      "skill": {
+        "$comment": "skill: machinery, family core",
+        "properties": {
+          "kind": {
+            "const": "skill"
+          },
+          "sigil": {
+            "const": true
+          },
+          "form": {
+            "enum": [
+              "container",
+              "set",
+              "section",
+              "member"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/skill"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "machinery",
+        "x-forms": [
+          "container",
+          "set",
+          "section"
+        ],
+        "x-body": "markdown",
+        "x-identity": true,
+        "x-identity-scope": "document",
+        "x-family": "core",
+        "x-grant": "default",
+        "x-acknowledgement": "[skill \"{name}\" is available — reference it as @skill/{name}]",
+        "if": {
+          "properties": {
+            "form": {
+              "not": {
+                "const": "set"
+              }
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "attrs": {
+              "required": [
+                "name"
+              ]
+            }
+          }
+        }
+      },
+      "config": {
+        "$comment": "config: machinery, family core",
+        "properties": {
+          "kind": {
+            "const": "config"
+          },
+          "sigil": {
+            "const": true
+          },
+          "form": {
+            "enum": [
+              "container"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/config"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "machinery",
+        "x-forms": [
+          "container"
+        ],
+        "x-body": "yaml",
+        "x-identity": false,
+        "x-identity-scope": "document",
+        "x-family": "core",
+        "x-grant": "default",
+        "x-acknowledgement": "[runtime configuration is applied]"
+      },
+      "mcp": {
+        "$comment": "mcp: machinery, family core",
+        "properties": {
+          "kind": {
+            "const": "mcp"
+          },
+          "sigil": {
+            "const": true
+          },
+          "form": {
+            "enum": [
+              "container",
+              "leaf"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/mcp"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent",
+                    "override"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "machinery",
+        "x-forms": [
+          "container",
+          "leaf"
+        ],
+        "x-body": "yaml",
+        "x-identity": true,
+        "x-identity-scope": "document",
+        "x-family": "core",
+        "x-grant": "default",
+        "x-acknowledgement": "[mcp server \"{name}\" is connected; its tools are available]",
+        "x-subblocks": [
+          "override"
+        ],
+        "if": {
+          "properties": {
+            "form": {
+              "not": {
+                "const": "set"
+              }
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "attrs": {
+              "required": [
+                "name"
+              ]
+            }
+          }
+        }
+      },
+      "stream": {
+        "$comment": "stream: machinery, family core",
+        "properties": {
+          "kind": {
+            "const": "stream"
+          },
+          "sigil": {
+            "const": true
+          },
+          "form": {
+            "enum": [
+              "container",
+              "leaf",
+              "set",
+              "member"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/stream"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "machinery",
+        "x-forms": [
+          "container",
+          "leaf",
+          "set"
+        ],
+        "x-body": "yaml",
+        "x-identity": true,
+        "x-identity-scope": "document",
+        "x-family": "core",
+        "x-grant": "default",
+        "x-acknowledgement": "[event stream \"{name}\" is declared]",
+        "if": {
+          "properties": {
+            "form": {
+              "not": {
+                "const": "set"
+              }
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "attrs": {
+              "required": [
+                "name"
+              ]
+            }
+          }
+        }
+      },
+      "tools": {
+        "$comment": "tools: machinery, family core",
+        "properties": {
+          "kind": {
+            "const": "tools"
+          },
+          "sigil": {
+            "const": true
+          },
+          "form": {
+            "enum": [
+              "container"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/tools"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "machinery",
+        "x-forms": [
+          "container"
+        ],
+        "x-body": "yaml",
+        "x-identity": false,
+        "x-identity-scope": "document",
+        "x-family": "core",
+        "x-grant": "default",
+        "x-acknowledgement": "[tool policy is applied]"
+      },
+      "file": {
+        "$comment": "file: machinery, family material",
+        "properties": {
+          "kind": {
+            "const": "file"
+          },
+          "sigil": {
+            "const": true
+          },
+          "form": {
+            "enum": [
+              "container"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/file"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "machinery",
+        "x-forms": [
+          "container"
+        ],
+        "x-body": "text",
+        "x-identity": true,
+        "x-identity-scope": "document",
+        "x-family": "material",
+        "x-grant": "material",
+        "x-acknowledgement": "[file \"{name}\" is present at {path}]",
+        "if": {
+          "properties": {
+            "form": {
+              "not": {
+                "const": "set"
+              }
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "attrs": {
+              "required": [
+                "name"
+              ]
+            }
+          }
+        }
+      },
+      "data": {
+        "$comment": "data: machinery, family material",
+        "properties": {
+          "kind": {
+            "const": "data"
+          },
+          "sigil": {
+            "const": true
+          },
+          "form": {
+            "enum": [
+              "container"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/data"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "machinery",
+        "x-forms": [
+          "container"
+        ],
+        "x-body": "table",
+        "x-identity": true,
+        "x-identity-scope": "document",
+        "x-family": "material",
+        "x-grant": "default",
+        "x-acknowledgement": "[data \"{name}\" is available]",
+        "if": {
+          "properties": {
+            "form": {
+              "not": {
+                "const": "set"
+              }
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "attrs": {
+              "required": [
+                "name"
+              ]
+            }
+          }
+        }
+      },
+      "media": {
+        "$comment": "media: machinery, family material",
+        "properties": {
+          "kind": {
+            "const": "media"
+          },
+          "sigil": {
+            "const": true
+          },
+          "form": {
+            "enum": [
+              "container",
+              "leaf"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/media"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "machinery",
+        "x-forms": [
+          "container",
+          "leaf"
+        ],
+        "x-body": "markdown",
+        "x-identity": true,
+        "x-identity-scope": "document",
+        "x-family": "material",
+        "x-grant": "material",
+        "x-acknowledgement": "[media \"{name}\" is available]",
+        "if": {
+          "properties": {
+            "form": {
+              "not": {
+                "const": "set"
+              }
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "attrs": {
+              "required": [
+                "name"
+              ]
+            }
+          }
+        }
+      },
+      "asset": {
+        "$comment": "asset: machinery, family material",
+        "properties": {
+          "kind": {
+            "const": "asset"
+          },
+          "sigil": {
+            "const": true
+          },
+          "form": {
+            "enum": [
+              "leaf"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/asset"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "machinery",
+        "x-forms": [
+          "leaf"
+        ],
+        "x-body": "none",
+        "x-identity": true,
+        "x-identity-scope": "document",
+        "x-family": "material",
+        "x-grant": "material",
+        "x-acknowledgement": "[asset \"{name}\" is available]",
+        "if": {
+          "properties": {
+            "form": {
+              "not": {
+                "const": "set"
+              }
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "attrs": {
+              "required": [
+                "name"
+              ]
+            }
+          }
+        }
+      },
+      "knowledge": {
+        "$comment": "knowledge: machinery, family knowledge",
+        "properties": {
+          "kind": {
+            "const": "knowledge"
+          },
+          "sigil": {
+            "const": true
+          },
+          "form": {
+            "enum": [
+              "container",
+              "leaf"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/knowledge"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "machinery",
+        "x-forms": [
+          "container",
+          "leaf"
+        ],
+        "x-body": "yaml",
+        "x-identity": true,
+        "x-identity-scope": "document",
+        "x-family": "knowledge",
+        "x-grant": "knowledge",
+        "x-acknowledgement": "[knowledge base \"{name}\" is available]",
+        "if": {
+          "properties": {
+            "form": {
+              "not": {
+                "const": "set"
+              }
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "attrs": {
+              "required": [
+                "name"
+              ]
+            }
+          }
+        }
+      },
+      "retrieval": {
+        "$comment": "retrieval: machinery, family knowledge",
+        "properties": {
+          "kind": {
+            "const": "retrieval"
+          },
+          "sigil": {
+            "const": true
+          },
+          "form": {
+            "enum": [
+              "container"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/retrieval"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "machinery",
+        "x-forms": [
+          "container"
+        ],
+        "x-body": "yaml",
+        "x-identity": true,
+        "x-identity-scope": "document",
+        "x-family": "knowledge",
+        "x-grant": "knowledge",
+        "if": {
+          "properties": {
+            "form": {
+              "not": {
+                "const": "set"
+              }
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "attrs": {
+              "required": [
+                "name"
+              ]
+            }
+          }
+        }
+      },
+      "source": {
+        "$comment": "source: machinery, family knowledge",
+        "properties": {
+          "kind": {
+            "const": "source"
+          },
+          "sigil": {
+            "const": true
+          },
+          "form": {
+            "enum": [
+              "container",
+              "leaf",
+              "set",
+              "member"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/source"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "machinery",
+        "x-forms": [
+          "container",
+          "leaf",
+          "set"
+        ],
+        "x-body": "yaml",
+        "x-identity": true,
+        "x-identity-scope": "document",
+        "x-family": "knowledge",
+        "x-grant": "knowledge",
+        "if": {
+          "properties": {
+            "form": {
+              "not": {
+                "const": "set"
+              }
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "attrs": {
+              "required": [
+                "name"
+              ]
+            }
+          }
+        }
+      },
+      "endpoint": {
+        "$comment": "endpoint: machinery, family interface",
+        "properties": {
+          "kind": {
+            "const": "endpoint"
+          },
+          "sigil": {
+            "const": true
+          },
+          "form": {
+            "enum": [
+              "container"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/endpoint"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "machinery",
+        "x-forms": [
+          "container"
+        ],
+        "x-body": "yaml",
+        "x-identity": true,
+        "x-identity-scope": "document",
+        "x-family": "interface",
+        "x-grant": "interface",
+        "x-acknowledgement": "[endpoint \"{name}\" listens at {path}]",
+        "if": {
+          "properties": {
+            "form": {
+              "not": {
+                "const": "set"
+              }
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "attrs": {
+              "required": [
+                "name"
+              ]
+            }
+          }
+        }
+      },
+      "ui": {
+        "$comment": "ui: machinery, family interface",
+        "properties": {
+          "kind": {
+            "const": "ui"
+          },
+          "sigil": {
+            "const": true
+          },
+          "form": {
+            "enum": [
+              "container"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/ui"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent",
+                    "schema",
+                    "preview"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "machinery",
+        "x-forms": [
+          "container"
+        ],
+        "x-body": "markdown",
+        "x-identity": true,
+        "x-identity-scope": "document",
+        "x-family": "interface",
+        "x-grant": "interface",
+        "x-subblocks": [
+          "schema",
+          "preview"
+        ],
+        "if": {
+          "properties": {
+            "form": {
+              "not": {
+                "const": "set"
+              }
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "attrs": {
+              "required": [
+                "name"
+              ]
+            }
+          }
+        }
+      },
+      "human": {
+        "$comment": "human: machinery, family interface",
+        "properties": {
+          "kind": {
+            "const": "human"
+          },
+          "sigil": {
+            "const": true
+          },
+          "form": {
+            "enum": [
+              "container",
+              "leaf",
+              "set",
+              "member"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/human"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "machinery",
+        "x-forms": [
+          "container",
+          "leaf",
+          "set"
+        ],
+        "x-body": "yaml",
+        "x-identity": true,
+        "x-identity-scope": "document",
+        "x-family": "interface",
+        "x-grant": "interface",
+        "x-acknowledgement": "[human role \"{name}\" may be asked]",
+        "if": {
+          "properties": {
+            "form": {
+              "not": {
+                "const": "set"
+              }
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "attrs": {
+              "required": [
+                "name"
+              ]
+            }
+          }
+        }
+      },
+      "channel": {
+        "$comment": "channel: machinery, family interface",
+        "properties": {
+          "kind": {
+            "const": "channel"
+          },
+          "sigil": {
+            "const": true
+          },
+          "form": {
+            "enum": [
+              "container",
+              "leaf",
+              "set",
+              "member"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/channel"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "machinery",
+        "x-forms": [
+          "container",
+          "leaf",
+          "set"
+        ],
+        "x-body": "yaml",
+        "x-identity": true,
+        "x-identity-scope": "document",
+        "x-family": "interface",
+        "x-grant": "interface",
+        "x-acknowledgement": "[channel \"{name}\" is available for {target}]",
+        "if": {
+          "properties": {
+            "form": {
+              "not": {
+                "const": "set"
+              }
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "attrs": {
+              "required": [
+                "name"
+              ]
+            }
+          }
+        }
+      },
+      "peer": {
+        "$comment": "peer: machinery, family identity",
+        "properties": {
+          "kind": {
+            "const": "peer"
+          },
+          "sigil": {
+            "const": true
+          },
+          "form": {
+            "enum": [
+              "container",
+              "leaf",
+              "set",
+              "member"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/peer"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "machinery",
+        "x-forms": [
+          "container",
+          "leaf",
+          "set"
+        ],
+        "x-body": "yaml",
+        "x-identity": true,
+        "x-identity-scope": "document",
+        "x-family": "identity",
+        "x-grant": "identity",
+        "if": {
+          "properties": {
+            "form": {
+              "not": {
+                "const": "set"
+              }
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "attrs": {
+              "required": [
+                "name"
+              ]
+            }
+          }
+        }
+      },
+      "policy": {
+        "$comment": "policy: machinery, family identity",
+        "properties": {
+          "kind": {
+            "const": "policy"
+          },
+          "sigil": {
+            "const": true
+          },
+          "form": {
+            "enum": [
+              "container"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/policy"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "machinery",
+        "x-forms": [
+          "container"
+        ],
+        "x-body": "yaml",
+        "x-identity": true,
+        "x-identity-scope": "document",
+        "x-family": "identity",
+        "x-grant": "identity",
+        "if": {
+          "properties": {
+            "form": {
+              "not": {
+                "const": "set"
+              }
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "attrs": {
+              "required": [
+                "name"
+              ]
+            }
+          }
+        }
+      },
+      "secret-ref": {
+        "$comment": "secret-ref: machinery, family identity",
+        "properties": {
+          "kind": {
+            "const": "secret-ref"
+          },
+          "sigil": {
+            "const": true
+          },
+          "form": {
+            "enum": [
+              "leaf",
+              "set",
+              "member"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/secret-ref"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "machinery",
+        "x-forms": [
+          "leaf",
+          "set"
+        ],
+        "x-body": "none",
+        "x-identity": true,
+        "x-identity-scope": "document",
+        "x-family": "identity",
+        "x-grant": "identity",
+        "if": {
+          "properties": {
+            "form": {
+              "not": {
+                "const": "set"
+              }
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "attrs": {
+              "required": [
+                "name"
+              ]
+            }
+          }
+        }
+      },
+      "runtime": {
+        "$comment": "runtime: machinery, family compute",
+        "properties": {
+          "kind": {
+            "const": "runtime"
+          },
+          "sigil": {
+            "const": true
+          },
+          "form": {
+            "enum": [
+              "container"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/runtime"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "machinery",
+        "x-forms": [
+          "container"
+        ],
+        "x-body": "yaml",
+        "x-identity": true,
+        "x-identity-scope": "document",
+        "x-family": "compute",
+        "x-grant": "compute",
+        "if": {
+          "properties": {
+            "form": {
+              "not": {
+                "const": "set"
+              }
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "attrs": {
+              "required": [
+                "name"
+              ]
+            }
+          }
+        }
+      },
+      "function": {
+        "$comment": "function: machinery, family compute",
+        "properties": {
+          "kind": {
+            "const": "function"
+          },
+          "sigil": {
+            "const": true
+          },
+          "form": {
+            "enum": [
+              "container",
+              "section"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/function"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent",
+                    "signature"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "machinery",
+        "x-forms": [
+          "container",
+          "section"
+        ],
+        "x-body": "code",
+        "x-identity": true,
+        "x-identity-scope": "document",
+        "x-family": "compute",
+        "x-grant": "compute",
+        "x-acknowledgement": "[tool \"{name}\" is available]",
+        "x-subblocks": [
+          "signature"
+        ],
+        "if": {
+          "properties": {
+            "form": {
+              "not": {
+                "const": "set"
+              }
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "attrs": {
+              "required": [
+                "name"
+              ]
+            }
+          }
+        }
+      },
+      "test": {
+        "$comment": "test: machinery, family compute",
+        "properties": {
+          "kind": {
+            "const": "test"
+          },
+          "sigil": {
+            "const": true
+          },
+          "form": {
+            "enum": [
+              "container",
+              "section"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/test"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent",
+                    "case"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "machinery",
+        "x-forms": [
+          "container",
+          "section"
+        ],
+        "x-body": "markdown",
+        "x-identity": true,
+        "x-identity-scope": "document",
+        "x-family": "compute",
+        "x-grant": "compute",
+        "x-subblocks": [
+          "case"
+        ],
+        "if": {
+          "properties": {
+            "form": {
+              "not": {
+                "const": "set"
+              }
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "attrs": {
+              "required": [
+                "name"
+              ]
+            }
+          }
+        }
+      },
+      "fixture": {
+        "$comment": "fixture: machinery, family compute",
+        "properties": {
+          "kind": {
+            "const": "fixture"
+          },
+          "sigil": {
+            "const": true
+          },
+          "form": {
+            "enum": [
+              "container"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/fixture"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "machinery",
+        "x-forms": [
+          "container"
+        ],
+        "x-body": "table",
+        "x-identity": true,
+        "x-identity-scope": "document",
+        "x-family": "compute",
+        "x-grant": "compute",
+        "if": {
+          "properties": {
+            "form": {
+              "not": {
+                "const": "set"
+              }
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "attrs": {
+              "required": [
+                "name"
+              ]
+            }
+          }
+        }
+      },
+      "git": {
+        "$comment": "git: machinery, family infra",
+        "properties": {
+          "kind": {
+            "const": "git"
+          },
+          "sigil": {
+            "const": true
+          },
+          "form": {
+            "enum": [
+              "container",
+              "leaf"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/git"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "machinery",
+        "x-forms": [
+          "container",
+          "leaf"
+        ],
+        "x-body": "yaml",
+        "x-identity": true,
+        "x-identity-scope": "document",
+        "x-family": "infra",
+        "x-grant": "infra",
+        "if": {
+          "properties": {
+            "form": {
+              "not": {
+                "const": "set"
+              }
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "attrs": {
+              "required": [
+                "name"
+              ]
+            }
+          }
+        }
+      },
+      "volume": {
+        "$comment": "volume: machinery, family infra",
+        "properties": {
+          "kind": {
+            "const": "volume"
+          },
+          "sigil": {
+            "const": true
+          },
+          "form": {
+            "enum": [
+              "leaf"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/volume"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "machinery",
+        "x-forms": [
+          "leaf"
+        ],
+        "x-body": "none",
+        "x-identity": true,
+        "x-identity-scope": "document",
+        "x-family": "infra",
+        "x-grant": "infra",
+        "if": {
+          "properties": {
+            "form": {
+              "not": {
+                "const": "set"
+              }
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "attrs": {
+              "required": [
+                "name"
+              ]
+            }
+          }
+        }
+      },
+      "image": {
+        "$comment": "image: machinery, family infra",
+        "properties": {
+          "kind": {
+            "const": "image"
+          },
+          "sigil": {
+            "const": true
+          },
+          "form": {
+            "enum": [
+              "leaf"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/image"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "machinery",
+        "x-forms": [
+          "leaf"
+        ],
+        "x-body": "none",
+        "x-identity": true,
+        "x-identity-scope": "document",
+        "x-family": "infra",
+        "x-grant": "infra",
+        "if": {
+          "properties": {
+            "form": {
+              "not": {
+                "const": "set"
+              }
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "attrs": {
+              "required": [
+                "name"
+              ]
+            }
+          }
+        }
+      },
+      "agent": {
+        "$comment": "agent: machinery, family compose",
+        "properties": {
+          "kind": {
+            "const": "agent"
+          },
+          "sigil": {
+            "const": true
+          },
+          "form": {
+            "enum": [
+              "container",
+              "leaf",
+              "set",
+              "member"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/agent"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "machinery",
+        "x-forms": [
+          "container",
+          "leaf",
+          "set"
+        ],
+        "x-body": "yaml",
+        "x-identity": true,
+        "x-identity-scope": "document",
+        "x-family": "compose",
+        "x-grant": "compose",
+        "x-acknowledgement": "[subagent \"{name}\" is available]",
+        "if": {
+          "properties": {
+            "form": {
+              "not": {
+                "const": "set"
+              }
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "attrs": {
+              "required": [
+                "name"
+              ]
+            }
+          }
+        }
+      },
+      "override": {
+        "$comment": "override: machinery, family compose, inside mcp",
+        "properties": {
+          "kind": {
+            "const": "override"
+          },
+          "sigil": {
+            "const": false
+          },
+          "form": {
+            "enum": [
+              "container"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/override"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "machinery",
+        "x-forms": [
+          "container"
+        ],
+        "x-body": "yaml",
+        "x-identity": false,
+        "x-identity-scope": "parent",
+        "x-family": "compose",
+        "x-grant": "default",
+        "x-parent": "mcp"
+      },
+      "case": {
+        "$comment": "case: machinery, inside test",
+        "properties": {
+          "kind": {
+            "const": "case"
+          },
+          "sigil": {
+            "const": false
+          },
+          "form": {
+            "enum": [
+              "container",
+              "set",
+              "member"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/case"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "machinery",
+        "x-forms": [
+          "container",
+          "set"
+        ],
+        "x-body": "yaml",
+        "x-identity": true,
+        "x-identity-scope": "parent",
+        "x-grant": "default",
+        "x-parent": "test",
+        "if": {
+          "properties": {
+            "form": {
+              "not": {
+                "const": "set"
+              }
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "attrs": {
+              "required": [
+                "name"
+              ]
+            }
+          }
+        }
+      },
+      "signature": {
+        "$comment": "signature: machinery, inside function",
+        "properties": {
+          "kind": {
+            "const": "signature"
+          },
+          "sigil": {
+            "const": false
+          },
+          "form": {
+            "enum": [
+              "container"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/signature"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "machinery",
+        "x-forms": [
+          "container"
+        ],
+        "x-body": "yaml",
+        "x-identity": false,
+        "x-identity-scope": "parent",
+        "x-grant": "default",
+        "x-parent": "function"
+      },
+      "schema": {
+        "$comment": "schema: machinery, inside ui",
+        "properties": {
+          "kind": {
+            "const": "schema"
+          },
+          "sigil": {
+            "const": false
+          },
+          "form": {
+            "enum": [
+              "container"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/schema"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "machinery",
+        "x-forms": [
+          "container"
+        ],
+        "x-body": "yaml",
+        "x-identity": false,
+        "x-identity-scope": "parent",
+        "x-grant": "default",
+        "x-parent": "ui"
+      },
+      "preview": {
+        "$comment": "preview: machinery, inside ui",
+        "properties": {
+          "kind": {
+            "const": "preview"
+          },
+          "sigil": {
+            "const": false
+          },
+          "form": {
+            "enum": [
+              "container"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/preview"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-disposition": "machinery",
+        "x-forms": [
+          "container"
+        ],
+        "x-body": "text",
+        "x-identity": false,
+        "x-identity-scope": "parent",
+        "x-grant": "default",
+        "x-parent": "ui"
+      }
+    }
+  },
+  "x-registry": {
+    "version": "1",
+    "machinery": [
+      "workflow",
+      "skill",
+      "config",
+      "mcp",
+      "stream",
+      "tools",
+      "file",
+      "data",
+      "media",
+      "asset",
+      "knowledge",
+      "retrieval",
+      "source",
+      "endpoint",
+      "ui",
+      "human",
+      "channel",
+      "peer",
+      "policy",
+      "secret-ref",
+      "runtime",
+      "function",
+      "test",
+      "fixture",
+      "git",
+      "volume",
+      "image",
+      "agent"
+    ],
+    "prose": [
+      "must",
+      "should",
+      "never",
+      "guardrail",
+      "note",
+      "info",
+      "tip",
+      "important",
+      "warning",
+      "caution",
+      "example",
+      "context",
+      "form",
+      "tool",
+      "glossary"
+    ],
+    "structural": [
+      "when",
+      "include",
+      "param"
+    ],
+    "subblocks": {
+      "override": "mcp",
+      "case": "test",
+      "signature": "function",
+      "schema": "ui",
+      "preview": "ui"
+    },
+    "families": {
+      "core": [
+        "workflow",
+        "skill",
+        "config",
+        "mcp",
+        "stream",
+        "tools"
+      ],
+      "material": [
+        "file",
+        "data",
+        "media",
+        "asset"
+      ],
+      "knowledge": [
+        "knowledge",
+        "retrieval",
+        "source"
+      ],
+      "interface": [
+        "endpoint",
+        "ui",
+        "human",
+        "channel"
+      ],
+      "identity": [
+        "peer",
+        "policy",
+        "secret-ref"
+      ],
+      "compute": [
+        "runtime",
+        "function",
+        "test",
+        "fixture"
+      ],
+      "infra": [
+        "git",
+        "volume",
+        "image"
+      ],
+      "compose": [
+        "agent"
+      ]
+    },
+    "grants": {
+      "material": [
+        "file",
+        "media",
+        "asset"
+      ],
+      "knowledge": [
+        "knowledge",
+        "retrieval",
+        "source"
+      ],
+      "interface": [
+        "endpoint",
+        "ui",
+        "human",
+        "channel"
+      ],
+      "identity": [
+        "peer",
+        "policy",
+        "secret-ref"
+      ],
+      "compute": [
+        "runtime",
+        "function",
+        "test",
+        "fixture"
+      ],
+      "infra": [
+        "git",
+        "volume",
+        "image"
+      ],
+      "compose": [
+        "agent"
+      ]
+    },
+    "default-grant": [
+      "workflow",
+      "skill",
+      "config",
+      "mcp",
+      "stream",
+      "tools",
+      "data"
+    ],
+    "wire-floor": [
+      "compose",
+      "identity"
+    ],
+    "keywords": {
+      "MUST": "must",
+      "MUST NOT": "never",
+      "SHOULD": "should",
+      "SHOULD NOT": "should",
+      "NEVER": "never",
+      "GUARDRAIL": "guardrail",
+      "NOTE": "note",
+      "INFO": "note",
+      "TIP": "tip",
+      "WARNING": "warning",
+      "CAUTION": "caution",
+      "IMPORTANT": "important",
+      "EXAMPLE": "example"
+    },
+    "sigils": {
+      "#": [
+        "instruction"
+      ],
+      "@": [
+        "principal",
+        "agent"
+      ],
+      "&": [
+        "server",
+        "skill",
+        "model",
+        "service",
+        "sandbox",
+        "connector"
+      ]
+    },
+    "forms": {
+      "container": ":::kind{attrs} … :::",
+      "leaf": "::kind{attrs}",
+      "set": ":::kind[]{attrs} … ::: (table or definition list)",
+      "section": "## !kind name {attrs}",
+      "keyword": "KEYWORD: …",
+      "alert": "> [!KEYWORD]"
+    },
+    "reserved-inline": ":kind[text]{attrs}"
+  },
+  "x-grammar": {
+    "kind": "^[A-Za-z][A-Za-z0-9_-]*$",
+    "name": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+    "key": "^[A-Za-z][A-Za-z0-9_.-]*$",
+    "openFence": "^(:{3,})(!?)([A-Za-z][A-Za-z0-9_-]*)(\\[\\])?\\s*(\\{.*\\})?\\s*$",
+    "closeFence": "^:{3,}\\s*$",
+    "leaf": "^::(?!:)(!?)([A-Za-z][A-Za-z0-9_-]*)\\s*(\\{.*\\})?\\s*$",
+    "sectionHeading": "^(#{1,6})[ \\t]+!([A-Za-z][A-Za-z0-9_-]*)[ \\t]+([A-Za-z0-9][A-Za-z0-9._-]*)\\s*(\\{.*\\})?\\s*#*\\s*$",
+    "keywordLine": "^(?:[-*+][ \\t]+|[0-9]+[.)][ \\t]+)?(\\*\\*)?(MUST NOT|SHOULD NOT|MUST|SHOULD|NEVER|GUARDRAIL|NOTE|INFO|TIP|WARNING|CAUTION|IMPORTANT|EXAMPLE):(\\*\\*)?[ \\t]+",
+    "alertOpen": "^>[ \\t]*\\[!([A-Za-z]+)\\][ \\t]*$",
+    "attrPair": "([A-Za-z][A-Za-z0-9_.-]*)(?:=(\\\"(?:[^\\\"\\\\\\\\]|\\\\\\\\.)*\\\"|[^\\s}\\\"]+))?",
+    "attrRef": "^@([A-Za-z][A-Za-z0-9_-]*)/([A-Za-z0-9][A-Za-z0-9._-]*)$",
+    "wikiLink": "\\[\\[([A-Za-z][A-Za-z0-9_-]*)/([A-Za-z0-9][A-Za-z0-9._-]*)(?:\\|([^\\]]+))?\\]\\]",
+    "fragmentRef": "\\]\\(#([A-Za-z][A-Za-z0-9_-]*)/([A-Za-z0-9][A-Za-z0-9._-]*)\\)",
+    "sigilLink": "\\[([#@&])([^\\]]+)\\]\\(((?:instruction|principal|agent|server|skill|model|service|sandbox|connector)://)([^)\\s]+)\\)",
+    "param": "\\$\\{([A-Za-z_][A-Za-z0-9_.-]*)\\}",
+    "tag": "(?:^|[\\s(])#([A-Za-z][A-Za-z0-9_-]*)",
+    "defListTerm": "^([A-Za-z0-9][A-Za-z0-9._-]*)\\s*(\\{.*\\})?\\s*$",
+    "defListDef": "^:[ \\t]+",
+    "codeFenceOpen": "^(`{3,}|~{3,})(.*)$"
+  },
+  "x-semantic-rules": [
+    {
+      "id": "identity-unique",
+      "spec": "§3.3 rule 9",
+      "rule": "For every kind with x-identity, attrs.name is unique across all top-level blocks and set members of that kind in the document. Sub-block names are scoped to their parent."
+    },
+    {
+      "id": "reserved-bare",
+      "spec": "§3.3 rule 3",
+      "rule": "A bare (sigil=false) block whose kind is in x-registry.machinery is refused: 'did you mean :::!kind'. Applies to container, leaf and set forms; never to headings or keywords."
+    },
+    {
+      "id": "sigiled-prose",
+      "spec": "§3.3 rule 2",
+      "rule": "A sigiled block whose kind is in x-registry.prose or x-registry.structural is refused: 'did you mean :::kind'."
+    },
+    {
+      "id": "unknown-sigiled",
+      "spec": "§3.3 rule 2",
+      "rule": "A sigiled block whose kind is not in x-registry.machinery is refused, naming the known set. (An unknown BARE kind never reaches the tree: the parser emits it as prose.)"
+    },
+    {
+      "id": "references-resolve",
+      "spec": "§3.4",
+      "rule": "Every @kind/name in attrs, every quoted @kind/name in a YAML body, every [[kind/name]] and [text](#kind/name) in prose resolves to a top-level block or set member of that kind with that name; otherwise refuse."
+    },
+    {
+      "id": "references-acyclic",
+      "spec": "§3.4",
+      "rule": "The graph of local references is acyclic; a cycle is refused naming the cycle. Cross-document references are cycle-guarded at resolution with published depth and fan-out caps."
+    },
+    {
+      "id": "subblock-parent",
+      "spec": "§5.4",
+      "rule": "A block whose kind has x-parent appears only in the children of a block of that parent kind. (The schema enforces the child side; a parser must not emit a sub-block at the top level.)"
+    },
+    {
+      "id": "body-required",
+      "spec": "§4.2",
+      "rule": "A leaf-form block of a kind whose x-body is not 'none' is refused unless the kind lists 'leaf' in x-forms."
+    },
+    {
+      "id": "section-fence",
+      "spec": "§4.4 rule 6",
+      "rule": "A section-form block of a kind whose x-body is yaml/code contains exactly one fenced code block, which is the definition; surrounding prose becomes attrs.description."
+    },
+    {
+      "id": "set-body-uniform",
+      "spec": "§4.3.3",
+      "rule": "A set body is entirely a table or entirely a definition list; the parser refuses otherwise. A kind whose x-body is deflist does not take the set form."
+    },
+    {
+      "id": "fence-column-zero",
+      "spec": "§3.2",
+      "rule": "Fences, leaves and section headings are recognized at column 0 only; indented ones are prose."
+    },
+    {
+      "id": "code-suspends",
+      "spec": "§3.3 rule 5",
+      "rule": "Inside a fenced code block, no fence, leaf, keyword, alert or inline form is recognized. Inline forms are also inert inside inline code."
+    },
+    {
+      "id": "keyword-scope",
+      "spec": "§4.5",
+      "rule": "Keyword lines are recognized wherever Markdown prose is interpreted except inside an example body; never inside yaml, code, headings or table cells."
+    },
+    {
+      "id": "grant-required",
+      "spec": "§6",
+      "rule": "A machinery block whose x-grant is not 'default' is refused unless the operator granted that family. Grants are an independent set; refuse naming the family and the key to add."
+    },
+    {
+      "id": "override-narrows",
+      "spec": "§5.3",
+      "rule": "An override may add tags, set disabled, or tighten an enum; it may not remove a tag, re-enable, widen an enum, replace a description, or change a default."
+    },
+    {
+      "id": "pins",
+      "spec": "§5.3",
+      "rule": "image digests are required (no mutable tags); a remote media/asset src requires sha256; runtime network=any is refused; a literal credential anywhere is refused."
+    },
+    {
+      "id": "version-skew",
+      "spec": "§3.3 rule 8",
+      "rule": "A declared spec version this validator does not implement, or a lexical marker it does not recognize, is a refusal — never silently parsed as prose."
+    },
+    {
+      "id": "front-matter-absent",
+      "spec": "§3.1",
+      "rule": "A document with no front matter, or with front matter lacking spec, is version 1."
+    }
+  ]
+}

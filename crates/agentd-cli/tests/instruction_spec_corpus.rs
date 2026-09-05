@@ -5,10 +5,11 @@
 //! Each fixture in `tests/instruction-spec-corpus/` is a bare instruction
 //! document plus its expected OBSERVABLE outcome: does it validate, which error
 //! substrings appear, and what registers (`--capabilities`). The corpus is the
-//! spec's teeth — the spec is being re-homed to instruction.md as its owner
-//! (CC-BY 4.0), and agentd conforms by running the corpus, not by claiming to.
-//! Dialect-1 behaviour pinned here is CONTRACT: a change that fails a fixture
-//! is a spec change, not a refactor.
+//! spec's teeth — the spec is owned by instruction.md (CC-BY 4.0 text), and
+//! agentd conforms by running the corpus, not by claiming to. The registry the
+//! parser uses IS the vendored `instruction-document.schema.json`; behaviour
+//! pinned here is CONTRACT: a change that fails a fixture is a spec change, not
+//! a refactor.
 #![cfg(all(unix, feature = "workflow"))]
 
 use std::path::Path;
@@ -168,93 +169,62 @@ fn the_conformance_corpus_passes_against_this_binary() {
     );
 }
 
-/// The spec repo's per-version registry, checked AGAINST the reference
-/// implementation: its spec-1 entry must equal the parser's own closed set.
-/// A registry that drifts from the code it describes is the schema-vs-loader
-/// failure all over again, so the equality is asserted, not assumed.
+/// The registry is the vendored JSON Schema itself, so it cannot drift from the
+/// parser — but the schema states its machinery set TWICE (the flat
+/// `x-registry.machinery` list, and the per-kind `$defs.kinds.*.x-disposition`),
+/// and those two views must agree or the file is internally inconsistent. Since
+/// the parser derives its set from `$defs`, this also proves the accessor reads
+/// the file the reference implementation actually ships.
 #[test]
-fn the_registry_spec_1_entry_matches_the_shipped_closed_set() {
-    let reg: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/instruction-spec-corpus/registry/kinds.json"),
-        )
-        .unwrap(),
-    )
-    .unwrap();
-    // agentd implements the sigiled format, which is the published registry's
-    // sole version 1 (29 machinery names). Its machinery set must equal the
-    // parser's own — a registry that drifts from the code it describes is the
-    // schema-vs-loader failure again.
-    let v1 = &reg["versions"]["1"];
-    let mut registry_machinery: Vec<&str> = v1["machinery"]
+fn the_schema_registry_agrees_with_the_parser() {
+    let schema: Value = serde_json::from_str(agentd::config::idoc::schema_json()).unwrap();
+    let mut listed: Vec<&str> = schema["x-registry"]["machinery"]
         .as_array()
         .into_iter()
         .flatten()
-        .filter_map(serde_json::Value::as_str)
+        .filter_map(Value::as_str)
         .collect();
-    registry_machinery.sort_unstable();
+    listed.sort_unstable();
     let mut known: Vec<&str> = agentd::config::idoc::machinery_names().collect();
     known.sort_unstable();
     assert_eq!(
-        registry_machinery, known,
-        "the spec registry's machinery set drifted from the parser"
+        listed, known,
+        "the schema's x-registry.machinery drifted from its own $defs.kinds"
     );
 }
 
-/// Drift check against the spec repo, when it is reachable: every vendored
-/// fixture document and the registry must be byte-identical to upstream.
-/// Skips cleanly where upstream is absent (CI, until the repo has a URL) —
-/// the behavioural fixtures above still run there.
+/// Drift check against the spec repo, when it is reachable: the vendored JSON
+/// Schema's registry and grammar must match upstream's. Compared SEMANTICALLY
+/// (the parsed `x-registry`/`x-grammar`/`$defs`), so a reformat upstream is not
+/// a false alarm but a real registry change is. Skips cleanly where upstream is
+/// absent (CI, before any clone); an EXPLICIT but missing path fails rather than
+/// skips — a drift check that skips on a bad path reports health it never
+/// performed, the vacuous-pass trap this whole effort has been hunting.
 #[test]
-fn vendored_corpus_matches_upstream_when_present() {
-    // An EXPLICIT `INSTRUCTION_SPEC_REPO` that does not exist is a
-    // configuration error and MUST fail — a drift check that skips when
-    // pointed at a missing path reports health it did not perform, the exact
-    // vacuous-pass trap this whole effort has been hunting (found here by the
-    // instruction.md session after a repo rename moved the path). Only the
-    // DEFAULT path (no env var — CI, before any clone) skips cleanly.
+fn the_vendored_schema_matches_upstream_when_present() {
     let explicit = std::env::var("INSTRUCTION_SPEC_REPO");
     let upstream = explicit
         .clone()
         .unwrap_or_else(|_| "/root/instruction-md/specification".into());
-    let up = Path::new(&upstream).join("conformance");
+    let up = Path::new(&upstream).join("instruction-document.schema.json");
     if !up.exists() {
         assert!(
             explicit.is_err(),
-            "INSTRUCTION_SPEC_REPO={upstream:?} was set but has no conformance/ — \
-             a drift check pointed at a missing path must fail, not skip"
+            "INSTRUCTION_SPEC_REPO={upstream:?} was set but has no \
+             instruction-document.schema.json — a drift check pointed at a \
+             missing path must fail, not skip"
         );
         eprintln!("no upstream spec clone at the default path; drift check skipped");
         return;
     }
-    let local = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/instruction-spec-corpus");
-    let mut checked = 0usize;
-    for rel in std::fs::read_dir(up.join("core"))
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .is_some_and(|n| n.to_string_lossy().ends_with(".instruction.md"))
-        })
-    {
-        let name = rel.file_name().unwrap();
-        let ours = local.join("core").join(name);
+    let up_schema: Value = serde_json::from_str(&std::fs::read_to_string(&up).unwrap())
+        .expect("upstream schema is valid JSON");
+    let ours: Value = serde_json::from_str(agentd::config::idoc::schema_json()).unwrap();
+    for key in ["x-registry", "x-grammar", "$defs"] {
         assert_eq!(
-            std::fs::read(&rel).unwrap(),
-            std::fs::read(&ours).unwrap_or_default(),
-            "vendored fixture {name:?} drifted from upstream"
+            ours[key], up_schema[key],
+            "the vendored schema's {key:?} drifted from upstream — \
+             re-vendor crates/agentd/src/config/instruction-document.schema.json"
         );
-        checked += 1;
     }
-    assert_eq!(
-        std::fs::read(up.join("registry/kinds.json")).unwrap(),
-        std::fs::read(local.join("registry/kinds.json")).unwrap(),
-        "vendored registry drifted from upstream"
-    );
-    assert!(
-        checked >= 6,
-        "upstream corpus present but near-empty ({checked})"
-    );
 }

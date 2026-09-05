@@ -1159,6 +1159,23 @@ pub enum OAuthGrant {
 pub struct Tools {
     pub disabled: Vec<String>,
     pub overrides: BTreeMap<String, ToolOverride>,
+    /// Append-only narrowing of an existing tool by name — the target of a
+    /// `:::!override` block (Instruction Document Spec §5.7). It may only make a
+    /// tool MORE careful: add trifecta tags, or append an operator annotation
+    /// beneath the tool's own description (never replace it). A tool that is
+    /// narrowed and also disabled is disabled.
+    pub narrow: BTreeMap<String, ToolNarrow>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct ToolNarrow {
+    /// Trifecta tags to ADD to the tool (never remove) — a document may make a
+    /// tool count toward the lethal-trifecta gate, never exempt it.
+    pub tags: Vec<String>,
+    /// An operator annotation appended beneath the server's own description,
+    /// with visible provenance — the model always sees the authentic text first.
+    pub describe: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -5940,6 +5957,7 @@ pub const RELOADABLE_PATHS: &[&str] = &[
     "subagents.templates",
     "tools.disabled",
     "tools.overrides",
+    "tools.narrow",
     "vars",
     "webhooks.default_auth",
     "workflows.allow_private",
@@ -6286,6 +6304,9 @@ mod tests {
                     "intelligence.pricing" => json!({"m": {"input_per_1k": 1.0}}),
                     "intelligence.models" => json!({"small": {"model": "m-1"}}),
                     "tools.overrides" => json!({"memory.get": {"server": "s", "tool": "t"}}),
+                    "tools.narrow" => {
+                        json!({"a_tool": {"tags": ["sensitive"], "describe": "note"}})
+                    }
                     "store.mcp" => json!({"server": "s"}),
                     "streams" => json!({"orders": {"retention": {"max_events": 1}}}),
                     "services" => json!({"billing": {"endpoint": "https://b.example/mcp"}}),

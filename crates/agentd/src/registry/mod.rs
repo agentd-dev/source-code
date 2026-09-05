@@ -388,6 +388,29 @@ impl Registry {
                 None => errors.push(format!("tools.disabled names an unknown tool {name:?}")),
             }
         }
+        // 6. Narrow (`:::!override`) — append-only: add trifecta tags, and
+        // append an operator annotation beneath the server's own description,
+        // never replacing it. Narrowing may only make a tool MORE careful.
+        for (name, narrow) in &settings.tools.narrow {
+            let Some(t) = reg.tools.get_mut(name) else {
+                errors.push(format!("tools.narrow names an unknown tool {name:?}"));
+                continue;
+            };
+            for tag in &narrow.tags {
+                match crate::sec::scope::TrifectaTag::parse(tag) {
+                    Some(tt) if !t.tags.contains(&tt) => t.tags.push(tt),
+                    Some(_) => {}
+                    None => errors.push(format!(
+                        "tools.narrow {name:?}: unknown trifecta tag {tag:?} (untrusted_input | sensitive | egress)"
+                    )),
+                }
+            }
+            if let Some(note) = &narrow.describe {
+                // The server's own description survives verbatim; the operator's
+                // annotation is delimited beneath it, provenance visible.
+                t.description = format!("{}\n\n[operator note]: {note}", t.description.trim_end());
+            }
+        }
         if errors.is_empty() {
             Ok(reg)
         } else {
@@ -976,6 +999,68 @@ mod tests {
             "mapping-only without a mapping is unavailable"
         );
         assert!(reg.warnings.iter().any(|w| w.contains("collides")));
+    }
+
+    #[test]
+    fn narrow_disables_tags_and_annotates_append_only() {
+        let servers = vec![ServerTools {
+            name: "gh".into(),
+            ns: None,
+            tags: vec![],
+            tools: vec![tool("create_ticket"), tool("delete_ticket")],
+        }];
+        let s = settings(json!({
+            "agent": {"instruction": "x"},
+            "tools": {
+                "disabled": [],
+                "narrow": {
+                    "delete_ticket": {"tags": ["sensitive"]},
+                    "create_ticket": {"tags": ["egress"], "describe": "ENG queue only"}
+                }
+            }
+        }));
+        let reg = Registry::build(&s, &servers).unwrap();
+        // Tags are ADDED (never removed): the tool now counts toward the gate.
+        assert!(
+            reg.get("delete_ticket")
+                .unwrap()
+                .tags
+                .contains(&TrifectaTag::Sensitive)
+        );
+        let ct = reg.get("create_ticket").unwrap();
+        assert!(ct.tags.contains(&TrifectaTag::Egress));
+        // The annotation is APPENDED with visible provenance; the tool's own
+        // description survives verbatim above it.
+        assert!(
+            ct.description.contains("[operator note]: ENG queue only"),
+            "{}",
+            ct.description
+        );
+        assert!(
+            ct.description.starts_with("create_ticket tool"),
+            "authentic desc survives: {}",
+            ct.description
+        );
+    }
+
+    #[test]
+    fn narrow_naming_an_unknown_tool_is_an_error() {
+        let servers = vec![ServerTools {
+            name: "s".into(),
+            ns: None,
+            tags: vec![],
+            tools: vec![tool("real")],
+        }];
+        let s = settings(json!({
+            "agent": {"instruction": "x"},
+            "tools": {"narrow": {"s.ghost": {"tags": ["sensitive"]}}}
+        }));
+        let e = Registry::build(&s, &servers).unwrap_err();
+        assert!(
+            e.iter()
+                .any(|m| m.contains("unknown tool") && m.contains("ghost")),
+            "{e:?}"
+        );
     }
 
     #[test]

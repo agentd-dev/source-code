@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! **The Instruction Document, dialect 2** — the reference implementation of
+//! **The Instruction Document** — the reference implementation of
 //! the [Instruction Document Specification](https://github.com/instruction-md/specification).
 //!
 //! One Markdown file defines the whole agent. This module is the parser and the
@@ -10,9 +10,8 @@
 //! shadows a machinery name is refused), resolves `@kind/name` references, and
 //! gates each block family behind the operator's `document_capabilities` grant.
 //!
-//! Only the current spec version (2) is implemented. A document that declares an
-//! older version, or none in a shape this dialect cannot read, is refused rather
-//! than mis-parsed — the format is dialect-2-native.
+//! The current spec version (1, the sigiled dialect) is the only one. A document
+//! pinning a newer version is refused rather than mis-parsed.
 //!
 //! What this module does NOT do is execute anything. A `!function` becomes a
 //! code-registered tool bound to a runtime *service*; a `!git` names a git MCP
@@ -134,7 +133,7 @@ use Disposition::{Machinery as M, Prose as P, Structural as S};
 use Family::*;
 
 /// The kind registry — the single source of truth, matching the spec's
-/// per-version registry (`conformance/registry/kinds.json`, spec version 2).
+/// per-version registry (`conformance/registry/kinds.json`, spec version 1).
 /// The conformance corpus asserts this agrees with the published registry.
 pub const KINDS: &[Kind] = &[
     // ── prose (bare; degrade into delivery) ──────────────────────────────
@@ -664,10 +663,13 @@ fn parse_front_matter(text: &str, errs: &mut Vec<String>) -> (BTreeMap<String, V
             .unwrap_or("")
             .parse()
             .unwrap_or(0);
-        if major != 0 && major != 2 {
+        // The sigiled Instruction Document dialect is spec version 1 (the sole
+        // version). A document pinning a higher version is written for a newer
+        // spec this agentd does not implement — refused rather than mis-read.
+        if major > 1 {
             errs.push(format!(
-                "front matter pins `spec: {s}`; this agentd implements the current \
-                 dialect (2) only"
+                "front matter pins `spec: {s}`; this agentd implements spec \
+                 version 1"
             ));
         }
     }
@@ -1071,6 +1073,54 @@ fn fold_machinery(b: &Block, out: &mut Extraction, errs: &mut Vec<String>) {
                 ack(out, "[tool policy is applied]");
             }
         }
+        // `:::!override{target=tool ...}` narrows an existing tool — append-only,
+        // folded into real registry config: disable, add trifecta tags, append
+        // an operator annotation. It may only make a tool MORE careful.
+        "override" => {
+            let Some(target) = b.attrs.get("target").cloned() else {
+                errs.push(format!(
+                    "line {}: :::!override needs a target=<tool>",
+                    b.line
+                ));
+                return;
+            };
+            let body = body_map(b, errs).unwrap_or_default();
+            let disabled = b
+                .attrs
+                .get("disabled")
+                .map(|v| v != "false")
+                .unwrap_or(false)
+                || body
+                    .get("disabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+            if disabled {
+                push_into(&mut out.config, "tools", "disabled").push(Value::String(target.clone()));
+                ack(out, &format!("[tool \"{target}\" is disabled]"));
+                return;
+            }
+            let mut narrow = serde_json::Map::new();
+            if let Some(tags) = body.get("tags").and_then(Value::as_array) {
+                narrow.insert("tags".into(), Value::Array(tags.clone()));
+            }
+            // The description narrows to an operator annotation, appended.
+            if let Some(desc) = body
+                .get("description")
+                .and_then(Value::as_str)
+                .or_else(|| b.attrs.get("description").map(String::as_str))
+            {
+                narrow.insert("describe".into(), Value::String(desc.to_string()));
+            }
+            if !narrow.is_empty() {
+                frag(&mut out.config, "tools")
+                    .entry("narrow")
+                    .or_insert_with(|| Value::Object(serde_json::Map::new()))
+                    .as_object_mut()
+                    .expect("narrow is an object")
+                    .insert(target.clone(), Value::Object(narrow));
+            }
+            ack(out, &format!("[tool \"{target}\" is narrowed]"));
+        }
         "skill" => match b.attrs.get("name") {
             Some(name) => {
                 out.skills.push(InlineSkill {
@@ -1347,7 +1397,7 @@ mod tests {
     fn every_family_loads_with_its_grant() {
         // One document exercising all seven grant-gated families plus the
         // default rung — the "all elements load" proof.
-        let doc = "---\nspec: \"2\"\n---\n            :::!file{name=cfg path=pyproject.toml}\n[project]\nname='x'\n:::\n            :::!data{name=slo}\ntiers: [gold, silver]\n:::\n            :::!knowledge{name=kb}\nserver: kb\n:::\n            :::!source{name=docs}\nkind: git\n:::\n            :::!ui{name=card}\nkind: form\n:::\n            :::!human{name=oncall}\nrole: approver\n:::\n            :::!policy{name=egress}\nmode: closed\n:::\n            :::!secret-ref{name=tok}\nkind: file\npath: /run/tok\n:::\n            :::!runtime{name=py}\nimage: ghcr.io/x@sha256:abc\n:::\n            :::!function{name=lint runtime=@runtime/py}\ndoc: lint\n:::\n            :::!git{name=repo}\nurl: https://x\n:::\n            :::!image{name=img}\ndigest: sha256:abc\n:::\n            :::!agent{name=rev}\ntemplate: reviewer\n:::";
+        let doc = "---\nspec: \"1\"\n---\n            :::!file{name=cfg path=pyproject.toml}\n[project]\nname='x'\n:::\n            :::!data{name=slo}\ntiers: [gold, silver]\n:::\n            :::!knowledge{name=kb}\nserver: kb\n:::\n            :::!source{name=docs}\nkind: git\n:::\n            :::!ui{name=card}\nkind: form\n:::\n            :::!human{name=oncall}\nrole: approver\n:::\n            :::!policy{name=egress}\nmode: closed\n:::\n            :::!secret-ref{name=tok}\nkind: file\npath: /run/tok\n:::\n            :::!runtime{name=py}\nimage: ghcr.io/x@sha256:abc\n:::\n            :::!function{name=lint runtime=@runtime/py}\ndoc: lint\n:::\n            :::!git{name=repo}\nurl: https://x\n:::\n            :::!image{name=img}\ndigest: sha256:abc\n:::\n            :::!agent{name=rev}\ntemplate: reviewer\n:::";
         let d = parse(doc).unwrap();
         let all = grants(&[
             "material",
@@ -1385,7 +1435,7 @@ mod tests {
 
     #[test]
     fn a_function_with_a_test_carries_its_case_sub_blocks() {
-        let doc = "---\nspec: \"2\"\n---\n            :::!runtime{name=py}\nimage: x@sha256:a\n:::\n            ::::!function{name=lint runtime=@runtime/py}\ndoc: lint\n::::\n            ::::!test{name=lint-works target=@function/lint}\n            :::case{name=one}\ngiven: {x: 1}\nexpect: {ok: true}\n:::\n            ::::";
+        let doc = "---\nspec: \"1\"\n---\n            :::!runtime{name=py}\nimage: x@sha256:a\n:::\n            ::::!function{name=lint runtime=@runtime/py}\ndoc: lint\n::::\n            ::::!test{name=lint-works target=@function/lint}\n            :::case{name=one}\ngiven: {x: 1}\nexpect: {ok: true}\n:::\n            ::::";
         let d = parse(doc).unwrap();
         let e = fold(&d, &grants(&["compute"])).unwrap();
         let tests = &e.declarations["test"];
@@ -1396,6 +1446,20 @@ mod tests {
             "the case sub-block is recorded"
         );
         assert_eq!(tests[0]["_sub"][0]["kind"], "case");
+    }
+
+    #[test]
+    fn override_folds_into_real_tool_config() {
+        // Disable folds into tools.disabled; narrowing folds into tools.narrow
+        // (append-only tags + an operator annotation).
+        let doc = "---\nspec: \"1\"\n---\n            :::!override{target=delete_ticket}\ndisabled: true\n:::\n            :::!override{target=create_ticket}\ntags: [sensitive]\ndescription: ENG queue only\n:::";
+        let e = fold(&parse(doc).unwrap(), &grants(&[])).unwrap();
+        assert_eq!(e.config["tools"]["disabled"][0], "delete_ticket");
+        let narrow = &e.config["tools"]["narrow"]["create_ticket"];
+        assert_eq!(narrow["tags"][0], "sensitive");
+        assert_eq!(narrow["describe"], "ENG queue only");
+        // override is default-rung (narrowing never needs a grant).
+        assert!(fold(&parse(doc).unwrap(), &grants(&[])).is_ok());
     }
 
     #[test]

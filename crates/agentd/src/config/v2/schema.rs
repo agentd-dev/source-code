@@ -146,7 +146,11 @@ fn top_level_properties(
                 "type": "object", "additionalProperties": false,
                 "properties": {
                     "disabled": { "type": "array", "items": { "type": "string" } },
-                    "overrides": { "type": "object", "additionalProperties": { "$ref": "#/$defs/ToolOverride" } }
+                    "overrides": { "type": "object", "additionalProperties": { "$ref": "#/$defs/ToolOverride" } },
+                    "narrow": { "type": "object", "additionalProperties": { "type": "object", "additionalProperties": false, "properties": {
+                        "tags": { "type": "array", "items": { "enum": ["untrusted_input", "sensitive", "egress"] }, "description": "trifecta tags to ADD (never remove)" },
+                        "describe": { "type": "string", "description": "operator annotation appended beneath the tool's own description" }
+                    } }, "description": "append-only narrowing of an existing tool (a :::!override block): add tags, append a note; never widen" }
                 }
             }));
     m.insert("store".to_string(), json!({

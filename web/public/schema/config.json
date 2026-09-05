@@ -3714,6 +3714,31 @@
           },
           "type": "array"
         },
+        "narrow": {
+          "additionalProperties": {
+            "additionalProperties": false,
+            "properties": {
+              "describe": {
+                "description": "operator annotation appended beneath the tool's own description",
+                "type": "string"
+              },
+              "tags": {
+                "description": "trifecta tags to ADD (never remove)",
+                "items": {
+                  "enum": [
+                    "untrusted_input",
+                    "sensitive",
+                    "egress"
+                  ]
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          },
+          "description": "append-only narrowing of an existing tool (a :::!override block): add tags, append a note; never widen",
+          "type": "object"
+        },
         "overrides": {
           "additionalProperties": {
             "$ref": "#/$defs/ToolOverride"

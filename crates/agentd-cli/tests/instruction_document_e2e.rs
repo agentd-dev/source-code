@@ -56,7 +56,7 @@ fn load(instruction: &str, capabilities: &[&str]) -> (bool, String, Value) {
 
 /// The whole surface, one document: it validates, and every element loads.
 const FULL: &str = r#"---
-spec: "2"
+spec: "1"
 ---
 # Support triage
 
@@ -123,7 +123,7 @@ Enterprise: 1 hour.
 "#;
 
 #[test]
-fn a_full_dialect_2_document_loads_every_element() {
+fn a_full_document_loads_every_element() {
     let all = [
         "material",
         "knowledge",
@@ -209,7 +209,7 @@ fn a_forgotten_sigil_is_refused_not_silently_demoted() {
     // Bare `:::workflow` (machinery without its sigil) is the trap dialect 2
     // closes: refused, pointing at the sigiled form — never silently prose.
     let (valid, err, _) = load(
-        "---\nspec: \"2\"\n---\n:::workflow{name=w}\nsteps: {f: {kind: finish}}\n:::",
+        "---\nspec: \"1\"\n---\n:::workflow{name=w}\nsteps: {f: {kind: finish}}\n:::",
         &[],
     );
     assert!(!valid);
@@ -221,7 +221,7 @@ fn prose_degrades_into_the_delivered_instruction() {
     // A pure-prose dialect-2 document validates and its guidance survives — the
     // degradation contract, black-box.
     let (valid, err, _) = load(
-        "---\nspec: \"2\"\n---\n:::must\nAlways cite sources.\n:::",
+        "---\nspec: \"1\"\n---\n:::must\nAlways cite sources.\n:::",
         &[],
     );
     assert!(valid, "{err}");

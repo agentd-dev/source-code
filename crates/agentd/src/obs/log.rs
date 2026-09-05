@@ -235,6 +235,7 @@ pub const EVENT_FAMILIES: &[&str] = &[
     "config",
     "context",
     "drain",
+    "freshness",
     "goal",
     "human",
     "inbox",

@@ -195,6 +195,35 @@ pub struct Settings {
     /// Operator surface only — a served `!config` may not write it.
     #[serde(default)]
     pub instruction_sources: Vec<InstructionSource>,
+    /// How the instruction DOCUMENT itself is handled in transit (RFC 0041):
+    /// the recipient keys that open an encrypted envelope. Operator surface
+    /// only, restart-only — a served `!config` may not write it, because a
+    /// document must never name the key that decrypts it.
+    #[serde(default)]
+    pub instruction: Instruction,
+}
+
+/// The `instruction:` section — envelope handling for the document itself.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct Instruction {
+    /// End-to-end decryption (RFC 0041). Absent = plaintext instructions only;
+    /// an encrypted envelope is then refused by name, never parsed as prose.
+    pub decrypt: Option<InstructionDecrypt>,
+}
+
+/// Recipient-key material for encrypted instruction envelopes.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct InstructionDecrypt {
+    /// Key FILES (never inline keys): each holds one or more of an
+    /// `AGE-SECRET-KEY-1…` identity, 64 hex chars, or base64 — a 32-byte key
+    /// usable as an X25519 identity (age, JWE ECDH-ES) and as a JWE `dir`
+    /// shared key. Several entries support rotation: the envelope selects.
+    pub keys: Vec<String>,
+    /// The passphrase for age scrypt envelopes — a `{{secret:…}}` reference,
+    /// resolved at use and redacted in every dump.
+    pub passphrase: Option<Secret>,
 }
 
 /// One pinned instruction source (§7.5). The verification logic lives behind
@@ -271,6 +300,21 @@ pub struct Agent {
     /// runtime effect of each is delegated to a service per the spec.
     #[serde(skip)]
     pub document_declarations: std::collections::BTreeMap<String, Vec<Value>>,
+    /// Where a pulled instruction came from (an `oci://` reference resolved at
+    /// config load, RFC 0040) — DERIVED: the runtime uses it to log
+    /// `instruction.loaded` with its version pin and to arm the freshness
+    /// re-pull against the original reference.
+    #[serde(skip)]
+    pub instruction_origin: Option<InstructionOrigin>,
+}
+
+/// The provenance of a load-time-resolved instruction reference.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InstructionOrigin {
+    pub uri: String,
+    /// The manifest digest the reference resolved to — the content pin the
+    /// §7.7 freshness re-pull compares.
+    pub manifest_digest: String,
 }
 
 /// How much a person wants to be asked.
@@ -2639,6 +2683,89 @@ impl Settings {
         // (`:::!config`/`:::!mcp`/`:::!stream`/`:::!tools`) contribute a fragment
         // that merges UNDER the explicit document — an instruction file alone
         // can define the whole agent, and an explicit key still wins.
+        #[cfg_attr(not(feature = "oci"), allow(unused_mut))]
+        let mut instruction_origin: Option<InstructionOrigin> = None;
+        // An `oci://` instruction (RFC 0040) is pulled at CONFIG LOAD, exactly
+        // like `--instruction-file` reads a file — because its machinery must
+        // fold into the config being built (workflows, mcp servers, the trust
+        // ladder), which is impossible once loading is over. URL-fetched
+        // workflow definitions set the precedent for a load-time dial. The
+        // resolved text replaces the reference; the origin (uri + manifest
+        // digest, the version pin) rides along for the runtime's freshness
+        // re-pull and the `instruction.loaded` log line.
+        if let Some(uri) = doc
+            .get("agent")
+            .and_then(|a| a.get("instruction"))
+            .and_then(Value::as_str)
+            .filter(|s| s.starts_with("oci://"))
+            .map(str::to_string)
+        {
+            #[cfg(feature = "oci")]
+            {
+                let pulled = crate::oci::pull(&uri)
+                    .map_err(|e| format!("{source}: agent.instruction {uri}: {e}"))?;
+                // Binary ciphertext is armored into text so the decrypt choke
+                // point below sees every envelope the same way.
+                let text = match String::from_utf8(pulled.bytes) {
+                    Ok(s) => s,
+                    Err(e) if crate::config::envelope::looks_encrypted(e.as_bytes()) => {
+                        crate::config::envelope::armor(e.as_bytes())
+                    }
+                    Err(_) => {
+                        return Err(format!(
+                            "{source}: agent.instruction {uri}: the artifact is neither \
+                             UTF-8 nor a recognized encrypted envelope"
+                        ));
+                    }
+                };
+                if let Some(a) = doc.get_mut("agent").and_then(Value::as_object_mut) {
+                    a.insert("instruction".into(), Value::String(text));
+                }
+                instruction_origin = Some(InstructionOrigin {
+                    uri,
+                    manifest_digest: pulled.manifest_digest,
+                });
+            }
+            #[cfg(not(feature = "oci"))]
+            return Err(format!(
+                "{source}: agent.instruction {uri}: an oci:// instruction requires \
+                 building with --features oci"
+            ));
+        }
+        // An ENCRYPTED instruction (RFC 0041) decrypts here, before anything
+        // inspects it — an envelope carries no `:::` markers, so running the
+        // idoc detection on ciphertext would silently deliver garbage prose.
+        // The recipient keys come from the same raw document (`instruction:`),
+        // read before typed deserialization exactly like the trust grants.
+        if let Some(instr) = doc
+            .get("agent")
+            .and_then(|a| a.get("instruction"))
+            .and_then(Value::as_str)
+            && crate::config::envelope::looks_encrypted(instr.as_bytes())
+        {
+            #[cfg(feature = "decrypt")]
+            {
+                let icfg: Instruction = doc
+                    .get("instruction")
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .map_err(|e| format!("{source}: instruction: {e}"))?
+                    .unwrap_or_default();
+                let plain = crate::config::decrypt::maybe_decrypt(instr.as_bytes().to_vec(), &icfg)
+                    .map_err(|e| format!("{source}: agent.instruction: {e}"))?;
+                let text = String::from_utf8(plain)
+                    .map_err(|_| format!("{source}: decrypted instruction is not UTF-8"))?;
+                if let Some(a) = doc.get_mut("agent").and_then(Value::as_object_mut) {
+                    a.insert("instruction".into(), Value::String(text));
+                }
+            }
+            #[cfg(not(feature = "decrypt"))]
+            return Err(format!(
+                "{source}: agent.instruction is an encrypted envelope; decrypting it \
+                 requires building with --features decrypt"
+            ));
+        }
         let mut idoc_extraction: Option<crate::config::idoc::Extraction> = None;
         if let Some(instr) = doc
             .get("agent")
@@ -2702,6 +2829,7 @@ impl Settings {
             settings.agent.inline_skills = ex.skills;
             settings.agent.document_declarations = ex.declarations;
         }
+        settings.agent.instruction_origin = instruction_origin;
         Ok(settings)
     }
 
@@ -3663,7 +3791,28 @@ fn apply_alias(
         }
         AliasKind::SetFromFile => {
             let path = take()?;
-            let text = super::read_file(&path)?;
+            // A BINARY age envelope given to `--instruction-file` is armored
+            // into its text form here, so the one decrypt choke point (in
+            // `from_document`) sees every envelope the same way. Text files —
+            // plaintext, armored age, compact JWE — pass through verbatim.
+            let text = if alias.path == "agent.instruction" {
+                let bytes = std::fs::read(&path)
+                    .map_err(|e| usage(format!("{}: {path}: {e}", alias.flag)))?;
+                match String::from_utf8(bytes) {
+                    Ok(s) => s,
+                    Err(e) if crate::config::envelope::looks_encrypted(e.as_bytes()) => {
+                        crate::config::envelope::armor(e.as_bytes())
+                    }
+                    Err(_) => {
+                        return Err(usage(format!(
+                            "{}: {path}: not UTF-8 and not a recognized encrypted envelope",
+                            alias.flag
+                        )));
+                    }
+                }
+            } else {
+                super::read_file(&path)?
+            };
             let mut patch = Value::Object(Map::new());
             paths::set_path(&mut patch, alias.path, Value::String(text));
             file::merge_into(doc, patch);
@@ -5883,6 +6032,9 @@ pub const RESTART_ONLY_PATHS: &[&str] = &[
     // which keys are trusted, is never a hot reload — a source an operator
     // believes they revoked must not stay live (§7.5, the same rule as grants).
     "instruction_sources",
+    // The instruction-envelope recipient keys (RFC 0041): which key can open a
+    // served document is trust configuration, never hot-swapped.
+    "instruction",
     // The webhook listener's SOCKET, not its rules: rebinding an address or
     // swapping a TLS identity needs a restart, while `webhooks.default_auth`
     // and the routes themselves (which live in `workflows[].steps[]`) are

@@ -138,6 +138,13 @@ sign = ["aauth"]
 # Plain HTTPS + JSON on the existing client; SHA-256 is the `ring` rustls
 # already resolves — no OCI client crate (the minimalism moat). OFF by default.
 oci = ["tls", "dep:ring"]
+# On-the-fly decryption of encrypted instruction envelopes (RFC 0041): age v1
+# (X25519 + scrypt passphrase) and JWE Compact (ECDH-ES, dir; A256GCM/A128GCM).
+# AEADs/HKDF/HMAC/PBKDF2 are the `ring` already present; the X25519 ladder and
+# scrypt's Salsa20/8 core are hand-rolled per their RFCs (ring's agreement API
+# cannot import a static recipient key). Rides `sign` — an encrypted document
+# is usually also a signed one. OFF by default.
+decrypt = ["sign"]
 
 [dependencies]
 # The A2A protocol itself (feature `a2a`): domain types generated from the

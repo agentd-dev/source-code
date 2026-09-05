@@ -18,6 +18,8 @@
 
 #[cfg(feature = "sign")]
 pub mod attest; // §7 instruction attestation (JWS/Ed25519, resolution manifest)
+#[cfg(feature = "decrypt")]
+pub mod decrypt; // on-the-fly instruction decryption: age v1 + JWE compact (RFC 0041)
 pub mod envelope; // encrypted-envelope detection (RFC 0041) — always compiled, no crypto
 pub mod envfile;
 pub mod file;

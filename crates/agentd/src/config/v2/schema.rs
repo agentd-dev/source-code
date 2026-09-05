@@ -318,6 +318,12 @@ fn top_level_properties(
                 "properties": {
                 "autonomous_as": { "type": "string", "description": "the actor a schedule/webhook/stream firing is attributed to (default `system`); without it the attribution chain is dropped at its first hop" },
                 "labels": { "type": "object", "additionalProperties": { "type": "string" }, "description": "labels stamped on autonomous work" } } }));
+    m.insert("instruction".to_string(), json!({ "type": "object", "additionalProperties": false,
+                "description": "envelope handling for the instruction document itself (RFC 0041). Operator surface, restart-only; a served !config may not write it.",
+                "properties": {
+                "decrypt": { "type": "object", "additionalProperties": false, "description": "end-to-end decryption: the recipient keys that open an encrypted instruction envelope (age v1 or JWE compact)", "properties": {
+                    "keys": { "type": "array", "items": { "type": "string" }, "description": "key FILE paths — each an AGE-SECRET-KEY-1… identity, 64 hex chars, or base64 (a 32-byte key; several entries support rotation)" },
+                    "passphrase": { "type": "string", "description": "the passphrase for age scrypt envelopes — a {{secret:…}} reference, resolved at use" } } } } }));
     m.insert("instruction_sources".to_string(), json!({ "type": "array",
                 "description": "pinned sources for SIGNED instruction documents (§7.5): publisher + author/delivery keys + a per-source capability ceiling + a freshness deadline. Pinning is by key and publisher, never by URI. Operator surface only.",
                 "items": { "type": "object", "additionalProperties": false, "properties": {

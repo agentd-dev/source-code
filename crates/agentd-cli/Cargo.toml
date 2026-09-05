@@ -43,6 +43,10 @@ cel = ["agentd/cel"]
 aauth = ["tls", "agentd/aauth"]
 # §7 instruction attestation (rides aauth; no new dependency).
 sign = ["aauth", "agentd/sign"]
+# Instruction pull from an OCI artifact registry (RFC 0040).
+oci = ["tls", "agentd/oci"]
+# On-the-fly decryption of encrypted instruction envelopes (RFC 0041).
+decrypt = ["sign", "agentd/decrypt"]
 internal-mocks = ["agentd/internal-mocks"]
 
 [dependencies]
@@ -59,6 +63,8 @@ serde_json = "1"
 libc = "0.2"
 
 [dev-dependencies]
+# The mock OCI registry in oci_instruction_e2e hashes blobs; test-only.
+ring = "0.17"
 tempfile = "3"
 
 # Unix-only test helper: send SIGTERM to a spawned agent to exercise the

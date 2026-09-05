@@ -46,6 +46,7 @@ version = "1.8.0"
 dependencies = [
  "agentd-core",
  "libc",
+ "ring",
  "serde_json",
  "tempfile",
 ]

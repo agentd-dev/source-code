@@ -2847,7 +2847,11 @@ fn fold_machinery(b: &Block, out: &mut Extraction, errs: &mut Vec<String>) {
                 // The document cannot grant itself trust (§6 rule 4): a served
                 // document is never a source of its own trust configuration, so
                 // `!config` may not write the operator-only trust surface.
-                for key in ["document_capabilities", "instruction_sources"] {
+                for key in [
+                    "document_capabilities",
+                    "instruction_sources",
+                    "instruction",
+                ] {
                     if m.contains_key(key) {
                         errs.push(format!(
                             "line {}: !config may not write `{key}` — it is operator \
@@ -3715,7 +3719,11 @@ into: {stream: s, subject: x.y}
     fn config_may_not_grant_itself_trust() {
         // §6 rule 4 / Appendix B self-grant: a document's !config cannot write
         // the operator-only trust surface.
-        for key in ["document_capabilities", "instruction_sources"] {
+        for key in [
+            "document_capabilities",
+            "instruction_sources",
+            "instruction",
+        ] {
             let doc = format!("---\nspec: \"1\"\n---\n:::!config\n{key}: [x]\n:::");
             let e = fold(&parse(&doc).unwrap(), &grants(&[])).unwrap_err();
             assert!(

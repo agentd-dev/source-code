@@ -702,8 +702,20 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
     }
 
     // The instruction: either static text, or a resource URI that is read
-    // now and subscribed to so later updates reach the agent.
-    if let Some(text) = rt.settings.agent.instruction.clone() {
+    // now and subscribed to so later updates reach the agent. An `oci://`
+    // reference was already pulled and folded at CONFIG LOAD (its machinery
+    // had to join the config); here it only records its provenance — the uri
+    // the freshness watch re-pulls, and the manifest digest that pins what ran.
+    if let Some(origin) = rt.settings.agent.instruction_origin.clone() {
+        rt.instruction.text = rt.settings.agent.instruction.clone().unwrap_or_default();
+        rt.instruction.source = "oci";
+        rt.instruction.uri = Some(origin.uri.clone());
+        log.info(
+            "instruction.loaded",
+            json!({"uri": origin.uri, "manifest_digest": origin.manifest_digest,
+                   "bytes": rt.instruction.text.len(), "version": rt.instruction.version}),
+        );
+    } else if let Some(text) = rt.settings.agent.instruction.clone() {
         if crate::config::v2::looks_like_resource_uri(&text) {
             match rt.subscribe_instruction(&text) {
                 Ok(()) => {}
@@ -1372,7 +1384,33 @@ impl Runtime {
             #[cfg(feature = "oci")]
             {
                 let pulled = crate::oci::pull(uri)?;
-                let text = self.decode_instruction_bytes(pulled.bytes)?;
+                let raw = self.decode_instruction_bytes(pulled.bytes)?;
+                // The DELIVERED text is the cleaned document (machinery folds
+                // to acknowledgement lines), matching what config load
+                // produced. A re-pulled document's machinery CHANGES apply on
+                // reload/restart (the §5.5 quiesce doctrine); a document that
+                // no longer folds keeps the running text — refuse-and-keep,
+                // never a half-applied instruction.
+                let text = if crate::config::idoc::contains_blocks(&raw) {
+                    let granted: std::collections::BTreeSet<String> = self
+                        .settings
+                        .agent
+                        .document_capabilities
+                        .iter()
+                        .cloned()
+                        .collect();
+                    match crate::config::idoc::extract(&raw, &granted) {
+                        Ok(ex) => ex.cleaned,
+                        Err(errs) => {
+                            return Err(format!(
+                                "re-pulled instruction no longer folds: {}",
+                                errs.join("; ")
+                            ));
+                        }
+                    }
+                } else {
+                    raw
+                };
                 let changed = self.instruction.text != text;
                 self.instruction = reactor::Instruction {
                     text,
@@ -1405,6 +1443,9 @@ impl Runtime {
     /// they are decrypted with the operator's recipient keys first; otherwise
     /// they must be UTF-8.
     fn decode_instruction_bytes(&self, bytes: Vec<u8>) -> Result<String, String> {
+        #[cfg(feature = "decrypt")]
+        let bytes = crate::config::decrypt::maybe_decrypt(bytes, &self.settings.instruction)?;
+        #[cfg(not(feature = "decrypt"))]
         if crate::config::envelope::looks_encrypted(&bytes) {
             return Err(
                 "the instruction is an encrypted envelope; decrypting it requires building \

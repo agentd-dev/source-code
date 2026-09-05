@@ -89,6 +89,39 @@ pub fn b64url_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Wrap a BINARY age file in its standard ASCII armor, so an envelope can
+/// travel through string-shaped config (`agent.instruction`) losslessly. The
+/// output is exactly what `age --armor` produces: std base64 with padding,
+/// 64-column lines, between the BEGIN/END markers.
+pub fn armor(bytes: &[u8]) -> String {
+    const STD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut b64 = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = (chunk[0] as u32) << 16
+            | (chunk.get(1).copied().unwrap_or(0) as u32) << 8
+            | chunk.get(2).copied().unwrap_or(0) as u32;
+        b64.push(STD[(n >> 18 & 63) as usize] as char);
+        b64.push(STD[(n >> 12 & 63) as usize] as char);
+        b64.push(if chunk.len() > 1 {
+            STD[(n >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        b64.push(if chunk.len() > 2 {
+            STD[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    let mut out = String::from("-----BEGIN AGE ENCRYPTED FILE-----\n");
+    for line in b64.as_bytes().chunks(64) {
+        out.push_str(std::str::from_utf8(line).unwrap());
+        out.push('\n');
+    }
+    out.push_str("-----END AGE ENCRYPTED FILE-----\n");
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -45,6 +45,12 @@ fn main() {
         .flatten()
         .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
         .collect();
+    let facts: BTreeMap<String, String> = ctx_v["facts"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+        .collect();
     let includes: BTreeMap<String, String> = ctx_v["includes"]
         .as_object()
         .into_iter()
@@ -55,6 +61,7 @@ fn main() {
     let ctx = Context {
         grants,
         params,
+        facts,
         resolve_include: Some(&resolver),
     };
 
@@ -63,7 +70,10 @@ fn main() {
             println!("{}", serde_json::to_string_pretty(&errs).unwrap());
         }
         ("refusals", Ok(d)) => {
-            println!("{}", serde_json::to_string_pretty(&validate(&d, &ctx)).unwrap());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&validate(&d, &ctx)).unwrap()
+            );
         }
         (_, Err(errs)) => {
             eprintln!("refused:");

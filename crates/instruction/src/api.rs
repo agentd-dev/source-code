@@ -48,6 +48,10 @@ pub struct Context<'a> {
     pub grants: BTreeSet<String>,
     /// `${parameter}` values, winning over declared defaults.
     pub params: BTreeMap<String, String>,
+    /// Runtime FACTS `when` conditions evaluate against (§5.2), alongside the
+    /// resolved parameters — e.g. `agent`, supplied by the consuming runtime
+    /// (this library assumes none).
+    pub facts: BTreeMap<String, String>,
     /// Resolves an `::include{id|uri}` to the included document's source;
     /// `None` (or a `None` return) degrades the include to its visible note.
     #[allow(clippy::type_complexity)]
@@ -125,6 +129,7 @@ pub fn deliver(document: &Document, ctx: &Context) -> Result<Delivery, Vec<Refus
         document,
         &ctx.grants,
         &ctx.params,
+        &ctx.facts,
         &resolver,
         0,
         &BTreeSet::new(),
@@ -155,6 +160,10 @@ fn build_manifest(
     resolver: &dyn Fn(&str) -> Option<String>,
 ) -> Manifest {
     let params_declared = doc::param_values(document, &ctx.params);
+    let mut when_facts = params_declared.clone();
+    for (k, v) in &ctx.facts {
+        when_facts.insert(k.clone(), v.clone());
+    }
     let mut parameters = Vec::new();
     // Every parameter that COULD have shaped the text: declared ones, plus
     // explicit overrides. Values appear as digests, never as values (§7.4).
@@ -168,7 +177,7 @@ fn build_manifest(
         match b.kind.as_str() {
             "when" => {
                 let id = format!("when#{}", b.line);
-                if doc::when_kept(b, &params_declared) {
+                if doc::when_kept(b, &when_facts) {
                     kept.push(id);
                 } else {
                     dropped.push(id);
@@ -214,8 +223,20 @@ fn authored_digest(document: &Document) -> String {
 /// implementations by. Consecutive members of one authored set are grouped
 /// under a synthetic `form: "set"` node with `members`.
 pub fn tree_json(document: &Document) -> Value {
-    let mut blocks = Vec::new();
     let nodes: Vec<&Block> = document.blocks().collect();
+    json!({
+        "spec": document.front.get("spec").cloned().unwrap_or_else(|| json!("1")),
+        "frontMatter": document.front,
+        "blocks": grouped_json(&nodes),
+    })
+}
+
+/// Render a run of sibling blocks, grouping consecutive members of one
+/// authored set under a synthetic `form: "set"` node — at the top level and
+/// inside `children` alike (a `:::case[]` inside a `!test` groups the same
+/// way).
+fn grouped_json(nodes: &[&Block]) -> Vec<Value> {
+    let mut out = Vec::new();
     let mut i = 0;
     while i < nodes.len() {
         let b = nodes[i];
@@ -226,20 +247,46 @@ pub fn tree_json(document: &Document) -> Value {
                 members.push(block_json(nodes[i], true));
                 i += 1;
             }
-            blocks.push(json!({
+            out.push(json!({
                 "kind": b.kind, "sigil": sigil_of(b), "form": "set",
                 "line": b.line, "attrs": {}, "members": members,
             }));
         } else {
-            blocks.push(block_json(b, false));
+            out.push(block_json(b, false));
             i += 1;
         }
     }
-    json!({
-        "spec": document.front.get("spec").cloned().unwrap_or_else(|| json!("1")),
-        "frontMatter": document.front,
-        "blocks": blocks,
-    })
+    out
+}
+
+/// Split a code body into `(lang, inner_text)` — the surrounding ``` fence
+/// lines are shape, not content, and the info string is the language.
+fn split_code_fence(body: &str) -> (String, String) {
+    let all: Vec<&str> = body.lines().collect();
+    let Some(open) = all.iter().position(|l| {
+        let t = l.trim_start();
+        t.starts_with("```") || t.starts_with("~~~")
+    }) else {
+        return (String::new(), body.to_string());
+    };
+    let lines = &all[open..];
+    let lang = lines[0]
+        .trim_start()
+        .trim_start_matches(['`', '~'])
+        .trim()
+        .to_string();
+    // The closer is the LAST line after the opener that is nothing but fence
+    // characters; an unterminated fence runs to the end.
+    let end = lines
+        .iter()
+        .skip(1)
+        .rposition(|l| {
+            let t = l.trim();
+            t.len() >= 3 && (t.chars().all(|c| c == '`') || t.chars().all(|c| c == '~'))
+        })
+        .map(|p| p + 1)
+        .unwrap_or(lines.len());
+    (lang, lines[1..end].join("\n"))
 }
 
 fn sigil_of(b: &Block) -> bool {
@@ -268,9 +315,11 @@ fn block_json(b: &Block, member: bool) -> Value {
     for (k, v) in &b.attrs {
         // §9.1 normalization: flags are true; multi-valued attributes are
         // arrays; everything else the (already unescaped) string.
-        let val = if v.is_empty() {
+        let val = if v.is_empty() || v == "true" {
             json!(true)
-        } else if doc::MULTI_VALUED.contains(&k.as_str()) || k == "may" || k == "values" {
+        } else if v == "false" {
+            json!(false)
+        } else if doc::registry().is_multivalued(&b.kind, k) {
             json!(v.split(',').map(str::trim).collect::<Vec<_>>())
         } else {
             json!(v)
@@ -294,21 +343,30 @@ fn block_json(b: &Block, member: bool) -> Value {
     o.insert("form".into(), json!(form_name(b, member)));
     o.insert("line".into(), json!(b.line));
     o.insert("attrs".into(), Value::Object(attrs));
-    if b.body.is_empty() && b.form == Form::Leaf {
-        o.insert("body".into(), json!({"type": "none", "text": ""}));
-    } else {
-        o.insert("body".into(), json!({"type": body_type, "text": b.body}));
+    // The §9.1 body shape per interpretation: tables carry parsed `rows`,
+    // definition lists parsed `entries`, code its inner text plus `lang`.
+    // A leaf (or a set member) has no body at all.
+    if !(b.form == Form::Leaf || member) {
+        let body = match body_type {
+            "table" => json!({"type": "table", "rows": doc::table_rows(&b.body)}),
+            "deflist" => json!({
+                "type": "deflist",
+                "entries": doc::tree_deflist_entries(&b.body)
+                    .into_iter()
+                    .map(|(term, definition)| json!({"term": term, "definition": definition}))
+                    .collect::<Vec<_>>(),
+            }),
+            "code" => {
+                let (lang, text) = split_code_fence(&b.body);
+                json!({"type": "code", "text": text, "lang": lang})
+            }
+            t => json!({"type": t, "text": b.body}),
+        };
+        o.insert("body".into(), body);
     }
     if !b.children.is_empty() {
-        o.insert(
-            "children".into(),
-            json!(
-                b.children
-                    .iter()
-                    .map(|c| block_json(c, false))
-                    .collect::<Vec<_>>()
-            ),
-        );
+        let kids: Vec<&Block> = b.children.iter().collect();
+        o.insert("children".into(), json!(grouped_json(&kids)));
     }
     Value::Object(o)
 }
@@ -336,6 +394,83 @@ mod tests {
         let errs = parse(":::workflow{name=w}\nsteps: {}\n:::").unwrap_err();
         assert_eq!(errs[0].line, Some(1));
         assert!(errs[0].message.contains("shadows a machinery name"));
+    }
+
+    #[test]
+    fn when_keeps_unknown_dimensions_and_matches_comma_sets() {
+        // §5.2 rules 2–3: an UNKNOWN key keeps the guidance; a known key
+        // matches any of the comma-separated values.
+        let d = parse(
+            ":::when{agent=\"claude, gpt\"}\nFor those agents.\n:::\n\n:::when{env=\"prod\"}\nProd only.\n:::",
+        )
+        .unwrap();
+        // No facts at all: both kept (no dimension can be evaluated).
+        let out = deliver(&d, &Context::default()).unwrap();
+        assert!(out.text.contains("For those agents.") && out.text.contains("Prod only."));
+        // agent fact outside the set drops the first; env unknown keeps the second.
+        let ctx = Context {
+            facts: [("agent".to_string(), "agentd".to_string())].into(),
+            ..Context::default()
+        };
+        let out = deliver(&d, &ctx).unwrap();
+        assert!(!out.text.contains("For those agents."), "{}", out.text);
+        assert!(out.text.contains("Prod only."));
+        assert_eq!(out.manifest.variants.dropped.len(), 1);
+        // A fact IN the comma-set keeps it.
+        let ctx = Context {
+            facts: [("agent".to_string(), "gpt".to_string())].into(),
+            ..Context::default()
+        };
+        assert!(
+            deliver(&d, &ctx)
+                .unwrap()
+                .text
+                .contains("For those agents.")
+        );
+    }
+
+    #[test]
+    fn a_bare_attribute_value_running_into_a_brace_is_refused() {
+        // §3.2: a bare value runs to whitespace or `}` — an unquoted value
+        // containing `}` (e.g. an unquoted `${var}`) is a refusal, with the
+        // quote-it fix named.
+        let errs = parse("::!git{name=src url=https://git.example/acme/${repo} ref=${branch}}")
+            .unwrap_err();
+        assert!(
+            errs[0].message.contains("quote values containing"),
+            "{}",
+            errs[0]
+        );
+        // Quoted, the same reference is fine.
+        assert!(parse("::!git{name=src url=\"https://git.example/acme/${repo}\"}").is_ok());
+    }
+
+    #[test]
+    fn keywords_and_alerts_are_tree_blocks_and_deliver_identically() {
+        let d = parse(
+            "MUST: run the tests.\n\n- NEVER: push to main.\n\n> [!TIP]\n> Sleep on it.\n> Then decide.\n",
+        )
+        .unwrap();
+        let t = tree_json(&d);
+        let blocks = t["blocks"].as_array().unwrap();
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(
+            (blocks[0]["kind"].as_str(), blocks[0]["form"].as_str()),
+            (Some("must"), Some("keyword"))
+        );
+        assert_eq!(blocks[0]["body"]["text"], "run the tests.");
+        assert_eq!(blocks[1]["kind"], "never");
+        assert_eq!(
+            (blocks[2]["kind"].as_str(), blocks[2]["form"].as_str()),
+            (Some("tip"), Some("alert"))
+        );
+        assert_eq!(blocks[2]["body"]["text"], "Sleep on it.\nThen decide.");
+        // Delivery is the same normalized text as before lifting.
+        let out = deliver(&d, &Context::default()).unwrap();
+        assert_eq!(
+            out.text,
+            "**MUST:** run the tests.\n\n- **NEVER:** push to main.\n\n**TIP:** Sleep on it.\nThen decide.\n"
+        );
     }
 
     #[test]

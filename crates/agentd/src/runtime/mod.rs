@@ -1399,7 +1399,9 @@ impl Runtime {
                         .iter()
                         .cloned()
                         .collect();
-                    match crate::config::idoc::extract(&raw, &granted) {
+                    let facts: std::collections::BTreeMap<String, String> =
+                        [("agent".to_string(), "agentd".to_string())].into();
+                    match crate::config::idoc::extract_with_facts(&raw, &granted, &facts) {
                         Ok(ex) => ex.cleaned,
                         Err(errs) => {
                             return Err(format!(

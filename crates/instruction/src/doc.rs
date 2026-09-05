@@ -96,6 +96,9 @@ pub struct Registry {
     kinds: BTreeMap<String, Kind>,
     grant_tokens: BTreeSet<String>,
     keywords: BTreeMap<String, String>,
+    /// kind → the attribute names the schema marks `x-multivalued`
+    /// (comma-separated within one value; normalized to arrays).
+    multivalued: BTreeMap<String, BTreeSet<String>>,
     version: u32,
 }
 
@@ -149,6 +152,21 @@ impl Registry {
             for (kw, kind) in m {
                 if let Some(k) = kind.as_str() {
                     keywords.insert(kw.clone(), k.to_string());
+                }
+            }
+        }
+        let mut multivalued: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        if let Some(attrs) = schema["$defs"]["attrs"].as_object() {
+            for (kind, spec) in attrs {
+                if let Some(props) = spec["properties"].as_object() {
+                    for (attr, a) in props {
+                        if a["x-multivalued"].as_bool() == Some(true) {
+                            multivalued
+                                .entry(kind.clone())
+                                .or_default()
+                                .insert(attr.clone());
+                        }
+                    }
                 }
             }
         }
@@ -210,6 +228,7 @@ impl Registry {
             kinds,
             grant_tokens,
             keywords,
+            multivalued,
             version,
         }
     }
@@ -222,6 +241,13 @@ impl Registry {
     /// The prose kind a keyword line introduces (`MUST` → `must`), if any.
     pub fn keyword_kind(&self, kw: &str) -> Option<&str> {
         self.keywords.get(kw).map(String::as_str)
+    }
+
+    /// Whether the schema marks `kind`'s attribute `attr` multi-valued.
+    pub fn is_multivalued(&self, kind: &str, attr: &str) -> bool {
+        self.multivalued
+            .get(kind)
+            .is_some_and(|set| set.contains(attr))
     }
 }
 
@@ -346,6 +372,7 @@ pub fn parse(text: &str) -> Result<Document, Vec<String>> {
     let mut nodes: Vec<Node> = Vec::new();
     let mut pending = String::new();
     let mut i = 0;
+    let mut in_code = None::<usize>;
     macro_rules! flush {
         () => {
             if !pending.is_empty() {
@@ -354,6 +381,38 @@ pub fn parse(text: &str) -> Result<Document, Vec<String>> {
         };
     }
     while i < lines.len() {
+        // Fenced code at top level suspends ALL recognition (§3.3 rule 5):
+        // fences, leaves, headings and keywords inside it are content.
+        if let Some(tl) = in_code {
+            if code_fence_len(lines[i]) == Some(tl) {
+                in_code = None;
+            }
+            if !pending.is_empty() {
+                pending.push('\n');
+            }
+            pending.push_str(lines[i]);
+            i += 1;
+            continue;
+        }
+        if let Some(tl) = code_fence_len(lines[i]) {
+            in_code = Some(tl);
+            if !pending.is_empty() {
+                pending.push('\n');
+            }
+            pending.push_str(lines[i]);
+            i += 1;
+            continue;
+        }
+        // A keyword paragraph / list item, or a blockquote alert, is a block
+        // of its prose kind (§4.5/§4.6) — lifted so the tree carries it.
+        if (keyword_block_parts(lines[i]).is_some() || alert_block_kind(lines[i]).is_some())
+            && let Some((b, next)) = lift_keyword_or_alert(&lines, i, base)
+        {
+            flush!();
+            nodes.push(Node::Block(b));
+            i = next;
+            continue;
+        }
         // The region a top-level block occupies (0-based body lines, inclusive)
         // is `[i, next-1]` — delivery replaces exactly this run of source lines.
         if let Some(sec) = section_open(lines[i]) {
@@ -852,6 +911,16 @@ fn collect_range(
                 children.push(c);
             }
             i += 1;
+            continue;
+        }
+        // A keyword paragraph or alert inside a section body is that section's
+        // CHILD block (§4.5; the fixture corpus pins the shape) and is
+        // excluded from the body prose.
+        if (keyword_block_parts(line).is_some() || alert_block_kind(line).is_some())
+            && let Some((b, next)) = lift_keyword_or_alert(lines, i, line_base)
+        {
+            children.push(b);
+            i = next.min(end);
             continue;
         }
         prose.push(line.to_string());
@@ -1429,6 +1498,13 @@ fn parse_attrs(src: &str) -> Result<BTreeMap<String, String>, String> {
                     if c.is_whitespace() {
                         break;
                     }
+                    if c == '}' {
+                        // §3.2: a bare value runs to whitespace or `}` — an
+                        // embedded `}` means the closer was inside the value.
+                        return Err(format!(
+                            "bare value {val:?} runs into '}}' — quote values containing '}}'"
+                        ));
+                    }
                     val.push(c);
                     chars.next();
                 }
@@ -1797,6 +1873,25 @@ pub fn extract(text: &str, granted: &BTreeSet<String>) -> Result<Extraction, Vec
     fold(&doc, granted)
 }
 
+/// As [`extract`], with runtime FACTS for `when` selection (§5.2) — e.g. the
+/// consuming runtime's own `agent` name. The library itself assumes no facts.
+pub fn extract_with_facts(
+    text: &str,
+    granted: &BTreeSet<String>,
+    facts: &BTreeMap<String, String>,
+) -> Result<Extraction, Vec<String>> {
+    let doc = parse(text)?;
+    fold_full(
+        &doc,
+        granted,
+        &BTreeMap::new(),
+        facts,
+        &|_| None,
+        0,
+        &BTreeSet::new(),
+    )
+}
+
 /// Merge a fragment UNDER a document: a key already present in `into` wins, so
 /// an explicit config key always beats what a directive contributed. Arrays of
 /// the same key concatenate (fragment first) so a document's `!mcp` servers add
@@ -1868,7 +1963,7 @@ fn body_map(b: &Block, errs: &mut Vec<String>) -> Option<serde_json::Map<String,
     };
     for (k, v) in &b.attrs {
         // The fence wins over a same-named body key.
-        m.insert(k.clone(), attr_scalar(k, v));
+        m.insert(k.clone(), attr_scalar(&b.kind, k, v));
     }
     Some(m)
 }
@@ -1984,11 +2079,6 @@ fn secret_ref_decls(doc: &Document) -> BTreeMap<String, (String, String)> {
     out
 }
 
-/// Attribute names the spec treats as multi-valued (comma-separated within one
-/// value, §4.3.1). agentd's config types these as arrays, so a comma-string
-/// attribute is split — `allow="read, run:tests"` becomes `["read", "run:tests"]`.
-pub(crate) const MULTI_VALUED: &[&str] = &["allow", "deny", "methods", "scopes", "tags"];
-
 fn attr_value(s: &str) -> Value {
     match s {
         "true" => Value::Bool(true),
@@ -2011,10 +2101,10 @@ fn attr_value(s: &str) -> Value {
     }
 }
 
-/// An attribute's value, expanded to an array for the multi-valued names the
-/// spec's encoding carries as comma-separated strings.
-fn attr_scalar(key: &str, s: &str) -> Value {
-    if MULTI_VALUED.contains(&key) {
+/// An attribute's value, expanded to an array where the schema marks the
+/// kind's attribute `x-multivalued` (comma-separated within one value).
+fn attr_scalar(kind: &str, key: &str, s: &str) -> Value {
+    if registry().is_multivalued(kind, key) {
         Value::Array(
             s.split(',')
                 .map(|p| Value::String(p.trim().to_string()))
@@ -2047,7 +2137,15 @@ pub fn fold_with_params(
     granted: &BTreeSet<String>,
     overrides: &BTreeMap<String, String>,
 ) -> Result<Extraction, Vec<String>> {
-    fold_full(doc, granted, overrides, &|_| None, 0, &BTreeSet::new())
+    fold_full(
+        doc,
+        granted,
+        overrides,
+        &BTreeMap::new(),
+        &|_| None,
+        0,
+        &BTreeSet::new(),
+    )
 }
 
 /// The full fold: `${parameter}` overrides, and an `include` resolver so a
@@ -2060,6 +2158,7 @@ pub fn fold_full(
     doc: &Document,
     granted: &BTreeSet<String>,
     overrides: &BTreeMap<String, String>,
+    facts: &BTreeMap<String, String>,
     resolve: IncludeResolver,
     depth: usize,
     seen: &BTreeSet<String>,
@@ -2075,6 +2174,13 @@ pub fn fold_full(
     // declarations) to render a `form` block's input list.
     let params = param_values(doc, overrides);
     let decls = param_decls(doc);
+    // `when` evaluates over the resolved parameters PLUS the runtime facts
+    // (facts win a collision — they are runtime-authoritative); `${}`
+    // substitution uses the parameters only.
+    let mut when_facts = params.clone();
+    for (k, v) in facts {
+        when_facts.insert(k.clone(), v.clone());
+    }
 
     // Pass 1: fold configuration, and record each TOP-LEVEL block's delivered
     // lines against the source region it occupies. Consecutive members of one
@@ -2103,12 +2209,25 @@ pub fn fold_full(
                 regions.push((b.region.0, b.region.1, deliver_set_lines(&members)));
                 i = j;
             }
+            Node::Block(b) if matches!(b.form, Form::Keyword | Form::Alert) => {
+                // A lifted keyword/alert delivers its RAW source lines through
+                // the same normalizer the un-lifted text pass applies — so the
+                // delivered bytes are identical by construction to when these
+                // lines rode in a prose run.
+                let src: Vec<String> = doc.source.split('\n').collect::<Vec<_>>()
+                    [b.region.0..=b.region.1]
+                    .iter()
+                    .map(|l| l.to_string())
+                    .collect();
+                regions.push((b.region.0, b.region.1, normalize_lines(src)));
+                i += 1;
+            }
             Node::Block(b) => {
                 fold_config(b, &mut out, &mut errs);
                 regions.push((
                     b.region.0,
                     b.region.1,
-                    deliver_block_lines(b, &params, &decls, granted, resolve, depth, seen),
+                    deliver_block_lines(b, &when_facts, &decls, granted, resolve, depth, seen),
                 ));
                 i += 1;
             }
@@ -2201,7 +2320,7 @@ fn deliver_block_lines(
             }
         }
         Disposition::Structural if b.kind == "include" => {
-            deliver_include(b, granted, resolve, depth, seen)
+            deliver_include(b, granted, params, resolve, depth, seen)
         }
         // `param` and any other structural block deliver nothing.
         Disposition::Structural => Vec::new(),
@@ -2216,6 +2335,7 @@ fn deliver_block_lines(
 fn deliver_include(
     b: &Block,
     granted: &BTreeSet<String>,
+    facts: &BTreeMap<String, String>,
     resolve: IncludeResolver,
     depth: usize,
     seen: &BTreeSet<String>,
@@ -2231,8 +2351,17 @@ fn deliver_include(
     };
     let mut seen2 = seen.clone();
     seen2.insert(id);
-    let inlined = parse(&text)
-        .and_then(|d| fold_full(&d, granted, &BTreeMap::new(), resolve, depth + 1, &seen2));
+    let inlined = parse(&text).and_then(|d| {
+        fold_full(
+            &d,
+            granted,
+            &BTreeMap::new(),
+            facts,
+            resolve,
+            depth + 1,
+            &seen2,
+        )
+    });
     match inlined {
         Ok(ex) => ex
             .cleaned
@@ -2255,15 +2384,16 @@ fn body_lines(body: &str) -> Vec<String> {
     }
 }
 
-/// Whether a `when` variant is kept for this reader: every `key="value"`
-/// attribute must equal the reader's parameter of that name. A condition
-/// referencing a parameter that is not in the context is not selected (its
-/// content is withheld rather than shown speculatively). A `when` with no
-/// simple attributes is always kept.
-pub(crate) fn when_kept(b: &Block, params: &BTreeMap<String, String>) -> bool {
-    b.attrs
-        .iter()
-        .all(|(k, v)| params.get(k).map(|pv| pv == v).unwrap_or(false))
+/// Whether a `when` variant is kept for this reader (§5.2 rules 2–3):
+/// conditions AND together; a condition's value is a comma-separated SET of
+/// admissible values (`agent="claude, gpt"` matches either); and a condition
+/// whose key is UNKNOWN to this reader KEEPS the content — a host that cannot
+/// evaluate a dimension keeps the guidance rather than censoring it.
+pub(crate) fn when_kept(b: &Block, facts: &BTreeMap<String, String>) -> bool {
+    b.attrs.iter().all(|(k, allowed)| match facts.get(k) {
+        None => true,
+        Some(actual) => allowed.split(',').any(|v| v.trim() == actual),
+    })
 }
 
 /// A set of machinery delivers ONE line naming its members (§4.3 / Appendix A);
@@ -2795,6 +2925,140 @@ fn canonical_keyword(kw: &str) -> Option<String> {
     registry().keyword_kind(kw).map(|kind| kind.to_uppercase())
 }
 
+/// If `line` STARTS a keyword block (§4.5): the kind it maps to, whether the
+/// line is a list item (a list-item keyword is its own single-line block),
+/// and the text after the label. `None` for prose.
+pub(crate) fn keyword_block_parts(line: &str) -> Option<(String, bool, String)> {
+    let (marker, rest) = split_list_marker(line);
+    let is_item = !marker.trim().is_empty();
+    let rest2 = rest.strip_prefix("**").unwrap_or(rest);
+    let colon = rest2.find(':')?;
+    let kw_raw = rest2[..colon].trim_end_matches("**").trim();
+    let kind = registry().keyword_kind(kw_raw)?.to_string();
+    let after = rest2[colon + 1..].trim_start_matches("**");
+    let after = after.strip_prefix([' ', '\t'])?;
+    Some((kind, is_item, after.trim_start().to_string()))
+}
+
+/// If `line` opens a blockquote alert (§4.6): the kind it maps to.
+pub(crate) fn alert_block_kind(line: &str) -> Option<String> {
+    let t = line.trim_start().strip_prefix('>')?.trim();
+    let inner = t.strip_prefix("[!")?.strip_suffix(']')?;
+    registry()
+        .keyword_kind(&inner.to_uppercase())
+        .map(str::to_string)
+}
+
+/// Lift a keyword or alert starting at `lines[i]` into a block. Returns the
+/// block and the index just past it. The block's BODY is the label-stripped
+/// text (§9.1); its REGION covers the raw lines, which is what delivery and
+/// any raw reconstruction slice from the source.
+pub(crate) fn lift_keyword_or_alert(
+    lines: &[&str],
+    i: usize,
+    base: usize,
+) -> Option<(Block, usize)> {
+    let line = lines[i];
+    if let Some(kind) = alert_block_kind(line) {
+        let mut body = Vec::new();
+        let mut j = i + 1;
+        while j < lines.len() {
+            let t = lines[j].trim_start();
+            if let Some(rest) = t.strip_prefix('>') {
+                body.push(rest.strip_prefix(' ').unwrap_or(rest).to_string());
+                j += 1;
+            } else {
+                break;
+            }
+        }
+        return Some((
+            Block {
+                kind,
+                disposition: Disposition::Prose,
+                name: None,
+                attrs: BTreeMap::new(),
+                body: body.join("\n"),
+                children: Vec::new(),
+                line: base + i + 1,
+                set_group: None,
+                form: Form::Alert,
+                region: (i, j - 1),
+            },
+            j,
+        ));
+    }
+    let (kind, is_item, first) = keyword_block_parts(line)?;
+    let mut body = vec![first];
+    let mut j = i + 1;
+    if !is_item {
+        // A paragraph extends to the next blank line — or the next line that
+        // itself starts a keyword, an alert, or any block form.
+        while j < lines.len() {
+            let l = lines[j];
+            if l.trim().is_empty()
+                || keyword_block_parts(l).is_some()
+                || alert_block_kind(l).is_some()
+                || open_fence(l).is_some()
+                || leaf_open(l).is_some()
+                || section_open(l).is_some()
+                || heading_level(l).is_some()
+                || code_fence_len(l).is_some()
+            {
+                break;
+            }
+            body.push(l.to_string());
+            j += 1;
+        }
+    }
+    Some((
+        Block {
+            kind,
+            disposition: Disposition::Prose,
+            name: None,
+            attrs: BTreeMap::new(),
+            body: body.join("\n"),
+            children: Vec::new(),
+            line: base + i + 1,
+            set_group: None,
+            form: Form::Keyword,
+            region: (i, j - 1),
+        },
+        j,
+    ))
+}
+
+/// Definition-list entries for the §9.1 tree: term free text, definition
+/// lines joined by NEWLINE (delivery joins by spaces; the tree keeps breaks).
+pub(crate) fn tree_deflist_entries(body: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut term: Option<String> = None;
+    let mut def: Vec<String> = Vec::new();
+    let flush =
+        |term: &mut Option<String>, def: &mut Vec<String>, out: &mut Vec<(String, String)>| {
+            if let Some(t) = term.take() {
+                out.push((t, def.join("\n")));
+            }
+            def.clear();
+        };
+    for line in body.lines() {
+        if let Some(rest) = line.trim_start().strip_prefix(':') {
+            def.push(rest.trim().to_string());
+        } else if line.trim().is_empty() {
+            flush(&mut term, &mut def, &mut out);
+        } else if term.is_some() && line.starts_with([' ', '\t']) {
+            def.push(line.trim().to_string());
+        } else {
+            flush(&mut term, &mut def, &mut out);
+            let name = line.split('{').next().unwrap_or(line).trim().to_string();
+            if !name.is_empty() {
+                term = Some(name);
+            }
+        }
+    }
+    flush(&mut term, &mut def, &mut out);
+    out
+}
+
 /// An `override` sub-block (inside `!mcp`) narrows one of the server's tools —
 /// append-only, folded into real registry config: disable, add trifecta tags,
 /// append an operator annotation. It may only make a tool MORE careful, and it
@@ -2923,11 +3187,25 @@ fn fold_machinery(b: &Block, out: &mut Extraction, errs: &mut Vec<String>) {
         }
         "skill" => match b.attrs.get("name") {
             Some(name) => {
+                // A section-form skill's standalone keyword/alert paragraphs
+                // were lifted into children (they are tree nodes, §9.1); the
+                // CATALOG body must not lose that guidance, so they re-render
+                // after the prose in source order.
+                let mut body = b.body.clone();
+                let mut rules: Vec<&Block> = b
+                    .children
+                    .iter()
+                    .filter(|c| matches!(c.form, Form::Keyword | Form::Alert))
+                    .collect();
+                rules.sort_by_key(|c| c.line);
+                for r in rules {
+                    body.push_str(&format!("\n\n**{}:** {}", r.kind.to_uppercase(), r.body));
+                }
                 out.skills.push(InlineSkill {
                     name: name.clone(),
                     description: b.attrs.get("description").cloned().unwrap_or_default(),
                     when_to_use: b.attrs.get("when").cloned(),
-                    body: b.body.clone(),
+                    body,
                 });
             }
             None => errs.push(format!("line {}: :::!skill needs a name", b.line)),
@@ -2976,7 +3254,7 @@ fn fold_machinery(b: &Block, out: &mut Extraction, errs: &mut Vec<String>) {
             let body_kind = lookup(other).map(|k| k.body).unwrap_or(BodyKind::Yaml);
             let mut rec = serde_json::Map::new();
             for (k, v) in &b.attrs {
-                rec.insert(k.clone(), attr_scalar(k, v));
+                rec.insert(k.clone(), attr_scalar(other, k, v));
             }
             match body_kind {
                 BodyKind::Yaml => {
@@ -3048,7 +3326,7 @@ fn fold_machinery(b: &Block, out: &mut Extraction, errs: &mut Vec<String>) {
 
 /// Parse a Markdown-table body into one record per row (header cells name the
 /// fields), for a `!data`/`!fixture` block.
-fn table_rows(body: &str) -> Vec<Value> {
+pub(crate) fn table_rows(body: &str) -> Vec<Value> {
     let rows: Vec<&str> = body
         .lines()
         .filter(|l| l.trim_start().starts_with('|'))
@@ -3759,6 +4037,7 @@ into: {stream: s, subject: x.y}
         let e = fold_full(
             &doc,
             &all_families(),
+            &BTreeMap::new(),
             &BTreeMap::new(),
             &resolve,
             0,

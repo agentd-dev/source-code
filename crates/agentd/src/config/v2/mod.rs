@@ -2794,7 +2794,11 @@ impl Settings {
                         .collect()
                 })
                 .unwrap_or_default();
-            match crate::config::idoc::extract(&instr, &granted) {
+            // The runtime supplies `agent` as a `when` fact (§5.2) — the
+            // one dimension agentd can always answer about itself.
+            let facts: std::collections::BTreeMap<String, String> =
+                [("agent".to_string(), "agentd".to_string())].into();
+            match crate::config::idoc::extract_with_facts(&instr, &granted, &facts) {
                 Ok(ex) => {
                     if let Some(a) = doc.get_mut("agent").and_then(Value::as_object_mut) {
                         a.insert("instruction".into(), Value::String(ex.cleaned.clone()));

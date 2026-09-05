@@ -107,7 +107,9 @@
             ],
             "properties": {
               "term": {
-                "$ref": "#/$defs/name"
+                "type": "string",
+                "minLength": 1,
+                "$comment": "free text for a definition-list body (glossary); a set member's term is its name and obeys the name grammar"
               },
               "attrs": {
                 "type": "object"

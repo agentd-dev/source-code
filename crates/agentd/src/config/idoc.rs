@@ -1824,7 +1824,32 @@ fn body_map(b: &Block, errs: &mut Vec<String>) -> Option<serde_json::Map<String,
         // The fence wins over a same-named body key.
         m.insert(k.clone(), attr_scalar(k, v));
     }
-    Some(m)
+    // `@secret-ref/name` is the spec's reference to a declared `!secret-ref`
+    // location (§3.4) — never a literal credential. Rewrite it to agentd's own
+    // secret-reference form so the inline-credential guard is satisfied and the
+    // value resolves at use, not read as a token.
+    let mut root = Value::Object(m);
+    resolve_secret_refs(&mut root);
+    match root {
+        Value::Object(m) => Some(m),
+        _ => None,
+    }
+}
+
+/// Recursively rewrite `@secret-ref/NAME` string values to `{{secret:NAME}}`.
+fn resolve_secret_refs(v: &mut Value) {
+    match v {
+        Value::String(s) => {
+            if let Some(name) = s.strip_prefix("@secret-ref/")
+                && !name.is_empty()
+            {
+                *s = format!("{{{{secret:{name}}}}}");
+            }
+        }
+        Value::Array(a) => a.iter_mut().for_each(resolve_secret_refs),
+        Value::Object(m) => m.values_mut().for_each(resolve_secret_refs),
+        _ => {}
+    }
 }
 
 /// Attribute names the spec treats as multi-valued (comma-separated within one
@@ -2787,6 +2812,18 @@ into: {stream: s, subject: x.y}
         assert!(srv.get("deny").is_none(), "deny is renamed");
         assert_eq!(srv["exclude"][0], "push:main");
         assert_eq!(srv["exclude"][1], "force-push");
+    }
+
+    #[test]
+    fn a_secret_ref_reference_is_not_read_as_a_literal_credential() {
+        // `@secret-ref/name` (§3.4) becomes agentd's `{{secret:name}}` form —
+        // a reference resolved at use, never an inline token.
+        let doc = "---\nspec: \"1\"\n---\n:::!mcp{name=t endpoint=https://x/mcp}\nauth: { kind: static, token: \"@secret-ref/tok\" }\n:::";
+        let e = fold(&parse(doc).unwrap(), &grants(&[])).unwrap();
+        assert_eq!(
+            e.config["mcp"]["servers"][0]["auth"]["token"], "{{secret:tok}}",
+            "the secret reference is rewritten, not left literal"
+        );
     }
 
     #[test]

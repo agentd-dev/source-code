@@ -189,6 +189,31 @@ pub struct Settings {
     pub security: Security,
     /// Who work is done ON BEHALF OF, and what travels with it.
     pub identity: Identity,
+    /// Pinned sources for SIGNED instruction documents (§7.5): each names a
+    /// publisher and its author/delivery keys, a per-source capability ceiling,
+    /// and a freshness deadline. Pinning is by key and publisher, never by URI.
+    /// Operator surface only — a served `!config` may not write it.
+    #[serde(default)]
+    pub instruction_sources: Vec<InstructionSource>,
+}
+
+/// One pinned instruction source (§7.5). The verification logic lives behind
+/// the `sign` feature (`config::attest`); this is the operator-facing config.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct InstructionSource {
+    /// The document this pin applies to (`instruction://…`).
+    pub uri: String,
+    /// The publisher the author signature must claim.
+    pub publisher: String,
+    /// Author (offline) verification keys — PEM paths.
+    pub author_keys: Vec<String>,
+    /// Delivery (online) verification keys — PEM paths.
+    pub delivery_keys: Vec<String>,
+    /// The per-source capability ceiling: effective families never exceed it.
+    pub max_capabilities: Vec<String>,
+    /// The revocation re-check deadline (a duration, e.g. `15m`).
+    pub freshness: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -5838,6 +5863,10 @@ pub const RESTART_ONLY_PATHS: &[&str] = &[
     // interface.enabled), so widening or narrowing the grant set is a restart —
     // the document is re-read against the new grants at boot.
     "agent.document_capabilities",
+    // Pinned trust for signed documents: widening what a source may attest, or
+    // which keys are trusted, is never a hot reload — a source an operator
+    // believes they revoked must not stay live (§7.5, the same rule as grants).
+    "instruction_sources",
     // The webhook listener's SOCKET, not its rules: rebinding an address or
     // swapping a TLS identity needs a restart, while `webhooks.default_auth`
     // and the routes themselves (which live in `workflows[].steps[]`) are
@@ -6288,6 +6317,9 @@ mod tests {
                         "workflows" => json!([{"name": "w", "steps": {}}]),
                         "a2a.principals" => json!([{"match": {"any": true}, "role": "user"}]),
                         "a2a.peers" => json!([{"name": "p", "endpoint": "https://p.example"}]),
+                        "instruction_sources" => {
+                            json!([{"uri": "instruction://x", "publisher": "https://pub.example"}])
+                        }
                         "skills.sources" => json!([{"server": "s"}]),
                         "security.policies" => {
                             json!([{"match": {"tool": "fs.*"}, "action": "deny"}])

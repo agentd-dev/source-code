@@ -318,6 +318,15 @@ fn top_level_properties(
                 "properties": {
                 "autonomous_as": { "type": "string", "description": "the actor a schedule/webhook/stream firing is attributed to (default `system`); without it the attribution chain is dropped at its first hop" },
                 "labels": { "type": "object", "additionalProperties": { "type": "string" }, "description": "labels stamped on autonomous work" } } }));
+    m.insert("instruction_sources".to_string(), json!({ "type": "array",
+                "description": "pinned sources for SIGNED instruction documents (§7.5): publisher + author/delivery keys + a per-source capability ceiling + a freshness deadline. Pinning is by key and publisher, never by URI. Operator surface only.",
+                "items": { "type": "object", "additionalProperties": false, "properties": {
+                "uri": { "type": "string", "description": "the document this pin applies to (instruction://…)" },
+                "publisher": { "type": "string", "description": "the publisher the author signature must claim" },
+                "author_keys": { "type": "array", "items": { "type": "string" }, "description": "author (offline) verification key PEM paths" },
+                "delivery_keys": { "type": "array", "items": { "type": "string" }, "description": "delivery (online) verification key PEM paths" },
+                "max_capabilities": { "type": "array", "items": { "enum": ["material", "knowledge", "interface", "identity", "compute", "infra", "compose"] }, "description": "the per-source ceiling; effective families never exceed it" },
+                "freshness": { "type": "string", "description": "the revocation re-check deadline (a duration, e.g. 15m)" } } } }));
     m.insert("security".to_string(), json!({ "type": "object", "additionalProperties": false, "properties": {
                 "allow_trifecta": { "type": "boolean" },
                 "policies": { "type": "array", "description": "ordered verdicts on a tool call; first match wins, no match is allow", "items": {

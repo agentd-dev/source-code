@@ -1,6 +1,6 @@
 # RFC 0041: Encrypted instruction documents — end-to-end confidentiality
 
-**Status:** Draft
+**Status:** Implemented (feature `decrypt`, default-off)
 **Author:** Andrii Tsok (drafted with Claude)
 **Date:** 2026-09-05
 **Extends:** RFC 0034 / RFC 0039 (instruction documents); composes with RFC 0040 (OCI transport) and the §7 signing surface.
@@ -63,8 +63,15 @@ model:
 
 | JWE field | Supported |
 |---|---|
-| `alg` (key management) | `ECDH-ES` and `ECDH-ES+A256KW` (X25519 recipient), `A256KW` (shared key wrap), `dir` (direct shared key), `PBES2-HS256+A128KW` (passphrase) |
-| `enc` (content) | `A256GCM`, `A128GCM`, `C20P` (ChaCha20-Poly1305) |
+| `alg` (key management) | `ECDH-ES` (X25519 recipient, RFC 8037) and `dir` (direct shared key) |
+| `enc` (content) | `A256GCM`, `A128GCM` |
+
+*(Implementation note, v1: the `*KW` families — `A256KW`, `ECDH-ES+A256KW`,
+`PBES2-*` — need the raw AES block cipher, which `ring` does not expose, and a
+hand-rolled table-based AES is a cache-timing liability that fails the bar
+hand-rolled X25519 passes; `C20P` never completed JOSE registration. All are
+refused BY NAME with the supported set. Passphrase deployments use age's
+scrypt stanzas below.)*
 
 **B. age (v1)** — the modern file-encryption format (X25519 recipients or an
 scrypt passphrase, ChaCha20-Poly1305 payload, HKDF key derivation). It is the
@@ -72,13 +79,14 @@ ergonomic "encrypt this file for these recipients" tool (`age -r <pubkey>`),
 which is how operators will actually produce envelopes; agentd implements the
 **decrypt** half.
 
-The **common algorithms** the request asks for map to: AES-256-GCM and
-ChaCha20-Poly1305 for content; X25519 (ECDH) and AES key-wrap for keys;
-scrypt/PBES2 for passphrases. All are on `ring` or a few dozen lines of glue
-(bech32 for age keys, base64url for JWE); none needs a new crate. Legacy
-algorithms (RSA-OAEP, PGP/OpenPGP, AES-CBC) are deliberately **out of scope** —
-the two modern AEAD suites cover the need without dragging in a large asymmetric
-or PGP stack.
+The **common algorithms** map to: AES-GCM and ChaCha20-Poly1305 for content;
+X25519 (ECDH) for recipients; scrypt for passphrases. All are on `ring` or a
+few dozen hand-rolled lines with published test vectors (the RFC 7748 X25519
+ladder — ring's agreement API is ephemeral-only and decryption needs a static
+recipient key — scrypt's RFC 7914 core, bech32, base64url); no new crate.
+Legacy algorithms (RSA-OAEP, PGP/OpenPGP, AES-CBC) are deliberately **out of
+scope** — the modern AEAD suites cover the need without dragging in a large
+asymmetric or PGP stack.
 
 ## 4. Recipient keys
 

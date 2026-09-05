@@ -331,3 +331,62 @@ interval. agentd's freshness watch re-fetches the instruction on that cadence;
 a source unreachable past its deadline **refuses new work while live runs
 drain**, and a successful re-read clears the freeze. `compute` and `infra` must
 re-check; other classes should.
+
+## Where the document comes from
+
+One document, four transports — each ending at the same parse → trust-ladder →
+fold pipeline:
+
+| Source | Written as | Trust act |
+|---|---|---|
+| inline | `agent.instruction: \|` … | the operator wrote it in place |
+| a file | `--instruction-file agent.md` | the operator named the path |
+| an MCP resource | `agent.instruction: "mcp://docs/agent"` | the operator named the resource (re-read on server notify) |
+| an **OCI artifact** (RFC 0040) | `agent.instruction: "oci://ghcr.io/acme/agent:v3"` or `…@sha256:…` | the operator pinned the reference |
+
+**OCI pull** (`--features oci`). The document is pushed to any OCI registry as
+a first-class artifact and pulled over the Distribution API at config load —
+token dance on a 401 (static docker-config credentials; credential-helper
+binaries are never executed), the manifest digest recorded as the version pin
+(`instruction.loaded` logs it), the blob verified against its descriptor
+digest before a byte is used, CDN redirects followed without the registry
+token. Push with any client:
+
+```console
+$ oras push ghcr.io/acme/support-agent:v3 \
+    --artifact-type application/vnd.instruction.document.v1 \
+    agent.md:'text/markdown; variant=instruction'
+```
+
+A `:tag` reference is re-pulled by the §7.7 freshness watch (a changed
+manifest digest updates the delivered text; machinery changes apply on
+reload/restart); a `@sha256:` reference is immutable.
+
+## Encrypted instructions
+
+A document can travel **end-to-end encrypted** (RFC 0041, `--features
+decrypt`): the author encrypts to the agent's recipient key, the registry /
+CDN / MCP server / bucket holds only ciphertext, and agentd decrypts on the
+fly — from any source above. Decrypting grants nothing: the trust ladder and
+the trifecta apply to the plaintext exactly as if it arrived clear.
+
+Two standard envelope formats, both on the crypto already in the tree:
+
+- **age v1** — what operators produce (`age -r age1… agent.md`, binary or
+  `--armor`): X25519 recipients and scrypt passphrases.
+- **JWE Compact** — the JOSE-native form that composes with §7 signing:
+  `ECDH-ES` (X25519) and `dir`, content `A256GCM`/`A128GCM`.
+
+```yaml
+instruction:
+  decrypt:
+    keys: [/etc/keys/agent.key]        # AGE-SECRET-KEY-1…, hex, or base64
+    passphrase: "{{secret:doc_pass}}"  # for age scrypt envelopes
+```
+
+`instruction.decrypt` is operator surface, restart-only, and unreachable from
+a served `:::!config` — a document never names the key that decrypts it. A
+binary built **without** the feature still detects an envelope and refuses it
+by name; ciphertext is never delivered to the model as prose. Sign-then-encrypt
+puts the §7 author signature *inside* the envelope (even authorship stays
+confidential); the delivery signature covers the ciphertext as sent.

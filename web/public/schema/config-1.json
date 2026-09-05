@@ -2752,6 +2752,31 @@
       },
       "type": "object"
     },
+    "instruction": {
+      "additionalProperties": false,
+      "description": "envelope handling for the instruction document itself (RFC 0041). Operator surface, restart-only; a served !config may not write it.",
+      "properties": {
+        "decrypt": {
+          "additionalProperties": false,
+          "description": "end-to-end decryption: the recipient keys that open an encrypted instruction envelope (age v1 or JWE compact)",
+          "properties": {
+            "keys": {
+              "description": "key FILE paths — each an AGE-SECRET-KEY-1… identity, 64 hex chars, or base64 (a 32-byte key; several entries support rotation)",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "passphrase": {
+              "description": "the passphrase for age scrypt envelopes — a {{secret:…}} reference, resolved at use",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
     "instruction_sources": {
       "description": "pinned sources for SIGNED instruction documents (§7.5): publisher + author/delivery keys + a per-source capability ceiling + a freshness deadline. Pinning is by key and publisher, never by URI. Operator surface only.",
       "items": {

@@ -5,6 +5,34 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## Unreleased
+
+### Added
+
+- **Instruction from an OCI artifact registry** (RFC 0040, feature `oci`,
+  default-off): `agent.instruction: "oci://registry/repo:tag[@sha256:…]"` pulls
+  the document over the Distribution API v2 at config load — token dance,
+  manifest + blob digest verification (a `@sha256:` pin must match; a `:tag`
+  records the digest it resolved to), static docker-config credentials
+  (credential-helper binaries are never executed), CDN redirects followed
+  without the registry token. The document's machinery folds into the config
+  like an inline instruction; the §7.7 freshness watch re-pulls a `:tag` on its
+  interval. Zero new crates — HTTP + JSON on the existing client, SHA-256 from
+  `ring`.
+- **End-to-end encrypted instructions** (RFC 0041, feature `decrypt`,
+  default-off): any source (inline, file, MCP resource, `oci://`) may deliver
+  an encrypted envelope — **age v1** (X25519 recipients + scrypt passphrases,
+  binary or armored; interop verified against the real `age` binary both ways)
+  or **JWE Compact** (`ECDH-ES`/`dir`, `A256GCM`/`A128GCM`) — and agentd
+  decrypts on the fly with keys from the new operator-only
+  `instruction.decrypt` section (restart-only; unreachable from a served
+  `!config`). Decrypting grants nothing: the trust ladder and trifecta apply
+  to the plaintext unchanged. Zero new crates: ring's AEADs/HKDF/HMAC/PBKDF2
+  plus a hand-rolled RFC 7748 X25519 ladder (ring's agreement API cannot
+  import a static recipient key) and RFC 7914 scrypt core, both pinned to
+  their published test vectors. A build without the feature still detects an
+  envelope and refuses it by name — ciphertext is never delivered as prose.
+
 ## v1.8.0 — the instruction runtime: forms, delivery, signing
 
 agentd is now a **conformant reference runtime for the

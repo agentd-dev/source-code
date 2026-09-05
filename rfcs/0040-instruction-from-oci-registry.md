@@ -1,6 +1,6 @@
 # RFC 0040: Instruction documents from an OCI artifact registry
 
-**Status:** Draft
+**Status:** Implemented (feature `oci`, default-off)
 **Author:** Andrii Tsok (drafted with Claude)
 **Date:** 2026-09-05
 **Extends:** RFC 0034 / RFC 0039 (instruction documents) — this adds a source, not a format.
@@ -80,9 +80,17 @@ It is equally valid as an `instruction_sources[].uri` (§7.5) and as an
 `::include{uri="oci://…"}` target (§5.2) — one transport for the whole
 composition graph.
 
-`looks_like_resource_uri` grows the `oci://` scheme; the loader routes it to the
-OCI puller instead of the https/MCP fetchers. Everything downstream — parse,
-trust-ladder grants, fold, delivery — is untouched.
+The pull happens at **config load** (`from_document`), not at runtime — the
+document's machinery must fold into the config being built (workflows, MCP
+servers, the trust ladder), which is impossible once loading is over;
+URL-fetched workflow definitions set the precedent for a load-time dial. The
+resolved text then flows through decryption (RFC 0041) and idoc extraction
+exactly like an inline document, and an `InstructionOrigin` (uri + manifest
+digest) rides into the runtime so `instruction.loaded` logs the version pin
+and the §7.7 freshness watch re-pulls the original reference. A freshness
+re-pull delivers the re-extracted cleaned text; machinery CHANGES apply on
+reload/restart (the §5.5 quiesce doctrine), and a document that no longer
+folds keeps the running text — refuse-and-keep.
 
 ## 4. The pull
 

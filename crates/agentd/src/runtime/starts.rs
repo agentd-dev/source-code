@@ -338,6 +338,17 @@ impl Runtime {
             );
             return;
         }
+        // §7.7 revocation: a stale signed instruction source refuses NEW work
+        // (live runs keep draining). The freeze clears on the next reachable
+        // re-read.
+        if self.freshness_frozen {
+            self.log.warn(
+                "start.frozen",
+                json!({"workflow": workflow, "node": node, "kind": kind,
+                       "cause": "signed instruction source is stale past its freshness deadline (§7.7)"}),
+            );
+            return;
+        }
         let inputs = match spec.get("inputs") {
             Some(mapping) => {
                 let mut data = crate::engine::template::Data::new();

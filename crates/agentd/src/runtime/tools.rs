@@ -1246,6 +1246,7 @@ impl Runtime {
                 );
             }
             Some("goal") => self.on_goal_check(&t.payload),
+            Some("freshness") => self.on_freshness_check(&t.payload),
             other => self
                 .log
                 .warn("timer.unknown_owner", json!({"id": t.id, "owner": other})),

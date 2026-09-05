@@ -349,6 +349,14 @@ pub struct Runtime {
     /// Unix-ms a goal LLM judge was dispatched (so overlapping checks don't spawn
     /// duplicate judges); `None` = none in flight.
     pub(crate) goal_judge_at: Option<u64>,
+    /// The §7.7 freshness deadline (unix-ms): a signed instruction source's
+    /// authorization must be re-read before this, or the runtime refuses NEW
+    /// work. `None` = no freshness watch armed.
+    pub(crate) freshness_deadline_ms: Option<u64>,
+    /// True when a signed instruction source has gone STALE past its freshness
+    /// deadline (§7.7 rule 2): new autonomous work is refused; live work drains.
+    /// A successful re-read clears it.
+    pub(crate) freshness_frozen: bool,
     /// Durable A2A tasks, keyed by task id.
     #[cfg(feature = "a2a")]
     pub(crate) tasks: BTreeMap<String, crate::a2a::Task>,

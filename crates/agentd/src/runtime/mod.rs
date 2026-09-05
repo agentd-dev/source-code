@@ -22,6 +22,7 @@ pub mod env; // system-prompt data + the default template
 pub mod events;
 #[cfg(feature = "exec")]
 pub mod exec; // guarded local command runner behind the `exec` tool (default-OFF)
+pub mod freshness; // §7.7 signed-instruction freshness watch: re-fetch + refuse-on-stale
 pub mod goal;
 pub mod http_node;
 pub mod human; // human-in-the-loop: ask_human gates + fallbacks
@@ -570,6 +571,8 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
         executing: BTreeMap::new(),
         last_manifest_flush: Instant::now(),
         goal_judge_at: None,
+        freshness_deadline_ms: None,
+        freshness_frozen: false,
         #[cfg(feature = "a2a")]
         tasks: BTreeMap::new(),
         #[cfg(feature = "a2a")]
@@ -914,6 +917,7 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
     rt.arm_workflows();
     rt.arm_long_lived_starts();
     rt.arm_goal();
+    rt.arm_freshness();
     rt.respawn_restored_subagents();
     rt.respawn_restored_instances();
     // The A2A transport: the HTTPS listener for conversations,

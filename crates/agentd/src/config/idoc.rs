@@ -84,6 +84,10 @@ pub struct Kind {
     pub sub_of: Option<String>,
     /// The one provenance line a machinery block delivers (spec `x-acknowledgement`).
     pub ack: Option<String>,
+    /// The singular/plural nouns a set of this kind is acknowledged by
+    /// (`x-noun`/`x-nouns`): `[3 human roles are declared: …]`.
+    pub noun: Option<String>,
+    pub nouns: Option<String>,
 }
 
 /// The registry as loaded from the vendored JSON Schema — every kind, plus the
@@ -98,7 +102,7 @@ pub struct Registry {
 /// The Instruction Document Specification's registry and grammar, vendored
 /// verbatim from `github.com/instruction-md/specification`. It is the single
 /// source of truth: the parser reads kinds, forms, bodies and grants from it.
-const SCHEMA_JSON: &str = include_str!("instruction-document.schema.json");
+const SCHEMA_JSON: &str = include_str!("instruction.schema.json");
 
 static REGISTRY: std::sync::LazyLock<Registry> = std::sync::LazyLock::new(Registry::load);
 
@@ -131,7 +135,7 @@ pub fn contains_blocks(text: &str) -> bool {
 impl Registry {
     fn load() -> Registry {
         let schema: Value = serde_json::from_str(SCHEMA_JSON)
-            .expect("the vendored instruction-document schema is valid JSON");
+            .expect("the vendored instruction schema is valid JSON");
         let reg = &schema["x-registry"];
         let version = reg["version"].as_u64().unwrap_or(1) as u32;
         let grant_tokens: BTreeSet<String> = reg["grants"]
@@ -197,6 +201,8 @@ impl Registry {
                     grant,
                     sub_of: d["x-parent"].as_str().map(str::to_string),
                     ack: d["x-acknowledgement"].as_str().map(str::to_string),
+                    noun: d["x-noun"].as_str().map(str::to_string),
+                    nouns: d["x-nouns"].as_str().map(str::to_string),
                 },
             );
         }

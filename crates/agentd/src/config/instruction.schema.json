@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://instruction.md/specification/1/instruction-document.schema.json",
-  "title": "Instruction Document — block tree, version 1",
-  "description": "Validates the BLOCK TREE a parser produces from an instruction document, not the Markdown itself. Pipeline: parse Markdown with the grammar in x-grammar → emit this JSON shape → validate → apply the semantic rules in x-semantic-rules, which JSON Schema cannot express. Every kind's disposition, family, grant, forms, body type and acknowledgement template are carried as x- keywords so a validator in any language can be driven entirely from this file.",
+  "$id": "https://instruction.md/specification/1/instruction.schema.json",
+  "title": "Instruction — block tree, version 1",
+  "description": "Validates the BLOCK TREE a parser produces from an instruction, not the Markdown itself. Pipeline: parse Markdown with the grammar in x-grammar → emit this JSON shape → validate → apply the semantic rules in x-semantic-rules, which JSON Schema cannot express. Every kind's disposition, family, grant, forms, body type and acknowledgement template are carried as x- keywords so a validator in any language can be driven entirely from this file.",
   "type": "object",
   "required": [
     "spec",
@@ -3509,6 +3509,8 @@
         "x-identity-scope": "document",
         "x-family": "core",
         "x-grant": "default",
+        "x-noun": "workflow",
+        "x-nouns": "workflows",
         "x-acknowledgement": "[workflow \"{name}\" is loaded and runs autonomously]",
         "if": {
           "properties": {
@@ -3621,6 +3623,8 @@
         "x-identity-scope": "document",
         "x-family": "core",
         "x-grant": "default",
+        "x-noun": "skill",
+        "x-nouns": "skills",
         "x-acknowledgement": "[skill \"{name}\" is available — reference it as @skill/{name}]",
         "if": {
           "properties": {
@@ -3820,6 +3824,8 @@
         "x-identity-scope": "document",
         "x-family": "core",
         "x-grant": "default",
+        "x-noun": "mcp server",
+        "x-nouns": "mcp servers",
         "x-acknowledgement": "[mcp server \"{name}\" is connected; its tools are available]",
         "x-subblocks": [
           "override"
@@ -3935,6 +3941,8 @@
         "x-identity-scope": "document",
         "x-family": "core",
         "x-grant": "default",
+        "x-noun": "event stream",
+        "x-nouns": "event streams",
         "x-acknowledgement": "[event stream \"{name}\" is declared]",
         "if": {
           "properties": {
@@ -4131,6 +4139,8 @@
         "x-identity-scope": "document",
         "x-family": "material",
         "x-grant": "material",
+        "x-noun": "file",
+        "x-nouns": "files",
         "x-acknowledgement": "[file \"{name}\" is present at {path}]",
         "if": {
           "properties": {
@@ -4238,6 +4248,8 @@
         "x-identity-scope": "document",
         "x-family": "material",
         "x-grant": "default",
+        "x-noun": "data block",
+        "x-nouns": "data blocks",
         "x-acknowledgement": "[data \"{name}\" is available]",
         "if": {
           "properties": {
@@ -4347,6 +4359,8 @@
         "x-identity-scope": "document",
         "x-family": "material",
         "x-grant": "material",
+        "x-noun": "media item",
+        "x-nouns": "media items",
         "x-acknowledgement": "[media \"{name}\" is available]",
         "if": {
           "properties": {
@@ -4454,6 +4468,8 @@
         "x-identity-scope": "document",
         "x-family": "material",
         "x-grant": "material",
+        "x-noun": "asset",
+        "x-nouns": "assets",
         "x-acknowledgement": "[asset \"{name}\" is available]",
         "if": {
           "properties": {
@@ -4563,6 +4579,8 @@
         "x-identity-scope": "document",
         "x-family": "knowledge",
         "x-grant": "knowledge",
+        "x-noun": "knowledge base",
+        "x-nouns": "knowledge bases",
         "x-acknowledgement": "[knowledge base \"{name}\" is available]",
         "if": {
           "properties": {
@@ -4670,6 +4688,8 @@
         "x-identity-scope": "document",
         "x-family": "knowledge",
         "x-grant": "knowledge",
+        "x-noun": "retrieval policy",
+        "x-nouns": "retrieval policies",
         "if": {
           "properties": {
             "form": {
@@ -4781,6 +4801,8 @@
         "x-identity-scope": "document",
         "x-family": "knowledge",
         "x-grant": "knowledge",
+        "x-noun": "source",
+        "x-nouns": "sources",
         "if": {
           "properties": {
             "form": {
@@ -4887,6 +4909,8 @@
         "x-identity-scope": "document",
         "x-family": "interface",
         "x-grant": "interface",
+        "x-noun": "endpoint",
+        "x-nouns": "endpoints",
         "x-acknowledgement": "[endpoint \"{name}\" listens at {path}]",
         "if": {
           "properties": {
@@ -4996,6 +5020,8 @@
         "x-identity-scope": "document",
         "x-family": "interface",
         "x-grant": "interface",
+        "x-noun": "ui",
+        "x-nouns": "uis",
         "x-subblocks": [
           "schema",
           "preview"
@@ -5111,6 +5137,8 @@
         "x-identity-scope": "document",
         "x-family": "interface",
         "x-grant": "interface",
+        "x-noun": "human role",
+        "x-nouns": "human roles",
         "x-acknowledgement": "[human role \"{name}\" may be asked]",
         "if": {
           "properties": {
@@ -5223,6 +5251,8 @@
         "x-identity-scope": "document",
         "x-family": "interface",
         "x-grant": "interface",
+        "x-noun": "channel",
+        "x-nouns": "channels",
         "x-acknowledgement": "[channel \"{name}\" is available for {target}]",
         "if": {
           "properties": {
@@ -5335,6 +5365,8 @@
         "x-identity-scope": "document",
         "x-family": "identity",
         "x-grant": "identity",
+        "x-noun": "peer",
+        "x-nouns": "peers",
         "if": {
           "properties": {
             "form": {
@@ -5441,6 +5473,8 @@
         "x-identity-scope": "document",
         "x-family": "identity",
         "x-grant": "identity",
+        "x-noun": "policy",
+        "x-nouns": "policies",
         "if": {
           "properties": {
             "form": {
@@ -5550,6 +5584,8 @@
         "x-identity-scope": "document",
         "x-family": "identity",
         "x-grant": "identity",
+        "x-noun": "secret reference",
+        "x-nouns": "secret references",
         "if": {
           "properties": {
             "form": {
@@ -5656,6 +5692,8 @@
         "x-identity-scope": "document",
         "x-family": "compute",
         "x-grant": "compute",
+        "x-noun": "runtime",
+        "x-nouns": "runtimes",
         "if": {
           "properties": {
             "form": {
@@ -5765,6 +5803,8 @@
         "x-identity-scope": "document",
         "x-family": "compute",
         "x-grant": "compute",
+        "x-noun": "function",
+        "x-nouns": "functions",
         "x-acknowledgement": "[tool \"{name}\" is available]",
         "x-subblocks": [
           "signature"
@@ -5878,6 +5918,8 @@
         "x-identity-scope": "document",
         "x-family": "compute",
         "x-grant": "compute",
+        "x-noun": "test",
+        "x-nouns": "tests",
         "x-subblocks": [
           "case"
         ],
@@ -5987,6 +6029,8 @@
         "x-identity-scope": "document",
         "x-family": "compute",
         "x-grant": "compute",
+        "x-noun": "fixture",
+        "x-nouns": "fixtures",
         "if": {
           "properties": {
             "form": {
@@ -6095,6 +6139,8 @@
         "x-identity-scope": "document",
         "x-family": "infra",
         "x-grant": "infra",
+        "x-noun": "git repository",
+        "x-nouns": "git repositories",
         "if": {
           "properties": {
             "form": {
@@ -6201,6 +6247,8 @@
         "x-identity-scope": "document",
         "x-family": "infra",
         "x-grant": "infra",
+        "x-noun": "volume",
+        "x-nouns": "volumes",
         "if": {
           "properties": {
             "form": {
@@ -6307,6 +6355,8 @@
         "x-identity-scope": "document",
         "x-family": "infra",
         "x-grant": "infra",
+        "x-noun": "image",
+        "x-nouns": "images",
         "if": {
           "properties": {
             "form": {
@@ -6418,6 +6468,8 @@
         "x-identity-scope": "document",
         "x-family": "compose",
         "x-grant": "compose",
+        "x-noun": "subagent",
+        "x-nouns": "subagents",
         "x-acknowledgement": "[subagent \"{name}\" is available]",
         "if": {
           "properties": {
@@ -6439,7 +6491,7 @@
         }
       },
       "override": {
-        "$comment": "override: machinery, family compose, inside mcp",
+        "$comment": "override: machinery, inside mcp",
         "properties": {
           "kind": {
             "const": "override"
@@ -6523,7 +6575,6 @@
         "x-body": "yaml",
         "x-identity": false,
         "x-identity-scope": "parent",
-        "x-family": "compose",
         "x-grant": "default",
         "x-parent": "mcp"
       },
@@ -7046,6 +7097,7 @@
         "agent"
       ]
     },
+    "set-acknowledgement": "[{count} {x-nouns} are declared: {names}]",
     "default-grant": [
       "workflow",
       "skill",
@@ -7141,7 +7193,7 @@
     {
       "id": "unknown-sigiled",
       "spec": "§3.3 rule 2",
-      "rule": "A sigiled block whose kind is not in x-registry.machinery is refused, naming the known set. (An unknown BARE kind never reaches the tree: the parser emits it as prose.)"
+      "rule": "A sigiled block whose kind is not in x-registry.machinery is refused, naming the implemented version and the known set. (An unknown BARE kind never reaches the tree: the parser emits it as prose.)"
     },
     {
       "id": "references-resolve",
@@ -7206,7 +7258,7 @@
     {
       "id": "version-skew",
       "spec": "§3.3 rule 8",
-      "rule": "A declared spec version this validator does not implement, or a lexical marker it does not recognize, is a refusal — never silently parsed as prose."
+      "rule": "A declared spec version this validator does not implement is a refusal. With unknown-sigiled this closes the silent path: a later version's machinery is either declared, and refused here, or sigiled and unknown, and refused there — never silently parsed as prose."
     },
     {
       "id": "front-matter-absent",

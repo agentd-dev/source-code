@@ -152,7 +152,7 @@ fn a_full_document_loads_every_element() {
 
     // The document surface reports what was granted and what loaded.
     let doc = &caps["document"];
-    assert_eq!(doc["spec"], "instruction-document/1");
+    assert_eq!(doc["spec"], "instruction/1");
     let decl = doc["declarations"]
         .as_object()
         .expect("declarations present");

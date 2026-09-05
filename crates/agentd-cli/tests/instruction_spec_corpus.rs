@@ -7,7 +7,7 @@
 //! substrings appear, and what registers (`--capabilities`). The corpus is the
 //! spec's teeth — the spec is owned by instruction.md (CC-BY 4.0 text), and
 //! agentd conforms by running the corpus, not by claiming to. The registry the
-//! parser uses IS the vendored `instruction-document.schema.json`; behaviour
+//! parser uses IS the vendored `instruction.schema.json`; behaviour
 //! pinned here is CONTRACT: a change that fails a fixture is a spec change, not
 //! a refactor.
 #![cfg(all(unix, feature = "workflow"))]
@@ -206,12 +206,12 @@ fn the_vendored_schema_matches_upstream_when_present() {
     let upstream = explicit
         .clone()
         .unwrap_or_else(|_| "/root/instruction-md/specification".into());
-    let up = Path::new(&upstream).join("instruction-document.schema.json");
+    let up = Path::new(&upstream).join("instruction.schema.json");
     if !up.exists() {
         assert!(
             explicit.is_err(),
             "INSTRUCTION_SPEC_REPO={upstream:?} was set but has no \
-             instruction-document.schema.json — a drift check pointed at a \
+             instruction.schema.json — a drift check pointed at a \
              missing path must fail, not skip"
         );
         eprintln!("no upstream spec clone at the default path; drift check skipped");
@@ -224,7 +224,7 @@ fn the_vendored_schema_matches_upstream_when_present() {
         assert_eq!(
             ours[key], up_schema[key],
             "the vendored schema's {key:?} drifted from upstream — \
-             re-vendor crates/agentd/src/config/instruction-document.schema.json"
+             re-vendor crates/agentd/src/config/instruction.schema.json"
         );
     }
 }

@@ -1236,7 +1236,7 @@ pub fn capabilities(loaded: &Loaded) -> Value {
         "document": (!s.agent.document_capabilities.is_empty()
             || !s.agent.document_declarations.is_empty())
             .then(|| json!({
-                "spec": "instruction-document/1",
+                "spec": "instruction/1",
                 "capabilities": s.agent.document_capabilities,
                 "declarations": s.agent.document_declarations.iter()
                     .map(|(k, v)| (k.clone(), json!(v.len())))

@@ -50,6 +50,33 @@ const WATCH_MASK: u32 = libc::IN_CLOSE_WRITE
     | libc::IN_MOVED_FROM
     | libc::IN_DELETE;
 
+/// What a watch FIRES for: one named file, or any file in the folder matching
+/// a glob. The two cases the reload path needs — a config or instruction
+/// document, and a folder of documents where a file appearing is as much a
+/// change as one being edited.
+pub enum Target {
+    /// One file, by basename — a config file, an instruction document.
+    File(String),
+    /// Any file in the directory matching a comma-separated `glob:` — a
+    /// folder of instruction documents, where a file APPEARING is as much a
+    /// change as one being edited.
+    Glob(String),
+}
+
+impl Target {
+    fn matches(&self, name: &str) -> bool {
+        match self {
+            Target::File(b) => name == b,
+            Target::Glob(p) => crate::config::fileset::glob_match_any(p, name),
+        }
+    }
+    fn describe(&self) -> &str {
+        match self {
+            Target::File(b) | Target::Glob(b) => b,
+        }
+    }
+}
+
 /// Decide what a batch of inotify records means for the watched config file:
 /// `(fire, rearm)`.
 ///
@@ -59,7 +86,7 @@ const WATCH_MASK: u32 = libc::IN_CLOSE_WRITE
 /// fixture carrying an `IN_CLOSE_WRITE` on the leaf file that a kubelet never
 /// emits. A false model of the writer, encoded in a passing test, is why the
 /// filter shipped unable to fire on Kubernetes at all.
-fn decide(events: &[(u32, Option<String>)], basename: &str) -> (bool, bool) {
+fn decide(events: &[(u32, Option<String>)], target: &Target) -> (bool, bool) {
     let (mut fire, mut rearm) = (false, false);
     for (mask, name) in events {
         // The watch was dropped (the projected dir was swapped out from under
@@ -79,7 +106,7 @@ fn decide(events: &[(u32, Option<String>)], basename: &str) -> (bool, bool) {
         // nothing in the update names it. Matching the basename alone meant the
         // watcher armed, received every event, and discarded all of them.
         let named = name.as_deref();
-        if named == Some(basename) || named == Some(KUBE_DATA_LINK) {
+        if named.is_some_and(|n| target.matches(n)) || named == Some(KUBE_DATA_LINK) {
             fire = true;
         }
     }
@@ -163,12 +190,31 @@ pub fn spawn_config_watcher(config_path: &Path, log: &Logger) {
         "config.watch.armed",
         json!({"path": path.display().to_string(), "dir": parent.display().to_string()}),
     );
+    spawn(parent, Target::File(basename), &log);
+}
+
+/// Watch a DIRECTORY for any file matching `glob` — what a `dir:` instruction
+/// needs, where the change that matters is often a document APPEARING rather
+/// than an existing one being edited. Same latch, same reload path.
+pub fn spawn_dir_watcher(dir: &Path, glob: &str, log: &Logger) {
+    log.info(
+        "config.watch.armed",
+        json!({"dir": dir.display().to_string(), "glob": glob}),
+    );
+    spawn(dir.to_path_buf(), Target::Glob(glob.to_string()), log);
+}
+
+fn spawn(dir: std::path::PathBuf, target: Target, log: &Logger) {
     let thread_log = log.clone();
+    let what = target.describe().to_string();
     if let Err(e) = std::thread::Builder::new()
         .name("config-watch".into())
-        .spawn(move || watch_loop(&parent, &basename, &thread_log))
+        .spawn(move || watch_loop(&dir, &target, &thread_log))
     {
-        log.warn("config.watch.error", json!({"err": e.to_string()}));
+        log.warn(
+            "config.watch.error",
+            json!({"err": e.to_string(), "target": what}),
+        );
     }
 }
 
@@ -177,7 +223,7 @@ pub fn spawn_config_watcher(config_path: &Path, log: &Logger) {
 /// reloads. Re-arms the directory watch after an `IN_IGNORED` so a second swap
 /// still fires.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn watch_loop(dir: &Path, basename: &str, log: &Logger) {
+fn watch_loop(dir: &Path, target: &Target, log: &Logger) {
     use std::os::unix::ffi::OsStrExt;
 
     // CLOEXEC so the fd never leaks into a re-exec'd subagent.
@@ -240,7 +286,7 @@ fn watch_loop(dir: &Path, basename: &str, log: &Logger) {
         if n == 0 {
             continue;
         }
-        let (mut fire, rearm) = decide(&parse_events(&buf[..n as usize]), basename);
+        let (mut fire, rearm) = decide(&parse_events(&buf[..n as usize]), target);
         if rearm {
             // Re-`add_watch` the same parent path (idempotent: if the old watch
             // is still valid the kernel returns the same wd). A re-arm failure is
@@ -263,7 +309,7 @@ fn watch_loop(dir: &Path, basename: &str, log: &Logger) {
             if crate::signals::reload_requested() {
                 continue;
             }
-            log.info("config.watch.fired", json!({"file": basename}));
+            log.info("config.watch.fired", json!({"file": target.describe()}));
             crate::signals::request_reload_from_watch();
         }
     }
@@ -383,7 +429,7 @@ mod tests {
             (0x0000_0080, Some("..data".to_string())),     // IN_MOVED_TO
             (0x0000_0200, Some("..2026_08_30_18_00_00.111".to_string())), // IN_DELETE
         ];
-        let (fire, rearm) = decide(&kubelet, "agentd.json");
+        let (fire, rearm) = decide(&kubelet, &Target::File("agentd.json".into()));
         assert!(
             fire,
             "the ..data rename IS the new revision being published"
@@ -391,11 +437,36 @@ mod tests {
         assert!(!rearm, "the mount dir is never removed, so nothing re-arms");
     }
 
+    /// A FOLDER target fires on any file matching its glob — including one
+    /// that did not exist when the watch was armed, which is the change an
+    /// operator makes most often to a `dir:` instruction. A file the glob
+    /// does not name is ignored, so a stray `.swp` is not a reload.
+    #[test]
+    fn a_folder_target_fires_on_a_matching_file_only() {
+        let target = Target::Glob("*.md,*.txt".into());
+        let created = [(0x0000_0100u32, Some("40-new-policy.md".to_string()))];
+        assert_eq!(decide(&created, &target), (true, false), "a new document");
+        let edited = [(0x0000_0008u32, Some("10-first.txt".to_string()))];
+        assert_eq!(decide(&edited, &target), (true, false), "an edit in place");
+        let noise = [
+            (0x0000_0008u32, Some(".10-first.md.swp".to_string())),
+            (0x0000_0100, Some("notes.yaml".to_string())),
+        ];
+        assert_eq!(
+            decide(&noise, &target),
+            (false, false),
+            "an editor swap file and a non-matching extension are not the instruction"
+        );
+    }
+
     /// The ordinary case still works: an editor rewriting the file in place.
     #[test]
     fn a_plain_write_to_the_watched_file_fires() {
         let edit = [(0x0000_0008u32, Some("agentd.json".to_string()))];
-        assert_eq!(decide(&edit, "agentd.json"), (true, false));
+        assert_eq!(
+            decide(&edit, &Target::File("agentd.json".into())),
+            (true, false)
+        );
     }
 
     /// And unrelated churn in the same directory does not.
@@ -406,14 +477,20 @@ mod tests {
             (0x0000_0008, Some("other.json".to_string())),
             (0x0000_0200, Some("..data-old".to_string())),
         ];
-        assert_eq!(decide(&noise, "agentd.json"), (false, false));
+        assert_eq!(
+            decide(&noise, &Target::File("agentd.json".into())),
+            (false, false)
+        );
     }
 
     /// A dropped watch still asks for a re-arm.
     #[test]
     fn in_ignored_requests_a_rearm() {
         let dropped = [(0x0000_8000u32, None)]; // IN_IGNORED, no name
-        assert_eq!(decide(&dropped, "agentd.json"), (false, true));
+        assert_eq!(
+            decide(&dropped, &Target::File("agentd.json".into())),
+            (false, true)
+        );
     }
 
     #[test]

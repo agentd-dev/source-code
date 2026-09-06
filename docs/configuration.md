@@ -243,17 +243,25 @@ file spelling is never in doubt.
 
 | Flag | Path | Env | Default | Description |
 |---|---|---|---|---|
-| `--instruction <VALUE>` | `agent.instruction` | `INSTRUCTION` | *(none)* | The standing task/policy — the text, a file path, or a URI (`oci://`, `mcp://`, `instruction://`, `https://`). agentd tells them apart; see §5a.1. |
+| `--instruction <VALUE>` | `agent.instruction` | `INSTRUCTION` | *(none)* | The standing task/policy — the text, a file path, a folder, or a URI (`oci://`, `mcp://`, `instruction://`, `https://`). agentd tells them apart; see §5a.1. |
 | `--instruction.text <TEXT>` | `agent.instruction.text` | — | — | The instruction itself, never read as a path or URI. |
 | `--instruction.file <PATH>` | `agent.instruction.file` | — | — | A local file (e.g. a ConfigMap/Secret projection); watched when `lifecycle.watch_config` is on. |
 | `--instruction.oci <REF>` | `agent.instruction.oci` | — | — | An OCI artifact — `ghcr.io/acme/agent:v3` or `…@sha256:…` (the `oci://` is implied). |
-| `--instruction.http <URL>` | `agent.instruction.http` | — | — | An `https://` document, fetched at load. |
+| `--instruction.dir <DIR>` | `agent.instruction.dir` | — | — | A **folder** of documents, combined into one instruction. §5a.1a. |
+| `--instruction.glob <GLOBS>` | `agent.instruction.glob` | — | `*.md,*.markdown,*.txt,*.instruction` | Which files under `dir` (comma-separated; `**` recurses). |
+| `--instruction.order <name\|date>` | `agent.instruction.order` | — | `name` | The order the folder's documents combine in. |
+| `--instruction.url <URL>` | `agent.instruction.url` | — | — | An `https://` document, fetched at load. |
 | `--instruction.mcp <URI>` | `agent.instruction.mcp` | — | — | A resource a declared MCP server serves (read + subscribed). |
 | `--instruction.refresh <auto\|off\|DUR>` | `agent.instruction.refresh` | — | `auto` | How often to re-read it; `auto` picks the mechanism that fits the source. §5a.2. |
 | `--instruction.unavailable <POLICY>` | `agent.instruction.unavailable` | — | `auto` | What to do when the source stops answering: `auto`, `keep`, `freeze`, `drain`, `exit`. §5a.3. |
 | `--instruction-file <PATH>` | `agent.instruction` | — | — | The earlier spelling of `--instruction.file`; still supported. |
-| `--prompt <TEXT>` | `agent.prompt` | `PROMPT` | *(none)* | A one-shot task: with no workflows configured, the generated run executes this while `instruction` stays the standing policy. |
-| `--prompt-file <PATH>` | `agent.prompt` | — | — | Read the prompt from a local file. |
+| `--prompt <VALUE>` | `agent.prompt` | `PROMPT` | *(none)* | A one-shot task: with no workflows configured, the generated run executes this while `instruction` stays the standing policy. Classified exactly as `--instruction` is, so a path names the file. |
+| `--prompt.text <TEXT>` | `agent.prompt.text` | — | — | The task itself, never read as a path or URI. |
+| `--prompt.file <PATH>` | `agent.prompt.file` | — | — | Read the task from a local file. |
+| `--prompt.dir <DIR>` | `agent.prompt.dir` | — | — | A folder of documents, combined into one task (`--prompt.glob`, `--prompt.order`). |
+| `--prompt.url <URL>` | `agent.prompt.url` | — | — | An `https://` document, fetched at load. |
+| `--prompt.oci <REF>` | `agent.prompt.oci` | — | — | An OCI artifact (needs `--features oci`). |
+| `--prompt-file <PATH>` | `agent.prompt` | — | — | The earlier spelling of `--prompt.file`; still supported. |
 | `--intelligence <LIST>` | `intelligence.endpoints` | `INTELLIGENCE` | *(none)* | Ordered, comma-separated LLM endpoint **list** for failover. Each element is `https://host[:port][/path]` (or a loopback `http://` for a same-host dev gateway) — see §4. |
 | `-c`, `--config <PATH>` | — | `AGENT_CONFIG` | *(none)* | Load a declarative config file — YAML or JSON (§12). Repeatable; the `=` form works too. |
 
@@ -597,8 +605,12 @@ breaker's open/closed state stays per step.
 
 ## 5a. The instruction — where it comes from, and what happens when it moves
 
-An agent's instruction is one setting with four transports and three
-behaviours. `agent.instruction` carries all of it.
+An agent's instruction is one setting with six sources and three behaviours.
+`agent.instruction` carries all of it.
+
+The same shape — the same classification, the same source keys, the same code —
+also carries [`agent.prompt`](#5a1b-the-same-shape-for-agentprompt-and-subagent-templates)
+and a [subagent template's instruction](#5a1b-the-same-shape-for-agentprompt-and-subagent-templates).
 
 ### 5a.1 Naming the source
 
@@ -608,6 +620,7 @@ The **short form** is a value, and agentd works out what kind it is:
 agent:
   instruction: "You are the order desk. Every paid order is fulfilled."
   # or  ./agent.md          — a path
+  # or  ./instructions/      — a FOLDER of documents, combined into one
   # or  oci://ghcr.io/acme/agent:v3
   # or  instruction://ins_1@stable   — a resource an MCP server serves
   # or  https://docs.example/agent.md
@@ -621,7 +634,9 @@ would be the worst outcome available:
 | contains a newline | **text** — no path has one, and this is what `instruction: \|` produces |
 | `scheme://…` | that **URI** — `oci://` an artifact, `https://` a document, anything else a served resource |
 | `file://…` | a **file**, said outright |
-| no whitespace **and** path-shaped (`/`, `./`, `../`, `~/`) or a document extension (`.md`, `.markdown`, `.txt`, `.instruction`) | a **file** |
+| no whitespace **and** a document extension (`.md`, `.markdown`, `.txt`, `.instruction`) | a **file** |
+| no whitespace **and** path-shaped (`/`, `./`, `../`, `~/`), ending in `/` or naming a folder that exists | a **directory** |
+| no whitespace **and** path-shaped otherwise | a **file** |
 | anything else | **text** |
 
 So `"Summarize the file report.md"` is text (it has spaces), `./agent.md` is a
@@ -634,7 +649,7 @@ settings live:
 ```yaml
 agent:
   instruction:
-    oci: "ghcr.io/acme/agent:latest"    # exactly one of: text file oci http mcp
+    oci: "ghcr.io/acme/agent:latest"    # exactly one of: text file dir oci url mcp
     refresh: 60s
     unavailable: drain
     decrypt: { keys: ["/etc/keys/agent.key"] }
@@ -662,6 +677,67 @@ name a server nests one URI inside another:
 The two spellings compose on the command line — `--instruction ./agent.md
 --instruction.refresh 30s` keeps both, in either order.
 
+### 5a.1a A folder of documents — `dir:`, `glob:`, `order:`
+
+A policy that outgrew one file does not need a build step. `dir:` combines
+every document a folder matches into **one** instruction:
+
+```yaml
+agent:
+  instruction:
+    dir: ./instructions            # or just: instruction: ./instructions/
+    glob: "*.md"                   # default: *.md,*.markdown,*.txt,*.instruction
+    order: name                    # name (default) | date
+```
+
+- **`order: name`** sorts by path, which is what a `10-`, `20-`, `30-` naming
+  convention exists to exploit — and it is stable across machines, unlike the
+  order a directory listing happens to come back in.
+- **`order: date`** sorts by modification time, oldest first, so the newest
+  material reads last.
+- A `**` in the glob **recurses**; a bare `*.md` does not — the same rule
+  every other tool that takes a glob uses.
+- Documents are joined with one blank line between them, each trimmed of
+  trailing blank lines, so the combination does not depend on how a file
+  happens to end.
+- Front matter belongs to a document, and the combination is **one** document:
+  the first file's front matter is kept, and a later file's is dropped with a
+  warning rather than left to read as prose in the middle of the text.
+- A folder that matches **nothing** is a refusal, not an empty instruction.
+
+This is the same `dir:`/`glob:`/`order:` a [workflow entry](#61-where-definitions-come-from)
+takes, running the same code, so a folder of documents behaves identically
+wherever it appears.
+
+With `lifecycle.watch_config` on, the **folder** is watched as well as the
+files in it — for a folder, the change an operator makes most often is dropping
+a new document in, which no watch on the files already there can see.
+
+### 5a.1b The same shape for `agent.prompt` and subagent templates
+
+A one-shot task and a subagent template's definition are documents too, and
+they are as likely to live in a file as to be typed at a terminal:
+
+```yaml
+agent:
+  prompt: ./tasks/close-the-books.md     # classified exactly as `instruction` is
+  # or  prompt: { file: ./task.md }
+  # or  prompt: { dir: ./tasks, order: date }
+  # or  prompt: { text: "./this-is-literally-the-task.md" }
+
+subagents:
+  templates:
+    researcher:
+      instruction: { dir: ./templates/researcher, glob: "*.md" }
+```
+
+Both take the load-time sources — `text`, `file`, `dir` (+`glob`, `order`),
+`url`, `oci` — and refuse the same way `instruction` does: two sources named,
+or a `glob:` with no `dir:` to match in, is an error at load. `mcp:` is
+instruction-only: an MCP resource is read *and subscribed* by the runtime's
+client, which does not exist yet at config load, so a child that needs one
+gets its own `agent.instruction`.
+
 ### 5a.2 Refresh — `auto`, `off`, or a duration
 
 `auto` (the default) picks the mechanism that fits the source, because polling
@@ -670,6 +746,7 @@ is only ever right for one of them:
 | Source | `auto` does |
 |---|---|
 | a **file** | watches it (inotify) when `lifecycle.watch_config` is on — instant, and no polling |
+| a **directory** | watches the folder *and* its documents, likewise — a new file appearing counts |
 | `oci://…@sha256:` | **nothing** — a digest pin is immutable, so re-reading can only return what it already returned |
 | `oci://…:tag` | polls every 5m — a mutable tag is the one case polling is for |
 | `mcp://`, `instruction://` | the server's `resources/updated` notification, polling every 5m as a fallback |
@@ -709,6 +786,34 @@ governs only what happens AFTER a successful start:
 Every outcome is one log line — `instruction.unavailable` with the policy that
 applied and whether the source was trust-pinned — so a frozen or draining
 agent is never a mystery.
+
+### 5a.3a What `lifecycle.watch_config` actually watches
+
+With `watch_config` on, agentd watches every document a **reload re-reads**,
+and nothing else:
+
+| Watched | Why |
+|---|---|
+| each config file that was loaded | the original case |
+| `agent.instruction`'s **file** | the document an operator edits most often |
+| `agent.instruction`'s **folder** and the documents in it | a document appearing is a change no file watch can see |
+| each workflow entry's `file:`, and each `dir:` on its glob | `workflows.*` is reloadable; the definitions live in those files |
+| `skills.dir`, and every skill file loaded from it | skills are documents, and the reload rebuilds the catalogue from the folder — the per-file watches catch a `<name>/SKILL.md` edit, which a watch on the parent folder never sees |
+
+A reload triggered this way re-reads those documents even when the config
+values around them are byte-identical — an edited workflow file whose entry
+never changed used to reload successfully and change nothing.
+
+**Deliberately not watched:**
+
+- `intelligence.token_file` needs no watch: it is re-read **at every dial**, so
+  a rotated Kubernetes projected token or SPIFFE JWT-SVID is picked up by the
+  next request with no reload at all.
+- TLS material — `a2a.tls`, `webhooks.tls`, `security.*` — is
+  [restart-only](#11-hot-reload--the-reloadablerestart-only-partition). A watch
+  there would fire a reload that *cannot* apply the rotation and would report
+  success anyway, which is precisely the failure this project refuses to ship.
+  Rotate a certificate by restarting the process.
 
 ### 5a.4 Encrypted instructions
 
@@ -801,6 +906,7 @@ workflows:
     allow_private: true             # the fetch rides the same SSRF guard as http nodes
   - dir: ./workflows                # every match becomes a workflow, named by file stem
     glob: "**/*.yaml"               # `*` within a segment, `**` crosses segments
+    order: name                     # name (default, path order) | date (mtime, oldest first)
 ```
 
 A `url` fetch happens once, at startup, before validation — an unreachable URL
@@ -810,6 +916,13 @@ header map (§3). A `dir` with zero matches is also exit `2`: an empty glob is
 almost always a typo, and fail-open here means a reactive daemon with no
 reactions. However a definition arrived, it is hashed and pinned identically —
 a run started under one hash finishes under it.
+
+`dir:`, `glob:` and `order:` are the same three settings an
+[instruction folder](#5a1a-a-folder-of-documents--dir-glob-order) takes,
+running the same code — a folder of documents is one behaviour, not two that
+look alike. With `lifecycle.watch_config` on, both the named files and the
+folders are watched, and a reload re-reads them even when the entries
+themselves did not change.
 
 **`security.workflows.immutable: true`** makes the loaded set read-only for the
 *agent itself*: `workflow.create` / `workflow.update` / `workflow.delete` tool
@@ -866,7 +979,9 @@ Four directives, fail-closed (an unknown name is exit `2` naming this set):
   retirement (§6.1, workflows doc §retirement). The model reads the *cleaned*
   instruction, where the block became a one-line note — prose and machinery
   never double-speak. An instruction that carries a workflow gets **no sugar
-  `main` loop**: it declared its machinery explicitly.
+  `main` loop**: it declared its machinery explicitly. That holds however the
+  document was named — inline, a file, a folder, an artifact — because the
+  decision is made after the source resolves and its directives are extracted.
 - **`:::skill{name, description, when}`** — an **inline skill**: the body
   joins the skills catalogue with no MCP server involved, referenced as
   `@skill:<name>` like any discovered skill. Inline wins a name collision —

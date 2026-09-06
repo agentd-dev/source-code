@@ -258,6 +258,14 @@ impl Catalogue {
     pub fn get(&self, name: &str) -> Option<&SkillMeta> {
         self.skills.get(name)
     }
+    /// Whether two catalogues hold the same skills — names, metadata, and the
+    /// BODY of a local or inline one, which is where an edited file shows up.
+    /// A reload rebuilds the catalogue whenever a local folder is configured,
+    /// and uses this to decide whether it actually changed anything.
+    pub fn same_skills_as(&self, other: &Catalogue) -> bool {
+        self.skills == other.skills
+    }
+
     pub fn names(&self) -> Vec<String> {
         self.skills.keys().cloned().collect()
     }

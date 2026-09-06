@@ -325,6 +325,17 @@ pub struct Agent {
     /// short form, which is the point of the short form.
     #[serde(skip)]
     pub instruction_spec: InstructionSpec,
+    /// The files a `dir:` instruction was combined FROM, in the order they
+    /// were combined — DERIVED. Watched exactly like a single `file:`, since
+    /// the whole point of the folder is that adding a document to it changes
+    /// the instruction.
+    #[serde(skip)]
+    pub instruction_dir_files: Vec<String>,
+    /// Warnings raised while resolving the instruction — DERIVED. Carried
+    /// here because `from_document` resolves the source but `load` owns the
+    /// diagnostics list.
+    #[serde(skip)]
+    pub instruction_warnings: Vec<String>,
 }
 
 /// The provenance of a load-time-resolved instruction reference.
@@ -429,8 +440,20 @@ pub struct InstructionSpec {
     pub file: Option<String>,
     /// An OCI artifact: `ghcr.io/acme/agent:v3` (the `oci://` is implied).
     pub oci: Option<String>,
-    /// An `https://` document, fetched at load.
-    pub http: Option<String>,
+    /// An `https://` document, fetched at load. Named `url` because a
+    /// workflow entry's HTTP source has been `url:` since long before this —
+    /// one concept, one word.
+    pub url: Option<String>,
+    /// A DIRECTORY of documents, combined into one instruction in `order`.
+    /// The same `dir:`/`glob:` a workflow entry takes, and the same code
+    /// behind it, so a folder of documents behaves identically wherever it
+    /// appears.
+    pub dir: Option<String>,
+    /// Which files under `dir` (comma-separated; `**` recurses). Defaults to
+    /// the document extensions.
+    pub glob: Option<String>,
+    /// `name` (default, path order) or `date` (mtime, oldest first).
+    pub order: Option<crate::config::fileset::Order>,
     /// A resource a configured MCP server serves, read and subscribed.
     ///
     /// Either the resource URI alone — `mcp: "instruction://ins_1@stable"`,
@@ -464,12 +487,24 @@ impl InstructionSpec {
             ("text", self.text.as_ref()),
             ("file", self.file.as_ref()),
             ("oci", self.oci.as_ref()),
-            ("http", self.http.as_ref()),
+            ("url", self.url.as_ref()),
+            ("dir", self.dir.as_ref()),
         ]
         .into_iter()
         .filter_map(|(k, v)| v.map(|v| (k, v.clone())))
         .chain(self.mcp.as_ref().map(|m| ("mcp", m.to_uri())))
         .collect();
+        // A setting about a folder with no folder named configures nothing.
+        // Refusing says so at load, rather than at the first puzzled reading
+        // of the config months later.
+        if self.dir.is_none() {
+            if self.glob.is_some() {
+                return Err("agent.instruction.glob has no dir to match in".into());
+            }
+            if self.order.is_some() {
+                return Err("agent.instruction.order has no dir to order".into());
+            }
+        }
         match named.as_slice() {
             // Settings without a source is a REFUSAL. Writing `instruction:`
             // at all is saying the agent has one; ending up with none because
@@ -482,9 +517,9 @@ impl InstructionSpec {
             // flag is merged into the document before this runs, so the
             // source is present by the time it is checked.
             [] => Err(
-                "agent.instruction names no source — set one of text, file, oci, \
-                       http or mcp (or use the short form `instruction: \"…\"`); omit \
-                       `instruction` entirely for an agent that has none"
+                "agent.instruction names no source — set one of text, file, dir, \
+                       oci, url or mcp (or use the short form `instruction: \"…\"`); \
+                       omit `instruction` entirely for an agent that has none"
                     .to_string(),
             ),
             [(kind, v)] => Ok(Some(match *kind {
@@ -494,6 +529,10 @@ impl InstructionSpec {
                 // path. Only the short form has to be classified.
                 "oci" if !v.starts_with("oci://") => format!("oci://{v}"),
                 "file" if !v.starts_with("file://") => format!("file://{v}"),
+                // A folder is combined into the scalar during load; the
+                // placeholder keeps the "exactly one source" arithmetic
+                // honest until that happens.
+                "dir" => String::new(),
                 _ => v.clone(),
             })),
             // Two sources IS ambiguous and unrecoverable — there is no right
@@ -580,9 +619,36 @@ pub enum InstructionValue {
     /// A path on disk (`file://` stripped). Read at load; watched when
     /// `lifecycle.watch_config` is on.
     File(String),
+    /// A DIRECTORY of documents, combined into one. Recognised only when the
+    /// value ends in `/` or names a folder that exists — a bare word is still
+    /// text, and a document extension still wins as a file.
+    Dir(String),
     /// `oci://` an artifact, `mcp://`/`instruction://`/… a served resource.
     Uri,
 }
+
+/// Which long-form key a short-form scalar belongs under. ONE mapping, used
+/// by both the config-file promotion and the flag merge — they disagreed once,
+/// which is exactly the kind of drift a shared function cannot have.
+pub fn instruction_key(v: &str) -> &'static str {
+    match classify_instruction(v) {
+        InstructionValue::Text => "text",
+        InstructionValue::File(_) => "file",
+        InstructionValue::Dir(_) => "dir",
+        InstructionValue::Uri if v.trim().starts_with("oci://") => "oci",
+        InstructionValue::Uri
+            if v.trim().starts_with("https://") || v.trim().starts_with("http://") =>
+        {
+            "url"
+        }
+        InstructionValue::Uri => "mcp",
+    }
+}
+
+/// Every long-form key that names a SOURCE (as opposed to a setting about
+/// one). The single list the refusals, the flag merge and the schema-path
+/// sample all read, so adding a source cannot leave one of them behind.
+pub const INSTRUCTION_SOURCE_KEYS: [&str; 6] = ["text", "file", "dir", "oci", "url", "mcp"];
 
 /// Classify an `agent.instruction` value. The rules are deliberately narrow so
 /// that prose is never mistaken for a path: a value is a FILE only when it
@@ -608,11 +674,195 @@ pub fn classify_instruction(v: &str) -> InstructionValue {
         let doc_extension = [".md", ".markdown", ".txt", ".instruction"]
             .iter()
             .any(|e| t.ends_with(e));
-        if path_shaped || doc_extension {
+        if doc_extension {
+            return InstructionValue::File(t.to_string());
+        }
+        if path_shaped {
+            // A trailing slash says "folder" outright; otherwise ask the disk,
+            // because `./instructions` and `./instructions.md` are told apart
+            // by what is there, not by their spelling.
+            if t.ends_with('/') || std::path::Path::new(&expand_home(t)).is_dir() {
+                return InstructionValue::Dir(t.trim_end_matches('/').to_string());
+            }
             return InstructionValue::File(t.to_string());
         }
     }
     InstructionValue::Text
+}
+
+/// Resolve an instruction-source VALUE — the short scalar or the long object —
+/// to the document text it names.
+///
+/// The AGENT's own instruction resolves inline in [`Settings::from_document`],
+/// because it has more to do there (envelope decryption, idoc extraction, the
+/// origin pin the freshness watch re-pulls). This is the shared resolver for
+/// every OTHER place a document can come from — a subagent template's
+/// instruction today — so `file:`, `dir:` + `glob:` + `order:` and `url:` mean
+/// exactly what they mean for the agent, rather than nearly.
+///
+/// Returns the text and any warnings. `mcp:` is refused: an MCP resource is
+/// read and SUBSCRIBED by the runtime's client, which does not exist at config
+/// load, so a template that wants one belongs in a child with its own
+/// `agent.instruction`.
+pub fn resolve_document_source(v: &Value, at: &str) -> Result<(String, Vec<String>), String> {
+    let spec: InstructionSpec = match v {
+        Value::String(scalar) => {
+            let key = instruction_key(scalar);
+            serde_json::from_value(json!({ key: scalar })).map_err(|e| format!("{at}: {e}"))?
+        }
+        Value::Object(_) => serde_json::from_value(v.clone()).map_err(|e| format!("{at}: {e}"))?,
+        _ => return Err(format!("{at} must be a string or an object")),
+    };
+    // The same "exactly one source" arithmetic the agent's instruction gets,
+    // including the refusal for settings with nothing to configure.
+    let value = spec
+        .source_value()
+        .map_err(|e| format!("{at}: {e}"))?
+        .ok_or_else(|| format!("{at} names no source"))?;
+    if let Some(dir) = spec.dir.as_deref() {
+        let c = combine_folder(
+            dir,
+            spec.glob.as_deref(),
+            spec.order.unwrap_or_default(),
+            at,
+        )?;
+        return Ok((c.text, c.warnings));
+    }
+    if let Some(text) = spec.text.as_deref() {
+        return Ok((text.to_string(), Vec::new()));
+    }
+    if let Some(path) = value.strip_prefix("file://") {
+        let expanded = expand_home(path);
+        let text =
+            std::fs::read_to_string(&expanded).map_err(|e| format!("{at} file {path:?}: {e}"))?;
+        return Ok((text, Vec::new()));
+    }
+    if value.starts_with("https://") || value.starts_with("http://") {
+        let text = crate::config::http_get(&value).map_err(|e| format!("{at} {value}: {e}"))?;
+        return Ok((text, Vec::new()));
+    }
+    if value.starts_with("oci://") {
+        #[cfg(feature = "oci")]
+        {
+            let pulled = crate::oci::pull(&value).map_err(|e| format!("{at} {value}: {e}"))?;
+            let text = String::from_utf8(pulled.bytes)
+                .map_err(|_| format!("{at} {value}: the artifact is not UTF-8"))?;
+            return Ok((text, Vec::new()));
+        }
+        #[cfg(not(feature = "oci"))]
+        return Err(format!(
+            "{at} {value}: an oci:// source requires building with --features oci"
+        ));
+    }
+    if spec.mcp.is_some() {
+        return Err(format!(
+            "{at}: an MCP resource is read and subscribed by the runtime's client, which \
+             does not exist at config load — give the child its own agent.instruction, or \
+             name a file, dir, url or oci source here"
+        ));
+    }
+    Ok((value, Vec::new()))
+}
+
+/// `~/` against `$HOME`, unchanged when there is no `$HOME` to expand against.
+fn expand_home(path: &str) -> String {
+    match path.strip_prefix("~/") {
+        Some(rest) => match std::env::var("HOME") {
+            Ok(home) => format!("{home}/{rest}"),
+            Err(_) => path.to_string(),
+        },
+        None => path.to_string(),
+    }
+}
+
+/// A folder of documents, combined into one — the result of a `dir:` source.
+pub struct CombinedFolder {
+    pub text: String,
+    /// The files that went into it, in the order they went in.
+    pub files: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+/// Combine every document a folder matches into ONE document, in `order`.
+///
+/// Shared by every `dir:` instruction source — the agent's own and a subagent
+/// template's — because "which files, in what order, joined how" is one
+/// behaviour, and two copies of it are two behaviours that only look alike.
+/// `at` prefixes every message with the setting being resolved.
+pub fn combine_folder(
+    dir: &str,
+    glob: Option<&str>,
+    order: crate::config::fileset::Order,
+    at: &str,
+) -> Result<CombinedFolder, String> {
+    let pattern = glob.unwrap_or(crate::config::fileset::DOCUMENT_GLOB);
+    let files = crate::config::fileset::expand_dir_ordered(&expand_home(dir), pattern, order)
+        .map_err(|e| format!("{at} dir {dir}: {e}"))?;
+    if files.is_empty() {
+        return Err(format!(
+            "{at} dir {dir}: no file matched {pattern:?} — a named directory with \
+             no match is a refusal, not an empty instruction"
+        ));
+    }
+    let mut warnings = Vec::new();
+    let mut text = String::new();
+    for (i, f) in files.iter().enumerate() {
+        let body = std::fs::read_to_string(f).map_err(|e| format!("{at} dir {dir}: {f}: {e}"))?;
+        // Front matter belongs to the document, and a combined instruction is
+        // ONE document: the first file's is kept, a later file's is dropped
+        // with a warning rather than left to read as prose mid-text.
+        let body = if i == 0 {
+            body
+        } else {
+            match strip_front_matter(&body) {
+                (stripped, true) => {
+                    warnings.push(format!(
+                        "{at} dir {dir}: front matter in {f} was dropped — only the first \
+                         document's front matter applies"
+                    ));
+                    stripped
+                }
+                (whole, false) => whole,
+            }
+        };
+        // Each document contributes its text with trailing blank lines
+        // trimmed, separated by ONE blank line — so the combination is stable
+        // however each file happens to end.
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(body.trim_end());
+        text.push('\n');
+    }
+    Ok(CombinedFolder {
+        text,
+        files,
+        warnings,
+    })
+}
+
+/// Split a leading `---` front-matter block off a document, returning the body
+/// and whether one was there. Only a fence on the FIRST line counts, which is
+/// the spec's own rule — a `---` further down is a horizontal rule and stays.
+pub fn strip_front_matter(text: &str) -> (String, bool) {
+    let t = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let Some(rest) = t
+        .strip_prefix("---\n")
+        .or_else(|| t.strip_prefix("---\r\n"))
+    else {
+        return (text.to_string(), false);
+    };
+    for (i, line) in rest.match_indices('\n') {
+        let _ = line;
+        let (block, after) = rest.split_at(i + 1);
+        let last = block[..block.len() - 1].rsplit('\n').next().unwrap_or("");
+        if last.trim_end() == "---" {
+            return (after.to_string(), true);
+        }
+    }
+    // An unterminated fence is not front matter; hand the document back whole
+    // rather than swallow it.
+    (text.to_string(), false)
 }
 
 /// `scheme://…` with no whitespace, and a scheme that is not a bare `http(s)`
@@ -2921,6 +3171,12 @@ impl Settings {
         if let Some(v) = doc.get("agent").and_then(|a| a.get("instruction"))
             && v.is_object()
         {
+            if v.get("http").is_some() {
+                return Err(format!(
+                    "{source}: agent.instruction.http was renamed to `url` — the spelling a \
+                     workflow entry's HTTP source already uses"
+                ));
+            }
             let spec: InstructionSpec = serde_json::from_value(v.clone())
                 .map_err(|e| format!("{source}: agent.instruction: {e}"))?;
             let value = spec.source_value().map_err(|e| format!("{source}: {e}"))?;
@@ -2941,6 +3197,20 @@ impl Settings {
         #[cfg_attr(not(feature = "oci"), allow(unused_mut))]
         let mut instruction_origin: Option<InstructionOrigin> = None;
         let mut instruction_path: Option<String> = None;
+        let mut instruction_dir_files: Vec<String> = Vec::new();
+        let mut instruction_warnings: Vec<String> = Vec::new();
+        // The SHORT form naming a folder — `--instruction ./instructions/`, or
+        // a path that turns out to be a directory. It sets the very `dir:` the
+        // long form sets, so exactly one piece of code combines a folder.
+        if instruction_spec.dir.is_none()
+            && let Some(v) = doc
+                .get("agent")
+                .and_then(|a| a.get("instruction"))
+                .and_then(Value::as_str)
+            && let InstructionValue::Dir(d) = classify_instruction(v)
+        {
+            instruction_spec.dir = Some(d);
+        }
         // A FILE-valued instruction is read here, before anything interprets
         // the value: earlier than envelope detection (a file may hold
         // ciphertext) and earlier than the idoc scan (its `:::` markers live
@@ -2953,13 +3223,7 @@ impl Settings {
             .and_then(Value::as_str)
             && let InstructionValue::File(path) = classify_instruction(v)
         {
-            let expanded = match path.strip_prefix("~/") {
-                Some(rest) => match std::env::var("HOME") {
-                    Ok(home) => format!("{home}/{rest}"),
-                    Err(_) => path.clone(),
-                },
-                None => path.clone(),
-            };
+            let expanded = expand_home(&path);
             let bytes = std::fs::read(&expanded).map_err(|e| {
                 format!(
                     "{source}: agent.instruction {path:?}: {e} — it reads as a FILE (no \
@@ -3031,6 +3295,23 @@ impl Settings {
                  building with --features oci"
             ));
         }
+        // A DIRECTORY of documents, combined into one instruction in the
+        // configured order. Same `dir:`/`glob:` a workflow entry takes, same
+        // code behind it (`config::fileset`), so a folder behaves the same
+        // wherever it appears.
+        if let Some(dir) = instruction_spec.dir.clone() {
+            let combined = combine_folder(
+                &dir,
+                instruction_spec.glob.as_deref(),
+                instruction_spec.order.unwrap_or_default(),
+                &format!("{source}: agent.instruction"),
+            )?;
+            if let Some(a) = doc.get_mut("agent").and_then(Value::as_object_mut) {
+                a.insert("instruction".into(), Value::String(combined.text));
+            }
+            instruction_dir_files = combined.files;
+            instruction_warnings.extend(combined.warnings);
+        }
         // An `https://` document, fetched at load for the same reason an OCI
         // artifact is: its machinery has to fold into the configuration being
         // built. Plain GET over the existing client — an endpoint needing
@@ -3040,7 +3321,7 @@ impl Settings {
             .and_then(|a| a.get("instruction"))
             .and_then(Value::as_str)
             .filter(|s| s.starts_with("https://") || s.starts_with("http://"))
-            .filter(|_| instruction_spec.http.is_some())
+            .filter(|_| instruction_spec.url.is_some())
             .map(str::to_string)
         {
             let text = crate::config::http_get(&url)
@@ -3148,6 +3429,47 @@ impl Settings {
                 }
             }
         }
+        // `agent.prompt` is a document too — a one-shot task is as likely to
+        // live in a file as to be typed at a terminal, and before this the
+        // only way to pass one was a shell `$(cat …)`. Same classification,
+        // same sources, same code.
+        if let Some(v) = doc.get("agent").and_then(|a| a.get("prompt"))
+            && !matches!(v, Value::String(sc) if instruction_key(sc) == "text")
+        {
+            let (text, warns) = resolve_document_source(v, &format!("{source}: agent.prompt"))?;
+            instruction_warnings.extend(warns);
+            if let Some(a) = doc.get_mut("agent").and_then(Value::as_object_mut) {
+                a.insert("prompt".into(), Value::String(text));
+            }
+        }
+        // A subagent template's instruction is a document too, and it takes
+        // every source the agent's own instruction takes that can be resolved
+        // at load — `file:`, a `dir:` of documents, `url:`, `oci:`. Resolved
+        // HERE, before typing, so `SubagentTemplate.instruction` stays the
+        // plain text that boot-time directive extraction already expects.
+        if let Some(templates) = doc
+            .get_mut("subagents")
+            .and_then(|s| s.get_mut("templates"))
+            .and_then(Value::as_object_mut)
+        {
+            for (name, t) in templates.iter_mut() {
+                let Some(v) = t.get("instruction") else {
+                    continue;
+                };
+                // Plain text is by far the common case and must not pay for
+                // this: only a non-string, or a string that classifies as a
+                // path or URI, is resolved.
+                if matches!(v, Value::String(sc) if instruction_key(sc) == "text") {
+                    continue;
+                }
+                let at = format!("{source}: subagents.templates.{name}.instruction");
+                let (text, warns) = resolve_document_source(v, &at)?;
+                instruction_warnings.extend(warns);
+                if let Some(o) = t.as_object_mut() {
+                    o.insert("instruction".into(), Value::String(text));
+                }
+            }
+        }
         let mut settings: Settings =
             serde_json::from_value(doc).map_err(|e| format!("{source} parse error: {e}"))?;
         // Workflows were spliced into the document before deserialization, so
@@ -3160,6 +3482,8 @@ impl Settings {
         settings.agent.instruction_origin = instruction_origin;
         settings.agent.instruction_path = instruction_path;
         settings.agent.instruction_spec = instruction_spec;
+        settings.agent.instruction_dir_files = instruction_dir_files;
+        settings.agent.instruction_warnings = instruction_warnings;
         Ok(settings)
     }
 
@@ -3336,8 +3660,23 @@ pub const ALIASES: &[Alias] = &[
         kind: AliasKind::Set,
     },
     Alias {
-        flag: "--instruction.http",
-        path: "agent.instruction.http",
+        flag: "--instruction.url",
+        path: "agent.instruction.url",
+        kind: AliasKind::Set,
+    },
+    Alias {
+        flag: "--instruction.dir",
+        path: "agent.instruction.dir",
+        kind: AliasKind::Set,
+    },
+    Alias {
+        flag: "--instruction.glob",
+        path: "agent.instruction.glob",
+        kind: AliasKind::Set,
+    },
+    Alias {
+        flag: "--instruction.order",
+        path: "agent.instruction.order",
         kind: AliasKind::Set,
     },
     Alias {
@@ -3358,6 +3697,41 @@ pub const ALIASES: &[Alias] = &[
     Alias {
         flag: "--prompt",
         path: "agent.prompt",
+        kind: AliasKind::Set,
+    },
+    Alias {
+        flag: "--prompt.text",
+        path: "agent.prompt.text",
+        kind: AliasKind::Set,
+    },
+    Alias {
+        flag: "--prompt.file",
+        path: "agent.prompt.file",
+        kind: AliasKind::Set,
+    },
+    Alias {
+        flag: "--prompt.dir",
+        path: "agent.prompt.dir",
+        kind: AliasKind::Set,
+    },
+    Alias {
+        flag: "--prompt.glob",
+        path: "agent.prompt.glob",
+        kind: AliasKind::Set,
+    },
+    Alias {
+        flag: "--prompt.order",
+        path: "agent.prompt.order",
+        kind: AliasKind::Set,
+    },
+    Alias {
+        flag: "--prompt.url",
+        path: "agent.prompt.url",
+        kind: AliasKind::Set,
+    },
+    Alias {
+        flag: "--prompt.oci",
+        path: "agent.prompt.oci",
         kind: AliasKind::Set,
     },
     Alias {
@@ -3605,6 +3979,14 @@ pub const ENV_ALIASES: &[(&str, &str)] = &[
 /// Naming one fails the load with its hint, so a stale command line is a loud
 /// error rather than a flag that is silently ignored.
 pub const REMOVED_FLAGS: &[(&str, &str)] = &[
+    // Renamed one release after it shipped: a workflow entry's HTTP source has
+    // been `url:` since long before `agent.instruction` had one, and two
+    // spellings for one concept is the kind of thing that never gets fixed
+    // later.
+    (
+        "--instruction.http",
+        "renamed to --instruction.url (`url:` in the config), the spelling a workflow entry already uses",
+    ),
     (
         "--mode",
         "modes are gone: give the workflow a start node (`once` | `loop` | `schedule` | `subscribe` | `signal` | `event` | `a2a` | `manual`) and set `lifecycle.run_until` if needed",
@@ -3940,11 +4322,6 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
     // is for the case where nothing did.
     apply_default_folders(&mut doc, &config_dirs(&config_paths), &mut warnings);
 
-    // --- sugar: `agentd --instruction X` with no workflows ---
-    if ask == Ask::Run || ask == Ask::Validate {
-        apply_instruction_sugar(&mut doc);
-    }
-
     // --- env substitution: `${VAR}` / `${VAR:-default}` in any string value of
     //     the merged document (config + workflows), from the process env. Distinct
     //     from `{{secret:…}}` (which resolves a redacted credential). ---
@@ -3970,6 +4347,18 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
 
     // --- type + validate ---
     let mut settings = Settings::from_document(doc.clone(), "config").map_err(usage)?;
+    // --- sugar: `agentd --instruction X` with no workflows ---
+    //
+    // Decided HERE, on the TYPED settings, not on the raw document: only after
+    // typing is the instruction actually resolved (a file read, a folder
+    // combined, an artifact pulled) and its `:::!workflow` directives extracted
+    // into `settings.workflows`. Judging the document instead meant the long
+    // form got no sugar at all (an object is not a non-blank string), and a
+    // path-valued short form got sugar *on top of* the workflows its own
+    // document declared — a model loop nobody asked for, dialing intelligence.
+    if ask == Ask::Run || ask == Ask::Validate {
+        apply_instruction_sugar(&mut doc, &mut settings);
+    }
     // --- durability a laptop already satisfies ---
     //
     // A long-lived instance that names no store gets the FILE adapter: durable
@@ -4042,6 +4431,7 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
     }
     let mut diags = validate(&loaded);
     diags.errors.splice(0..0, service_errors);
+    warnings.extend(loaded.settings.agent.instruction_warnings.clone());
     warnings.extend(diags.warnings);
     loaded.warnings = warnings;
     if ask != Ask::Validate
@@ -4131,30 +4521,22 @@ fn binding_for<'a>(bindings: &'a [Binding], path: &str) -> Option<&'a Binding> {
 /// scalar is promoted into the source key it names, so the two spellings
 /// compose instead of the object silently replacing the string.
 /// `--instruction ./a.md --instruction.refresh 30s` means what it reads as.
-fn promote_instruction_scalar(doc: &mut Value) {
+/// `agent.<field>` in its SHORT form, rewritten as the long form so a dotted
+/// flag can be merged into it. `instruction` and `prompt` both take the two
+/// spellings, so both promote through this.
+fn promote_document_scalar(doc: &mut Value, field: &str) {
     let Some(agent) = doc.get_mut("agent").and_then(Value::as_object_mut) else {
         return;
     };
-    let Some(scalar) = agent
-        .get("instruction")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-    else {
+    let Some(scalar) = agent.get(field).and_then(Value::as_str).map(str::to_string) else {
         return;
     };
-    let key = match classify_instruction(&scalar) {
-        InstructionValue::Text => "text",
-        InstructionValue::File(_) => "file",
-        InstructionValue::Uri if scalar.starts_with("oci://") => "oci",
-        InstructionValue::Uri
-            if scalar.starts_with("http://") || scalar.starts_with("https://") =>
-        {
-            "http"
-        }
-        InstructionValue::Uri => "mcp",
-    };
-    agent.insert("instruction".into(), serde_json::json!({ key: scalar }));
+    let key = instruction_key(&scalar);
+    agent.insert(field.into(), serde_json::json!({ key: scalar }));
 }
+
+/// The `agent.` fields that take both a short scalar and a long object.
+const DOCUMENT_FIELDS: [&str; 2] = ["instruction", "prompt"];
 
 fn apply_alias(
     doc: &mut Value,
@@ -4174,39 +4556,41 @@ fn apply_alias(
         // overwrote the object and `--instruction.refresh 30s --instruction
         // ./a.md` silently lost the refresh — valid config, dropped setting.
         AliasKind::Set
-            if alias.path == "agent.instruction"
-                && doc
-                    .get("agent")
-                    .and_then(|a| a.get("instruction"))
-                    .is_some_and(Value::is_object) =>
+            if DOCUMENT_FIELDS.iter().any(|f| {
+                alias.path == format!("agent.{f}")
+                    && doc
+                        .get("agent")
+                        .and_then(|a| a.get(*f))
+                        .is_some_and(Value::is_object)
+            }) =>
         {
+            let field = alias.path.trim_start_matches("agent.").to_string();
             let raw = take()?;
-            let key = match classify_instruction(&raw) {
-                InstructionValue::Text => "text",
-                InstructionValue::File(_) => "file",
-                InstructionValue::Uri if raw.starts_with("oci://") => "oci",
-                InstructionValue::Uri
-                    if raw.starts_with("http://") || raw.starts_with("https://") =>
-                {
-                    "http"
-                }
-                InstructionValue::Uri => "mcp",
-            };
+            let key = instruction_key(&raw);
             if let Some(obj) = doc
                 .get_mut("agent")
                 .and_then(Value::as_object_mut)
-                .and_then(|a| a.get_mut("instruction"))
+                .and_then(|a| a.get_mut(&field))
                 .and_then(Value::as_object_mut)
             {
-                for k in ["text", "file", "oci", "http", "mcp"] {
+                for k in INSTRUCTION_SOURCE_KEYS {
                     obj.remove(k);
                 }
                 obj.insert(key.into(), Value::String(raw));
             }
         }
-        AliasKind::Set if alias.path.starts_with("agent.instruction.") => {
+        AliasKind::Set
+            if DOCUMENT_FIELDS
+                .iter()
+                .any(|f| alias.path.starts_with(&format!("agent.{f}."))) =>
+        {
             let raw = take()?;
-            promote_instruction_scalar(doc);
+            let field = alias.path["agent.".len()..]
+                .split('.')
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            promote_document_scalar(doc, &field);
             let mut patch = Value::Object(Map::new());
             paths::set_path(&mut patch, alias.path, Value::String(raw));
             file::merge_into(doc, patch);
@@ -4528,49 +4912,39 @@ fn apply_default_folders(doc: &mut Value, dirs: &[PathBuf], warnings: &mut Vec<S
 /// tools are root-scoped, so a prompt running as a step could never define the
 /// loop/schedule it was asked for (`Caller::Workflow` vs `Caller::Root` in
 /// the registry).
-fn apply_instruction_sugar(doc: &mut Value) {
-    let has_workflows = doc
-        .pointer("/workflows")
-        .and_then(Value::as_array)
-        .is_some_and(|w| !w.is_empty());
-    let nonblank = |p: &str| {
-        doc.pointer(p)
-            .and_then(Value::as_str)
-            .is_some_and(|s| !s.trim().is_empty())
-    };
-    let has_instruction = nonblank("/agent/instruction");
-    // An instruction that CARRIES a `:::!workflow` directive has authored its
-    // machinery explicitly — extraction (from_document) will add it to
-    // `workflows:`, so generating a sugar `main` here would bolt a model loop
-    // onto a config that declared none.
-    let carries_workflow = doc
-        .pointer("/agent/instruction")
-        .and_then(Value::as_str)
-        .is_some_and(|t| t.lines().any(|l| l.starts_with(":::!workflow")));
-    // A prompt runs as a root turn, so an instruction+prompt pair needs no
-    // sugar workflow at all — the prompt IS the job.
-    if has_workflows || carries_workflow || !has_instruction || nonblank("/agent/prompt") {
+fn apply_instruction_sugar(doc: &mut Value, settings: &mut Settings) {
+    let nonblank = |v: &Option<String>| v.as_deref().is_some_and(|s| !s.trim().is_empty());
+    // Any workflow at all — declared in the config, loaded from a
+    // `workflows/` folder, or extracted from the instruction's own
+    // `:::!workflow` directives — means the machinery was authored, and
+    // bolting a model loop onto it would run work nobody declared.
+    //
+    // A prompt likewise: it runs as a root turn, so an instruction+prompt pair
+    // needs no workflow — the prompt IS the job.
+    if !settings.workflows.is_empty()
+        || !nonblank(&settings.agent.instruction)
+        || nonblank(&settings.agent.prompt)
+    {
         return;
     }
-    let work = json!({
-        "kind": "agent",
-        "depends_on": ["start"],
-        "instruction": "{{env.instruction}}",
+    let sugar = json!({
+        "name": "main",
+        "version": 3,
+        "steps": {
+            "start": { "kind": "once" },
+            "work":  {
+                "kind": "agent",
+                "depends_on": ["start"],
+                "instruction": "{{env.instruction}}",
+            },
+            "done":  { "kind": "finish", "depends_on": ["work"], "status": "completed", "output": "{{steps.work.output}}" }
+        }
     });
+    // Both sides, together: `settings` is what runs, `doc` is what the
+    // effective-config output and the document rules read.
+    settings.workflows.push(sugar.clone());
     let mut patch = Value::Object(Map::new());
-    paths::set_path(
-        &mut patch,
-        "workflows",
-        json!([{
-            "name": "main",
-            "version": 3,
-            "steps": {
-                "start": { "kind": "once" },
-                "work":  work,
-                "done":  { "kind": "finish", "depends_on": ["work"], "status": "completed", "output": "{{steps.work.output}}" }
-            }
-        }]),
-    );
+    paths::set_path(&mut patch, "workflows", json!([sugar]));
     file::merge_into(doc, patch);
 }
 
@@ -6609,6 +6983,7 @@ pub const RELOADABLE_PATHS: &[&str] = &[
     "workflows.key",
     "workflows.limits",
     "workflows.name",
+    "workflows.order",
     "workflows.outputs",
     "workflows.priority",
     "workflows.state",
@@ -6915,7 +7290,12 @@ mod tests {
                     // a path that exists; the network ones are covered by their
                     // own tests (oci_instruction_e2e, registry_consumer_e2e)
                     // rather than by a sample.
-                    "agent.instruction.file" => json!("Cargo.toml"),
+                    // …the file key gets a path that exists, and the folder
+                    // keys a directory that exists AND holds a matching
+                    // document, since an empty match is a refusal by design.
+                    p if is_document_path(p, "file") => json!("Cargo.toml"),
+                    p if is_document_path(p, "dir") => json!("."),
+                    p if is_document_path(p, "glob") => json!("README.md"),
 
                     "config_version" => json!("2"),
                     _ => json!("x"),
@@ -6983,10 +7363,7 @@ mod tests {
             // (an artifact pulled, a URL fetched), so a synthetic value here
             // would make a real network call. They are covered end to end by
             // oci_instruction_e2e and registry_consumer_e2e instead.
-            if matches!(
-                b.path.as_str(),
-                "agent.instruction.oci" | "agent.instruction.http"
-            ) {
+            if is_document_path(&b.path, "oci") || is_document_path(&b.path, "url") {
                 continue;
             }
             let mut doc = Value::Object(Map::new());
@@ -6997,18 +7374,33 @@ mod tests {
             // rather than leaving an agent silently instruction-less. A
             // single-path sample has to supply one, the same way
             // `fill_required` supplies schema-required siblings.
-            if b.path.starts_with("agent.instruction.")
-                && !b.path.starts_with("agent.instruction.text")
-                && !b.path.starts_with("agent.instruction.file")
-                && !b.path.starts_with("agent.instruction.oci")
-                && !b.path.starts_with("agent.instruction.http")
-                && !b.path.starts_with("agent.instruction.mcp")
+            if let Some(field) = DOCUMENT_FIELDS
+                .iter()
+                .find(|f| b.path.starts_with(&format!("agent.{f}.")))
+                && !INSTRUCTION_SOURCE_KEYS
+                    .iter()
+                    .any(|k| b.path.starts_with(&format!("agent.{field}.{k}")))
             {
-                paths::set_path(&mut doc, "agent.instruction.text", json!("x"));
+                // `glob`/`order` configure a FOLDER and are refused without
+                // one; every other setting takes any source.
+                if is_document_path(&b.path, "glob") || is_document_path(&b.path, "order") {
+                    paths::set_path(&mut doc, &format!("agent.{field}.dir"), json!("."));
+                } else {
+                    paths::set_path(&mut doc, &format!("agent.{field}.text"), json!("x"));
+                }
             }
             Settings::from_document(doc, "t")
                 .unwrap_or_else(|e| panic!("path {} does not deserialize: {e}", b.path));
         }
+    }
+
+    /// `agent.instruction.<leaf>` or `agent.prompt.<leaf>` — the two settings
+    /// that name a document source, which the sample builder has to treat
+    /// alike or leave one of them untested.
+    fn is_document_path(path: &str, leaf: &str) -> bool {
+        DOCUMENT_FIELDS
+            .iter()
+            .any(|f| path == format!("agent.{f}.{leaf}"))
     }
 
     /// Along `path`, every schema object with `required` gets its required
@@ -7836,6 +8228,302 @@ mod tests {
             .as_deref(),
             Some("mcp://gateway/instruction://ins_1@stable")
         );
+    }
+
+    /// The short and long forms are the SAME setting, so an agent defined
+    /// either way gets the same one-shot sugar workflow — and a document that
+    /// carries its own `:::!workflow` gets none, however its source was named.
+    #[test]
+    fn the_sugar_workflow_does_not_depend_on_how_the_source_was_named() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.md"), "be terse\n").unwrap();
+        let carries_doc = concat!(
+            "be terse\n\n",
+            ":::!workflow{name=own}\n",
+            "steps:\n",
+            "  s: { kind: once }\n",
+            "  f: { kind: finish, depends_on: [s], status: completed }\n",
+            ":::\n"
+        );
+        std::fs::write(dir.path().join("wf.md"), carries_doc).unwrap();
+        let plain = dir.path().join("a.md").to_string_lossy().to_string();
+        let carries = dir.path().join("wf.md").to_string_lossy().to_string();
+        let names = |instruction: Value| -> Vec<String> {
+            let cfg = dir.path().join(format!("c{}.json", rand_tag()));
+            std::fs::write(
+                &cfg,
+                serde_json::json!({"config_version": "1",
+                    "agent": {"name": "a", "instruction": instruction, "preflight": "never"},
+                    "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
+                    "store": {"kind": "memory"}})
+                .to_string(),
+            )
+            .unwrap();
+            let env: Vec<(String, String)> = Vec::new();
+            let (l, _) = super::load(&["-c".to_string(), cfg.to_string_lossy().to_string()], &env)
+                .expect("loads");
+            l.settings
+                .workflows
+                .iter()
+                .filter_map(|w| w["name"].as_str().map(str::to_string))
+                .collect()
+        };
+        assert_eq!(names(json!(plain.clone())), vec!["main"], "the short form");
+        assert_eq!(
+            names(json!({"file": plain})),
+            vec!["main"],
+            "the long form is the same setting, so it gets the same sugar"
+        );
+        // A document that authored its own machinery keeps exactly that —
+        // bolting a model loop onto it would run work nobody declared.
+        assert_eq!(names(json!(carries.clone())), vec!["own"], "short form");
+        assert_eq!(names(json!({"file": carries})), vec!["own"], "long form");
+    }
+
+    /// A distinct suffix per generated config file within one test.
+    fn rand_tag() -> u64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64
+    }
+
+    /// `agent.prompt` and a subagent template's `instruction` are documents
+    /// too, and take the same sources through the same code — that is the
+    /// whole point of the shared resolver.
+    #[test]
+    fn a_prompt_and_a_template_take_the_same_document_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("task.md"), "summarize the inbox\n").unwrap();
+        std::fs::write(dir.path().join("tpl-10.md"), "you research\n").unwrap();
+        std::fs::write(dir.path().join("tpl-20.md"), "carefully\n").unwrap();
+        let task = dir.path().join("task.md").to_string_lossy().to_string();
+        let folder = dir.path().to_string_lossy().to_string();
+        let s = Settings::from_document(
+            serde_json::json!({"config_version": "2",
+                "agent": {"name": "a", "instruction": "be terse", "prompt": task},
+                "subagents": {"templates": {
+                    "r": {"instruction": {"dir": folder, "glob": "tpl-*.md"}}}},
+                "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
+                "store": {"kind": "memory"}}),
+            "t",
+        )
+        .expect("loads");
+        assert_eq!(
+            s.agent.prompt.as_deref(),
+            Some("summarize the inbox\n"),
+            "a path-shaped prompt names the file, exactly as an instruction does"
+        );
+        assert_eq!(
+            s.subagents.templates["r"].instruction, "you research\n\ncarefully\n",
+            "a template's folder combines through the same code"
+        );
+
+        // …and the long form still means "this text, never a path".
+        let s = Settings::from_document(
+            serde_json::json!({"config_version": "2",
+                "agent": {"name": "a", "instruction": "be terse",
+                          "prompt": {"text": "./not-a-file.md"}},
+                "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
+                "store": {"kind": "memory"}}),
+            "t",
+        )
+        .expect("loads");
+        assert_eq!(s.agent.prompt.as_deref(), Some("./not-a-file.md"));
+    }
+
+    /// A folder of documents is ONE instruction, combined in `order`. The
+    /// test writes them out of alphabetical order on purpose: `name` order is
+    /// a contract, not whatever `read_dir` happens to return.
+    #[test]
+    fn an_instruction_folder_combines_its_documents_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, body) in [
+            ("20-second.md", "second"),
+            ("10-first.md", "first"),
+            ("30-third.txt", "third"),
+            ("notes.yaml", "not a document"),
+        ] {
+            std::fs::write(dir.path().join(name), format!("{body}\n")).unwrap();
+        }
+        let load_dir = |extra: serde_json::Value| {
+            let mut instruction = serde_json::json!({"dir": dir.path().to_string_lossy()});
+            for (k, v) in extra.as_object().unwrap() {
+                instruction[k] = v.clone();
+            }
+            Settings::from_document(
+                serde_json::json!({"config_version": "2",
+                    "agent": {"name": "a", "instruction": instruction},
+                    "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
+                    "store": {"kind": "memory"}}),
+                "t",
+            )
+        };
+        let s = load_dir(json!({})).expect("folder loads");
+        assert_eq!(
+            s.agent.instruction.as_deref(),
+            Some("first\n\nsecond\n\nthird\n"),
+            "combined in name order, and `notes.yaml` is not a document"
+        );
+        assert_eq!(
+            s.agent.instruction_dir_files.len(),
+            3,
+            "the three documents"
+        );
+
+        // `glob:` narrows the same way it does for a workflow folder.
+        let only_md = load_dir(json!({"glob": "*.md"})).expect("glob loads");
+        assert_eq!(
+            only_md.agent.instruction.as_deref(),
+            Some("first\n\nsecond\n")
+        );
+    }
+
+    /// `order: date` reads newest material LAST, which is the point of it.
+    #[test]
+    fn an_instruction_folder_can_combine_in_date_order() {
+        let dir = tempfile::tempdir().unwrap();
+        // `zzz` is last by name and first by date — so a passing assertion
+        // can only come from the mtime sort, never from the default.
+        std::fs::write(dir.path().join("zzz.md"), "older\n").unwrap();
+        std::fs::write(dir.path().join("aaa.md"), "newer\n").unwrap();
+        filetime_set(&dir.path().join("zzz.md"), 1_000_000);
+        filetime_set(&dir.path().join("aaa.md"), 2_000_000);
+        let doc = |order: &str| {
+            Settings::from_document(
+                serde_json::json!({"config_version": "2",
+                    "agent": {"name": "a", "instruction":
+                        {"dir": dir.path().to_string_lossy(), "order": order}},
+                    "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
+                    "store": {"kind": "memory"}}),
+                "t",
+            )
+            .expect("loads")
+            .agent
+            .instruction
+            .unwrap()
+        };
+        assert_eq!(doc("date"), "older\n\nnewer\n");
+        assert_eq!(doc("name"), "newer\n\nolder\n");
+    }
+
+    /// Set an mtime without a dependency: `utimes(2)` through the libc we
+    /// already link.
+    fn filetime_set(path: &std::path::Path, secs: i64) {
+        let c = std::ffi::CString::new(path.to_string_lossy().as_bytes()).unwrap();
+        let tv = [
+            libc::timeval {
+                tv_sec: secs,
+                tv_usec: 0,
+            },
+            libc::timeval {
+                tv_sec: secs,
+                tv_usec: 0,
+            },
+        ];
+        assert_eq!(unsafe { libc::utimes(c.as_ptr(), tv.as_ptr()) }, 0);
+    }
+
+    /// A combined instruction is ONE document, so only the first file's front
+    /// matter applies — and dropping the rest is said out loud.
+    #[test]
+    fn a_folder_keeps_only_the_first_documents_front_matter() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.md"), "---\nid: ins_1\n---\nfirst\n").unwrap();
+        std::fs::write(dir.path().join("b.md"), "---\nid: ins_2\n---\nsecond\n").unwrap();
+        let s = Settings::from_document(
+            serde_json::json!({"config_version": "2",
+                "agent": {"name": "a", "instruction": {"dir": dir.path().to_string_lossy()}},
+                "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
+                "store": {"kind": "memory"}}),
+            "t",
+        )
+        .expect("loads");
+        assert_eq!(
+            s.agent.instruction.as_deref(),
+            Some("---\nid: ins_1\n---\nfirst\n\nsecond\n")
+        );
+        assert!(
+            s.agent
+                .instruction_warnings
+                .iter()
+                .any(|w| w.contains("front matter") && w.contains("b.md")),
+            "the dropped front matter is reported: {:?}",
+            s.agent.instruction_warnings
+        );
+    }
+
+    /// The short form takes a folder too — the value is classified, and a
+    /// path that IS a directory is a directory.
+    #[test]
+    fn the_short_form_recognizes_a_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.md"), "policy\n").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        assert_eq!(
+            classify_instruction(&path),
+            InstructionValue::Dir(path.clone()),
+            "an existing directory"
+        );
+        assert_eq!(
+            classify_instruction("./nowhere/"),
+            InstructionValue::Dir("./nowhere".into()),
+            "a trailing slash says folder without asking the disk"
+        );
+        // `~/` is expanded before the disk is asked, so a home-relative folder
+        // is a folder rather than a file that then fails to open.
+        if let Ok(home) = std::env::var("HOME") {
+            let sub = std::path::Path::new(&home).join(".agentd-classify-test");
+            std::fs::create_dir_all(&sub).unwrap();
+            assert_eq!(
+                classify_instruction("~/.agentd-classify-test"),
+                InstructionValue::Dir("~/.agentd-classify-test".into())
+            );
+            let _ = std::fs::remove_dir(&sub);
+        }
+        assert!(
+            matches!(classify_instruction("./a.md"), InstructionValue::File(_)),
+            "a document extension is still a file"
+        );
+        let s = Settings::from_document(
+            serde_json::json!({"config_version": "2",
+                "agent": {"name": "a", "instruction": path},
+                "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
+                "store": {"kind": "memory"}}),
+            "t",
+        )
+        .expect("loads");
+        assert_eq!(s.agent.instruction.as_deref(), Some("policy\n"));
+        assert!(
+            s.agent.instruction_spec.dir.is_some(),
+            "same dir: as the long form"
+        );
+    }
+
+    /// A named folder that matches nothing is a refusal, not an empty
+    /// instruction — an agent without instructions is not an agent.
+    #[test]
+    fn an_empty_folder_and_a_dangling_glob_are_refusals() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = |instruction: serde_json::Value| {
+            Settings::from_document(
+                serde_json::json!({"config_version": "2",
+                    "agent": {"name": "a", "instruction": instruction},
+                    "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
+                    "store": {"kind": "memory"}}),
+                "t",
+            )
+            .unwrap_err()
+        };
+        let e = base(json!({"dir": dir.path().to_string_lossy()}));
+        assert!(e.contains("no file matched"), "{e}");
+        let e = base(json!({"text": "be terse", "glob": "*.md"}));
+        assert!(e.contains("no dir to match in"), "{e}");
+        let e = base(json!({"text": "be terse", "order": "date"}));
+        assert!(e.contains("no dir to order"), "{e}");
+        let e = base(json!({"dir": dir.path().to_string_lossy(), "text": "be terse"}));
+        assert!(e.contains("names 2 sources"), "{e}");
     }
 
     #[test]

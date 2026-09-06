@@ -93,12 +93,15 @@ fn top_level_properties(
                 "properties": {
                     "name": { "type": "string", "description": "instance identity (falls back to the downward-API instance, then the hostname)" },
                     "instruction": { "oneOf": [
-                    { "type": "string", "description": "short form: the instruction itself, a FILE path (no whitespace, path-shaped or a document extension), or a URI (`oci://`, `mcp://`, `instruction://`, `https://`). Every other setting takes its default." },
+                    { "type": "string", "description": "short form: the instruction itself, a FILE path (no whitespace, path-shaped or a document extension), a DIRECTORY (path-shaped, trailing `/` or an existing folder), or a URI (`oci://`, `mcp://`, `instruction://`, `https://`). Every other setting takes its default." },
                     { "type": "object", "additionalProperties": false, "description": "long form: name the source explicitly and set everything about it here", "properties": {
                         "text": { "type": "string", "description": "the instruction itself, never read as a path or URI" },
                         "file": { "type": "string", "description": "a path on disk; watched when lifecycle.watch_config is on" },
                         "oci": { "type": "string", "description": "an OCI artifact — ghcr.io/acme/agent:v3 (the oci:// is implied)" },
-                        "http": { "type": "string", "description": "an https:// document, fetched at load" },
+                        "url": { "type": "string", "description": "an https:// document, fetched at load (same key a workflow entry uses)" },
+                        "dir": { "type": "string", "description": "a folder of documents, combined into ONE instruction in `order`" },
+                        "glob": { "type": "string", "description": "comma-separated globs relative to `dir` (default `*.md,*.markdown,*.txt,*.instruction`); `**` recurses" },
+                        "order": { "enum": ["name", "date"], "description": "how `dir` files are combined: name (default, path order) or date (mtime, oldest first)" },
                         "mcp": { "oneOf": [ { "type": "string" }, { "type": "object", "additionalProperties": false, "required": ["resource"], "properties": { "server": { "type": "string", "description": "which configured MCP server to ask; omitted = whichever one serves it" }, "resource": { "type": "string", "description": "the resource URI, e.g. instruction://ins_1@stable" } } } ], "description": "a resource a configured MCP server serves, read and subscribed — the URI alone, or {server, resource} when it matters which server is asked" },
                         "refresh": { "type": "string", "description": "how often to re-read: `auto` (default — inotify for a file, never for a digest-pinned artifact, 5m for a mutable tag or served resource), `off`, or a duration" },
                         "unavailable": { "enum": ["auto", "keep", "freeze", "drain", "exit"], "description": "when the source stops answering after startup: auto (freeze when trust-pinned, else keep), keep, freeze (refuse new work), drain (finish live work then exit 0), exit" },
@@ -106,7 +109,17 @@ fn top_level_properties(
                             "keys": { "type": "array", "items": { "type": "string" }, "description": "key FILE paths — an AGE-SECRET-KEY-1… identity, 64 hex chars, or base64" },
                             "passphrase": { "type": "string", "description": "for age scrypt envelopes — a {{secret:…}} reference" } } } } }
                 ] },
-                    "prompt": { "type": "string", "description": "a one-shot task (--prompt): with no workflows configured the generated run executes this, while `instruction` stays the standing policy (the run's system prompt)" },
+                    "prompt": { "oneOf": [
+                    { "type": "string", "description": "short form: a one-shot task (--prompt) — the text itself, a FILE path, a DIRECTORY, or an https:// document, classified exactly as `instruction` is. With no workflows configured the generated run executes it, while `instruction` stays the standing policy (the run's system prompt)." },
+                    { "type": "object", "additionalProperties": false, "description": "long form: name the source explicitly", "properties": {
+                        "text": { "type": "string", "description": "the task itself, never read as a path or URI" },
+                        "file": { "type": "string", "description": "a path on disk" },
+                        "dir": { "type": "string", "description": "a folder of documents, combined into ONE task in `order`" },
+                        "glob": { "type": "string", "description": "comma-separated globs relative to `dir` (default `*.md,*.markdown,*.txt,*.instruction`); `**` recurses" },
+                        "order": { "enum": ["name", "date"], "description": "name (default, path order) or date (mtime, oldest first)" },
+                        "url": { "type": "string", "description": "an https:// document, fetched at load" },
+                        "oci": { "type": "string", "description": "an OCI artifact — ghcr.io/acme/task:v3" } } }
+                ] },
                     "preflight": { "enum": ["never", "auto", "always"] },
                     "wake_on": { "type": "array", "items": { "enum": ["a2a_message", "human_reply", "subagent_result", "workflow_finished", "workflow_failed", "instruction_updated", "budget_resumed"] } },
                     "on_workflow_finished": { "enum": ["ignore", "note", "think"] },
@@ -479,7 +492,8 @@ fn defs_properties(
                 "timeout": duration,
                 "allow_private": { "type": "boolean", "description": "permit `url` to resolve to a private/loopback address" },
                 "dir": { "type": "string", "description": "load every matching file in a directory" },
-                "glob": { "type": "string", "description": "comma-separated globs relative to `dir` (default `*.yaml,*.yml,*.json`); `**` recurses" } },
+                "glob": { "type": "string", "description": "comma-separated globs relative to `dir` (default `*.yaml,*.yml,*.json`); `**` recurses" },
+                "order": { "enum": ["name", "date"], "description": "the order `dir` files load in: name (default, path order) or date (mtime, oldest first)" } },
                 "additionalProperties": false,
                 "description": "a {name, file|uri|url} reference, a {dir, glob} directory, or an inline workflow definition" });
     if let (Some(dst), Some(src)) = (
@@ -511,7 +525,17 @@ fn defs_properties(
     m.insert("SubagentTemplate".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["instruction"],
                 "description": "an operator-declared subagent definition: `instruction` is a full instruction document — no config-defining directives = the flat worker; machinery (:::workflow/:::mcp/:::stream/:::config/:::tools) = an instance-tier child",
                 "properties": {
-                "instruction": { "type": "string", "description": "the definition; {{params.X}} holes fold in at spawn as data, never re-parsed for directives" },
+                "instruction": { "oneOf": [
+                    { "type": "string", "description": "the definition; {{params.X}} holes fold in at spawn as data, never re-parsed for directives. A path-shaped value or a URI names the document instead of being it — the same classification agent.instruction uses." },
+                    { "type": "object", "additionalProperties": false, "description": "name the source explicitly: the load-time sources agent.instruction takes", "properties": {
+                        "text": { "type": "string", "description": "the definition itself, never read as a path or URI" },
+                        "file": { "type": "string", "description": "a path on disk" },
+                        "dir": { "type": "string", "description": "a folder of documents, combined into ONE definition in `order`" },
+                        "glob": { "type": "string", "description": "comma-separated globs relative to `dir` (default `*.md,*.markdown,*.txt,*.instruction`); `**` recurses" },
+                        "order": { "enum": ["name", "date"], "description": "name (default, path order) or date (mtime, oldest first)" },
+                        "url": { "type": "string", "description": "an https:// document, fetched at load" },
+                        "oci": { "type": "string", "description": "an OCI artifact — ghcr.io/acme/agent:v3" } } }
+                ] },
                 "params": { "type": "object", "additionalProperties": { "$ref": "#/$defs/ParamSpec" }, "description": "the ONLY holes the model may fill, schema-validated at spawn" },
                 "servers": { "type": "array", "items": { "type": "string" }, "description": "flat tier: narrowing server grants from the parent's set" },
                 "tools": { "type": "array", "items": { "type": "string" }, "description": "flat tier: narrowing tool grants" },

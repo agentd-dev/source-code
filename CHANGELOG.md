@@ -5,6 +5,79 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## Unreleased — one shape for every document a config names
+
+v1.10.0 made `agent.instruction` one coherent setting. This release applies
+the same shape everywhere a document is named, and closes two places where a
+value was read once at startup and never again.
+
+### Changed (breaking, one release old)
+
+- **`agent.instruction.http:` is now `url:`** (`--instruction.http` →
+  `--instruction.url`). A workflow entry's HTTP source has been `url:` since
+  long before `agent.instruction` had one, and two spellings for one concept
+  never get fixed later. Both the old flag and the old config key are refused
+  by name, naming the replacement.
+- **`intelligence.token_file` is read at every dial**, not once at startup. A
+  Kubernetes projected service-account token is rewritten in place about
+  hourly, and the SPIFFE JWT-SVID configured beside it already re-read per
+  request — a token copied into a startup field was stale from the first
+  rotation onward on a daemon built to run for weeks. A mistyped path is still
+  a startup refusal; a read that fails later logs `intel.token_file.error` and
+  lets the provider's own 401 speak.
+- **A reload re-reads external documents** even when the config values around
+  them are unchanged: a workflow entry naming `file:`/`dir:`/`uri:`/`url:`, and
+  a local `skills.dir`. Editing a workflow file and sending SIGHUP used to
+  reload successfully and change nothing — the entry it compared was identical.
+
+### Fixed
+
+- **The one-shot sugar workflow is decided after the instruction resolves.**
+  `agentd --instruction X` with no workflows synthesizes a `main` workflow;
+  that decision read the raw config document, where a v1.10.0 long-form
+  `instruction: {file: …}` is an object rather than a non-blank string. Two
+  consequences, both now closed: the long form got **no** sugar workflow (a
+  configured agent that did nothing), and a short form naming a document that
+  declares its own `:::!workflow` got the sugar `main` **on top of** its own
+  machinery — a model loop nobody asked for, dialing intelligence and exiting
+  4. The decision now reads the typed settings, where the source is resolved
+  and the document's directives are already extracted.
+
+### Added
+
+- **`dir:` + `glob:` + `order:` for instructions.** A folder of documents
+  combines into ONE instruction: `order: name` (default, path order — what a
+  `10-`, `20-` convention exists to exploit) or `order: date` (mtime, oldest
+  first). `**` recurses. Documents join with one blank line between them; the
+  first file's front matter is kept and a later file's is dropped with a
+  warning; a folder matching nothing is a refusal, not an empty instruction.
+  The short form takes a folder too — `--instruction ./instructions/`, or any
+  path that turns out to be a directory.
+- **The same shape for `agent.prompt`** — `--prompt.text`, `--prompt.file`,
+  `--prompt.dir` (+`--prompt.glob`, `--prompt.order`), `--prompt.url`, and the
+  same classification of a bare value, so a path names the file. `--prompt-file`
+  still works as the earlier spelling of `--prompt.file`.
+- **The same shape for `subagents.templates[].instruction`** — `file:`,
+  `dir:`/`glob:`/`order:`, `url:`, `oci:`, or the text itself. `mcp:` stays
+  instruction-only: an MCP resource is read *and subscribed* by a client that
+  does not exist at config load.
+- **`order:` for workflow directories**, the same two values, through the same
+  code as instructions — `config::fileset` is now the single implementation of
+  "which files, in what order", shared by both.
+- **The watch covers every document a reload re-reads**: the instruction file,
+  an instruction folder *and* its documents, each workflow `file:` and `dir:`,
+  and `skills.dir`. For a folder the watch is on the folder and its glob,
+  because the change an operator makes most often is dropping a new document
+  in — which no watch on the files already there can see. One watcher thread
+  per distinct target.
+
+### Deliberately not watched
+
+TLS material (`a2a.tls`, `webhooks.tls`, `security.*`) is restart-only, so a
+watch there would fire a reload that cannot apply the rotation and would report
+success anyway — the exact defect class the reloadable/restart-only partition
+exists to prevent. `intelligence.token_file` needs no watch at all now.
+
 ## v1.10.0 — one instruction setting, and it keeps itself current
 
 v1.9.0 taught agentd to fetch an instruction from anywhere. This release makes

@@ -804,6 +804,21 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
             rt.instruction.text = text;
         }
     }
+    // A folder instruction says WHICH documents it combined, in the order it
+    // combined them. Without it the agent's standing policy is the one input
+    // an operator cannot reconstruct from the config alone.
+    if !rt.settings.agent.instruction_dir_files.is_empty() {
+        log.info(
+            "instruction.loaded",
+            json!({"dir": rt.settings.agent.instruction_spec.dir,
+                   "files": rt.settings.agent.instruction_dir_files,
+                   "order": match rt.settings.agent.instruction_spec.order.unwrap_or_default() {
+                       crate::config::fileset::Order::Date => "date",
+                       crate::config::fileset::Order::Name => "name",
+                   },
+                   "bytes": rt.instruction.text.len()}),
+        );
+    }
 
     if let Err(errs) = rt.load_workflows() {
         for e in &errs {
@@ -998,15 +1013,81 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
     // through the same validate-then-apply path.
     #[cfg(all(unix, feature = "config-watch"))]
     if rt.settings.lifecycle.watch_config {
+        // One watcher thread per distinct target: several workflows commonly
+        // name one folder, and a duplicate watch is a duplicate reload.
+        let mut watched_files: std::collections::BTreeSet<String> = Default::default();
+        let mut watched_dirs: std::collections::BTreeSet<(String, String)> = Default::default();
+        let mut watch_file = |path: &str, log: &crate::obs::log::Logger| {
+            if watched_files.insert(path.to_string()) {
+                crate::config::watch::spawn_config_watcher(std::path::Path::new(path), log);
+            }
+        };
         for (path, _) in &loaded.files {
-            crate::config::watch::spawn_config_watcher(std::path::Path::new(path), &log);
+            watch_file(path, &log);
         }
         // The instruction FILE too. It is the document an operator edits most
         // often, and watching only the config meant editing it changed
         // nothing until something else triggered a reload — the reload path
         // re-read it correctly, nothing ever asked it to.
         if let Some(path) = rt.settings.agent.instruction_path.clone() {
-            crate::config::watch::spawn_config_watcher(std::path::Path::new(&path), &log);
+            watch_file(&path, &log);
+        }
+        // Every document a RELOAD re-reads, for the same reason: a workflow
+        // named by `file:`, and the files a `dir:` instruction combined.
+        // (Credential and TLS files are deliberately NOT here: `a2a.tls`,
+        // `webhooks.tls` and `security` are restart-only, so a watch would
+        // fire a reload that could not apply the rotation and would report
+        // success anyway. `intelligence.token_file` needs no watch at all —
+        // it is re-read at every dial.)
+        for f in &rt.settings.agent.instruction_dir_files {
+            watch_file(f, &log);
+        }
+        for w in &rt.settings.workflows {
+            if let Some(f) = w.get("file").and_then(Value::as_str) {
+                watch_file(f, &log);
+            }
+        }
+        let mut watch_dir = |dir: &str, glob: &str, log: &crate::obs::log::Logger| {
+            if watched_dirs.insert((dir.to_string(), glob.to_string())) {
+                crate::config::watch::spawn_dir_watcher(std::path::Path::new(dir), glob, log);
+            }
+        };
+        // …and the FOLDERS, on their globs: for a folder the change an
+        // operator makes most often is dropping a new document in, which no
+        // watch on the files already there can see.
+        if let Some(dir) = rt.settings.agent.instruction_spec.dir.clone() {
+            let glob = rt
+                .settings
+                .agent
+                .instruction_spec
+                .glob
+                .clone()
+                .unwrap_or_else(|| crate::config::fileset::DOCUMENT_GLOB.to_string());
+            watch_dir(&dir, &glob, &log);
+        }
+        for w in &rt.settings.workflows {
+            if let Some(d) = w.get("dir").and_then(Value::as_str) {
+                let glob = w
+                    .get("glob")
+                    .and_then(Value::as_str)
+                    .unwrap_or("*.yaml,*.yml,*.json");
+                watch_dir(d, glob, &log);
+            }
+        }
+        // A local skills folder: skills are documents read from disk, and the
+        // reload rebuilds the catalogue from it. The folder watch catches a
+        // new top-level document; the per-file watches catch an edit to one
+        // already loaded, including a `<name>/SKILL.md` in a subdirectory,
+        // which an inotify watch on the parent folder never sees.
+        if let Some(dir) = rt.settings.skills.dir.clone() {
+            watch_dir(&dir, "*.md,*.markdown", &log);
+            for name in rt.skills.names() {
+                if let Some(m) = rt.skills.get(&name)
+                    && m.source.server == "file"
+                {
+                    watch_file(&m.source.reference, &log);
+                }
+            }
         }
     }
     rt.arm_workflows();
@@ -1413,10 +1494,18 @@ impl Runtime {
     /// and so a child spawned late in a long life does not inherit an expired
     /// one.
     pub(crate) fn current_intel_bearer(&self) -> Option<String> {
-        self.intel_bearer
-            .as_ref()
-            .and_then(|f| f())
-            .or_else(|| self.intel_token.clone())
+        let (bearer, err) = bearer_now(
+            self.intel_bearer.as_ref().and_then(|f| f()),
+            self.settings.intelligence.token_file.as_deref(),
+            self.intel_token.as_deref(),
+        );
+        if let Some(e) = err {
+            // Never fatal here: the dial that follows fails with the
+            // provider's own 401, and a rotation caught mid-write should not
+            // take a daemon down.
+            self.log.warn("intel.token_file.error", json!({"err": e}));
+        }
+        bearer
     }
 
     /// The AWS SigV4 intelligence-auth spec, when `intelligence.auth` selects
@@ -1436,6 +1525,35 @@ impl Runtime {
     }
 }
 
+/// The bearer for one dial, in precedence order: the credential provider's
+/// refreshing token, then a mounted token FILE read AT THIS INSTANT, then the
+/// static `intelligence.token`. Returns the read error rather than logging, so
+/// it is a pure function with a test that can fail.
+///
+/// The file is deliberately not cached. A Kubernetes projected service-account
+/// token is rewritten in place about hourly, and the SPIFFE JWT-SVID an
+/// operator configures right beside it already re-reads per request through
+/// `{{secret-file:…}}`. A value copied into a startup field is stale from the
+/// first rotation onward — on a daemon built to run for weeks, that is the
+/// same "copied once, never rebuilt" defect the reload guardrails exist for.
+/// One `open(2)` per dial buys it back.
+pub(crate) fn bearer_now(
+    refreshing: Option<String>,
+    token_file: Option<&str>,
+    static_token: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    if let Some(t) = refreshing {
+        return (Some(t), None);
+    }
+    if let Some(path) = token_file {
+        return match crate::sec::secret::read_token_file(path) {
+            Ok(t) => (Some(t), None),
+            Err(e) => (None, Some(e)),
+        };
+    }
+    (static_token.map(str::to_string), None)
+}
+
 /// Resolve `intelligence.token` / `token_file` (secret refs, files).
 fn resolve_intel_token(
     settings: &crate::config::v2::Settings,
@@ -1447,9 +1565,13 @@ fn resolve_intel_token(
         return Ok(Some(resolved));
     }
     if let Some(p) = &settings.intelligence.token_file {
-        return crate::sec::secret::read_token_file(p)
-            .map(Some)
-            .map_err(|e| format!("intelligence.token_file: {e}"));
+        // Read to PROVE it is readable — a mistyped path is a startup
+        // refusal, as it has always been — and then drop the value:
+        // `current_intel_bearer` re-reads it per dial so a rotated token is
+        // picked up without a reload.
+        crate::sec::secret::read_token_file(p)
+            .map_err(|e| format!("intelligence.token_file: {e}"))?;
+        return Ok(None);
     }
     // No token in the configuration: the intel client falls back to its own
     // environment conventions (`AGENT_INTELLIGENCE_TOKEN`…).
@@ -1984,5 +2106,61 @@ impl Runtime {
         for s in tools_changed {
             self.log.info("mcp.tools_changed", json!({"server": s, "note": "recorded only; the tool catalogue is rebuilt at the next config reload"}));
         }
+    }
+}
+
+#[cfg(test)]
+mod bearer_tests {
+    use super::bearer_now;
+
+    /// A mounted token file is read at the instant of use, so a rotation
+    /// reaches the very next dial. Reading it once at startup — what this
+    /// replaced — makes the second assertion return the first token.
+    #[test]
+    fn a_rotated_token_file_reaches_the_next_dial() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        std::fs::write(&path, "first\n").unwrap();
+        let p = path.to_string_lossy().to_string();
+
+        let (b, err) = bearer_now(None, Some(&p), Some("static"));
+        assert_eq!(b.as_deref(), Some("first"), "trailing newline trimmed");
+        assert!(err.is_none());
+
+        // The kubelet rewrites the projected token in place.
+        std::fs::write(&path, "second\n").unwrap();
+        let (b, _) = bearer_now(None, Some(&p), Some("static"));
+        assert_eq!(b.as_deref(), Some("second"), "re-read, not cached");
+    }
+
+    #[test]
+    fn precedence_is_refreshing_then_file_then_static() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        std::fs::write(&path, "from-file").unwrap();
+        let p = path.to_string_lossy().to_string();
+
+        let (b, _) = bearer_now(Some("oauth".into()), Some(&p), Some("static"));
+        assert_eq!(b.as_deref(), Some("oauth"), "a refreshing provider wins");
+        let (b, _) = bearer_now(None, Some(&p), Some("static"));
+        assert_eq!(b.as_deref(), Some("from-file"), "a file beats the static");
+        let (b, _) = bearer_now(None, None, Some("static"));
+        assert_eq!(b.as_deref(), Some("static"));
+        let (b, _) = bearer_now(None, None, None);
+        assert_eq!(b, None, "no credential configured");
+    }
+
+    /// An unreadable file mid-rotation is reported, not fatal, and never
+    /// falls back to a stale static value it was configured to replace.
+    #[test]
+    fn an_unreadable_token_file_reports_and_yields_nothing() {
+        let (b, err) = bearer_now(None, Some("/no/such/token"), Some("static"));
+        assert_eq!(b, None);
+        let err = err.expect("an error is reported");
+        assert!(err.contains("/no/such/token"), "{err}");
+        assert!(
+            !err.contains("static"),
+            "an error never carries a credential"
+        );
     }
 }

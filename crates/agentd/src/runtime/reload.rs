@@ -287,7 +287,14 @@ impl Runtime {
         // Skills sources — the config section, or the instruction's inline
         // `:::!skill` definitions (they live on `agent`, but they land in this
         // catalogue).
-        if old.skills != new.skills || old.agent.inline_skills != new.agent.inline_skills {
+        // …and rebuilt whenever a LOCAL folder is configured, even with the
+        // section unchanged: the skills live in files, and comparing the
+        // setting only would make "edit a skill, send SIGHUP" a reload that
+        // reports success and changes nothing.
+        if old.skills != new.skills
+            || old.agent.inline_skills != new.agent.inline_skills
+            || new.skills.dir.is_some()
+        {
             let mut cat = crate::context::skills::Catalogue::new(
                 new.skills
                     .reference_prefix
@@ -309,14 +316,32 @@ impl Runtime {
                 cat.add_dir(std::path::Path::new(dir));
             }
             cat.add_inline(&new.agent.inline_skills);
+            // Rebuilt on every reload when a local folder is configured, so
+            // the report has to compare rather than assume: saying "skills"
+            // changed on a reload that changed nothing is the same dishonesty
+            // in the other direction.
+            let differs = !cat.same_skills_as(&self.skills);
             self.skills = cat;
-            changed.push("skills");
+            if differs {
+                changed.push("skills");
+            }
         }
         // Workflows: reload definitions. Retirement (runtime::retire) gives
         // every old version the same exit — unsubscribe what nothing else
         // wants, pin for live runs, apply its own `unload:` policy — whether
         // it was removed outright or replaced by a new hash.
-        if old.workflows != new.workflows {
+        // Re-read whenever an entry names an external DOCUMENT, not only when
+        // the entries themselves differ: `file:`/`dir:`/`uri:`/`url:` point at
+        // content that changes without the config changing, and the entry
+        // comparison cannot see that. `load_workflows` re-reads, and the
+        // retirement loop below already keys off each definition's HASH, so an
+        // unchanged document reloads to the same hash and nothing churns.
+        let external = new.workflows.iter().any(|w| {
+            ["file", "dir", "uri", "url"]
+                .iter()
+                .any(|k| w.get(*k).is_some())
+        });
+        if old.workflows != new.workflows || external {
             let previous = std::mem::take(&mut self.workflows);
             if let Err(errs) = self.load_workflows() {
                 self.workflows = previous; // the running set stays authoritative
@@ -338,7 +363,17 @@ impl Runtime {
                 self.retire_workflow(wf, reason);
             }
             self.arm_workflows();
-            changed.push("workflows");
+            // Say "workflows" only when the loaded SET actually differs. A
+            // re-read of unchanged documents must not report a change it did
+            // not make — the reverse of the defect above, and just as
+            // misleading in a reload log.
+            let same = previous.len() == self.workflows.len()
+                && previous
+                    .iter()
+                    .all(|(n, w)| self.workflows.get(n).is_some_and(|nw| nw.hash == w.hash));
+            if !same {
+                changed.push("workflows");
+            }
         }
         if old.limits != new.limits
             || old.lifecycle.idle_grace != new.lifecycle.idle_grace

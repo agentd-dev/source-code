@@ -106,7 +106,9 @@ where the block became a one-line note — `[workflow "triage" is loaded and
 runs autonomously]` — so the prose and the machinery cannot double-speak (a
 model paraphrasing a workflow definition it can also see verbatim is a bug
 factory). And the config generates **no sugar `main` loop** for a
-directive-carrying instruction: it declared its machinery explicitly.
+directive-carrying instruction: it declared its machinery explicitly — however
+the document was named, since the decision is made once the source has
+resolved.
 
 ### `:::!skill{name, description, when}` — an inline skill
 
@@ -333,7 +335,7 @@ re-check; other classes should.
 
 ## Where the document comes from
 
-One document, five transports — each ending at the same parse → trust-ladder →
+One document, six sources — each ending at the same parse → trust-ladder →
 fold pipeline. `agent.instruction` names all of them, either as a value it
 classifies or as an explicit key:
 
@@ -343,7 +345,8 @@ classifies or as an explicit key:
 | a file | `instruction: ./agent.md` | `file:` | the operator named the path |
 | an MCP resource | `instruction: "instruction://ins_1@stable"` | `mcp:` (or `{server, resource}`) | the operator named the resource (re-read on server notify) |
 | an **OCI artifact** (RFC 0040) | `instruction: "oci://ghcr.io/acme/agent:v3"` | `oci:` | the operator pinned the reference |
-| an HTTPS document | `instruction: "https://docs.example/agent.md"` | `http:` | the operator named the URL |
+| an HTTPS document | `instruction: "https://docs.example/agent.md"` | `url:` | the operator named the URL |
+| a **folder** of documents | `instruction: ./instructions/` | `dir:` (+ `glob:`, `order:`) | the operator named the folder; the matches combine into one document |
 
 ```yaml
 agent:

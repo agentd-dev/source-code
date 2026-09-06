@@ -839,8 +839,50 @@
           "type": "boolean"
         },
         "instruction": {
-          "description": "the definition; {{params.X}} holes fold in at spawn as data, never re-parsed for directives",
-          "type": "string"
+          "oneOf": [
+            {
+              "description": "the definition; {{params.X}} holes fold in at spawn as data, never re-parsed for directives. A path-shaped value or a URI names the document instead of being it — the same classification agent.instruction uses.",
+              "type": "string"
+            },
+            {
+              "additionalProperties": false,
+              "description": "name the source explicitly: the load-time sources agent.instruction takes",
+              "properties": {
+                "dir": {
+                  "description": "a folder of documents, combined into ONE definition in `order`",
+                  "type": "string"
+                },
+                "file": {
+                  "description": "a path on disk",
+                  "type": "string"
+                },
+                "glob": {
+                  "description": "comma-separated globs relative to `dir` (default `*.md,*.markdown,*.txt,*.instruction`); `**` recurses",
+                  "type": "string"
+                },
+                "oci": {
+                  "description": "an OCI artifact — ghcr.io/acme/agent:v3",
+                  "type": "string"
+                },
+                "order": {
+                  "description": "name (default, path order) or date (mtime, oldest first)",
+                  "enum": [
+                    "name",
+                    "date"
+                  ]
+                },
+                "text": {
+                  "description": "the definition itself, never read as a path or URI",
+                  "type": "string"
+                },
+                "url": {
+                  "description": "an https:// document, fetched at load",
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            }
+          ]
         },
         "limits": {
           "additionalProperties": true,
@@ -1106,6 +1148,13 @@
         },
         "name": {
           "type": "string"
+        },
+        "order": {
+          "description": "the order `dir` files load in: name (default, path order) or date (mtime, oldest first)",
+          "enum": [
+            "name",
+            "date"
+          ]
         },
         "outputs": {
           "properties": {
@@ -2528,7 +2577,7 @@
         "instruction": {
           "oneOf": [
             {
-              "description": "short form: the instruction itself, a FILE path (no whitespace, path-shaped or a document extension), or a URI (`oci://`, `mcp://`, `instruction://`, `https://`). Every other setting takes its default.",
+              "description": "short form: the instruction itself, a FILE path (no whitespace, path-shaped or a document extension), a DIRECTORY (path-shaped, trailing `/` or an existing folder), or a URI (`oci://`, `mcp://`, `instruction://`, `https://`). Every other setting takes its default.",
               "type": "string"
             },
             {
@@ -2553,12 +2602,16 @@
                   },
                   "type": "object"
                 },
+                "dir": {
+                  "description": "a folder of documents, combined into ONE instruction in `order`",
+                  "type": "string"
+                },
                 "file": {
                   "description": "a path on disk; watched when lifecycle.watch_config is on",
                   "type": "string"
                 },
-                "http": {
-                  "description": "an https:// document, fetched at load",
+                "glob": {
+                  "description": "comma-separated globs relative to `dir` (default `*.md,*.markdown,*.txt,*.instruction`); `**` recurses",
                   "type": "string"
                 },
                 "mcp": {
@@ -2590,6 +2643,13 @@
                   "description": "an OCI artifact — ghcr.io/acme/agent:v3 (the oci:// is implied)",
                   "type": "string"
                 },
+                "order": {
+                  "description": "how `dir` files are combined: name (default, path order) or date (mtime, oldest first)",
+                  "enum": [
+                    "name",
+                    "date"
+                  ]
+                },
                 "refresh": {
                   "description": "how often to re-read: `auto` (default — inotify for a file, never for a digest-pinned artifact, 5m for a mutable tag or served resource), `off`, or a duration",
                   "type": "string"
@@ -2607,6 +2667,10 @@
                     "drain",
                     "exit"
                   ]
+                },
+                "url": {
+                  "description": "an https:// document, fetched at load (same key a workflow entry uses)",
+                  "type": "string"
                 }
               },
               "type": "object"
@@ -2636,8 +2700,50 @@
           ]
         },
         "prompt": {
-          "description": "a one-shot task (--prompt): with no workflows configured the generated run executes this, while `instruction` stays the standing policy (the run's system prompt)",
-          "type": "string"
+          "oneOf": [
+            {
+              "description": "short form: a one-shot task (--prompt) — the text itself, a FILE path, a DIRECTORY, or an https:// document, classified exactly as `instruction` is. With no workflows configured the generated run executes it, while `instruction` stays the standing policy (the run's system prompt).",
+              "type": "string"
+            },
+            {
+              "additionalProperties": false,
+              "description": "long form: name the source explicitly",
+              "properties": {
+                "dir": {
+                  "description": "a folder of documents, combined into ONE task in `order`",
+                  "type": "string"
+                },
+                "file": {
+                  "description": "a path on disk",
+                  "type": "string"
+                },
+                "glob": {
+                  "description": "comma-separated globs relative to `dir` (default `*.md,*.markdown,*.txt,*.instruction`); `**` recurses",
+                  "type": "string"
+                },
+                "oci": {
+                  "description": "an OCI artifact — ghcr.io/acme/task:v3",
+                  "type": "string"
+                },
+                "order": {
+                  "description": "name (default, path order) or date (mtime, oldest first)",
+                  "enum": [
+                    "name",
+                    "date"
+                  ]
+                },
+                "text": {
+                  "description": "the task itself, never read as a path or URI",
+                  "type": "string"
+                },
+                "url": {
+                  "description": "an https:// document, fetched at load",
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            }
+          ]
         },
         "tools": {
           "additionalProperties": false,

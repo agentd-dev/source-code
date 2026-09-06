@@ -10,6 +10,7 @@ use super::children::ChildKind;
 use super::events::kinds;
 use super::reactor::{PendingKind, Runtime, Target};
 use super::tools::{ToolCaller, ToolOutcome};
+use crate::config::fileset::{Order, expand_dir_ordered};
 use crate::config::v2::substitute_config_vars;
 use crate::context::Msg;
 use crate::engine::model::{OnError, Step, Workflow, parse_workflow};
@@ -94,7 +95,11 @@ impl Runtime {
                         .get("glob")
                         .and_then(Value::as_str)
                         .unwrap_or("*.yaml,*.yml,*.json");
-                    match expand_dir(dir, pattern) {
+                    let order = match doc.get("order").and_then(Value::as_str) {
+                        Some("date") => Order::Date,
+                        _ => Order::Name,
+                    };
+                    match expand_dir_ordered(dir, pattern, order) {
                         Ok(paths) if paths.is_empty() => {
                             // Silence here would mean a schedule that never
                             // fires and no way to tell why.
@@ -3391,121 +3396,5 @@ fn collect_memory_keys(v: &Value, out: &mut Vec<String>) {
         Value::Array(a) => a.iter().for_each(|x| collect_memory_keys(x, out)),
         Value::Object(o) => o.values().for_each(|x| collect_memory_keys(x, out)),
         _ => {}
-    }
-}
-
-/// Expand a workflow directory into the files it contains.
-///
-/// `pattern` is a comma-separated list of shell-style globs relative to `dir`.
-/// `**` crosses directory boundaries, so `**/*.yaml` walks the tree and
-/// `*.yaml` does not — the distinction people already expect from every other
-/// tool that takes a glob.
-///
-/// Results are SORTED. A directory listing is in whatever order the filesystem
-/// feels like, and load order decides which of two same-named workflows is
-/// reported as the duplicate — a diagnostic that changed between machines would
-/// be worse than useless.
-fn expand_dir(dir: &str, pattern: &str) -> Result<Vec<String>, String> {
-    let root = std::path::Path::new(dir);
-    if !root.is_dir() {
-        return Err(format!("not a directory ({})", root.display()));
-    }
-    let pats: Vec<&str> = pattern
-        .split(',')
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .collect();
-    let recursive = pats.iter().any(|p| p.contains("**"));
-    let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        let rd = std::fs::read_dir(&d).map_err(|e| e.to_string())?;
-        for ent in rd.flatten() {
-            let path = ent.path();
-            if path.is_dir() {
-                if recursive {
-                    stack.push(path);
-                }
-                continue;
-            }
-            let rel = path.strip_prefix(root).unwrap_or(&path);
-            let rels = rel.to_string_lossy();
-            if pats.iter().any(|p| glob_match(p, &rels)) {
-                out.push(path.to_string_lossy().into_owned());
-            }
-        }
-    }
-    out.sort();
-    Ok(out)
-}
-
-/// Shell-style glob matching: `*` within a segment, `**` across segments, `?`
-/// for one character. Small on purpose — a workflow directory does not need
-/// brace expansion or character classes, and a dependency for this would be a
-/// poor trade in a tree that counts them.
-fn glob_match(pat: &str, text: &str) -> bool {
-    // `**/x` should also match a bare `x` at the root: people write it meaning
-    // "at any depth", which includes none.
-    if let Some(rest) = pat.strip_prefix("**/")
-        && glob_match(rest, text)
-    {
-        return true;
-    }
-    let (p, t): (Vec<char>, Vec<char>) = (pat.chars().collect(), text.chars().collect());
-    fn go(p: &[char], t: &[char]) -> bool {
-        match p.first() {
-            None => t.is_empty(),
-            Some('*') => {
-                let doubled = p.get(1) == Some(&'*');
-                let rest = if doubled { &p[2..] } else { &p[1..] };
-                // A single `*` stops at a separator; `**` does not.
-                let mut i = 0;
-                loop {
-                    if go(rest, &t[i..]) {
-                        return true;
-                    }
-                    if i >= t.len() {
-                        return false;
-                    }
-                    if !doubled && t[i] == '/' {
-                        return false;
-                    }
-                    i += 1;
-                }
-            }
-            Some('?') if !t.is_empty() => go(&p[1..], &t[1..]),
-            Some(c) if t.first() == Some(c) => go(&p[1..], &t[1..]),
-            _ => false,
-        }
-    }
-    go(&p, &t)
-}
-
-#[cfg(test)]
-mod glob_tests {
-    use super::glob_match;
-
-    #[test]
-    fn a_single_star_stays_inside_one_segment_and_double_crosses() {
-        // The distinction people expect from every other tool that takes a glob.
-        assert!(glob_match("*.yaml", "nightly.yaml"));
-        assert!(
-            !glob_match("*.yaml", "team/nightly.yaml"),
-            "* must not cross /"
-        );
-        assert!(glob_match("**/*.yaml", "team/nightly.yaml"));
-        assert!(glob_match("**/*.yaml", "a/b/c/deep.yaml"));
-        // `**/x` means "at any depth", and no depth is a depth — otherwise a
-        // recursive pattern silently skips the files at the root.
-        assert!(glob_match("**/*.yaml", "nightly.yaml"));
-
-        assert!(glob_match("flows/*.json", "flows/a.json"));
-        assert!(!glob_match("flows/*.json", "flows/a.yaml"));
-        assert!(!glob_match("*.yaml", "yaml"), "the dot is literal");
-        assert!(glob_match("?.yaml", "a.yaml"));
-        assert!(!glob_match("?.yaml", "ab.yaml"));
-        // A pattern with no wildcard is an exact name.
-        assert!(glob_match("nightly.yaml", "nightly.yaml"));
-        assert!(!glob_match("nightly.yaml", "nightly.yml"));
     }
 }

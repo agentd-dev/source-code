@@ -21,8 +21,9 @@ pub mod attest; // §7 instruction attestation (JWS/Ed25519, resolution manifest
 #[cfg(feature = "decrypt")]
 pub mod decrypt; // on-the-fly instruction decryption: age v1 + JWE compact (RFC 0041)
 pub mod envelope;
+pub mod fileset; // dir:+glob:+order: — one implementation, shared by workflows and instructions
 
-/// GET a document over HTTP(S) — the `http:` instruction source. Redirects are
+/// GET a document over HTTP(S) — the `url:` document source. Redirects are
 /// followed; a non-2xx is a refusal naming the status, because an error page
 /// silently installed as an agent's instruction is the worst outcome here.
 pub fn http_get(url: &str) -> Result<String, String> {

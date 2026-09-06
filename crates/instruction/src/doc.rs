@@ -1143,10 +1143,16 @@ fn form_refusal(k: &Kind, form: Form, line_no: usize) -> String {
             (Disposition::Machinery, _) => format!(
                 "line {line_no}: {} requires a body ({}) — use :::!{}",
                 k.name,
-                if k.name == "workflow" {
-                    "its steps"
-                } else {
-                    "its definition"
+                // What the body IS, from the schema's own body kind — so a
+                // text-bodied kind is not told to write "its definition".
+                // `workflow` names its steps (the corpus pins that wording).
+                match (k.name.as_str(), k.body) {
+                    ("workflow", _) => "its steps",
+                    (_, BodyKind::Yaml) => "its definition",
+                    (_, BodyKind::Code) => "its code",
+                    (_, BodyKind::Table) => "its rows",
+                    (_, BodyKind::Deflist) => "its entries",
+                    _ => "a text body",
                 },
                 k.name
             ),

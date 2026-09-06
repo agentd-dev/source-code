@@ -141,8 +141,7 @@ fn an_instance_template_boots_answers_typed_commands_and_retires_on_ttl() {
         \x20   room:\n\
         \x20     instruction: |\n\
         \x20       You are the room for {{params.id}}.\n\
-        \x20       :::!workflow\n\
-        \x20       name: on-ping\n\
+        \x20       :::!workflow{name=on-ping}\n\
         \x20       version: 3\n\
         \x20       steps:\n\
         \x20         cmd: { kind: a2a, command: room.ping, roles: [agent, operator] }\n\
@@ -194,8 +193,7 @@ fn a_singleton_instance_refuses_a_second_live_spawn() {
         \x20   board:\n\
         \x20     instruction: |\n\
         \x20       The one board.\n\
-        \x20       :::!workflow\n\
-        \x20       name: on-ask\n\
+        \x20       :::!workflow{name=on-ask}\n\
         \x20       version: 3\n\
         \x20       steps:\n\
         \x20         cmd: { kind: a2a, command: board.ask, roles: [agent, operator] }\n\
@@ -234,8 +232,7 @@ fn template_machinery_may_not_define_listeners_and_fails_the_parents_boot() {
         \x20       :::!config\n\
         \x20       webhooks: { listen: \"http://127.0.0.1:1\" }\n\
         \x20       :::\n\
-        \x20       :::!workflow\n\
-        \x20       name: w\n\
+        \x20       :::!workflow{name=w}\n\
         \x20       version: 3\n\
         \x20       steps: { s: { kind: once }, f: { kind: finish, depends_on: [s], status: completed } }\n\
         \x20       :::\n",

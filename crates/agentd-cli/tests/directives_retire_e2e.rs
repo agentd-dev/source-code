@@ -99,8 +99,7 @@ agent:
   instruction: |
     You watch the queue and keep things tidy.
 
-    :::!workflow
-    name: embedded
+    :::!workflow{name=embedded}
     steps:
       start: {kind: once}
       make:  {kind: assign, depends_on: [start], value: "made-by-embedded"}
@@ -162,7 +161,7 @@ fn an_unknown_machinery_directive_is_refused_naming_the_known_set() {
     let cfg = common::unique_path("dir-bad", "yaml");
     std::fs::write(
         &cfg,
-        "config_version: \"1\"\nagent:\n  name: x\n  instruction: |\n    :::!workfow\n    name: typo\n    :::\nstore:\n  kind: none\n",
+        "config_version: \"1\"\nagent:\n  name: x\n  instruction: |\n    :::!workfow{name=typo}\n    :::\nstore:\n  kind: none\n",
     )
     .unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_agentd"))
@@ -188,8 +187,7 @@ agent:
   instruction: |
     Keep ticking.
 
-    :::!workflow
-    name: tick
+    :::!workflow{{name=tick}}
     steps:
       s: {{kind: schedule, every: 400ms}}
       v: {{kind: assign, depends_on: [s], value: "{version}"}}

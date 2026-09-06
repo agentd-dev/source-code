@@ -35,16 +35,14 @@ limits: { max_runs: 20 }
 retention: { max_events: 100 }
 :::
 
-:::!workflow
-name: producer
+:::!workflow{name=producer}
 steps:
   s:   { kind: once, policy: always }
   pub: { kind: emit, depends_on: [s], stream: orders, subject: order.paid, data: { n: 7 } }
   f:   { kind: finish, depends_on: [pub], status: completed }
 :::
 
-:::!workflow
-name: fulfil
+:::!workflow{name=fulfil}
 steps:
   take: { kind: stream, stream: orders, subject: "order.*", from: earliest }
   f:    { kind: finish, depends_on: [take], status: completed, output: "shipped #{{steps.take.output.data.n}}" }

@@ -1757,6 +1757,16 @@ fn parse_front_matter(text: &str, errs: &mut Vec<String>) -> (BTreeMap<String, V
 fn check_identity(blocks: &[&Block], errs: &mut Vec<String>) {
     let mut seen: BTreeMap<(String, String), usize> = BTreeMap::new();
     for b in blocks {
+        // `x-identity`: identity is the `name` ATTRIBUTE and nothing else. A
+        // `name:` key inside a YAML body is a body field that happens to be
+        // called name — it does not make the block named. Set MEMBERS carry
+        // their names per row and are checked as the set is parsed.
+        if lookup(&b.kind).is_some_and(|k| k.identity)
+            && b.set_group.is_none()
+            && b.name.as_deref().unwrap_or("").is_empty()
+        {
+            errs.push(format!("line {}: {} requires name", b.line, b.kind));
+        }
         if let Some(name) = &b.name
             && lookup(&b.kind).is_some_and(|k| k.sub_of.is_none())
         {
@@ -2595,32 +2605,15 @@ fn deliver_set_lines(members: &[&Block]) -> Vec<String> {
 
 /// A machinery block's acknowledgement line from the schema's `x-acknowledgement`
 /// template, or `None` for a kind that delivers nothing (§3.5 step 5).
-/// A top-level `name:` scalar in a YAML body, unquoted or quoted.
-fn body_name(body: &str) -> Option<String> {
-    body.lines().find_map(|l| {
-        let v = l.strip_prefix("name:")?.trim();
-        let v = v.trim_matches(['"', '\'']).trim();
-        (!v.is_empty()).then(|| v.to_string())
-    })
-}
-
 fn machinery_ack(b: &Block) -> Option<String> {
     let kind = lookup(&b.kind)?;
     let tmpl = kind.ack.as_deref()?;
-    // The identity is the `name` attribute; a YAML-bodied kind whose document
-    // put the name in the BODY instead (a workflow written as a plain inline
-    // entry) still gets NAMED here — an acknowledgement that says a workflow
-    // loaded without saying which one tells the model strictly less than the
-    // block it replaced.
+    // Identity is the `name` attribute (`x-identity`); a block that reaches
+    // delivery without one was already refused at parse.
     let name = b
         .name
         .clone()
         .or_else(|| b.attrs.get("name").cloned())
-        .or_else(|| {
-            (kind.body == BodyKind::Yaml)
-                .then(|| body_name(&b.body))
-                .flatten()
-        })
         .unwrap_or_default();
     let path = b.attrs.get("path").cloned().unwrap_or_default();
     let target = b.attrs.get("target").cloned().unwrap_or_default();
@@ -3373,7 +3366,7 @@ fn fold_machinery(b: &Block, out: &mut Extraction, errs: &mut Vec<String>) {
                             }
                         }
                     }
-                    None => errs.push(format!("line {}: :::!mcp needs a name", b.line)),
+                    None => errs.push(format!("line {}: mcp requires name", b.line)),
                 }
             }
         }
@@ -3386,7 +3379,7 @@ fn fold_machinery(b: &Block, out: &mut Extraction, errs: &mut Vec<String>) {
                     Some(name) => {
                         frag(&mut out.config, "streams").insert(name.clone(), Value::Object(m));
                     }
-                    None => errs.push(format!("line {}: :::!stream needs a name", b.line)),
+                    None => errs.push(format!("line {}: stream requires name", b.line)),
                 }
             }
         }
@@ -3406,7 +3399,7 @@ fn fold_machinery(b: &Block, out: &mut Extraction, errs: &mut Vec<String>) {
                     body: b.delivery_body().to_string(),
                 });
             }
-            None => errs.push(format!("line {}: :::!skill needs a name", b.line)),
+            None => errs.push(format!("line {}: skill requires name", b.line)),
         },
         // ── extended families: cleanly map to real config where one exists ───
         "endpoint" => {
@@ -3415,7 +3408,7 @@ fn fold_machinery(b: &Block, out: &mut Extraction, errs: &mut Vec<String>) {
             // run); otherwise it fires the workflow. The listener address is
             // `webhooks.listen` (agent-level); this block declares the ROUTE.
             let Some(name) = b.name.clone().or_else(|| b.attrs.get("name").cloned()) else {
-                errs.push(format!("line {}: :::!endpoint needs a name", b.line));
+                errs.push(format!("line {}: endpoint requires name", b.line));
                 return;
             };
             let body = body_map(b, errs).unwrap_or_default();

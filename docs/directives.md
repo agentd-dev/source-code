@@ -161,8 +161,7 @@ retention: { max_events: 10000 }
 disabled: ["exec"]
 :::
 
-:::!workflow
-name: fulfil
+:::!workflow{name=fulfil}
 steps:
   take: { kind: stream, stream: orders, subject: "order.*" }
   act:  { kind: agent, depends_on: [take], instruction: "fulfil it" }

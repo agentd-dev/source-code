@@ -329,8 +329,9 @@ fn top_level_properties(
                 "items": { "type": "object", "additionalProperties": false, "properties": {
                 "uri": { "type": "string", "description": "the document this pin applies to (instruction://…)" },
                 "publisher": { "type": "string", "description": "the publisher the author signature must claim" },
-                "author_keys": { "type": "array", "items": { "type": "string" }, "description": "author (offline) verification key PEM paths" },
-                "delivery_keys": { "type": "array", "items": { "type": "string" }, "description": "delivery (online) verification key PEM paths" },
+                "author_keys": { "type": "array", "items": { "type": "string" }, "description": "author (offline) verification keys: key file paths (raw/hex/base64url Ed25519), or instruction://…keys.json JWKS uris fetched from the serving registry; empty + publisher set = discover from the read's publisherKeys" },
+                "delivery_keys": { "type": "array", "items": { "type": "string" }, "description": "delivery (online) verification keys — same forms as author_keys" },
+                "reader": { "type": "string", "description": "this consumer's reader id for the delivery aud check (§7.6 step 2), e.g. principal://… or agent://…; delivery verification runs only when set" },
                 "max_capabilities": { "type": "array", "items": { "enum": ["material", "knowledge", "interface", "identity", "compute", "infra", "compose"] }, "description": "the per-source ceiling; effective families never exceed it" },
                 "freshness": { "type": "string", "description": "the revocation re-check deadline (a duration, e.g. 15m)" } } } }));
     m.insert("security".to_string(), json!({ "type": "object", "additionalProperties": false, "properties": {

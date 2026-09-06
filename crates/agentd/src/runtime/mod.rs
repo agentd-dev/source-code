@@ -60,6 +60,77 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// The `kid` from a compact JWS's protected header, if any.
+#[cfg(feature = "sign")]
+fn jws_kid(jws: &str) -> Option<String> {
+    let head = jws.split('.').next()?;
+    let bytes = crate::config::envelope::b64url_decode(head)?;
+    serde_json::from_slice::<Value>(&bytes)
+        .ok()?
+        .get("kid")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// Resolve an Ed25519 verification key (+ its lifecycle state) from a list of
+/// key sources: an `instruction://…` uri is read from the serving client and
+/// parsed as a JWKS (`keys[] {kid, x, state?}`, revoked keys never returned);
+/// anything else is a FILE holding a raw-32 / hex / base64url public key
+/// (state "active"). The first source that yields a key matching `kid` (or
+/// any key when the JWS names none) wins.
+#[cfg(feature = "sign")]
+fn resolve_verify_key(
+    client: &Arc<McpClient>,
+    sources: &[String],
+    kid: Option<&str>,
+) -> Option<(Vec<u8>, String)> {
+    for src in sources {
+        if src.starts_with("instruction://") {
+            let Ok(r) = client.read_resource(src) else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_str::<Value>(&r.text()) else {
+                continue;
+            };
+            for k in v["keys"].as_array().into_iter().flatten() {
+                if k["kty"].as_str() != Some("OKP") || k["crv"].as_str() != Some("Ed25519") {
+                    continue;
+                }
+                if let Some(want) = kid
+                    && k["kid"].as_str() != Some(want)
+                {
+                    continue;
+                }
+                if let Some(key) = k["x"]
+                    .as_str()
+                    .and_then(crate::config::envelope::b64url_decode)
+                {
+                    let state = k["state"].as_str().unwrap_or("active").to_string();
+                    return Some((key, state));
+                }
+            }
+        } else if let Ok(bytes) = std::fs::read(src) {
+            let key = match bytes.len() {
+                32 => Some(bytes),
+                _ => {
+                    let text = String::from_utf8_lossy(&bytes).trim().to_string();
+                    if text.len() == 64 && text.chars().all(|c| c.is_ascii_hexdigit()) {
+                        (0..32)
+                            .map(|i| u8::from_str_radix(&text[2 * i..2 * i + 2], 16).ok())
+                            .collect()
+                    } else {
+                        crate::config::envelope::b64url_decode(&text).filter(|v| v.len() == 32)
+                    }
+                }
+            };
+            if let Some(key) = key {
+                return Some((key, "active".to_string()));
+            }
+        }
+    }
+    None
+}
+
 /// Check every secret reference in `doc`; prompt for the promptable ones when
 /// `--prompt-missing` was given and a controlling terminal exists; report
 /// whatever is still missing — all of it, together — and return the exit code
@@ -1463,6 +1534,151 @@ impl Runtime {
         String::from_utf8(bytes).map_err(|_| "the instruction is not valid UTF-8".to_string())
     }
 
+    /// §7.6 wire verification for a registry-served instruction: when an
+    /// `instruction_sources` entry pins a `publisher` for this document, the
+    /// read MUST carry a valid author attestation from a key of that
+    /// publisher's set — and, when `reader` is configured, a valid delivery
+    /// attestation for this reader too. Every failure is a refusal (the
+    /// running text is kept; the caller surfaces the error), never a
+    /// downgrade. Returns the author-attested capability set for the §7.8
+    /// wire-admission intersection, or `None` when no source demanded
+    /// verification.
+    #[allow(clippy::type_complexity)]
+    fn verify_registry_read(
+        &self,
+        client: &Arc<McpClient>,
+        uri: &str,
+        raw: &str,
+        meta: &Option<Value>,
+    ) -> Result<Option<Vec<String>>, String> {
+        let doc_id = uri.split('@').next().unwrap_or(uri);
+        let Some(src) = self
+            .settings
+            .instruction_sources
+            .iter()
+            .find(|s| s.uri.split('@').next().unwrap_or(&s.uri) == doc_id)
+            .filter(|s| !s.publisher.is_empty())
+        else {
+            return Ok(None);
+        };
+        #[cfg(not(feature = "sign"))]
+        {
+            let _ = (client, raw, meta);
+            Err(format!(
+                "instruction_sources pins publisher {:?} for {doc_id}, but this build \
+                 cannot verify signatures — rebuild with --features sign",
+                src.publisher
+            ))
+        }
+        #[cfg(feature = "sign")]
+        {
+            use instruction_core::sign;
+            let get = |k: &str| -> Option<String> {
+                meta.as_ref()
+                    .and_then(|m| m.get(format!("md.instruction/{k}")))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            };
+            // A pinned read of a revoked version HOLDS (§7.7): refuse the swap.
+            if meta
+                .as_ref()
+                .and_then(|m| m.get("md.instruction/revoked"))
+                .is_some_and(|v| !v.is_null())
+            {
+                return Err(format!(
+                    "{doc_id}: this version is REVOKED — refusing to apply it"
+                ));
+            }
+            let jws = get("signature").ok_or_else(|| {
+                format!(
+                    "instruction_sources pins publisher {:?} but the read carries no author signature — refuse (§7.6)",
+                    src.publisher
+                )
+            })?;
+            let kid = jws_kid(&jws);
+            // Resolve the author key set: pinned entries first, else the
+            // read's own publisherKeys discovery uri.
+            let mut key_uris: Vec<String> = src.author_keys.clone();
+            if key_uris.is_empty()
+                && let Some(disc) = get("publisherKeys")
+            {
+                key_uris.push(disc);
+            }
+            let (key, state) =
+                resolve_verify_key(client, &key_uris, kid.as_deref()).ok_or_else(|| {
+                    format!("{doc_id}: no author verification key resolves (kid {kid:?})")
+                })?;
+            match state.as_str() {
+                "active" | "retired" => {}
+                other => {
+                    return Err(format!(
+                        "{doc_id}: author key {kid:?} is {other} — refusing (§7.7)"
+                    ));
+                }
+            }
+            let claims = sign::verify_author(&jws, &key)?;
+            let want = sign::digest(raw.as_bytes());
+            if claims.digest != want {
+                return Err(format!(
+                    "{doc_id}: author signature covers {} but the delivered bytes hash to {want} — refuse",
+                    claims.digest
+                ));
+            }
+            if claims.publisher != src.publisher {
+                return Err(format!(
+                    "{doc_id}: author claims publisher {:?}, not the pinned {:?} — refuse",
+                    claims.publisher, src.publisher
+                ));
+            }
+            if claims.exp < crate::state::now_ms() / 1000 {
+                return Err(format!("{doc_id}: the author signature has expired"));
+            }
+            // Delivery attestation: only when this consumer knows who it is.
+            if let Some(reader) = &src.reader {
+                let d_jws = get("deliverySignature").ok_or_else(|| {
+                    format!("{doc_id}: reader is pinned but the read carries no delivery signature")
+                })?;
+                let d_kid = jws_kid(&d_jws);
+                let mut d_uris = src.delivery_keys.clone();
+                if d_uris.is_empty()
+                    && let Some(disc) = get("deliveryKeys")
+                {
+                    d_uris.push(disc);
+                }
+                let (d_key, _) = resolve_verify_key(client, &d_uris, d_kid.as_deref())
+                    .ok_or_else(|| format!("{doc_id}: no delivery key resolves (kid {d_kid:?})"))?;
+                let d = sign::verify_delivery(&d_jws, &d_key)?;
+                if d.aud.as_deref() != Some(reader.as_str()) {
+                    return Err(format!(
+                        "{doc_id}: delivery is for {:?}, not this reader {reader:?} (§7.6 step 2)",
+                        d.aud.as_deref().unwrap_or("<none>")
+                    ));
+                }
+                if d.exp < crate::state::now_ms() / 1000 {
+                    return Err(format!("{doc_id}: the delivery signature has expired"));
+                }
+                if d.digest != want {
+                    return Err(format!(
+                        "{doc_id}: delivery digest does not cover these bytes"
+                    ));
+                }
+            }
+            self.log.info(
+                "instruction.verified",
+                json!({"uri": uri, "kid": kid, "key_state": state,
+                       "publisher": src.publisher,
+                       "author_capabilities": claims.capabilities,
+                       "delivery_checked": src.reader.is_some()}),
+            );
+            // §7.6 step 5 intersection input: grant ∩ max_capabilities ∩ author.
+            let mut caps = claims.capabilities;
+            if !src.max_capabilities.is_empty() {
+                caps.retain(|c| src.max_capabilities.contains(c));
+            }
+            Ok(Some(caps))
+        }
+    }
+
     /// Consumer-alignment reporting (RFC-0028 §3.3): ensure ONE binding on
     /// the registry serving the instruction, then report each applied version.
     /// Best-effort by design — a registry that cannot take the report must
@@ -1602,18 +1818,27 @@ impl Runtime {
                             .and_then(Value::as_str)
                             .map(str::to_string)
                     };
+                    // §7.6 wire verification, BEFORE anything interprets the
+                    // bytes: a source that pins a publisher gets exactly what
+                    // that publisher signed, or nothing.
+                    let attested = self.verify_registry_read(&c, &res, &raw, &meta)?;
                     // Delivered text is the CLEANED document when it carries
                     // machinery (resolution "raw" = resolve locally); the
                     // machinery itself applies on reload/restart. A document
                     // that no longer folds keeps the running text.
                     let text = if crate::config::idoc::contains_blocks(&raw) {
-                        let granted: std::collections::BTreeSet<String> = self
+                        let mut granted: std::collections::BTreeSet<String> = self
                             .settings
                             .agent
                             .document_capabilities
                             .iter()
                             .cloned()
                             .collect();
+                        // §7.8 wire admission: a verified document folds under
+                        // grant ∩ ceiling ∩ author-attested — a signature CAPS.
+                        if let Some(caps) = &attested {
+                            granted.retain(|g| caps.contains(g));
+                        }
                         let facts: BTreeMap<String, String> =
                             [("agent".to_string(), "agentd".to_string())].into();
                         match crate::config::idoc::extract_with_facts(&raw, &granted, &facts) {

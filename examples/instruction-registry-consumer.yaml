@@ -38,7 +38,19 @@ mcp:
 
 instruction_sources:
   - uri: "instruction://ins_01M1SSQR9NG8AYS34KWRMGY4E1@stable"
+    # Pinning a publisher makes §7.6 verification MANDATORY on every read
+    # (build with --features sign): the author JWS must verify against this
+    # publisher's key set, revoked keys and revoked versions refuse, and the
+    # fold runs under grant ∩ ceiling ∩ author-attested capabilities. An
+    # unsigned read then refuses at startup — fail closed, never a downgrade.
     publisher: "https://instruction.md/pub/agentd-dev"
+    # Author keys: file paths (raw/hex/base64url Ed25519), or JWKS uris like
+    # "instruction://pub/<owner>/keys.json" read from the serving registry;
+    # EMPTY = discover from the read's own publisherKeys pointer.
+    author_keys: []
+    # Set your reader id (the delivery `aud`, e.g. principal://… or agent://…)
+    # to ALSO require a delivery attestation bound to this consumer:
+    # reader: "principal://usr_…"
     # The re-read cadence (and §7.7 staleness deadline): unreachable past this,
     # NEW work is refused while live runs drain.
     freshness: 60s

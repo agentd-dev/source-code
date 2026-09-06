@@ -235,10 +235,19 @@ pub struct InstructionSource {
     pub uri: String,
     /// The publisher the author signature must claim.
     pub publisher: String,
-    /// Author (offline) verification keys — PEM paths.
+    /// Author (offline) verification keys: file paths (raw 32-byte, hex, or
+    /// base64url Ed25519 public keys), or `instruction://…keys.json` JWKS
+    /// URIs fetched from the SAME server that serves the instruction. Empty
+    /// with a `publisher` set = discover from the read's `publisherKeys` uri.
     pub author_keys: Vec<String>,
-    /// Delivery (online) verification keys — PEM paths.
+    /// Delivery (online) verification keys — same forms as `author_keys`.
     pub delivery_keys: Vec<String>,
+    /// This consumer's reader id for the delivery `aud` check (§7.6 step 2),
+    /// e.g. `principal://usr_…` or `agent://…`. Delivery-signature
+    /// verification runs only when this is set — an `aud` check against an
+    /// unknown self would be a silent downgrade.
+    #[serde(default)]
+    pub reader: Option<String>,
     /// The per-source capability ceiling: effective families never exceed it.
     pub max_capabilities: Vec<String>,
     /// The revocation re-check deadline (a duration, e.g. `15m`).

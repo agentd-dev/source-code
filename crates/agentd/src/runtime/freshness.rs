@@ -122,6 +122,7 @@ mod tests {
             author_keys: vec![],
             delivery_keys: vec![],
             max_capabilities: vec![],
+            reader: None,
             freshness: freshness.map(str::to_string),
         }
     }

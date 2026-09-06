@@ -2526,8 +2526,22 @@
           "type": "array"
         },
         "instruction": {
-          "description": "static text, or a single-token URI a configured MCP server serves (read + subscribed)",
+          "description": "the instruction itself, a FILE path (no whitespace, path-shaped or a document extension; `file://` to be explicit), or a URI — `oci://` an artifact, `mcp://`/`instruction://` a served resource",
           "type": "string"
+        },
+        "instruction_refresh": {
+          "description": "how often to re-read the instruction: `auto` (default — inotify for a file, no polling for a digest-pinned artifact, 5m for a mutable tag or served resource), `off`, or a duration",
+          "type": "string"
+        },
+        "instruction_unavailable": {
+          "description": "what to do when the source stops answering after startup: auto (freeze when trust-pinned, else keep), keep (carry on with the last good instruction), freeze (refuse new work, drain live), drain (finish live work then exit 0), exit (stop now)",
+          "enum": [
+            "auto",
+            "keep",
+            "freeze",
+            "drain",
+            "exit"
+          ]
         },
         "max_parallel_turns": {
           "minimum": 1,

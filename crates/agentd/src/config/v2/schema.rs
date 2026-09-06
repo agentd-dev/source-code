@@ -92,7 +92,9 @@ fn top_level_properties(
                 "type": "object", "additionalProperties": false,
                 "properties": {
                     "name": { "type": "string", "description": "instance identity (falls back to the downward-API instance, then the hostname)" },
-                    "instruction": { "type": "string", "description": "static text, or a single-token URI a configured MCP server serves (read + subscribed)" },
+                    "instruction": { "type": "string", "description": "the instruction itself, a FILE path (no whitespace, path-shaped or a document extension; `file://` to be explicit), or a URI — `oci://` an artifact, `mcp://`/`instruction://` a served resource" },
+                "instruction_refresh": { "type": "string", "description": "how often to re-read the instruction: `auto` (default — inotify for a file, no polling for a digest-pinned artifact, 5m for a mutable tag or served resource), `off`, or a duration" },
+                "instruction_unavailable": { "enum": ["auto", "keep", "freeze", "drain", "exit"], "description": "what to do when the source stops answering after startup: auto (freeze when trust-pinned, else keep), keep (carry on with the last good instruction), freeze (refuse new work, drain live), drain (finish live work then exit 0), exit (stop now)" },
                     "prompt": { "type": "string", "description": "a one-shot task (--prompt): with no workflows configured the generated run executes this, while `instruction` stays the standing policy (the run's system prompt)" },
                     "preflight": { "enum": ["never", "auto", "always"] },
                     "wake_on": { "type": "array", "items": { "enum": ["a2a_message", "human_reply", "subagent_result", "workflow_finished", "workflow_failed", "instruction_updated", "budget_resumed"] } },

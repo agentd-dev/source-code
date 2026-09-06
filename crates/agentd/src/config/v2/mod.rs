@@ -319,6 +319,22 @@ pub struct Agent {
     /// DERIVED. `lifecycle.watch_config` watches it alongside the config.
     #[serde(skip)]
     pub instruction_path: Option<String>,
+    /// How often to re-read the instruction: `auto` (the default — the
+    /// mechanism that fits the source), `off`, or a duration.
+    ///
+    /// `auto` is per-kind because polling is only ever right for one of them:
+    /// a FILE is watched by inotify (instant, no polling); a `@sha256:` OCI
+    /// pin is immutable, so re-reading it can only return what it already
+    /// returned; a mutable `:tag` is polled; a served resource relies on the
+    /// server's notifications and polls as a fallback; inline text has no
+    /// source to re-read.
+    #[serde(default)]
+    pub instruction_refresh: Option<String>,
+    /// What to do when the instruction source stops answering: `auto` (the
+    /// default), `keep`, `freeze`, `drain` or `exit`. See
+    /// [`InstructionUnavailable`].
+    #[serde(default)]
+    pub instruction_unavailable: InstructionUnavailable,
 }
 
 /// The provenance of a load-time-resolved instruction reference.
@@ -396,6 +412,35 @@ impl Agent {
             .as_deref()
             .is_some_and(looks_like_resource_uri)
     }
+}
+
+/// What to do when the instruction source stops answering AFTER startup.
+/// (At startup there is no previous instruction to fall back to, so an
+/// unreachable source is always a refusal to start.)
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum InstructionUnavailable {
+    /// FREEZE when the source is trust-pinned (a `publisher` in
+    /// `instruction_sources`), because a stale *authorization* is a security
+    /// matter — §7.7 — and KEEP otherwise, because an unsigned source that
+    /// stops answering is usually a network blip and the agent already holds
+    /// a good copy of its instruction.
+    #[default]
+    Auto,
+    /// Carry on with the last good instruction. Highest availability; the
+    /// agent may run on an instruction its source has since withdrawn.
+    Keep,
+    /// Serve live work to completion, refuse NEW work. The §7.7 posture: the
+    /// agent stops taking on anything it cannot justify, without abandoning
+    /// what it already accepted.
+    Freeze,
+    /// Finish live work, then exit 0 — an orchestrator restarts the pod and
+    /// startup re-reads the source, which is the natural repair.
+    Drain,
+    /// Stop now, exit non-zero. For an agent whose instruction is so
+    /// load-bearing that running without a fresh one is worse than not
+    /// running.
+    Exit,
 }
 
 /// What an `agent.instruction` VALUE is. One flag carries all four, because
@@ -6182,6 +6227,13 @@ pub const RELOADABLE_PATHS: &[&str] = &[
     "a2a.push",
     "agent.approval",
     "agent.ask_human_fallback",
+    // Read live at the moment the policy fires, from `self.settings`, which a
+    // reload replaces.
+    "agent.instruction_unavailable",
+    // `reload.rs` re-arms the freshness timer when this changes, which is
+    // what makes the claim true even when it was previously `off` and no
+    // timer existed to pick the change up.
+    "agent.instruction_refresh",
     "agent.conversation_budget",
     "agent.instruction",
     "agent.max_parallel_turns",

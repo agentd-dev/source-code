@@ -60,6 +60,16 @@ impl Timers {
         Ok(id)
     }
 
+    /// Every armed timer whose owner has this `kind` — so a subsystem can
+    /// find and replace its own timer rather than stacking a second one.
+    pub fn armed_of_kind(&self, kind: &str) -> Vec<String> {
+        self.map
+            .iter()
+            .filter(|(_, rec)| rec.owner["kind"] == kind)
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
     /// Disarm (delete) a timer — armed or still settling (a cancelled run's
     /// timers arrive here through `owned_by`, which reports both, so a row that
     /// fired moments ago is deleted rather than left to re-fire after a restart).

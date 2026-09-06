@@ -127,6 +127,15 @@ impl Runtime {
             self.governor = g;
             changed.push("intelligence.budget");
         }
+        // The refresh cadence: re-arm so a changed interval takes effect now
+        // rather than at the next restart. `arm_freshness` disarms the old
+        // timer first, so this replaces rather than stacks — and it is what
+        // makes `agent.instruction_refresh` honestly RELOADABLE, including
+        // the case where it was `off` and no timer existed to notice.
+        if old.agent.instruction_refresh != new.agent.instruction_refresh {
+            self.arm_freshness();
+            changed.push("agent.instruction_refresh");
+        }
         // Instruction (static text; a resource instruction re-subscribes).
         if old.agent.instruction != new.agent.instruction {
             match new.agent.instruction.clone() {

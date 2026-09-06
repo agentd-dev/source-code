@@ -111,7 +111,17 @@ pub struct Claims {
 /// protected header carries `alg: EdDSA` and the claim's `typ`, so an author
 /// signature can never be replayed as a delivery one or vice versa.
 pub fn sign(key: &AgentKey, claims: &Claims) -> Result<String, String> {
-    let header = serde_json::json!({ "alg": "EdDSA", "typ": claims.typ });
+    sign_kid(key, claims, None)
+}
+
+/// As [`sign`], naming the key in the protected header. A publisher that
+/// rotates keys serves a key SET, so the header must say which member signed
+/// — a verifier selects on the JWS's own `kid`, never on metadata beside it.
+pub fn sign_kid(key: &AgentKey, claims: &Claims, kid: Option<&str>) -> Result<String, String> {
+    let header = match kid {
+        Some(k) => serde_json::json!({ "alg": "EdDSA", "typ": claims.typ, "kid": k }),
+        None => serde_json::json!({ "alg": "EdDSA", "typ": claims.typ }),
+    };
     let h = b64::url_nopad(
         serde_json::to_string(&header)
             .map_err(|e| e.to_string())?

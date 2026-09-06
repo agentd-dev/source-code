@@ -164,6 +164,14 @@ fn handle_request(req: Request, state: &State) -> (Response, bool) {
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("")
                 .to_string();
+            // A REGISTRY-shaped instruction: the document plus the
+            // `md.instruction/*` alignment metadata a registry serves
+            // (RFC-0028 §3.3), signed with a FIXED test seed when the `sign`
+            // feature is built, so the consumer's §7.6 verification — and its
+            // fail-closed refusals — have coverage with no live gateway.
+            if asked.starts_with("instruction://") {
+                return (Response::ok(req.id, registry_read(&asked)), false);
+            }
             let (mime, text) = match asked.as_str() {
                 "skill://incident-runbook" => ("text/x-skill+markdown", "# Incident runbook\n1. Acknowledge the alert. 2. Find the blast radius. 3. Mitigate first, root-cause later. 4. Write the timeline.".to_string()),
                 "mock://instruction" => ("text/plain", "You are the mock-served agent. Follow the served instruction.".to_string()),
@@ -267,6 +275,20 @@ fn handle_tool_call(req: Request, state: &State) -> Response {
     let params = req.params.clone().unwrap_or(json!({}));
     let name = params.get("name").and_then(serde_json::Value::as_str);
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
+    // The registry's consumer-alignment tools (RFC-0028 §3.3). The call is
+    // echoed on stderr so an e2e can assert WHAT the consumer reported
+    // without needing a live registry.
+    if let Some(n) = name
+        && n.starts_with("instructions.bindings.")
+    {
+        eprintln!("MOCK_BINDINGS {n} {args}");
+        return match n {
+            "instructions.bindings.create" => {
+                tool_ok(req.id, json!({"bindingId": "sub_mock_1", "mode": "follow"}))
+            }
+            _ => tool_ok(req.id, json!({"ok": true})),
+        };
+    }
     let key = || {
         args.get("key")
             .and_then(serde_json::Value::as_str)
@@ -542,4 +564,158 @@ fn write_json(stream: &mut TcpStream, payload: serde_json::Value, session: bool)
     let _ = stream.write_all(head.as_bytes());
     let _ = stream.write_all(&body);
     let _ = stream.flush();
+}
+
+/// The document this mock's registry serves. `REGISTRY_VERSION` moves when the
+/// caller asks for `@next`, so a test can watch an apply boundary.
+const REGISTRY_DOC: &str = "---\nspec: \"1\"\nid: instruction://ins_mock\n---\n# Mock registry agent\n\nServe the mock.\n\n:::!workflow{name=mock-drain}\nsteps:\n  start: { kind: manual }\n  done:  { kind: finish, depends_on: [start] }\n:::\n";
+const REGISTRY_DOC_V2: &str = "---\nspec: \"1\"\nid: instruction://ins_mock\n---\n# Mock registry agent\n\nServe the mock, version two.\n\n:::!workflow{name=mock-drain}\nsteps:\n  start: { kind: manual }\n  done:  { kind: finish, depends_on: [start] }\n:::\n";
+/// The fixed Ed25519 seed the mock signs with; a test derives the public key
+/// from it to pin the publisher.
+pub const MOCK_SIGN_SEED: [u8; 32] = [7u8; 32];
+/// The REGISTRY's delivery key — a different key from the publisher's, at its
+/// own document, exactly as the instruction.md gateway serves it. A verifier
+/// that reaches for the publisher key (or the publisher's JWKS shape) to check
+/// a delivery signature passes a naive mock and fails a real registry.
+pub const MOCK_DELIVERY_SEED: [u8; 32] = [9u8; 32];
+const MOCK_PUBLISHER: &str = "https://instruction.md/pub/mock";
+const MOCK_PUBLISHER_KID: &str = "mock-1";
+const MOCK_DELIVERY_KID: &str = "delivery";
+const MOCK_DELIVERY_KEYS_URI: &str = "instruction://delivery-keys.json";
+
+/// `resources/read` for an `instruction://…` uri: contents + `_meta`.
+fn registry_read(uri: &str) -> serde_json::Value {
+    // The publisher's JWKS, for key discovery.
+    if uri == MOCK_DELIVERY_KEYS_URI {
+        return json!({"contents": [{"uri": uri, "mimeType": "application/json",
+            "text": mock_delivery_jwks()}]});
+    }
+    if uri.contains("/keys.json") {
+        return json!({"contents": [{"uri": uri, "mimeType": "application/json",
+            "text": mock_jwks()}]});
+    }
+    let v2 = uri.ends_with("@next");
+    let text = if v2 { REGISTRY_DOC_V2 } else { REGISTRY_DOC };
+    let version_id = if v2 { "ver_mock_2" } else { "ver_mock_1" };
+    let mut meta = json!({
+        "md.instruction/canonical": "instruction://ins_mock",
+        "md.instruction/versionId": version_id,
+        "md.instruction/revision": if v2 { 2 } else { 1 },
+        "md.instruction/ref": if v2 { "next" } else { "stable" },
+        "md.instruction/spec": "1",
+        "md.instruction/publisher": MOCK_PUBLISHER,
+        "md.instruction/resolution": "raw",
+        "md.instruction/publisherKeys": "instruction://pub/mock/keys.json",
+        "md.instruction/deliveryKeys": MOCK_DELIVERY_KEYS_URI,
+    });
+    let digest = mock_digest(text.as_bytes());
+    meta["md.instruction/digest"] = json!(digest);
+    meta["md.instruction/deliveredDigest"] = json!(digest);
+    if let Some((author, delivery)) = mock_signatures(text, version_id) {
+        meta["md.instruction/signature"] = json!(author);
+        meta["md.instruction/deliverySignature"] = json!(delivery);
+        // The publisher kid describes the AUTHOR signature only; the delivery
+        // JWS names its own key in its header.
+        meta["md.instruction/kid"] = json!(MOCK_PUBLISHER_KID);
+        meta["md.instruction/signatureKeyState"] = json!("active");
+    }
+    json!({"contents": [{"uri": uri, "mimeType": "text/markdown; variant=instruction",
+        "text": text, "_meta": meta}]})
+}
+
+#[cfg(feature = "sign")]
+fn mock_digest(bytes: &[u8]) -> String {
+    crate::config::attest::digest(bytes)
+}
+#[cfg(not(feature = "sign"))]
+fn mock_digest(_bytes: &[u8]) -> String {
+    String::new()
+}
+
+#[cfg(feature = "sign")]
+fn mock_jwks() -> String {
+    let key = crate::aauth::AgentKey::from_seed(&MOCK_SIGN_SEED).expect("test seed");
+    let x = crate::aauth::b64::url_nopad(key.public_bytes());
+    // The registry's real document carries more than `keys` + `publisher`;
+    // served here so a consumer that denies unknown fields fails in CI
+    // rather than in production.
+    json!({"keys": [{"kty": "OKP", "crv": "Ed25519", "alg": "EdDSA", "use": "sig",
+                     "kid": MOCK_PUBLISHER_KID, "state": "active", "x": x,
+                     "source": "platform", "createdAt": "2026-09-06T00:00:00.000Z"}],
+           "publisher": MOCK_PUBLISHER, "organizationId": "org_mock",
+           "platformSigning": true, "revision": 1,
+           "updatedAt": "2026-09-06T00:00:00.000Z"})
+    .to_string()
+}
+
+/// The REGISTRY's delivery key document: `{issuer, keys}` — no `publisher`.
+#[cfg(feature = "sign")]
+fn mock_delivery_jwks() -> String {
+    let key = crate::aauth::AgentKey::from_seed(&MOCK_DELIVERY_SEED).expect("test seed");
+    let x = crate::aauth::b64::url_nopad(key.public_bytes());
+    json!({"issuer": "https://instruction.md/pub",
+           "keys": [{"kty": "OKP", "crv": "Ed25519", "alg": "EdDSA", "use": "sig",
+                     "kid": MOCK_DELIVERY_KID, "x": x}]})
+    .to_string()
+}
+#[cfg(not(feature = "sign"))]
+fn mock_delivery_jwks() -> String {
+    json!({"issuer": "https://instruction.md/pub", "keys": []}).to_string()
+}
+#[cfg(not(feature = "sign"))]
+fn mock_jwks() -> String {
+    json!({"keys": []}).to_string()
+}
+
+/// `(author_jws, delivery_jws)` over this document, for the fixed test reader.
+#[cfg(feature = "sign")]
+fn mock_signatures(text: &str, version_id: &str) -> Option<(String, String)> {
+    use crate::config::attest::{Authored, Claims, Manifest, Variants, sign_kid};
+    let digest = crate::config::attest::digest(text.as_bytes());
+    let author = Claims {
+        spec: crate::config::attest::SPEC_CLAIM.into(),
+        typ: "author".into(),
+        doc: "instruction://ins_mock".into(),
+        version: version_id.into(),
+        digest: crate::config::attest::author_digest(text.as_bytes()),
+        capabilities: vec!["core".into(), "compute".into()],
+        publisher: MOCK_PUBLISHER.into(),
+        iat: 1,
+        exp: u64::MAX / 2,
+        aud: None,
+        manifest: None,
+        author: None,
+    };
+    let pub_key = crate::aauth::AgentKey::from_seed(&MOCK_SIGN_SEED).ok()?;
+    let a_jws = sign_kid(&pub_key, &author, Some(MOCK_PUBLISHER_KID)).ok()?;
+    let delivery = Claims {
+        typ: "delivery".into(),
+        digest,
+        aud: Some("agent://mock-reader".into()),
+        manifest: Some(Manifest {
+            authored: Authored {
+                version: version_id.into(),
+                digest: crate::config::attest::author_digest(text.as_bytes()),
+            },
+            parameters: Vec::new(),
+            facts: Vec::new(),
+            variants: Variants {
+                kept: Vec::new(),
+                dropped: Vec::new(),
+            },
+            includes: Vec::new(),
+            limits: json!({}),
+        }),
+        author: Some(a_jws.clone()),
+        ..author
+    };
+    let del_key = crate::aauth::AgentKey::from_seed(&MOCK_DELIVERY_SEED).ok()?;
+    Some((
+        a_jws,
+        sign_kid(&del_key, &delivery, Some(MOCK_DELIVERY_KID)).ok()?,
+    ))
+}
+#[cfg(not(feature = "sign"))]
+fn mock_signatures(_text: &str, _v: &str) -> Option<(String, String)> {
+    None
 }

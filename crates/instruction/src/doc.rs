@@ -2595,12 +2595,32 @@ fn deliver_set_lines(members: &[&Block]) -> Vec<String> {
 
 /// A machinery block's acknowledgement line from the schema's `x-acknowledgement`
 /// template, or `None` for a kind that delivers nothing (§3.5 step 5).
+/// A top-level `name:` scalar in a YAML body, unquoted or quoted.
+fn body_name(body: &str) -> Option<String> {
+    body.lines().find_map(|l| {
+        let v = l.strip_prefix("name:")?.trim();
+        let v = v.trim_matches(['"', '\'']).trim();
+        (!v.is_empty()).then(|| v.to_string())
+    })
+}
+
 fn machinery_ack(b: &Block) -> Option<String> {
-    let tmpl = lookup(&b.kind)?.ack.as_deref()?;
+    let kind = lookup(&b.kind)?;
+    let tmpl = kind.ack.as_deref()?;
+    // The identity is the `name` attribute; a YAML-bodied kind whose document
+    // put the name in the BODY instead (a workflow written as a plain inline
+    // entry) still gets NAMED here — an acknowledgement that says a workflow
+    // loaded without saying which one tells the model strictly less than the
+    // block it replaced.
     let name = b
         .name
         .clone()
         .or_else(|| b.attrs.get("name").cloned())
+        .or_else(|| {
+            (kind.body == BodyKind::Yaml)
+                .then(|| body_name(&b.body))
+                .flatten()
+        })
         .unwrap_or_default();
     let path = b.attrs.get("path").cloned().unwrap_or_default();
     let target = b.attrs.get("target").cloned().unwrap_or_default();

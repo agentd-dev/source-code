@@ -1496,6 +1496,10 @@ impl Runtime {
                     uri: Some(uri.to_string()),
                     server: None,
                     version: self.instruction.version + u64::from(changed),
+                    // A registry version id is a REGISTRY concept; an OCI
+                    // artifact pins by digest instead (recorded on the pull).
+                    version_id: None,
+                    delivered_digest: Some(pulled.layer_digest.clone()),
                 };
                 self.log.info(
                     "instruction.loaded",

@@ -174,7 +174,7 @@ jobs:
               | jq -r ".packages[] | select(.name==\"$1\") | .version"
           }
 
-          crates="agentd-net agentd-mcp agentd-core agentd-cli"
+          crates="agentd-net agentd-mcp agentd-instruction agentd-core agentd-cli"
 
           # What is actually missing from the index? Asked BEFORE credentials,
           # because "nothing to publish" is the normal case for agentd-net and

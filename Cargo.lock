@@ -64,6 +64,7 @@ name = "agentd-core"
 version = "1.8.0"
 dependencies = [
  "a2a-rs",
+ "agentd-instruction",
  "agentd-mcp",
  "agentd-net",
  "async-trait",
@@ -74,7 +75,6 @@ dependencies = [
  "futures-util",
  "hyper",
  "hyper-util",
- "instruction-core",
  "libc",
  "ring",
  "serde",
@@ -84,6 +84,16 @@ dependencies = [
  "tokio-rustls",
  "tokio-stream",
  "tower",
+]
+
+[[package]]
+name = "agentd-instruction"
+version = "0.1.0"
+dependencies = [
+ "ring",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -1065,16 +1075,6 @@ dependencies = [
  "hashbrown 0.17.1",
  "serde",
  "serde_core",
-]
-
-[[package]]
-name = "instruction-core"
-version = "0.1.0"
-dependencies = [
- "ring",
- "serde",
- "serde_json",
- "tempfile",
 ]
 
 [[package]]

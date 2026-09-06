@@ -12,9 +12,13 @@
 # consumer) appears only behind the `sign` feature for digests + Ed25519
 # verification.
 #
-# `publish = false`: path-usable by design; publishing to crates.io (and the
-# license for a platform-consumable artifact — currently AGPL like the tree
-# it was extracted from) are the owner's calls, not defaults.
+# Published to crates.io, because a published crate cannot depend on an
+# unpublished one: agentd-core embeds this parser, so agentd-core and
+# agentd-cli are unpublishable while this is path-only. AGPL-3.0-only, the
+# same terms as the rest of the workspace — deliberately NOT a relicensing
+# decision. Whether a platform-consumable artifact should be Apache-2.0 (so
+# the instruction.md MCPG plugin can link it) is a separate question, and one
+# a later version can answer; published versions keep their own terms.
 #
 # THIRD-PARTY CONTENT (see ../../NOTICE): this crate vendors two artifacts from
 # the Instruction Specification — `src/instruction.schema.json` (CC BY 4.0,
@@ -23,14 +27,18 @@
 # relicensing this crate: both permit redistribution with attribution, which
 # NOTICE provides.
 [package]
-name = "instruction-core"
+# `agentd-instruction` rather than `instruction-core`: this crate implements a
+# specification instruction.md OWNS, and a crates.io name is permanent (a yank
+# hides a version, never the name). Taking `instruction-*` in an agentd release
+# would stake a claim on their namespace; the lib is still `instruction_core`,
+# the same package-vs-lib split agentd-core/`agentd` already uses.
+name = "agentd-instruction"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.96"
 description = "Reference implementation of the Instruction Specification: parser, validator, delivery pipeline, and signature verification"
 license = "AGPL-3.0-only"
 repository = "https://github.com/agentd-dev/source-code"
-publish = false
 
 [lib]
 name = "instruction_core"

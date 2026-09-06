@@ -5,10 +5,10 @@
 //! by.
 //!
 //! ```console
-//! $ cargo run -p instruction-core --example dump -- tree  doc.md            > tree.json
-//! $ cargo run -p instruction-core --example dump -- text  doc.md ctx.json   > delivered.txt
-//! $ cargo run -p instruction-core --example dump -- manifest doc.md ctx.json > manifest.json
-//! $ cargo run -p instruction-core --example dump -- refusals doc.md         > refusals.json
+//! $ cargo run -p agentd-instruction --example dump -- tree  doc.md            > tree.json
+//! $ cargo run -p agentd-instruction --example dump -- text  doc.md ctx.json   > delivered.txt
+//! $ cargo run -p agentd-instruction --example dump -- manifest doc.md ctx.json > manifest.json
+//! $ cargo run -p agentd-instruction --example dump -- refusals doc.md         > refusals.json
 //! ```
 //!
 //! `ctx.json` (optional): `{"grants": ["compute", …], "params": {"env": "prod"},

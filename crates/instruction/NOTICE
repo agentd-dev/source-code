@@ -1,0 +1,30 @@
+agentd-instruction — third-party material included in this crate
+================================================================
+
+This crate's own source is AGPL-3.0-only (see the repository's LICENSE).
+Two artifacts in it come from the Instruction Specification
+(https://github.com/instruction-md/specification), owned by instruction.md,
+and carry their own terms. They are named here because this notice ships
+inside the published package: attribution has to travel with the copy, and a
+crate that redistributes someone else's material without saying so is silent
+in exactly the place a reader would look.
+
+1. `src/instruction.schema.json`
+   The specification's machine-readable registry — kinds, forms, grants and
+   semantic rules — read as DATA by the parser, which is why the parser cannot
+   drift from the specification.
+   Licence: **CC BY 4.0**.
+   Attribution: "The Instruction Specification", instruction.md,
+   https://github.com/instruction-md/specification.
+
+2. `tests/conformance/**`
+   The specification's conformance corpus: the shared fixtures this
+   implementation and the TypeScript one (`@instruction-md/spec`) are both
+   held to.
+   Licence: **Apache-2.0** — the full text is at
+   `tests/conformance/LICENSE`, copied alongside the fixtures with the
+   corpus README as that licence requires.
+
+Both licences permit redistribution with attribution, which this notice and
+the copied LICENSE provide. Neither artifact is compiled into the library as
+code: the schema is parsed at runtime as data, the corpus is test input.

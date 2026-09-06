@@ -580,6 +580,9 @@ pub const MOCK_SIGN_SEED: [u8; 32] = [7u8; 32];
 pub const MOCK_DELIVERY_SEED: [u8; 32] = [9u8; 32];
 const MOCK_PUBLISHER: &str = "https://instruction.md/pub/mock";
 const MOCK_PUBLISHER_KID: &str = "mock-1";
+/// Only the signing paths name the delivery key; a build without `sign`
+/// serves no attestations at all.
+#[cfg(feature = "sign")]
 const MOCK_DELIVERY_KID: &str = "delivery";
 const MOCK_DELIVERY_KEYS_URI: &str = "instruction://delivery-keys.json";
 

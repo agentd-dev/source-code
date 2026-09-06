@@ -56,6 +56,21 @@ if [ "${1:-}" != "quick" ]; then
   step "test (workspace, all features)"
   cargo test --workspace --all-features || fail=1
 
+  # A release publishes agentd-net, agentd-mcp, agentd-core and agentd-cli to
+  # crates.io. `cargo publish` refuses a crate whose path dependency is not
+  # itself published, and that refusal arrives at TAG time — after the binaries
+  # and the container are built — where it is most expensive. Prove it now.
+  step "the release's crates can be published"
+  for c in agentd-net agentd-mcp agentd-core agentd-cli; do
+    if cargo publish -p "$c" --dry-run --allow-dirty >/tmp/ci-gate-pub.log 2>&1; then
+      echo "  ok    $c"
+    else
+      echo "  FAIL  $c"
+      grep -m3 -E '^(error|  )' /tmp/ci-gate-pub.log | sed 's/^/        /'
+      fail=1
+    fi
+  done
+
   step "published schemas are current"
   cargo build -p agentd-cli --all-features >/dev/null 2>&1
   ./scripts/gen-schemas.sh >/dev/null

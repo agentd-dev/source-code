@@ -471,12 +471,22 @@ impl InstructionSpec {
         .chain(self.mcp.as_ref().map(|m| ("mcp", m.to_uri())))
         .collect();
         match named.as_slice() {
-            // Settings without a source is not an error: the agent simply has
-            // no instruction (a supported state), and a mistyped source key is
-            // caught by `deny_unknown_fields` rather than by this. It is also
-            // how a base layer carries settings while a flag supplies the
-            // source.
-            [] => Ok(None),
+            // Settings without a source is a REFUSAL. Writing `instruction:`
+            // at all is saying the agent has one; ending up with none because
+            // a source key was forgotten is how an agent silently becomes an
+            // agent without instructions, which is not an agent. (A config
+            // that omits `instruction:` entirely is a different, supported
+            // shape — a workflow-only or `--prompt` agent.)
+            //
+            // This does not break "settings here, source from a flag": the
+            // flag is merged into the document before this runs, so the
+            // source is present by the time it is checked.
+            [] => Err(
+                "agent.instruction names no source — set one of text, file, oci, \
+                       http or mcp (or use the short form `instruction: \"…\"`); omit \
+                       `instruction` entirely for an agent that has none"
+                    .to_string(),
+            ),
             [(kind, v)] => Ok(Some(match *kind {
                 // The source keys are explicit BY CONSTRUCTION: a value under
                 // `file:` is a path even if it looks like prose, and a value
@@ -6982,6 +6992,20 @@ mod tests {
             let mut doc = Value::Object(Map::new());
             paths::set_path(&mut doc, &b.path, sample);
             fill_required(&mut doc, &schema::schema(), &b.path);
+            // `agent.instruction`'s SETTINGS (refresh, unavailable, decrypt…)
+            // are meaningless without a source, and the loader refuses that
+            // rather than leaving an agent silently instruction-less. A
+            // single-path sample has to supply one, the same way
+            // `fill_required` supplies schema-required siblings.
+            if b.path.starts_with("agent.instruction.")
+                && !b.path.starts_with("agent.instruction.text")
+                && !b.path.starts_with("agent.instruction.file")
+                && !b.path.starts_with("agent.instruction.oci")
+                && !b.path.starts_with("agent.instruction.http")
+                && !b.path.starts_with("agent.instruction.mcp")
+            {
+                paths::set_path(&mut doc, "agent.instruction.text", json!("x"));
+            }
             Settings::from_document(doc, "t")
                 .unwrap_or_else(|e| panic!("path {} does not deserialize: {e}", b.path));
         }
@@ -7741,6 +7765,36 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{e}").contains("retired flat schema"), "{e}");
+    }
+
+    #[test]
+    fn an_instruction_that_names_no_source_is_refused_not_silently_absent() {
+        use super::InstructionSpec;
+        // Writing `instruction:` is saying the agent HAS one. Ending up with
+        // none because a source key was forgotten is how an agent silently
+        // becomes an agent without instructions, which is not an agent.
+        let settings_only = InstructionSpec {
+            refresh: Some("60s".into()),
+            ..InstructionSpec::default()
+        };
+        let e = settings_only.source_value().unwrap_err();
+        assert!(e.contains("names no source"), "{e}");
+        assert!(
+            e.contains("omit `instruction` entirely"),
+            "the refusal points at the supported way to have none: {e}"
+        );
+        // An empty object is the same mistake with less typing.
+        assert!(InstructionSpec::default().source_value().is_err());
+        // Omitting `instruction` ALTOGETHER stays supported — a workflow-only
+        // or `--prompt` agent is a different shape, not a broken one.
+        let doc = serde_json::json!({
+            "config_version": "1",
+            "agent": {"name": "a", "preflight": "never"},
+            "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
+            "store": {"kind": "memory"},
+        });
+        let s = Settings::from_document(doc, "t").expect("no instruction is a valid agent");
+        assert!(s.agent.instruction.is_none());
     }
 
     #[test]

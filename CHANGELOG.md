@@ -5,6 +5,72 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## v1.10.0 — one instruction setting, and it keeps itself current
+
+v1.9.0 taught agentd to fetch an instruction from anywhere. This release makes
+that one coherent setting: `agent.instruction` says where the document comes
+from, how current to keep it, and what to do when its source stops answering.
+
+### Changed — `--instruction` now accepts what `--instruction-file` did
+
+`agent.instruction` / `--instruction` takes the instruction TEXT, a FILE path,
+or a URI (`oci://`, `mcp://`, `instruction://`, `https://`) and tells them
+apart. `--instruction-file` still works; it is now the explicit spelling of
+`--instruction.file` rather than the only way to name a file.
+
+The classification is deliberately narrow, because reading prose as a path
+would be the worst outcome available: a value is a file only when it cannot
+plausibly be an instruction — no whitespace at all, and either `file://`, a
+path-shaped prefix, or a document extension. A multi-line value is always
+text. `"Summarize the file report.md"` stays text; `./agent.md` is a file; a
+named file that is missing is a refusal naming both readings.
+
+### Added
+
+- **The long form.** `agent.instruction` also takes an object naming the
+  source outright — `text:`, `file:`, `oci:`, `http:` or `mcp:` — plus
+  `refresh:`, `unavailable:` and `decrypt:`. Under it a key means what it
+  says, so only the short form is ever classified. Every setting is optional:
+  the short form is the same setting with all of them at their defaults.
+  `mcp:` takes the resource URI or `{server, resource}`, because the URI-only
+  way to name a server nests one URI inside another.
+- **`--instruction.<key>` flags** for every one of those:
+  `--instruction.oci ghcr.io/acme/agent:v3`, `--instruction.refresh 60s`, and
+  so on. They compose with the short form in either order.
+- **`http:`** — an `https://` document fetched at load (redirects followed,
+  non-2xx refused, size-capped, envelope-aware). Previously an `https://`
+  value was routed to MCP servers as a resource lookup and never fetched.
+- **`refresh: auto`** (the default) picks the mechanism that fits the source
+  rather than polling everything: a FILE is watched by inotify — instant, and
+  now watched alongside the config files, which it was not before; a
+  `@sha256:` OCI pin is never re-read, because a digest cannot change; a
+  mutable `:tag` or a served resource polls every 5m. `off` or a duration
+  overrides it, and a change takes effect on reload without a restart.
+  Automatic re-reading previously required an `instruction_sources` entry —
+  the TRUST section — so an operator who wrote `:latest` and reasonably
+  expected updates got none, silently.
+- **`unavailable:`** decides what happens when the source stops answering
+  after startup: `keep` (carry on with the last good instruction), `freeze`
+  (serve live work, refuse new — the §7.7 posture), `drain` (finish live work,
+  exit 0 so an orchestrator restarts into a fresh read), `exit`, or `auto`
+  (the default: freeze a trust-pinned source, keep an unpinned one, because a
+  stale authorization is a security question and an unreachable unsigned
+  artifact is an availability one). Every outcome is one `instruction.unavailable`
+  log line naming the policy that applied.
+
+At **startup** an unreachable source stays fatal and no policy softens it:
+there is nothing to fall back to, and an agent without its instructions is not
+an agent. For the same reason, an `instruction:` block that names no source is
+now refused rather than leaving the agent silently instruction-less — omit
+`instruction` entirely for a workflow-only or `--prompt` agent.
+
+### Documentation
+
+`configuration.md` §5a is the full reference for all of it — classification,
+what `auto` does per source kind and why, how `refresh` differs from
+`instruction_sources[].freshness` (a poll interval versus the §7.7 revocation
+deadline), each unavailability policy, and encrypted instructions.
+
 ## v1.9.0 — instructions that travel: registries, signatures, envelopes
 
 An instruction document could already define a whole agent. This release is

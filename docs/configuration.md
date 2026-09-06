@@ -642,9 +642,14 @@ agent:
 
 Under the long form a source key means what it says: a value under `file:` is
 a path even if it reads like prose, and a value under `text:` is the
-instruction even if it looks like a path. Naming **two** sources is a refusal
-(there is no right guess); naming **none** simply means no instruction, with
-the settings inert.
+instruction even if it looks like a path.
+
+Naming **two** sources is a refusal — there is no right guess. Naming **none**
+is also a refusal: writing `instruction:` is saying the agent has one, and
+ending up without it because a source key was forgotten is how an agent
+silently becomes an agent with no instructions, which is not an agent. To have
+none deliberately, omit `instruction` entirely — a workflow-only or `--prompt`
+agent is a different shape, not a broken one.
 
 `mcp:` takes either the resource URI or the pair, because the URI-only way to
 name a server nests one URI inside another:
@@ -687,9 +692,11 @@ let an authorization expire between checks.
 
 ### 5a.3 When the source stops answering
 
-At **startup** an unreachable source is always fatal (exit 6): there is no
-previous instruction to fall back to, and an agent with no instructions should
-not start. After startup, `unavailable` decides:
+At **startup** an unreachable source is always fatal (exit 6), and
+deliberately so: there is no previous instruction to fall back to, and an
+agent without its instructions is not an agent — it is a process that will do
+something other than what it was told. No policy softens this; `unavailable`
+governs only what happens AFTER a successful start:
 
 | Policy | Behaviour | Use when |
 |---|---|---|

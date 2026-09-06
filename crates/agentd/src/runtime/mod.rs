@@ -1001,6 +1001,13 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
         for (path, _) in &loaded.files {
             crate::config::watch::spawn_config_watcher(std::path::Path::new(path), &log);
         }
+        // The instruction FILE too. It is the document an operator edits most
+        // often, and watching only the config meant editing it changed
+        // nothing until something else triggered a reload — the reload path
+        // re-read it correctly, nothing ever asked it to.
+        if let Some(path) = rt.settings.agent.instruction_path.clone() {
+            crate::config::watch::spawn_config_watcher(std::path::Path::new(&path), &log);
+        }
     }
     rt.arm_workflows();
     rt.arm_long_lived_starts();

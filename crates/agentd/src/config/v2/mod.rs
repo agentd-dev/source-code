@@ -315,6 +315,10 @@ pub struct Agent {
     /// re-pull against the original reference.
     #[serde(skip)]
     pub instruction_origin: Option<InstructionOrigin>,
+    /// The FILE the instruction was read from, when the value named one —
+    /// DERIVED. `lifecycle.watch_config` watches it alongside the config.
+    #[serde(skip)]
+    pub instruction_path: Option<String>,
 }
 
 /// The provenance of a load-time-resolved instruction reference.
@@ -392,6 +396,51 @@ impl Agent {
             .as_deref()
             .is_some_and(looks_like_resource_uri)
     }
+}
+
+/// What an `agent.instruction` VALUE is. One flag carries all four, because
+/// an operator thinks "here is the instruction" and should not have to pick
+/// the flag that matches its transport.
+#[derive(Debug, Clone, PartialEq)]
+pub enum InstructionValue {
+    /// The instruction itself.
+    Text,
+    /// A path on disk (`file://` stripped). Read at load; watched when
+    /// `lifecycle.watch_config` is on.
+    File(String),
+    /// `oci://` an artifact, `mcp://`/`instruction://`/… a served resource.
+    Uri,
+}
+
+/// Classify an `agent.instruction` value. The rules are deliberately narrow so
+/// that prose is never mistaken for a path: a value is a FILE only when it
+/// cannot plausibly be an instruction — no whitespace at all, and either an
+/// explicit `file://`, a path-shaped prefix, or a document extension. A
+/// multi-line value is always text, because no path contains a newline.
+pub fn classify_instruction(v: &str) -> InstructionValue {
+    let t = v.trim();
+    if v.contains('\n') {
+        return InstructionValue::Text;
+    }
+    if let Some(rest) = t.strip_prefix("file://") {
+        return InstructionValue::File(rest.to_string());
+    }
+    if looks_like_resource_uri(t) {
+        return InstructionValue::Uri;
+    }
+    if !t.is_empty() && !t.contains(char::is_whitespace) {
+        let path_shaped = t.starts_with('/')
+            || t.starts_with("./")
+            || t.starts_with("../")
+            || t.starts_with("~/");
+        let doc_extension = [".md", ".markdown", ".txt", ".instruction"]
+            .iter()
+            .any(|e| t.ends_with(e));
+        if path_shaped || doc_extension {
+            return InstructionValue::File(t.to_string());
+        }
+    }
+    InstructionValue::Text
 }
 
 /// `scheme://…` with no whitespace, and a scheme that is not a bare `http(s)`
@@ -2694,6 +2743,50 @@ impl Settings {
         // can define the whole agent, and an explicit key still wins.
         #[cfg_attr(not(feature = "oci"), allow(unused_mut))]
         let mut instruction_origin: Option<InstructionOrigin> = None;
+        let mut instruction_path: Option<String> = None;
+        // A FILE-valued instruction is read here, before anything interprets
+        // the value: earlier than envelope detection (a file may hold
+        // ciphertext) and earlier than the idoc scan (its `:::` markers live
+        // in the file, not in the path). A named file that is missing is a
+        // REFUSAL naming both readings — silently treating a mistyped path as
+        // the agent's instruction is the worst available outcome.
+        if let Some(v) = doc
+            .get("agent")
+            .and_then(|a| a.get("instruction"))
+            .and_then(Value::as_str)
+            && let InstructionValue::File(path) = classify_instruction(v)
+        {
+            let expanded = match path.strip_prefix("~/") {
+                Some(rest) => match std::env::var("HOME") {
+                    Ok(home) => format!("{home}/{rest}"),
+                    Err(_) => path.clone(),
+                },
+                None => path.clone(),
+            };
+            let bytes = std::fs::read(&expanded).map_err(|e| {
+                format!(
+                    "{source}: agent.instruction {path:?}: {e} — it reads as a FILE (no \
+                     whitespace, path-shaped or a document extension); pass the text with a \
+                     newline, or fix the path"
+                )
+            })?;
+            let text = match String::from_utf8(bytes) {
+                Ok(t) => t,
+                Err(e) if crate::config::envelope::looks_encrypted(e.as_bytes()) => {
+                    crate::config::envelope::armor(e.as_bytes())
+                }
+                Err(_) => {
+                    return Err(format!(
+                        "{source}: agent.instruction {path:?}: not UTF-8 and not a \
+                         recognized encrypted envelope"
+                    ));
+                }
+            };
+            if let Some(a) = doc.get_mut("agent").and_then(Value::as_object_mut) {
+                a.insert("instruction".into(), Value::String(text));
+            }
+            instruction_path = Some(expanded);
+        }
         // An `oci://` instruction (RFC 0040) is pulled at CONFIG LOAD, exactly
         // like `--instruction-file` reads a file — because its machinery must
         // fold into the config being built (workflows, mcp servers, the trust
@@ -2843,6 +2936,7 @@ impl Settings {
             settings.agent.document_declarations = ex.declarations;
         }
         settings.agent.instruction_origin = instruction_origin;
+        settings.agent.instruction_path = instruction_path;
         Ok(settings)
     }
 
@@ -7289,6 +7383,33 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{e}").contains("retired flat schema"), "{e}");
+    }
+
+    #[test]
+    fn one_instruction_value_classifies_text_files_and_uris() {
+        use super::{InstructionValue as V, classify_instruction as c};
+        // Prose is never a path — including prose that ENDS in a document
+        // extension, which is why the rule requires no whitespace at all.
+        assert_eq!(c("You are a helpful agent."), V::Text);
+        assert_eq!(c("Summarize the file report.md"), V::Text);
+        assert_eq!(c("Be terse."), V::Text);
+        // A multi-line value is text by construction: no path has a newline,
+        // and this is what an inline `instruction: |` block produces.
+        assert_eq!(c("agent.md\nis not a path"), V::Text);
+        // Paths: shape or extension, and `file://` says so outright.
+        assert_eq!(
+            c("/etc/agentd/agent.md"),
+            V::File("/etc/agentd/agent.md".into())
+        );
+        assert_eq!(c("./agent.md"), V::File("./agent.md".into()));
+        assert_eq!(c("agent.md"), V::File("agent.md".into()));
+        assert_eq!(c("file:///tmp/x"), V::File("/tmp/x".into()));
+        // URIs keep their existing meaning.
+        assert_eq!(c("oci://ghcr.io/acme/agent:v3"), V::Uri);
+        assert_eq!(c("instruction://ins_1@stable"), V::Uri);
+        assert_eq!(c("mcp://docs/agent"), V::Uri);
+        // A bare word with no extension is text, not a guess at a file.
+        assert_eq!(c("agent"), V::Text);
     }
 
     #[test]

@@ -444,16 +444,11 @@ pub struct InstructionSpec {
     /// workflow entry's HTTP source has been `url:` since long before this —
     /// one concept, one word.
     pub url: Option<String>,
-    /// A DIRECTORY of documents, combined into one instruction in `order`.
-    /// The same `dir:`/`glob:` a workflow entry takes, and the same code
-    /// behind it, so a folder of documents behaves identically wherever it
-    /// appears.
-    pub dir: Option<String>,
-    /// Which files under `dir` (comma-separated; `**` recurses). Defaults to
-    /// the document extensions.
-    pub glob: Option<String>,
-    /// `name` (default, path order) or `date` (mtime, oldest first).
-    pub order: Option<crate::config::fileset::Order>,
+    /// A DIRECTORY of documents, combined into one instruction: `dir: ./x`,
+    /// or `dir: {path, glob, order}`. `glob` and `order` live INSIDE it
+    /// because they qualify it and nothing else. The same folder source a
+    /// workflow entry takes, and the same code behind it.
+    pub dir: Option<crate::config::fileset::Dir>,
     /// A resource a configured MCP server serves, read and subscribed.
     ///
     /// Either the resource URI alone — `mcp: "instruction://ins_1@stable"`,
@@ -488,23 +483,12 @@ impl InstructionSpec {
             ("file", self.file.as_ref()),
             ("oci", self.oci.as_ref()),
             ("url", self.url.as_ref()),
-            ("dir", self.dir.as_ref()),
         ]
         .into_iter()
         .filter_map(|(k, v)| v.map(|v| (k, v.clone())))
         .chain(self.mcp.as_ref().map(|m| ("mcp", m.to_uri())))
+        .chain(self.dir.as_ref().map(|d| ("dir", d.path().to_string())))
         .collect();
-        // A setting about a folder with no folder named configures nothing.
-        // Refusing says so at load, rather than at the first puzzled reading
-        // of the config months later.
-        if self.dir.is_none() {
-            if self.glob.is_some() {
-                return Err("agent.instruction.glob has no dir to match in".into());
-            }
-            if self.order.is_some() {
-                return Err("agent.instruction.order has no dir to order".into());
-            }
-        }
         match named.as_slice() {
             // Settings without a source is a REFUSAL. Writing `instruction:`
             // at all is saying the agent has one; ending up with none because
@@ -529,10 +513,6 @@ impl InstructionSpec {
                 // path. Only the short form has to be classified.
                 "oci" if !v.starts_with("oci://") => format!("oci://{v}"),
                 "file" if !v.starts_with("file://") => format!("file://{v}"),
-                // A folder is combined into the scalar during load; the
-                // placeholder keeps the "exactly one source" arithmetic
-                // honest until that happens.
-                "dir" => String::new(),
                 _ => v.clone(),
             })),
             // Two sources IS ambiguous and unrecoverable — there is no right
@@ -710,7 +690,12 @@ pub fn resolve_document_source(v: &Value, at: &str) -> Result<(String, Vec<Strin
             let key = instruction_key(scalar);
             serde_json::from_value(json!({ key: scalar })).map_err(|e| format!("{at}: {e}"))?
         }
-        Value::Object(_) => serde_json::from_value(v.clone()).map_err(|e| format!("{at}: {e}"))?,
+        Value::Object(_) => {
+            if let Some(m) = moved_under_dir(v) {
+                return Err(format!("{at}.{m}"));
+            }
+            serde_json::from_value(v.clone()).map_err(|e| format!("{at}: {e}"))?
+        }
         _ => return Err(format!("{at} must be a string or an object")),
     };
     // The same "exactly one source" arithmetic the agent's instruction gets,
@@ -719,13 +704,8 @@ pub fn resolve_document_source(v: &Value, at: &str) -> Result<(String, Vec<Strin
         .source_value()
         .map_err(|e| format!("{at}: {e}"))?
         .ok_or_else(|| format!("{at} names no source"))?;
-    if let Some(dir) = spec.dir.as_deref() {
-        let c = combine_folder(
-            dir,
-            spec.glob.as_deref(),
-            spec.order.unwrap_or_default(),
-            at,
-        )?;
+    if let Some(dir) = spec.dir.as_ref() {
+        let c = combine_folder(dir, at)?;
         return Ok((c.text, c.warnings));
     }
     if let Some(text) = spec.text.as_deref() {
@@ -764,6 +744,22 @@ pub fn resolve_document_source(v: &Value, at: &str) -> Result<(String, Vec<Strin
     Ok((value, Vec::new()))
 }
 
+/// `glob:`/`order:` beside `dir:` rather than inside it. They qualify the
+/// folder and nothing else, so the nested spelling is the only one — and a
+/// config written against the flat one is told exactly where it moved rather
+/// than being met with "unknown field".
+fn moved_under_dir(v: &Value) -> Option<String> {
+    for k in ["glob", "order"] {
+        if v.get(k).is_some() {
+            return Some(format!(
+                "{k} belongs inside `dir` — write `dir: {{path: …, {k}: …}}`; it \
+                 qualifies the folder and nothing else"
+            ));
+        }
+    }
+    None
+}
+
 /// `~/` against `$HOME`, unchanged when there is no `$HOME` to expand against.
 fn expand_home(path: &str) -> String {
     match path.strip_prefix("~/") {
@@ -790,14 +786,16 @@ pub struct CombinedFolder {
 /// behaviour, and two copies of it are two behaviours that only look alike.
 /// `at` prefixes every message with the setting being resolved.
 pub fn combine_folder(
-    dir: &str,
-    glob: Option<&str>,
-    order: crate::config::fileset::Order,
+    source: &crate::config::fileset::Dir,
     at: &str,
 ) -> Result<CombinedFolder, String> {
-    let pattern = glob.unwrap_or(crate::config::fileset::DOCUMENT_GLOB);
-    let files = crate::config::fileset::expand_dir_ordered(&expand_home(dir), pattern, order)
-        .map_err(|e| format!("{at} dir {dir}: {e}"))?;
+    let dir = source.path();
+    let pattern = source
+        .glob()
+        .unwrap_or(crate::config::fileset::DOCUMENT_GLOB);
+    let files =
+        crate::config::fileset::expand_dir_ordered(&expand_home(dir), pattern, source.order())
+            .map_err(|e| format!("{at} dir {dir}: {e}"))?;
     if files.is_empty() {
         return Err(format!(
             "{at} dir {dir}: no file matched {pattern:?} — a named directory with \
@@ -3177,6 +3175,9 @@ impl Settings {
                      workflow entry's HTTP source already uses"
                 ));
             }
+            if let Some(m) = moved_under_dir(v) {
+                return Err(format!("{source}: agent.instruction.{m}"));
+            }
             let spec: InstructionSpec = serde_json::from_value(v.clone())
                 .map_err(|e| format!("{source}: agent.instruction: {e}"))?;
             let value = spec.source_value().map_err(|e| format!("{source}: {e}"))?;
@@ -3209,7 +3210,7 @@ impl Settings {
                 .and_then(Value::as_str)
             && let InstructionValue::Dir(d) = classify_instruction(v)
         {
-            instruction_spec.dir = Some(d);
+            instruction_spec.dir = Some(crate::config::fileset::Dir::Path(d));
         }
         // A FILE-valued instruction is read here, before anything interprets
         // the value: earlier than envelope detection (a file may hold
@@ -3300,12 +3301,7 @@ impl Settings {
         // code behind it (`config::fileset`), so a folder behaves the same
         // wherever it appears.
         if let Some(dir) = instruction_spec.dir.clone() {
-            let combined = combine_folder(
-                &dir,
-                instruction_spec.glob.as_deref(),
-                instruction_spec.order.unwrap_or_default(),
-                &format!("{source}: agent.instruction"),
-            )?;
+            let combined = combine_folder(&dir, &format!("{source}: agent.instruction"))?;
             if let Some(a) = doc.get_mut("agent").and_then(Value::as_object_mut) {
                 a.insert("instruction".into(), Value::String(combined.text));
             }
@@ -3671,12 +3667,12 @@ pub const ALIASES: &[Alias] = &[
     },
     Alias {
         flag: "--instruction.glob",
-        path: "agent.instruction.glob",
+        path: "agent.instruction.dir.glob",
         kind: AliasKind::Set,
     },
     Alias {
         flag: "--instruction.order",
-        path: "agent.instruction.order",
+        path: "agent.instruction.dir.order",
         kind: AliasKind::Set,
     },
     Alias {
@@ -3716,12 +3712,12 @@ pub const ALIASES: &[Alias] = &[
     },
     Alias {
         flag: "--prompt.glob",
-        path: "agent.prompt.glob",
+        path: "agent.prompt.dir.glob",
         kind: AliasKind::Set,
     },
     Alias {
         flag: "--prompt.order",
-        path: "agent.prompt.order",
+        path: "agent.prompt.dir.order",
         kind: AliasKind::Set,
     },
     Alias {
@@ -4538,6 +4534,25 @@ fn promote_document_scalar(doc: &mut Value, field: &str) {
 /// The `agent.` fields that take both a short scalar and a long object.
 const DOCUMENT_FIELDS: [&str; 2] = ["instruction", "prompt"];
 
+/// `dir: ./x` rewritten as `dir: {path: ./x}` so `--instruction.glob` has an
+/// object to merge into. The same promotion the document field itself gets,
+/// one level down — a short spelling must never be silently replaced by the
+/// setting that qualifies it.
+fn promote_dir_scalar(doc: &mut Value, field: &str) {
+    let Some(spec) = doc
+        .get_mut("agent")
+        .and_then(Value::as_object_mut)
+        .and_then(|a| a.get_mut(field))
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    let Some(path) = spec.get("dir").and_then(Value::as_str).map(str::to_string) else {
+        return;
+    };
+    spec.insert("dir".into(), json!({ "path": path }));
+}
+
 fn apply_alias(
     doc: &mut Value,
     bindings: &[Binding],
@@ -4573,10 +4588,25 @@ fn apply_alias(
                 .and_then(|a| a.get_mut(&field))
                 .and_then(Value::as_object_mut)
             {
+                // A FOLDER already carrying its `glob`/`order` keeps them: the
+                // short form names the path, it does not throw away the
+                // settings that qualify it. (`--instruction.glob "*.md"
+                // --instruction ./docs` loses nothing, in either order.)
+                let folder_settings = (key == "dir")
+                    .then(|| obj.get("dir").and_then(Value::as_object).cloned())
+                    .flatten();
                 for k in INSTRUCTION_SOURCE_KEYS {
                     obj.remove(k);
                 }
-                obj.insert(key.into(), Value::String(raw));
+                match folder_settings {
+                    Some(mut dir) => {
+                        dir.insert("path".into(), Value::String(raw));
+                        obj.insert("dir".into(), Value::Object(dir));
+                    }
+                    None => {
+                        obj.insert(key.into(), Value::String(raw));
+                    }
+                }
             }
         }
         AliasKind::Set
@@ -4591,6 +4621,9 @@ fn apply_alias(
                 .unwrap_or_default()
                 .to_string();
             promote_document_scalar(doc, &field);
+            if alias.path.starts_with(&format!("agent.{field}.dir.")) {
+                promote_dir_scalar(doc, &field);
+            }
             let mut patch = Value::Object(Map::new());
             paths::set_path(&mut patch, alias.path, Value::String(raw));
             file::merge_into(doc, patch);
@@ -6983,7 +7016,6 @@ pub const RELOADABLE_PATHS: &[&str] = &[
     "workflows.key",
     "workflows.limits",
     "workflows.name",
-    "workflows.order",
     "workflows.outputs",
     "workflows.priority",
     "workflows.state",
@@ -7294,8 +7326,10 @@ mod tests {
                     // keys a directory that exists AND holds a matching
                     // document, since an empty match is a refusal by design.
                     p if is_document_path(p, "file") => json!("Cargo.toml"),
-                    p if is_document_path(p, "dir") => json!("."),
-                    p if is_document_path(p, "glob") => json!("README.md"),
+                    p if is_document_path(p, "dir") || is_document_path(p, "dir.path") => {
+                        json!(".")
+                    }
+                    p if is_document_path(p, "dir.glob") => json!("README.md"),
 
                     "config_version" => json!("2"),
                     _ => json!("x"),
@@ -7345,6 +7379,11 @@ mod tests {
                     _ => json!({"k": "v"}),
                 },
                 paths::Kind::Any => match b.path.as_str() {
+                    // A `dir` binding is `oneOf [string, object]`, so it
+                    // arrives here rather than under `String` — and a folder
+                    // has to exist and hold a matching document, since an
+                    // empty match is a refusal by design.
+                    p if is_document_path(p, "dir") => json!("."),
                     "intelligence.endpoints" => json!("https://a,https://b"),
                     "goal.on_achieved" | "goal.on_stuck" => json!("finish"),
                     p if p.ends_with("timeout")
@@ -7377,15 +7416,16 @@ mod tests {
             if let Some(field) = DOCUMENT_FIELDS
                 .iter()
                 .find(|f| b.path.starts_with(&format!("agent.{f}.")))
-                && !INSTRUCTION_SOURCE_KEYS
+            {
+                // A folder's own settings need the folder to exist — and
+                // `fill_required` supplies `path` from the generic sample,
+                // which is not a directory.
+                if is_document_path(&b.path, "dir.glob") || is_document_path(&b.path, "dir.order") {
+                    paths::set_path(&mut doc, &format!("agent.{field}.dir.path"), json!("."));
+                } else if !INSTRUCTION_SOURCE_KEYS
                     .iter()
                     .any(|k| b.path.starts_with(&format!("agent.{field}.{k}")))
-            {
-                // `glob`/`order` configure a FOLDER and are refused without
-                // one; every other setting takes any source.
-                if is_document_path(&b.path, "glob") || is_document_path(&b.path, "order") {
-                    paths::set_path(&mut doc, &format!("agent.{field}.dir"), json!("."));
-                } else {
+                {
                     paths::set_path(&mut doc, &format!("agent.{field}.text"), json!("x"));
                 }
             }
@@ -8230,6 +8270,59 @@ mod tests {
         );
     }
 
+    /// `--instruction ./folder --instruction.glob "*.md"` composes: the
+    /// dotted flag promotes the `dir:` scalar into its object form rather
+    /// than replacing it, exactly as `--instruction.refresh` promotes the
+    /// instruction itself. Both orders, because a flag order that silently
+    /// drops a setting is the defect this shape exists to prevent.
+    #[test]
+    fn a_folder_flag_and_its_settings_compose_in_either_order() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.md"), "first\n").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "second\n").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        let cfg = dir.path().join("c.json");
+        std::fs::write(
+            &cfg,
+            serde_json::json!({"config_version": "1",
+                "agent": {"name": "a", "preflight": "never"},
+                "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
+                "store": {"kind": "memory"}})
+            .to_string(),
+        )
+        .unwrap();
+        let c = cfg.to_string_lossy().to_string();
+        for args in [
+            vec![
+                "-c".into(),
+                c.clone(),
+                "--instruction".into(),
+                path.clone(),
+                "--instruction.glob".into(),
+                "*.md".into(),
+            ],
+            vec![
+                "-c".into(),
+                c.clone(),
+                "--instruction.glob".into(),
+                "*.md".into(),
+                "--instruction".into(),
+                path.clone(),
+            ],
+        ] {
+            let env: Vec<(String, String)> = Vec::new();
+            let s = super::load(&args, &env).expect("loads").0.settings;
+            assert_eq!(
+                s.agent.instruction.as_deref(),
+                Some("first\n"),
+                "the glob narrowed the folder, and the folder survived the glob"
+            );
+            let dir = s.agent.instruction_spec.dir.expect("a folder source");
+            assert_eq!(dir.glob(), Some("*.md"));
+            assert_eq!(dir.path(), path);
+        }
+    }
+
     /// The short and long forms are the SAME setting, so an agent defined
     /// either way gets the same one-shot sugar workflow — and a document that
     /// carries its own `:::!workflow` gets none, however its source was named.
@@ -8304,7 +8397,7 @@ mod tests {
             serde_json::json!({"config_version": "2",
                 "agent": {"name": "a", "instruction": "be terse", "prompt": task},
                 "subagents": {"templates": {
-                    "r": {"instruction": {"dir": folder, "glob": "tpl-*.md"}}}},
+                    "r": {"instruction": {"dir": {"path": folder, "glob": "tpl-*.md"}}}}},
                 "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
                 "store": {"kind": "memory"}}),
             "t",
@@ -8348,10 +8441,11 @@ mod tests {
             std::fs::write(dir.path().join(name), format!("{body}\n")).unwrap();
         }
         let load_dir = |extra: serde_json::Value| {
-            let mut instruction = serde_json::json!({"dir": dir.path().to_string_lossy()});
+            let mut folder = serde_json::json!({"path": dir.path().to_string_lossy()});
             for (k, v) in extra.as_object().unwrap() {
-                instruction[k] = v.clone();
+                folder[k] = v.clone();
             }
+            let instruction = serde_json::json!({ "dir": folder });
             Settings::from_document(
                 serde_json::json!({"config_version": "2",
                     "agent": {"name": "a", "instruction": instruction},
@@ -8394,7 +8488,7 @@ mod tests {
             Settings::from_document(
                 serde_json::json!({"config_version": "2",
                     "agent": {"name": "a", "instruction":
-                        {"dir": dir.path().to_string_lossy(), "order": order}},
+                        {"dir": {"path": dir.path().to_string_lossy(), "order": order}}},
                     "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
                     "store": {"kind": "memory"}}),
                 "t",
@@ -8504,7 +8598,7 @@ mod tests {
     /// A named folder that matches nothing is a refusal, not an empty
     /// instruction — an agent without instructions is not an agent.
     #[test]
-    fn an_empty_folder_and_a_dangling_glob_are_refusals() {
+    fn an_empty_folder_and_a_misplaced_glob_are_refusals() {
         let dir = tempfile::tempdir().unwrap();
         let base = |instruction: serde_json::Value| {
             Settings::from_document(
@@ -8518,10 +8612,12 @@ mod tests {
         };
         let e = base(json!({"dir": dir.path().to_string_lossy()}));
         assert!(e.contains("no file matched"), "{e}");
+        // `glob`/`order` beside `dir` rather than inside it: the refusal says
+        // where they moved, because "unknown field" would not.
         let e = base(json!({"text": "be terse", "glob": "*.md"}));
-        assert!(e.contains("no dir to match in"), "{e}");
-        let e = base(json!({"text": "be terse", "order": "date"}));
-        assert!(e.contains("no dir to order"), "{e}");
+        assert!(e.contains("belongs inside `dir`"), "{e}");
+        let e = base(json!({"dir": {"path": "."}, "order": "date"}));
+        assert!(e.contains("belongs inside `dir`"), "{e}");
         let e = base(json!({"dir": dir.path().to_string_lossy(), "text": "be terse"}));
         assert!(e.contains("names 2 sources"), "{e}");
     }

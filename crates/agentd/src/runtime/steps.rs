@@ -10,7 +10,7 @@ use super::children::ChildKind;
 use super::events::kinds;
 use super::reactor::{PendingKind, Runtime, Target};
 use super::tools::{ToolCaller, ToolOutcome};
-use crate::config::fileset::{Order, expand_dir_ordered};
+use crate::config::fileset::{Dir, expand_dir_ordered};
 use crate::config::v2::substitute_config_vars;
 use crate::context::Msg;
 use crate::engine::model::{OnError, Step, Workflow, parse_workflow};
@@ -88,22 +88,47 @@ impl Runtime {
             if doc.get("steps").is_none() {
                 substitute_config_vars(&mut doc, &self.settings.vars, "workflow entry", &mut errs);
             }
-            match doc.get("dir").and_then(Value::as_str) {
+            // `dir:` is the folder source shared with instructions: a path,
+            // or `{path, glob, order}`. The FLAT `glob:` beside a string
+            // `dir:` is the older spelling and still works — it shipped — but
+            // `order:` exists only in the nested form, so the setting that
+            // qualifies a folder has exactly one home going forward.
+            let entry_dir = match doc.get("dir") {
+                None => None,
+                Some(v) => match serde_json::from_value::<Dir>(v.clone()) {
+                    Ok(Dir::Path(path)) => Some(Dir::Detailed {
+                        path,
+                        glob: doc.get("glob").and_then(Value::as_str).map(str::to_string),
+                        order: None,
+                    }),
+                    Ok(detailed) => {
+                        if doc.get("glob").is_some() {
+                            errs.push(
+                                "workflow entry: `glob` beside an object `dir` — put it inside \
+                                 (`dir: {path: …, glob: …}`)"
+                                    .to_string(),
+                            );
+                        }
+                        Some(detailed)
+                    }
+                    Err(e) => {
+                        errs.push(format!("workflow entry dir: {e}"));
+                        None
+                    }
+                },
+            };
+            match entry_dir {
                 None => docs.push(doc),
                 Some(dir) => {
-                    let pattern = doc
-                        .get("glob")
-                        .and_then(Value::as_str)
-                        .unwrap_or("*.yaml,*.yml,*.json");
-                    let order = match doc.get("order").and_then(Value::as_str) {
-                        Some("date") => Order::Date,
-                        _ => Order::Name,
-                    };
-                    match expand_dir_ordered(dir, pattern, order) {
+                    let pattern = dir.glob().unwrap_or("*.yaml,*.yml,*.json");
+                    match expand_dir_ordered(dir.path(), pattern, dir.order()) {
                         Ok(paths) if paths.is_empty() => {
                             // Silence here would mean a schedule that never
                             // fires and no way to tell why.
-                            errs.push(format!("workflow dir {dir}: no file matched {pattern:?}"));
+                            errs.push(format!(
+                                "workflow dir {}: no file matched {pattern:?}",
+                                dir.path()
+                            ));
                         }
                         Ok(paths) => {
                             for path in paths {
@@ -114,7 +139,7 @@ impl Runtime {
                                 docs.push(d);
                             }
                         }
-                        Err(e) => errs.push(format!("workflow dir {dir}: {e}")),
+                        Err(e) => errs.push(format!("workflow dir {}: {e}", dir.path())),
                     }
                 }
             }

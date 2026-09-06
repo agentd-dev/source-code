@@ -849,27 +849,44 @@
               "description": "name the source explicitly: the load-time sources agent.instruction takes",
               "properties": {
                 "dir": {
-                  "description": "a folder of documents, combined into ONE definition in `order`",
-                  "type": "string"
+                  "description": "a folder of documents, combined into ONE document — `glob` and `order` live inside it because they qualify it and nothing else",
+                  "oneOf": [
+                    {
+                      "description": "the folder path",
+                      "type": "string"
+                    },
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "glob": {
+                          "description": "comma-separated globs relative to `path` (default `*.md,*.markdown,*.txt,*.instruction`); `**` recurses",
+                          "type": "string"
+                        },
+                        "order": {
+                          "description": "name (default, path order) or date (mtime, oldest first)",
+                          "enum": [
+                            "name",
+                            "date"
+                          ]
+                        },
+                        "path": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "path"
+                      ],
+                      "type": "object"
+                    }
+                  ]
                 },
                 "file": {
                   "description": "a path on disk",
                   "type": "string"
                 },
-                "glob": {
-                  "description": "comma-separated globs relative to `dir` (default `*.md,*.markdown,*.txt,*.instruction`); `**` recurses",
-                  "type": "string"
-                },
                 "oci": {
                   "description": "an OCI artifact — ghcr.io/acme/agent:v3",
                   "type": "string"
-                },
-                "order": {
-                  "description": "name (default, path order) or date (mtime, oldest first)",
-                  "enum": [
-                    "name",
-                    "date"
-                  ]
                 },
                 "text": {
                   "description": "the definition itself, never read as a path or URI",
@@ -1095,8 +1112,35 @@
           "type": "string"
         },
         "dir": {
-          "description": "load every matching file in a directory",
-          "type": "string"
+          "description": "load every matching file in a directory; `glob` and `order` live inside the object form",
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "glob": {
+                  "description": "comma-separated globs relative to `path` (default `*.yaml,*.yml,*.json`); `**` recurses",
+                  "type": "string"
+                },
+                "order": {
+                  "description": "name (default, path order) or date (mtime, oldest first)",
+                  "enum": [
+                    "name",
+                    "date"
+                  ]
+                },
+                "path": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path"
+              ],
+              "type": "object"
+            }
+          ]
         },
         "durable": {
           "description": "false = runs are memory-only (no checkpoints, gone after a restart) — the fast path for recomputable work; absent = the store.durability.work default (durable)",
@@ -1107,7 +1151,7 @@
           "type": "string"
         },
         "glob": {
-          "description": "comma-separated globs relative to `dir` (default `*.yaml,*.yml,*.json`); `**` recurses",
+          "description": "the older spelling of `dir: {path, glob}`, still supported beside a string `dir`",
           "type": "string"
         },
         "headers": {
@@ -1148,13 +1192,6 @@
         },
         "name": {
           "type": "string"
-        },
-        "order": {
-          "description": "the order `dir` files load in: name (default, path order) or date (mtime, oldest first)",
-          "enum": [
-            "name",
-            "date"
-          ]
         },
         "outputs": {
           "properties": {
@@ -2603,15 +2640,39 @@
                   "type": "object"
                 },
                 "dir": {
-                  "description": "a folder of documents, combined into ONE instruction in `order`",
-                  "type": "string"
+                  "description": "a folder of documents, combined into ONE document — `glob` and `order` live inside it because they qualify it and nothing else",
+                  "oneOf": [
+                    {
+                      "description": "the folder path",
+                      "type": "string"
+                    },
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "glob": {
+                          "description": "comma-separated globs relative to `path` (default `*.md,*.markdown,*.txt,*.instruction`); `**` recurses",
+                          "type": "string"
+                        },
+                        "order": {
+                          "description": "name (default, path order) or date (mtime, oldest first)",
+                          "enum": [
+                            "name",
+                            "date"
+                          ]
+                        },
+                        "path": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "path"
+                      ],
+                      "type": "object"
+                    }
+                  ]
                 },
                 "file": {
                   "description": "a path on disk; watched when lifecycle.watch_config is on",
-                  "type": "string"
-                },
-                "glob": {
-                  "description": "comma-separated globs relative to `dir` (default `*.md,*.markdown,*.txt,*.instruction`); `**` recurses",
                   "type": "string"
                 },
                 "mcp": {
@@ -2642,13 +2703,6 @@
                 "oci": {
                   "description": "an OCI artifact — ghcr.io/acme/agent:v3 (the oci:// is implied)",
                   "type": "string"
-                },
-                "order": {
-                  "description": "how `dir` files are combined: name (default, path order) or date (mtime, oldest first)",
-                  "enum": [
-                    "name",
-                    "date"
-                  ]
                 },
                 "refresh": {
                   "description": "how often to re-read: `auto` (default — inotify for a file, never for a digest-pinned artifact, 5m for a mutable tag or served resource), `off`, or a duration",
@@ -2710,27 +2764,44 @@
               "description": "long form: name the source explicitly",
               "properties": {
                 "dir": {
-                  "description": "a folder of documents, combined into ONE task in `order`",
-                  "type": "string"
+                  "description": "a folder of documents, combined into ONE document — `glob` and `order` live inside it because they qualify it and nothing else",
+                  "oneOf": [
+                    {
+                      "description": "the folder path",
+                      "type": "string"
+                    },
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "glob": {
+                          "description": "comma-separated globs relative to `path` (default `*.md,*.markdown,*.txt,*.instruction`); `**` recurses",
+                          "type": "string"
+                        },
+                        "order": {
+                          "description": "name (default, path order) or date (mtime, oldest first)",
+                          "enum": [
+                            "name",
+                            "date"
+                          ]
+                        },
+                        "path": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "path"
+                      ],
+                      "type": "object"
+                    }
+                  ]
                 },
                 "file": {
                   "description": "a path on disk",
                   "type": "string"
                 },
-                "glob": {
-                  "description": "comma-separated globs relative to `dir` (default `*.md,*.markdown,*.txt,*.instruction`); `**` recurses",
-                  "type": "string"
-                },
                 "oci": {
                   "description": "an OCI artifact — ghcr.io/acme/task:v3",
                   "type": "string"
-                },
-                "order": {
-                  "description": "name (default, path order) or date (mtime, oldest first)",
-                  "enum": [
-                    "name",
-                    "date"
-                  ]
                 },
                 "text": {
                   "description": "the task itself, never read as a path or URI",

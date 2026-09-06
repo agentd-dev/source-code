@@ -807,12 +807,15 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
     // A folder instruction says WHICH documents it combined, in the order it
     // combined them. Without it the agent's standing policy is the one input
     // an operator cannot reconstruct from the config alone.
-    if !rt.settings.agent.instruction_dir_files.is_empty() {
+    if let Some(dir) = rt.settings.agent.instruction_spec.dir.as_ref()
+        && !rt.settings.agent.instruction_dir_files.is_empty()
+    {
         log.info(
             "instruction.loaded",
-            json!({"dir": rt.settings.agent.instruction_spec.dir,
+            json!({"dir": dir.path(),
+                   "glob": dir.glob().unwrap_or(crate::config::fileset::DOCUMENT_GLOB),
                    "files": rt.settings.agent.instruction_dir_files,
-                   "order": match rt.settings.agent.instruction_spec.order.unwrap_or_default() {
+                   "order": match dir.order() {
                        crate::config::fileset::Order::Date => "date",
                        crate::config::fileset::Order::Name => "name",
                    },
@@ -1056,14 +1059,11 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
         // operator makes most often is dropping a new document in, which no
         // watch on the files already there can see.
         if let Some(dir) = rt.settings.agent.instruction_spec.dir.clone() {
-            let glob = rt
-                .settings
-                .agent
-                .instruction_spec
-                .glob
-                .clone()
-                .unwrap_or_else(|| crate::config::fileset::DOCUMENT_GLOB.to_string());
-            watch_dir(&dir, &glob, &log);
+            watch_dir(
+                dir.path(),
+                dir.glob().unwrap_or(crate::config::fileset::DOCUMENT_GLOB),
+                &log,
+            );
         }
         for w in &rt.settings.workflows {
             if let Some(d) = w.get("dir").and_then(Value::as_str) {

@@ -20,6 +20,74 @@ pub enum Order {
     Date,
 }
 
+/// A folder source: the path, and the two settings that only mean anything
+/// with a folder to apply them to.
+///
+/// `glob` and `order` live INSIDE `dir` rather than beside it because they
+/// qualify it and nothing else — a `glob:` with no folder configures nothing,
+/// and a flat spelling has to refuse that combination at load instead of
+/// making it unsayable. The short spelling is the common case:
+///
+/// ```yaml
+/// dir: ./instructions                    # every document, in name order
+/// dir: { path: ./instructions, glob: "*.md", order: date }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Dir {
+    /// `dir: ./instructions`
+    Path(String),
+    /// `dir: { path, glob?, order? }`
+    Detailed {
+        path: String,
+        glob: Option<String>,
+        order: Option<Order>,
+    },
+}
+
+impl Dir {
+    pub fn path(&self) -> &str {
+        match self {
+            Dir::Path(p) | Dir::Detailed { path: p, .. } => p,
+        }
+    }
+    pub fn glob(&self) -> Option<&str> {
+        match self {
+            Dir::Path(_) => None,
+            Dir::Detailed { glob, .. } => glob.as_deref(),
+        }
+    }
+    pub fn order(&self) -> Order {
+        match self {
+            Dir::Path(_) => Order::default(),
+            Dir::Detailed { order, .. } => order.unwrap_or_default(),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Dir {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Long {
+            path: String,
+            #[serde(default)]
+            glob: Option<String>,
+            #[serde(default)]
+            order: Option<Order>,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Path(String),
+            Long(Long),
+        }
+        Ok(match Raw::deserialize(d)? {
+            Raw::Path(p) => Dir::Path(p),
+            Raw::Long(Long { path, glob, order }) => Dir::Detailed { path, glob, order },
+        })
+    }
+}
+
 /// Expand a workflow directory into the files it contains.
 ///
 /// `pattern` is a comma-separated list of shell-style globs relative to `dir`.

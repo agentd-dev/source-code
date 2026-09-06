@@ -248,8 +248,8 @@ file spelling is never in doubt.
 | `--instruction.file <PATH>` | `agent.instruction.file` | — | — | A local file (e.g. a ConfigMap/Secret projection); watched when `lifecycle.watch_config` is on. |
 | `--instruction.oci <REF>` | `agent.instruction.oci` | — | — | An OCI artifact — `ghcr.io/acme/agent:v3` or `…@sha256:…` (the `oci://` is implied). |
 | `--instruction.dir <DIR>` | `agent.instruction.dir` | — | — | A **folder** of documents, combined into one instruction. §5a.1a. |
-| `--instruction.glob <GLOBS>` | `agent.instruction.glob` | — | `*.md,*.markdown,*.txt,*.instruction` | Which files under `dir` (comma-separated; `**` recurses). |
-| `--instruction.order <name\|date>` | `agent.instruction.order` | — | `name` | The order the folder's documents combine in. |
+| `--instruction.glob <GLOBS>` | `agent.instruction.dir.glob` | — | `*.md,*.markdown,*.txt,*.instruction` | Which files under the folder (comma-separated; `**` recurses). |
+| `--instruction.order <name\|date>` | `agent.instruction.dir.order` | — | `name` | The order the folder's documents combine in. |
 | `--instruction.url <URL>` | `agent.instruction.url` | — | — | An `https://` document, fetched at load. |
 | `--instruction.mcp <URI>` | `agent.instruction.mcp` | — | — | A resource a declared MCP server serves (read + subscribed). |
 | `--instruction.refresh <auto\|off\|DUR>` | `agent.instruction.refresh` | — | `auto` | How often to re-read it; `auto` picks the mechanism that fits the source. §5a.2. |
@@ -258,7 +258,7 @@ file spelling is never in doubt.
 | `--prompt <VALUE>` | `agent.prompt` | `PROMPT` | *(none)* | A one-shot task: with no workflows configured, the generated run executes this while `instruction` stays the standing policy. Classified exactly as `--instruction` is, so a path names the file. |
 | `--prompt.text <TEXT>` | `agent.prompt.text` | — | — | The task itself, never read as a path or URI. |
 | `--prompt.file <PATH>` | `agent.prompt.file` | — | — | Read the task from a local file. |
-| `--prompt.dir <DIR>` | `agent.prompt.dir` | — | — | A folder of documents, combined into one task (`--prompt.glob`, `--prompt.order`). |
+| `--prompt.dir <DIR>` | `agent.prompt.dir` | — | — | A folder of documents, combined into one task (`--prompt.glob` → `agent.prompt.dir.glob`, `--prompt.order` → `…dir.order`). |
 | `--prompt.url <URL>` | `agent.prompt.url` | — | — | An `https://` document, fetched at load. |
 | `--prompt.oci <REF>` | `agent.prompt.oci` | — | — | An OCI artifact (needs `--features oci`). |
 | `--prompt-file <PATH>` | `agent.prompt` | — | — | The earlier spelling of `--prompt.file`; still supported. |
@@ -677,7 +677,7 @@ name a server nests one URI inside another:
 The two spellings compose on the command line — `--instruction ./agent.md
 --instruction.refresh 30s` keeps both, in either order.
 
-### 5a.1a A folder of documents — `dir:`, `glob:`, `order:`
+### 5a.1a A folder of documents — `dir:`
 
 A policy that outgrew one file does not need a build step. `dir:` combines
 every document a folder matches into **one** instruction:
@@ -686,9 +686,20 @@ every document a folder matches into **one** instruction:
 agent:
   instruction:
     dir: ./instructions            # or just: instruction: ./instructions/
-    glob: "*.md"                   # default: *.md,*.markdown,*.txt,*.instruction
-    order: name                    # name (default) | date
+
+# …and when the defaults are not what you want, the folder carries its own
+# settings, because `glob` and `order` qualify the folder and nothing else:
+agent:
+  instruction:
+    dir:
+      path: ./instructions
+      glob: "*.md"                 # default: *.md,*.markdown,*.txt,*.instruction
+      order: name                  # name (default) | date
 ```
+
+Writing `glob:` or `order:` beside `dir:` rather than inside it is a refusal
+that says where they live — a setting with nothing to qualify should not be
+sayable, which is why they are nested rather than validated.
 
 - **`order: name`** sorts by path, which is what a `10-`, `20-`, `30-` naming
   convention exists to exploit — and it is stable across machines, unlike the
@@ -705,7 +716,7 @@ agent:
   warning rather than left to read as prose in the middle of the text.
 - A folder that matches **nothing** is a refusal, not an empty instruction.
 
-This is the same `dir:`/`glob:`/`order:` a [workflow entry](#61-where-definitions-come-from)
+This is the same folder source a [workflow entry](#61-where-definitions-come-from)
 takes, running the same code, so a folder of documents behaves identically
 wherever it appears.
 
@@ -722,18 +733,19 @@ they are as likely to live in a file as to be typed at a terminal:
 agent:
   prompt: ./tasks/close-the-books.md     # classified exactly as `instruction` is
   # or  prompt: { file: ./task.md }
-  # or  prompt: { dir: ./tasks, order: date }
+  # or  prompt: { dir: { path: ./tasks, order: date } }
   # or  prompt: { text: "./this-is-literally-the-task.md" }
 
 subagents:
   templates:
     researcher:
-      instruction: { dir: ./templates/researcher, glob: "*.md" }
+      instruction: { dir: { path: ./templates/researcher, glob: "*.md" } }
 ```
 
-Both take the load-time sources — `text`, `file`, `dir` (+`glob`, `order`),
-`url`, `oci` — and refuse the same way `instruction` does: two sources named,
-or a `glob:` with no `dir:` to match in, is an error at load. `mcp:` is
+Both take the load-time sources — `text`, `file`, `dir` (carrying its own
+`glob` and `order`), `url`, `oci` — and refuse the same way `instruction`
+does: naming two sources, or putting `glob:`/`order:` outside the `dir:` they
+qualify, is an error at load. `mcp:` is
 instruction-only: an MCP resource is read *and subscribed* by the runtime's
 client, which does not exist yet at config load, so a child that needs one
 gets its own `agent.instruction`.
@@ -905,8 +917,11 @@ workflows:
     timeout: 10s                    # default 30s
     allow_private: true             # the fetch rides the same SSRF guard as http nodes
   - dir: ./workflows                # every match becomes a workflow, named by file stem
-    glob: "**/*.yaml"               # `*` within a segment, `**` crosses segments
-    order: name                     # name (default, path order) | date (mtime, oldest first)
+    glob: "**/*.yaml"               # the older spelling; still supported
+  - dir:                            # the folder carries its own settings
+      path: ./workflows
+      glob: "**/*.yaml"             # `*` within a segment, `**` crosses segments
+      order: date                   # name (default, path order) | date (mtime, oldest first)
 ```
 
 A `url` fetch happens once, at startup, before validation — an unreachable URL
@@ -917,9 +932,9 @@ almost always a typo, and fail-open here means a reactive daemon with no
 reactions. However a definition arrived, it is hashed and pinned identically —
 a run started under one hash finishes under it.
 
-`dir:`, `glob:` and `order:` are the same three settings an
-[instruction folder](#5a1a-a-folder-of-documents--dir-glob-order) takes,
-running the same code — a folder of documents is one behaviour, not two that
+`dir:` is the same folder source an
+[instruction folder](#5a1a-a-folder-of-documents--dir) takes —
+a path, or `{path, glob, order}` — running the same code — a folder of documents is one behaviour, not two that
 look alike. With `lifecycle.watch_config` on, both the named files and the
 folders are watched, and a reload re-reads them even when the entries
 themselves did not change.

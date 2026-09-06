@@ -99,9 +99,7 @@ fn top_level_properties(
                         "file": { "type": "string", "description": "a path on disk; watched when lifecycle.watch_config is on" },
                         "oci": { "type": "string", "description": "an OCI artifact — ghcr.io/acme/agent:v3 (the oci:// is implied)" },
                         "url": { "type": "string", "description": "an https:// document, fetched at load (same key a workflow entry uses)" },
-                        "dir": { "type": "string", "description": "a folder of documents, combined into ONE instruction in `order`" },
-                        "glob": { "type": "string", "description": "comma-separated globs relative to `dir` (default `*.md,*.markdown,*.txt,*.instruction`); `**` recurses" },
-                        "order": { "enum": ["name", "date"], "description": "how `dir` files are combined: name (default, path order) or date (mtime, oldest first)" },
+                        "dir": { "oneOf": [ { "type": "string", "description": "the folder path" }, { "type": "object", "additionalProperties": false, "required": ["path"], "properties": { "path": { "type": "string" }, "glob": { "type": "string", "description": "comma-separated globs relative to `path` (default `*.md,*.markdown,*.txt,*.instruction`); `**` recurses" }, "order": { "enum": ["name", "date"], "description": "name (default, path order) or date (mtime, oldest first)" } } } ], "description": "a folder of documents, combined into ONE document — `glob` and `order` live inside it because they qualify it and nothing else" },
                         "mcp": { "oneOf": [ { "type": "string" }, { "type": "object", "additionalProperties": false, "required": ["resource"], "properties": { "server": { "type": "string", "description": "which configured MCP server to ask; omitted = whichever one serves it" }, "resource": { "type": "string", "description": "the resource URI, e.g. instruction://ins_1@stable" } } } ], "description": "a resource a configured MCP server serves, read and subscribed — the URI alone, or {server, resource} when it matters which server is asked" },
                         "refresh": { "type": "string", "description": "how often to re-read: `auto` (default — inotify for a file, never for a digest-pinned artifact, 5m for a mutable tag or served resource), `off`, or a duration" },
                         "unavailable": { "enum": ["auto", "keep", "freeze", "drain", "exit"], "description": "when the source stops answering after startup: auto (freeze when trust-pinned, else keep), keep, freeze (refuse new work), drain (finish live work then exit 0), exit" },
@@ -114,9 +112,7 @@ fn top_level_properties(
                     { "type": "object", "additionalProperties": false, "description": "long form: name the source explicitly", "properties": {
                         "text": { "type": "string", "description": "the task itself, never read as a path or URI" },
                         "file": { "type": "string", "description": "a path on disk" },
-                        "dir": { "type": "string", "description": "a folder of documents, combined into ONE task in `order`" },
-                        "glob": { "type": "string", "description": "comma-separated globs relative to `dir` (default `*.md,*.markdown,*.txt,*.instruction`); `**` recurses" },
-                        "order": { "enum": ["name", "date"], "description": "name (default, path order) or date (mtime, oldest first)" },
+                        "dir": { "oneOf": [ { "type": "string", "description": "the folder path" }, { "type": "object", "additionalProperties": false, "required": ["path"], "properties": { "path": { "type": "string" }, "glob": { "type": "string", "description": "comma-separated globs relative to `path` (default `*.md,*.markdown,*.txt,*.instruction`); `**` recurses" }, "order": { "enum": ["name", "date"], "description": "name (default, path order) or date (mtime, oldest first)" } } } ], "description": "a folder of documents, combined into ONE document — `glob` and `order` live inside it because they qualify it and nothing else" },
                         "url": { "type": "string", "description": "an https:// document, fetched at load" },
                         "oci": { "type": "string", "description": "an OCI artifact — ghcr.io/acme/task:v3" } } }
                 ] },
@@ -491,9 +487,8 @@ fn defs_properties(
                 "headers": { "type": "object", "additionalProperties": { "type": "string" }, "description": "headers for `url` — credential values must be {{secret:…}} references" },
                 "timeout": duration,
                 "allow_private": { "type": "boolean", "description": "permit `url` to resolve to a private/loopback address" },
-                "dir": { "type": "string", "description": "load every matching file in a directory" },
-                "glob": { "type": "string", "description": "comma-separated globs relative to `dir` (default `*.yaml,*.yml,*.json`); `**` recurses" },
-                "order": { "enum": ["name", "date"], "description": "the order `dir` files load in: name (default, path order) or date (mtime, oldest first)" } },
+                "dir": { "oneOf": [ { "type": "string" }, { "type": "object", "additionalProperties": false, "required": ["path"], "properties": { "path": { "type": "string" }, "glob": { "type": "string", "description": "comma-separated globs relative to `path` (default `*.yaml,*.yml,*.json`); `**` recurses" }, "order": { "enum": ["name", "date"], "description": "name (default, path order) or date (mtime, oldest first)" } } } ], "description": "load every matching file in a directory; `glob` and `order` live inside the object form" },
+                "glob": { "type": "string", "description": "the older spelling of `dir: {path, glob}`, still supported beside a string `dir`" } },
                 "additionalProperties": false,
                 "description": "a {name, file|uri|url} reference, a {dir, glob} directory, or an inline workflow definition" });
     if let (Some(dst), Some(src)) = (
@@ -530,9 +525,7 @@ fn defs_properties(
                     { "type": "object", "additionalProperties": false, "description": "name the source explicitly: the load-time sources agent.instruction takes", "properties": {
                         "text": { "type": "string", "description": "the definition itself, never read as a path or URI" },
                         "file": { "type": "string", "description": "a path on disk" },
-                        "dir": { "type": "string", "description": "a folder of documents, combined into ONE definition in `order`" },
-                        "glob": { "type": "string", "description": "comma-separated globs relative to `dir` (default `*.md,*.markdown,*.txt,*.instruction`); `**` recurses" },
-                        "order": { "enum": ["name", "date"], "description": "name (default, path order) or date (mtime, oldest first)" },
+                        "dir": { "oneOf": [ { "type": "string", "description": "the folder path" }, { "type": "object", "additionalProperties": false, "required": ["path"], "properties": { "path": { "type": "string" }, "glob": { "type": "string", "description": "comma-separated globs relative to `path` (default `*.md,*.markdown,*.txt,*.instruction`); `**` recurses" }, "order": { "enum": ["name", "date"], "description": "name (default, path order) or date (mtime, oldest first)" } } } ], "description": "a folder of documents, combined into ONE document — `glob` and `order` live inside it because they qualify it and nothing else" },
                         "url": { "type": "string", "description": "an https:// document, fetched at load" },
                         "oci": { "type": "string", "description": "an OCI artifact — ghcr.io/acme/agent:v3" } } }
                 ] },

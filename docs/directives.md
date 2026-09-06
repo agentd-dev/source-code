@@ -346,7 +346,7 @@ classifies or as an explicit key:
 | an MCP resource | `instruction: "instruction://ins_1@stable"` | `mcp:` (or `{server, resource}`) | the operator named the resource (re-read on server notify) |
 | an **OCI artifact** (RFC 0040) | `instruction: "oci://ghcr.io/acme/agent:v3"` | `oci:` | the operator pinned the reference |
 | an HTTPS document | `instruction: "https://docs.example/agent.md"` | `url:` | the operator named the URL |
-| a **folder** of documents | `instruction: ./instructions/` | `dir:` (+ `glob:`, `order:`) | the operator named the folder; the matches combine into one document |
+| a **folder** of documents | `instruction: ./instructions/` | `dir:` (a path, or `{path, glob, order}`) | the operator named the folder; the matches combine into one document |
 
 ```yaml
 agent:

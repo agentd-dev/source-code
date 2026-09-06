@@ -92,9 +92,20 @@ fn top_level_properties(
                 "type": "object", "additionalProperties": false,
                 "properties": {
                     "name": { "type": "string", "description": "instance identity (falls back to the downward-API instance, then the hostname)" },
-                    "instruction": { "type": "string", "description": "the instruction itself, a FILE path (no whitespace, path-shaped or a document extension; `file://` to be explicit), or a URI — `oci://` an artifact, `mcp://`/`instruction://` a served resource" },
-                "instruction_refresh": { "type": "string", "description": "how often to re-read the instruction: `auto` (default — inotify for a file, no polling for a digest-pinned artifact, 5m for a mutable tag or served resource), `off`, or a duration" },
-                "instruction_unavailable": { "enum": ["auto", "keep", "freeze", "drain", "exit"], "description": "what to do when the source stops answering after startup: auto (freeze when trust-pinned, else keep), keep (carry on with the last good instruction), freeze (refuse new work, drain live), drain (finish live work then exit 0), exit (stop now)" },
+                    "instruction": { "oneOf": [
+                    { "type": "string", "description": "short form: the instruction itself, a FILE path (no whitespace, path-shaped or a document extension), or a URI (`oci://`, `mcp://`, `instruction://`, `https://`). Every other setting takes its default." },
+                    { "type": "object", "additionalProperties": false, "description": "long form: name the source explicitly and set everything about it here", "properties": {
+                        "text": { "type": "string", "description": "the instruction itself, never read as a path or URI" },
+                        "file": { "type": "string", "description": "a path on disk; watched when lifecycle.watch_config is on" },
+                        "oci": { "type": "string", "description": "an OCI artifact — ghcr.io/acme/agent:v3 (the oci:// is implied)" },
+                        "http": { "type": "string", "description": "an https:// document, fetched at load" },
+                        "mcp": { "oneOf": [ { "type": "string" }, { "type": "object", "additionalProperties": false, "required": ["resource"], "properties": { "server": { "type": "string", "description": "which configured MCP server to ask; omitted = whichever one serves it" }, "resource": { "type": "string", "description": "the resource URI, e.g. instruction://ins_1@stable" } } } ], "description": "a resource a configured MCP server serves, read and subscribed — the URI alone, or {server, resource} when it matters which server is asked" },
+                        "refresh": { "type": "string", "description": "how often to re-read: `auto` (default — inotify for a file, never for a digest-pinned artifact, 5m for a mutable tag or served resource), `off`, or a duration" },
+                        "unavailable": { "enum": ["auto", "keep", "freeze", "drain", "exit"], "description": "when the source stops answering after startup: auto (freeze when trust-pinned, else keep), keep, freeze (refuse new work), drain (finish live work then exit 0), exit" },
+                        "decrypt": { "type": "object", "additionalProperties": false, "description": "recipient keys for an encrypted envelope (RFC 0041)", "properties": {
+                            "keys": { "type": "array", "items": { "type": "string" }, "description": "key FILE paths — an AGE-SECRET-KEY-1… identity, 64 hex chars, or base64" },
+                            "passphrase": { "type": "string", "description": "for age scrypt envelopes — a {{secret:…}} reference" } } } } }
+                ] },
                     "prompt": { "type": "string", "description": "a one-shot task (--prompt): with no workflows configured the generated run executes this, while `instruction` stays the standing policy (the run's system prompt)" },
                     "preflight": { "enum": ["never", "auto", "always"] },
                     "wake_on": { "type": "array", "items": { "enum": ["a2a_message", "human_reply", "subagent_result", "workflow_finished", "workflow_failed", "instruction_updated", "budget_resumed"] } },

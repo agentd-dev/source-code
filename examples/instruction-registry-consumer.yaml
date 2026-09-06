@@ -26,8 +26,17 @@ config_version: "1"
 agent:
   name: loop-demo
   preflight: never
-  # Replace with your instruction id; `@stable` follows the ref.
-  instruction: "instruction://ins_01M1SSQR9NG8AYS34KWRMGY4E1@stable"
+  instruction:
+    # Replace with your instruction id; `@stable` follows the ref. Add
+    # `server: gateway` if more than one connected server could serve it.
+    mcp: "instruction://ins_01M1SSQR9NG8AYS34KWRMGY4E1@stable"
+    # `auto` would poll every 5m and rely on the server's notifications; the
+    # loop demo wants a tighter, predictable cadence to measure against.
+    refresh: 30s
+    # This consumer would rather keep serving on the instruction it holds than
+    # stop when the registry blips. A trust-pinned source (below) would
+    # default to `freeze` instead — see configuration.md §5a.3.
+    unavailable: keep
 
 mcp:
   servers:

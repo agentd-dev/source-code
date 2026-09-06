@@ -57,7 +57,7 @@ impl super::reactor::Runtime {
         let pinned = self.settings.instruction_sources.iter().any(|s| {
             !s.publisher.is_empty() && uri.starts_with(s.uri.split('@').next().unwrap_or(&s.uri))
         });
-        let policy = match self.settings.agent.instruction_unavailable {
+        let policy = match self.settings.agent.instruction_spec.unavailable {
             P::Auto if pinned => P::Freeze,
             P::Auto => P::Keep,
             other => other,
@@ -109,7 +109,7 @@ impl super::reactor::Runtime {
     /// slower than the deadline would let authorization expire between checks.
     fn min_freshness_ms(&self) -> Option<u64> {
         let revocation = min_freshness_ms(&self.settings.instruction_sources);
-        let poll = match self.settings.agent.instruction_refresh.as_deref() {
+        let poll = match self.settings.agent.instruction_spec.refresh.as_deref() {
             None | Some("auto") => self.auto_refresh_ms(),
             Some("off") | Some("never") => None,
             Some(d) => crate::config::parse_duration(d)

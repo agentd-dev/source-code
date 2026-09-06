@@ -132,9 +132,9 @@ impl Runtime {
         // timer first, so this replaces rather than stacks — and it is what
         // makes `agent.instruction_refresh` honestly RELOADABLE, including
         // the case where it was `off` and no timer existed to notice.
-        if old.agent.instruction_refresh != new.agent.instruction_refresh {
+        if old.agent.instruction_spec.refresh != new.agent.instruction_spec.refresh {
             self.arm_freshness();
-            changed.push("agent.instruction_refresh");
+            changed.push("agent.instruction.refresh");
         }
         // Instruction (static text; a resource instruction re-subscribes).
         if old.agent.instruction != new.agent.instruction {

@@ -1533,7 +1533,17 @@ impl Runtime {
     /// they must be UTF-8.
     fn decode_instruction_bytes(&self, bytes: Vec<u8>) -> Result<String, String> {
         #[cfg(feature = "decrypt")]
-        let bytes = crate::config::decrypt::maybe_decrypt(bytes, &self.settings.instruction)?;
+        let bytes = {
+            // The long form's keys win; the top-level `instruction:` section
+            // is the earlier spelling of the same setting.
+            let icfg = match &self.settings.agent.instruction_spec.decrypt {
+                Some(d) => crate::config::v2::Instruction {
+                    decrypt: Some(d.clone()),
+                },
+                None => self.settings.instruction.clone(),
+            };
+            crate::config::decrypt::maybe_decrypt(bytes, &icfg)?
+        };
         #[cfg(not(feature = "decrypt"))]
         if crate::config::envelope::looks_encrypted(&bytes) {
             return Err(

@@ -319,22 +319,12 @@ pub struct Agent {
     /// DERIVED. `lifecycle.watch_config` watches it alongside the config.
     #[serde(skip)]
     pub instruction_path: Option<String>,
-    /// How often to re-read the instruction: `auto` (the default — the
-    /// mechanism that fits the source), `off`, or a duration.
-    ///
-    /// `auto` is per-kind because polling is only ever right for one of them:
-    /// a FILE is watched by inotify (instant, no polling); a `@sha256:` OCI
-    /// pin is immutable, so re-reading it can only return what it already
-    /// returned; a mutable `:tag` is polled; a served resource relies on the
-    /// server's notifications and polls as a fallback; inline text has no
-    /// source to re-read.
-    #[serde(default)]
-    pub instruction_refresh: Option<String>,
-    /// What to do when the instruction source stops answering: `auto` (the
-    /// default), `keep`, `freeze`, `drain` or `exit`. See
-    /// [`InstructionUnavailable`].
-    #[serde(default)]
-    pub instruction_unavailable: InstructionUnavailable,
+    /// Everything about the instruction beyond its value — refresh cadence,
+    /// unavailability policy, decryption keys. DERIVED: it is set from the
+    /// long form of `agent.instruction`, and left at its defaults by the
+    /// short form, which is the point of the short form.
+    #[serde(skip)]
+    pub instruction_spec: InstructionSpec,
 }
 
 /// The provenance of a load-time-resolved instruction reference.
@@ -411,6 +401,133 @@ impl Agent {
         self.instruction
             .as_deref()
             .is_some_and(looks_like_resource_uri)
+    }
+}
+
+/// The long form of `agent.instruction`: name the source explicitly and set
+/// everything about it in one place.
+///
+/// ```yaml
+/// agent:
+///   instruction:
+///     oci: "ghcr.io/acme/agent:latest"   # or file:/text:/http:/mcp:
+///     refresh: 60s                        # default: auto
+///     unavailable: drain                  # default: auto
+///     decrypt: { keys: [/etc/keys/agent.key] }
+/// ```
+///
+/// The short form — `instruction: "<text | path | uri>"` — is the same
+/// setting with every option left at its default, and is what most
+/// configurations want.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct InstructionSpec {
+    // ── exactly one source ─────────────────────────────────────────────────
+    /// The instruction itself, never interpreted as a path or a URI.
+    pub text: Option<String>,
+    /// A path on disk; watched when `lifecycle.watch_config` is on.
+    pub file: Option<String>,
+    /// An OCI artifact: `ghcr.io/acme/agent:v3` (the `oci://` is implied).
+    pub oci: Option<String>,
+    /// An `https://` document, fetched at load.
+    pub http: Option<String>,
+    /// A resource a configured MCP server serves, read and subscribed.
+    ///
+    /// Either the resource URI alone — `mcp: "instruction://ins_1@stable"`,
+    /// served by whichever connected server answers for it — or the pair,
+    /// when it matters which server is asked:
+    ///
+    /// ```yaml
+    /// mcp: { server: gateway, resource: "instruction://ins_1@stable" }
+    /// ```
+    ///
+    /// The pair exists because the URI-only spelling for a specific server is
+    /// `mcp://<server>/<resource-uri>`, which nests one URI inside another and
+    /// reads terribly for anything but the simplest resource id.
+    pub mcp: Option<McpResource>,
+    // ── how it behaves ─────────────────────────────────────────────────────
+    /// `auto` (per source kind), `off`, or a duration.
+    pub refresh: Option<String>,
+    /// What to do when the source stops answering after startup.
+    pub unavailable: InstructionUnavailable,
+    /// Recipient keys for an encrypted envelope (RFC 0041).
+    pub decrypt: Option<InstructionDecrypt>,
+}
+
+impl InstructionSpec {
+    /// The single source this names, as the scalar the loader resolves.
+    /// `None` when it names none (settings only — the agent has no
+    /// instruction, which is a supported state); a refusal when it names
+    /// several, because guessing which one was meant is worse than asking.
+    pub fn source_value(&self) -> Result<Option<String>, String> {
+        let named: Vec<(&str, String)> = [
+            ("text", self.text.as_ref()),
+            ("file", self.file.as_ref()),
+            ("oci", self.oci.as_ref()),
+            ("http", self.http.as_ref()),
+        ]
+        .into_iter()
+        .filter_map(|(k, v)| v.map(|v| (k, v.clone())))
+        .chain(self.mcp.as_ref().map(|m| ("mcp", m.to_uri())))
+        .collect();
+        match named.as_slice() {
+            // Settings without a source is not an error: the agent simply has
+            // no instruction (a supported state), and a mistyped source key is
+            // caught by `deny_unknown_fields` rather than by this. It is also
+            // how a base layer carries settings while a flag supplies the
+            // source.
+            [] => Ok(None),
+            [(kind, v)] => Ok(Some(match *kind {
+                // The source keys are explicit BY CONSTRUCTION: a value under
+                // `file:` is a path even if it looks like prose, and a value
+                // under `text:` is the instruction even if it looks like a
+                // path. Only the short form has to be classified.
+                "oci" if !v.starts_with("oci://") => format!("oci://{v}"),
+                "file" if !v.starts_with("file://") => format!("file://{v}"),
+                _ => v.clone(),
+            })),
+            // Two sources IS ambiguous and unrecoverable — there is no right
+            // guess about which one was meant.
+            many => Err(format!(
+                "agent.instruction names {} sources ({}) — name exactly one",
+                many.len(),
+                many.iter().map(|(k, _)| *k).collect::<Vec<_>>().join(", ")
+            )),
+        }
+    }
+}
+
+/// An instruction served over MCP: the resource, and optionally which server.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum McpResource {
+    /// `mcp: "instruction://…"` — any connected server that serves it.
+    Uri(String),
+    /// `mcp: { server: …, resource: … }` — that server, that resource.
+    Named {
+        #[serde(default)]
+        server: Option<String>,
+        resource: String,
+    },
+}
+
+impl McpResource {
+    /// The single `agent.instruction` scalar this resolves to. A named server
+    /// becomes the `mcp://<server>/<resource>` form the runtime already
+    /// routes on, so the config shape stays pleasant without the resolver
+    /// growing a second path.
+    pub fn to_uri(&self) -> String {
+        match self {
+            McpResource::Uri(u) => u.clone(),
+            McpResource::Named {
+                server: None,
+                resource,
+            } => resource.clone(),
+            McpResource::Named {
+                server: Some(s),
+                resource,
+            } => format!("mcp://{s}/{resource}"),
+        }
     }
 }
 
@@ -2786,6 +2903,31 @@ impl Settings {
         // (`:::!config`/`:::!mcp`/`:::!stream`/`:::!tools`) contribute a fragment
         // that merges UNDER the explicit document — an instruction file alone
         // can define the whole agent, and an explicit key still wins.
+        // `agent.instruction` in its LONG form: an object naming the source
+        // explicitly plus everything about it. Collapse it to the scalar the
+        // rest of this function already resolves, and keep the settings — so
+        // the two spellings share one code path and cannot drift.
+        let mut instruction_spec = InstructionSpec::default();
+        if let Some(v) = doc.get("agent").and_then(|a| a.get("instruction"))
+            && v.is_object()
+        {
+            let spec: InstructionSpec = serde_json::from_value(v.clone())
+                .map_err(|e| format!("{source}: agent.instruction: {e}"))?;
+            let value = spec.source_value().map_err(|e| format!("{source}: {e}"))?;
+            if let Some(a) = doc.get_mut("agent").and_then(Value::as_object_mut) {
+                match value {
+                    Some(v) => {
+                        a.insert("instruction".into(), Value::String(v));
+                    }
+                    // Settings only: no instruction, and the settings are
+                    // simply inert rather than an error.
+                    None => {
+                        a.remove("instruction");
+                    }
+                }
+            }
+            instruction_spec = spec;
+        }
         #[cfg_attr(not(feature = "oci"), allow(unused_mut))]
         let mut instruction_origin: Option<InstructionOrigin> = None;
         let mut instruction_path: Option<String> = None;
@@ -2879,6 +3021,24 @@ impl Settings {
                  building with --features oci"
             ));
         }
+        // An `https://` document, fetched at load for the same reason an OCI
+        // artifact is: its machinery has to fold into the configuration being
+        // built. Plain GET over the existing client — an endpoint needing
+        // credentials should be served through MCP, which has an auth story.
+        if let Some(url) = doc
+            .get("agent")
+            .and_then(|a| a.get("instruction"))
+            .and_then(Value::as_str)
+            .filter(|s| s.starts_with("https://") || s.starts_with("http://"))
+            .filter(|_| instruction_spec.http.is_some())
+            .map(str::to_string)
+        {
+            let text = crate::config::http_get(&url)
+                .map_err(|e| format!("{source}: agent.instruction {url}: {e}"))?;
+            if let Some(a) = doc.get_mut("agent").and_then(Value::as_object_mut) {
+                a.insert("instruction".into(), Value::String(text));
+            }
+        }
         // An ENCRYPTED instruction (RFC 0041) decrypts here, before anything
         // inspects it — an envelope carries no `:::` markers, so running the
         // idoc detection on ciphertext would silently deliver garbage prose.
@@ -2892,13 +3052,20 @@ impl Settings {
         {
             #[cfg(feature = "decrypt")]
             {
-                let icfg: Instruction = doc
-                    .get("instruction")
-                    .cloned()
-                    .map(serde_json::from_value)
-                    .transpose()
-                    .map_err(|e| format!("{source}: instruction: {e}"))?
-                    .unwrap_or_default();
+                // Keys from the long form first; the top-level `instruction:`
+                // section remains as the earlier spelling.
+                let icfg = match &instruction_spec.decrypt {
+                    Some(d) => Instruction {
+                        decrypt: Some(d.clone()),
+                    },
+                    None => doc
+                        .get("instruction")
+                        .cloned()
+                        .map(serde_json::from_value)
+                        .transpose()
+                        .map_err(|e| format!("{source}: instruction: {e}"))?
+                        .unwrap_or_default(),
+                };
                 let plain = crate::config::decrypt::maybe_decrypt(instr.as_bytes().to_vec(), &icfg)
                     .map_err(|e| format!("{source}: agent.instruction: {e}"))?;
                 let text = String::from_utf8(plain)
@@ -2982,6 +3149,7 @@ impl Settings {
         }
         settings.agent.instruction_origin = instruction_origin;
         settings.agent.instruction_path = instruction_path;
+        settings.agent.instruction_spec = instruction_spec;
         Ok(settings)
     }
 
@@ -3138,6 +3306,44 @@ pub const ALIASES: &[Alias] = &[
         flag: "--instruction-file",
         path: "agent.instruction",
         kind: AliasKind::SetFromFile,
+    },
+    // The long form's keys, spelled from the setting rather than the whole
+    // path: `--instruction.oci ghcr.io/acme/agent:v3` beside
+    // `--instruction "…"`, because they are the same setting.
+    Alias {
+        flag: "--instruction.text",
+        path: "agent.instruction.text",
+        kind: AliasKind::Set,
+    },
+    Alias {
+        flag: "--instruction.file",
+        path: "agent.instruction.file",
+        kind: AliasKind::Set,
+    },
+    Alias {
+        flag: "--instruction.oci",
+        path: "agent.instruction.oci",
+        kind: AliasKind::Set,
+    },
+    Alias {
+        flag: "--instruction.http",
+        path: "agent.instruction.http",
+        kind: AliasKind::Set,
+    },
+    Alias {
+        flag: "--instruction.mcp",
+        path: "agent.instruction.mcp",
+        kind: AliasKind::Set,
+    },
+    Alias {
+        flag: "--instruction.refresh",
+        path: "agent.instruction.refresh",
+        kind: AliasKind::Set,
+    },
+    Alias {
+        flag: "--instruction.unavailable",
+        path: "agent.instruction.unavailable",
+        kind: AliasKind::Set,
     },
     Alias {
         flag: "--prompt",
@@ -3911,6 +4117,35 @@ fn binding_for<'a>(bindings: &'a [Binding], path: &str) -> Option<&'a Binding> {
     bindings.iter().find(|b| b.path == path)
 }
 
+/// A dotted `--instruction.<setting>` flag alongside a SHORT-form value: the
+/// scalar is promoted into the source key it names, so the two spellings
+/// compose instead of the object silently replacing the string.
+/// `--instruction ./a.md --instruction.refresh 30s` means what it reads as.
+fn promote_instruction_scalar(doc: &mut Value) {
+    let Some(agent) = doc.get_mut("agent").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let Some(scalar) = agent
+        .get("instruction")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let key = match classify_instruction(&scalar) {
+        InstructionValue::Text => "text",
+        InstructionValue::File(_) => "file",
+        InstructionValue::Uri if scalar.starts_with("oci://") => "oci",
+        InstructionValue::Uri
+            if scalar.starts_with("http://") || scalar.starts_with("https://") =>
+        {
+            "http"
+        }
+        InstructionValue::Uri => "mcp",
+    };
+    agent.insert("instruction".into(), serde_json::json!({ key: scalar }));
+}
+
 fn apply_alias(
     doc: &mut Value,
     bindings: &[Binding],
@@ -3924,6 +4159,48 @@ fn apply_alias(
             .ok_or_else(|| usage(format!("{} requires a value", alias.flag)))
     };
     match alias.kind {
+        // The SHORT form arriving after long-form settings: keep the
+        // settings and replace only the source. Without this the scalar
+        // overwrote the object and `--instruction.refresh 30s --instruction
+        // ./a.md` silently lost the refresh — valid config, dropped setting.
+        AliasKind::Set
+            if alias.path == "agent.instruction"
+                && doc
+                    .get("agent")
+                    .and_then(|a| a.get("instruction"))
+                    .is_some_and(Value::is_object) =>
+        {
+            let raw = take()?;
+            let key = match classify_instruction(&raw) {
+                InstructionValue::Text => "text",
+                InstructionValue::File(_) => "file",
+                InstructionValue::Uri if raw.starts_with("oci://") => "oci",
+                InstructionValue::Uri
+                    if raw.starts_with("http://") || raw.starts_with("https://") =>
+                {
+                    "http"
+                }
+                InstructionValue::Uri => "mcp",
+            };
+            if let Some(obj) = doc
+                .get_mut("agent")
+                .and_then(Value::as_object_mut)
+                .and_then(|a| a.get_mut("instruction"))
+                .and_then(Value::as_object_mut)
+            {
+                for k in ["text", "file", "oci", "http", "mcp"] {
+                    obj.remove(k);
+                }
+                obj.insert(key.into(), Value::String(raw));
+            }
+        }
+        AliasKind::Set if alias.path.starts_with("agent.instruction.") => {
+            let raw = take()?;
+            promote_instruction_scalar(doc);
+            let mut patch = Value::Object(Map::new());
+            paths::set_path(&mut patch, alias.path, Value::String(raw));
+            file::merge_into(doc, patch);
+        }
         AliasKind::Set => {
             let raw = take()?;
             let b = binding_for(bindings, alias.path).ok_or_else(|| {
@@ -6227,13 +6504,6 @@ pub const RELOADABLE_PATHS: &[&str] = &[
     "a2a.push",
     "agent.approval",
     "agent.ask_human_fallback",
-    // Read live at the moment the policy fires, from `self.settings`, which a
-    // reload replaces.
-    "agent.instruction_unavailable",
-    // `reload.rs` re-arms the freshness timer when this changes, which is
-    // what makes the claim true even when it was previously `off` and no
-    // timer existed to pick the change up.
-    "agent.instruction_refresh",
     "agent.conversation_budget",
     "agent.instruction",
     "agent.max_parallel_turns",
@@ -6629,6 +6899,14 @@ mod tests {
         for b in paths::bindings_of(&schema::schema()) {
             let sample = match &b.kind {
                 paths::Kind::String => match b.path.as_str() {
+                    // `agent.instruction`'s source keys are RESOLVED at load —
+                    // a file is read, an artifact pulled, a URL fetched — so a
+                    // synthetic value would do real I/O here. The file key gets
+                    // a path that exists; the network ones are covered by their
+                    // own tests (oci_instruction_e2e, registry_consumer_e2e)
+                    // rather than by a sample.
+                    "agent.instruction.file" => json!("Cargo.toml"),
+
                     "config_version" => json!("2"),
                     _ => json!("x"),
                 },
@@ -6691,6 +6969,16 @@ mod tests {
                     _ => json!("x"),
                 },
             };
+            // `agent.instruction`'s remote source keys are RESOLVED at load
+            // (an artifact pulled, a URL fetched), so a synthetic value here
+            // would make a real network call. They are covered end to end by
+            // oci_instruction_e2e and registry_consumer_e2e instead.
+            if matches!(
+                b.path.as_str(),
+                "agent.instruction.oci" | "agent.instruction.http"
+            ) {
+                continue;
+            }
             let mut doc = Value::Object(Map::new());
             paths::set_path(&mut doc, &b.path, sample);
             fill_required(&mut doc, &schema::schema(), &b.path);
@@ -6714,11 +7002,28 @@ mod tests {
                 None => v.clone(),
             }
         };
+        // A `oneOf` node carries its properties in the object branch (the
+        // long form of a value that also has a scalar shorthand), so walking
+        // and required-filling both have to look there — same reason the
+        // bindings walker does.
+        let object_branch = |v: &Value| -> Value {
+            match v.get("oneOf").and_then(Value::as_array) {
+                Some(branches) => branches
+                    .iter()
+                    .find(|b| b.get("properties").is_some())
+                    .cloned()
+                    .unwrap_or_else(|| v.clone()),
+                None => v.clone(),
+            }
+        };
         let mut node = schema.clone();
         let mut prefix = String::new();
         let segs: Vec<&str> = path.split('.').collect();
         for (i, seg) in segs.iter().enumerate() {
-            let props = node.get("properties").cloned().unwrap_or(Value::Null);
+            let props = object_branch(&node)
+                .get("properties")
+                .cloned()
+                .unwrap_or(Value::Null);
             node = resolve(&props.get(*seg).cloned().unwrap_or(Value::Null));
             prefix = if prefix.is_empty() {
                 (*seg).to_string()
@@ -6728,8 +7033,9 @@ mod tests {
             if i + 1 == segs.len() {
                 break;
             }
-            if let Some(req) = node.get("required").and_then(Value::as_array) {
-                let props = node.get("properties").cloned().unwrap_or(Value::Null);
+            let branch = object_branch(&node);
+            if let Some(req) = branch.get("required").and_then(Value::as_array) {
+                let props = branch.get("properties").cloned().unwrap_or(Value::Null);
                 for r in req.iter().filter_map(Value::as_str) {
                     let p = format!("{prefix}.{r}");
                     if doc.pointer(&format!("/{}", p.replace('.', "/"))).is_none() {
@@ -7435,6 +7741,105 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{e}").contains("retired flat schema"), "{e}");
+    }
+
+    #[test]
+    fn an_mcp_instruction_names_its_resource_and_optionally_its_server() {
+        use super::{InstructionSpec, McpResource};
+        let spec = |m: McpResource| InstructionSpec {
+            mcp: Some(m),
+            ..InstructionSpec::default()
+        };
+        // The URI alone: whichever connected server serves it.
+        assert_eq!(
+            spec(McpResource::Uri("instruction://ins_1@stable".into()))
+                .source_value()
+                .unwrap()
+                .as_deref(),
+            Some("instruction://ins_1@stable")
+        );
+        // `{resource}` is the same thing said longhand.
+        assert_eq!(
+            spec(McpResource::Named {
+                server: None,
+                resource: "instruction://ins_1".into()
+            })
+            .source_value()
+            .unwrap()
+            .as_deref(),
+            Some("instruction://ins_1")
+        );
+        // `{server, resource}` becomes the `mcp://<server>/<resource>` form
+        // the runtime already routes on — so naming a server is pleasant in
+        // config without the resolver growing a second path.
+        assert_eq!(
+            spec(McpResource::Named {
+                server: Some("gateway".into()),
+                resource: "instruction://ins_1@stable".into(),
+            })
+            .source_value()
+            .unwrap()
+            .as_deref(),
+            Some("mcp://gateway/instruction://ins_1@stable")
+        );
+    }
+
+    #[test]
+    fn the_short_and_long_instruction_forms_compose_in_either_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let doc = dir.path().join("a.md");
+        std::fs::write(&doc, "# Doc\n").unwrap();
+        let base = dir.path().join("c.json");
+        std::fs::write(
+            &base,
+            serde_json::json!({"config_version": "1",
+                "agent": {"name": "a", "preflight": "never"},
+                "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
+                "store": {"kind": "memory"}})
+            .to_string(),
+        )
+        .unwrap();
+        let load = |args: Vec<String>| {
+            let env: Vec<(String, String)> = Vec::new();
+            super::load(&args, &env).map(|(l, _)| l.settings)
+        };
+        let p = doc.to_string_lossy().to_string();
+        let c = base.to_string_lossy().to_string();
+        // A dotted setting must not erase the short-form SOURCE, and the
+        // short form must not erase the settings — in either order. Both
+        // directions were silently lossy before the promotion/merge arms.
+        for args in [
+            vec![
+                "-c".into(),
+                c.clone(),
+                "--instruction".into(),
+                p.clone(),
+                "--instruction.refresh".into(),
+                "30s".into(),
+            ],
+            vec![
+                "-c".into(),
+                c.clone(),
+                "--instruction.refresh".into(),
+                "30s".into(),
+                "--instruction".into(),
+                p.clone(),
+            ],
+        ] {
+            let s = load(args).expect("loads");
+            assert_eq!(
+                s.agent.instruction_spec.refresh.as_deref(),
+                Some("30s"),
+                "the dotted setting survived"
+            );
+            assert!(
+                s.agent
+                    .instruction
+                    .as_deref()
+                    .is_some_and(|t| t.contains("# Doc")),
+                "the short-form source was still read"
+            );
+        }
     }
 
     #[test]

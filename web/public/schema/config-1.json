@@ -2526,21 +2526,91 @@
           "type": "array"
         },
         "instruction": {
-          "description": "the instruction itself, a FILE path (no whitespace, path-shaped or a document extension; `file://` to be explicit), or a URI — `oci://` an artifact, `mcp://`/`instruction://` a served resource",
-          "type": "string"
-        },
-        "instruction_refresh": {
-          "description": "how often to re-read the instruction: `auto` (default — inotify for a file, no polling for a digest-pinned artifact, 5m for a mutable tag or served resource), `off`, or a duration",
-          "type": "string"
-        },
-        "instruction_unavailable": {
-          "description": "what to do when the source stops answering after startup: auto (freeze when trust-pinned, else keep), keep (carry on with the last good instruction), freeze (refuse new work, drain live), drain (finish live work then exit 0), exit (stop now)",
-          "enum": [
-            "auto",
-            "keep",
-            "freeze",
-            "drain",
-            "exit"
+          "oneOf": [
+            {
+              "description": "short form: the instruction itself, a FILE path (no whitespace, path-shaped or a document extension), or a URI (`oci://`, `mcp://`, `instruction://`, `https://`). Every other setting takes its default.",
+              "type": "string"
+            },
+            {
+              "additionalProperties": false,
+              "description": "long form: name the source explicitly and set everything about it here",
+              "properties": {
+                "decrypt": {
+                  "additionalProperties": false,
+                  "description": "recipient keys for an encrypted envelope (RFC 0041)",
+                  "properties": {
+                    "keys": {
+                      "description": "key FILE paths — an AGE-SECRET-KEY-1… identity, 64 hex chars, or base64",
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "passphrase": {
+                      "description": "for age scrypt envelopes — a {{secret:…}} reference",
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                },
+                "file": {
+                  "description": "a path on disk; watched when lifecycle.watch_config is on",
+                  "type": "string"
+                },
+                "http": {
+                  "description": "an https:// document, fetched at load",
+                  "type": "string"
+                },
+                "mcp": {
+                  "description": "a resource a configured MCP server serves, read and subscribed — the URI alone, or {server, resource} when it matters which server is asked",
+                  "oneOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "resource": {
+                          "description": "the resource URI, e.g. instruction://ins_1@stable",
+                          "type": "string"
+                        },
+                        "server": {
+                          "description": "which configured MCP server to ask; omitted = whichever one serves it",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "resource"
+                      ],
+                      "type": "object"
+                    }
+                  ]
+                },
+                "oci": {
+                  "description": "an OCI artifact — ghcr.io/acme/agent:v3 (the oci:// is implied)",
+                  "type": "string"
+                },
+                "refresh": {
+                  "description": "how often to re-read: `auto` (default — inotify for a file, never for a digest-pinned artifact, 5m for a mutable tag or served resource), `off`, or a duration",
+                  "type": "string"
+                },
+                "text": {
+                  "description": "the instruction itself, never read as a path or URI",
+                  "type": "string"
+                },
+                "unavailable": {
+                  "description": "when the source stops answering after startup: auto (freeze when trust-pinned, else keep), keep, freeze (refuse new work), drain (finish live work then exit 0), exit",
+                  "enum": [
+                    "auto",
+                    "keep",
+                    "freeze",
+                    "drain",
+                    "exit"
+                  ]
+                }
+              },
+              "type": "object"
+            }
           ]
         },
         "max_parallel_turns": {

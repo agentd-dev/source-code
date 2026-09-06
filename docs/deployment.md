@@ -30,7 +30,7 @@ resolved from env / mounted files — never inline values.
 
 | Concern | Section / path | Short flag |
 |---|---|---|
-| Instruction | `agent.instruction` (text or a resource URI) | `--instruction` / `--instruction-file` |
+| Instruction | `agent.instruction` — text, a file, `oci://`, `mcp://` or `https://` (configuration.md §5a) | `--instruction` / `--instruction.file` / `--instruction.oci` |
 | Intelligence | `intelligence.endpoints` (ordered failover), `.model`, `.token` | `--intelligence` / `--model` / `--intelligence-token` |
 | Token budget | `intelligence.budget.windows` (rate-limit the burn) | — |
 | MCP servers | `mcp.servers: [{name, endpoint}]` | `--mcp name=<endpoint>` |

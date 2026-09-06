@@ -66,7 +66,7 @@ host.
 
 ```bash
 agentd \
-  --instruction-file ./task.md \
+  --instruction ./task.md \
   --intelligence http://127.0.0.1:4000/v1/chat/completions \
   --model gpt-4o \
   --mcp fs=https://intra/fs/mcp

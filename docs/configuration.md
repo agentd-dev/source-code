@@ -243,8 +243,15 @@ file spelling is never in doubt.
 
 | Flag | Path | Env | Default | Description |
 |---|---|---|---|---|
-| `--instruction <TEXT>` | `agent.instruction` | `INSTRUCTION` | *(none)* | The standing task/policy. May also be a single-token resource URI a declared MCP server serves (read + subscribed). |
-| `--instruction-file <PATH>` | `agent.instruction` | — | — | Read the instruction from a local file (e.g. a ConfigMap/Secret projection). |
+| `--instruction <VALUE>` | `agent.instruction` | `INSTRUCTION` | *(none)* | The standing task/policy — the text, a file path, or a URI (`oci://`, `mcp://`, `instruction://`, `https://`). agentd tells them apart; see §5a.1. |
+| `--instruction.text <TEXT>` | `agent.instruction.text` | — | — | The instruction itself, never read as a path or URI. |
+| `--instruction.file <PATH>` | `agent.instruction.file` | — | — | A local file (e.g. a ConfigMap/Secret projection); watched when `lifecycle.watch_config` is on. |
+| `--instruction.oci <REF>` | `agent.instruction.oci` | — | — | An OCI artifact — `ghcr.io/acme/agent:v3` or `…@sha256:…` (the `oci://` is implied). |
+| `--instruction.http <URL>` | `agent.instruction.http` | — | — | An `https://` document, fetched at load. |
+| `--instruction.mcp <URI>` | `agent.instruction.mcp` | — | — | A resource a declared MCP server serves (read + subscribed). |
+| `--instruction.refresh <auto\|off\|DUR>` | `agent.instruction.refresh` | — | `auto` | How often to re-read it; `auto` picks the mechanism that fits the source. §5a.2. |
+| `--instruction.unavailable <POLICY>` | `agent.instruction.unavailable` | — | `auto` | What to do when the source stops answering: `auto`, `keep`, `freeze`, `drain`, `exit`. §5a.3. |
+| `--instruction-file <PATH>` | `agent.instruction` | — | — | The earlier spelling of `--instruction.file`; still supported. |
 | `--prompt <TEXT>` | `agent.prompt` | `PROMPT` | *(none)* | A one-shot task: with no workflows configured, the generated run executes this while `instruction` stays the standing policy. |
 | `--prompt-file <PATH>` | `agent.prompt` | — | — | Read the prompt from a local file. |
 | `--intelligence <LIST>` | `intelligence.endpoints` | `INTELLIGENCE` | *(none)* | Ordered, comma-separated LLM endpoint **list** for failover. Each element is `https://host[:port][/path]` (or a loopback `http://` for a same-host dev gateway) — see §4. |
@@ -588,6 +595,135 @@ breaker's open/closed state stays per step.
 
 ---
 
+## 5a. The instruction — where it comes from, and what happens when it moves
+
+An agent's instruction is one setting with four transports and three
+behaviours. `agent.instruction` carries all of it.
+
+### 5a.1 Naming the source
+
+The **short form** is a value, and agentd works out what kind it is:
+
+```yaml
+agent:
+  instruction: "You are the order desk. Every paid order is fulfilled."
+  # or  ./agent.md          — a path
+  # or  oci://ghcr.io/acme/agent:v3
+  # or  instruction://ins_1@stable   — a resource an MCP server serves
+  # or  https://docs.example/agent.md
+```
+
+The classification is deliberately narrow, because reading prose as a path
+would be the worst outcome available:
+
+| The value | Read as |
+|---|---|
+| contains a newline | **text** — no path has one, and this is what `instruction: \|` produces |
+| `scheme://…` | that **URI** — `oci://` an artifact, `https://` a document, anything else a served resource |
+| `file://…` | a **file**, said outright |
+| no whitespace **and** path-shaped (`/`, `./`, `../`, `~/`) or a document extension (`.md`, `.markdown`, `.txt`, `.instruction`) | a **file** |
+| anything else | **text** |
+
+So `"Summarize the file report.md"` is text (it has spaces), `./agent.md` is a
+file, and a named file that is missing is a **refusal** that names both
+readings rather than an agent silently instructed with a path.
+
+The **long form** names the source explicitly and is the only place the other
+settings live:
+
+```yaml
+agent:
+  instruction:
+    oci: "ghcr.io/acme/agent:latest"    # exactly one of: text file oci http mcp
+    refresh: 60s
+    unavailable: drain
+    decrypt: { keys: ["/etc/keys/agent.key"] }
+```
+
+Under the long form a source key means what it says: a value under `file:` is
+a path even if it reads like prose, and a value under `text:` is the
+instruction even if it looks like a path. Naming **two** sources is a refusal
+(there is no right guess); naming **none** simply means no instruction, with
+the settings inert.
+
+`mcp:` takes either the resource URI or the pair, because the URI-only way to
+name a server nests one URI inside another:
+
+```yaml
+    mcp: "instruction://ins_1@stable"                              # any server that serves it
+    mcp: { server: gateway, resource: "instruction://ins_1@stable" }  # that server
+```
+
+The two spellings compose on the command line — `--instruction ./agent.md
+--instruction.refresh 30s` keeps both, in either order.
+
+### 5a.2 Refresh — `auto`, `off`, or a duration
+
+`auto` (the default) picks the mechanism that fits the source, because polling
+is only ever right for one of them:
+
+| Source | `auto` does |
+|---|---|
+| a **file** | watches it (inotify) when `lifecycle.watch_config` is on — instant, and no polling |
+| `oci://…@sha256:` | **nothing** — a digest pin is immutable, so re-reading can only return what it already returned |
+| `oci://…:tag` | polls every 5m — a mutable tag is the one case polling is for |
+| `mcp://`, `instruction://` | the server's `resources/updated` notification, polling every 5m as a fallback |
+| **text** | nothing to re-read |
+
+A duration (`refresh: 30s`) overrides it; `off` disables re-reading entirely.
+A change to `refresh` takes effect on reload without a restart.
+
+**What a refresh applies.** A re-read updates the DELIVERED TEXT — what the
+model reads. The machinery a document declares (`:::!workflow`, `:::!mcp`, …)
+folds into configuration at LOAD, so machinery changes apply on a reload or
+restart, not on a poll. A SIGHUP (or a watched config file changing) re-reads
+the source *and* re-folds its machinery, which is the full update path.
+
+`instruction_sources[].freshness` is a different thing that looks similar: it
+is the §7.7 **revocation deadline** for a signed document — how long an
+authorization may go unconfirmed before the agent stops acting on it. When
+both are set the tighter one wins, since a poll slower than the deadline would
+let an authorization expire between checks.
+
+### 5a.3 When the source stops answering
+
+At **startup** an unreachable source is always fatal (exit 6): there is no
+previous instruction to fall back to, and an agent with no instructions should
+not start. After startup, `unavailable` decides:
+
+| Policy | Behaviour | Use when |
+|---|---|---|
+| `keep` | carry on with the last good instruction | availability matters more than currency; the agent already holds a good copy |
+| `freeze` | serve live work, refuse NEW work | the §7.7 posture — stop taking on what you cannot justify, without abandoning what you accepted |
+| `drain` | finish live work, then exit 0 | an orchestrator will restart you, and startup re-reads the source — often right in Kubernetes |
+| `exit` | stop now, non-zero | running on a stale instruction is worse than not running |
+| `auto` *(default)* | `freeze` when the source is **trust-pinned** (a `publisher` in `instruction_sources`), `keep` otherwise | a stale *authorization* is a security question; an unreachable unsigned artifact is usually a blip |
+
+Every outcome is one log line — `instruction.unavailable` with the policy that
+applied and whether the source was trust-pinned — so a frozen or draining
+agent is never a mystery.
+
+### 5a.4 Encrypted instructions
+
+Any source may deliver an encrypted envelope (age v1 or JWE compact); the
+recipient keys live with the instruction:
+
+```yaml
+agent:
+  instruction:
+    oci: "ghcr.io/acme/agent:latest"
+    decrypt:
+      keys: ["/etc/keys/agent.key"]          # AGE-SECRET-KEY-1…, hex, or base64
+      passphrase: "{{secret:doc_pass}}"      # for age scrypt envelopes
+```
+
+Decryption happens before anything interprets the bytes, so an encrypted file,
+artifact or served resource all work the same way. Decrypting grants nothing:
+the trust ladder and the trifecta apply to the plaintext exactly as if it had
+arrived in the clear. A build without `--features decrypt` still RECOGNISES an
+envelope and refuses it by name — ciphertext is never delivered to a model as
+prose. See [directives.md](directives.md#encrypted-instructions).
+
 ## 6. Process shape — `lifecycle.run_until` and start nodes
 
 Two independent settings decide whether the process is a one-shot **job** or a
@@ -691,7 +827,7 @@ and [`workflows.md`](workflows.md) for the node catalogue —
 
 ### 6.2 Directives — an instruction that carries its machinery
 
-`agent.instruction` (inline, `--instruction-file`, or a config file) may embed
+`agent.instruction` (inline, a file, an artifact, a served resource) may embed
 **colon-fence directives** — the `:::type{attrs}` … `:::` container syntax
 MyST and ChatGPT readers already know:
 
@@ -1304,7 +1440,7 @@ And a JSON one:
 
 ```console
 $ agentd --config /etc/agentd/config.json \
-    --instruction-file /etc/agentd/task.txt   # instruction + secrets via env/flag
+    --instruction /etc/agentd/task.md         # instruction + secrets via env/flag
 ```
 
 For the reloadable-vs-restart-only partition of these fields, see §11.

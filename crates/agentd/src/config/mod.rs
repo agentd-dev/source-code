@@ -20,7 +20,69 @@
 pub mod attest; // §7 instruction attestation (JWS/Ed25519, resolution manifest)
 #[cfg(feature = "decrypt")]
 pub mod decrypt; // on-the-fly instruction decryption: age v1 + JWE compact (RFC 0041)
-pub mod envelope; // encrypted-envelope detection (RFC 0041) — always compiled, no crypto
+pub mod envelope;
+
+/// GET a document over HTTP(S) — the `http:` instruction source. Redirects are
+/// followed; a non-2xx is a refusal naming the status, because an error page
+/// silently installed as an agent's instruction is the worst outcome here.
+pub fn http_get(url: &str) -> Result<String, String> {
+    use crate::net::http::{self, Url};
+    const MAX_REDIRECTS: usize = 3;
+    const MAX_BYTES: usize = 8 * 1024 * 1024;
+    let mut current = url.to_string();
+    for _ in 0..=MAX_REDIRECTS {
+        let u = Url::parse(&current).map_err(|e| format!("url {current}: {e}"))?;
+        let tcp = http::connect_tcp(&u.host, u.port, std::time::Duration::from_secs(30))
+            .map_err(|e| format!("connect {}: {e}", u.host))?;
+        let mut stream: Box<dyn http::Stream> = if u.is_tls() {
+            #[cfg(feature = "tls")]
+            {
+                Box::new(
+                    crate::net::tls::connect(tcp, &u.host, None)
+                        .map_err(|e| format!("tls {}: {e}", u.host))?,
+                )
+            }
+            #[cfg(not(feature = "tls"))]
+            {
+                return Err("https requires building with --features tls".into());
+            }
+        } else {
+            Box::new(tcp)
+        };
+        let resp = http::send(
+            stream.as_mut(),
+            &u.host_header(),
+            "GET",
+            &u.path,
+            &[("Accept", "text/markdown, text/plain, */*")],
+            &[],
+        )
+        .map_err(|e| format!("GET {current}: {e}"))?;
+        if (301..=308).contains(&resp.status) {
+            match resp.header("location") {
+                Some(loc) => {
+                    current = loc.to_string();
+                    continue;
+                }
+                None => return Err(format!("{current}: redirect with no Location")),
+            }
+        }
+        if !resp.is_success() {
+            return Err(format!("{current}: HTTP {}", resp.status));
+        }
+        if resp.body.len() > MAX_BYTES {
+            return Err(format!("{current}: document exceeds {MAX_BYTES} bytes"));
+        }
+        return match String::from_utf8(resp.body) {
+            Ok(t) => Ok(t),
+            Err(e) if envelope::looks_encrypted(e.as_bytes()) => Ok(envelope::armor(e.as_bytes())),
+            Err(_) => Err(format!(
+                "{current}: not UTF-8 and not a recognized encrypted envelope"
+            )),
+        };
+    }
+    Err(format!("{url}: too many redirects"))
+} // encrypted-envelope detection (RFC 0041) — always compiled, no crypto
 pub mod envfile;
 pub mod file;
 pub mod idoc;

@@ -144,7 +144,8 @@ $ agentd \
 
 Three things are wired here:
 
-- **`--instruction`** — the task. (Use `--instruction-file <path>` to read it
+- **`--instruction`** — the task: the text itself, a file path, or a URI
+  (`oci://`, `instruction://`, `https://`). (`--instruction.file <path>` reads it
   from a file, or set the `INSTRUCTION` env var.)
 - **`--intelligence https://gw.example/v1`** — the LLM endpoint. A direct provider
   is `--intelligence https://api.openai.com/v1/...` with `--intelligence-token`; a

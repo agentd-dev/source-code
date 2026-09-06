@@ -74,7 +74,7 @@ says. That single rule carries the whole security story:
 
 | Surface | Directives |
 |---|---|
-| `agent.instruction` — inline, `--instruction-file`, a config file | **executed** — this is operator-authored config |
+| `agent.instruction` — inline, a file, an artifact, a config file | **executed** — this is operator-authored config |
 | conversation / A2A messages / tool results | **never** — executing definitions out of untrusted text would be prompt injection as a feature; this is not configurable, on purpose |
 | URI-fetched instructions, skill bodies from MCP servers | **inert** — the operator did not write them in place, so their fences render as prose; an opt-in trust gate is the planned path |
 
@@ -135,7 +135,7 @@ like*, instead of one undifferentiated wall of prose.
 ## The whole agent from one document
 
 Four more directives make the instruction file able to define everything a
-config file can — so `agentd --instruction-file agent.md` IS a complete
+config file can — so `agentd --instruction agent.md` IS a complete
 deployment:
 
 ```markdown
@@ -333,15 +333,30 @@ re-check; other classes should.
 
 ## Where the document comes from
 
-One document, four transports — each ending at the same parse → trust-ladder →
-fold pipeline:
+One document, five transports — each ending at the same parse → trust-ladder →
+fold pipeline. `agent.instruction` names all of them, either as a value it
+classifies or as an explicit key:
 
-| Source | Written as | Trust act |
-|---|---|---|
-| inline | `agent.instruction: \|` … | the operator wrote it in place |
-| a file | `--instruction-file agent.md` | the operator named the path |
-| an MCP resource | `agent.instruction: "mcp://docs/agent"` | the operator named the resource (re-read on server notify) |
-| an **OCI artifact** (RFC 0040) | `agent.instruction: "oci://ghcr.io/acme/agent:v3"` or `…@sha256:…` | the operator pinned the reference |
+| Source | Short form | Long form | Trust act |
+|---|---|---|---|
+| inline | `instruction: \|` … | `text:` | the operator wrote it in place |
+| a file | `instruction: ./agent.md` | `file:` | the operator named the path |
+| an MCP resource | `instruction: "instruction://ins_1@stable"` | `mcp:` (or `{server, resource}`) | the operator named the resource (re-read on server notify) |
+| an **OCI artifact** (RFC 0040) | `instruction: "oci://ghcr.io/acme/agent:v3"` | `oci:` | the operator pinned the reference |
+| an HTTPS document | `instruction: "https://docs.example/agent.md"` | `http:` | the operator named the URL |
+
+```yaml
+agent:
+  instruction:
+    oci: "ghcr.io/acme/agent:latest"
+    refresh: 60s          # auto | off | duration      — see configuration.md §5a.2
+    unavailable: drain    # auto | keep | freeze | …   — see configuration.md §5a.3
+    decrypt: { keys: ["/etc/keys/agent.key"] }
+```
+
+The full reference — how a bare value is classified, what `auto` does per
+source kind, and what each unavailability policy means — is
+[configuration.md §5a](configuration.md).
 
 **OCI pull** (`--features oci`). The document is pushed to any OCI registry as
 a first-class artifact and pulled over the Distribution API at config load —
@@ -357,9 +372,16 @@ $ oras push ghcr.io/acme/support-agent:v3 \
     agent.md:'text/markdown; variant=instruction'
 ```
 
-A `:tag` reference is re-pulled by the §7.7 freshness watch (a changed
-manifest digest updates the delivered text; machinery changes apply on
-reload/restart); a `@sha256:` reference is immutable.
+A `:tag` reference is re-pulled on the refresh cadence — `auto` polls a mutable
+tag every 5m, and a changed manifest digest updates the delivered text.
+A `@sha256:` reference is never re-pulled, because a digest pin cannot change.
+Machinery changes (a new `:::!workflow`, an added `:::!mcp`) fold into
+configuration at LOAD, so they apply on a reload or restart rather than on a
+poll; SIGHUP re-pulls AND re-folds, which is the full update path.
+
+**A file is watched, not polled.** With `lifecycle.watch_config` on, agentd
+watches the instruction file alongside the config files, so editing the
+document applies it — no interval, no delay.
 
 ## Encrypted instructions
 
@@ -377,14 +399,18 @@ Two standard envelope formats, both on the crypto already in the tree:
   `ECDH-ES` (X25519) and `dir`, content `A256GCM`/`A128GCM`.
 
 ```yaml
-instruction:
-  decrypt:
-    keys: [/etc/keys/agent.key]        # AGE-SECRET-KEY-1…, hex, or base64
-    passphrase: "{{secret:doc_pass}}"  # for age scrypt envelopes
+agent:
+  instruction:
+    oci: "ghcr.io/acme/agent:latest"     # any source
+    decrypt:
+      keys: ["/etc/keys/agent.key"]      # AGE-SECRET-KEY-1…, hex, or base64
+      passphrase: "{{secret:doc_pass}}"  # for age scrypt envelopes
 ```
 
-`instruction.decrypt` is operator surface, restart-only, and unreachable from
-a served `:::!config` — a document never names the key that decrypts it. A
+The keys are operator surface and unreachable from a served `:::!config` — a
+document never names the key that decrypts it. (A top-level `instruction:`
+section carrying `decrypt:` is the earlier spelling and still works; the form
+above wins where both are set.) A
 binary built **without** the feature still detects an envelope and refuses it
 by name; ciphertext is never delivered to the model as prose. Sign-then-encrypt
 puts the §7 author signature *inside* the envelope (even authorship stays

@@ -148,6 +148,30 @@ fn walk_object(obj_schema: &Value, defs: &Value, prefix: &str, out: &mut Vec<Bin
             walk_object(&prop, defs, &path, out);
             continue;
         }
+        // A `oneOf` whose branches are "a scalar shorthand" and "the full
+        // object" is walked through the OBJECT branch, so the dotted flags of
+        // the long form resolve while the short form stays a plain value.
+        // `agent.instruction` is the case this exists for: `--instruction
+        // oci://…` and `--instruction.refresh 60s` are the same setting.
+        if let Some(branches) = prop.get("oneOf").and_then(Value::as_array)
+            && let Some(obj) = branches.iter().find(|b| {
+                b.get("type").and_then(Value::as_str) == Some("object")
+                    && b.get("properties").is_some()
+            })
+        {
+            walk_object(obj, defs, &path, out);
+            // The scalar branch keeps the bare flag usable, with exactly the
+            // kind it had before this branch existed — `oneOf` without a
+            // `type` resolves to `Any`, and a caller that samples by kind
+            // (the schema-path test) depends on that not shifting.
+            out.push(Binding {
+                path: path.clone(),
+                kind: kind_of(&prop, defs),
+                entry_kind: None,
+                description: description.clone(),
+            });
+            continue;
+        }
         let kind = kind_of(&prop, defs);
         let entry_kind = match kind {
             Kind::Object => Some(

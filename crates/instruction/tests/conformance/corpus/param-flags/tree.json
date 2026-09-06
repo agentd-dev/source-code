@@ -1,0 +1,74 @@
+{
+  "spec": "1",
+  "frontMatter": {
+    "spec": "1",
+    "id": "instruction://ins_param-flags",
+    "title": "Bare attribute flags"
+  },
+  "blocks": [
+    {
+      "kind": "param",
+      "sigil": false,
+      "form": "leaf",
+      "line": 11,
+      "attrs": {
+        "name": "product",
+        "type": "string",
+        "source": "workspace",
+        "required": true
+      }
+    },
+    {
+      "kind": "param",
+      "sigil": false,
+      "form": "leaf",
+      "line": 12,
+      "attrs": {
+        "name": "audience",
+        "type": "enum",
+        "values": [
+          "developers",
+          "operators"
+        ],
+        "source": "prompt",
+        "default": "developers",
+        "description": "Who reads the notes"
+      }
+    },
+    {
+      "kind": "param",
+      "sigil": false,
+      "form": "leaf",
+      "line": 13,
+      "attrs": {
+        "name": "tone",
+        "type": "string",
+        "source": "prompt"
+      }
+    },
+    {
+      "kind": "form",
+      "sigil": false,
+      "form": "container",
+      "line": 15,
+      "attrs": {
+        "title": "This release"
+      },
+      "body": {
+        "type": "markdown",
+        "text": "Which audience? ${audience}"
+      }
+    },
+    {
+      "kind": "must",
+      "sigil": false,
+      "form": "keyword",
+      "line": 19,
+      "attrs": {},
+      "body": {
+        "type": "markdown",
+        "text": "keep every note under 80 words."
+      }
+    }
+  ]
+}

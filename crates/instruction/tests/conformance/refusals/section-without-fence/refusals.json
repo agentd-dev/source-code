@@ -1,0 +1,6 @@
+[
+  {
+    "line": 1,
+    "message": "a workflow section must contain exactly one fenced yaml block"
+  }
+]

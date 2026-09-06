@@ -1,0 +1,6 @@
+[
+  {
+    "line": 2,
+    "message": "a literal credential is never allowed (API key) — use a secret-ref"
+  }
+]

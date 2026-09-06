@@ -1,0 +1,12 @@
+# Nested keywords
+
+**MUST:** Read the diff before commenting.
+**SHOULD:** quote the line you are commenting on.
+
+**NEVER:** skip the checklist.
+
+**TIP:** Say what you checked.
+
+<reference title="Where rules live">
+**SHOULD:** keep rules near the code they govern.
+</reference>

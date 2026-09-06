@@ -1,0 +1,6 @@
+[
+  {
+    "line": 1,
+    "message": "runtime \"r\": network: any is refused — the sandbox boundary is the security boundary"
+  }
+]

@@ -1,0 +1,4 @@
+:::glossary[]
+Term
+:   def
+:::

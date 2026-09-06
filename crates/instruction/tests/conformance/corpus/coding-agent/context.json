@@ -1,0 +1,10 @@
+{
+  "params": {
+    "repo": "acme/api",
+    "branch": "feature/x",
+    "default_branch": "main"
+  },
+  "facts": {
+    "agent": "agentd"
+  }
+}

@@ -1,0 +1,10 @@
+[
+  {
+    "line": null,
+    "message": "front matter: spec \"1.0\" is not a version — versions are integers"
+  },
+  {
+    "line": null,
+    "message": "/frontMatter/spec: must match pattern \"^[0-9]+$\""
+  }
+]

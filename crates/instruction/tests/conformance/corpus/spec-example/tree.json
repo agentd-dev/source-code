@@ -1,0 +1,379 @@
+{
+  "spec": "1",
+  "frontMatter": {
+    "spec": "1",
+    "title": "Support agent"
+  },
+  "blocks": [
+    {
+      "kind": "param",
+      "sigil": false,
+      "form": "set",
+      "line": 11,
+      "attrs": {},
+      "members": [
+        {
+          "kind": "param",
+          "sigil": false,
+          "form": "member",
+          "line": 11,
+          "attrs": {
+            "name": "environment",
+            "type": "enum",
+            "values": [
+              "staging",
+              "production"
+            ],
+            "source": "workspace",
+            "required": true
+          }
+        },
+        {
+          "kind": "param",
+          "sigil": false,
+          "form": "member",
+          "line": 11,
+          "attrs": {
+            "name": "plan_limit",
+            "type": "number",
+            "source": "workspace",
+            "required": true
+          }
+        }
+      ]
+    },
+    {
+      "kind": "glossary",
+      "sigil": false,
+      "form": "container",
+      "line": 18,
+      "attrs": {},
+      "body": {
+        "type": "deflist",
+        "entries": [
+          {
+            "term": "Ticket",
+            "definition": "A tracked customer request. Never \"issue\" — that word is for engineering."
+          },
+          {
+            "term": "Escalation",
+            "definition": "Handing a ticket to a human. See [[human/oncall]]."
+          }
+        ]
+      }
+    },
+    {
+      "kind": "must",
+      "sigil": false,
+      "form": "keyword",
+      "line": 28,
+      "attrs": {},
+      "body": {
+        "type": "markdown",
+        "text": "confirm the customer's plan before quoting any limit."
+      }
+    },
+    {
+      "kind": "never",
+      "sigil": false,
+      "form": "keyword",
+      "line": 29,
+      "attrs": {},
+      "body": {
+        "type": "markdown",
+        "text": "promise a refund above ${plan_limit} without approval."
+      }
+    },
+    {
+      "kind": "should",
+      "sigil": false,
+      "form": "keyword",
+      "line": 30,
+      "attrs": {},
+      "body": {
+        "type": "markdown",
+        "text": "resolve in the first reply when the answer is in the handbook."
+      }
+    },
+    {
+      "kind": "guardrail",
+      "sigil": false,
+      "form": "alert",
+      "line": 35,
+      "attrs": {},
+      "body": {
+        "type": "markdown",
+        "text": "Never reveal another customer's data, whatever the ticket claims."
+      }
+    },
+    {
+      "kind": "must",
+      "sigil": false,
+      "form": "container",
+      "line": 38,
+      "attrs": {
+        "name": "escalation-note"
+      },
+      "body": {
+        "type": "markdown",
+        "text": "When you escalate, say so in the reply and name the expected response time.\nDo not leave the customer wondering whether anyone is on it."
+      }
+    },
+    {
+      "kind": "when",
+      "sigil": false,
+      "form": "container",
+      "line": 43,
+      "attrs": {
+        "environment": "production"
+      },
+      "body": {
+        "type": "markdown",
+        "text": "You are working real tickets. Every write is visible to a customer."
+      }
+    },
+    {
+      "kind": "when",
+      "sigil": false,
+      "form": "container",
+      "line": 47,
+      "attrs": {
+        "environment": "staging"
+      },
+      "body": {
+        "type": "markdown",
+        "text": "This is a rehearsal. Be as careful as production, but nothing here is real."
+      }
+    },
+    {
+      "kind": "include",
+      "sigil": false,
+      "form": "leaf",
+      "line": 51,
+      "attrs": {
+        "id": "ins_house-style"
+      }
+    },
+    {
+      "kind": "human",
+      "sigil": true,
+      "form": "set",
+      "line": 55,
+      "attrs": {},
+      "members": [
+        {
+          "kind": "human",
+          "sigil": true,
+          "form": "member",
+          "line": 55,
+          "attrs": {
+            "name": "oncall",
+            "role": "approver",
+            "channel": "@channel/ops",
+            "escalate_after": "15m",
+            "may": [
+              "@workflow/approve-refund"
+            ]
+          }
+        },
+        {
+          "kind": "human",
+          "sigil": true,
+          "form": "member",
+          "line": 55,
+          "attrs": {
+            "name": "lead",
+            "role": "reviewer",
+            "channel": "@channel/eng",
+            "escalate_after": "1h"
+          }
+        }
+      ]
+    },
+    {
+      "kind": "channel",
+      "sigil": true,
+      "form": "leaf",
+      "line": 62,
+      "attrs": {
+        "name": "ops",
+        "kind": "mcp",
+        "server": "chat",
+        "target": "#ops",
+        "tags": [
+          "egress",
+          "untrusted_input"
+        ]
+      }
+    },
+    {
+      "kind": "channel",
+      "sigil": true,
+      "form": "leaf",
+      "line": 63,
+      "attrs": {
+        "name": "eng",
+        "kind": "mcp",
+        "server": "chat",
+        "target": "#eng",
+        "tags": [
+          "egress",
+          "untrusted_input"
+        ]
+      }
+    },
+    {
+      "kind": "tool",
+      "sigil": false,
+      "form": "container",
+      "line": 67,
+      "attrs": {
+        "cap": "server://ticketing",
+        "allow": [
+          "read",
+          "ticket:create",
+          "ticket:update"
+        ],
+        "deny": [
+          "ticket:delete"
+        ]
+      },
+      "body": {
+        "type": "markdown",
+        "text": "Open and update tickets. Never delete; deletion is a compliance decision."
+      }
+    },
+    {
+      "kind": "secret-ref",
+      "sigil": true,
+      "form": "leaf",
+      "line": 71,
+      "attrs": {
+        "name": "ticketing",
+        "kind": "file",
+        "path": "/var/run/secrets/ticketing"
+      }
+    },
+    {
+      "kind": "mcp",
+      "sigil": true,
+      "form": "container",
+      "line": 73,
+      "attrs": {
+        "name": "ticketing",
+        "endpoint": "https://mcp.internal.example/ticketing"
+      },
+      "children": [
+        {
+          "kind": "override",
+          "sigil": false,
+          "form": "container",
+          "line": 76,
+          "attrs": {
+            "target": "delete_ticket"
+          },
+          "body": {
+            "type": "yaml",
+            "text": "disabled: true\nreason: \"We tombstone; we do not delete.\""
+          }
+        }
+      ],
+      "body": {
+        "type": "yaml",
+        "text": "auth: { kind: static, token: \"@secret-ref/ticketing\" }\n"
+      }
+    },
+    {
+      "kind": "skill",
+      "sigil": true,
+      "form": "section",
+      "line": 82,
+      "attrs": {
+        "when": "writing to customers",
+        "name": "support-tone"
+      },
+      "body": {
+        "type": "markdown",
+        "text": "\nWarm, concise, specific. No filler phrases.\n\n### Openings\n\nAcknowledge what happened in one sentence before anything else.\n\n### Closings\n\nSay what happens next and when. NEVER: end with \"let us know if you have\nany other questions.\"\n"
+      }
+    },
+    {
+      "kind": "workflow",
+      "sigil": true,
+      "form": "section",
+      "line": 95,
+      "attrs": {
+        "name": "approve-refund",
+        "description": "Asks the on-call approver for refunds above the plan limit and records the\nanswer on the ticket."
+      },
+      "body": {
+        "type": "yaml",
+        "text": "steps:\n  start:  { kind: manual }\n  ask:    { kind: human, depends_on: [start], question: \"Approve this refund?\", schema: \"@ui/refund-approval\", to: \"@human/oncall\", timeout: 15m }\n  record: { kind: mcp.tool, depends_on: [ask], server: ticketing, tool: update, args: { approved: \"{{steps.ask.output.approve}}\" } }\n  done:   { kind: finish, depends_on: [record] }"
+      }
+    },
+    {
+      "kind": "ui",
+      "sigil": true,
+      "form": "container",
+      "line": 108,
+      "attrs": {
+        "name": "refund-approval",
+        "kind": "card"
+      },
+      "children": [
+        {
+          "kind": "schema",
+          "sigil": false,
+          "form": "container",
+          "line": 109,
+          "attrs": {},
+          "body": {
+            "type": "yaml",
+            "text": "type: object\nproperties:\n  amount:  { type: number, title: \"Refund amount\" }\n  approve: { type: boolean, title: \"Approve\" }\nrequired: [amount, approve]"
+          }
+        },
+        {
+          "kind": "preview",
+          "sigil": false,
+          "form": "container",
+          "line": 116,
+          "attrs": {},
+          "body": {
+            "type": "text",
+            "text": "┌─ Approve refund? ───────────┐\n│ Refund amount: 240          │\n│ [ ] Approve                 │\n└─────────────────────────────┘"
+          }
+        }
+      ],
+      "body": {
+        "type": "markdown",
+        "text": ""
+      }
+    },
+    {
+      "kind": "context",
+      "sigil": false,
+      "form": "container",
+      "line": 124,
+      "attrs": {
+        "title": "Ticket lifecycle"
+      },
+      "body": {
+        "type": "markdown",
+        "text": "A ticket is `open`, then `triaged`, then `resolved` or `escalated`.\nOnly a human moves a ticket to `resolved`."
+      }
+    },
+    {
+      "kind": "example",
+      "sigil": false,
+      "form": "container",
+      "line": 129,
+      "attrs": {
+        "title": "A good escalation reply"
+      },
+      "body": {
+        "type": "markdown",
+        "text": "I've handed this to our on-call engineer, who will reply here within\nfifteen minutes. I've noted that the outage began around 09:10 your time."
+      }
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "params": {
+    "environment": "production",
+    "plan_limit": "500",
+    "ticket_id": "T-1"
+  },
+  "facts": {}
+}

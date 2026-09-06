@@ -1,0 +1,642 @@
+{
+  "spec": "1",
+  "frontMatter": {
+    "spec": "1",
+    "id": "instruction://ins_coding-agent",
+    "title": "Coding agent"
+  },
+  "blocks": [
+    {
+      "kind": "param",
+      "sigil": false,
+      "form": "set",
+      "line": 12,
+      "attrs": {},
+      "members": [
+        {
+          "kind": "param",
+          "sigil": false,
+          "form": "member",
+          "line": 12,
+          "attrs": {
+            "name": "repo",
+            "type": "string",
+            "source": "workspace",
+            "required": true,
+            "description": "The repository you are working in"
+          }
+        },
+        {
+          "kind": "param",
+          "sigil": false,
+          "form": "member",
+          "line": 12,
+          "attrs": {
+            "name": "default_branch",
+            "type": "string",
+            "source": "workspace",
+            "required": false,
+            "default": "main",
+            "description": "The branch PRs target"
+          }
+        },
+        {
+          "kind": "param",
+          "sigil": false,
+          "form": "member",
+          "line": 12,
+          "attrs": {
+            "name": "agent",
+            "type": "string",
+            "source": "agent_attribute",
+            "required": false,
+            "description": "Which model host is reading this"
+          }
+        }
+      ]
+    },
+    {
+      "kind": "must",
+      "sigil": false,
+      "form": "keyword",
+      "line": 22,
+      "attrs": {},
+      "body": {
+        "type": "markdown",
+        "text": "run the full test suite before opening a PR, and say in the PR which\ntests you added."
+      }
+    },
+    {
+      "kind": "must",
+      "sigil": false,
+      "form": "keyword",
+      "line": 24,
+      "attrs": {},
+      "body": {
+        "type": "markdown",
+        "text": "keep every change on a branch; never commit to `${default_branch}`."
+      }
+    },
+    {
+      "kind": "should",
+      "sigil": false,
+      "form": "keyword",
+      "line": 25,
+      "attrs": {},
+      "body": {
+        "type": "markdown",
+        "text": "keep functions under forty lines; extract a helper when one grows."
+      }
+    },
+    {
+      "kind": "should",
+      "sigil": false,
+      "form": "keyword",
+      "line": 26,
+      "attrs": {},
+      "body": {
+        "type": "markdown",
+        "text": "prefer a failing test that demonstrates the bug over a description of it."
+      }
+    },
+    {
+      "kind": "never",
+      "sigil": false,
+      "form": "keyword",
+      "line": 27,
+      "attrs": {},
+      "body": {
+        "type": "markdown",
+        "text": "use `any` in TypeScript without a comment justifying it."
+      }
+    },
+    {
+      "kind": "never",
+      "sigil": false,
+      "form": "keyword",
+      "line": 28,
+      "attrs": {},
+      "body": {
+        "type": "markdown",
+        "text": "delete a test to make a suite pass."
+      }
+    },
+    {
+      "kind": "guardrail",
+      "sigil": false,
+      "form": "alert",
+      "line": 30,
+      "attrs": {},
+      "body": {
+        "type": "markdown",
+        "text": "Never run a command that reaches the network from inside the repository —\ninstalls, fetches, uploads — except through the declared runtime, which\nhas no network. If a task seems to need it, stop and say so."
+      }
+    },
+    {
+      "kind": "must",
+      "sigil": false,
+      "form": "container",
+      "line": 35,
+      "attrs": {
+        "name": "secrets-out-of-diffs"
+      },
+      "body": {
+        "type": "markdown",
+        "text": "Before opening a PR, read your own diff for anything that looks like a\ncredential, token or private key. If you find one, remove it, rotate nothing\nyourself, and tell [[human/reviewer]] which file it was in."
+      }
+    },
+    {
+      "kind": "when",
+      "sigil": false,
+      "form": "container",
+      "line": 41,
+      "attrs": {
+        "agent": "claude"
+      },
+      "body": {
+        "type": "markdown",
+        "text": "Use the shell tool to run commands; do not describe a command you could run.\nRead files before editing them."
+      }
+    },
+    {
+      "kind": "when",
+      "sigil": false,
+      "form": "container",
+      "line": 46,
+      "attrs": {
+        "agent": "gpt"
+      },
+      "body": {
+        "type": "markdown",
+        "text": "Prefer the file tools over shell for reading and editing. Run the test suite\nthrough the declared function, not through an ad-hoc shell command."
+      }
+    },
+    {
+      "kind": "tool",
+      "sigil": false,
+      "form": "container",
+      "line": 53,
+      "attrs": {
+        "cap": "server://git",
+        "allow": [
+          "read",
+          "branch:create",
+          "commit",
+          "push:branch",
+          "pr:create"
+        ],
+        "deny": [
+          "push:main",
+          "force-push",
+          "tag",
+          "delete-branch"
+        ]
+      },
+      "body": {
+        "type": "markdown",
+        "text": "Branch, commit, push your branch, open a PR. Everything that rewrites\nhistory or touches `${default_branch}` is denied."
+      }
+    },
+    {
+      "kind": "tool",
+      "sigil": false,
+      "form": "container",
+      "line": 58,
+      "attrs": {
+        "cap": "server://ci",
+        "allow": [
+          "read",
+          "run:tests"
+        ]
+      },
+      "body": {
+        "type": "markdown",
+        "text": "Read CI results and trigger the test job for your branch. You cannot\napprove, retry a deploy, or change the pipeline."
+      }
+    },
+    {
+      "kind": "secret-ref",
+      "sigil": true,
+      "form": "leaf",
+      "line": 63,
+      "attrs": {
+        "name": "git",
+        "kind": "file",
+        "path": "/var/run/secrets/git-token"
+      }
+    },
+    {
+      "kind": "secret-ref",
+      "sigil": true,
+      "form": "leaf",
+      "line": 64,
+      "attrs": {
+        "name": "ci",
+        "kind": "file",
+        "path": "/var/run/secrets/ci-token"
+      }
+    },
+    {
+      "kind": "mcp",
+      "sigil": true,
+      "form": "leaf",
+      "line": 66,
+      "attrs": {
+        "name": "git",
+        "endpoint": "https://mcp.internal.example/git",
+        "allow": [
+          "read",
+          "branch:*",
+          "commit",
+          "push:branch",
+          "pr:create"
+        ],
+        "deny": [
+          "push:main",
+          "force-push"
+        ]
+      }
+    },
+    {
+      "kind": "mcp",
+      "sigil": true,
+      "form": "leaf",
+      "line": 67,
+      "attrs": {
+        "name": "ci",
+        "endpoint": "https://mcp.internal.example/ci",
+        "allow": [
+          "read",
+          "run:tests"
+        ]
+      }
+    },
+    {
+      "kind": "git",
+      "sigil": true,
+      "form": "leaf",
+      "line": 71,
+      "attrs": {
+        "name": "source",
+        "url": "https://git.example/acme/${repo}",
+        "ref": "${default_branch}"
+      }
+    },
+    {
+      "kind": "volume",
+      "sigil": true,
+      "form": "leaf",
+      "line": 72,
+      "attrs": {
+        "name": "work",
+        "kind": "ephemeral",
+        "size": "2Gi"
+      }
+    },
+    {
+      "kind": "image",
+      "sigil": true,
+      "form": "leaf",
+      "line": 73,
+      "attrs": {
+        "name": "py311",
+        "digest": "sha256:3f0a9c1e7b2d4f6a8c0e2b4d6f8a0c2e4b6d8f0a2c4e6b8d0f2a4c6e8b0d2f4a",
+        "registry": "registry.example/acme/py311"
+      }
+    },
+    {
+      "kind": "file",
+      "sigil": true,
+      "form": "container",
+      "line": 75,
+      "attrs": {
+        "name": "pyproject",
+        "path": "pyproject.toml",
+        "mode": "0644"
+      },
+      "body": {
+        "type": "text",
+        "text": "[project]\nname = \"acme-lint\"\nrequires-python = \">=3.11\"\n\n[tool.pytest.ini_options]\naddopts = \"-q\""
+      }
+    },
+    {
+      "kind": "runtime",
+      "sigil": true,
+      "form": "container",
+      "line": 84,
+      "attrs": {
+        "name": "py311",
+        "isolation": "oci",
+        "image": "@image/py311",
+        "network": "none"
+      },
+      "body": {
+        "type": "yaml",
+        "text": "resources: { cpu: \"1\", memory: 512Mi, timeout: 60s }\nmounts:\n  - { git: \"@git/source\", at: /work }\n  - { file: \"@file/pyproject\", at: /work/pyproject.toml }\n  - { volume: \"@volume/work\", at: /tmp/work }"
+      }
+    },
+    {
+      "kind": "function",
+      "sigil": true,
+      "form": "container",
+      "line": 94,
+      "attrs": {
+        "name": "lint",
+        "runtime": "@runtime/py311"
+      },
+      "children": [
+        {
+          "kind": "signature",
+          "sigil": false,
+          "form": "container",
+          "line": 111,
+          "attrs": {},
+          "body": {
+            "type": "yaml",
+            "text": "input:  { diff: string }\noutput: { count: integer, findings: [{ line: integer, text: string }] }"
+          }
+        }
+      ],
+      "body": {
+        "type": "code",
+        "text": "import json\n\ndef main(diff: str) -> dict:\n    findings = []\n    for n, line in enumerate(diff.splitlines(), 1):\n        if line.startswith(\"+\") and \"TODO\" in line:\n            findings.append({\"line\": n, \"text\": line[1:].strip()})\n        if line.startswith(\"+\") and \": any\" in line:\n            findings.append({\"line\": n, \"text\": \"unjustified any\"})\n    return {\"count\": len(findings), \"findings\": findings}",
+        "lang": "python"
+      }
+    },
+    {
+      "kind": "function",
+      "sigil": true,
+      "form": "container",
+      "line": 117,
+      "attrs": {
+        "name": "run-tests",
+        "runtime": "@runtime/py311"
+      },
+      "children": [
+        {
+          "kind": "signature",
+          "sigil": false,
+          "form": "container",
+          "line": 128,
+          "attrs": {},
+          "body": {
+            "type": "yaml",
+            "text": "input:  {}\noutput: { passed: integer, failed: integer, skipped: integer }"
+          }
+        }
+      ],
+      "body": {
+        "type": "code",
+        "text": "cd /work && python -m pytest --json-report --json-report-file=/tmp/work/report.json >/dev/null 2>&1\npython - <<'PY'\nimport json; r = json.load(open(\"/tmp/work/report.json\"))[\"summary\"]\nprint(json.dumps({\"passed\": r.get(\"passed\", 0), \"failed\": r.get(\"failed\", 0), \"skipped\": r.get(\"skipped\", 0)}))\nPY",
+        "lang": "bash"
+      }
+    },
+    {
+      "kind": "test",
+      "sigil": true,
+      "form": "container",
+      "line": 134,
+      "attrs": {
+        "name": "lint-catches-what-it-should",
+        "target": "@function/lint"
+      },
+      "children": [
+        {
+          "kind": "case",
+          "sigil": false,
+          "form": "set",
+          "line": 135,
+          "attrs": {},
+          "members": [
+            {
+              "kind": "case",
+              "sigil": false,
+              "form": "member",
+              "line": 135,
+              "attrs": {
+                "name": "finds-todo",
+                "given": "{ diff: \"+ x = 1  # TODO: fix\" }",
+                "expect": "{ count: 1 }"
+              }
+            },
+            {
+              "kind": "case",
+              "sigil": false,
+              "form": "member",
+              "line": 135,
+              "attrs": {
+                "name": "ignores-removed",
+                "given": "{ diff: \"- # TODO: gone\" }",
+                "expect": "{ count: 0 }"
+              }
+            },
+            {
+              "kind": "case",
+              "sigil": false,
+              "form": "member",
+              "line": 135,
+              "attrs": {
+                "name": "flags-bare-any",
+                "given": "{ diff: \"+ const v: any = load()\" }",
+                "expect": "{ count: 1 }"
+              }
+            },
+            {
+              "kind": "case",
+              "sigil": false,
+              "form": "member",
+              "line": 135,
+              "attrs": {
+                "name": "clean-diff",
+                "given": "{ diff: \"+ const v: number = 1\" }",
+                "expect": "{ count: 0 }"
+              }
+            }
+          ]
+        }
+      ],
+      "body": {
+        "type": "markdown",
+        "text": ""
+      }
+    },
+    {
+      "kind": "fixture",
+      "sigil": true,
+      "form": "container",
+      "line": 145,
+      "attrs": {
+        "name": "clean-repo"
+      },
+      "body": {
+        "type": "table",
+        "rows": [
+          {
+            "path": "README.md",
+            "content": "# clean"
+          },
+          {
+            "path": "src/main.py",
+            "content": "print(\"hi\")"
+          },
+          {
+            "path": "tests/t.py",
+            "content": "def test_ok(): pass"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "human",
+      "sigil": true,
+      "form": "set",
+      "line": 155,
+      "attrs": {},
+      "members": [
+        {
+          "kind": "human",
+          "sigil": true,
+          "form": "member",
+          "line": 155,
+          "attrs": {
+            "name": "reviewer",
+            "role": "reviewer",
+            "channel": "@channel/eng",
+            "escalate_after": "4h"
+          }
+        },
+        {
+          "kind": "human",
+          "sigil": true,
+          "form": "member",
+          "line": 155,
+          "attrs": {
+            "name": "oncall",
+            "role": "approver",
+            "channel": "@channel/eng",
+            "escalate_after": "30m"
+          }
+        }
+      ]
+    },
+    {
+      "kind": "channel",
+      "sigil": true,
+      "form": "leaf",
+      "line": 162,
+      "attrs": {
+        "name": "eng",
+        "kind": "mcp",
+        "server": "chat",
+        "target": "#eng",
+        "tags": [
+          "egress",
+          "untrusted_input"
+        ]
+      }
+    },
+    {
+      "kind": "skill",
+      "sigil": true,
+      "form": "section",
+      "line": 164,
+      "attrs": {
+        "when": "reviewing a diff, yours or someone else's",
+        "name": "code-review"
+      },
+      "children": [
+        {
+          "kind": "never",
+          "sigil": false,
+          "form": "keyword",
+          "line": 181,
+          "attrs": {},
+          "body": {
+            "type": "markdown",
+            "text": "block a PR on style alone."
+          }
+        }
+      ],
+      "body": {
+        "type": "markdown",
+        "text": "\nRead the whole diff before commenting on any of it. Then, in this order:\n\n### Correctness\n\nDoes it do what the PR says? Trace one happy path and one failure path by\nhand. If you cannot, say which path you could not trace.\n\n### Tests\n\nIs the new behaviour tested? Is the bug it fixes reproduced by a test that\nfails without the fix? SHOULD: ask for that test if it is missing.\n\n### Everything else\n\nNaming, structure and style come last, and only if the first two are clean.\n"
+      }
+    },
+    {
+      "kind": "skill",
+      "sigil": true,
+      "form": "section",
+      "line": 183,
+      "attrs": {
+        "when": "writing a commit or PR description",
+        "name": "commit-messages"
+      },
+      "children": [
+        {
+          "kind": "example",
+          "sigil": false,
+          "form": "container",
+          "line": 189,
+          "attrs": {
+            "title": "A good commit message"
+          },
+          "body": {
+            "type": "markdown",
+            "text": "Reject bare `any` in the linter\n\nUnannotated `any` hides type errors that the rest of the toolchain would\ncatch. The linter now flags it unless a justifying comment follows on the\nsame line, matching the rule in the coding agent's instruction.\n\nRefs T-4821"
+          }
+        }
+      ],
+      "body": {
+        "type": "markdown",
+        "text": "\nOne line, imperative mood, under seventy characters, saying what the change\ndoes — not what you did. Then a blank line, then why, in as many lines as it\ntakes. Reference the ticket at the end.\n\n"
+      }
+    },
+    {
+      "kind": "workflow",
+      "sigil": true,
+      "form": "section",
+      "line": 199,
+      "attrs": {
+        "name": "ci-triage",
+        "description": "Wakes when a CI run on one of your branches fails, reads the log, and either\nfixes it or asks the reviewer."
+      },
+      "body": {
+        "type": "yaml",
+        "text": "steps:\n  wake: { kind: subscribe, server: ci, uri: \"ci://runs/failed?branch=mine\" }\n  read: { kind: mcp.tool, depends_on: [wake], server: ci, tool: read_log, args: { run: \"{{steps.wake.output.run_id}}\" } }\n  decide:\n    kind: agent\n    depends_on: [read]\n    instruction: |\n      Fix the failure if it is in your change. Otherwise reply with the single\n      line NEEDS-HUMAN, then a summary for the reviewer.\n      {{steps.read.output}}\n  ask:\n    kind: human\n    depends_on: [decide]\n    when: \"steps.decide.output.startsWith('NEEDS-HUMAN')\"\n    question: \"{{steps.decide.output}}\"\n    to: \"@human/reviewer\"\n    timeout: 4h\n  done: { kind: finish, depends_on: [decide, ask] }"
+      }
+    },
+    {
+      "kind": "context",
+      "sigil": false,
+      "form": "container",
+      "line": 225,
+      "attrs": {
+        "title": "Repository layout"
+      },
+      "body": {
+        "type": "markdown",
+        "text": "`src/` is the package, `tests/` mirrors it one-to-one, `tools/` holds\nscripts that are not shipped. Configuration lives in `pyproject.toml` and\nnowhere else."
+      }
+    },
+    {
+      "kind": "glossary",
+      "sigil": false,
+      "form": "container",
+      "line": 231,
+      "attrs": {},
+      "body": {
+        "type": "deflist",
+        "entries": [
+          {
+            "term": "PR",
+            "definition": "A pull request. You open them; humans merge them."
+          },
+          {
+            "term": "Green",
+            "definition": "Every test passed and the linter found nothing. Not \"mostly green.\""
+          }
+        ]
+      }
+    }
+  ]
+}

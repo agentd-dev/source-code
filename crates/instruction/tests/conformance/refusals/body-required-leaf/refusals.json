@@ -1,0 +1,6 @@
+[
+  {
+    "line": 1,
+    "message": "workflow requires a body (its steps) — use :::!workflow"
+  }
+]

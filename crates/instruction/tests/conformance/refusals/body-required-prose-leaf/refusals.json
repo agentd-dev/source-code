@@ -1,0 +1,6 @@
+[
+  {
+    "line": 1,
+    "message": "must requires a body (text) — write \"MUST: …\" or use :::must"
+  }
+]

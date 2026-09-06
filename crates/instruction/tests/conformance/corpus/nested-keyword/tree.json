@@ -1,0 +1,99 @@
+{
+  "spec": "1",
+  "frontMatter": {
+    "spec": "1",
+    "id": "instruction://ins_nested-keyword",
+    "title": "Nested keywords"
+  },
+  "blocks": [
+    {
+      "kind": "must",
+      "sigil": false,
+      "form": "container",
+      "line": 9,
+      "attrs": {
+        "name": "review"
+      },
+      "children": [
+        {
+          "kind": "should",
+          "sigil": false,
+          "form": "keyword",
+          "line": 11,
+          "attrs": {},
+          "body": {
+            "type": "markdown",
+            "text": "quote the line you are commenting on."
+          }
+        }
+      ],
+      "body": {
+        "type": "markdown",
+        "text": "Read the diff before commenting."
+      }
+    },
+    {
+      "kind": "when",
+      "sigil": false,
+      "form": "container",
+      "line": 14,
+      "attrs": {
+        "environment": "production"
+      },
+      "children": [
+        {
+          "kind": "never",
+          "sigil": false,
+          "form": "keyword",
+          "line": 15,
+          "attrs": {},
+          "body": {
+            "type": "markdown",
+            "text": "skip the checklist."
+          }
+        },
+        {
+          "kind": "tip",
+          "sigil": false,
+          "form": "alert",
+          "line": 17,
+          "attrs": {},
+          "body": {
+            "type": "markdown",
+            "text": "Say what you checked."
+          }
+        }
+      ],
+      "body": {
+        "type": "markdown",
+        "text": ""
+      }
+    },
+    {
+      "kind": "context",
+      "sigil": false,
+      "form": "container",
+      "line": 21,
+      "attrs": {
+        "title": "Where rules live"
+      },
+      "children": [
+        {
+          "kind": "should",
+          "sigil": false,
+          "form": "keyword",
+          "line": 22,
+          "attrs": {},
+          "body": {
+            "type": "markdown",
+            "text": "keep rules near the code they govern."
+          }
+        }
+      ],
+      "body": {
+        "type": "markdown",
+        "text": ""
+      }
+    }
+  ]
+}

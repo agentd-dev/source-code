@@ -1,0 +1,6 @@
+[
+  {
+    "line": 1,
+    "message": "image \"py311\" is not digest-pinned"
+  }
+]

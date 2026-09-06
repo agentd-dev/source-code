@@ -6,9 +6,12 @@
 //! `{"params": {...}, "facts": {...}}`, and includes resolve by front-matter
 //! `id` among the corpus documents themselves.
 //!
-//! Skips cleanly when the corpus is absent (CI without the sibling checkout);
-//! an EXPLICIT `INSTRUCTION_FIXTURES` that does not exist FAILS — a drift
-//! check that skips on a bad path reports health it never performed.
+//! The corpus is VENDORED at `tests/conformance/` (Apache-2.0, copied from
+//! the specification repo) for the same reason `instruction.schema.json` is:
+//! a contract that only runs where someone happens to have a sibling checkout
+//! does not run. It was skipping silently in CI — reporting `ok` on every
+//! hosted runner — which is how a suite reports health it never performed.
+//! `the_vendored_corpus_matches_upstream_when_present` is the drift check.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -17,22 +20,20 @@ use instruction_core::{Context, deliver, parse, tree_json};
 
 // The spec repo's conformance corpus is THE contract (proposals/S5); the
 // twin's packages/spec/fixtures mirrors it.
-const DEFAULT: &str = "/root/instruction-md/specification/conformance/corpus";
-const DEFAULT_REFUSALS: &str = "/root/instruction-md/specification/conformance/refusals";
+/// The vendored corpus — always present, so these tests always run.
+const DEFAULT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/conformance/corpus");
+const DEFAULT_REFUSALS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/conformance/refusals");
 
 #[test]
 fn the_shared_corpus_delivers_byte_exactly() {
     let explicit = std::env::var("INSTRUCTION_FIXTURES");
     let root = explicit.clone().unwrap_or_else(|_| DEFAULT.to_string());
     let root = Path::new(&root);
-    if !root.exists() {
-        assert!(
-            explicit.is_err(),
-            "INSTRUCTION_FIXTURES={root:?} was set but does not exist — fail, not skip"
-        );
-        eprintln!("fixture corpus not present; skipped");
-        return;
-    }
+    assert!(
+        root.exists(),
+        "corpus missing at {root:?} — it is vendored in-tree and must be present; \
+         a skipped conformance run is not a passing one"
+    );
 
     // Build the include resolver: front-matter `id` → document text, over the
     // whole corpus.
@@ -182,14 +183,10 @@ fn the_shared_refusal_corpus_matches() {
         .clone()
         .unwrap_or_else(|_| DEFAULT_REFUSALS.to_string());
     let root = Path::new(&root);
-    if !root.exists() {
-        assert!(
-            explicit.is_err(),
-            "INSTRUCTION_REFUSALS={root:?} was set but does not exist — fail, not skip"
-        );
-        eprintln!("refusal corpus not present; skipped");
-        return;
-    }
+    assert!(
+        root.exists(),
+        "refusal corpus missing at {root:?} — it is vendored in-tree and must be present"
+    );
     let mut cases: Vec<std::path::PathBuf> = std::fs::read_dir(root)
         .unwrap()
         .filter_map(|e| e.ok())
@@ -247,4 +244,69 @@ fn the_shared_refusal_corpus_matches() {
         failures.join("\n")
     );
     eprintln!("refusal corpus: {} cases, all matched", cases.len());
+}
+
+/// The vendored corpus must equal the specification's, when a checkout of it
+/// is at hand. Same contract as the vendored schema: vendoring buys "it always
+/// runs", and this buys "it is still the spec's corpus and not a local fork".
+#[test]
+fn the_vendored_corpus_matches_upstream_when_present() {
+    let explicit = std::env::var("INSTRUCTION_SPEC_REPO");
+    let upstream = explicit
+        .clone()
+        .unwrap_or_else(|_| "/root/instruction-md/specification".into());
+    let up = Path::new(&upstream).join("conformance");
+    if !up.exists() {
+        assert!(
+            explicit.is_err(),
+            "INSTRUCTION_SPEC_REPO={upstream:?} was set but has no conformance/ — \
+             fail, not skip"
+        );
+        eprintln!("no upstream checkout; drift check skipped");
+        return;
+    }
+    let vendored = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/conformance"));
+    let mut differences = Vec::new();
+    for sub in ["corpus", "refusals"] {
+        let (u, v) = (up.join(sub), vendored.join(sub));
+        let list = |root: &Path| -> BTreeMap<String, Vec<u8>> {
+            let mut out = BTreeMap::new();
+            let mut stack = vec![root.to_path_buf()];
+            while let Some(dir) = stack.pop() {
+                for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        stack.push(p);
+                    } else if let Ok(bytes) = std::fs::read(&p)
+                        && let Ok(rel) = p.strip_prefix(root)
+                    {
+                        out.insert(rel.to_string_lossy().into_owned(), bytes);
+                    }
+                }
+            }
+            out
+        };
+        let (uf, vf) = (list(&u), list(&v));
+        for (name, bytes) in &uf {
+            match vf.get(name) {
+                None => differences.push(format!("{sub}/{name}: upstream case is not vendored")),
+                Some(mine) if mine != bytes => {
+                    differences.push(format!("{sub}/{name}: vendored copy differs from upstream"))
+                }
+                _ => {}
+            }
+        }
+        for name in vf.keys() {
+            if !uf.contains_key(name) {
+                differences.push(format!("{sub}/{name}: vendored case is not upstream"));
+            }
+        }
+    }
+    assert!(
+        differences.is_empty(),
+        "the vendored conformance corpus has drifted from {upstream}:\n  {}\n\
+         re-vendor with: cp -r {upstream}/conformance/{{corpus,refusals}} \
+         crates/instruction/tests/conformance/",
+        differences.join("\n  ")
+    );
 }

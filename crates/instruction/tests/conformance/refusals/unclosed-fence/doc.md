@@ -1,0 +1,2 @@
+:::!skill{name=x}
+text

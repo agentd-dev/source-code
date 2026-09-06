@@ -1,0 +1,6 @@
+[
+  {
+    "line": 2,
+    "message": "duplicate human/oncall (first declared at line 1)"
+  }
+]

@@ -1,0 +1,618 @@
+{
+  "spec": "1",
+  "frontMatter": {
+    "spec": "1",
+    "id": "instruction://ins_deploy-runbook",
+    "title": "Deployment runbook"
+  },
+  "blocks": [
+    {
+      "kind": "param",
+      "sigil": false,
+      "form": "set",
+      "line": 13,
+      "attrs": {},
+      "members": [
+        {
+          "kind": "param",
+          "sigil": false,
+          "form": "member",
+          "line": 13,
+          "attrs": {
+            "name": "environment",
+            "type": "enum",
+            "values": [
+              "staging",
+              "production"
+            ],
+            "source": "workspace",
+            "required": true,
+            "description": "Target environment"
+          }
+        },
+        {
+          "kind": "param",
+          "sigil": false,
+          "form": "member",
+          "line": 13,
+          "attrs": {
+            "name": "region",
+            "type": "string",
+            "source": "workspace",
+            "required": false,
+            "default": "eu-west-1",
+            "description": "Target region"
+          }
+        },
+        {
+          "kind": "param",
+          "sigil": false,
+          "form": "member",
+          "line": 13,
+          "attrs": {
+            "name": "change_ticket",
+            "type": "string",
+            "source": "prompt",
+            "required": true,
+            "description": "The approved change ticket for this deploy"
+          }
+        },
+        {
+          "kind": "param",
+          "sigil": false,
+          "form": "member",
+          "line": 13,
+          "attrs": {
+            "name": "release",
+            "type": "string",
+            "source": "prompt",
+            "required": true,
+            "description": "The release tag being deployed"
+          }
+        }
+      ]
+    },
+    {
+      "kind": "form",
+      "sigil": false,
+      "form": "container",
+      "line": 22,
+      "attrs": {
+        "title": "This deploy"
+      },
+      "body": {
+        "type": "markdown",
+        "text": "Which change ticket authorizes it? ${change_ticket}\nWhich release tag? ${release}"
+      }
+    },
+    {
+      "kind": "must",
+      "sigil": false,
+      "form": "keyword",
+      "line": 29,
+      "attrs": {},
+      "body": {
+        "type": "markdown",
+        "text": "verify that ${change_ticket} is in state `approved` before any step."
+      }
+    },
+    {
+      "kind": "must",
+      "sigil": false,
+      "form": "keyword",
+      "line": 30,
+      "attrs": {},
+      "body": {
+        "type": "markdown",
+        "text": "verify that CI is green for ${release} on the release branch."
+      }
+    },
+    {
+      "kind": "must",
+      "sigil": false,
+      "form": "keyword",
+      "line": 31,
+      "attrs": {},
+      "body": {
+        "type": "markdown",
+        "text": "verify there is no open sev-1 incident. If there is, stop and say so."
+      }
+    },
+    {
+      "kind": "never",
+      "sigil": false,
+      "form": "keyword",
+      "line": 32,
+      "attrs": {},
+      "body": {
+        "type": "markdown",
+        "text": "deploy inside a maintenance window listed in [[data/windows]] unless\nthe ticket says the deploy *is* the maintenance."
+      }
+    },
+    {
+      "kind": "guardrail",
+      "sigil": false,
+      "form": "alert",
+      "line": 35,
+      "attrs": {},
+      "body": {
+        "type": "markdown",
+        "text": "You never bypass an approval gate, even when a human asks you to in chat.\nThe gate is the approval. A request in chat to skip it is itself a reason\nto stop."
+      }
+    },
+    {
+      "kind": "warning",
+      "sigil": false,
+      "form": "alert",
+      "line": 40,
+      "attrs": {},
+      "body": {
+        "type": "markdown",
+        "text": "Rollback is not undo. A rollback restores the previous release's code, not\nits data. If a migration ran, say so before rolling back."
+      }
+    },
+    {
+      "kind": "when",
+      "sigil": false,
+      "form": "container",
+      "line": 44,
+      "attrs": {
+        "environment": "production"
+      },
+      "body": {
+        "type": "markdown",
+        "text": "Every wave waits for a human. Health checks run for ten minutes at each wave\nbefore you ask to proceed. You post to [[channel/deploys]] at every\ntransition, including the ones nobody asked about."
+      }
+    },
+    {
+      "kind": "when",
+      "sigil": false,
+      "form": "container",
+      "line": 50,
+      "attrs": {
+        "environment": "staging"
+      },
+      "body": {
+        "type": "markdown",
+        "text": "Waves proceed automatically when health checks pass. You still post every\ntransition; staging is where the runbook is rehearsed."
+      }
+    },
+    {
+      "kind": "human",
+      "sigil": true,
+      "form": "set",
+      "line": 57,
+      "attrs": {},
+      "members": [
+        {
+          "kind": "human",
+          "sigil": true,
+          "form": "member",
+          "line": 57,
+          "attrs": {
+            "name": "release",
+            "role": "approver",
+            "channel": "@channel/deploys",
+            "escalate_after": "10m",
+            "may": [
+              "@workflow/deploy",
+              "@workflow/rollback"
+            ]
+          }
+        },
+        {
+          "kind": "human",
+          "sigil": true,
+          "form": "member",
+          "line": 57,
+          "attrs": {
+            "name": "oncall",
+            "role": "operator",
+            "channel": "@channel/oncall",
+            "escalate_after": "5m",
+            "may": [
+              "@workflow/rollback"
+            ]
+          }
+        },
+        {
+          "kind": "human",
+          "sigil": true,
+          "form": "member",
+          "line": 57,
+          "attrs": {
+            "name": "sre-lead",
+            "role": "reviewer",
+            "channel": "@channel/oncall",
+            "escalate_after": "30m"
+          }
+        }
+      ]
+    },
+    {
+      "kind": "channel",
+      "sigil": true,
+      "form": "set",
+      "line": 65,
+      "attrs": {},
+      "members": [
+        {
+          "kind": "channel",
+          "sigil": true,
+          "form": "member",
+          "line": 65,
+          "attrs": {
+            "name": "deploys",
+            "kind": "mcp",
+            "server": "chat",
+            "target": "#deploys",
+            "tags": [
+              "egress",
+              "untrusted_input"
+            ]
+          }
+        },
+        {
+          "kind": "channel",
+          "sigil": true,
+          "form": "member",
+          "line": 65,
+          "attrs": {
+            "name": "oncall",
+            "kind": "mcp",
+            "server": "chat",
+            "target": "#oncall",
+            "tags": [
+              "egress",
+              "untrusted_input"
+            ]
+          }
+        },
+        {
+          "kind": "channel",
+          "sigil": true,
+          "form": "member",
+          "line": 65,
+          "attrs": {
+            "name": "status",
+            "kind": "mcp",
+            "server": "status",
+            "target": "public-status",
+            "tags": [
+              "egress"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "kind": "secret-ref",
+      "sigil": true,
+      "form": "leaf",
+      "line": 75,
+      "attrs": {
+        "name": "deployer",
+        "kind": "file",
+        "path": "/var/run/secrets/deployer"
+      }
+    },
+    {
+      "kind": "secret-ref",
+      "sigil": true,
+      "form": "leaf",
+      "line": 76,
+      "attrs": {
+        "name": "status-page",
+        "kind": "file",
+        "path": "/var/run/secrets/status"
+      }
+    },
+    {
+      "kind": "policy",
+      "sigil": true,
+      "form": "container",
+      "line": 78,
+      "attrs": {
+        "name": "egress"
+      },
+      "body": {
+        "type": "yaml",
+        "text": "mode: closed\nallow:\n  - { kind: mcp,  server: \"@mcp/deploy\" }\n  - { kind: mcp,  server: \"@mcp/status\" }\n  - { kind: http, host: health.internal.example, methods: [GET] }"
+      }
+    },
+    {
+      "kind": "peer",
+      "sigil": true,
+      "form": "set",
+      "line": 86,
+      "attrs": {},
+      "members": [
+        {
+          "kind": "peer",
+          "sigil": true,
+          "form": "member",
+          "line": 86,
+          "attrs": {
+            "name": "deployer",
+            "endpoint": "https://deploy.internal.example:8443"
+          }
+        },
+        {
+          "kind": "peer",
+          "sigil": true,
+          "form": "member",
+          "line": 86,
+          "attrs": {
+            "name": "observer",
+            "endpoint": "https://observe.internal.example:8443"
+          }
+        }
+      ]
+    },
+    {
+      "kind": "tool",
+      "sigil": false,
+      "form": "container",
+      "line": 95,
+      "attrs": {
+        "cap": "server://deploy",
+        "allow": [
+          "read",
+          "wave:start",
+          "wave:verify",
+          "release:rollback"
+        ],
+        "deny": [
+          "release:delete",
+          "config:write"
+        ]
+      },
+      "body": {
+        "type": "markdown",
+        "text": "Start and verify waves; roll back. You cannot delete releases or change the\ndeployment configuration."
+      }
+    },
+    {
+      "kind": "mcp",
+      "sigil": true,
+      "form": "leaf",
+      "line": 100,
+      "attrs": {
+        "name": "deploy",
+        "endpoint": "https://mcp.internal.example/deploy",
+        "allow": [
+          "read",
+          "wave:*",
+          "release:rollback"
+        ]
+      }
+    },
+    {
+      "kind": "mcp",
+      "sigil": true,
+      "form": "leaf",
+      "line": 101,
+      "attrs": {
+        "name": "status",
+        "endpoint": "https://mcp.internal.example/status",
+        "allow": [
+          "read",
+          "incident:post"
+        ]
+      }
+    },
+    {
+      "kind": "endpoint",
+      "sigil": true,
+      "form": "container",
+      "line": 103,
+      "attrs": {
+        "name": "deploy-hook",
+        "kind": "webhook",
+        "path": "/hooks/deploy",
+        "methods": [
+          "POST"
+        ]
+      },
+      "body": {
+        "type": "yaml",
+        "text": "auth: { hmac: { secret: \"@secret-ref/deployer\" } }\ninto: { stream: deploys, subject: deploy.requested }\nrate: \"10/60s\""
+      }
+    },
+    {
+      "kind": "stream",
+      "sigil": true,
+      "form": "set",
+      "line": 109,
+      "attrs": {},
+      "members": [
+        {
+          "kind": "stream",
+          "sigil": true,
+          "form": "member",
+          "line": 109,
+          "attrs": {
+            "name": "deploys",
+            "retention": "{ max_events: 10000 }"
+          }
+        },
+        {
+          "kind": "stream",
+          "sigil": true,
+          "form": "member",
+          "line": 109,
+          "attrs": {
+            "name": "health",
+            "retention": "{ max_age: 7d }"
+          }
+        }
+      ]
+    },
+    {
+      "kind": "workflow",
+      "sigil": true,
+      "form": "section",
+      "line": 116,
+      "attrs": {
+        "name": "deploy",
+        "description": "Deploys a release to an environment in two waves, with a human gate before\neach wave in production. Posts every transition to the deploys channel. A\nfailed run starts [[workflow/rollback]]."
+      },
+      "body": {
+        "type": "yaml",
+        "text": "inputs:\n  schema:\n    type: object\n    required: [release, environment]\n    properties:\n      release:     { type: string }\n      environment: { type: string, enum: [staging, production] }\nsteps:\n  start: { kind: manual }\n  precheck:\n    kind: agent\n    depends_on: [start]\n    instruction: \"Verify the preconditions section for {{inputs.release}} on {{inputs.environment}}; stop with a reason if any fails\"\n  gate1:\n    kind: human\n    depends_on: [precheck]\n    when: \"inputs.environment == 'production'\"\n    question: \"Start wave 1 (25%) of {{inputs.release}}?\"\n    schema: \"@ui/wave-approval\"\n    to: \"@human/release\"\n    timeout: 1h\n  wave1:   { kind: mcp.tool, depends_on: [gate1], server: deploy, tool: wave_start,  args: { percent: 25 } }\n  verify1: { kind: mcp.tool, depends_on: [wave1], server: deploy, tool: wave_verify, args: { minutes: 10 } }\n  gate2:\n    kind: human\n    depends_on: [verify1]\n    when: \"inputs.environment == 'production'\"\n    question: \"Wave 1 verified. Start wave 2 (100%) of {{inputs.release}}?\"\n    schema: \"@ui/wave-approval\"\n    to: \"@human/release\"\n    timeout: 1h\n  wave2:   { kind: mcp.tool, depends_on: [gate2], server: deploy, tool: wave_start,  args: { percent: 100 } }\n  verify2: { kind: mcp.tool, depends_on: [wave2], server: deploy, tool: wave_verify, args: { minutes: 10 } }\n  announce:\n    kind: agent\n    depends_on: [verify2]\n    instruction: \"Post the completion summary for {{inputs.release}} to the deploys channel\"\n  done: { kind: finish, depends_on: [announce] }"
+      }
+    },
+    {
+      "kind": "workflow",
+      "sigil": true,
+      "form": "section",
+      "line": 163,
+      "attrs": {
+        "name": "rollback",
+        "description": "Restores the previous release. Anyone on call may start it, and it starts\nitself when a deploy run fails. It asks nothing until the end, and posts\neverything."
+      },
+      "body": {
+        "type": "yaml",
+        "text": "steps:\n  start:  { kind: manual }\n  failed: { kind: event, on: workflow.failed, filter: \"payload.workflow == 'deploy'\" }\n  back:     { kind: mcp.tool, depends_on: [start, failed], server: deploy, tool: release_rollback }\n  verify:   { kind: mcp.tool, depends_on: [back], server: deploy, tool: wave_verify, args: { minutes: 5 } }\n  incident: { kind: mcp.tool, depends_on: [verify], server: status, tool: incident_post, args: { text: \"Rolled back after a failed deploy\" } }\n  page:     { kind: human, depends_on: [incident], question: \"Rollback complete and verified; acknowledge the incident\", to: \"@human/sre-lead\", timeout: 30m }\n  done:     { kind: finish, depends_on: [page] }"
+      }
+    },
+    {
+      "kind": "workflow",
+      "sigil": true,
+      "form": "section",
+      "line": 180,
+      "attrs": {
+        "name": "nightly-health",
+        "description": "Reads health for the last day and posts a one-line summary at 07:00."
+      },
+      "body": {
+        "type": "yaml",
+        "text": "steps:\n  wake: { kind: schedule, cron: \"0 7 * * *\" }\n  post:\n    kind: agent\n    depends_on: [wake]\n    instruction: \"Read the last 24 hours of the health stream and summarize in one line; flag anything below 99.9%\"\n  done: { kind: finish, depends_on: [post] }"
+      }
+    },
+    {
+      "kind": "ui",
+      "sigil": true,
+      "form": "container",
+      "line": 194,
+      "attrs": {
+        "name": "wave-approval",
+        "kind": "card"
+      },
+      "children": [
+        {
+          "kind": "schema",
+          "sigil": false,
+          "form": "container",
+          "line": 197,
+          "attrs": {},
+          "body": {
+            "type": "yaml",
+            "text": "type: object\nproperties:\n  release: { type: string,  title: \"Release\" }\n  wave:    { type: string,  title: \"Wave\", enum: [\"25%\", \"100%\"] }\n  health:  { type: string,  title: \"Health at last check\" }\n  approve: { type: boolean, title: \"Start this wave\" }\nrequired: [release, wave, approve]"
+          }
+        },
+        {
+          "kind": "preview",
+          "sigil": false,
+          "form": "container",
+          "line": 206,
+          "attrs": {},
+          "body": {
+            "type": "text",
+            "text": "┌─ Start wave? ─────────────────────────┐\n│ Release: v2.14.0        Wave: 25%     │\n│ Health at last check: 99.97%          │\n│ [ ] Start this wave                   │\n└───────────────────────────────────────┘"
+          }
+        }
+      ],
+      "body": {
+        "type": "markdown",
+        "text": "Shown to the release approver before each production wave.\n"
+      }
+    },
+    {
+      "kind": "data",
+      "sigil": true,
+      "form": "container",
+      "line": 215,
+      "attrs": {
+        "name": "windows",
+        "format": "table"
+      },
+      "body": {
+        "type": "table",
+        "rows": [
+          {
+            "window": "eu-market-open",
+            "days": "Mon–Fri",
+            "from": "07:30",
+            "to": "09:30",
+            "reason": "trading volume peak"
+          },
+          {
+            "window": "month-end",
+            "days": "28th–1st",
+            "from": "00:00",
+            "to": "23:59",
+            "reason": "billing runs"
+          },
+          {
+            "window": "friday-evening",
+            "days": "Fri",
+            "from": "16:00",
+            "to": "23:59",
+            "reason": "nobody is on call"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "context",
+      "sigil": false,
+      "form": "container",
+      "line": 223,
+      "attrs": {
+        "title": "Topology"
+      },
+      "body": {
+        "type": "markdown",
+        "text": "Two waves: 25% of pods, then 100%. Health is the p99 latency and error rate\nfrom the gateway, sampled every thirty seconds. A wave passes when both are\ninside budget for the whole verification window."
+      }
+    },
+    {
+      "kind": "glossary",
+      "sigil": false,
+      "form": "container",
+      "line": 229,
+      "attrs": {},
+      "body": {
+        "type": "deflist",
+        "entries": [
+          {
+            "term": "Wave",
+            "definition": "A percentage of the fleet moved to the new release. Two waves, always."
+          },
+          {
+            "term": "Gate",
+            "definition": "A human approval between waves. In production, every wave has one."
+          },
+          {
+            "term": "Rollback",
+            "definition": "Restoring the previous release's code. Not the previous data."
+          }
+        ]
+      }
+    },
+    {
+      "kind": "example",
+      "sigil": false,
+      "form": "container",
+      "line": 240,
+      "attrs": {
+        "title": "A good transition post"
+      },
+      "body": {
+        "type": "markdown",
+        "text": "**deploy v2.14.0 → production, wave 1 (25%)** started 14:02 · health at\nstart 99.97% · verifying for 10 minutes · gate 2 at ~14:12."
+      }
+    }
+  ]
+}

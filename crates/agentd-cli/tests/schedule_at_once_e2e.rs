@@ -194,7 +194,7 @@ fn a_schedule_with_at_fires_exactly_once_and_not_again_after_a_restart() {
 /// One `sleep` long enough to be suspended-and-durable when the process dies.
 const SLEEP_STEPS: &str = r#"{
     "start": {"kind": "once"},
-    "nap": {"kind": "sleep", "depends_on": ["start"], "duration": "1s"},
+    "nap": {"kind": "sleep", "depends_on": ["start"], "duration": "5s"},
     "done": {"kind": "finish", "depends_on": ["nap"], "status": "completed"}
 }"#;
 
@@ -240,7 +240,9 @@ fn a_suspended_step_whose_timer_is_gone_is_repaired_at_restore() {
     // Life 1: reach the suspended `sleep`, then die without warning.
     let (child, err_path) = spawn_daemon(&cfg, &dir);
     let pid = child.id() as i32;
-    let rows = wait_for_timer_rows(&dir);
+    // A barrier, not a list: it returns once the sleep step has armed its
+    // durable timer (and asserts loudly if it never does).
+    wait_for_timer_rows(&dir);
     unsafe { libc::kill(pid, libc::SIGKILL) };
     let mut child = child;
     let _ = child.wait();
@@ -254,8 +256,23 @@ fn a_suspended_step_whose_timer_is_gone_is_repaired_at_restore() {
     // The crash window this simulates: the timer row was deleted, the effect it
     // was carrying was not yet durable. What restore sees is a `Suspended` step
     // pointing at a timer that is not there.
-    for row in &rows {
-        std::fs::remove_file(row).expect("delete the timer row");
+    //
+    // Delete whatever is on disk NOW rather than the paths listed before the
+    // kill: on a loaded runner the daemon can fire and reap its own row in
+    // that window, and a row already gone satisfies the precondition just as
+    // well as one this test removed. The invariant is the assertion below —
+    // the timer directory is empty — not who emptied it.
+    for row in std::fs::read_dir(timer_dir(&dir))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+    {
+        match std::fs::remove_file(&row) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => panic!("delete the timer row {}: {e}", row.display()),
+        }
     }
     assert!(
         std::fs::read_dir(timer_dir(&dir))

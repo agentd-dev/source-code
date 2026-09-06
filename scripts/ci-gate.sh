@@ -61,11 +61,33 @@ if [ "${1:-}" != "quick" ]; then
   # itself published, and that refusal arrives at TAG time — after the binaries
   # and the container are built — where it is most expensive. Prove it now.
   step "the release's crates can be published"
+  # Mirror release.yml: a version already on the index is what a release
+  # SKIPS, and dry-running it compares the working tree against bytes that
+  # were frozen at that version — noise, not signal. Only an unpublished
+  # version is a real question, and that is exactly the state a release is in
+  # once it bumps.
+  #
+  # agentd-cli is the one crate this cannot answer early: cargo resolves its
+  # agentd-core dependency from the INDEX, so at a new version it is
+  # unverifiable until agentd-core is published at that same version. The
+  # release publishes in dependency order for that reason; verifying
+  # agentd-core is the meaningful half.
   for c in agentd-net agentd-mcp agentd-instruction agentd-core agentd-cli; do
+    v=$(cargo metadata --no-deps --format-version 1 2>/dev/null \
+        | python3 -c "import json,sys;print(next(p['version'] for p in json.load(sys.stdin)['packages'] if p['name']=='$c'))")
+    if [ "$(curl -s -o /dev/null -w '%{http_code}' -A 'agentd-ci-gate' \
+            "https://crates.io/api/v1/crates/$c/$v")" = "200" ]; then
+      echo "  --    $c $v already on crates.io (a release skips it)"
+      continue
+    fi
+    if [ "$c" = "agentd-cli" ]; then
+      echo "  --    $c $v verifiable only after agentd-core $v publishes"
+      continue
+    fi
     if cargo publish -p "$c" --dry-run --allow-dirty >/tmp/ci-gate-pub.log 2>&1; then
-      echo "  ok    $c"
+      echo "  ok    $c $v"
     else
-      echo "  FAIL  $c"
+      echo "  FAIL  $c $v"
       grep -m3 -E '^(error|  )' /tmp/ci-gate-pub.log | sed 's/^/        /'
       fail=1
     fi

@@ -25,6 +25,15 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # The Instruction Specification, so the vendored conformance corpus is
+      # checked against the PUBLISHED one rather than trusted. Without this the
+      # drift check skips here and runs only where a maintainer happens to have
+      # a sibling checkout — which is how a vendored fixture silently forks.
+      - uses: actions/checkout@v4
+        with:
+          repository: instruction-md/specification
+          path: .spec-upstream
+      - run: echo "INSTRUCTION_SPEC_REPO=$GITHUB_WORKSPACE/.spec-upstream" >> "$GITHUB_ENV"
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       # The whole workspace under all features: agent's feature-gated tests

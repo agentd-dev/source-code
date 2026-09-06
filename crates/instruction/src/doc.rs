@@ -1138,30 +1138,31 @@ fn form_refusal(k: &Kind, form: Form, line_no: usize) -> String {
     if form == Form::Leaf && k.body != BodyKind::None {
         // Machinery names what the body is; a keyword-capable prose kind
         // points at the one-line spelling first.
-        let kw = registry().keyword_kind_reverse(&k.name);
-        return match (k.disposition, kw) {
-            (Disposition::Machinery, _) => format!(
-                "line {line_no}: {} requires a body ({}) — use :::!{}",
-                k.name,
-                // What the body IS, from the schema's own body kind — so a
-                // text-bodied kind is not told to write "its definition".
-                // `workflow` names its steps (the corpus pins that wording).
-                match (k.name.as_str(), k.body) {
-                    ("workflow", _) => "its steps",
-                    (_, BodyKind::Yaml) => "its definition",
-                    (_, BodyKind::Code) => "its code",
-                    (_, BodyKind::Table) => "its rows",
-                    (_, BodyKind::Deflist) => "its entries",
-                    _ => "a text body",
-                },
-                k.name
-            ),
-            (_, Some(kw)) => format!(
-                "line {line_no}: {} requires a body (text) — write \"{kw}: …\" or use :::{}",
+        // What the body IS, from the schema's own `x-body` — never from the
+        // kind's disposition (a prose `glossary` still names "its entries").
+        // `workflow` is the single exception the corpus pins.
+        let noun = match (k.name.as_str(), k.body) {
+            ("workflow", _) => "its steps",
+            (_, BodyKind::Yaml) => "its definition",
+            (_, BodyKind::Code) => "its code",
+            (_, BodyKind::Table) => "its rows",
+            (_, BodyKind::Deflist) => "its entries",
+            (_, BodyKind::Text) => "a text body",
+            _ => "text",
+        };
+        let sig = if k.disposition == Disposition::Machinery {
+            "!"
+        } else {
+            ""
+        };
+        // A keyword-capable prose kind points at the one-line spelling first.
+        return match registry().keyword_kind_reverse(&k.name) {
+            Some(kw) => format!(
+                "line {line_no}: {} requires a body ({noun}) — write \"{kw}: …\" or use :::{}",
                 k.name, k.name
             ),
-            _ => format!(
-                "line {line_no}: {} requires a body (text) — use :::{}",
+            None => format!(
+                "line {line_no}: {} requires a body ({noun}) — use :::{sig}{}",
                 k.name, k.name
             ),
         };

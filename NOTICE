@@ -1,0 +1,36 @@
+agentd — third-party material vendored into this repository
+===========================================================
+
+agentd's own source is AGPL-3.0-only (see LICENSE). Some files in this tree
+come from elsewhere and carry their own terms. They are listed here because a
+licence statement that names only the project's own licence is silent about
+precisely the files someone might copy out of it.
+
+The Instruction Specification (https://github.com/instruction-md/specification),
+owned by instruction.md. agentd is its reference implementation, so two
+artifacts are vendored rather than referenced — a contract that only holds
+where someone happens to have a checkout does not hold.
+
+1. `crates/instruction/src/instruction.schema.json`
+   The specification's machine-readable registry (kinds, forms, grants,
+   semantic rules). Licence: **CC BY 4.0** — the specification repository's
+   root LICENSE. Attribution: "The Instruction Specification", instruction.md,
+   https://github.com/instruction-md/specification. Vendored so the parser
+   reads its kind registry from the specification itself and cannot drift from
+   it; `the_vendored_schema_matches_upstream_when_present` checks the copy
+   against the published original.
+
+2. `crates/instruction/tests/conformance/**` (102 files)
+   The specification's conformance corpus: the shared fixtures the Rust and
+   TypeScript implementations are both held to. Licence: **Apache-2.0** — see
+   `crates/instruction/tests/conformance/LICENSE`, copied alongside the
+   fixtures with the corpus README as that licence requires. Vendored so the
+   suite runs everywhere rather than only where a sibling checkout exists;
+   `the_vendored_corpus_matches_upstream_when_present` checks every file
+   against the published corpus in both directions.
+
+Both licences are compatible with distributing this repository under the AGPL:
+CC BY 4.0 and Apache-2.0 permit redistribution with attribution, which this
+notice and the copied LICENSE files provide. Neither vendored artifact is
+compiled into the agentd binary as code — the schema is read as data, and the
+corpus is test input.

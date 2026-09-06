@@ -489,4 +489,6 @@ feature set):
 
 ## License
 
-AGPL-3.0-only — see [LICENSE](LICENSE). agentd is fully open source; commercial licensing (for proprietary embedding or AGPL-free use) and commercial support are available — contact agent@agentd.dev.
+AGPL-3.0-only — see [LICENSE](LICENSE). Some files are vendored from the
+Instruction Specification under their own terms (the schema under CC BY 4.0,
+the conformance corpus under Apache-2.0) — see [NOTICE](NOTICE). agentd is fully open source; commercial licensing (for proprietary embedding or AGPL-free use) and commercial support are available — contact agent@agentd.dev.

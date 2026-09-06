@@ -5,9 +5,36 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
-## Unreleased
+## v1.9.0 — instructions that travel: registries, signatures, envelopes
+
+An instruction document could already define a whole agent. This release is
+about that document arriving from somewhere else and still being trustworthy:
+pulled from a registry or an OCI artifact, encrypted end to end, signed by its
+publisher and verified before a byte of it is interpreted.
+
+The reference parser is now a published crate — `agentd-instruction`, MIT OR
+Apache-2.0 — so other implementations of the specification link it instead of
+reimplementing it.
+
+### Changed — action required for one document shape
+
+- **A machinery block of an identified kind now REQUIRES its `name`
+  attribute.** The specification's `x-identity` (28 kinds) means identity is
+  the `name` ATTRIBUTE and nothing else; a `name:` key inside a YAML body is a
+  body field that happens to be called name. agentd previously accepted
+  `:::!workflow` with the name in the body and delivered a nameless
+  acknowledgement for it. It is now refused at load with
+  `workflow requires name`. The fix is one line per block:
+
+      :::!workflow          →   :::!workflow{name=drain}
+      name: drain               steps: …
+      steps: …
+
+  Every conforming reader refuses the old shape, so a document that relied on
+  it was already unusable outside agentd.
 
 ### Added
+
 
 - **Instruction from an OCI artifact registry** (RFC 0040, feature `oci`,
   default-off): `agent.instruction: "oci://registry/repo:tag[@sha256:…]"` pulls
@@ -32,6 +59,59 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   import a static recipient key) and RFC 7914 scrypt core, both pinned to
   their published test vectors. A build without the feature still detects an
   envelope and refuses it by name — ciphertext is never delivered as prose.
+- **The reference parser as a crate**: `agentd-instruction` (lib
+  `instruction_core`) — parse, validate, the byte-exact §3.5 delivery pipeline
+  with its §7.4 manifest, the §9.1 block-tree dump, and §7 verification behind
+  a `sign` feature. Published **MIT OR Apache-2.0** from 0.2.0 so the other
+  implementations of the specification can link it rather than reimplement it;
+  agentd itself stays AGPL-3.0-only. agentd consumes it through re-export
+  shims, so `config::idoc` call sites are unchanged.
+- **§7.6 wire verification of registry-served instructions**: pinning a
+  `publisher` in `instruction_sources` makes verification mandatory — the
+  author JWS against the publisher's key set (pinned key files or JWKS URIs,
+  or discovered from the read's own `publisherKeys`), key lifecycle enforced
+  (`retired` verifies past versions, `revoked` refuses), revoked versions
+  refuse the swap, and the fold runs under grant ∩ ceiling ∩ author-attested
+  capabilities. With `reader:` set, the audience-bound delivery attestation is
+  verified too. Fail-closed throughout: an unsigned read under a pinned
+  publisher refuses startup, and a failed re-read keeps the running text.
+- **Registry-consumer alignment** (RFC-0016 §6, RFC-0028 §3.3): an
+  `instruction://…@ref` read captures the registry's `md.instruction/*`
+  metadata; the apply boundary is one log line
+  (`instruction.applied {old_version_id → new_version_id, delivered_digest}`),
+  which is the publish→applied latency measure; one durable consumer binding
+  per instruction is created and reported after each apply; every MCP session
+  announces `clientInfo {name, version}` plus the workload label; and the
+  current `version_id` is exposed in status.
+- **The §7.7 freshness watch**: a durable timer re-fetches a signed
+  instruction on the shortest pinned `freshness`, and a source unreachable
+  past its deadline REFUSES NEW WORK while live runs drain — a stale
+  authorization stops being usable without stopping the agent mid-flight.
+
+### Fixed
+
+- The machinery acknowledgement named the wrong thing (or nothing) for a
+  workflow whose name lived in its body — the model was told a workflow had
+  loaded without being told which one. See **Changed** for what replaced it.
+- `instruction_spec_corpus` and the shared conformance corpus were SKIPPING in
+  CI rather than running: they defaulted to a path outside the repository, so
+  every hosted runner reported `ok` while executing nothing. The corpus is now
+  vendored in-tree (Apache-2.0, with its LICENSE), absence is a hard failure,
+  and a drift check compares every fixture against the published specification
+  — which CI now checks out so that check runs too.
+- A `sleep`-step e2e raced its own daemon: a 1s timer could fire and be reaped
+  between the test listing the timer row and killing the process.
+
+### Notes for operators
+
+- `oci` and `decrypt` join the release feature set; `sign` was already in it.
+  A build without a feature refuses the corresponding input by name rather
+  than degrading — an encrypted envelope is never parsed as prose, and an
+  `oci://` instruction is never silently skipped.
+- `scripts/ci-gate.sh` runs what CI runs, including the fifteen-row feature
+  matrix and a `cargo publish --dry-run` of every crate a release publishes.
+  The publish check exists because a path dependency on an unpublished crate
+  is only reported by cargo at tag time, after the binaries are built.
 
 ## v1.8.0 — the instruction runtime: forms, delivery, signing
 

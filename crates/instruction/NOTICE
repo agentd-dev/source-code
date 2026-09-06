@@ -1,8 +1,13 @@
 agentd-instruction — third-party material included in this crate
 ================================================================
 
-This crate's own source is AGPL-3.0-only (see the repository's LICENSE).
-Two artifacts in it come from the Instruction Specification
+This crate's own source is `MIT OR Apache-2.0` (see LICENSE-MIT and
+LICENSE-APACHE beside this file) — permissive, so that other implementations
+of the specification can link the reference implementation instead of
+reimplementing it. The agentd runtime that embeds this crate remains
+AGPL-3.0-only; that is a different licence on a different work.
+
+Two artifacts in this crate come from the Instruction Specification
 (https://github.com/instruction-md/specification), owned by instruction.md,
 and carry their own terms. They are named here because this notice ships
 inside the published package: attribution has to travel with the copy, and a
@@ -26,5 +31,8 @@ in exactly the place a reader would look.
    corpus README as that licence requires.
 
 Both licences permit redistribution with attribution, which this notice and
-the copied LICENSE provide. Neither artifact is compiled into the library as
+the copied LICENSE provide. They are the terms the specification publishes
+under, and they are unchanged by this crate's own relicensing: a permissive
+crate may carry CC BY 4.0 data and Apache-2.0 test fixtures, and the
+obligations that travel with them are stated here rather than assumed. Neither artifact is compiled into the library as
 code: the schema is parsed at runtime as data, the corpus is test input.

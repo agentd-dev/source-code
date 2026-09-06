@@ -14,11 +14,19 @@
 #
 # Published to crates.io, because a published crate cannot depend on an
 # unpublished one: agentd-core embeds this parser, so agentd-core and
-# agentd-cli are unpublishable while this is path-only. AGPL-3.0-only, the
-# same terms as the rest of the workspace — deliberately NOT a relicensing
-# decision. Whether a platform-consumable artifact should be Apache-2.0 (so
-# the instruction.md MCPG plugin can link it) is a separate question, and one
-# a later version can answer; published versions keep their own terms.
+# agentd-cli are unpublishable while this is path-only.
+#
+# LICENCE: `MIT OR Apache-2.0` from 0.2.0, the Rust ecosystem default —
+# NOT the AGPL the rest of this workspace carries. That is deliberate and it
+# is what makes the crate integrable: the reference implementation of an open
+# specification is only useful if the other implementations of that
+# specification can link it, and a copyleft parser forces every consumer to
+# reimplement the spec instead — which is exactly the duplication this crate
+# exists to end. agentd itself stays AGPL-3.0-only; a permissive dependency
+# does not weaken that.
+#
+# 0.1.0 was published AGPL-3.0-only and stays that way forever — crates.io
+# versions are immutable, so the relicence lives on 0.2.0 onward.
 #
 # THIRD-PARTY CONTENT (see ../../NOTICE): this crate vendors two artifacts from
 # the Instruction Specification — `src/instruction.schema.json` (CC BY 4.0,
@@ -33,11 +41,11 @@
 # would stake a claim on their namespace; the lib is still `instruction_core`,
 # the same package-vs-lib split agentd-core/`agentd` already uses.
 name = "agentd-instruction"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.96"
 description = "Reference implementation of the Instruction Specification: parser, validator, delivery pipeline, and signature verification"
-license = "AGPL-3.0-only"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/agentd-dev/source-code"
 
 [lib]

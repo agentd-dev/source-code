@@ -1,7 +1,11 @@
 agentd — third-party material vendored into this repository
 ===========================================================
 
-agentd's own source is AGPL-3.0-only (see LICENSE). Some files in this tree
+agentd's own source is AGPL-3.0-only (see LICENSE), with one deliberate
+exception: `crates/instruction` (published as `agentd-instruction`) is
+`MIT OR Apache-2.0` from 0.2.0, so that other implementations of the
+Instruction Specification can link the reference implementation rather than
+reimplement it. See `crates/instruction/NOTICE`. Some files in this tree
 come from elsewhere and carry their own terms. They are listed here because a
 licence statement that names only the project's own licence is silent about
 precisely the files someone might copy out of it.

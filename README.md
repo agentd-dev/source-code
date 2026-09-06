@@ -489,6 +489,9 @@ feature set):
 
 ## License
 
-AGPL-3.0-only — see [LICENSE](LICENSE). Some files are vendored from the
+AGPL-3.0-only — see [LICENSE](LICENSE). One crate is deliberately permissive:
+`agentd-instruction` (the Instruction Specification's reference parser,
+`crates/instruction`) is MIT OR Apache-2.0, so other implementations can link
+it. Some files are vendored from the
 Instruction Specification under their own terms (the schema under CC BY 4.0,
 the conformance corpus under Apache-2.0) — see [NOTICE](NOTICE). agentd is fully open source; commercial licensing (for proprietary embedding or AGPL-free use) and commercial support are available — contact agent@agentd.dev.

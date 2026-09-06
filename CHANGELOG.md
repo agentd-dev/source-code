@@ -5,7 +5,7 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
-## Unreleased — one shape for every document a config names
+## v1.11.0 — one shape for every document a config names
 
 v1.10.0 made `agent.instruction` one coherent setting. This release applies
 the same shape everywhere a document is named, and closes two places where a
@@ -45,25 +45,34 @@ value was read once at startup and never again.
 
 ### Added
 
-- **`dir:` + `glob:` + `order:` for instructions.** A folder of documents
-  combines into ONE instruction: `order: name` (default, path order — what a
-  `10-`, `20-` convention exists to exploit) or `order: date` (mtime, oldest
-  first). `**` recurses. Documents join with one blank line between them; the
-  first file's front matter is kept and a later file's is dropped with a
-  warning; a folder matching nothing is a refusal, not an empty instruction.
-  The short form takes a folder too — `--instruction ./instructions/`, or any
-  path that turns out to be a directory.
+- **A folder of documents as one instruction** — `dir: ./instructions`, or
+  `dir: {path, glob, order}` when the defaults are not right. `glob` and
+  `order` live INSIDE `dir` because they qualify it and nothing else: a
+  setting with nothing to qualify is unsayable rather than validated (writing
+  either beside `dir` is a refusal that names where they belong). `order:
+  name` is path order — what a `10-`, `20-` convention exists to exploit —
+  and `order: date` is mtime, oldest first; `**` recurses. Documents join with
+  one blank line between them; the first file's front matter is kept and a
+  later file's is dropped with a warning; a folder matching nothing is a
+  refusal, not an empty instruction. The short form takes a folder too —
+  `--instruction ./instructions/`, or any path that turns out to be a
+  directory — and `--instruction.glob` / `--instruction.order` compose with it
+  in either order.
 - **The same shape for `agent.prompt`** — `--prompt.text`, `--prompt.file`,
-  `--prompt.dir` (+`--prompt.glob`, `--prompt.order`), `--prompt.url`, and the
+  `--prompt.dir` (with `--prompt.glob` / `--prompt.order` setting the folder's
+  own keys), `--prompt.url`, and the
   same classification of a bare value, so a path names the file. `--prompt-file`
   still works as the earlier spelling of `--prompt.file`.
 - **The same shape for `subagents.templates[].instruction`** — `file:`,
-  `dir:`/`glob:`/`order:`, `url:`, `oci:`, or the text itself. `mcp:` stays
+  `dir:` (with its `glob`/`order`), `url:`, `oci:`, or the text itself. `mcp:` stays
   instruction-only: an MCP resource is read *and subscribed* by a client that
   does not exist at config load.
-- **`order:` for workflow directories**, the same two values, through the same
-  code as instructions — `config::fileset` is now the single implementation of
-  "which files, in what order", shared by both.
+- **The same folder source for workflow directories**: `dir:` now also takes
+  `{path, glob, order}`, through the same code as instructions —
+  `config::fileset` is the single implementation of "which files, in what
+  order". A flat `glob:` beside a string `dir:` is the older spelling and
+  still works; `order:` exists only in the object form, so the new setting has
+  exactly one home.
 - **The watch covers every document a reload re-reads**: the instruction file,
   an instruction folder *and* its documents, each workflow `file:` and `dir:`,
   and `skills.dir`. For a folder the watch is on the folder and its glob,

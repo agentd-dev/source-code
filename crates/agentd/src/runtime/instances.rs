@@ -1006,6 +1006,7 @@ fn validate_composed(doc: &Value) -> Result<(), String> {
         file_doc: doc.clone(),
         files: Vec::new(),
         warnings: Vec::new(),
+        trace: Default::default(),
     };
     let diags = crate::config::v2::validate(&loaded);
     let mut errs = res;

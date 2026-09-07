@@ -272,6 +272,32 @@ see docs/configuration.md."
             );
             exit::SUCCESS
         }
+        // `--effective-config`: the assembled document, where each setting came
+        // from, and the fragment an instruction declared. On stdout, so it
+        // pipes into `jq`; the warnings stay on stderr with every other event.
+        Ask::EffectiveConfig => {
+            for w in &loaded.warnings {
+                eprintln!("{}", json!({"event": "config.warning", "msg": w}));
+            }
+            // The report runs on an INVALID config on purpose, so it has to
+            // say so — a document printed without its errors would read as a
+            // clean bill of health.
+            let diags = agentd::config::v2::validate(&loaded);
+            for e in &diags.errors {
+                eprintln!("{}", json!({"event": "config.invalid", "error": e}));
+            }
+            let files: Vec<String> = loaded.files.iter().map(|(p, _)| p.clone()).collect();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&agentd::config::effective::report(
+                    &loaded.trace,
+                    &files,
+                    &loaded.settings.agent.document_config,
+                ))
+                .unwrap_or_else(|_| "{}".to_string())
+            );
+            exit::SUCCESS
+        }
         Ask::Capabilities => {
             println!(
                 "{}",

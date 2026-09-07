@@ -20,6 +20,7 @@
 pub mod attest; // §7 instruction attestation (JWS/Ed25519, resolution manifest)
 #[cfg(feature = "decrypt")]
 pub mod decrypt; // on-the-fly instruction decryption: age v1 + JWE compact (RFC 0041)
+pub mod effective; // --effective-config: the assembled document + where each setting came from
 pub mod envelope;
 pub mod fileset; // dir:+glob:+order: — one implementation, shared by workflows and instructions
 
@@ -2200,7 +2201,7 @@ fn check_subscriptions_reference_declared_servers(cfg: &Config, diags: &mut Vec<
 /// Heuristic: is this header name credential-shaped? A header so named must
 /// carry a `{{secret:…}}` *reference*, never an inline literal, so a secret
 /// cannot be smuggled into a config file under a plausible header name.
-pub(crate) fn is_secret_shaped_key(name: &str) -> bool {
+pub fn is_secret_shaped_key(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
     n == "authorization"
         || n == "x-api-key"

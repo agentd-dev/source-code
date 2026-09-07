@@ -5,6 +5,38 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## Unreleased
+
+### Added
+
+- **`--effective-config`: what am I running, and who said so.** One JSON object
+  on stdout — the assembled document, the layer that set each setting
+  (`file ./agentd.local.yml`, `env`, `flag`, the conventional folder, the
+  generator), the `:::!config` fragment the instruction declared, and the files
+  that were loaded. `--validate-config` answers "is this valid"; nothing
+  answered "what is it". A running config is now assembled from up to three
+  discovery rungs, the environment, the flags, three conventional folders and a
+  fragment inside an instruction that may itself be a folder, an artifact or a
+  URL — that question got hard to answer by reading.
+
+  It runs on an INVALID config on purpose (the moment it is most wanted),
+  reporting the errors on stderr beside the document, and exits `0` because a
+  report is not a verdict. Values under a credential-shaped key are redacted; a
+  `{{secret:…}}` reference is shown as written. The provenance credits the
+  layer that CHANGED a value, not a later one that restated it — naming the
+  restater would send an operator to edit the wrong file. Documented in
+  configuration.md §10a.
+
+### Fixed
+
+- **`install.sh` no longer depends on one rate-limited endpoint.** Resolving
+  "latest" went through the GitHub REST API, which allows 60 unauthenticated
+  requests an hour per IP — a CI runner, a NAT'd office or a shared cloud host
+  can exhaust that without ever having run the installer, and the install then
+  died on a 403 with no way forward but pinning a version by hand. It now falls
+  back to the `releases/latest` web redirect, which answers the same question
+  and is not API-rate-limited, and the failure message names the releases page.
+
 ## v1.11.0 — one shape for every document a config names
 
 v1.10.0 made `agent.instruction` one coherent setting. This release applies

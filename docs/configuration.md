@@ -372,6 +372,7 @@ and run time) is documented in [`security.md`](security.md) §11.
 |---|---|---|---|---|
 | `-c`, `--config <PATH>` | — | `AGENT_CONFIG` | *(none)* | Load a declarative config file — YAML (`.yaml`/`.yml`) or JSON (`.json`/`.jsonc`; other extensions are sniffed) (§12). The lowest non-default precedence layer. |
 | `--validate-config` | — | — | — | Load + validate (files + env + flags), print the admission verdict (one `config.valid` line, or one `config.invalid` line per diagnostic — **all** collected in one pass), exit `0`/`2`. Side-effect-free. |
+| `--effective-config` | — | — | — | Print the **assembled** config and where each setting came from (§10a), to stdout as one JSON object, and exit `0`. Runs on an invalid config too — that is when it is most wanted — reporting the errors on stderr beside it. Credential-shaped values are redacted. Side-effect-free. |
 | `--config-schema` | — | — | — | Print the settings JSON Schema (Draft 2020-12) to stdout and exit `0`. Side-effect-free. |
 | `--workflow-schema` | — | — | — | Print the workflow JSON Schema + node registry to stdout and exit `0`. |
 | `--watch-config` | `lifecycle.watch_config` | `WATCH_CONFIG` | `false` | Watch each config file's parent directory via `inotify` and reload on change (the same reload SIGHUP triggers). Needs a `--config`/`AGENT_CONFIG` file (validated, exit `2`) and the `config-watch` build feature — without the feature the watch is simply not installed. See §11. |
@@ -1091,6 +1092,53 @@ disposition (terminates) — restart to reconfigure. Restart-only paths
 `a2a.bearer`, `security`, …) never reload (§11).
 
 ---
+
+## 10a. `--effective-config` — what am I running, and who said so
+
+`--validate-config` answers *is this valid*. This answers *what is it*:
+
+```console
+$ agentd --effective-config | jq .provenance
+{
+  "agent.instruction":     "file /home/me/.config/agentd/config.yml",
+  "agent.name":            "file ./agentd.local.yml",
+  "intelligence.model":    "flag",
+  "intelligence.endpoints": "env",
+  "workflows":             "convention (folder beside the config)"
+}
+```
+
+One JSON object on stdout:
+
+| Key | What it is |
+|---|---|
+| `config` | the document the loader assembled — files, then environment, then flags, then the conventional folders, with `${VAR}` expanded |
+| `provenance` | per setting, the layer that **changed** it. A later layer restating a value identically is not credited: it changed nothing, and naming it would send you to edit the wrong file |
+| `document_config` | the `:::!config` fragment the *instruction* declared. It merges **under** `config` (an explicit setting still wins) and is applied after the document is typed, so it is the one thing a config file cannot show you |
+| `files` | the config files that were loaded, in layer order |
+| `notes` | the caveats above, in the output itself |
+
+Three things worth knowing:
+
+- **It runs on a broken config.** The moment you most need to know what is in
+  effect is when something is wrong, so validation errors are reported on
+  stderr *beside* the document rather than replacing it. Exit is `0`: this is a
+  report, not a verdict — `--validate-config` owns the verdict.
+- **Credentials are redacted.** A config file may not carry a live credential,
+  but an env var or a flag may, and `${VAR}` expansion has already happened by
+  the time the report is built. Any value under a credential-shaped key becomes
+  `"<redacted>"`; a `{{secret:…}}` *reference* is shown as written, because
+  which reference a setting uses is one of the things you need to see.
+- **It resolves the instruction, like every other load.** Naming a `file:`,
+  `dir:`, `url:` or `oci:` instruction means this command reads that file or
+  folder, and fetches that URL or artifact — the same work `--validate-config`
+  does, because the document's `:::!config` can only be reported after it has
+  been read. It writes nothing.
+- **Defaults are not shown.** A path absent from `config` takes the default in
+  `--config-schema`. The report is what was *stated*, plus what agentd
+  generated (a `main` workflow synthesized for a bare `--instruction` run is in
+  there, attributed to the generator — a report that omitted it would describe
+  a config nobody runs).
 
 ## 10. Observability of config
 

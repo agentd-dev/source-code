@@ -336,6 +336,12 @@ pub struct Agent {
     /// diagnostics list.
     #[serde(skip)]
     pub instruction_warnings: Vec<String>,
+    /// The `:::!config` fragment the instruction declared — DERIVED. It is
+    /// merged UNDER the document during typing and never written back into
+    /// it, so `--effective-config` has no other way to show a setting that an
+    /// instruction, rather than a config file, put into effect.
+    #[serde(skip)]
+    pub document_config: Map<String, Value>,
 }
 
 /// The provenance of a load-time-resolved instruction reference.
@@ -3474,6 +3480,7 @@ impl Settings {
         if let Some(ex) = idoc_extraction {
             settings.agent.inline_skills = ex.skills;
             settings.agent.document_declarations = ex.declarations;
+            settings.agent.document_config = ex.config;
         }
         settings.agent.instruction_origin = instruction_origin;
         settings.agent.instruction_path = instruction_path;
@@ -4039,6 +4046,8 @@ pub const REMOVED_FLAGS: &[(&str, &str)] = &[
 #[derive(Debug, Clone)]
 pub struct Loaded {
     pub settings: Settings,
+    /// The layer snapshots behind `--effective-config`; empty otherwise.
+    pub trace: crate::config::effective::Trace,
     /// The effective document (files ← env ← flags), what `Settings` typed.
     pub doc: Value,
     /// The merged FILE layer alone (before env/flags).
@@ -4063,6 +4072,10 @@ pub enum Ask {
     ContextTemplate,
     Validate,
     Capabilities,
+    /// `--effective-config`: print the assembled document and where each
+    /// setting came from, then exit. `--validate-config` answers "is this
+    /// valid"; this answers "what is it, and who said so".
+    EffectiveConfig,
     /// `--login <target>`: complete the interactive OAuth device flow for a
     /// configured endpoint and cache the token.
     Login(String),
@@ -4114,6 +4127,15 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
     let schema = schema::schema();
     let bindings = paths::bindings_of(&schema);
     let mut warnings = Vec::new();
+    // `--effective-config` snapshots the document at each layer boundary. Only
+    // when it was asked for: the report costs a handful of clones, and every
+    // other invocation is a daemon starting up. The flag is looked for here
+    // rather than after the arg loop because the earliest layers apply before
+    // that loop runs.
+    let mut trace = args
+        .iter()
+        .any(|a| a == "--effective-config")
+        .then(crate::config::effective::Trace::default);
 
     // --- FILE layer: several files, later wins (JSON Merge Patch) ---
     let super::ConfigPaths {
@@ -4198,6 +4220,23 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
         }
     }
     let mut doc = file_doc.clone();
+    // Per FILE, not per file LAYER: the discovery chain exists so a person's
+    // defaults, a checkout's settings and one machine's overrides can each
+    // live where they belong, and "which of the three set this?" is the whole
+    // question. Re-read through the same reader and the same merge, so the
+    // attribution cannot describe a merge the loader did not do.
+    if let Some(t) = trace.as_mut() {
+        let mut cumulative = Value::Object(Map::new());
+        for (path, _) in &files {
+            if let Ok((d, _)) = file::read_document(path) {
+                file::merge_into(&mut cumulative, d);
+            }
+            t.record(format!("file {path}"), &cumulative);
+        }
+        if files.is_empty() {
+            t.record("built-in", &doc);
+        }
+    }
 
     // --- ENV layer: derived path names, then the short aliases. A path name
     // wins over an alias for the same field, since it names the field exactly
@@ -4221,6 +4260,9 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
     let (derived, _applied) = paths::env_document_in(&bindings, &envmap).map_err(usage)?;
     file::merge_into(&mut env_doc, derived);
     file::merge_into(&mut doc, env_doc);
+    if let Some(t) = trace.as_mut() {
+        t.record("env", &doc);
+    }
 
     // --- FLAG layer: aliases + generic path flags, in argument order ---
     let mut ask = Ask::Run;
@@ -4236,6 +4278,7 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
             "--context-template" => ask = Ask::ContextTemplate,
             "--validate-config" => ask = Ask::Validate,
             "--capabilities" => ask = Ask::Capabilities,
+            "--effective-config" => ask = Ask::EffectiveConfig,
             "--login" => {
                 let t = it
                     .next()
@@ -4316,7 +4359,13 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
     // Runs BEFORE the instruction sugar on purpose: a project with a
     // `workflows/` folder has declared its machinery, and the sugar `main` loop
     // is for the case where nothing did.
+    if let Some(t) = trace.as_mut() {
+        t.record("flag", &doc);
+    }
     apply_default_folders(&mut doc, &config_dirs(&config_paths), &mut warnings);
+    if let Some(t) = trace.as_mut() {
+        t.record("convention (folder beside the config)", &doc);
+    }
 
     // --- env substitution: `${VAR}` / `${VAR:-default}` in any string value of
     //     the merged document (config + workflows), from the process env. Distinct
@@ -4342,6 +4391,9 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
     }
 
     // --- type + validate ---
+    if let Some(t) = trace.as_mut() {
+        t.record("${…} environment substitution", &doc);
+    }
     let mut settings = Settings::from_document(doc.clone(), "config").map_err(usage)?;
     // --- sugar: `agentd --instruction X` with no workflows ---
     //
@@ -4352,8 +4404,13 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
     // form got no sugar at all (an object is not a non-blank string), and a
     // path-valued short form got sugar *on top of* the workflows its own
     // document declared — a model loop nobody asked for, dialing intelligence.
-    if ask == Ask::Run || ask == Ask::Validate {
+    // …and `--effective-config` too: a report that omitted the workflow a run
+    // would synthesize would describe a config nobody runs.
+    if ask == Ask::Run || ask == Ask::Validate || ask == Ask::EffectiveConfig {
         apply_instruction_sugar(&mut doc, &mut settings);
+    }
+    if let Some(t) = trace.as_mut() {
+        t.record("generated (the one-shot sugar workflow)", &doc);
     }
     // --- durability a laptop already satisfies ---
     //
@@ -4400,6 +4457,7 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
         file_doc,
         files,
         warnings: Vec::new(),
+        trace: trace.unwrap_or_default(),
     };
     // `--prompt-missing`, before validation: the person is standing at a
     // terminal ready to supply what is missing, so ask FIRST and let the
@@ -4430,7 +4488,14 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
     warnings.extend(loaded.settings.agent.instruction_warnings.clone());
     warnings.extend(diags.warnings);
     loaded.warnings = warnings;
+    // `--effective-config` is deliberately in this list: the moment an
+    // operator most needs to know what is in effect and who set it is when the
+    // config is WRONG. A report that refuses to run on a broken config is
+    // missing exactly when it was wanted — `--validate-config` is the one that
+    // answers "is this valid", and the errors are still reported alongside the
+    // document rather than hidden.
     if ask != Ask::Validate
+        && ask != Ask::EffectiveConfig
         && ask != Ask::Help
         && ask != Ask::Version
         && ask != Ask::Schema
@@ -7083,6 +7148,8 @@ pub fn help_text() -> String {
          \nCONTROL:\n\
          \x20 -c, --config <PATH>        a settings file (repeatable; `=` form too; or AGENT_CONFIG=a.yaml:b.yaml)\n\
          \x20 --validate-config          load+validate everything, print the verdict, exit 0/2\n\
+         \x20 --effective-config         print the assembled config + where each setting came from\n\
+         \x20                            (runs on an invalid config too; credentials redacted)\n\
          \x20 --config-schema            print the settings JSON Schema and exit\n\
          \x20 --context-template        print the built-in system-prompt template and exit\n\
      \x20 --workflow-schema          print the workflow JSON Schema + node registry and exit\n\

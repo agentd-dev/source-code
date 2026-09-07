@@ -78,9 +78,18 @@ need tar
 if command -v curl >/dev/null 2>&1; then
   fetch() { curl -fsSL "$1"; }
   fetch_to() { curl -fsSL -o "$2" "$1"; }
+  # Where `…/releases/latest` REDIRECTS to — the tag is the last path segment.
+  # `-o /dev/null -w %{url_effective}` reports the final URL without
+  # downloading the page.
+  final_url() { curl -fsSL -o /dev/null -w '%{url_effective}' "$1"; }
 elif command -v wget >/dev/null 2>&1; then
   fetch() { wget -qO- "$1"; }
   fetch_to() { wget -qO "$2" "$1"; }
+  # wget prints the redirect chain on stderr; the last `Location:` is the tag.
+  final_url() {
+    wget -q --max-redirect=5 -O /dev/null -S "$1" 2>&1 \
+      | awk '/[Ll]ocation:/ { u = $2 } END { if (u) print u }'
+  }
 else
   fail "need curl or wget"
 fi
@@ -112,8 +121,21 @@ esac
 
 # --- resolve version --------------------------------------------------------
 if [ -z "$VERSION" ]; then
-  VERSION=$(fetch "${API}/latest" | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
-  [ "$VERSION" ] || fail "could not resolve the latest release tag; pin one with --version"
+  # Two ways to ask, because the first one has a quota. The REST API is nicer
+  # to parse, but it is rate-limited to 60 requests an hour per IP for an
+  # unauthenticated caller — a CI runner, a NAT'd office or a shared cloud
+  # host can exhaust that without ever having run this script, and the install
+  # then dies on a 403 with no way forward but pinning a version by hand.
+  #
+  # The `releases/latest` web redirect answers the same question and is not
+  # API-rate-limited: it 302s to `…/releases/tag/vX.Y.Z`, and the tag is the
+  # last path segment.
+  VERSION=$(fetch "${API}/latest" 2>/dev/null | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
+  if [ -z "$VERSION" ]; then
+    VERSION=$(final_url "https://github.com/${REPO}/releases/latest" 2>/dev/null \
+              | sed -n 's#.*/releases/tag/\(.*\)$#\1#p')
+  fi
+  [ "$VERSION" ] || fail "could not resolve the latest release tag (GitHub unreachable, or its API quota is spent) — pin one with --version <tag>, from https://github.com/${REPO}/releases"
 fi
 
 ASSET="agentd-${VERSION}-${TARGET}.tar.gz"

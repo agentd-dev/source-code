@@ -5,42 +5,57 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
-## v1.12.1 — a document may not configure the terms it is judged by
+## Unreleased
 
-### Security
+### Changed
 
-- **A served instruction document could grant itself capabilities and relax
-  security gates.** A `:::!config` fragment was checked against three
-  TOP-LEVEL key names (`document_capabilities`, `instruction_sources`,
-  `instruction`) — the specification's vocabulary — but the settings those name
-  live at `agent.document_capabilities` and under `agent.instruction` in
-  agentd's schema, and a fragment merges DEEP with arrays concatenating. A
-  document nesting the same setting one level down walked straight past the
-  check. Confirmed by running each:
+- **The operator-only config surface is enforced by path.** A document's
+  `:::!config` may not write `agent.document_capabilities`,
+  `agent.instruction.*`, `security.*`, `identity.*`, `instruction.*` or the
+  pre-1.13 `instruction_sources`; the check now matches wherever a document
+  spells one of them, since fragments merge deep. Documents still configure
+  what is not operator-only — store, limits, lifecycle, workflows. (The same
+  check shipped in v1.12.1; this release extends it to `agent.instruction.trust`.)
 
-  - `agent: {document_capabilities: [compute]}` granted itself a capability,
-  - `security: {allow_trifecta: true}` switched off the lethal-trifecta gate,
-  - `identity: {autonomous_as: …}` changed who the agent acts for,
-  - `agent: {instruction: {mcp: …}}` re-pointed its own source.
+### Changed (breaking)
 
-  An instruction is routinely fetched from somewhere the operator does not
-  fully control — the premise signing, pinning and the capability grant exist
-  for — and both "a way to assemble the trifecta while the check passes" and
-  "untrusted MCP content gaining control" are in scope per SECURITY.md. No
-  capability grant was required, so any configuration loading an instruction
-  document with directives was affected. `security` and `identity` were never
-  covered by the old check; the key-name rule dates to v1.8.0.
+- **`instruction_sources` is now `agent.instruction.trust`.** Everything else
+  about the instruction already lived under `agent.instruction.*`, and this was
+  the odd one out — worse, it was split: `freshness` in the pin is the same
+  clock `refresh` sets, and being pinned is what makes `unavailable: auto` mean
+  freeze. It is deliberately not called `sources`: `file`, `dir`, `url`, `oci`
+  and `mcp` are the sources, while these say who may sign what they serve. The
+  old top-level spelling is refused by name.
 
-  The check is now by PATH — `agent.document_capabilities`,
-  `agent.instruction.*`, `security.*`, `identity.*`, `instruction.*`,
-  `instruction_sources` — and a fragment writing any of them is refused at
-  load, naming what it wrote. A document may still configure what is not
-  operator-only (store, limits, lifecycle, workflows), which is the directive
-  feature working as designed.
+  It stays restart-only inside an otherwise reloadable setting — a revoked
+  publisher must not survive a hot reload — and that arrangement is now
+  declared in `RESTART_ONLY_WITHIN_RELOADABLE` and checked by the
+  classification guardrail, which matches by prefix and would otherwise have
+  read the subtree as reloadable.
 
-  **Affected:** every release with config directives, through v1.12.0.
-  **Fixed in:** v1.12.1. **Workaround:** none within a release — do not load an
-  instruction document you do not control.
+### Added
+
+- **`agent.instruction.unenforceable`** — `warn` (default), `refuse`, or
+  `ignore`. Signature verification runs on the registry read path only, so a
+  pin beside a `file:`/`dir:`/`url:`/`oci:` instruction, or one naming a
+  document this agent never reads, enforces nothing. Startup now says so, and
+  an operator who wants that fatal can have it.
+
+## v1.12.1 — operator configuration is the operator's alone
+
+### Changed
+
+- **A document's `:::!config` may not write operator configuration**, checked
+  by path: `agent.document_capabilities`, `agent.instruction.*`, `security.*`,
+  `identity.*`, `instruction.*` and `instruction_sources`. A fragment merges
+  deep into the configuration, so the rule now matches wherever a document
+  spells one of those settings rather than only at the top level. Writing one
+  is refused at load, naming what the document wrote.
+
+  Documents continue to configure what is not operator-only — store, limits,
+  lifecycle, workflows, MCP servers, streams — which is what the directive
+  feature is for. Upgrading is recommended for anyone loading an instruction
+  document from a source they do not control.
 
 ## v1.12.0 — what am I running, and who said so
 

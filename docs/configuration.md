@@ -774,7 +774,7 @@ folds into configuration at LOAD, so machinery changes apply on a reload or
 restart, not on a poll. A SIGHUP (or a watched config file changing) re-reads
 the source *and* re-folds its machinery, which is the full update path.
 
-`instruction_sources[].freshness` is a different thing that looks similar: it
+`agent.instruction.trust[].freshness` is a different thing that looks similar: it
 is the §7.7 **revocation deadline** for a signed document — how long an
 authorization may go unconfirmed before the agent stops acting on it. When
 both are set the tighter one wins, since a poll slower than the deadline would
@@ -794,7 +794,7 @@ governs only what happens AFTER a successful start:
 | `freeze` | serve live work, refuse NEW work | the §7.7 posture — stop taking on what you cannot justify, without abandoning what you accepted |
 | `drain` | finish live work, then exit 0 | an orchestrator will restart you, and startup re-reads the source — often right in Kubernetes |
 | `exit` | stop now, non-zero | running on a stale instruction is worse than not running |
-| `auto` *(default)* | `freeze` when the source is **trust-pinned** (a `publisher` in `instruction_sources`), `keep` otherwise | a stale *authorization* is a security question; an unreachable unsigned artifact is usually a blip |
+| `auto` *(default)* | `freeze` when the source is **trust-pinned** (a `publisher` under `agent.instruction.trust`), `keep` otherwise | a stale *authorization* is a security question; an unreachable unsigned artifact is usually a blip |
 
 Every outcome is one log line — `instruction.unavailable` with the policy that
 applied and whether the source was trust-pinned — so a frozen or draining
@@ -827,6 +827,53 @@ never changed used to reload successfully and change nothing.
   there would fire a reload that *cannot* apply the rotation and would report
   success anyway, which is precisely the failure this project refuses to ship.
   Rotate a certificate by restarting the process.
+
+### 5a.3b Trust — who may sign this document
+
+`agent.instruction.trust` pins the publisher and keys a SIGNED instruction must
+carry. It lives here rather than at the top level because it is not a separate
+subject: its `freshness` is the same clock `refresh` sets, and being pinned is
+what makes `unavailable: auto` mean freeze rather than keep.
+
+```yaml
+agent:
+  instruction:
+    mcp: "instruction://ins_42@stable"
+    unenforceable: warn        # warn (default) | refuse | ignore
+    trust:
+      - uri: "instruction://ins_42"
+        publisher: "https://instruction.md/pub/acme"
+        author_keys: [/etc/keys/acme-author.pem]
+        delivery_keys: [/etc/keys/delivery.pem]
+        reader: "agent://ops-1"     # enables the delivery `aud` check
+        max_capabilities: [material]
+        freshness: 15m
+```
+
+It is **not** a source. `file`, `dir`, `url`, `oci` and `mcp` above say where
+the document comes from; `trust` says who may have signed what they serve. (It
+was `instruction_sources` at the top level through v1.12.0; the old spelling is
+refused by name.)
+
+**Where it applies.** Signature verification runs on the registry read path, so
+a pin enforces something only when the instruction is served over MCP *and* the
+pin names that document. Beside a `file:`, `dir:`, `url:` or `oci:`
+instruction it enforces nothing — an `oci:` reference gets a content-digest
+check, which is integrity, not authorship.
+
+**`unenforceable`** decides what that means, because a security control that
+silently does nothing is worse than an absent one:
+
+| Value | Behaviour | Use when |
+|---|---|---|
+| `warn` *(default)* | one line at startup naming the pin and why it is inert | the pin is right for production, and development runs from a file |
+| `refuse` | exit `2` | the pin is the point — if the signature cannot be checked, this is not the agent you meant to run |
+| `ignore` | silence | one config deliberately shared across deployments that differ |
+
+**Restart-only.** Widening what a source may attest, or which keys are trusted,
+is never a hot reload — a publisher an operator believes they revoked must not
+stay live. It is the one restart-only setting inside an otherwise reloadable
+one, declared as such so the partition stays checkable (§11).
 
 ### 5a.4 Encrypted instructions
 

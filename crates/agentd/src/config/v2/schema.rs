@@ -88,6 +88,19 @@ fn top_level_properties(
     tool_select: &Value,
     budget: &Value,
 ) {
+    // Hoisted out of the `agent` literal below: that `json!` sits at the
+    // macro's recursion limit, and inlining one more object of this size tips
+    // it over. Same trick as `duration` / `budget` / `tool_select`.
+    let instruction_trust = json!({ "type": "array",
+                            "description": "WHO may sign this document (§7.5): publisher + author/delivery keys + a per-source capability ceiling + a revocation deadline, per document. NOT a source — `file`/`dir`/`url`/`oci`/`mcp` above are the sources; these say who may sign what they serve. Operator surface only; restart-only.",
+                            "items": { "type": "object", "additionalProperties": false, "properties": {
+                "uri": { "type": "string", "description": "the document this pin applies to (instruction://…)" },
+                "publisher": { "type": "string", "description": "the publisher the author signature must claim" },
+                "author_keys": { "type": "array", "items": { "type": "string" }, "description": "author (offline) verification keys: key file paths (raw/hex/base64url Ed25519), or instruction://…keys.json JWKS uris fetched from the serving registry; empty + publisher set = discover from the read's publisherKeys" },
+                "delivery_keys": { "type": "array", "items": { "type": "string" }, "description": "delivery (online) verification keys — same forms as author_keys" },
+                "reader": { "type": "string", "description": "this consumer's reader id for the delivery aud check (§7.6 step 2), e.g. principal://… or agent://…; delivery verification runs only when set" },
+                "max_capabilities": { "type": "array", "items": { "enum": ["material", "knowledge", "interface", "identity", "compute", "infra", "compose"] }, "description": "the per-source ceiling; effective families never exceed it" },
+                "freshness": { "type": "string", "description": "the revocation re-check deadline (a duration, e.g. 15m)" } } } });
     m.insert("agent".to_string(), json!({
                 "type": "object", "additionalProperties": false,
                 "properties": {
@@ -103,6 +116,8 @@ fn top_level_properties(
                         "mcp": { "oneOf": [ { "type": "string" }, { "type": "object", "additionalProperties": false, "required": ["resource"], "properties": { "server": { "type": "string", "description": "which configured MCP server to ask; omitted = whichever one serves it" }, "resource": { "type": "string", "description": "the resource URI, e.g. instruction://ins_1@stable" } } } ], "description": "a resource a configured MCP server serves, read and subscribed — the URI alone, or {server, resource} when it matters which server is asked" },
                         "refresh": { "type": "string", "description": "how often to re-read: `auto` (default — inotify for a file, never for a digest-pinned artifact, 5m for a mutable tag or served resource), `off`, or a duration" },
                         "unavailable": { "enum": ["auto", "keep", "freeze", "drain", "exit"], "description": "when the source stops answering after startup: auto (freeze when trust-pinned, else keep), keep, freeze (refuse new work), drain (finish live work then exit 0), exit" },
+                        "unenforceable": { "enum": ["warn", "refuse", "ignore"], "description": "what a `trust` pin that cannot be enforced means at startup — signature verification runs only for an `mcp:` instruction, so a pin beside a file/dir/url/oci source, or one naming another document, enforces nothing: warn (default), refuse (exit 2), ignore" },
+                        "trust": instruction_trust,
                         "decrypt": { "type": "object", "additionalProperties": false, "description": "recipient keys for an encrypted envelope (RFC 0041)", "properties": {
                             "keys": { "type": "array", "items": { "type": "string" }, "description": "key FILE paths — an AGE-SECRET-KEY-1… identity, 64 hex chars, or base64" },
                             "passphrase": { "type": "string", "description": "for age scrypt envelopes — a {{secret:…}} reference" } } } } }
@@ -346,16 +361,6 @@ fn top_level_properties(
                 "decrypt": { "type": "object", "additionalProperties": false, "description": "end-to-end decryption: the recipient keys that open an encrypted instruction envelope (age v1 or JWE compact)", "properties": {
                     "keys": { "type": "array", "items": { "type": "string" }, "description": "key FILE paths — each an AGE-SECRET-KEY-1… identity, 64 hex chars, or base64 (a 32-byte key; several entries support rotation)" },
                     "passphrase": { "type": "string", "description": "the passphrase for age scrypt envelopes — a {{secret:…}} reference, resolved at use" } } } } }));
-    m.insert("instruction_sources".to_string(), json!({ "type": "array",
-                "description": "pinned sources for SIGNED instruction documents (§7.5): publisher + author/delivery keys + a per-source capability ceiling + a freshness deadline. Pinning is by key and publisher, never by URI. Operator surface only.",
-                "items": { "type": "object", "additionalProperties": false, "properties": {
-                "uri": { "type": "string", "description": "the document this pin applies to (instruction://…)" },
-                "publisher": { "type": "string", "description": "the publisher the author signature must claim" },
-                "author_keys": { "type": "array", "items": { "type": "string" }, "description": "author (offline) verification keys: key file paths (raw/hex/base64url Ed25519), or instruction://…keys.json JWKS uris fetched from the serving registry; empty + publisher set = discover from the read's publisherKeys" },
-                "delivery_keys": { "type": "array", "items": { "type": "string" }, "description": "delivery (online) verification keys — same forms as author_keys" },
-                "reader": { "type": "string", "description": "this consumer's reader id for the delivery aud check (§7.6 step 2), e.g. principal://… or agent://…; delivery verification runs only when set" },
-                "max_capabilities": { "type": "array", "items": { "enum": ["material", "knowledge", "interface", "identity", "compute", "infra", "compose"] }, "description": "the per-source ceiling; effective families never exceed it" },
-                "freshness": { "type": "string", "description": "the revocation re-check deadline (a duration, e.g. 15m)" } } } }));
     m.insert("security".to_string(), json!({ "type": "object", "additionalProperties": false, "properties": {
                 "allow_trifecta": { "type": "boolean" },
                 "policies": { "type": "array", "description": "ordered verdicts on a tool call; first match wins, no match is allow", "items": {

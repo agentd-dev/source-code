@@ -54,7 +54,7 @@ impl super::reactor::Runtime {
         // `auto`: a trust-pinned source FREEZES (§7.7 — a stale authorization
         // is a security matter); an unpinned one KEEPS (a failed poll on an
         // unsigned artifact is usually a blip, and the agent holds a good copy).
-        let pinned = self.settings.instruction_sources.iter().any(|s| {
+        let pinned = self.settings.agent.instruction_spec.trust.iter().any(|s| {
             !s.publisher.is_empty() && uri.starts_with(s.uri.split('@').next().unwrap_or(&s.uri))
         });
         let policy = match self.settings.agent.instruction_spec.unavailable {
@@ -108,7 +108,7 @@ impl super::reactor::Runtime {
     /// on it. When both are set the tighter one wins, because a poll that is
     /// slower than the deadline would let authorization expire between checks.
     fn min_freshness_ms(&self) -> Option<u64> {
-        let revocation = min_freshness_ms(&self.settings.instruction_sources);
+        let revocation = min_freshness_ms(&self.settings.agent.instruction_spec.trust);
         let poll = match self.settings.agent.instruction_spec.refresh.as_deref() {
             None | Some("auto") => self.auto_refresh_ms(),
             Some("off") | Some("never") => None,

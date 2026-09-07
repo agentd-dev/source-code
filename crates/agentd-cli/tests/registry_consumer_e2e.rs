@@ -44,10 +44,11 @@ fn boot(instruction: &str, sources: Value) -> Run {
     let cfg = json!({
         "config_version": "1",
         "agent": {"name": "reg-consumer", "preflight": "never",
-                  "instruction": instruction,
+                  // The pins live WITH the instruction they protect
+                  // (`agent.instruction.trust`), so the long form carries both.
+                  "instruction": {"mcp": instruction, "trust": sources},
                   "document_capabilities": ["compute"]},
         "mcp": {"servers": [{"name": "registry", "endpoint": format!("{}/mcp", mock.uri())}]},
-        "instruction_sources": sources,
         "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
         "store": {"kind": "memory"},
     });

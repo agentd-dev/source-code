@@ -18,7 +18,7 @@
 > behind an operator grant in `agent.document_capabilities` (the trust ladder;
 > fail-closed, restart-only). Any `:::`, `::`, or `## !kind` marker routes a
 > document to the parser; front matter may pin `spec: "1"` but need not. A
-> document may be **signed** (§7) and pinned in `instruction_sources` — see
+> document may be **signed** (§7) and pinned under `agent.instruction.trust` — see
 > [Signing and trust](#signing-and-trust) below. See the spec for the full
 > block reference and the delivery rules; the shapes here are the core kinds.
 
@@ -307,19 +307,31 @@ already in the tree via rustls, no new dependency. The
 $ cargo run -p agentd-core --example sign_roundtrip --features sign -- <doc.md>
 ```
 
-**Pinning.** Operators pin the sources they trust in `instruction_sources` —
-by key and publisher, never by URI, which the server controls:
+**Pinning.** Operators pin who may sign a document under
+`agent.instruction.trust` — by key and publisher, never by URI, which the
+server controls. It lives with the instruction because it is not a separate
+subject: its `freshness` is the same clock `refresh` sets, and being pinned is
+what makes `unavailable: auto` mean freeze.
 
 ```yaml
-document_capabilities: [material, compute]
-instruction_sources:
-  - uri: "instruction://ins_42"
-    publisher: "https://instruction.md/pub/acme"
-    author_keys: [/etc/keys/acme-author.pem]
-    delivery_keys: [/etc/keys/delivery.pem]
-    max_capabilities: [material]      # this source's ceiling
-    freshness: 15m                    # re-check interval
+agent:
+  document_capabilities: [material, compute]
+  instruction:
+    mcp: "instruction://ins_42@stable"
+    unenforceable: warn               # warn (default) | refuse | ignore
+    trust:
+      - uri: "instruction://ins_42"
+        publisher: "https://instruction.md/pub/acme"
+        author_keys: [/etc/keys/acme-author.pem]
+        delivery_keys: [/etc/keys/delivery.pem]
+        max_capabilities: [material]  # this source's ceiling
+        freshness: 15m                # re-check interval
 ```
+
+Signature verification runs on the registry READ path, so a pin only enforces
+something when the instruction is served over MCP and the pin names it.
+`unenforceable` says what a pin that enforces nothing means: `warn` (default),
+`refuse` (exit 2), or `ignore`.
 
 **A document may not configure the terms it is judged by.** A `:::!config`
 fragment is refused outright when it writes any of:
@@ -327,12 +339,12 @@ fragment is refused outright when it writes any of:
 | Refused | Because |
 |---|---|
 | `agent.document_capabilities` | it is the grant set deciding which families this document may activate |
-| `agent.instruction.*` | source and `decrypt` — a document that rewrites these points the next read at itself |
-| `instruction_sources`, `instruction.*` | who may sign it, and which key opens it |
+| `agent.instruction.*` | source, `trust` and `decrypt` — a document that rewrites these points the next read at itself |
 | `security.*` | the gates: trifecta, egress, `exec`, policies, TLS trust, AAuth |
 | `identity.*` | who work is done on behalf of |
+| `instruction.*`, `instruction_sources` | the envelope recipient keys, and the pre-1.13 spelling of `trust` |
 
-The check is by **path**, not by top-level key name: the fragment merges deep
+The check is by **path**, not by top-level key name — the fragment merges deep
 and arrays concatenate, so a nested `agent: {document_capabilities: […]}` is
 the same self-grant as a top-level one and is refused the same way.
 

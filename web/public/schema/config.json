@@ -2712,6 +2712,61 @@
                   "description": "the instruction itself, never read as a path or URI",
                   "type": "string"
                 },
+                "trust": {
+                  "description": "WHO may sign this document (§7.5): publisher + author/delivery keys + a per-source capability ceiling + a revocation deadline, per document. NOT a source — `file`/`dir`/`url`/`oci`/`mcp` above are the sources; these say who may sign what they serve. Operator surface only; restart-only.",
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "author_keys": {
+                        "description": "author (offline) verification keys: key file paths (raw/hex/base64url Ed25519), or instruction://…keys.json JWKS uris fetched from the serving registry; empty + publisher set = discover from the read's publisherKeys",
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": "array"
+                      },
+                      "delivery_keys": {
+                        "description": "delivery (online) verification keys — same forms as author_keys",
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": "array"
+                      },
+                      "freshness": {
+                        "description": "the revocation re-check deadline (a duration, e.g. 15m)",
+                        "type": "string"
+                      },
+                      "max_capabilities": {
+                        "description": "the per-source ceiling; effective families never exceed it",
+                        "items": {
+                          "enum": [
+                            "material",
+                            "knowledge",
+                            "interface",
+                            "identity",
+                            "compute",
+                            "infra",
+                            "compose"
+                          ]
+                        },
+                        "type": "array"
+                      },
+                      "publisher": {
+                        "description": "the publisher the author signature must claim",
+                        "type": "string"
+                      },
+                      "reader": {
+                        "description": "this consumer's reader id for the delivery aud check (§7.6 step 2), e.g. principal://… or agent://…; delivery verification runs only when set",
+                        "type": "string"
+                      },
+                      "uri": {
+                        "description": "the document this pin applies to (instruction://…)",
+                        "type": "string"
+                      }
+                    },
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
                 "unavailable": {
                   "description": "when the source stops answering after startup: auto (freeze when trust-pinned, else keep), keep, freeze (refuse new work), drain (finish live work then exit 0), exit",
                   "enum": [
@@ -2720,6 +2775,14 @@
                     "freeze",
                     "drain",
                     "exit"
+                  ]
+                },
+                "unenforceable": {
+                  "description": "what a `trust` pin that cannot be enforced means at startup — signature verification runs only for an `mcp:` instruction, so a pin beside a file/dir/url/oci source, or one naming another document, enforces nothing: warn (default), refuse (exit 2), ignore",
+                  "enum": [
+                    "warn",
+                    "refuse",
+                    "ignore"
                   ]
                 },
                 "url": {
@@ -3037,61 +3100,6 @@
         }
       },
       "type": "object"
-    },
-    "instruction_sources": {
-      "description": "pinned sources for SIGNED instruction documents (§7.5): publisher + author/delivery keys + a per-source capability ceiling + a freshness deadline. Pinning is by key and publisher, never by URI. Operator surface only.",
-      "items": {
-        "additionalProperties": false,
-        "properties": {
-          "author_keys": {
-            "description": "author (offline) verification keys: key file paths (raw/hex/base64url Ed25519), or instruction://…keys.json JWKS uris fetched from the serving registry; empty + publisher set = discover from the read's publisherKeys",
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          },
-          "delivery_keys": {
-            "description": "delivery (online) verification keys — same forms as author_keys",
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          },
-          "freshness": {
-            "description": "the revocation re-check deadline (a duration, e.g. 15m)",
-            "type": "string"
-          },
-          "max_capabilities": {
-            "description": "the per-source ceiling; effective families never exceed it",
-            "items": {
-              "enum": [
-                "material",
-                "knowledge",
-                "interface",
-                "identity",
-                "compute",
-                "infra",
-                "compose"
-              ]
-            },
-            "type": "array"
-          },
-          "publisher": {
-            "description": "the publisher the author signature must claim",
-            "type": "string"
-          },
-          "reader": {
-            "description": "this consumer's reader id for the delivery aud check (§7.6 step 2), e.g. principal://… or agent://…; delivery verification runs only when set",
-            "type": "string"
-          },
-          "uri": {
-            "description": "the document this pin applies to (instruction://…)",
-            "type": "string"
-          }
-        },
-        "type": "object"
-      },
-      "type": "array"
     },
     "intelligence": {
       "additionalProperties": false,

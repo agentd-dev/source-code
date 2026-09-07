@@ -1697,7 +1697,9 @@ impl Runtime {
         let doc_id = uri.split('@').next().unwrap_or(uri);
         let Some(src) = self
             .settings
-            .instruction_sources
+            .agent
+            .instruction_spec
+            .trust
             .iter()
             .find(|s| s.uri.split('@').next().unwrap_or(&s.uri) == doc_id)
             .filter(|s| !s.publisher.is_empty())

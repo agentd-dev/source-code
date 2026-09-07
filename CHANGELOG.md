@@ -5,7 +5,10 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
-## Unreleased
+## v1.12.0 — what am I running, and who said so
+
+Two things an operator meets before anything else in agentd: getting it
+installed, and working out what a config actually does. Both got in the way.
 
 ### Added
 
@@ -26,6 +29,19 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   layer that CHANGED a value, not a later one that restated it — naming the
   restater would send an operator to edit the wrong file. Documented in
   configuration.md §10a.
+
+### Tests
+
+- **The surfaces v1.11.0 changed but did not test.** Auditing the release
+  rather than waiting for a failure turned up four: no guardrail tied an alias
+  to a schema path (the `agent.instruction` / `agent.prompt` alias arms merge a
+  patch directly, so a path that moved — as `glob` and `order` did — would
+  write a key nothing reads); the config-KEY rename refusals had no test, only
+  the removed-FLAG list; a workflow entry's `dir: {path, glob, order}` and its
+  misplaced-`glob` refusal had none at all; and the reload's re-read of
+  external documents had none. All four are covered and mutation-checked —
+  reverting the re-read reproduces the original symptom exactly, a
+  `"changed":["nothing"]` logged after the file on disk said otherwise.
 
 ### Fixed
 

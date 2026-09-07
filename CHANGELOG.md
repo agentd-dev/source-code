@@ -5,7 +5,10 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
-## Unreleased
+## v1.13.0 — trust lives with the instruction it protects
+
+Everything about an agent's instruction now sits under `agent.instruction.*`,
+including who may sign it — and a setting that cannot enforce anything says so.
 
 ### Changed
 

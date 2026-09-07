@@ -123,3 +123,99 @@ fn a_daemon_reloads_on_sighup_refuses_restart_only_changes_and_drains_on_sigterm
     let _ = llm.wait();
     let _ = std::fs::remove_file(&cfg_path);
 }
+
+/// A reload re-reads the DOCUMENTS the config points at, not just the config
+/// values — and says so only when something actually changed.
+///
+/// The entry `- {name: wf, file: ./x.yaml}` is byte-identical across both
+/// reloads here, so comparing the config alone (what the reload used to do)
+/// would skip the re-read entirely and report nothing changed while the file
+/// on disk said something different. The second half is the other direction:
+/// re-reading unchanged documents must NOT report a change it did not make.
+#[test]
+fn a_reload_rereads_a_workflow_file_and_reports_only_a_real_change() {
+    let mock_llm_addr = common::unique_path("mock-llm-wf", "addr");
+    let _ = std::fs::remove_file(&mock_llm_addr);
+    let mut llm = Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .args(["--internal-mock-llm", &mock_llm_addr, "final"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let llm_uri = format!("http://{}", common::read_addr_file(&mock_llm_addr));
+
+    let wf_path = common::unique_path("agentd-reload-wf", "yaml");
+    let wf = |status: &str| {
+        format!(
+            "name: worker\nsteps:\n  s: {{kind: manual}}\n  f: {{kind: finish, depends_on: [s], status: {status}}}\n"
+        )
+    };
+    std::fs::write(&wf_path, wf("completed")).unwrap();
+    let cfg_path = common::unique_path("agentd-reload-wfcfg", "yaml");
+    let cfg = format!(
+        "config_version: \"1\"\nagent:\n  name: d\n  instruction: standing\nintelligence:\n  endpoints: {llm_uri}\n  model: mock\nworkflows:\n  - name: worker\n    file: {wf_path}\nlifecycle:\n  run_until: drained\n  drain_timeout: 5s\nobservability:\n  log_level: info\n"
+    );
+    std::fs::write(&cfg_path, &cfg).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .args(["--config", &cfg_path])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn agentd");
+    let pid = child.id() as i32;
+    let stderr = child.stderr.take().unwrap();
+    let (tx, rx) = mpsc::channel::<serde_json::Value>();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                let _ = tx.send(v);
+            }
+        }
+    });
+    wait_event(&rx, "proc.ready", Duration::from_secs(20));
+
+    let changed_of = |v: &serde_json::Value| -> Vec<String> {
+        v["changed"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|c| c.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    // 1. The FILE changes; the config does not. The reload must re-read it.
+    std::fs::write(&wf_path, wf("failed")).unwrap();
+    unsafe { libc::kill(pid, libc::SIGHUP) };
+    let reloaded = wait_event(&rx, "config.reloaded", Duration::from_secs(20));
+    assert!(
+        changed_of(&reloaded).contains(&"workflows".to_string()),
+        "an edited workflow FILE is a change even though the entry is identical: {reloaded}"
+    );
+
+    // 2. Nothing changes. The re-read must not invent one.
+    unsafe { libc::kill(pid, libc::SIGHUP) };
+    let quiet = wait_event(&rx, "config.reloaded", Duration::from_secs(20));
+    assert!(
+        !changed_of(&quiet).contains(&"workflows".to_string()),
+        "re-reading unchanged documents reported a change it did not make: {quiet}"
+    );
+
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "no exit after SIGTERM");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = reader.join();
+    let _ = llm.kill();
+    let _ = llm.wait();
+    let _ = std::fs::remove_file(&cfg_path);
+    let _ = std::fs::remove_file(&wf_path);
+}

@@ -8171,6 +8171,63 @@ mod tests {
         assert_eq!(l2.settings.intelligence.model.as_deref(), Some("path"));
     }
 
+    /// Every alias must name a path the SCHEMA has. The generic `Set` arm
+    /// looks its path up in the bindings and fails loudly, but the arms that
+    /// handle `agent.instruction` / `agent.prompt` merge a patch directly —
+    /// so a typo there (or a path that moved, as `glob` and `order` did when
+    /// they went inside `dir`) would produce a document key nothing reads,
+    /// caught only if someone happened to use the flag.
+    #[test]
+    fn every_alias_names_a_real_schema_path() {
+        let bindings = paths::bindings_of(&schema::schema());
+        let missing: Vec<&str> = ALIASES
+            .iter()
+            .filter(|a| !bindings.iter().any(|b| b.path == a.path))
+            .map(|a| a.flag)
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these aliases name paths the schema does not have: {missing:?}"
+        );
+        // …and the ones this release moved point where they now live.
+        for (flag, path) in [
+            ("--instruction.glob", "agent.instruction.dir.glob"),
+            ("--instruction.order", "agent.instruction.dir.order"),
+            ("--instruction.url", "agent.instruction.url"),
+            ("--prompt.glob", "agent.prompt.dir.glob"),
+            ("--prompt.order", "agent.prompt.dir.order"),
+        ] {
+            let a = ALIASES
+                .iter()
+                .find(|a| a.flag == flag)
+                .unwrap_or_else(|| panic!("no alias {flag}"));
+            assert_eq!(a.path, path, "{flag}");
+        }
+    }
+
+    /// The config KEY renames are refused by name too, not only the flags —
+    /// `deny_unknown_fields` would say "unknown field", which tells an
+    /// operator nothing about where the setting went.
+    #[test]
+    fn renamed_instruction_keys_name_their_replacement() {
+        let load = |instruction: Value| {
+            Settings::from_document(
+                serde_json::json!({"config_version": "1",
+                    "agent": {"name": "a", "instruction": instruction},
+                    "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
+                    "store": {"kind": "memory"}}),
+                "t",
+            )
+            .unwrap_err()
+        };
+        let e = load(json!({"http": "https://docs.example/agent.md"}));
+        assert!(e.contains("renamed to `url`"), "{e}");
+        let e = load(json!({"dir": ".", "glob": "*.md"}));
+        assert!(e.contains("belongs inside `dir`"), "{e}");
+        let e = load(json!({"dir": ".", "order": "date"}));
+        assert!(e.contains("belongs inside `dir`"), "{e}");
+    }
+
     #[test]
     fn removed_flags_name_their_replacement() {
         for (flag, _) in REMOVED_FLAGS {

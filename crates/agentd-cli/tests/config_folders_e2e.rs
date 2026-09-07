@@ -155,6 +155,77 @@ fn a_workflows_folder_is_adopted_in_filename_order() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// An EXPLICIT `workflows: [{dir: …}]` entry takes the same folder source an
+/// instruction folder takes — a path, or `{path, glob, order}` — and `order`
+/// decides load order. Written and mtime-set against the name order on
+/// purpose: `date` here can only pass by reading mtimes.
+#[test]
+fn a_workflow_dir_entry_takes_the_object_form_with_its_own_order() {
+    let (root, home, work) = project("wfdirobj");
+    std::fs::create_dir_all(work.join("flows")).unwrap();
+    std::fs::write(work.join("flows/10-alpha.yaml"), wf("alpha")).unwrap();
+    std::fs::write(work.join("flows/20-bravo.yaml"), wf("bravo")).unwrap();
+    std::fs::write(work.join("flows/notes.txt"), "not a workflow\n").unwrap();
+    // alpha is FIRST by name and LAST by date.
+    set_mtime(&work.join("flows/20-bravo.yaml"), 1_000_000);
+    set_mtime(&work.join("flows/10-alpha.yaml"), 2_000_000);
+
+    let loaded = |cfg: &str| -> Vec<String> {
+        std::fs::write(work.join("agentd.yml"), format!("{BASE}{cfg}")).unwrap();
+        let (code, log) = run_in(&work, &home, &[]);
+        assert_eq!(code, Some(0), "{log}");
+        log.lines()
+            .filter(|l| l.contains("\"workflow.loaded\""))
+            .filter_map(|l| {
+                ["alpha", "bravo"]
+                    .into_iter()
+                    .find(|n| l.contains(&format!("\"name\":\"{n}\"")))
+                    .map(str::to_string)
+            })
+            .collect()
+    };
+
+    assert_eq!(
+        loaded("workflows:\n  - dir: ./flows\n"),
+        ["alpha", "bravo"],
+        "a bare path: name order, and `notes.txt` is not a workflow"
+    );
+    assert_eq!(
+        loaded("workflows:\n  - dir: { path: ./flows, glob: \"*.yaml\", order: date }\n"),
+        ["bravo", "alpha"],
+        "the object form's `order: date` reads mtimes"
+    );
+
+    // …and the setting has ONE home: `glob` beside an object `dir` is refused
+    // rather than silently ignored.
+    std::fs::write(
+        work.join("agentd.yml"),
+        format!("{BASE}workflows:\n  - dir: {{ path: ./flows }}\n    glob: \"*.yaml\"\n"),
+    )
+    .unwrap();
+    let (code, log) = run_in(&work, &home, &[]);
+    assert_eq!(code, Some(2), "{log}");
+    assert!(log.contains("put it inside"), "{log}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Set an mtime without a dependency: `utimes(2)` through libc.
+fn set_mtime(path: &Path, secs: i64) {
+    let c = std::ffi::CString::new(path.to_string_lossy().as_bytes()).unwrap();
+    let tv = [
+        libc::timeval {
+            tv_sec: secs,
+            tv_usec: 0,
+        },
+        libc::timeval {
+            tv_sec: secs,
+            tv_usec: 0,
+        },
+    ];
+    assert_eq!(unsafe { libc::utimes(c.as_ptr(), tv.as_ptr()) }, 0);
+}
+
 /// The folder is a CONVENTION: it fills in a setting nobody wrote, and never
 /// argues with one that was. An explicit `workflows:` — including an empty
 /// list meaning "none" — is the operator's decision.

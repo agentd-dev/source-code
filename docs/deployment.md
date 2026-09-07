@@ -687,8 +687,8 @@ mounted Secret files at load/reload ([`configuration.md`](configuration.md)).
 ### Management over HTTPS
 
 The **A2A listener** (`a2a.listen`, `--features a2a`) is also the management
-transport. Over it an operator issues the admin family — `drain`, `lameduck`,
-`pause`, `resume`, `cancel` (equivalently `a2a.drain`, …) — and the read
+transport. Over it an operator issues the admin family as command ops — `admin.drain`,
+`admin.lameduck`, `admin.pause`, `admin.resume`, `admin.cancel` — and the read
 commands `status` and `config` (the effective merged document, with secret
 references left unresolved). Workflow control rides the same channel:
 `workflow.run` / `workflow.status` / `workflow.cancel` / `workflow.signal`.

@@ -114,28 +114,46 @@ peer can never drain or pause the instance it is talking to.
 
 ---
 
-## 2. The operator admin methods
+## 2. The operator admin ops
 
-These five **A2A admin methods** steer a running instance without an in-band
-config change. An operator invokes them as JSON-RPC methods on the listener, and
-each returns its body directly; a refusal is a JSON-RPC error, not a result. The
-names are also reported in the capabilities manifest at `a2a.admin`, so what an
-instance advertises and what it serves cannot diverge.
+These five operations steer a running instance without an in-band config
+change. They are **command ops**: an ordinary A2A `SendMessage` carrying a
+DataPart, which is how the protocol expresses "do this specific thing", so any
+A2A client can call them without knowing anything agentd-specific.
 
-| Method | What it does | Exits the process? |
+| Op | What it does | Exits the process? |
 |---|---|---|
-| `a2a.drain` | Begin a graceful drain (identical to SIGTERM) → exit `0` | yes, eventually |
-| `a2a.lameduck` | Accepted as an alias of `a2a.drain` | yes, eventually |
-| `a2a.pause` | Hold the whole instance, or one run, at a safe boundary | no |
-| `a2a.resume` | Clear a prior `a2a.pause` | no |
-| `a2a.cancel` | Cancel one run by id | no |
+| `admin.drain` | Begin a graceful drain (identical to SIGTERM) → exit `0` | yes, eventually |
+| `admin.lameduck` | Accepted as an alias of `admin.drain` | yes, eventually |
+| `admin.pause` | Hold the whole instance, or one run, at a safe boundary | no |
+| `admin.resume` | Clear a prior `admin.pause` | no |
+| `admin.cancel` | Cancel one run by id | no |
 
-The bare spellings (`drain`, `pause`, …) are accepted too, and admin-method
-matching is case-insensitive. Every call takes an optional `reason` string
-(default `"operator request"`), which is carried into the logs and the audit
-record.
+```jsonc
+{ "jsonrpc":"2.0", "id":1, "method":"SendMessage",
+  "params": { "message": { "role":"ROLE_USER", "messageId":"m-1", "parts": [
+      { "data": { "agentd": { "op":"admin.drain", "reason":"rolling update" } } }
+  ] } } }
+```
 
-### 2.1 `a2a.drain` — graceful shutdown for a rolling update
+The reply is a completed **Task** whose result carries the acknowledgement
+(`{"ok":true,"state":"draining",…}`). Every op takes an optional `reason`
+(default `"operator request"`), carried into the logs and the audit record.
+
+**Operator-only, by role alone.** Unlike an ordinary command op, an explicit
+`grants:` entry does not reach these — not even `grants: ["*"]`. A principal
+that could drain the instance it is talking to would be an operator, and a
+delegating peer is not one. The ops appear as skills on
+`GetExtendedAgentCard` only for callers who may actually run them.
+
+> **Deprecated:** the older `a2a.drain` / `a2a.pause` / … JSON-RPC methods still
+> answer, and are declared on the agent card under
+> `https://agentd.dev/a2a/ext/admin-methods/v1` so the card does not hide a
+> surface that exists. They are **not A2A methods** — a peer that has never
+> heard of agentd cannot discover them — and they are removed in the next
+> minor. Each call logs `a2a.method.deprecated` naming its replacement.
+
+### 2.1 `admin.drain` — graceful shutdown for a rolling update
 
 `drain` trips the same one-way latch a `SIGTERM` does: readiness flips to
 NotReady, in-flight work winds down at its boundaries, state is checkpointed,
@@ -144,7 +162,8 @@ then the process exits **`0`** (a clean drain is `0`, never `143`). It returns
 
 ```jsonc
 // params are the args directly (no nested "arguments")
-{ "jsonrpc":"2.0", "id":1, "method":"a2a.drain", "params":{ "reason":"rolling update" } }
+{ "jsonrpc":"2.0", "id":1, "method":"SendMessage", "params": { "message": { "parts": [
+    { "data": { "agentd": { "op":"admin.drain", "reason":"rolling update" } } } ] } } }
 // result
 { "ok":true, "state":"draining", "reason":"rolling update" }
 ```
@@ -153,12 +172,12 @@ The drain budget is `lifecycle.drain_timeout` — a call cannot push the drain p
 it. `drain` is idempotent: a second `drain` (or a later SIGTERM) is a no-op on an
 already-draining instance.
 
-> **To drain a pod for a rolling update:** call `a2a.drain`, then let the
+> **To drain a pod for a rolling update:** call `admin.drain`, then let the
 > orchestrator wait out `terminationGracePeriodSeconds` (keep
 > `lifecycle.drain_timeout` strictly below it — see
 > [configuration §9](configuration.md)). The instance leaves on its own.
 
-### 2.2 `a2a.pause` / `a2a.resume` — hold work without leaving
+### 2.2 `admin.pause` / `admin.resume` — hold work without leaving
 
 With **no** `run` parameter, `pause` holds the **whole instance**: no new
 conversation turns dispatch and no workflow steps schedule. Intake keeps
@@ -171,13 +190,16 @@ With a `run` id, it flips just that run between `Paused` and `Running`; the
 scheduler skips paused runs and every other run keeps moving.
 
 ```jsonc
-{ "method":"a2a.pause",  "params":{} }
+{ "method":"SendMessage", "params": { "message": { "parts": [
+    { "data": { "agentd": { "op":"admin.pause" } } } ] } } }
 { "ok":true, "state":"paused", "reason":"operator request" }
 
-{ "method":"a2a.pause",  "params":{ "run":"reconcile-01J8…" } }
+{ "method":"SendMessage", "params": { "message": { "parts": [
+    { "data": { "agentd": { "op":"admin.pause", "run":"reconcile-01J8…" } } } ] } } }
 { "ok":true, "paused":"reconcile-01J8…" }
 
-{ "method":"a2a.resume", "params":{} }
+{ "method":"SendMessage", "params": { "message": { "parts": [
+    { "data": { "agentd": { "op":"admin.resume" } } } ] } } }
 { "ok":true, "state":"running" }
 ```
 
@@ -187,13 +209,14 @@ instance stays a member of the fleet. Pausing an already-terminal run is an
 id is a task-not-found error. The instance-wide hold is reported as
 `paused: true` in the `status` view.
 
-### 2.3 `a2a.cancel` — kill one run, keep the pod
+### 2.3 `admin.cancel` — kill one run, keep the pod
 
 `cancel` cancels one run **by id**, walking its live steps down — but it leaves
 the pod running (unlike `drain`, which also exits).
 
 ```jsonc
-{ "method":"a2a.cancel", "params":{ "run":"reconcile-01J8…", "reason":"superseded" } }
+{ "method":"SendMessage", "params": { "message": { "parts": [
+    { "data": { "agentd": { "op":"admin.cancel", "run":"reconcile-01J8…", "reason":"superseded" } } } ] } } }
 { "ok":true, "cancelled":"reconcile-01J8…" }
 ```
 
@@ -275,7 +298,8 @@ $ agentd --capabilities -c /etc/agentd/ops.yaml
   "a2a":{ "listen":"https://0.0.0.0:8443", "tls":true, "mtls":true, "bearer":false,
           "methods":["SendMessage","SendStreamingMessage","GetTask","CancelTask",
                      "ListTasks","SubscribeToTask","GetAgentCard"],
-          "admin":["a2a.drain","a2a.lameduck","a2a.cancel","a2a.pause","a2a.resume"],
+          "command_ops":["status","…","admin.drain","admin.pause","admin.resume","admin.cancel"],
+          "extensions":["https://agentd.dev/a2a/ext/command/v1","…"],
           "command_ops":["status","config","workflow.run",…],
           "principals":[…], "loopback_operator":false },
   "interface":{…}, "store":"mcp",
@@ -436,7 +460,7 @@ Two sinks, independently selectable:
 
 An A2A call's `action` is `a2a.<method>` — and `a2a.<method>:<op>` when the
 message carried a command DataPart — so `a2a.SendMessage:workflow.run` and
-`a2a.drain` are both first-class, filterable audit actions. This is the answer to
+`admin.drain` are both first-class, filterable audit actions. This is the answer to
 "why did the agent do that, and on whose authority?".
 
 ---

@@ -280,11 +280,24 @@ fn interface_info_and_the_debug_reads_work_over_a2a() {
     let tasks_after = count(&rpc(&addr, 4, "ListTasks", json!({})));
     assert_eq!(tasks_before, tasks_after, "interface reads are taskless");
 
-    // The agent card advertises the surface (public discovery).
+    // The agent card advertises the surface (public discovery). Position is
+    // not the claim — the command vocabulary is declared on every card — so
+    // this asks whether the interface extension is THERE, in both the current
+    // spelling and the legacy one kept for pinned clients.
     let card = rpc(&addr, 5, "GetAgentCard", json!({}));
-    assert_eq!(
-        card["capabilities"]["extensions"][0]["uri"],
-        "urn:agentd:interface"
+    let uris: Vec<&str> = card["capabilities"]["extensions"]
+        .as_array()
+        .expect("the card declares its extensions")
+        .iter()
+        .filter_map(|e| e["uri"].as_str())
+        .collect();
+    assert!(
+        uris.contains(&"https://agentd.dev/a2a/ext/interface/v1"),
+        "the interface extension is declared: {uris:?}"
+    );
+    assert!(
+        uris.contains(&"urn:agentd:interface"),
+        "and its pre-1.14 spelling, for a pinned display client: {uris:?}"
     );
 
     // A conversation turn, then read its transcript (debug).
@@ -471,9 +484,23 @@ fn the_interface_is_gated_off_by_default() {
     // …and the core surface still answers (status command untouched).
     let st = command(&addr, 4, "status", json!({}));
     assert_eq!(st["task"]["status"]["state"], "TASK_STATE_COMPLETED");
-    // The card carries no interface extension.
+    // The card promises nothing about the interface. Other extensions (the
+    // command vocabulary) are still declared — the claim under test is that a
+    // surface this instance will NOT serve is never advertised, which is what
+    // makes the card a promise.
     let card = rpc(&addr, 5, "GetAgentCard", json!({}));
-    assert!(card["capabilities"].get("extensions").is_none());
+    let uris: Vec<&str> = card["capabilities"]["extensions"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|e| e["uri"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        !uris.iter().any(|u| u.contains("interface")),
+        "the interface is off, so no interface extension may be advertised: {uris:?}"
+    );
+    assert!(
+        uris.contains(&"https://agentd.dev/a2a/ext/command/v1"),
+        "…while what this instance does serve is still declared: {uris:?}"
+    );
 
     std::fs::remove_file(&cfg).ok();
 }

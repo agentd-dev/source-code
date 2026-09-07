@@ -288,19 +288,29 @@ export class AgentdClient {
   }
 
   // ---- admin -------------------------------------------------------------
+  //
+  // Operator-only, and sent the way every other operation is: a `SendMessage`
+  // carrying a command DataPart. The older `a2a.*` JSON-RPC methods still
+  // answer but are deprecated — they are not A2A methods, so a client that
+  // used them would be speaking a private protocol.
 
   async drain(reason = 'requested from the interface'): Promise<Json> {
-    return rpc(this.ep, 'a2a.drain', { reason });
+    return this.commandResult('admin.drain', { reason });
   }
 
   /** Pause one run, or (no arg) hold the whole instance. Reversible. */
   async pause(run?: string): Promise<Json> {
-    return rpc(this.ep, 'a2a.pause', run ? { run } : {});
+    return this.commandResult('admin.pause', run ? { run } : {});
   }
 
   /** Resume a paused run / the instance. */
   async resume(run?: string): Promise<Json> {
-    return rpc(this.ep, 'a2a.resume', run ? { run } : {});
+    return this.commandResult('admin.resume', run ? { run } : {});
+  }
+
+  /** Cancel one run by id. */
+  async cancelRun(run: string, reason?: string): Promise<Json> {
+    return this.commandResult('admin.cancel', reason ? { run, reason } : { run });
   }
 
   // ---- streams -----------------------------------------------------------

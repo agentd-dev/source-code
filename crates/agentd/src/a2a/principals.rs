@@ -96,6 +96,14 @@ impl Principal {
         if self.role == Role::Anonymous {
             return false;
         }
+        // The admin family answers to the ROLE alone — checked before grants,
+        // because `grants: ["*"]` on a `user` must not hand out the power to
+        // drain the instance. The JSON-RPC spelling was hard-denied for
+        // non-operators regardless of grants; moving these onto the command
+        // surface must not quietly relax that.
+        if is_admin_op(tool) {
+            return self.role == Role::Operator;
+        }
         if tool == "status" || tool == "interface.info" {
             // Liveness and capability discovery: a named caller must be able to
             // learn whether agentd is up and what interface it offers before it
@@ -286,7 +294,23 @@ pub fn scope_key_for(id: &str) -> String {
     format!("principal:{id}")
 }
 
-/// The admin methods (operator-only).
+/// The admin COMMAND ops — the A2A-compliant spelling, invoked through
+/// `SendMessage` with a command DataPart like every other op.
+///
+/// Operator-only unconditionally: unlike an ordinary command, an explicit
+/// `grants:` entry does NOT reach these. A principal that could drain the
+/// instance it is talking to is not a peer, it is an operator, and the two
+/// are different roles on purpose.
+pub fn is_admin_op(op: &str) -> bool {
+    matches!(
+        op,
+        "admin.drain" | "admin.lameduck" | "admin.pause" | "admin.resume" | "admin.cancel"
+    )
+}
+
+/// The admin methods (operator-only). The `a2a.*` JSON-RPC spellings are
+/// DEPRECATED: they are not A2A methods, and a peer that has never heard of
+/// agentd cannot call them. [`is_admin_op`] is the replacement.
 pub fn is_admin(method: &str) -> bool {
     matches!(
         bare(method).as_str(),

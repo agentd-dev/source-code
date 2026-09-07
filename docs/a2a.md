@@ -63,6 +63,49 @@ Errors use the codes the spec assigns, because peers branch on them: `-32601`
 for a method that does not exist, `-32001` for a task that does not. A peer
 should never have to string-match an error message.
 
+### Everything else is a declared extension
+
+Those are the A2A methods, and agentd answers **only** those — the set is
+checked against an independent implementation of the spec in CI. Anything
+agentd speaks beyond them is declared on the card as an `AgentExtension`, which
+is the mechanism [the specification provides](https://github.com/a2aproject/A2A/blob/main/docs/topics/extensions.md)
+for exactly this:
+
+| Extension URI | What it declares |
+|---|---|
+| `https://agentd.dev/a2a/ext/command/v1` | the **command ops** — structured operations sent as a DataPart on `SendMessage`. Data-only: no new method, no changed core structure, never `required` |
+| `https://agentd.dev/a2a/ext/interface/v1` | `SubscribeToEvents`, the instance-wide observation feed. A method extension, because A2A has no instance-feed concept |
+| `https://agentd.dev/a2a/ext/admin-methods/v1` | the **deprecated** `a2a.*` JSON-RPC methods, declared because they are still answered, and removed in the next minor |
+
+A client activates one by listing its URI in the **`A2A-Extensions`** request
+header (comma-separated); the response echoes the header with the ones actually
+activated. Asking for an extension agentd does not implement is not an error —
+it simply is not echoed, and none of agentd's extensions is `required`, so a
+client that sends no header at all still gets a complete service.
+
+```console
+$ curl -H 'A2A-Extensions: https://agentd.dev/a2a/ext/command/v1' …
+< A2A-Extensions: https://agentd.dev/a2a/ext/command/v1
+```
+
+### Calling an operation: the command DataPart
+
+There is no tool-call primitive in A2A. The protocol's answer is a message that
+carries structured input, so an operation is an ordinary `SendMessage` whose
+part is a DataPart under the `agentd` key:
+
+```jsonc
+{ "jsonrpc":"2.0", "id":1, "method":"SendMessage",
+  "params": { "message": { "role":"ROLE_USER", "messageId":"m-1", "parts": [
+      { "data": { "agentd": { "op":"workflow.run", "workflow":"triage" } } }
+  ] } } }
+```
+
+Every op is also published as a **skill** on the agent card, and
+`GetExtendedAgentCard` narrows that list to the ops *this caller* may run — so
+"what may I ask for" is answered by the protocol's own discovery, not by
+reading this page.
+
 ### The wire is proto3 JSON
 
 A2A is defined in protocol buffers, and its JSON binding is proto3 JSON — which
@@ -133,7 +176,7 @@ reader before it reaches anyone.
 
 | Role | May call |
 |---|---|
-| `operator` | everything, unconditionally |
+| `operator` | everything, unconditionally — including the `admin.*` ops |
 | `user` | `workflow.run` / `status` / `cancel`, `subagent.send` / `status`, `plan.get`, `ask_human`, `conversation.get`, `run.get` |
 | `agent` | `workflow.run`, `workflow.status` |
 | `anonymous` | nothing — denied at every layer, and an explicit `grants: ["*"]` does not rescue it |
@@ -264,6 +307,10 @@ bearer.
 See [interface.md](interface.md) for the client surface.
 
 ## See also
+
+- [a2a-extensions.md](a2a-extensions.md) — everything agentd speaks beyond core
+  A2A, in one place: the declarations, the `A2A-Extensions` handshake, the
+  command DataPart, and the checks that keep the claim true.
 
 - [mcp.md](mcp.md) — the other direction: where tools and events come from.
 - [security.md](security.md) — principals, the trifecta rule, and what the

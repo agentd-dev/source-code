@@ -42,6 +42,41 @@ use std::time::{Duration, Instant};
 
 /// The A2A methods this surface serves, in the PascalCase dialect.
 /// `SubscribeToEvents` is served only while `interface.enabled`.
+/// The extension URI under which agentd declares its command vocabulary — the
+/// A2A-sanctioned way to say "I also speak this". A peer discovers the ops
+/// from the card instead of from our documentation.
+/// One line per command op, for the card. A skill without a description is a
+/// skill a caller has to guess at.
+fn command_description(op: &str) -> &'static str {
+    match op {
+        "status" => "Runs, subagents, conversations and budget, as one snapshot",
+        "config" => "The effective configuration, credentials redacted (operator-only)",
+        "workflow.run" => "Start a workflow; the reply is the task it runs under",
+        "workflow.status" => "The status of one run",
+        "workflow.cancel" => "Cancel one run by id",
+        "workflow.signal" => "Deliver a signal a workflow is waiting on",
+        "subagent.send" => "Send a message to a warm subagent",
+        "subagent.kill" => "Stop a subagent",
+        "subagent.status" => "The status of one subagent, or all of them",
+        "plan.get" => "The current plan",
+        "admin.drain" => "Begin a graceful drain, then exit 0 (operator-only)",
+        "admin.lameduck" => "Alias of admin.drain (operator-only)",
+        "admin.pause" => "Hold the instance, or one run, at a safe boundary (operator-only)",
+        "admin.resume" => "Clear a prior pause (operator-only)",
+        "admin.cancel" => "Cancel one run by id (operator-only)",
+        "interface.info" => "What display surface this instance offers",
+        "conversation.get" => "Read one conversation (debug)",
+        "run.get" => "Read one run (debug)",
+        "debug.events" => "The recent event ring (operator-only, debug)",
+        _ => "",
+    }
+}
+
+pub use super::surface::{
+    ADMIN_METHODS_EXTENSION, COMMAND_EXTENSION, EXTENSION_METHODS, EXTENSIONS, INTERFACE_EXTENSION,
+    INTERFACE_EXTENSION_LEGACY, command_ops_of,
+};
+
 pub const METHODS: &[&str] = &[
     "SendMessage",
     "SendStreamingMessage",
@@ -795,6 +830,17 @@ impl Runtime {
             "GetExtendedAgentCard" => self.a2a_extended_card(&principal),
             "Pair" => self.a2a_pair(&params),
             m if crate::a2a::principals::is_admin(m) => {
+                // DEPRECATED: not an A2A method. A peer that has never heard of
+                // agentd cannot discover or call it, which is the whole reason
+                // the command DataPart exists. Answered for one more minor so
+                // an operator's scripts do not break silently.
+                self.log.warn(
+                    "a2a.method.deprecated",
+                    json!({"method": m,
+                           "use": format!("SendMessage with a command DataPart {{\"op\": \"admin.{}\"}}",
+                                          bare(&method).trim_start_matches("a2a.")),
+                           "removed_in": "the next minor"}),
+                );
                 self.a2a_admin(&principal, bare(&method), &params)
             }
             other => err_obj(
@@ -1084,6 +1130,26 @@ impl Runtime {
                 "command",
                 FeedVis::Owner(Some(principal.id.clone())),
                 json!({"op": op, "principal": principal.id, "contextId": ctx}),
+            );
+        }
+        // The admin family, reached the A2A way: `SendMessage` with a command
+        // DataPart, like every other op. The result is a completed Task, which
+        // is the protocol's model for work — a stock client can call these
+        // without knowing a single agentd-specific method.
+        if crate::a2a::principals::is_admin_op(op) {
+            let body = self.a2a_admin(principal, op, &data);
+            let text = body
+                .get("state")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| op.to_string());
+            return self.task_complete_now(
+                &ctx,
+                principal,
+                Link::Turn { ctx: ctx.clone() },
+                State::Completed,
+                Some(text),
+                Some(body),
             );
         }
         match op {
@@ -2023,11 +2089,12 @@ impl Runtime {
             .unwrap_or("operator request")
             .to_string();
         match method.to_ascii_lowercase().as_str() {
-            "drain" | "a2a.drain" | "lameduck" | "a2a.lameduck" => {
+            "drain" | "a2a.drain" | "admin.drain" | "lameduck" | "a2a.lameduck"
+            | "admin.lameduck" => {
                 self.begin_drain(&reason);
                 json!({"ok": true, "state": "draining", "reason": reason})
             }
-            "cancel" | "a2a.cancel" => {
+            "cancel" | "a2a.cancel" | "admin.cancel" => {
                 if let Some(run) = params.get("run").and_then(Value::as_str) {
                     self.cancel_run(run, &reason);
                     json!({"ok": true, "cancelled": run})
@@ -2040,51 +2107,55 @@ impl Runtime {
             // without one, hold the WHOLE instance — intake continues (inbox,
             // tasks), but no new turns dispatch and no steps schedule until
             // resume. Reversible, unlike drain.
-            "pause" | "a2a.pause" => match params.get("run").and_then(Value::as_str) {
-                Some(run) => match self.runs.get_mut(run) {
-                    Some(r) if r.status.is_terminal() => {
-                        err_obj(::mcp::rpc::INVALID_PARAMS, "the run is already terminal")
+            "pause" | "a2a.pause" | "admin.pause" => {
+                match params.get("run").and_then(Value::as_str) {
+                    Some(run) => match self.runs.get_mut(run) {
+                        Some(r) if r.status.is_terminal() => {
+                            err_obj(::mcp::rpc::INVALID_PARAMS, "the run is already terminal")
+                        }
+                        Some(r) => {
+                            r.status = crate::engine::RunStatus::Paused;
+                            r.touch();
+                            self.log
+                                .info("run.paused", json!({"run": run, "reason": reason}));
+                            json!({"ok": true, "paused": run})
+                        }
+                        None => err_obj(TASK_NOT_FOUND, "no such run"),
+                    },
+                    None => {
+                        self.paused = true;
+                        crate::obs::metrics::set_paused(true);
+                        self.log.info("agent.paused", json!({"reason": reason}));
+                        self.feed_push(
+                            "lifecycle",
+                            FeedVis::All,
+                            json!({"paused": true, "reason": reason}),
+                        );
+                        json!({"ok": true, "state": "paused", "reason": reason})
                     }
-                    Some(r) => {
-                        r.status = crate::engine::RunStatus::Paused;
-                        r.touch();
-                        self.log
-                            .info("run.paused", json!({"run": run, "reason": reason}));
-                        json!({"ok": true, "paused": run})
-                    }
-                    None => err_obj(TASK_NOT_FOUND, "no such run"),
-                },
-                None => {
-                    self.paused = true;
-                    crate::obs::metrics::set_paused(true);
-                    self.log.info("agent.paused", json!({"reason": reason}));
-                    self.feed_push(
-                        "lifecycle",
-                        FeedVis::All,
-                        json!({"paused": true, "reason": reason}),
-                    );
-                    json!({"ok": true, "state": "paused", "reason": reason})
                 }
-            },
-            "resume" | "a2a.resume" => match params.get("run").and_then(Value::as_str) {
-                Some(run) => match self.runs.get_mut(run) {
-                    Some(r) if r.status == crate::engine::RunStatus::Paused => {
-                        r.status = crate::engine::RunStatus::Running;
-                        r.touch();
-                        self.log.info("run.resumed", json!({"run": run}));
-                        json!({"ok": true, "resumed": run})
+            }
+            "resume" | "a2a.resume" | "admin.resume" => {
+                match params.get("run").and_then(Value::as_str) {
+                    Some(run) => match self.runs.get_mut(run) {
+                        Some(r) if r.status == crate::engine::RunStatus::Paused => {
+                            r.status = crate::engine::RunStatus::Running;
+                            r.touch();
+                            self.log.info("run.resumed", json!({"run": run}));
+                            json!({"ok": true, "resumed": run})
+                        }
+                        Some(_) => err_obj(::mcp::rpc::INVALID_PARAMS, "the run is not paused"),
+                        None => err_obj(TASK_NOT_FOUND, "no such run"),
+                    },
+                    None => {
+                        self.paused = false;
+                        crate::obs::metrics::set_paused(false);
+                        self.log.info("agent.resumed", json!({}));
+                        self.feed_push("lifecycle", FeedVis::All, json!({"paused": false}));
+                        json!({"ok": true, "state": "running"})
                     }
-                    Some(_) => err_obj(::mcp::rpc::INVALID_PARAMS, "the run is not paused"),
-                    None => err_obj(TASK_NOT_FOUND, "no such run"),
-                },
-                None => {
-                    self.paused = false;
-                    crate::obs::metrics::set_paused(false);
-                    self.log.info("agent.resumed", json!({}));
-                    self.feed_push("lifecycle", FeedVis::All, json!({"paused": false}));
-                    json!({"ok": true, "state": "running"})
                 }
-            },
+            }
             other => err_obj(
                 UNSUPPORTED_OPERATION,
                 &format!("unknown admin op {other:?}"),
@@ -2092,14 +2163,48 @@ impl Runtime {
         }
     }
 
+    /// The command ops this instance serves, in one place: the card renders
+    /// them as skills, the extension declares them, and the capabilities
+    /// manifest reports them. Three views, one list — they cannot disagree.
+    pub(crate) fn command_ops(&self) -> Vec<&'static str> {
+        command_ops_of(&self.settings)
+    }
+
+    /// The command ops as A2A skills.
+    fn command_skills(&self) -> Vec<Value> {
+        self.command_ops()
+            .into_iter()
+            .map(|op| {
+                let tag = if crate::a2a::principals::is_admin_op(op) {
+                    "admin"
+                } else {
+                    "command"
+                };
+                json!({
+                    "id": op,
+                    "name": op,
+                    "description": command_description(op),
+                    "tags": ["command", tag],
+                    "inputModes": ["application/json"],
+                    "outputModes": ["application/json"],
+                })
+            })
+            .collect()
+    }
+
     /// The A2A agent card (served over `GetAgentCard`; the framework is
     /// POST-only, so there is no `/.well-known` GET path).
     fn a2a_agent_card(&self) -> Value {
-        let skills: Vec<Value> = self
+        let mut skills: Vec<Value> = self
             .workflows
             .values()
             .map(|w| json!({"id": w.name, "name": w.name, "description": w.description.clone().unwrap_or_default(), "tags": ["workflow"]}))
             .collect();
+        // The commands are skills too. A skill is A2A's own answer to "what can
+        // I ask this agent to do", so a stock client discovers `workflow.run`
+        // and `admin.drain` the same way it discovers a workflow — and the
+        // extended card below narrows the list to what the CALLER may run.
+        skills.extend(self.command_skills());
         // The card is a promise, so `pushNotifications` tracks whether this
         // instance will actually accept a webhook rather than whether the code
         // exists (conformance checks both directions of that).
@@ -2108,13 +2213,54 @@ impl Runtime {
             "pushNotifications": self.settings.a2a.push.enabled,
             "stateTransitionHistory": true,
         });
+        // What agentd speaks beyond the A2A core, declared the way the protocol
+        // provides for (`AgentExtension`): a URI a peer can recognise, and
+        // params it can act on. Everything callable is reachable through
+        // `SendMessage` with a command DataPart, so a client that ignores the
+        // extension entirely can still converse — `required` is false.
+        let mut extensions = vec![json!({
+            "uri": COMMAND_EXTENSION,
+            "description": "Structured operations invoked as a DataPart on SendMessage: \
+                            {\"data\": {\"agentd\": {\"op\": \"…\", …}}}. \
+                            The ops this caller may run are its skills on the extended card.",
+            "required": false,
+            "params": {"ops": self.command_ops(), "dataPartKey": "agentd"},
+        })];
         // Advertise the interface surface so a display client can discover it
         // before authenticating. The card is public, so only the on/off bit
         // rides here; `interface.info` is authenticated and carries the rest.
         if self.settings.interface.enabled {
-            capabilities["extensions"] =
-                json!([{"uri": "urn:agentd:interface", "params": {"enabled": true}}]);
+            extensions.push(json!({
+                "uri": INTERFACE_EXTENSION,
+                "description": "The instance-wide observation feed display clients render. \
+                                A2A has no instance feed, so the method is declared here.",
+                "required": false,
+                "params": {"enabled": true, "methods": ["SubscribeToEvents"]},
+            }));
+            extensions.push(json!({
+                "uri": INTERFACE_EXTENSION_LEGACY,
+                "description": "Deprecated spelling of the interface extension; use \
+                                https://agentd.dev/a2a/ext/interface/v1.",
+                "required": false,
+                "params": {"enabled": true, "deprecated": true},
+            }));
         }
+        // Declared because they are still answered. The compliant way to reach
+        // the same five operations is a command DataPart — `admin.drain` and
+        // friends — which any A2A client can send without knowing agentd.
+        extensions.push(json!({
+            "uri": ADMIN_METHODS_EXTENSION,
+            "description": "DEPRECATED custom JSON-RPC methods (a2a.drain, a2a.lameduck, \
+                            a2a.pause, a2a.resume, a2a.cancel). Superseded by the admin.* \
+                            command ops; removed in the next minor.",
+            "required": false,
+            "params": {
+                "methods": ["a2a.drain", "a2a.lameduck", "a2a.pause", "a2a.resume", "a2a.cancel"],
+                "deprecated": true,
+                "replacement": COMMAND_EXTENSION,
+            },
+        }));
+        capabilities["extensions"] = json!(extensions);
         let url = self.settings.a2a.listen.clone().unwrap_or_default();
         json!({
             "name": "agentd",
@@ -2150,12 +2296,20 @@ impl Runtime {
             return err_obj(-32007, "the extended card requires an authenticated caller");
         }
         let mut card = self.a2a_agent_card();
-        let skills: Vec<Value> = self
+        let mut skills: Vec<Value> = self
             .workflows
             .values()
             .filter(|w| principal.may_command(&format!("workflow.run:{}", w.name)))
             .map(|w| json!({"id": w.name, "name": w.name, "description": w.description.clone().unwrap_or_default(), "tags": ["workflow"]}))
             .collect();
+        // …and the ops THIS caller may run. An operator sees the admin family;
+        // a `user` does not, and that is the answer to "which tools may I
+        // call" without a second protocol.
+        skills.extend(self.command_skills().into_iter().filter(|sk| {
+            sk["id"]
+                .as_str()
+                .is_some_and(|op| principal.may_command(op))
+        }));
         card["skills"] = json!(skills);
         card["supportsAuthenticatedExtendedCard"] = json!(true);
         card
@@ -2498,6 +2652,76 @@ pub(crate) fn spawn_a2a_listener(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every method agentd answers is either an A2A method or DECLARED as an
+    /// extension. The oracle checks the first half against an independent
+    /// implementation of the spec; this checks the second, which is the half
+    /// that rots — a method added without a declaration is a private protocol
+    /// no peer can discover, and nothing else would notice.
+    #[test]
+    fn every_non_spec_method_is_declared_as_an_extension() {
+        // The A2A JSON-RPC vocabulary (the oracle pins this against a2a-rs).
+        const SPEC: &[&str] = &[
+            "SendMessage",
+            "SendStreamingMessage",
+            "GetTask",
+            "ListTasks",
+            "CancelTask",
+            "SubscribeToTask",
+            "CreateTaskPushNotificationConfig",
+            "GetTaskPushNotificationConfig",
+            "ListTaskPushNotificationConfigs",
+            "DeleteTaskPushNotificationConfig",
+            "GetExtendedAgentCard",
+        ];
+        let undeclared: Vec<&&str> = METHODS
+            .iter()
+            .filter(|m| !SPEC.contains(m))
+            .filter(|m| !EXTENSION_METHODS.iter().any(|(name, _)| name == *m))
+            .collect();
+        assert!(
+            undeclared.is_empty(),
+            "these methods are neither A2A nor declared under an extension: {undeclared:?}"
+        );
+        // …and every declaration names an extension this build can activate,
+        // so a client that asks for it by URI is actually granted it.
+        for (method, uri) in EXTENSION_METHODS {
+            assert!(
+                EXTENSIONS.contains(uri),
+                "{method:?} is declared under {uri:?}, which is not in EXTENSIONS"
+            );
+        }
+    }
+
+    /// The admin family answers to the ROLE, never to a grant. Before these
+    /// moved onto the command surface they were hard-denied for non-operators
+    /// regardless of `grants:`; the move must not relax that.
+    #[test]
+    fn admin_ops_are_operator_only_whatever_the_grants_say() {
+        use crate::a2a::principals::{Principal, is_admin_op};
+        use crate::config::v2::Role;
+        let with = |role: Role, grants: &[&str]| Principal {
+            role,
+            grants: grants.iter().map(|g| (*g).to_string()).collect(),
+            ..Principal::anonymous()
+        };
+        for op in ["admin.drain", "admin.pause", "admin.resume", "admin.cancel"] {
+            assert!(is_admin_op(op), "{op} is in the admin family");
+            assert!(
+                with(Role::Operator, &[]).may_command(op),
+                "an operator may {op} with no grants at all"
+            );
+            for role in [Role::User, Role::Agent] {
+                assert!(
+                    !with(role, &["*"]).may_command(op),
+                    "{role:?} with grants ['*'] must still not {op}"
+                );
+                assert!(!with(role, &[op]).may_command(op), "nor by naming it");
+            }
+        }
+        // …while an ordinary command still answers to grants as before.
+        assert!(with(Role::Agent, &["workflow.run"]).may_command("workflow.run"));
+    }
 
     #[test]
     fn task_ids_are_ulids_so_two_lives_cannot_mint_the_same_one() {

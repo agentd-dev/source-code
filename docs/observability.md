@@ -114,7 +114,7 @@ the core set; build-gated surfaces add a few more, noted inline.
 | `scope.trifecta_refused` / `scope.trifecta_grant` | `legs` — the Rule-of-Two refused the grant (exit 2) or `--allow-trifecta` overrode it with a warning |
 | `cgroup.armed` | `memory_max`, `memory_current`, `memory_high` — cgroup-v2 awareness (best-effort, quiet off-cgroup) |
 | `a2a.connect` / `a2a.send` / `a2a.delegate` | `peer`/`principal`/`method` — a peer connected, an A2A message/command was served, or a peer delegated a run (`--features a2a`) |
-| `a2a.drain` / `a2a.lameduck` / `a2a.pause` / `a2a.resume` / `a2a.cancel` / `a2a.denied` | an operator admin-command outcome, or an authorization refusal |
+| `a2a.denied` / `a2a.method.deprecated` | an authorization refusal, or a call to one of the deprecated `a2a.*` JSON-RPC methods (the admin OPS are audited, not logged — see below) |
 | `run.start` · `run.done` / `run.deadline` / `run.refused` / `run.stalled` / `run.dropped` | a workflow run's start + its terminal outcome |
 | `workflow.finished` / `workflow.failed` · `workflow.run` / `define` / `loaded` / `deleted` | workflow lifecycle |
 | `health.json` | `file` — the health-file heartbeat writer started |
@@ -159,8 +159,8 @@ each lives in [`docs/operations.md`](operations.md).
 | `a2a.listen` | `supervisor` | `authority`, `bound`, `tls`, `mtls`, `require_auth`, `interface`, `pairing` — the listener bound |
 | `a2a.connect` | `supervisor` | `origin`, `conn` — a peer opened a connection (level `debug`) |
 | `a2a.denied` | `supervisor` | `principal`, `method`, `op` — an authorization refusal |
-| `drain.start` / `drain.done` / `drain.abandon` | `supervisor` | the `a2a.drain` admin method and SIGTERM share this path (see the lifecycle table above) |
-| `agent.paused` / `agent.resumed` | `supervisor` | `reason` — an instance-wide `a2a.pause` hold went on or came off |
+| `drain.start` / `drain.done` / `drain.abandon` | `supervisor` | the `admin.drain` op and SIGTERM share this path (see the lifecycle table above) |
+| `agent.paused` / `agent.resumed` | `supervisor` | `reason` — an instance-wide `admin.pause` hold went on or came off |
 | `run.paused` / `run.resumed` | `supervisor` | `run`, `reason` — a single run was held or released |
 | `config.reloaded` | `supervisor` | `trigger` (`sighup`/`watch`), `changed` (the reloadable group labels; a reload with no material change reports `["nothing"]`) — a reload was **applied** |
 | `config.reload.invalid` | `supervisor` | `trigger`, `error` — the candidate did not validate; a clean no-op |
@@ -169,10 +169,12 @@ each lives in [`docs/operations.md`](operations.md).
 | `intel.swap` | `intel` | `kind` (`model`/`endpoint`), `model_from`, `model_to`, `endpoint_change`, `policy` — a hot-swap was applied at a turn boundary (no URL, no secret) |
 | `intel.swap.reject` | `intel` | a parked swap was refused at the turn boundary |
 
-> The admin methods themselves are recorded in the **audit stream**, not as
-> separate log events: an `audit` line carries `action:"a2a.drain"` (or
-> `"a2a.SendMessage:workflow.run"` for a command DataPart) with the principal,
-> role and outcome. See [operations §6](operations.md).
+> The admin ops themselves are recorded in the **audit stream**, not as
+> separate log events: every command DataPart yields an `audit` line whose
+> action is `a2a.<method>:<op>` — `"a2a.SendMessage:admin.drain"`,
+> `"a2a.SendMessage:workflow.run"` — with the principal, role and outcome. (A
+> call to a deprecated `a2a.*` method audits as `action:"a2a.a2a.drain"`, which
+> is one more reason to move off them.) See [operations §6](operations.md).
 
 > The intelligence-swap line carries the model *names* (non-secret identifiers),
 > the swap kind, and whether the endpoint list changed — **never** the endpoint
@@ -577,8 +579,8 @@ array). The same cardinality discipline as the default story applies: **never**
 
 The A2A/hot-reload surfaces add these to the frozen set:
 
-- **`agent_paused`** *(gauge, 0/1)* — `1` while an `a2a.pause` hold is in effect;
-  `0` after `a2a.resume`. **Pause is not readiness** — `agent_ready` ignores it
+- **`agent_paused`** *(gauge, 0/1)* — `1` while an `admin.pause` hold is in effect;
+  `0` after `admin.resume`. **Pause is not readiness** — `agent_ready` ignores it
   (it tracks only drain / lame-duck), so a paused instance can still read
   `agent_ready 1`. Read the `paused` field of the A2A `status` command for the
   authoritative answer: the gauge is rendered but never written, so it reads `0`

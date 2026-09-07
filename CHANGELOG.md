@@ -5,6 +5,61 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## Unreleased
+
+### Changed (breaking, with a deprecation window)
+
+- **The operator admin family is now command ops, not custom JSON-RPC
+  methods.** `admin.drain`, `admin.lameduck`, `admin.pause`, `admin.resume`
+  and `admin.cancel` are invoked as an ordinary A2A `SendMessage` carrying a
+  command DataPart, the way every other agentd operation already was — so a
+  peer holding a conformant A2A client can drain an instance without knowing
+  anything agentd-specific. The reply is a Task, which is the protocol's model
+  for work.
+
+  The old `a2a.drain` / `a2a.pause` / … methods still answer for one minor and
+  log `a2a.method.deprecated` naming the replacement. They are declared on the
+  agent card under `https://agentd.dev/a2a/ext/admin-methods/v1` — a card that
+  hid a surface the instance serves would be lying — and are removed next
+  release.
+
+  The admin family answers to the ROLE alone: an explicit `grants:` entry does
+  not reach it, not even `grants: ["*"]`, which preserves exactly what the
+  method-level check gave before.
+
+### Added
+
+- **A2A extensions, declared and negotiated the way the specification
+  provides.** Everything agentd speaks beyond the eleven core methods is now an
+  `AgentExtension` on the card, with a versioned URI, a description and
+  `required: false`:
+  `https://agentd.dev/a2a/ext/command/v1` (the command ops),
+  `https://agentd.dev/a2a/ext/interface/v1` (`SubscribeToEvents`), and the
+  deprecated-methods extension above. The `urn:agentd:interface` spelling stays
+  declared for one minor.
+
+- **The `A2A-Extensions` handshake.** A client lists the URIs it means to
+  activate; the response echoes the ones actually activated. Unknown URIs are
+  dropped rather than refused, and no extension is `required`, so a client that
+  sends no header still gets a complete service. The header is allowed in the
+  CORS preflight and exposed on the response, so a browser client can use it.
+
+- **Command ops are advertised as skills.** `GetAgentCard` lists them;
+  `GetExtendedAgentCard` narrows the list to what the CALLING principal may
+  run — so "which operations may I use" is answered by A2A's own discovery.
+
+- **[docs/a2a-extensions.md](docs/a2a-extensions.md)** — the whole subject in
+  one page: the spec's rules, what agentd declares and why, the handshake, the
+  DataPart shape with the full op table, the migration off the deprecated
+  methods, and the three checks that keep the claim true.
+
+### Fixed
+
+- **The capabilities manifest and the agent card cannot disagree about the
+  command surface.** Both, and the extension declaration, now read one list
+  (`command_ops_of`); the manifest previously carried its own copy that had
+  already drifted (it never mentioned the admin family).
+
 ## v1.13.0 — trust lives with the instruction it protects
 
 Everything about an agent's instruction now sits under `agent.instruction.*`,

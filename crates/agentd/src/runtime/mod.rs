@@ -36,6 +36,7 @@ pub mod starts;
 pub mod steps;
 pub(crate) mod streams;
 pub mod subagents;
+pub mod surface;
 pub mod timers;
 pub mod tools;
 pub mod turns;
@@ -1314,24 +1315,8 @@ pub fn capabilities(loaded: &Loaded) -> Value {
             "SubscribeToTask",
             "GetAgentCard",
         ];
-        let mut command_ops = vec![
-            "status",
-            "config",
-            "workflow.run",
-            "workflow.status",
-            "workflow.cancel",
-            "workflow.signal",
-            "subagent.send",
-            "subagent.kill",
-            "subagent.status",
-            "plan.get",
-        ];
         if s.interface.enabled {
             methods.push("SubscribeToEvents");
-            command_ops.push("interface.info");
-            if s.interface.debug {
-                command_ops.extend(["conversation.get", "run.get", "debug.events"]);
-            }
         }
         json!({
             "listen": listen,
@@ -1339,8 +1324,16 @@ pub fn capabilities(loaded: &Loaded) -> Value {
             "mtls": s.a2a.tls.client_ca.is_some(),
             "bearer": s.a2a.bearer.is_some(),
             "methods": methods,
-            "admin": ["a2a.drain", "a2a.lameduck", "a2a.cancel", "a2a.pause", "a2a.resume"],
-            "command_ops": command_ops,
+            // The command ops come from the ONE list the agent card renders as
+            // skills and the extension declares, so the manifest cannot
+            // advertise a surface the card denies (they disagreed once: the
+            // manifest listed ops the card never mentioned).
+            "command_ops": crate::runtime::surface::command_ops_of(s),
+            "extensions": crate::runtime::surface::EXTENSIONS,
+            // DEPRECATED, and named as such: these are not A2A methods. The
+            // `admin.*` ops above reach the same five operations the way the
+            // protocol provides for.
+            "admin_methods_deprecated": ["a2a.drain", "a2a.lameduck", "a2a.cancel", "a2a.pause", "a2a.resume"],
             "principals": principals,
             "loopback_operator": s.a2a.principals.is_empty(),
         })

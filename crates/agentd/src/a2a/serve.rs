@@ -472,7 +472,14 @@ async fn preflight(State(app): State<Arc<App>>, headers: HeaderMap) -> Response 
             ),
             (
                 header::ACCESS_CONTROL_ALLOW_HEADERS,
-                "content-type, authorization, last-event-id".to_string(),
+                // `a2a-extensions` rides here too, or a browser client could
+                // never activate one: the preflight would reject the header
+                // before the request that carries it is ever sent.
+                "content-type, authorization, last-event-id, a2a-extensions".to_string(),
+            ),
+            (
+                header::ACCESS_CONTROL_EXPOSE_HEADERS,
+                "a2a-extensions".to_string(),
             ),
             (header::ACCESS_CONTROL_MAX_AGE, "600".to_string()),
         ],
@@ -528,10 +535,43 @@ async fn rpc(
         .get(header::ORIGIN)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    allow_origin(
+    // The extension handshake: a client lists the extensions it means to
+    // activate, and the response says which of them actually were.
+    let activated = activated_extensions(&headers);
+    let resp = allow_origin(
         dispatch(app, peer_id, peer, headers, body).await,
         allowed.as_deref(),
-    )
+    );
+    with_activated_extensions(resp, &activated)
+}
+
+/// The `A2A-Extensions` request header, intersected with what this build can
+/// activate. Unknown URIs are ignored rather than refused: the spec's rule is
+/// that a client asks and the response reports what was granted, and none of
+/// agentd's extensions is `required`, so a request naming only unknown ones is
+/// still a perfectly good request.
+fn activated_extensions(headers: &HeaderMap) -> Vec<String> {
+    headers
+        .get("a2a-extensions")
+        .and_then(|v| v.to_str().ok())
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|u| crate::runtime::a2a_server::EXTENSIONS.contains(u))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Echo the activated set, as the spec asks a server to.
+fn with_activated_extensions(mut resp: Response, activated: &[String]) -> Response {
+    if !activated.is_empty()
+        && let Ok(v) = axum::http::HeaderValue::from_str(&activated.join(", "))
+    {
+        resp.headers_mut().insert("a2a-extensions", v);
+    }
+    resp
 }
 
 async fn dispatch(

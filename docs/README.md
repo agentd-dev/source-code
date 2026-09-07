@@ -45,6 +45,7 @@ Three properties make it different from an agent framework:
 - [node-registry.md](node-registry.md) — every workflow node, what it requires, and the traps that bite first.
 | [modes-and-triggers.md](modes-and-triggers.md) | Job or daemon, and the start nodes that decide when a run fires. |
 | [mcp.md](mcp.md) | Where tools and events come from: the client subset and the Streamable HTTP transport. |
+| [a2a-extensions.md](a2a-extensions.md) | Everything agentd speaks beyond core A2A: the declarations, the `A2A-Extensions` handshake, and the command DataPart. |
 | [why-rust.md](why-rust.md) | The dependency moat, what is hand-rolled, and where the choice costs something. |
 
 **Build & operate** — using it for real.

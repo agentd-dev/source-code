@@ -88,6 +88,13 @@ export const DOCS = [
     blurb: "How peers, operators and the display clients reach in: principals, tasks, and the agent card.",
   },
   {
+    slug: "a2a-extensions",
+    file: "docs/a2a-extensions.md",
+    title: "A2A extensions",
+    group: "concepts",
+    blurb: "Everything agentd speaks beyond core A2A: declaration, the A2A-Extensions handshake, the command DataPart, and what keeps it conformant.",
+  },
+  {
     slug: "subagents",
     file: "docs/subagents.md",
     title: "Subagents",

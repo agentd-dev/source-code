@@ -321,9 +321,20 @@ instruction_sources:
     freshness: 15m                    # re-check interval
 ```
 
-This is operator surface: a served document's `:::!config` may not write
-`document_capabilities` or `instruction_sources` — a document is never a source
-of its own trust configuration.
+**A document may not configure the terms it is judged by.** A `:::!config`
+fragment is refused outright when it writes any of:
+
+| Refused | Because |
+|---|---|
+| `agent.document_capabilities` | it is the grant set deciding which families this document may activate |
+| `agent.instruction.*` | source and `decrypt` — a document that rewrites these points the next read at itself |
+| `instruction_sources`, `instruction.*` | who may sign it, and which key opens it |
+| `security.*` | the gates: trifecta, egress, `exec`, policies, TLS trust, AAuth |
+| `identity.*` | who work is done on behalf of |
+
+The check is by **path**, not by top-level key name: the fragment merges deep
+and arrays concatenate, so a nested `agent: {document_capabilities: […]}` is
+the same self-grant as a top-level one and is refused the same way.
 
 **Revocation.** A signature is valid forever; a document that can execute code
 must stop being usable the moment it stops being sanctioned. Authorization is

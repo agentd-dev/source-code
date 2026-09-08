@@ -5,7 +5,11 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
-## Unreleased
+## v1.14.0 — who wrote it, who pushed it, and both keep being checked
+
+Two independent questions about the document an agent takes its policy from —
+who authored it, and who published the artifact carrying it — each with its own
+answer, and neither of them stopping at startup.
 
 ### Changed (breaking)
 

@@ -84,8 +84,6 @@ impl Principal {
                     None => true, // natural language / streaming
                     Some(tool) => self.may_command(tool),
                 },
-                // Operator admin family is operator-only (handled by role above).
-                m if m.starts_with("a2a.") && is_admin(m) => false,
                 _ => false,
             },
         }
@@ -306,42 +304,6 @@ pub fn is_admin_op(op: &str) -> bool {
         op,
         "admin.drain" | "admin.lameduck" | "admin.pause" | "admin.resume" | "admin.cancel"
     )
-}
-
-/// The admin methods (operator-only). The `a2a.*` JSON-RPC spellings are
-/// DEPRECATED: they are not A2A methods, and a peer that has never heard of
-/// agentd cannot call them. [`is_admin_op`] is the replacement.
-pub fn is_admin(method: &str) -> bool {
-    matches!(
-        bare(method).as_str(),
-        "a2a.drain"
-            | "a2a.lameduck"
-            | "a2a.pause"
-            | "a2a.resume"
-            | "a2a.cancel"
-            | "drain"
-            | "lameduck"
-            | "pause"
-            | "resume"
-            | "cancel"
-    )
-}
-
-/// The method name folded for matching, owned.
-///
-/// Owned rather than `&'static str` because the only way to hand a lowercased
-/// copy back as `'static` is `String::leak`, and `m` is the `method` member of
-/// a JSON-RPC request: remote input, unbounded in length, and reached *before*
-/// the caller is known to be anybody — an `Authorization: Bearer junk` header
-/// resolves to the anonymous principal rather than a 401, and every request
-/// passes through [`is_admin`] on its way to being refused. One leak per
-/// request with an attacker-chosen name is an unbounded RSS climb driven from
-/// off the box, so nothing here may outlive the call.
-fn bare(m: &str) -> String {
-    m.strip_prefix("a2a.")
-        .map(|_| m)
-        .unwrap_or(m)
-        .to_ascii_lowercase()
 }
 
 /// What the transport learned about the caller.

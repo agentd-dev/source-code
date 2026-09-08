@@ -196,16 +196,21 @@ fn a_workflow_dir_entry_takes_the_object_form_with_its_own_order() {
         "the object form's `order: date` reads mtimes"
     );
 
-    // …and the setting has ONE home: `glob` beside an object `dir` is refused
-    // rather than silently ignored.
-    std::fs::write(
-        work.join("agentd.yml"),
-        format!("{BASE}workflows:\n  - dir: {{ path: ./flows }}\n    glob: \"*.yaml\"\n"),
-    )
-    .unwrap();
-    let (code, log) = run_in(&work, &home, &[]);
-    assert_eq!(code, Some(2), "{log}");
-    assert!(log.contains("put it inside"), "{log}");
+    // …and the setting has ONE home: `glob` beside `dir` is refused rather
+    // than silently ignored, in either spelling of `dir`.
+    for entry in [
+        "  - dir: { path: ./flows }\n    glob: \"*.yaml\"\n",
+        "  - dir: ./flows\n    glob: \"*.yaml\"\n",
+    ] {
+        std::fs::write(
+            work.join("agentd.yml"),
+            format!("{BASE}workflows:\n{entry}"),
+        )
+        .unwrap();
+        let (code, log) = run_in(&work, &home, &[]);
+        assert_eq!(code, Some(2), "{log}");
+        assert!(log.contains("belongs inside"), "{log}");
+    }
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -390,8 +395,7 @@ workflows:
     steps:
       s: { kind: manual }
       f: { kind: finish, depends_on: [s], status: completed }
-  - dir: "{{config.wf_dir}}"
-    glob: "*.yaml"
+  - dir: { path: "{{config.wf_dir}}", glob: "*.yaml" }
   - name: via_file
     file: "{{config.wf_file}}"
 "#;

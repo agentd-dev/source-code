@@ -282,8 +282,7 @@ fn interface_info_and_the_debug_reads_work_over_a2a() {
 
     // The agent card advertises the surface (public discovery). Position is
     // not the claim — the command vocabulary is declared on every card — so
-    // this asks whether the interface extension is THERE, in both the current
-    // spelling and the legacy one kept for pinned clients.
+    // this asks whether the interface extension is THERE.
     let card = rpc(&addr, 5, "GetAgentCard", json!({}));
     let uris: Vec<&str> = card["capabilities"]["extensions"]
         .as_array()
@@ -294,10 +293,6 @@ fn interface_info_and_the_debug_reads_work_over_a2a() {
     assert!(
         uris.contains(&"https://agentd.dev/a2a/ext/interface/v1"),
         "the interface extension is declared: {uris:?}"
-    );
-    assert!(
-        uris.contains(&"urn:agentd:interface"),
-        "and its pre-1.14 spelling, for a pinned display client: {uris:?}"
     );
 
     // A conversation turn, then read its transcript (debug).

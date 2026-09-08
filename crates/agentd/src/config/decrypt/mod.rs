@@ -20,7 +20,7 @@ mod scrypt;
 pub mod x25519;
 
 use crate::config::envelope::{self, b64url_decode};
-use crate::config::v2::Instruction;
+use crate::config::v2::InstructionDecrypt;
 
 /// The loaded recipient-key material, resolved from operator config once.
 #[derive(Default)]
@@ -36,7 +36,7 @@ pub struct Keys {
 /// Decrypt `bytes` when they are an encrypted envelope; pass them through
 /// untouched when they are not. The single choke point every instruction
 /// source (inline, file, MCP resource, OCI blob) routes through.
-pub fn maybe_decrypt(bytes: Vec<u8>, cfg: &Instruction) -> Result<Vec<u8>, String> {
+pub fn maybe_decrypt(bytes: Vec<u8>, cfg: Option<&InstructionDecrypt>) -> Result<Vec<u8>, String> {
     if !envelope::looks_encrypted(&bytes) {
         return Ok(bytes);
     }
@@ -44,7 +44,7 @@ pub fn maybe_decrypt(bytes: Vec<u8>, cfg: &Instruction) -> Result<Vec<u8>, Strin
     if keys.x25519.is_empty() && keys.shared.is_empty() && keys.passphrase.is_none() {
         return Err(
             "the instruction is an encrypted envelope but no recipient key is configured — \
-             set instruction.decrypt.keys (and/or instruction.decrypt.passphrase)"
+             set agent.instruction.decrypt.keys (and/or …passphrase)"
                 .to_string(),
         );
     }
@@ -73,8 +73,8 @@ pub fn maybe_decrypt(bytes: Vec<u8>, cfg: &Instruction) -> Result<Vec<u8>, Strin
 /// chars of base64 — each a 32-byte key usable as BOTH an X25519 identity and
 /// a JWE `dir` shared key (the envelope's algorithm decides which it plays).
 /// `passphrase` resolves `{{secret:…}}` references before use.
-pub fn load_keys(cfg: &Instruction) -> Result<Keys, String> {
-    let Some(d) = &cfg.decrypt else {
+pub fn load_keys(cfg: Option<&InstructionDecrypt>) -> Result<Keys, String> {
+    let Some(d) = cfg else {
         return Ok(Keys::default());
     };
     let mut keys = Keys::default();
@@ -124,23 +124,21 @@ fn parse_key_line(line: &str) -> Option<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::v2::{Instruction, InstructionDecrypt};
+    use crate::config::v2::InstructionDecrypt;
 
-    fn cfg_with_key(dir: &std::path::Path, content: &str) -> Instruction {
+    fn cfg_with_key(dir: &std::path::Path, content: &str) -> InstructionDecrypt {
         let p = dir.join("key.txt");
         std::fs::write(&p, content).unwrap();
-        Instruction {
-            decrypt: Some(InstructionDecrypt {
-                keys: vec![p.to_string_lossy().into_owned()],
-                passphrase: None,
-            }),
+        InstructionDecrypt {
+            keys: vec![p.to_string_lossy().into_owned()],
+            passphrase: None,
         }
     }
 
     #[test]
     fn plaintext_passes_through_untouched() {
         let doc = b"---\nspec: \"1\"\n---\nplain".to_vec();
-        let out = maybe_decrypt(doc.clone(), &Instruction::default()).unwrap();
+        let out = maybe_decrypt(doc.clone(), None).unwrap();
         assert_eq!(out, doc);
     }
 
@@ -148,8 +146,8 @@ mod tests {
     fn an_envelope_with_no_keys_is_refused_naming_the_config() {
         let sk = [2u8; 32];
         let enc = agefile::encrypt(b"x", &[x25519::public_key(&sk)], None).unwrap();
-        let e = maybe_decrypt(enc, &Instruction::default()).unwrap_err();
-        assert!(e.contains("instruction.decrypt.keys"), "{e}");
+        let e = maybe_decrypt(enc, None).unwrap_err();
+        assert!(e.contains("agent.instruction.decrypt.keys"), "{e}");
     }
 
     #[test]
@@ -161,10 +159,10 @@ mod tests {
         let doc = b"---\nspec: \"1\"\n---\n# E2EE\n";
 
         let enc = agefile::encrypt(doc, &[pk], None).unwrap();
-        assert_eq!(maybe_decrypt(enc, &cfg).unwrap(), doc);
+        assert_eq!(maybe_decrypt(enc, Some(&cfg)).unwrap(), doc);
 
         let jwe = jwe::encrypt_ecdh_es(doc, &pk).unwrap();
-        assert_eq!(maybe_decrypt(jwe.into_bytes(), &cfg).unwrap(), doc);
+        assert_eq!(maybe_decrypt(jwe.into_bytes(), Some(&cfg)).unwrap(), doc);
     }
 
     #[test]
@@ -174,10 +172,10 @@ mod tests {
         let hexline: String = key.iter().map(|b| format!("{b:02x}")).collect();
         let cfg = cfg_with_key(dir.path(), &format!("# a comment\n{hexline}\n"));
         let jwe = jwe::encrypt_dir(b"doc", &key).unwrap();
-        assert_eq!(maybe_decrypt(jwe.into_bytes(), &cfg).unwrap(), b"doc");
+        assert_eq!(maybe_decrypt(jwe.into_bytes(), Some(&cfg)).unwrap(), b"doc");
         // Garbage key material is a config error, not a silent skip.
         let bad = cfg_with_key(dir.path(), "not a key\n");
         let enc = jwe::encrypt_dir(b"doc", &key).unwrap();
-        assert!(maybe_decrypt(enc.into_bytes(), &bad).is_err());
+        assert!(maybe_decrypt(enc.into_bytes(), Some(&bad)).is_err());
     }
 }

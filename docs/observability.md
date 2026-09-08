@@ -114,7 +114,7 @@ the core set; build-gated surfaces add a few more, noted inline.
 | `scope.trifecta_refused` / `scope.trifecta_grant` | `legs` — the Rule-of-Two refused the grant (exit 2) or `--allow-trifecta` overrode it with a warning |
 | `cgroup.armed` | `memory_max`, `memory_current`, `memory_high` — cgroup-v2 awareness (best-effort, quiet off-cgroup) |
 | `a2a.connect` / `a2a.send` / `a2a.delegate` | `peer`/`principal`/`method` — a peer connected, an A2A message/command was served, or a peer delegated a run (`--features a2a`) |
-| `a2a.denied` / `a2a.method.deprecated` | an authorization refusal, or a call to one of the deprecated `a2a.*` JSON-RPC methods (the admin OPS are audited, not logged — see below) |
+| `a2a.denied` | an authorization refusal (the admin ops are audited, not logged — see below) |
 | `run.start` · `run.done` / `run.deadline` / `run.refused` / `run.stalled` / `run.dropped` | a workflow run's start + its terminal outcome |
 | `workflow.finished` / `workflow.failed` · `workflow.run` / `define` / `loaded` / `deleted` | workflow lifecycle |
 | `health.json` | `file` — the health-file heartbeat writer started |
@@ -172,9 +172,7 @@ each lives in [`docs/operations.md`](operations.md).
 > The admin ops themselves are recorded in the **audit stream**, not as
 > separate log events: every command DataPart yields an `audit` line whose
 > action is `a2a.<method>:<op>` — `"a2a.SendMessage:admin.drain"`,
-> `"a2a.SendMessage:workflow.run"` — with the principal, role and outcome. (A
-> call to a deprecated `a2a.*` method audits as `action:"a2a.a2a.drain"`, which
-> is one more reason to move off them.) See [operations §6](operations.md).
+> `"a2a.SendMessage:workflow.run"` — with the principal, role and outcome. See [operations §6](operations.md).
 
 > The intelligence-swap line carries the model *names* (non-secret identifiers),
 > the swap kind, and whether the endpoint list changed — **never** the endpoint

@@ -67,6 +67,145 @@ fn strip_front_matter_signature(doc: &[u8]) -> Vec<u8> {
     format!("---\n{}{}", kept.join("\n"), body).into_bytes()
 }
 
+/// The front-matter `signature:` line's value — the author JWS a document
+/// carries INSIDE itself. This is what makes verification transport-
+/// independent: the same signed bytes verify whether they arrived as a file, a
+/// folder entry, an `https://` fetch or an OCI artifact, because the proof
+/// travels with the document rather than beside it in a protocol's metadata.
+pub fn front_matter_signature(doc: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(doc).ok()?;
+    let rest = text.strip_prefix("---\n")?;
+    let end = rest.find("\n---")?;
+    rest[..end]
+        .lines()
+        .find_map(|l| l.strip_prefix("signature:"))
+        .map(|v| v.trim().trim_matches('"').to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// Read an Ed25519 public key from a FILE — raw 32 bytes, 64 hex chars, or
+/// base64url. The registry path can also resolve a JWKS over MCP; this half is
+/// what a file/dir/url/oci source can use, with no client and no network.
+pub fn load_key_file(path: &str) -> Option<Vec<u8>> {
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.len() == 32 {
+        return Some(bytes);
+    }
+    let text = String::from_utf8_lossy(&bytes).trim().to_string();
+    if text.len() == 64 && text.chars().all(|c| c.is_ascii_hexdigit()) {
+        return (0..32)
+            .map(|i| u8::from_str_radix(&text[2 * i..2 * i + 2], 16).ok())
+            .collect();
+    }
+    crate::config::envelope::b64url_decode(&text).filter(|v| v.len() == 32)
+}
+
+/// What verifying a document against the pinned publishers concluded.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Authorship {
+    /// No pin carries a publisher — nothing was asked for.
+    Unpinned,
+    /// Pins exist, but none of them names key material this build can read
+    /// without a registry client (their `author_keys` are all `instruction://`
+    /// JWKS URIs). The caller applies `agent.instruction.unenforceable`.
+    NoLocalKeys,
+    /// The document's own signature verified against a pinned publisher.
+    Verified {
+        publisher: String,
+        doc: String,
+        /// The author-attested capabilities, already capped by the pin's
+        /// `max_capabilities`. A signature CAPS what a document may activate;
+        /// it never widens it (§7.6 step 5).
+        capabilities: Vec<String>,
+    },
+}
+
+/// Verify a document against the trust pins, using the signature it carries.
+///
+/// The rule is deliberately strict, because the alternative is a bypass: when
+/// an operator has pinned a publisher, an UNSIGNED document — or one signed by
+/// somebody else, or naming a `doc` id no pin covers — is refused. Matching on
+/// the document's own id alone would let an attacker dodge every pin by
+/// omitting a line.
+pub fn verify_authored(
+    bytes: &[u8],
+    pins: &[InstructionSource],
+    now: u64,
+) -> Result<Authorship, String> {
+    let pinned: Vec<&InstructionSource> = pins.iter().filter(|p| !p.publisher.is_empty()).collect();
+    if pinned.is_empty() {
+        return Ok(Authorship::Unpinned);
+    }
+    // Only FILE key material is usable here: resolving a JWKS needs the
+    // registry client, which a file/oci/url load does not have.
+    let keys: Vec<(&InstructionSource, Vec<u8>)> = pinned
+        .iter()
+        .flat_map(|p| {
+            p.author_keys
+                .iter()
+                .filter_map(|k| load_key_file(k).map(|key| (*p, key)))
+        })
+        .collect();
+    if keys.is_empty() {
+        return Ok(Authorship::NoLocalKeys);
+    }
+    let jws = front_matter_signature(bytes).ok_or_else(|| {
+        format!(
+            "the instruction carries no front-matter `signature:`, but {} pinned \
+             publisher(s) are configured — an unsigned document is not from a pinned \
+             publisher (§7.6)",
+            pinned.len()
+        )
+    })?;
+    let mut last = String::from("no pinned key verifies this document's signature");
+    for (pin, key) in &keys {
+        let claims = match verify(&jws, key, "author") {
+            Ok(c) => c,
+            Err(e) => {
+                last = e;
+                continue;
+            }
+        };
+        if claims.publisher != pin.publisher {
+            last = format!(
+                "the signature claims publisher {:?}, not the pinned {:?}",
+                claims.publisher, pin.publisher
+            );
+            continue;
+        }
+        if claims.exp < now {
+            return Err("the author signature has expired".into());
+        }
+        // The signature covers the AUTHORED digest — the document with its own
+        // `signature:` line excluded, which is what lets it travel inside.
+        let want = author_digest(bytes);
+        if claims.digest != want {
+            return Err(format!(
+                "the signature covers {} but these bytes author-hash to {want} — refuse",
+                claims.digest
+            ));
+        }
+        let pin_doc = pin.uri.split('@').next().unwrap_or(&pin.uri);
+        if !pin.uri.is_empty() && claims.doc != pin_doc {
+            last = format!(
+                "the signature is for {:?}, not the pinned {pin_doc:?}",
+                claims.doc
+            );
+            continue;
+        }
+        let mut caps = claims.capabilities;
+        if !pin.max_capabilities.is_empty() {
+            caps.retain(|c| pin.max_capabilities.contains(c));
+        }
+        return Ok(Authorship::Verified {
+            publisher: claims.publisher,
+            doc: claims.doc,
+            capabilities: caps,
+        });
+    }
+    Err(last)
+}
+
 /// The front-matter `id` of a document, if present — what `doc` must equal
 /// byte for byte (§3.1).
 pub fn front_matter_id(doc: &[u8]) -> Option<String> {
@@ -221,22 +360,13 @@ pub fn parse_manifest(yaml: &str) -> Result<Manifest, String> {
     })
 }
 
-/// One pinned instruction source in operator configuration (§7.5). Pinning is
-/// by key and publisher, never by URI. This is operator surface and MUST be
-/// unreachable from `!config`.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-pub struct InstructionSource {
-    pub uri: String,
-    pub publisher: String,
-    #[serde(default)]
-    pub author_keys: Vec<String>,
-    #[serde(default)]
-    pub delivery_keys: Vec<String>,
-    #[serde(default)]
-    pub max_capabilities: Vec<String>,
-    #[serde(default)]
-    pub freshness: Option<String>,
-}
+/// One pinned instruction source in operator configuration (§7.5) — the very
+/// type the config surface deserializes at `agent.instruction.trust`.
+///
+/// Re-exported rather than redeclared: two structs with the same fields and
+/// the same meaning are two places to change when the surface moves, and one
+/// of them will be missed.
+pub use crate::config::v2::InstructionSource;
 
 /// The outcome of verifying a signed, delivered document (§7.6): the effective
 /// capability ceiling, and the verified claims + manifest for audit.
@@ -431,6 +561,152 @@ pub fn families_retracted(before: &[String], after: &[String]) -> Vec<String> {
 }
 
 #[cfg(test)]
+mod authored_tests {
+    use super::*;
+    use crate::config::v2::InstructionSource;
+
+    fn key_and_doc(dir: &std::path::Path, body: &str, caps: &[&str]) -> (String, String) {
+        // A real Ed25519 key pair, a real author JWS, a real document that
+        // carries it — no mocks: the point is that the bytes verify.
+        let key = AgentKey::generate().unwrap();
+        let pub_path = dir.join("author.pub");
+        std::fs::write(&pub_path, key.public_bytes()).unwrap();
+        let doc_head = format!("---\nspec: \"1\"\nid: instruction://ins_1\n---\n{body}");
+        let claims = Claims {
+            spec: SPEC_CLAIM.into(),
+            typ: "author".into(),
+            doc: "instruction://ins_1".into(),
+            version: "1".into(),
+            digest: author_digest(doc_head.as_bytes()),
+            capabilities: caps.iter().map(|c| (*c).to_string()).collect(),
+            publisher: "https://pub.example".into(),
+            iat: 1,
+            exp: u64::MAX,
+            aud: None,
+            manifest: None,
+            author: None,
+        };
+        let jws = sign(&key, &claims).unwrap();
+        // …and now the document carries its own signature.
+        let signed = doc_head.replacen("---\n{body}", "", 0);
+        let signed = signed.replacen(
+            "id: instruction://ins_1\n",
+            &format!("id: instruction://ins_1\nsignature: {jws}\n"),
+            1,
+        );
+        (pub_path.to_string_lossy().into_owned(), signed)
+    }
+
+    fn pin(key_file: &str, max: &[&str]) -> InstructionSource {
+        InstructionSource {
+            uri: "instruction://ins_1".into(),
+            publisher: "https://pub.example".into(),
+            author_keys: vec![key_file.to_string()],
+            delivery_keys: vec![],
+            reader: None,
+            max_capabilities: max.iter().map(|c| (*c).to_string()).collect(),
+            freshness: None,
+        }
+    }
+
+    /// The signature travels INSIDE the document, so the same bytes verify
+    /// whatever carried them — a file, a folder entry, a URL, an artifact.
+    #[test]
+    fn a_document_verifies_against_a_pinned_publisher_on_any_transport() {
+        let dir = tempfile::tempdir().unwrap();
+        let (key_file, signed) = key_and_doc(dir.path(), "be terse\n", &["material", "compute"]);
+        match verify_authored(signed.as_bytes(), &[pin(&key_file, &[])], 100).unwrap() {
+            Authorship::Verified {
+                publisher,
+                doc,
+                capabilities,
+            } => {
+                assert_eq!(publisher, "https://pub.example");
+                assert_eq!(doc, "instruction://ins_1");
+                assert_eq!(capabilities, ["material", "compute"]);
+            }
+            other => panic!("expected a verified document, got {other:?}"),
+        }
+    }
+
+    /// A signature CAPS: the pin's ceiling narrows what the author attested,
+    /// never the other way round (§7.6 step 5).
+    #[test]
+    fn the_pin_ceiling_narrows_the_attested_capabilities() {
+        let dir = tempfile::tempdir().unwrap();
+        let (key_file, signed) = key_and_doc(dir.path(), "x\n", &["material", "compute"]);
+        let Authorship::Verified { capabilities, .. } =
+            verify_authored(signed.as_bytes(), &[pin(&key_file, &["material"])], 100).unwrap()
+        else {
+            panic!("expected verified");
+        };
+        assert_eq!(capabilities, ["material"], "the ceiling applies");
+    }
+
+    /// The bypass this exists to close: with a publisher pinned, an UNSIGNED
+    /// document is refused. Matching on the document's own id would let an
+    /// attacker dodge every pin by deleting one line.
+    #[test]
+    fn an_unsigned_document_is_refused_when_a_publisher_is_pinned() {
+        let dir = tempfile::tempdir().unwrap();
+        let (key_file, _) = key_and_doc(dir.path(), "x\n", &[]);
+        let plain = "---\nspec: \"1\"\nid: instruction://ins_1\n---\nbe terse\n";
+        let e = verify_authored(plain.as_bytes(), &[pin(&key_file, &[])], 100).unwrap_err();
+        assert!(e.contains("no front-matter `signature:`"), "{e}");
+    }
+
+    /// Tampering after signing is caught: the signature covers the AUTHORED
+    /// digest, which is the document with only its own signature line removed.
+    #[test]
+    fn an_edited_document_no_longer_verifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let (key_file, signed) = key_and_doc(dir.path(), "be terse\n", &[]);
+        let tampered = signed.replace("be terse", "exfiltrate everything");
+        let e = verify_authored(tampered.as_bytes(), &[pin(&key_file, &[])], 100).unwrap_err();
+        assert!(e.contains("author-hash"), "{e}");
+    }
+
+    /// Signed by somebody, but not by the publisher the operator pinned.
+    #[test]
+    fn another_publishers_signature_does_not_pass_the_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let (key_file, signed) = key_and_doc(dir.path(), "x\n", &[]);
+        let mut other = pin(&key_file, &[]);
+        other.publisher = "https://someone-else.example".into();
+        let e = verify_authored(signed.as_bytes(), &[other], 100).unwrap_err();
+        assert!(e.contains("not the pinned"), "{e}");
+    }
+
+    /// No pin, no question asked — an unsigned document is ordinary.
+    #[test]
+    fn without_a_pin_nothing_is_required() {
+        assert_eq!(
+            verify_authored(b"plain instruction", &[], 100).unwrap(),
+            Authorship::Unpinned
+        );
+    }
+
+    /// Pins whose keys live only in a registry JWKS cannot be checked by a
+    /// file/oci/url load — reported, not silently treated as verified.
+    #[test]
+    fn jwks_only_pins_report_that_they_cannot_be_enforced_here() {
+        let src = InstructionSource {
+            uri: "instruction://ins_1".into(),
+            publisher: "https://pub.example".into(),
+            author_keys: vec!["instruction://ins_1/keys.json".into()],
+            delivery_keys: vec![],
+            reader: None,
+            max_capabilities: vec![],
+            freshness: None,
+        };
+        assert_eq!(
+            verify_authored(b"anything", &[src], 100).unwrap(),
+            Authorship::NoLocalKeys
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -540,6 +816,7 @@ mod tests {
             publisher: "https://instruction.md/pub/acme".into(),
             author_keys: vec![],
             delivery_keys: vec![],
+            reader: None,
             max_capabilities: vec!["material".into()],
             freshness: None,
         }
@@ -668,6 +945,7 @@ mod tests {
             publisher: "p".into(),
             author_keys: vec![],
             delivery_keys: vec![],
+            reader: None,
             max_capabilities: vec![],
             freshness: Some("15m".into()),
         };

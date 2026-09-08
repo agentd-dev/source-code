@@ -88,6 +88,7 @@ fn main() {
         publisher: publisher.into(),
         author_keys: vec![],
         delivery_keys: vec![],
+        reader: None,
         max_capabilities: vec!["material".into()],
         freshness: Some("15m".into()),
     };

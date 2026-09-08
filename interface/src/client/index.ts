@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 export * from './types.js';
-export { rpc, rpcStream, sseParser } from './wire.js';
+export { COMMAND_EXTENSION, INTERFACE_EXTENSION, rpc, rpcStream, sseParser } from './wire.js';
 export { AgentdClient, normalizeTask } from './client.js';
 export type { SendOptions } from './client.js';
 export { Mirror } from './mirror.js';

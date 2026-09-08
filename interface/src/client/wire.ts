@@ -10,16 +10,32 @@ import { Endpoint, Json, RpcError } from './types.js';
 
 let nextId = 1;
 
-function headers(ep: Endpoint): Record<string, string> {
+/**
+ * The A2A extensions agentd declares on its card. A client names the ones it
+ * intends to use in `A2A-Extensions`; the response echoes what was actually
+ * activated. Neither is `required`, so sending the header is an announcement,
+ * not a precondition — but announcing lets the peer confirm the vocabulary
+ * instead of inferring it from the payload.
+ */
+export const COMMAND_EXTENSION = 'https://agentd.dev/a2a/ext/command/v1';
+export const INTERFACE_EXTENSION = 'https://agentd.dev/a2a/ext/interface/v1';
+
+function headers(ep: Endpoint, exts?: readonly string[]): Record<string, string> {
   const h: Record<string, string> = { 'content-type': 'application/json' };
   if (ep.bearer) h.authorization = `Bearer ${ep.bearer}`;
+  if (exts && exts.length > 0) h['a2a-extensions'] = exts.join(', ');
   return h;
 }
 
 /** One unary JSON-RPC call; returns `result` or throws {@link RpcError}. */
-export async function rpc(ep: Endpoint, method: string, params: Json): Promise<Json> {
+export async function rpc(
+  ep: Endpoint,
+  method: string,
+  params: Json,
+  exts?: readonly string[],
+): Promise<Json> {
   const body = JSON.stringify({ jsonrpc: '2.0', id: nextId++, method, params });
-  const res = await fetch(ep.url, { method: 'POST', headers: headers(ep), body });
+  const res = await fetch(ep.url, { method: 'POST', headers: headers(ep, exts), body });
   if (!res.ok) throw new RpcError(-res.status, `HTTP ${res.status} from ${ep.url}`);
   const v = (await res.json()) as { result?: Json; error?: { code: number; message: string } };
   if (v.error) throw new RpcError(v.error.code, v.error.message);
@@ -70,9 +86,10 @@ export async function rpcStream(
   params: Json,
   onFrame: (frame: StreamFrame) => void,
   signal?: AbortSignal,
+  exts?: readonly string[],
 ): Promise<void> {
   const body = JSON.stringify({ jsonrpc: '2.0', id: nextId++, method, params });
-  const res = await fetch(ep.url, { method: 'POST', headers: headers(ep), body, signal });
+  const res = await fetch(ep.url, { method: 'POST', headers: headers(ep, exts), body, signal });
   if (!res.ok) throw new RpcError(-res.status, `HTTP ${res.status} from ${ep.url}`);
   const ctype = res.headers.get('content-type') ?? '';
   if (!ctype.includes('text/event-stream')) {

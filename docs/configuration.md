@@ -254,14 +254,14 @@ file spelling is never in doubt.
 | `--instruction.mcp <URI>` | `agent.instruction.mcp` | — | — | A resource a declared MCP server serves (read + subscribed). |
 | `--instruction.refresh <auto\|off\|DUR>` | `agent.instruction.refresh` | — | `auto` | How often to re-read it; `auto` picks the mechanism that fits the source. §5a.2. |
 | `--instruction.unavailable <POLICY>` | `agent.instruction.unavailable` | — | `auto` | What to do when the source stops answering: `auto`, `keep`, `freeze`, `drain`, `exit`. §5a.3. |
-| `--instruction-file <PATH>` | `agent.instruction` | — | — | The earlier spelling of `--instruction.file`; still supported. |
+
 | `--prompt <VALUE>` | `agent.prompt` | `PROMPT` | *(none)* | A one-shot task: with no workflows configured, the generated run executes this while `instruction` stays the standing policy. Classified exactly as `--instruction` is, so a path names the file. |
 | `--prompt.text <TEXT>` | `agent.prompt.text` | — | — | The task itself, never read as a path or URI. |
 | `--prompt.file <PATH>` | `agent.prompt.file` | — | — | Read the task from a local file. |
 | `--prompt.dir <DIR>` | `agent.prompt.dir` | — | — | A folder of documents, combined into one task (`--prompt.glob` → `agent.prompt.dir.glob`, `--prompt.order` → `…dir.order`). |
 | `--prompt.url <URL>` | `agent.prompt.url` | — | — | An `https://` document, fetched at load. |
 | `--prompt.oci <REF>` | `agent.prompt.oci` | — | — | An OCI artifact (needs `--features oci`). |
-| `--prompt-file <PATH>` | `agent.prompt` | — | — | The earlier spelling of `--prompt.file`; still supported. |
+
 | `--intelligence <LIST>` | `intelligence.endpoints` | `INTELLIGENCE` | *(none)* | Ordered, comma-separated LLM endpoint **list** for failover. Each element is `https://host[:port][/path]` (or a loopback `http://` for a same-host dev gateway) — see §4. |
 | `-c`, `--config <PATH>` | — | `AGENT_CONFIG` | *(none)* | Load a declarative config file — YAML or JSON (§12). Repeatable; the `=` form works too. |
 
@@ -796,6 +796,11 @@ governs only what happens AFTER a successful start:
 | `exit` | stop now, non-zero | running on a stale instruction is worse than not running |
 | `auto` *(default)* | `freeze` when the source is **trust-pinned** (a `publisher` under `agent.instruction.trust`), `keep` otherwise | a stale *authorization* is a security question; an unreachable unsigned artifact is usually a blip |
 
+"Stops answering" includes answering with something the pin refuses: a re-pull
+whose signature does not verify is a failed re-read, and takes the same policy
+path. That is the point of `auto` — a registry that starts serving unsigned
+documents is a security event, not a blip.
+
 Every outcome is one log line — `instruction.unavailable` with the policy that
 applied and whether the source was trust-pinned — so a frozen or draining
 agent is never a mystery.
@@ -855,18 +860,83 @@ the document comes from; `trust` says who may have signed what they serve. (It
 was `instruction_sources` at the top level through v1.12.0; the old spelling is
 refused by name.)
 
-**Where it applies.** Signature verification runs on the registry read path, so
-a pin enforces something only when the instruction is served over MCP *and* the
-pin names that document. Beside a `file:`, `dir:`, `url:` or `oci:`
-instruction it enforces nothing — an `oci:` reference gets a content-digest
-check, which is integrity, not authorship.
+**Where it applies — everywhere.** The signature travels INSIDE the document,
+as a front-matter `signature:` line, so the same signed bytes verify however
+they arrived: a file, a folder entry, an `https://` fetch, an OCI artifact, or
+a registry read. Verification happens once the bytes are in hand (after
+decryption, before anything interprets them), against the publisher and keys
+pinned here.
+
+With a publisher pinned, an **unsigned** document is refused — as is one signed
+by anybody else, or one whose `doc` id no pin covers. Matching on the
+document's own id alone would let an attacker dodge every pin by deleting a
+line.
+
+A **folder** is verified per file, before the documents are combined: the
+combination carries no single signature, because a later document's front
+matter (its `signature:` included) is dropped when they join.
+
+**And it keeps applying.** The §7.7 freshness watch re-pulls a mutable source on
+a cadence; every re-pull is verified against the same pins before its bytes
+become the running instruction, and the capabilities it attests cap the grant
+again — a re-pulled document that attests fewer families gets fewer. A refusal
+keeps the instruction the agent already holds rather than adopting an
+unverified one. Verifying only at startup would have left open the exact case a
+pin is for: a document swapped under a running agent.
+
+The one case a local load cannot check is a pin whose `author_keys` are all
+`instruction://…keys.json` JWKS URIs — resolving one needs the registry client.
+Point `author_keys` at a key **file** to verify a file/dir/url/oci document;
+`unenforceable` decides what that case means. A build without `--features sign`
+cannot check any signature, so a pin there is a startup refusal rather than a
+silent pass.
+
+### Verifying the artifact too — `oci: {ref, cosign_key}`
+
+`trust` answers *who wrote this document*. For an OCI artifact there is a
+second, independent question — *who pushed this artifact* — and cosign answers
+it:
+
+```yaml
+agent:
+  instruction:
+    oci:
+      ref: "ghcr.io/acme/agent@sha256:…"
+      cosign_key: /etc/keys/cosign.pub    # PEM PUBLIC KEY (P-256 or Ed25519)
+```
+
+With a key configured, the pull fetches the signature cosign stores beside the
+artifact (the `sha256-….sig` tag in the same repository), verifies it against
+the key, and checks that the signed payload names **this** manifest digest —
+so a valid signature over a different artifact is refused. An unsigned artifact
+is refused too. The §7.7 freshness re-pull runs the same check: a moved tag is
+a new artifact and gets the same scrutiny.
+
+`cosign_key` is not special to `agent.instruction`: every place a document can
+come from — `agent.prompt`, a subagent template's `instruction` — resolves
+through the same code, and takes the same `oci: {ref, cosign_key}`.
+
+Public-key cosign only. Keyless verification would put a Fulcio certificate
+chain and a Rekor transparency-log lookup in the startup path, which is a poor
+trade for a runtime that counts its dependencies — the verification itself
+reuses `ring`, which the `oci` feature already builds.
+
+The two mechanisms are complementary, and neither substitutes for the other: a
+registry compromise can serve a genuinely-authored document from the wrong
+place, and a stolen push credential can publish an artifact nobody authored.
+
+**What a signature is not.** An `oci://…@sha256:` reference pins the bytes
+immutably, which defeats a tag swap but says nothing about who wrote them.
+TLS authenticates the host you dialled, often a CDN. An encrypted envelope
+proves the sender had your public key, not authorship. The pins here are the
+only thing that answers "who wrote this".
 
 **`unenforceable`** decides what that means, because a security control that
 silently does nothing is worse than an absent one:
 
 | Value | Behaviour | Use when |
 |---|---|---|
-| `warn` *(default)* | one line at startup naming the pin and why it is inert | the pin is right for production, and development runs from a file |
+| `warn` *(default)* | one line at startup naming the pin and why its keys cannot be resolved | the pin is right for production, where the registry serves the JWKS |
 | `refuse` | exit `2` | the pin is the point — if the signature cannot be checked, this is not the agent you meant to run |
 | `ignore` | silence | one config deliberately shared across deployments that differ |
 
@@ -965,8 +1035,7 @@ workflows:
     timeout: 10s                    # default 30s
     allow_private: true             # the fetch rides the same SSRF guard as http nodes
   - dir: ./workflows                # every match becomes a workflow, named by file stem
-    glob: "**/*.yaml"               # the older spelling; still supported
-  - dir:                            # the folder carries its own settings
+  - dir:                            # …or the folder carries its own settings
       path: ./workflows
       glob: "**/*.yaml"             # `*` within a segment, `**` crosses segments
       order: date                   # name (default, path order) | date (mtime, oldest first)

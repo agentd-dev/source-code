@@ -403,6 +403,14 @@ impl HttpConn {
             ("Content-Type", "application/json"),
             ("Accept", "text/event-stream"),
         ];
+        // A client activates what it speaks. The command DataPart is agentd's
+        // command extension, so a request carrying one announces it — the peer
+        // echoes back what it activated, and a peer that does not know the
+        // extension simply ignores the header. Announced only when there IS a
+        // command: an ordinary conversational message uses nothing extra.
+        if command.is_some() {
+            headers.push(("A2A-Extensions", crate::runtime::surface::COMMAND_EXTENSION));
+        }
         for (name, value) in &self.auth.headers {
             headers.push((name.as_str(), value.as_str()));
         }
@@ -561,6 +569,24 @@ impl HttpConn {
     }
 }
 
+/// Does this request's params carry a command DataPart? Used to decide
+/// whether to announce the command extension on the way out.
+fn params_carry_command(params: &Option<Value>) -> bool {
+    params
+        .as_ref()
+        .and_then(|p| p.get("message"))
+        .and_then(|m| m.get("parts"))
+        .and_then(Value::as_array)
+        .is_some_and(|parts| {
+            parts.iter().any(|part| {
+                part.get("data")
+                    .and_then(|d| d.get("agentd"))
+                    .and_then(|a| a.get("op"))
+                    .is_some()
+            })
+        })
+}
+
 impl Caller for HttpConn {
     fn call(&mut self, method: &str, params: Value, deadline: Instant) -> Result<Value, String> {
         let id = self.next_id;
@@ -571,6 +597,11 @@ impl Caller for HttpConn {
         let mut stream = self.connect(timeout)?;
         let sig = self.signature_headers(&body);
         let mut headers: Vec<(&str, &str)> = vec![("Content-Type", "application/json")];
+        // Same rule as the streaming path: announce the command extension when
+        // this request actually carries a command DataPart.
+        if params_carry_command(&req.params) {
+            headers.push(("A2A-Extensions", crate::runtime::surface::COMMAND_EXTENSION));
+        }
         for (name, value) in &self.auth.headers {
             headers.push((name.as_str(), value.as_str()));
         }

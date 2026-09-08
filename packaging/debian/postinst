@@ -1,7 +1,7 @@
 #!/bin/sh
 # cargo-deb `maintainer-scripts` — runs on install / upgrade.
 # Creates /etc/agentd/ (empty) for any operator config (e.g. an instruction
-# file referenced via --instruction-file in /etc/default/agentd).
+# file referenced via --instruction.file in /etc/default/agentd).
 
 set -e
 

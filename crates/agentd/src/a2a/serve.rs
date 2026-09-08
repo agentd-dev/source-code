@@ -668,13 +668,6 @@ async fn dispatch(
         }
         _ => {}
     }
-    if crate::a2a::principals::is_admin(&method) {
-        if !principal.is_operator() {
-            return err(id, -32003, "operator role required");
-        }
-        return unary(&app, id, &method, params, principal).await;
-    }
-
     // Authorization for the spec's methods: natural language is open to any
     // non-anonymous role; a command DataPart is checked against the role's
     // command grants.

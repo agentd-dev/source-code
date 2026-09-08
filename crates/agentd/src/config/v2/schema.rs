@@ -110,13 +110,13 @@ fn top_level_properties(
                     { "type": "object", "additionalProperties": false, "description": "long form: name the source explicitly and set everything about it here", "properties": {
                         "text": { "type": "string", "description": "the instruction itself, never read as a path or URI" },
                         "file": { "type": "string", "description": "a path on disk; watched when lifecycle.watch_config is on" },
-                        "oci": { "type": "string", "description": "an OCI artifact — ghcr.io/acme/agent:v3 (the oci:// is implied)" },
+                        "oci": oci_source(),
                         "url": { "type": "string", "description": "an https:// document, fetched at load (same key a workflow entry uses)" },
                         "dir": { "oneOf": [ { "type": "string", "description": "the folder path" }, { "type": "object", "additionalProperties": false, "required": ["path"], "properties": { "path": { "type": "string" }, "glob": { "type": "string", "description": "comma-separated globs relative to `path` (default `*.md,*.markdown,*.txt,*.instruction`); `**` recurses" }, "order": { "enum": ["name", "date"], "description": "name (default, path order) or date (mtime, oldest first)" } } } ], "description": "a folder of documents, combined into ONE document — `glob` and `order` live inside it because they qualify it and nothing else" },
                         "mcp": { "oneOf": [ { "type": "string" }, { "type": "object", "additionalProperties": false, "required": ["resource"], "properties": { "server": { "type": "string", "description": "which configured MCP server to ask; omitted = whichever one serves it" }, "resource": { "type": "string", "description": "the resource URI, e.g. instruction://ins_1@stable" } } } ], "description": "a resource a configured MCP server serves, read and subscribed — the URI alone, or {server, resource} when it matters which server is asked" },
                         "refresh": { "type": "string", "description": "how often to re-read: `auto` (default — inotify for a file, never for a digest-pinned artifact, 5m for a mutable tag or served resource), `off`, or a duration" },
                         "unavailable": { "enum": ["auto", "keep", "freeze", "drain", "exit"], "description": "when the source stops answering after startup: auto (freeze when trust-pinned, else keep), keep, freeze (refuse new work), drain (finish live work then exit 0), exit" },
-                        "unenforceable": { "enum": ["warn", "refuse", "ignore"], "description": "what a `trust` pin that cannot be enforced means at startup — signature verification runs only for an `mcp:` instruction, so a pin beside a file/dir/url/oci source, or one naming another document, enforces nothing: warn (default), refuse (exit 2), ignore" },
+                        "unenforceable": { "enum": ["warn", "refuse", "ignore"], "description": "what a `trust` pin whose keys cannot be resolved locally means at startup — `author_keys` that are all instruction:// JWKS uris need the registry client a file/dir/url/oci load does not have: warn (default), refuse (exit 2), ignore" },
                         "trust": instruction_trust,
                         "decrypt": { "type": "object", "additionalProperties": false, "description": "recipient keys for an encrypted envelope (RFC 0041)", "properties": {
                             "keys": { "type": "array", "items": { "type": "string" }, "description": "key FILE paths — an AGE-SECRET-KEY-1… identity, 64 hex chars, or base64" },
@@ -129,7 +129,7 @@ fn top_level_properties(
                         "file": { "type": "string", "description": "a path on disk" },
                         "dir": { "oneOf": [ { "type": "string", "description": "the folder path" }, { "type": "object", "additionalProperties": false, "required": ["path"], "properties": { "path": { "type": "string" }, "glob": { "type": "string", "description": "comma-separated globs relative to `path` (default `*.md,*.markdown,*.txt,*.instruction`); `**` recurses" }, "order": { "enum": ["name", "date"], "description": "name (default, path order) or date (mtime, oldest first)" } } } ], "description": "a folder of documents, combined into ONE document — `glob` and `order` live inside it because they qualify it and nothing else" },
                         "url": { "type": "string", "description": "an https:// document, fetched at load" },
-                        "oci": { "type": "string", "description": "an OCI artifact — ghcr.io/acme/task:v3" } } }
+                        "oci": oci_source() } }
                 ] },
                     "preflight": { "enum": ["never", "auto", "always"] },
                     "wake_on": { "type": "array", "items": { "enum": ["a2a_message", "human_reply", "subagent_result", "workflow_finished", "workflow_failed", "instruction_updated", "budget_resumed"] } },
@@ -355,12 +355,6 @@ fn top_level_properties(
                 "properties": {
                 "autonomous_as": { "type": "string", "description": "the actor a schedule/webhook/stream firing is attributed to (default `system`); without it the attribution chain is dropped at its first hop" },
                 "labels": { "type": "object", "additionalProperties": { "type": "string" }, "description": "labels stamped on autonomous work" } } }));
-    m.insert("instruction".to_string(), json!({ "type": "object", "additionalProperties": false,
-                "description": "envelope handling for the instruction document itself (RFC 0041). Operator surface, restart-only; a served !config may not write it.",
-                "properties": {
-                "decrypt": { "type": "object", "additionalProperties": false, "description": "end-to-end decryption: the recipient keys that open an encrypted instruction envelope (age v1 or JWE compact)", "properties": {
-                    "keys": { "type": "array", "items": { "type": "string" }, "description": "key FILE paths — each an AGE-SECRET-KEY-1… identity, 64 hex chars, or base64 (a 32-byte key; several entries support rotation)" },
-                    "passphrase": { "type": "string", "description": "the passphrase for age scrypt envelopes — a {{secret:…}} reference, resolved at use" } } } } }));
     m.insert("security".to_string(), json!({ "type": "object", "additionalProperties": false, "properties": {
                 "allow_trifecta": { "type": "boolean" },
                 "policies": { "type": "array", "description": "ordered verdicts on a tool call; first match wins, no match is allow", "items": {
@@ -389,6 +383,18 @@ fn top_level_properties(
                     "max_output": { "type": "integer" },
                     "env": { "type": "array", "items": { "type": "string" }, "description": "env var names passed through" } } },
                 "egress": { "enum": ["open", "closed"], "description": "closed = an outbound MCP dial whose URL matches no services: catalog entry is refused; default open" } } }));
+}
+
+/// One `oci:` node everywhere a document can come from: the agent's own
+/// instruction, a one-shot prompt and a subagent template all pull through
+/// the same resolver, so they take the same cosign key.
+fn oci_source() -> Value {
+    json!({ "oneOf": [
+        { "type": "string", "description": "an OCI artifact — ghcr.io/acme/agent:v3 (the oci:// is implied)" },
+        { "type": "object", "additionalProperties": false, "required": ["ref"], "properties": {
+            "ref": { "type": "string", "description": "the artifact reference; `@sha256:…` pins it immutably" },
+            "cosign_key": { "type": "string", "description": "public key FILE (PEM `PUBLIC KEY`, P-256 or Ed25519) the artifact's cosign signature must verify against — who PUSHED it, as distinct from `trust`, which pins who WROTE the document" } } }
+    ], "description": "an OCI artifact: the reference, or {ref, cosign_key} to verify the artifact signature too" })
 }
 
 fn defs_properties(
@@ -492,10 +498,9 @@ fn defs_properties(
                 "headers": { "type": "object", "additionalProperties": { "type": "string" }, "description": "headers for `url` — credential values must be {{secret:…}} references" },
                 "timeout": duration,
                 "allow_private": { "type": "boolean", "description": "permit `url` to resolve to a private/loopback address" },
-                "dir": { "oneOf": [ { "type": "string" }, { "type": "object", "additionalProperties": false, "required": ["path"], "properties": { "path": { "type": "string" }, "glob": { "type": "string", "description": "comma-separated globs relative to `path` (default `*.yaml,*.yml,*.json`); `**` recurses" }, "order": { "enum": ["name", "date"], "description": "name (default, path order) or date (mtime, oldest first)" } } } ], "description": "load every matching file in a directory; `glob` and `order` live inside the object form" },
-                "glob": { "type": "string", "description": "the older spelling of `dir: {path, glob}`, still supported beside a string `dir`" } },
+                "dir": { "oneOf": [ { "type": "string" }, { "type": "object", "additionalProperties": false, "required": ["path"], "properties": { "path": { "type": "string" }, "glob": { "type": "string", "description": "comma-separated globs relative to `path` (default `*.yaml,*.yml,*.json`); `**` recurses" }, "order": { "enum": ["name", "date"], "description": "name (default, path order) or date (mtime, oldest first)" } } } ], "description": "load every matching file in a directory; `glob` and `order` live inside the object form" } },
                 "additionalProperties": false,
-                "description": "a {name, file|uri|url} reference, a {dir, glob} directory, or an inline workflow definition" });
+                "description": "a {name, file|uri|url} reference, a {dir} directory (a path, or {path, glob, order}), or an inline workflow definition" });
     if let (Some(dst), Some(src)) = (
         wf_ref["properties"].as_object_mut(),
         workflow_doc.get("properties").and_then(Value::as_object),
@@ -532,7 +537,7 @@ fn defs_properties(
                         "file": { "type": "string", "description": "a path on disk" },
                         "dir": { "oneOf": [ { "type": "string", "description": "the folder path" }, { "type": "object", "additionalProperties": false, "required": ["path"], "properties": { "path": { "type": "string" }, "glob": { "type": "string", "description": "comma-separated globs relative to `path` (default `*.md,*.markdown,*.txt,*.instruction`); `**` recurses" }, "order": { "enum": ["name", "date"], "description": "name (default, path order) or date (mtime, oldest first)" } } } ], "description": "a folder of documents, combined into ONE document — `glob` and `order` live inside it because they qualify it and nothing else" },
                         "url": { "type": "string", "description": "an https:// document, fetched at load" },
-                        "oci": { "type": "string", "description": "an OCI artifact — ghcr.io/acme/agent:v3" } } }
+                        "oci": oci_source() } }
                 ] },
                 "params": { "type": "object", "additionalProperties": { "$ref": "#/$defs/ParamSpec" }, "description": "the ONLY holes the model may fill, schema-validated at spawn" },
                 "servers": { "type": "array", "items": { "type": "string" }, "description": "flat tier: narrowing server grants from the parent's set" },

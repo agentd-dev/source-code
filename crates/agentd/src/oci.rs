@@ -134,6 +134,24 @@ pub struct Pulled {
 /// Pull an instruction artifact by `oci://` reference — resolve, verify,
 /// select, fetch, verify. Every failure is a refusal naming the step.
 pub fn pull(uri: &str) -> Result<Pulled, String> {
+    pull_verified(uri, None)
+}
+
+/// [`pull`], with the artifact's **cosign** signature verified against
+/// `cosign_key` when one is configured.
+///
+/// This proves a different thing from the document signature that travels
+/// inside the instruction: that is who WROTE the document, this is who PUSHED
+/// this artifact. Both are worth having and neither substitutes for the other
+/// — a registry compromise can serve a genuinely-authored document from the
+/// wrong place, and a stolen push credential can publish an artifact nobody
+/// authored.
+///
+/// Public-key cosign only. Keyless (Fulcio + a Rekor transparency-log lookup)
+/// would put a certificate chain and two more network dependencies in the
+/// startup path, which is a poor trade for a runtime that counts its
+/// dependencies.
+pub fn pull_verified(uri: &str, cosign_key: Option<&str>) -> Result<Pulled, String> {
     let r = OciRef::parse(uri)?;
     let creds = docker_basic_auth(&r.host);
     let mut token: Option<String> = None;
@@ -167,6 +185,12 @@ pub fn pull(uri: &str) -> Result<Pulled, String> {
                     artifact is a single manifest — push with a plain artifact manifest"
                 .into(),
         );
+    }
+
+    // 1a. The artifact signature, before a byte of it is used.
+    if let Some(key_path) = cosign_key {
+        let key = load_cosign_key(key_path)?;
+        verify_cosign(&r, &manifest_digest, &key, &mut token, creds.as_deref())?;
     }
 
     // 2. Select the instruction layer.
@@ -277,6 +301,152 @@ fn get(
         return Err(format!("oci: response exceeds {MAX_BYTES} bytes"));
     }
     Ok(resp)
+}
+
+// ── cosign: who PUSHED this artifact ────────────────────────────────────────
+//
+// The layout is cosign's, not the OCI spec's: a signature for the manifest
+// `sha256:abc…` lives in the SAME repository under the tag `sha256-abc….sig`.
+// That tag resolves to an ordinary manifest whose layers each carry a
+// "simple signing" payload blob, with the signature itself in the layer's
+// `dev.cosignproject.cosign/signature` annotation. The payload names the
+// digest it covers, which is what ties the signature to this artifact.
+
+/// The cosign annotation that carries the base64 signature.
+const COSIGN_SIG_ANNOTATION: &str = "dev.cosignproject.cosign/signature";
+/// The media type of a cosign "simple signing" payload layer.
+const COSIGN_PAYLOAD_TYPE: &str = "application/vnd.dev.cosign.simplesigning.v1+json";
+
+/// A public key for verifying an artifact signature.
+#[derive(Debug)]
+enum CosignKey {
+    /// ECDSA P-256, cosign's default (`cosign generate-key-pair`).
+    P256(Vec<u8>),
+    /// Ed25519, for operators who chose it.
+    Ed25519(Vec<u8>),
+}
+
+/// Read a cosign public key: PEM (`-----BEGIN PUBLIC KEY-----`, SPKI DER
+/// inside) for either algorithm, or the raw point.
+///
+/// The SPKI is parsed by SHAPE rather than with an ASN.1 decoder: for these two
+/// algorithms the encoding is fixed-length and fixed-layout, so a length plus
+/// an offset check is exact — and a general DER parser is a large thing to own
+/// for two constants.
+fn load_cosign_key(path: &str) -> Result<CosignKey, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("oci: cosign key {path}: {e}"))?;
+    let body: String = text
+        .lines()
+        .filter(|l| !l.starts_with("-----"))
+        .collect::<Vec<_>>()
+        .concat();
+    let der = crate::config::envelope::b64url_decode(body.trim())
+        .ok_or_else(|| format!("oci: cosign key {path}: not base64/PEM"))?;
+    match der.len() {
+        // SPKI(P-256) = 91 bytes, the uncompressed point at 26..91 (0x04 X Y).
+        91 if der[26] == 0x04 => Ok(CosignKey::P256(der[26..].to_vec())),
+        // SPKI(Ed25519) = 44 bytes, the 32-byte key at 12..44.
+        44 => Ok(CosignKey::Ed25519(der[12..].to_vec())),
+        // A raw uncompressed point, or a raw Ed25519 key.
+        65 if der[0] == 0x04 => Ok(CosignKey::P256(der)),
+        32 => Ok(CosignKey::Ed25519(der)),
+        n => Err(format!(
+            "oci: cosign key {path}: {n}-byte key is neither a P-256 nor an Ed25519 \
+             public key (expected a PEM `PUBLIC KEY`)"
+        )),
+    }
+}
+
+/// Verify `payload` against `sig` with `key`.
+fn cosign_verify_bytes(key: &CosignKey, payload: &[u8], sig: &[u8]) -> bool {
+    match key {
+        CosignKey::P256(point) => {
+            ring::signature::UnparsedPublicKey::new(&ring::signature::ECDSA_P256_SHA256_ASN1, point)
+                .verify(payload, sig)
+                .is_ok()
+        }
+        CosignKey::Ed25519(k) => {
+            ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, k)
+                .verify(payload, sig)
+                .is_ok()
+        }
+    }
+}
+
+/// The digest a cosign payload claims to cover.
+fn cosign_payload_digest(payload: &[u8]) -> Option<String> {
+    let v: Value = serde_json::from_slice(payload).ok()?;
+    v["critical"]["image"]["docker-manifest-digest"]
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Fetch and check the cosign signature for `manifest_digest`.
+fn verify_cosign(
+    r: &OciRef,
+    manifest_digest: &str,
+    key: &CosignKey,
+    token: &mut Option<String>,
+    creds: Option<&str>,
+) -> Result<(), String> {
+    let tag = format!("{}.sig", manifest_digest.replace(':', "-"));
+    let path = format!("/v2/{}/manifests/{tag}", r.repo);
+    let accept = "application/vnd.oci.image.manifest.v1+json, \
+                  application/vnd.docker.distribution.manifest.v2+json";
+    let resp = get_with_auth(r, &path, accept, token, creds)?;
+    if !resp.is_success() {
+        return Err(format!(
+            "oci: no cosign signature for {manifest_digest} ({tag}: HTTP {}) — a key is \
+             configured, so an unsigned artifact is refused",
+            resp.status
+        ));
+    }
+    let m: Value = serde_json::from_slice(&resp.body)
+        .map_err(|e| format!("oci: cosign manifest is not JSON: {e}"))?;
+    let layers = m["layers"].as_array().cloned().unwrap_or_default();
+    let mut tried = 0;
+    for layer in &layers {
+        if layer["mediaType"].as_str() != Some(COSIGN_PAYLOAD_TYPE) {
+            continue;
+        }
+        let Some(sig_b64) = layer["annotations"][COSIGN_SIG_ANNOTATION].as_str() else {
+            continue;
+        };
+        let Some(sig) = crate::config::envelope::b64url_decode(sig_b64) else {
+            continue;
+        };
+        let Some(digest) = layer["digest"].as_str() else {
+            continue;
+        };
+        tried += 1;
+        let blob = get_blob(r, &format!("/v2/{}/blobs/{digest}", r.repo), token, creds)?;
+        // The blob is the signed payload: check it hashes to what the manifest
+        // says before trusting a signature over it.
+        let got = format!("sha256:{}", sha256_hex(&blob));
+        if got != digest {
+            return Err(format!(
+                "oci: cosign payload hashes to {got} but its manifest says {digest} — refused"
+            ));
+        }
+        if !cosign_verify_bytes(key, &blob, &sig) {
+            continue;
+        }
+        // …and that the payload covers THIS artifact, not another one the
+        // same publisher signed.
+        match cosign_payload_digest(&blob).as_deref() {
+            Some(d) if d == manifest_digest => return Ok(()),
+            Some(d) => {
+                return Err(format!(
+                    "oci: the cosign signature covers {d}, not {manifest_digest} — refused"
+                ));
+            }
+            None => continue,
+        }
+    }
+    Err(format!(
+        "oci: no cosign signature over {manifest_digest} verifies against the configured \
+         key ({tried} candidate signature(s))"
+    ))
 }
 
 /// GET with bearer auth, running the Distribution token dance once on a 401:
@@ -535,6 +705,115 @@ fn _assert_stream_traits(s: &mut dyn http::Stream) -> &mut (dyn http::Stream) {
     let _ = s as &mut dyn Read;
     let _ = s as &mut dyn Write;
     s
+}
+
+#[cfg(test)]
+mod cosign_tests {
+    use super::*;
+
+    /// A real ECDSA P-256 key pair, a real signature over a real payload: the
+    /// verifier is only worth anything if it accepts what cosign produces and
+    /// rejects everything else.
+    fn p256() -> (ring::signature::EcdsaKeyPair, Vec<u8>) {
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = ring::signature::EcdsaKeyPair::generate_pkcs8(
+            &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+            &rng,
+        )
+        .unwrap();
+        let kp = ring::signature::EcdsaKeyPair::from_pkcs8(
+            &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+            pkcs8.as_ref(),
+            &rng,
+        )
+        .unwrap();
+        let pubkey = {
+            use ring::signature::KeyPair;
+            kp.public_key().as_ref().to_vec()
+        };
+        (kp, pubkey)
+    }
+
+    #[test]
+    fn a_p256_signature_over_the_payload_verifies_and_a_tampered_one_does_not() {
+        let rng = ring::rand::SystemRandom::new();
+        let (kp, point) = p256();
+        let payload = br#"{"critical":{"image":{"docker-manifest-digest":"sha256:abc"}}}"#;
+        let sig = kp.sign(&rng, payload).unwrap();
+        let key = CosignKey::P256(point);
+        assert!(cosign_verify_bytes(&key, payload, sig.as_ref()));
+        // …a different payload under the same signature does not.
+        assert!(!cosign_verify_bytes(&key, b"other bytes", sig.as_ref()));
+        // …nor a mangled signature.
+        let mut bad = sig.as_ref().to_vec();
+        bad[10] ^= 0xff;
+        assert!(!cosign_verify_bytes(&key, payload, &bad));
+    }
+
+    /// The payload names the digest it covers; that is what binds a signature
+    /// to THIS artifact rather than another one the same key signed.
+    #[test]
+    fn the_payload_digest_is_read_from_the_simple_signing_json() {
+        let p = br#"{"critical":{"identity":{"docker-reference":"ghcr.io/acme/agent"},
+                     "image":{"docker-manifest-digest":"sha256:deadbeef"},
+                     "type":"cosign container image signature"},"optional":null}"#;
+        assert_eq!(cosign_payload_digest(p).as_deref(), Some("sha256:deadbeef"));
+        assert_eq!(cosign_payload_digest(b"not json"), None);
+    }
+
+    /// Key loading accepts what `cosign generate-key-pair` writes (a PEM SPKI)
+    /// and what an operator might paste (the raw point), and refuses the rest
+    /// by size rather than guessing.
+    #[test]
+    fn cosign_keys_load_from_pem_and_raw_forms() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, point) = p256();
+        assert_eq!(point.len(), 65, "an uncompressed P-256 point");
+
+        // A PEM SPKI, as cosign writes it: the 26-byte P-256 prefix + point.
+        let mut der = vec![
+            0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06,
+            0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
+        ];
+        der.extend_from_slice(&point);
+        assert_eq!(der.len(), 91);
+        let b64 = {
+            const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut out = String::new();
+            for c in der.chunks(3) {
+                let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
+                let n = u32::from_be_bytes([0, b[0], b[1], b[2]]);
+                for i in 0..4 {
+                    if i <= c.len() {
+                        out.push(A[(n >> (18 - 6 * i) & 63) as usize] as char);
+                    } else {
+                        out.push('=');
+                    }
+                }
+            }
+            out
+        };
+        let pem = dir.path().join("cosign.pub");
+        std::fs::write(
+            &pem,
+            format!("-----BEGIN PUBLIC KEY-----\n{b64}\n-----END PUBLIC KEY-----\n"),
+        )
+        .unwrap();
+        match load_cosign_key(pem.to_str().unwrap()).unwrap() {
+            CosignKey::P256(k) => assert_eq!(k, point, "the point survives the PEM round trip"),
+            _ => panic!("expected a P-256 key"),
+        }
+
+        // A key of the wrong size is named, not guessed at.
+        let junk = dir.path().join("junk.pub");
+        std::fs::write(
+            &junk,
+            "-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----\n",
+        )
+        .unwrap();
+        let e = load_cosign_key(junk.to_str().unwrap()).unwrap_err();
+        assert!(e.contains("neither a P-256 nor an Ed25519"), "{e}");
+    }
 }
 
 #[cfg(test)]

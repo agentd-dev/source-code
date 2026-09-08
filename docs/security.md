@@ -477,6 +477,35 @@ The client also follows **no redirects at all** — there is no `3xx`/`Location`
 redirect comes back as a response, so the redirect-chain SSRF pivot does not exist here,
 and neither does transparent redirect following.
 
+## Where the instruction came from
+
+The instruction is the agent's standing policy: whoever controls it controls
+what the agent will do. agentd can check two independent things about it, and
+they answer different questions.
+
+**Who WROTE it — `agent.instruction.trust`.** The Instruction Specification §7
+author signature travels inside the document, as a front-matter `signature:`
+line. With a publisher pinned, agentd verifies that signature after decryption
+and before anything interprets the bytes — the one point a `file:`, `dir:`,
+`url:`, `oci:` and registry-served document all converge on. An unsigned
+document is refused, as is one signed by another publisher or naming a `doc`
+id no pin covers. A folder is verified per file, before the documents combine.
+The attested capabilities CAP the grant: effective = grant ∩ ceiling ∩
+attested, so a signature can never widen what the operator gave.
+
+**Who PUSHED it — `oci: {ref, cosign_key}`.** For an OCI artifact, the cosign
+signature beside it says which publisher pushed these bytes to this registry.
+agentd fetches it, verifies it against the configured public key, and checks
+that the signed payload names this manifest digest.
+
+Neither substitutes for the other. A registry compromise can serve a genuinely
+authored document from the wrong place; a stolen push credential can publish an
+artifact nobody authored. Pinning the reference by digest (`@sha256:…`) removes
+the mutable-tag question entirely and is the cheapest of the three.
+
+A build without `--features sign` cannot check an author signature at all, so a
+configured pin is a startup refusal there rather than a silent pass.
+
 ## What agentd does not protect against
 
 Stated plainly so you size the surrounding environment correctly.
@@ -511,3 +540,6 @@ Stated plainly so you size the surrounding environment correctly.
    never co-locate it with an untrusted-content reader.
 7. Run `agentd --validate-config -c agentd.yaml` in CI — the same authority startup runs,
    exiting `2` on any diagnostic.
+8. Pin where the instruction comes from: a digest rather than a tag, `trust` for who wrote
+   it, `cosign_key` for who pushed it. A document you did not verify is a policy you did
+   not write.

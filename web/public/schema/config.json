@@ -885,8 +885,30 @@
                   "type": "string"
                 },
                 "oci": {
-                  "description": "an OCI artifact — ghcr.io/acme/agent:v3",
-                  "type": "string"
+                  "description": "an OCI artifact: the reference, or {ref, cosign_key} to verify the artifact signature too",
+                  "oneOf": [
+                    {
+                      "description": "an OCI artifact — ghcr.io/acme/agent:v3 (the oci:// is implied)",
+                      "type": "string"
+                    },
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "cosign_key": {
+                          "description": "public key FILE (PEM `PUBLIC KEY`, P-256 or Ed25519) the artifact's cosign signature must verify against — who PUSHED it, as distinct from `trust`, which pins who WROTE the document",
+                          "type": "string"
+                        },
+                        "ref": {
+                          "description": "the artifact reference; `@sha256:…` pins it immutably",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "ref"
+                      ],
+                      "type": "object"
+                    }
+                  ]
                 },
                 "text": {
                   "description": "the definition itself, never read as a path or URI",
@@ -1076,7 +1098,7 @@
     },
     "WorkflowRef": {
       "additionalProperties": false,
-      "description": "a {name, file|uri|url} reference, a {dir, glob} directory, or an inline workflow definition",
+      "description": "a {name, file|uri|url} reference, a {dir} directory (a path, or {path, glob, order}), or an inline workflow definition",
       "properties": {
         "allow_private": {
           "description": "permit `url` to resolve to a private/loopback address",
@@ -1148,10 +1170,6 @@
         },
         "file": {
           "description": "a path on disk",
-          "type": "string"
-        },
-        "glob": {
-          "description": "the older spelling of `dir: {path, glob}`, still supported beside a string `dir`",
           "type": "string"
         },
         "headers": {
@@ -2701,8 +2719,30 @@
                   ]
                 },
                 "oci": {
-                  "description": "an OCI artifact — ghcr.io/acme/agent:v3 (the oci:// is implied)",
-                  "type": "string"
+                  "description": "an OCI artifact: the reference, or {ref, cosign_key} to verify the artifact signature too",
+                  "oneOf": [
+                    {
+                      "description": "an OCI artifact — ghcr.io/acme/agent:v3 (the oci:// is implied)",
+                      "type": "string"
+                    },
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "cosign_key": {
+                          "description": "public key FILE (PEM `PUBLIC KEY`, P-256 or Ed25519) the artifact's cosign signature must verify against — who PUSHED it, as distinct from `trust`, which pins who WROTE the document",
+                          "type": "string"
+                        },
+                        "ref": {
+                          "description": "the artifact reference; `@sha256:…` pins it immutably",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "ref"
+                      ],
+                      "type": "object"
+                    }
+                  ]
                 },
                 "refresh": {
                   "description": "how often to re-read: `auto` (default — inotify for a file, never for a digest-pinned artifact, 5m for a mutable tag or served resource), `off`, or a duration",
@@ -2778,7 +2818,7 @@
                   ]
                 },
                 "unenforceable": {
-                  "description": "what a `trust` pin that cannot be enforced means at startup — signature verification runs only for an `mcp:` instruction, so a pin beside a file/dir/url/oci source, or one naming another document, enforces nothing: warn (default), refuse (exit 2), ignore",
+                  "description": "what a `trust` pin whose keys cannot be resolved locally means at startup — `author_keys` that are all instruction:// JWKS uris need the registry client a file/dir/url/oci load does not have: warn (default), refuse (exit 2), ignore",
                   "enum": [
                     "warn",
                     "refuse",
@@ -2863,8 +2903,30 @@
                   "type": "string"
                 },
                 "oci": {
-                  "description": "an OCI artifact — ghcr.io/acme/task:v3",
-                  "type": "string"
+                  "description": "an OCI artifact: the reference, or {ref, cosign_key} to verify the artifact signature too",
+                  "oneOf": [
+                    {
+                      "description": "an OCI artifact — ghcr.io/acme/agent:v3 (the oci:// is implied)",
+                      "type": "string"
+                    },
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "cosign_key": {
+                          "description": "public key FILE (PEM `PUBLIC KEY`, P-256 or Ed25519) the artifact's cosign signature must verify against — who PUSHED it, as distinct from `trust`, which pins who WROTE the document",
+                          "type": "string"
+                        },
+                        "ref": {
+                          "description": "the artifact reference; `@sha256:…` pins it immutably",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "ref"
+                      ],
+                      "type": "object"
+                    }
+                  ]
                 },
                 "text": {
                   "description": "the task itself, never read as a path or URI",
@@ -3071,31 +3133,6 @@
             "type": "string"
           },
           "description": "labels stamped on autonomous work",
-          "type": "object"
-        }
-      },
-      "type": "object"
-    },
-    "instruction": {
-      "additionalProperties": false,
-      "description": "envelope handling for the instruction document itself (RFC 0041). Operator surface, restart-only; a served !config may not write it.",
-      "properties": {
-        "decrypt": {
-          "additionalProperties": false,
-          "description": "end-to-end decryption: the recipient keys that open an encrypted instruction envelope (age v1 or JWE compact)",
-          "properties": {
-            "keys": {
-              "description": "key FILE paths — each an AGE-SECRET-KEY-1… identity, 64 hex chars, or base64 (a 32-byte key; several entries support rotation)",
-              "items": {
-                "type": "string"
-              },
-              "type": "array"
-            },
-            "passphrase": {
-              "description": "the passphrase for age scrypt envelopes — a {{secret:…}} reference, resolved at use",
-              "type": "string"
-            }
-          },
           "type": "object"
         }
       },

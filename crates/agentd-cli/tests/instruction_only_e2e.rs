@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The whole agent from ONE markdown file, through the config-defining
-//! directives: `agentd --instruction-file agent.md`, no `--config` at all.
+//! directives: `agentd --instruction.file agent.md`, no `--config` at all.
 //! The document declares its runtime (`:::!config`), an event stream
 //! (`:::!stream`), and two workflows (`:::!workflow`) that talk to each other
 //! over that stream — and the process runs them and exits clean. Also: the
@@ -57,7 +57,7 @@ fn one_markdown_file_defines_and_runs_the_whole_agent() {
     std::fs::write(&md, AGENT_MD).unwrap();
 
     let out = Command::new(env!("CARGO_BIN_EXE_agentd"))
-        .args(["--instruction-file", &md])
+        .args(["--instruction.file", &md])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .output()
@@ -88,7 +88,7 @@ fn an_explicit_flag_beats_the_documents_fragment() {
     // store and workflows included, was honoured).
     let out = Command::new(env!("CARGO_BIN_EXE_agentd"))
         .args([
-            "--instruction-file",
+            "--instruction.file",
             &md,
             "--observability.log_level",
             "warn",

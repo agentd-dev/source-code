@@ -13,7 +13,7 @@ Environment=AGENT_INTELLIGENCE=https://gw.example/v1
 EnvironmentFile=/etc/agentd/triage.env
 ExecStart=/usr/local/bin/agentd \
   --mode reactive \
-  --instruction-file /etc/agentd/triage.txt \
+  --instruction.file /etc/agentd/triage.txt \
   --model my-model \
   --mcp tickets=https://mcp-tickets.internal/mcp \
   --subscribe tickets://queue/inbound \

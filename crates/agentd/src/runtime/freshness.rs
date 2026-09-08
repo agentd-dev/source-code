@@ -18,7 +18,7 @@ use crate::state::now_ms;
 
 impl super::reactor::Runtime {
     /// Arm the freshness watch at startup/restore. A no-op unless
-    /// `instruction_sources` pins a `freshness` and the instruction is
+    /// `agent.instruction.trust` pins a `freshness` and the instruction is
     /// re-fetchable (a resource URI). Idempotent — a restart re-arms.
     pub(crate) fn arm_freshness(&mut self) {
         // Idempotent: a reload calls this again so a changed interval takes
@@ -55,7 +55,18 @@ impl super::reactor::Runtime {
         // is a security matter); an unpinned one KEEPS (a failed poll on an
         // unsigned artifact is usually a blip, and the agent holds a good copy).
         let pinned = self.settings.agent.instruction_spec.trust.iter().any(|s| {
-            !s.publisher.is_empty() && uri.starts_with(s.uri.split('@').next().unwrap_or(&s.uri))
+            if s.publisher.is_empty() {
+                return false;
+            }
+            // A REGISTRY read names the document by the same uri the pin does,
+            // and one config can pin several — so the pin has to match this
+            // one. Every other transport carries the signature inside the
+            // document, where there is nothing to match on: config load
+            // verified those bytes against these pins, so the source is
+            // pinned. Requiring the uri match there read an `oci://` source as
+            // unpinned and quietly downgraded `auto` from freeze to keep.
+            let registry = uri.starts_with("instruction://") || uri.starts_with("mcp://");
+            !registry || uri.starts_with(s.uri.split('@').next().unwrap_or(&s.uri))
         });
         let policy = match self.settings.agent.instruction_spec.unavailable {
             P::Auto if pinned => P::Freeze,
@@ -103,7 +114,7 @@ impl super::reactor::Runtime {
     ///
     /// Two inputs, and they mean different things. `agent.instruction_refresh`
     /// is a POLL interval: how current the operator wants the text.
-    /// `instruction_sources[].freshness` is the §7.7 revocation deadline: how
+    /// `agent.instruction.trust[].freshness` is the §7.7 revocation deadline: how
     /// long an authorization may go unconfirmed before the agent stops acting
     /// on it. When both are set the tighter one wins, because a poll that is
     /// slower than the deadline would let authorization expire between checks.

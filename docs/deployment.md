@@ -96,7 +96,7 @@ agentd --instruction "$(cat task.md)" --intelligence https://gw.example/v1 \
 ```
 
 Read the instruction from a file (handy for ConfigMap/Secret projection) with
-`--instruction-file`, or set `INSTRUCTION` in the environment. The intelligence
+`--instruction.file`, or set `INSTRUCTION` in the environment. The intelligence
 token is **never** logged — pass it via `AGENT_INTELLIGENCE_TOKEN` or
 `--intelligence-token`, not on a shared command line where it lands in `ps`.
 
@@ -345,7 +345,7 @@ directly. Two postures:
 
 ```bash
 # Direct HTTPS (default build):
-agentd --intelligence https://gw.example/v1 --instruction-file /etc/task.txt \
+agentd --intelligence https://gw.example/v1 --instruction.file /etc/task.txt \
   --mcp fs=https://mcp-fs.internal/mcp
 ```
 
@@ -461,7 +461,7 @@ spec:
         - name: agent
           image: ghcr.io/example/agent:1.0.0
           args:                          # a bare instruction = a `once` job
-            - --instruction-file
+            - --instruction.file
             - /etc/agentd/task.txt
             - --intelligence
             - https://gw.example/v1
@@ -500,7 +500,7 @@ spec:
             - name: agent
               image: ghcr.io/example/agent:1.0.0
               args:
-                - --instruction-file
+                - --instruction.file
                 - /etc/agentd/nightly.txt
                 - --intelligence
                 - https://gw.example/v1
@@ -667,7 +667,7 @@ spec:
           args:
             - --config=/etc/agentd/config.json      # mounted from the ConfigMap
             - --watch-config                        # reload on a ConfigMap update
-            - --instruction-file                    # only `--config` takes the `=` form
+            - --instruction.file                    # only `--config` takes the `=` form
             - /etc/agentd/task.txt
             - --metrics-addr
             - ":9090"

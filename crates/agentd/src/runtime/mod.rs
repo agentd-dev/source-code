@@ -1329,11 +1329,7 @@ pub fn capabilities(loaded: &Loaded) -> Value {
             // advertise a surface the card denies (they disagreed once: the
             // manifest listed ops the card never mentioned).
             "command_ops": crate::runtime::surface::command_ops_of(s),
-            "extensions": crate::runtime::surface::EXTENSIONS,
-            // DEPRECATED, and named as such: these are not A2A methods. The
-            // `admin.*` ops above reach the same five operations the way the
-            // protocol provides for.
-            "admin_methods_deprecated": ["a2a.drain", "a2a.lameduck", "a2a.cancel", "a2a.pause", "a2a.resume"],
+            "extensions": crate::runtime::surface::extensions_of(s),
             "principals": principals,
             "loopback_operator": s.a2a.principals.is_empty(),
         })
@@ -1581,8 +1577,24 @@ impl Runtime {
         if uri.starts_with("oci://") {
             #[cfg(feature = "oci")]
             {
-                let pulled = crate::oci::pull(uri)?;
+                // The freshness re-pull verifies exactly as the first pull did:
+                // a rotated tag is a new artifact and gets the same scrutiny.
+                let pulled = crate::oci::pull_verified(
+                    uri,
+                    self.settings
+                        .agent
+                        .instruction_spec
+                        .oci
+                        .as_ref()
+                        .and_then(crate::config::v2::OciSource::cosign_key),
+                )?;
                 let raw = self.decode_instruction_bytes(pulled.bytes)?;
+                // The pin that guarded the FIRST pull guards every re-pull. A
+                // document swapped under a running agent is precisely what an
+                // author signature is for, and a control that stops applying
+                // once the daemon is up is not a control. Refuse-and-keep: the
+                // caller surfaces the error and the running text stands.
+                let attested = self.verify_repulled_authorship(&raw)?;
                 // The DELIVERED text is the cleaned document (machinery folds
                 // to acknowledgement lines), matching what config load
                 // produced. A re-pulled document's machinery CHANGES apply on
@@ -1590,11 +1602,15 @@ impl Runtime {
                 // no longer folds keeps the running text — refuse-and-keep,
                 // never a half-applied instruction.
                 let text = if crate::config::idoc::contains_blocks(&raw) {
+                    // grant ∩ ceiling ∩ attested, exactly as §7.6 step 5 folds
+                    // it at load: a re-pulled document that attests FEWER
+                    // families gets fewer, never the set the old one carried.
                     let granted: std::collections::BTreeSet<String> = self
                         .settings
                         .agent
                         .document_capabilities
                         .iter()
+                        .filter(|c| attested.as_ref().is_none_or(|a| a.contains(c)))
                         .cloned()
                         .collect();
                     let facts: std::collections::BTreeMap<String, String> =
@@ -1642,23 +1658,60 @@ impl Runtime {
         self.subscribe_instruction_mcp(uri, server, res)
     }
 
+    /// The §7 AUTHOR signature on a re-fetched document, checked against the
+    /// same `agent.instruction.trust` pins config load used.
+    ///
+    /// Returns the attested capability families when a pin verified, `None`
+    /// when nothing is pinned. Every failure is an error — the caller keeps
+    /// the running instruction rather than adopting an unverified one.
+    ///
+    /// Only the OCI re-pull needs it: an `mcp:` read verifies on the wire
+    /// (`verify_registry_read`), and a file/url source is re-read by a config
+    /// reload, which runs the load-time check.
+    #[cfg(feature = "oci")]
+    fn verify_repulled_authorship(&self, raw: &str) -> Result<Option<Vec<String>>, String> {
+        let pins = &self.settings.agent.instruction_spec.trust;
+        if pins.is_empty() {
+            return Ok(None);
+        }
+        #[cfg(feature = "sign")]
+        {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            match crate::config::attest::verify_authored(raw.as_bytes(), pins, now)? {
+                crate::config::attest::Authorship::Verified { capabilities, .. } => {
+                    Ok(Some(capabilities))
+                }
+                // Keys this process cannot resolve locally. The operator
+                // already chose what that means at startup
+                // (`agent.instruction.unenforceable`); re-deciding it here
+                // would let a re-pull be stricter than the boot that allowed
+                // the agent to run at all.
+                crate::config::attest::Authorship::NoLocalKeys
+                | crate::config::attest::Authorship::Unpinned => Ok(None),
+            }
+        }
+        // A pin on a build that cannot verify is refused at config load, so
+        // this is unreachable in a running daemon — and fails closed anyway.
+        #[cfg(not(feature = "sign"))]
+        {
+            let _ = raw;
+            Err("the instruction is trust-pinned, but this build cannot verify signatures — rebuild with --features sign".to_string())
+        }
+    }
+
     /// Fetched instruction bytes → the plaintext document. When the `decrypt`
     /// feature is built and the bytes are an encrypted envelope (RFC 0041),
     /// they are decrypted with the operator's recipient keys first; otherwise
     /// they must be UTF-8.
     fn decode_instruction_bytes(&self, bytes: Vec<u8>) -> Result<String, String> {
         #[cfg(feature = "decrypt")]
-        let bytes = {
-            // The long form's keys win; the top-level `instruction:` section
-            // is the earlier spelling of the same setting.
-            let icfg = match &self.settings.agent.instruction_spec.decrypt {
-                Some(d) => crate::config::v2::Instruction {
-                    decrypt: Some(d.clone()),
-                },
-                None => self.settings.instruction.clone(),
-            };
-            crate::config::decrypt::maybe_decrypt(bytes, &icfg)?
-        };
+        let bytes = crate::config::decrypt::maybe_decrypt(
+            bytes,
+            self.settings.agent.instruction_spec.decrypt.as_ref(),
+        )?;
         #[cfg(not(feature = "decrypt"))]
         if crate::config::envelope::looks_encrypted(&bytes) {
             return Err(
@@ -1671,7 +1724,7 @@ impl Runtime {
     }
 
     /// §7.6 wire verification for a registry-served instruction: when an
-    /// `instruction_sources` entry pins a `publisher` for this document, the
+    /// `agent.instruction.trust` entry pins a `publisher` for this document, the
     /// read MUST carry a valid author attestation from a key of that
     /// publisher's set — and, when `reader` is configured, a valid delivery
     /// attestation for this reader too. Every failure is a refusal (the
@@ -1703,7 +1756,7 @@ impl Runtime {
         {
             let _ = (client, raw, meta);
             Err(format!(
-                "instruction_sources pins publisher {:?} for {doc_id}, but this build \
+                "agent.instruction.trust pins publisher {:?} for {doc_id}, but this build \
                  cannot verify signatures — rebuild with --features sign",
                 src.publisher
             ))
@@ -1729,7 +1782,7 @@ impl Runtime {
             }
             let jws = get("signature").ok_or_else(|| {
                 format!(
-                    "instruction_sources pins publisher {:?} but the read carries no author signature — refuse (§7.6)",
+                    "agent.instruction.trust pins publisher {:?} but the read carries no author signature — refuse (§7.6)",
                     src.publisher
                 )
             })?;

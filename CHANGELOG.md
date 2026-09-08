@@ -7,7 +7,7 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 
 ## Unreleased
 
-### Changed (breaking, with a deprecation window)
+### Changed (breaking)
 
 - **The operator admin family is now command ops, not custom JSON-RPC
   methods.** `admin.drain`, `admin.lameduck`, `admin.pause`, `admin.resume`
@@ -17,15 +17,103 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   anything agentd-specific. The reply is a Task, which is the protocol's model
   for work.
 
-  The old `a2a.drain` / `a2a.pause` / … methods still answer for one minor and
-  log `a2a.method.deprecated` naming the replacement. They are declared on the
-  agent card under `https://agentd.dev/a2a/ext/admin-methods/v1` — a card that
-  hid a surface the instance serves would be lying — and are removed next
-  release.
+  The old `a2a.drain` / `a2a.pause` / … methods are **removed**, not
+  deprecated: a call gets `-32601` and the code that served them is deleted.
+  They were never A2A methods, so no conformant peer could reach them; keeping
+  a second spelling alive would only have delayed the day somebody depended on
+  it. agentd's own TypeScript client moved with them.
 
   The admin family answers to the ROLE alone: an explicit `grants:` entry does
   not reach it, not even `grants: ["*"]`, which preserves exactly what the
   method-level check gave before.
+
+### Security
+
+- **A pinned publisher is now verified on every transport, not just MCP.** The
+  §7 author signature travels inside the document as a front-matter
+  `signature:` line — `author_digest` has always excluded that line so it
+  could — and it is checked at the one point every source converges on: after
+  decryption, before anything interprets the bytes. A `file:`, `dir:`, `url:`
+  or `oci:` instruction now gets the same authorship guarantee a registry read
+  had.
+
+  With a publisher pinned, an unsigned document is REFUSED, as is one signed by
+  another publisher or naming a `doc` id no pin covers — matching on the
+  document's own id alone would let an attacker dodge every pin by deleting a
+  line. The attested capabilities cap the grant exactly as they do on the wire
+  (§7.6 step 5): grant ∩ ceiling ∩ attested.
+
+  A folder is verified **per file**, before combining: the combination carries
+  no single signature, since a later document's front matter is dropped when
+  they join. A pin whose `author_keys` are all registry JWKS URIs cannot be
+  resolved by a local load, and falls to `agent.instruction.unenforceable`.
+
+  This wires up `attest::verify_document`'s sibling path — the verification
+  code was written, tested and exercised only by an example.
+
+- **OCI artifacts can require a cosign signature** — `oci: {ref, cosign_key}`.
+  The pull fetches the signature cosign stores beside the artifact (the
+  `sha256-....sig` tag), verifies it against the configured public key (PEM
+  SPKI, P-256 or Ed25519), and checks that the signed payload names THIS
+  manifest digest — so a valid signature over a different artifact is refused,
+  as is an unsigned one. The freshness re-pull applies the same check, because
+  a moved tag is a new artifact.
+
+  It answers a different question from `trust`: who PUSHED the artifact, versus
+  who WROTE the document. Public-key only — keyless would add a Fulcio chain
+  and a Rekor lookup to the startup path; the verification reuses the `ring`
+  the `oci` feature already builds, so no new dependency.
+
+  `cosign_key` is not special to `agent.instruction`: `agent.prompt` and a
+  subagent template's `instruction` resolve through the same code and take the
+  same `oci: {ref, cosign_key}`.
+
+- **A trust pin keeps applying after startup.** The §7.7 freshness watch
+  re-pulls an `oci:` instruction on a cadence, and adopted whatever came back:
+  the author signature was checked at config load and never again. A pin exists
+  precisely because a document can be swapped under a RUNNING agent, so
+  verifying only at boot left the hole open. Every re-pull now verifies against
+  the same pins, caps capabilities by what the NEW document attests (a
+  re-pulled document that attests fewer families gets fewer), and refuses by
+  keeping the running instruction rather than adopting an unverified one.
+
+- **`unavailable: auto` freezes a pinned OCI source, as documented.** The
+  pinned/unpinned decision matched the pin's `uri` against the source's — which
+  works for a registry read, where both name the same document, and never
+  matches an `oci://`, `file:` or `url:` source, whose signature travels inside
+  the document instead. So `auto` silently read a pinned artifact as unpinned
+  and chose `keep` where the docs promise `freeze`.
+
+- **One `InstructionSource`.** The trust-pin type existed twice, once in the
+  config surface and once in `attest`; they were the same fields with the same
+  meaning, which is two places to update and one to forget.
+
+### Removed
+
+- **Every legacy spelling.** No deprecation windows anywhere in the config or
+  CLI surface: each of these is refused by name, pointing at its replacement,
+  and the code that served it is deleted.
+
+  | Gone | Use |
+  |---|---|
+  | `--instruction-file` | `--instruction.file` (or `--instruction <PATH>`) |
+  | `--prompt-file` | `--prompt.file` (or `--prompt <PATH>`) |
+  | top-level `instruction: {decrypt}` | `agent.instruction.decrypt` |
+  | a workflow entry's flat `glob:` beside `dir:` | `dir: {path, glob, order}` |
+
+- **The superseded config loader.** `config::Config` — the pre-`config_version`
+  loader with its own `load`/`reload`/`validate`/`effective_view` and its own
+  `RESTART_ONLY_FIELDS` list — is deleted, about 4,300 lines. `config::v2`'s
+  `Settings` has been the only loader the runtime calls for several releases;
+  the old type stayed compiled, and every guardrail test that walks the config
+  surface had to walk it twice. Two answers to "is this field reloadable?" is
+  one answer too many.
+
+  Dead code went with them: `principals::is_admin` and `principals::bare` (the
+  compiler found the second), the bare `drain`/`pause`/`cancel` match arms that
+  only the removed methods could reach, the operator pre-check in the listener,
+  and the manifest's deprecated-methods field. `maybe_decrypt` now takes the
+  recipient keys rather than a config section that no longer exists.
 
 ### Added
 
@@ -33,10 +121,9 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   provides.** Everything agentd speaks beyond the eleven core methods is now an
   `AgentExtension` on the card, with a versioned URI, a description and
   `required: false`:
-  `https://agentd.dev/a2a/ext/command/v1` (the command ops),
-  `https://agentd.dev/a2a/ext/interface/v1` (`SubscribeToEvents`), and the
-  deprecated-methods extension above. The `urn:agentd:interface` spelling stays
-  declared for one minor.
+  `https://agentd.dev/a2a/ext/command/v1` (the command ops) and
+  `https://agentd.dev/a2a/ext/interface/v1` (`SubscribeToEvents`). The earlier
+  `urn:agentd:interface` spelling is gone with everything else.
 
 - **The `A2A-Extensions` handshake.** A client lists the URIs it means to
   activate; the response echoes the ones actually activated. Unknown URIs are
@@ -50,15 +137,55 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 
 - **[docs/a2a-extensions.md](docs/a2a-extensions.md)** — the whole subject in
   one page: the spec's rules, what agentd declares and why, the handshake, the
-  DataPart shape with the full op table, the migration off the deprecated
+  DataPart shape with the full op table, the one-line migration off the removed
   methods, and the three checks that keep the claim true.
 
 ### Fixed
 
-- **The capabilities manifest and the agent card cannot disagree about the
-  command surface.** Both, and the extension declaration, now read one list
-  (`command_ops_of`); the manifest previously carried its own copy that had
-  already drifted (it never mentioned the admin family).
+- **The built-in command ops are a reserved namespace.** A workflow's `a2a`
+  start node could declare any command name, and a declared command takes the
+  durable-inbox path — which does not run the per-op authorization the
+  built-ins carry. The dispatch comment claimed "a built-in wins"; the code
+  checked the declaration first. Harmless while the built-ins were reads like
+  `status`; not harmless once `admin.*` joined them, where a collision would
+  shadow an operator's drain control with a run anyone the start node admits
+  could fire — and where the model may create workflows, that author is the
+  model. Now refused at validation (config load and `workflow.create`), and the
+  listener dispatches a built-in to its own handler regardless.
+
+- **CI now lints the feature set the release actually ships.** One matrix row
+  was commented "the release-artifact set, exactly" and had not been: `sign`,
+  `oci` and `decrypt` joined the release long after it was written, so the
+  combination that ships was the one combination nothing linted, and neither
+  was any of the three on its own. Both gaps produced `-D warnings` breaks in
+  this cycle. The row is corrected, the three have solo rows, and
+  `release_matrix.rs` now derives the requirement from `release.yml` — CI and
+  the local gate cannot drift from the release, or from each other, without a
+  test failing.
+
+- **The shipped examples load again, and a test says so from now on.**
+  `examples/instruction-registry-consumer.yaml` still wrote `instruction_sources:`
+  at the top level, and four runner scripts plus the systemd unit still passed
+  `--instruction-file` — both refused by name since the rename, so copying any
+  of them produced an immediate exit 2. `examples/` is documentation people
+  copy, and nothing in the tree checked it: now every example that declares
+  `config_version` goes through `--validate-config`, and every shipped script
+  and unit is scanned for a flag the CLI refuses.
+
+- **An outbound command announces the extension it uses.** A peer call
+  carrying a command DataPart now sends `A2A-Extensions`, on both the streaming
+  and non-streaming paths, so the peer can confirm activation instead of
+  inferring the vocabulary. agentd's TypeScript client does the same — on a
+  command DataPart and on `SubscribeToEvents`, and on nothing else, since a
+  plain conversational send uses no extension.
+
+- **The capabilities manifest and the agent card cannot disagree.** Both, and
+  the extension declaration, now read one list of ops (`command_ops_of`) and
+  one list of extensions (`extensions_of`). The manifest previously carried its
+  own copy of the ops, which had already drifted — it never mentioned the admin
+  family — and it advertised the interface extension unconditionally while the
+  card correctly withheld it when `interface.enabled` was off. A peer reads the
+  card and a controller reads the manifest; the two must say the same thing.
 
 ## v1.13.0 — trust lives with the instruction it protects
 

@@ -146,12 +146,12 @@ that could drain the instance it is talking to would be an operator, and a
 delegating peer is not one. The ops appear as skills on
 `GetExtendedAgentCard` only for callers who may actually run them.
 
-> **Deprecated:** the older `a2a.drain` / `a2a.pause` / … JSON-RPC methods still
-> answer, and are declared on the agent card under
-> `https://agentd.dev/a2a/ext/admin-methods/v1` so the card does not hide a
-> surface that exists. They are **not A2A methods** — a peer that has never
-> heard of agentd cannot discover them — and they are removed in the next
-> minor. Each call logs `a2a.method.deprecated` naming its replacement.
+> **Removed:** earlier builds answered `a2a.drain` / `a2a.pause` / … as custom
+> JSON-RPC methods. They are gone — a call gets `-32601` — because they were not
+> A2A methods and no conformant peer could discover them. The five operations
+> above are the replacement; see
+> [a2a-extensions.md](a2a-extensions.md#6-there-is-no-legacy-path) for the
+> one-line migration.
 
 ### 2.1 `admin.drain` — graceful shutdown for a rolling update
 
@@ -298,9 +298,9 @@ $ agentd --capabilities -c /etc/agentd/ops.yaml
   "a2a":{ "listen":"https://0.0.0.0:8443", "tls":true, "mtls":true, "bearer":false,
           "methods":["SendMessage","SendStreamingMessage","GetTask","CancelTask",
                      "ListTasks","SubscribeToTask","GetAgentCard"],
-          "command_ops":["status","…","admin.drain","admin.pause","admin.resume","admin.cancel"],
+          "command_ops":["status","config","workflow.run","…",
+                         "admin.drain","admin.pause","admin.resume","admin.cancel"],
           "extensions":["https://agentd.dev/a2a/ext/command/v1","…"],
-          "command_ops":["status","config","workflow.run",…],
           "principals":[…], "loopback_operator":false },
   "interface":{…}, "store":"mcp",
   "lifecycle":{ "run_until":"auto", "daemon":true } }
@@ -309,8 +309,9 @@ $ agentd --capabilities -c /etc/agentd/ops.yaml
 The three fields a controller branches on:
 
 - **`a2a`** — `null` when no listener is configured. Its presence is the
-  graceful-degradation contract: `methods`, `admin` and `command_ops` are exactly
-  what this instance serves, so a controller drives only what is declared.
+  graceful-degradation contract: `methods`, `command_ops` and `extensions` are
+  exactly what this instance serves — the same three lists the agent card
+  publishes — so a controller drives only what is declared.
 - **`lifecycle.daemon`** — `true` when the instance is long-lived (a listener,
   or a workflow with a `loop` / `schedule` / `subscribe` / `signal` / `event`
   start node). A `false` here means a Job, not a Deployment.

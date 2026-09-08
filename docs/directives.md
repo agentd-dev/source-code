@@ -328,9 +328,11 @@ agent:
         freshness: 15m                # re-check interval
 ```
 
-Signature verification runs on the registry READ path, so a pin only enforces
-something when the instruction is served over MCP and the pin names it.
-`unenforceable` says what a pin that enforces nothing means: `warn` (default),
+A pin is enforced wherever the document came from — the §7 author signature
+travels inside the document, so a `file:`, `dir:`, `url:` or `oci:` load checks
+it the same way a registry read does. What a local load cannot do is FETCH a
+key: `author_keys` that are all `instruction://…keys.json` JWKS uris need the
+registry client. `unenforceable` says what that case means: `warn` (default),
 `refuse` (exit 2), or `ignore`.
 
 **A document may not configure the terms it is judged by.** A `:::!config`

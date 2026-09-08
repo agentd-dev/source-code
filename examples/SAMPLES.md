@@ -82,7 +82,7 @@ an intelligence URI with an unsupported scheme, both fail fast).
 ## The instruction files
 
 Instructions are plain text passed with `--instruction "<text>"`,
-`--instruction-file <path>`, or the `INSTRUCTION` env var. A good instruction
+`--instruction.file <path>`, or the `INSTRUCTION` env var. A good instruction
 ends with an explicit **output contract** so the run has a crisp terminal state
 the supervisor can map to an exit code.
 
@@ -141,7 +141,7 @@ The script runs (abbreviated):
 ```bash
 agentd \
   --mode once \
-  --instruction-file instructions/research.md \
+  --instruction.file instructions/research.md \
   --model claude-opus-4 \
   --mcp "search=https://mcp-search.internal/mcp" \
   --mcp "fs=https://mcp-fs.internal/mcp" \
@@ -175,7 +175,7 @@ Abbreviated:
 ```bash
 agentd \
   --mode reactive \
-  --instruction-file instructions/triage.md \
+  --instruction.file instructions/triage.md \
   --model claude-opus-4 \
   --mcp "inbox=https://mcp-inbox.internal/mcp" \
   --mcp "tickets=https://mcp-tickets.internal/mcp" \
@@ -215,7 +215,7 @@ Abbreviated:
 agentd \
   --mode loop \
   --interval 5m \
-  --instruction-file instructions/triage.md \
+  --instruction.file instructions/triage.md \
   --model claude-opus-4 \
   --mcp "inbox=https://mcp-inbox.internal/mcp" \
   --mcp "tickets=https://mcp-tickets.internal/mcp" \
@@ -262,7 +262,7 @@ one (branded wins on conflict).
 | Flag | Env | Meaning |
 |---|---|---|
 | `--instruction <TEXT>` | `INSTRUCTION` | the task |
-| `--instruction-file <PATH>` | — | read the instruction from a file |
+| `--instruction.file <PATH>` | — | read the instruction from a file |
 | `--intelligence <URI>` | `AGENT_INTELLIGENCE` | `https://host/…` (or loopback `http://127.0.0.1:PORT` for a dev sidecar) |
 | `--intelligence-token <T>` | `AGENT_INTELLIGENCE_TOKEN` | bearer / api key (redacted) |
 | `--model <NAME>` | `AGENT_MODEL` | model id |

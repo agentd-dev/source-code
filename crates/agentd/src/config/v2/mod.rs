@@ -189,21 +189,6 @@ pub struct Settings {
     pub security: Security,
     /// Who work is done ON BEHALF OF, and what travels with it.
     pub identity: Identity,
-    /// How the instruction DOCUMENT itself is handled in transit (RFC 0041):
-    /// the recipient keys that open an encrypted envelope. Operator surface
-    /// only, restart-only — a served `!config` may not write it, because a
-    /// document must never name the key that decrypts it.
-    #[serde(default)]
-    pub instruction: Instruction,
-}
-
-/// The `instruction:` section — envelope handling for the document itself.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields, default)]
-pub struct Instruction {
-    /// End-to-end decryption (RFC 0041). Absent = plaintext instructions only;
-    /// an encrypted envelope is then refused by name, never parsed as prose.
-    pub decrypt: Option<InstructionDecrypt>,
 }
 
 /// Recipient-key material for encrypted instruction envelopes.
@@ -438,8 +423,9 @@ pub struct InstructionSpec {
     pub text: Option<String>,
     /// A path on disk; watched when `lifecycle.watch_config` is on.
     pub file: Option<String>,
-    /// An OCI artifact: `ghcr.io/acme/agent:v3` (the `oci://` is implied).
-    pub oci: Option<String>,
+    /// An OCI artifact: `ghcr.io/acme/agent:v3` (the `oci://` is implied), or
+    /// `{ref, cosign_key}` when the artifact's own signature is checked too.
+    pub oci: Option<OciSource>,
     /// An `https://` document, fetched at load. Named `url` because a
     /// workflow entry's HTTP source has been `url:` since long before this —
     /// one concept, one word.
@@ -500,13 +486,17 @@ impl InstructionSpec {
         let named: Vec<(&str, String)> = [
             ("text", self.text.as_ref()),
             ("file", self.file.as_ref()),
-            ("oci", self.oci.as_ref()),
             ("url", self.url.as_ref()),
         ]
         .into_iter()
         .filter_map(|(k, v)| v.map(|v| (k, v.clone())))
         .chain(self.mcp.as_ref().map(|m| ("mcp", m.to_uri())))
         .chain(self.dir.as_ref().map(|d| ("dir", d.path().to_string())))
+        .chain(
+            self.oci
+                .as_ref()
+                .map(|o| ("oci", o.reference().to_string())),
+        )
         .collect();
         match named.as_slice() {
             // Settings without a source is a REFUSAL. Writing `instruction:`
@@ -519,12 +509,12 @@ impl InstructionSpec {
             // This does not break "settings here, source from a flag": the
             // flag is merged into the document before this runs, so the
             // source is present by the time it is checked.
-            [] => Err(
-                "agent.instruction names no source — set one of text, file, dir, \
-                       oci, url or mcp (or use the short form `instruction: \"…\"`); \
-                       omit `instruction` entirely for an agent that has none"
-                    .to_string(),
-            ),
+            // Settings with no source. Whether that is an error depends on
+            // WHICH document this is: a config file may legitimately carry the
+            // decrypt keys or the refresh cadence while a flag or a later file
+            // names the source. `Ok(None)` reports the shape; the merged-document
+            // caller is the one that refuses it.
+            [] => Ok(None),
             [(kind, v)] => Ok(Some(match *kind {
                 // The source keys are explicit BY CONSTRUCTION: a value under
                 // `file:` is a path even if it looks like prose, and a value
@@ -542,6 +532,67 @@ impl InstructionSpec {
                 many.iter().map(|(k, _)| *k).collect::<Vec<_>>().join(", ")
             )),
         }
+    }
+}
+
+/// An OCI artifact source: the reference, and optionally the public key its
+/// **cosign** signature must verify against.
+///
+/// The key lives here, with the reference it applies to, for the same reason
+/// `glob` lives inside `dir`: it qualifies this source and nothing else. It is
+/// a different question from `trust` — that pins who WROTE the document,
+/// wherever it came from; this pins who PUSHED this artifact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OciSource {
+    /// `oci: ghcr.io/acme/agent:v3`
+    Reference(String),
+    /// `oci: {ref: …, cosign_key: /etc/keys/cosign.pub}`
+    Detailed {
+        reference: String,
+        cosign_key: Option<String>,
+    },
+}
+
+impl OciSource {
+    pub fn reference(&self) -> &str {
+        match self {
+            OciSource::Reference(r) | OciSource::Detailed { reference: r, .. } => r,
+        }
+    }
+    pub fn cosign_key(&self) -> Option<&str> {
+        match self {
+            OciSource::Reference(_) => None,
+            OciSource::Detailed { cosign_key, .. } => cosign_key.as_deref(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for OciSource {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Long {
+            #[serde(rename = "ref")]
+            reference: String,
+            #[serde(default)]
+            cosign_key: Option<String>,
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Reference(String),
+            Long(Long),
+        }
+        Ok(match Raw::deserialize(d)? {
+            Raw::Reference(r) => OciSource::Reference(r),
+            Raw::Long(Long {
+                reference,
+                cosign_key,
+            }) => OciSource::Detailed {
+                reference,
+                cosign_key,
+            },
+        })
     }
 }
 
@@ -579,14 +630,15 @@ impl McpResource {
     }
 }
 
-/// What a trust pin that CANNOT BE ENFORCED means at startup.
+/// What a trust pin whose KEYS CANNOT BE RESOLVED means at startup.
 ///
-/// Signature verification runs only for a document a registry SERVES (an
-/// `mcp:` instruction): that is where a publisher signs, and where a document
-/// can be swapped under a running agent. A pin beside a `file:`, `dir:`,
-/// `url:` or `oci:` instruction, or one naming a document this agent never
-/// reads, therefore enforces nothing — and a security control that silently
-/// does nothing is worse than one that is absent, because it is believed.
+/// A pin is enforced on every transport: the §7 author signature travels
+/// inside the document, so a `file:`, `dir:`, `url:` or `oci:` load verifies
+/// it exactly as a registry read does. The one thing a local load cannot do is
+/// fetch key MATERIAL — `author_keys` that are all `instruction://…keys.json`
+/// JWKS uris need the registry client, which does not exist at config load.
+/// That case is the operator's call, because a security control that silently
+/// does nothing is worse than one that is absent: it is believed.
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum InstructionUnenforceable {
@@ -600,8 +652,8 @@ pub enum InstructionUnenforceable {
     /// run.
     Refuse,
     /// Say nothing. For ONE config deliberately shared across deployments that
-    /// differ — the pin enforces in the served one and is inert in the other,
-    /// and the operator has decided that is fine.
+    /// differ — the keys resolve in the registry-served one and cannot in the
+    /// other, and the operator has decided that is fine.
     Ignore,
 }
 
@@ -769,7 +821,12 @@ pub fn resolve_document_source(v: &Value, at: &str) -> Result<(String, Vec<Strin
     if value.starts_with("oci://") {
         #[cfg(feature = "oci")]
         {
-            let pulled = crate::oci::pull(&value).map_err(|e| format!("{at} {value}: {e}"))?;
+            // The same cosign key an `agent.instruction.oci` may carry: a
+            // subagent's instruction is an instruction, and an artifact
+            // nobody signed is no more trustworthy for being a child's.
+            let pulled =
+                crate::oci::pull_verified(&value, spec.oci.as_ref().and_then(|o| o.cosign_key()))
+                    .map_err(|e| format!("{at} {value}: {e}"))?;
             let text = String::from_utf8(pulled.bytes)
                 .map_err(|_| format!("{at} {value}: the artifact is not UTF-8"))?;
             return Ok((text, Vec::new()));
@@ -803,6 +860,15 @@ fn moved_under_dir(v: &Value) -> Option<String> {
         }
     }
     None
+}
+
+/// Unix seconds, for signature `exp` checks.
+#[cfg(feature = "sign")]
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// `~/` against `$HOME`, unchanged when there is no `$HOME` to expand against.
@@ -841,8 +907,6 @@ pub const DOCUMENT_MAY_NOT_WRITE: &[&str] = &[
     "security",
     // Who work is done on behalf of.
     "identity",
-    // The envelope recipient keys (RFC 0041).
-    "instruction",
     // The pre-1.13 spelling of `agent.instruction.trust`. Kept so a fragment
     // written against the old surface is refused as OPERATOR configuration,
     // which is what it is, rather than being handed the rename hint.
@@ -3282,6 +3346,25 @@ impl Settings {
             let spec: InstructionSpec = serde_json::from_value(v.clone())
                 .map_err(|e| format!("{source}: agent.instruction: {e}"))?;
             let value = spec.source_value().map_err(|e| format!("{source}: {e}"))?;
+            // Settings without a source are a REFUSAL — writing `instruction:`
+            // at all is saying the agent has one, and ending up with none
+            // because a source key was forgotten is how an agent silently
+            // becomes an agent with no instructions, which is not an agent.
+            //
+            // Judged on the MERGED document only. A single file carrying just
+            // the decrypt keys, with `--instruction.file` naming the document,
+            // is a legitimate layering — refusing it per file would make the
+            // completeness rule fight the precedence rules.
+            if value.is_none()
+                && source == MERGED_DOCUMENT
+                && v.as_object().is_some_and(|o| !o.is_empty())
+            {
+                return Err(format!(
+                    "{source}: agent.instruction names no source — set one of text, file, dir, \
+                     oci, url or mcp (or use the short form `instruction: \"…\"`); omit \
+                     `instruction` entirely for an agent that has none"
+                ));
+            }
             if let Some(a) = doc.get_mut("agent").and_then(Value::as_object_mut) {
                 match value {
                     Some(v) => {
@@ -3367,8 +3450,14 @@ impl Settings {
         {
             #[cfg(feature = "oci")]
             {
-                let pulled = crate::oci::pull(&uri)
-                    .map_err(|e| format!("{source}: agent.instruction {uri}: {e}"))?;
+                let pulled = crate::oci::pull_verified(
+                    &uri,
+                    instruction_spec
+                        .oci
+                        .as_ref()
+                        .and_then(OciSource::cosign_key),
+                )
+                .map_err(|e| format!("{source}: agent.instruction {uri}: {e}"))?;
                 // Binary ciphertext is armored into text so the decrypt choke
                 // point below sees every envelope the same way.
                 let text = match String::from_utf8(pulled.bytes) {
@@ -3440,22 +3529,11 @@ impl Settings {
         {
             #[cfg(feature = "decrypt")]
             {
-                // Keys from the long form first; the top-level `instruction:`
-                // section remains as the earlier spelling.
-                let icfg = match &instruction_spec.decrypt {
-                    Some(d) => Instruction {
-                        decrypt: Some(d.clone()),
-                    },
-                    None => doc
-                        .get("instruction")
-                        .cloned()
-                        .map(serde_json::from_value)
-                        .transpose()
-                        .map_err(|e| format!("{source}: instruction: {e}"))?
-                        .unwrap_or_default(),
-                };
-                let plain = crate::config::decrypt::maybe_decrypt(instr.as_bytes().to_vec(), &icfg)
-                    .map_err(|e| format!("{source}: agent.instruction: {e}"))?;
+                let plain = crate::config::decrypt::maybe_decrypt(
+                    instr.as_bytes().to_vec(),
+                    instruction_spec.decrypt.as_ref(),
+                )
+                .map_err(|e| format!("{source}: agent.instruction: {e}"))?;
                 let text = String::from_utf8(plain)
                     .map_err(|_| format!("{source}: decrypted instruction is not UTF-8"))?;
                 if let Some(a) = doc.get_mut("agent").and_then(Value::as_object_mut) {
@@ -3468,6 +3546,108 @@ impl Settings {
                  requires building with --features decrypt"
             ));
         }
+        // ── The document's OWN signature (§7.6), whatever carried it ────────
+        //
+        // Verified HERE, after decryption and before anything interprets the
+        // bytes, because this is the one point every source converges on: a
+        // file, a folder entry, an `https://` fetch and an OCI artifact all
+        // arrive as the same text. The proof travels inside the document (a
+        // front-matter `signature:`), so it survives repackaging — the same
+        // signed bytes verify however they were shipped.
+        //
+        // A registry read is the exception: its author AND delivery signatures
+        // ride in MCP `_meta`, and the runtime verifies them at the read
+        // (`verify_registry_read`), where the client that can resolve a JWKS
+        // exists.
+        // A build without `sign` cannot check a signature at all, so a pinned
+        // publisher is a refusal rather than a silent pass — the same rule the
+        // registry read applies. A control an operator configured must never
+        // be quietly absent because of how the binary was compiled.
+        #[cfg(not(feature = "sign"))]
+        let attested_capabilities: Option<Vec<String>> = {
+            if !instruction_spec.trust.is_empty() {
+                return Err(format!(
+                    "{source}: agent.instruction.trust pins a publisher, but this build \
+                     cannot verify signatures — rebuild with --features sign"
+                ));
+            }
+            None
+        };
+        #[cfg(feature = "sign")]
+        let attested_capabilities: Option<Vec<String>> = {
+            let mut attested: Option<Vec<String>> = None;
+            // A FOLDER is many documents, and the combination carries no single
+            // signature — the second document's front matter (its `signature:`
+            // included) is dropped when they join. So each file is verified on its
+            // own bytes, before they become one instruction.
+            if !instruction_dir_files.is_empty() && !instruction_spec.trust.is_empty() {
+                for f in &instruction_dir_files {
+                    let bytes = std::fs::read(f).map_err(|e| format!("{source}: {f}: {e}"))?;
+                    match crate::config::attest::verify_authored(
+                        &bytes,
+                        &instruction_spec.trust,
+                        now_secs(),
+                    ) {
+                        Ok(crate::config::attest::Authorship::Verified { publisher, .. }) => {
+                            instruction_warnings.push(format!(
+                                "agent.instruction: verified {f} against {publisher}"
+                            ));
+                        }
+                        Ok(_) => {}
+                        Err(e) => return Err(format!("{source}: agent.instruction {f}: {e}")),
+                    }
+                }
+            }
+            if let Some(instr) = doc
+                .get("agent")
+                .and_then(|a| a.get("instruction"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                && instruction_dir_files.is_empty()
+                && !looks_like_resource_uri(&instr)
+                && !instruction_spec.trust.is_empty()
+            {
+                match crate::config::attest::verify_authored(
+                    instr.as_bytes(),
+                    &instruction_spec.trust,
+                    now_secs(),
+                ) {
+                    Ok(crate::config::attest::Authorship::Verified {
+                        publisher,
+                        doc: signed_doc,
+                        capabilities,
+                    }) => {
+                        instruction_warnings.push(format!(
+                            "agent.instruction: verified {signed_doc} against pinned publisher \
+                         {publisher}"
+                        ));
+                        attested = Some(capabilities);
+                    }
+                    // Pins exist but name no key material this load can read —
+                    // their `author_keys` are all registry JWKS URIs. The operator
+                    // said what that means.
+                    Ok(crate::config::attest::Authorship::NoLocalKeys) => {
+                        let why = "agent.instruction.trust pins a publisher, but its author_keys \
+                               are all instruction:// JWKS uris — resolving one needs the \
+                               registry client, which a file/dir/url/oci load does not have. \
+                               Point author_keys at a key FILE to verify this document";
+                        match instruction_spec.unenforceable {
+                            InstructionUnenforceable::Ignore => {}
+                            InstructionUnenforceable::Warn => {
+                                instruction_warnings.push(why.to_string())
+                            }
+                            InstructionUnenforceable::Refuse => {
+                                return Err(format!("{source}: {why}"));
+                            }
+                        }
+                    }
+                    Ok(crate::config::attest::Authorship::Unpinned) => {}
+                    Err(e) => return Err(format!("{source}: agent.instruction: {e}")),
+                }
+            }
+            attested
+        };
+
         let mut idoc_extraction: Option<crate::config::idoc::Extraction> = None;
         if let Some(instr) = doc
             .get("agent")
@@ -3485,7 +3665,7 @@ impl Settings {
             // `agent.document_capabilities`, read raw here before the document
             // is deserialized. The fragment merges UNDER the document, so an
             // explicit config key still wins.
-            let granted: std::collections::BTreeSet<String> = doc
+            let mut granted: std::collections::BTreeSet<String> = doc
                 .get("agent")
                 .and_then(|a| a.get("document_capabilities"))
                 .and_then(Value::as_array)
@@ -3496,6 +3676,11 @@ impl Settings {
                         .collect()
                 })
                 .unwrap_or_default();
+            // §7.6 step 5: grant ∩ ceiling ∩ author-attested. A signature caps
+            // what the document may activate; it never widens it.
+            if let Some(attested) = &attested_capabilities {
+                granted.retain(|g| attested.contains(g));
+            }
             // The runtime supplies `agent` as a `when` fact (§5.2) — the
             // one dimension agentd can always answer about itself.
             let facts: std::collections::BTreeMap<String, String> =
@@ -3549,6 +3734,13 @@ impl Settings {
         // `instruction_sources` moved under the instruction it protects, and
         // was renamed on the way: `file`, `dir`, `url`, `oci` and `mcp` are
         // the SOURCES, while these say who may sign what they serve.
+        if doc.get("instruction").is_some() {
+            return Err(format!(
+                "{source}: the top-level `instruction` section is gone — the envelope \
+                 recipient keys live at `agent.instruction.decrypt`, with everything else \
+                 about the instruction"
+            ));
+        }
         if doc.get("instruction_sources").is_some() {
             return Err(format!(
                 "{source}: instruction_sources moved to `agent.instruction.trust` — it is not \
@@ -3751,11 +3943,6 @@ pub const ALIASES: &[Alias] = &[
         path: "agent.instruction",
         kind: AliasKind::Set,
     },
-    Alias {
-        flag: "--instruction-file",
-        path: "agent.instruction",
-        kind: AliasKind::SetFromFile,
-    },
     // The long form's keys, spelled from the setting rather than the whole
     // path: `--instruction.oci ghcr.io/acme/agent:v3` beside
     // `--instruction "…"`, because they are the same setting.
@@ -3848,11 +4035,6 @@ pub const ALIASES: &[Alias] = &[
         flag: "--prompt.oci",
         path: "agent.prompt.oci",
         kind: AliasKind::Set,
-    },
-    Alias {
-        flag: "--prompt-file",
-        path: "agent.prompt",
-        kind: AliasKind::SetFromFile,
     },
     Alias {
         flag: "--intelligence",
@@ -4102,6 +4284,16 @@ pub const REMOVED_FLAGS: &[(&str, &str)] = &[
         "--instruction.http",
         "renamed to --instruction.url (`url:` in the config), the spelling a workflow entry already uses",
     ),
+    // One spelling per concept. `--instruction.file` is the key of the long
+    // form, which is where every other instruction setting already lives.
+    (
+        "--instruction-file",
+        "use --instruction.file <PATH> (or --instruction <PATH>, which classifies a path-shaped value as a file)",
+    ),
+    (
+        "--prompt-file",
+        "use --prompt.file <PATH> (or --prompt <PATH>, classified the same way)",
+    ),
     (
         "--mode",
         "modes are gone: give the workflow a start node (`once` | `loop` | `schedule` | `subscribe` | `signal` | `event` | `a2a` | `manual`) and set `lifecycle.run_until` if needed",
@@ -4233,6 +4425,10 @@ pub fn probe(args: &[String], env: &[(String, String)]) -> Result<Detected, Conf
 /// name) and `env`. Returns `(Loaded, Ask)`; `Ask` tells the caller what the
 /// invocation wants (`--help`, `--config-schema`, `--validate-config`, …).
 /// Errors are `ConfigError::Usage` (exit 2), before any side effect.
+/// The `source` label `load` passes when it types the MERGED document — the
+/// one place completeness rules apply, because every layer has landed.
+pub const MERGED_DOCUMENT: &str = "config";
+
 pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), ConfigError> {
     let env = super::debrand_env(env);
     let envmap: HashMap<&str, &str> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
@@ -5028,7 +5224,7 @@ fn apply_default_folders(doc: &mut Value, dirs: &[PathBuf], warnings: &mut Vec<S
     {
         obj.insert(
             "workflows".into(),
-            json!([{"dir": d.to_string_lossy(), "glob": "*.yaml,*.yml,*.json"}]),
+            json!([{"dir": {"path": d.to_string_lossy(), "glob": "*.yaml,*.yml,*.json"}}]),
         );
     }
 
@@ -5406,67 +5602,6 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
     // move that failure before any side effect.
     for m in missing_references(&loaded.doc, "config", &s.vars) {
         err(&mut d, m);
-    }
-
-    // A trust pin that cannot be enforced. Signature verification runs on the
-    // registry READ path only (`Runtime::verify_registry_read`, its one call
-    // site), so a pin is live exactly when the agent's instruction is served
-    // over MCP and names the pinned document. Anything else pins nothing —
-    // and a security control that silently does nothing is worse than an
-    // absent one, because it is believed. `unenforceable` is the operator's
-    // call about what that means here.
-    //
-    // If verification ever grows a second call site — a signed local file, a
-    // subagent template's document — this check has to grow with it, or it
-    // starts reporting a pin as dead that has become live.
-    {
-        let spec = &s.agent.instruction_spec;
-        let served = s
-            .agent
-            .instruction
-            .as_deref()
-            .is_some_and(looks_like_resource_uri)
-            || spec.mcp.is_some();
-        let doc_id = |u: &str| {
-            u.rsplit('/')
-                .next()
-                .unwrap_or(u)
-                .split('@')
-                .next()
-                .unwrap_or(u)
-                .to_string()
-        };
-        let instruction_doc = s
-            .agent
-            .instruction
-            .as_deref()
-            .filter(|_| served)
-            .map(doc_id);
-        for (i, pin) in spec.trust.iter().enumerate() {
-            let at = format!("agent.instruction.trust[{i}]");
-            let why = if !served {
-                Some(format!(
-                    "{at} pins publisher {:?}, but this agent's instruction is not served over MCP — signature verification runs only on a registry read, so this pin enforces nothing",
-                    pin.publisher
-                ))
-            } else if instruction_doc.as_deref() != Some(doc_id(&pin.uri).as_str()) {
-                Some(format!(
-                    "{at} pins {:?}, which is not the document this agent reads ({}) — the pin enforces nothing",
-                    pin.uri,
-                    s.agent.instruction.as_deref().unwrap_or("<none>")
-                ))
-            } else {
-                None
-            };
-            let Some(why) = why else { continue };
-            match spec.unenforceable {
-                InstructionUnenforceable::Ignore => {}
-                InstructionUnenforceable::Warn => d.warnings.push(format!(
-                    "{why}. Set agent.instruction.unenforceable: refuse to make this fatal, or ignore to silence it."
-                )),
-                InstructionUnenforceable::Refuse => err(&mut d, why),
-            }
-        }
     }
 
     // An `auth.hmac.algo` the verifier does not implement. Refused at listener
@@ -7118,9 +7253,6 @@ pub const RESTART_ONLY_PATHS: &[&str] = &[
     // This is the one restart-only path INSIDE a reloadable one; see
     // RESTART_ONLY_WITHIN_RELOADABLE.
     "agent.instruction.trust",
-    // The instruction-envelope recipient keys (RFC 0041): which key can open a
-    // served document is trust configuration, never hot-swapped.
-    "instruction",
     // The webhook listener's SOCKET, not its rules: rebinding an address or
     // swapping a TLS identity needs a restart, while `webhooks.default_auth`
     // and the routes themselves (which live in `workflows[].steps[]`) are
@@ -7250,7 +7382,6 @@ pub const RELOADABLE_PATHS: &[&str] = &[
     "workflows.dir",
     "workflows.durable",
     "workflows.file",
-    "workflows.glob",
     "workflows.headers",
     "workflows.inputs",
     "workflows.key",
@@ -7655,7 +7786,20 @@ mod tests {
             // (an artifact pulled, a URL fetched), so a synthetic value here
             // would make a real network call. They are covered end to end by
             // oci_instruction_e2e and registry_consumer_e2e instead.
-            if is_document_path(&b.path, "oci") || is_document_path(&b.path, "url") {
+            // …and the nested keys of those sources with them: a sample under
+            // `oci` would pull from a registry that does not exist.
+            if is_document_path(&b.path, "oci")
+                || is_document_path(&b.path, "url")
+                || b.path.contains(".oci.")
+                || b.path.contains(".url.")
+            {
+                continue;
+            }
+            // A build without `sign` cannot verify a signature, so a trust pin
+            // is a deliberate startup REFUSAL there rather than a silent pass.
+            // The sample would be asserting the opposite of the guarantee.
+            #[cfg(not(feature = "sign"))]
+            if b.path.contains(".trust") {
                 continue;
             }
             let mut doc = Value::Object(Map::new());
@@ -8546,18 +8690,38 @@ mod tests {
         // Writing `instruction:` is saying the agent HAS one. Ending up with
         // none because a source key was forgotten is how an agent silently
         // becomes an agent without instructions, which is not an agent.
+        //
+        // `source_value` REPORTS the shape rather than judging it — a single
+        // config file may carry the decrypt keys or the refresh cadence while
+        // a flag names the document, and judging per layer would make this
+        // rule fight the precedence rules. The refusal lives on the MERGED
+        // document (`instruction_settings_may_layer_but_the_result_must_name_a_source`).
         let settings_only = InstructionSpec {
             refresh: Some("60s".into()),
             ..InstructionSpec::default()
         };
-        let e = settings_only.source_value().unwrap_err();
+        assert_eq!(
+            settings_only.source_value(),
+            Ok(None),
+            "settings, no source"
+        );
+        assert_eq!(InstructionSpec::default().source_value(), Ok(None));
+
+        // …and the merged document is where it is refused, by name.
+        let e = Settings::from_document(
+            serde_json::json!({"config_version": "1",
+                "agent": {"name": "a", "preflight": "never",
+                          "instruction": {"refresh": "60s"}},
+                "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
+                "store": {"kind": "memory"}}),
+            MERGED_DOCUMENT,
+        )
+        .unwrap_err();
         assert!(e.contains("names no source"), "{e}");
         assert!(
             e.contains("omit `instruction` entirely"),
             "the refusal points at the supported way to have none: {e}"
         );
-        // An empty object is the same mistake with less typing.
-        assert!(InstructionSpec::default().source_value().is_err());
         // Omitting `instruction` ALTOGETHER stays supported — a workflow-only
         // or `--prompt` agent is a different shape, not a broken one.
         let doc = serde_json::json!({
@@ -8814,71 +8978,101 @@ mod tests {
         assert_eq!(ok.limits.max_runs, Some(9));
     }
 
-    /// A trust pin enforces something only when the instruction is SERVED and
-    /// the pin names it. Anything else is a security control that does
-    /// nothing, and `unenforceable` is the operator's call about what that
-    /// means: say so (default), refuse to start, or stay quiet.
+    /// Settings without a source are refused on the MERGED document, not on
+    /// each layer: a config file may carry the decrypt keys or the refresh
+    /// cadence while a flag names the document. Refusing per file would make
+    /// the completeness rule fight the precedence rules — and it did: an
+    /// encrypted-instruction deployment with the keys in the config and
+    /// `--instruction.file` on the command line stopped loading.
     #[test]
-    fn an_unenforceable_trust_pin_is_reported_per_policy() {
-        let pin = json!([{"uri": "instruction://ins_42", "publisher": "https://pub.example"}]);
-        let load = |instruction: Value, policy: Option<&str>| {
-            let mut spec = instruction;
-            spec["trust"] = pin.clone();
+    fn instruction_settings_may_layer_but_the_result_must_name_a_source() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.md"), "be terse\n").unwrap();
+        let doc = dir.path().join("a.md").to_string_lossy().to_string();
+        let cfg = dir.path().join("c.json");
+        // A file carrying SETTINGS only — no source anywhere in it.
+        std::fs::write(
+            &cfg,
+            serde_json::json!({"config_version": "1",
+                "agent": {"name": "a", "preflight": "never",
+                          "instruction": {"refresh": "30s"}},
+                "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
+                "store": {"kind": "memory"}})
+            .to_string(),
+        )
+        .unwrap();
+        let c = cfg.to_string_lossy().to_string();
+        let env: Vec<(String, String)> = Vec::new();
+
+        // With the source on the command line, the pair is complete.
+        let s = super::load(
+            &["-c".into(), c.clone(), "--instruction.file".into(), doc],
+            &env,
+        )
+        .expect("a file of settings plus a flag naming the source is a valid config")
+        .0
+        .settings;
+        assert_eq!(s.agent.instruction.as_deref(), Some("be terse\n"));
+        assert_eq!(s.agent.instruction_spec.refresh.as_deref(), Some("30s"));
+
+        // …and without it, the merged document is refused, naming the keys.
+        let e = super::load(&["-c".into(), c], &env).unwrap_err();
+        let msg = format!("{e}");
+        assert!(msg.contains("names no source"), "{msg}");
+    }
+
+    /// A pin now enforces on every transport, so the only thing left that
+    /// cannot be checked locally is key MATERIAL: `author_keys` that are all
+    /// registry JWKS URIs, which need the client a file/dir/url/oci load does
+    /// not have. `unenforceable` is the operator's call about that case.
+    #[test]
+    #[cfg(feature = "sign")]
+    fn a_pin_whose_keys_cannot_be_resolved_locally_is_reported_per_policy() {
+        let load = |policy: Option<&str>| {
+            let mut spec = serde_json::json!({
+                "text": "be terse",
+                "trust": [{"uri": "instruction://ins_42",
+                           "publisher": "https://pub.example",
+                           "author_keys": ["instruction://ins_42/keys.json"]}],
+            });
             if let Some(p) = policy {
                 spec["unenforceable"] = json!(p);
             }
-            let doc = serde_json::json!({"config_version": "1",
-                "agent": {"name": "a", "instruction": spec, "preflight": "never"},
-                "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
-                "store": {"kind": "memory"}});
-            let settings = Settings::from_document(doc.clone(), "t").expect("types");
-            let loaded = Loaded {
-                settings,
-                doc: doc.clone(),
-                file_doc: doc,
-                files: Vec::new(),
-                warnings: Vec::new(),
-                trace: Default::default(),
-            };
-            let d = validate(&loaded);
-            (d.errors, d.warnings)
+            Settings::from_document(
+                serde_json::json!({"config_version": "1",
+                    "agent": {"name": "a", "instruction": spec, "preflight": "never"},
+                    "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
+                    "store": {"kind": "memory"}}),
+                MERGED_DOCUMENT,
+            )
         };
 
-        // A file-backed instruction: verification runs on the registry read
-        // path only, so the pin enforces nothing.
-        let (errs, warns) = load(json!({"text": "be terse"}), None);
-        assert!(errs.is_empty(), "warn is the default: {errs:?}");
+        // warn (the default): it loads, and says so.
+        let s = load(None).expect("warn does not refuse");
         assert!(
-            warns.iter().any(|w| w.contains("not served over MCP")),
-            "{warns:?}"
-        );
-        let (errs, _) = load(json!({"text": "be terse"}), Some("refuse"));
-        assert!(
-            errs.iter().any(|e| e.contains("not served over MCP")),
-            "refuse makes it fatal: {errs:?}"
-        );
-        let (errs, warns) = load(json!({"text": "be terse"}), Some("ignore"));
-        assert!(errs.is_empty() && !warns.iter().any(|w| w.contains("enforces nothing")));
-
-        // A SERVED instruction the pin does not name is just as inert.
-        let (_, warns) = load(json!({"mcp": "instruction://ins_99@stable"}), None);
-        assert!(
-            warns
+            s.agent
+                .instruction_warnings
                 .iter()
-                .any(|w| w.contains("not the document this agent reads")),
-            "{warns:?}"
+                .any(|w| w.contains("JWKS uris")),
+            "{:?}",
+            s.agent.instruction_warnings
         );
-
-        // …and the pin that DOES name the served document is silent.
-        let (errs, warns) = load(json!({"mcp": "instruction://ins_42@stable"}), None);
-        assert!(errs.is_empty(), "{errs:?}");
+        // refuse: fatal, naming what to do about it.
+        let e = load(Some("refuse")).unwrap_err();
+        assert!(e.contains("key FILE"), "{e}");
+        // ignore: silence.
+        let s = load(Some("ignore")).expect("ignore does not refuse");
         assert!(
-            !warns.iter().any(|w| w.contains("enforces nothing")),
-            "an enforceable pin says nothing: {warns:?}"
+            !s.agent
+                .instruction_warnings
+                .iter()
+                .any(|w| w.contains("JWKS")),
+            "{:?}",
+            s.agent.instruction_warnings
         );
     }
 
-    /// The old top-level spelling names where it went, rather than dying as an
+    /// The old top-level spelling names where it went    /// The old top-level spelling names where it went, rather than dying as an
     /// unknown field.
     #[test]
     fn instruction_sources_names_its_replacement() {
@@ -9224,7 +9418,7 @@ mod tests {
         let f = write_tmp("read me from a file", "txt");
         let (l, _) = load(
             &args(&[
-                "--instruction-file",
+                "--instruction.file",
                 f.path().to_str().unwrap(),
                 "--budget-exit-code",
                 "9",
@@ -9240,6 +9434,17 @@ mod tests {
         );
         assert_eq!(l.settings.lifecycle.exit_code_map.get("3"), Some(&9));
         assert_eq!(l.settings.lifecycle.exit_code_map.get("7"), Some(&9));
+
+        // The retired spellings say where they went, rather than "unknown
+        // argument" — the whole point of removing them by name.
+        for (gone, want) in [
+            ("--instruction-file", "--instruction.file"),
+            ("--prompt-file", "--prompt.file"),
+        ] {
+            let e = load(&args(&[gone, f.path().to_str().unwrap()]), &base_env()).unwrap_err();
+            let msg = format!("{e}");
+            assert!(msg.contains(gone) && msg.contains(want), "{msg}");
+        }
     }
 
     // ---- validation -----------------------------------------------------------

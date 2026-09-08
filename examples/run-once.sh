@@ -20,7 +20,7 @@ export AGENT_INTELLIGENCE="${AGENT_INTELLIGENCE:-https://gw.example/v1}"
 
 exec "$AGENTD" \
   --mode once \
-  --instruction-file "$(dirname "$0")/instructions/research.md" \
+  --instruction.file "$(dirname "$0")/instructions/research.md" \
   --model "claude-opus-4" \
   --mcp search=https://mcp-search.internal/mcp \
   --mcp fs=https://mcp-fs.internal/mcp \

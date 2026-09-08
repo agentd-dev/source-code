@@ -89,27 +89,21 @@ impl Runtime {
                 substitute_config_vars(&mut doc, &self.settings.vars, "workflow entry", &mut errs);
             }
             // `dir:` is the folder source shared with instructions: a path,
-            // or `{path, glob, order}`. The FLAT `glob:` beside a string
-            // `dir:` is the older spelling and still works — it shipped — but
-            // `order:` exists only in the nested form, so the setting that
-            // qualifies a folder has exactly one home going forward.
+            // or `{path, glob, order}`. `glob` and `order` live INSIDE it —
+            // one home for the settings that qualify a folder, here as
+            // everywhere else.
             let entry_dir = match doc.get("dir") {
                 None => None,
                 Some(v) => match serde_json::from_value::<Dir>(v.clone()) {
-                    Ok(Dir::Path(path)) => Some(Dir::Detailed {
-                        path,
-                        glob: doc.get("glob").and_then(Value::as_str).map(str::to_string),
-                        order: None,
-                    }),
-                    Ok(detailed) => {
+                    Ok(dir) => {
                         if doc.get("glob").is_some() {
                             errs.push(
-                                "workflow entry: `glob` beside an object `dir` — put it inside \
-                                 (`dir: {path: …, glob: …}`)"
+                                "workflow entry: `glob` beside `dir` — it belongs inside \
+                                 (`dir: {path: …, glob: …}`), which is where `order` lives too"
                                     .to_string(),
                             );
                         }
-                        Some(detailed)
+                        Some(dir)
                     }
                     Err(e) => {
                         errs.push(format!("workflow entry dir: {e}"));

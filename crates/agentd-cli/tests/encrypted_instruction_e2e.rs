@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! **Encrypted instruction documents, end to end** (RFC 0041): a document that
 //! carries machinery is encrypted to the agent's recipient key, handed to the
-//! real binary as an inline armored envelope, a binary `--instruction-file`,
+//! real binary as an inline armored envelope, a binary `--instruction.file`,
 //! and a compact JWE — and in each case the plaintext parses, the trust ladder
 //! applies, and the machinery registers in `--capabilities`. The fail-closed
 //! half is pinned too: an envelope with no configured key is a refusal that
-//! names `instruction.decrypt.keys`, never ciphertext delivered as prose.
+//! names `agent.instruction.decrypt.keys`, never ciphertext delivered as prose.
 #![cfg(all(unix, feature = "decrypt", feature = "workflow"))]
 
 mod common;
@@ -51,7 +51,8 @@ fn base_cfg(instruction: &str, key_file: Option<&str>) -> Value {
         "store": {"kind": "memory"},
     });
     if let Some(k) = key_file {
-        cfg["instruction"] = json!({"decrypt": {"keys": [k]}});
+        // The long form: the source plus the key that opens it, together.
+        cfg["agent"]["instruction"] = json!({"text": instruction, "decrypt": {"keys": [k]}});
     }
     cfg
 }
@@ -116,8 +117,8 @@ fn a_binary_age_file_via_instruction_file_is_armored_and_decrypted() {
         &cfg_path,
         serde_json::to_vec(&json!({
             "config_version": "1",
-            "agent": {"name": "sealed", "preflight": "never"},
-            "instruction": {"decrypt": {"keys": [key_path]}},
+            "agent": {"name": "sealed", "preflight": "never",
+                      "instruction": {"decrypt": {"keys": [key_path]}}},
             "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
             "store": {"kind": "memory"},
         }))
@@ -128,7 +129,7 @@ fn a_binary_age_file_via_instruction_file_is_armored_and_decrypted() {
         .args([
             "-c",
             &cfg_path,
-            "--instruction-file",
+            "--instruction.file",
             &doc_path,
             "--capabilities",
         ])
@@ -136,7 +137,7 @@ fn a_binary_age_file_via_instruction_file_is_armored_and_decrypted() {
         .unwrap();
     assert!(
         c.status.success(),
-        "binary envelope via --instruction-file refused: {}",
+        "binary envelope via --instruction.file refused: {}",
         String::from_utf8_lossy(&c.stderr)
     );
     let caps: Value = serde_json::from_slice(&c.stdout).unwrap();
@@ -154,7 +155,7 @@ fn an_envelope_with_no_key_is_refused_naming_the_config() {
     let (ok, err, _) = run_cfg(&base_cfg(&armored, None));
     assert!(!ok, "an undecryptable envelope must refuse startup");
     assert!(
-        err.contains("instruction.decrypt.keys"),
+        err.contains("agent.instruction.decrypt.keys"),
         "the refusal names the fix:\n{err}"
     );
     // And the WRONG key refuses too — never ciphertext-as-prose.

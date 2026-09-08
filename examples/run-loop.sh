@@ -20,7 +20,7 @@ export AGENT_INTELLIGENCE="${AGENT_INTELLIGENCE:-https://gw.example/v1}"
 exec "$AGENTD" \
   --mode loop \
   --interval 5m \
-  --instruction-file "$(dirname "$0")/instructions/triage.md" \
+  --instruction.file "$(dirname "$0")/instructions/triage.md" \
   --model "claude-opus-4" \
   --mcp inbox=https://mcp-inbox.internal/mcp \
   --mcp tickets=https://mcp-tickets.internal/mcp \

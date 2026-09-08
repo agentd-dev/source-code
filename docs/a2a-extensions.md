@@ -47,8 +47,6 @@ uses the first and the third.
 |---|---|---|
 | `https://agentd.dev/a2a/ext/command/v1` | data-only | the **command ops** — structured operations sent as a DataPart on `SendMessage` |
 | `https://agentd.dev/a2a/ext/interface/v1` | method | `SubscribeToEvents`, the instance-wide observation feed |
-| `urn:agentd:interface` | method | the pre-1.14 spelling of the line above, kept for one minor |
-| `https://agentd.dev/a2a/ext/admin-methods/v1` | method | the **deprecated** `a2a.*` JSON-RPC methods |
 
 None is `required`. A client that sends no `A2A-Extensions` header at all gets a
 complete, working service: it can converse, run workflows, read tasks and
@@ -90,6 +88,12 @@ Two behaviours to rely on:
 For a browser client, both directions are wired: `A2A-Extensions` is in the
 CORS preflight's allowed request headers *and* in `Access-Control-Expose-Headers`,
 so JavaScript can actually read the echo.
+
+agentd's own clients announce: the Rust peer client sends the header on both the
+streaming and non-streaming command paths, and the TypeScript client
+(`@agentd/interface`) sends it on a command DataPart and on `SubscribeToEvents`
+— and on nothing else, because a plain conversational `SendMessage` uses no
+extension and claiming one you are not using is noise.
 
 ---
 
@@ -136,6 +140,21 @@ The list an instance actually serves is in the extension's
 "which operations may I use" is answered by A2A's own discovery rather than by
 this page.
 
+### The built-in ops are a reserved namespace
+
+A workflow's `a2a` start node registers a command name, which is how a peer
+reaches a start node at all. Those names may not collide with a built-in op: a
+declared command takes the durable-inbox path, where the per-op authorization
+the built-ins carry does not run, so a workflow claiming `admin.drain` would
+shadow an operator's control with a run that anyone its `roles:` admits could
+fire. On an instance where the model may create workflows, that author is the
+model.
+
+The collision is refused at validation — at config load and at
+`workflow.create` alike — and the listener dispatches a built-in to its own
+handler regardless, so the reservation holds even if a definition slipped
+through from somewhere else.
+
 ### The admin family answers to the role, not to a grant
 
 `admin.*` is operator-only, and an explicit `grants:` entry does **not** reach
@@ -156,39 +175,28 @@ extension is for.
 It is declared only when `interface.enabled` is set, because the card is a
 promise: an instance that will not serve the feed must not advertise it.
 
-The `urn:agentd:interface` URI is the older spelling of the same thing. It is
-still declared so a pinned display client keeps working, and it goes away in the
-next minor.
-
 ---
 
-## 6. The deprecated admin methods
+## 6. There is no legacy path
 
-Before this, the five lifecycle operations were custom JSON-RPC methods:
-`a2a.drain`, `a2a.lameduck`, `a2a.pause`, `a2a.resume`, `a2a.cancel`. They still
-answer, and they are declared under
-`https://agentd.dev/a2a/ext/admin-methods/v1` — a card that hid a surface the
-instance actually serves would be lying.
-
-They are deprecated because they are **not A2A methods**. A peer holding a
-conformant A2A client cannot discover them, cannot call them, and gets `-32601`
-if it guesses. Every call logs `a2a.method.deprecated` naming its replacement.
-
-**Migrating** is mechanical:
+Earlier builds answered five custom JSON-RPC methods — `a2a.drain`,
+`a2a.lameduck`, `a2a.pause`, `a2a.resume`, `a2a.cancel`. They are **gone**, not
+deprecated: a call to one now gets `-32601`, the code that served them has been
+deleted, and nothing on the card mentions them. The same five operations are
+`admin.drain`, `admin.lameduck`, `admin.pause`, `admin.resume` and
+`admin.cancel`, sent as a command DataPart:
 
 ```jsonc
-// before
+// then
 { "method": "a2a.pause", "params": { "run": "reconcile-01J8…" } }
 
-// after
+// now
 { "method": "SendMessage", "params": { "message": { "parts": [
     { "data": { "agentd": { "op": "admin.pause", "run": "reconcile-01J8…" } } } ] } } }
 ```
 
-The reply shape changes with it: you get a Task whose result holds the
-acknowledgement, instead of the acknowledgement directly.
-
----
+The reply is a Task whose result carries the acknowledgement, rather than the
+acknowledgement directly.
 
 ## 7. How this is kept honest
 

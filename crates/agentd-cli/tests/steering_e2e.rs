@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! **Steering over A2A** end to end: a client fires `workflow.signal` to
 //! resume a waiting run, pauses/resumes one run and the whole instance
-//! (`a2a.pause`/`a2a.resume`), and reads a conversation's plan — the control
+//! (`admin.pause`/`admin.resume` command ops), and reads a conversation's plan — the control
 //! verbs a display client uses beyond cancel/drain.
 #![cfg(all(unix, feature = "a2a"))]
 
@@ -264,7 +264,7 @@ fn a_single_run_pauses_and_resumes() {
     let run_id = wait_run_id(&addr, 10);
 
     // Pause the run mid-flight; it must NOT complete while paused.
-    let paused = rpc(&addr, 3, "a2a.pause", json!({"run": run_id}));
+    let paused = artifact_json(&command(&addr, 3, "admin.pause", json!({"run": run_id})));
     assert_eq!(paused["paused"], run_id, "{paused}");
     std::thread::sleep(Duration::from_millis(1600)); // past the sleep deadline
     let view = artifact_json(&command(
@@ -280,7 +280,7 @@ fn a_single_run_pauses_and_resumes() {
     );
 
     // Resume → completes.
-    let resumed = rpc(&addr, 5, "a2a.resume", json!({"run": run_id}));
+    let resumed = artifact_json(&command(&addr, 5, "admin.resume", json!({"run": run_id})));
     assert_eq!(resumed["resumed"], run_id, "{resumed}");
     wait_run(&addr, &run_id, 10, "completion after resume", |v| {
         v["status"] == "completed"
@@ -294,7 +294,7 @@ fn a_global_pause_holds_new_work_and_resume_releases_it() {
     let (_daemon, addr, cfg) = spawn_bound(|port| steer_config(&llm.uri, port, ""));
 
     // Pause the instance; intake continues but nothing dispatches.
-    let paused = rpc(&addr, 1, "a2a.pause", json!({}));
+    let paused = artifact_json(&command(&addr, 1, "admin.pause", json!({})));
     assert_eq!(paused["state"], "paused");
     let st = command(&addr, 2, "status", json!({}));
     assert_eq!(artifact_json(&st)["paused"], true, "{st}");
@@ -315,7 +315,7 @@ fn a_global_pause_holds_new_work_and_resume_releases_it() {
     );
 
     // Resume → the queued turn dispatches and completes.
-    rpc(&addr, 5, "a2a.resume", json!({}));
+    command(&addr, 5, "admin.resume", json!({}));
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let t = rpc(&addr, 6, "GetTask", json!({"id": task_id}));

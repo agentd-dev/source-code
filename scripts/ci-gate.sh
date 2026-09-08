@@ -27,7 +27,10 @@ ROWS=(
   "--features aauth"
   "--features a2a,hot-reload"
   "--release --features internal-mocks"
-  "--features a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel"
+  "--features sign"
+  "--features oci"
+  "--features decrypt"
+  "--features a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt"
   "--all-features"
 )
 

@@ -35,6 +35,7 @@ use crate::a2a::{CallerIdentity, Principal, Resolver};
 use crate::obs::log::Logger;
 use crate::runtime::events::{Event, kinds};
 use crate::runtime::reactor::{PendingKind, Runtime};
+use crate::runtime::surface;
 use serde_json::{Value, json};
 use std::sync::mpsc::{Sender, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
@@ -73,8 +74,8 @@ fn command_description(op: &str) -> &'static str {
 }
 
 pub use super::surface::{
-    ADMIN_METHODS_EXTENSION, COMMAND_EXTENSION, EXTENSION_METHODS, EXTENSIONS, INTERFACE_EXTENSION,
-    INTERFACE_EXTENSION_LEGACY, command_ops_of,
+    COMMAND_EXTENSION, EXTENSION_METHODS, EXTENSIONS, INTERFACE_EXTENSION, command_ops_of,
+    extensions_of,
 };
 
 pub const METHODS: &[&str] = &[
@@ -730,8 +731,7 @@ fn is_secret_node(node: &Value) -> bool {
 /// Is this schema node the shared `string_map` node — an object of plain string
 /// values? Every one of them in the settings schema is a HEADER map, and a
 /// header value is credential-bearing by nature (an `Authorization: Bearer …`
-/// from env is inline), which is why the v1 view already exposed header NAMES
-/// only (`config::Config::effective_view`).
+/// from env is inline), so this view exposes header NAMES only.
 fn is_header_map_node(node: &Value) -> bool {
     node.get("properties").is_none() && node["additionalProperties"]["type"] == "string"
 }
@@ -829,20 +829,6 @@ impl Runtime {
             "GetAgentCard" => self.a2a_agent_card(),
             "GetExtendedAgentCard" => self.a2a_extended_card(&principal),
             "Pair" => self.a2a_pair(&params),
-            m if crate::a2a::principals::is_admin(m) => {
-                // DEPRECATED: not an A2A method. A peer that has never heard of
-                // agentd cannot discover or call it, which is the whole reason
-                // the command DataPart exists. Answered for one more minor so
-                // an operator's scripts do not break silently.
-                self.log.warn(
-                    "a2a.method.deprecated",
-                    json!({"method": m,
-                           "use": format!("SendMessage with a command DataPart {{\"op\": \"admin.{}\"}}",
-                                          bare(&method).trim_start_matches("a2a.")),
-                           "removed_in": "the next minor"}),
-                );
-                self.a2a_admin(&principal, bare(&method), &params)
-            }
             other => err_obj(
                 UNSUPPORTED_OPERATION,
                 &format!("unsupported method: {other}"),
@@ -896,8 +882,18 @@ impl Runtime {
         // like a declared command — the REACTOR consumes them
         // before start matching; they never reach a model or a workflow.
         let internal_op = command_op(message).is_some_and(|op| op.starts_with("_instance."));
-        let declared = internal_op
-            || command_op(message).is_some_and(|op| self.workflow_declares_a2a_command(&op));
+        // A BUILT-IN always wins, which the paragraph above has always claimed
+        // and the code did not do: `declared` was checked first, so a workflow
+        // declaring `{kind: a2a, command: "status"}` took the inbox path and
+        // skipped `a2a_command` — and with it `may_command`. Harmless for a
+        // read; not harmless once `admin.*` joined the built-in surface, where
+        // a declared collision would shadow an operator's drain control with a
+        // workflow anyone the start node admits could trigger. Declaring one is
+        // refused at validation; this is the second lock.
+        let builtin = command_op(message).is_some_and(|op| surface::is_builtin_op(&op));
+        let declared = !builtin
+            && (internal_op
+                || command_op(message).is_some_and(|op| self.workflow_declares_a2a_command(&op)));
         // A declared command with a `schema:` is a CONTRACT: a payload that
         // does not match is refused HERE, synchronously, with the mismatch —
         // not accepted into the inbox to fail later where the caller cannot
@@ -2089,12 +2085,11 @@ impl Runtime {
             .unwrap_or("operator request")
             .to_string();
         match method.to_ascii_lowercase().as_str() {
-            "drain" | "a2a.drain" | "admin.drain" | "lameduck" | "a2a.lameduck"
-            | "admin.lameduck" => {
+            "admin.drain" | "admin.lameduck" => {
                 self.begin_drain(&reason);
                 json!({"ok": true, "state": "draining", "reason": reason})
             }
-            "cancel" | "a2a.cancel" | "admin.cancel" => {
+            "admin.cancel" => {
                 if let Some(run) = params.get("run").and_then(Value::as_str) {
                     self.cancel_run(run, &reason);
                     json!({"ok": true, "cancelled": run})
@@ -2107,55 +2102,51 @@ impl Runtime {
             // without one, hold the WHOLE instance — intake continues (inbox,
             // tasks), but no new turns dispatch and no steps schedule until
             // resume. Reversible, unlike drain.
-            "pause" | "a2a.pause" | "admin.pause" => {
-                match params.get("run").and_then(Value::as_str) {
-                    Some(run) => match self.runs.get_mut(run) {
-                        Some(r) if r.status.is_terminal() => {
-                            err_obj(::mcp::rpc::INVALID_PARAMS, "the run is already terminal")
-                        }
-                        Some(r) => {
-                            r.status = crate::engine::RunStatus::Paused;
-                            r.touch();
-                            self.log
-                                .info("run.paused", json!({"run": run, "reason": reason}));
-                            json!({"ok": true, "paused": run})
-                        }
-                        None => err_obj(TASK_NOT_FOUND, "no such run"),
-                    },
-                    None => {
-                        self.paused = true;
-                        crate::obs::metrics::set_paused(true);
-                        self.log.info("agent.paused", json!({"reason": reason}));
-                        self.feed_push(
-                            "lifecycle",
-                            FeedVis::All,
-                            json!({"paused": true, "reason": reason}),
-                        );
-                        json!({"ok": true, "state": "paused", "reason": reason})
+            "admin.pause" => match params.get("run").and_then(Value::as_str) {
+                Some(run) => match self.runs.get_mut(run) {
+                    Some(r) if r.status.is_terminal() => {
+                        err_obj(::mcp::rpc::INVALID_PARAMS, "the run is already terminal")
                     }
-                }
-            }
-            "resume" | "a2a.resume" | "admin.resume" => {
-                match params.get("run").and_then(Value::as_str) {
-                    Some(run) => match self.runs.get_mut(run) {
-                        Some(r) if r.status == crate::engine::RunStatus::Paused => {
-                            r.status = crate::engine::RunStatus::Running;
-                            r.touch();
-                            self.log.info("run.resumed", json!({"run": run}));
-                            json!({"ok": true, "resumed": run})
-                        }
-                        Some(_) => err_obj(::mcp::rpc::INVALID_PARAMS, "the run is not paused"),
-                        None => err_obj(TASK_NOT_FOUND, "no such run"),
-                    },
-                    None => {
-                        self.paused = false;
-                        crate::obs::metrics::set_paused(false);
-                        self.log.info("agent.resumed", json!({}));
-                        self.feed_push("lifecycle", FeedVis::All, json!({"paused": false}));
-                        json!({"ok": true, "state": "running"})
+                    Some(r) => {
+                        r.status = crate::engine::RunStatus::Paused;
+                        r.touch();
+                        self.log
+                            .info("run.paused", json!({"run": run, "reason": reason}));
+                        json!({"ok": true, "paused": run})
                     }
+                    None => err_obj(TASK_NOT_FOUND, "no such run"),
+                },
+                None => {
+                    self.paused = true;
+                    crate::obs::metrics::set_paused(true);
+                    self.log.info("agent.paused", json!({"reason": reason}));
+                    self.feed_push(
+                        "lifecycle",
+                        FeedVis::All,
+                        json!({"paused": true, "reason": reason}),
+                    );
+                    json!({"ok": true, "state": "paused", "reason": reason})
                 }
-            }
+            },
+            "admin.resume" => match params.get("run").and_then(Value::as_str) {
+                Some(run) => match self.runs.get_mut(run) {
+                    Some(r) if r.status == crate::engine::RunStatus::Paused => {
+                        r.status = crate::engine::RunStatus::Running;
+                        r.touch();
+                        self.log.info("run.resumed", json!({"run": run}));
+                        json!({"ok": true, "resumed": run})
+                    }
+                    Some(_) => err_obj(::mcp::rpc::INVALID_PARAMS, "the run is not paused"),
+                    None => err_obj(TASK_NOT_FOUND, "no such run"),
+                },
+                None => {
+                    self.paused = false;
+                    crate::obs::metrics::set_paused(false);
+                    self.log.info("agent.resumed", json!({}));
+                    self.feed_push("lifecycle", FeedVis::All, json!({"paused": false}));
+                    json!({"ok": true, "state": "running"})
+                }
+            },
             other => err_obj(
                 UNSUPPORTED_OPERATION,
                 &format!("unknown admin op {other:?}"),
@@ -2218,6 +2209,9 @@ impl Runtime {
         // params it can act on. Everything callable is reachable through
         // `SendMessage` with a command DataPart, so a client that ignores the
         // extension entirely can still converse — `required` is false.
+        // One list decides WHICH extensions this instance declares
+        // (`extensions_of`, shared with `--capabilities`); this only decides
+        // how each is described.
         let mut extensions = vec![json!({
             "uri": COMMAND_EXTENSION,
             "description": "Structured operations invoked as a DataPart on SendMessage: \
@@ -2229,7 +2223,7 @@ impl Runtime {
         // Advertise the interface surface so a display client can discover it
         // before authenticating. The card is public, so only the on/off bit
         // rides here; `interface.info` is authenticated and carries the rest.
-        if self.settings.interface.enabled {
+        if extensions_of(&self.settings).contains(&INTERFACE_EXTENSION) {
             extensions.push(json!({
                 "uri": INTERFACE_EXTENSION,
                 "description": "The instance-wide observation feed display clients render. \
@@ -2237,29 +2231,7 @@ impl Runtime {
                 "required": false,
                 "params": {"enabled": true, "methods": ["SubscribeToEvents"]},
             }));
-            extensions.push(json!({
-                "uri": INTERFACE_EXTENSION_LEGACY,
-                "description": "Deprecated spelling of the interface extension; use \
-                                https://agentd.dev/a2a/ext/interface/v1.",
-                "required": false,
-                "params": {"enabled": true, "deprecated": true},
-            }));
         }
-        // Declared because they are still answered. The compliant way to reach
-        // the same five operations is a command DataPart — `admin.drain` and
-        // friends — which any A2A client can send without knowing agentd.
-        extensions.push(json!({
-            "uri": ADMIN_METHODS_EXTENSION,
-            "description": "DEPRECATED custom JSON-RPC methods (a2a.drain, a2a.lameduck, \
-                            a2a.pause, a2a.resume, a2a.cancel). Superseded by the admin.* \
-                            command ops; removed in the next minor.",
-            "required": false,
-            "params": {
-                "methods": ["a2a.drain", "a2a.lameduck", "a2a.pause", "a2a.resume", "a2a.cancel"],
-                "deprecated": true,
-                "replacement": COMMAND_EXTENSION,
-            },
-        }));
         capabilities["extensions"] = json!(extensions);
         let url = self.settings.a2a.listen.clone().unwrap_or_default();
         json!({
@@ -2653,6 +2625,35 @@ pub(crate) fn spawn_a2a_listener(
 mod tests {
     use super::*;
 
+    /// The card and `--capabilities` declare the same extensions.
+    ///
+    /// A peer reads the card; a controller reads the manifest. They came from
+    /// two lists, and disagreed the moment `interface.enabled` was off: the
+    /// card correctly withheld the interface extension while the manifest
+    /// advertised it unconditionally. Both now read `extensions_of`.
+    #[test]
+    fn the_card_and_the_manifest_declare_the_same_extensions() {
+        for enabled in [false, true] {
+            let mut s = crate::config::v2::Settings::default();
+            s.interface.enabled = enabled;
+            let declared = extensions_of(&s);
+            assert_eq!(
+                declared.contains(&INTERFACE_EXTENSION),
+                enabled,
+                "the interface extension follows interface.enabled"
+            );
+            assert!(
+                declared.contains(&COMMAND_EXTENSION),
+                "the command extension is unconditional"
+            );
+            // Anything declarable must be activatable, or the handshake would
+            // drop a URI the card just advertised.
+            for uri in &declared {
+                assert!(EXTENSIONS.contains(uri), "{uri} is not activatable");
+            }
+        }
+    }
+
     /// Every method agentd answers is either an A2A method or DECLARED as an
     /// extension. The oracle checks the first half against an independent
     /// implementation of the spec; this checks the second, which is the half
@@ -2691,6 +2692,71 @@ mod tests {
                 "{method:?} is declared under {uri:?}, which is not in EXTENSIONS"
             );
         }
+    }
+
+    /// The built-in command surface is RESERVED, in both directions.
+    ///
+    /// A workflow's `a2a` start declaring one is refused at validation, and the
+    /// listener dispatches a built-in to its own handler regardless — because a
+    /// declared command takes the inbox path, where the per-op authorization
+    /// the built-ins carry does not run. Before `admin.*` existed this could
+    /// only shadow a read like `status`; now it could shadow an operator's
+    /// drain control with a run that anyone the start node admits may trigger,
+    /// and where the model may create workflows, the author is the model.
+    #[test]
+    fn a_workflow_cannot_claim_a_built_in_command_name() {
+        use crate::runtime::surface::is_builtin_op;
+        for op in [
+            "status",
+            "config",
+            "workflow.run",
+            "subagent.kill",
+            "admin.drain",
+            "admin.pause",
+            "interface.info",
+        ] {
+            assert!(is_builtin_op(op), "{op} is reserved");
+        }
+        for op in [
+            "review.start",
+            "order.paid",
+            "admin",
+            "admin.custom",
+            "drain",
+        ] {
+            assert!(!is_builtin_op(op), "{op} is a workflow's to claim");
+        }
+
+        // The validator refuses the collision, naming it.
+        let wf = serde_json::json!({
+            "name": "shadow", "version": 3,
+            "steps": {
+                "s": {"kind": "a2a", "command": "admin.drain"},
+                "f": {"kind": "finish", "depends_on": ["s"], "status": "completed"}
+            }
+        });
+        let errs = crate::engine::model::parse_workflow(&wf)
+            .err()
+            .unwrap_or_default();
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("admin.drain") && e.contains("built-in")),
+            "the refusal names the collision: {errs:?}"
+        );
+
+        // …and a name of the workflow's own still loads.
+        let ok = serde_json::json!({
+            "name": "fine", "version": 3,
+            "steps": {
+                "s": {"kind": "a2a", "command": "review.start"},
+                "f": {"kind": "finish", "depends_on": ["s"], "status": "completed"}
+            }
+        });
+        assert!(
+            crate::engine::model::parse_workflow(&ok).is_ok(),
+            "{:?}",
+            crate::engine::model::parse_workflow(&ok).err()
+        );
     }
 
     /// The admin family answers to the ROLE, never to a grant. Before these

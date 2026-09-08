@@ -75,7 +75,10 @@ jobs:
           - "--features aauth" # AAuth [DRAFT] — Ed25519 identity + RFC 9421 signing (ships build-from-source, like cel)
           - "--features a2a,hot-reload" # the combo that latently broke once
           - "--release --features internal-mocks" # debug auto-enables it; --release exercises the opt-in path
-          - "--features a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel" # the release-artifact set, exactly
+          - "--features sign" # §7 signing/verification — in the release set
+          - "--features oci" # oci:// instruction pulls + cosign — in the release set
+          - "--features decrypt" # encrypted instruction envelopes — in the release set
+          - "--features a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt" # the release-artifact set, exactly (pinned by release_matrix.rs)
           - "--all-features"
     steps:
       - uses: actions/checkout@v4

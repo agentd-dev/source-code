@@ -24,7 +24,7 @@ export AGENT_INTELLIGENCE="${AGENT_INTELLIGENCE:-https://gw.example/v1}"
 # kept-alive Deployment; tune to taste.
 exec "$AGENTD" \
   --mode reactive \
-  --instruction-file "$(dirname "$0")/instructions/triage.md" \
+  --instruction.file "$(dirname "$0")/instructions/triage.md" \
   --model "claude-opus-4" \
   --mcp inbox=https://mcp-inbox.internal/mcp \
   --mcp tickets=https://mcp-tickets.internal/mcp \

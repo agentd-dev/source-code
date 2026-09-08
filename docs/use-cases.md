@@ -57,7 +57,7 @@ scheduler can branch on it.
 
 ```bash
 agentd \
-  --instruction-file instructions/research.md \
+  --instruction.file instructions/research.md \
   --intelligence https://gw.example/v1 \
   --mcp search=https://mcp-search.internal/mcp \
   --mcp fs=https://mcp-fs.internal/mcp \
@@ -145,7 +145,7 @@ data lake for schema violations every 15 minutes.
 ```bash
 # the k8s CronJob spec runs, on each fire, a plain job:
 agentd \
-  --instruction-file /etc/agentd/audit.md \
+  --instruction.file /etc/agentd/audit.md \
   --intelligence https://gw.example/v1 \
   --mcp fs=https://mcp-fs.internal/mcp \
   --mcp tickets=https://mcp-tickets.internal/mcp \
@@ -206,7 +206,7 @@ backfill across subagents and reconcile their reports.
 
 ```bash
 agentd \
-  --instruction-file /etc/agentd/repo-audit.md \
+  --instruction.file /etc/agentd/repo-audit.md \
   --intelligence https://gw.example/v1 \
   --mcp fs=https://mcp-fs.internal/mcp \
   --mcp tickets=https://mcp-tickets.internal/mcp \

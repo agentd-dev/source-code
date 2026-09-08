@@ -75,7 +75,6 @@ for exactly this:
 |---|---|
 | `https://agentd.dev/a2a/ext/command/v1` | the **command ops** — structured operations sent as a DataPart on `SendMessage`. Data-only: no new method, no changed core structure, never `required` |
 | `https://agentd.dev/a2a/ext/interface/v1` | `SubscribeToEvents`, the instance-wide observation feed. A method extension, because A2A has no instance-feed concept |
-| `https://agentd.dev/a2a/ext/admin-methods/v1` | the **deprecated** `a2a.*` JSON-RPC methods, declared because they are still answered, and removed in the next minor |
 
 A client activates one by listing its URI in the **`A2A-Extensions`** request
 header (comma-separated); the response echoes the header with the ones actually

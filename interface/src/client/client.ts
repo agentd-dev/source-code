@@ -17,7 +17,7 @@ import {
   TaskState,
   TaskView,
 } from './types.js';
-import { rpc, rpcStream, StreamFrame } from './wire.js';
+import { COMMAND_EXTENSION, INTERFACE_EXTENSION, rpc, rpcStream, StreamFrame } from './wire.js';
 
 /**
  * Epoch milliseconds from either form of timestamp.
@@ -141,7 +141,8 @@ export class AgentdClient {
       parts: [{ data: { agentd: { op, ...args } } }],
     };
     if (contextId) message.contextId = contextId;
-    return rpc(this.ep, 'SendMessage', { message });
+    // A command DataPart is the command extension's vocabulary — say so.
+    return rpc(this.ep, 'SendMessage', { message }, [COMMAND_EXTENSION]);
   }
 
   /**
@@ -290,9 +291,9 @@ export class AgentdClient {
   // ---- admin -------------------------------------------------------------
   //
   // Operator-only, and sent the way every other operation is: a `SendMessage`
-  // carrying a command DataPart. The older `a2a.*` JSON-RPC methods still
-  // answer but are deprecated — they are not A2A methods, so a client that
-  // used them would be speaking a private protocol.
+  // carrying a command DataPart. The older `a2a.*` JSON-RPC methods are gone,
+  // not deprecated: they were never A2A methods, so a client that used them
+  // was speaking a private protocol.
 
   async drain(reason = 'requested from the interface'): Promise<Json> {
     return this.commandResult('admin.drain', { reason });
@@ -345,6 +346,7 @@ export class AgentdClient {
         else if (r.goodbye) goodbye = { seq: ((r.goodbye as { [k: string]: Json }).seq as number) ?? fromSeq };
       },
       signal,
+      [INTERFACE_EXTENSION],
     );
     if (errorFrame) throw new RpcError(errorFrame.code, errorFrame.message);
     return goodbye;

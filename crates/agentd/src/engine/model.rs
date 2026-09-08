@@ -1918,7 +1918,24 @@ fn parse_step(
             }
         }
         // The A2A start takes the same `into:` binding as `webhook`.
-        "a2a" => check_into(&spec, &at, errs),
+        "a2a" => {
+            check_into(&spec, &at, errs);
+            // …and may not claim a name the built-in command surface owns.
+            // A declared command takes the inbox path, which does not run the
+            // per-op authorization the built-ins carry — so a workflow
+            // claiming `admin.drain` would shadow an operator's control with a
+            // run that anyone its `roles:` admits could trigger. Refused here,
+            // at load AND at `workflow.create`, because both reach this
+            // validation.
+            if let Some(cmd) = spec.get("command").and_then(Value::as_str)
+                && crate::runtime::surface::is_builtin_op(cmd)
+            {
+                errs.push(format!(
+                    "{at}: command {cmd:?} is a built-in operation and cannot be \
+                     declared by a workflow — pick a name of your own"
+                ));
+            }
+        }
         // The typed A2A form: `command` carries the op, `args` its payload.
         "a2a.delegate" => {
             if spec.get("objective").is_none() && spec.get("command").is_none() {

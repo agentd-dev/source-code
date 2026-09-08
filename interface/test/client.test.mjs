@@ -261,3 +261,31 @@ test('durations are measured, formatted at the right precision, and honest about
   const late = m.state.steps.get('r').find((x) => x.step === 'late');
   assert.equal(late.ms, undefined, 'an unobserved start must not be invented');
 });
+
+test('a command send announces the extension whose vocabulary it uses', async () => {
+  const { AgentdClient, COMMAND_EXTENSION } = await import('../dist/client/index.js');
+  const seen = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    seen.push({ url, headers: init.headers, body: JSON.parse(init.body) });
+    return {
+      ok: true,
+      json: async () => ({ jsonrpc: '2.0', id: 1, result: { task: null } }),
+    };
+  };
+  try {
+    const c = new AgentdClient({ url: 'http://127.0.0.1:9/' });
+    await c.command('admin.pause', { run: 'r1' });
+    // …and a plain conversational send does NOT claim it: the core protocol
+    // needs no extension, and claiming one you are not using is noise.
+    await c.send('hello');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  assert.equal(seen.length, 2);
+  assert.equal(seen[0].headers['a2a-extensions'], COMMAND_EXTENSION);
+  assert.deepEqual(seen[0].body.params.message.parts, [
+    { data: { agentd: { op: 'admin.pause', run: 'r1' } } },
+  ]);
+  assert.equal(seen[1].headers['a2a-extensions'], undefined);
+});

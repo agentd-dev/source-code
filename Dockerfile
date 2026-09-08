@@ -3,12 +3,20 @@
 # agentd cloud-native appliance image — a fully static musl binary on `scratch`.
 #
 # The image ships the **cloud-native feature set**
-# (`a2a,metrics,cron,otel,hot-reload,config-watch`): the A2A v2 HTTPS listener
+# (`a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt`): the A2A v2 HTTPS listener
 # (RFC 0029, the external channel + delegation peers), the `/healthz`+`/readyz`+
 # `/metrics` HTTP probe surface (so k8s liveness/readiness probes work), UTC-cron
-# scheduling, OTLP trace+log export, and SIGHUP + inotify config hot-reload (a
-# ConfigMap volume swap reloads in place). All but `a2a` (which pulls the TLS
-# stack) are hand-rolled and add NO dependency.
+# scheduling, OTLP trace+log export, SIGHUP + inotify config hot-reload (a
+# ConfigMap volume swap reloads in place), OAuth/SigV4/SPIFFE endpoint auth,
+# AAuth agent identity, CEL expressions, §7 instruction signature verification,
+# `oci://` instruction pulls with cosign, and encrypted instruction envelopes.
+# `cel` is the one dependency-BEARING member; all but it and `a2a` (which pulls
+# the TLS stack) are hand-rolled and add NO dependency, `sign`/`oci`/`decrypt`
+# reusing the `ring` rustls already links.
+#
+# This list is the same one `.github/workflows/release.yml` builds, and
+# `release_matrix.rs` fails if the two drift: the image and the standalone
+# binaries are the same release and must have the same capabilities.
 # HTTPS is the primary transport for both intelligence and MCP, so `tls` is ON by
 # DEFAULT: rustls with the `ring` provider + bundled webpki roots, so there is no
 # system CA bundle to mount. MCP and A2A are the official/published protocol
@@ -27,7 +35,7 @@
 
 # ---- builder -------------------------------------------------------------
 FROM rust:1.96-alpine AS builder
-ARG FEATURES="a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel"
+ARG FEATURES="a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt"
 # Alpine's host target IS <arch>-unknown-linux-musl, so the release binary is
 # static (crt-static is on for musl). Building WITHOUT an explicit --target uses
 # that host target, which is exactly what each buildx platform wants — so one

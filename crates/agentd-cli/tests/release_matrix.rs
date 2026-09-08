@@ -83,6 +83,94 @@ fn ci_lints_exactly_what_the_release_ships() {
     );
 }
 
+/// The IMAGE ships what the binaries ship.
+///
+/// The container job left `FEATURES` to the Dockerfile's own default, and the
+/// default stopped matching `release.yml`: `sign`, `oci` and `decrypt` reached
+/// the standalone binaries and never reached the image, so
+/// `ghcr.io/agentd-dev/agentd` could not verify an instruction signature the
+/// release notes said it could. Two artifacts of the same release must have the
+/// same capabilities.
+#[test]
+fn the_image_is_built_with_the_same_features_as_the_binaries() {
+    let want = release_features();
+    let dockerfile =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Dockerfile"))
+            .unwrap();
+    let line = dockerfile
+        .lines()
+        .find(|l| l.starts_with("ARG FEATURES="))
+        .expect("the Dockerfile declares ARG FEATURES");
+    let mut have: Vec<String> = line
+        .split_once('=')
+        .unwrap()
+        .1
+        .trim()
+        .trim_matches('"')
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .collect();
+    let mut want_sorted = want.clone();
+    have.sort();
+    want_sorted.sort();
+    assert_eq!(
+        have, want_sorted,
+        "the Dockerfile default and release.yml FEATURES disagree — a local \
+         `docker build .` would not produce the released image"
+    );
+
+    // …and the workflow passes it rather than trusting the default to stay
+    // right, which is how it drifted in the first place.
+    let release = workflow("release.yml");
+    assert!(
+        release.contains("FEATURES=${{ env.FEATURES }}"),
+        "the container job must pass FEATURES explicitly as a build-arg"
+    );
+}
+
+/// Every place that WRITES OUT the shipped feature set writes the same one.
+///
+/// The list is copied into the README, the deployment guide, the architecture
+/// note and the Dockerfile's own header. Every one of those copies was a
+/// release behind. A reader who follows any of them builds something other
+/// than what ships.
+#[test]
+fn every_documented_copy_of_the_feature_set_is_current() {
+    let want = release_features().join(",");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut stale = Vec::new();
+    for f in [
+        "README.md",
+        "Dockerfile",
+        "docs/deployment.md",
+        "docs/architecture.md",
+    ] {
+        let text = std::fs::read_to_string(root.join(f)).unwrap();
+        for (n, line) in text.lines().enumerate() {
+            // A list naming `aauth` alongside `oauth` is claiming to BE the
+            // shipped set. Deliberate subsets (the Dockerfile's
+            // `--build-arg FEATURES=a2a,metrics,cron,otel` example) name
+            // neither, and are left alone.
+            let mut rest = line;
+            while let Some(i) = rest.find("a2a,metrics") {
+                let run: String = rest[i..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == ',' || *c == '-')
+                    .collect();
+                if run.contains("aauth") && run.contains("oauth") && run != want {
+                    stale.push(format!("{f}:{}: {run}", n + 1));
+                }
+                rest = &rest[i + 3..];
+            }
+        }
+    }
+    assert!(
+        stale.is_empty(),
+        "these name the shipped feature set and are out of date (want {want}):\n{}",
+        stale.join("\n")
+    );
+}
+
 /// The local pre-push gate runs the same rows as CI. A gate that is a subset of
 /// CI is a gate that says "clean" and then goes red on push.
 #[test]

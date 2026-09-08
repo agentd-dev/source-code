@@ -5,6 +5,34 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## v1.14.1 — the image ships what the binaries ship
+
+### Fixed
+
+- **The published container was built with a narrower feature set than the
+  release's binaries.** `release.yml` builds the standalone binaries from its
+  `FEATURES` list and left the container job to the Dockerfile's own `ARG
+  FEATURES` default — which never gained `sign`, `oci` or `decrypt`. So
+  `ghcr.io/agentd-dev/agentd` could not verify an instruction signature, pull
+  an `oci://` instruction, or open an encrypted envelope, while the binary
+  beside it could and the release notes said both could. Verified by running
+  the published 1.14.0 image: `agent.instruction.trust` came back
+  "this build cannot verify signatures".
+
+  The workflow now passes `FEATURES` explicitly rather than trusting a default
+  to stay in step, and the Dockerfile default matches. Two artifacts of one
+  release have one capability surface.
+
+- **Every documented copy of the feature set was a release behind** — the
+  README (twice), `docs/deployment.md`, `docs/architecture.md` and the
+  Dockerfile's own header. `docs/deployment.md`'s table now describes `cel`,
+  `sign`, `oci` and `decrypt` as well.
+
+- **Two more rows in `release_matrix.rs`**, since a comment is not a mechanism:
+  the Dockerfile's `ARG FEATURES` must equal `release.yml`'s, the container job
+  must pass it as a build-arg, and any list in those four documents that names
+  itself as the shipped set (it names both `aauth` and `oauth`) must be current.
+
 ## v1.14.0 — who wrote it, who pushed it, and both keep being checked
 
 Two independent questions about the document an agent takes its policy from —

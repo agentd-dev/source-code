@@ -528,7 +528,7 @@ ticking.
 The resulting footprint, on a stripped x86_64 glibc release build (`opt-level =
 "z"`, LTO, `panic = "abort"`, one codegen unit): 2.88 MiB with
 `--no-default-features`, 3.83 MiB with default `tls`, 4.43 MiB with the shipped
-set `a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel`. Release
+set `a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt`. Release
 artifacts are cross-compiled static-musl for `x86_64` and `aarch64`, plus a
 multi-arch, cosign-signed OCI image with an SPDX SBOM.
 

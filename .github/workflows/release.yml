@@ -59,7 +59,14 @@ jobs:
           files: dist/*
 
   # Multi-arch OCI image → GHCR, cosign-signed (keyless OIDC) with an SPDX SBOM
-  # attestation. The Dockerfile defaults FEATURES to the cloud-native set.
+  # attestation.
+  #
+  # FEATURES is passed EXPLICITLY rather than left to the Dockerfile's default.
+  # It was left to the default, and the default stopped matching: `sign`, `oci`
+  # and `decrypt` joined this release's binaries and never reached the image,
+  # so the container could not verify a signature the release notes promised it
+  # could. release_matrix.rs now pins the Dockerfile default to this list too,
+  # but the build no longer depends on that agreement.
   container:
     permissions:
       contents: read
@@ -96,6 +103,7 @@ jobs:
           # org.opencontainers.image.* set, including `created`; these args just
           # fill the Dockerfile's local-build defaults.
           build-args: |
+            FEATURES=${{ env.FEATURES }}
             VERSION=${{ github.ref_name }}
             REVISION=${{ github.sha }}
       - uses: sigstore/cosign-installer@v3

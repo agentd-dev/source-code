@@ -223,9 +223,10 @@ own process tree. You do **not** need an external `tini`.
 
 The published image (`Dockerfile` at the repo root) ships the **cloud-native
 feature set** by default —
-`FEATURES="a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel"` (the same
+`FEATURES="a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt"` (the same
 set the release workflow builds). `a2a` brings the A2A SDK and the async stack
-its listener runs on; `aauth` is a direct edge on `ring`, already in the tree as
+its listener runs on; `cel` is the one dependency-bearing member; `aauth`,
+`sign`, `oci` and `decrypt` are direct edges on `ring`, already in the tree as
 rustls's crypto provider; the rest are hand-rolled and add no dependency. What
 each adds:
 
@@ -239,10 +240,13 @@ each adds:
 | `config-watch` | The `inotify` file-watch reload trigger (`lifecycle.watch_config`) — a ConfigMap volume swap reloads in place. Implies `hot-reload`. |
 | `oauth` | OAuth 2.1 endpoint credentials (device, authorization-code + PKCE, client-credentials, refresh, OIDC discovery) for intelligence / MCP / A2A endpoints — see [`authentication.md`](authentication.md). |
 | `aauth` | AAuth agent identity: an Ed25519 keypair, agent-token enrolment, and RFC 9421 HTTP message signatures on outbound MCP requests. |
+| `cel` | CEL expressions in workflow `when:` / `inputs:` — the one member with a dependency. |
+| `sign` | §7 instruction signature verification: `agent.instruction.trust` pins a publisher, and without this feature a pin is a startup refusal rather than a silent pass. |
+| `oci` | `oci://` instruction pulls over the Distribution API, and the cosign artifact check (`oci: {ref, cosign_key}`). |
+| `decrypt` | Encrypted instruction envelopes — age v1 and JWE (`agent.instruction.decrypt`). |
 
 Build a narrower (or wider) surface with `--build-arg FEATURES=…`. Other features
-`exec` (the guarded local-command tool, off at runtime too), `cel` (CEL
-expressions in workflows — the one feature with a dependency), and
+are `exec` (the guarded local-command tool, off at runtime too) and
 `internal-mocks` (test scaffolding). `tls` is in the **default** set (it is the
 transport — every network surface is HTTPS); `a2a` rides it.
 `--no-default-features` drops TLS for the loopback-`http://`-to-a-sidecar
@@ -252,7 +256,7 @@ posture.
 # syntax=docker/dockerfile:1
 # Static musl binary on scratch — the cloud-native feature set.
 FROM rust:1-alpine AS build
-ARG FEATURES="a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel"
+ARG FEATURES="a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt"
 RUN apk add --no-cache musl-dev
 WORKDIR /src
 COPY . .

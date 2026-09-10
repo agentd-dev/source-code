@@ -18,7 +18,11 @@
 //! types and [`version`] the era model; the [`client`], [`http`] transport, and
 //! [`server`] base build on them.
 //!
-//! Dependency budget: `serde` + `serde_json` only (the agentd minimalism moat).
+//! Dependencies: the official `rmcp` SDK and the async seam it needs, over
+//! agentd's own `net` transport — plus serde/serde_json, and `vsock` only when
+//! the `vsock` feature asks the server to listen on one. (The header in
+//! `Cargo.toml` says the same thing; this copy said "serde + serde_json only",
+//! which stopped being true when the SDK was adopted.)
 
 pub mod client;
 pub mod http;

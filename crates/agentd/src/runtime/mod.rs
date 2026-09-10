@@ -631,6 +631,7 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
         principal_labels: BTreeMap::new(),
         exit: None,
         draining: false,
+        lifetime_spent: false,
         paused: false,
         drain_started: None,
         drain_reason: String::new(),

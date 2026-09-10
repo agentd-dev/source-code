@@ -38,6 +38,7 @@ pub fn schema() -> Value {
         "properties": {
             "windows": { "type": "array", "items": { "$ref": "#/$defs/BudgetWindow" } },
             "lifetime_tokens": { "type": "integer", "minimum": 0, "description": "hard ceiling; 0 = unbounded" },
+            "lifetime_exhausted": { "enum": ["drain", "refuse", "exit"], "description": "what the PROCESS does once lifetime_tokens is spent: drain (default — finish live work, exit 0, let an orchestrator restart with a fresh window), refuse (keep refusing every admission and stay up), exit (stop now, exit 7)" },
             "scope": { "type": "array", "items": { "enum": ["instance", "run", "conversation", "principal"] } },
             "on_exhausted": { "enum": ["wait", "slow", "degrade", "refuse", "fail"] },
             "slow": { "type": "object", "additionalProperties": false, "properties": { "factor": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 } } },
@@ -151,10 +152,8 @@ fn top_level_properties(
                     "models": { "type": "object", "description": "named model tiers: cost/quality tiering inside one workflow without forking a process. A tier points AT a `services:` entry and may only narrow — it inherits that service's trifecta tags and can never declare its own floor.", "additionalProperties": {
                         "type": "object", "additionalProperties": false, "required": ["model"], "properties": {
                             "model": { "type": "string", "description": "the wire model name sent to the provider" },
-                            "service": { "type": "string", "description": "a `services:` entry of kind: intelligence supplying endpoint, auth and tags" },
                             "window": { "type": "integer", "minimum": 1, "description": "this model's context window, so compaction stops guessing from the model NAME" },
-                            "fallback": { "type": "string", "description": "the tier to degrade to — a ladder that walks down instead of failing" },
-                            "pricing": { "type": "object", "additionalProperties": false, "properties": { "input_per_1k": { "type": "number" }, "output_per_1k": { "type": "number" } } } } } },
+                            "fallback": { "type": "string", "description": "the tier to degrade to — a ladder that walks down instead of failing" } } } },
                     "default": { "type": "string", "description": "the tier used when nothing names one" },
                     "preflight_model": { "type": "string", "description": "the tier preflight runs on — a recurring fixed cost that does not need the answering model" },
                     "dialect": { "enum": ["openai", "anthropic", "bedrock"], "description": "wire dialect; bedrock = native Amazon Bedrock Converse (pair with auth.kind=aws)" },
@@ -165,7 +164,6 @@ fn top_level_properties(
                     "swap_policy": { "enum": ["finish-on-old", "restart-turn"] },
                     "structured_output": { "enum": ["auto", "json_schema", "tool", "prompt"] },
                     "budget": budget,
-                    "pricing": { "type": "object", "additionalProperties": { "$ref": "#/$defs/Pricing" } },
                     "timeout": duration
                 }
             }));
@@ -409,8 +407,6 @@ fn defs_properties(
                 "tokens": { "type": "integer", "minimum": 1 },
                 "requests": { "type": "integer", "minimum": 1 },
                 "reset": { "type": "string", "pattern": "^[0-9]{2}:[0-9]{2}Z$", "description": "calendar-window reset time (UTC), e.g. 00:00Z" } } }));
-    m.insert("Pricing".to_string(), json!({ "type": "object", "additionalProperties": false, "properties": {
-                "input_per_1k": { "type": "number", "minimum": 0 }, "output_per_1k": { "type": "number", "minimum": 0 }, "currency": { "type": "string" } } }));
     m.insert("McpServer".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["name"],
                 "oneOf": [ { "required": ["endpoint"] }, { "required": ["service"] } ],
                 "properties": {

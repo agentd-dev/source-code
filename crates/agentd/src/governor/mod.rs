@@ -17,7 +17,10 @@
 //!   scope's tactic applies.
 //! - **Reservation** — `admit` reserves an estimate against every window; the
 //!   reported usage `settle`s it (replacing the estimate).
-//! - **Lifetime** — `lifetime_tokens` is the hard ceiling (always `fail`).
+//! - **Lifetime** — `lifetime_tokens` is the hard ceiling. It answers
+//!   `Exhausted`, not `Fail`: the window never resets, so the question is not
+//!   what this unit does but what the INSTANCE does
+//!   (`intelligence.budget.lifetime_exhausted`).
 //!
 //! Pure and clock-injected (`now_ms`) — the runtime feeds it, the manifest
 //! stores it, `agent://budget` reads it.
@@ -40,8 +43,12 @@ pub enum Admission {
     Wait { until_ms: u64, reason: String },
     /// Declined (`refuse` tactic).
     Refuse { reason: String },
-    /// Fail the unit (`fail` tactic / lifetime ceiling).
+    /// Fail the unit (`fail` tactic).
     Fail { reason: String },
+    /// The LIFETIME ceiling is spent. Distinct from `Fail` because it is not a
+    /// property of this unit — no later unit can succeed either, so the
+    /// instance has a decision to make (`intelligence.budget.lifetime_exhausted`).
+    Exhausted { reason: String },
 }
 
 /// One window's durable counters.
@@ -378,7 +385,7 @@ impl Governor {
             };
             self.events += 1;
             if ex.window == "lifetime" {
-                return Admission::Fail {
+                return Admission::Exhausted {
                     reason: format!("lifetime token budget exhausted ({key})"),
                 };
             }
@@ -655,7 +662,11 @@ mod tests {
             g.admit(500, &[], hour_start + 1_800_000),
             Admission::Ok { .. }
         ));
-        // Lifetime ceiling always fails.
+        // The lifetime ceiling is EXHAUSTED, not merely failed: no later
+        // admission can succeed either, so the instance has a decision to make
+        // (`intelligence.budget.lifetime_exhausted`). `on_exhausted` is a
+        // WINDOW tactic and deliberately does not apply — there is nothing to
+        // wait for when the window never resets.
         let mut g = Governor::new(&budget(
             json!({"lifetime_tokens": 50, "on_exhausted": "wait"}),
         ));
@@ -664,7 +675,7 @@ mod tests {
         };
         g.settle(reservation, usage(30));
         assert!(
-            matches!(g.admit(30, &[], now), Admission::Fail { reason } if reason.contains("lifetime"))
+            matches!(g.admit(30, &[], now), Admission::Exhausted { reason } if reason.contains("lifetime"))
         );
         assert_eq!(g.lifetime_used(), 30);
         // No budget configured ⇒ always ok.

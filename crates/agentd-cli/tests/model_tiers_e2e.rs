@@ -192,19 +192,25 @@ fn a_fallback_cycle_is_refused_at_startup() {
     assert!(log.contains("fallback cycle"), "{log}");
 }
 
-/// A tier pointing at a service that is not `kind: intelligence` is a
-/// configuration mistake — it would inherit the wrong tags.
+/// A tier's `service:` is refused by name.
+///
+/// It named a `kind: intelligence` catalogue entry, was checked at startup, and
+/// was then ignored — every tier's call goes to `intelligence.endpoints`, which
+/// is what the client is built from. A key that reads like routing and does not
+/// route is worse than an absent one: `examples/voice/hands.yaml` used it to
+/// "point" two tiers at a gateway whose credential consequently never reached a
+/// dial. Refused since 1.15.
 #[test]
-fn a_tier_pointing_at_a_non_intelligence_service_is_refused() {
+fn a_tier_service_is_refused_because_it_never_selected_an_endpoint() {
     let (code, log) = run(&format!(
-        "{BASE}services:\n  billing: {{ kind: mcp, endpoint: \"https://b.example/mcp\" }}\n\
+        "{BASE}services:\n  gw: {{ kind: intelligence, endpoint: \"https://g.example/v1\" }}\n\
          intelligence:\n  endpoints: \"mock:json\"\n\
-        \x20 models:\n    x: {{ model: m, service: billing }}\n  default: x\n"
+        \x20 models:\n    x: {{ model: m, service: gw }}\n  default: x\n"
     ));
     assert_eq!(code, Some(2), "{log}");
     assert!(
-        log.contains("needs `kind: intelligence`"),
-        "the refusal should name the mismatch\n{log}"
+        log.contains("unknown field `service`") && log.contains("`model`"),
+        "the refusal should name the field and what a tier does take\n{log}"
     );
 }
 

@@ -308,6 +308,7 @@ own `resume_policy` (`force` to always restart it) is the per-graph control.
 | `--deadline <dur>` | `limits.run.deadline` | `DEADLINE` | `3600s` | Per-run wall-clock deadline (duration syntax, §7). **Reloadable** (§11). |
 | `--max-depth <N>` | `limits.subagents.depth` | — | `3` | Subagent tree depth cap — how many levels of children a tree may nest. |
 | `--budget-tokens-lifetime <N>` | `intelligence.budget.lifetime_tokens` | `BUDGET_TOKENS` | `0` (unbounded) | Per-**instance** cumulative token cap across **all** runs. See §3.4a. |
+| — | `intelligence.budget.lifetime_exhausted` | — | `drain` | What the PROCESS does once that cap is spent: `drain` (finish live work, exit 0), `refuse` (stay up refusing), `exit` (stop now, exit 7). See §3.4a. |
 | `--budget-exit-code <N>` | `lifecycle.exit_code_map` | — | *(none)* | Remap the policy exit codes `3` and `7` to `N` (`0..=255`) — e.g. exit `0` so a budget stop is not a pod failure. |
 
 `limits.max_runs` (concurrent runs, default `8`), `limits.step_timeout`,
@@ -324,22 +325,37 @@ AAuth direct dial) still stays bounded. `0` (the default) is unbounded.
 - **A job** is that single run, so the effective per-run cap is
   `min(limits.run.tokens, intelligence.budget.lifetime_tokens)`; exhaustion is
   the ordinary `EXIT_BUDGET(7)` path (remappable with `--budget-exit-code`).
-- **A daemon** meters cumulative usage; once the cap is reached it **stops
-  accepting new work**, but the transition is a refusal rather than a drain or
-  an event: admission fails with `lifetime token budget exhausted (<scope>)`,
-  which drops a conversation turn (logged `budget.refused`) and fails the step
-  in a workflow with that reason. The process itself keeps running under its
-  ordinary `lifecycle.run_until` — nothing drains and nothing exits on
-  exhaustion, so the warning has to come from the gauge below.
+- **A daemon** meters cumulative usage; once the cap is reached, what happens
+  to the instance is `intelligence.budget.lifetime_exhausted`. The unit that
+  tripped it always fails — a conversation turn is dropped (logged
+  `budget.refused`), a workflow step fails with `lifetime token budget
+  exhausted (<scope>)` — and then:
+
+  | Policy | The instance | Use when |
+  |---|---|---|
+  | `drain` *(default)* | finishes live work, then exits `0` | an orchestrator restarts it with a fresh window, which is what a lifetime budget is usually for |
+  | `refuse` | stays up, refusing every admission | you would rather inspect a stopped instance than lose it. The pre-1.15 behaviour |
+  | `exit` | stops now, exit `7` | overrunning the ceiling is a failure to notice, not a lifecycle |
+
+  The transition is one log line — `budget.lifetime_exhausted` with the policy
+  that applied — emitted once, not once per refused admission. This is the same
+  vocabulary `agent.instruction.unavailable` uses for the other "something this
+  agent depends on ran out" question, minus the two words that cannot apply
+  here: you cannot `keep` spending, and `freeze` is indistinguishable from
+  `refuse` when live work needs tokens too.
 - **Observability**: the gauge `agent_budget_tokens_remaining` tracks the balance
   continuously — the alerting/scaling hook is a threshold rule on that gauge,
-  since the runtime fires nothing of its own as the cap approaches. On the
+  since the runtime fires nothing of its own as the cap APPROACHES (the
+  `budget.lifetime_exhausted` line above comes after the fact, not before it). On the
   fleet, the budget is per-member (each pod carries its own instance budget); an
   aggregate fleet cap remains a gateway concern.
 
 The lifetime ceiling is the blunt end of `intelligence.budget`, which also takes
 rolling `windows` (`{per: hour, tokens: 2000000}`), an `on_exhausted` tactic
 (`wait`\|`slow`\|`degrade`\|`refuse`\|`fail`), a `reserve`, and a `scope`.
+`on_exhausted` governs a WINDOW, where "wait" is a real answer because the
+window resets; `lifetime_exhausted` governs the ceiling that never resets, which
+is why they are two settings and not one.
 `agent.conversation_budget` is the same shape applied per conversation.
 
 ### 3.5 Runtime / observability / security
@@ -1530,7 +1546,7 @@ each path is equally reachable from env and flags (§1.1), so
 | `config_version` | `"1"`. Optional, but pin it — any other value is exit `2`. |
 | `vars` | Named values (any JSON type, nestable) referenced as `{{config.NAME}}` anywhere a string sits — see §12.4. |
 | `agent` | `name`, `instruction`, `prompt`, `preflight`, `wake_on`, `tools` (`internal`/`mcp`/`code` allow-lists), `max_parallel_turns`, `conversation_budget`, `ask_human_fallback`, `on_workflow_finished`. |
-| `intelligence` | `endpoints[]`, `model`, `dialect`, `swap_policy`, `timeout`, `headers{}`, `token`/`token_file`, `auth{}` (OAuth 2.1 / AWS SigV4 / SPIFFE), `budget{}`, `pricing`, `structured_output`. |
+| `intelligence` | `endpoints[]`, `model`, `dialect`, `swap_policy`, `timeout`, `headers{}`, `token`/`token_file`, `auth{}` (OAuth 2.1 / AWS SigV4 / SPIFFE), `budget{}`, `structured_output`. |
 | `mcp` | `servers[]` — `{name, endpoint, headers{}, tags{glob:[…]}, ns, allow[], exclude[], timeout, auth{}, oauth{}, aauth}` — and `default_timeout`. `allow`/`exclude` gate the server's advertised tool names by glob (exclude beats allow; a gated-out tool never registers). |
 | `tools` | `disabled[]`, `overrides{}` (retarget a tool at a declared server, optionally rewriting `args`/`result`). |
 | `context` | `template` (the system-prompt template; unset = the built-in, printed by `agentd --context-template`), `templates{}` (named alternates a node picks with `context: {template: <name>}`), `summarize{prompt, model}` (the compaction guidance and a cheaper model to run it on), `compact_at`, `keep_last`, `model_window`, `plan{}`. |

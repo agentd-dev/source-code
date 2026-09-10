@@ -384,23 +384,6 @@
       },
       "type": "object"
     },
-    "Pricing": {
-      "additionalProperties": false,
-      "properties": {
-        "currency": {
-          "type": "string"
-        },
-        "input_per_1k": {
-          "minimum": 0,
-          "type": "number"
-        },
-        "output_per_1k": {
-          "minimum": 0,
-          "type": "number"
-        }
-      },
-      "type": "object"
-    },
     "Principal": {
       "additionalProperties": false,
       "properties": {
@@ -452,6 +435,14 @@
                     }
                   },
                   "type": "object"
+                },
+                "lifetime_exhausted": {
+                  "description": "what the PROCESS does once lifetime_tokens is spent: drain (default — finish live work, exit 0, let an orchestrator restart with a fresh window), refuse (keep refusing every admission and stay up), exit (stop now, exit 7)",
+                  "enum": [
+                    "drain",
+                    "refuse",
+                    "exit"
+                  ]
                 },
                 "lifetime_tokens": {
                   "description": "hard ceiling; 0 = unbounded",
@@ -765,6 +756,14 @@
                 }
               },
               "type": "object"
+            },
+            "lifetime_exhausted": {
+              "description": "what the PROCESS does once lifetime_tokens is spent: drain (default — finish live work, exit 0, let an orchestrator restart with a fresh window), refuse (keep refusing every admission and stay up), exit (stop now, exit 7)",
+              "enum": [
+                "drain",
+                "refuse",
+                "exit"
+              ]
             },
             "lifetime_tokens": {
               "description": "hard ceiling; 0 = unbounded",
@@ -2551,6 +2550,14 @@
               },
               "type": "object"
             },
+            "lifetime_exhausted": {
+              "description": "what the PROCESS does once lifetime_tokens is spent: drain (default — finish live work, exit 0, let an orchestrator restart with a fresh window), refuse (keep refusing every admission and stay up), exit (stop now, exit 7)",
+              "enum": [
+                "drain",
+                "refuse",
+                "exit"
+              ]
+            },
             "lifetime_tokens": {
               "description": "hard ceiling; 0 = unbounded",
               "minimum": 0,
@@ -3155,6 +3162,14 @@
               },
               "type": "object"
             },
+            "lifetime_exhausted": {
+              "description": "what the PROCESS does once lifetime_tokens is spent: drain (default — finish live work, exit 0, let an orchestrator restart with a fresh window), refuse (keep refusing every admission and stay up), exit (stop now, exit 7)",
+              "enum": [
+                "drain",
+                "refuse",
+                "exit"
+              ]
+            },
             "lifetime_tokens": {
               "description": "hard ceiling; 0 = unbounded",
               "minimum": 0,
@@ -3265,22 +3280,6 @@
                 "description": "the wire model name sent to the provider",
                 "type": "string"
               },
-              "pricing": {
-                "additionalProperties": false,
-                "properties": {
-                  "input_per_1k": {
-                    "type": "number"
-                  },
-                  "output_per_1k": {
-                    "type": "number"
-                  }
-                },
-                "type": "object"
-              },
-              "service": {
-                "description": "a `services:` entry of kind: intelligence supplying endpoint, auth and tags",
-                "type": "string"
-              },
               "window": {
                 "description": "this model's context window, so compaction stops guessing from the model NAME",
                 "minimum": 1,
@@ -3298,12 +3297,6 @@
         "preflight_model": {
           "description": "the tier preflight runs on — a recurring fixed cost that does not need the answering model",
           "type": "string"
-        },
-        "pricing": {
-          "additionalProperties": {
-            "$ref": "#/$defs/Pricing"
-          },
-          "type": "object"
         },
         "structured_output": {
           "enum": [

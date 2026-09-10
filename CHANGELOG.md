@@ -24,6 +24,30 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   empty — so a typo in the catalog refuses the dial instead of waving it
   through, and the typed parse reports the real error a moment later.
 
+### Changed (breaking)
+
+- **A spent lifetime token budget now ends the instance** —
+  `intelligence.budget.lifetime_exhausted`, defaulting to `drain`. Before this,
+  a daemon whose `lifetime_tokens` were spent sat there refusing every turn
+  forever: admission failed, turns dropped, steps failed, and nothing acted on
+  it, so the only warning was a gauge somebody had to be watching. A budget
+  that cannot end anything is not a budget.
+
+  `drain` finishes live work and exits `0`, which is what a lifetime ceiling is
+  usually for — an orchestrator restarts the instance with a fresh window.
+  `refuse` keeps the old behaviour for an operator who would rather inspect a
+  stopped instance than lose it, and `exit` stops now with exit `7`. The
+  transition is one `budget.lifetime_exhausted` line carrying the policy that
+  applied, emitted once rather than once per refused admission.
+
+  This is the vocabulary `agent.instruction.unavailable` already uses for the
+  other "something this agent depends on ran out" question, minus the two words
+  that cannot apply: you cannot `keep` spending, and `freeze` is
+  indistinguishable from `refuse` when live work needs tokens too. Internally
+  the lifetime ceiling answers `Admission::Exhausted` rather than `Fail`,
+  because it is not a property of the unit that tripped it — no later unit can
+  succeed either.
+
 ### Fixed
 
 - **`agentd --config-schema=1` no longer walks the config-discovery chain.**
@@ -54,6 +78,23 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   `interface.info` now reads that same list instead of keeping a fifth copy.
 
 ### Removed
+
+- **`intelligence.models.<tier>.service`.** It named a `kind: intelligence`
+  catalogue entry, was checked at startup, and was then ignored: every tier's
+  call went to `intelligence.endpoints` regardless. A config reading "this tier
+  talks to my on-prem gateway" talked to the shared one — a routing key that
+  does not route, which is the worst kind of security-adjacent lie because it
+  reads like a control. Refused by name; the sibling `model`, `window` and
+  `fallback` all have real consumers and stay.
+
+- **`intelligence.pricing` and a tier's `pricing:`.** They parsed, validated,
+  published a shape into the JSON schema for editor autocomplete — and nothing
+  ever multiplied a rate by a token count. No event carried a money figure, and
+  every limit under `intelligence.budget` is denominated in tokens and requests.
+  An operator writing their rate card into the config could reasonably expect a
+  spend figure back out; there was none. Real cost accounting is a feature worth
+  designing (cached versus fresh tokens, tier rollups, what a currency budget
+  does when a provider reprices mid-run), not a field left half-declared.
 
 - **`emit: {metric: …}`.** The field validated, ran green and recorded nothing:
   no code path ever read it. An accepted field that does nothing is worse than a

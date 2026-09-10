@@ -348,6 +348,18 @@ impl Runtime {
                     .or_default() = until_ms;
                 return Err(TurnDefer::Later(Box::new(job)));
             }
+            Admission::Exhausted { reason } => {
+                self.apply_lifetime_exhausted(&reason);
+                self.log
+                    .warn("budget.refused", json!({"ctx": ctx_id, "reason": reason}));
+                if let Some(c) = self.contexts.get_mut(&ctx_id) {
+                    c.append(Msg::note(format!("turn not run: {reason}")));
+                }
+                if let Some(ev) = &job.event {
+                    self.inbox_done(ev);
+                }
+                return Err(TurnDefer::Dropped);
+            }
             Admission::Refuse { reason } | Admission::Fail { reason } => {
                 self.log
                     .warn("budget.refused", json!({"ctx": ctx_id, "reason": reason}));
@@ -1055,7 +1067,9 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
                     reason: None,
                 }
             }
-            Admission::Refuse { reason } | Admission::Fail { reason } => ControlMsg::BudgetGrant {
+            Admission::Exhausted { reason }
+            | Admission::Refuse { reason }
+            | Admission::Fail { reason } => ControlMsg::BudgetGrant {
                 id,
                 ok: false,
                 wait_ms: 0,

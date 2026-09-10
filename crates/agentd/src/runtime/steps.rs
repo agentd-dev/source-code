@@ -2158,6 +2158,11 @@ impl Runtime {
                 }
                 return;
             }
+            Admission::Exhausted { reason } => {
+                self.apply_lifetime_exhausted(&reason);
+                self.finish_step(run_id, step_id, StepStatus::Failed, None, Some(reason), 0);
+                return;
+            }
             Admission::Refuse { reason } | Admission::Fail { reason } => {
                 self.finish_step(run_id, step_id, StepStatus::Failed, None, Some(reason), 0);
                 return;

@@ -30,20 +30,28 @@ agent:
     apologising at length. You are being read aloud to someone standing in a
     kitchen.
 
-# Two tiers behind one gateway. The deep tier exists for exactly one step: the
+# Two tiers on one endpoint. The deep tier exists for exactly one step: the
 # open question a person asks out loud, where the agent has tools and has to
 # think. Everything else runs on the fast one.
+#
+# A tier carries the wire model name and its context window — it does NOT
+# select an endpoint. Every tier's call goes to `intelligence.endpoints`, which
+# is what the client is built from, so the credential belongs there too. (This
+# example used to point its tiers at a `services:` entry, which read like
+# routing and was not: the key was checked at startup and then ignored, so the
+# token below never reached a dial. It was removed in 1.15 for exactly that.)
 services:
   gateway:
     kind: intelligence
     endpoint: https://api.openai.com/v1
-    auth: { kind: static, token: "{{secret:OPENAI_API_KEY}}" }
     rate: "120/1m"
 
 intelligence:
+  endpoints: ["https://api.openai.com/v1"]
+  token: "{{secret:OPENAI_API_KEY}}"
   models:
-    quick: { service: gateway, model: gpt-5.1-mini, window: 128000 }
-    deep:  { service: gateway, model: gpt-5.1,      window: 200000, fallback: quick }
+    quick: { model: gpt-5.1-mini, window: 128000 }
+    deep:  { model: gpt-5.1,      window: 200000, fallback: quick }
   default: quick
   preflight_model: quick
   budget:

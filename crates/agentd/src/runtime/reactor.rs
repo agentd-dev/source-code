@@ -325,6 +325,10 @@ pub struct Runtime {
     pub(crate) job_shape: bool,
     pub(crate) exit: Option<i32>,
     pub(crate) draining: bool,
+    /// The lifetime token ceiling has tripped and its policy has been applied.
+    /// Latched so a ceiling every subsequent admission also trips does not
+    /// re-log or re-drain.
+    pub(crate) lifetime_spent: bool,
     /// Operator-held (admin.pause): intake continues; no new turns dispatch and
     /// no steps schedule until admin.resume. Reversible, unlike drain.
     pub(crate) paused: bool,
@@ -1124,6 +1128,45 @@ impl Runtime {
         if crate::signals::reload_requested() {
             crate::signals::clear_reload();
             self.on_reload_requested();
+        }
+    }
+
+    /// The lifetime token ceiling is spent — decide what the INSTANCE does.
+    ///
+    /// Called from every admission that trips it, so it must be idempotent: a
+    /// drain already under way is left alone, and the log line is emitted once.
+    /// The unit that tripped it still fails; this only answers the larger
+    /// question of whether the process should carry on refusing.
+    pub(crate) fn apply_lifetime_exhausted(&mut self, reason: &str) {
+        use crate::config::v2::LifetimeExhausted as P;
+        let policy = self.settings.intelligence.budget.lifetime_exhausted;
+        if self.lifetime_spent {
+            return;
+        }
+        self.lifetime_spent = true;
+        self.log.warn(
+            "budget.lifetime_exhausted",
+            json!({"reason": reason, "policy": format!("{policy:?}").to_lowercase()}),
+        );
+        match policy {
+            // Deliberately nothing beyond the line above: the operator asked to
+            // keep the instance up, and every admission from here fails.
+            P::Refuse => {}
+            P::Drain => {
+                self.note_root(
+                    "budget.lifetime_exhausted: the lifetime token budget is spent; \
+                     finishing live work and then exiting."
+                        .into(),
+                );
+                self.begin_drain("lifetime token budget exhausted");
+            }
+            P::Exit => {
+                self.log.error(
+                    "proc.exit",
+                    json!({"code": crate::exit::BUDGET, "err": reason}),
+                );
+                self.exit = Some(crate::exit::BUDGET);
+            }
         }
     }
 

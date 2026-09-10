@@ -272,10 +272,8 @@ services:
 
 intelligence:
   models:
-    big:   {service: frontier, model: big-model-1,   window: 200000, fallback: small,
-            pricing: {input_per_1k: 3.00, output_per_1k: 15.00}}
-    small: {service: frontier, model: small-model-3, window: 128000,
-            pricing: {input_per_1k: 0.25, output_per_1k: 1.25}}
+    big:   {model: big-model-1,   window: 200000, fallback: small}
+    small: {model: small-model-3, window: 128000}
   default: big
   preflight_model: small
 
@@ -294,34 +292,29 @@ and the five shaping presets — `classify`, `extract`, `summarize`, `judge`,
 high-volume steps, and a catalogue that could not reach them left the only
 lever on the whole instance.
 
-A tier is **not** a second service catalogue. `services:` already names
-endpoints, auth and rate — and, on `kind: mcp` entries, the tool surface
-(`allow`, `exclude`, `tags`, `breaker`); restating those here would be a
-parallel mechanism. A tier points *at* a `kind: intelligence` service and may
-only **narrow**: its whole vocabulary is `model`, `service`, `window`,
-`fallback` and `pricing`, and `service` may only *name* a `kind: intelligence`
-entry that `services:` already declared and audited — a tier writes no
-endpoint, no `auth` and no `tags` of its own, so "make it cheaper" cannot
-quietly mint a new endpoint or credential. Trifecta tags are not part of
-this — `tags` is `kind: mcp` vocabulary, and writing it on a
-`kind: intelligence` entry is exit 2.
+A tier is **not** a second service catalogue, and it never was: its whole
+vocabulary is `model`, `window` and `fallback`. A tier writes no endpoint, no
+`auth` and no `tags` of its own, so "make it cheaper" cannot quietly mint a new
+endpoint or credential. Trifecta tags are not part of this either — `tags` is
+`kind: mcp` vocabulary, and writing it on a `kind: intelligence` entry is
+exit 2.
 
-What `service:` actually buys is a **check**, not a second dial. The key is
-read at exactly one place — startup validation — where naming an entry
-`services:` never declared, or an entry of any kind but `intelligence`, is
-exit 2:
+Two keys that used to live here are gone as of 1.15, because neither did
+anything. `service:` named a `kind: intelligence` catalogue entry, was checked
+at startup, and was then ignored — every tier's call went to
+`intelligence.endpoints` regardless, so a config reading "this tier talks to my
+on-prem gateway" talked to the shared one. `pricing:` parsed and validated and
+was never multiplied by anything. Both are refused by name now rather than
+accepted and inert; see [Cost](#cost-recorded-not-spent) for what replaced the
+second one, which is nothing.
 
-```text
-intelligence.models.big.service: "billing" is not declared (add it under `services:`)
-intelligence.models.big.service: "reports" is `kind: mcp` — a model tier needs `kind: intelligence`
-```
-
-After that the reference is spent. Every tier's call goes to the endpoint
-list `intelligence.endpoints` names — the ordered failover list below —
-because that list, and nothing else, is what the client is built from at
-startup and rebuilt from on reload; a tier contributes the wire model name
-and, when it declares one, the window. `security.egress: closed` works the
-same way from the other side: it walks the four outbound surfaces —
+Every tier's call goes to the endpoint list `intelligence.endpoints` names —
+the ordered failover list below — because that list, and nothing else, is what
+the client is built from at startup and rebuilt from on reload; a tier
+contributes the wire model name and, when it declares one, the window. That is
+the whole reason `service:` was removed: it looked like it selected an endpoint
+and did not, and there is no honest way to document a routing key that does not
+route. `security.egress: closed` works the same way from the other side: it walks the four outbound surfaces —
 `mcp.servers`, `intelligence.endpoints`, `a2a.peers`, and the HTTP dials
 (`store.http`, a workflow `url:` reference, a literal `http` step URL) — and
 demands each URL match a catalogue entry of its own kind on scheme, authority
@@ -343,20 +336,27 @@ conditions it exists to survive.
 `turn.model` puts the resolved model on the log line, because "how much did
 that cost, and on what" now has a per-turn answer.
 
-The "on what" is the half agentd answers. `pricing` is **recorded, not
-spent**: a tier's `pricing: {input_per_1k, output_per_1k}` and the
-instance-wide `intelligence.pricing` map beside it parse and validate as
-config, and there the trail ends. `input_per_1k` occurs four times in the
-whole crate tree, and those four are the `Pricing` struct, the two places the
-JSON-schema generator publishes its shape — inline in the tier, and as the
-shared `Pricing` definition — so an editor can autocomplete it, and the
-sample value `every_schema_path_deserializes_a_sample` builds to prove the
-path deserializes. There is no runtime call site at all: nothing multiplies a
-rate by a token count, no event carries a money figure, and every limit under
-`intelligence.budget` is denominated in tokens and requests rather than
-currency. Declare the rates if you want them written down beside the models
-they belong to, for a reader or for a tool of your own; do not expect to read
-a spend figure back out of agentd.
+<a id="cost-recorded-not-spent"></a>
+The "on what" is the half agentd answers, and only that half. There is **no
+cost accounting**: `intelligence.pricing` and a tier's `pricing:` were removed
+in 1.15 because nothing ever read them. They parsed, validated, published a
+shape into the JSON schema so editors could autocomplete them — and then the
+trail ended. Nothing multiplied a rate by a token count, no event carried a
+money figure, and every limit under `intelligence.budget` is denominated in
+tokens and requests rather than currency.
+
+Both spellings are refused by name now. A config field that accepts a number
+and does nothing with it is worse than an absent one, because it reads like a
+feature: an operator writes their rate card into the config and reasonably
+expects a spend figure to come back out.
+
+If you want money, take it from the token counts: `turn.model` puts the
+resolved model on the log line and the usage events carry the token totals, so
+a rate card applied downstream — in your metrics pipeline, against
+`agent_tokens_total` by model — gives you a figure agentd can stand behind.
+Real in-process cost accounting is a feature worth designing rather than half
+declaring: which tokens are cached, how a tier rollup composes, what a budget
+denominated in currency does when a provider changes its prices mid-run.
 
 ## Resilience: multi-endpoint failover & the circuit breaker
 

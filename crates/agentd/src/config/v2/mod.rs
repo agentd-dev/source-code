@@ -1118,7 +1118,6 @@ pub struct Intelligence {
     pub swap_policy: Option<String>,
     pub structured_output: StructuredOutput,
     pub budget: Budget,
-    pub pricing: BTreeMap<String, Pricing>,
     pub timeout: Option<Dur>,
     /// Named model TIERS. The model was one instance-global string, so
     /// choosing a cheap model for a classify step and a frontier one for a
@@ -1147,9 +1146,6 @@ pub struct Intelligence {
 pub struct ModelTier {
     /// The wire model name sent to the provider. Required.
     pub model: Option<String>,
-    /// A `services:` entry of `kind: intelligence` supplying the endpoint,
-    /// auth and tags. Absent ⇒ the top-level `intelligence` endpoint.
-    pub service: Option<String>,
     /// This model's context window, so compaction stops guessing from the
     /// model NAME (a substring match that is wrong for every provider whose
     /// naming does not happen to match).
@@ -1157,7 +1153,6 @@ pub struct ModelTier {
     /// The tier to fall back to when this one is unavailable or the budget is
     /// squeezed — a degradation ladder that walks DOWN instead of failing.
     pub fallback: Option<String>,
-    pub pricing: Option<Pricing>,
 }
 
 impl Intelligence {
@@ -1234,6 +1229,15 @@ pub enum StructuredOutput {
 pub struct Budget {
     pub windows: Vec<BudgetWindow>,
     pub lifetime_tokens: Option<u64>,
+    /// What the PROCESS does once `lifetime_tokens` is spent.
+    ///
+    /// `on_exhausted` governs a WINDOW, where the answer can be "wait": the
+    /// window resets. A lifetime ceiling never resets, so the only question
+    /// left is what happens to the instance — and before this the answer was
+    /// nothing. A daemon whose lifetime budget was spent sat there refusing
+    /// every turn until an operator noticed a gauge, which is the shape of
+    /// control this project treats as worse than an absent one.
+    pub lifetime_exhausted: LifetimeExhausted,
     pub scope: Option<Vec<BudgetScope>>,
     pub on_exhausted: BudgetTactic,
     pub slow: Slow,
@@ -1288,6 +1292,27 @@ pub enum BudgetScope {
     Principal,
 }
 
+/// What the process does when the lifetime token ceiling is reached.
+///
+/// The same vocabulary `agent.instruction.unavailable` uses for the other
+/// "something this agent depends on ran out" question, minus the two words
+/// that cannot apply: you cannot `keep` spending, and `freeze` (serve live
+/// work, refuse new) is indistinguishable from `refuse` here because live work
+/// needs tokens too.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LifetimeExhausted {
+    /// Finish live work, then exit 0. The default: an orchestrator restarts the
+    /// instance with a fresh window, which is what a lifetime budget is for.
+    #[default]
+    Drain,
+    /// Refuse every admission and stay up. The pre-1.15 behaviour — for an
+    /// operator who would rather inspect a stopped instance than lose it.
+    Refuse,
+    /// Stop now, exit 7 (`BUDGET`), abandoning live work.
+    Exit,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum BudgetTactic {
@@ -1325,14 +1350,6 @@ pub enum ReserveEstimate {
     Context,
     Fixed,
     None,
-}
-
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields, default)]
-pub struct Pricing {
-    pub input_per_1k: Option<f64>,
-    pub output_per_1k: Option<f64>,
-    pub currency: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -5737,22 +5754,6 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
         if t.model.as_deref().unwrap_or("").trim().is_empty() {
             err(&mut d, format!("{at}: `model` is required"));
         }
-        if let Some(svc) = &t.service {
-            match s.services.get(svc) {
-                None => err(
-                    &mut d,
-                    format!("{at}.service: {svc:?} is not declared (add it under `services:`)"),
-                ),
-                Some(entry) if entry.kind != ServiceKind::Intelligence => err(
-                    &mut d,
-                    format!(
-                        "{at}.service: {svc:?} is `kind: {}` — a model tier needs `kind: intelligence`",
-                        entry.kind.as_str()
-                    ),
-                ),
-                Some(_) => {}
-            }
-        }
         if let Some(f) = &t.fallback {
             if !s.intelligence.models.contains_key(f) {
                 err(&mut d, format!("{at}.fallback: no model tier named {f:?}"));
@@ -7356,7 +7357,6 @@ pub const RELOADABLE_PATHS: &[&str] = &[
     "intelligence.model",
     "intelligence.models",
     "intelligence.preflight_model",
-    "intelligence.pricing",
     "intelligence.structured_output",
     "intelligence.swap_policy",
     "intelligence.timeout",
@@ -7778,7 +7778,6 @@ mod tests {
                     _ => json!(["s"]),
                 },
                 paths::Kind::Object => match b.path.as_str() {
-                    "intelligence.pricing" => json!({"m": {"input_per_1k": 1.0}}),
                     "intelligence.models" => json!({"small": {"model": "m-1"}}),
                     "tools.overrides" => json!({"memory.get": {"server": "s", "tool": "t"}}),
                     "tools.narrow" => {

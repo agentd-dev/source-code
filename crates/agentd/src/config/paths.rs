@@ -33,6 +33,7 @@
 //! (The no-arg [`bindings`] still walks the legacy v1 schema in
 //! [`super::file`], and is reached only by this module's own tests.)
 
+#[cfg(test)]
 use super::file::config_schema;
 use super::yaml;
 use serde_json::{Map, Value};
@@ -115,6 +116,12 @@ fn canonical_flag_body(s: &str) -> String {
 
 /// Every path in the (v1) config-file schema, in schema order (nested objects
 /// are walked; arrays and free-form maps are leaves).
+/// TEST-ONLY. The retired flat schema survives as a FIXTURE for the tests
+/// that exercise this module's own mechanics; production types against
+/// [`super::v2::Settings`] and derives its bindings from the v2 schema. The
+/// `#[cfg(test)]` is the enforcement: nothing outside a test can reach it, so
+/// it cannot quietly become live again.
+#[cfg(test)]
 pub fn bindings() -> Vec<Binding> {
     bindings_of(&config_schema())
 }
@@ -325,6 +332,9 @@ pub fn set_path(root: &mut Value, path: &str, value: Value) {
     }
 }
 
+/// TEST-ONLY: a thin wrapper over the `*_in` variant, bound to the retired
+/// flat schema. Production calls the `*_in` form with the v2 bindings.
+#[cfg(test)]
 /// The env layer as a config DOCUMENT: for every schema path, the first present
 /// env candidate (`AGENTD_…` > `AGENT_…` > bare) is coerced and set at its
 /// path. Returns the document (an empty object when nothing is set) plus the
@@ -391,6 +401,9 @@ impl FlagTarget {
     }
 }
 
+/// TEST-ONLY: a thin wrapper over the `*_in` variant, bound to the retired
+/// flat schema. Production calls the `*_in` form with the v2 bindings.
+#[cfg(test)]
 /// Resolve a `--flag` (with or without the leading dashes) to the schema path it
 /// addresses — canonicalizing `.`/`_`/`-` — or, for a dotted flag whose longest
 /// schema-path prefix is a free-form map, to that map plus the remaining
@@ -443,6 +456,9 @@ pub fn resolve_flag_in(all: &[Binding], arg: &str) -> Result<Option<FlagTarget>,
     Ok(None)
 }
 
+/// TEST-ONLY: a thin wrapper over the `*_in` variant, bound to the retired
+/// flat schema. Production calls the `*_in` form with the v2 bindings.
+#[cfg(test)]
 /// The `--help` section listing every config path with its flag and env name.
 pub fn help_section() -> String {
     help_section_in(&bindings())

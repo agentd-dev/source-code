@@ -1125,12 +1125,17 @@ pub struct Intelligence {
     /// and the breaker was per ENDPOINT, so a frontier and a cheap model
     /// behind one gateway shared one breaker and one spend pool.
     ///
-    /// A tier is NOT a second service catalog: `services:` already names
-    /// endpoints, auth, tags, rate and breaker, and restating those here would
-    /// be a parallel mechanism. A tier points AT a service and may only
-    /// narrow — it inherits that service's trifecta tags and can never declare
-    /// its own floor, so "make it cheaper" cannot quietly become a different
-    /// security decision.
+    /// A tier is NOT a second service catalog, and its whole vocabulary is
+    /// `model`, `window` and `fallback`: no endpoint, no auth, no tags. That is
+    /// what keeps "make it cheaper" from quietly becoming a different security
+    /// decision — a tier cannot mint a credential or a destination, because it
+    /// has nowhere to write one.
+    ///
+    /// It never inherited tags either: `tags` is `kind: mcp` vocabulary and is
+    /// refused on a `kind: intelligence` entry. A `service:` key used to sit
+    /// here and was removed in 1.15 — it named a catalog entry, was validated,
+    /// and was then ignored, since the client is built from
+    /// `intelligence.endpoints` and nothing else.
     pub models: BTreeMap<String, ModelTier>,
     /// Which tier is used when nothing names one. Falls back to `model`.
     pub default: Option<String>,

@@ -641,8 +641,11 @@ async fn dispatch(
             return unary(&app, id, "GetAgentCard", json!({}), principal).await;
         }
         // Served here rather than passed down for the same reason as the public
-        // card: both must be the *same document*, and a round trip through the
-        // SDK's `AgentCard` drops any field it has no place for.
+        // card: a round trip through the SDK's typed `AgentCard` drops any field
+        // it has no place for. Unlike the public card this one is SCOPED — the
+        // skills are the ones this caller may actually run, and it sets
+        // `supportsAuthenticatedExtendedCard` — so the two are deliberately not
+        // the same document.
         "GetExtendedAgentCard" | "agent/getAuthenticatedExtendedCard" => {
             if principal.is_anonymous() {
                 return err(

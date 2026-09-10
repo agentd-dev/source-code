@@ -28,19 +28,22 @@
 //! config error (exit 2) instead of a silently-ignored value — the single most
 //! common config footgun, closed at parse time.
 //!
-//! [`ConfigFile`] and [`config_schema`] are the RETIRED flat schema, not the
-//! live typing path: a document that speaks it is refused outright at load
-//! ("config file speaks the retired flat schema", [`super::v2::load`]). They
-//! survive for tests alone — this module's own, and the no-arg
-//! [`super::paths::bindings`], which still derives its bindings from this
-//! schema and is itself reached only from `paths`' tests.
+//! `ConfigFile` and `config_schema` are the RETIRED flat schema, not the live
+//! typing path: a document that speaks it is refused outright at load ("config
+//! file speaks the retired flat schema", [`super::v2::load`]). They survive as
+//! a test FIXTURE — a small, stable schema for exercising this module's merge
+//! semantics and `paths`' binding walk without pinning those tests to the real
+//! settings schema, which changes every release. All of it is `#[cfg(test)]`,
+//! so the compiler, not this paragraph, is what keeps it out of production.
 //!
 //! The schema is **hand-written** (no `schemars` — a forbidden dependency) and
 //! kept faithful to this struct by a unit test asserting the schema's top-level
 //! properties match the struct's fields, so the two cannot diverge unnoticed.
 
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -142,6 +145,9 @@ pub fn read_document(path: &str) -> Result<(Value, Format), String> {
     Ok((doc, format))
 }
 
+/// TEST-ONLY: [`read_documents_checked`] bound to the retired flat typing.
+/// Production passes the v2 check.
+#[cfg(test)]
 /// Read several config files, in order, into ONE effective document: each later
 /// file is merged over the previous ones with **JSON Merge Patch** semantics
 /// (RFC 7396) — objects merge recursively, scalars and lists are REPLACED by the
@@ -226,6 +232,11 @@ pub const SCHEMA_CONTRACT_VERSION: &str = "1.0";
 /// The deserialized config-file shape — one source of truth for the loader, the
 /// validator, and the `--config-schema` generator. `serde` only.
 ///
+/// TEST-ONLY. The retired flat schema's typed shape, kept as the fixture the
+/// tests in this module and in [`super::paths`] exercise their mechanics
+/// against. Production types against [`super::v2::Settings`]; the `#[cfg(test)]`
+/// makes that a compiler guarantee rather than a comment.
+#[cfg(test)]
 /// `deny_unknown_fields` rejects a typo'd key at parse time (exit 2). A flattened
 /// catch-all is INTENTIONALLY ABSENT — `deny_unknown_fields` is the guard.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -351,6 +362,7 @@ pub const CONFIG_FILE_FIELDS: &[&str] = &[
     "intelligence_headers",
 ];
 
+#[cfg(test)]
 impl ConfigFile {
     /// Parse config text (YAML or JSON — sniffed, since there is no path). A
     /// malformed document is an `Err` with a message the caller maps to exit 2
@@ -456,6 +468,12 @@ fn strip_jsonc(src: &str) -> String {
 /// `additionalProperties:false` mirrors `deny_unknown_fields`; `$id` pins the
 /// major; `x-agentd-contract-version` ties it to the manifest. agentctl
 /// validates a CR against this before applying it to a pod.
+/// TEST-ONLY. The retired flat schema survives as a FIXTURE for the tests
+/// that exercise this module's own mechanics; production types against
+/// [`super::v2::Settings`] and derives its bindings from the v2 schema. The
+/// `#[cfg(test)]` is the enforcement: nothing outside a test can reach it, so
+/// it cannot quietly become live again.
+#[cfg(test)]
 pub fn config_schema() -> Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",

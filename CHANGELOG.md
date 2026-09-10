@@ -79,6 +79,16 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 
 ### Fixed
 
+- **The retired flat schema is `#[cfg(test)]`, so the compiler enforces what a
+  comment used to claim.** `ConfigFile`, `config_schema`, `paths::bindings` and
+  the four no-arg wrappers over them (`read_documents`, `env_document`,
+  `resolve_flag`, `help_section`) were reachable from production and reached
+  only from tests — the module header said so in prose, which is not a
+  mechanism. They are now gated, and referencing one from production fails to
+  compile. They stay because they are a genuinely useful FIXTURE: a small,
+  stable schema for exercising merge semantics and the binding walk without
+  pinning those tests to the real settings schema, which changes every release.
+
 - **A document made of one v2 section is a v2 document.** The schema-detection
   key list was a hand-maintained subset and had fallen seven sections behind —
   `mcp`, `services`, `identity`, `interface`, `goal`, `subagents` and

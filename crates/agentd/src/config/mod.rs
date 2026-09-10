@@ -13,7 +13,7 @@
 //! round-trip.
 //!
 //! Module layout: [`file`] (the config document: format detection, the typed
-//! `ConfigFile` shape, the JSON Schema), [`v2`] (the typed [`v2::Settings`], its
+//! the retired flat shape, kept `#[cfg(test)]` as a fixture), [`v2`] (the typed [`v2::Settings`], its
 //! JSON Schema, and the loader that merges file < env < flag), [`yaml`] (the
 //! hand-rolled YAML-subset reader), [`paths`] (schema-derived path bindings:
 //! `AGENTD_<PATH>` env names and `--<path>` flags for every config-file path),

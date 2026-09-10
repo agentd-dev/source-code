@@ -372,7 +372,7 @@ function Subagents({ mirror, client }: { mirror: Mirror; client: AgentdClient })
   const summary = (handle ? (s.subagents.get(handle) ?? {}) : {}) as { [k: string]: Json };
   const d = (detail ?? summary) as { [k: string]: Json };
   const status = String(d.status ?? '');
-  const warm = status === 'running' || status === 'spawning';
+  const warm = status === 'running';
 
   const act = async (fn: () => Promise<unknown>, ok: string) => {
     setBusy(true);
@@ -495,7 +495,6 @@ function stepClass(st: { phase: string; status?: string }): string {
 function subagentClass(status: string): string {
   switch (status) {
     case 'running':
-    case 'spawning':
       return 'is-running';
     case 'completed':
       return 'is-done';

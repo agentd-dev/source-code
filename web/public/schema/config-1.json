@@ -1564,7 +1564,6 @@
         "fields": [
           "note",
           "audit",
-          "metric",
           "value",
           "stream",
           "subject",

@@ -30,9 +30,10 @@ agentd trusts its own binary, the OS, and the operator's configuration. What arr
 the network is bounded to a whitelist: an A2A caller's `config.set` reaches three
 display/debug paths plus `agent.approval` — the human-approval mode, operator-only and
 deliberately settable mid-session, because how closely you want to be asked changes with
-what the agent is doing (`a2a_server.rs:1574`) — and nothing else, every other path refused
-by name (`a2a_server.rs:1590`). The model can never register an MCP server, edit an
-endpoint, or name a binary to run.
+what the agent is doing (`a2a_server.rs::interface_config_set`) — and nothing else, every
+other path refused by name in that same function's catch-all arm, which answers with the
+list of what *is* settable. The model can never register an MCP server, edit an endpoint,
+or name a binary to run.
 
 ## Capability scoping
 
@@ -46,18 +47,20 @@ which enforce it at different points, and the difference matters:
 
 - A workflow `agent` step honours its `tools:` list — the plan is filtered by pattern
   (`*`, an exact name, or `prefix*`) before the child sees the definitions
-  (`runtime/steps.rs:2097`, `registry/mod.rs:671`, `:838`).
+  (`runtime/steps.rs::step_turn`, `registry/mod.rs::defs_for`, `::pattern_matches`).
 - `subagent.run`'s `tools:` argument **does** confine the child. The supervisor mints it
-  into the spawn payload as a grant (`runtime/subagents.rs:407`), and the child filters
-  both its tool catalogue and its dispatch routing map against it
-  (`agentloop/runner.rs:587`), so an excluded tool is unreachable rather than merely
-  unadvertised. A caller-supplied `context` entry cannot forge or widen that grant — any
-  allow-list already on the seed is dropped before the mint (`subagents.rs:303`).
-  `servers:` narrows independently: the payload is built from just those server specs, so
-  the child cannot dial the rest (`subagents.rs:225`).
+  into the spawn payload as a grant (`runtime/subagents.rs::subagent_run`, through
+  `subagent/protocol.rs::narrow_tools`), and the child filters both its tool catalogue and
+  its dispatch routing map against it (`agentloop/runner.rs::narrow_catalogue`), so an
+  excluded tool is unreachable rather than merely unadvertised. A caller-supplied `context`
+  entry cannot forge or widen that grant — any allow-list already on the seed is dropped
+  before the mint, because `subagent_run` discards every seed message whose role is
+  `subagent/protocol.rs::ALLOWED_TOOLS_ROLE`. `servers:` narrows independently: the payload
+  is built from just those server specs, so the child cannot dial the rest (the same
+  function's read of `args["servers"]`).
 
-An unknown name in `servers:` is filtered out silently, not rejected
-(`subagents.rs:229`) — a typo yields a less capable child and no diagnostic.
+An unknown name in `servers:` is filtered out silently, not rejected — that read filters
+on `self.mcp_specs.contains_key`, so a typo yields a less capable child and no diagnostic.
 
 `sec/scope.rs` also defines a `Scope` / `ToolScope` intersection type — `parent ∩
 requested` over a server whitelist and a tool-name whitelist, both dimensions checked
@@ -79,7 +82,8 @@ The trust budget is three operator-declared tags:
 | `egress` | the tool can move data out or change external state — HTTP POST, send mail, open a pull request |
 
 Tags are parsed as snake-case strings from config only; an unrecognized tag is a hard
-config error (`config/v2/mod.rs:1670`). Nothing the model or a server says feeds the gate.
+config error (`config/v2/mod.rs::McpServer::tag_set`). Nothing the model or a server says
+feeds the gate.
 
 ```yaml
 config_version: "1"
@@ -91,19 +95,20 @@ security:
   allow_trifecta: false   # default; adding an `egress` server here refuses startup
 ```
 
-The budget is an OR-fold across legs, never a count (`scope.rs:111`) — repeating one leg
-across twenty tools stays one leg. The Rule of Two is literally `legs() < 3`
-(`scope.rs:139`), so **every pair is allowed**, including `sensitive` + `egress`. A tool
-that reads secrets and can POST is fine as long as nothing in the same grant reads
-untrusted input.
+The budget is an OR-fold across legs, never a count (`scope.rs::Trifecta::merge`) —
+repeating one leg across twenty tools stays one leg. The Rule of Two is literally
+`legs() < 3` (`scope.rs::evaluate`), so **every pair is allowed**, including `sensitive` +
+`egress`. A tool that reads secrets and can POST is fine as long as nothing in the same
+grant reads untrusted input.
 
 Tags are **per server, not per tool.** The config shape is a map keyed by glob, but
 `McpServer::tag_set()` iterates `self.tags.values()` and discards the keys
-(`config/v2/mod.rs:1668`); `Registry::build` stamps that union onto every tool of the server
-(`registry/mod.rs:365`). So `tags: {"send_*": ["egress"], "read_*": ["untrusted_input"]}`
-does not split the server into two risk classes — both tools end up
-`untrusted_input | egress`. The only real split is one MCP server per tag profile. An
-**untagged server counts as `untrusted_input`** (`config/v2/mod.rs:6922`), the
+(`config/v2/mod.rs::McpServer::tag_set`); `Registry::build` stamps that union onto every
+tool of the server (`registry/mod.rs::Registry::build`). So
+`tags: {"send_*": ["egress"], "read_*": ["untrusted_input"]}` does not split the server
+into two risk classes — both tools end up `untrusted_input | egress`. The only real split
+is one MCP server per tag profile. An **untagged server counts as `untrusted_input`**
+(`config/v2/mod.rs::validate`, in the fold headed `// trifecta over the root grant`), the
 conservative default.
 
 ### Where the gate runs
@@ -127,38 +132,41 @@ flowchart TB
   K -- ok --> M["payload minted, binary re-exec'd"]
 ```
 
-Gate 1 lives inside config `validate()` (`config/v2/mod.rs:6941`), the single validation
-authority that both startup and `--validate-config` run, so the two can never disagree. A
-refusal is a config error — exit `2`, before any side effect:
+Gate 1 lives inside config `validate()` (`config/v2/mod.rs::validate`, where the
+root-grant fold ends in a `check_trifecta` call), the single validation authority that
+both startup and
+`--validate-config` run, so the two can never disagree. A refusal is a config error —
+exit `2`, before any side effect:
 
 ```text
 lethal-trifecta refused: the root grant wires untrusted_input + sensitive + egress
 into one agent; narrow the tags or set security.allow_trifecta (audited)
 ```
 
-Gate 2 is at the `subagent.run` chokepoint (`runtime/subagents.rs:240`), over the tags of
-the *requested* server subset. It returns an `isError` tool result the parent's model must
-adapt to, not a crash.
+Gate 2 is at the `subagent.run` chokepoint (`runtime/subagents.rs::subagent_run`, which
+calls `check_trifecta` itself), over the tags of the *requested* server subset. It returns
+an `isError` tool result the parent's model must adapt to, not a crash.
 
 Because gate 1 folds over **every declared server**, it is a whole-instance budget. An
 instance declaring an untrusted-input reader, a secrets server, and an egress server will
 not start, even if you intend to hand each leg to a different subagent. To run that shape
 you either set `security.allow_trifecta: true` — which relaxes gate 2 as well — or run
 separate agentd instances per risk profile. `security` is a restart-only config path
-(`config/v2/mod.rs:7268`), so a hot reload can never widen the override; a reload touching
-it is refused as `restart_required` and the running config is kept.
+(`config/v2/mod.rs::RESTART_ONLY_PATHS`), so a hot reload can never widen the override; a
+reload touching it is refused as `restart_required` and the running config is kept.
 
 Not every leg comes from `mcp.servers`: a binary built with the `exec` feature and
-running with `security.exec.enabled` contributes `sensitive` + `egress` to this same fold
-(`config/v2/mod.rs:6936`), so enabling the local runner beside an untrusted-input server
-refuses startup like any other trifecta.
+running with `security.exec.enabled` contributes `sensitive` + `egress` to this same fold,
+pushed by its `#[cfg(feature = "exec")]` arm, so enabling the local runner beside an
+untrusted-input server refuses startup like any other trifecta.
 
 **Two gaps to know.** No warn event is emitted when the override is exercised: a
 `scope.trifecta_grant` event name is reserved but never written, so an allowed trifecta
 proceeds silently and the only trace is the config value. And code-registered (embedder)
-tools sit outside the accounting: they are
-inserted with `Grant::all()` and an empty tag vector (`registry/mod.rs:274`, `:277`), so an
-embedder whose native tool does egress or reads secrets defeats the budget silently.
+tools sit outside the accounting: they are inserted with `Grant::all()` and an empty tag
+vector — the `ToolSpec` literal that `registry/mod.rs::Registry::build` writes for a code
+tool — so an embedder whose native tool does egress or reads secrets defeats the budget
+silently.
 
 ### The tag floor and closed egress
 
@@ -266,7 +274,7 @@ evaluating the guard to nothing.
 The defense that does the real work is process isolation plus a distilled return. A
 subagent runs in its own process with its own context, and the parent appends only the
 child's distillate — never its transcript. A string result over `DISTILL_CAP` (8000
-bytes) is truncated back to a UTF-8 boundary (`subagents.rs:22`, `:858`).
+bytes) is truncated back to a UTF-8 boundary (`subagents.rs::DISTILL_CAP`, `::distill`).
 
 ```mermaid
 flowchart LR
@@ -281,7 +289,7 @@ Poisoned bytes live only in the reader's context and are gone when that process 
 reader holds no sensitive tool, so it has no secret to encode into its summary. This is a
 trusted-planner / untrusted-data split realized as OS process isolation rather than taint
 tracking. The tree is flat by construction: a subagent is handed no in-child orchestration
-tools (`subagent/control.rs:316`), so it cannot spawn children in-process.
+tools (`subagent/control.rs::NoSelfTools`), so it cannot spawn children in-process.
 
 ## Caller scopes
 
@@ -289,7 +297,7 @@ Internally there are four caller kinds: `Root`, `Workflow`, `Subagent`, `Princip
 Grants only ever gate **internal** contracts — for MCP and code tools the check
 short-circuits to allowed for root and workflow callers, and for a subagent spawned without
 a `tools:` grant; a subagent that carries one is held to it for every tool class, MCP and
-code included (`registry/mod.rs:651-655`). MCP restriction otherwise happens through
+code included (`registry/mod.rs::allowed`). MCP restriction otherwise happens through
 `agent.tools.mcp` selection and the per-spawn server subset, never through grants.
 
 | Tier | Callers | Examples |
@@ -305,7 +313,7 @@ External callers arrive over A2A. The transport supplies a `CallerIdentity` — 
 mTLS SANs and subject, a bearer reference, an AAuth agent id, a loopback flag — and
 `Resolver::resolve` walks the `a2a.principals` rules first-match, then falls back to
 operator on verified management, then operator on loopback with no principals configured,
-then anonymous (`a2a/principals.rs:382`).
+then anonymous (`a2a/principals.rs::Resolver::resolve`).
 
 ```yaml
 a2a:
@@ -327,39 +335,44 @@ RPC method and `Principal::may_command` for a command DataPart:
 | `anonymous` | nothing — denied at every layer, and an explicit `grants: ["*"]` does not rescue it |
 
 `status` and `interface.info` are always granted to any non-anonymous role
-(`principals.rs:105`). Of the 53 internal contracts, exactly one — `status` — carries a
-default grant for `user`/`agent`. The admin family (`drain`, `lameduck`, `pause`, `resume`,
-`cancel`) is refused by name for every non-operator role, independent of grants. Bearer
-tokens and pairing codes are compared in constant time — one `ct_eq`
-(`principals.rs:501`) over a principal's bearer (`:421`), the static server bearer
-(`a2a/serve.rs:923`) and the rotating pairing code (`a2a_server.rs:293`).
+(`principals.rs::Principal::may_command`). Of the 53 internal contracts, exactly one —
+`status` — carries a default grant for `user`/`agent`. The admin family (`drain`,
+`lameduck`, `pause`, `resume`, `cancel`) is refused by name for every non-operator role,
+independent of grants. Bearer
+tokens and pairing codes are compared in constant time: `principals.rs::ct_eq` for a
+principal's bearer (`::Compiled::matches`), and the shared `sha.rs::ct_eq` for the static
+server bearer (`a2a/serve.rs::is_server_bearer`) and the rotating pairing code
+(`a2a_server.rs::PairingState::pair`). Those are two copies of the same
+length-check-then-XOR-fold compare rather than one shared helper — a duplication to know
+about, not a hole.
 
 Two honest limits. **A2A role limits bound command DataParts, not conversation:** a
 natural-language message from a `user` principal drives a turn handed the *root* tool plan
-(`runtime/turns.rs:283`), so a caller who cannot invoke `workflow.delete` as a command may
-still be able to ask for it in prose. And **the registry's `Grant.roles` table is not the
-live one** — `Principal::as_caller()` has no production call site, so editing a contract's
-`user`/`agent` grant changes nothing for A2A.
+(`runtime/turns.rs::start_root_turn`), so a caller who cannot invoke `workflow.delete` as a
+command may still be able to ask for it in prose. And **the registry's `Grant.roles` table
+is not the live one** — `Principal::as_caller()` has no production call site, so editing a
+contract's `user`/`agent` grant changes nothing for A2A.
 
 ## The exec runner
 
 agentd runs no local code by default. The `exec` tool exists as a contract, but a local
-runner materializes only when the `exec` cargo feature and `security.exec.enabled` are
-both true (`registry/mod.rs:215`); otherwise `exec` is `Impl::MappingOnly`, which fails
-`is_available()` and routes nowhere — unavailable for every caller including operator.
+runner materializes only when the `exec` cargo feature and `security.exec.enabled` are both
+true (`registry/mod.rs::Registry::build`); otherwise `exec` is `Impl::MappingOnly`, which
+fails `is_available()` and routes nowhere — unavailable for every caller including operator.
 The dispatch arm itself is `#[cfg(feature = "exec")]`, so a default binary answers "no
-built-in implementation". Map the contract onto an MCP server with `tools.overrides` and
-the command runs in that server's sandbox instead.
+built-in implementation". Map the contract onto an MCP server with `tools.overrides` and the
+command runs in that server's sandbox instead.
 
 Watch the tag weight when you do. `Registry::build` stamps `exec` `sensitive` + `egress`,
 and those per-tool tags are what the `security.policies` engine matches on —
-`Registry::tags_of` is read by `apply_policy` (`runtime/tools.rs:765`), by the turn-worker
-routing split (`runtime/turns.rs:217`) and by the subagent `gated_tools` mint
-(`runtime/subagents.rs:338`) — while an override replaces them wholesale with the serving
-server's tags (`registry/mod.rs:612`). What actually reaches the trifecta budget is the
-config-side contribution above: two legs when the local runner is built *and* enabled, and
-otherwise whatever the MCP server you mapped it onto declares. Mapping `exec` onto an untagged
-server moves the blast radius off-box and files it as `untrusted_input`.
+`Registry::tags_of` is read by `runtime/tools.rs::apply_policy`, by the turn-worker routing
+split (`runtime/turns.rs::tool_plan`) and by the subagent `gated_tools` mint
+(`runtime/subagents.rs::subagent_run`) — while an override replaces them wholesale with
+the serving server's tags (`registry/mod.rs::apply_override`). What actually reaches the
+trifecta budget is the config-side contribution above: two legs when the local runner is
+built *and* enabled, and otherwise whatever the MCP server you mapped it onto declares.
+Mapping `exec` onto an untagged server moves the blast radius off-box and files it as
+`untrusted_input`.
 
 ```yaml
 security:
@@ -374,17 +387,19 @@ security:
 
 | Guard | Behaviour | Why |
 |-------|-----------|-----|
-| argv, never a shell | `Command::new(cmd).args(argv)` — execve directly (`exec.rs:70`) | no metacharacters, globs, `$(…)` or pipes, so no command injection |
-| allow-list | exact equality on `argv[0]`; empty list denies all (`tools.rs:979`) | `enabled: true` alone runs nothing |
-| workdir confinement | mandatory; a requested `cwd` is canonicalized then checked with `starts_with(base)` (`exec.rs:45`) | defeats `..` traversal and symlink escape together |
-| timeout | `min(requested, max)`, default 30s; the child is killed and reaped (`exec.rs:106`) | a request can shorten but never extend the ceiling |
-| output cap | default 1 MiB; the reader drains past the cap and discards the excess (`exec.rs:131`) | bounded capture, and no deadlock on a full pipe |
-| minimal env | `env_clear()` then rebuild from the named list (`exec.rs:78`) | the agent's environment, and its secrets, are never inherited |
+| argv, never a shell | `Command::new(cmd).args(argv)` — execve directly (`exec.rs::run_command`) | no metacharacters, globs, `$(…)` or pipes, so no command injection |
+| allow-list | exact equality on `argv[0]`; empty list denies all (`runtime/tools.rs::exec_tool`) | `enabled: true` alone runs nothing |
+| workdir confinement | mandatory; a requested `cwd` is canonicalized then checked with `starts_with(base)` (`exec.rs::resolve_cwd`) | defeats `..` traversal and symlink escape together |
+| timeout | `min(requested, max)`, default 30s; the child is killed and reaped (`exec.rs::run_command`) | a request can shorten but never extend the ceiling |
+| output cap | default 1 MiB; the reader drains past the cap and discards the excess (`exec.rs::read_capped`) | bounded capture, and no deadlock on a full pipe |
+| minimal env | `env_clear()` then rebuild from the named list (`exec.rs::run_command`) | the agent's environment, and its secrets, are never inherited |
 | off the reactor | a named `tool:exec` thread; stdin fed from a further thread | a child that writes before reading cannot stall the daemon |
-| audit | `exec.run{cmd, argc, cwd, timeout_ms, caller}` (`tools.rs:1018`) | the confinement is logged, never the output |
+| audit | `exec.run{cmd, argc, cwd, timeout_ms, caller}` (`runtime/tools.rs::exec_tool`) | the confinement is logged, never the output |
 
 Every guard is re-checked at call time even though `Registry::build` already gated the
-route (`tools.rs:965`). Output is `{stdout, stderr, exit_code, timed_out}`.
+route — `runtime/tools.rs::exec_tool` re-derives the allow-list, the workdir and both
+clamps from live settings on every call. Output is
+`{stdout, stderr, exit_code, timed_out}`.
 
 Two things before you enable it. A misconfiguration surfaces as an `isError` result at
 first call, not as a startup failure — the feature, `enabled`, a non-empty `allow`, and a
@@ -395,24 +410,26 @@ allow-listing `bash` reinstates the entire injection surface by construction.
 
 Secrets have exactly two reference forms, `{{secret:NAME}}` (process environment) and
 `{{secret-file:PATH}}` (a mounted file). Both resolve at the instant of use
-(`sec/secret.rs:73`), so a rotated file is picked up without a restart. Exactly one
+(`sec/secret.rs::resolve`), so a rotated file is picked up without a restart. Exactly one
 trailing newline — or CRLF — is stripped from a file read, because kubelet projects a
 Secret verbatim while editors append one; interior whitespace stays part of the credential.
 
 An unknown `{{…}}` token is an **error**, not a pass-through, so a typo cannot smuggle
-braces onto the wire. Errors name the reference, never the value: a missing variable
-yields `{{secret:NAME}} is not set in the environment`. The `Secret` newtype's `Debug`
-prints `***` (`config/v2/mod.rs:69`), so a credential cannot reach a log line, a payload
-dump, or a panic message through formatting. The durable subagent record is written with
-the intelligence token nulled out, re-supplied from live settings on restore
-(`subagents.rs:841`).
+braces onto the wire. Errors name the reference, never the value: a missing variable yields
+`{{secret:NAME}} is not set in the environment`. The `Secret` newtype's `Debug` prints
+`***` (`config/v2/mod.rs::Secret`), so a credential cannot reach a log line, a payload dump,
+or a panic message through formatting. The durable subagent record is written with the
+intelligence token nulled out, re-supplied from live settings on restore
+(`subagents.rs::secret_free_payload`).
 
 Two checks catch an inline credential in the config **file**. Four paths must be references
 outright — `/intelligence/token`, `/a2a/bearer`, `/security/aauth/enroll_token`, and each
-MCP server's `oauth.client_secret` (`config/v2/mod.rs:7179`). Separately, any header whose
+MCP server's `oauth.client_secret` (`config/v2/mod.rs::secret_violations`, whose first
+three come from `::FILE_SECRET_PATHS`). Separately, any header whose
 *key* looks credential-shaped — `authorization`, `api-key`, `x-api-key`, `token`,
 `password`, `secret`, or anything ending `-token` / `_token` / `-key` / `_key`
-(`config/mod.rs:602`) — is refused with an inline value, across `intelligence.headers`,
+(`config/mod.rs::is_secret_shaped_key`) — is refused with an inline value, across
+`intelligence.headers`,
 `mcp.servers[].headers` and `a2a.peers[].headers`.
 
 The limit is the key name, not the value: a bearer pasted into `headers.X-Session` passes
@@ -423,27 +440,29 @@ Outbound credential providers — OAuth2, AWS SigV4, SPIFFE, `agentd login` — 
 ## Transport and identity
 
 MCP endpoints are HTTPS-only, with plaintext `http://` permitted for loopback hosts alone;
-anything else exits `2` before any side effect (`config/mod.rs:504`). The same rule holds
-for the intelligence endpoint. A non-loopback `a2a.listen` **must** configure client auth —
-`a2a.tls.client_ca`, `a2a.bearer`, or `interface.pairing` — or startup fails validation,
-and plaintext `http://` on a non-loopback bind is likewise a startup error
-(`config/v2/mod.rs:6602`, `:6609`).
+anything else exits `2` before any side effect (`config/mod.rs::mcp_endpoint_scheme_ok`).
+The same rule holds for the intelligence endpoint. A non-loopback `a2a.listen` **must**
+configure client auth — `a2a.tls.client_ca`, `a2a.bearer`, or `interface.pairing` — or
+startup fails validation, and plaintext `http://` on a non-loopback bind is likewise a
+startup error (`config/v2/mod.rs::validate`, the two refusals in its `a2a.listen` block).
 
 One default deserves emphasis: **a loopback caller with no `a2a.principals` configured
-resolves to operator** with `grants: ["*"]` (`principals.rs:375`, `:393`). Anything that
-can reach the loopback port — a sidecar, a co-tenant process, an SSRF from another service
-in the same network namespace — is a full operator, which includes flipping
-`agent.approval` to `accept` over `config.set`: the agent's own `ask_human` gates then
-answer themselves from whatever they recommend, and the ones recommending nothing fall to a
-model judge (`runtime/human.rs:107`, `:135`) — until the next reload puts the file's value
-back, since `agent.approval` is reloadable (`config/v2/mod.rs:7295`). Two kinds of gate
+resolves to operator** with `grants: ["*"]` (`principals.rs::Resolver::build` sets the flag,
+`::Resolver::resolve` acts on it). Anything that can reach the loopback port — a sidecar, a
+co-tenant process, an SSRF from another service in the same network namespace — is a full
+operator, which includes flipping `agent.approval` to `accept` over `config.set`: the
+agent's own `ask_human` gates then answer themselves from whatever they recommend, and the
+ones recommending nothing fall to a model judge (`runtime/human.rs::ask_human_tool`,
+`::spawn_human_judge`) — until the next reload puts the file's value back, since
+`agent.approval` is reloadable (`config/v2/mod.rs::RELOADABLE_PATHS`). Two kinds of gate
 survive that flip: one that names its decider with `to:`, which is never auto-answered
-whatever the policy says (`runtime/human.rs:101`), and an operator-declared
-`security.policies` `ask`, which is deliberately not routed through `agent.approval` at all
-(`runtime/tools.rs:830`). Configure principals on any host you do not fully own.
+whatever the policy says — the `_ if addressee.is_some()` arm of `ask_human_tool`
+short-circuits ahead of every approval mode — and an operator-declared `security.policies`
+`ask`, which is deliberately not routed through `agent.approval` at all
+(`runtime/tools.rs::policy_gate`). Configure principals on any host you do not fully own.
 
 The only process agentd launches is a re-exec of its own binary via `current_exe()`
-(`runtime/mod.rs:541`), marked with the `AGENT_SUBAGENT` environment variable. The child's
+(`runtime/mod.rs::run`), marked with the `AGENT_SUBAGENT` environment variable. The child's
 work arrives as a serialized control frame on its stdin — data to a model loop, never argv
 to a shell. Each child gets its own process group so the kill ladder can target the
 subtree, an optional cgroup leaf whose `Drop` writes `cgroup.kill`, and `PR_SET_PDEATHSIG`
@@ -452,55 +471,57 @@ so a supervisor death collapses it.
 ## SSRF defenses
 
 The SSRF classifier guards the outbound surfaces where the URL is not purely operator
-config: the workflow `http` node (`runtime/http_node.rs:338`), the one place a URL can be
-model- or graph-derived; caller-registered A2A push targets, vetted at registration where
-the caller is present to be told why and again at delivery because DNS can change its mind
-in between (`a2a/push.rs:53`, `:92`); and the AAuth Person-Server dial, where it is the
-URL the PS *returns* that is vetted — the operator's configured `ps_url` still dials by
-name, so a loopback PS keeps working in development (`aauth/ps.rs:183`, `:186`).
+config: the workflow `http` node (`runtime/http_node.rs::do_http`), the one place a URL
+can be model- or graph-derived; caller-registered A2A push targets, vetted at registration
+where the caller is present to be told why and again at delivery because DNS can change its
+mind in between (`a2a/push.rs::check_url`, `::deliver`); and the AAuth Person-Server dial,
+where it is the URL the PS *returns* that is vetted — the operator's configured `ps_url`
+still dials by name, so a loopback PS keeps working in development (`aauth/ps.rs::connect`,
+whose `vetted` argument picks between `ssrf::connect_vetted` and a plain `connect_tcp`).
 Intelligence, MCP, configured A2A peers, and OAuth traffic goes out unguarded by design,
 because those endpoints come from operator config; a model that can influence any of those
 URLs is outside the guard. A configured peer dial in particular is a plain `connect_tcp`
-with no classification at all (`mcp/a2a_client.rs:348`) — it is only the *push targets* a
-caller registers at runtime that are guarded.
+with no classification at all (`mcp/a2a_client.rs::HttpConn::connect`) — it is only the
+*push targets* a caller registers at runtime that are guarded.
 
 Blocked as non-global: `0.0.0.0/8`, `127/8`, `10/8`, `172.16/12`, `192.168/16`,
 `169.254/16` (the cloud-metadata range), `100.64/10` CGNAT, `240/4` reserved, `224/4`
 multicast, and the broadcast address; for IPv6, `::`, `::1`, `fe80::/10`, `fc00::/7`,
-`ff00::/8`, `2001:db8::/32` (`net/ssrf.rs:114`, `:138`). IPv6 is classified by first
-peeling `::ffff:a.b.c.d` and `::a.b.c.d` forms back to v4 and re-running the v4 rules —
+`ff00::/8`, `2001:db8::/32` (`net/ssrf.rs::is_global_v4` and `::is_global_v6`, which
+`::is_global` dispatches between). IPv6 is classified by first peeling `::ffff:a.b.c.d`
+and `::a.b.c.d` forms back to v4 and re-running the v4 rules —
 the classic bypass, closed. `guard_host` rejects if **any** resolved address is non-global,
 so a hostname answering with both a public and a private address is refused outright.
 Header names and values containing `\r` or `\n` are rejected at request construction in
-both send paths, before any bytes are written (`net/http.rs:174`, `:440`).
+both send paths, before any bytes are written (`net/http.rs::send`, `::send_streaming`).
 
 **The guard and the dial are one step.** A check that resolves a name, likes the answer and
 then dials the *name* is decorative: the connect resolves a second time, and an attacker
 holding the authoritative DNS answers the check public and the connect `169.254.169.254`.
 So `ssrf::connect_vetted` resolves once, classifies every address it got back, and connects
 to an address it vetted, re-asserting `is_global` immediately before the syscall
-(`net/ssrf.rs:357`). TLS/SNI and the `Host` header stay on the hostname — connect by IP,
-verify by name — so certificate validation is unaffected. All three guarded dial paths use
-it (`runtime/http_node.rs:338`, `a2a/push.rs:92`, `aauth/ps.rs:183`), which closes the
-rebinding pivot on each. `guard_host` survives for the one question asked where there is no
-socket yet: may this push target be registered at all (`a2a/push.rs:53`), answered while
-the caller is still there to be told no. Its own doc says it is not sufficient at delivery
-time, which is exactly why delivery guards again.
+(`net/ssrf.rs::connect_vetted`). TLS/SNI and the `Host` header stay on the hostname —
+connect by IP, verify by name — so certificate validation is unaffected. All three guarded
+dial paths use it (`http_node.rs::do_http`, `push.rs::deliver`, `ps.rs::connect`), which
+closes the rebinding pivot on each. `guard_host` survives for the one question asked where
+there is no socket yet: may this push target be registered at all (`push.rs::check_url`),
+answered while the caller is still there to be told no. Its own doc says it is not
+sufficient at delivery time, which is exactly why delivery guards again.
 
 One limit remains. **`allow_private: true` is an off switch, not a "permit RFC-1918"
 switch.** It does not permit a narrower range; it removes the classifier. `guard_host`
-returns Ok without resolving at all (`net/ssrf.rs:219`), and on the dial path
+returns Ok without resolving at all (`net/ssrf.rs::guard_host`), and on the dial path
 `resolve_guarded` still resolves — it has to, to have an address to connect to — but skips
-every address check, as does the pre-syscall re-assertion (`net/ssrf.rs:292`, `:324`). The
-workflow `http` node exposes it as a plain per-node boolean in the graph spec. Review it in
-graph diffs the way you review a credential.
+every address check (`net/ssrf.rs::resolve_guarded_with`), as does the pre-syscall
+re-assertion (`::connect_addrs`). The workflow `http` node exposes it as a plain per-node
+boolean in the graph spec. Review it in graph diffs the way you review a credential.
 
 The low-level client follows **no redirects at all** — there is no `3xx`/`Location`
-handling, so a redirect comes back as a plain response and the redirect-chain pivot does
-not exist for the `http` node. Two document-fetch paths layer redirect following on top of
-it, both at config load and both from an operator-named reference: the `url:` instruction
-source, up to three hops (`config/mod.rs:66`), and the OCI blob fetch, which has to follow
-a registry's CDN (`oci.rs:509`).
+handling, so a redirect comes back as a plain response and the redirect-chain pivot does not
+exist for the `http` node. Two document-fetch paths layer redirect following on top of it,
+both at config load and both from an operator-named reference: the `url:` instruction
+source, up to three hops (`config/mod.rs::http_get`), and the OCI blob fetch, which has to
+follow a registry's CDN (`oci.rs::get_blob`).
 
 ## Where the instruction came from
 
@@ -550,7 +571,7 @@ Stated plainly so you size the surrounding environment correctly.
   is not detected; the only connect-time log is `mcp.connect{server, tools}` with a count.
 - **No audit event for a trifecta override** — it proceeds silently.
 - **No artifact redaction.** Artifacts carry a `sensitive` flag, but `artifact.get` returns
-  the content regardless (`runtime/artifacts.rs:133`).
+  the content regardless (`runtime/artifacts.rs::get_value`).
 - **No policy engine, request signing, or RBAC beyond the principal roles above.**
 
 ## Operator checklist

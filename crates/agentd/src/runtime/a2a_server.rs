@@ -79,20 +79,11 @@ pub use super::surface::{
     extensions_of,
 };
 
-pub const METHODS: &[&str] = &[
-    "SendMessage",
-    "SendStreamingMessage",
-    "GetTask",
-    "CancelTask",
-    "ListTasks",
-    "SubscribeToTask",
-    "SubscribeToEvents",
-    "CreateTaskPushNotificationConfig",
-    "GetTaskPushNotificationConfig",
-    "ListTaskPushNotificationConfigs",
-    "DeleteTaskPushNotificationConfig",
-    "GetExtendedAgentCard",
-];
+/// The JSON-RPC surface, defined in [`crate::runtime::surface`] so the
+/// always-compiled `--capabilities` manifest can read it without the `a2a`
+/// feature. Re-exported here because this is where the dispatch lives.
+pub use crate::runtime::surface::{LOCAL_METHODS, METHODS};
+
 /// A2A error: no such task.
 pub const TASK_NOT_FOUND: i64 = -32001;
 /// A2A error: the operation is not supported over this surface.
@@ -1383,18 +1374,12 @@ impl Runtime {
             );
         }
         let debug = self.settings.interface.debug;
-        let mut ops = vec!["interface.info", "config.set"];
-        if debug {
-            ops.extend([
-                "conversation.get",
-                "run.get",
-                "subagent.get",
-                "debug.events",
-            ]);
-        }
-        if self.a2a_pairing.is_some() {
-            ops.push("pairing.code");
-        }
+        // The same list the card renders as skills and `--capabilities`
+        // reports, narrowed to this surface — not a fifth copy of it.
+        let ops: Vec<&str> = crate::runtime::surface::interface_ops_of(&self.settings)
+            .into_iter()
+            .filter(|op| *op != "pairing.code" || self.a2a_pairing.is_some())
+            .collect();
         let display = &self.settings.interface.display;
         json!({"interface": {
             "enabled": true,

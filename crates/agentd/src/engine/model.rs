@@ -591,7 +591,6 @@ pub const KINDS: &[KindInfo] = &[
         &[
             "note",
             "audit",
-            "metric",
             "value",
             "stream",
             "subject",

@@ -1202,7 +1202,9 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
             std::path::PathBuf::from(path),
             run_id.clone(),
             "1".into(),
-            std::time::Duration::from_secs(10),
+            // The same window `/healthz` judges by: two liveness verdicts from
+            // one heartbeat is a monitoring bug waiting to happen.
+            std::time::Duration::from_millis(crate::obs::health::LIVENESS_STALE_AFTER_MS),
         );
     }
     // OTLP logs export (optional): mirror the JSON-lines log surface
@@ -1306,18 +1308,18 @@ pub fn capabilities(loaded: &Loaded) -> Value {
             .iter()
             .map(|p| json!({"role": format!("{:?}", p.role).to_lowercase(), "match": principal_match_desc(&p.matcher), "grants": p.grants}))
             .collect();
-        let mut methods = vec![
-            "SendMessage",
-            "SendStreamingMessage",
-            "GetTask",
-            "CancelTask",
-            "ListTasks",
-            "SubscribeToTask",
-            "GetAgentCard",
-        ];
-        if s.interface.enabled {
-            methods.push("SubscribeToEvents");
-        }
+        // Derived from the list the listener actually dispatches, plus the two
+        // bootstrap calls it answers ahead of the dispatch table. This was a
+        // fourth hand-maintained copy and it had drifted: it omitted
+        // `GetExtendedAgentCard` and the four push-config methods, and listed
+        // `GetAgentCard`, which `METHODS` does not carry.
+        let mut methods: Vec<&str> = crate::runtime::surface::METHODS
+            .iter()
+            .copied()
+            .filter(|m| *m != "SubscribeToEvents" || s.interface.enabled)
+            .chain(crate::runtime::surface::LOCAL_METHODS.iter().copied())
+            .collect();
+        methods.sort_unstable();
         json!({
             "listen": listen,
             "tls": s.a2a.tls.cert.is_some(),

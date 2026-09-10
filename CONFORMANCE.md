@@ -32,7 +32,7 @@ deferred.
 | Black-box conformance suite (`cargo run -p agentd-conformance`) | **21 passed / 0 failed** (the 2.0 families: supervisor, security, store, durability, tools, a2a-conversation, interface) |
 | ACC schema+behavior harness (drives the real binary; see *Validation report*) | **22 passed / 0 failed** |
 | Golden `--capabilities` fixtures vs `manifest.schema.json` (both, agentctl-owned) | **2 / 2 valid** |
-| agentctl `agent-contract-client` fixture tests | **6 / 6 pass** (cross-repo consistency) |
+| agentctl `agent-contract-client` fixture tests | **5 / 5 pass** (cross-repo consistency) |
 | `cargo clippy --all-targets -D warnings` (default + full) | clean |
 
 Hard invariants preserved: the manifest is built `json!`→`Value` (the `Secret`
@@ -132,26 +132,32 @@ admin-verb values of `agentd-1.3.1-configured.json`. They remain the **real
 `--capabilities` captures from agentd 1.3.1** and both validate against the
 *current* `manifest.schema.json`.
 
-The current binary's `--capabilities` is a **superset** of the 1.3.1 capture
-(it adds the additive `surfaces{exit_codes, config_schema}`, `webhooks` and
-`document`) and is validated **live** against `manifest.schema.json` — that live
-validation, plus the behavioral suites, is the authoritative conformance proof,
-not a static fixture. Both sum-type branches of every capturable key are
-covered: the off/null branches by `agentd-1.3.1-default.json`, the
-string/object branches by `agentd-1.3.1-configured.json`.
+The current binary's `--capabilities` is additive over the 1.3.1 capture in three
+blocks — `surfaces{exit_codes, config_schema}`, `webhooks` and `document` — with
+one non-additive move, `a2a.admin`'s verbs folding into `command_ops`. It is
+validated **live** against `manifest.schema.json`, and that live validation, plus
+the behavioral suites, is the authoritative conformance proof, not a static
+fixture. Both sum-type branches of every capturable key are covered: the off/null
+branches by `agentd-1.3.1-default.json`, the string/object branches by
+`agentd-1.3.1-configured.json`.
 
 > **Re-capture is a coordinated agentctl-side change, intentionally not forced
-> here.** Regenerating the `default`/`configured` captures from the v2.8.1 binary
-> was attempted (deliverable #2) but reverted by the contract owner, because the
-> capture would move `version` 2.5.0→2.8.1 and `default.json`'s `claim` from object
-> to *omitted* (a bare release build has no `cluster` feature), breaking the pinned
-> `fixtures.rs` assertions. Since the agentctl repo owns the fixtures **and** their
-> tests, re-capturing must move both in lockstep there; the regenerated v2.8.1
-> captures are available for adoption. Forcing them from agentd would make the two
-> repos inconsistent (a failing agentctl test), so they are deliberately left to
-> the owner. `intelligence.healthy` stays `"unknown"` in any one-shot capture (the
-> probe is network-free admission, ACC SPEC §3) — its boolean branch is reachable
-> only on the live resource and is unit-tested there.
+> here.** `contract/README.md` carries the regeneration recipe, and running it
+> against 1.14.1 yields two captures that still validate against
+> `manifest.schema.json` — but they move four things `fixtures.rs` pins by hand.
+> `version` becomes `"1.14.1"`, so the `Some("1.3.1")` assertion fails for both
+> captures. The `hook` workflow's `start_kinds` becomes `["webhook"]` and
+> `consumer`'s becomes `["stream"]`, because the manifest now derives start kinds
+> from the parser's own kind table rather than a hand-maintained list — that is
+> exactly the U3 gap the test anticipates in its own failure message ("if this
+> starts failing, upstream fixed it; update the contract"). The `a2a.admin` array
+> is gone: the same five verbs — drain, lameduck, cancel, pause and resume — now
+> ride in `command_ops` under the neutral `admin.*` spellings, so `admin_verbs()`
+> reads empty. And the captures are named for the version they came from, so
+> `load()`'s paths move with them. Only the three added blocks pass untouched,
+> covered by `additive_unknown_keys_are_tolerated`. Since the agentctl repo owns
+> both the fixtures and the tests that pin them, the two must move in lockstep
+> there; forcing a re-capture from agentd would only leave the other repo red.
 
 ## Gaps closed in this pass
 
@@ -199,7 +205,7 @@ confirm the surface exists. `cancel{handle:"0"}`/omitted fans a whole-run cancel
 | Ask | Disposition |
 |---|---|
 | **CC/P6** — manifest/config as consumable schemas; `--config-schema`/`--validate-config` round-trip | **RESOLVED.** Draft-2020-12 closed `--config-schema`; `--validate-config` 0/2; drift tests pin it to the struct + `contract_version`. |
-| **P3b** — versioned golden corpus per feature-set | **PARTIAL (owner-pinned).** The two-fixture corpus exists and validates against the current schema, exercising both branches of every capturable sum-type. The corpus is agentctl-owned and currently pinned to the 2.5.0 captures by `fixtures.rs`; a broader per-feature matrix keyed by `(major.minor + digest)`, and re-capture to the current version, are coordinated agentctl-side tasks (see *Golden fixtures*). |
+| **P3b** — versioned golden corpus per feature-set | **PARTIAL (owner-pinned).** The two-fixture corpus exists and validates against the current schema, exercising both branches of every capturable sum-type. The corpus is agentctl-owned and currently pinned to the 1.3.1 captures by `fixtures.rs`; a broader per-feature matrix keyed by `(major.minor + digest)`, and re-capture to the current version, are coordinated agentctl-side tasks (see *Golden fixtures*). |
 | **P2** — freeze A2A wire strings + `surfaces.a2a` | **RESOLVED (reference binding).** `surfaces.a2a` emitted; reference PascalCase `a2a.*` served. Normative spelling stays open per the contract; a gateway translates. |
 | **P10** — reconcile autoscaling metric names | **RESOLVED (source wins).** Only `agent_pending_events` emitted; `agent_reactive_backlog` an alias-only, never on the scrape; `agent_tokens_per_sec`/`agent_intelligence_latency_ms` stay provisional/not-emitted. |
 | **P-pause** — pause/resume served | **RESOLVED.** Both ship (frozen order), Management-gated, reflected in `agent_paused`. |

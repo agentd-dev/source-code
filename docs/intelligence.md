@@ -306,6 +306,29 @@ quietly mint a new endpoint or credential. Trifecta tags are not part of
 this — `tags` is `kind: mcp` vocabulary, and writing it on a
 `kind: intelligence` entry is exit 2.
 
+What `service:` actually buys is a **check**, not a second dial. The key is
+read at exactly one place — startup validation — where naming an entry
+`services:` never declared, or an entry of any kind but `intelligence`, is
+exit 2:
+
+```text
+intelligence.models.big.service: "billing" is not declared (add it under `services:`)
+intelligence.models.big.service: "reports" is `kind: mcp` — a model tier needs `kind: intelligence`
+```
+
+After that the reference is spent. Every tier's call goes to the endpoint
+list `intelligence.endpoints` names — the ordered failover list below —
+because that list, and nothing else, is what the client is built from at
+startup and rebuilt from on reload; a tier contributes the wire model name
+and, when it declares one, the window. `security.egress: closed` works the
+same way from the other side: it walks the four outbound surfaces —
+`mcp.servers`, `intelligence.endpoints`, `a2a.peers`, and the HTTP dials
+(`store.http`, a workflow `url:` reference, a literal `http` step URL) — and
+demands each URL match a catalogue entry of its own kind on scheme, authority
+and a path that extends the entry's on a segment boundary. The endpoint is
+what gets admitted; a tier naming a catalogued entry admits nothing on its
+own.
+
 A tier's declared `window` also replaces the compaction threshold's guess from
 the model *name*, which is a substring match and simply wrong for any provider
 whose naming does not happen to match.
@@ -319,6 +342,21 @@ conditions it exists to survive.
 
 `turn.model` puts the resolved model on the log line, because "how much did
 that cost, and on what" now has a per-turn answer.
+
+The "on what" is the half agentd answers. `pricing` is **recorded, not
+spent**: a tier's `pricing: {input_per_1k, output_per_1k}` and the
+instance-wide `intelligence.pricing` map beside it parse and validate as
+config, and there the trail ends. `input_per_1k` occurs four times in the
+whole crate tree, and those four are the `Pricing` struct, the two places the
+JSON-schema generator publishes its shape — inline in the tier, and as the
+shared `Pricing` definition — so an editor can autocomplete it, and the
+sample value `every_schema_path_deserializes_a_sample` builds to prove the
+path deserializes. There is no runtime call site at all: nothing multiplies a
+rate by a token count, no event carries a money figure, and every limit under
+`intelligence.budget` is denominated in tokens and requests rather than
+currency. Declare the rates if you want them written down beside the models
+they belong to, for a reader or for a tool of your own; do not expect to read
+a spend figure back out of agentd.
 
 ## Resilience: multi-endpoint failover & the circuit breaker
 

@@ -210,11 +210,20 @@ workflows:
 
 A `subscribe` start node needs both a `server` and a `uri`; omit either and the
 config fails validation and exits `2`, naming the missing field
-(`kind "subscribe" requires field "server"`). The token ceiling is tree-wide and
-lifetime-scoped — it is the ultimate backpressure. `--health-file` gives an
-orchestrator a liveness heartbeat to probe; `lifecycle.drain_timeout` (25s in
-this config, which is also the default) bounds graceful shutdown and should stay
-under the pod's termination grace.
+(`kind "subscribe" requires field "server"`). `--max-tokens` is **per run**, not
+per lifetime: it sets `limits.run.tokens`, the cap each triage run is measured
+against on its own, and a subagent inherits the same figure as its own allowance
+rather than drawing on a shared pool — so the 2,000,000 above (which is also the
+built-in default) bounds one wake, not the week. The lifetime ceiling is a
+different setting: `intelligence.budget.lifetime_tokens`
+(`--budget-tokens-lifetime`, default `0` = unbounded), the instance-wide hard stop
+the token governor enforces across every run, alongside
+`intelligence.budget.windows[]` for per-hour or per-day pacing. That budget, not
+the run cap, is the backpressure a daemon meant to stay up for weeks needs.
+
+`--health-file` gives an orchestrator a liveness heartbeat to probe;
+`lifecycle.drain_timeout` (25s in this config, which is also the default) bounds
+graceful shutdown and should stay under the pod's termination grace.
 
 > **How reactivity works.** agentd subscribes over the MCP servers'
 > Streamable-HTTP transport and wakes on pushed `notifications/resources/updated`
@@ -225,9 +234,12 @@ under the pod's termination grace.
 
 ## Sample 3 — `run-loop.sh` (a `loop` start node)
 
-Re-enter the instruction on a cadence until a bound — max iterations (via the
-step cap), the wall-clock `--deadline`, or the tree-wide token ceiling — or a
-drain signal. The Job-with-deadline / Deployment shape.
+Re-enter the instruction on a cadence until a bound — `max_iterations` on the loop
+node, or an `until` expression over the last outcome — or a drain signal. The
+per-run ceilings are not loop bounds: `--max-steps` / `--max-tokens` (and this
+config's own `limits.run.steps` of 25) fail the *iteration* that exhausts one,
+after which the node re-arms on its backoff. The Job-with-deadline / Deployment
+shape.
 
 ```bash
 export AGENT_INTELLIGENCE=https://gw.example/v1
@@ -280,11 +292,23 @@ which is what a kept-alive Deployment relies on.
 agentd emits structured JSON lines on stderr (one event per line), illustrative:
 
 ```json
-{"ts":"2026-06-25T10:15:00.142Z","level":"info","event":"run.start","run_id":"research-20260625-101500","mode":"once","model":"claude-opus-4"}
-{"ts":"2026-06-25T10:15:00.310Z","level":"info","event":"mcp.connect","server":"search","proto":"2025-11-25"}
-{"ts":"2026-06-25T10:15:02.880Z","level":"info","event":"subagent.spawn","route":"root","depth":0}
-{"ts":"2026-06-25T10:15:09.501Z","level":"info","event":"run.exit","run_id":"research-20260625-101500","status":"completed","exit_code":0}
+{"ts":"2026-06-25T10:15:00.142Z","level":"info","event":"run.start","run_id":"research-20260625-101500","run":"main-01K17S3P8QJ0V2WQ0K6R4M9Y3T","workflow":"main","node":"start","inbox_event":"01K17S3P8Q6F1B7C4D0E2G8H5J","acting_for":null,"key":null}
+{"ts":"2026-06-25T10:15:00.310Z","level":"info","event":"mcp.connect","run_id":"research-20260625-101500","server":"search","tools":7}
+{"ts":"2026-06-25T10:15:02.880Z","level":"info","event":"subagent.spawn","run_id":"research-20260625-101500","handle":"sub-1","mode":"sync","node":1,"depth":1,"servers":2}
+{"ts":"2026-06-25T10:15:09.501Z","level":"info","event":"run.done","run_id":"research-20260625-101500","run":"main-01K17S3P8QJ0V2WQ0K6R4M9Y3T","workflow":"main","status":"completed","err":null}
 ```
+
+Every line also carries `agent_id`, `agent_path`, `comp` (`supervisor` / `agent` /
+`mcp` / `intel`) and `pid` — elided above for width — plus `trace_id` while a trace
+is in flight; `subagent.spawn` adds `priority` and the child's `memory_bytes` /
+`cpu_seconds` rlimits, and its `pid` is the **child's**, because per-event fields
+are merged over the canonical ones and win on a name clash. Two ids look alike and
+are not: the canonical `run_id` is the **instance's**, the one `--run-id` sets and
+every line repeats, while `run` is the **workflow run's** own `<workflow>-<ULID>`
+(here `main`, the workflow the instruction sugar generates). The terminal line is
+`run.done` — there is no `run.exit` — carrying the run's terminal `status`
+(`completed`, `failed`, `refused`, `cancelled` or `stalled`) and `err`; its
+`output` field stays `null` unless `observability.log_content` is on.
 
 Credentials never appear in any log line — the `--intelligence-token` value is
 redacted (`***`) in all agentd output, including panic messages.
@@ -316,10 +340,11 @@ conflict).
 | `--mode …` | — | **removed in 2.0** — use a start node (`once` / `loop` / `schedule` / `subscribe` / …); `AGENT_MODE` is not read either |
 | `--subscribe <uri>` | — | **removed in 2.0** — use a `subscribe` start node: `{kind: subscribe, server: <name>, uri: <uri>}` |
 | `--interval <dur>` | — | **removed in 2.0** — `interval` on a `loop` start node, or `every` on a `schedule` start node |
-| `--max-steps <N>` | `AGENT_MAX_STEPS` | per-run step cap (default 50) |
-| `--max-tokens <N>` | `AGENT_MAX_TOKENS` | token budget (default 200000) |
-| `--deadline <dur>` | `AGENT_DEADLINE` | wall-clock deadline (default `600s`) |
-| `--max-depth <N>` | — | subagent tree depth cap (default 4) |
+| `--max-steps <N>` | `AGENT_MAX_STEPS` | per-run step cap (`limits.run.steps`, default 500) |
+| `--max-tokens <N>` | `AGENT_MAX_TOKENS` | token budget for a **single run** (`limits.run.tokens`, default 2000000) |
+| `--budget-tokens-lifetime <N>` | `AGENT_BUDGET_TOKENS` | the instance's cumulative ceiling across **all** runs (`intelligence.budget.lifetime_tokens`, default `0` = unbounded) |
+| `--deadline <dur>` | `AGENT_DEADLINE` | wall-clock deadline (`limits.run.deadline`, default `3600s`) |
+| `--max-depth <N>` | — | subagent tree depth cap (`limits.subagents.depth`, default 3) |
 | `--run-id <ID>` | `AGENT_RUN_ID` | idempotency key (auto-generated if unset) |
 | `--log-level <L>` | `AGENT_LOG_LEVEL` | `trace\|debug\|info\|warn\|error` (default `info`) |
 | `--drain-timeout <dur>` | `AGENT_DRAIN_TIMEOUT` | graceful drain budget (default `25s`) |

@@ -781,7 +781,11 @@ pub fn classify_instruction(v: &str) -> InstructionValue {
 /// read and SUBSCRIBED by the runtime's client, which does not exist at config
 /// load, so a template that wants one belongs in a child with its own
 /// `agent.instruction`.
-pub fn resolve_document_source(v: &Value, at: &str) -> Result<(String, Vec<String>), String> {
+pub fn resolve_document_source(
+    v: &Value,
+    at: &str,
+    policy: &EgressPolicy,
+) -> Result<(String, Vec<String>), String> {
     let spec: InstructionSpec = match v {
         Value::String(scalar) => {
             let key = instruction_key(scalar);
@@ -815,10 +819,16 @@ pub fn resolve_document_source(v: &Value, at: &str) -> Result<(String, Vec<Strin
         return Ok((text, Vec::new()));
     }
     if value.starts_with("https://") || value.starts_with("http://") {
+        policy
+            .allows(ServiceKind::Http, &value)
+            .map_err(|e| format!("{at}: {e}"))?;
         let text = crate::config::http_get(&value).map_err(|e| format!("{at} {value}: {e}"))?;
         return Ok((text, Vec::new()));
     }
     if value.starts_with("oci://") {
+        policy
+            .allows(ServiceKind::Http, &value)
+            .map_err(|e| format!("{at}: {e}"))?;
         #[cfg(feature = "oci")]
         {
             // The same cosign key an `agent.instruction.oci` may carry: a
@@ -1611,6 +1621,46 @@ pub fn egress_allows(
         "security.egress is `closed` and {url} matches no `kind: {}` services: catalog entry — catalog the endpoint to allow it",
         kind.as_str()
     ))
+}
+
+/// [`egress_allows`], answered from the RAW document instead of parsed
+/// [`Settings`], for the dials that happen before the parse.
+///
+/// The instruction fetch is the one dial that PRECEDES the parse: an `url:` or
+/// `oci:` document has to be in hand before typed deserialization, because its
+/// machinery folds into the configuration being built. So the boot sweep in
+/// `validate()` — which walks MCP, intelligence, peers, the store and workflow
+/// refs — structurally cannot see it, and `security.egress: closed` did not
+/// cover the document that becomes the agent's own standing policy.
+///
+/// Reading the two fields it needs straight off the document is what closes
+/// that. It fails CLOSED on anything it cannot understand: an unparseable
+/// `security.egress` is treated as `closed`, and an unparseable `services:` map
+/// as empty, so a malformed catalog refuses the dial rather than waving it
+/// through. The typed parse reports the real error a moment later.
+pub struct EgressPolicy {
+    egress: Egress,
+    services: BTreeMap<String, Service>,
+}
+
+impl EgressPolicy {
+    /// Read the policy off the raw document, once, before anything dials.
+    pub fn read(doc: &Value) -> EgressPolicy {
+        EgressPolicy {
+            egress: match doc.get("security").and_then(|s| s.get("egress")) {
+                None => Egress::default(),
+                Some(v) => serde_json::from_value(v.clone()).unwrap_or(Egress::Closed),
+            },
+            services: doc
+                .get("services")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default(),
+        }
+    }
+
+    pub fn allows(&self, kind: ServiceKind, url: &str) -> Result<(), String> {
+        egress_allows(&self.services, self.egress, kind, url)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -3330,6 +3380,10 @@ impl Settings {
         // explicitly plus everything about it. Collapse it to the scalar the
         // rest of this function already resolves, and keep the settings — so
         // the two spellings share one code path and cannot drift.
+        // Read ONCE, before any of the pre-parse dials below: an `url:` or
+        // `oci:` document is fetched before typed deserialization, so the boot
+        // sweep in `validate()` cannot cover it.
+        let egress_policy = EgressPolicy::read(&doc);
         let mut instruction_spec = InstructionSpec::default();
         if let Some(v) = doc.get("agent").and_then(|a| a.get("instruction"))
             && v.is_object()
@@ -3448,6 +3502,9 @@ impl Settings {
             .filter(|s| s.starts_with("oci://"))
             .map(str::to_string)
         {
+            egress_policy
+                .allows(ServiceKind::Http, &uri)
+                .map_err(|e| format!("{source}: agent.instruction: {e}"))?;
             #[cfg(feature = "oci")]
             {
                 let pulled = crate::oci::pull_verified(
@@ -3510,6 +3567,9 @@ impl Settings {
             .filter(|_| instruction_spec.url.is_some())
             .map(str::to_string)
         {
+            egress_policy
+                .allows(ServiceKind::Http, &url)
+                .map_err(|e| format!("{source}: agent.instruction: {e}"))?;
             let text = crate::config::http_get(&url)
                 .map_err(|e| format!("{source}: agent.instruction {url}: {e}"))?;
             if let Some(a) = doc.get_mut("agent").and_then(Value::as_object_mut) {
@@ -3725,7 +3785,8 @@ impl Settings {
         if let Some(v) = doc.get("agent").and_then(|a| a.get("prompt"))
             && !matches!(v, Value::String(sc) if instruction_key(sc) == "text")
         {
-            let (text, warns) = resolve_document_source(v, &format!("{source}: agent.prompt"))?;
+            let (text, warns) =
+                resolve_document_source(v, &format!("{source}: agent.prompt"), &egress_policy)?;
             instruction_warnings.extend(warns);
             if let Some(a) = doc.get_mut("agent").and_then(Value::as_object_mut) {
                 a.insert("prompt".into(), Value::String(text));
@@ -3769,7 +3830,7 @@ impl Settings {
                     continue;
                 }
                 let at = format!("{source}: subagents.templates.{name}.instruction");
-                let (text, warns) = resolve_document_source(v, &at)?;
+                let (text, warns) = resolve_document_source(v, &at, &egress_policy)?;
                 instruction_warnings.extend(warns);
                 if let Some(o) = t.as_object_mut() {
                     o.insert("instruction".into(), Value::String(text));
@@ -3921,7 +3982,6 @@ pub enum AliasKind {
     /// `--flag <value>` appends a parsed element to the array at `path`.
     Append,
     /// `--flag <value>` reads the FILE at `<value>` and sets `path` to its text.
-    SetFromFile,
     /// Handled by dedicated code (`--mcp-tags`, `--budget-exit-code`).
     Special,
 }
@@ -5016,35 +5076,6 @@ fn apply_alias(
         AliasKind::SetTrue => {
             let mut patch = Value::Object(Map::new());
             paths::set_path(&mut patch, alias.path, Value::Bool(true));
-            file::merge_into(doc, patch);
-        }
-        AliasKind::SetFromFile => {
-            let path = take()?;
-            // A BINARY age envelope read from a file into `agent.instruction`
-            // is armored into its text form here, so the one decrypt choke
-            // point (in `from_document`) sees every envelope the same way. Text
-            // files — plaintext, armored age, compact JWE — pass through
-            // verbatim.
-            let text = if alias.path == "agent.instruction" {
-                let bytes = std::fs::read(&path)
-                    .map_err(|e| usage(format!("{}: {path}: {e}", alias.flag)))?;
-                match String::from_utf8(bytes) {
-                    Ok(s) => s,
-                    Err(e) if crate::config::envelope::looks_encrypted(e.as_bytes()) => {
-                        crate::config::envelope::armor(e.as_bytes())
-                    }
-                    Err(_) => {
-                        return Err(usage(format!(
-                            "{}: {path}: not UTF-8 and not a recognized encrypted envelope",
-                            alias.flag
-                        )));
-                    }
-                }
-            } else {
-                super::read_file(&path)?
-            };
-            let mut patch = Value::Object(Map::new());
-            paths::set_path(&mut patch, alias.path, Value::String(text));
             file::merge_into(doc, patch);
         }
         AliasKind::Append => {
@@ -7448,7 +7479,7 @@ pub fn help_text() -> String {
     );
     for a in ALIASES {
         let shape = match a.kind {
-            AliasKind::Set | AliasKind::SetFromFile => "<value>",
+            AliasKind::Set => "<value>",
             AliasKind::SetTrue => "",
             AliasKind::Append => "<value>  (adds one)",
             AliasKind::Special => "<value>",
@@ -9070,6 +9101,97 @@ mod tests {
                 .any(|w| w.contains("JWKS")),
             "{:?}",
             s.agent.instruction_warnings
+        );
+    }
+
+    /// `security.egress: closed` covers the instruction fetch.
+    ///
+    /// The instruction is the agent's standing policy, and it is the ONE dial
+    /// that happens before the parse — so the boot sweep in `validate()`, which
+    /// walks MCP, intelligence, peers, the store and workflow refs, could never
+    /// see it. `closed` meant closed everywhere except for the document that
+    /// decides what the agent will do.
+    #[test]
+    fn a_closed_egress_covers_the_document_the_agent_takes_its_policy_from() {
+        let load = |instruction: Value, services: Value| {
+            Settings::from_document(
+                json!({"config_version": "1",
+                    "agent": {"name": "a", "instruction": instruction, "preflight": "never"},
+                    "security": {"egress": "closed"},
+                    "services": services,
+                    "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
+                    "store": {"kind": "memory"}}),
+                MERGED_DOCUMENT,
+            )
+        };
+
+        // An uncatalogued host is refused BEFORE the fetch — the error names
+        // the policy, not a connection failure, which is how we know no dial
+        // happened.
+        let e = load(json!({"url": "https://evil.example/policy.md"}), json!({})).unwrap_err();
+        assert!(e.contains("security.egress is `closed`"), "{e}");
+        assert!(e.contains("agent.instruction"), "{e}");
+
+        // …and so is an OCI artifact.
+        let e = load(json!({"oci": "ghcr.io/evil/agent:v1"}), json!({})).unwrap_err();
+        assert!(e.contains("security.egress is `closed`"), "{e}");
+
+        // A catalogued one gets past the policy and fails on the dial instead,
+        // which is the proof that the gate is the only thing that stopped it.
+        let e = load(
+            json!({"url": "https://127.0.0.1:1/policy.md"}),
+            json!({"docs": {"kind": "http", "endpoint": "https://127.0.0.1:1/"}}),
+        )
+        .unwrap_err();
+        assert!(
+            !e.contains("security.egress"),
+            "the catalogued host passes the gate: {e}"
+        );
+
+        // The same gate covers a one-shot prompt and a subagent template, which
+        // resolve through the shared document resolver.
+        let e = Settings::from_document(
+            json!({"config_version": "1",
+                "agent": {"name": "a", "instruction": "be terse", "preflight": "never",
+                          "prompt": {"url": "https://evil.example/task.md"}},
+                "security": {"egress": "closed"},
+                "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
+                "store": {"kind": "memory"}}),
+            MERGED_DOCUMENT,
+        )
+        .unwrap_err();
+        assert!(e.contains("security.egress is `closed`"), "{e}");
+        assert!(e.contains("agent.prompt"), "{e}");
+    }
+
+    /// The pre-parse gate fails CLOSED on a config it cannot understand.
+    ///
+    /// It reads `security.egress` and `services:` off the raw document, ahead
+    /// of the typed parse that would reject a malformed one. If a typo in
+    /// either let the dial through, the control would be defeated by the very
+    /// mistakes it most needs to survive.
+    #[test]
+    fn an_unparseable_egress_policy_refuses_the_dial_rather_than_allowing_it() {
+        // A misspelled policy value.
+        let p = EgressPolicy::read(&json!({"security": {"egress": "clsoed"}}));
+        assert!(
+            p.allows(ServiceKind::Http, "https://evil.example/x")
+                .is_err()
+        );
+        // A `services:` map that does not deserialize is an EMPTY catalog, so
+        // nothing matches.
+        let p = EgressPolicy::read(
+            &json!({"security": {"egress": "closed"}, "services": ["not", "a", "map"]}),
+        );
+        assert!(
+            p.allows(ServiceKind::Http, "https://evil.example/x")
+                .is_err()
+        );
+        // Absent policy is `open`, the documented default.
+        let p = EgressPolicy::read(&json!({}));
+        assert!(
+            p.allows(ServiceKind::Http, "https://anywhere.example/x")
+                .is_ok()
         );
     }
 

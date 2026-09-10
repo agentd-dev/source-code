@@ -89,20 +89,30 @@ defaults to `8/2s` — a burst of 8, refilling four tokens a second.
 
 ## The crate split
 
-Four publishable crates, and a conformance suite that deliberately links none of
+Five publishable crates, and a conformance suite that deliberately links none of
 them.
 
 | Crate | Library | Size | Owns |
 |---|---|---|---|
 | `agentd-net` | `net` | 2,310 lines | HTTP/1.1 + SSE client, TLS, SSRF classifier, X.509 extraction |
 | `agentd-mcp` | `mcp` | 6,567 lines | MCP wire types, protocol eras, client, Streamable-HTTP server |
+| `agentd-instruction` | `instruction_core` | 6,691 lines | the Instruction Specification reference implementation: parser, validator, §3.5 delivery, §7 verification |
 | `agentd-core` | `agentd` | ~89,000 lines | the engine: loop, supervisor, workflows, registry, config, state |
 | `agentd-cli` | bin `agentd` | 749 lines | argv dispatch and exit codes, nothing else |
 | `agentd-conformance` | — | — | black-box checks that drive the real binary |
 
+Sizes are `wc -l` over each crate's `src/`, so the inline `#[cfg(test)]` modules
+count and the integration tests in `tests/` do not. The engine's is rounded
+because it moves with every commit; the leaves are stable enough to state exactly.
+
 The name mismatch is not aesthetic: `agentd` on crates.io belongs to an unrelated
 project, so the package is `agentd-core` with `[lib] name = "agentd"`, and
 dependents rename it back so embedders still write `use agentd::…`.
+`agentd-instruction` carries the same package-vs-lib split for a different
+reason — the specification is instruction.md's, not ours, so a release must not
+stake a claim on the `instruction-*` namespace — and from 0.2.0 it is the one
+crate here under `MIT OR Apache-2.0` rather than the AGPL, because a reference
+implementation the other implementations cannot link is a reference nobody uses.
 
 **Third-party surface sits in the leaves, and is optional above them.** `net`
 holds one heavy end of the default build — `rustls`, `webpki-roots` and
@@ -114,9 +124,11 @@ external crates, every one optional and every one off by default: `ring` for
 `aauth`, `sign` and `oci`, `cel-interpreter` for `cel`, and the A2A stack behind
 `a2a` — `a2a-rs`, `buffa`, `buffa-types`, `tokio`, `axum`, `tokio-rustls`,
 `hyper`, `hyper-util`, `tower`, `async-trait`, `tokio-stream` and
-`futures-util`. `net` and `mcp` also contain **zero** `unsafe`; in the engine
-every `unsafe` block outside `#[cfg(test)]` is libc FFI, spread across about a
-dozen runtime files plus the terminal plumbing.
+`futures-util`. `net`, `mcp` and `instruction` also contain **zero** `unsafe`;
+in the engine every `unsafe` block outside `#[cfg(test)]` is libc FFI: thirty
+blocks across thirteen files, almost all of them signal handling, spawn, reaping,
+kill and cgroup work, plus the inotify watch and the termios juggling in
+`config/prompt.rs`.
 (The test-only ones are `std::env::set_var` calls, which edition 2024 made
 unsafe.)
 
@@ -377,18 +389,15 @@ Both plug into agentd's own HTTP transport, so the credentials only agentd knows
 about — AAuth signatures, SigV4, mTLS identities, refreshed OAuth tokens — and
 the SSRF guard all still apply. The SDKs own the protocol; agentd owns the socket.
 
-The resolved graph is what it is:
+The resolved graph is wide, and it is counted in exactly one place:
+[why-rust.md](why-rust.md#what-that-costs-and-what-it-does-not) carries the
+per-build totals together with the `cargo tree` invocation that produces them
+and the convention for what is and is not counted. Those numbers are
+deliberately not repeated here — three counts written down in two files drift
+apart on the next dependency bump, and a reader is then holding two answers with
+no way to tell which one is stale.
 
-| Build | External crates |
-|---|---|
-| `--no-default-features` | 70 |
-| default (`tls` + MCP) | 82 |
-| the shipped release feature set (adds A2A and CEL) | 167 |
-
-Counted as `cargo tree -p agentd-cli … -e normal` unique packages, less the five
-in-tree workspace crates.
-
-A graph that size is not one you can hold in your head, so agentd does not
+A graph of that width is not one you can hold in your head, so agentd does not
 claim you can. What CI enforces instead is a property of the thing a user
 actually receives: the release binary must be a statically linked musl artifact
 that runs on `scratch` — about 8.5 MiB for the shipped feature set, with no

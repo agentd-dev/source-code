@@ -16,10 +16,12 @@ AGENTD="${AGENTD:-agentd}"
 export AGENT_INTELLIGENCE="${AGENT_INTELLIGENCE:-https://gw.example/v1}"
 # export AGENT_INTELLIGENCE_TOKEN=...   # set in your environment, not here
 
-# A long-lived agent should bound its cumulative cost: --max-tokens and
-# --deadline are tree-wide and lifetime-scoped (the budget is the ultimate
-# backpressure). Everything else — the loop, the servers, the instruction —
-# lives in the config beside this script.
+# --max-tokens and --deadline bound ONE RUN (`limits.run.*`), and each spawned
+# subagent gets its own copy of the same ceiling — they are not a cumulative
+# cap. The lifetime ceiling is `intelligence.budget.lifetime_tokens`; set it in
+# the config if this agent should stop spending after a total. Everything else —
+# the loop, the servers, the instruction — lives in the config beside this
+# script.
 exec "$AGENTD" \
   --config "$(dirname "$0")/loop-triage.yaml" \
   --max-tokens 1000000 \

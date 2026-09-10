@@ -418,7 +418,8 @@ the pod is not "ready", so an orchestrator won't route work to it.
    ```
 
    `alive` is the heartbeat verdict: the supervisor's last loop tick is fresher
-   than the liveness window (10s) and no drain is under way. Once a drain begins
+   than the liveness window (5s — `obs::health::LIVENESS_STALE_AFTER_MS`, the
+   same window `/healthz` judges by) and no drain is under way. Once a drain begins
    the writer emits one final record with `draining:true` and stops. A Kubernetes
    `exec` probe reads `alive` (or checks `ts` freshness itself). One
    dependency-free file write per second:

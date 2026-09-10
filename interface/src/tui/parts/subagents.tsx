@@ -26,7 +26,6 @@ function col(v: unknown, width: number): string {
 function statusColor(status: string): string {
   switch (status) {
     case 'running':
-    case 'spawning':
       return theme.accent;
     case 'completed':
       return theme.agent;
@@ -105,7 +104,7 @@ export function SubagentDetail({
         subagent {handle}
       </Text>
       {line('status', d.status, statusColor(String(d.status ?? '')))}
-      {!['running', 'spawning'].includes(String(d.status ?? '')) ? (
+      {String(d.status ?? '') !== 'running' ? (
         <Text color={theme.dim}>{'(not running — messaging and stopping apply to a live subagent)'}</Text>
       ) : null}
       {line('mode', d.mode)}

@@ -101,8 +101,16 @@ definition happens identically for an embedded one, and cannot drift:
 - `security.workflows.immutable` still means what it says — the model cannot
   rewrite it, because it is config, not conversation.
 
-Attributes: `{name=…}` overrides the body's `name`, `{armed=false}` loads it
-disarmed.
+Attributes: `{name=…}` is **required** — a workflow's identity is the fence
+attribute and nothing else, so a block that carries none is refused at load
+with the fence's line and `workflow requires name`. A `name:` inside the YAML
+body is a body field that happens to be called name; it does not name the
+block, and when both are written the attribute wins, because the fence
+attributes are folded over the parsed body last. The **section** form carries
+the same attribute in its heading — `## !workflow nightly`, with the prose
+beneath it becoming the workflow's `description` — and those two forms are
+the only ones `workflow` takes: a `:::!workflow[]` set table is refused, the
+message naming the two it does. `{armed=false}` loads the workflow disarmed.
 
 Two things happen to the *text*. The model reads the **cleaned** instruction,
 where the block became a one-line note — `[workflow "triage" is loaded and

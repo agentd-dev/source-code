@@ -5,6 +5,86 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## Unreleased
+
+### Security
+
+- **`security.egress: closed` now covers the instruction fetch.** An `url:` or
+  `oci:` instruction is resolved BEFORE typed deserialization — its machinery
+  has to fold into the configuration being built — so the boot sweep in
+  `validate()`, which walks MCP, intelligence, peers, the store and workflow
+  refs, structurally could not see it. `closed` meant closed everywhere except
+  for the document that becomes the agent's own standing policy: agentd would
+  dial an uncatalogued host to fetch it.
+
+  The policy is now read off the raw document once, before anything dials, and
+  covers `agent.instruction`, `agent.prompt` and subagent templates alike. It
+  fails CLOSED on a config it cannot understand — an unparseable
+  `security.egress` is treated as `closed`, an unparseable `services:` map as
+  empty — so a typo in the catalog refuses the dial instead of waving it
+  through, and the typed parse reports the real error a moment later.
+
+### Fixed
+
+- **`agentd --config-schema=1` no longer walks the config-discovery chain.**
+  `is_informational` listed `--config-schema=2`, a spelling the argument loop
+  refuses outright, and omitted `=1`, the one it accepts — so a malformed
+  `agentd.yml` in the working directory could break a purely informational
+  invocation, which is the exact failure that function exists to prevent.
+
+- **One heartbeat, one liveness verdict.** The `--health-file` writer took a
+  hardcoded 10s staleness window while `/healthz` judged the same heartbeat at
+  `LIVENESS_STALE_AFTER_MS` (5s), so a wedged reactor read unhealthy on the
+  endpoint and `alive: true` in the file for five seconds. The writer now takes
+  the constant.
+
+- **`--capabilities` reports the methods the listener actually serves.** The
+  manifest's `a2a.methods` was a fourth hand-maintained copy and had drifted: it
+  omitted `GetExtendedAgentCard` and the four push-notification-config methods,
+  and listed `GetAgentCard`, which the dispatch table does not carry. It is now
+  derived from `METHODS` plus the new `LOCAL_METHODS` — the two calls answered
+  ahead of the dispatch table (`GetAgentCard`, `Pair`), which were served and
+  named nowhere.
+
+- **The interface ops are advertised.** `config.set`, `subagent.get` and
+  `pairing.code` were dispatched by the listener but absent from
+  `command_ops_of`, so the agent card's skills, the command extension's
+  `params.ops` and `--capabilities` all under-reported the served surface —
+  the drift the "one list feeds three views" invariant exists to prevent.
+  `interface.info` now reads that same list instead of keeping a fifth copy.
+
+### Removed
+
+- **`emit: {metric: …}`.** The field validated, ran green and recorded nothing:
+  no code path ever read it. An accepted field that does nothing is worse than a
+  refused one, because the operator believes it worked.
+
+- **`AliasKind::SetFromFile`.** No alias used it, so the arm was unreachable;
+  the envelope-armoring it performed is done for real in `from_document`.
+
+- **`sdk/typescript/`.** Nothing in the repository referenced it — no build, no
+  test, no publish workflow, no documentation. It declared version 1.3.0 against
+  a 1.14.1 runtime, emitted `type:` values absent from the node registry, and
+  targeted a TOML dialect the loader has never read.
+
+- **`ink-text-input`** from the interface's dependencies, and the `'spawning'`
+  subagent status from four client call sites. No daemon ever sends `spawning`:
+  a record is built with `spawned` and always overwritten with `running` or
+  `failed` before the insert. Deleted rather than remapped to `retiring`, which
+  would newly treat a retiring child as live and permit messaging and stopping
+  it.
+
+### Changed
+
+- **`docs/security.md` cites symbols, not line numbers.** All 83 `file.rs:NNN`
+  anchors became `file.rs::symbol`, because ten of them broke during this very
+  session as unrelated edits shifted the lines beneath them.
+
+- **One dependency-count table.** It lived in both `docs/architecture.md` and
+  `docs/why-rust.md` and they disagreed; why-rust.md is now authoritative, with
+  the counting convention stated beside the numbers, and architecture.md links
+  to it. A number that appears once cannot disagree with itself.
+
 ## v1.14.1 — the image ships what the binaries ship
 
 ### Fixed

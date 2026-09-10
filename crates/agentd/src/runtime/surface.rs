@@ -24,6 +24,34 @@ pub const COMMAND_EXTENSION: &str = "https://agentd.dev/a2a/ext/command/v1";
 /// The instance-wide observation feed display clients render. A2A has no such
 /// concept, so `SubscribeToEvents` is declared here as a method extension.
 pub const INTERFACE_EXTENSION: &str = "https://agentd.dev/a2a/ext/interface/v1";
+/// Calls answered by the listener BEFORE the dispatch table, so they never
+/// appear in [`METHODS`]: the public card read, and the interface pairing
+/// handshake. Both are served — `--capabilities` reports them — and both are
+/// deliberately outside the spec-method assertions, which is why they need a
+/// name of their own rather than an exception buried in three test files.
+pub const LOCAL_METHODS: &[&str] = &["GetAgentCard", "Pair"];
+
+/// Every JSON-RPC method the A2A listener dispatches.
+///
+/// Lives here rather than beside the dispatch because the `--capabilities`
+/// manifest is always compiled and the listener is `a2a`-gated: a manifest that
+/// could not read this list grew a hand-typed copy of it, and that copy drifted
+/// by five methods.
+pub const METHODS: &[&str] = &[
+    "SendMessage",
+    "SendStreamingMessage",
+    "GetTask",
+    "CancelTask",
+    "ListTasks",
+    "SubscribeToTask",
+    "SubscribeToEvents",
+    "CreateTaskPushNotificationConfig",
+    "GetTaskPushNotificationConfig",
+    "ListTaskPushNotificationConfigs",
+    "DeleteTaskPushNotificationConfig",
+    "GetExtendedAgentCard",
+];
+
 /// The methods agentd answers that A2A does not define, each paired with the
 /// extension that declares it. Nothing may be served off this list:
 /// `every_non_spec_method_is_declared_as_an_extension` is the check.
@@ -115,11 +143,32 @@ pub fn command_ops_of(s: &Settings) -> Vec<&'static str> {
         "admin.resume",
         "admin.cancel",
     ];
-    if s.interface.enabled {
-        ops.push("interface.info");
-        if s.interface.debug {
-            ops.extend(["conversation.get", "run.get", "debug.events"]);
-        }
+    ops.extend(interface_ops_of(s));
+    ops
+}
+
+/// The ops the DISPLAY surface owns, in the order `interface.info` reports them.
+///
+/// Split out only because `interface.info` answers with this subset while the
+/// card wants the whole set — one list, not two. `config.set`, `subagent.get`
+/// and `pairing.code` were dispatched by the listener and advertised nowhere
+/// until this existed, which is exactly the under-reporting the "one list feeds
+/// three views" invariant is supposed to prevent.
+pub fn interface_ops_of(s: &crate::config::v2::Settings) -> Vec<&'static str> {
+    if !s.interface.enabled {
+        return Vec::new();
+    }
+    let mut ops = vec!["interface.info", "config.set"];
+    if s.interface.debug {
+        ops.extend([
+            "conversation.get",
+            "run.get",
+            "subagent.get",
+            "debug.events",
+        ]);
+    }
+    if s.interface.pairing.enabled {
+        ops.push("pairing.code");
     }
     ops
 }

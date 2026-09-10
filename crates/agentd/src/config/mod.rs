@@ -687,11 +687,6 @@ fn validate_one_intelligence_uri(uri: &str) -> Result<(), ConfigError> {
     )))
 }
 
-pub(crate) fn read_file(path: &str) -> Result<String, ConfigError> {
-    std::fs::read_to_string(path)
-        .map_err(|e| usage(format!("cannot read instruction file {path}: {e}")))
-}
-
 /// How one argument spells the config-file flag. `--config` is the canonical
 /// form; `-c` is the short alias, and either may attach its value with `=`
 /// (`-c=a.yaml`, `--config=a.yaml`) as well as separate it with a space.
@@ -883,7 +878,7 @@ fn is_informational(args: &[String]) -> bool {
                 | "-V"
                 | "--version"
                 | "--config-schema"
-                | "--config-schema=2"
+                | "--config-schema=1"
                 | "--workflow-schema"
         )
     })

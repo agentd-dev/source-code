@@ -19,10 +19,11 @@ AGENTD="${AGENTD:-agentd}"
 export AGENT_INTELLIGENCE="${AGENT_INTELLIGENCE:-https://gw.example/v1}"
 # export AGENT_INTELLIGENCE_TOKEN=...   # set in your environment, not here
 
-# A reactive daemon should bound its cumulative cost: --max-tokens here is
-# tree-wide and lifetime-scoped (the budget is the ultimate backpressure). A
-# high token ceiling and no hard deadline is typical for a kept-alive
-# Deployment; tune to taste.
+# --max-tokens bounds ONE RUN (`limits.run.tokens`), not the daemon's lifetime
+# spend — every wake gets the same allowance again. For a cumulative ceiling set
+# `intelligence.budget.lifetime_tokens` in the config. A generous per-run
+# allowance and no hard deadline is typical for a kept-alive Deployment; tune to
+# taste.
 exec "$AGENTD" \
   --config "$(dirname "$0")/reactive-triage.yaml" \
   --max-tokens 2000000 \

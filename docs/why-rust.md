@@ -70,14 +70,39 @@ integration.
 
 ### What that costs, and what it does not
 
-| Build | External crates |
-|---|---|
-| `--no-default-features` | 70 |
-| default (`tls` + MCP) | 82 |
-| shipped release feature set (adds A2A and CEL) | 167 |
+| Build | Crates resolved | Of them, external |
+|---|---|---|
+| `--no-default-features` | 75 | 70 |
+| default (`tls` + MCP) | 87 | 82 |
+| shipped release feature set (adds A2A and CEL) | 172 | 167 |
 
-Counted as `cargo tree -p agentd-cli … -e normal` unique packages, less the five
-in-tree workspace crates.
+The convention carries more weight than the totals, because it is what makes
+them reproducible instead of quoted: unique package names printed by
+`cargo tree -p agentd-cli -e normal --prefix none`, counted once each however
+many versions or paths reach them, with `-e normal` dropping build- and
+dev-dependencies because neither is linked into the shipped binary. The middle
+column is what that command prints; the right-hand column subtracts the five
+in-tree workspace crates it also lists — `agentd-cli`, `agentd-core`,
+`agentd-net`, `agentd-mcp` and `agentd-instruction` — which are this repository,
+not somebody else's code inside the trust boundary. The third row is the default
+features plus the list `.github/workflows/release.yml` hands to `cross build`
+(`a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt`),
+and it comes out the same for the host target and for
+`--target x86_64-unknown-linux-musl`, the one that actually ships. Measured on
+cargo 1.98.0 against the committed `Cargo.lock`.
+
+Two of those twelve features account for the whole jump from 87 to 172: adding
+`a2a` to the default build resolves 151 crates and adding `cel` resolves 109,
+the two overlap in exactly one crate (`uuid`), and the remaining ten add nothing
+at all. That is the honest shape of the trade — the graph is wide because of one
+protocol stack and one expression language, not because a hundred small
+conveniences were waved through.
+
+This section is the only place in the documentation that carries those counts.
+[architecture.md](architecture.md#the-dependency-ledger-stated-honestly) points
+here rather than repeating them, because the same three numbers written down in
+two files drift apart on the next dependency bump, and a reader is then holding
+two answers with no way to tell which one is stale.
 
 What CI gates is not that count but what actually reaches a user: the release
 binary is a **statically linked musl artifact that runs on `scratch`** — about
@@ -254,17 +279,21 @@ right for a shipped appliance and wrong for a fast edit loop. CI compounds it:
 unification hides a build that is broken on its own.
 
 **You own the hand-rolled code forever.** Roughly 108,000 lines of source across
-the workspace, 89,000 of them in the engine. The YAML reader is a subset; the
-cron parser is 5-field UTC
-only and finds the next fire by stepping a minute at a time for up to four years.
-Each is a spec revision you will handle yourself, and a bug nobody else reports.
+the workspace, 89,000 of them in the engine — `wc -l` over the `.rs` files under
+the six workspace members' `src/`, which counts the inline `#[cfg(test)]` modules
+and not the integration tests in `tests/`. Rounded deliberately, unlike every
+other figure here: it is the one number that moves with every commit, so a count
+to the line would be stale before you finished reading it. The YAML reader is a
+subset; the cron parser is 5-field UTC only and finds the next fire by stepping a
+minute at a time for up to four years. Each is a spec revision you will handle
+yourself, and a bug nobody else reports.
 
 **`unsafe` is quarantined, not absent, and `panic = "abort"` is unforgiving.**
-Zero `unsafe` in `net` and `mcp`; 57 blocks in the engine, 27 of them inside
-`#[cfg(test)]` and mostly env-var juggling (edition 2024 made `set_var` unsafe),
-the other 30 libc FFI across thirteen files. A panic in the supervisor path takes
-the whole tree down by design, which makes every `unwrap` an availability
-decision.
+Zero `unsafe` in `net`, `mcp` and `instruction`; 57 blocks in the engine, 27 of
+them inside `#[cfg(test)]` and mostly env-var juggling (edition 2024 made
+`set_var` unsafe), the other 30 libc FFI across thirteen files. A panic in the
+supervisor path takes the whole tree down by design, which makes every `unwrap`
+an availability decision.
 
 **The learning curve is real.** Edition 2024, a `rust-version` floor of 1.96 —
 set by the protocol SDKs, not by us, which is one of the ordinary costs of

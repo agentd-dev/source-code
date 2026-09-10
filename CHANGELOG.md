@@ -77,6 +77,33 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   the drift the "one list feeds three views" invariant exists to prevent.
   `interface.info` now reads that same list instead of keeping a fifth copy.
 
+### Fixed
+
+- **A document made of one v2 section is a v2 document.** The schema-detection
+  key list was a hand-maintained subset and had fallen seven sections behind —
+  `mcp`, `services`, `identity`, `interface`, `goal`, `subagents` and
+  `webhooks` were all absent — so a `-c` overlay carrying only `mcp:`, an
+  ordinary layer in the config chain, was refused as "the flat schema, which
+  agentd does not accept". Doubly wrong: the document is not flat, and the
+  retired schema had nothing to do with it. The list is now derived from the
+  settings schema, so a section added tomorrow is detected tomorrow.
+
+### Changed
+
+- **`examples/mcp-servers.json` is now `examples/mcp-servers.fragment.json`**,
+  and carries no `config_version`. It was never a runnable config — it declares
+  `mcp.servers` and nothing else, no instruction and no intelligence endpoint —
+  but it looked like one, and SAMPLES.md told readers to "load it with
+  `--config`". It is an inventory to layer *under* a config with a second `-c`,
+  which is the shape `examples/startup/` already uses for its catalogue, and it
+  now says so.
+
+  Its four servers hold all three trifecta legs deliberately, so merging the
+  whole file into one agent is refused. That refusal is the lesson the sample
+  exists to teach, and a test now pins it — along with the fragment carrying no
+  `config_version`, and the detection fix above. `.json` examples were not
+  covered by the example sweep at all before this.
+
 ### Removed
 
 - **`intelligence.models.<tier>.service`.** It named a `kind: intelligence`

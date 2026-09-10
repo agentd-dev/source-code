@@ -13,6 +13,9 @@
 //! checked for a flag the CLI now refuses.
 #![cfg(unix)]
 
+#[cfg(all(feature = "cel", feature = "sign"))]
+mod common;
+
 use std::path::{Path, PathBuf};
 #[cfg(all(feature = "cel", feature = "sign"))]
 use std::process::Command;
@@ -120,6 +123,71 @@ fn every_shipped_example_config_validates() {
         "shipped example configs no longer load:\n\n{}",
         failures.join("\n\n")
     );
+}
+
+/// The shipped FRAGMENT is a fragment, and its refusal is the lesson.
+///
+/// `examples/mcp-servers.fragment.json` carries `mcp.servers` and nothing else,
+/// to be layered under a real config with a second `-c`. Its four servers hold
+/// all three trifecta legs on purpose, so merging the whole thing into one
+/// agent is refused — which is what SAMPLES.md teaches, and therefore something
+/// a test should hold still. Note the file is `.json`: the config sweep above
+/// collects only `.yaml`/`.yml`, so nothing covered it until now.
+#[cfg(all(feature = "cel", feature = "sign"))]
+#[test]
+fn the_server_fragment_layers_under_a_config_and_its_trifecta_is_refused() {
+    let frag = examples_root().join("mcp-servers.fragment.json");
+    let text = std::fs::read_to_string(&frag).expect("the fragment is shipped");
+    assert!(
+        !text.contains("config_version"),
+        "a fragment must not claim to be a whole document — that is what makes \
+         `-c base -c fragment` the documented shape"
+    );
+
+    // A base config the fragment layers under. Two of the four servers is a
+    // legal agent; all four is not.
+    let base = common::unique_path("frag-base", "yaml");
+    std::fs::write(
+        &base,
+        "config_version: \"1\"\nagent: { name: frag, instruction: \"be terse\", preflight: never }\n\
+         intelligence: { endpoints: [\"mock:final\"], model: mock }\nstore: { kind: memory }\n",
+    )
+    .unwrap();
+
+    let run = |args: &[&std::ffi::OsStr]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_agentd"))
+            .arg("--validate-config")
+            .args(args)
+            .env("FS_TOKEN", "test-value")
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stderr).to_string()
+    };
+
+    // Merged into a config, the trifecta gate refuses it — by name, naming all
+    // three legs, so the reader learns which tags collided.
+    let merged = run(&[
+        "-c".as_ref(),
+        base.as_ref(),
+        "-c".as_ref(),
+        frag.as_os_str(),
+    ]);
+    assert!(
+        merged.contains("lethal-trifecta refused")
+            && merged.contains("untrusted_input")
+            && merged.contains("sensitive")
+            && merged.contains("egress"),
+        "the refusal is the lesson, and must name the legs:\n{merged}"
+    );
+
+    // …and the fragment is a v2 document even alone: a config whose only
+    // section is `mcp:` must not be mistaken for the retired flat schema.
+    let alone = run(&["-c".as_ref(), frag.as_os_str()]);
+    assert!(
+        !alone.contains("flat schema"),
+        "a document made of one v2 section is a v2 document:\n{alone}"
+    );
+    let _ = std::fs::remove_file(&base);
 }
 
 /// The scripts and unit files people copy invoke the CLI directly, so a removed

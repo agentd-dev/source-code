@@ -33,7 +33,7 @@
 | `voice/` | **(2.0)** A voice-controlled household agent: `subscribe` start on an MCP resource, `window` for conversational context, `on_overflow: replace` as barge-in, `event: human.asked` to speak every gate aloud, and an addressed gate a voice cannot answer. |
 | `instructions/triage.md` | An instruction file with an output contract — classify an inbox item, take one action, emit JSON. Used by the reactive and loop samples. |
 | `instructions/research.md` | An instruction file with an output contract — research a topic to a single sourced answer. Used by the once sample. |
-| `mcp-servers.json` | An illustrative MCP server config (name + remote `endpoint` + auth `headers` + `tags`), the shape a `--config` JSON file carries. |
+| `mcp-servers.fragment.json` | A server-list **fragment**, not a runnable config: the shape of `mcp.servers` (name + remote `endpoint` + auth `headers` + `tags`), meant to be layered under a config with a second `-c`. |
 | `run-once.sh` | Run the instruction to a terminal status, then exit. Flags only, no config file — so agentd synthesizes the one-shot `main` workflow (a `once` start, an `agent` step, a `finish`). Job / CLI shape. |
 | `run-reactive.sh` | Idle, wake on MCP resource changes, never exit on its own. The trigger is the `subscribe` start node in [`reactive-triage.yaml`](reactive-triage.yaml), which the script passes with `--config`. Deployment shape. |
 | `run-loop.sh` | Re-enter on a cadence until a bound or a drain signal. The trigger is the `loop` start node in [`loop-triage.yaml`](loop-triage.yaml), which the script passes with `--config`. Job-with-deadline / Deployment shape. |
@@ -102,20 +102,39 @@ the supervisor can map to an exit code.
 
 ## The MCP server config
 
-`mcp-servers.json` shows the shape of a declarative MCP server list: a document
-that opens with `config_version: "1"` and carries the list under **`mcp.servers`**.
+`mcp-servers.fragment.json` is an **inventory, not an agent**. It carries
+`mcp.servers` and nothing else — no instruction, no intelligence endpoint — so it
+is a layer to put *under* a config, not a config to run:
+
+```bash
+agentd -c ./my-agent.yaml -c examples/mcp-servers.fragment.json
+```
+
+`--config` is repeatable and merges left to right (RFC 7396, later files win per
+leaf), which is what makes a shared server list a real deployment pattern:
+`examples/startup/` uses the same shape for its service catalogue. The file
+deliberately carries no `config_version` — it is not claiming to be a whole
+document.
+
 Each server has a `name`, a remote `endpoint` (an `https://host/mcp`
 Streamable-HTTP URL that agentd CONNECTS to — it spawns no process), optional auth
 `headers` (carrying `{{secret:NAME}}` references resolved at connect time, never
 inlined or logged), and `tags` that scope the Rule-of-Two trust budget
 (RFC 0009/0012). The `endpoint` is trusted config and is never built from model- or
-server-controlled strings. Load it with **`--config <path>`** (or `AGENTD_CONFIG`);
-the intelligence token still stays env/flag only.
+server-controlled strings. The intelligence token stays env/flag only.
 
-> **These four servers together hold all three trifecta legs**, so loading the file
-> as a whole config is refused at startup — `untrusted_input + sensitive + egress`
-> in one grant. That is the tags doing their job, not a defect in the sample: a real
-> deployment splits them across two instances, as [`hiring/`](hiring/) and
+> **These four servers together hold all three trifecta legs**, so merging the
+> whole file into one agent is refused at startup — `untrusted_input + sensitive
+> + egress` in one grant:
+>
+> ```text
+> lethal-trifecta refused: the root grant wires untrusted_input + sensitive +
+> egress into one agent; narrow the tags or set security.allow_trifecta (audited)
+> ```
+>
+> That refusal is the point of the sample, not a defect in it, and a test pins
+> it. Take the two servers a given agent actually needs — a real deployment
+> splits the legs across two instances, as [`hiring/`](hiring/) and
 > [`voice/`](voice/) do.
 
 > **Config precedence.** `--config` is the lowest non-default layer

@@ -3915,23 +3915,33 @@ impl Settings {
 /// absent: it exists in both schemas, so it decides nothing. `intelligence`
 /// is absent for a different reason — it is a STRING (the endpoint list) in
 /// the flat schema but an OBJECT here, so [`detect`] judges it by shape.
-pub const V2_KEYS: &[&str] = &[
-    "agent",
-    "store",
-    "workflows",
-    "tools",
-    "a2a",
-    "lifecycle",
-    "observability",
-    "security",
-    "knowledge",
-    "search",
-    "skills",
-    "memory",
-    "context",
-    "vars",
-    "streams",
-];
+/// Every top-level section of the settings schema, minus the three that decide
+/// nothing.
+///
+/// DERIVED, not hand-listed. The list used to be a hand-maintained subset and
+/// had fallen seven sections behind — `mcp`, `services`, `identity`,
+/// `interface`, `goal`, `subagents` and `webhooks` were all missing, so a
+/// document whose only section was one of them (a `-c` overlay carrying just
+/// `mcp:`, say) fell through to `Detected::V1` and was refused as "the flat
+/// schema, which agentd does not accept". Reading the schema means a section
+/// added tomorrow is detected tomorrow.
+pub fn v2_keys() -> Vec<String> {
+    schema::schema()["properties"]
+        .as_object()
+        .map(|o| {
+            o.keys()
+                .filter(|k| !DETECTION_IGNORES.contains(&k.as_str()))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Sections that cannot decide which schema a document speaks.
+/// `config_version` is judged explicitly; `limits` exists in BOTH schemas; and
+/// `intelligence` is a string in the flat one and an object here, so [`detect`]
+/// judges it by shape instead.
+pub const DETECTION_IGNORES: &[&str] = &["config_version", "limits", "intelligence"];
 
 /// v1 (flat) top-level keys.
 pub const V1_KEYS: &[&str] = &[
@@ -3968,9 +3978,10 @@ pub fn detect(doc: &Value) -> Detected {
     let version = obj.get("config_version").and_then(Value::as_str);
     let intel_is_object = obj.get("intelligence").is_some_and(Value::is_object);
     let intel_is_string = obj.get("intelligence").is_some_and(Value::is_string);
-    let has_v2 = version == Some(schema::CONFIG_VERSION)
-        || intel_is_object
-        || obj.keys().any(|k| V2_KEYS.contains(&k.as_str()));
+    let has_v2 = version == Some(schema::CONFIG_VERSION) || intel_is_object || {
+        let v2 = v2_keys();
+        obj.keys().any(|k| v2.iter().any(|v| v == k))
+    };
     let has_v1 = intel_is_string
         || obj.keys().any(|k| V1_KEYS.contains(&k.as_str()))
         || matches!(version, Some(v) if v != schema::CONFIG_VERSION);
@@ -9191,6 +9202,47 @@ mod tests {
         assert!(
             p.allows(ServiceKind::Http, "https://anywhere.example/x")
                 .is_ok()
+        );
+    }
+
+    /// A document made of nothing but a v2 section is a v2 document.
+    ///
+    /// The detection list was a hand-maintained subset of the schema and had
+    /// fallen seven sections behind, so `-c overlay.json` carrying only `mcp:`
+    /// — a perfectly ordinary layer in the config chain — was refused as "the
+    /// flat schema, which agentd does not accept". The message was doubly
+    /// wrong: the document is not flat, and the retired schema had nothing to
+    /// do with it.
+    #[test]
+    fn every_v2_section_identifies_a_document_as_v2_on_its_own() {
+        // Read the SCHEMA, not `v2_keys()`. Deriving the input from the
+        // function under test makes the test drop a key exactly when the code
+        // does — which is how the first draft of this passed while `mcp` was
+        // filtered back out of the derivation.
+        let sections: Vec<String> = schema::schema()["properties"]
+            .as_object()
+            .expect("the schema has top-level properties")
+            .keys()
+            .filter(|k| !DETECTION_IGNORES.contains(&k.as_str()))
+            .cloned()
+            .collect();
+        assert!(sections.len() > 20, "{} sections?", sections.len());
+        for key in sections {
+            let doc = json!({ &key: {} });
+            assert_eq!(
+                detect(&doc),
+                Detected::V2,
+                "a document whose only section is `{key}` must read as v2"
+            );
+        }
+        // The three that deliberately decide nothing still do not.
+        assert_eq!(detect(&json!({"limits": {}})), Detected::V1);
+        // `intelligence` is judged by SHAPE, not by name: an object is v2, the
+        // flat schema's endpoint string is v1.
+        assert_eq!(detect(&json!({"intelligence": {}})), Detected::V2);
+        assert_eq!(
+            detect(&json!({"intelligence": "https://x/v1"})),
+            Detected::V1
         );
     }
 

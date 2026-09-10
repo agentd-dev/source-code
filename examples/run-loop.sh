@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
-# run-loop.sh — polling/work-until-done daemon: re-enter the instruction on a
-# cadence until a bound (max iterations via steps, wall-clock deadline, or
-# tree-wide token ceiling) or a drain signal is hit.
+# run-loop.sh — the triage agent on a 5-minute cadence: wake, triage whatever is
+# waiting, sleep, repeat. Never exits on its own (a drain signal or a fatal/limit
+# class stops it) — deploy it as a long-lived Deployment.
 #
-# All flags below exist in crates/agentd/src/config.rs. Tools come from remote
-# MCP servers reached over Streamable HTTP — agentd runs no local code of its own.
-#
-# --interval D selects the re-entry cadence: D>0 polls every D; D=0 re-enters
-# immediately on completion (work-until-done). Here we poll every 5 minutes.
-# A wall-clock --deadline turns this into a bounded "Job with a deadline".
+# The cadence is a `loop` start node, which fires again each time the previous
+# run FINISHES — so `interval` is the gap between runs, not a wall-clock
+# schedule, and two runs never overlap. `--mode loop --interval 5m` was the 1.x
+# spelling of this; modes were removed in 2.0 and the shape they encoded became
+# a start node. See docs/modes-and-triggers.md.
 
 set -euo pipefail
 
@@ -17,15 +16,12 @@ AGENTD="${AGENTD:-agentd}"
 export AGENT_INTELLIGENCE="${AGENT_INTELLIGENCE:-https://gw.example/v1}"
 # export AGENT_INTELLIGENCE_TOKEN=...   # set in your environment, not here
 
+# A long-lived agent should bound its cumulative cost: --max-tokens and
+# --deadline are tree-wide and lifetime-scoped (the budget is the ultimate
+# backpressure). Everything else — the loop, the servers, the instruction —
+# lives in the config beside this script.
 exec "$AGENTD" \
-  --mode loop \
-  --interval 5m \
-  --instruction.file "$(dirname "$0")/instructions/triage.md" \
-  --model "claude-opus-4" \
-  --mcp inbox=https://mcp-inbox.internal/mcp \
-  --mcp tickets=https://mcp-tickets.internal/mcp \
-  --max-steps 25 \
+  --config "$(dirname "$0")/loop-triage.yaml" \
   --max-tokens 1000000 \
   --deadline 2h \
-  --drain-timeout 25s \
   --log-level info

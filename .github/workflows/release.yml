@@ -21,9 +21,15 @@ permissions:
 # AAuth [DRAFT] agent-identity client (`--features aauth`). AAuth ships in the
 # artifact because its crypto (`ring`) is ALREADY linked by rustls (the `tls`
 # default) — zero marginal dependency, so the minimalism moat is untouched.
-# CEL (`--features cel`) is the one dependency-BEARING opt-in and stays
-# build-from-source by design (the moat holds in shipped artifacts). (The 1.x
-# serve-mcp/serve-https/events/cluster/workflow features were removed in 2.0.)
+# CEL (`--features cel`) is the one shipped feature that buys a crate for
+# config expressiveness alone (`cel-interpreter`, ~1.8 MiB) — carried since
+# 2.3.0, because a published binary without it refuses every `when:` guard at
+# config validation (an `iterate.until` then fails its step at run time, and a
+# start-node `filter` silently drops the event), which made every non-trivial
+# config a build-from-source job. The 1.x serve-mcp/serve-https/events/cluster
+# features were removed in 2.0; `workflow` survives as a feature — CI lints it
+# solo — but is not shipped, because the workflow engine itself compiles
+# unconditionally.
 env:
   FEATURES: "a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt"
 

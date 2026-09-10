@@ -1,35 +1,28 @@
 {
-  "//": "Illustrative MCP server config — the mcp_servers[] shape a --config file carries.",
-  "//1": "Each server is a REMOTE endpoint reached over Streamable HTTP (RFC 0004):",
-  "//2": "agentd CONNECTS to `endpoint` and speaks JSON-RPC 2.0 over HTTP(S) — it spawns",
-  "//3": "no process and runs no local code. The endpoint is TRUSTED config and is NEVER",
-  "//4": "built from model- or server-controlled strings (RFC 0012).",
-  "//5": "On the CLI this same shape is expressed as --mcp name=https://host/mcp (repeatable).",
-  "//6": "Per-server `headers` carry auth/framing as {{secret:NAME}} references, resolved at",
-  "//7": "connect time — never inlined or logged. `tags` scope the Rule-of-Two trust budget.",
-
-  "mcp_servers": [
-    {
-      "name": "fs",
-      "endpoint": "https://mcp-fs.internal/mcp",
-      "headers": { "authorization": "Bearer {{secret:FS_TOKEN}}" },
-      "tags": { "*": ["sensitive"] }
-    },
-    {
-      "name": "search",
-      "endpoint": "https://mcp-search.internal/mcp",
-      "tags": { "*": ["egress", "untrusted_input"] }
-    },
-    {
-      "name": "tickets",
-      "endpoint": "https://mcp-tickets.internal/mcp",
-      "tags": { "*": ["egress"] }
-    },
-    {
-      "name": "inbox",
-      "//": "Exposes subscribable resources so reactive mode can wake on new items.",
-      "endpoint": "https://mcp-inbox.internal/mcp",
-      "tags": { "*": ["untrusted_input"] }
-    }
-  ]
+  "config_version": "1",
+  "mcp": {
+    "servers": [
+      {
+        "name": "fs",
+        "endpoint": "https://mcp-fs.internal/mcp",
+        "headers": { "authorization": "Bearer {{secret:FS_TOKEN}}" },
+        "tags": { "*": ["sensitive"] }
+      },
+      {
+        "name": "search",
+        "endpoint": "https://mcp-search.internal/mcp",
+        "tags": { "*": ["egress", "untrusted_input"] }
+      },
+      {
+        "name": "tickets",
+        "endpoint": "https://mcp-tickets.internal/mcp",
+        "tags": { "*": ["egress"] }
+      },
+      {
+        "name": "inbox",
+        "endpoint": "https://mcp-inbox.internal/mcp",
+        "tags": { "*": ["untrusted_input"] }
+      }
+    ]
+  }
 }

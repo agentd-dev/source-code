@@ -443,7 +443,7 @@ ENTRYPOINT ["/agentd"]
         <div className="grid gap-4 lg:grid-cols-2">
           <Term title="install and check">{`$ curl -fsSL https://agentd.dev/install.sh | sh
 $ agentd --validate-config -c agent.yaml
-{"event":"config.valid","schema":"2"}`}</Term>
+{"event":"config.valid","files":["agent.yaml"],"schema":"1"}`}</Term>
           <Term title="or in a container">{`$ docker run --rm ghcr.io/agentd-dev/agentd:latest \\
     --prompt "summarise the incident channel" \\
     --intelligence https://gateway.internal/v1 \\

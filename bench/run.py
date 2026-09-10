@@ -248,7 +248,10 @@ def _agentd_turn(agentd: str, instruction: str, intel: str, mcp_url: str | None,
                  timeout_s: float, model: str | None = None) -> tuple[str, int, int, int, int]:
     """One agentd `once` run (an agent OR user turn). Returns
     (reply, tokens, steps, tool_calls, exit)."""
-    argv = [agentd, "--mode", "once", "--instruction", instruction,
+    # No mode flag: an --instruction with no start node gets the sugar `main`
+    # workflow, which is exactly what `--mode once` used to spell. Modes were
+    # removed in 2.0 and are refused by name.
+    argv = [agentd, "--instruction", instruction,
             "--intelligence", intel, "--log-level", "info", "--log-content"]
     if model:
         argv += ["--model", model]
@@ -340,15 +343,14 @@ def run_task_once(agentd: str, task: dict, timeout_s: float) -> RunResult:
         workdir = Path(td)
         argv = [agentd, "--log-level", "info"]
         # A `workflow` task runs an agent-authored graph (the ablation's decomposed
-        # variant, RFC 0024 §5); the graph carries the instruction, so `once` mode's
-        # --instruction is replaced by --mode workflow --workflow. Needs a
-        # `--features workflow` build of agentd.
+        # variant, RFC 0024 §5); the graph carries the instruction, so --workflow
+        # replaces --instruction. Needs a `--features workflow` build of agentd.
         if "workflow" in task:
             wf = workdir / "workflow.json"
             wf.write_text(json.dumps(task["workflow"]))
-            argv += ["--mode", "workflow", "--workflow", str(wf)]
+            argv += ["--workflow", str(wf)]
         else:
-            argv += ["--mode", task.get("mode", "once"), "--instruction", task["instruction"]]
+            argv += ["--instruction", task["instruction"]]
         # Tool-call grading needs the arguments in telemetry.
         if "tool_calls" in task.get("grade", {}):
             argv += ["--log-content"]

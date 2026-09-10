@@ -78,7 +78,7 @@ login and caches the token.
 
 ```yaml
 limits:
-  run: { steps: 50, tokens: 200000, deadline: 10m }   # defaults
+  run: { steps: 500, tokens: 2000000, deadline: 1h }   # defaults
   subagents: { depth: 3 }
 lifecycle:
   run_until: drained     # auto | idle | drained. `drained` = behave like a daemon.

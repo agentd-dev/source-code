@@ -97,9 +97,10 @@ otel = []
 # four-layer cycle termination with distinct graph statuses. Dependency-free (serde
 # + serde_json::Value::pointer only — the minimalism moat). Default OFF: an absent
 # build is byte-for-byte today; the degenerate single-Agent-node workflow reproduces
-# today's behaviour. The ENGINE is transport-free (self-tools + the driver need no
-# listener); the `agent://workflow` served resource lights up only when a serving
-# feature is also built (its read arm lives behind `serve-mcp`).
+# today's behaviour. The ENGINE is transport-free — the self-tools and the driver
+# need no listener, and workflows are reached over A2A (`workflow.run` /
+# `workflow.status` / `workflow.cancel` / `workflow.signal`), not as a served
+# resource.
 workflow = []
 # Built-in mock intelligence + mock MCP server (the hidden `--internal-mock-llm`
 # / `--internal-mock-mcp` re-exec modes) that the test + conformance suites drive.

@@ -677,7 +677,7 @@ impl Runtime {
     /// Every tick: advance every live run.
     pub(crate) fn schedule_runs(&mut self) {
         if self.paused {
-            return; // operator hold (a2a.pause) — steps park until resume
+            return; // operator hold (admin.pause) — steps park until resume
         }
         // Higher-priority runs schedule first each tick, so under contention
         // (fan-out slots, per-tick capacity) their ready steps win. Stable
@@ -2002,9 +2002,9 @@ impl Runtime {
             }
         }
         // `context`: seed messages — a bare array, or the object form
-        // `{cards: [...], seed: [...]}` where `cards` controls which
-        // environment sections THIS step's system prompt carries (node-level
-        // context control; the config's `context.cards` is the default).
+        // `{template: <name>, seed: [...]}`, where `template` names one of the
+        // config's `context.templates` to render THIS step's system prompt
+        // (node-level context control; `context.template` is the default).
         let step_template: Option<String> = spec
             .get("context")
             .and_then(Value::as_object)

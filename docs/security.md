@@ -26,31 +26,38 @@ it make a security decision: capability tags come from operator config only, and
 in security terms. The defenses here are structural — they bound what a compromised loop
 *can reach*, not what it *intends*.
 
-agentd trusts its own binary, the OS, and the operator's configuration. Nothing that
-carries authority arrives from the network — an A2A caller's `config.set` reaches three
-display/debug paths and nothing else (`a2a_server.rs:1613`) — and the model can never
-register an MCP server, edit an endpoint, or name a binary to run.
+agentd trusts its own binary, the OS, and the operator's configuration. What arrives from
+the network is bounded to a whitelist: an A2A caller's `config.set` reaches three
+display/debug paths plus `agent.approval` — the human-approval mode, operator-only and
+deliberately settable mid-session, because how closely you want to be asked changes with
+what the agent is doing (`a2a_server.rs:1574`) — and nothing else, every other path refused
+by name (`a2a_server.rs:1590`). The model can never register an MCP server, edit an
+endpoint, or name a binary to run.
 
 ## Capability scoping
 
-agentd has 48 internal tool contracts (memory, artifacts, plans, subagents, workflows).
+agentd has 53 internal tool contracts (memory, artifacts, plans, subagents, workflows).
 Every *task* capability — reading a repository, sending mail, querying a database —
 arrives from an operator-declared MCP server. Declaring a server is a trust decision
 equivalent to adding a dependency you call at your own privilege.
 
 Narrowing is set membership, not a policy language, and it lands at exactly two surfaces —
-which behave differently, and the difference matters:
+which enforce it at different points, and the difference matters:
 
 - A workflow `agent` step honours its `tools:` list — the plan is filtered by pattern
   (`*`, an exact name, or `prefix*`) before the child sees the definitions
-  (`runtime/steps.rs:1309`, `registry/mod.rs:631`).
-- `subagent.run`'s `tools:` argument **does not confine the child**. It is written into the
-  durable record as `allowed_tools` and never read back (`runtime/subagents.rs:556`). The
-  only enforced narrowing for a spawned subagent is `servers:` — the payload is built from
-  just those server specs, so the child cannot dial the rest (`subagents.rs:249`).
+  (`runtime/steps.rs:2097`, `registry/mod.rs:671`, `:838`).
+- `subagent.run`'s `tools:` argument **does** confine the child. The supervisor mints it
+  into the spawn payload as a grant (`runtime/subagents.rs:407`), and the child filters
+  both its tool catalogue and its dispatch routing map against it
+  (`agentloop/runner.rs:587`), so an excluded tool is unreachable rather than merely
+  unadvertised. A caller-supplied `context` entry cannot forge or widen that grant — any
+  allow-list already on the seed is dropped before the mint (`subagents.rs:303`).
+  `servers:` narrows independently: the payload is built from just those server specs, so
+  the child cannot dial the rest (`subagents.rs:225`).
 
 An unknown name in `servers:` is filtered out silently, not rejected
-(`subagents.rs:178`) — a typo yields a less capable child and no diagnostic.
+(`subagents.rs:229`) — a typo yields a less capable child and no diagnostic.
 
 `sec/scope.rs` also defines a `Scope` / `ToolScope` intersection type — `parent ∩
 requested` over a server whitelist and a tool-name whitelist, both dimensions checked
@@ -72,7 +79,7 @@ The trust budget is three operator-declared tags:
 | `egress` | the tool can move data out or change external state — HTTP POST, send mail, open a pull request |
 
 Tags are parsed as snake-case strings from config only; an unrecognized tag is a hard
-config error (`config/v2/mod.rs:483`). Nothing the model or a server says feeds the gate.
+config error (`config/v2/mod.rs:1670`). Nothing the model or a server says feeds the gate.
 
 ```yaml
 config_version: "1"
@@ -86,17 +93,17 @@ security:
 
 The budget is an OR-fold across legs, never a count (`scope.rs:111`) — repeating one leg
 across twenty tools stays one leg. The Rule of Two is literally `legs() < 3`
-(`scope.rs:133`), so **every pair is allowed**, including `sensitive` + `egress`. A tool
+(`scope.rs:139`), so **every pair is allowed**, including `sensitive` + `egress`. A tool
 that reads secrets and can POST is fine as long as nothing in the same grant reads
 untrusted input.
 
 Tags are **per server, not per tool.** The config shape is a map keyed by glob, but
 `McpServer::tag_set()` iterates `self.tags.values()` and discards the keys
-(`config/v2/mod.rs:479`); `Registry::build` stamps that union onto every tool of the server
-(`registry/mod.rs:320`). So `tags: {"send_*": ["egress"], "read_*": ["untrusted_input"]}`
+(`config/v2/mod.rs:1668`); `Registry::build` stamps that union onto every tool of the server
+(`registry/mod.rs:365`). So `tags: {"send_*": ["egress"], "read_*": ["untrusted_input"]}`
 does not split the server into two risk classes — both tools end up
 `untrusted_input | egress`. The only real split is one MCP server per tag profile. An
-**untagged server counts as `untrusted_input`** (`config/v2/mod.rs:3042`), the
+**untagged server counts as `untrusted_input`** (`config/v2/mod.rs:6922`), the
 conservative default.
 
 ### Where the gate runs
@@ -120,7 +127,7 @@ flowchart TB
   K -- ok --> M["payload minted, binary re-exec'd"]
 ```
 
-Gate 1 lives inside config `validate()` (`config/v2/mod.rs:3061`), the single validation
+Gate 1 lives inside config `validate()` (`config/v2/mod.rs:6941`), the single validation
 authority that both startup and `--validate-config` run, so the two can never disagree. A
 refusal is a config error — exit `2`, before any side effect:
 
@@ -129,7 +136,7 @@ lethal-trifecta refused: the root grant wires untrusted_input + sensitive + egre
 into one agent; narrow the tags or set security.allow_trifecta (audited)
 ```
 
-Gate 2 is at the `subagent.run` chokepoint (`runtime/subagents.rs:189`), over the tags of
+Gate 2 is at the `subagent.run` chokepoint (`runtime/subagents.rs:240`), over the tags of
 the *requested* server subset. It returns an `isError` tool result the parent's model must
 adapt to, not a crash.
 
@@ -138,19 +145,19 @@ instance declaring an untrusted-input reader, a secrets server, and an egress se
 not start, even if you intend to hand each leg to a different subagent. To run that shape
 you either set `security.allow_trifecta: true` — which relaxes gate 2 as well — or run
 separate agentd instances per risk profile. `security` is a restart-only config path
-(`config/v2/mod.rs:3228`), so a hot reload can never widen the override; a reload touching
+(`config/v2/mod.rs:7268`), so a hot reload can never widen the override; a reload touching
 it is refused as `restart_required` and the running config is kept.
 
 Not every leg comes from `mcp.servers`: a binary built with the `exec` feature and
 running with `security.exec.enabled` contributes `sensitive` + `egress` to this same fold
-(`config/v2/mod.rs:3055`), so enabling the local runner beside an untrusted-input server
+(`config/v2/mod.rs:6936`), so enabling the local runner beside an untrusted-input server
 refuses startup like any other trifecta.
 
 **Two gaps to know.** No warn event is emitted when the override is exercised: a
 `scope.trifecta_grant` event name is reserved but never written, so an allowed trifecta
 proceeds silently and the only trace is the config value. And code-registered (embedder)
 tools sit outside the accounting: they are
-inserted with `Grant::all()` and an empty tag vector (`registry/mod.rs:244`), so an
+inserted with `Grant::all()` and an empty tag vector (`registry/mod.rs:274`, `:277`), so an
 embedder whose native tool does egress or reads secrets defeats the budget silently.
 
 ### The tag floor and closed egress
@@ -163,17 +170,22 @@ tags, and any MCP declaration whose endpoint matches the entry gets those tags
 **unioned in before the gate runs** — referencing or inline, unconditionally.
 Under-tagging a catalogued endpoint is therefore impossible rather than undetected.
 `security.egress: closed` extends the catalog from authority to allow-list
-across **every outbound surface**: MCP dials, intelligence endpoints, A2A
-peers, the `http` step (with per-entry `methods:` ceilings), the HTTP store,
-workflow-reference URLs, and caller-registered A2A push targets — refused at
-boot for configured surfaces, at execution for templated ones. Entries carry
-a `kind:` and matching is kind-filtered. There is deliberately no in-config
-exception list: the way to allow an endpoint is to catalog it, which is
-exactly the reviewable event it should be. What the catalog does **not**
-bind: where a *compromised MCP server* can reach (network egress policy stays
-complementary — the entry list is what makes those rules derivable), and
-`observability.otel.endpoint` (telemetry export is operator plumbing;
-validation says so rather than implying coverage).
+across the outbound surfaces it knows about: MCP dials, intelligence
+endpoints, A2A peers, the `http` step (with per-entry `methods:` ceilings),
+stream `forward:` targets, the HTTP store, workflow-reference URLs, and
+caller-registered A2A push targets — refused at boot for configured surfaces,
+at execution for templated ones. Entries carry a `kind:` and matching is
+kind-filtered. There is deliberately no in-config exception list: the way to
+allow an endpoint is to catalog it, which is exactly the reviewable event it
+should be. What the catalog does **not** bind: where a *compromised MCP
+server* can reach (network egress policy stays complementary — the entry list
+is what makes those rules derivable), `observability.otel.endpoint`
+(telemetry export is operator plumbing; validation says so rather than
+implying coverage), and the instruction fetch itself — an `agent.instruction`
+or subagent-template `url:` / `oci:` source is dialled while the
+configuration is still being assembled, before there is an egress policy to
+consult, so pin it by digest and treat the document host as operator plumbing
+too.
 
 ## Policies: a verdict on the call
 
@@ -254,7 +266,7 @@ evaluating the guard to nothing.
 The defense that does the real work is process isolation plus a distilled return. A
 subagent runs in its own process with its own context, and the parent appends only the
 child's distillate — never its transcript. A string result over `DISTILL_CAP` (8000
-bytes) is truncated back to a UTF-8 boundary (`subagents.rs:22`, `:562`).
+bytes) is truncated back to a UTF-8 boundary (`subagents.rs:22`, `:858`).
 
 ```mermaid
 flowchart LR
@@ -269,15 +281,16 @@ Poisoned bytes live only in the reader's context and are gone when that process 
 reader holds no sensitive tool, so it has no secret to encode into its summary. This is a
 trusted-planner / untrusted-data split realized as OS process isolation rather than taint
 tracking. The tree is flat by construction: a subagent is handed no in-child orchestration
-tools (`subagent/control.rs:52`), so it cannot spawn children in-process.
+tools (`subagent/control.rs:316`), so it cannot spawn children in-process.
 
 ## Caller scopes
 
 Internally there are four caller kinds: `Root`, `Workflow`, `Subagent`, `Principal`.
 Grants only ever gate **internal** contracts — for MCP and code tools the check
-short-circuits to allowed for root, workflow, and subagent callers
-(`registry/mod.rs:453`). MCP restriction happens through `agent.tools.mcp` selection and
-the per-spawn server subset, never through grants.
+short-circuits to allowed for root and workflow callers, and for a subagent spawned without
+a `tools:` grant; a subagent that carries one is held to it for every tool class, MCP and
+code included (`registry/mod.rs:651-655`). MCP restriction otherwise happens through
+`agent.tools.mcp` selection and the per-spawn server subset, never through grants.
 
 | Tier | Callers | Examples |
 |------|---------|----------|
@@ -292,7 +305,7 @@ External callers arrive over A2A. The transport supplies a `CallerIdentity` — 
 mTLS SANs and subject, a bearer reference, an AAuth agent id, a loopback flag — and
 `Resolver::resolve` walks the `a2a.principals` rules first-match, then falls back to
 operator on verified management, then operator on loopback with no principals configured,
-then anonymous (`a2a/principals.rs:217`).
+then anonymous (`a2a/principals.rs:382`).
 
 ```yaml
 a2a:
@@ -314,11 +327,12 @@ RPC method and `Principal::may_command` for a command DataPart:
 | `anonymous` | nothing — denied at every layer, and an explicit `grants: ["*"]` does not rescue it |
 
 `status` and `interface.info` are always granted to any non-anonymous role
-(`principals.rs:86`). Of the 48 internal contracts, exactly one — `status` — carries a
+(`principals.rs:105`). Of the 53 internal contracts, exactly one — `status` — carries a
 default grant for `user`/`agent`. The admin family (`drain`, `lameduck`, `pause`, `resume`,
 `cancel`) is refused by name for every non-operator role, independent of grants. Bearer
-tokens and pairing codes are compared in constant time (`principals.rs:256`,
-`a2a_server.rs:582`, `:308`).
+tokens and pairing codes are compared in constant time — one `ct_eq`
+(`principals.rs:501`) over a principal's bearer (`:421`), the static server bearer
+(`a2a/serve.rs:923`) and the rotating pairing code (`a2a_server.rs:293`).
 
 Two honest limits. **A2A role limits bound command DataParts, not conversation:** a
 natural-language message from a `user` principal drives a turn handed the *root* tool plan
@@ -331,18 +345,20 @@ live one** — `Principal::as_caller()` has no production call site, so editing 
 
 agentd runs no local code by default. The `exec` tool exists as a contract, but a local
 runner materializes only when the `exec` cargo feature and `security.exec.enabled` are
-both true (`registry/mod.rs:184`); otherwise `exec` is `Impl::MappingOnly`, which fails
+both true (`registry/mod.rs:215`); otherwise `exec` is `Impl::MappingOnly`, which fails
 `is_available()` and routes nowhere — unavailable for every caller including operator.
 The dispatch arm itself is `#[cfg(feature = "exec")]`, so a default binary answers "no
 built-in implementation". Map the contract onto an MCP server with `tools.overrides` and
 the command runs in that server's sandbox instead.
 
 Watch the tag weight when you do. `Registry::build` stamps `exec` `sensitive` + `egress`,
-but those per-tool tags feed nothing — `Registry::tags_of`, their only reader, has no call
-site — and an override replaces them wholesale with the serving server's tags
-(`registry/mod.rs:420`). What actually reaches the trifecta budget is the config-side
-contribution above: two legs when the local runner is built *and* enabled, and otherwise
-whatever the MCP server you mapped it onto declares. Mapping `exec` onto an untagged
+and those per-tool tags are what the `security.policies` engine matches on —
+`Registry::tags_of` is read by `apply_policy` (`runtime/tools.rs:765`), by the turn-worker
+routing split (`runtime/turns.rs:217`) and by the subagent `gated_tools` mint
+(`runtime/subagents.rs:338`) — while an override replaces them wholesale with the serving
+server's tags (`registry/mod.rs:612`). What actually reaches the trifecta budget is the
+config-side contribution above: two legs when the local runner is built *and* enabled, and
+otherwise whatever the MCP server you mapped it onto declares. Mapping `exec` onto an untagged
 server moves the blast radius off-box and files it as `untrusted_input`.
 
 ```yaml
@@ -359,16 +375,16 @@ security:
 | Guard | Behaviour | Why |
 |-------|-----------|-----|
 | argv, never a shell | `Command::new(cmd).args(argv)` — execve directly (`exec.rs:70`) | no metacharacters, globs, `$(…)` or pipes, so no command injection |
-| allow-list | exact equality on `argv[0]`; empty list denies all (`tools.rs:668`) | `enabled: true` alone runs nothing |
+| allow-list | exact equality on `argv[0]`; empty list denies all (`tools.rs:979`) | `enabled: true` alone runs nothing |
 | workdir confinement | mandatory; a requested `cwd` is canonicalized then checked with `starts_with(base)` (`exec.rs:45`) | defeats `..` traversal and symlink escape together |
 | timeout | `min(requested, max)`, default 30s; the child is killed and reaped (`exec.rs:106`) | a request can shorten but never extend the ceiling |
 | output cap | default 1 MiB; the reader drains past the cap and discards the excess (`exec.rs:131`) | bounded capture, and no deadlock on a full pipe |
 | minimal env | `env_clear()` then rebuild from the named list (`exec.rs:78`) | the agent's environment, and its secrets, are never inherited |
 | off the reactor | a named `tool:exec` thread; stdin fed from a further thread | a child that writes before reading cannot stall the daemon |
-| audit | `exec.run{cmd, argc, cwd, timeout_ms, caller}` (`tools.rs:707`) | the confinement is logged, never the output |
+| audit | `exec.run{cmd, argc, cwd, timeout_ms, caller}` (`tools.rs:1018`) | the confinement is logged, never the output |
 
 Every guard is re-checked at call time even though `Registry::build` already gated the
-route (`tools.rs:652`). Output is `{stdout, stderr, exit_code, timed_out}`.
+route (`tools.rs:965`). Output is `{stdout, stderr, exit_code, timed_out}`.
 
 Two things before you enable it. A misconfiguration surfaces as an `isError` result at
 first call, not as a startup failure — the feature, `enabled`, a non-empty `allow`, and a
@@ -389,14 +405,14 @@ yields `{{secret:NAME}} is not set in the environment`. The `Secret` newtype's `
 prints `***` (`config/v2/mod.rs:69`), so a credential cannot reach a log line, a payload
 dump, or a panic message through formatting. The durable subagent record is written with
 the intelligence token nulled out, re-supplied from live settings on restore
-(`subagents.rs:552`).
+(`subagents.rs:841`).
 
 Two checks catch an inline credential in the config **file**. Four paths must be references
 outright — `/intelligence/token`, `/a2a/bearer`, `/security/aauth/enroll_token`, and each
-MCP server's `oauth.client_secret` (`config/v2/mod.rs:3168`). Separately, any header whose
+MCP server's `oauth.client_secret` (`config/v2/mod.rs:7179`). Separately, any header whose
 *key* looks credential-shaped — `authorization`, `api-key`, `x-api-key`, `token`,
 `password`, `secret`, or anything ending `-token` / `_token` / `-key` / `_key`
-(`config/mod.rs:2553`) — is refused with an inline value, across `intelligence.headers`,
+(`config/mod.rs:602`) — is refused with an inline value, across `intelligence.headers`,
 `mcp.servers[].headers` and `a2a.peers[].headers`.
 
 The limit is the key name, not the value: a bearer pasted into `headers.X-Session` passes
@@ -407,20 +423,27 @@ Outbound credential providers — OAuth2, AWS SigV4, SPIFFE, `agentd login` — 
 ## Transport and identity
 
 MCP endpoints are HTTPS-only, with plaintext `http://` permitted for loopback hosts alone;
-anything else exits `2` before any side effect (`config/mod.rs:671`). The same rule holds
+anything else exits `2` before any side effect (`config/mod.rs:504`). The same rule holds
 for the intelligence endpoint. A non-loopback `a2a.listen` **must** configure client auth —
 `a2a.tls.client_ca`, `a2a.bearer`, or `interface.pairing` — or startup fails validation,
 and plaintext `http://` on a non-loopback bind is likewise a startup error
-(`config/v2/mod.rs:2786`).
+(`config/v2/mod.rs:6602`, `:6609`).
 
 One default deserves emphasis: **a loopback caller with no `a2a.principals` configured
-resolves to operator** with `grants: ["*"]` (`principals.rs:210`, `:228`). Anything that
+resolves to operator** with `grants: ["*"]` (`principals.rs:375`, `:393`). Anything that
 can reach the loopback port — a sidecar, a co-tenant process, an SSRF from another service
-in the same network namespace — is a full operator. Configure principals on any host you
-do not fully own.
+in the same network namespace — is a full operator, which includes flipping
+`agent.approval` to `accept` over `config.set`: the agent's own `ask_human` gates then
+answer themselves from whatever they recommend, and the ones recommending nothing fall to a
+model judge (`runtime/human.rs:107`, `:135`) — until the next reload puts the file's value
+back, since `agent.approval` is reloadable (`config/v2/mod.rs:7295`). Two kinds of gate
+survive that flip: one that names its decider with `to:`, which is never auto-answered
+whatever the policy says (`runtime/human.rs:101`), and an operator-declared
+`security.policies` `ask`, which is deliberately not routed through `agent.approval` at all
+(`runtime/tools.rs:830`). Configure principals on any host you do not fully own.
 
 The only process agentd launches is a re-exec of its own binary via `current_exe()`
-(`runtime/mod.rs:308`), marked with the `AGENT_SUBAGENT` environment variable. The child's
+(`runtime/mod.rs:541`), marked with the `AGENT_SUBAGENT` environment variable. The child's
 work arrives as a serialized control frame on its stdin — data to a model loop, never argv
 to a shell. Each child gets its own process group so the kill ladder can target the
 subtree, an optional cgroup leaf whose `Drop` writes `cgroup.kill`, and `PR_SET_PDEATHSIG`
@@ -428,54 +451,56 @@ so a supervisor death collapses it.
 
 ## SSRF defenses
 
-The SSRF classifier has exactly **one call site in the workspace**: the workflow `http`
-node (`runtime/http_node.rs:228`) — the one outbound surface where a URL can be model- or
-graph-derived. Intelligence, MCP, A2A, and OAuth traffic goes out unguarded by design,
+The SSRF classifier guards the outbound surfaces where the URL is not purely operator
+config: the workflow `http` node (`runtime/http_node.rs:338`), the one place a URL can be
+model- or graph-derived; caller-registered A2A push targets, vetted at registration where
+the caller is present to be told why and again at delivery because DNS can change its mind
+in between (`a2a/push.rs:53`, `:92`); and the AAuth Person-Server dial, where it is the
+URL the PS *returns* that is vetted — the operator's configured `ps_url` still dials by
+name, so a loopback PS keeps working in development (`aauth/ps.rs:183`, `:186`).
+Intelligence, MCP, configured A2A peers, and OAuth traffic goes out unguarded by design,
 because those endpoints come from operator config; a model that can influence any of those
-URLs is outside the guard.
+URLs is outside the guard. A configured peer dial in particular is a plain `connect_tcp`
+with no classification at all (`mcp/a2a_client.rs:348`) — it is only the *push targets* a
+caller registers at runtime that are guarded.
 
 Blocked as non-global: `0.0.0.0/8`, `127/8`, `10/8`, `172.16/12`, `192.168/16`,
 `169.254/16` (the cloud-metadata range), `100.64/10` CGNAT, `240/4` reserved, `224/4`
 multicast, and the broadcast address; for IPv6, `::`, `::1`, `fe80::/10`, `fc00::/7`,
-`ff00::/8`, `2001:db8::/32` (`net/ssrf.rs:101`, `:138`). IPv6 is classified by first
+`ff00::/8`, `2001:db8::/32` (`net/ssrf.rs:114`, `:138`). IPv6 is classified by first
 peeling `::ffff:a.b.c.d` and `::a.b.c.d` forms back to v4 and re-running the v4 rules —
 the classic bypass, closed. `guard_host` rejects if **any** resolved address is non-global,
 so a hostname answering with both a public and a private address is refused outright.
 Header names and values containing `\r` or `\n` are rejected at request construction in
-both send paths, before any bytes are written (`net/http.rs:174`, `:393`).
+both send paths, before any bytes are written (`net/http.rs:174`, `:440`).
 
-Two limits of the guard:
+**The guard and the dial are one step.** A check that resolves a name, likes the answer and
+then dials the *name* is decorative: the connect resolves a second time, and an attacker
+holding the authoritative DNS answers the check public and the connect `169.254.169.254`.
+So `ssrf::connect_vetted` resolves once, classifies every address it got back, and connects
+to an address it vetted, re-asserting `is_global` immediately before the syscall
+(`net/ssrf.rs:357`). TLS/SNI and the `Host` header stay on the hostname — connect by IP,
+verify by name — so certificate validation is unaffected. All three guarded dial paths use
+it (`runtime/http_node.rs:338`, `a2a/push.rs:92`, `aauth/ps.rs:183`), which closes the
+rebinding pivot on each. `guard_host` survives for the one question asked where there is no
+socket yet: may this push target be registered at all (`a2a/push.rs:53`), answered while
+the caller is still there to be told no. Its own doc says it is not sufficient at delivery
+time, which is exactly why delivery guards again.
 
-```mermaid
-sequenceDiagram
-  participant N as http node
-  participant G as ssrf::guard_host
-  participant D as DNS
-  participant T as connect_tcp
-  N->>G: guard_host(host, allow_private=false)
-  G->>D: resolve #1
-  D-->>G: 93.184.216.34 (public)
-  G-->>N: Ok
-  Note over G,T: only the hostname crosses, not the vetted IP
-  N->>T: connect_tcp(host, port)
-  T->>D: resolve #2 (independent)
-  D-->>T: 169.254.169.254 (metadata)
-  Note over T: dials the second answer
-```
+One limit remains. **`allow_private: true` is an off switch, not a "permit RFC-1918"
+switch.** It does not permit a narrower range; it removes the classifier. `guard_host`
+returns Ok without resolving at all (`net/ssrf.rs:219`), and on the dial path
+`resolve_guarded` still resolves — it has to, to have an address to connect to — but skips
+every address check, as does the pre-syscall re-assertion (`net/ssrf.rs:292`, `:324`). The
+workflow `http` node exposes it as a plain per-node boolean in the graph spec. Review it in
+graph diffs the way you review a credential.
 
-**There is no DNS pinning.** `guard_host` resolves and vets, then `connect_tcp` resolves
-the host a second time and dials that answer (`net/http.rs:143`). A hostile DNS server can
-answer public on the first query and a metadata address on the second. Treat the guard as a
-filter against careless URLs, not as a defense against an attacker who controls DNS —
-network policy is the control that closes this.
-
-**`allow_private: true` is an off switch, not a "permit RFC-1918" switch.** It returns Ok
-without even resolving (`ssrf.rs:191`), and the workflow `http` node exposes it as a plain
-per-node boolean in the graph spec. Review it in graph diffs the way you review a credential.
-
-The client also follows **no redirects at all** — there is no `3xx`/`Location` handling. A
-redirect comes back as a response, so the redirect-chain SSRF pivot does not exist here,
-and neither does transparent redirect following.
+The low-level client follows **no redirects at all** — there is no `3xx`/`Location`
+handling, so a redirect comes back as a plain response and the redirect-chain pivot does
+not exist for the `http` node. Two document-fetch paths layer redirect following on top of
+it, both at config load and both from an operator-named reference: the `url:` instruction
+source, up to three hops (`config/mod.rs:66`), and the OCI blob fetch, which has to follow
+a registry's CDN (`oci.rs:509`).
 
 ## Where the instruction came from
 
@@ -514,17 +539,18 @@ Stated plainly so you size the surrounding environment correctly.
   hardening is process-group isolation, an optional cgroup leaf, and `PR_SET_PDEATHSIG`.
   Confinement, filesystem scope, and aggregate resource limits are the deployment's job.
 - **No egress network policy.** Which hosts the process may reach is a NetworkPolicy or
-  firewall concern; the SSRF guard covers one node kind.
+  firewall concern; the SSRF guard covers only the surfaces named above.
 - **No content-based injection detection.** No classifier, no "is this injection?" model
   call. The defense is containment, and containment is not a guarantee.
-- **No per-tool tagging.** Tags apply per server; glob keys are parsed and discarded.
+- **No per-tool tagging in `mcp.servers[].tags`.** Server tags apply per server; the glob
+  keys are parsed and discarded. Per-tool tags exist only through
+  `tools.narrow.<tool>.tags`, which is append-only — a tag may be added, never removed —
+  and reaches the `security.policies` matcher rather than the startup trifecta fold.
 - **No rug-pull detection.** A server that mutates a tool description after first connect
   is not detected; the only connect-time log is `mcp.connect{server, tools}` with a count.
 - **No audit event for a trifecta override** — it proceeds silently.
 - **No artifact redaction.** Artifacts carry a `sensitive` flag, but `artifact.get` returns
   the content regardless (`runtime/artifacts.rs:133`).
-- **No confinement from `subagent.run`'s `tools:` argument** — only `servers:` narrows a
-  spawned child.
 - **No policy engine, request signing, or RBAC beyond the principal roles above.**
 
 ## Operator checklist

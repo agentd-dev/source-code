@@ -34,7 +34,7 @@ flowchart TB
     SA["subagent<br/>a nested agent loop"]
   end
 
-  STORE[("remote state store<br/>MCP tools · HTTP · memory")]
+  STORE[("state store<br/>file · MCP tools · HTTP · memory")]
   MCPS["MCP servers"]
   LLM["intelligence endpoint"]
 
@@ -42,7 +42,7 @@ flowchart TB
   LISTEN --> LOOP
   LOOP --> REG
   LOOP --> ADAPT
-  ADAPT <-->|HTTPS| STORE
+  ADAPT <-->|"put · get · list · delete"| STORE
   LOOP -->|"spawn: setpgid in pre_exec"| TW
   LOOP -->|spawn| SA
   TW -->|"length-prefixed control frames"| LOOP
@@ -77,7 +77,7 @@ defaults to `8/2s` — a burst of 8, refilling four tokens a second.
 | Workflow engine | `engine/`, `runtime/steps.rs` | the durable DAG: runs, steps, nested bodies |
 | Tool registry | `registry/` | tool definitions, grants, precedence `internal > code > MCP` |
 | Durable state | `state/mod.rs` | entity kinds, manifest, inbox, timers, checkpoint policy |
-| Store adapters | `store/{mcp,http,memory}.rs` | the four-operation contract |
+| Store adapters | `store/{file,mcp,http,memory}.rs` | the four-operation contract |
 | Supervisor tree | `supervisor/*.rs` | spawn, process groups, reaping, kill ladder, stuck detection |
 | Turn worker, subagent | `runtime/worker.rs`, `subagent/` | one LLM turn; the nested agentic loop |
 | A2A listener | `runtime/a2a_server.rs` | conversations, durable tasks, the display-client feed |
@@ -95,23 +95,28 @@ them.
 | Crate | Library | Size | Owns |
 |---|---|---|---|
 | `agentd-net` | `net` | 2,310 lines | HTTP/1.1 + SSE client, TLS, SSRF classifier, X.509 extraction |
-| `agentd-mcp` | `mcp` | 6,564 lines | MCP wire types, protocol eras, client, Streamable-HTTP server |
-| `agentd-core` | `agentd` | ~81,000 lines | the engine: loop, supervisor, workflows, registry, config, state |
-| `agentd-cli` | bin `agentd` | 717 lines | argv dispatch and exit codes, nothing else |
+| `agentd-mcp` | `mcp` | 6,567 lines | MCP wire types, protocol eras, client, Streamable-HTTP server |
+| `agentd-core` | `agentd` | ~89,000 lines | the engine: loop, supervisor, workflows, registry, config, state |
+| `agentd-cli` | bin `agentd` | 749 lines | argv dispatch and exit codes, nothing else |
 | `agentd-conformance` | — | — | black-box checks that drive the real binary |
 
 The name mismatch is not aesthetic: `agentd` on crates.io belongs to an unrelated
 project, so the package is `agentd-core` with `[lib] name = "agentd"`, and
 dependents rename it back so embedders still write `use agentd::…`.
 
-**Third-party surface is quarantined in the leaf.** `net` holds the whole heavy
-end of the default build — `rustls`, `webpki-roots` and `rustls-pemfile` behind
-its `tls` feature, `vsock` behind `vsock` — and `mcp` adds only serde on top.
-Beyond its own three (`serde`, `serde_json`, `libc`), the engine names two
-further external crates, both optional and both off by default: `ring` for
-`aauth` and `cel-interpreter` for `cel`. `net` and `mcp` also contain
-**zero** `unsafe`; in the engine every `unsafe` block outside `#[cfg(test)]` is
-libc FFI, spread across about a dozen runtime files plus the terminal plumbing.
+**Third-party surface sits in the leaves, and is optional above them.** `net`
+holds one heavy end of the default build — `rustls`, `webpki-roots` and
+`rustls-pemfile` behind its `tls` feature, `vsock` behind `vsock` — and `mcp`
+carries the other: the official `rmcp` SDK and the async runtime it needs
+(`tokio`, `futures`, `sse-stream`, `tokio-stream`, `thiserror`, `http`). Beyond
+its own three (`serde`, `serde_json`, `libc`), the engine names fourteen further
+external crates, every one optional and every one off by default: `ring` for
+`aauth`, `sign` and `oci`, `cel-interpreter` for `cel`, and the A2A stack behind
+`a2a` — `a2a-rs`, `buffa`, `buffa-types`, `tokio`, `axum`, `tokio-rustls`,
+`hyper`, `hyper-util`, `tower`, `async-trait`, `tokio-stream` and
+`futures-util`. `net` and `mcp` also contain **zero** `unsafe`; in the engine
+every `unsafe` block outside `#[cfg(test)]` is libc FFI, spread across about a
+dozen runtime files plus the terminal plumbing.
 (The test-only ones are `std::env::set_var` calls, which edition 2024 made
 unsafe.)
 
@@ -217,12 +222,18 @@ syscalls return `EINTR`; `SIGPIPE` is ignored, so writing to a dead child is an
 
 ---
 
-## Where state lives, and why the store is remote
+## Where state lives, and when the store should be remote
 
-agentd keeps **no durable state on local disk**. Every unit of progress — an
-accepted message, a fired trigger, a workflow step, a turn, a subagent result, a
-memory write, a timer — goes to a **remote store**. The contract is four
-operations:
+agentd's durable state is a key-value store behind one small contract, and
+where that store lives is a deployment choice. A long-lived instance that names
+no `store.kind` gets the local **file** store — one file per key under a
+directory it holds an exclusive lock on — because an agent on a laptop or a VM
+should survive a restart without an external service standing by; a one-shot job
+may keep no state at all. Point `store` at a **remote** adapter the moment the
+process is disposable, which in a container it always is. Either way the same
+things are written: every unit of progress — an accepted message, a fired
+trigger, a workflow step, a turn, a subagent result, a memory write, a timer —
+goes to the store. The contract is four operations:
 
 ```
 put(key, seq, envelope)  → Ok | Conflict{latest_seq} | Err(io)
@@ -231,10 +242,11 @@ list(prefix)             → [{key, seq}] | Unsupported | Err(io)
 delete(key)              → Ok | Unsupported | Err(io)
 ```
 
-Keys are `<prefix>/<instance>/<kind>/<id>` across eleven entity kinds —
+Keys are `<prefix>/<instance>/<kind>/<id>` across twelve entity kinds —
 `manifest`, `inbox`, `context`, `run`, `subagent`, `task`, `memory`, `artifact`,
-`timer`, `audit`, `cred`. Values are versioned envelopes carrying `seq`, `ts`,
-the writing `instance`, and an optional `hash` binding a run to its definition.
+`timer`, `event`, `audit`, `cred`. Values are versioned envelopes carrying
+`seq`, `ts`, the writing `instance`, and an optional `hash` binding a run to its
+definition.
 
 **`put` is a compare-and-set on `seq`, and a conflict is fatal.** If another
 writer owns a key, the instance stops accepting work rather than racing. That is
@@ -249,13 +261,16 @@ you. It carries the key (`_meta["agent/idempotency_key"]`) so a well-behaved
 server can collapse the replay.
 
 **agentd links no database client** and defines no schema beyond the envelope.
-Three adapters implement the contract: `mcp` maps the operations onto any MCP
-server's tools through JSON or CEL templates, `http` onto plain HTTP, `memory`
-in-process for tests. A local write-ahead log is a deliberate non-goal — which is
-the "why remote". A container's filesystem is not a durability boundary; an
-evicted pod takes its disk with it. Making the store an outbound HTTP call to
-something that already has an operational story means agentd inherits that story
-instead of inventing a worse one.
+Four adapters implement the contract. `file` writes one file per key under a
+locked local directory, and is the default for a long-lived instance; `mcp` maps
+the operations onto any MCP server's tools through JSON or CEL templates; `http`
+onto plain HTTP; `memory` in-process for tests. Even the file store keeps no
+local write-ahead log — one envelope per key, never a journal — which is what
+makes the remote answer the right one as soon as the box is disposable: a
+container's filesystem is not a durability boundary, and an evicted pod takes
+its disk with it. Making the store an outbound HTTP call to something that
+already has an operational story means agentd inherits that story instead of
+inventing a worse one.
 
 Restore is explicit: read the manifest, `get` each indexed entity, verify
 definition hashes, rebuild registries, re-arm timers from absolute deadlines,
@@ -317,21 +332,23 @@ MCP and A2A are not in it.
 | Layer | Where | Instead of |
 |---|---|---|
 | HTTP/1.1 client + SSE reader | `net/http.rs`, 690 lines | `ureq` + `url` → IDNA → ICU |
-| YAML subset reader | `config/yaml.rs`, 1,307 lines | `serde_yaml`, itself unmaintained |
+| YAML subset reader | `instruction/yaml.rs`, 1,307 lines (re-exported as `config::yaml`) | `serde_yaml`, itself unmaintained |
 | JSON Schema subset | `jsonschema.rs`, 803 lines | a schema crate and a regex engine |
 | Cron | `triggers/timer.rs` | `croner` |
 | Prometheus text | `obs/metrics.rs` | `prometheus` / `metrics` |
 | OTLP export | `obs/otel.rs` | `opentelemetry` + protobuf + gRPC |
 | inotify config watch | `config/watch.rs` | `notify` / `inotify` |
-| NDJSON logging | `obs/log.rs`, 519 lines | `tracing` |
+| NDJSON logging | `obs/log.rs`, 807 lines | `tracing` |
 | SHA-256, HMAC, ULID, base64, SigV4, DER walk, token bucket, FNV-1a | various | six or seven crates |
 
 The reasoning is per-row but rhymes. Cron is five UTC fields as `u64` bitsets,
 whose `next_after` steps one minute at a time bounded at four years so Feb-29
 expressions terminate. OTLP goes over HTTP/JSON rather than gRPC because tonic
-would drag tokio into the default build. `tracing` is declined because implicit
-async span context is moot in a processes-plus-threads design and the process
-tree already supplies correlation.
+would add a protobuf codegen and a gRPC stack on top of the tokio the MCP SDK
+already brings, for an export path the existing HTTP client already covers.
+`tracing` is declined because implicit async span context is moot in a
+processes-plus-threads design and the process tree already supplies
+correlation.
 
 Two are worth more than a table row.
 
@@ -364,9 +381,12 @@ The resolved graph is what it is:
 
 | Build | External crates |
 |---|---|
-| `--no-default-features` | 78 |
-| default (`tls` + MCP) | 91 |
-| the full shipped feature set (adds A2A) | 187 |
+| `--no-default-features` | 70 |
+| default (`tls` + MCP) | 82 |
+| the shipped release feature set (adds A2A and CEL) | 167 |
+
+Counted as `cargo tree -p agentd-cli … -e normal` unique packages, less the five
+in-tree workspace crates.
 
 A graph that size is not one you can hold in your head, so agentd does not
 claim you can. What CI enforces instead is a property of the thing a user
@@ -381,7 +401,7 @@ every build, however carefully our own manifests ask for `ring`. A vendored
 `connectrpc` with three corrected dependency entries removes it — see
 `third_party/connectrpc/PATCH.md`. CI asserts `aws-lc` stays out of the graph.
 
-Two gates remain: the feature matrix compiles, clippies and tests 17 combinations
+Two gates remain: the feature matrix compiles, clippies and tests 18 combinations
 including every shipped feature solo, because `--all-features` unification hides
 broken solo builds; and `deny.toml` bans wildcard versions, denies yanked crates,
 and carries a hand-maintained permissive-only licence allow-list.
@@ -390,7 +410,7 @@ and carries a hand-maintained permissive-only licence allow-list.
 
 ## Feature flags are the capability surface
 
-Capability is decided at compile time. Of the thirteen features besides
+Capability is decided at compile time. Of the sixteen features besides
 `default`, eight are literally empty arrays — they gate hand-rolled code, not
 dependencies.
 
@@ -407,17 +427,22 @@ dependencies.
 | `workflow` | none | nothing live — the durable DAG engine is unconditional |
 | `exec` | none | the guarded local command runner |
 | `aauth` | none new — reuses `ring` | Ed25519 identity + RFC 9421 signing |
-| `cel` | **+28** | CEL predicates and expressions |
+| `sign` | none new — reuses `ring` | §7 instruction signature verification |
+| `oci` | none new — reuses `ring` | `oci://` instruction pulls, cosign verification |
+| `decrypt` | none | age v1 and JWE instruction envelopes |
+| `cel` | **+22** | CEL predicates and expressions |
 | `internal-mocks` | none | the mock LLM and MCP servers the tests drive |
 
 Read that table twice, because the naive model — "features control dependency
-cost" — mispredicts two rows.
+cost" — mispredicts five of its rows.
 
 `aauth` adds Ed25519 signing with **zero new crates**, reusing the `ring` that
-rustls already resolved — a capability that costs nothing to carry. `cel` is the
-opposite trade and is carried anyway: 28 extra crates, more than the rest of the
-default tree put together, in exchange for expressions being available to every
-`when`, `until` and `filter` in a shipped binary.
+rustls already resolved — a capability that costs nothing to carry, and the same
+is true of the `sign`, `oci` and `decrypt` that ride on it. `cel` is the
+opposite trade and is carried anyway: 22 extra crates — an ANTLR runtime and a
+regex engine among them, a quarter again on top of the default tree — in
+exchange for expressions being available to every `when`, `until` and `filter`
+in a shipped binary.
 
 `exec` costs **nothing** in dependencies and is still absent from every shipped
 binary. It is gated on *posture*: agentd's default position is that it runs no
@@ -525,9 +550,10 @@ unhealthy, while a healthy tree with one stuck subagent keeps reading healthy �
 the reactor is the thing detecting and killing that child, so it is still
 ticking.
 
-The resulting footprint, on a stripped x86_64 glibc release build (`opt-level =
-"z"`, LTO, `panic = "abort"`, one codegen unit): 2.88 MiB with
-`--no-default-features`, 3.83 MiB with default `tls`, 4.43 MiB with the shipped
+The resulting footprint, on a stripped x86_64 glibc release build of 1.14.1
+(`opt-level = "z"`, LTO, `panic = "abort"`, one codegen unit): 5,376,480 B
+(5.13 MiB) with `--no-default-features`, 6,365,288 B (6.07 MiB) with default
+`tls`, 10,235,536 B (9.76 MiB) with the shipped
 set `a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt`. Release
 artifacts are cross-compiled static-musl for `x86_64` and `aarch64`, plus a
 multi-arch, cosign-signed OCI image with an SPDX SBOM.

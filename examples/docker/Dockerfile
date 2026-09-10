@@ -13,19 +13,24 @@
 # http:// sidecar. See the FEATURES build-arg below.
 #
 # MCP SERVERS ARE REMOTE HTTP ENDPOINTS. agentd ships no tools of its own and runs
-# no local code (rfcs/0001, rfcs/0012 — no exec tool). Every tool comes from an MCP
-# server agentd CONNECTS to over Streamable HTTP (`--mcp name=https://host/mcp`); it
-# spawns no process. So nothing MCP-related is bundled into this image — deploy each
-# MCP server as its own service and point --mcp at its URL. See examples/docker/README.md.
+# no local code by default (rfcs/0001, rfcs/0012). The one exception is `exec`, the
+# guarded local command runner, which is off at build time (the `exec` cargo feature,
+# deliberately absent from this image's FEATURES) and again at run time
+# (`security.exec.enabled`); without both it is a mapping-only contract whose
+# execution is delegated off-box through `tools.overrides`. Every other tool comes
+# from an MCP server agentd CONNECTS to over Streamable HTTP
+# (`--mcp name=https://host/mcp`); it spawns no process. So nothing MCP-related is
+# bundled into this image — deploy each MCP server as its own service and point
+# --mcp at its URL. See examples/docker/README.md.
 
 # ---------------------------------------------------------------------------
 # Stage 1 — build
 # ---------------------------------------------------------------------------
-FROM rust:1.88-bookworm AS build
+FROM rust:1.96-bookworm AS build
 
 # Capability surface is compile-time. The default build links `tls` (the
 # transport). Override to add opt-in surfaces, e.g.
-# --build-arg FEATURES=serve-https,a2a,cron,workflow — or --no-default-features
+# --build-arg FEATURES=a2a,cron,metrics,otel,workflow — or --no-default-features
 # (empty FEATURES + the build below) for the TLS-free loopback-sidecar posture.
 ARG FEATURES=""
 
@@ -41,11 +46,11 @@ COPY . .
 
 # Build the release binary. `--no-default-features` strips the crate's default
 # `tls` feature, giving the minimal loopback-sidecar posture; opt TLS back in
-# (direct https://) with FEATURES=tls, or a served surface with serve-https.
+# (direct https://) with FEATURES=tls, or the A2A listener with FEATURES=a2a.
 RUN if [ -n "${FEATURES}" ]; then FEAT="--features ${FEATURES}"; else FEAT=""; fi; \
     cargo build --release --locked \
         --target ${TARGET} \
-        -p agentd \
+        -p agentd-cli \
         --no-default-features ${FEAT} \
     && cp target/${TARGET}/release/agentd /agentd
 

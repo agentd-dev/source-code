@@ -3434,7 +3434,7 @@ impl Settings {
             instruction_path = Some(expanded);
         }
         // An `oci://` instruction (RFC 0040) is pulled at CONFIG LOAD, exactly
-        // like `--instruction-file` reads a file — because its machinery must
+        // like `--instruction.file` reads a file — because its machinery must
         // fold into the config being built (workflows, mcp servers, the trust
         // ladder), which is impossible once loading is over. URL-fetched
         // workflow definitions set the precedent for a load-time dial. The
@@ -5020,10 +5020,11 @@ fn apply_alias(
         }
         AliasKind::SetFromFile => {
             let path = take()?;
-            // A BINARY age envelope given to `--instruction-file` is armored
-            // into its text form here, so the one decrypt choke point (in
-            // `from_document`) sees every envelope the same way. Text files —
-            // plaintext, armored age, compact JWE — pass through verbatim.
+            // A BINARY age envelope read from a file into `agent.instruction`
+            // is armored into its text form here, so the one decrypt choke
+            // point (in `from_document`) sees every envelope the same way. Text
+            // files — plaintext, armored age, compact JWE — pass through
+            // verbatim.
             let text = if alias.path == "agent.instruction" {
                 let bytes = std::fs::read(&path)
                     .map_err(|e| usage(format!("{}: {path}: {e}", alias.flag)))?;
@@ -6411,7 +6412,7 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             // store. So the message says how to take that default back, not
             // just which backends exist.
             if s.is_long_lived() {
-                err(&mut d, "store.kind is none but the instance is long-lived (serves A2A / webhooks / a goal watchdog / has a loop|schedule|subscribe|signal|event|a2a|webhook start node) — configure a durable store (store.kind: file | mcp | http), or drop store.kind to get the local file store by default".into());
+                err(&mut d, "store.kind is none but the instance is long-lived (serves A2A / webhooks / a goal watchdog / has a loop|schedule|subscribe|signal|event|stream|correlate|a2a|webhook start node) — configure a durable store (store.kind: file | mcp | http), or drop store.kind to get the local file store by default".into());
             } else if !s.workflows.is_empty() {
                 d.warnings.push("store.kind is none: this one-shot run is not durable (a crash re-runs it from scratch); set store.kind for durability".into());
             }

@@ -181,7 +181,7 @@ fn a_peer_supplied_push_target_inside_the_appliance_is_refused_without_being_dia
 #[test]
 fn a_target_the_operator_allowed_still_arrives_with_the_host_header_on_the_name() {
     // The other half of the bar: a guard that refuses everything is not a fix.
-    // `security.a2a.push.allow_private` is the operator's decision, and on a
+    // `a2a.push.allow_private` is the operator's decision, and on a
     // cluster where the receiver really is on a private address the delivery
     // still has to happen — through the same vetted dial.
     let (port, seen) = spawn_receiver();

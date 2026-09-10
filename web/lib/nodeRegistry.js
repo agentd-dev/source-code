@@ -1,9 +1,22 @@
 // The workflow node registry that drives the editor palette and property forms.
-// The data (`workflow-nodes.json`) is generated from the agentd binary's
-// `--workflow-schema` output — the single source of truth for the node
+// The data (`workflow-nodes.json`) is the `$defs.kinds` object from the agentd
+// binary's `--workflow-schema` output — the single source of truth for the node
 // catalogue, so the editor can only offer kinds and fields the binary accepts.
-// Regenerate whenever the binary's registry changes:
-//   agentd --workflow-schema | jq … > web/lib/workflow-nodes.json   (see docs)
+// Two keys per entry are the site's own and have no counterpart in the binary:
+// `category` picks the palette group and header colour, and `kind` echoes the
+// object key so `kindsInCategory` can map over the values.
+//
+// `scripts/gen-schemas.sh` regenerates this file from the binary alongside
+// `web/public/schema/`, and `scripts/ci-gate.sh` diffs both — a stale copy fails
+// the gate. It drifted badly before that existed: it sat six kinds behind the
+// binary — `stream`, `correlate`, `message` and the three
+// `memory.push`/`shift`/`pop` — which the palette could not offer and
+// `validate.js` rejected as unknown on import. Regenerate with:
+//   cargo build -p agentd-cli --all-features && ./scripts/gen-schemas.sh
+// It carries each entry's `category` across and re-derives `kind`; a NEW kind
+// arrives with no category at all (the script prints a NOTE naming it), and an
+// entry without one is invisible to the palette — `kindsInCategory` filters it
+// out and `accentFor` falls through to grey — so pick its group by hand.
 import NODES from "./workflow-nodes.json";
 
 export { NODES };

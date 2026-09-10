@@ -72,7 +72,7 @@ const JSON_LD = {
       url: "https://agentd.dev",
       downloadUrl: "https://agentd.dev/install.sh",
       installUrl: "https://agentd.dev/docs/getting-started/",
-      license: "https://www.apache.org/licenses/LICENSE-2.0",
+      license: "https://www.gnu.org/licenses/agpl-3.0.html",
       offers: { "@type": "Offer", price: "0", priceCurrency: "USD" },
       sameAs: [
         "https://github.com/agentd-dev/source-code",

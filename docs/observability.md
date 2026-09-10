@@ -81,43 +81,48 @@ allocation — below-level calls cost essentially nothing.
 
 ---
 
-## The closed event vocabulary
+## The event vocabulary
 
 The `event` string is the backbone — what you filter, count, and alert on. It is
-a small, **closed**, dotted set. Adding an event later is cheap; renaming one
+a dotted, hierarchical set. Adding an event later is cheap; renaming one
 breaks dashboards. The supervisor/lifecycle and agentic-loop events below are
-the core set; build-gated surfaces add a few more, noted inline.
+the core set, not the whole set — the deeper subsystems and the build-gated
+surfaces each add their own — so filter on a prefix, never on this list being
+exhaustive.
 
 ### Supervisor / lifecycle (`comp:"supervisor"`)
 
 | Event | Fields beyond canonical |
 |---|---|
-| `proc.start` | `mode`, `pid`, `version`, `argv_hash` |
+| `proc.start` | `version`, `runtime`, `instance`, `config_files` |
 | `proc.ready` | readiness reached (see [Health](#health-shape-aware)) |
-| `proc.shutdown` | `signal`, `reason` |
 | `proc.exit` | `code`, `uptime_ms` |
-| `config.loaded` | `mcp_servers` (count/names), `mode`, limits — no secrets |
+| `config.invalid` / `config.warning` / `config.reloaded` | `error` / `warning` — one validation or reload finding, never a secret value; `config.reloaded` carries `trigger` and `changed` |
 | `mcp.connect` | `server`, `transport`, `tools` (count), `resources` (count) |
 | `mcp.connect.fail` | `server`, `transport`, `err` |
 | `mcp.disconnect` | `server`, `reason` |
-| `trigger.armed` | `kind` (`once`/`loop`/`schedule`/`subscribe`/`signal`/`event`/`stream`/`a2a`/`manual`), detail |
-| `trigger.fired` | `kind`, `resource_uri?`, `route` (`spawn`/`continue`) |
+| `start.schedule.armed` / `start.subscribe.armed` | `workflow`, `node` + `next_ms` (schedule) or `server`, `uri` (subscribe) — a start node armed |
+| `start.fired` | `workflow`, `node`, `kind` — a start node fired; an A2A start logs `start.a2a.fired` (`conversation`, `command`, `role`) first |
 | `subscribe` | `resource_uri`, `server`, `by` (`config`/`agent`) |
 | `unsubscribe` | `resource_uri`, `server`, `by` |
-| `resource.updated` | `resource_uri`, `server` — the reactive "heartbeat of meaning" |
 | `subagent.spawn` | `node`, `depth` (the child re-exec'd) |
-| `subagent.ready` / `subagent.result` / `subagent.failed` / `subagent.exit` | the child's lifecycle: `Ready` → `Result`/`Failed` → reaped (`node`, `status`/`err`/`outcome`) |
+| `subagent.result` / `child.exit` | the child's terminal pair: the result frame (`handle`, `status`, `tokens`, `err`), then the reap (`node`, `pid`, `kind`, `outcome`) |
 | `subagent.stuck` | `node` — liveness classification (not a deadline) condemned the child |
-| `subagent.drain` / `subagent.sigterm` / `subagent.sigkill` / `subagent.teardown` | the bounded kill ladder (`reason`, `live`) |
+| `child.unhealthy` / `subagent.kill` / `subagent.cancel` / `subagent.respawn` | `node`, `health` / `handle` / `reason` / `handle`, `node` — the child was found unhealthy, stopped, acknowledged its cancel, or was respawned |
 | `drain.start` / `drain.done` / `drain.abandon` | `live`, `drain_ms` — the SIGTERM drain began, completed, or exceeded its budget (the ladder is forced) |
 | `limit.exceeded` | `limit` (`tree_tokens`/…) — a tree budget tripped |
-| `scope.trifecta_refused` / `scope.trifecta_grant` | `legs` — the Rule-of-Two refused the grant (exit 2) or `--allow-trifecta` overrode it with a warning |
+| (no event) | the lethal-trifecta refusal happens inside `validate()`, **before the logger exists**, so it surfaces as a plain-text refusal message on stderr with exit 2 — as a `config.invalid` diagnostic line under `--validate-config` and `--effective-config` — never as a structured log event; an allowed trifecta (`--allow-trifecta` / `security.allow_trifecta`) emits nothing at all |
 | `cgroup.armed` | `memory_max`, `memory_current`, `memory_high` — cgroup-v2 awareness (best-effort, quiet off-cgroup) |
-| `a2a.connect` / `a2a.send` / `a2a.delegate` | `peer`/`principal`/`method` — a peer connected, an A2A message/command was served, or a peer delegated a run (`--features a2a`) |
+| `a2a.conn` / `a2a.send` / `a2a.delegate` | `err` / `run`, `step`, `to` / `run`, `step`, `peer` — a connection could not be served (level `debug`), an A2A message was sent to a peer, or a run was delegated to one (`--features a2a`) |
 | `a2a.denied` | an authorization refusal (the admin ops are audited, not logged — see below) |
 | `run.start` · `run.done` / `run.deadline` / `run.refused` / `run.stalled` / `run.dropped` | a workflow run's start + its terminal outcome |
 | `workflow.finished` / `workflow.failed` · `workflow.run` / `define` / `loaded` / `deleted` | workflow lifecycle |
-| `health.json` | `file` — the health-file heartbeat writer started |
+
+`--validate-config` is the exception to every rule above: it answers with a bare
+`{"event": "config.valid", …}` or `{"event": "config.invalid", …}` line carrying
+none of the canonical envelope fields, because there is no instance to describe —
+nothing has started, and nothing will. Treat it as the tool's verdict, not as a
+log event, and branch on the exit code.
 
 ### Agentic loop (`comp:"agent"`; `intel.*` carry `comp:"intel"`)
 
@@ -131,8 +136,6 @@ the core set; build-gated surfaces add a few more, noted inline.
 | `intel.result` | `model`, `tokens_in`, `tokens_out`, `finish_reason`, `dur_ms` |
 | `tool.call` | `tool`, `id`, (`args` only with content capture on) |
 | `tool.result` | `tool`, `is_error`, `bytes` (`content` only with content capture on) |
-| `self.schedule` | `after_s`, `queued` — the agentd scheduled a future self-wake-up |
-| `self.subscribe` | `action` (`subscribe`/`unsubscribe`), `uri` — the agentd changed its own subscriptions |
 
 `comp:"mcp"` is used for transport-level lines folded from MCP
 `notifications/message`; it reuses these event names (e.g. `mcp.disconnect`) and
@@ -141,10 +144,11 @@ introduces **no** new `event` strings.
 > **Emission notes (vocabulary vs wire).** A graceful shutdown is
 > `proc.exit{reason:"drain"}` (there is no separate `proc.shutdown`); the
 > restart-governor breaker tripping is `proc.exit{reason:"restart_breaker"}`; the
-> child kill path is the `subagent.drain → sigterm → sigkill` ladder above (no
-> generic `subagent.signal`/`subagent.restart`). The reactive self-tools emit
-> the canonical `trigger.armed`/`trigger.fired` with `kind:"self_schedule"` /
-> `kind:"self_subscribe"`. Build-gated surfaces also emit `metrics.*` /
+> child kill path is `child.unhealthy` → `subagent.kill`/`subagent.cancel` →
+> `child.exit` (no generic `subagent.signal`/`subagent.restart`). Start nodes
+> arm and fire under the `start.*` vocabulary — `start.schedule.armed` /
+> `start.subscribe.armed` / `start.fired` — never a generic
+> `trigger.armed`/`trigger.fired`. Build-gated surfaces also emit `metrics.*` /
 > `cron.unavailable` / `mcp.serve_unavailable` when a flag needs a feature.
 
 ### Operability: the listener, hot reload, intelligence swap
@@ -157,7 +161,7 @@ each lives in [`docs/operations.md`](operations.md).
 | Event | `comp` | Fields beyond canonical |
 |---|---|---|
 | `a2a.listen` | `supervisor` | `authority`, `bound`, `tls`, `mtls`, `require_auth`, `interface`, `pairing` — the listener bound |
-| `a2a.connect` | `supervisor` | `origin`, `conn` — a peer opened a connection (level `debug`) |
+| `a2a.conn` | `supervisor` | `err` — a connection could not be served (level `debug`) |
 | `a2a.denied` | `supervisor` | `principal`, `method`, `op` — an authorization refusal |
 | `drain.start` / `drain.done` / `drain.abandon` | `supervisor` | the `admin.drain` op and SIGTERM share this path (see the lifecycle table above) |
 | `agent.paused` / `agent.resumed` | `supervisor` | `reason` — an instance-wide `admin.pause` hold went on or came off |
@@ -219,10 +223,11 @@ not a filter that silently matches nothing.
 
 ### Why not the event ring
 
-The obvious implementation would tee the in-memory `agentd://events` ring. That
-ring is explicitly lossy oldest-evicted and installed only under `--serve-mcp`
-with the `events` feature, so teeing it would produce silent gaps in exactly
-the consumer being sold, and in the default deployment would do nothing at all.
+The obvious implementation would tee the in-memory ring the `debug.events`
+command op drains. That ring is explicitly lossy oldest-evicted and is installed
+only when `interface.enabled` and `interface.debug` are both on, so teeing it
+would produce silent gaps in exactly the consumer being sold, and in the default
+deployment would do nothing at all.
 This taps the emission itself, beside the existing ring and OTLP taps.
 
 ### Budgeting its own volume
@@ -396,7 +401,7 @@ the pod is not "ready", so an orchestrator won't route work to it.
    | 5 | semantic — task cannot be done / refused | non-retriable |
    | 6 | required MCP server failed to connect / handshake / died | retriable |
    | 7 | budget exceeded (steps / tokens / deadline / tree) | policy |
-   | 124 | supervisor hard-kill backstop — child unresponsive past the deadline (mnemonic to `timeout(1)`; a self-detected deadline is 7) | — |
+   | 124 | hard wall-clock deadline — a run or turn ran past `limits.run.deadline` (mnemonic to `timeout(1)`) | — |
    | 137 | killed by SIGKILL (128+9, OS-set) — often OOM | raise memory |
    | 143 | killed by SIGTERM (128+15, OS-set) — ungraceful | — |
 
@@ -408,7 +413,7 @@ the pod is not "ready", so an orchestrator won't route work to it.
    write-temp-then-`rename`:
 
    ```json
-   {"ts":"2026-06-25T10:00:00.123Z","run_id":"01J8XAMPLE...","mode":"2.0",
+   {"ts":"2026-06-25T10:00:00.123Z","run_id":"01J8XAMPLE...","mode":"1",
     "supervisor_tick_age_ms":34,"alive":true,"draining":false}
    ```
 
@@ -518,9 +523,10 @@ jq '[ select(.event=="intel.result") | .tokens_out ] | add' telemetry.ndjson
 The metrics that matter (derivable from logs by default; emitted directly under
 the features below):
 
-- **Gauges:** `agent_active_subagents`, `agent_tree_depth`,
-  `agent_tree_breadth`, `agent_subscriptions_active`, `agent_ready` (0/1),
-  `agent_up`.
+- **Gauges:** `agent_ready` (0/1) and `agent_up` — plus `agent_active_subagents`,
+  `agent_tree_depth`, `agent_tree_breadth` and `agent_subscriptions_active`, which
+  are **reserved**: rendered, never written in this build, so they sit flat at `0`
+  (see [Reactive-backlog gauges (reserved)](#reactive-backlog-gauges-reserved)).
 - **Counters:** `agent_loop_steps_total`, `agent_intel_calls_total`,
   `agent_tokens_total{type=in|out}`, `agent_reactions_total`,
   `agent_subagents_spawned_total`, `agent_subagents_exited_total{status}`,
@@ -580,9 +586,9 @@ The A2A/hot-reload surfaces add these to the frozen set:
 - **`agent_paused`** *(gauge, 0/1)* — `1` while an `admin.pause` hold is in effect;
   `0` after `admin.resume`. **Pause is not readiness** — `agent_ready` ignores it
   (it tracks only drain / lame-duck), so a paused instance can still read
-  `agent_ready 1`. Read the `paused` field of the A2A `status` command for the
-  authoritative answer: the gauge is rendered but never written, so it reads `0`
-  even while a hold is on.
+  `agent_ready 1`. The instance-wide `admin.pause` / `admin.resume` handlers set
+  the gauge on both edges, and the A2A `status` command's `paused` field reports
+  the same state; a per-run hold (`admin.pause` with a `run`) moves neither.
 - **`agent_config_reload_total{result}`** *(counter)* — hot reloads by result.
   The label domain is bounded to `applied` | `rejected` | `other`; a refused
   reload (invalid candidate, or a restart-only diff) currently lands in `other`,
@@ -591,10 +597,12 @@ The A2A/hot-reload surfaces add these to the frozen set:
   log line.
 - **`agent_config_generation`** *(gauge)* — the count of successfully-applied
   reloads, monotonic in practice, so a scraper can detect "this instance has
-  picked up generation N" against the controller's desired generation. Like
-  `agent_paused` it is rendered but never written; the durable manifest's
-  `lifecycle.config_generation` and the `config.reloaded` log line are the
-  reliable signals.
+  picked up generation N" against the controller's desired generation. The reload
+  path writes it on every applied reload, using the same number it stamps into the
+  durable manifest's `lifecycle.config_generation`; the `config.reloaded` line
+  announces the reload itself (`trigger`, `changed`) and does **not** carry the
+  generation, which is computed only after that line is written — read the number
+  from `/metrics` or the manifest, never by `jq`-ing the reload event.
 - **`agent_drains_total{phase}`** *(counter)* — drain phase transitions; the
   closed domain is `started` | `completed` | `forced` | `other` (so `completed`
   vs `forced` distinguishes a clean drain from one that overran its budget).
@@ -605,7 +613,8 @@ The A2A/hot-reload surfaces add these to the frozen set:
 - **`agent_refusals_total{reason}`** *(counter; **process-local**)* — guard trips
   by reason (`trifecta` | `rate` | `budget` | `depth` | `mcp` | `other`). Refusals
   trip in the re-exec'd child loop, so this reflects only the scraped process — the
-  headline safety signal is the refusal / `scope.trifecta_refused` log line.
+  headline safety signal is the startup refusal itself: the
+  `agentd: lethal-trifecta refused: …` line on stderr and exit 2.
 - **`agent_intel_up`** *(gauge, 0/1)* and **`agent_intel_errors_total{reason}`**
   *(counter; `unreachable`|`auth`|`timeout`|`5xx`|`other`)* — intelligence-endpoint
   reachability + error breakdown.
@@ -626,9 +635,13 @@ The A2A/hot-reload surfaces add these to the frozen set:
   cgroup-v2 `memory.max` / `memory.current`, emitted only for the fields the
   kernel exposes (absent off-cgroup, keeping `/metrics` clean).
 
-#### Reactive-backlog gauges (the scaling-signal set)
+#### Reactive-backlog gauges (reserved)
 
-Point-in-time gauges a horizontal scaler reads:
+Rendered with their `# HELP` / `# TYPE` lines and flat at `0`: nothing in this
+build writes them, so a scaler that targets one is watching a signal that can
+never move. **Do not target an HPA at them** — [`scaling.md`](scaling.md) §5 has
+the gauges that do move. The same reservation covers `agent_active_subagents`,
+`agent_tree_depth` and `agent_tree_breadth`.
 
 - **`agent_pending_events`** — reactive events received but not yet routed.
 - **`agent_inflight_reactions`** — reactions currently executing.

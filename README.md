@@ -46,10 +46,11 @@ idle daemon 5.5 MiB RSS · protocols from their own SDKs · HTTPS everywhere · 
    at 5.5 MiB on one thread, and lands as a single-layer `FROM scratch` image with no shell, no
    libc, and nothing to CVE-scan but agentd itself.
 2. **MCP as the universal interface.** agentd has no built-in `fs`/`http`/`shell`
-   tool library and executes nothing locally. Every capability is a **remote MCP
-   server** you declare with `--mcp name=https://…`. One protocol in, one
-   protocol out — tools and resources are all MCP, and agentd itself is
-   addressable as an MCP server.
+   tool library and, in a release binary, executes nothing locally — the `exec`
+   contract is mapping-only unless it is *both* compiled in and enabled (see
+   [Security model](#security-model)). Every capability is a **remote MCP
+   server** you declare with `--mcp name=https://…` — one protocol out, tools
+   and resources alike. What comes *in* is A2A; see 5.
 3. **Reactivity via resource subscriptions.** Instead of polling, an agentd with
    a `subscribe` start node **idles at near-zero CPU and wakes when an MCP
    resource it subscribed to changes** (notify-then-read). An upstream change is
@@ -79,9 +80,9 @@ idle daemon 5.5 MiB RSS · protocols from their own SDKs · HTTPS everywhere · 
        └────────────┬─────────────────────────────────────┬───────────────┘
                     │ spawn (re-exec, narrowed payload)   │ serve (optional)
        ┌────────────▼────────────────┐       ┌────────────▼───────────────┐
-       │  subagent (agentic loop)    │       │  self-MCP over HTTP(S)     │
-       │  think → tool → observe …   │       │  tools · agent:// resources│
-       │  or: workflow driver        │       │  A2A Tasks · operator ctl  │
+       │  subagent (agentic loop)    │       │  A2A listener over HTTPS   │
+       │  think → tool → observe …   │       │  Tasks · streaming · card  │
+       │  or: workflow driver        │       │  commands · operator ctl   │
        └──────┬──────────────┬───────┘       └────────────────────────────┘
               │ HTTPS        │ HTTPS
        ┌──────▼──────┐  ┌────▼──────────────┐
@@ -92,10 +93,14 @@ idle daemon 5.5 MiB RSS · protocols from their own SDKs · HTTPS everywhere · 
        └─────────────┘  └───────────────────┘
 ```
 
-Every network edge is HTTP(S) — the LLM, the MCP servers, the served self-MCP,
-A2A peers, and operator control — with mTLS and/or bearer auth (plaintext
-`http://` is loopback-only, for dev). agentd links no unix/vsock/stdio
-transport and spawns no tool processes.
+Every network edge is HTTP(S) — the LLM, the MCP servers, the served A2A
+endpoint, A2A peers, and operator control — with mTLS and/or bearer auth
+(plaintext `http://` is loopback-only, for dev). agentd links no vsock or stdio
+transport and spawns no tool processes in a release binary (the `exec` local
+runner is a build-and-config opt-in — see [Security model](#security-model));
+the one non-TCP transport is a unix domain socket for a co-located A2A peer, where the kernel is the authenticator
+— mode `0600` plus an `SO_PEERCRED` uid check instead of TLS (see
+[docs/a2a.md](docs/a2a.md)).
 
 ## Install
 
@@ -208,7 +213,8 @@ Recurring / reactive shapes are **workflow start nodes** in a
 config_version: "1"
 intelligence: { endpoints: https://gw.example/v1, model: gpt-… }
 store: { kind: mcp, mcp: { server: state } }         # a daemon needs a durable store
-a2a:   { listen: https://0.0.0.0:8443, tls: { cert: …, key: … } }   # the external channel
+a2a:   { listen: https://0.0.0.0:8443,
+         tls: { cert: …, key: …, client_ca: … } }    # the external channel
 workflows:
   - name: watch
     steps:
@@ -218,7 +224,10 @@ workflows:
 lifecycle: { run_until: drained }                    # a daemon
 ```
 
-`--traceparent` continues an upstream W3C trace.
+A non-loopback `a2a.listen` is **refused at startup** unless the endpoint has
+client auth — `a2a.tls.client_ca` (mTLS, and then *every* caller needs a client
+certificate), `a2a.bearer`, or `interface.pairing`. `--traceparent` continues an
+upstream W3C trace.
 
 ## Workflows
 
@@ -344,18 +353,28 @@ every child is one `SIGKILL` from gone.
 
 ## Security model
 
-- **No local execution.** There is no `exec`, no shell, no local tool — the
-  attack surface of a tool call is the remote MCP server's, not the host's.
+- **No local execution by default.** `exec` ships as a mapping-only contract:
+  a local runner exists only when the binary was built `--features exec` (never
+  a release binary) *and* `security.exec.enabled` is set. Otherwise the attack
+  surface of a tool call is the remote MCP server's, not the host's.
 - **Rule-of-Two trifecta gate.** Tag servers with
   `--mcp-tags name=untrusted_input,sensitive,egress`; a config that wires all
   three legs into one agent is **refused at startup** unless you explicitly
   `--allow-trifecta`.
 - **Authenticated everything.** Outbound: bearer/OAuth 2.1 client-credentials +
   bundled webpki roots (+ `--tls-ca` for private PKI). Inbound: mTLS client CA
-  and/or constant-time bearer; **operator verbs require the Management
-  identity** — unauthenticated peers can't even see them.
-- **Hardened served surface.** Cross-origin requests are rejected (403);
-  sessions get unique `Mcp-Session-Id`s; plaintext serving is loopback-only.
+  and/or constant-time bearer; **operator verbs (the `admin.*` ops) require the
+  operator role** — granted by a matching `a2a.principals` rule, by a verified
+  `a2a.bearer`, by any client certificate `a2a.tls.client_ca` accepted that no
+  rule claims (on a listener that sets a bearer or declares no principals), or
+  by a loopback caller when no principals are configured. Discovery stays
+  public, though: the unauthenticated agent card advertises the whole command
+  surface, `admin.*` included, and only the authenticated
+  `GetExtendedAgentCard` narrows the skills to the ops that caller may actually
+  run.
+- **Hardened served surface.** Cross-origin requests are rejected (403 — only
+  loopback and the origins listed in `interface.origins` are admitted);
+  plaintext serving is loopback-only.
 - **Secrets discipline.** Tokens come from env or mounted files
   (`--intelligence-token-file` rotates live) and are never logged; telemetry
   logs lengths, not contents, unless you opt in with `--log-content`.
@@ -391,21 +410,23 @@ exhausted · `124` supervisor hard-kill backstop · `137`/`143` external kills. 
 clean drain is always `0`, never `143`. Policy codes (`3`/`7`) can be remapped with `--budget-exit-code` for
 schedulers that treat nonzero as retry-forever.
 
-**Telemetry:** JSON-lines on stderr (trace-correlated, `--log-level`),
-optional `--report-file` run-outcome report (atomic write), Prometheus
-`/metrics` + `/healthz` + `/readyz` via `--metrics-addr` (`--features
-metrics`), OTLP spans with GenAI semconv via `--features otel`, a liveness
-heartbeat file via `--health-file`, and the `agent://events` live ring when
-serving (`--features events`).
+**Telemetry:** JSON-lines on stderr (trace-correlated, `--log-level`), a
+`--report-file` path the schema accepts but the runtime does not write — the
+terminal outcome is the `proc.exit` event and the A2A task artifact —
+Prometheus `/metrics` + `/healthz` + `/readyz` via `--metrics-addr`
+(`--features metrics`), OTLP spans with GenAI semconv via `--features otel`, a
+liveness heartbeat file via `--health-file`, and the live log ring tailed with
+the `debug.events` command op (needs `interface.enabled` + `interface.debug`).
 
 **Discovery:** `agentd --capabilities` prints a machine-readable manifest
-(`contract_version: "1.0"` + a `surfaces{}` block of exactly what's compiled
-and configured in) and exits — feature-detect from this, not the version
-string.
+(`runtime: "1"`, a `surfaces{}` block pinning the `exit_codes` and
+`config_schema` contract versions, and, alongside it, exactly what's compiled
+and configured in) and exits — feature-detect from this, not the version string.
 
-**Control plane:** a Management-authenticated peer drives the served endpoint
-with the `a2a.Drain` / `a2a.LameDuck` / `a2a.Pause` / `a2a.Resume` /
-`a2a.Cancel` admin methods. `SIGTERM` starts a graceful drain
+**Control plane:** an operator-role principal drives the served endpoint with
+the `admin.drain` / `admin.lameduck` / `admin.pause` / `admin.resume` /
+`admin.cancel` command ops — each a DataPart on an ordinary A2A `SendMessage`,
+not a custom JSON-RPC method. `SIGTERM` starts a graceful drain
 (`--drain-timeout` < pod grace).
 
 **Hot reload** (`--features hot-reload`): `SIGHUP` — or a ConfigMap volume

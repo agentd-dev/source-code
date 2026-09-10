@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The **internal tool contracts**: name, description, input and output JSON
 //! Schemas, whether a built-in implementation exists (mapping-only contracts
-//! are `code.run`, `knowledge.*`, `search.*`), and the default grants.
+//! are `code.run`, `exec`, `knowledge.*`, `search.*` — `exec` gains a built-in
+//! runner only under `--features exec` plus `security.exec.enabled`), and the
+//! default grants.
 //!
 //! The contract is what callers see, and an override swaps only the
 //! implementation behind it. That separation is what lets an operator move a

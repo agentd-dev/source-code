@@ -5,26 +5,35 @@
 //! hand-rolled [`super::yaml`] subset reader — no `serde_yaml`, the minimalism
 //! moat) or **JSON** with comments (`.json`/`.jsonc`); an unknown extension is
 //! sniffed (`{`/`[` ⇒ JSON, else YAML). Both parse to the same
-//! `serde_json::Value` document ([`read_document`]) and then to the typed
-//! [`ConfigFile`] ([`ConfigFile::from_document`]) — so validation, the schema,
+//! `serde_json::Value` document ([`read_document`]), which this module also
+//! merges across the config chain ([`read_documents_checked`], RFC 7396) before
+//! handing it to the typed [`super::v2::Settings`] — so validation, the schema,
 //! the env/flag path bindings ([`super::paths`]) and hot reload are all
 //! format-agnostic.
 //!
-//! The file carries **only verbose structural config**: the MCP-server
-//! inventory, declared subscriptions, A2A peers, limits, and the model/log
-//! knobs. It **never** carries secrets or per-environment scalars (those stay
-//! env/flag).
+//! The file carries the whole declarative agent — its instruction, its
+//! workflows, its MCP servers, A2A peers, store, context, lifecycle, limits and
+//! security policy. It **never** carries a literal secret: from a file a
+//! credential MUST be a `{{secret:NAME}}` / `{{secret-file:PATH}}` reference, so
+//! the document can be committed and mounted as it stands.
 //!
 //! Precedence: `built-in default < FILE < env < flag`. The file is loaded
-//! first, then `Config::load` applies env and flags over it; a flag/env for the
-//! same key wins. List-valued keys (`mcp_servers`, `subscribe`, `a2a_peers`)
-//! *seed* the list — repeatable `--mcp`/`--subscribe`/`--a2a-peer` flags **add
-//! to** the file's list rather than replacing it, matching the repeatable-flag
-//! semantics operators already expect.
+//! first, then [`super::v2::load`] applies env and flags over it; a flag/env for
+//! the same key wins. List-valued keys (`mcp.servers`, `a2a.peers`) *seed* the
+//! list — repeatable `--mcp`/`--a2a-peer` flags **add to** the file's list
+//! rather than replacing it, matching the repeatable-flag semantics operators
+//! already expect.
 //!
 //! `deny_unknown_fields` makes a typo'd key (`max_token` vs `max_tokens`) a hard
 //! config error (exit 2) instead of a silently-ignored value — the single most
 //! common config footgun, closed at parse time.
+//!
+//! [`ConfigFile`] and [`config_schema`] are the RETIRED flat schema, not the
+//! live typing path: a document that speaks it is refused outright at load
+//! ("config file speaks the retired flat schema", [`super::v2::load`]). They
+//! survive for tests alone — this module's own, and the no-arg
+//! [`super::paths::bindings`], which still derives its bindings from this
+//! schema and is itself reached only from `paths`' tests.
 //!
 //! The schema is **hand-written** (no `schemars` — a forbidden dependency) and
 //! kept faithful to this struct by a unit test asserting the schema's top-level
@@ -206,10 +215,12 @@ fn kind_name(v: &Value) -> &'static str {
     }
 }
 
-/// The `x-agentd-contract-version` the schema carries. It is the same value as
-/// the capabilities manifest's `contract_version` — a tool that validated a
-/// document against this schema knows exactly which runtime contract it targets
-/// — and `tests::schema_contract_version_matches_manifest` holds the two equal.
+/// The `x-agentd-contract-version` the schema carries — the runtime contract a
+/// tool that validated a document against this schema is targeting. The
+/// capabilities manifest reports its own surface versions separately, under
+/// `surfaces` (`exit_codes`, and `config_schema`, which is the document major
+/// [`super::v2::schema::CONFIG_VERSION`]); nothing currently holds the two in
+/// lockstep.
 pub const SCHEMA_CONTRACT_VERSION: &str = "1.0";
 
 /// The deserialized config-file shape — one source of truth for the loader, the

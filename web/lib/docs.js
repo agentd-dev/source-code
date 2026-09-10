@@ -148,7 +148,7 @@ export const DOCS = [
     file: "docs/node-registry.md",
     title: "Node registry",
     group: "reference",
-    blurb: "All 67 workflow nodes with their required fields, generated from the binary's own registry — plus the five things that are easy to get wrong.",
+    blurb: "All 73 workflow nodes with their required fields, generated from the binary's own registry — plus the six things that are easy to get wrong.",
   },
 
   // ── Operate ───────────────────────────────────────────────────

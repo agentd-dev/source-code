@@ -42,9 +42,11 @@ Three properties make it different from an agent framework:
 | [agent-loop.md](agent-loop.md) | One turn end to end — context assembly, the round loop, tool dispatch, termination. |
 | [subagents.md](subagents.md) | Delegation as a process tree: narrowed context, distilled returns, depth limits. |
 | [workflows.md](workflows.md) | Durable DAGs: start nodes, the node catalogue, data flow, waits, resume. |
-- [node-registry.md](node-registry.md) — every workflow node, what it requires, and the traps that bite first.
+| [node-registry.md](node-registry.md) | Every workflow node, what it requires, and the traps that bite first. |
+| [directives.md](directives.md) | Instructions that carry their own machinery: embedded workflows, skills and context, and the trust ladder that decides what a document may declare. |
 | [modes-and-triggers.md](modes-and-triggers.md) | Job or daemon, and the start nodes that decide when a run fires. |
 | [mcp.md](mcp.md) | Where tools and events come from: the client subset and the Streamable HTTP transport. |
+| [a2a.md](a2a.md) | The channel that reaches *in*: principals and first-match-wins matching, tasks, and the agent card. |
 | [a2a-extensions.md](a2a-extensions.md) | Everything agentd speaks beyond core A2A: the declarations, the `A2A-Extensions` handshake, and the command DataPart. |
 | [why-rust.md](why-rust.md) | The dependency moat, what is hand-rolled, and where the choice costs something. |
 
@@ -55,11 +57,14 @@ Three properties make it different from an agent framework:
 | [configuration.md](configuration.md) | Every setting, the three spellings, precedence, and validation. |
 | [experience.md](experience.md) | Validate before anything runs; exit codes as an API; telemetry you can filter. |
 | [interface.md](interface.md) | The terminal and web clients: one daemon, many synchronized surfaces. |
+| [hosting-the-ui.md](hosting-the-ui.md) | Serving the web client from a public domain: three static files, and a host that never sees a request to an agent. |
 | [coding-agent.md](coding-agent.md) | A pair-programming agent on a repository — tools, approvals, budgets, practices. |
+| [two-person-company.md](two-person-company.md) | A use case worked all the way through: an eleven-agent software company whose only employees are the CEO and CTO. |
 | [security.md](security.md) | Capability scoping, the Rule of Two, the exec fence, secrets, and the limits of all of it. |
 | [authentication.md](authentication.md) | Authenticating outbound to model, MCP and A2A endpoints. |
 | [observability.md](observability.md) | Structured telemetry, the correlation tuple, health and metrics. |
 | [deployment.md](deployment.md) | Job, CronJob, long-lived Deployment, systemd — and drain choreography. |
+| [pid1.md](pid1.md) | agentd as init: PID 1 on a custom Linux — orphan reaping, signals, and where shipped behaviour ends and exploration begins. |
 | [operations.md](operations.md) | Driving a live daemon: the admin surface, capabilities, hot reload. |
 | [scaling.md](scaling.md) | Many replicas over one queue: partitioning at the source, queue-side leases, idempotency. |
 

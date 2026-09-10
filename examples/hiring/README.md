@@ -43,7 +43,7 @@ So:
 | reads internal docs | yes (sensitive) | yes (sensitive) |
 | writes files / sends mail | **no** | **yes** (egress) |
 | legs | 2 | 2 |
-| driven by | workflows | its instruction, over A2A |
+| driven by | webhook + subscribe workflows | typed A2A commands, over mTLS |
 
 `security.allow_trifecta: true` exists and would collapse this to one instance.
 For a system that ingests attacker-authored documents about real people, do not
@@ -86,10 +86,19 @@ verdict routes to a `human` gate before anything is filed.
 | `application-received` | webhook `/ashby/application` | pulls the application + CV, `extract`s the fit matrix, `judge`s for injection, routes clean → file / suspicious → human, delegates the write |
 | `decision-changed` | `subscribe` to `candidates.xlsx` | reads pending `action` cells and switches: Select → guides + mail, Review → ask a human, Reject → record |
 
-**`hiring-actions`** — no workflows, deliberately. Inbound A2A work arrives as a
-*turn* against its instruction and tools (the `a2a` **start node** is not
-implemented in 2.2.0 — only outbound `a2a.delegate` is). It is a narrow effector
-with a small toolset and a short list of rules it will not break.
+**`hiring-actions`** — four workflows, each a thin `a2a` start node bound to one
+typed command and `roles: [agent, operator]`, so only the intake instance's client
+certificate (or an operator by hand) can fire it:
+
+| Workflow | Command | Does |
+|---|---|---|
+| `scaffold-job` | `hiring.scaffold` | creates the Drive `candidates/` subfolder and an empty `candidates.xlsx` with the matrix columns |
+| `file-candidate` | `hiring.file` | creates the candidate folder, stores the documents, writes ONE row into the matrix |
+| `prepare-interview` | `hiring.prepare` | generates the interview guides and mails the hiring manager — never the candidate |
+| `record-decision` | `hiring.decision` | records the outcome in the matrix and in Ashby, mailing nobody |
+
+It is a narrow effector with a small toolset and a short list of rules it will not
+break.
 
 ## Talking to it and steering it
 
@@ -145,14 +154,11 @@ endpoints and mTLS certs and they run.
 
 ## Constraints worth knowing before you extend this
 
-- **CEL ships from 2.3.0.** `when:`, `filter:` and `until:` need the `cel`
-  build feature, which is now in the released binaries; on 2.2.0 and earlier a
-  config using them exits 2. This config deliberately branches with `switch` on
-  data and with model nodes (`route`, `classify`, `judge`) instead, so it runs
-  on either — and because a decision you can read in the config beats one buried
-  in an expression.
-- **`a2a` start nodes, `a2a.send` and `a2a.wait` are not implemented** in 2.2.0.
-  Outbound is `a2a.delegate`; inbound arrives as a turn.
+- **`when:`, `filter:` and `until:` need the `cel` build feature**, which is in
+  the released binaries; a build without it exits 2 on a config that uses them.
+  This config deliberately branches with `switch` on data and with model nodes
+  (`route`, `classify`, `judge`) instead, because a decision you can read in the
+  config beats one buried in an expression.
 - **A long-lived instance needs a durable store.** Both use `store.kind: file`,
   which is the default. On Kubernetes mount a volume at that path, or move to
   `mcp`/`http` — a file store on a container's writable layer survives a restart

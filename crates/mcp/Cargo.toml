@@ -2,7 +2,10 @@
 # model + (progressively) the transport dialects, client, and server that agentd's
 # runtime builds on. Deliberately free of agentd internals so it can be reused and
 # so the multi-version (legacy handshake ↔ modern stateless) logic lives in one
-# place. Dependency budget mirrors agentd: serde + serde_json only.
+# place. Dependencies: the official `rmcp` SDK and the async seam it needs
+# (tokio, futures, sse-stream, tokio-stream, thiserror, http), over agentd's own
+# `net` transport — plus serde/serde_json, and `vsock` only when the `vsock`
+# feature asks the server to listen on one.
 [package]
 name = "agentd-mcp"
 version = "1.0.1"

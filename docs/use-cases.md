@@ -75,7 +75,7 @@ child won't self-terminate, kills with `124`.
 
 **Why agentd.** A bad config exits `2` in milliseconds, before any token is
 spent. Setting `--run-id` makes a retried Job idempotent. The whole thing is one
-~1 MB static binary on `scratch` — nothing to install, nothing to patch.
+~8.5 MiB static binary on `scratch` — nothing to install, nothing to patch.
 
 ## 2. Reactive event triage / responder
 
@@ -187,9 +187,10 @@ then re-execs a child process. The child returns a **distillate** (~1–2k token
 — never its transcript. Caps (depth 3, 8 children/node, 64/tree, the tree-token
 ceiling) come back as ordinary tool-result errors the model can adapt to — a
 runaway loop gets refusals, never a fork bomb. The
-[Rule-of-Two](security.md) trifecta check is enforced once, at startup, over the
-root's whole grant; because scope only ever narrows as you descend, no subtree
-can re-acquire a capability the root was refused
+[Rule-of-Two](security.md) trifecta check is enforced at two points — at startup
+over the root's whole grant, and again at every `subagent.run` over the narrowed
+server set; because scope only ever narrows as you descend, no subtree can
+re-acquire a capability the root was refused
 (see [`subagents.md`](subagents.md)).
 
 ## 4. Parallel fan-out / map-reduce
@@ -299,7 +300,7 @@ the actor side of a partition like this one.
 auth). Any A2A client — a control plane, a workflow engine, **or another
 agent** — drives it: a **natural-language** `SendMessage` becomes a durable
 conversation turn whose answer comes back as the task's artifact, and a
-**command** DataPart (`workflow.run` / `status` / `cancel`) pokes the daemon.
+**command** DataPart (`workflow.run` / `status` / `workflow.cancel`) pokes the daemon.
 Because agentd is symmetric, composition needs no new protocol: the orchestrator
 declares the worker (a separately-deployed HTTPS service) as one more
 `--a2a-peer`.

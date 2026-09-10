@@ -45,7 +45,7 @@ impl super::reactor::Runtime {
     }
 
     /// The instruction source has been unreachable past its deadline. What
-    /// that MEANS is the operator's call (`agent.instruction_unavailable`),
+    /// that MEANS is the operator's call (`agent.instruction.unavailable`),
     /// because the right answer differs by deployment: a support agent should
     /// keep answering on the instruction it has; a deploy agent whose
     /// authorization may have been withdrawn should not.
@@ -112,7 +112,7 @@ impl super::reactor::Runtime {
 
     /// How often to re-read, in ms — `None` = never.
     ///
-    /// Two inputs, and they mean different things. `agent.instruction_refresh`
+    /// Two inputs, and they mean different things. `agent.instruction.refresh`
     /// is a POLL interval: how current the operator wants the text.
     /// `agent.instruction.trust[].freshness` is the §7.7 revocation deadline: how
     /// long an authorization may go unconfirmed before the agent stops acting

@@ -9,7 +9,7 @@
 
 use crate::config::v2::Settings;
 
-// ── A2A extensions (spec: docs/topics/extensions.md) ────────────────────────
+// ── A2A extensions (spec: docs/a2a-extensions.md) ───────────────────────────
 //
 // Anything agentd speaks beyond the core protocol is declared as an
 // `AgentExtension` on the card, identified by a URI. The spec's guidance on
@@ -30,9 +30,11 @@ pub const INTERFACE_EXTENSION: &str = "https://agentd.dev/a2a/ext/interface/v1";
 pub const EXTENSION_METHODS: &[(&str, &str)] = &[("SubscribeToEvents", INTERFACE_EXTENSION)];
 
 /// Every extension URI this build can activate, for the `A2A-Extensions`
-/// handshake. Activation is not declaration: an instance that will not serve
-/// the interface feed still recognises the header naming it, and simply does
-/// not echo it back.
+/// handshake. Activation is not declaration: the echo is intersected with this
+/// build-wide list and never consults `Settings`, so an instance that will not
+/// serve the interface feed still recognises — and echoes back — the header
+/// naming it. Whether the instance DECLARES the extension on its card is
+/// `extensions_of`'s decision, and that one does read `Settings`.
 pub const EXTENSIONS: &[&str] = &[COMMAND_EXTENSION, INTERFACE_EXTENSION];
 
 /// Every extension THIS instance declares on its card, in card order.

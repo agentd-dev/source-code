@@ -16,9 +16,11 @@
 #   --help
 #
 # Release binaries are Linux/musl (amd64 + arm64) and carry the cloud-native
-# feature set. Two things are deliberately NOT in them, and need a source build:
+# feature set, `cel` included — it has been in the shipped set since 2.3.0,
+# because a published binary that refused `when`/`until`/`filter` at validation
+# made every non-trivial config a build-from-source job. One thing is
+# deliberately NOT in them, and needs a source build:
 #   * `exec`, the local command runner (docs/coding-agent.md)
-#   * `cel`, the only dependency-bearing feature
 # macOS and Windows have no prebuilt binary yet — this script tells you how to
 # build instead of pretending otherwise.
 
@@ -48,8 +50,8 @@ Options (flag, or the matching env var):
   -h, --help
 
 Release binaries are Linux/musl (amd64 + arm64). \`exec\` (the local command
-runner) and \`cel\` are deliberately not compiled into them — those need a
-source build. macOS and Windows have no prebuilt binary yet.
+runner) is deliberately not compiled into them — that needs a source build.
+macOS and Windows have no prebuilt binary yet.
 EOF
   exit 0
 }

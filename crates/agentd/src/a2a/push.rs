@@ -41,7 +41,7 @@ const DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
 /// `127.0.0.1` could reach agentd's own surfaces.
 ///
 /// `allow_private` is the operator's decision
-/// (`security.egress.allow_private`), not the caller's: on a cluster where the
+/// (`a2a.push.allow_private`), not the caller's: on a cluster where the
 /// receiver legitimately lives on a private address, refusing every private
 /// target would make the feature useless — but that has to be someone's
 /// explicit choice.

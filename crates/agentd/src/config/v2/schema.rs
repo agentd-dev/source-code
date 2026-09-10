@@ -257,7 +257,7 @@ fn top_level_properties(
     );
     m.insert("vars".to_string(), json!({ "type": "object", "additionalProperties": true,
                 "description": "operator-defined constants; reference anywhere (and in workflows) as {{config.NAME}} — dotted paths reach nested values, unresolved references refuse startup" }));
-    m.insert("workflows".to_string(), json!({ "type": "array", "items": { "$ref": "#/$defs/WorkflowRef" }, "description": "inline workflow definitions or {name, file|uri} references" }));
+    m.insert("workflows".to_string(), json!({ "type": "array", "items": { "$ref": "#/$defs/WorkflowRef" }, "description": "inline workflow definitions, or {name, file|uri|url} / {name, dir} references" }));
     m.insert("limits".to_string(), json!({ "type": "object", "additionalProperties": false, "properties": {
                 "max_runs": { "type": "integer", "minimum": 1 },
                 "run": { "type": "object", "additionalProperties": false, "properties": {

@@ -1,7 +1,8 @@
 # agent workspace.
 #
-# `crates/agentd` is the runtime — a single binary that is CLI, daemon, and
-# subagent re-exec in one. `crates/agentd-conformance` is the black-box
+# `crates/agentd` is the engine library (`agentd-core`) and `crates/agentd-cli`
+# is the thin binary shell over it — one `agentd` binary that is CLI, daemon,
+# and subagent re-exec in one. `crates/agentd-conformance` is the black-box
 # conformance suite: it drives the real binary (MCP client/server, supervisor,
 # the ReAct loop) and asserts each contract, never linking the agent library.
 [workspace]

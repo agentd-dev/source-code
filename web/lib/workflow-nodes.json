@@ -4,9 +4,11 @@
     "fields": [
       "command",
       "roles",
-      "inputs"
+      "inputs",
+      "schema",
+      "into"
     ],
-    "implemented": false,
+    "implemented": true,
     "kind": "a2a",
     "required": [],
     "start": true
@@ -16,14 +18,18 @@
     "fields": [
       "peer",
       "objective",
+      "command",
+      "args",
       "output_contract",
-      "timeout"
+      "timeout",
+      "idempotency",
+      "breaker",
+      "rate"
     ],
     "implemented": true,
     "kind": "a2a.delegate",
     "required": [
-      "peer",
-      "objective"
+      "peer"
     ],
     "start": false
   },
@@ -32,9 +38,15 @@
     "fields": [
       "to",
       "parts",
-      "context"
+      "command",
+      "args",
+      "context",
+      "timeout",
+      "idempotency",
+      "breaker",
+      "rate"
     ],
-    "implemented": false,
+    "implemented": true,
     "kind": "a2a.send",
     "required": [
       "to"
@@ -47,7 +59,7 @@
       "conversation",
       "timeout"
     ],
-    "implemented": false,
+    "implemented": true,
     "kind": "a2a.wait",
     "required": [],
     "start": false
@@ -63,7 +75,8 @@
       "limits",
       "context",
       "skills",
-      "system"
+      "system",
+      "model"
     ],
     "implemented": true,
     "kind": "agent",
@@ -191,7 +204,8 @@
       "input",
       "classes",
       "prompt",
-      "skills"
+      "skills",
+      "model"
     ],
     "implemented": true,
     "kind": "classify",
@@ -200,6 +214,26 @@
       "classes"
     ],
     "start": false
+  },
+  "correlate": {
+    "category": "trigger",
+    "fields": [
+      "stream",
+      "on",
+      "by",
+      "window",
+      "on_incomplete",
+      "filter",
+      "max_pending",
+      "inputs"
+    ],
+    "implemented": true,
+    "kind": "correlate",
+    "required": [
+      "stream",
+      "on"
+    ],
+    "start": true
   },
   "dedupe": {
     "category": "data",
@@ -220,7 +254,12 @@
       "note",
       "audit",
       "metric",
-      "value"
+      "value",
+      "stream",
+      "subject",
+      "data",
+      "correlation",
+      "forward"
     ],
     "implemented": true,
     "kind": "emit",
@@ -247,7 +286,8 @@
       "input",
       "output_schema",
       "prompt",
-      "skills"
+      "skills",
+      "model"
     ],
     "implemented": true,
     "kind": "extract",
@@ -325,7 +365,10 @@
       "timeout",
       "expect",
       "allow_private",
-      "sign"
+      "sign",
+      "idempotency",
+      "breaker",
+      "rate"
     ],
     "implemented": true,
     "kind": "http",
@@ -387,7 +430,8 @@
       "input",
       "rubric",
       "prompt",
-      "skills"
+      "skills",
+      "model"
     ],
     "implemented": true,
     "kind": "judge",
@@ -486,7 +530,10 @@
     "fields": [
       "server",
       "tool",
-      "args"
+      "args",
+      "idempotency",
+      "breaker",
+      "rate"
     ],
     "implemented": true,
     "kind": "mcp.tool",
@@ -531,6 +578,32 @@
     "required": [],
     "start": false
   },
+  "memory.pop": {
+    "category": "io",
+    "fields": [
+      "key"
+    ],
+    "implemented": true,
+    "kind": "memory.pop",
+    "required": [
+      "key"
+    ],
+    "start": false
+  },
+  "memory.push": {
+    "category": "io",
+    "fields": [
+      "key",
+      "value"
+    ],
+    "implemented": true,
+    "kind": "memory.push",
+    "required": [
+      "key",
+      "value"
+    ],
+    "start": false
+  },
   "memory.set": {
     "category": "io",
     "fields": [
@@ -543,6 +616,35 @@
     "required": [
       "key",
       "value"
+    ],
+    "start": false
+  },
+  "memory.shift": {
+    "category": "io",
+    "fields": [
+      "key"
+    ],
+    "implemented": true,
+    "kind": "memory.shift",
+    "required": [
+      "key"
+    ],
+    "start": false
+  },
+  "message": {
+    "category": "orchestration",
+    "fields": [
+      "to",
+      "text",
+      "parts",
+      "wait",
+      "timeout",
+      "on_timeout"
+    ],
+    "implemented": true,
+    "kind": "message",
+    "required": [
+      "to"
     ],
     "start": false
   },
@@ -628,7 +730,8 @@
       "input",
       "choices",
       "prompt",
-      "skills"
+      "skills",
+      "model"
     ],
     "implemented": true,
     "kind": "route",
@@ -723,25 +826,44 @@
     ],
     "start": false
   },
+  "stream": {
+    "category": "trigger",
+    "fields": [
+      "stream",
+      "subject",
+      "filter",
+      "from",
+      "rate",
+      "batch",
+      "inputs"
+    ],
+    "implemented": true,
+    "kind": "stream",
+    "required": [
+      "stream"
+    ],
+    "start": true
+  },
   "subagent": {
     "category": "orchestration",
     "fields": [
       "instruction",
+      "template",
+      "params",
       "mode",
-      "workflow",
       "tools",
       "servers",
       "limits",
+      "priority",
       "context",
       "output_contract",
       "output_schema",
-      "skills"
+      "skills",
+      "durable"
     ],
     "implemented": true,
     "kind": "subagent",
-    "required": [
-      "instruction"
-    ],
+    "required": [],
     "start": false
   },
   "subgraph": {
@@ -764,10 +886,9 @@
       "debounce_ms",
       "coalesce",
       "filter",
-      "claim",
-      "shard",
       "deliver",
       "on_no_listener",
+      "window",
       "inputs"
     ],
     "implemented": true,
@@ -784,7 +905,8 @@
       "input",
       "length",
       "prompt",
-      "skills"
+      "skills",
+      "model"
     ],
     "implemented": true,
     "kind": "summarize",
@@ -798,7 +920,8 @@
     "fields": [
       "on",
       "cases",
-      "default"
+      "default",
+      "on_no_match"
     ],
     "implemented": true,
     "kind": "switch",
@@ -828,7 +951,8 @@
       "check",
       "retries",
       "skills",
-      "system"
+      "system",
+      "model"
     ],
     "implemented": true,
     "kind": "think",
@@ -890,7 +1014,11 @@
       "subagent",
       "conversation",
       "webhook",
-      "timeout"
+      "stream",
+      "subject",
+      "match",
+      "timeout",
+      "on_timeout"
     ],
     "implemented": true,
     "kind": "wait",
@@ -907,10 +1035,13 @@
       "auth",
       "parallelism",
       "on_overflow",
+      "rate",
       "idempotency",
       "respond",
       "filter",
-      "inputs"
+      "inputs",
+      "signal",
+      "into"
     ],
     "implemented": true,
     "kind": "webhook",

@@ -18,7 +18,7 @@ the LLM request/response. Do not conflate the two.
 > of endpoints for failover (see
 > [Resilience](#resilience-multi-endpoint-failover--the-circuit-breaker)), and
 > that list and the model are **hot-swappable** without a restart (see
-> [Runtime hot-swap](#runtime-hot-swap-model-swap)). The single-endpoint
+> [Runtime hot-swap](#runtime-hot-swap---model-swap)). The single-endpoint
 > behaviour described first is exactly the one-element-list case.
 
 ## The one URI: HTTPS
@@ -254,8 +254,11 @@ Example of the redaction (the token is set but never echoed):
 The model used to be one instance-global string. Choosing a cheap model for a
 classify step and a frontier one for a judgement call meant forking a subagent
 process purely to change it — `model` appeared in no node's field list, so
-writing it on a step was exit 2. The breaker was per *endpoint*, so a frontier
-and a cheap model behind one gateway shared one breaker and one spend pool.
+writing it on a step was exit 2. The breaker is per *endpoint* and is not
+operator-tunable — three consecutive failures open it, and the cooldown
+starts at 5s and doubles to a 60s cap — so a frontier and a cheap model
+behind one gateway still share one breaker; what a tier separates is the
+wire model and the context window, not the failure accounting.
 
 `intelligence.models` names each tier once:
 
@@ -265,9 +268,7 @@ services:
     kind: intelligence
     endpoint: https://api.example.com/v1
     auth: {kind: oauth2, issuer: "https://id.example.com", grant: client_credentials}
-    tags: {"*": [sensitive]}            # the trifecta floor lives HERE, once
     rate: "60/1m"
-    breaker: {failures: 3, cooldown: 30s}
 
 intelligence:
   models:
@@ -294,11 +295,16 @@ high-volume steps, and a catalogue that could not reach them left the only
 lever on the whole instance.
 
 A tier is **not** a second service catalogue. `services:` already names
-endpoints, auth, tags, rate and breaker; restating those here would be a
+endpoints, auth and rate — and, on `kind: mcp` entries, the tool surface
+(`allow`, `exclude`, `tags`, `breaker`); restating those here would be a
 parallel mechanism. A tier points *at* a `kind: intelligence` service and may
-only **narrow** — it inherits that service's trifecta tags and can never
-declare its own floor, so "make it cheaper" cannot quietly become a different
-security decision.
+only **narrow**: its whole vocabulary is `model`, `service`, `window`,
+`fallback` and `pricing`, and `service` may only *name* a `kind: intelligence`
+entry that `services:` already declared and audited — a tier writes no
+endpoint, no `auth` and no `tags` of its own, so "make it cheaper" cannot
+quietly mint a new endpoint or credential. Trifecta tags are not part of
+this — `tags` is `kind: mcp` vocabulary, and writing it on a
+`kind: intelligence` entry is exit 2.
 
 A tier's declared `window` also replaces the compaction threshold's guess from
 the model *name*, which is a substring match and simply wrong for any provider
@@ -475,7 +481,7 @@ Every one of these is a `config_version: "1"` document path as well —
 `--<path>`; the flags above are the short spellings. Durations accept `ms`, `s`,
 `m`, `h`, or a bare integer (seconds). The endpoint list and `model` are
 **reloadable** (see [Configuration](configuration.md) and the
-[hot-swap](#runtime-hot-swap-model-swap) section); a token in a file must be a
+[hot-swap](#runtime-hot-swap---model-swap) section); a token in a file must be a
 `{{secret:…}}` reference.
 
 ---

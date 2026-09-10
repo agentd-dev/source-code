@@ -309,9 +309,12 @@ $ agentd --capabilities -c /etc/agentd/ops.yaml
 The three fields a controller branches on:
 
 - **`a2a`** — `null` when no listener is configured. Its presence is the
-  graceful-degradation contract: `methods`, `command_ops` and `extensions` are
-  exactly what this instance serves — the same three lists the agent card
-  publishes — so a controller drives only what is declared.
+  graceful-degradation contract: `command_ops` and `extensions` are exactly what
+  this instance serves — the same two lists the agent card publishes, as its
+  skills and its declared extensions — so a controller drives only what is
+  declared. `methods` names the core JSON-RPC calls a controller drives; the
+  listener answers a few beyond it — the push-notification-config calls and
+  `GetExtendedAgentCard` — which [`a2a.md`](a2a.md) tabulates in full.
 - **`lifecycle.daemon`** — `true` when the instance is long-lived (a listener,
   or a workflow with a `loop` / `schedule` / `subscribe` / `signal` / `event`
   start node). A `false` here means a Job, not a Deployment.
@@ -323,9 +326,9 @@ structural: model name plus endpoint *count*. Principal matchers are described,
 never dumped: a `bearer_ref` renders as `***`.
 
 Not every feature is in the released binary. `a2a`, `metrics`, `cron`, `otel`,
-`hot-reload`, `config-watch`, `aauth`, `oauth` and `cel` ship in the published
-builds; `exec` is the one build-from-source opt-in. The manifest reflects the
-binary you actually have.
+`hot-reload`, `config-watch`, `aauth`, `oauth`, `cel`, `sign`, `oci` and
+`decrypt` ship in the published builds; `exec` is the one build-from-source
+opt-in. The manifest reflects the binary you actually have.
 
 ### 4.2 `--config-schema` and `--validate-config`
 
@@ -461,8 +464,8 @@ Two sinks, independently selectable:
 
 An A2A call's `action` is `a2a.<method>` — and `a2a.<method>:<op>` when the
 message carried a command DataPart — so `a2a.SendMessage:workflow.run` and
-`admin.drain` are both first-class, filterable audit actions. This is the answer to
-"why did the agent do that, and on whose authority?".
+`a2a.SendMessage:admin.drain` are both first-class, filterable audit actions.
+This is the answer to "why did the agent do that, and on whose authority?".
 
 ---
 

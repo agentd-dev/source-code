@@ -137,7 +137,7 @@ from exactly two places, and they compose:
 ### Route A — the `exec` runner (local, guarded)
 
 The pragmatic local choice, and what the config above uses. Every call is
-fenced (details in [security.md §11](security.md)):
+fenced (details in [The exec runner](security.md#the-exec-runner)):
 
 - **argv, never a shell** — no `sh -c`, so no globbing, `$(…)`, pipes, or
   command injection. Want a shell? Allow-list `bash` and call it explicitly:
@@ -224,10 +224,12 @@ What happens when nobody is watching is a policy you set
 - **Blast radius.** `workdir` + allow-list are the real fence; the model's
   cooperation is not a control. Start read-only and widen as you trust it.
 - **Durability.** `store.kind: memory` keeps everything in the process — fine
-  to start, but the session dies with the daemon. Point `store` at an MCP or
-  HTTP store ([configuration.md](configuration.md)) and
-  conversations, tasks and workflow runs survive a restart — including a
-  pending approval.
+  to start, but the session dies with the daemon. Set `store.kind: file`, or
+  delete the `store:` block entirely — a long-lived instance defaults to the
+  local file store — and conversations, tasks and workflow runs survive a
+  restart, including a pending approval. Point `store` at an MCP or HTTP store
+  ([configuration.md](configuration.md)) when the box the agent runs on is not
+  the box you trust to keep the state.
 
 ---
 
@@ -250,7 +252,8 @@ What happens when nobody is watching is a policy you set
 - **Watch from a second surface.** Leave the TUI at your desk and open the web
   UI on another screen or your phone; both render the same session live. From
   another machine, `/pair` gives a rotating code — `agentd-tui --endpoint … --code 483921`
-  — so no bearer needs copying around ([interface.md §4.3](interface.md)).
+  — so no bearer needs copying around
+  ([Pairing-code login](interface.md#54-pairing-code-login-interfacepairing)).
 - **Delegate exploration.** "Check whether this pattern appears elsewhere" is a
   subagent's job: it runs in its own process with its own context and reports a
   distillate, so a wide search never floods the conversation you are reading.

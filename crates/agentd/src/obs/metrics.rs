@@ -8,11 +8,12 @@
 //! atomic registry backs an opt-in HTTP `/metrics` scrape surface (`obs::serve`).
 //!
 //! Counters are **per supervisor process**. The long-lived root daemon's surface
-//! reflects the runs it supervises — every one-shot, reaction, and scheduled fire
-//! flows through `supervise_once` — plus the tokens its *direct* children report
-//! up the control channel. Nested subagents keep their own (process-local)
-//! counters, still visible in their logs; cross-process metric rollup is a
-//! deliberate non-goal (the same process boundary the tree token ceiling draws).
+//! reflects the runs it supervises — every one-shot, reaction, and scheduled
+//! fire flows through the reactor's run-start path (`runtime::steps`) — plus
+//! the tokens its *direct* children report up the control channel. Nested
+//! subagents keep their own (process-local) counters, still visible in their
+//! logs; cross-process metric rollup is a deliberate non-goal (the same process
+//! boundary the tree token ceiling draws).
 //!
 //! ## The frozen `metrics_schema` contract
 //!
@@ -58,7 +59,8 @@ pub enum RunOutcome {
     Killed,
 }
 
-/// A supervised run began (`supervise_once` entry).
+/// A supervised run began (the reactor's run-start path,
+/// `runtime::steps::on_start_event`).
 pub fn record_run_started() {
     #[cfg(feature = "metrics")]
     imp::REGISTRY.runs_started.fetch_add(1, Ordering::Relaxed);

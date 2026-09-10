@@ -37,7 +37,7 @@ resolved from env / mounted files — never inline values.
 | Durable store | `store.kind: file\|mcp\|http\|memory\|none` (defaults: `file` for a long-lived instance, `none` for a one-shot), `store.file.path`, `store.mcp.server` | — |
 | **A2A listener** | `a2a.listen`, `a2a.tls`, `a2a.principals`, `a2a.bearer` | — |
 | **A2A peers** | `a2a.peers: [{name, endpoint}]` | — |
-| Workflows / triggers | `workflows: [{name, steps}]` (start nodes: once/loop/schedule/subscribe/signal/event/webhook/manual) | — |
+| Workflows / triggers | `workflows: [{name, steps}]` (start nodes: once/manual/loop/schedule/subscribe/stream/correlate/signal/event/a2a/webhook) | — |
 | Limits | `limits.max_runs`, `limits.run.{steps,tokens,deadline}`, `limits.subagents.depth` | `--max-steps` / `--deadline` |
 | Lifecycle | `lifecycle.run_until` (auto\|idle\|drained), `lifecycle.drain_timeout` | `--drain-timeout` |
 | Run ID | `lifecycle.run_id` (idempotency key) | `--run-id` |
@@ -55,8 +55,11 @@ machine-readable schema), `agentd --capabilities` (the effective surface).
 
 > **Scope.** The external channel is **A2A** (`a2a.listen`): one HTTPS listener
 > carries conversations, operator commands, and durable tasks. On its MCP side
-> agentd is a client only — it declares no client capabilities, so it services
-> no `roots`, `sampling`, `elicitation` or `tasks` requests from a server.
+> agentd is a client only — on the connections a turn's own child process holds
+> it declares one client capability, `elicitation` (a server's mid-call question
+> becomes a human `ask_human` gate); the supervisor's connections, the ones
+> behind `tool:` steps and resource subscriptions, declare none. On neither does
+> it service `roots`, `sampling` or `tasks` requests from a server.
 
 ---
 
@@ -246,7 +249,8 @@ each adds:
 | `decrypt` | Encrypted instruction envelopes — age v1 and JWE (`agent.instruction.decrypt`). |
 
 Build a narrower (or wider) surface with `--build-arg FEATURES=…`. Other features
-are `exec` (the guarded local-command tool, off at runtime too) and
+are `exec` (the guarded local-command tool, off at runtime too), `workflow`
+(gates nothing live — the durable DAG engine is unconditional) and
 `internal-mocks` (test scaffolding). `tls` is in the **default** set (it is the
 transport — every network surface is HTTPS); `a2a` rides it.
 `--no-default-features` drops TLS for the loopback-`http://`-to-a-sidecar
@@ -281,10 +285,13 @@ ENTRYPOINT ["/agentd"]
 
 > **Build-arg, not flag.** `FEATURES` selects what the **binary** can do; it is a
 > compile-time choice, not a runtime flag. Config for a feature the image was not
-> built with still *validates* — it simply has no effect at runtime (an
-> `a2a.listen` on a non-`a2a` build never binds; a `cron` field on a non-`cron`
-> build never fires). Pin the feature set for your image and keep config and
-> build in step.
+> built with is either inert or a loud refusal, never a silent downgrade: an
+> `a2a.listen` on a non-`a2a` build never binds and a `cron` field on a
+> non-`cron` build never fires, but anything that is a *control* — a CEL guard
+> in `security.policies[].match.args`, an `agent.instruction.trust` pin — fails
+> validation with exit `2` rather than passing quietly, because a control that
+> silently does nothing turns a deny into an allow. Pin the feature set for your
+> image and keep config and build in step.
 
 ### Durable state on a `scratch` image
 
@@ -407,7 +414,7 @@ against it (the constants live in
 | `5` | agentd ran correctly but the task **cannot** be done / refused | **non-retriable** |
 | `6` | a required MCP server failed to connect / handshake / died | retriable |
 | `7` | budget exceeded (steps / tokens / deadline / tree) | policy |
-| `124` | supervisor hard-kill backstop (a child that won't self-terminate; a self-detected `--deadline` is `7`) | — |
+| `124` | hard wall-clock deadline — a run past `limits.run.deadline` (mnemonic to `timeout(1)`) | policy |
 | `137` | killed by `SIGKILL` (OOM / kubelet) — OS-set | raise memory limit |
 | `143` | killed by `SIGTERM` **without** clean drain — OS-set | distinguishes ungraceful from `0` |
 
@@ -716,7 +723,9 @@ files:
 - `examples/k8s/job-once.yaml` — one-shot `Job` with `podFailurePolicy`
 - `examples/k8s/cronjob-schedule.yaml` — scheduled `CronJob`
 - `examples/k8s/deployment-reactive.yaml` — daemon `Deployment` with HTTP probes
-- `examples/docker/Dockerfile` — the static-on-scratch image
+- `Dockerfile` (repo root) — the static-on-scratch image of §3
+- `examples/docker/Dockerfile` — the distroless, `--no-default-features`
+  variant for the TLS-free loopback-sidecar posture
 - `examples/systemd-agentd.service` — daemon systemd unit
 
 ---

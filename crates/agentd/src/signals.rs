@@ -49,8 +49,8 @@ mod imp {
     // set when a drain begins so a load balancer stops sending new work while the
     // tree winds down, and clearable again. NOT a signal. It rides here rather
     // than in a feature-gated module so both the `/readyz` probe (obs::serve,
-    // `metrics`) and the served control surface (mcp::server, `a2a`) read one
-    // process-global truth without either feature depending on the other.
+    // `metrics`) and the A2A control surface (`a2a`) read one process-global
+    // truth without either feature depending on the other.
     // Distinct from `DRAINING`: lame-duck never exits.
     static LAME_DUCK: AtomicBool = AtomicBool::new(false);
     // Tree-wide pause state. Like `LAME_DUCK`, it rides here rather than in a

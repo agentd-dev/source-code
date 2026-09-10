@@ -178,7 +178,7 @@ reader before it reaches anyone.
 | `operator` | everything, unconditionally — including the `admin.*` ops |
 | `user` | `workflow.run` / `status` / `cancel`, `subagent.send` / `status`, `plan.get`, `ask_human`, `conversation.get`, `run.get` |
 | `agent` | `workflow.run`, `workflow.status` |
-| `anonymous` | nothing — denied at every layer, and an explicit `grants: ["*"]` does not rescue it |
+| `anonymous` | nothing beyond public discovery (`GetAgentCard`) and the pairing handshake (`Pair`, when `interface.pairing` is on) — denied at every other layer, and an explicit `grants: ["*"]` does not rescue it |
 
 Principals are matched **first-match-wins**, in the order written. agentd does
 not rank rules by specificity — so the most specific rule wins only if you put

@@ -1401,7 +1401,8 @@ pub fn capabilities(loaded: &Loaded) -> Value {
         },
         // The instruction document as an agent: what the trust ladder granted,
         // and every extended-family block that loaded (kind → count). Present
-        // only when the instruction is a dialect-2 document that declared any.
+        // only when the instruction is an Instruction Document (`instruction/1`)
+        // that declared any.
         "document": (!s.agent.document_capabilities.is_empty()
             || !s.agent.document_declarations.is_empty())
             .then(|| json!({

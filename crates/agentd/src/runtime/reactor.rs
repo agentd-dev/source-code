@@ -325,8 +325,8 @@ pub struct Runtime {
     pub(crate) job_shape: bool,
     pub(crate) exit: Option<i32>,
     pub(crate) draining: bool,
-    /// Operator-held (a2a.pause): intake continues; no new turns dispatch and
-    /// no steps schedule until a2a.resume. Reversible, unlike drain.
+    /// Operator-held (admin.pause): intake continues; no new turns dispatch and
+    /// no steps schedule until admin.resume. Reversible, unlike drain.
     pub(crate) paused: bool,
     pub(crate) drain_started: Option<Instant>,
     pub(crate) drain_reason: String,

@@ -12,23 +12,34 @@ export function validId(s) {
   return /^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$/.test(s || "");
 }
 
-/** Cross-cutting fields every step may carry, whatever its kind. */
+/**
+ * Cross-cutting fields every step may carry, whatever its kind — model.rs
+ * `COMMON_FIELDS`, copied name for name. Field checking is the union of this
+ * set and the kind's own list, so a name in neither is refused, and any
+ * divergence here breaks the promise above in both directions: drop a name the
+ * runtime accepts (`idempotent`, `cache`, `budget`, `skills`, `otel`) and the
+ * editor flags a graph the daemon loads; add one it does not (`if`, `foreach`,
+ * `label`, or `concurrency`, which is a workflow-level key rather than a step
+ * key) and the editor green-lights a graph `--validate-config` exits 2 on.
+ * `writes` and `mode` are absent because both are per-kind fields — `writes` on
+ * `assign`/`transform`, `mode` on those two plus `workflow`/`subagent` — which the
+ * union already allows there.
+ */
 const COMMON = new Set([
   "kind",
   "depends_on",
   "when",
-  "if",
-  "on_error",
   "retry",
   "timeout",
-  "foreach",
-  "concurrency",
-  "description",
-  "label",
+  "on_error",
+  "idempotent",
   "on_replay",
   "output_schema",
-  "writes",
-  "mode",
+  "cache",
+  "budget",
+  "skills",
+  "otel",
+  "description",
 ]);
 
 /**
@@ -159,7 +170,7 @@ export function validateWorkflow(wf) {
   }
 
   if (!starts.length) {
-    err("a workflow needs a start node (once, schedule, loop, subscribe, signal, event, a2a, manual)");
+    err("a workflow needs a start node (once, manual, loop, schedule, subscribe, stream, correlate, signal, event, a2a, webhook)");
   }
 
   // Acyclic

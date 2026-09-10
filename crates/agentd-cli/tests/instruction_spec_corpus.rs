@@ -224,7 +224,7 @@ fn the_vendored_schema_matches_upstream_when_present() {
         assert_eq!(
             ours[key], up_schema[key],
             "the vendored schema's {key:?} drifted from upstream — \
-             re-vendor crates/agentd/src/config/instruction.schema.json"
+             re-vendor crates/instruction/src/instruction.schema.json"
         );
     }
 }

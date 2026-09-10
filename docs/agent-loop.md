@@ -63,7 +63,7 @@ A blocked job keeps its place in the queue.
 ## Waking the agent
 
 For a long time an `a2a_message` had exactly two producers: the A2A listener
-and boot `--prompt`. That meant ten trigger kinds could start a *run*, and
+and boot `--prompt`. That meant eleven trigger kinds could start a *run*, and
 nothing inside the process could start a *turn* — the accumulated conversation,
 with its plan, its loaded skills and its compaction history, was addressable
 only from outside the daemon, over HTTP, by someone else.

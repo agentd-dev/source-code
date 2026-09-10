@@ -9,15 +9,16 @@ handshake.
 
 The configuration is one nested **`config_version: "1"`** document, with the
 sections `agent`, `goal`, `intelligence`, `mcp`, `tools`, `store`, `memory`,
-`context`, `knowledge`, `search`, `skills`, `workflows`, `webhooks`, `limits`,
-`lifecycle`, `a2a`, `interface`, `observability`, `security`. Every
-**path** in that schema is also an env var (`limits.max_runs` ⇒
-`AGENTD_LIMITS_MAX_RUNS`) and a flag (`--limits.max-runs`); a set of short
-spellings is wired up as **aliases** (`--instruction`, `--intelligence`,
-`--model`, `--mcp`, `--config`, `--log-level`, …). The authoritative machine-readable schema
-is **`agentd --config-schema`**; **`agentd --capabilities`** prints the
-effective configured surface; **`agentd --validate-config`** validates without
-side effects (exit `2` on error).
+`context`, `knowledge`, `search`, `skills`, `subagents`, `services`,
+`workflows`, `streams`, `webhooks`, `limits`, `lifecycle`, `a2a`, `interface`,
+`identity`, `observability`, `security`, `vars`. Every **path** in that schema
+is also an env var (`limits.max_runs` ⇒ `AGENTD_LIMITS_MAX_RUNS`) and a flag
+(`--limits.max-runs`); a set of short spellings is wired up as **aliases**
+(`--instruction`, `--intelligence`, `--model`, `--mcp`, `--config`,
+`--log-level`, …). The authoritative machine-readable schema is
+**`agentd --config-schema`**; **`agentd --capabilities`** prints the effective
+configured surface; **`agentd --validate-config`** validates without side
+effects (exit `2` on error).
 
 ---
 
@@ -182,14 +183,14 @@ a bad document only reproduces it).
 | every `mcp.servers[]` has a unique non-reserved name, a valid endpoint, and parseable tags | `mcp.servers[]: a server has an empty name` · `mcp.servers[]: duplicate server name 'fs'` · `mcp server 'a': mcp endpoint must be https://host[:port][/path] (got: ftp://x)` |
 | every server reference resolves (`store.mcp.server`, `knowledge.server`, `search.server`, `skills.sources[].server`, `tools.overrides[].server`) | `store.mcp.server 'state' is not a declared MCP server` |
 | the chosen `store.kind` carries its block | `store.kind is mcp but store.mcp is not set` · `store.http needs at least 'get' and 'put' operations` · `store.file.path is empty — set a directory, or omit the field to use $AGENTD_STATE_DIR / $XDG_STATE_HOME/agentd/state` |
-| a **long-lived** instance (an `a2a.listen`/`webhooks.listen`, a `goal`, or a `loop`/`schedule`/`subscribe`/`signal`/`event`/`stream`/`a2a`/`webhook` start node) has a durable `store` — naming no store at all **defaults** to `kind: file` (§12.3), so this fires only when a config asks for `kind: none` outright | `store.kind is none but the instance is long-lived … — configure a durable store (store.kind: file \| mcp \| http), or drop store.kind to get the local file store by default` |
-| every workflow is named, unique, and has exactly one of `file` \| `uri` \| `steps` | `workflows['w'] must have exactly one of file \| uri \| steps` |
+| a **long-lived** instance (an `a2a.listen`/`webhooks.listen`, a `goal`, or a `loop`/`schedule`/`subscribe`/`signal`/`event`/`stream`/`correlate`/`a2a`/`webhook` start node) has a durable `store` — naming no store at all **defaults** to `kind: file` (§12.3), so this fires only when a config asks for `kind: none` outright | `store.kind is none but the instance is long-lived … — configure a durable store (store.kind: file \| mcp \| http), or drop store.kind to get the local file store by default` |
+| every workflow is named, unique, and has exactly one of `file` \| `uri` \| `url` \| `steps` | `workflows['w'] must have exactly one of file \| uri \| url \| steps (dir is a separate entry shape)` |
 | every inline workflow parses under the workflow node registry — the *same* parse the runtime runs at startup | `workflow "w" step "s": unknown field "every" for kind "loop" (allowed: interval, delay, until, max_iterations, backoff, inputs)` |
 | an `a2a.listen: https://…` sets `a2a.tls.cert` + `a2a.tls.key`, and a non-loopback bind authenticates its clients | `a2a.listen is https:// but a2a.tls.cert / a2a.tls.key are not set` · `a2a.listen on a non-loopback address needs client auth: a2a.bearer, interface.pairing, or a2a.tls.client_ca (mTLS — then EVERY caller needs a client certificate, bearer-only and paired included)` |
 | `interface.enabled` has a listener to ride, and pairing has an interface | `interface.enabled requires a2a.listen (the interface is served on the A2A listener)` |
 | a `webhook` node has a listener | `a 'webhook' node (start or wait) is used but webhooks.listen is not set — configure webhooks.listen (https://host:port)` |
 | a non-loopback `webhooks.listen` authenticates every route it serves — symmetric with `a2a.listen`, since both are inbound listeners that trigger work | `webhooks.listen on a non-loopback address needs auth: set webhooks.default_auth (hmac, bearer or header), or give every 'webhook' node its own auth (HMAC recommended) — unauthenticated: w/h` |
-| every `a2a.peers[]` is uniquely named with an `http(s)://` endpoint; every `a2a.principals[]` match names a subject | `a2a peer 'p': endpoint must be http(s)://` · `a2a.principals[0]: match needs one of san \| sub \| bearer_ref \| aauth_agent \| any` |
+| every `a2a.peers[]` is uniquely named with an `http(s)://` endpoint; every `a2a.principals[]` match names a subject | `a2a peer 'p': endpoint must be http(s):// (or unix:///path for a co-located peer)` · `a2a.principals[0]: match needs one of san \| sub \| bearer_ref \| aauth_agent \| any` |
 | `lifecycle.exit_code_map` remaps only the policy codes | `lifecycle.exit_code_map: only the policy codes 3 and 7 are remappable (got key "5")` |
 | `lifecycle.watch_config` has a file to watch | `lifecycle.watch_config requires a config file (--config / AGENTD_CONFIG)` |
 | `observability.log_level` is a known level; an `audit.sink: store` has a store | `observability.audit.sink includes 'store' but store.kind is none` |
@@ -254,14 +255,12 @@ file spelling is never in doubt.
 | `--instruction.mcp <URI>` | `agent.instruction.mcp` | — | — | A resource a declared MCP server serves (read + subscribed). |
 | `--instruction.refresh <auto\|off\|DUR>` | `agent.instruction.refresh` | — | `auto` | How often to re-read it; `auto` picks the mechanism that fits the source. §5a.2. |
 | `--instruction.unavailable <POLICY>` | `agent.instruction.unavailable` | — | `auto` | What to do when the source stops answering: `auto`, `keep`, `freeze`, `drain`, `exit`. §5a.3. |
-
-| `--prompt <VALUE>` | `agent.prompt` | `PROMPT` | *(none)* | A one-shot task: with no workflows configured, the generated run executes this while `instruction` stays the standing policy. Classified exactly as `--instruction` is, so a path names the file. |
+| `--prompt <VALUE>` | `agent.prompt` | `PROMPT` | *(none)* | A one-shot task: delivered as a message into the agent's root context at startup — a root turn with the full tool surface, not a generated workflow step — while `instruction` stays the standing policy. Naming a prompt also suppresses the `--instruction` sugar workflow. Classified exactly as `--instruction` is, so a path names the file. |
 | `--prompt.text <TEXT>` | `agent.prompt.text` | — | — | The task itself, never read as a path or URI. |
 | `--prompt.file <PATH>` | `agent.prompt.file` | — | — | Read the task from a local file. |
 | `--prompt.dir <DIR>` | `agent.prompt.dir` | — | — | A folder of documents, combined into one task (`--prompt.glob` → `agent.prompt.dir.glob`, `--prompt.order` → `…dir.order`). |
 | `--prompt.url <URL>` | `agent.prompt.url` | — | — | An `https://` document, fetched at load. |
 | `--prompt.oci <REF>` | `agent.prompt.oci` | — | — | An OCI artifact (needs `--features oci`). |
-
 | `--intelligence <LIST>` | `intelligence.endpoints` | `INTELLIGENCE` | *(none)* | Ordered, comma-separated LLM endpoint **list** for failover. Each element is `https://host[:port][/path]` (or a loopback `http://` for a same-host dev gateway) — see §4. |
 | `-c`, `--config <PATH>` | — | `AGENT_CONFIG` | *(none)* | Load a declarative config file — YAML or JSON (§12). Repeatable; the `=` form works too. |
 
@@ -326,12 +325,15 @@ AAuth direct dial) still stays bounded. `0` (the default) is unbounded.
   `min(limits.run.tokens, intelligence.budget.lifetime_tokens)`; exhaustion is
   the ordinary `EXIT_BUDGET(7)` path (remappable with `--budget-exit-code`).
 - **A daemon** meters cumulative usage; once the cap is reached it **stops
-  accepting new work** and **drains cleanly** (exit `0` by default — the
-  preferred outcome — or `--budget-exit-code` to signal a policy stop). A
-  `budget.exhausted` event marks the transition.
+  accepting new work**, but the transition is a refusal rather than a drain or
+  an event: admission fails with `lifetime token budget exhausted (<scope>)`,
+  which drops a conversation turn (logged `budget.refused`) and fails the step
+  in a workflow with that reason. The process itself keeps running under its
+  ordinary `lifecycle.run_until` — nothing drains and nothing exits on
+  exhaustion, so the warning has to come from the gauge below.
 - **Observability**: the gauge `agent_budget_tokens_remaining` tracks the balance
-  continuously, and a one-shot `limit.threshold` event fires the first time usage
-  crosses 90% of the cap — the alerting/scaling hook, *before* exhaustion. On the
+  continuously — the alerting/scaling hook is a threshold rule on that gauge,
+  since the runtime fires nothing of its own as the cap approaches. On the
   fleet, the budget is per-member (each pod carries its own instance budget); an
   aggregate fleet cap remains a gateway concern.
 
@@ -987,12 +989,14 @@ long-lived **daemon**, and what wakes it:
 | `schedule` | on a clock | `cron: "0 2 * * *"` (needs `--features cron`), or `every: 1h`, or `at: "02:00Z"`; plus `tz`, `jitter`, `catch_up` |
 | `subscribe` | when an MCP **resource** updates | `server`, `uri` (both required), `debounce_ms`, `coalesce`, `filter`, `deliver`, `on_no_listener`, `window` |
 | `signal` | when a named signal arrives | `name` (required), `filter`, `deliver` |
-| `event` | on a runtime event | `on` (required — e.g. `workflow_finished`), `filter` |
+| `event` | on a runtime event | `on` (required — the event name as the runtime spells it, e.g. `workflow.finished`), `filter` |
 | `stream` | on each event of a declared stream | `stream` (required), `subject` (exact or `prefix.*`), `filter`, `from` (`new` \| `earliest`) |
+| `correlate` | when a **set** of related stream events has arrived — a join over events, not steps | `stream`, `on` (two or more subject patterns) and `window` (all required), `by`, `on_incomplete`, `filter`, `max_pending` |
 | `webhook` | on an inbound HTTP request | `path` (required), `methods`, `auth`, `parallelism`, `on_overflow`, `rate`, `idempotency`, `respond` |
 
-The **long-lived** kinds — `loop`, `schedule`, `subscribe`, `signal`, `event`,
-`stream`, `webhook` — make the instance a daemon under `run_until: auto`, and a daemon is
+The **long-lived** kinds — every start kind except `once` and `manual`: `loop`,
+`schedule`, `subscribe`, `signal`, `event`, `stream`, `correlate`, `a2a`,
+`webhook` — make the instance a daemon under `run_until: auto`, and a daemon is
 **durable**: with no `store` section it gets `kind: file` on the local filesystem
 (§12.3), and an explicit `kind: none` on a daemon is exit `2` (§2). A bare
 `a2a.listen` does the same without any start node: an inbound A2A message
@@ -1013,7 +1017,11 @@ workflows:
 
 Every workflow needs a start node and a `finish` step, and every non-start step
 declares `depends_on`; `--validate-config` runs the same workflow parse the
-runtime does, so a mistyped field is caught before the first side effect (§2).
+runtime does for **inline** `steps:`, so a mistyped field is caught before the
+first side effect (§2). A `file:`, `dir:` or `url:` reference carries no
+steps in the config document itself; it is resolved at startup, when the file is
+read or the URL fetched — so a typo inside a referenced definition (or a `dir:`
+that matches no file) surfaces there instead.
 
 The **job** shape needs no workflow at all: `agentd --instruction "…"
 --intelligence https://…` expands to a `once → agent → finish` workflow, runs one
@@ -1104,7 +1112,9 @@ agent:
     :::
 ```
 
-Four directives, fail-closed (an unknown name is exit `2` naming this set):
+Four directives. The machinery ones are fail-closed — an unknown `:::!name` is
+exit `2`, naming the line and the kinds this reader knows — while an unknown
+*bare* name is deliberately inert: it stays prose, delivered verbatim:
 
 - **`:::!workflow`** — the YAML body joins `workflows:` exactly as an inline
   entry: same `{{config.*}}` folding, validation, hashing, pinning, and
@@ -1114,7 +1124,7 @@ Four directives, fail-closed (an unknown name is exit `2` naming this set):
   `main` loop**: it declared its machinery explicitly. That holds however the
   document was named — inline, a file, a folder, an artifact — because the
   decision is made after the source resolves and its directives are extracted.
-- **`:::skill{name, description, when}`** — an **inline skill**: the body
+- **`:::!skill{name, description, when}`** — an **inline skill**: the body
   joins the skills catalogue with no MCP server involved, referenced as
   `@skill:<name>` like any discovered skill. Inline wins a name collision —
   the operator wrote it closer to this agent than any server did.
@@ -1336,13 +1346,15 @@ unit of work picks the new values up):
 **Restart-only paths** — a reload whose effective document differs under any of
 these is **refused** with `restart_required` (roll the pod instead):
 
-`config_version`, `agent.name`, `store.kind`, `store.prefix`, `store.mcp`,
-`store.http`, `store.file`, `lifecycle.run_until`, `lifecycle.drain_timeout`,
-`lifecycle.run_id`, `lifecycle.exit_code_map`, `lifecycle.watch_config`,
-`a2a.listen`, `a2a.tls`, `a2a.bearer`, `interface.enabled`,
-`interface.pairing`, `webhooks.listen`, `webhooks.tls`, `observability.otel`,
-`observability.metrics_addr`, `observability.health_file`,
-`observability.events_ring`, `observability.traceparent`, `security`.
+`config_version`, `agent.name`, `agent.document_capabilities`,
+`agent.instruction.trust` (§5a.3b), `store.kind`, `store.prefix`, `store.mcp`,
+`store.http`, `store.file`, `store.max_value_bytes`, `lifecycle.run_until`,
+`lifecycle.drain_timeout`, `lifecycle.run_id`, `lifecycle.exit_code_map`,
+`lifecycle.watch_config`, `a2a.listen`, `a2a.tls`, `a2a.bearer`,
+`interface.enabled`, `interface.pairing`, `webhooks.listen`, `webhooks.tls`,
+`observability.otel`, `observability.metrics_addr`,
+`observability.health_file`, `observability.events_ring`,
+`observability.traceparent`, `security`.
 
 The webhook and interface entries name the **socket**, not the rules: rebinding
 an address, swapping a TLS identity, arming the observation feed or the pairing
@@ -1395,7 +1407,7 @@ linter or a formatter picks up its dotfile:
 
 | Rung | Looked for | For |
 |---|---|---|
-| user | `$XDG_CONFIG_HOME/agentd/config.yml`, else `~/.config/agentd/config.yml` | defaults that follow the person, not the checkout |
+| user | `$XDG_CONFIG_HOME/agentd/config.yml` (also `config.yaml`), else `~/.config/agentd/config.yml` (also `config.yaml`) | defaults that follow the person, not the checkout |
 | project | `./agentd.yml` (also `agentd.yaml`, `.agentd.yml`, `.agentd.yaml`) | the config a repository checks in |
 | local | `./agentd.local.yml` (also `.yaml`) | one machine's overrides, expected to be git-ignored |
 
@@ -1446,14 +1458,16 @@ can be a directory you read rather than one long file:
 |---|---|---|
 | `workflows/` | `workflows:` | `*.yaml`, `*.yml`, `*.json` — one workflow document each |
 | `skills/` | `skills.dir` | `<name>.md`, or the Agent Skill form `<name>/SKILL.md` |
-| `subagents/` | `subagents.templates` | `*.yaml` — one template each, named by file stem |
-| `context/` | `context.templates` | `*.md` — the whole body is the template, named by stem |
+| `subagents/` | `subagents.templates` | `*.yaml`, `*.yml`, `*.json` — one template each, named by file stem |
+| `context/` | `context.templates` | `*.md`, `*.txt`, `*.hbs` — the whole body is the template, named by stem |
 
-They are looked for beside the **last** config file loaded (the most specific
-rung), or the working directory when none. Load order within a folder is
-filename order, so `10-`, `20-` prefixes work — though a workflow still needs a
-legal `name:` inside it, since names must match `[a-zA-Z_][a-zA-Z0-9_-]{0,63}`
-and cannot start with a digit.
+They are looked for beside **each** config file that was loaded, most specific
+first (the last file, then the one before it, and so on) — the first of those
+directories that has the folder wins; or the working directory when no config
+file was loaded at all. Load order within a folder is filename order, so `10-`,
+`20-` prefixes work — though a workflow still needs a legal `name:` inside it,
+since names must match `[a-zA-Z_][a-zA-Z0-9_-]{0,63}` and cannot start with a
+digit.
 
 Two rules make these **conventions** rather than declarations:
 
@@ -1466,9 +1480,9 @@ Two rules make these **conventions** rather than declarations:
 
 A `skills/` folder is the one that adds a capability rather than moving one:
 skills previously reached agentd only through an MCP server or an inline
-`:::skill` directive. A skill grants no tool — it is prose the model reads — so
+`:::!skill` directive. A skill grants no tool — it is prose the model reads — so
 a local file needs no server. Frontmatter is optional: with none, the file stem
-names the skill and its first paragraph describes it. Like `:::skill`, a local
+names the skill and its first paragraph describes it. Like `:::!skill`, a local
 file wins a name collision with a discovered one.
 
 ### 12.2 Several files — later overrides earlier
@@ -1489,7 +1503,7 @@ $ AGENT_CONFIG=/etc/agentd/base.yaml \
 # base.yaml < site.yaml < local-overrides.yml < env < flags
 ```
 
-```yaml
+```text
 # base.yaml                     # site.yaml
 intelligence:                   intelligence:
   model: default-model            model: site-model      # replaces
@@ -1520,8 +1534,8 @@ each path is equally reachable from env and flags (§1.1), so
 | `mcp` | `servers[]` — `{name, endpoint, headers{}, tags{glob:[…]}, ns, allow[], exclude[], timeout, auth{}, oauth{}, aauth}` — and `default_timeout`. `allow`/`exclude` gate the server's advertised tool names by glob (exclude beats allow; a gated-out tool never registers). |
 | `tools` | `disabled[]`, `overrides{}` (retarget a tool at a declared server, optionally rewriting `args`/`result`). |
 | `context` | `template` (the system-prompt template; unset = the built-in, printed by `agentd --context-template`), `templates{}` (named alternates a node picks with `context: {template: <name>}`), `summarize{prompt, model}` (the compaction guidance and a cheaper model to run it on), `compact_at`, `keep_last`, `model_window`, `plan{}`. |
-| `store` | `kind` (`file`\|`mcp`\|`http`\|`memory`\|`none`), the matching `file{path, min_free}` / `mcp{}` / `http{}` block, `prefix`, `timeout`, `on_error`, `durability{a2a, steps, work}`, `checkpoint{}`, `audit`, `retention{runs{keep_last, ttl}}`, `max_value_bytes`. Defaults per instance shape — see below. **`retention.runs`** bounds durable run records: a terminal run is dropped once it falls outside `keep_last` (newest first) or past `ttl`. Nothing in flight is ever dropped. The default is unbounded, so a long-lived instance keeps one record per run for its whole uptime — set one of these and steady-state size tracks concurrent runs rather than uptime. **`max_value_bytes`** refuses a durable write larger than N bytes. Set it when the store's READ limit is lower than its write limit — an MCP store reached through a broker often caps a tool RESULT well below its request body, so agentd can write a checkpoint it cannot read back and the failure lands on the next boot restore rather than on the write that caused it. Over the cap, the write is refused (`store.on_error` decides what happens next) with a message naming the key, the size and the cap; nothing is stored. Unbounded by default. `durability.work: ephemeral` flips the deployment's durability CLASS: runs and subagent records are memory-only unless a workflow says `durable: true` (docs/workflows.md §durability) — the fast path when all work is recomputable. |
-| `workflows` | Inline definitions, or `{name, file}` / `{name, uri}` / `{name, url, headers, timeout, allow_private}` references, or a `{dir, glob}` scan (§6). `security.workflows.immutable: true` locks the loaded set. |
+| `store` | `kind` (`file`\|`mcp`\|`http`\|`memory`\|`none`), the matching `file{path, min_free}` / `mcp{}` / `http{}` block, `prefix`, `timeout`, `on_error`, `durability{a2a, steps, work}`, `checkpoint{}`, `audit`, `retention{runs{keep_last, ttl}}`, `max_value_bytes`. Defaults per instance shape — see below. **`retention.runs`** bounds durable run records: a terminal run is dropped once it falls outside `keep_last` (newest first) or past `ttl`. Nothing in flight is ever dropped. The default is unbounded, so a long-lived instance keeps one record per run for its whole uptime — set one of these and steady-state size tracks concurrent runs rather than uptime. **`max_value_bytes`** refuses a durable write larger than N bytes. Set it when the store's READ limit is lower than its write limit — an MCP store reached through a broker often caps a tool RESULT well below its request body, so agentd can write a checkpoint it cannot read back and the failure lands on the next boot restore rather than on the write that caused it. Over the cap, the write is refused (`store.on_error` decides what happens next) with a message naming the key, the size and the cap; nothing is stored. Unbounded by default, and **restart-only** (§11): the cap rides the policy built once at startup, so a reload that changes it is refused rather than leaving writes refused at the old value an operator believes they raised. `durability.work: ephemeral` flips the deployment's durability CLASS: runs and subagent records are memory-only unless a workflow says `durable: true` (docs/workflows.md §durability) — the fast path when all work is recomputable. |
+| `workflows` | Inline definitions, or `{name, file}` / `{name, uri}` / `{name, url, headers, timeout, allow_private}` references, or a folder scan — `{dir: <path>}` or `{dir: {path, glob, order}}` (§6.1); `glob` and `order` live INSIDE `dir`, and a sibling `glob` is exit `2`. `security.workflows.immutable: true` locks the loaded set. |
 | `streams` | Declared event streams: `streams: {orders: {retention: {max_events: 10000, max_age: 7d}}}`. An `emit` step or `stream` start naming an undeclared stream is exit `2`. Events are durable in the store; retention trims from the head (`max_events` defaults to 10000). |
 | `goal` | The goal watchdog: `statement`, `check{via,condition,every}`, `stuck_after`, `on_achieved`, `on_stuck`. |
 | `limits` | `max_message_depth` (chained `message` deliveries; default 8), `max_runs`, `run{steps,tokens,deadline}`, `step_timeout`, `inline_max_bytes`, `subagents{depth,breadth,total,rate}`. |

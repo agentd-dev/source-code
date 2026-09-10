@@ -228,7 +228,7 @@ policy + history + the stateful env bridge; the user turn is a second model with
 the scenario and no tools, whose reply is the next user message. The env state
 persists across turns, and grading is outcome-based on the end-state.
 
-```json
+```jsonc
 {"id": "…", "policy": "You are a support agent. …the rules…",
  "instruction": "Hi, I need to cancel order o1.",          // the first user message
  "intelligence": "https://gw/v1", "model": "claude-opus-4-8",

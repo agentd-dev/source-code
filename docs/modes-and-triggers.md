@@ -6,8 +6,9 @@ decided by two independent things:
 
 - the process **lifecycle shape** — whether the instance is a one-shot *job* or a
   long-lived *daemon* (`lifecycle.run_until`); or
-- a workflow **start node** — a *trigger* that fires runs (`once`, `loop`,
-  `schedule`, `subscribe`, `signal`, `event`, `stream`, `manual`, `a2a`).
+- a workflow **start node** — a *trigger* that fires runs (`once`, `manual`,
+  `loop`, `schedule`, `subscribe`, `signal`, `event`, `stream`, `correlate`,
+  `a2a`, `webhook`).
 
 A one-shot job and a long-lived daemon share the same inner loop, the same
 durable state model, the same turn workers, and the same tool registry — they
@@ -28,7 +29,7 @@ lifecycle:
 |---|---|---|
 | `idle`    | **job**   | no runs, turns, or pending inbox — after `idle_grace` |
 | `drained` | **daemon** | never on its own; a SIGTERM drains in-flight work then exits 0 |
-| `auto` (default) | job **unless** it has an A2A listener (`a2a.listen`) or a long-lived start node (`loop`/`schedule`/`subscribe`/`signal`/`event`/`stream`/`a2a`) — then a daemon | as above, per the shape it resolves to |
+| `auto` (default) | job **unless** it has an A2A listener (`a2a.listen`) or a long-lived start node (every start kind except `once` and `manual`: `loop`/`schedule`/`subscribe`/`signal`/`event`/`stream`/`correlate`/`a2a`/`webhook`) — then a daemon | as above, per the shape it resolves to |
 
 ```mermaid
 flowchart LR
@@ -63,18 +64,23 @@ decides *when* a run fires. One workflow may have several.
 workflows:
   - name: nightly-report
     steps:
-      s:  { kind: schedule, at: "02:00Z" }        # ← the trigger
+      s:  { kind: schedule, cron: "0 2 * * *" }   # ← the trigger
       gen: { kind: agent, depends_on: [s], instruction: "Summarise yesterday." }
       f:  { kind: finish, depends_on: [gen] }
 ```
+
+`cron` is a 5-field UTC expression and needs the `cron` build feature (it is in
+the released binaries). `at:` is not a wall-clock time — it is a one-shot
+**delay**, `at: 8h`, that consumes itself when it fires; `every: 24h` paces a
+plain interval with no build feature at all.
 
 | start `kind` | fires a run… | key fields |
 |---|---|---|
 | `once`      | once, at startup (unless a live run was restored) | — |
 | `manual`    | only when explicitly triggered (`workflow.run`, or an A2A `workflow.run` command) | — |
-| `loop`      | repeatedly, on an interval, until a condition | `every`, `until`, `max_iterations`, `backoff` |
-| `schedule`  | on a clock | `cron: "0 2 * * *"`, or `every: 1h`, or `at: "02:00Z"` |
-| `subscribe` | when an MCP **resource** updates | `server`, `uri`, `debounce`, `coalesce`, `filter` |
+| `loop`      | repeatedly, on an interval, until a condition | `interval`, `delay`, `until`, `max_iterations`, `backoff` |
+| `schedule`  | on a clock | `cron: "0 2 * * *"`, or `every: 1h`, or `at: 30m` (a one-shot **delay**, not a wall-clock time) |
+| `subscribe` | when an MCP **resource** updates | `server`, `uri`, `debounce_ms`, `filter`, `window` |
 | `signal`    | when a named signal arrives | `name` |
 | `event`     | on a runtime event | `on: workflow.finished` \| `workflow.failed` \| `lifecycle.shutdown` |
 | `a2a`       | when an A2A message/command arrives for it | — |

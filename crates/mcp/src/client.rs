@@ -595,15 +595,15 @@ impl McpClient {
         self.read_resource_within(uri, self.timeout)
     }
 
-    /// `resources/read` for the reactor thread's notify-then-read
-    /// (`read_current`), which blocks on it and therefore wants a shorter bound
-    /// than the data path: a slow-but-alive resource server must not outrun the
-    /// liveness heartbeat. A timeout surfaces as [`McpError::Timeout`]; because
-    /// the reactor is level-triggered it treats a timed-out read exactly like
-    /// any read failure (act on empty / skip), so a transient slow read is
-    /// recovered on the next `updated` notification or re-read. The read is
-    /// served by the SDK connection, whose own request bound applies;
-    /// `timeout` is accepted for call-site symmetry.
+    /// `resources/read` for the reactor thread's notify-then-read, which blocks
+    /// on it and therefore wants a shorter bound than the data path: a
+    /// slow-but-alive resource server must not outrun the liveness heartbeat. A
+    /// timeout surfaces as [`McpError::Timeout`]; because the reactor is
+    /// level-triggered it treats a timed-out read exactly like any read failure
+    /// (act on empty / skip), so a transient slow read is recovered on the next
+    /// `updated` notification or re-read. The read is served by the SDK
+    /// connection, whose own request bound applies; `timeout` is accepted for
+    /// call-site symmetry.
     pub fn read_resource_within(
         &self,
         uri: &str,

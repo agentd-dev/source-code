@@ -7,9 +7,12 @@ description: Install, configure, run and operate agentd — the durable agent da
 
 agentd is a single static binary that runs an LLM agent as a **daemon**: state
 (conversations, tasks, workflow runs) lives in the process, not in a CLI. It
-links no unix/vsock/stdio transport and — by default — **executes nothing
-locally**; every capability is something the operator wires on. Terminal and
-browser UIs attach to it as thin clients and render the same live state.
+links no vsock or stdio transport and — by default — **executes nothing
+locally**; MCP servers and the model endpoint are HTTPS-only, so there is no
+local process to spawn, and every capability is something the operator wires
+on. (A2A is the one socket exception: a co-located peer, an instance child
+included, is dialled and served over a unix socket.) Terminal and browser UIs
+attach to it as thin clients and render the same live state.
 
 ## The rule that prevents most mistakes
 
@@ -125,7 +128,8 @@ service:billing` serves every consumer.
 `subagents.templates` (the model instantiates by name and fills declared,
 schema-checked `params` only; `allow_freeform: false` makes templates the
 only spawn path). A template whose instruction embeds machinery
-(`:::workflow`, `:::mcp`, …) spawns a full **instance child**: its own
+(`:::!workflow`, `:::!mcp`, … — machinery kinds need the `!` sigil; a bare
+`:::workflow` is refused at parse) spawns a full **instance child**: its own
 workflows and store, an A2A peer over a unix socket, retired by
 `ttl`/`until`/`subagent.retire`.
 
@@ -180,8 +184,8 @@ The exit code *is* the terminal status — branch on it, don't parse stdout:
 | 4 | intelligence unreachable / auth failed | endpoint URL, token reference resolving |
 | 5 | refused | preflight/policy — read the reason on stderr |
 | 6 | a required MCP server is down | that server's health; `required: false` to soften |
-| 7 | budget hit (steps/tokens/deadline) | `limits.run`, `intelligence.budget` |
-| 124 | supervisor hard-kill backstop | a child that would not self-terminate |
+| 7 | budget hit (steps or tokens) | `limits.run`, `intelligence.budget` |
+| 124 | hard wall-clock deadline (mnemonic to `timeout(1)`) | `limits.run.deadline` — the run outlived it |
 
 stdout carries the result; **stderr carries JSON-lines telemetry**, one event
 per line, trace-correlated. Filter it rather than reading it raw:

@@ -171,9 +171,10 @@ fn empty_address_list_is_an_error_not_a_panic() {
 
 #[test]
 fn allow_private_still_reaches_a_loopback_listener() {
-    // The operator escape hatch (`security.egress.allow_private`) has to keep
-    // dialling private targets, and this is also the proof that `connect_addrs`
-    // really opens a socket rather than always erroring.
+    // The operator escape hatch (`a2a.push.allow_private`, or a node's own
+    // `allow_private: true`) has to keep dialling private targets, and this is
+    // also the proof that `connect_addrs` really opens a socket rather than
+    // always erroring.
     let (listener, addr) = honeypot();
     let stream = connect_addrs("localhost", &[addr], T, true).expect("escape hatch must connect");
     assert_eq!(stream.peer_addr().expect("peer addr"), addr);

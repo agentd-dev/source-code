@@ -2,16 +2,17 @@
 //! The **A2A transport binding**: the HTTPS listener that turns A2A requests
 //! into runtime work, and the durable-task lifecycle behind it.
 //!
-//! Two halves meet here. The **transport** ([`A2aAuth`], [`A2aHandler`]) runs
-//! on the framework's per-connection threads: it resolves the caller to a
-//! [`Principal`], enforces the authorization matrix, and posts each request to
-//! the single-writer loop as [`Event::A2a`], blocking on a per-request oneshot.
-//! The **binding** (`impl Runtime`) runs on the loop: it creates/advances
-//! durable [`Task`]s, routes natural-language messages to conversation turns
-//! and command DataParts to the registry, and answers `GetTask`/`ListTasks`/
-//! `CancelTask` and the operator admin family. Reads that must not stall the
-//! loop — a blocking `SendMessage`, a stream — are served by the transport
-//! thread polling a **shared task-snapshot map** the loop keeps current.
+//! Two halves meet here. The **transport** ([`A2aBridge`] plus `a2a::serve`'s
+//! `Listener` and its `Auth`) runs on the framework's per-connection threads:
+//! it resolves the caller to a [`Principal`], enforces the authorization
+//! matrix, and posts each request to the single-writer loop as [`Event::A2a`],
+//! blocking on a per-request oneshot. The **binding** (`impl Runtime`) runs on
+//! the loop: it creates/advances durable [`Task`]s, routes natural-language
+//! messages to conversation turns and command DataParts to the registry, and
+//! answers `GetTask`/`ListTasks`/`CancelTask` and the operator admin family.
+//! Reads that must not stall the loop — a blocking `SendMessage`, a stream —
+//! are served by the transport thread polling a **shared task-snapshot map**
+//! the loop keeps current.
 //!
 //! Identity note: `PeerOrigin` carries only two values, so the caller's full
 //! evidence — the presented bearer AND the verified mTLS leaf identity, subject
@@ -2183,8 +2184,9 @@ impl Runtime {
             .collect()
     }
 
-    /// The A2A agent card (served over `GetAgentCard`; the framework is
-    /// POST-only, so there is no `/.well-known` GET path).
+    /// The A2A agent card: served over `GetAgentCard`, and unauthenticated on
+    /// GET at `/.well-known/agent-card.json` and `/.well-known/agent.json` —
+    /// discovery is public by both of its conventional paths.
     fn a2a_agent_card(&self) -> Value {
         let mut skills: Vec<Value> = self
             .workflows

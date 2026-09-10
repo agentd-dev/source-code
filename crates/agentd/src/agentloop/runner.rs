@@ -1075,8 +1075,10 @@ mod tests {
     // a zero here silently zeroes the whole chain. These tests drive the *real*
     // loop against the built-in mock LLM and assert the returned `Usage` carries
     // the model's reported tokens. The consumer half is covered by the
-    // `obs::metrics` `record_tokens` tests, and end to end by the reactive
-    // `/metrics` scrape in `reactive_e2e`.
+    // `obs::metrics` `record_tokens` tests. In production that function has one
+    // call site — the reactor's usage rollup on `AgentMsg::Usage`
+    // (`runtime::reactor`) — so the producer proven here is the only thing that
+    // ever feeds it.
     #[cfg(unix)]
     mod usage_producer {
         use super::*;

@@ -9,10 +9,11 @@ deferred.
 
 > **Naming model.** The product/binary/image is **`agentd`**, and it now
 > **emits the neutral ACC tokens only** — `agent://` resources, `agent_` metrics,
-> `agent_version`, `agent/*` `_meta`, and `AGENT_*` env (documented). The legacy
-> branded spellings are **still accepted on input** (graceful) but never emitted.
-> The image is `ghcr.io/agentd-dev/agentd`. The golden fixtures were re-captured from
-> the `agentd 1.0.0` binary (`agent_version: "1.0.0"`); the agentctl fixture tests moved in lockstep. Where this
+> the unbranded manifest `version`, `agent/*` `_meta`, and `AGENT_*` env
+> (documented). The legacy branded spellings are **still accepted on input**
+> (graceful) but never emitted. The image is `ghcr.io/agentd-dev/agentd`. The
+> golden fixtures were re-captured from the `agentd 1.3.1` binary
+> (`version: "1.3.1"`); the agentctl fixture tests moved in lockstep. Where this
 > document still cites a branded form below, read it as the legacy input alias.
 
 - Contract (consumed, **never edited by `agentd`**):
@@ -26,11 +27,11 @@ deferred.
 
 | Evidence | Result |
 |---|---|
-| `cargo test -p agentd` (full feature matrix) | **579 passed / 0 failed** |
-| `cargo test -p agentd` (default features) | **406 passed / 0 failed** |
-| Black-box conformance suite (`cargo run -p agentd-conformance`) | **18 passed / 0 failed** (the 2.0 families: supervisor, security, store, durability, tools, a2a-conversation, interface) |
+| `cargo test -p agentd-core --all-features` (full feature matrix) | **615 passed / 0 failed** (614 unit + 1 doc-test) |
+| `cargo test -p agentd-core` (default features) | **428 passed / 0 failed** (427 unit + 1 doc-test) |
+| Black-box conformance suite (`cargo run -p agentd-conformance`) | **21 passed / 0 failed** (the 2.0 families: supervisor, security, store, durability, tools, a2a-conversation, interface) |
 | ACC schema+behavior harness (drives the real binary; see *Validation report*) | **22 passed / 0 failed** |
-| Golden `--capabilities` fixtures vs `manifest.schema.json` (all 4, agentctl-owned) | **4 / 4 valid** |
+| Golden `--capabilities` fixtures vs `manifest.schema.json` (both, agentctl-owned) | **2 / 2 valid** |
 | agentctl `agent-contract-client` fixture tests | **6 / 6 pass** (cross-repo consistency) |
 | `cargo clippy --all-targets -D warnings` (default + full) | clean |
 
@@ -44,15 +45,25 @@ no credential reaches the manifest / config file / identity path.
 
 | Surface | ACC schema | Status | Notes |
 |---|---|---|---|
-| **Capabilities manifest** | `manifest.schema.json` | ✅ PASS | `json!`→`Value` (secret-safe); all required root keys; emits the neutral `agent_version` (the legacy branded `agentd_version` is not emitted) + `surfaces.events_schema` (when served). Sum types correct. Live `agent://capabilities` is parsed-equal to the one-shot. |
-| **Management profile** | `management-profile.json` | ✅ PASS | Frozen order `[drain, lame-duck, pause, resume, cancel]`; Management-gated; a non-Management caller of an operator **tool or resource** (read **and** subscribe) → `-32601`. `attach` not a tool; no `force`. `drain ≡ SIGTERM ≡ exit 0`; `lame-duck` readiness-only; `cancel{handle:"0"\|omitted}` = whole run. |
+| **Capabilities manifest** | `manifest.schema.json` | ✅ PASS | `json!`→`Value` (secret-safe); all required root keys; emits neutral `version` + `runtime` + `surfaces{exit_codes, config_schema}`. Sum types correct. Live `agent://capabilities` is parsed-equal to the one-shot. |
+| **Management profile** | `a2a.profile.json` (`admin_verbs`) | ✅ PASS | Frozen order `[drain, lame-duck, pause, resume, cancel]`; Management-gated; a non-Management caller of an operator **tool or resource** (read **and** subscribe) → `-32601`. `attach` not a tool; no `force`. `drain ≡ SIGTERM ≡ exit 0`; `lame-duck` readiness-only; `cancel{handle:"0"\|omitted}` = whole run. |
 | **Exit codes** | `exit-codes.table.json` | ✅ PASS | Table + `pod_failure_intent` exact; unknown → `retriable`; `EXIT_CODES="1.0"`. Clean drain = **0, not 143**. Only **3 & 7** remappable, via the new `--budget-exit-code`. |
-| **Run-outcome report** | `report.schema.json` | ✅ PASS | 12 required keys; `report_schema="1.0"`; `mode ∈ {once,loop,schedule}` (never `reactive`); 9-value closed `status`; `distillate_ref` `^(agent\|agentd)://`; `instance`/`trace_id` omitted-not-null; tokens never currency. A real once-run report validates. |
-| **Metrics** | `metrics.registry.json` | ✅ PASS | `metrics_schema="1.0"`; all **34** stable non-cgroup names present on a live scrape (`agent_memory_*` are cgroup-v2-conditional); **no histogram samples**; `agent_saturation` the only float; bounded labels only; `agent_pending_events` canonical (no `agent_reactive_backlog`). |
-| **Events** | `events.schema.json` | ✅ PASS | `agent://events` read body = `{events_schema:"1.0", oldest_seq, newest_seq, dropped, events[]}`; each line carries monotonic `seq` + the required tuple; `level`/`comp` closed, `event` open; lossy ring; `?after/level/event` parsing. Accepts the neutral `agent://` scheme. Validates live. |
+| **Run-outcome report** | *(retired anchor — behavioral)* | ✅ PASS | 12 required keys; `report_schema="1.0"`; `mode ∈ {once,loop,schedule}` (never `reactive`); 9-value closed `status`; `distillate_ref` `^(agent\|agentd)://`; `instance`/`trace_id` omitted-not-null; tokens never currency. A real once-run report validates. |
+| **Metrics** | `metrics.registry.json` | ✅ PASS | `metrics_schema="1.2"`; all **37** `live` non-cgroup names present on a live scrape (`agent_memory_*` are cgroup-v2-conditional); **no histogram samples**; `agent_saturation` the only float; bounded labels only; `agent_pending_events` canonical (no `agent_reactive_backlog`). |
+| **Events** | *(retired anchor — behavioral)* | ✅ PASS | `agent://events` read body = `{events_schema:"1.0", oldest_seq, newest_seq, dropped, events[]}`; each line carries monotonic `seq` + the required tuple; `level`/`comp` closed, `event` open; lossy ring; `?after/level/event` parsing. Accepts the neutral `agent://` scheme. Validates live. |
 | **Config file** | `config.schema.json` | ✅ PASS | The one **closed** surface — typo → exit 2. `--validate-config` 0/2 (good→0, typo→2, inline secret-shaped header→2). `--config-schema` emits a valid draft-2020-12 closed doc, `x-agentd-contract-version="1.0"`. Restart-only keys rejected on a live reload. |
-| **A2A** | `a2a.methods.json` | ✅ PASS | 6 live methods served, 5 gateway-owned → `-32601`; closed error set `-32001/-32601/-32602/-32603`; Management-gated; COMPLETED task = exactly one `<taskId>.distillate` artifact; framed streaming until `final`; `TASK_STATE_*` mapping; `surfaces.a2a` emitted. Live drive confirms the error codes. |
+| **Workflow dialect** | `workflow.schema.json` | ✅ PASS | `agentd --workflow-schema` emits the vendored dialect `$id` `https://agentd.dev/schema/workflow-3.json`; **73** kinds, **11** of them start nodes (`once`, `manual`, `loop`, `schedule`, `subscribe`, `stream`, `correlate`, `signal`, `event`, `a2a`, `webhook` — `KINDS`, `engine/model.rs:108`). The 1.3.1 capture pins 72 kinds; the dialect is additive within its major, so a consumer written against that capture still parses. |
+| **Reload/restart partition** | `restart-only.json` | ✅ PASS (superset) | `RESTART_ONLY_PATHS` (`config/v2/mod.rs:7212`) holds **28** paths — all **21** the capture pins, plus seven it predates (`interface.enabled`, `interface.pairing`, `store.max_value_bytes`, `agent.document_capabilities`, `agent.instruction.trust`, `webhooks.listen`, `webhooks.tls`). A diff touching one applies **nothing** and reports restart-required; `every_config_path_is_classified` proves the restart-only and reloadable partitions cover the whole surface. |
+| **Store profile** | `store.profile.json` | ✅ PASS | `store.kind: mcp` maps its four operations onto the profile verbatim — `state.put`/`state.get`/`state.list`/`state.delete`, reading `result.structuredContent.{ok, latest, state, keys}` (`store/mcp.rs::default_ops`). Every call carries `_meta["agent/idempotency_key"] = "<key>#<seq>"` and `agent/instance`; all four remappable via `store.mcp.{put,get,list,delete}`. Driven black-box by the conformance `store` family. |
+| **A2A** | `a2a.profile.json` | ✅ PASS | 11 spec methods + `SubscribeToEvents` served (plus the `GetAgentCard`/`Pair` bootstrap calls); no spec method is gateway-owned; closed error set `-32001/-32601/-32602/-32603`; Management-gated; COMPLETED task = exactly one `<taskId>.distillate` artifact; framed streaming until `final`; `TASK_STATE_*` mapping; `surfaces.a2a` emitted. Live drive confirms the error codes. |
 | **Env convention** | `env-convention.json` | ✅ PASS | Downward-API identity; **neutral `AGENT_*` is the documented form**, the legacy `AGENTD_*` still accepted on input (env, identity, per-endpoint tokens). Empty → unset; `run_id` always present; `AGENT_SHARD "K/N"` rejects `N==0`/`K>=N` → exit 2; credentials only on the `*_TOKEN[_FILE]` path. |
+
+`management-profile.json`, `report.schema.json`, `events.schema.json` and
+`a2a.methods.json` were **retired with ACC 1.x** (`contract/README.md`): the
+management surface folded into the A2A `admin_verbs`, `a2a.methods.json` became
+`a2a.profile.json`, and the report/event shapes are no longer contract anchors —
+those two rows are held behaviorally. Every one of the nine artifacts the
+contract vendors today (ACC SPEC §1) has a row above.
 
 ## Validation report (live harness — drives the real binary)
 
@@ -65,31 +76,43 @@ contract schema with a draft-2020-12 validator (or asserted behaviorally).
 [PASS] config:--validate-config (good)→0 — exit 0
 [PASS] config:typo'd key→exit 2          — exit 2
 [PASS] config:inline secret header→exit 2— exit 2
-[PASS] report:once-run vs schema         — valid vs report.schema.json
+[PASS] report:once-run shape             — behavioral (anchor retired with ACC 1.x)
 [PASS] report:mode≠reactive / distillate_ref scheme / exit_code
 [PASS] manifest:live agent://capabilities vs schema   — valid vs manifest.schema.json
 [PASS] manifest:neutral agent:// scheme accepted
 [PASS] manifest:live≈--capabilities (semantic, modulo run_id + live intel overlay)
-[PASS] events:agent://events read-body vs schema      — valid vs events.schema.json
+[PASS] events:agent://events read-body                — behavioral (anchor retired)
 [PASS] a2a:GetTask unknown id→-32001 / gateway method→-32601 / empty text→-32602
-[PASS] metrics:34 stable names present / no histogram samples / pending_events canonical
+[PASS] metrics:37 live names present / no histogram samples / pending_events canonical
 [PASS] exit:bad flag→2 / intel down→4 / --budget-exit-code leaves non-budget (4) untouched
   22/22 checks passed
 ```
 
 The black-box `agentd-conformance` suite independently drives the exit-code table
-under induced failures: `exit-0-on-success`, `exit-2-on-bad-flag`,
-`exit-2-on-validation`, `exit-4-on-intel-down`, `exit-6-on-required-mcp-down`,
-**`drain-0-on-sigterm`** (clean drain = 0, not 143), `spawn-rate-refused` — all pass.
+under induced failures: `supervisor/exit-0-on-success`,
+`supervisor/exit-2-on-bad-flag`, `supervisor/exit-2-on-retired-v1-flag`,
+`supervisor/exit-4-on-intel-down` — all pass.
 
 ### Reproduce
 
+The `acc_validate.py` that captured the transcript above is not vendored in this
+repo, so the probes it drives are spelled out against the real binary instead:
+
 ```sh
-cargo run -p agentd-conformance                 # 38 behavioral checks
-cargo build -p agentd --features "serve-mcp,a2a,events,metrics,cluster,internal-mocks"
-python3 acc_validate.py ./target/debug/agentd   # 22 live schema+behavior checks
-# fixtures vs schema:
-for f in /root/agentctl-dev/source-code/contract/fixtures/capabilities/*.json; do
+cargo run -p agentd-conformance                 # 21 behavioral checks
+cargo build --release -p agentd-cli             # or: -p agentd-cli --features "a2a,metrics,internal-mocks"
+C=/root/agentctl-dev/source-code/contract
+A=$PWD/target/release/agentd                   # absolute: one probe runs from the fixture dir
+
+$A --config-schema   | python3 -c 'import json,sys; d=json.load(sys.stdin); print("x-contract", d["x-agentd-contract-version"], "closed", not d["additionalProperties"])'
+$A --workflow-schema | python3 -c 'import json,sys; d=json.load(sys.stdin); print("dialect", d["$id"], len(d["$defs"]["kinds"]), "kinds")'
+(cd $C/fixtures/config && HOOK_BEARER=x $A -c full-featured.yml --validate-config); echo "good exit=$?"  # 0
+printf 'config_version: "1"\nagent:\n  nmae: x\n' > /tmp/typo.yaml
+$A -c /tmp/typo.yaml --validate-config; echo "typo exit=$?"                                             # 2
+$A --capabilities > /tmp/live.json
+
+# the live manifest and both golden fixtures vs manifest.schema.json:
+for f in /tmp/live.json $C/fixtures/capabilities/*.json; do
   python3 - "$f" <<'PY'
 import json,sys; from jsonschema import Draft202012Validator
 s=json.load(open("/root/agentctl-dev/source-code/contract/schemas/manifest.schema.json"))
@@ -102,21 +125,23 @@ done
 
 The golden corpus in `contract/fixtures/capabilities/` is **owned by the agentctl
 contract repo** and pinned by its `agent-contract-client` fixture tests
-(`tests/fixtures.rs`), which assert exact content — `default.json` `version ==
-"2.5.0"` and `surfaces.claim` as an object, plus the `full-features.json` surface
-values. They remain the **real `--capabilities` captures from agentd 1.0.0** and
-all four validate against the *current* `manifest.schema.json`.
+(`tests/fixtures.rs`), which assert exact content — every capture parses,
+identifies as runtime 1 and carries `version == "1.3.1"`, plus the bare
+daemonless shape of `agentd-1.3.1-default.json` and the listener, workflow and
+admin-verb values of `agentd-1.3.1-configured.json`. They remain the **real
+`--capabilities` captures from agentd 1.3.1** and both validate against the
+*current* `manifest.schema.json`.
 
-The current binary's `--capabilities` is a **superset** of the 2.5.0 capture
-(it adds the additive `agent_version`, `surfaces.events_schema`, and
-`intelligence.discovery`/`models`) and is validated **live** against
-`manifest.schema.json` — that live validation, plus the behavioral suites, is the
-authoritative conformance proof, not a static fixture. Both sum-type branches of
-every capturable key are covered: the off/null branches by `default` +
-`minimal-degraded`, the string/object branches by `full-features` + `reference-full`.
+The current binary's `--capabilities` is a **superset** of the 1.3.1 capture
+(it adds the additive `surfaces{exit_codes, config_schema}`, `webhooks` and
+`document`) and is validated **live** against `manifest.schema.json` — that live
+validation, plus the behavioral suites, is the authoritative conformance proof,
+not a static fixture. Both sum-type branches of every capturable key are
+covered: the off/null branches by `agentd-1.3.1-default.json`, the
+string/object branches by `agentd-1.3.1-configured.json`.
 
 > **Re-capture is a coordinated agentctl-side change, intentionally not forced
-> here.** Regenerating `default.json`/`full-features.json` from the v2.8.1 binary
+> here.** Regenerating the `default`/`configured` captures from the v2.8.1 binary
 > was attempted (deliverable #2) but reverted by the contract owner, because the
 > capture would move `version` 2.5.0→2.8.1 and `default.json`'s `claim` from object
 > to *omitted* (a bare release build has no `cluster` feature), breaking the pinned
@@ -153,8 +178,9 @@ now **also accepted on input** (cutover to neutral-primary is a GA decision):
   `AGENT_INTELLIGENCE_TOKEN[_N][_FILE]` accepted; value stays opaque (L5).
 - **Resource URIs** (`agentd_uri.rs`) — `agent://…` accepted on read alongside
   `agent://…` for every resource; still emits branded `agent://`.
-- **Manifest** (`capabilities.rs`) — emits neutral `agent_version` next to
-  `agentd_version`, plus additive `surfaces.events_schema` when the stream is served.
+- **Manifest** (`runtime/mod.rs::capabilities()`) — emits the neutral, unbranded
+  `version` alongside `runtime: "1"` and `surfaces{exit_codes, config_schema}`;
+  no branded `agentd_version` is emitted, and there is no `events_schema` key.
 
 ### Operator-surface gating uniformity (ACC SPEC L7)
 A non-`Management` caller of an operator **tool or resource** — `inventory`,
@@ -173,7 +199,7 @@ confirm the surface exists. `cancel{handle:"0"}`/omitted fans a whole-run cancel
 | Ask | Disposition |
 |---|---|
 | **CC/P6** — manifest/config as consumable schemas; `--config-schema`/`--validate-config` round-trip | **RESOLVED.** Draft-2020-12 closed `--config-schema`; `--validate-config` 0/2; drift tests pin it to the struct + `contract_version`. |
-| **P3b** — versioned golden corpus per feature-set | **PARTIAL (owner-pinned).** The four-fixture corpus exists and validates against the current schema, exercising both branches of every capturable sum-type. The corpus is agentctl-owned and currently pinned to the 2.5.0 captures by `fixtures.rs`; a broader per-feature matrix keyed by `(major.minor + digest)`, and re-capture to the current version, are coordinated agentctl-side tasks (see *Golden fixtures*). |
+| **P3b** — versioned golden corpus per feature-set | **PARTIAL (owner-pinned).** The two-fixture corpus exists and validates against the current schema, exercising both branches of every capturable sum-type. The corpus is agentctl-owned and currently pinned to the 2.5.0 captures by `fixtures.rs`; a broader per-feature matrix keyed by `(major.minor + digest)`, and re-capture to the current version, are coordinated agentctl-side tasks (see *Golden fixtures*). |
 | **P2** — freeze A2A wire strings + `surfaces.a2a` | **RESOLVED (reference binding).** `surfaces.a2a` emitted; reference PascalCase `a2a.*` served. Normative spelling stays open per the contract; a gateway translates. |
 | **P10** — reconcile autoscaling metric names | **RESOLVED (source wins).** Only `agent_pending_events` emitted; `agent_reactive_backlog` an alias-only, never on the scrape; `agent_tokens_per_sec`/`agent_intelligence_latency_ms` stay provisional/not-emitted. |
 | **P-pause** — pause/resume served | **RESOLVED.** Both ship (frozen order), Management-gated, reflected in `agent_paused`. |
@@ -216,10 +242,12 @@ the `agent_intel_all_down` stable gauge, code 124 `returned_by_agent:true`). age
 made **no** edit to any ACC schema in this pass; remaining disagreements are
 recorded here as asks rather than schema edits:
 
-- **C1 — `SPEC.md` §4.4 metric count is stale.** The prose says "46 records — 29
-  stable, 8 legacy, 9 provisional"; the registry JSON now has **51 records — 36
-  stable, 8 legacy, 7 provisional**. agentd emits a superset of the stable set; the
-  registry JSON, not the prose, is authoritative. Suggest updating the prose.
+- **C1 — metric-registry counts (the prose count is gone upstream).** The ask was
+  that `SPEC.md`'s prose count be reconciled with the registry JSON. ACC 2 dropped
+  the prose count entirely — §1 now just points at `metrics.registry.json`, which
+  holds **54 records — 39 `live`, 13 `reserved`, 2 `child_local`** (the
+  stable/legacy/provisional vocabulary is retired). Every `live` name is emitted by
+  `obs/metrics.rs`; the registry JSON, not the prose, stays authoritative.
 - **C2 — "ULID" wording for `run_id`** (note 3) is not schema-enforced and not met
   literally by the reference; suggest softening to "opaque stable id (ULID
   recommended)".

@@ -144,6 +144,11 @@ fn every_documented_copy_of_the_feature_set_is_current() {
         "Dockerfile",
         "docs/deployment.md",
         "docs/architecture.md",
+        // ci.yml writes the list twice — the matrix row and the step that
+        // builds the binary the image ships — and the second copy was a
+        // release behind, so the static-link gate compiled a narrower binary
+        // than the one it was gating.
+        ".github/workflows/ci.yml",
     ] {
         let text = std::fs::read_to_string(root.join(f)).unwrap();
         for (n, line) in text.lines().enumerate() {

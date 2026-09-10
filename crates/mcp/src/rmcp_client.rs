@@ -620,9 +620,11 @@ mod tests {
     }
 
     #[test]
-    fn we_ask_for_the_newest_revision_we_know_not_rmcps_conservative_default() {
-        // rmcp's ProtocolVersion::LATEST is the older stable; asking for it
-        // would silently give up the stateless dialect this crate supports.
+    fn the_stateless_revision_exists_but_the_sdk_still_pins_the_older_stable() {
+        // The backend deliberately asks for `ProtocolVersion::default()` —
+        // rmcp's `LATEST`, currently 2025-11-25. This only records that the
+        // newer stateless constant exists and still differs, so the day rmcp
+        // promotes it this test is the tripwire.
         let ours = ProtocolVersion::V_2026_07_28;
         assert_eq!(ours.to_string(), crate::version::LATEST_MODERN_VERSION);
         assert_ne!(ours.to_string(), ProtocolVersion::LATEST.to_string());

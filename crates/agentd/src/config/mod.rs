@@ -4,17 +4,20 @@
 //! Precedence, top wins: `built-in default < config FILE < env var < CLI flag`.
 //! Everything is env-settable (12-factor). The optional
 //! declarative file ([`file`] — YAML or JSON, `--config`/`AGENTD_CONFIG`)
-//! carries only verbose structural config (MCP-server inventory, declared
-//! subscriptions, A2A peers, limits, model/log knobs) and **never** secrets —
-//! those stay env/flag only. The whole config is validated **before any side
+//! carries the whole declarative agent — its instruction, its workflows, its
+//! MCP servers (`mcp.servers`), A2A peers (`a2a.peers`), store, context,
+//! lifecycle, limits and security policy — and **never** a literal secret:
+//! those arrive as `{{secret:…}}` / `{{secret-file:…}}` references, or stay
+//! env/flag only. The whole config is validated **before any side
 //! effect** — a bad config exits `2` in milliseconds, not after an LLM
 //! round-trip.
 //!
 //! Module layout: [`file`] (the config document: format detection, the typed
-//! `ConfigFile` shape, the JSON Schema), [`yaml`] (the hand-rolled YAML-subset
-//! reader), [`paths`] (schema-derived path bindings: `AGENTD_<PATH>` env names
-//! and `--<path>` flags for every config-file path), [`watch`] (the inotify
-//! reload trigger).
+//! `ConfigFile` shape, the JSON Schema), [`v2`] (the typed [`v2::Settings`], its
+//! JSON Schema, and the loader that merges file < env < flag), [`yaml`] (the
+//! hand-rolled YAML-subset reader), [`paths`] (schema-derived path bindings:
+//! `AGENTD_<PATH>` env names and `--<path>` flags for every config-file path),
+//! [`watch`] (the inotify reload trigger).
 
 #[cfg(feature = "sign")]
 pub mod attest; // §7 instruction attestation (JWS/Ed25519, resolution manifest)
@@ -140,10 +143,13 @@ impl SwapPolicy {
     }
 }
 
-/// Where `--serve-mcp` binds the served self-MCP. `Stdio` is the implicit
-/// default (no `--serve-mcp`). The sole transport is
-/// [`Http`](ServeTarget::Http) — `https://HOST:PORT` (TLS, the control plane) or
-/// `http://LOOPBACK:PORT` (plaintext, loopback-only dev/tests).
+/// Where a listener binds — the parsed form of a `listen` target. `a2a.listen`
+/// (spelled `--listen`, or the legacy `--serve-mcp` alias) is the main one;
+/// `webhooks.listen` parses through the same type. Two transports:
+/// [`Http`](ServeTarget::Http), `https://HOST:PORT` (TLS, the control plane) or
+/// `http://LOOPBACK:PORT` (plaintext, loopback-only dev/tests), and
+/// [`Unix`](ServeTarget::Unix), `unix:///PATH` for co-located peers — which the
+/// A2A listener accepts and the webhook surface, being external, refuses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServeTarget {
     /// Bind an HTTP(S) listener at `bind` (a `host:port` authority). `tls` is the

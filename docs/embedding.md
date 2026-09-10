@@ -77,8 +77,11 @@ Handlers are plain Rust (`Fn(&Value) -> Result<Value, String> + Send + Sync`),
 may run concurrently (loop + workflow lanes), and `Err(reason)` is the normal
 tool-error path — the model sees a failed call; a workflow step applies its
 `on_error` (`fail` | `continue` | `goto:<step>`) and any `retry`. Registration
-refuses duplicates and agentd's own internal names (`subagent.*`, `workflow.*`,
-…) — the orchestration surface is unshadowable.
+refuses duplicates and agentd's self/control primitive names (`subagent.spawn`,
+`schedule`, `subscribe`, `resource.read`, …); a code tool whose name collides
+with any *other* internal contract (`memory.set`, `subagent.run`,
+`workflow.create`, …) registers, then is dropped with a warning when the
+registry is built — either way the orchestration surface is unshadowable.
 
 Trust: a code tool is **your compiled code** — first-party like the rest of
 your binary, outside the `--mcp-tags` trifecta accounting. You own what it
@@ -190,7 +193,7 @@ and the `run_v2` entrypoint.
 ```toml
 [dependencies]
 # lib name is `agentd`, so code reads `use agentd::…`
-agentd = { package = "agentd-core", version = "2.0", features = ["a2a", "metrics"] }
+agentd = { package = "agentd-core", version = "1.14", features = ["a2a", "metrics"] }
 ```
 
 (The crates.io name `agentd` belongs to an unrelated project — hence the

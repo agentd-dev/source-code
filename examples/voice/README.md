@@ -15,9 +15,12 @@ That is not a limitation being worked around; it is the line that makes the rest
 of the design possible. Three properties of the runtime put it there:
 
 - The webhook body is parsed as JSON or else read as `String::from_utf8_lossy`
-  (`runtime/webhooks.rs:230`). Raw PCM does not survive that.
-- There is no base64 codec in the agentd crate at all — the only one is private
-  to `crates/mcp`.
+  (`runtime/webhooks.rs:305`). Raw PCM does not survive that.
+- There is no audio codec in the agentd crate at all. The base64 it does carry is
+  hand-rolled, for envelopes and credentials — encrypted-instruction detection
+  (`config::envelope`), AAuth and attestation signatures (`aauth::b64`), OAuth PKCE
+  (`auth::browser`), OCI pulls (`oci`), the age and JWE decrypt paths
+  (`config::decrypt`) — and not one of them turns bytes into sound.
 - The three-dependency default build means no DSP library is ever arriving.
 
 So the split is: **the edge owns sound, agentd owns everything after the

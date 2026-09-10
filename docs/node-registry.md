@@ -4,7 +4,7 @@ Every workflow node agentd implements, what it needs, and what it does. The
 tables are generated from the binary's own registry (`agentd --workflow-schema`),
 so the required-field columns are what the parser actually enforces.
 
-**72 kinds — 10 start nodes and 62 steps. All are implemented.** If this page and
+**73 kinds — 11 start nodes and 62 steps. All are implemented.** If this page and
 the binary ever disagree, the binary is right; regenerate from
 `agentd --workflow-schema`.
 
@@ -67,10 +67,10 @@ matches on.
 | `once` | — | `policy` `inputs` | Fires when armed at boot/restore, or on `workflow.run`. `policy: ensure` skips if a run is already live. |
 | `manual` | — | `inputs` | Fires only on `workflow.run` (a tool call or an A2A command). Nothing arms it. |
 | `loop` | — | `interval` `delay` `until` `max_iterations` `backoff` `inputs` | Fires again each time the previous run finishes. `interval`/`delay` pace it, `until` and `max_iterations` stop it, `backoff` slows it after failures. |
-| `schedule` | — | `cron` `every` `tz` `jitter` `catch_up` `at` `inputs` | Fires on a 5-field UTC cron or an `every` interval. `at` is one-shot and consumes itself. `catch_up` decides what a missed window does. |
-| `subscribe` | `server` `uri` | `debounce_ms` `coalesce` `filter` `deliver` `on_no_listener` `window` `inputs` | Fires when an MCP resource changes (notify-then-read). `debounce_ms`/`coalesce` collapse bursts; `filter` drops uninteresting reads; `window: {samples: N}` delivers the last N read values (`output.window`) — the trend, not just the reading. |
+| `schedule` | — | `cron` `every` `tz` `jitter` `catch_up` `at` `inputs` | Fires on a 5-field UTC cron or an `every` interval. `at` is one-shot and consumes itself. `tz`, `jitter` and `catch_up` parse but nothing reads them — a missed occurrence is always skipped, never replayed. |
+| `subscribe` | `server` `uri` | `debounce_ms` `coalesce` `filter` `deliver` `on_no_listener` `window` `inputs` | Fires when an MCP resource changes (notify-then-read). `debounce_ms` collapses bursts (the newest payload wins inside the window); `filter` drops uninteresting reads; `window: {samples: N}` delivers the last N read values (`output.window`) — the trend, not just the reading. `coalesce`, `deliver` and `on_no_listener` parse but nothing reads them. |
 | `signal` | `name` | `filter` `deliver` `inputs` | Fires on a named signal from another run, a tool, or an operator. |
-| `event` | `on` | `filter` `inputs` | Fires on an internal event — `workflow.finished|failed`, `subagent.finished`, `budget.exhausted`, `config.reloaded`, `restore.done`, `human.asked`, `human.answered`, `human.timeout`, `lifecycle.shutdown` (the deinit hook: the drain waits for its runs). Output is `{event, payload: {…}}` — read `…output.payload.*`; the CEL `filter` sees the inner payload. |
+| `event` | `on` | `filter` `inputs` | Fires on an internal event — `workflow.finished\|failed`, `subagent.finished`, `budget.exhausted`, `config.reloaded`, `restore.done`, `human.asked`, `human.answered`, `human.timeout`, `lifecycle.shutdown` (the deinit hook: the drain waits for its runs). Output is `{event, payload: {…}}` — read `…output.payload.*`; the CEL `filter` sees the inner payload. |
 | `stream` | `stream` | `subject` `filter` `from` `rate` `batch` `inputs` | Fires once per event on a declared stream — including events another workflow `emit`ted. `subject` matches exactly or by `prefix.*` glob; `from: earliest` replays the backlog into a consumer that did not exist when the events were published; the offset is durable, so a restart resumes where it left off, exactly once. A workflow never fires on its own emits; `rate: "<burst>/<per>"` paces consumption (events queue durably — `rate: "1/1d"` turns a stream into a worked-off daily queue). `batch: {size: 2..=1000, window?: <dur>}` makes one run per GROUP instead of per event — for anything that amortises, like a bulk write or one LLM call over a page — and the payload becomes `…output.events[]` / `…output.count` / `…output.full` (`full: false` means the window elapsed before the batch filled). `batch` and `rate` are mutually exclusive: both pace consumption and compose confusingly. Output is otherwise the event: `…output.subject`, `…output.data.*`, `…output.correlation`. |
 | `correlate` | `stream` `on` | `by` `window` `on_incomplete` `filter` `max_pending` `inputs` | Fires when a SET of events sharing one correlation value has arrived. `depends_on` joins steps; this joins events. `on` lists two or more subject patterns; `by` is a dot path into the event, defaulting to the envelope's own `correlation` (which `emit` sets). Half-collected sets live in durable start-state, so a restart resumes a join — which is why `window` is **required**: it bounds how long one is kept. `on_incomplete: fire_partial` fires the partial set when the window expires ("paid but never shipped" *is* the event); the default `discard` drops it. Output: `…output.events[]` in `on` order, `…output.correlation`, `…output.complete`, `…output.missing[]` — check `complete` before treating a partial firing as a finished join. `max_pending` (default 1000) caps the durable pending map; past it, new correlation values are refused and logged rather than growing without limit. |
 | `a2a` | — | `command` `roles` `schema` `into` `inputs` | Fires when a principal sends a message whose command matches. Declaring `command` REGISTERS it as an A2A command the listener accepts — the **built-in ops are reserved**, so a name like `status` or `admin.drain` is refused at validation rather than shadowing the operation it collides with; `schema` is the payload CONTRACT — a non-conforming command is refused at the listener, synchronously, naming the mismatch. `roles` narrows who may fire it. Output: `…output.args.*` (the typed payload), plus `parts`/`text`/`principal`. **`into: {stream, subject}`** appends the message to a stream instead of firing a run, after the principal and any `roles` filter have been applied — the peer-facing half of the same binding. |
@@ -89,28 +89,28 @@ matches on.
 | `join` | `handles` | `timeout` `min` `partials` | Awaits async `handles` (from `workflow {mode: async}` or `subagent`). `min` and `partials` decide what "enough" means. |
 | `subgraph` | `body` | — | An inline nested graph. Scopes ids, so the same step names can repeat in different subgraphs. |
 | `workflow` | `name` | `inputs` `mode` `start` `version` `cascade` | Starts another workflow as a child run. `mode: sync` blocks, `async` returns a handle for `join`, `detached` forgets it. `cascade` propagates cancellation. |
-| `wait` | `on` | `server` `uri` `condition` `signal` `run` `subagent` `conversation` `webhook` `stream` `subject` `match` `timeout` `on_timeout` | Suspends until `on` resolves: `resource | condition | signal | run | subagent | message | event | webhook`. Durable — a restart resumes the wait. `on_timeout: <step>` makes the deadline an EXPECTED branch: the named step runs (forced), the wait's dependents stay unfired, the run continues. A signal wait's output is `{signal, payload, from}`. `on: event` parks on a declared `stream`, anchored where the log stood when it armed: `subject` globs, and the CEL `match` sees `event`, `inputs` and `vars` together — which is how a run waits for the reply about *its own* order rather than the first one to arrive. There is no `from: earliest`: resolving on an event that predates the run would break at-least-once for everything downstream. Its output is the event. |
+| `wait` | `on` | `server` `uri` `condition` `signal` `run` `subagent` `conversation` `webhook` `stream` `subject` `match` `timeout` `on_timeout` | Suspends until `on` resolves: `resource \| condition \| signal \| run \| subagent \| message \| event \| webhook`. Durable — a restart resumes the wait. `on_timeout: <step>` makes the deadline an EXPECTED branch: the named step runs (forced), the wait's dependents stay unfired, the run continues. A signal wait's output is `{signal, payload, from}`. `on: event` parks on a declared `stream`, anchored where the log stood when it armed: `subject` globs, and the CEL `match` sees `event`, `inputs` and `vars` together — which is how a run waits for the reply about *its own* order rather than the first one to arrive. There is no `from: earliest`: resolving on an event that predates the run would break at-least-once for everything downstream. Its output is the event. |
 | `sleep` | `duration` | — | Suspends for `duration`. Durable: the timer survives a restart. |
 | `assert` | `condition` | `message` | Fails the run unless `condition` holds. A guard you want loud. |
 | `fail` | — | `message` `code` | Ends the run as failed with `message`/`code`. |
 | `noop` | — | — | Does nothing. A join point, a switch target, or a placeholder. |
 | `checkpoint` | — | `name` | Forces a durable checkpoint here rather than at the next natural boundary. |
-| `finish` | — | `status` `output` `reason` | Ends the run with `status` (`completed|failed|refused|cancelled`) and an optional `output`. |
+| `finish` | — | `status` `output` `reason` | Ends the run with `status` (`completed\|failed\|refused\|cancelled`) and an optional `output`. |
 
 ### Data shaping (deterministic, no model, no network)
 
 | Kind | Required | Other fields | What it does |
 |---|---|---|---|
-| `assign` | `value` | `writes` `mode` | Writes `value` into the run vars at `writes` (default: the step id). `mode: overwrite|append|merge`. |
+| `assign` | `value` | `writes` `mode` | Writes `value` into the run vars at `writes` (default: the step id). `mode: overwrite\|append\|merge\|union`. |
 | `transform` | `value` | `writes` `mode` | Identical to `assign`; the name reads better when the value is computed from other data. |
 | `map` | `over` `expr` | `as` | Applies `expr` to every element of `over`. `as` names the element (default `item`). Needs CEL. |
 | `filter` | `over` `expr` | `as` | Keeps elements of `over` whose `expr` is true. Needs CEL. |
 | `reduce` | `over` `expr` | `initial` `as` `acc` | Folds `over` with `expr` from `initial`; `acc` names the accumulator. Needs CEL. |
-| `sort` | `over` | `by` `order` | Orders `over`, optionally `by` a field and `order: asc|desc`. |
+| `sort` | `over` | `by` `order` | Orders `over`, optionally `by` a field and `order: asc\|desc`. |
 | `dedupe` | `over` | `by` | Removes duplicates from `over`, optionally `by` a key. |
 | `chunk` | `value` `size` | `by` `overlap` | Splits `value` into pieces of `size`, with optional `overlap`. |
 | `template` | — | `text` `value` | Renders `text` (or `value`) against the run data. The general-purpose string builder. |
-| `parse` | `text` | `format` | Parses `text` into data — `format: json|yaml|…`. |
+| `parse` | `text` | `format` | Parses `text` into data — `format: json\|yaml\|…`. |
 | `validate` | `value` `schema` | — | Checks `value` against a JSON `schema`; fails the step if it does not conform. |
 
 ### Durable state
@@ -141,7 +141,7 @@ matches on.
 | Kind | Required | Other fields | What it does |
 |---|---|---|---|
 | `mcp.tool` | `server` `tool` | `args` `idempotency` `breaker` `rate` | Calls `tool` on a declared MCP `server` with `args`. The main way a workflow reaches the outside world. Always attaches a retry-stable `agent/idempotency_key` in `_meta`; `idempotency: {value: …}` substitutes an application key. |
-| `mcp.resource` | `server` `op` | `uri` `name` `arguments` `reference` `argument` | Reads MCP resources — `op: read|list|prompt|complete`. |
+| `mcp.resource` | `server` `op` | `uri` `name` `arguments` `reference` `argument` | Reads MCP resources — `op: read\|list\|prompt\|complete`. |
 | `tool` | `name` | `args` | Calls a tool by registry name, wherever it lives (internal, code-registered, or MCP). |
 | `http` | `url` | `method` `headers` `query` `body` `json` `timeout` `expect` `allow_private` `sign` `idempotency` `breaker` `rate` | One outbound HTTP request. SSRF-guarded: resolved once and dialled by the vetted address. `allow_private` is a separate, larger decision. `idempotency: {header: NAME}` (or `{query: NAME}`) sends a retry-stable derived key; `value:` overrides it with an application key. |
 | `a2a.send` | `to` | `parts` `command` `args` `context` `timeout` `idempotency` `breaker` `rate` | Notifies a peer and continues — fire-and-forget. Completes when the peer ACCEPTS the message. `idempotency: true` pins the A2A `messageId` across retries so the peer can deduplicate. `command` + `args` send the TYPED DataPart the peer's `a2a` start matches on — deterministic dispatch, not prose the peer's model interprets. |
@@ -182,10 +182,8 @@ Every step accepts these regardless of kind:
 | Field | Effect |
 |---|---|
 | `depends_on` | the DAG edge. A non-start step with no dependency is refused as an unreachable root |
-| `when` | a CEL guard; the step is skipped when it is false (needs `cel`) |
+| `when` | a CEL guard; the step is **pruned** when it is false, so anything that depends only on it is pruned too (needs `cel`) |
 | `retry` | `{max, backoff}` — retry on failure: exponential doubling with deterministic ±20% jitter, durable timer between attempts |
-| `breaker` | `{failures, cooldown}` — cross-run circuit breaker, on the remote-effect kinds only (`http`, `mcp.tool`, `a2a.send`, `a2a.delegate`): opens after N consecutive failures, fails fast, one probe per cooldown; durable per `workflow/step` |
-| `rate` | `"<burst>/<per>s"` — outbound throttle on the same kinds: the step WAITS (durable timer, no attempt consumed) for a token, so fan-outs drain at the declared pace instead of bursting |
 | `timeout` | bound the step; a suspended step resumes as timed out |
 | `on_error` | `fail` (default) · `continue` · `goto:<step>` |
 | `output_schema` | validate the step's output; also SHAPES the answer for model kinds |
@@ -195,6 +193,16 @@ Every step accepts these regardless of kind:
 | `on_replay` | what restore does with a step caught in flight by a crash: `retry` (default), `skip`, or `fail` |
 | `idempotent` | parsed and validated, but nothing reads it — use `on_replay` to control a replay |
 | `description`, `otel` | documentation and trace attributes |
+
+### `breaker` and `rate` are not among them
+
+Both are kind-specific, declared only on the kinds below, so a `breaker:` or a
+`rate:` on anything else is refused as an unknown field:
+
+| Field | Kinds that accept it | Effect |
+|---|---|---|
+| `breaker` | `mcp.tool`, `http`, `a2a.send`, `a2a.delegate` | `{failures, cooldown}` — cross-run circuit breaker: opens after N consecutive failures, fails fast, one probe per cooldown; durable per `workflow/step` |
+| `rate` | those four remote-effect kinds, plus `stream`, `webhook` and `batch` | `"<burst>/<per>s"` — on a remote-effect step, an outbound throttle: the step WAITS (durable timer, no attempt consumed) for a token, so fan-outs drain at the declared pace instead of bursting. On `stream`, `webhook` and `batch` it paces intake or the fan-out instead — see those rows above |
 
 ## Durability, and what a restart does
 

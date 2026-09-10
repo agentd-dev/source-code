@@ -23,13 +23,21 @@
 //!
 //! ## Two vocabularies on one endpoint
 //!
-//! Most methods are the specification's. A few are agentd's own — the
-//! observation feed the display clients read (`SubscribeToEvents`), the pairing
-//! exchange (`Pair`), and the operator admin family (`a2a.*`) — and those are
-//! answered here rather than passed down, because a2a-rs correctly does not know
-//! them. Anything else goes to the protocol layer, including the methods it
-//! implements that agentd does not, so an unimplemented method is refused with
-//! the code the spec assigns rather than a generic failure.
+//! Most methods are the specification's. A few are answered here rather than
+//! passed down: the observation feed the display clients read
+//! (`SubscribeToEvents`) and the pairing exchange (`Pair`) are agentd's own, so
+//! a2a-rs correctly does not know them; the public card read (`GetAgentCard`)
+//! is agentd's convenience over a document the spec publishes only at
+//! `.well-known`, and both must answer with the *same* card; and the spec's own
+//! `GetExtendedAgentCard` is served locally too — it is that card plus the
+//! skills this caller may actually run, and a round trip through the SDK's
+//! typed `AgentCard` drops any field it has no place for. Operator admin is not
+//! a method family: `admin.drain`, `admin.pause` and their siblings ride in as
+//! command DataParts on `SendMessage` and are handled in
+//! [`crate::runtime::a2a_server`]. Anything else goes to the protocol layer,
+//! including the methods it implements that agentd does not, so an
+//! unimplemented method is refused with the code the spec assigns rather than a
+//! generic failure.
 
 use std::net::SocketAddr;
 use std::sync::Arc;

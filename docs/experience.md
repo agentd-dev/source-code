@@ -76,10 +76,14 @@ agentd: invalid --lifecycle.run_until: "forever" is not one of auto|idle|drained
 
 Two substitution mechanisms share the document and must not be confused.
 `${VAR}` and `${VAR:-default}` expand from the process environment across
-*every* string, inline workflows included; braces are required, `$${` is a
+*every* string, inline workflows included — with one exception:
+`agent.instruction` is lifted out before the pass and restored after, because a
+`${name}` inside an instruction document is an instruction *parameter* resolved
+by the instruction layer, not a process variable. Braces are required, `$${` is a
 literal `${`, and an unset variable with no default is a hard error rather than
-an empty string. Credentials are the other: from a *file* they must be a
-`{{secret:NAME}}` or `{{secret-file:PATH}}` reference, and they never print.
+an empty string.
+Credentials are the other: from a *file* they must be a `{{secret:NAME}}` or
+`{{secret-file:PATH}}` reference, and they never print.
 
 ## Nothing happens until the document is valid
 
@@ -95,7 +99,7 @@ of them:
 
 ```
 $ agentd -c app.yaml --validate-config
-{"event":"config.invalid","msg":"store.kind is none but the instance is long-lived (serves A2A / webhooks / a goal watchdog / has a loop|schedule|subscribe|signal|event|a2a|webhook start node) — configure a durable store (store.kind: file | mcp | http), or drop store.kind to get the local file store by default"}
+{"event":"config.invalid","msg":"store.kind is none but the instance is long-lived (serves A2A / webhooks / a goal watchdog / has a loop|schedule|subscribe|signal|event|stream|correlate|a2a|webhook start node) — configure a durable store (store.kind: file | mcp | http), or drop store.kind to get the local file store by default"}
 {"event":"config.invalid","msg":"a2a.listen is https:// but a2a.tls.cert / a2a.tls.key are not set"}
 {"event":"config.invalid","msg":"a2a.listen on a non-loopback address needs client auth: a2a.bearer, interface.pairing, or a2a.tls.client_ca (mTLS — then EVERY caller needs a client certificate, bearer-only and paired included)"}
 {"event":"config.invalid","msg":"interface.origins: \"https://ops.example.com/\" is not an origin (want scheme://host[:port], no path)"}
@@ -116,7 +120,7 @@ typo names *its own file* rather than the merged blob:
 ```
 $ agentd -c app.yaml -c prod.yaml --validate-config
 agentd: config file prod.yaml parse error: unknown field `url`,
-expected one of `name`, `endpoint`, `ns`, `headers`, `tags`, `aauth`, `oauth`, `auth`, `timeout`
+expected one of `name`, `endpoint`, `service`, `ns`, `headers`, `tags`, `allow`, `exclude`, `aauth`, `oauth`, `auth`, `timeout`
 ```
 
 Workflows get the same treatment. Each node kind has a closed field list, and an
@@ -126,9 +130,9 @@ that an `agent` step takes `instruction` (a `prompt` belongs to `think`) and a
 
 ```
 $ agentd -c release.yaml --validate-config      # two guessed field names
-{"event":"config.invalid","msg":"workflow \"release\" step \"draft\": unknown field \"prompt\" for kind \"agent\" (allowed: instruction, output_contract, output_schema, tools, servers, limits, context, skills, system)"}
+{"event":"config.invalid","msg":"workflow \"release\" step \"draft\": unknown field \"prompt\" for kind \"agent\" (allowed: instruction, output_contract, output_schema, tools, servers, limits, context, skills, system, model)"}
 {"event":"config.invalid","msg":"workflow \"release\" step \"draft\": kind \"agent\" requires field \"instruction\""}
-{"event":"config.invalid","msg":"workflow \"release\" step \"start\": unknown field \"debounce\" for kind \"subscribe\" (allowed: server, uri, debounce_ms, coalesce, filter, deliver, on_no_listener, inputs)"}
+{"event":"config.invalid","msg":"workflow \"release\" step \"start\": unknown field \"debounce\" for kind \"subscribe\" (allowed: server, uri, debounce_ms, coalesce, filter, deliver, on_no_listener, window, inputs)"}
 ```
 
 Structure is checked too: a workflow needs a start node and a `finish` step,
@@ -359,10 +363,12 @@ revokes them all.
 
 The daemon also owns the client chrome: `interface.display.top` and `.bottom`
 come from `interface.info`, and every attached surface lays out the same items.
-`config.set` changes exactly three paths at runtime — `interface.debug`,
-`interface.display.top`, `interface.display.bottom`. Anything else is refused
-with the whitelist and a pointer to the config file plus SIGHUP; the daemon
-never writes configuration, so provenance stays with your documents.
+`config.set` changes exactly four paths at runtime — `interface.debug`,
+`interface.display.top`, `interface.display.bottom`, and `agent.approval`
+(`ask` | `auto` | `accept`, because how closely you want to be asked is a
+decision made *during* a session). Anything else is refused with the whitelist
+and a pointer to the config file plus SIGHUP; the daemon never writes
+configuration, so provenance stays with your documents.
 
 `interface.debug` is the single gate on the four reads that expose content and
 internals — `conversation.get` (message bodies), `run.get`, `subagent.get`, and
@@ -466,7 +472,7 @@ These limits are consequences of the design above, not gaps in it.
   and nothing else, which keeps the 1024-event replay ring meaningful.
 - **Validation checks the document, not the world.** It cannot tell you an MCP
   server is down; that is startup's job, and it is exit 6.
-- **Runtime reconfiguration is three keys.** Everything else is the config file
+- **Runtime reconfiguration is four keys.** Everything else is the config file
   plus SIGHUP, and a diff under a restart-only path refuses the whole reload.
 - **Paired sessions are in memory**, and **a turn's human gate does not survive
   a restart** — only run-linked gates are re-armed.

@@ -293,8 +293,9 @@ pub fn broadcast_distinct(subs: &SubRegistry, note: &Notification) {
 // ---------------------------------------------------------------------------
 // The connection framework: the lifecycle/version machinery, the `Handler` seam,
 // and the blocking thread-per-connection listeners. An embedder implements
-// [`Handler`] for its domain surface and calls [`serve_unix`] / [`serve_vsock`];
-// everything below is transport- and domain-agnostic.
+// [`Handler`] for its domain surface and calls [`bind_unix`] +
+// [`spawn_accept_unix`] (or [`bind_vsock`] + [`spawn_accept_vsock`]); everything
+// below is transport- and domain-agnostic.
 // ---------------------------------------------------------------------------
 
 /// The embedder's domain seam. The framework owns the transport, the framing, the

@@ -50,10 +50,10 @@ the JSON-RPC/SSE wire, the event-sourced `Mirror`, and the `Observation` driver
 ```js
 import { AgentdClient, Mirror, Observation } from '@agentd-dev/cli';
 
-const client = new AgentdClient({ endpoint: 'http://127.0.0.1:8420' });
+const client = new AgentdClient({ url: 'http://127.0.0.1:8420' });
 const mirror = new Mirror();
 const obs = new Observation(client, mirror);
-obs.start();                    // mirror.state is now a live projection
+obs.start();                    // mirror.getState() is now a live projection
 ```
 
 Build your own surface on that and it stays consistent with the shipped ones,
@@ -73,6 +73,8 @@ of the Rust workspace or its release artifact — agentd's own 3-dependency
 default build is unaffected by anything here.
 
 The protocol these clients speak is specified in
-[RFC 0032](https://agentd.dev/docs/rfc-0032/).
+[RFC 0032](https://github.com/agentd-dev/source-code/blob/main/rfcs/0032-interface-and-observation-plane.md);
+the rendered overview is [the interface guide](https://agentd.dev/docs/interface/).
 
-Apache-2.0
+AGPL-3.0-only — see
+[LICENSE](https://github.com/agentd-dev/source-code/blob/main/LICENSE).

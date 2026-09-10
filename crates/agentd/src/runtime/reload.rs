@@ -130,7 +130,7 @@ impl Runtime {
         // The refresh cadence: re-arm so a changed interval takes effect now
         // rather than at the next restart. `arm_freshness` disarms the old
         // timer first, so this replaces rather than stacks — and it is what
-        // makes `agent.instruction_refresh` honestly RELOADABLE, including
+        // makes `agent.instruction.refresh` honestly RELOADABLE, including
         // the case where it was `off` and no timer existed to notice.
         if old.agent.instruction_spec.refresh != new.agent.instruction_spec.refresh {
             self.arm_freshness();

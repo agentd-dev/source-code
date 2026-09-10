@@ -39,7 +39,7 @@ $ git clone <repo> agent && cd agent
 $ cargo build -p agentd-cli --release
     Finished `release` profile [optimized] target(s)
 $ ./target/release/agentd --version
-agentd.0
+agentd 1.14.1
 ```
 
 The result is **one static binary** that starts fast, idles cheaply, and drops
@@ -197,8 +197,8 @@ an external scheduler can branch on it:
 | supervisor hard-kill backstop (a child that won't self-terminate) | 124 |
 | bad config (validation) | 2 |
 
-Every run is bounded by limits you can tune — `--max-steps` (default 50),
-`--max-tokens` (default 200000), and `--deadline` (default 600s) — so a confused
+Every run is bounded by limits you can tune — `--max-steps` (default 500),
+`--max-tokens` (default 2000000), and `--deadline` (default 3600s) — so a confused
 or runaway loop can never burn unbounded cost. See
 [configuration.md](configuration.md) for the full list.
 
@@ -239,7 +239,7 @@ lifecycle: { run_until: drained }
 $ agentd --config poll.yaml
 ```
 
-- **`every: 5m`** is the cadence; `every: 0` re-runs immediately on completion
+- **`interval: 5m`** is the cadence; `interval: 0` re-runs immediately on completion
   (work-until-done). `max_iterations`, `until` (a CEL condition), and `backoff`
   bound it; a `SIGTERM` drains it. A healthy idle loop backs off rather than
   spinning hot — a `Deployment`-shaped workload.

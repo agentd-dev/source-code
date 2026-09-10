@@ -19,7 +19,6 @@ export AGENT_INTELLIGENCE="${AGENT_INTELLIGENCE:-https://gw.example/v1}"
 # export AGENT_INTELLIGENCE_TOKEN=...   # set in your environment, not here
 
 exec "$AGENTD" \
-  --mode once \
   --instruction.file "$(dirname "$0")/instructions/research.md" \
   --model "claude-opus-4" \
   --mcp search=https://mcp-search.internal/mcp \

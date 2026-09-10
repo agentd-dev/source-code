@@ -35,10 +35,11 @@ use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// The liveness staleness window (ms): a supervisor tick older than this reads
-/// unhealthy on `/healthz` and in the `--health-file` (`alive:false`), so k8s
-/// SIGKILLs the pod. The single source of truth for the window —
-/// `obs::serve`'s `/healthz` and the `--health-file` writer both read it, and the
-/// reactor-thread MANAGEMENT timeout below is sized strictly under it.
+/// unhealthy on `/healthz`, so k8s SIGKILLs the pod. `obs::serve`'s `/healthz`
+/// reads this constant directly; the `--health-file` writer takes its window as
+/// a parameter and is spawned with its own, longer 10s one, so the file's
+/// `alive:false` trails `/healthz`. The reactor-thread MANAGEMENT timeout below
+/// is sized strictly under this window.
 pub const LIVENESS_STALE_AFTER_MS: u64 = 5_000;
 
 /// The SHORT per-request timeout (ms) for reactor-thread MANAGEMENT calls — the

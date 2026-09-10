@@ -5,7 +5,7 @@
 > a long-lived reactive daemon, or a durable DAG workflow. Tools come only from
 > remote **MCP** servers over HTTPS; it speaks **A2A** to other agents; it
 > executes nothing locally unless you compile *and* enable the guarded `exec`
-> runner. This file is the condensed reference for LLMs. Version 1.7.0.
+> runner. This file is the condensed reference for LLMs. Version 1.14.1.
 
 Canonical docs: https://agentd.dev/docs/ · Agent Skill: https://agentd.dev/SKILL.md · Source: https://github.com/agentd-dev/source-code
 
@@ -148,7 +148,7 @@ the file's); the repeatable named flags `--mcp`, `--a2a-peer`, `--workflow`
 `vars`, `services`, `streams`, `agent`, `goal`, `intelligence`, `mcp`, `tools`,
 `store`, `memory`, `context`, `knowledge`, `search`, `skills`, `workflows`,
 `subagents`, `webhooks`, `limits`, `lifecycle`, `a2a`, `interface`,
-`observability`, `security`, plus `config_version` (must be `"1"`).
+`observability`, `security`, `identity`, plus `config_version` (must be `"1"`).
 
 Every section rejects unknown keys, so a misspelled name is exit `2` naming the
 key — never a silently ignored setting.
@@ -257,7 +257,8 @@ does not exempt either. A loopback listener with no auth stays valid, so local
 development is unaffected.
 
 Per-node options on a `webhook` start node: **`path`**, `methods`, `auth`,
-`parallelism`, `on_overflow`, `idempotency`, `respond`, `filter`, `inputs`.
+`parallelism`, `on_overflow`, `rate`, `idempotency`, `respond`, `filter`,
+`inputs`, `signal`, `into`.
 
 ---
 
@@ -305,8 +306,11 @@ workflows:
       b: { kind: …, depends_on: [a] }
 ```
 
-Instead of `steps`, a workflow may use `file:` (a path) or `uri:` (an MCP
-resource) — exactly one of the three.
+Instead of `steps`, a workflow entry may use `file:` (a path), `uri:` (an MCP
+resource) or `url:` (HTTP) — exactly one of the four. A `dir:` entry is a
+different shape: it names no workflow at all, because it expands into one entry
+per matching file and each file carries its own name (a path, or
+`{path, glob, order}`; default glob `*.yaml,*.yml,*.json`).
 
 ### 7.2 Start nodes — what makes a run
 
@@ -316,9 +320,11 @@ resource) — exactly one of the three.
 | `manual` | `workflow.run` only | — |
 | `loop` | the previous run finished | `interval`, `delay`, `until`, `max_iterations`, `backoff` |
 | `schedule` | cron or interval | `cron` (5-field), `every`, `tz` (UTC default), `jitter`, `catch_up`, `at` (one-shot) |
-| `subscribe` | an MCP resource changed (notify-then-read) | **`server`**, **`uri`**, `debounce_ms`, `coalesce`, `filter`, `deliver` |
+| `subscribe` | an MCP resource changed (notify-then-read) | **`server`**, **`uri`**, `debounce_ms`, `coalesce`, `filter`, `deliver`, `window` |
+| `stream` | an event lands on a declared durable stream | **`stream`**, `subject`, `filter`, `from`, `rate`, `batch` |
+| `correlate` | a correlated SET of stream events has arrived | **`stream`**, **`on`**, `by`, **`window`**, `on_incomplete`, `filter`, `max_pending` |
 | `signal` | a named signal arrives | **`name`**, `filter`, `deliver` |
-| `event` | an internal event | **`on`** (`workflow.finished\|failed`, `subagent.finished`, `budget.exhausted`, `config.reloaded`, `restore.done`, `human.timeout`, …) |
+| `event` | an internal event | **`on`**: `workflow.finished`, `workflow.failed`, `human.asked`, `human.answered`, `lifecycle.shutdown` (the complete set) |
 | `a2a` | a principal sends a message whose command matches | `command` (absent = any message), `roles`, `inputs` |
 | `webhook` | an inbound HTTP request | **`path`**, `methods`, `auth`, `idempotency`, `respond`, `parallelism` |
 
@@ -342,7 +348,7 @@ Required fields in **bold**.
 | `join` | await **`handles`** from async children; `timeout`, `min`, `partials` |
 | `subgraph` | an inline nested graph — **`body`** |
 | `workflow` | start a child run — **`name`**, `mode: sync\|async\|detached`, `inputs`, `start`, `cascade` |
-| `wait` | block on **`on`**: `resource\|condition\|signal\|run\|subagent\|message\|webhook`; `timeout` |
+| `wait` | block on **`on`**: `resource\|condition\|signal\|run\|subagent\|message\|event\|webhook`; `timeout` |
 | `sleep` | wait **`duration`** |
 | `assert` | fail unless **`condition`** holds; `message` |
 | `fail` | end the run as failed — `message`, `code` |
@@ -381,7 +387,7 @@ Required fields in **bold**.
 | `a2a.wait` | suspend until a message arrives on a `conversation`; `timeout`. The reply half of `a2a.send` |
 | `workflow.signal` | send **`name`** to a waiting run; `payload`, `run` |
 | `workflow.wait` / `.cancel` | await or cancel **`run`**; `timeout`, `reason` |
-| `emit` | emit an internal event other workflows can start on |
+| `emit` | append an event to a declared stream — **`stream`** and **`subject`** travel together (one without the other is a load error); `data`, `correlation`, `forward`. `stream`/`correlate` starts consume it. Without a stream: writes `note` to the root transcript, logs `audit`, returns `value` |
 
 **Intelligence & agents** (these are the steps that cost tokens)
 
@@ -461,17 +467,25 @@ Required fields in **bold**.
 - **TUI / web UI** — `agentd tui` / `agentd ui`, or detached with
   `npm i -g @agentd-dev/cli` then `agentd-tui --endpoint <url>`. They are thin
   clients: all state lives in the daemon.
-- **Served MCP** — agentd is addressable as an MCP server itself
-  (`agentd://` status and subagent resources).
+- **No served MCP** — agentd is an MCP *client* only; nothing addresses it over
+  MCP. A `resource.read` for an `agentd://` URI routes to the agent's own loop
+  instead of to a server — an extension point an embedder can fill, not a
+  surface another process can reach. `--serve-mcp` survives as an alias for
+  `a2a.listen`, so A2A is the only agent-facing protocol served inbound — the
+  second inbound listener is `webhooks.listen` (§5.7), which turns an HTTP
+  request into a run.
 
 ---
 
 ## 11. Build features
 
-Compile-time; `--capabilities` reports what a given binary has.
+Compile-time, and nothing at runtime enumerates them — `--capabilities`
+reports the *configured* surface, what this binary is set up to do, not the
+features it was built with.
 
 In the release binaries: `a2a`, `metrics`, `cron`, `otel`, `hot-reload`,
-`config-watch`, `aauth`, `oauth`, `cel`, and `tls` (on by default).
+`config-watch`, `aauth`, `oauth`, `cel`, `sign`, `oci`, `decrypt`, and `tls`
+(on by default).
 
 **Not** in the release binaries — build from source to get it: `exec`, the
 guarded local command runner, which is off at the cargo feature *and* at
@@ -506,7 +520,7 @@ Useful to know so you do not assume otherwise:
 | exit `7` | a budget (steps/tokens/deadline) was exhausted — `lifecycle.exit_code_map` can make this non-fatal |
 | "store.kind is none but the instance is long-lived" | drop `store.kind` to get the file store, or configure `mcp`/`http` |
 | "is locked by pid N" | another agentd is using that state directory — give this one its own `agent.name` or `store.file.path` |
-| a workflow never fires | check `armed`, the start node's conditions, and that `--capabilities` shows the feature it needs (`cron`, `cel`) |
+| a workflow never fires | check `armed`, the start node's conditions, and that the binary was built with the feature that start needs — a CEL guard on a non-`cel` build is refused at validation (exit `2`), but a `cron:` schedule on a non-`cron` build simply never arms, and says nothing |
 | the trifecta gate refuses startup | tag your MCP servers; an untagged server counts as untrusted input |
 
 ---
@@ -519,12 +533,12 @@ Useful to know so you do not assume otherwise:
 | https://agentd.dev/docs/getting-started/ | checkout to a first run |
 | https://agentd.dev/docs/configuration/ | **the full config reference** — every path, type, default |
 | https://agentd.dev/docs/workflows/ | **the full workflow reference** — every node and field |
-| https://agentd.dev/docs/node-registry/ | **the node registry** — all 67 kinds with required fields, plus the five traps (references are `steps.<id>.output.<path>`; `switch` cases are strings; signals are edge-triggered) |
+| https://agentd.dev/docs/node-registry/ | **the node registry** — all 73 kinds with required fields, plus the six traps (references are `steps.<id>.output.<path>`; `switch` cases are strings; signals are edge-triggered) |
 | https://agentd.dev/docs/architecture/ | the two loops, the process tree, how a run flows |
 | https://agentd.dev/docs/harness/ | what keeps an agent bounded; durability and replay |
 | https://agentd.dev/docs/agent-loop/ | the agentic loop itself |
 | https://agentd.dev/docs/modes-and-triggers/ | one-shot, daemon, reactive, scheduled |
-| https://agentd.dev/docs/mcp/ | MCP client and served MCP |
+| https://agentd.dev/docs/mcp/ | the MCP client: servers, tools, resources, subscriptions |
 | https://agentd.dev/docs/a2a/ | the A2A surface, principals, tasks, commands |
 | https://agentd.dev/docs/intelligence/ | endpoints, dialects, failover, budgets |
 | https://agentd.dev/docs/authentication/ | per-endpoint credentials: static, OAuth2, AWS SigV4, SPIFFE |

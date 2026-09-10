@@ -97,25 +97,27 @@ static STDERR_LOCK: Mutex<()> = Mutex::new(());
 // ---------------------------------------------------------------------------
 // The bounded in-memory event ring. A projection of the same stderr stream —
 // identical lines, identical closed event vocabulary — captured into a
-// fixed-size ring the `agentd://events` resource drains with an `?after=<seq>`
-// cursor (the self-MCP server reads it; this module only owns the store). NOT a
+// fixed-size ring the `debug.events` command op drains with an `after` cursor
+// (the A2A command surface reads it; this module only owns the store). NOT a
 // second telemetry path: stderr stays the source of truth; the ring is the
 // live-tail convenience.
 //
-// It is installed only when serving wants it (the supervisor calls
-// [`install_event_ring`] once at startup); without that, capture is a single
-// relaxed atomic load that short-circuits, so the default build pays nothing.
+// It is installed only when the debug tail is wanted (`interface.enabled` plus
+// `interface.debug`, at startup or when `config.set` turns debug on later);
+// without that, capture is a single relaxed atomic load that short-circuits, so
+// the default build pays nothing.
 // The ring is lossy and bounded by design: an overrun drops the oldest and bumps
 // `dropped`, never blocking — a slow or dead subscriber can never back-pressure
 // the supervisor.
 
-/// Envelope version for the `agentd://events` read body. Bumped only on a
+/// Envelope version for the `debug.events` read body. Bumped only on a
 /// breaking change to the `{oldest_seq,newest_seq,dropped,events}` envelope —
 /// never for the per-line schema, which is versioned independently of this.
 pub const EVENTS_SCHEMA: &str = "1.0";
 
-/// Default ring capacity, overridable with `AGENTD_EVENTS_RING`: the last N
-/// emitted lines held in memory. Bounds memory on a slow subscriber.
+/// Default ring capacity, overridable with `observability.events_ring`
+/// (`--events-ring`): the last N emitted lines held in memory. Bounds memory on
+/// a slow subscriber.
 pub const EVENTS_RING_DEFAULT: usize = 1024;
 
 /// One captured line plus its monotonic ring `seq` — the only field added over
@@ -171,26 +173,24 @@ static RING_INSTALLED: AtomicU64 = AtomicU64::new(0);
 /// Monotonic ring sequence — the cursor key. Shared across all loggers in the
 /// process so every captured line gets a globally-ordered `seq`.
 static RING_SEQ: AtomicU64 = AtomicU64::new(0);
-/// Set on every ring push; the served `agentd://events` resource coalesces this
-/// into one `notifications/resources/updated` per tick rather than notifying per
-/// captured line. A flag, not a callback, keeps this `obs` layer free of any
-/// self-MCP server type — the server polls and clears it. Non-blocking, so a
-/// push never waits on a subscriber.
+/// Set on every ring push, so a reader can coalesce a burst into one
+/// notification per tick rather than notifying per captured line. A flag, not a
+/// callback, keeps this `obs` layer free of any server type — the reader polls
+/// and clears it. Non-blocking, so a push never waits on a subscriber.
 static EVENTS_DIRTY: AtomicU64 = AtomicU64::new(0);
 
-/// Take-and-clear the "new events since last check" flag — the served
-/// `agentd://events` resource calls this on its coalescing tick to decide whether
-/// to fire a `notifications/resources/updated`. Returns `true` if any line was
-/// captured since the last call.
+/// Take-and-clear the "new events since last check" flag — a reader calls this
+/// on its coalescing tick to decide whether to notify subscribers. Returns
+/// `true` if any line was captured since the last call.
 pub fn take_events_dirty() -> bool {
     EVENTS_DIRTY.swap(0, Ordering::Relaxed) != 0
 }
 
-/// Install the bounded event ring with capacity `cap`. Called once by the
-/// supervisor when the served `agentd://events` resource is wanted (gated by
-/// `--serve-mcp` plus the `events` feature at the call site). Idempotent — a
-/// second call resizes and clears. Never fatal: telemetry must not crash the
-/// run, so a poisoned lock is recovered rather than propagated.
+/// Install the bounded event ring with capacity `cap`. Called by the runtime
+/// when the live log tail is wanted — `interface.enabled` plus `interface.debug`
+/// at startup, or `config.set interface.debug` later. Idempotent — a second
+/// call resizes and clears. Never fatal: telemetry must not crash the run, so a
+/// poisoned lock is recovered rather than propagated.
 pub fn install_event_ring(cap: usize) {
     let mut g = EVENT_RING.lock().unwrap_or_else(|e| e.into_inner());
     *g = Some(EventRing::new(cap));
@@ -206,11 +206,13 @@ pub fn install_event_ring(cap: usize) {
 // globbing, filters and dedup those already have.
 //
 // It is NOT the event ring. The ring is an explicitly lossy oldest-evicted
-// buffer installed only under `--serve-mcp` plus the `events` feature; teeing
-// it into a durable stream would produce silent gaps in exactly the consumer
-// being sold, and in the default deployment would do nothing at all. This taps
-// the emission itself — every `log.info`/`warn`/`error` call site — and is
-// opt-in per family, carrying metadata rather than payloads.
+// buffer, installed only when the interface debug tail is on
+// (`interface.enabled` plus `interface.debug`, at startup or when `config.set`
+// turns debug on later); teeing it into a durable stream would produce silent
+// gaps in exactly the consumer being sold, and in the default deployment —
+// where the ring is never installed at all — would do nothing. This taps the
+// emission itself — every `log.info`/`warn`/`error` call site — and is opt-in
+// per family, carrying metadata rather than payloads.
 //
 // Volume is the real hazard, because the refusals that matter most arrive in
 // storms precisely when the constrained resource is the thing being written
@@ -415,9 +417,9 @@ pub fn drain_runtime_tap() -> (Vec<TappedEvent>, u64) {
     (t.queue.drain(..).collect(), dropped)
 }
 
-/// A snapshot of the ring window an `agentd://events?after=<seq>` read returns:
-/// the entries with `seq > after` (after optional level/event-prefix filtering),
-/// plus the ring's current window bounds and cumulative `dropped`.
+/// A snapshot of the ring window a `debug.events` read with an `after` cursor
+/// returns: the entries with `seq > after` (after optional level/event-prefix
+/// filtering), plus the ring's current window bounds and cumulative `dropped`.
 pub struct EventWindow {
     pub events: Vec<Value>,
     pub oldest_seq: u64,
@@ -556,8 +558,8 @@ impl Logger {
             }
         }
         let value = Value::Object(m);
-        // Project the line into the bounded `agentd://events` ring — the same
-        // line, captured for the live-tail resource. A no-op (one relaxed atomic
+        // Project the line into the bounded event ring — the same line,
+        // captured for the `debug.events` live tail. A no-op (one relaxed atomic
         // load) unless a ring is installed. Best-effort: capture never blocks and
         // never fails the log write.
         capture_to_ring(level.as_str(), event, &value);

@@ -15,10 +15,10 @@
 //!
 //! Trade-off to understand: this runs the reasoning IN YOUR
 //! PROCESS — simplest integration, no process isolation. When you want the
-//! supervisor's kill-ladder/limits around the model (the stock posture), spawn
-//! the run as a supervised subtree instead: build a `SpawnPayload` and call
-//! `supervisor::reactor::supervise_once` (exactly what `agentd-cli` does), and
-//! install the re-exec dispatch at the top of your `main`.
+//! supervisor's kill-ladder/limits around the model (the stock posture), run
+//! the daemon instead: load a config and call `agentd::runtime::run` (exactly
+//! what `agentd-cli` does), and install the re-exec dispatch at the top of your
+//! `main`.
 
 use agentd::agentloop::action::SelfHandler;
 use agentd::agentloop::runner::{LoopInput, run_loop};

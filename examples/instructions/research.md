@@ -4,8 +4,8 @@ Work to a single, well-sourced answer, then stop.
 
 # Question
 
-Summarize the current state of <TOPIC> and the two or three most load-bearing
-open questions about it. (Replace <TOPIC> at run time via --instruction, or keep
+Summarize the current state of `<TOPIC>` and the two or three most load-bearing
+open questions about it. (Replace `<TOPIC>` at run time via --instruction, or keep
 this file as a template and pass the concrete topic on the command line.)
 
 # Procedure

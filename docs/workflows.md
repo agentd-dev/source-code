@@ -73,7 +73,7 @@ file. The top-level keys are a closed set — anything else is a parse error.
 | `durable` | default `true` (or the `store.durability.work` deployment default) — `false` makes runs memory-only: no run record, no checkpoints, forgotten by a restart. The fast path for recomputable work; see §durability. |
 | `state` | declares the run variables: a per-key `schema` that gates every write, and/or a `reducer` saying how concurrent writes combine (see §declared state) |
 | `steps` | the graph: an object of step id to step |
-| `file` / `uri` | load the document from a path or an MCP resource instead of inline (a config entry can also use `url:` with headers, or a `dir:`+`glob:` scan — see the configuration doc §6.1) |
+| `file` / `uri` | load the document from a path or an MCP resource instead of inline (a config entry can also use `url:` with headers, or a `dir:` folder scan, `dir: {path, glob, order}` — `glob` and `order` live inside `dir`, and a sibling `glob` is refused by name at startup (exit `2`); see the configuration doc §6.1) |
 
 A complete, runnable example:
 
@@ -119,9 +119,15 @@ $ agentd -c digest.yaml
 `run_until: idle` gives a job: the process exits once nothing is in flight, with
 an exit code derived from the `once` run's terminal status. `drained` keeps the
 process alive for long-lived triggers. `auto` (the default) picks the job shape
-when there is no A2A listener and no `loop`, `schedule`, `subscribe`, `signal`
-or `event` start node — re-checked against workflows the agent creates at
-runtime, so an instance never idles out from under work it was asked to set up.
+when there is no A2A listener and no long-lived start node — that is every
+start kind except `once` and `manual`, so `loop`, `schedule`, `subscribe`,
+`stream`, `correlate`, `signal`, `event`, `a2a` and `webhook` all keep the
+process alive. The set is written as those two exceptions rather than as a list
+of long-lived kinds so that a trigger added later is long-lived by default: a
+wrong "keeps running" costs an idle process, a wrong "may exit" kills a listener
+under its own traffic. The `auto` decision is re-checked against workflows the
+agent creates at runtime, so an instance never idles out from under work it was
+asked to set up.
 
 ## How a run starts
 
@@ -162,8 +168,10 @@ counts as satisfied, so a step depending on any of them still runs.
 | `subscribe` | **`server`**, **`uri`**, `debounce_ms`, `coalesce`, `filter`, `deliver`, `on_no_listener`, `window`, `inputs` |
 | `signal` | **`name`**, `filter`, `deliver`, `inputs` |
 | `event` | **`on`**, `filter`, `inputs` |
-| `stream` | **`stream`**, `subject`, `filter`, `from`, `rate`, `inputs` |
-| `webhook` | **`path`**, `methods`, `auth`, `parallelism`, `on_overflow`, `rate`, `idempotency`, `respond`, `filter`, `signal`, `inputs` |
+| `stream` | **`stream`**, `subject`, `filter`, `from`, `rate`, `batch`, `inputs` |
+| `correlate` | **`stream`**, **`on`**, `by`, `window`, `on_incomplete`, `filter`, `max_pending`, `inputs` |
+| `a2a` | `command`, `roles`, `schema`, `into`, `inputs` |
+| `webhook` | **`path`**, `methods`, `auth`, `parallelism`, `on_overflow`, `rate`, `idempotency`, `respond`, `filter`, `signal`, `into`, `inputs` |
 
 Behaviour the field names do not give away:
 
@@ -248,7 +256,7 @@ Invalid inputs are not an error you can catch: the event is logged as
 
 ## The node catalogue
 
-There are 72 kinds, and all of them are wired. The four A2A ones split by
+There are 73 kinds, and all of them are wired. The four A2A ones split by
 direction and by whether they block: `a2a` is a START node (an inbound message
 whose command matches begins a run), `a2a.send` notifies a peer without waiting,
 `a2a.wait` suspends until a message lands on a conversation, and `a2a.delegate`
@@ -527,7 +535,12 @@ capped at 4 levels.
   `on_error: continue` fills its slot with `{index, error}`. `collect: {into,
   mode}` also writes the aggregate to a blackboard variable.
 - Element batching defaults to size 1 for `foreach` and 10 for `batch`;
-  `parallel` defaults to 1 and is clamped to 8.
+  `parallel` defaults to 4; an inline definition asking for more than
+  `limits.workflow.fan_out` (8 when unset) is refused at load — the check runs
+  in config validation, over that definition's top-level steps only — and the
+  ceiling clamps the default plus every definition that skipped that check: one
+  loaded from a `file:`, `url:`, `uri:` or `dir:` entry, one whose `parallel`
+  sits on a step nested inside a `body:`, and one the agent creates at runtime.
 - `batch.by` groups elements by a dotted key, in first-appearance order, and
   each **group** becomes one element — so `item` inside the body is that group's
   whole array, not a record. A body written for `foreach` breaks when moved to a
@@ -662,7 +675,8 @@ restart resumes at the next batch").
 ```mermaid
 stateDiagram-v2
     [*] --> Pending
-    Pending --> Skipped: when guard false
+    Pending --> Pruned: when guard false, or an untaken switch branch
+    Pending --> Skipped: a sibling start node fired, or on_replay skip on restore
     Pending --> Running: begin_step, checkpointed before the effect
     Running --> Done: success
     Running --> Failed: error
@@ -676,6 +690,7 @@ stateDiagram-v2
     Suspended --> Pending: budget or retry timer fires
     Done --> [*]
     Skipped --> [*]
+    Pruned --> [*]
     Failed --> [*]
     Timeout --> [*]
     Cancelled --> [*]
@@ -714,8 +729,10 @@ edit — one prompt string included — is a new identity.
 | `stalled` | yes | no ready step and no `finish` reached |
 
 `pending` and `suspended` exist in the enum but are never assigned to a run. Step
-statuses are `pending`, `running`, `done`, `failed`, `skipped`, `cancelled`,
-`timeout` and `suspended`; the first two and `suspended` are non-terminal.
+statuses are `pending`, `running`, `done`, `failed`, `skipped`, `pruned`,
+`cancelled`, `timeout` and `suspended`; the first two and `suspended` are
+non-terminal. `pruned` is terminal and, unlike `skipped`, does not satisfy
+dependents: it marks a branch nobody took.
 
 
 ### Retirement — how a definition leaves
@@ -766,7 +783,7 @@ naming a disconnected server, exits the process with the usage code.
 |---|---|
 | top-level steps per workflow | 512 (body steps are not counted) |
 | body nesting depth | 4 |
-| `parallel` on `foreach`/`batch` | clamped to 8 |
+| `parallel` on `foreach`/`batch` | defaults to 4; ceiling `limits.workflow.fan_out`, 8 when unset — an inline definition asking for more is refused at load, over its top-level steps only; everything else is clamped |
 | `iterate.max_iterations` | 10 000 |
 | step id length and shape | 64, `[a-zA-Z_][a-zA-Z0-9_-]{0,63}` |
 | `retry.max` | clamped to 20 at parse; backoff doubles, shift capped at 10 |
@@ -774,8 +791,19 @@ naming a disconnected server, exits the process with the usage code.
 | concurrent runs | 4 per workflow (clamped 1..1024), 8 globally |
 
 The scheduler explains most surprising runtime behaviour. It is a pure function
-over the workflow, the run and the data, iterated to a fixpoint so a step skipped
-by a false `when` unblocks its dependents in the same pass.
+over the workflow, the run and the data, iterated to a fixpoint so a step
+**pruned** by a false `when` releases its dependents in the same pass — a pruned
+dependency is never waited on, but it does not *satisfy* anything either: a step
+whose every parent is pruned is pruned too, and only a step with another live
+parent still runs.
+
+A false `when` guard prunes only in the top-level scheduler. Inside a nested body
+— `foreach`, `batch`, `iterate`, `parallel`, `race`, `subgraph` — a false guard
+still marks the step `skipped`, and a skipped step *satisfies* its dependents:
+the body runs its own smaller scheduler, and the tail behind a guarded-off step
+there runs rather than pruning away. `switch` is the exception: it prunes its
+untaken targets at any depth, body included — and inside a body a pruned step
+satisfies nothing, so anything depending only on it never becomes ready.
 
 ```mermaid
 flowchart TD
@@ -784,13 +812,15 @@ flowchart TD
     B -->|"terminal"| D["nothing to do"]
     B -->|"Pending"| E{"forced by switch or goto?"}
     E -->|"yes"| R["READY"]
-    E -->|"no"| F{"any dependency Failed, Cancelled or Timeout?"}
+    E -->|"no"| Q{"has dependencies, and every one Pruned?"}
+    Q -->|"yes"| K["mark Pruned, rerun the fixpoint"]
+    Q -->|"no"| F{"any dependency Failed, Cancelled or Timeout?"}
     F -->|"yes"| G["blocked forever, so the run stalls"]
-    F -->|"no"| H{"all dependencies Done or Skipped?"}
+    F -->|"no"| H{"all dependencies Done, Skipped or Pruned?"}
     H -->|"no"| I["not ready yet"]
     H -->|"yes"| J{"when guard"}
     J -->|"absent or true"| R
-    J -->|"false"| K["mark Skipped, rerun the fixpoint"]
+    J -->|"false"| K
     J -->|"CEL error"| L["the run fails"]
     R --> M{"ready set empty?"}
     M -->|"no"| N["execute the ready steps"]
@@ -809,7 +839,9 @@ The failure modes that cost the most debugging time:
   success. Guards must test `steps.<id>.error`.
 - **`switch` and `on_error: goto` force their target** to run even with its
   `depends_on` unsatisfied — the only backward edge in an otherwise acyclic
-  graph. `switch` also marks every other case target and the `default` `Skipped`.
+  graph. `switch` also marks every other case target and the `default`
+  **`Pruned`** — not `Skipped`, so the untaken branch's whole tail is pruned
+  along with it.
 - **`outputs.schema` turns a bad result into a failed run.** It is checked for
   well-formedness at parse time, and applied at `finish`: a run that would
   complete with an output the schema rejects fails that `finish` step instead,

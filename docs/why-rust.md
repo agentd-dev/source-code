@@ -72,10 +72,12 @@ integration.
 
 | Build | External crates |
 |---|---|
-| `--no-default-features` | 75 |
-| default (`tls` + MCP) | 88 |
-| shipped release feature set (adds A2A) | 156 |
-| … plus CEL | 179 |
+| `--no-default-features` | 70 |
+| default (`tls` + MCP) | 82 |
+| shipped release feature set (adds A2A and CEL) | 167 |
+
+Counted as `cargo tree -p agentd-cli … -e normal` unique packages, less the five
+in-tree workspace crates.
 
 What CI gates is not that count but what actually reaches a user: the release
 binary is a **statically linked musl artifact that runs on `scratch`** — about
@@ -136,7 +138,7 @@ at the framing layer, closing header injection once.
 |---|---|---|
 | HTTP/1.1 client + SSE reader | `net/src/http.rs`, 690 lines | `ureq` → `url` → IDNA → ICU |
 | X.509 field extraction | `net/src/x509.rs`, 304 lines | `x509-parser` |
-| YAML subset reader | `config/yaml.rs`, 1,307 lines | `serde_yaml` (unmaintained) |
+| YAML subset reader | `instruction/src/yaml.rs`, 1,307 lines (re-exported as `config::yaml`) | `serde_yaml` (unmaintained) |
 | JSON Schema subset (2020-12) | `jsonschema.rs`, 803 lines | a validator **and** a regex engine |
 | 5-field UTC cron | `triggers/timer.rs`, 216 lines | `croner` / `cron` |
 | Prometheus exposition text | `obs/metrics.rs` | `prometheus` / `metrics` |
@@ -248,17 +250,17 @@ not the same measurement.
 
 **Compile times.** `lto = true`, `codegen-units = 1` and `opt-level = "z"` are
 right for a shipped appliance and wrong for a fast edit loop. CI compounds it:
-17 feature rows, two crates each, clippy and tests — because `--all-features`
+18 feature rows, two crates each, clippy and tests — because `--all-features`
 unification hides a build that is broken on its own.
 
-**You own the hand-rolled code forever.** Roughly 93,000 lines of source across
-the workspace, 81,000 of them in the engine. The YAML reader is a subset; the
+**You own the hand-rolled code forever.** Roughly 108,000 lines of source across
+the workspace, 89,000 of them in the engine. The YAML reader is a subset; the
 cron parser is 5-field UTC
 only and finds the next fire by stepping a minute at a time for up to four years.
 Each is a spec revision you will handle yourself, and a bug nobody else reports.
 
 **`unsafe` is quarantined, not absent, and `panic = "abort"` is unforgiving.**
-Zero `unsafe` in `net` and `mcp`; 60 blocks in the engine, half of them inside
+Zero `unsafe` in `net` and `mcp`; 57 blocks in the engine, 27 of them inside
 `#[cfg(test)]` and mostly env-var juggling (edition 2024 made `set_var` unsafe),
 the other 30 libc FFI across thirteen files. A panic in the supervisor path takes
 the whole tree down by design, which makes every `unwrap` an availability

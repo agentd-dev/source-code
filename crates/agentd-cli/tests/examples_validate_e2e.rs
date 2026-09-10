@@ -127,9 +127,15 @@ fn every_shipped_example_config_validates() {
 /// and `--validate-config` cannot see them.
 #[test]
 fn no_shipped_script_or_unit_uses_a_removed_flag() {
-    // Every spelling this project removed rather than deprecated. A hyphenated
-    // flag is the shape they all had, before the dotted form took over.
-    const REMOVED: &[&str] = &["--instruction-file", "--prompt-file"];
+    // The WHOLE table, not a subset. This once covered two of the sixteen
+    // spellings, with a comment explaining that shipped scripts still invoked
+    // several of the rest — which is a note that the check does not check,
+    // and three runner scripts stayed broken behind it. Reading the authority
+    // means a flag retired tomorrow is covered tomorrow.
+    let removed: Vec<&str> = agentd::config::v2::REMOVED_FLAGS
+        .iter()
+        .map(|(f, _)| *f)
+        .collect();
 
     let root = examples_root();
     let mut files = Vec::new();
@@ -149,15 +155,34 @@ fn no_shipped_script_or_unit_uses_a_removed_flag() {
     }
     walk(&root, &mut files);
     walk(&root.join("../packaging"), &mut files);
+    // The benchmark harness drives the same CLI, and rotted the same way: it
+    // still spelled `--mode once` long after modes were removed, so every
+    // offline run in bench/README.md's quick start exited 2.
+    walk(&root.join("../bench"), &mut files);
 
     let mut hits = Vec::new();
     for f in &files {
+        // Prose may NAME a removed flag — a migration note saying it is gone is
+        // correct and useful. Only things that get executed are scanned.
+        if f.extension().is_some_and(|e| e == "md") {
+            continue;
+        }
         let Ok(text) = std::fs::read_to_string(f) else {
             continue;
         };
         for (n, line) in text.lines().enumerate() {
-            for flag in REMOVED {
-                if line.contains(flag) {
+            // A comment explaining the migration is fine; an invocation is not.
+            if line.trim_start().starts_with('#') {
+                continue;
+            }
+            for flag in &removed {
+                // A token boundary, not a substring: `--model` contains
+                // `--mode`, and `--claim` prefixes `--claim-ttl`. Matching
+                // loosely reported three false positives on the first run.
+                if line
+                    .split(|c: char| c.is_whitespace() || c == '=')
+                    .any(|t| t.trim_matches(|c| c == '"' || c == '\'' || c == '\\') == *flag)
+                {
                     hits.push(format!("{}:{}: {}", f.display(), n + 1, line.trim()));
                 }
             }

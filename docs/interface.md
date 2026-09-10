@@ -415,7 +415,7 @@ any program can be a display client:
   reconnect with the goodbye cursor; `hello.resync` means re-bootstrap via the
   `status` command. Events are principal-scoped.
 - Taskless reads (command DataParts): `interface.info`, and under debug
-  `conversation.get`, `run.get`, `debug.events`.
+  `conversation.get`, `run.get`, `subagent.get`, `debug.events`.
 - The reply to any prompt arrives as its task's terminal artifact on the feed —
   the same event every other client folds in.
 

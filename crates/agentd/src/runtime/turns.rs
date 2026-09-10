@@ -241,7 +241,7 @@ impl Runtime {
             return;
         }
         if self.paused {
-            return; // operator hold (a2a.pause) — turns queue until resume
+            return; // operator hold (admin.pause) — turns queue until resume
         }
         if self.draining || self.turn_queue.is_empty() {
             return;

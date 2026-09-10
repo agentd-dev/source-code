@@ -2536,7 +2536,7 @@ fn validate_graph(wf: &Workflow, errs: &mut Vec<String>) {
     let name = &wf.name;
     let starts: Vec<&Step> = wf.start_steps();
     if starts.is_empty() {
-        errs.push(format!("workflow {name:?}: at least one start node is required (once|manual|loop|schedule|subscribe|signal|event|a2a)"));
+        errs.push(format!("workflow {name:?}: at least one start node is required (once|manual|loop|schedule|subscribe|signal|event|stream|correlate|a2a|webhook)"));
     }
     // Dependencies + goto targets exist.
     for s in wf.steps.values() {

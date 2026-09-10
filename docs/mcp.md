@@ -18,10 +18,18 @@ drive each other with no special-case wire.
 agentd ships **no** task tools of its own and runs no local code. Every
 capability — read a file, query an API, run a search — is a tool on some MCP
 server you declare. agentd discovers them with `tools/list` and invokes them with
-`tools/call`. If you declare zero servers, agentd's task toolbox is empty (its only
-built-in tools are its own control primitives — `subagent.*`, `workflow.*`,
-`memory.*`, `plan.*`, `skills.*`, `instruction.*` — which act on the agent itself,
-never on the world).
+`tools/call`. If you declare zero servers, agentd's task toolbox is empty (its
+built-in tools are its own control and bookkeeping primitives — `subagent.*`,
+`workflow.*`, `memory.*`, `artifact.*`, `plan.*`, `skills.*`, `instruction.*`,
+`message.send`, `ask_human`, `think`, `sleep`, `await`, `context.compact`,
+`finish` and `status` — which act on the agent, its own conversations, its own
+model or the operator, never on the world). Four more are contracts without a
+built-in implementation — `knowledge.*`, `search.*`, `code.run` and `exec` —
+which resolve only when an operator maps them to an MCP server (and `exec`
+additionally needs `--features exec` plus `security.exec.enabled`). One more,
+`resource.read`, joins the catalogue only when there is something to read: an
+MCP server's resource, or an `agentd://` self-resource such as an async child's
+completion.
 
 This is deliberate: the action space is configuration, not code. Swapping what
 an agent can do never means rebuilding agentd.
@@ -70,14 +78,18 @@ mcp:
 ### 1.3 The handshake and capability negotiation
 
 On connect, before anything else, agentd runs the MCP lifecycle. It pins
-`protocolVersion: "2025-11-25"` and declares **no client capabilities at all**:
+`protocolVersion: "2025-11-25"` and declares client capabilities sparingly. The
+handshake below is a **supervisor** boot connection — the one the process dials
+while assembling the tool catalogue at startup and again on reload — and it
+declares none at all:
 
 ```jsonc
 // agentd → server
 { "jsonrpc":"2.0","id":1,"method":"initialize","params":{
     "protocolVersion":"2025-11-25",
-    "capabilities":{},                                   // empty, deliberately
-    "clientInfo":{"name":"agentd","version":"1.0.0"}     // the client's version; title omitted
+    "capabilities":{},                                    // a boot connection declares none
+    "clientInfo":{"name":"agentd","version":"1.14.1",
+                  "title":"<instance>"}                   // build version; title = the instance name
 }}
 // server → agentd
 { "jsonrpc":"2.0","id":1,"result":{
@@ -93,14 +105,24 @@ On connect, before anything else, agentd runs the MCP lifecycle. It pins
 { "jsonrpc":"2.0","method":"notifications/initialized" }
 ```
 
-Why `capabilities:{}`? You only declare a *client* capability when you intend to
-*service* it, and agentd services none. It does not offer `roots`, `sampling`,
-`elicitation`, or `tasks`. This is the minimal interop posture and the smallest
-injection surface, and it is self-enforcing on the wire: agentd reads
-**notifications** off the server→client stream and nothing else. A server→client
-*request* has no declared capability behind it, so it is dropped rather than
-answered — there is no `roots/list` to leak a filesystem scope and no
-`sampling/createMessage` to turn the agent's model into someone else's.
+A connection the **agent loop** holds — a turn worker's or a subagent's — sends
+`"capabilities":{"elicitation":{}}` instead, and no `title`: the workload label
+is stamped once, in the supervisor process, and the spawn payload that re-execs
+a child carries no instance name, so a child's `clientInfo.title` is absent.
+
+Why so nearly empty? You only declare a *client* capability when you intend to
+*service* it, and agentd services one: `elicitation`. A server's
+`elicitation/create` becomes an `ask_human` gate — the question is rendered in
+every attached display client, the answer is shaped against the server's
+`requestedSchema`, and an answer that cannot be made to conform, or that nobody
+gives within 300s, comes back to the server as `cancel`. It offers no `roots`,
+`sampling` or `tasks`. That is the minimal interop posture and the smallest
+injection surface, and it is self-enforcing on the wire: apart from
+elicitation, agentd reads **notifications** off the server→client stream and
+nothing else. Any other server→client *request* has no declared capability
+behind it, so it is dropped rather than answered — there is no `roots/list` to
+leak a filesystem scope and no `sampling/createMessage` to turn the agent's
+model into someone else's.
 
 **Version negotiation.** agentd offers `2025-11-25` and accepts a downgrade to
 `2025-06-18`, `2025-03-26`, or `2024-11-05` where the feature use overlaps
@@ -252,10 +274,19 @@ on each update (notify-then-read).
 
 ### 1.7 Liveness and lifecycle
 
-Every request is bounded by that server's timeout (`mcp.servers[].timeout`, else
-`mcp.default_timeout`, default **60s**), so a wedged server cannot hang the loop:
-the call fails, the failure becomes an observation, and the run carries on. Its
-`ping` method is available as an explicit liveness round-trip.
+Every request is bounded, though not all by the same clock. The supervisor's
+own connections — the boot handshake, `tools/list` — honour that server's
+timeout (`mcp.servers[].timeout`, else `mcp.default_timeout`, default **60s**),
+and the registry-routed calls the runtime dispatches — a workflow's `tool:`
+step, its `memory.*`/`artifact.*`/`knowledge.*`/`search.*` steps — take
+`mcp.default_timeout` directly. A workflow's own `mcp.tool` step is bounded by
+that step's `timeout` instead (else `limits.step_timeout`, default **600s**),
+because it names its server itself rather than routing through the registry.
+The in-loop `tools/call`s a turn worker or a subagent makes are bounded by a
+fixed **60s**: the spawn payload carries no per-server timeout, so neither dial
+reaches the child. Either way a wedged server cannot hang the loop: the call
+fails, the failure becomes an observation, and the run carries on. Its `ping`
+method is available as an explicit liveness round-trip.
 
 Because agentd spawns no process for an MCP server, there is no child to signal
 or reap — closing the HTTP connection *is* the shutdown. The notification thread

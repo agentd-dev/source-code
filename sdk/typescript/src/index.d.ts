@@ -49,7 +49,10 @@ export class Workflow {
   node(id: string, spec: NodeSpec): this;
   edge(from: string, to: string, opts?: { when?: string }): this;
   policy(p: Policy): this;
-  /** Compile to workflow TOML — validate it with `agentd --validate-only`. */
+  /** Compile to workflow TOML. Note that this predates the current workflow
+   *  dialect: agentd reads YAML/JSON documents of `kind:` steps, not TOML
+   *  `[[nodes]]`, and there is no `--validate-only` flag (the validator is
+   *  `agentd --validate-config`), so what this emits is not loadable as-is. */
   toToml(): string;
 }
 

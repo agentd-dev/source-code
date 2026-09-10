@@ -1,8 +1,8 @@
 # agentd examples
 
-> ### Read this first — two eras live here
+> ### Read this first
 >
-> **Current (agentd 2.0):**
+> **The whole-system samples:**
 >
 > | File | What it is |
 > |---|---|
@@ -12,16 +12,16 @@
 > | **`tail/`** | **Processing lines as they arrive** — react to appended CSV/text lines with a durable byte cursor that survives a restart, partial-line hold-back, and rotation detection. A directory-shaped project (`agentd.yml` + `workflows/`). |
 > | **`voice/`** | **A voice agent, end to end** — wake word, speech, and a room full of people who are not authenticated. Two instances split by the lethal-trifecta gate (the ears that hear vs. the hands that unlock), plus a stdlib-only reference MCP server for the microphone and the speaker. Runs with `--fake` and no hardware. |
 >
-> **Legacy (agentd 1.x — superseded, kept for reference):** the `run-*.sh`
-> scripts, the k8s manifests and the flag tables below drive the **`--mode`**
-> surface that agentd 2.0 **removed**. A 1.x invocation is now rejected at
-> startup with a migration hint, so those commands will not run as written.
-> The 2.0 equivalents are: one durable runtime (`lifecycle.run_until` = job or
-> daemon) with workflow **start nodes** (`once` / `loop` / `schedule` /
-> `subscribe` / `signal` / `event` / `a2a`) as the triggers — see
-> [modes-and-triggers.md](../docs/modes-and-triggers.md) and
-> [getting-started.md](../docs/getting-started.md). Modernizing these scripts
-> is tracked work, not a claim that they work today.
+> **Coming from agentd 1.x?** The `--mode`, `--subscribe` and `--interval`
+> spellings the 1.x samples used were **removed in 2.0**: naming one now fails
+> the load with a hint naming its replacement, so a stale command line is a loud
+> error rather than a flag that quietly does nothing. They survive in the flag
+> table below only as that migration map. What replaced them is one durable
+> runtime (`lifecycle.run_until` = job or daemon) triggered by workflow **start
+> nodes** (`once` / `loop` / `schedule` / `subscribe` / `signal` / `event` /
+> `a2a`) — which is what the runner scripts and the k8s manifests here run on
+> today. See [modes-and-triggers.md](../docs/modes-and-triggers.md) and
+> [getting-started.md](../docs/getting-started.md).
 
 ---
 
@@ -34,9 +34,9 @@
 | `instructions/triage.md` | An instruction file with an output contract — classify an inbox item, take one action, emit JSON. Used by the reactive and loop samples. |
 | `instructions/research.md` | An instruction file with an output contract — research a topic to a single sourced answer. Used by the once sample. |
 | `mcp-servers.json` | An illustrative MCP server config (name + remote `endpoint` + auth `headers` + `tags`), the shape a `--config` JSON file carries. |
-| `run-once.sh` | `--mode once`: run the instruction to a terminal status, then exit. Job / CLI shape. |
-| `run-reactive.sh` | `--mode reactive`: idle, wake on MCP resource changes, never exit on its own. Deployment shape. |
-| `run-loop.sh` | `--mode loop`: re-enter on a cadence until a bound or a drain signal. Job-with-deadline / Deployment shape. |
+| `run-once.sh` | Run the instruction to a terminal status, then exit. Flags only, no config file — so agentd synthesizes the one-shot `main` workflow (a `once` start, an `agent` step, a `finish`). Job / CLI shape. |
+| `run-reactive.sh` | Idle, wake on MCP resource changes, never exit on its own. The trigger is the `subscribe` start node in [`reactive-triage.yaml`](reactive-triage.yaml), which the script passes with `--config`. Deployment shape. |
+| `run-loop.sh` | Re-enter on a cadence until a bound or a drain signal. The trigger is the `loop` start node in [`loop-triage.yaml`](loop-triage.yaml), which the script passes with `--config`. Job-with-deadline / Deployment shape. |
 
 All three scripts assume `agentd` is on `$PATH` (override with `AGENTD=/path/to/agentd`)
 and that an intelligence endpoint is reachable. Build the binary with
@@ -74,8 +74,8 @@ endpoint. So every sample needs two things wired:
    server-controlled strings (RFC 0012).
 
 A bad config exits `2` in milliseconds, before any LLM round-trip — agentd
-validates everything up front (e.g. `--mode reactive` with no `--subscribe`, or
-an intelligence URI with an unsupported scheme, both fail fast).
+validates everything up front (e.g. a `subscribe` start node with no `server`,
+or an intelligence URI with an unsupported scheme, both fail fast).
 
 ---
 
@@ -102,16 +102,25 @@ the supervisor can map to an exit code.
 
 ## The MCP server config
 
-`mcp-servers.json` shows the shape of a declarative MCP server list: each server
-has a `name`, a remote `endpoint` (an `https://host/mcp` Streamable-HTTP URL),
-optional auth `headers` (carrying `{{secret:NAME}}` references resolved at connect
-time, never inlined or logged), and `tags` that scope the Rule-of-Two trust budget
-(RFC 0009/0012). Load it with **`--config <path>`** (or `AGENTD_CONFIG`); the
-intelligence token still stays env/flag only.
+`mcp-servers.json` shows the shape of a declarative MCP server list: a document
+that opens with `config_version: "1"` and carries the list under **`mcp.servers`**.
+Each server has a `name`, a remote `endpoint` (an `https://host/mcp`
+Streamable-HTTP URL that agentd CONNECTS to — it spawns no process), optional auth
+`headers` (carrying `{{secret:NAME}}` references resolved at connect time, never
+inlined or logged), and `tags` that scope the Rule-of-Two trust budget
+(RFC 0009/0012). The `endpoint` is trusted config and is never built from model- or
+server-controlled strings. Load it with **`--config <path>`** (or `AGENTD_CONFIG`);
+the intelligence token still stays env/flag only.
+
+> **These four servers together hold all three trifecta legs**, so loading the file
+> as a whole config is refused at startup — `untrusted_input + sensitive + egress`
+> in one grant. That is the tags doing their job, not a defect in the sample: a real
+> deployment splits them across two instances, as [`hiring/`](hiring/) and
+> [`voice/`](voice/) do.
 
 > **Config precedence.** `--config` is the lowest non-default layer
 > (`default < FILE < env < flag`, RFC 0017 §3). Repeatable list flags like `--mcp`
-> **add** to the file's `mcp_servers`, so a file can declare the base set and a
+> **add** to the file's `mcp.servers`, so a file can declare the base set and a
 > flag can append one for a one-off run.
 
 The `--mcp` flag equivalents of the sample file (agentd connects to each URL):
@@ -125,7 +134,7 @@ The `--mcp` flag equivalents of the sample file (agentd connects to each URL):
 
 ---
 
-## Sample 1 — `run-once.sh` (mode: once)
+## Sample 1 — `run-once.sh` (a `once` start node)
 
 Run an instruction to a terminal status, then exit. This is the Job / CLI shape:
 result on stdout, telemetry on stderr, no daemon, no served surface.
@@ -140,14 +149,19 @@ The script runs (abbreviated):
 
 ```bash
 agentd \
-  --mode once \
   --instruction.file instructions/research.md \
   --model claude-opus-4 \
-  --mcp "search=https://mcp-search.internal/mcp" \
-  --mcp "fs=https://mcp-fs.internal/mcp" \
+  --mcp search=https://mcp-search.internal/mcp \
+  --mcp fs=https://mcp-fs.internal/mcp \
   --max-steps 40 --max-tokens 150000 --deadline 5m \
-  --run-id "research-20260625-101500"
+  --log-level info \
+  --run-id "research-$(date +%Y%m%d-%H%M%S)"
 ```
+
+There is no config file and no workflow here, and none is needed: an instruction
+that arrives without one gets the sugar workflow agentd synthesizes for it —
+`start: {kind: once}`, an `agent` step carrying the instruction, a `finish` — so
+the flags above are the whole configuration for a job that runs once.
 
 The exit code maps the root subagent's terminal status: `completed`→`0`,
 `refused`→`5`, budget/exhausted (steps / tokens / the run's own `deadline`)→`7`
@@ -157,7 +171,7 @@ Setting an explicit `--run-id` makes retries idempotent.
 
 ---
 
-## Sample 2 — `run-reactive.sh` (mode: reactive)
+## Sample 2 — `run-reactive.sh` (a `subscribe` start node)
 
 Idle at near-zero CPU; wake on `notifications/resources/updated`; triage the
 changed item; return to idle. The daemon **never exits on its own** — only a
@@ -174,21 +188,33 @@ Abbreviated:
 
 ```bash
 agentd \
-  --mode reactive \
-  --instruction.file instructions/triage.md \
-  --model claude-opus-4 \
-  --mcp "inbox=https://mcp-inbox.internal/mcp" \
-  --mcp "tickets=https://mcp-tickets.internal/mcp" \
-  --subscribe "inbox:///items/new" \
-  --max-steps 25 --max-tokens 2000000 \
-  --health-file /run/agentd/health --drain-timeout 25s
+  --config reactive-triage.yaml \
+  --max-tokens 2000000 \
+  --health-file /run/agentd/health \
+  --log-level info
 ```
 
-`--mode reactive` **requires** at least one `--subscribe <uri>`; without it the
-config fails validation and exits `2`. The token ceiling is tree-wide and
+Everything structural — the instruction, the two MCP servers, the file store,
+the drain budget and the subscription itself — lives in
+[`reactive-triage.yaml`](reactive-triage.yaml); the flags are only the ceilings
+and the things a deployment owns. The trigger is one start node:
+
+```yaml
+workflows:
+  - name: triage
+    steps:
+      new_item: { kind: subscribe, server: inbox, uri: "inbox:///items/new" }
+      work:     { kind: agent, depends_on: [new_item], instruction: "…" }
+      done:     { kind: finish, depends_on: [work] }
+```
+
+A `subscribe` start node needs both a `server` and a `uri`; omit either and the
+config fails validation and exits `2`, naming the missing field
+(`kind "subscribe" requires field "server"`). The token ceiling is tree-wide and
 lifetime-scoped — it is the ultimate backpressure. `--health-file` gives an
-orchestrator a liveness heartbeat to probe; `--drain-timeout` (default 25s)
-bounds graceful shutdown and should stay under the pod's termination grace.
+orchestrator a liveness heartbeat to probe; `lifecycle.drain_timeout` (25s in
+this config, which is also the default) bounds graceful shutdown and should stay
+under the pod's termination grace.
 
 > **How reactivity works.** agentd subscribes over the MCP servers'
 > Streamable-HTTP transport and wakes on pushed `notifications/resources/updated`
@@ -197,7 +223,7 @@ bounds graceful shutdown and should stay under the pod's termination grace.
 
 ---
 
-## Sample 3 — `run-loop.sh` (mode: loop)
+## Sample 3 — `run-loop.sh` (a `loop` start node)
 
 Re-enter the instruction on a cadence until a bound — max iterations (via the
 step cap), the wall-clock `--deadline`, or the tree-wide token ceiling — or a
@@ -213,25 +239,38 @@ Abbreviated:
 
 ```bash
 agentd \
-  --mode loop \
-  --interval 5m \
-  --instruction.file instructions/triage.md \
-  --model claude-opus-4 \
-  --mcp "inbox=https://mcp-inbox.internal/mcp" \
-  --mcp "tickets=https://mcp-tickets.internal/mcp" \
-  --max-steps 25 --max-tokens 1000000 --deadline 2h \
-  --drain-timeout 25s
+  --config loop-triage.yaml \
+  --max-tokens 1000000 \
+  --deadline 2h \
+  --log-level info
 ```
 
-`--interval D` sets the re-entry cadence: `D>0` polls every `D`; `D=0`
-re-enters immediately on completion (work-until-done). A `--deadline` turns the
-loop into a bounded run; omit it (and let the orchestrator own lifecycle) for a
-kept-alive Deployment.
+The cadence is the start node in [`loop-triage.yaml`](loop-triage.yaml), beside
+the same instruction and MCP servers the reactive sample declares:
+
+```yaml
+workflows:
+  - name: triage
+    steps:
+      every_5m: { kind: loop, interval: 5m }
+      work:     { kind: agent, depends_on: [every_5m], instruction: "…" }
+      done:     { kind: finish, depends_on: [work] }
+```
+
+`interval` is the gap between runs, not a wall-clock period: the node re-arms
+only when the previous run **finishes**, so two runs never overlap and a slow
+run pushes the next one out. `interval: 0` (the default) re-enters immediately
+on completion — work-until-done. The loop's own bounds sit on the same node:
+`max_iterations` caps how many times it re-enters, and `until` — an expression
+over the last outcome — stops it early. A drain signal stops it at any point,
+which is what a kept-alive Deployment relies on.
 
 > **Scheduling note.** For production cron, the **recommended** path is an
-> external scheduler (e.g. a k8s CronJob) invoking `agentd --mode once …` — robust
-> to clock skew and restart. agentd also has a `--mode schedule` (per-fire
-> identical to `once`, requires `--interval <dur>` or `--cron <expr>`) for
+> external scheduler (e.g. a k8s CronJob) firing one `once`-start pod per tick —
+> robust to clock skew and restart, and what
+> [`k8s/cronjob-schedule.yaml`](k8s/cronjob-schedule.yaml) does. agentd also has
+> a `schedule` start node (`every: <dur>`, `cron: <expr>` with the `cron`
+> feature, or a one-shot `at: <dur>`), per fire identical to `once`, for
 > non-orchestrated deployments (RFC 0008).
 
 ---
@@ -254,10 +293,16 @@ redacted (`***`) in all agentd output, including panic messages.
 
 ## Flag reference (used by these samples)
 
-Every flag below is in `crates/agentd/src/config.rs`; run `agentd --help` for the
-full list. Anything env-settable (12-factor) is shown with its env var. The
-neutral `AGENT_*` env prefix is accepted as an alias for the branded `AGENTD_*`
-one (branded wins on conflict).
+Most flags below are aliases in the `ALIASES` table in
+`crates/agentd/src/config/v2/mod.rs`, which maps each spelling onto a config path;
+`--config`/`-c` is parsed by hand instead, because the file layer has already
+consumed it by the time the flag layer runs. `--mode`, `--subscribe` and
+`--interval` are the 1.x spellings this file keeps for reference — they live in
+`REMOVED_FLAGS`, so naming one now fails the load with a migration hint rather than
+being quietly ignored. Run `agentd --help` for the current list. Anything
+env-settable (12-factor) is shown with its env var. The neutral `AGENT_*` env
+prefix is accepted as an alias for the branded `AGENTD_*` one (branded wins on
+conflict).
 
 | Flag | Env | Meaning |
 |---|---|---|
@@ -267,10 +312,10 @@ one (branded wins on conflict).
 | `--intelligence-token <T>` | `AGENT_INTELLIGENCE_TOKEN` | bearer / api key (redacted) |
 | `--model <NAME>` | `AGENT_MODEL` | model id |
 | `--mcp name=<endpoint>` | — | declare a remote MCP server URL (repeatable; Streamable HTTP) |
-| `--config <PATH>` | `AGENT_CONFIG` | load a declarative JSON config file (`mcp_servers[]`, limits, …) |
-| `--mode once\|loop\|reactive\|schedule` | `AGENT_MODE` | the driver (default `once`) |
-| `--subscribe <uri>` | — | subscribe to an MCP resource (repeatable; required for `reactive`) |
-| `--interval <dur>` | — | loop/schedule cadence (e.g. `5m`, `0`=immediate) |
+| `--config <PATH>` | `AGENT_CONFIG` | load a declarative config file (`mcp.servers`, limits, …) |
+| `--mode …` | — | **removed in 2.0** — use a start node (`once` / `loop` / `schedule` / `subscribe` / …); `AGENT_MODE` is not read either |
+| `--subscribe <uri>` | — | **removed in 2.0** — use a `subscribe` start node: `{kind: subscribe, server: <name>, uri: <uri>}` |
+| `--interval <dur>` | — | **removed in 2.0** — `interval` on a `loop` start node, or `every` on a `schedule` start node |
 | `--max-steps <N>` | `AGENT_MAX_STEPS` | per-run step cap (default 50) |
 | `--max-tokens <N>` | `AGENT_MAX_TOKENS` | token budget (default 200000) |
 | `--deadline <dur>` | `AGENT_DEADLINE` | wall-clock deadline (default `600s`) |
@@ -279,7 +324,7 @@ one (branded wins on conflict).
 | `--log-level <L>` | `AGENT_LOG_LEVEL` | `trace\|debug\|info\|warn\|error` (default `info`) |
 | `--drain-timeout <dur>` | `AGENT_DRAIN_TIMEOUT` | graceful drain budget (default `25s`) |
 | `--health-file <PATH>` | — | liveness heartbeat file |
-| `--serve-mcp https://host:port` | `AGENT_SERVE_MCP` | serve agentd's own MCP over HTTP(S) with mTLS/bearer (`serve-https`; loopback `http://` for dev) |
+| `--serve-mcp https://host:port` | `AGENT_SERVE_MCP` | serve agentd's own MCP over HTTP(S) with mTLS/bearer (sets `a2a.listen`; needs the `a2a` feature; loopback `http://` for dev) |
 
 Durations accept `ms` / `s` / `m` / `h`, or a bare integer (seconds): `250ms`,
 `30`, `5m`, `2h`.
@@ -288,13 +333,24 @@ Durations accept `ms` / `s` / `m` / `h`, or a bare integer (seconds): `250ms`,
 
 ## Boundaries
 
-- **All transports are HTTP(S).** Intelligence, the MCP client, the served
-  self-MCP, and A2A / operator control are HTTP(S) with mTLS/bearer auth;
-  plaintext `http://` is a **loopback-only** dev carve-out. agentd links no
-  unix/vsock of its own.
-- **agentd ships no tools and runs no local code.** There is no `exec` tool; every
-  tool comes from a remote MCP server it connects to.
-- **Agent-authored cyclic workflows** ship under `--features workflow` — the
-  model self-authors a `Graph` and agentd drives it (see
-  [`docs/workflows.md`](../docs/workflows.md)).
+- **Every network transport is HTTP(S).** Intelligence, the MCP client, the served
+  self-MCP, and A2A / operator control are HTTP(S) with mTLS/bearer auth; plaintext
+  `http://` is a **loopback-only** dev carve-out. Off the network it speaks two
+  things. A **unix domain socket** (`unix:///run/agentd/a2a.sock`) carries that same
+  HTTP/1.1 + JSON-RPC without TLS, because the kernel authenticates the peer by uid
+  — which is how a co-located A2A peer, an instance child reaching its parent, is
+  wired. And between the supervisor and its subagents there is a length-framed
+  JSON-RPC over the child's own stdio pipes: a 4-byte length prefix, so an
+  instruction or a distilled result containing newlines survives the wire.
+- **agentd ships no tools and runs no local code by default.** The one exception is
+  `exec`, the guarded local command runner, off at build time (the `exec` cargo
+  feature, deliberately not in the released binaries) and again at run time
+  (`security.exec.enabled`); without both it is a mapping-only contract whose
+  execution is delegated off-box through `tools.overrides` — see
+  [`coding-agent.yaml`](coding-agent.yaml). Every other tool comes from a remote MCP
+  server it connects to.
+- **Agent-authored cyclic workflows** are in every build — the engine is
+  unconditional, so the model self-authors a `Graph` and agentd drives it with no
+  feature flag behind it; `cel` is what `when:` / `until:` / `filter:` need, and it
+  is in the released binaries (see [`docs/workflows.md`](../docs/workflows.md)).
 - **MCP `tasks` / `sampling` / `roots`** as a client are **(deferred)**, RFC 0013.

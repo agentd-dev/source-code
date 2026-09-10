@@ -28,7 +28,7 @@ pub fn estimate_value(v: &Value) -> u64 {
 }
 
 /// The default context window when the model is unknown (a conservative
-/// modern default; `intelligence.model_window` overrides).
+/// modern default; `context.model_window` overrides).
 pub const DEFAULT_MODEL_WINDOW: u64 = 128_000;
 
 /// A best-effort window from the model name (kept tiny and obviously

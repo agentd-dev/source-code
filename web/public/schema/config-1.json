@@ -4168,7 +4168,7 @@
       "type": "object"
     },
     "workflows": {
-      "description": "inline workflow definitions or {name, file|uri} references",
+      "description": "inline workflow definitions, or {name, file|uri|url} / {name, dir} references",
       "items": {
         "$ref": "#/$defs/WorkflowRef"
       },

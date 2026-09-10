@@ -7,7 +7,7 @@
  * a screenshot mocked up by hand drifts from the product the moment either
  * changes, while these are regenerated from the code that ships.
  *
- *   node tools/frames.mjs > ../docs/_tui-frames.json
+ *   node tools/frames.mjs > ../docs/_generated/tui-frames.json
  */
 import './_force_color.mjs';
 import React from 'react';

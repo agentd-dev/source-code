@@ -4,13 +4,13 @@
 //! derived mechanically from the path — so a re-defined parameter set needs no
 //! per-field plumbing here.
 //!
-//! For a config path `limits.max_steps`:
+//! For a config path `limits.run.steps`:
 //!
 //! | source | name                                                    |
 //! |--------|---------------------------------------------------------|
-//! | file   | `limits: { max_steps: 5 }` (YAML or JSON)               |
-//! | env    | `AGENTD_LIMITS_MAX_STEPS` > `AGENT_LIMITS_MAX_STEPS` > `LIMITS_MAX_STEPS` |
-//! | flag   | `--limits.max_steps 5` / `--limits.max-steps 5` / `--limits-max-steps 5` |
+//! | file   | `limits: { run: { steps: 5 } }` (YAML or JSON)          |
+//! | env    | `AGENTD_LIMITS_RUN_STEPS` > `AGENT_LIMITS_RUN_STEPS` > `LIMITS_RUN_STEPS` |
+//! | flag   | `--limits.run.steps 5` / `--limits.run-steps 5` / `--limits-run-steps 5` |
 //!
 //! The env candidates are the branded, the neutral, and the bare spelling of
 //! the upper-cased path with `.` → `_`; the first present wins.
@@ -19,7 +19,7 @@
 //! type ([`Kind`]): integers/numbers/booleans parse, enums are checked against
 //! their allowed set, arrays take a `[a, b]` literal or a comma-separated list,
 //! objects take a `{k: v}` / JSON literal — everything else is the verbatim
-//! string. The typed [`super::file::ConfigFile`] then re-validates the merged
+//! string. The typed [`super::v2::Settings`] then re-validates the merged
 //! document exactly as it does the file (unknown keys, ranges).
 //!
 //! A dotted flag may also reach INTO a free-form map (a schema object with
@@ -28,8 +28,10 @@
 //! schema path), typed by the map's value type. Array elements are not
 //! addressable by path (set the whole list, or use the named repeatable flag).
 //!
-//! The single source of truth is [`super::file::config_schema`] — the same
-//! JSON Schema `--config-schema` prints — walked once at startup.
+//! The single source of truth is [`super::v2::schema::schema`] — the same JSON
+//! Schema `--config-schema` prints — walked once at startup by [`bindings_of`].
+//! (The no-arg [`bindings`] still walks the legacy v1 schema in
+//! [`super::file`], and is reached only by this module's own tests.)
 
 use super::file::config_schema;
 use super::yaml;
@@ -78,7 +80,7 @@ impl Kind {
 /// One config-file path with its schema type and (optional) description.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Binding {
-    /// Dotted path from the document root, e.g. `limits.max_steps`.
+    /// Dotted path from the document root, e.g. `limits.run.steps`.
     pub path: String,
     pub kind: Kind,
     pub description: Option<String>,
@@ -106,7 +108,7 @@ impl Binding {
     }
 }
 
-/// `limits.max_steps` / `limits-max-steps` / `limits.max-steps` → `limits-max-steps`.
+/// `limits.run.steps` / `limits-run-steps` / `limits.run-steps` → `limits-run-steps`.
 fn canonical_flag_body(s: &str) -> String {
     s.replace(['.', '_'], "-")
 }

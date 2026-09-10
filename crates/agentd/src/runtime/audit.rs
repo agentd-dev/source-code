@@ -132,7 +132,9 @@ impl Runtime {
 
 #[cfg(test)]
 mod tests {
-    // The emitter is exercised end-to-end by `runtime_v2_audit_e2e` (a real
-    // daemon with `observability.audit.sink: [log]`); a pure-unit test would only
-    // restate the JSON shape. The shape is asserted there against the log line.
+    // The emitter is exercised end-to-end by
+    // `runtime_v2_a2a_e2e::a2a_calls_are_audited_when_the_audit_log_sink_is_on`
+    // (a real daemon with `observability.audit.sink: [log]`); a pure-unit test
+    // would only restate the JSON shape. The shape is asserted there against
+    // the log line.
 }

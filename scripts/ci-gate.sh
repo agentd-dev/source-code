@@ -99,8 +99,8 @@ if [ "${1:-}" != "quick" ]; then
   step "published schemas are current"
   cargo build -p agentd-cli --all-features >/dev/null 2>&1
   ./scripts/gen-schemas.sh >/dev/null
-  git diff --exit-code -- web/public/schema >/dev/null || {
-    echo "  web/public/schema is stale — commit the regenerated schemas"
+  git diff --exit-code -- web/public/schema web/lib/workflow-nodes.json >/dev/null || {
+    echo "  web/public/schema or web/lib/workflow-nodes.json is stale — commit the regenerated files"
     fail=1
   }
 fi

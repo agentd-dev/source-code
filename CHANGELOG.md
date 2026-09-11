@@ -5,6 +5,70 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## Unreleased
+
+### Security (breaking)
+
+- **A served document may only configure what it IS.** The boundary between a
+  document's machinery and the operator's configuration was a deny-list of six
+  path prefixes — `agent.document_capabilities`, `agent.instruction`,
+  `security`, `identity` and two retired spellings — and the settings schema has
+  143 paths. Everything nobody had thought about was writable by an unsigned,
+  unpinned instruction with no capability grant at all, because `:::!config` is
+  family `core`, below the trust ladder entirely.
+
+  Five of those were exploitable, and each was reproduced before it was closed:
+
+  - **`services`** is the catalogue `security.egress: closed` is checked
+    against. A document catalogued its own destination and the closed-egress
+    sweep passed it — the gate still ran, and the allow-list it reads had become
+    the gated party's to write. The pairing is deliberate: `mcp.servers` stays a
+    document's to declare, `services` does not. The document says what it needs;
+    the operator says what is reachable.
+  - **`agent.tools`** — fragments merge deep and arrays CONCATENATE, document
+    entries first, so an operator who narrowed `internal:` to `[think, finish]`
+    got `[exec, subagent.run, think, finish]` once the document asked.
+  - **`intelligence.endpoints`** — same concatenation, so the document's
+    endpoint landed ahead of the operator's and became the primary: the whole
+    conversation, system prompt and tool results included.
+  - **`a2a.principals`** — `any → user` with `grants: ["*"]` admitted anonymous
+    callers to every non-admin command. (`any → operator` was already refused by
+    a validation check, and the admin family answers to the role regardless.)
+  - **`interface.enabled` and `webhooks.listen`** — the human control plane and
+    an inbound socket of the document's choosing.
+
+  The boundary is now an **allow-list**: `DOCUMENT_MAY_WRITE` names what
+  describes the agent (its workflows, streams, MCP servers, A2A peers, context,
+  goal, limits, model choice, loop shape, and the two `tools` keys that only
+  ever narrow), `OPERATOR_ONLY` names what describes the deployment, and a path
+  in **neither is refused**. The
+  polarity is the fix, not the list contents: a deny-list can only refuse what
+  somebody already thought of, which is precisely how all five arose.
+
+- **A subagent template's machinery faces the same boundary.** It had a
+  seven-key list of its own that never consulted the document rule, so the
+  boundary was reachable in one hop: the identical `:::!config` that is refused
+  in the agent's own document — `identity.autonomous_as`,
+  `agent.document_capabilities`, `agent.instruction.trust` — was accepted inside
+  a template and the child was spawned with it. One classifier now answers
+  wherever a served document contributes configuration, and it subsumes the old
+  list. A child keeps ONE narrowing of its own, and it is a different rule
+  rather than the same one twice: `a2a:` and `intelligence:` are a document's to
+  write at large but a child's are overwritten wholesale at spawn, so a template
+  writing them is refused instead of silently ignored — which had been true of
+  `intelligence:` all along. A child's service catalogue is also assigned
+  unconditionally: a parent with none must hand the child an empty one rather
+  than leave whatever the template wrote.
+
+### Added
+
+- **`every_config_path_is_classified_for_documents`** — the forcing function,
+  and the reason the two lists above will still be true next release. It walks
+  the generated settings schema and fails on any path in neither list, the same
+  shape `every_config_path_is_classified` has held the reload partition to since
+  three reload defects turned out to be unclassified fields. Both checks now
+  share one schema walk, because "what is the config surface?" has one answer.
+
 ## v1.15.0 — nothing claims more than it does
 
 One subject, reached from several directions: the distance between what agentd

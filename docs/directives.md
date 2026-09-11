@@ -182,9 +182,10 @@ steps:
 :::
 ```
 
-- **`:::!config`** — any config fragment (a YAML mapping of sections:
-  `store`, `lifecycle`, `limits`, `intelligence`, …). Several blocks merge in
-  document order, later winning.
+- **`:::!config`** — a config fragment (a YAML mapping of sections: `limits`,
+  `context`, `store.kind`, `lifecycle.run_until`, `intelligence.model`, …),
+  bounded by the allow-list below — a document configures what it IS, not the
+  deployment it runs in. Several blocks merge in document order, later winning.
 - **`:::!mcp{name=…}`** — one `mcp.servers[]` entry; attributes merge over the
   body. The `allow`/`exclude` globs are real config (they work in the config
   file too): they gate the server's **advertised** tool names at the
@@ -346,21 +347,69 @@ key: `author_keys` that are all `instruction://…keys.json` JWKS uris need the
 registry client. `unenforceable` says what that case means: `warn` (default),
 `refuse` (exit 2), or `ignore`.
 
-**A document may not configure the terms it is judged by.** A `:::!config`
-fragment is refused outright when it writes any of:
+**A document configures what it IS, never the deployment it runs in.** The
+boundary is an allow-list: a `:::!config` fragment may write the settings that
+describe this agent, and everything else is the operator's. A path in neither
+list is refused, so a setting added tomorrow is the operator's until somebody
+says otherwise.
 
-| Refused | Because |
+| A document may write | Why |
+|---|---|
+| `workflows`, `streams`, `mcp`, `vars` | what the agent DOES — the whole point of `:::!workflow`, `:::!stream` and `:::!mcp` |
+| `a2a.peers` | another agent this one dials — the same class as `mcp.servers`, and covered by the same closed-egress sweep (`:::peer` declares one) |
+| `context`, `goal`, `knowledge`, `search`, `memory`, `limits` | how it thinks, remembers and bounds itself |
+| `intelligence.model(s)`, `.budget`, `.dialect`, `.timeout`, `.default`, `.swap_policy`, `.structured_output`, `.preflight_model` | WHICH model and how much of it |
+| `agent.name`, `.approval`, `.ask_human_fallback`, `.conversation_budget`, `.max_parallel_turns`, `.on_workflow_finished`, `.preflight`, `.wake_on` | the agent loop's own shape |
+| `tools.narrow`, `tools.disabled` | `narrow` only ADDS trifecta tags and descriptions — more dangerous than the operator said, never less; `disabled` only takes capability AWAY, and is the spec's `deny` form |
+| `skills.max_bytes`, `.max_loaded`, `.reference_prefix` | caps on the skill loader |
+| `store.kind`, `.durability`, `.checkpoint`, `.on_error`, `.timeout`, `.max_value_bytes`, `.prefix` | the durability CLASS and the caps around it — never the PLACE |
+| `lifecycle.run_until`, `.idle_grace`, `.until_signal` | when this agent is finished. `agentd --instruction doc.md` is a shipped shape, and an agent that cannot say when it is done is not one |
+| `observability.log_level`, `.runtime_events` | how loud the log is, and routing runtime events into a `streams:` entry the document declared |
+
+| Refused — operator only | Because |
 |---|---|
 | `agent.document_capabilities` | it is the grant set deciding which families this document may activate |
-| `agent.instruction.*` | source, `trust` and `decrypt` — a document that rewrites these points the next read at itself |
+| `agent.instruction.*`, `agent.prompt` | source, `trust` and `decrypt` — a document that rewrites these points the next read at itself |
+| `agent.tools`, `tools.overrides` | the tool grant, and re-routing a built-in onto a server. Arrays CONCATENATE, so a document naming tools could only ever widen the operator's list |
 | `security.*` | the gates: trifecta, egress, `exec`, policies, TLS trust, AAuth |
+| `services` | the catalogue `security.egress: closed` is checked AGAINST. A gate whose allow-list the gated party writes is not a gate |
 | `identity.*` | who work is done on behalf of |
+| `a2a.listen`, `.tls`, `.bearer`, `.principals`, `.push`, `.conversation_ttl` | who may talk to THIS agent and as what, over which socket, with which credential |
+| `interface.*`, `webhooks.*` | the human control plane, and inbound sockets with the auth on them. A document declares a `:::endpoint` ROUTE; the listener it is served on is the operator's |
+| `intelligence.endpoints`, `.token`, `.token_file`, `.headers`, `.auth` | where the conversation goes and the credential it goes with |
+| `subagents.*` | a whole child agent — its own source, grants and identity. A document REFERENCES a template (`:::agent template=…`); defining one is the operator's |
+| `store.file`, `.http`, `.mcp`, `.audit`, `.retention` | WHERE state lives — a path on the host, or a remote the deployment must be willing to reach — and the audit record |
+| `lifecycle.drain_timeout`, `.exit_code_map`, `.run_id`, `.watch_config` | the orchestration contract: what an orchestrator sees, and whether the process watches its own config file |
+| `observability.log_content`, `.audit`, `.otel`, `.metrics_addr`, `.health_file`, `.report_file`, `.events_ring`, `.traceparent` | `log_content` puts conversation TEXT into the operator's log pipeline; `otel.endpoint` is the one egress `closed` deliberately does not cover; the rest name sockets and files |
+| `skills.dir`, `skills.sources` | where skills are READ FROM — a folder or source whose contents become prompt text |
 | `instruction_sources` | the pre-1.13 spelling of `trust` — refused as operator configuration rather than handed the rename hint |
-| `instruction` | the specification's own top-level spelling for the same surface — refused by name during the fold, before the fragment ever reaches the path check below; agentd's config lost the section (the envelope keys live at `agent.instruction.decrypt`), and a document may not re-point the instruction it is |
+| `instruction` | the specification's own top-level spelling for the same surface — refused by name during the fold, before the fragment reaches the path check; agentd's config lost the section (the envelope keys live at `agent.instruction.decrypt`), and a document may not re-point the instruction it is |
 
 The check is by **path**, not by top-level key name — the fragment merges deep
 and arrays concatenate, so a nested `agent: {document_capabilities: […]}` is
 the same self-grant as a top-level one and is refused the same way.
+
+**A template's machinery faces the same boundary.** A subagent template's
+`:::!config` is a served document's fragment too, so it is classified by the
+same rule. Without that the boundary was reachable by one hop: the fragment
+refused in the agent's own document was accepted inside a template, and the
+child was spawned with it.
+
+A child takes one narrowing on top: `a2a:` and `intelligence:` are refused in a
+template even though a document at large may write them, because the parent
+composes both for a child (`model:` and `budget:` on the template are how you
+set the child's model and ceiling).
+
+**The two lists are held to the schema.** `every_config_path_is_classified_for_documents`
+walks the generated settings schema and fails on any path in neither list — the
+same forcing function the reload partition has, for the same reason. A path
+nobody classified is not "probably fine", it is unexamined.
+
+**This makes `closed` mean what it says; it does not make `open` safe.** With
+`security.egress: open` a document may still name any host in `mcp.servers` —
+that is what `open` means. For any deployment whose instruction document is not
+fully under the operator's control, `security.egress: closed` plus an
+operator-written `services:` catalogue is the posture.
 
 **Revocation.** A signature is valid forever; a document that can execute code
 must stop being usable the moment it stops being sanctioned. Authorization is

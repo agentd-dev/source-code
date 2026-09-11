@@ -31,7 +31,7 @@ You are the order desk.
 :::!config
 store: { kind: memory }
 lifecycle: { run_until: idle, idle_grace: 900ms }
-observability: { log_level: info, log_content: true }
+observability: { log_level: info }
 limits: { max_runs: 20 }
 :::
 "#;

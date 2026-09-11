@@ -351,12 +351,20 @@ impl Runtime {
         }
         doc["lifecycle"] = lifecycle;
         // The child inherits the parent's service catalog, egress posture and
-        // trifecta override. A template cannot set these (they are in
-        // REFUSED_FRAGMENT_KEYS): a child must never be able to grant itself a
-        // wider trust budget than the parent that spawned it.
-        if let Some(services) = self.settings_doc.get("services") {
-            doc["services"] = services.clone();
-        }
+        // trifecta override. A template cannot set any of these — they are
+        // `OPERATOR_ONLY`, so `document_wrote_operator_config` refuses the
+        // fragment at compile — because a child must never be able to grant
+        // itself a wider trust budget than the parent that spawned it.
+        //
+        // Assigned UNCONDITIONALLY. A parent with no catalogue of its own must
+        // hand the child an empty one rather than leave in place whatever the
+        // template wrote: composition must not depend on a check somewhere
+        // else still holding.
+        doc["services"] = self
+            .settings_doc
+            .get("services")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
         let mut security = json!({});
         if self.settings.security.allow_trifecta {
             security["allow_trifecta"] = json!(true);

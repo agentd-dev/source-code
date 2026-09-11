@@ -27,7 +27,7 @@ const AGENT_MD: &str = r#"You are the order desk. Every paid order is fulfilled.
 :::!config
 store: { kind: memory }
 lifecycle: { run_until: idle, idle_grace: 900ms }
-observability: { log_level: info, log_content: true }
+observability: { log_level: info }
 limits: { max_runs: 20 }
 :::
 
@@ -56,8 +56,12 @@ fn one_markdown_file_defines_and_runs_the_whole_agent() {
     let md = format!("{dir}/agent.md");
     std::fs::write(&md, AGENT_MD).unwrap();
 
+    // `--log-content` on the command line, not in the document: a run's output
+    // is conversation content, so the log omits it unless an operator asks —
+    // and `observability.log_content` is the operator's to set (§6 rule 4),
+    // which is exactly the point of reading it back here.
     let out = Command::new(env!("CARGO_BIN_EXE_agentd"))
-        .args(["--instruction.file", &md])
+        .args(["--instruction.file", &md, "--log-content"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .output()

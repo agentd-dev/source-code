@@ -559,7 +559,7 @@ unhealthy, while a healthy tree with one stuck subagent keeps reading healthy â€
 the reactor is the thing detecting and killing that child, so it is still
 ticking.
 
-The resulting footprint, on a stripped x86_64 glibc release build of 1.14.1
+The resulting footprint, on a stripped x86_64 glibc release build of 1.15.0
 (`opt-level = "z"`, LTO, `panic = "abort"`, one codegen unit): 5,376,480 B
 (5.13 MiB) with `--no-default-features`, 6,365,288 B (6.07 MiB) with default
 `tls`, 10,235,536 B (9.76 MiB) with the shipped

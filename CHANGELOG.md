@@ -5,7 +5,15 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
-## Unreleased
+## v1.15.0 — nothing claims more than it does
+
+One subject, reached from several directions: the distance between what agentd
+said and what agentd did. A card carrying four fields the protocol has no room
+for. A routing key that never routed. A rate card nothing multiplied. A metric
+field nothing recorded. A budget that could refuse forever and end nothing. A
+conformance oracle whose independence had quietly become circular. Each is
+either removed or made true — and where a claim is worth keeping, it is now
+DERIVED from the thing it describes instead of maintained beside it.
 
 ### Changed (breaking)
 
@@ -24,53 +32,6 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   `capabilities.extendedAgentCard`. A unit test pins the card as a fixpoint of
   the SDK's type — parse, re-serialize, compare — which is the mechanical form
   of "we do not invent card fields".
-
-### Removed
-
-- **`crates/a2a-oracle`.** It booted the daemon and re-parsed every response
-  with `a2a-rs` to prove "two independent readings agree". That was true and
-  valuable while the A2A server was hand-written; it stopped being either when
-  the listener BECAME `a2a-rs`'s JSON-RPC adapter, because the same generated
-  types then sat on both ends of the round trip and agreed by construction. Its
-  README still opened "agentd's A2A server is hand-written".
-
-  What it actually proved that nothing else did — that our method names and
-  error codes are the SDK's own constants — needed no daemon at all and is now a
-  unit test, strengthened to check both directions: a method we invented fails,
-  and so does a spec method we forgot to answer. The live error-code behaviour
-  it also covered was already asserted by
-  `a2a-conversation/protocol-errors-use-the-specified-codes`. Removing it takes
-  a whole crate, a CI job and ~180 build dependencies with it.
-
-### Fixed
-
-- **Three MCP methods moved onto the official SDK.** `prompts/get`,
-  `completion/complete` and `resources/templates/list` were the last operations
-  agentd reached over its own hand-rolled JSON-RPC path while every other call
-  went through `rmcp`. They now call the SDK, which also means the completion
-  `ref` is type-checked against the protocol's tagged union before it reaches
-  the wire, and resource-template pagination is the SDK's cursor walk rather
-  than ours.
-
-
-### Security
-
-- **`security.egress: closed` now covers the instruction fetch.** An `url:` or
-  `oci:` instruction is resolved BEFORE typed deserialization — its machinery
-  has to fold into the configuration being built — so the boot sweep in
-  `validate()`, which walks MCP, intelligence, peers, the store and workflow
-  refs, structurally could not see it. `closed` meant closed everywhere except
-  for the document that becomes the agent's own standing policy: agentd would
-  dial an uncatalogued host to fetch it.
-
-  The policy is now read off the raw document once, before anything dials, and
-  covers `agent.instruction`, `agent.prompt` and subagent templates alike. It
-  fails CLOSED on a config it cannot understand — an unparseable
-  `security.egress` is treated as `closed`, an unparseable `services:` map as
-  empty — so a typo in the catalog refuses the dial instead of waving it
-  through, and the typed parse reports the real error a moment later.
-
-### Changed (breaking)
 
 - **A spent lifetime token budget now ends the instance** —
   `intelligence.budget.lifetime_exhausted`, defaulting to `drain`. Before this,
@@ -94,55 +55,22 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   because it is not a property of the unit that tripped it — no later unit can
   succeed either.
 
-### Fixed
+### Security
 
-- **`agentd --config-schema=1` no longer walks the config-discovery chain.**
-  `is_informational` listed `--config-schema=2`, a spelling the argument loop
-  refuses outright, and omitted `=1`, the one it accepts — so a malformed
-  `agentd.yml` in the working directory could break a purely informational
-  invocation, which is the exact failure that function exists to prevent.
+- **`security.egress: closed` now covers the instruction fetch.** An `url:` or
+  `oci:` instruction is resolved BEFORE typed deserialization — its machinery
+  has to fold into the configuration being built — so the boot sweep in
+  `validate()`, which walks MCP, intelligence, peers, the store and workflow
+  refs, structurally could not see it. `closed` meant closed everywhere except
+  for the document that becomes the agent's own standing policy: agentd would
+  dial an uncatalogued host to fetch it.
 
-- **One heartbeat, one liveness verdict.** The `--health-file` writer took a
-  hardcoded 10s staleness window while `/healthz` judged the same heartbeat at
-  `LIVENESS_STALE_AFTER_MS` (5s), so a wedged reactor read unhealthy on the
-  endpoint and `alive: true` in the file for five seconds. The writer now takes
-  the constant.
-
-- **`--capabilities` reports the methods the listener actually serves.** The
-  manifest's `a2a.methods` was a fourth hand-maintained copy and had drifted: it
-  omitted `GetExtendedAgentCard` and the four push-notification-config methods,
-  and listed `GetAgentCard`, which the dispatch table does not carry. It is now
-  derived from `METHODS` plus the new `LOCAL_METHODS` — the two calls answered
-  ahead of the dispatch table (`GetAgentCard`, `Pair`), which were served and
-  named nowhere.
-
-- **The interface ops are advertised.** `config.set`, `subagent.get` and
-  `pairing.code` were dispatched by the listener but absent from
-  `command_ops_of`, so the agent card's skills, the command extension's
-  `params.ops` and `--capabilities` all under-reported the served surface —
-  the drift the "one list feeds three views" invariant exists to prevent.
-  `interface.info` now reads that same list instead of keeping a fifth copy.
-
-### Fixed
-
-- **The retired flat schema is `#[cfg(test)]`, so the compiler enforces what a
-  comment used to claim.** `ConfigFile`, `config_schema`, `paths::bindings` and
-  the four no-arg wrappers over them (`read_documents`, `env_document`,
-  `resolve_flag`, `help_section`) were reachable from production and reached
-  only from tests — the module header said so in prose, which is not a
-  mechanism. They are now gated, and referencing one from production fails to
-  compile. They stay because they are a genuinely useful FIXTURE: a small,
-  stable schema for exercising merge semantics and the binding walk without
-  pinning those tests to the real settings schema, which changes every release.
-
-- **A document made of one v2 section is a v2 document.** The schema-detection
-  key list was a hand-maintained subset and had fallen seven sections behind —
-  `mcp`, `services`, `identity`, `interface`, `goal`, `subagents` and
-  `webhooks` were all absent — so a `-c` overlay carrying only `mcp:`, an
-  ordinary layer in the config chain, was refused as "the flat schema, which
-  agentd does not accept". Doubly wrong: the document is not flat, and the
-  retired schema had nothing to do with it. The list is now derived from the
-  settings schema, so a section added tomorrow is detected tomorrow.
+  The policy is now read off the raw document once, before anything dials, and
+  covers `agent.instruction`, `agent.prompt` and subagent templates alike. It
+  fails CLOSED on a config it cannot understand — an unparseable
+  `security.egress` is treated as `closed`, an unparseable `services:` map as
+  empty — so a typo in the catalog refuses the dial instead of waving it
+  through, and the typed parse reports the real error a moment later.
 
 ### Changed
 
@@ -160,7 +88,31 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   `config_version`, and the detection fix above. `.json` examples were not
   covered by the example sweep at all before this.
 
+- **`docs/security.md` cites symbols, not line numbers.** All 83 `file.rs:NNN`
+  anchors became `file.rs::symbol`, because ten of them broke during this very
+  session as unrelated edits shifted the lines beneath them.
+
+- **One dependency-count table.** It lived in both `docs/architecture.md` and
+  `docs/why-rust.md` and they disagreed; why-rust.md is now authoritative, with
+  the counting convention stated beside the numbers, and architecture.md links
+  to it. A number that appears once cannot disagree with itself.
+
 ### Removed
+
+- **`crates/a2a-oracle`.** It booted the daemon and re-parsed every response
+  with `a2a-rs` to prove "two independent readings agree". That was true and
+  valuable while the A2A server was hand-written; it stopped being either when
+  the listener BECAME `a2a-rs`'s JSON-RPC adapter, because the same generated
+  types then sat on both ends of the round trip and agreed by construction. Its
+  README still opened "agentd's A2A server is hand-written".
+
+  What it actually proved that nothing else did — that our method names and
+  error codes are the SDK's own constants — needed no daemon at all and is now a
+  unit test, strengthened to check both directions: a method we invented fails,
+  and so does a spec method we forgot to answer. The live error-code behaviour
+  it also covered was already asserted by
+  `a2a-conversation/protocol-errors-use-the-specified-codes`. Removing it takes
+  a whole crate, a CI job and ~180 build dependencies with it.
 
 - **`intelligence.models.<tier>.service`.** It named a `kind: intelligence`
   catalogue entry, was checked at startup, and was then ignored: every tier's
@@ -198,16 +150,61 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   would newly treat a retiring child as live and permit messaging and stopping
   it.
 
-### Changed
+### Fixed
 
-- **`docs/security.md` cites symbols, not line numbers.** All 83 `file.rs:NNN`
-  anchors became `file.rs::symbol`, because ten of them broke during this very
-  session as unrelated edits shifted the lines beneath them.
+- **Three MCP methods moved onto the official SDK.** `prompts/get`,
+  `completion/complete` and `resources/templates/list` were the last operations
+  agentd reached over its own hand-rolled JSON-RPC path while every other call
+  went through `rmcp`. They now call the SDK, which also means the completion
+  `ref` is type-checked against the protocol's tagged union before it reaches
+  the wire, and resource-template pagination is the SDK's cursor walk rather
+  than ours.
 
-- **One dependency-count table.** It lived in both `docs/architecture.md` and
-  `docs/why-rust.md` and they disagreed; why-rust.md is now authoritative, with
-  the counting convention stated beside the numbers, and architecture.md links
-  to it. A number that appears once cannot disagree with itself.
+- **`agentd --config-schema=1` no longer walks the config-discovery chain.**
+  `is_informational` listed `--config-schema=2`, a spelling the argument loop
+  refuses outright, and omitted `=1`, the one it accepts — so a malformed
+  `agentd.yml` in the working directory could break a purely informational
+  invocation, which is the exact failure that function exists to prevent.
+
+- **One heartbeat, one liveness verdict.** The `--health-file` writer took a
+  hardcoded 10s staleness window while `/healthz` judged the same heartbeat at
+  `LIVENESS_STALE_AFTER_MS` (5s), so a wedged reactor read unhealthy on the
+  endpoint and `alive: true` in the file for five seconds. The writer now takes
+  the constant.
+
+- **`--capabilities` reports the methods the listener actually serves.** The
+  manifest's `a2a.methods` was a fourth hand-maintained copy and had drifted: it
+  omitted `GetExtendedAgentCard` and the four push-notification-config methods,
+  and listed `GetAgentCard`, which the dispatch table does not carry. It is now
+  derived from `METHODS` plus the new `LOCAL_METHODS` — the two calls answered
+  ahead of the dispatch table (`GetAgentCard`, `Pair`), which were served and
+  named nowhere.
+
+- **The interface ops are advertised.** `config.set`, `subagent.get` and
+  `pairing.code` were dispatched by the listener but absent from
+  `command_ops_of`, so the agent card's skills, the command extension's
+  `params.ops` and `--capabilities` all under-reported the served surface —
+  the drift the "one list feeds three views" invariant exists to prevent.
+  `interface.info` now reads that same list instead of keeping a fifth copy.
+
+- **The retired flat schema is `#[cfg(test)]`, so the compiler enforces what a
+  comment used to claim.** `ConfigFile`, `config_schema`, `paths::bindings` and
+  the four no-arg wrappers over them (`read_documents`, `env_document`,
+  `resolve_flag`, `help_section`) were reachable from production and reached
+  only from tests — the module header said so in prose, which is not a
+  mechanism. They are now gated, and referencing one from production fails to
+  compile. They stay because they are a genuinely useful FIXTURE: a small,
+  stable schema for exercising merge semantics and the binding walk without
+  pinning those tests to the real settings schema, which changes every release.
+
+- **A document made of one v2 section is a v2 document.** The schema-detection
+  key list was a hand-maintained subset and had fallen seven sections behind —
+  `mcp`, `services`, `identity`, `interface`, `goal`, `subagents` and
+  `webhooks` were all absent — so a `-c` overlay carrying only `mcp:`, an
+  ordinary layer in the config chain, was refused as "the flat schema, which
+  agentd does not accept". Doubly wrong: the document is not flat, and the
+  retired schema had nothing to do with it. The list is now derived from the
+  settings schema, so a section added tomorrow is detected tomorrow.
 
 ## v1.14.1 — the image ships what the binaries ship
 

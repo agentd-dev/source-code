@@ -88,7 +88,7 @@ declares none at all:
 { "jsonrpc":"2.0","id":1,"method":"initialize","params":{
     "protocolVersion":"2025-11-25",
     "capabilities":{},                                    // a boot connection declares none
-    "clientInfo":{"name":"agentd","version":"1.14.1",
+    "clientInfo":{"name":"agentd","version":"1.15.0",
                   "title":"<instance>"}                   // build version; title = the instance name
 }}
 // server → agentd

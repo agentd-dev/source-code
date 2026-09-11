@@ -449,6 +449,50 @@ impl RmcpClient {
         self.convert(&res, "prompts/list")
     }
 
+    pub fn get_prompt(
+        &self,
+        name: &str,
+        arguments: Option<Value>,
+    ) -> Result<crate::wire::GetPromptResult, McpError> {
+        let mut params = rmcp::model::GetPromptRequestParams::new(name);
+        params.arguments = arguments.and_then(|a| a.as_object().cloned());
+        let res = self
+            .rt
+            .block_on(self.service.get_prompt(params))
+            .map_err(|e| rpc_err(&self.name, &format!("prompts/get {name}"), e))?;
+        self.convert(&res, "prompts/get")
+    }
+
+    pub fn complete(
+        &self,
+        reference: Value,
+        argument: Value,
+    ) -> Result<crate::wire::CompleteResult, McpError> {
+        // Both halves are protocol-typed by the SDK: `ref` is a tagged union
+        // over prompt/resource references, and a shape it does not recognise is
+        // refused here rather than on the wire.
+        let r#ref = serde_json::from_value(reference)
+            .map_err(|e| rpc_err(&self.name, "completion/complete ref", e))?;
+        let argument = serde_json::from_value(argument)
+            .map_err(|e| rpc_err(&self.name, "completion/complete argument", e))?;
+        let res = self
+            .rt
+            .block_on(
+                self.service
+                    .complete(rmcp::model::CompleteRequestParams::new(r#ref, argument)),
+            )
+            .map_err(|e| rpc_err(&self.name, "completion/complete", e))?;
+        self.convert(&res, "completion/complete")
+    }
+
+    pub fn list_resource_templates(&self) -> Result<Vec<crate::wire::ResourceTemplate>, McpError> {
+        let res = self
+            .rt
+            .block_on(self.service.list_all_resource_templates())
+            .map_err(|e| rpc_err(&self.name, "resources/templates/list", e))?;
+        self.convert(&res, "resources/templates/list")
+    }
+
     /// Subscribe to a resource, by whichever mechanism the negotiated revision
     /// actually defines.
     ///

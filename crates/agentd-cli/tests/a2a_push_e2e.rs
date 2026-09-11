@@ -381,9 +381,19 @@ fn the_extended_card_is_the_authenticated_one() {
         "an authenticated caller gets the extended card: {extended}"
     );
     assert_eq!(extended["result"]["name"], "agentd");
+    // The card announces the extended card through the capability the A2A
+    // message actually carries. `supportsAuthenticatedExtendedCard` was a flat
+    // field of the older card shape, is in neither `AgentCard` nor
+    // `AgentCapabilities`, and was dropped by every typed reader.
     assert_eq!(
-        extended["result"]["supportsAuthenticatedExtendedCard"], true,
+        extended["result"]["capabilities"]["extendedAgentCard"], true,
         "{extended}"
+    );
+    assert!(
+        extended["result"]
+            .get("supportsAuthenticatedExtendedCard")
+            .is_none(),
+        "the retired flat spelling must be gone: {extended}"
     );
 
     std::fs::remove_file(&cfg_path).ok();

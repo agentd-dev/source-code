@@ -49,9 +49,11 @@ reading as the code, so they agree with it. What finally disagrees is somebody
 else's client, in production, and what it reports is nothing — a message that
 never arrived, a task that never looked finished. That failure mode is
 demonstrable, not hypothetical: handing agentd's A2A responses to an
-independent implementation of the same spec turns up faults of exactly this
-shape — every one of them valid JSON that agentd's own tests accept.
-([a2a.md](a2a.md) lists them; `crates/a2a-oracle` is the harness.)
+independent implementation of the same spec turned up faults of exactly this
+shape — every one of them valid JSON that agentd's own tests accepted. The
+answer in the end was better than a second reader: adopt the implementation, so
+the wire shape comes from types generated off the protocol's own schema and
+there is nothing left to misread. ([a2a.md](a2a.md) has the account.)
 
 So MCP is [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk), the
 official Rust SDK, and A2A is [`a2a-rs`](https://github.com/emillindfors/a2a-rs),

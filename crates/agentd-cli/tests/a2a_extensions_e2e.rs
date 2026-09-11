@@ -178,7 +178,15 @@ fn the_card_declares_the_extensions_and_the_commands_are_skills() {
             e["description"].as_str().is_some_and(|d| !d.is_empty()),
             "an extension needs a description: {e}"
         );
-        assert!(e["required"].is_boolean(), "required is declared: {e}");
+        // `required` is a plain proto3 `bool`, so a conformant wire OMITS it
+        // when false and a peer reads absence as "not required" — which is the
+        // A2A extensions spec's own default. Absent or `false`, never `true`:
+        // no extension agentd declares may be a precondition.
+        assert_ne!(
+            e["required"],
+            json!(true),
+            "no extension may be required: {e}"
+        );
     }
 
     // The ops ride the declaration, so a peer can enumerate them…

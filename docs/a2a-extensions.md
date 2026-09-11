@@ -213,12 +213,12 @@ acknowledgement directly.
 
 Three checks, because a compliance claim that nobody verifies decays:
 
-- **The method set is checked against an independent implementation.** The
-  `a2a-oracle` suite boots the real daemon and asserts every method in
-  `METHODS` — the spec surface agentd claims — is one `a2a-rs`, a different
-  author's reading of the same spec, also names; the one declared extension
-  method in that list, `SubscribeToEvents`, is skipped by name. A method we
-  invented or misspelled fails there.
+- **The method set is checked against the SDK's own constants.** A unit test
+  asserts `METHODS` — the spec surface agentd claims — and
+  `a2a_rs::adapter::transport::jsonrpc_wire::methods` name the same set, in both
+  directions: a method we invented or misspelled fails, and so does a spec
+  method we forgot to answer. The one declared extension in that list,
+  `SubscribeToEvents`, is skipped by name.
 - **Every non-spec method must be declared.** `EXTENSION_METHODS` pairs each
   extra method with the extension that declares it, and a unit test refuses any
   method that is in neither the spec list nor a declaration. Both that test and

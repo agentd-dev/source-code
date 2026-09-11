@@ -17,13 +17,12 @@ use crate::http::{HttpError, HttpTransport, McpEndpoint};
 use crate::inbound;
 use crate::rpc::{self, RpcError};
 use crate::wire::{
-    CallToolResult, CompleteParams, CompleteResult, Era, GetPromptParams, GetPromptResult,
-    Implementation, LATEST_MODERN_VERSION, ListResourceTemplatesResult, Prompt, ReadResourceResult,
-    Resource, ResourceTemplate, ServerCapabilities, Task, Tool, as_task_result, method,
+    CallToolResult, CompleteResult, Era, GetPromptResult, Implementation, LATEST_MODERN_VERSION,
+    Prompt, ReadResourceResult, Resource, ResourceTemplate, ServerCapabilities, Task, Tool,
+    as_task_result, method,
 };
 // The modern (stateless) request builders live alongside `wire` in the mcp crate.
 use crate::modern;
-use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -477,11 +476,12 @@ impl McpClient {
                 self.name
             )));
         }
-        let params = GetPromptParams {
-            name: name.to_string(),
-            arguments,
+        let Some(c) = &self.rmcp else {
+            return Err(McpError::Transport(
+                "the MCP connection is not established".into(),
+            ));
         };
-        self.request_as(method::PROMPTS_GET, Some(to_value(&params)))
+        c.get_prompt(name, arguments)
     }
 
     /// `completion/complete` — argument autocompletion for a prompt / resource-
@@ -493,12 +493,12 @@ impl McpClient {
                 self.name
             )));
         }
-        let params = CompleteParams {
-            reference,
-            argument,
-            context: None,
+        let Some(c) = &self.rmcp else {
+            return Err(McpError::Transport(
+                "the MCP connection is not established".into(),
+            ));
         };
-        self.request_as(method::COMPLETION_COMPLETE, Some(to_value(&params)))
+        c.complete(reference, argument)
     }
 
     /// `resources/templates/list`, paginated. Empty when the server doesn't
@@ -507,19 +507,13 @@ impl McpClient {
         if !self.caps.supports_resources() {
             return Ok(Vec::new());
         }
-        let mut templates = Vec::new();
-        let mut cursor: Option<String> = None;
-        loop {
-            let params = cursor.as_ref().map(|c| json!({ "cursor": c }));
-            let page: ListResourceTemplatesResult =
-                self.request_as(method::RESOURCES_TEMPLATES_LIST, params)?;
-            templates.extend(page.resource_templates);
-            match page.next_cursor {
-                Some(c) => cursor = Some(c),
-                None => break,
-            }
-        }
-        Ok(templates)
+        let Some(c) = &self.rmcp else {
+            return Err(McpError::Transport(
+                "the MCP connection is not established".into(),
+            ));
+        };
+        // The SDK walks the cursor; pagination is its problem, not ours.
+        c.list_resource_templates()
     }
 
     /// `ping` — a liveness round-trip both sides of MCP must answer. Returns
@@ -812,10 +806,6 @@ fn queue_notification(queue: &Mutex<VecDeque<rpc::Notification>>, n: Value) {
             .unwrap_or_else(|e| e.into_inner())
             .push_back(note);
     }
-}
-
-fn to_value<T: Serialize>(v: &T) -> Value {
-    serde_json::to_value(v).unwrap_or(Value::Null)
 }
 
 #[cfg(test)]

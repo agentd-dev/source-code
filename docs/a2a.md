@@ -164,12 +164,19 @@ Anything agentd wants to say that the spec has no field for goes under
 `agentd/statusHistory`. That is what proto3 leaves open for extensions, and it
 means a strict peer can ignore all of it.
 
-This is verified two ways. `agentd-conformance` asserts the shapes on every path
-that emits a task; and `crates/a2a-oracle` — excluded from the default build —
-boots the real daemon and parses its responses with
-[a2a-rs](https://github.com/emillindfors/a2a-rs), an unrelated implementation of
-the same specification, so a misreading on our side has to survive a second
-reader before it reaches anyone.
+This is verified by construction rather than by cross-check. The listener IS
+[a2a-rs](https://github.com/emillindfors/a2a-rs)'s JSON-RPC adapter, and every
+task, message and card agentd emits is serialized by types that crate generates
+from the A2A protobuf — so the wire shape is the schema's, not our reading of
+it. `agentd-conformance` then asserts the behaviour those shapes carry on every
+path that emits a task.
+
+There used to be a second reader here: an `a2a-oracle` crate that booted the
+daemon and re-parsed its responses with a2a-rs. It was worth having while the
+server was hand-written. Once the server became a2a-rs, the round trip had the
+same generated types on both ends and agreed by construction, so it was retired
+— keeping the two assertions that did not depend on a daemon (our method names
+and error codes are the SDK's constants) as unit tests.
 
 ## Roles, and what each may call
 

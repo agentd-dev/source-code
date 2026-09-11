@@ -7,6 +7,52 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 
 ## Unreleased
 
+### Changed (breaking)
+
+- **The agent card is what the A2A library emits.** It carried four fields the
+  protocol's own message does not have — `protocolVersion`, `url` and
+  `preferredTransport` (the pre-`supportedInterfaces` card spelling) and a
+  `stateTransitionHistory` capability — so every typed reader silently dropped
+  them, and that loss was the stated reason for hand-serving the card instead of
+  passing it to the SDK. Nothing in the repository read any of the four.
+
+  The card is now built and then round-tripped through `a2a_rs`'s generated
+  `AgentCard`, so the wire form is the one the A2A protobuf defines rather than
+  our rendering of it. That also makes it canonical proto3 JSON: `required:
+  false` on an extension is now ABSENT, which is what a conformant peer emits
+  and reads. `supportsAuthenticatedExtendedCard` becomes the message's own
+  `capabilities.extendedAgentCard`. A unit test pins the card as a fixpoint of
+  the SDK's type — parse, re-serialize, compare — which is the mechanical form
+  of "we do not invent card fields".
+
+### Removed
+
+- **`crates/a2a-oracle`.** It booted the daemon and re-parsed every response
+  with `a2a-rs` to prove "two independent readings agree". That was true and
+  valuable while the A2A server was hand-written; it stopped being either when
+  the listener BECAME `a2a-rs`'s JSON-RPC adapter, because the same generated
+  types then sat on both ends of the round trip and agreed by construction. Its
+  README still opened "agentd's A2A server is hand-written".
+
+  What it actually proved that nothing else did — that our method names and
+  error codes are the SDK's own constants — needed no daemon at all and is now a
+  unit test, strengthened to check both directions: a method we invented fails,
+  and so does a spec method we forgot to answer. The live error-code behaviour
+  it also covered was already asserted by
+  `a2a-conversation/protocol-errors-use-the-specified-codes`. Removing it takes
+  a whole crate, a CI job and ~180 build dependencies with it.
+
+### Fixed
+
+- **Three MCP methods moved onto the official SDK.** `prompts/get`,
+  `completion/complete` and `resources/templates/list` were the last operations
+  agentd reached over its own hand-rolled JSON-RPC path while every other call
+  went through `rmcp`. They now call the SDK, which also means the completion
+  `ref` is type-checked against the protocol's tagged union before it reaches
+  the wire, and resource-template pagination is the SDK's cursor walk rather
+  than ours.
+
+
 ### Security
 
 - **`security.egress: closed` now covers the instruction fetch.** An `url:` or

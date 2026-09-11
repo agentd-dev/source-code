@@ -2140,40 +2140,40 @@ impl Runtime {
         }
     }
 
-    /// The command ops this instance serves, in one place: the card renders
-    /// them as skills, the extension declares them, and the capabilities
-    /// manifest reports them. Three views, one list — they cannot disagree.
-    pub(crate) fn command_ops(&self) -> Vec<&'static str> {
-        command_ops_of(&self.settings)
-    }
-
     /// The command ops as A2A skills.
     fn command_skills(&self) -> Vec<Value> {
-        self.command_ops()
-            .into_iter()
-            .map(|op| {
-                let tag = if crate::a2a::principals::is_admin_op(op) {
-                    "admin"
-                } else {
-                    "command"
-                };
-                json!({
-                    "id": op,
-                    "name": op,
-                    "description": command_description(op),
-                    "tags": ["command", tag],
-                    "inputModes": ["application/json"],
-                    "outputModes": ["application/json"],
-                })
-            })
-            .collect()
+        command_skills_of(&self.settings)
     }
+}
 
+/// The command ops as A2A skills, from settings alone.
+fn command_skills_of(settings: &crate::config::v2::Settings) -> Vec<Value> {
+    command_ops_of(settings)
+        .into_iter()
+        .map(|op| {
+            let tag = if crate::a2a::principals::is_admin_op(op) {
+                "admin"
+            } else {
+                "command"
+            };
+            json!({
+                "id": op,
+                "name": op,
+                "description": command_description(op),
+                "tags": ["command", tag],
+                "inputModes": ["application/json"],
+                "outputModes": ["application/json"],
+            })
+        })
+        .collect()
+}
+
+impl Runtime {
     /// The A2A agent card: served over `GetAgentCard`, and unauthenticated on
     /// GET at `/.well-known/agent-card.json` and `/.well-known/agent.json` —
     /// discovery is public by both of its conventional paths.
     fn a2a_agent_card(&self) -> Value {
-        let mut skills: Vec<Value> = self
+        let skills: Vec<Value> = self
             .workflows
             .values()
             .map(|w| json!({"id": w.name, "name": w.name, "description": w.description.clone().unwrap_or_default(), "tags": ["workflow"]}))
@@ -2182,65 +2182,7 @@ impl Runtime {
         // I ask this agent to do", so a stock client discovers `workflow.run`
         // and `admin.drain` the same way it discovers a workflow — and the
         // extended card below narrows the list to what the CALLER may run.
-        skills.extend(self.command_skills());
-        // The card is a promise, so `pushNotifications` tracks whether this
-        // instance will actually accept a webhook rather than whether the code
-        // exists (conformance checks both directions of that).
-        let mut capabilities = json!({
-            "streaming": true,
-            "pushNotifications": self.settings.a2a.push.enabled,
-            "stateTransitionHistory": true,
-        });
-        // What agentd speaks beyond the A2A core, declared the way the protocol
-        // provides for (`AgentExtension`): a URI a peer can recognise, and
-        // params it can act on. Everything callable is reachable through
-        // `SendMessage` with a command DataPart, so a client that ignores the
-        // extension entirely can still converse — `required` is false.
-        // One list decides WHICH extensions this instance declares
-        // (`extensions_of`, shared with `--capabilities`); this only decides
-        // how each is described.
-        let mut extensions = vec![json!({
-            "uri": COMMAND_EXTENSION,
-            "description": "Structured operations invoked as a DataPart on SendMessage: \
-                            {\"data\": {\"agentd\": {\"op\": \"…\", …}}}. \
-                            The ops this caller may run are its skills on the extended card.",
-            "required": false,
-            "params": {"ops": self.command_ops(), "dataPartKey": "agentd"},
-        })];
-        // Advertise the interface surface so a display client can discover it
-        // before authenticating. The card is public, so only the on/off bit
-        // rides here; `interface.info` is authenticated and carries the rest.
-        if extensions_of(&self.settings).contains(&INTERFACE_EXTENSION) {
-            extensions.push(json!({
-                "uri": INTERFACE_EXTENSION,
-                "description": "The instance-wide observation feed display clients render. \
-                                A2A has no instance feed, so the method is declared here.",
-                "required": false,
-                "params": {"enabled": true, "methods": ["SubscribeToEvents"]},
-            }));
-        }
-        capabilities["extensions"] = json!(extensions);
-        let url = self.settings.a2a.listen.clone().unwrap_or_default();
-        json!({
-            "name": "agentd",
-            "description": "A durable agent (agentd) — conversations, workflows, and subagents over A2A.",
-            "version": crate::VERSION,
-            // How a peer actually reaches this instance. `supportedInterfaces`
-            // is the field the current card carries; a card without one parses
-            // fine and tells a peer nothing it can dial, which is the worst of
-            // both. The flat `url`/`preferredTransport` below are the older
-            // spelling, kept because agentd's own clients read them.
-            "supportedInterfaces": [
-                {"url": url, "protocolBinding": "JSONRPC", "protocolVersion": "0.3.0"}
-            ],
-            "protocolVersion": "0.3.0",
-            "url": url,
-            "preferredTransport": "JSONRPC",
-            "capabilities": capabilities,
-            "defaultInputModes": ["text/plain", "application/json"],
-            "defaultOutputModes": ["text/plain", "application/json"],
-            "skills": skills,
-        })
+        agent_card_of(&self.settings, skills, self.command_skills())
     }
 
     /// The **authenticated** card: the public one, plus what only a named
@@ -2270,7 +2212,6 @@ impl Runtime {
                 .is_some_and(|op| principal.may_command(op))
         }));
         card["skills"] = json!(skills);
-        card["supportsAuthenticatedExtendedCard"] = json!(true);
         card
     }
 
@@ -2608,9 +2549,163 @@ pub(crate) fn spawn_a2a_listener(
     })
 }
 
+/// The card, from settings and a skill list alone — no `Runtime`.
+///
+/// Free-standing so it can be round-tripped through the SDK's typed
+/// `AgentCard` in a unit test, which is the precondition for serving the card
+/// THROUGH `a2a_rs` rather than beside it.
+fn agent_card_of(
+    settings: &crate::config::v2::Settings,
+    mut skills: Vec<Value>,
+    command_skills: Vec<Value>,
+) -> Value {
+    skills.extend(command_skills);
+    // The card is a promise, so `pushNotifications` tracks whether this
+    // instance will actually accept a webhook rather than whether the code
+    // exists (conformance checks both directions of that).
+    // Exactly the four fields `AgentCapabilities` carries in the A2A
+    // protobuf: streaming, pushNotifications, extensions, extendedAgentCard.
+    // `stateTransitionHistory` used to sit here and is not a field of the
+    // current message — it was dropped on every typed round trip, silently.
+    let mut capabilities = json!({
+        "streaming": true,
+        "pushNotifications": settings.a2a.push.enabled,
+        "extendedAgentCard": true,
+    });
+    // What agentd speaks beyond the A2A core, declared the way the protocol
+    // provides for (`AgentExtension`): a URI a peer can recognise, and
+    // params it can act on. Everything callable is reachable through
+    // `SendMessage` with a command DataPart, so a client that ignores the
+    // extension entirely can still converse — `required` is false.
+    // One list decides WHICH extensions this instance declares
+    // (`extensions_of`, shared with `--capabilities`); this only decides
+    // how each is described.
+    let mut extensions = vec![json!({
+        "uri": COMMAND_EXTENSION,
+        "description": "Structured operations invoked as a DataPart on SendMessage: \
+                        {\"data\": {\"agentd\": {\"op\": \"…\", …}}}. \
+                        The ops this caller may run are its skills on the extended card.",
+        "required": false,
+        "params": {"ops": command_ops_of(settings), "dataPartKey": "agentd"},
+    })];
+    // Advertise the interface surface so a display client can discover it
+    // before authenticating. The card is public, so only the on/off bit
+    // rides here; `interface.info` is authenticated and carries the rest.
+    if extensions_of(settings).contains(&INTERFACE_EXTENSION) {
+        extensions.push(json!({
+            "uri": INTERFACE_EXTENSION,
+            "description": "The instance-wide observation feed display clients render. \
+                            A2A has no instance feed, so the method is declared here.",
+            "required": false,
+            "params": {"enabled": true, "methods": ["SubscribeToEvents"]},
+        }));
+    }
+    capabilities["extensions"] = json!(extensions);
+    let url = settings.a2a.listen.clone().unwrap_or_default();
+    let card = json!({
+        "name": "agentd",
+        "description": "A durable agent (agentd) — conversations, workflows, and subagents over A2A.",
+        "version": crate::VERSION,
+        // How a peer reaches this instance. `supportedInterfaces` is the
+        // field `AgentCard` carries; the flat `url`/`preferredTransport`
+        // trio that used to sit beside it was the pre-interfaces spelling,
+        // is in neither the message nor anything that reads a card in this
+        // repository, and was dropped by every typed round trip anyway.
+        "supportedInterfaces": [
+            {"url": url, "protocolBinding": "JSONRPC", "protocolVersion": "0.3.0"}
+        ],
+        "capabilities": capabilities,
+        "defaultInputModes": ["text/plain", "application/json"],
+        "defaultOutputModes": ["text/plain", "application/json"],
+        "skills": skills,
+    });
+    // Emit what the SDK emits. The card is a protocol document, and the only
+    // authority on its wire form is the type generated from the A2A protobuf:
+    // proto3 JSON omits a field at its default, so `required: false` on an
+    // extension is ABSENT on a conformant wire and a peer reads absence as
+    // false. Hand-written JSON was right in content and non-canonical in shape.
+    //
+    // A conversion failure would mean the card is not an `AgentCard`, which the
+    // unit test makes impossible; were it ever to happen, sending the
+    // hand-built form beats sending nothing.
+    match serde_json::from_value::<a2a_rs::domain::AgentCard>(card.clone())
+        .ok()
+        .and_then(|c| serde_json::to_value(c).ok())
+    {
+        Some(canonical) => canonical,
+        None => card,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The card survives the SDK's typed `AgentCard` without losing a field.
+    ///
+    /// This is the precondition for serving the card THROUGH `a2a_rs` rather
+    /// than beside it. It used not to hold: the card carried
+    /// `protocolVersion`/`url`/`preferredTransport` and a
+    /// `stateTransitionHistory` capability, none of which are fields of the
+    /// A2A protobuf, so a typed round trip silently dropped them — and that
+    /// loss was the stated reason for hand-serving the card in the first
+    /// place. Emitting what the message actually has removes the reason.
+    #[test]
+    fn the_card_round_trips_through_the_sdks_typed_agent_card() {
+        let mut s = crate::config::v2::Settings::default();
+        s.a2a.listen = Some("https://agent.example:8443".into());
+        s.interface.enabled = true;
+        let ours = agent_card_of(&s, Vec::new(), command_skills_of(&s));
+
+        // The card IS the SDK's serialization now, so it must parse back into
+        // the SDK's type unchanged — the fixpoint that proves nothing we set is
+        // outside the message.
+        let typed: a2a_rs::domain::AgentCard =
+            serde_json::from_value(ours.clone()).expect("the card is an AgentCard");
+        let back = serde_json::to_value(&typed).expect("and serializes again");
+        assert_eq!(ours, back, "the card is not a fixpoint of the SDK's type");
+
+        // Every field the A2A message REQUIRES is present and populated.
+        for key in [
+            "name",
+            "description",
+            "version",
+            "supportedInterfaces",
+            "capabilities",
+            "defaultInputModes",
+            "defaultOutputModes",
+            "skills",
+        ] {
+            assert!(
+                !ours[key].is_null(),
+                "the card omits the required field `{key}`: {ours}"
+            );
+        }
+        // …and nothing the message does NOT have. These four were emitted for
+        // years and dropped by every typed reader: three are the pre-interfaces
+        // card spelling, and `stateTransitionHistory` left `AgentCapabilities`.
+        for gone in ["protocolVersion", "url", "preferredTransport"] {
+            assert!(
+                ours.get(gone).is_none(),
+                "`{gone}` is not an AgentCard field"
+            );
+        }
+        assert!(
+            ours["capabilities"].get("stateTransitionHistory").is_none(),
+            "`stateTransitionHistory` is not an AgentCapabilities field"
+        );
+        // And the extensions we declare are still declared after the trip.
+        let exts = back["capabilities"]["extensions"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        for uri in extensions_of(&s) {
+            assert!(
+                exts.iter().any(|e| e["uri"] == uri),
+                "{uri} lost in the round trip: {back}"
+            );
+        }
+    }
 
     /// The card and `--capabilities` declare the same extensions.
     ///
@@ -2639,6 +2734,56 @@ mod tests {
                 assert!(EXTENSIONS.contains(uri), "{uri} is not activatable");
             }
         }
+    }
+
+    /// Every method agentd answers is spelled the way the SDK spells it, and
+    /// the error codes peers branch on are the SDK's constants.
+    ///
+    /// These two assertions are what the `a2a-oracle` crate was really for.
+    /// The rest of it booted the daemon and deserialized the replies with
+    /// `a2a_rs` — which stopped proving anything the day the listener became
+    /// `a2a_rs`'s own adapter: the same generated types on both ends of the
+    /// round trip agree by construction. These do not need a daemon at all,
+    /// and they still bind agentd's vocabulary to the crate generated from the
+    /// A2A protobuf. The live behaviour the oracle also checked is covered by
+    /// `a2a-conversation/protocol-errors-use-the-specified-codes`.
+    #[test]
+    fn our_method_names_and_error_codes_are_the_sdks() {
+        use a2a_rs::adapter::transport::jsonrpc_wire::methods as m;
+        let spec = [
+            m::SEND_MESSAGE,
+            m::SEND_STREAMING_MESSAGE,
+            m::GET_TASK,
+            m::LIST_TASKS,
+            m::CANCEL_TASK,
+            m::SUBSCRIBE_TO_TASK,
+            m::CREATE_PUSH_CONFIG,
+            m::GET_PUSH_CONFIG,
+            m::LIST_PUSH_CONFIGS,
+            m::DELETE_PUSH_CONFIG,
+            m::GET_EXTENDED_AGENT_CARD,
+        ];
+        // Everything we dispatch is one of theirs, spelled identically — a
+        // method we invented or misspelled is unreachable, and silently so.
+        for name in METHODS {
+            if *name == "SubscribeToEvents" {
+                continue; // ours, declared as an extension rather than claimed
+            }
+            assert!(
+                spec.contains(name),
+                "agentd answers {name:?}, which is not an A2A method: {spec:?}"
+            );
+        }
+        // …and every spec method is one we answer, so the card cannot promise
+        // a surface the dispatcher lacks.
+        for name in spec {
+            assert!(
+                METHODS.contains(&name),
+                "the spec defines {name:?} and agentd does not answer it"
+            );
+        }
+        assert_eq!(a2a_rs::domain::error::TASK_NOT_FOUND, -32001);
+        assert_eq!(a2a_rs::domain::error::UNSUPPORTED_OPERATION, -32004);
     }
 
     /// Every method agentd answers is either an A2A method or DECLARED as an

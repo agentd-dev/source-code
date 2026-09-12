@@ -5,7 +5,19 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
-## Unreleased
+## v1.16.0 — a document configures what it is, not where it runs
+
+v1.12.1 established that a served document may not configure the terms it is
+judged by. This release is the mechanism behind that sentence, because the
+enforcement was a list of six path prefixes and the settings schema has 143
+paths — so the rule held for the six things somebody had thought of, and
+everything else was writable by an unsigned, unpinned document with no
+capability grant at all.
+
+The boundary is now an allow-list, and the question it answers is whether a
+setting describes the AGENT or the DEPLOYMENT it runs in. A path in neither
+list is refused, and a test walks the generated schema to make sure there are
+none.
 
 ### Security (breaking)
 

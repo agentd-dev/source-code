@@ -39,7 +39,7 @@ $ git clone <repo> agent && cd agent
 $ cargo build -p agentd-cli --release
     Finished `release` profile [optimized] target(s)
 $ ./target/release/agentd --version
-agentd 1.15.0
+agentd 1.16.0
 ```
 
 The result is **one static binary** that starts fast, idles cheaply, and drops

@@ -566,9 +566,18 @@ current settings on every request) gains the scheme.
 
 - Operator role → `operator` (every operator credential, operator-scope device
   sessions and launch sessions).
-- User and agent roles → `<role>:<id>`, where `<id>` is the rule's declared
-  `id`, else the certificate subject CN, else the first SAN.
+- User and agent roles → `<role>:<id>` when the rule declares `id`; else, from
+  the certificate, `<role>:cn=<subject CN>`, else `<role>:san=<first SAN>`.
 - User-scope device sessions → `user:<name>`, the name the approver gave (§10.3).
+
+The `cn=` / `san=` marker keeps derived ids out of the declared namespace **by
+construction**: `=` is in neither the declared-id charset nor the approval-name
+charset, so no certificate can spell a declared id or a device name. Without
+it, a rule `{id: deploy-bot, match: {bearer_ref: …}}` beside a rule
+`{match: {san: "*.corp"}}` would hand any CA-issued certificate with CN
+`deploy-bot` the principal `user:deploy-bot` — and with it that caller's tasks,
+conversations, rate bucket and status scope. Uniqueness among declared ids alone
+cannot see that merge.
 
 A session id (`ds_…` or `ls_…`) is **never** part of the principal id. It rides
 on `Principal.session`, appears as `sid` in every audit event of that caller,
@@ -1094,10 +1103,11 @@ memory store persists no ownership either). There is no command that releases
 a registered id (§19).
 
 **Cert-derived ids.** A rule without `id` takes its principal id from the
-certificate's subject CN or first SAN, and those ids are not registered. They
-cannot collide with device names today only because the device grant is refused
-together with `client_ca` (§10.2). **If that combination is ever allowed, the
-registry must cover cert-derived ids too.**
+certificate: `<role>:cn=<CN>` or `<role>:san=<SAN>` (§7.4). Those ids are not
+registered, and need not be: the `=` they carry is outside both the declared-id
+and the approval-name charsets, so they can never equal a rule id or a device
+name — whether or not the device grant is ever allowed alongside `client_ca`
+(§10.2).
 
 ## 11. The launch grant and the thin launcher
 
@@ -1583,8 +1593,8 @@ in-process (§11.1).
 - **The device grant alongside mTLS.** The TLS verifier makes client
   certificates mandatory, so `/oauth2/*` is unreachable without one. Supporting
   both needs an optional-client-auth verifier in `agentd-net`; until then the
-  combination is refused at load. (If it is ever allowed, the identity registry
-  must cover cert-derived ids — §10.4.)
+  combination is refused at load. (Cert-derived ids need no registry entry if
+  it is ever allowed: they cannot spell a device name — §7.4, §10.4.)
 - **Per-source limits behind a TLS-terminating proxy.** `X-Forwarded-For` is
   never trusted, so behind a proxy every limiter acts globally; documented.
 - **A per-principal cap on concurrent streams.** Per-request admission bounds

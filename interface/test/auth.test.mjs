@@ -145,6 +145,71 @@ test('device login', async (t) => {
     assert.equal(f.calls.length, 3);
   });
 
+  await t.test('a 429 on the token endpoint waits out its Retry-After', async () => {
+    const clock = fakeClock();
+    const f = scriptedFetch([
+      DEVICE_CODE,
+      { status: 429, body: { error: 'slow_down' }, headers: { 'retry-after': '30' } },
+      { body: { access_token: 'agentd_at_1', token_type: 'Bearer' } },
+    ]);
+    await deviceLogin({ flow: FLOW, clientId: 'c', fetch: f, clock, onCode: () => {} });
+    // The interval before the first poll, then the server's 30 s — not the
+    // 5 s interval, and not the slow_down step either.
+    assert.deepEqual(clock.sleeps, [5000, 30000]);
+  });
+
+  await t.test('a token response that is not a Bearer is refused', async () => {
+    const f = scriptedFetch([DEVICE_CODE, { body: { access_token: 'agentd_at_1', token_type: 'mac' } }]);
+    await assert.rejects(
+      deviceLogin({ flow: FLOW, clientId: 'c', fetch: f, clock: fakeClock(), onCode: () => {} }),
+      (e) => e.code === 'invalid-response',
+    );
+  });
+
+  await t.test('a verification URI a person could not safely follow is refused', async () => {
+    for (const uri of ['javascript:alert(document.domain)', 'http://phish.example/device', 'not a url']) {
+      const shown = [];
+      const f = scriptedFetch([{ body: { ...DEVICE_CODE.body, verification_uri: uri } }]);
+      await assert.rejects(
+        deviceLogin({ flow: FLOW, clientId: 'c', fetch: f, clock: fakeClock(), onCode: (c) => shown.push(c) }),
+        (e) => e.code === 'invalid-response',
+        uri,
+      );
+      assert.deepEqual(shown, [], `onCode must never see ${uri}`);
+      assert.equal(f.calls.length, 1, 'no poll follows');
+    }
+    // A bad complete URI is dropped; the plain one still works.
+    const shown = [];
+    const f = scriptedFetch([
+      { body: { ...DEVICE_CODE.body, verification_uri_complete: 'javascript:alert(1)' } },
+      { body: { access_token: 'a', token_type: 'Bearer' } },
+    ]);
+    await deviceLogin({ flow: FLOW, clientId: 'c', fetch: f, clock: fakeClock(), onCode: (c) => shown.push(c) });
+    assert.equal(shown.length, 1);
+    assert.equal(shown[0].verificationUri, `${ORIGIN}/oauth2/device`);
+    assert.ok(!('verificationUriComplete' in shown[0]), JSON.stringify(shown[0]));
+    // A safe complete URI is passed through.
+    const ok = [];
+    await deviceLogin({
+      flow: FLOW,
+      clientId: 'c',
+      clock: fakeClock(),
+      onCode: (c) => ok.push(c),
+      fetch: scriptedFetch([
+        { body: { ...DEVICE_CODE.body, verification_uri_complete: `${ORIGIN}/oauth2/device?user_code=BCDF-GHJK` } },
+        { body: { access_token: 'a', token_type: 'Bearer' } },
+      ]),
+    });
+    assert.equal(ok[0].verificationUriComplete, `${ORIGIN}/oauth2/device?user_code=BCDF-GHJK`);
+  });
+
+  await t.test('the token endpoint must share the device endpoint origin', async () => {
+    const f = scriptedFetch([DEVICE_CODE]);
+    const flow = { deviceAuthorizationUrl: 'https://a.example/oauth2/device_authorization', tokenUrl: 'https://evil.example/oauth2/token' };
+    await assert.rejects(deviceLogin({ flow, clientId: 'c', clock: fakeClock(), onCode: () => {}, fetch: f }), IssuerMismatch);
+    assert.equal(f.calls.length, 0, 'nothing is sent to either');
+  });
+
   await t.test('plain http off loopback is refused before any request', async () => {
     for (const flow of [
       { ...FLOW, tokenUrl: 'http://agent.example/oauth2/token' },
@@ -364,6 +429,16 @@ test('launch exchange', async () => {
   }
   assert.equal(LAUNCH_GRANT_TYPE, 'https://agentd.dev/oauth/grant-type/launch/v1');
   await assert.rejects(launchExchange('http://agent.example/oauth2/token', 'c', 'agentd-ui'), InsecureEndpoint);
+  // A launch code is redeemable only over loopback, so even https elsewhere
+  // would only burn it — or hand it to whoever answers. Nothing is sent.
+  const f = scriptedFetch([]);
+  await assert.rejects(launchExchange('https://agent.example/oauth2/token', 'c', 'agentd-ui', { fetch: f }), InsecureEndpoint);
+  await assert.rejects(launchAuthorize('https://agent.example/oauth2/launch_authorization', 'agentd-ui', { fetch: f }), InsecureEndpoint);
+  await assert.rejects(
+    launchPoll('https://agent.example/oauth2/token', 'agentd_lr_1', 'agentd-ui', fakeClock(), { fetch: f }),
+    InsecureEndpoint,
+  );
+  assert.equal(f.calls.length, 0);
 });
 
 test('terminal launch request', async () => {
@@ -421,6 +496,26 @@ test('no credential reaches persistent storage', () => {
   const local = recordingStorage();
   persistEndpoint(local, { endpoint: 'http://127.0.0.1:8420', bearer: 'sekrit', token: 'agentd_at_x' });
   assert.deepEqual(local.writes, [[ENDPOINT_KEY, JSON.stringify({ endpoint: 'http://127.0.0.1:8420' })]]);
+
+  // A v1.16 web UI left `{endpoint, bearer}` under the same key. Reading the
+  // endpoint scrubs the bearer out of persistent storage.
+  const legacy = recordingStorage();
+  legacy.setItem(ENDPOINT_KEY, JSON.stringify({ endpoint: 'http://127.0.0.1:8420', bearer: 'operator-secret' }));
+  assert.equal(loadEndpoint(legacy), 'http://127.0.0.1:8420');
+  assert.deepEqual(JSON.parse(legacy.getItem(ENDPOINT_KEY)), { endpoint: 'http://127.0.0.1:8420' });
+  // …and an entry with a credential but no endpoint to keep is removed.
+  for (const junk of [JSON.stringify({ bearer: 'operator-secret' }), '{not json', JSON.stringify(['x'])]) {
+    const s = recordingStorage();
+    s.setItem(ENDPOINT_KEY, junk);
+    assert.equal(loadEndpoint(s), undefined, junk);
+    assert.equal(s.getItem(ENDPOINT_KEY), null, junk);
+  }
+  // A clean entry is read without a write.
+  const clean = recordingStorage();
+  persistEndpoint(clean, { endpoint: 'http://127.0.0.1:8420' });
+  clean.writes.length = 0;
+  assert.equal(loadEndpoint(clean), 'http://127.0.0.1:8420');
+  assert.deepEqual(clean.writes, []);
 
   // Whatever the global storages are, a store writes only to the one it was given.
   const had = { localStorage: globalThis.localStorage, sessionStorage: globalThis.sessionStorage };

@@ -24,6 +24,16 @@ import {
   parseRetryAfter,
 } from '../dist/client/errors.js';
 import { ClientError, RpcError } from '../dist/client/types.js';
+import {
+  AuthError,
+  DeviceDenied,
+  DeviceExpired,
+  InsecureEndpoint,
+  IssuerMismatch,
+  LaunchExpired,
+  LaunchRefused,
+  NoLauncher,
+} from '../dist/client/auth.js';
 import { AgentdClient } from '../dist/client/index.js';
 
 const EP = { url: 'http://agent.test/' };
@@ -215,6 +225,35 @@ test('every request carries a2a-version, tenant and content-type', async (t) => 
   // everything else alone.
   assert.deepEqual(withTenant({ id: 'a', tenant: 'x' }, 't1'), { id: 'a', tenant: 't1' });
   assert.deepEqual(withTenant({ id: 'a' }), { id: 'a' });
+});
+
+test('a credential never travels in the clear', async (t) => {
+  const calls = stubFetch(t, (req) => ok(req, { tasks: [] }));
+  // One missing `s` must not hand the token to the path: refused before fetch.
+  for (const url of ['http://agent.example.com/', 'http://10.0.0.5:8420/', 'http://[2001:db8::1]:8420/']) {
+    for (const call of [
+      () => rpc({ url, bearer: 'agentd_at_secret' }, 'ListTasks', {}),
+      () => rpcStream({ url, bearer: 'agentd_at_secret' }, 'SubscribeToTask', { id: 't' }, () => {}),
+    ]) {
+      await rejects(call(), (e) => {
+        assert.ok(e instanceof ClientError && e.kind === 'insecure-endpoint', String(e));
+        assert.equal(classify(e).kind, 'incompatible');
+      });
+    }
+  }
+  assert.equal(calls.length, 0, 'nothing may be sent');
+  // https anywhere, http on loopback, and http with no credential all go out.
+  for (const ep of [
+    { url: 'https://agent.example.com/', bearer: 'b' },
+    { url: 'http://127.0.0.1:8420/', bearer: 'b' },
+    { url: 'http://localhost:8420/', bearer: 'b' },
+    { url: 'http://[::1]:8420/', bearer: 'b' },
+    { url: 'http://agent.example.com/' },
+  ]) {
+    await rpc(ep, 'ListTasks', {});
+  }
+  assert.equal(calls.length, 5);
+  assert.equal(calls[1].headers.authorization, 'Bearer b');
 });
 
 // ---- errors ------------------------------------------------------------------
@@ -523,6 +562,29 @@ test('classify() sorts failures', () => {
       /x/,
     ],
     ['-32001', new RpcError(-32001, 'not found'), {}, 'protocol', /not found/],
+    // Sign-in failures land in the same kinds as the calls they gate.
+    [
+      'device authorization 429',
+      new AuthError('temporarily_unavailable', 'device authorization: temporarily_unavailable', {
+        status: 429,
+        retryAfterMs: 12000,
+      }),
+      {},
+      'rate-limited',
+      /temporarily_unavailable/,
+      12000,
+    ],
+    ['temporarily_unavailable without 429', new AuthError('temporarily_unavailable', 'busy'), {}, 'rate-limited', /busy/],
+    ['insecure sign-in endpoint', new InsecureEndpoint('in the clear'), {}, 'incompatible', /in the clear/],
+    ['insecure call endpoint', new ClientError('insecure-endpoint', 'in the clear'), {}, 'incompatible', /in the clear/],
+    ['issuer mismatch', new IssuerMismatch('another issuer'), {}, 'incompatible', /another issuer/],
+    ['device denied', new DeviceDenied(), {}, 'unauthenticated', /denied — sign in again/],
+    ['device expired', new DeviceExpired(), {}, 'unauthenticated', /expired .* — sign in again/],
+    ['launch refused', new LaunchRefused(), {}, 'unauthenticated', /sign in again/],
+    ['launch expired', new LaunchExpired(), {}, 'unauthenticated', /sign in again/],
+    ['no launcher', new NoLauncher(), {}, 'unavailable', /agentd ui/],
+    ['token endpoint 503', new AuthError('http-503', 'sign-in: http-503', { status: 503 }), {}, 'transient', /503/],
+    ['invalid-response', new AuthError('invalid-response', 'junk answer'), {}, 'protocol', /junk answer/],
   ];
   for (const [name, e, ctx, kind, msg, retry] of cases) {
     const f = classify(e, ctx);

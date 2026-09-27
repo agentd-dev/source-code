@@ -25,6 +25,17 @@ import {
   VERSION_NOT_SUPPORTED,
 } from './types.js';
 import { A2A_VERSION } from './wire.js';
+import {
+  AuthError,
+  DeviceDenied,
+  DeviceExpired,
+  InsecureEndpoint,
+  IssuerMismatch,
+  LaunchExpired,
+  LaunchRefused,
+  NoLauncher,
+} from './auth.js';
+import { DAEMON_KEYS } from './daemon-keys.js';
 
 const TCHAR = /[!#$%&'*+\-.^_`|~0-9A-Za-z]/;
 
@@ -196,12 +207,6 @@ export interface Failure {
   retryAfterMs?: number;
 }
 
-/**
- * The daemon key a browser's origin must be listed under. Named here because
- * the hint below is the one place it is shown.
- */
-const CORS_ORIGINS_KEY = 'a2a.cors.origins';
-
 /** The page's origin when running in a browser; `undefined` in Node. */
 function pageOrigin(): string | undefined {
   const g = globalThis as { window?: unknown; location?: { origin?: string } };
@@ -215,7 +220,7 @@ function networkMessage(e: TypeError): string {
     // network, so name the likelier cause a person can actually fix.
     return (
       `network error or CORS refusal — is ${origin} listed in the agent's allowed origins ` +
-      `(agentd: ${CORS_ORIGINS_KEY})?`
+      `(agentd: ${DAEMON_KEYS.corsOrigins})?`
     );
   }
   const cause = (e as { cause?: { code?: string; message?: string } }).cause;
@@ -235,6 +240,7 @@ export function classify(e: unknown, ctx: { extensionCall?: boolean } = {}): Fai
       case 'cross-origin':
       case 'required-extension':
       case 'unsupported-scheme':
+      case 'insecure-endpoint':
         return { kind: 'incompatible', message: e.message };
       case 'extension-not-activated':
       case 'extension-not-declared':
@@ -290,8 +296,45 @@ export function classify(e: unknown, ctx: { extensionCall?: boolean } = {}): Fai
     }
     return { kind: 'protocol', message: e.message };
   }
+  if (e instanceof AuthError) return classifyAuth(e);
   if (e instanceof TypeError) return { kind: 'transient', message: networkMessage(e) };
   return { kind: 'protocol', message: e instanceof Error ? e.message : String(e) };
+}
+
+/**
+ * A sign-in failure. The OAuth endpoints answer in their own vocabulary
+ * (RFC 6749 §5.2, RFC 8628 §3.5), so these rows are separate from the
+ * JSON-RPC ones above — but they land in the same kinds, so a UI waits out a
+ * rate-limited device authorization exactly as it waits out a rate-limited
+ * call, instead of printing it as a protocol error.
+ */
+function classifyAuth(e: AuthError): Failure {
+  // The device endpoint answers a burst with 429 `temporarily_unavailable`
+  // and a Retry-After; either marker alone is enough.
+  if (e.status === 429 || e.code === 'temporarily_unavailable') {
+    const f: Failure = { kind: 'rate-limited', message: e.message };
+    if (e.retryAfterMs !== undefined) f.retryAfterMs = e.retryAfterMs;
+    return f;
+  }
+  // An endpoint that would carry a credential in the clear, or metadata that
+  // describes another server: no retry fixes either.
+  if (e instanceof InsecureEndpoint || e instanceof IssuerMismatch) {
+    return { kind: 'incompatible', message: e.message };
+  }
+  // The sign-in itself ended — denied, expired, or its code already spent.
+  // Only a fresh sign-in helps, so a loop stops and asks for the person.
+  if (
+    e instanceof DeviceDenied ||
+    e instanceof DeviceExpired ||
+    e instanceof LaunchRefused ||
+    e instanceof LaunchExpired
+  ) {
+    return { kind: 'unauthenticated', message: `${e.message} — sign in again` };
+  }
+  // No launcher to approve a request: that path is not offered here.
+  if (e instanceof NoLauncher) return { kind: 'unavailable', message: e.message };
+  if (e.status !== undefined && e.status >= 500) return { kind: 'transient', message: e.message };
+  return { kind: 'protocol', message: e.message };
 }
 
 /** The one line a UI prints for a failure. */

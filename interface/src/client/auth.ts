@@ -194,6 +194,20 @@ export function requireSecureUrl(url: string, what = 'endpoint'): URL {
   );
 }
 
+/**
+ * {@link requireSecureUrl}, and a loopback host besides. A launch code or
+ * request is redeemable only from a loopback peer (an SSH `-L` forward is
+ * loopback too), so sending one anywhere else could only burn it — or hand a
+ * single-use operator credential to whoever answers.
+ */
+function requireLoopbackUrl(url: string, what: string): URL {
+  const u = requireSecureUrl(url, what);
+  if (!isLoopbackHost(u.hostname)) {
+    throw new InsecureEndpoint(`${what} ${u.href} is not on this machine: a launch sign-in is redeemable only over loopback`);
+  }
+  return u;
+}
+
 /** The origin of a URL (`scheme://host[:port]`, no trailing slash). */
 export function originOf(url: string): string {
   return new URL(url).origin;
@@ -480,6 +494,14 @@ export async function deviceLogin(o: DeviceLoginOptions): Promise<Credential> {
   // token travel to both.
   const authUrl = requireSecureUrl(o.flow.deviceAuthorizationUrl, 'the device authorization endpoint');
   const tokenUrl = requireSecureUrl(o.flow.tokenUrl, 'the token endpoint');
+  // One authorization server, on the listener origin: a card (or a caller)
+  // that names a token endpoint anywhere else would have us post the device
+  // code to a server that did not issue it.
+  if (tokenUrl.origin !== authUrl.origin) {
+    throw new IssuerMismatch(
+      `the token endpoint ${tokenUrl.origin} is not on the device authorization endpoint's origin ${authUrl.origin}`,
+    );
+  }
   const form: Record<string, string> = { client_id: o.clientId };
   if (o.scope !== undefined) form.scope = o.scope;
   const started = clock.now();
@@ -494,8 +516,32 @@ export async function deviceLogin(o: DeviceLoginOptions): Promise<Credential> {
   ) {
     throw new AuthError('invalid-response', 'the device authorization answer is incomplete', { status: a.status });
   }
+  // The verification URI is the link a person is told to follow, and a UI
+  // renders it as one: a `javascript:` URI would run in the UI's origin, where
+  // the credentials of every other endpoint live, and a plaintext one is a
+  // phishing page. The daemon's own config holds the same line (https, or
+  // http on loopback); the client does not take the server's word for it.
+  const safe = (u: string): boolean => {
+    try {
+      requireSecureUrl(u);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  if (!safe(b.verification_uri)) {
+    throw new AuthError(
+      'invalid-response',
+      `the verification URI ${JSON.stringify(b.verification_uri)} is not an https:// URL (or http:// on a loopback host)`,
+      { status: a.status },
+    );
+  }
   const code: DeviceCode = { userCode: b.user_code, verificationUri: b.verification_uri, expiresIn: b.expires_in };
-  if (typeof b.verification_uri_complete === 'string') code.verificationUriComplete = b.verification_uri_complete;
+  // The complete URI is a convenience; one that fails the same test is
+  // dropped, and the person types the code at the plain URI instead.
+  if (typeof b.verification_uri_complete === 'string' && safe(b.verification_uri_complete)) {
+    code.verificationUriComplete = b.verification_uri_complete;
+  }
   o.onCode(code);
   return poll(
     {
@@ -576,7 +622,7 @@ export async function revokeToken(
  * could only be refused — and a refusal is final ({@link LaunchRefused}).
  */
 export async function launchExchange(tokenUrl: string, code: string, clientId: string, o: AuthTransport = {}): Promise<Credential> {
-  const url = requireSecureUrl(tokenUrl, 'the token endpoint');
+  const url = requireLoopbackUrl(tokenUrl, 'the token endpoint');
   const a = await send(url, { method: 'POST', form: { grant_type: LAUNCH_GRANT_TYPE, code, client_id: clientId } }, o);
   if (a.status === 200) return credentialOf(a, Date.now());
   if (errorCode(a) === 'invalid_grant') throw new LaunchRefused();
@@ -600,7 +646,7 @@ export interface LaunchRequest {
  * the card declares it.
  */
 export async function launchAuthorize(authorizationUrl: string, clientId: string, o: AuthTransport = {}): Promise<LaunchRequest> {
-  const url = requireSecureUrl(authorizationUrl, 'the launch authorization endpoint');
+  const url = requireLoopbackUrl(authorizationUrl, 'the launch authorization endpoint');
   const a = await send(url, { method: 'POST', form: { client_id: clientId } }, o);
   if (a.status === 404) throw new NoLauncher();
   if (a.status !== 200) throw failure(a, 'launch authorization');
@@ -628,7 +674,7 @@ export async function launchPoll(
   clock: Clock = systemClock,
   o: AuthTransport & { interval?: number } = {},
 ): Promise<Credential> {
-  const url = requireSecureUrl(tokenUrl, 'the token endpoint');
+  const url = requireLoopbackUrl(tokenUrl, 'the token endpoint');
   return poll(
     {
       tokenUrl: url,

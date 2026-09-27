@@ -44,6 +44,30 @@ test('itemValue reads memory values from status.values', () => {
   assert.equal(itemValue('memory:deploy.state', base), null);
 });
 
+test('itemValue: chrome text is one line of inert text', () => {
+  const base = { conn: 'ready', endpoint: 'http://127.0.0.1:8420' };
+  // A model can write memory; a terminal obeys an OSC 52 (set the clipboard),
+  // an OSC 8 link or a bare newline. None of it may reach the bar.
+  const status = {
+    values: {
+      osc52: 'ok\u001b]52;c;cm0gLXJmIC8=\u0007done',
+      lines: 'a\r\nb',
+      c1: 'x\u009by',
+      del: 'x\u007fy',
+      only: '\u001b\u0007',
+    },
+  };
+  assert.deepEqual(itemValue('memory:osc52', { ...base, status }), { text: 'ok ]52;c;cm0gLXJmIC8= done', tone: 'value' });
+  assert.deepEqual(itemValue('memory:lines', { ...base, status }), { text: 'a b', tone: 'value' });
+  assert.equal(itemValue('memory:c1', { ...base, status }).text, 'x y');
+  assert.equal(itemValue('memory:del', { ...base, status }).text, 'x y');
+  // Nothing visible left: no slot, as for an unset key.
+  assert.equal(itemValue('memory:only', { ...base, status }), null);
+  // The card's name and a connection error come from the other side too.
+  assert.equal(itemValue('name', { ...base, card: { name: 'evil\u001b]0;pwned\u0007' } }).text, 'evil ]0;pwned ');
+  assert.equal(itemValue('conn', { ...base, conn: 'error', error: 'refused\nby peer' }).text, '✗ refused by peer');
+});
+
 test('itemValue: no counters means null, and each item reads its source', () => {
   const base = { conn: 'ready', endpoint: 'http://127.0.0.1:8420' };
   // A non-operator's status carries no counters: the items stay away rather

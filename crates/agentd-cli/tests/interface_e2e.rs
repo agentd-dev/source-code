@@ -447,6 +447,16 @@ fn a_configured_web_origin_gets_cors_and_others_stay_rejected() {
             .any(|(k, v)| k == "access-control-allow-origin" && v == "https://ui.example"),
         "{headers:?}"
     );
+    // Every request the TS clients make carries `a2a-version` (a missing one
+    // means 0.3 to a 1.0 server), and it is not a CORS-safelisted header: a
+    // preflight that does not allow it fails every browser call.
+    assert!(
+        headers
+            .iter()
+            .any(|(k, v)| k == "access-control-allow-headers"
+                && v.split(',').any(|h| h.trim() == "a2a-version")),
+        "the preflight must allow a2a-version: {headers:?}"
+    );
     // Private Network Access: a page on a PUBLIC origin reaching a daemon on
     // loopback is the shape Chrome gates. It sends this header on the preflight
     // and drops the real request unless the answer grants it — so a hosted UI

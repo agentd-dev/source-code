@@ -138,18 +138,24 @@ explicit host:port.
 
 `url` is an origin — `scheme://host[:port]`, no path, query or fragment, and
 `https://` unless the host is loopback — because card discovery and the OAuth
-metadata are served at the origin root.
+metadata are served at the origin root. It is published as the OAuth issuer,
+which clients compare as text, so it must be written canonically: lowercase,
+without the scheme's default port (`https://agent.example.com`, not
+`https://Agent.Example.com:443`); the error names the canonical form.
 
 `cors.origins` lists every browser origin allowed to call the listener,
-matched exactly. There is no wildcard, and a UI served from loopback must be
-listed too.
+matched exactly. There is no wildcard (`*` and `https://*.example.com` are
+both refused), and a UI served from loopback must be listed too.
 
 `device_grant` needs an operator credential to approve codes — `a2a.bearer`,
 or a principals rule with `role: operator` and `match.bearer_ref` — and is
 refused together with `a2a.tls.client_ca` and on a `unix://` listener.
-`events`, `introspection` and `device_grant` all require `a2a.listen`.
+`url`, `cors.origins`, `events`, `introspection` and `device_grant` all
+require `a2a.listen`.
 
 `principals[].id` is `[A-Za-z0-9._@:/+-]{1,128}` and unique across rules.
+Each rule's `match` sets exactly one of `san`, `sub`, `bearer_ref`,
+`aauth_agent` or `any`.
 
 ## interface — the display clients
 

@@ -63,7 +63,7 @@ impl Addressee {
                     // nothing vouches for, so a gate "answered by anonymous"
                     // records nothing at all.
                     Some("anonymous") => {
-                        return Err("`to.role: anonymous` names nobody — a gate answered by an                                     unidentified caller records nothing"
+                        return Err("`to.role: anonymous` names nobody — a gate answered by an unidentified caller records nothing"
                             .into());
                     }
                     Some(other) => {

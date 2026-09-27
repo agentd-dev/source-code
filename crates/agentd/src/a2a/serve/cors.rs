@@ -52,8 +52,11 @@ pub(super) async fn preflight(State(app): State<Arc<App>>, headers: HeaderMap) -
                 header::ACCESS_CONTROL_ALLOW_HEADERS,
                 // `a2a-extensions` rides here too, or a browser client could
                 // never activate one: the preflight would reject the header
-                // before the request that carries it is ever sent.
-                "content-type, authorization, last-event-id, a2a-extensions".to_string(),
+                // before the request that carries it is ever sent. The same
+                // holds for `a2a-version`, which every A2A 1.0 client sends on
+                // every call — without it a browser can make no call at all.
+                "content-type, authorization, last-event-id, a2a-extensions, a2a-version"
+                    .to_string(),
             ),
             (
                 header::ACCESS_CONTROL_EXPOSE_HEADERS,

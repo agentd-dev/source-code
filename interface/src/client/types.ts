@@ -262,6 +262,8 @@ export type ClientErrorKind =
   | 'op-not-offered'
   | 'invalid-response'
   | 'unsupported-scheme'
+  /** A credential would travel in the clear: plain http to a non-loopback host. */
+  | 'insecure-endpoint'
   /** The feed ended with goodbye `revoked`: the session is gone. */
   | 'session-revoked'
   /** The credential's own expiry passed (there is no refresh token). */

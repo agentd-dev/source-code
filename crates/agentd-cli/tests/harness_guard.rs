@@ -358,15 +358,25 @@ fn sources(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// The suites that may name `GetAgentCard`: a test proving the server REFUSES
+/// the method has to send it. Listed by file name, so each exception is a
+/// deliberate line here rather than a pattern the scan happens to miss.
+const GET_AGENT_CARD_REFUSAL_TESTS: &[&str] = &[];
+
 /// The legacy spellings, refused everywhere but the harness.
 ///
 /// * `"blocking"` — the pre-1.0 inverse of `returnImmediately`, which the spec
 ///   does not have;
 /// * the card read as a JSON-RPC method — the spec publishes the public card at
-///   a well-known URL, and `common::get_card` reads it there;
+///   a well-known URL, and `common::get_card` reads it there. The method name
+///   is refused as a string literal in ANY position, because the suites called
+///   it positionally (`rpc(addr, 1, "GetAgentCard", …)`) far more often than
+///   they spelled a `"method"` key;
 /// * a command DataPart typed out by hand — it would carry neither the
 ///   extension mark nor the activation header, so it only works against a
-///   server that checks neither. Only the two harness files may build one.
+///   server that checks neither. Only the two harness files may build one. The
+///   `"agentd":` key is refused whatever follows it: `op` need not come first,
+///   and the value may be a variable.
 #[test]
 fn no_legacy_shapes() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -400,7 +410,11 @@ fn no_legacy_shapes() {
                 "{name}: \"blocking\" — say `returnImmediately` (SendMessage::return_immediately)"
             ));
         }
-        if flat.contains("\"method\":\"GetAgentCard\"") {
+        let refusal_test = file
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| GET_AGENT_CARD_REFUSAL_TESTS.contains(&n));
+        if !refusal_test && text.contains("\"GetAgentCard\"") {
             found.push(format!(
                 "{name}: GetAgentCard as a method — read the card with get_card"
             ));
@@ -408,7 +422,7 @@ fn no_legacy_shapes() {
         let is_harness = harnesses
             .iter()
             .any(|h| h.canonicalize().ok() == file.canonicalize().ok());
-        if !is_harness && flat.contains("\"agentd\":{\"op\"") {
+        if !is_harness && flat.contains("\"agentd\":") {
             found.push(format!(
                 "{name}: a hand-built command DataPart — use SendMessage::command"
             ));

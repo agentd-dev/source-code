@@ -6060,16 +6060,6 @@ fn validate_auth_block(auth: &Auth, ctx: &str) -> Vec<String> {
     out
 }
 
-/// Why a declared header value's `{{secret:NAME}}` / `{{secret-file:PATH}}` ref
-/// does not resolve, or `None` when it does (or when the value carries no ref).
-///
-/// This is the security half of header validation, and it is not cosmetic: a
-/// header whose ref does not resolve is a header that is **not sent**, so
-/// without this check the process starts and dials the endpoint with no
-/// credential at all. Validating before any side effect makes that exit 2 at
-/// startup, naming the ref — the same rule, and the same resolver, the runtime
-/// applies at the moment of use. The message names the ref and never the
-/// resolved value, so a diagnostic cannot leak the credential.
 /// A web origin as a browser sends one: the scheme, the host (lowercased,
 /// IPv6 brackets stripped) and the port with the scheme's default applied — so
 /// `https://H.example` and `https://h.example:443` are the same origin, which
@@ -6104,9 +6094,19 @@ pub fn parse_origin(s: &str) -> Result<Origin, String> {
         let (h, after) = v6
             .split_once(']')
             .ok_or_else(|| format!("unclosed IPv6 bracket ({want})"))?;
-        if h.parse::<std::net::Ipv6Addr>().is_err() {
-            return Err(format!("{h:?} is not an IPv6 address"));
+        let ip = h
+            .parse::<std::net::Ipv6Addr>()
+            .map_err(|_| format!("{h:?} is not an IPv6 address"))?;
+        // Kept in the compressed form a browser serialises (RFC 5952), so
+        // `[0:0:0:0:0:0:0:1]` and `[::1]` are one origin. An IPv4-mapped
+        // address is the one case Rust and a browser print differently;
+        // nobody needs it, since the IPv4 address itself can be written.
+        if ip.to_ipv4_mapped().is_some() {
+            return Err(format!(
+                "{h:?} is an IPv4-mapped address; write the IPv4 address instead"
+            ));
         }
+        let h = ip.to_string();
         match after {
             "" => (h, None),
             p => (
@@ -6127,13 +6127,16 @@ pub fn parse_origin(s: &str) -> Result<Origin, String> {
         if h.is_empty() || h.contains(':') {
             return Err(format!("no host ({want})"));
         }
-        (h, p)
+        host_ok(h)?;
+        (h.to_string(), p)
     };
     let port = match port {
         None => default_port,
-        Some(p) => p
-            .parse::<u16>()
-            .ok()
+        // Digits only: `u16::from_str` also takes a leading `+`, which no
+        // browser would ever put in an Origin.
+        Some(p) => Some(p)
+            .filter(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|p| p.parse::<u16>().ok())
             .filter(|p| *p != 0)
             .ok_or_else(|| format!("port {p:?} is not 1..=65535"))?,
     };
@@ -6142,6 +6145,59 @@ pub fn parse_origin(s: &str) -> Result<Origin, String> {
         host: host.to_ascii_lowercase(),
         port,
     })
+}
+
+/// A host a browser could put in an Origin: a DNS name
+/// (`[A-Za-z0-9_-]+` labels joined by `.`, one trailing `.` allowed) or a
+/// dotted-quad IPv4 address. Anything else — a wildcard, a space, a
+/// percent-escape — parses as text but can never equal what a browser sends,
+/// so an origin written with it would be a setting that loads and matches
+/// nothing.
+fn host_ok(h: &str) -> Result<(), String> {
+    if h.contains('*') {
+        return Err(format!(
+            "{h:?}: wildcards are not supported; list each exact origin"
+        ));
+    }
+    let labels = h.strip_suffix('.').unwrap_or(h);
+    let dns = labels.split('.').all(|l| {
+        !l.is_empty()
+            && l.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    });
+    if !dns {
+        return Err(format!("{h:?} is not a host name or an IP address"));
+    }
+    // A numeric last label makes a browser read the whole host as IPv4 and
+    // rewrite it (`127.1` is `127.0.0.1`), so only the canonical dotted quad
+    // is taken — the one spelling that is also what the browser sends.
+    let last = labels.rsplit('.').next().unwrap_or("");
+    if last.bytes().all(|b| b.is_ascii_digit())
+        && h.parse::<std::net::Ipv4Addr>()
+            .map_or(true, |ip| ip.to_string() != h)
+    {
+        return Err(format!("{h:?} is not a dotted-quad IPv4 address"));
+    }
+    Ok(())
+}
+
+impl Origin {
+    /// The origin as a browser serialises it — lowercase, IPv6 in brackets,
+    /// the port only when it is not the scheme's default. What an Origin
+    /// header carries, and what a client compares an OAuth issuer against.
+    pub fn serialize(&self) -> String {
+        let default = if self.scheme == "https" { 443 } else { 80 };
+        let host = if self.host.contains(':') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
+        if self.port == default {
+            format!("{}://{host}", self.scheme)
+        } else {
+            format!("{}://{host}:{}", self.scheme, self.port)
+        }
+    }
 }
 
 /// `a2a.url`: an origin, with a single trailing `/` tolerated because that is
@@ -6169,6 +6225,17 @@ fn validate_a2a_url(url: &str) -> Result<Origin, String> {
     if o.scheme != "https" && !crate::net::http::is_loopback_host(&o.host) {
         return Err(format!(
             "a2a.url: {url:?}: plaintext http:// is allowed for a loopback host only; use https://"
+        ));
+    }
+    // The value is published verbatim as the OAuth issuer, and a client checks
+    // the issuer against the origin its browser or URL parser computes. A
+    // spelling that parses to the same origin but differs as text —
+    // `https://Agent.Example:443` — would fail that check on every client, so
+    // only the canonical spelling is taken, and the error names it.
+    let canonical = o.serialize();
+    if bare != canonical {
+        return Err(format!(
+            "a2a.url: {url:?} is not in canonical form; write {canonical:?} (lowercase, no default port) — it is published as the OAuth issuer, which clients compare as text"
         ));
     }
     Ok(o)
@@ -6209,7 +6276,11 @@ fn validate_device_grant(a2a: &A2a, listen: Option<&super::ServeTarget>, d: &mut
             .filter(|(scheme, rest)| {
                 let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
                 let host = super::serve_host_of(authority);
+                // No userinfo: in `http://127.0.0.1:80@evil.example/` the host
+                // a browser dials is evil.example, while the split above would
+                // read 127.0.0.1 and wave plaintext through as loopback.
                 !host.is_empty()
+                    && !authority.contains('@')
                     && !rest.contains('#')
                     && (*scheme == "https"
                         || (*scheme == "http" && crate::net::http::is_loopback_host(host)))
@@ -6217,7 +6288,7 @@ fn validate_device_grant(a2a: &A2a, listen: Option<&super::ServeTarget>, d: &mut
             .is_some();
         if !ok {
             d.errors.push(format!(
-                "a2a.device_grant.verification_uri: {uri:?} (want an https:// URL, or http:// on a loopback host, with no fragment)"
+                "a2a.device_grant.verification_uri: {uri:?} (want an https:// URL, or http:// on a loopback host, with no userinfo or fragment)"
             ));
         }
     }
@@ -6269,6 +6340,16 @@ fn principal_id_ok(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"._@:/+-".contains(&b))
 }
 
+/// Why a declared header value's `{{secret:NAME}}` / `{{secret-file:PATH}}` ref
+/// does not resolve, or `None` when it does (or when the value carries no ref).
+///
+/// This is the security half of header validation, and it is not cosmetic: a
+/// header whose ref does not resolve is a header that is **not sent**, so
+/// without this check the process starts and dials the endpoint with no
+/// credential at all. Validating before any side effect makes that exit 2 at
+/// startup, naming the ref — the same rule, and the same resolver, the runtime
+/// applies at the moment of use. The message names the ref and never the
+/// resolved value, so a diagnostic cannot leak the credential.
 fn unresolved_secret_ref(value: &str) -> Option<String> {
     if !crate::sec::secret::has_secret_ref(value) {
         return None;
@@ -7331,6 +7412,8 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
         .as_deref()
         .and_then(|l| super::ServeTarget::parse(l).ok());
     for (on, what) in [
+        (s.a2a.url.is_some(), "a2a.url"),
+        (!s.a2a.cors.origins.is_empty(), "a2a.cors.origins"),
         (s.a2a.events.enabled, "a2a.events.enabled"),
         (s.a2a.introspection.enabled, "a2a.introspection.enabled"),
         (s.a2a.device_grant.enabled, "a2a.device_grant.enabled"),
@@ -7605,16 +7688,32 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
     }
     for (i, pr) in s.a2a.principals.iter().enumerate() {
         let m = &pr.matcher;
-        if m.san.is_none()
-            && m.sub.is_none()
-            && m.bearer_ref.is_none()
-            && m.aauth_agent.is_none()
-            && !m.any
-        {
+        let set = [
+            m.san.is_some(),
+            m.sub.is_some(),
+            m.bearer_ref.is_some(),
+            m.aauth_agent.is_some(),
+            m.any,
+        ]
+        .into_iter()
+        .filter(|b| *b)
+        .count();
+        if set == 0 {
             err(
                 &mut d,
                 format!(
                     "a2a.principals[{i}]: match needs one of san | sub | bearer_ref | aauth_agent | any"
+                ),
+            );
+        } else if set > 1 {
+            // The resolver consults exactly one matcher per rule (by a fixed
+            // precedence), so the others would be silently ignored — a
+            // `bearer_ref` beside a `san` authenticates nobody, yet it would
+            // count as the operator credential the device grant requires.
+            err(
+                &mut d,
+                format!(
+                    "a2a.principals[{i}]: match sets more than one of san | sub | bearer_ref | aauth_agent | any; a rule matches one way — write one rule per matcher"
                 ),
             );
         }
@@ -10628,6 +10727,14 @@ mod tests {
         let bearer = "  bearer: \"{{secret:A2A_TEST_BEARER}}\"\n";
         for (yaml, what) in [
             (
+                "a2a:\n  url: \"https://agent.example\"\n".to_string(),
+                "a2a.url",
+            ),
+            (
+                "a2a:\n  cors: {origins: [\"https://ui.example\"]}\n".to_string(),
+                "a2a.cors.origins",
+            ),
+            (
                 "a2a:\n  events: {enabled: true}\n".to_string(),
                 "a2a.events.enabled",
             ),
@@ -10663,7 +10770,11 @@ mod tests {
 
     #[test]
     fn a2a_url_is_an_origin() {
-        let at = |url: &str| load_errors(&format!("a2a: {{url: \"{url}\"}}\n"));
+        let at = |url: &str| {
+            load_errors(&format!(
+                "a2a: {{listen: \"http://127.0.0.1:8420\", url: \"{url}\"}}\n"
+            ))
+        };
         let e = at("https://h/agent");
         assert!(
             e.contains("a2a.url must be an origin (scheme://host[:port]); A2A card discovery and OAuth metadata are served at the origin root"),
@@ -10687,11 +10798,52 @@ mod tests {
             "{}",
             at("https://h:0")
         );
+        // Hosts a browser would never send, and a port `u16` parses but no
+        // browser writes: each would be published as a card URL and an
+        // issuer nothing can match.
+        for bad in [
+            "https://*.example.com",
+            "https://bad host/",
+            "https://h.example ",
+            "https://%41",
+            "https://a..b",
+            "https://127.1",
+            "https://h:+443",
+        ] {
+            assert!(!at(bad).is_empty(), "{bad:?} must be refused");
+        }
+        // The value is published as the OAuth issuer and clients compare it as
+        // text against the origin their URL parser computes, so only the
+        // canonical spelling loads — and the error names it.
+        for (written, canonical) in [
+            ("https://H.example:443/", "https://h.example"),
+            ("https://agent.example.com:443", "https://agent.example.com"),
+            ("HTTPS://agent.example", "https://agent.example"),
+            ("http://[0:0:0:0:0:0:0:1]:8420", "http://[::1]:8420"),
+            ("http://127.0.0.1:08420", "http://127.0.0.1:8420"),
+        ] {
+            let e = at(written);
+            assert!(
+                e.contains(&format!("write {canonical:?}")),
+                "{written}: {e}"
+            );
+            assert_eq!(at(canonical), "", "{canonical}");
+        }
+        assert_eq!(at("https://agent.example:8443/"), "");
+        assert_eq!(
+            at("https://h.example./"),
+            "",
+            "a trailing dot is kept by browsers"
+        );
     }
 
     #[test]
     fn cors_origins_validation() {
-        let at = |o: &str| load_errors(&format!("a2a: {{cors: {{origins: [\"{o}\"]}}}}\n"));
+        let at = |o: &str| {
+            load_errors(&format!(
+                "a2a: {{listen: \"http://127.0.0.1:8420\", cors: {{origins: [\"{o}\"]}}}}\n"
+            ))
+        };
         assert!(
             at("*").contains(
                 "a2a.cors.origins: `*` is not allowed; list each exact origin (a loopback UI origin must be listed too)"
@@ -10731,6 +10883,38 @@ mod tests {
         assert_eq!(parse_origin("http://[::1]:4173").unwrap().host, "::1");
         assert_eq!(parse_origin("http://h").unwrap().port, 80);
         assert!(parse_origin("https://u:p@h").is_err());
+        // An origin that loads must be one a browser can send: no wildcard
+        // (named, since it is the natural thing to try), no space, no
+        // percent-escape, no non-canonical IPv4, a port of digits only.
+        let e = at("https://*.example.com");
+        assert!(
+            e.contains("wildcards are not supported; list each exact origin"),
+            "{e}"
+        );
+        for bad in [
+            "https://ui example.com",
+            "https://ui.example.com ",
+            "https://%41",
+            "https://ui..example",
+            "https://127.1",
+            "https://h:+443",
+            "https://h:",
+            "http://[::ffff:127.0.0.1]:4173",
+        ] {
+            assert!(parse_origin(bad).is_err(), "{bad:?} parsed");
+            assert!(!at(bad).is_empty(), "{bad:?} loaded");
+        }
+        // The IPv6 host is kept compressed, so both spellings are one origin.
+        assert_eq!(
+            parse_origin("http://[0:0:0:0:0:0:0:1]:4173").unwrap(),
+            parse_origin("http://[::1]:4173").unwrap()
+        );
+        assert_eq!(
+            parse_origin("HTTP://[::1]:80").unwrap().serialize(),
+            "http://[::1]"
+        );
+        assert_eq!(at("http://my_service:4173"), "");
+        assert_eq!(at("https://ui.example.com."), "");
     }
 
     #[test]
@@ -10801,6 +10985,9 @@ mod tests {
             ("https:///device", false),
             ("https://id.example/device#x", false),
             ("id.example/device", false),
+            // The host a browser dials here is evil.example, in plaintext.
+            ("http://127.0.0.1:80@evil.example/device", false),
+            ("http://user@127.0.0.1:8420/device", false),
         ] {
             let e = grant(&format!(", verification_uri: \"{uri}\""));
             assert_eq!(e.is_empty(), ok, "{uri}: {e}");
@@ -10833,6 +11020,16 @@ mod tests {
             "a2a:\n{loopback}  principals: [{{id: ops, match: {{bearer_ref: \"{{{{secret:A2A_TEST_BEARER}}}}\"}}, role: operator}}]\n  device_grant: {{enabled: true}}\n"
         ));
         assert!(!e.contains(msg), "an operator rule: {e}");
+        // A bearer_ref that shares its rule with a `san` never authenticates
+        // anyone (the resolver consults one matcher per rule), so it is no
+        // operator credential — the rule is refused outright.
+        let e = load_errors(&format!(
+            "a2a:\n{loopback}  principals: [{{id: ops, match: {{san: x.example, bearer_ref: \"{{{{secret:A2A_TEST_BEARER}}}}\"}}, role: operator}}]\n  device_grant: {{enabled: true}}\n"
+        ));
+        assert!(
+            e.contains("a2a.principals[0]: match sets more than one of san | sub | bearer_ref | aauth_agent | any"),
+            "{e}"
+        );
         // And the grant with a2a.bearer on a non-loopback https bind loads.
         assert_eq!(
             load_errors(&format!(
@@ -10868,6 +11065,17 @@ mod tests {
         // No prefix is reserved: device sessions are `user:<name>`, never a
         // `device:` id, so a rule may use one.
         assert_eq!(rules("device:x", "c"), "");
+        // One matcher per rule, whichever two are combined.
+        for m in [
+            "{san: a.example, sub: s}",
+            "{sub: s, any: true}",
+            "{san: a.example, aauth_agent: \"https://a.example\"}",
+        ] {
+            let e = load_errors(&format!(
+                "a2a:\n  principals:\n    - {{id: a, match: {m}, role: user}}\n"
+            ));
+            assert!(e.contains("match sets more than one of"), "{m}: {e}");
+        }
     }
 
     #[test]
@@ -10907,7 +11115,15 @@ mod tests {
         let e = load_errors(
             "security: {policies: [{match: {tool: x}, action: ask, to: {role: anonymous}}]}\n",
         );
-        assert!(e.contains("names nobody"), "{e}");
+        // The whole sentence: the parser's text is an operator-facing
+        // diagnostic now, and a broken string continuation once left a run of
+        // spaces in the middle of it.
+        assert!(
+            e.contains(
+                "`to.role: anonymous` names nobody — a gate answered by an unidentified caller records nothing"
+            ),
+            "{e}"
+        );
         let e = load_errors("security: {policies: [{match: {tool: x}, action: ask, to: {}}]}\n");
         assert!(e.contains("names nobody"), "{e}");
     }

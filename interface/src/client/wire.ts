@@ -12,6 +12,7 @@
 
 import { ClientError, Endpoint, Json, RpcError } from './types.js';
 import { parseChallenge, parseRetryAfter } from './errors.js';
+import { isLoopbackHost } from './auth.js';
 
 /**
  * The A2A protocol version this client speaks. It goes on every JSON-RPC
@@ -174,7 +175,33 @@ async function httpError(ep: Endpoint, res: Response): Promise<RpcError> {
   });
 }
 
+/**
+ * Refuse to send a credential in the clear. The sign-in requests already hold
+ * this line (`requireSecureUrl` in auth.ts), and the token they yield — or an
+ * operator bearer — is worth no less on every later call: a typed
+ * `http://agent.example.com` (one missing `s`) would otherwise hand it to
+ * anyone on the path with the very first request, before any discovery error
+ * could appear. Plain http stays fine for loopback, and for a call with no
+ * credential at all.
+ */
+function refuseCleartextCredential(ep: Endpoint): void {
+  if (!ep.bearer) return;
+  let u: URL;
+  try {
+    // A page may address the daemon relative to itself.
+    u = new URL(ep.url, (globalThis as { location?: { href?: string } }).location?.href);
+  } catch {
+    return; // not a URL: fetch refuses it without sending anything
+  }
+  if (u.protocol === 'https:' || (u.protocol === 'http:' && isLoopbackHost(u.hostname))) return;
+  throw new ClientError(
+    'insecure-endpoint',
+    `${u.href} would carry the credential in the clear: use https://, or http:// on a loopback host`,
+  );
+}
+
 async function post(ep: Endpoint, method: string, params: Json, accept: string, o: CallOptions) {
+  refuseCleartextCredential(ep);
   const id = nextId++;
   const body = JSON.stringify({ jsonrpc: '2.0', id, method, params: withTenant(params, ep.tenant) });
   const res = await fetch(ep.url, {

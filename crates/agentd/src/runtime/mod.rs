@@ -18,6 +18,8 @@ pub mod artifacts;
 pub mod audit;
 pub mod breaker;
 pub mod children;
+#[cfg(feature = "a2a")]
+pub mod conversations;
 pub mod env; // system-prompt data + the default template
 pub mod events;
 #[cfg(feature = "exec")]
@@ -26,6 +28,8 @@ pub mod freshness; // §7.7 signed-instruction freshness watch: re-fetch + refus
 pub mod goal;
 pub mod http_node;
 pub mod human; // human-in-the-loop: ask_human gates + fallbacks
+#[cfg(feature = "a2a")]
+pub mod identities; // the identity registry: principal names that survive restarts
 pub(crate) mod instances; // instance-tier template children (a full daemon each)
 pub mod nested;
 pub mod pressure; // disk/memory pressure: shed new work, drain what is in flight
@@ -1302,41 +1306,6 @@ pub fn capabilities(loaded: &Loaded) -> Value {
             json!({"name": w["name"].as_str().unwrap_or(""), "description": w.get("description").and_then(Value::as_str), "start_kinds": starts, "inputs_schema": w.get("inputs").is_some()})
         })
         .collect();
-    let a2a = s.a2a.listen.as_ref().map(|listen| {
-        let principals: Vec<Value> = s
-            .a2a
-            .principals
-            .iter()
-            .map(|p| json!({"role": format!("{:?}", p.role).to_lowercase(), "match": principal_match_desc(&p.matcher), "grants": p.grants}))
-            .collect();
-        // Derived from the list the listener actually dispatches, plus the two
-        // bootstrap calls it answers ahead of the dispatch table. This was a
-        // fourth hand-maintained copy and it had drifted: it omitted
-        // `GetExtendedAgentCard` and the four push-config methods, and listed
-        // `GetAgentCard`, which `METHODS` does not carry.
-        let mut methods: Vec<&str> = crate::runtime::surface::METHODS
-            .iter()
-            .copied()
-            .filter(|m| *m != "SubscribeToEvents" || s.interface.enabled)
-            .chain(crate::runtime::surface::LOCAL_METHODS.iter().copied())
-            .collect();
-        methods.sort_unstable();
-        json!({
-            "listen": listen,
-            "tls": s.a2a.tls.cert.is_some(),
-            "mtls": s.a2a.tls.client_ca.is_some(),
-            "bearer": s.a2a.bearer.is_some(),
-            "methods": methods,
-            // The command ops come from the ONE list the agent card renders as
-            // skills and the extension declares, so the manifest cannot
-            // advertise a surface the card denies (they disagreed once: the
-            // manifest listed ops the card never mentioned).
-            "command_ops": crate::runtime::surface::command_ops_of(s),
-            "extensions": crate::runtime::surface::extensions_of(s),
-            "principals": principals,
-            "loopback_operator": s.a2a.principals.is_empty(),
-        })
-    });
     json!({
         "runtime": "1",
         "version": crate::VERSION,
@@ -1349,7 +1318,7 @@ pub fn capabilities(loaded: &Loaded) -> Value {
         "knowledge": {"server": s.knowledge.server},
         "search": {"server": s.search.server},
         "skills": {"sources": s.skills.sources.len()},
-        "a2a": a2a,
+        "a2a": crate::runtime::surface::manifest::a2a_section(s),
         "interface": {"enabled": s.interface.enabled, "debug": s.interface.debug, "origins": s.interface.origins.len(), "pairing": s.interface.pairing.enabled, "display": {"top": s.interface.display.top, "bottom": s.interface.display.bottom}},
         "store": format!("{:?}", s.store.kind).to_lowercase(),
         // For the file adapter the kind alone under-reports: what an operator
@@ -1416,23 +1385,6 @@ pub fn capabilities(loaded: &Loaded) -> Value {
                     .collect::<serde_json::Map<_, _>>(),
             })),
     })
-}
-
-/// A redacted description of a principal matcher (secrets never leak here).
-fn principal_match_desc(m: &crate::config::v2::PrincipalMatch) -> Value {
-    if m.any {
-        json!({"any": true})
-    } else if let Some(s) = &m.san {
-        json!({"san": s})
-    } else if let Some(s) = &m.sub {
-        json!({"sub": s})
-    } else if m.bearer_ref.is_some() {
-        json!({"bearer_ref": "***"})
-    } else if let Some(a) = &m.aauth_agent {
-        json!({"aauth_agent": a})
-    } else {
-        json!({})
-    }
 }
 
 /// Build the intelligence credential provider: a closure returning the current

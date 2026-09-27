@@ -24,7 +24,7 @@ the real request unless the answer carries
 `Access-Control-Allow-Private-Network: true`. Without that answer a hosted
 client fails with a CORS error that names no cause.
 
-agentd answers it (`crates/agentd/src/a2a/serve.rs`), and the grant is
+agentd answers it (`crates/agentd/src/a2a/serve/cors.rs`), and the grant is
 deliberately narrow: it rides the `interface.origins` allow-list, so it says
 "the origin you already configured may reach this daemon", never "any website
 may". An unconfigured origin is refused before the header is considered, and

@@ -80,7 +80,7 @@ defaults to `8/2s` — a burst of 8, refilling four tokens a second.
 | Store adapters | `store/{file,mcp,http,memory}.rs` | the four-operation contract |
 | Supervisor tree | `supervisor/*.rs` | spawn, process groups, reaping, kill ladder, stuck detection |
 | Turn worker, subagent | `runtime/worker.rs`, `subagent/` | one LLM turn; the nested agentic loop |
-| A2A listener | `runtime/a2a_server.rs` | conversations, durable tasks, the display-client feed |
+| A2A listener | `runtime/a2a_server/` | conversations, durable tasks, the display-client feed |
 | MCP client | `crates/mcp/src/client.rs` | tool calls, resource reads, notifications |
 | Intelligence client | `intel/` | endpoint list, failover, three in-binary dialects |
 | Observability | `obs/*.rs` | NDJSON logs, Prometheus text, OTLP export, probes |

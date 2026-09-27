@@ -30,7 +30,7 @@ agentd trusts its own binary, the OS, and the operator's configuration. What arr
 the network is bounded to a whitelist: an A2A caller's `config.set` reaches three
 display/debug paths plus `agent.approval` — the human-approval mode, operator-only and
 deliberately settable mid-session, because how closely you want to be asked changes with
-what the agent is doing (`a2a_server.rs::interface_config_set`) — and nothing else, every
+what the agent is doing (`a2a_server/introspection.rs::interface_config_set`) — and nothing else, every
 other path refused by name in that same function's catch-all arm, which answers with the
 list of what *is* settable. The model can never register an MCP server, edit an endpoint,
 or name a binary to run.
@@ -313,7 +313,7 @@ External callers arrive over A2A. The transport supplies a `CallerIdentity` — 
 mTLS SANs and subject, a bearer reference, an AAuth agent id, a loopback flag — and
 `Resolver::resolve` walks the `a2a.principals` rules first-match, then falls back to
 operator on verified management, then operator on loopback with no principals configured,
-then anonymous (`a2a/principals.rs::Resolver::resolve`).
+then anonymous (`a2a/principals/resolve.rs::Resolver::resolve`).
 
 ```yaml
 a2a:
@@ -335,14 +335,14 @@ RPC method and `Principal::may_command` for a command DataPart:
 | `anonymous` | nothing — denied at every layer, and an explicit `grants: ["*"]` does not rescue it |
 
 `status` and `interface.info` are always granted to any non-anonymous role
-(`principals.rs::Principal::may_command`). Of the 53 internal contracts, exactly one —
+(`principals/mod.rs::Principal::may_command`). Of the 53 internal contracts, exactly one —
 `status` — carries a default grant for `user`/`agent`. The admin family (`drain`,
 `lameduck`, `pause`, `resume`, `cancel`) is refused by name for every non-operator role,
 independent of grants. Bearer
-tokens and pairing codes are compared in constant time: `principals.rs::ct_eq` for a
+tokens and pairing codes are compared in constant time: `principals/resolve.rs::ct_eq` for a
 principal's bearer (`::Compiled::matches`), and the shared `sha.rs::ct_eq` for the static
-server bearer (`a2a/serve.rs::is_server_bearer`) and the rotating pairing code
-(`a2a_server.rs::PairingState::pair`). Those are two copies of the same
+server bearer (`a2a/serve/identity.rs::is_server_bearer`) and the rotating pairing code
+(`a2a_server/pairing.rs::PairingState::pair`). Those are two copies of the same
 length-check-then-XOR-fold compare rather than one shared helper — a duplication to know
 about, not a hole.
 
@@ -447,7 +447,7 @@ startup fails validation, and plaintext `http://` on a non-loopback bind is like
 startup error (`config/v2/mod.rs::validate`, the two refusals in its `a2a.listen` block).
 
 One default deserves emphasis: **a loopback caller with no `a2a.principals` configured
-resolves to operator** with `grants: ["*"]` (`principals.rs::Resolver::build` sets the flag,
+resolves to operator** with `grants: ["*"]` (`principals/resolve.rs::Resolver::build` sets the flag,
 `::Resolver::resolve` acts on it). Anything that can reach the loopback port — a sidecar, a
 co-tenant process, an SSRF from another service in the same network namespace — is a full
 operator, which includes flipping `agent.approval` to `accept` over `config.set`: the

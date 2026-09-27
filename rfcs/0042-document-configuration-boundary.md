@@ -73,8 +73,17 @@ primary: system prompt, tool results and all.
 **`a2a.principals` — who may call.** `match: {any: true}, role: user,
 grants: ["*"]` validated, admitting anonymous callers to every non-admin
 command. (`any → operator` was already refused by a validation check, and the
-admin family answers to the role rather than to grants — so operator control
-itself was never reachable.)
+admin family answered to the role rather than to grants. But the other ops the
+code and the docs called operator-only — `pairing.code`, `config.set`, `config`,
+`debug.events`, `subagent.get` — answered to grants, so `*` reached them; and
+the document could switch on `interface.pairing` itself. Through `pairing.code`
+such a caller could mint an operator session, so operator control **was**
+reachable.)
+
+> **Corrected 2026-09-27.** This paragraph originally ended "so operator control
+> itself was never reachable", which was false: only `admin.*` answered to the
+> role. RFC 0043 (v1.17.0) closes it with an operator floor in the one op table,
+> checked before any grant, and removes pairing.
 
 **`interface.enabled` and `webhooks.listen` — the control surfaces.** A document
 turned on the human control plane (HITL gates, steering, pause) and opened an

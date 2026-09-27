@@ -1,6 +1,8 @@
 # RFC 0032 — The display-client interface & observation plane
 
-- Status: **Implemented**
+- Status: **Implemented; superseded in part by RFC 0043** (2026-09-27): §3, §4, §5 and §12–§16, and the
+  configuration (§2), authorization (§6), browser (§7), client (§8) and passthrough (§9) rules. Each
+  place carries a dated note.
 - Requires: RFC 0029 (A2A conversations, principals, commands), RFC 0016 §7.2 (the event ring)
 - Companions: `docs/interface.md` (operator guide), `docs/design/03-tui-thin-client.md` (design rationale),
   `interface/` (the clients: one npm package, `@agentd-dev/cli`)
@@ -32,6 +34,8 @@ Principles:
 
 ## 2. Configuration
 
+> **Superseded by RFC 0043 (2026-09-27).** The `interface` section is removed in v1.17.0 and refused by name (RFC 0043 §13.2). `enabled` became `a2a.events.enabled`, `debug` became `a2a.introspection.enabled`, `origins` became `a2a.cors.origins` (exact origins, no loopback trust), `display` moved to the clients, and `pairing` was replaced by the OAuth device authorization grant, `a2a.device_grant` (RFC 0043 §13.3).
+
 ```yaml
 interface:
   enabled: true          # serve the interface methods (default false)
@@ -54,6 +58,8 @@ remote client presents the bearer / mTLS identity RFC 0029 already defines.
 
 ## 3. Discovery
 
+> **Superseded by RFC 0043 (2026-09-27).** Discovery is the standard card at `GET /.well-known/agent-card.json`; `GetAgentCard` and `interface.info` are removed and refused by name. The public card declares events/v1, command/v2 and task-annotations/v1 with their params, and the per-caller view is `GetExtendedAgentCard` behind a declared security scheme (RFC 0043 §8, §9).
+
 - The public agent card (`GetAgentCard`) advertises
   `capabilities.extensions: [{uri: "urn:agentd:interface", params: {enabled: true}}]`
   when the surface is on — only the on/off bit is public.
@@ -69,6 +75,8 @@ remote client presents the bearer / mTLS identity RFC 0029 already defines.
 Clients key their debug panes off `debug` — the daemon decides what may render.
 
 ## 4. The feed — `SubscribeToEvents`
+
+> **Superseded by RFC 0043 (2026-09-27).** The feed is the method `agentd.events/SubscribeToEvents` of the extension `https://agentd.dev/a2a/ext/events/v1`, callable only when the caller activates that extension. The hello frame's `debug` is `introspection`, `goodbye` carries `reason: deadline|revoked`, and the `message`, `command` and `pairing` kinds are deleted: the transcript is `Task.history`, and sign-in events are the `auth` kind (RFC 0043 §9.3, §14.1).
 
 A new server-streaming A2A method (SSE over the POST response, like
 `SubscribeToTask`). Params: `{"fromSeq": <n>}` (0 = from the window start).
@@ -107,6 +115,8 @@ machinery.
 
 ## 5. The reads (taskless command ops)
 
+> **Superseded by RFC 0043 (2026-09-27).** The reads are rows of the one op table under command/v2 and answer with an A2A Message (RFC 0043 §9.2.1). `interface.info`, `pairing.code` and `config.set` are removed and refused by name (use the card and `status`, the device grant, and `admin.set`). The introspection ops are gated by `a2a.introspection.enabled`, and `config` and `debug.events` answer to the operator role whatever the grants say.
+
 Interface reads deliberately create **no durable task** (unlike `status` /
 `config`): they are reads, not work, and a client polls them freely without
 growing the task store. They return their document directly.
@@ -127,6 +137,8 @@ naming the gate (`interface.enabled` / `interface.debug`).
 
 ## 6. Authorization
 
+> **Superseded by RFC 0043 (2026-09-27).** Authorization is RFC 0043 §7.6: every named role may call every served method, and each op has a floor in the op table, checked before any grant.
+
 - `SubscribeToEvents` joins the §2-matrix method list for every non-anonymous
   role (the feed itself scopes per event).
 - `interface.info` is always granted to non-anonymous roles (like `status`).
@@ -136,6 +148,8 @@ naming the gate (`interface.enabled` / `interface.debug`).
 
 ## 7. Browsers
 
+> **Superseded by RFC 0043 (2026-09-27).** There is no implicit loopback trust: every browser origin, a loopback one included, is listed in `a2a.cors.origins`, except the UI that `agentd ui` launches. A request carrying `Origin` is never the implicit operator, so a browser always authenticates (RFC 0043 §7.2, §8.2, §12).
+
 The DNS-rebind `Origin` guard gains a configured allowlist: an origin that is
 loopback **or** listed in `interface.origins` is served **with CORS response
 headers** (echoed origin, `OPTIONS` preflight answered before auth); any other
@@ -144,6 +158,8 @@ SSE stream via fetch, so `Authorization` works. A web UI served from loopback
 (`agentd-ui`) needs no configuration; a hosted copy lists its origin.
 
 ## 8. The clients (`interface/`, a separate Node package)
+
+> **Superseded by RFC 0043 (2026-09-27).** The clients are ordinary A2A 1.0 clients: they discover the standard card, activate only declared extensions, build the transcript from `Task.history` (the `message` feed kind is gone), and fall back to a standards-only mode on core methods (`ListTasks` paging, `SubscribeToTask`) instead of polling agentd's reads. They sign in with the device grant or the launch grant and hold no long-lived credential; the web UI keeps its session in `sessionStorage` only (RFC 0043 §12, §15).
 
 Not bundled into agentd; the Rust dependency moat is untouched. They ship as
 **one npm package, `@agentd-dev/cli`**, providing both binaries and the client
@@ -171,6 +187,8 @@ against the UIs that render from it.
 
 ## 9. The passthrough — `agentd tui` / `agentd ui`
 
+> **Superseded by RFC 0043 (2026-09-27).** `agentd tui` / `agentd ui` are a thin launcher: they force no configuration, never hand the client `a2a.bearer` (no `AGENTD_BEARER`), pass the client only `--endpoint` plus `--launch-fd` or `--listen-fd`, and sign it in with a single-use launch code. `--debug` is refused by name and `AGENTD_INTERFACE_LOG` became `--daemon-log` (RFC 0043 §11).
+
 One command runs the daemon AND its display client:
 
 ```
@@ -193,6 +211,8 @@ The detached forms remain first-class: `agentd -c …` + `agentd-tui --endpoint 
 
 ## 12. The daemon-driven chrome (`interface.display`)
 
+> **Superseded by RFC 0043 (2026-09-27).** The chrome layout is the clients' own (`agentd-tui --top/--bottom`, `AGENTD_TUI_TOP/BOTTOM`, the web UI's `/layout`); the daemon publishes values through `observability.status_values` and nothing else (RFC 0043 §13.3).
+
 The daemon decides what its display clients render in their edges — the top
 (header) and bottom (status bar) — as ordered item lists, served in
 `interface.info.display` and runtime-shapeable via `config.set` (§14): every
@@ -207,6 +227,8 @@ Item vocabulary: `name` `version` `instance` `model` `endpoint` `conn` `debug`
 validation **warning**, not an error.
 
 ## 13. Pairing-code login (`interface.pairing`)
+
+> **Superseded by RFC 0043 (2026-09-27).** Pairing is removed: `Pair`, `interface.pair` and `pairing.code` are refused by name. Sign-in is the RFC 8628 device authorization grant on the listener origin, approved by an operator who names the person (`auth.device.approve {user_code, as}` → `user:<name>`), or the launch grant of `agentd tui` / `agentd ui` (RFC 0043 §10, §11). A credential-less request is never admitted as anonymous.
 
 The friction pairing removes: connecting a browser tab or a remote TUI without
 copying a long-lived bearer out of config/secret stores. The pattern is device
@@ -240,6 +262,8 @@ field, `AgentdClient.pair()`.
 
 ## 14. Runtime config (`config.set`) — and its deliberate limit
 
+> **Superseded by RFC 0043 (2026-09-27).** `config.set` became the command/v2 op `admin.set {path, value}` on the operator floor, over `agent.approval` and `a2a.introspection.enabled`; the display keys are gone with `interface.display`. The deliberate limit below still holds (RFC 0043 §9.2.1).
+
 `config.set {path, value}` (operator) updates a **whitelisted** set of knobs
 in the running daemon, echoing a `config` feed event so every client converges:
 
@@ -256,6 +280,8 @@ change the rest. `/config` (the `config` command) remains the read: the full
 effective document, or one path.
 
 ## 15. Composer affordances (client-side, shared)
+
+> **Superseded by RFC 0043 (2026-09-27).** The slash commands are gated by the card: an op appears only when the card (or the extended card) offers it, and workflows come from the extended card or `status.workflows`. `/pair` is replaced by device sign-in and an `/approve` that requires the name of the person being let in, and runtime settings go through `admin.set` (RFC 0043 §15.2).
 
 Both shipped UIs speak the same input language (implemented once in
 the package's composer module):
@@ -274,6 +300,8 @@ the package's composer module):
   `$words` are untouched; `$$` escapes a literal dollar.
 
 ## 16. Human-in-the-loop (`ask_human` + the `human` node)
+
+> **Superseded by RFC 0043 (2026-09-27).** HITL no longer depends on `interface.enabled`. An ask owned by a caller's task always gates while the A2A listener serves; an unowned ask gates only with `agent.ask_human_unowned: gate`, else the fallback applies; a policy ask is addressed to `security.policies[].to` (default the operator); and the answer is recorded in the task's `history`, not a `message` feed event (RFC 0043 §14).
 
 The interaction loop the interface exists for. An ask — the model calling
 `ask_human`, or a workflow reaching a `human` step — flips (or creates) the

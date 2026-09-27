@@ -393,6 +393,11 @@
           },
           "type": "array"
         },
+        "id": {
+          "description": "the principal id this rule's callers act as (<role>:<id>) and own their work by; unique across rules",
+          "pattern": "^[A-Za-z0-9._@:/+-]{1,128}$",
+          "type": "string"
+        },
         "labels": {
           "additionalProperties": {
             "type": "string"
@@ -2466,6 +2471,81 @@
             "integer"
           ]
         },
+        "cors": {
+          "additionalProperties": false,
+          "properties": {
+            "origins": {
+              "description": "browser origins (scheme://host[:port]) allowed to call the listener, matched exactly; `*` and paths are refused, and a loopback UI origin must be listed too",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "type": "object"
+        },
+        "device_grant": {
+          "additionalProperties": false,
+          "description": "the OAuth 2.0 device authorization grant (RFC 8628): a client shows a code, an operator approves it, the client gets a session token. Needs an operator credential (a2a.bearer, or a principals rule with role operator and match.bearer_ref); refused with a2a.tls.client_ca and on a unix:// listener. Restart-only.",
+          "properties": {
+            "code_ttl": {
+              "description": "how long a device code waits for approval, 1m..30m (default 10m)",
+              "type": [
+                "string",
+                "integer"
+              ]
+            },
+            "enabled": {
+              "type": "boolean"
+            },
+            "rate": {
+              "description": "`<burst>/<per>s` applied to every session principal",
+              "type": "string"
+            },
+            "scopes": {
+              "description": "the scopes a client may request (default [user]); non-empty, no duplicates",
+              "items": {
+                "enum": [
+                  "user",
+                  "operator"
+                ]
+              },
+              "type": "array"
+            },
+            "token_ttl": {
+              "description": "session-token lifetime, 5m..30d (default 8h)",
+              "type": [
+                "string",
+                "integer"
+              ]
+            },
+            "verification_uri": {
+              "description": "where the approving person is sent: an https:// URL, or http:// on a loopback host; unset = the listener's own page",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "events": {
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "description": "declare the events/v1 extension and serve its observation feed; requires a2a.listen; restart-only",
+              "type": "boolean"
+            }
+          },
+          "type": "object"
+        },
+        "introspection": {
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "description": "serve the operator introspection ops (transcripts, run step detail, the log ring, audit records on the feed); requires a2a.listen; reloadable",
+              "type": "boolean"
+            }
+          },
+          "type": "object"
+        },
         "listen": {
           "description": "https://host:port (loopback http:// for dev)",
           "type": "string"
@@ -2511,6 +2591,10 @@
             }
           },
           "type": "object"
+        },
+        "url": {
+          "description": "the public origin callers reach this listener at (scheme://host[:port], no path, query or fragment; https unless the host is loopback) — the Agent Card's interface URL and the OAuth issuer. Restart-only",
+          "type": "string"
         }
       },
       "type": "object"
@@ -2536,6 +2620,13 @@
             "finish",
             "stop",
             "auto"
+          ]
+        },
+        "ask_human_unowned": {
+          "description": "what an ask_human no caller owns (raised by a schedule, webhook or stream) does: gate (an operator answers it on the A2A listener; requires a2a.listen) or fallback (default — ask_human_fallback applies)",
+          "enum": [
+            "gate",
+            "fallback"
           ]
         },
         "conversation_budget": {
@@ -2619,6 +2710,10 @@
             }
           },
           "type": "object"
+        },
+        "description": {
+          "description": "what this agent does, in a sentence — the public Agent Card's description. Operator-only: a served document cannot rewrite what the unauthenticated card claims",
+          "type": "string"
         },
         "document_capabilities": {
           "description": "instruction-document families this agent's instruction may use (the trust ladder). Empty grants only the default rung; naming a family admits its blocks. Fail-closed, restart-only.",
@@ -3697,6 +3792,13 @@
           },
           "type": "object"
         },
+        "status_values": {
+          "description": "memory keys whose current values the status op publishes as status.values; operator-only",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "traceparent": {
           "type": "string"
         }
@@ -3848,6 +3950,37 @@
               },
               "timeout": {
                 "type": "string"
+              },
+              "to": {
+                "description": "who may answer an `ask` gate (only with action: ask); unset = {role: operator}",
+                "oneOf": [
+                  {
+                    "description": "a principal-id glob",
+                    "type": "string"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "id": {
+                        "type": "string"
+                      },
+                      "labels": {
+                        "additionalProperties": {
+                          "type": "string"
+                        },
+                        "type": "object"
+                      },
+                      "role": {
+                        "enum": [
+                          "operator",
+                          "user",
+                          "agent"
+                        ]
+                      }
+                    },
+                    "type": "object"
+                  }
+                ]
               }
             },
             "type": "object"
@@ -3979,12 +4112,31 @@
         },
         "retention": {
           "additionalProperties": false,
+          "description": "what to keep once a record is finished; unset keeps everything",
           "properties": {
             "runs": {
               "additionalProperties": false,
               "properties": {
                 "keep_last": {
                   "description": "keep at most this many terminal runs",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "ttl": {
+                  "description": "a duration: `10m`, `90s`, `500ms`, or bare seconds",
+                  "type": [
+                    "string",
+                    "integer"
+                  ]
+                }
+              },
+              "type": "object"
+            },
+            "tasks": {
+              "additionalProperties": false,
+              "properties": {
+                "keep_last": {
+                  "description": "keep at most this many terminal A2A tasks",
                   "minimum": 0,
                   "type": "integer"
                 },

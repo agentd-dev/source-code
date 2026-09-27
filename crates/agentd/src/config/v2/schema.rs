@@ -106,6 +106,7 @@ fn top_level_properties(
                 "type": "object", "additionalProperties": false,
                 "properties": {
                     "name": { "type": "string", "description": "instance identity (falls back to the downward-API instance, then the hostname)" },
+                    "description": { "type": "string", "description": "what this agent does, in a sentence — the public Agent Card's description. Operator-only: a served document cannot rewrite what the unauthenticated card claims" },
                     "instruction": { "oneOf": [
                     { "type": "string", "description": "short form: the instruction itself, a FILE path (no whitespace, path-shaped or a document extension), a DIRECTORY (path-shaped, trailing `/` or an existing folder), or a URI (`oci://`, `mcp://`, `instruction://`, `https://`). Every other setting takes its default." },
                     { "type": "object", "additionalProperties": false, "description": "long form: name the source explicitly and set everything about it here", "properties": {
@@ -140,6 +141,7 @@ fn top_level_properties(
                     "max_parallel_turns": { "type": "integer", "minimum": 1 },
                     "conversation_budget": budget,
                     "ask_human_fallback": { "enum": ["wait", "pause", "idle", "fail", "finish", "stop", "auto"], "description": "what ask_human does with no human channel (and, for auto, on an unanswered gate timeout): wait (park until timeout), fail (default), or auto (an LLM judge answers on the operator's behalf, marked as auto)" },
+                    "ask_human_unowned": { "enum": ["gate", "fallback"], "description": "what an ask_human no caller owns (raised by a schedule, webhook or stream) does: gate (an operator answers it on the A2A listener; requires a2a.listen) or fallback (default — ask_human_fallback applies)" },
                 "approval": { "enum": ["ask", "auto", "accept"], "description": "whether a gate asks a person (ask), lets an LLM judge decide (auto), or takes the ask's recommendation (accept); runtime-settable via config.set" },
                 "document_capabilities": { "type": "array", "items": { "enum": ["material", "knowledge", "interface", "identity", "compute", "infra", "compose"] }, "description": "instruction-document families this agent's instruction may use (the trust ladder). Empty grants only the default rung; naming a family admits its blocks. Fail-closed, restart-only." }
                 }
@@ -197,9 +199,12 @@ fn top_level_properties(
                     "http": { "$ref": "#/$defs/StoreHttp" },
                     "file": { "$ref": "#/$defs/StoreFile" },
                     "checkpoint": { "type": "object", "additionalProperties": false, "properties": { "debounce_ms": { "type": "integer", "minimum": 0 } } },
-                    "retention": { "type": "object", "additionalProperties": false, "properties": {
+                    "retention": { "type": "object", "additionalProperties": false, "description": "what to keep once a record is finished; unset keeps everything", "properties": {
                         "runs": { "type": "object", "additionalProperties": false, "properties": {
                             "keep_last": { "type": "integer", "minimum": 0, "description": "keep at most this many terminal runs" },
+                            "ttl": duration } },
+                        "tasks": { "type": "object", "additionalProperties": false, "properties": {
+                            "keep_last": { "type": "integer", "minimum": 0, "description": "keep at most this many terminal A2A tasks" },
                             "ttl": duration } } } },
                     "durability": { "type": "object", "additionalProperties": false, "properties": {
                         "a2a": { "enum": ["strict", "eventual"] }, "steps": { "enum": ["strict", "eventual"] },
@@ -288,8 +293,28 @@ fn top_level_properties(
                     "limits": { "type": "object", "additionalProperties": true },
                     "durable": { "type": "boolean", "description": "default durability class for spawns (false = memory-only records)" } } },
                 "templates": { "type": "object", "additionalProperties": { "$ref": "#/$defs/SubagentTemplate" } } } }));
+    // Hoisted out of the `a2a` literal for the same recursion-limit reason as
+    // `instruction_trust`. The scope vocabulary is the enum's own list.
+    let device_scopes: Vec<&str> = super::DeviceScope::ALL.iter().map(|s| s.as_str()).collect();
+    let device_grant = json!({ "type": "object", "additionalProperties": false,
+                    "description": "the OAuth 2.0 device authorization grant (RFC 8628): a client shows a code, an operator approves it, the client gets a session token. Needs an operator credential (a2a.bearer, or a principals rule with role operator and match.bearer_ref); refused with a2a.tls.client_ca and on a unix:// listener. Restart-only.",
+                    "properties": {
+                    "enabled": { "type": "boolean" },
+                    "scopes": { "type": "array", "items": { "enum": device_scopes }, "description": "the scopes a client may request (default [user]); non-empty, no duplicates" },
+                    "token_ttl": { "type": ["string", "integer"], "description": "session-token lifetime, 5m..30d (default 8h)" },
+                    "code_ttl": { "type": ["string", "integer"], "description": "how long a device code waits for approval, 1m..30m (default 10m)" },
+                    "verification_uri": { "type": "string", "description": "where the approving person is sent: an https:// URL, or http:// on a loopback host; unset = the listener's own page" },
+                    "rate": { "type": "string", "description": "`<burst>/<per>s` applied to every session principal" } } });
     m.insert("a2a".to_string(), json!({ "type": "object", "additionalProperties": false, "properties": {
                 "listen": { "type": "string", "description": "https://host:port (loopback http:// for dev)" },
+                "url": { "type": "string", "description": "the public origin callers reach this listener at (scheme://host[:port], no path, query or fragment; https unless the host is loopback) — the Agent Card's interface URL and the OAuth issuer. Restart-only" },
+                "cors": { "type": "object", "additionalProperties": false, "properties": {
+                    "origins": { "type": "array", "items": { "type": "string" }, "description": "browser origins (scheme://host[:port]) allowed to call the listener, matched exactly; `*` and paths are refused, and a loopback UI origin must be listed too" } } },
+                "device_grant": device_grant,
+                "events": { "type": "object", "additionalProperties": false, "properties": {
+                    "enabled": { "type": "boolean", "description": "declare the events/v1 extension and serve its observation feed; requires a2a.listen; restart-only" } } },
+                "introspection": { "type": "object", "additionalProperties": false, "properties": {
+                    "enabled": { "type": "boolean", "description": "serve the operator introspection ops (transcripts, run step detail, the log ring, audit records on the feed); requires a2a.listen; reloadable" } } },
                 "tls": { "type": "object", "additionalProperties": false, "properties": {
                     "cert": { "type": "string" }, "key": { "type": "string" }, "client_ca": { "type": "string" } } },
                 "bearer": secret,
@@ -347,7 +372,8 @@ fn top_level_properties(
                     "include": { "type": "array", "items": { "type": "string" }, "description": "event families taken in full (the segment before the first dot); an unknown family is a startup error" },
                     "sampled": { "type": "array", "items": { "type": "string" }, "description": "event families taken at 1-in-16 — for high-rate families that arrive in storms" },
                     "queue": { "type": "integer", "minimum": 1, "description": "how many events may queue between ticks before the tap drops and counts (default 512)" } } },
-                "traceparent": { "type": "string" } } }));
+                "traceparent": { "type": "string" },
+                "status_values": { "type": "array", "items": { "type": "string" }, "description": "memory keys whose current values the status op publishes as status.values; operator-only" } } }));
     m.insert("identity".to_string(), json!({ "type": "object", "additionalProperties": false,
                 "description": "who work is done ON BEHALF OF — including work nobody typed",
                 "properties": {
@@ -366,7 +392,13 @@ fn top_level_properties(
                         "action": { "enum": ["allow", "deny", "ask", "shadow"], "description": "shadow refuses and says the call was held; it never fabricates a result" },
                         "question": { "type": "string", "description": "the question put to a person for `ask`; {{tool}}, {{caller}} and {{args}} are substituted" },
                         "on_timeout": { "enum": ["allow", "deny", "ask", "shadow"], "description": "what an unanswered `ask` becomes (default deny)" },
-                        "timeout": { "type": "string" } } } },
+                        "timeout": { "type": "string" },
+                        "to": { "oneOf": [
+                            { "type": "string", "description": "a principal-id glob" },
+                            { "type": "object", "additionalProperties": false, "properties": {
+                                "id": { "type": "string" }, "role": { "enum": ["operator", "user", "agent"] },
+                                "labels": { "type": "object", "additionalProperties": { "type": "string" } } } } ],
+                            "description": "who may answer an `ask` gate (only with action: ask); unset = {role: operator}" } } } },
                 "workflows": { "type": "object", "additionalProperties": false, "properties": {
                     "immutable": { "type": "boolean", "description": "refuse workflow.create/update/delete at runtime — definitions become read-only for the model, subagents and operators alike; loading from config/file/url/dir is unaffected" } } },
                 "tls_ca": { "type": "string" },
@@ -516,6 +548,7 @@ fn defs_properties(
         }
     }
     m.insert("Principal".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["match", "role"], "properties": {
+                "id": { "type": "string", "pattern": "^[A-Za-z0-9._@:/+-]{1,128}$", "description": "the principal id this rule's callers act as (<role>:<id>) and own their work by; unique across rules" },
                 "match": { "type": "object", "additionalProperties": false, "properties": {
                     "san": { "type": "string" }, "sub": { "type": "string" }, "bearer_ref": { "type": "string" }, "aauth_agent": { "type": "string" }, "any": { "type": "boolean" } } },
                 "role": { "enum": ["operator", "user", "agent", "anonymous"] },

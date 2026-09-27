@@ -24,7 +24,7 @@ key rather than a setting that silently does nothing.
 | `mcp` | MCP servers (HTTPS), their tags and tool exposure |
 | `tools` | tool overrides, renames, routing |
 | `security` | the `exec` fence, trifecta allowance, TLS CA, AAuth, cgroups |
-| `a2a` | the HTTP listener, peers, principals, TLS/bearer client auth |
+| `a2a` | the HTTP listener, its public URL, peers, principals, TLS/bearer client auth, browser origins, device sign-in, the event feed |
 | `interface` | the TUI/web-UI surface: enable, debug, chrome, pairing |
 | `workflows` | durable DAGs and their triggers |
 | `webhooks` | inbound HTTP triggers |
@@ -44,7 +44,9 @@ agent:
   instruction: |          # standing policy. HOW to work — not today's task.
     …
   preflight: auto         # never | auto | always — the intent classifier
+  description: Answers billing questions   # the public Agent Card's description (operator-only)
   ask_human_fallback: fail  # what an unanswerable question does (see below)
+  ask_human_unowned: fallback  # gate | fallback — an ask no caller owns (see below)
   wake_on: [a2a_message, human_reply, subagent_result, workflow_finished]
   max_parallel_turns: 1
 ```
@@ -56,6 +58,11 @@ agent:
 | `wait` (aliases `pause`, `idle`) | park until the ask times out | interactive — you will come back |
 | `fail` (default; `finish`, `stop`) | the ask errors, the agent decides what to do | headless/CI, where hanging is worse |
 | `auto` | an LLM judge answers conservatively, always marked as auto | unattended, progress beats precision |
+
+`ask_human_unowned` covers an ask raised by a schedule, webhook or stream,
+which no caller owns: `gate` opens a gate an operator answers on the A2A
+listener (it requires `a2a.listen`); `fallback` (the default) applies
+`ask_human_fallback`.
 
 ## intelligence
 
@@ -94,17 +101,55 @@ for anything a UI attaches to.
 stops, including pending approvals. Point it at an MCP or HTTP store and
 conversations, tasks and workflow runs survive a restart.
 
+```yaml
+store:
+  retention:
+    runs:  { keep_last: 500, ttl: 30d }   # finished workflow runs
+    tasks: { keep_last: 500, ttl: 30d }   # finished A2A tasks
+```
+
+Unset retention keeps every finished record.
+
 ## a2a — the listener
 
 ```yaml
 a2a:
   listen: http://127.0.0.1:8420    # loopback ⇒ caller is the operator, no credential
+  url: https://agent.example.com   # the public origin: card interface URL + OAuth issuer
   bearer: "{{secret:A2A_TOKEN}}"   # REQUIRED (or mTLS/pairing) for non-loopback
   tls: { cert: …, key: …, client_ca: … }
+  principals:
+    - id: ci-bot                   # the principal id it acts as (user:ci-bot); unique
+      match: { bearer_ref: "{{secret:CI_TOKEN}}" }
+      role: user
+  cors:
+    origins: [https://ui.example.com]   # exact origins; `*` and paths are refused
+  device_grant:                    # OAuth device sign-in (RFC 8628)
+    enabled: false
+    scopes: [user]                 # user | operator
+    token_ttl: 8h                  # 5m..30d
+    code_ttl: 10m                  # 1m..30m
+  events: { enabled: false }       # the events/v1 observation feed (restart-only)
+  introspection: { enabled: false }  # operator introspection ops (reloadable)
 ```
 
 Plaintext `http://` is loopback-only by design. `:0` is refused — bind an
 explicit host:port.
+
+`url` is an origin — `scheme://host[:port]`, no path, query or fragment, and
+`https://` unless the host is loopback — because card discovery and the OAuth
+metadata are served at the origin root.
+
+`cors.origins` lists every browser origin allowed to call the listener,
+matched exactly. There is no wildcard, and a UI served from loopback must be
+listed too.
+
+`device_grant` needs an operator credential to approve codes — `a2a.bearer`,
+or a principals rule with `role: operator` and `match.bearer_ref` — and is
+refused together with `a2a.tls.client_ca` and on a `unix://` listener.
+`events`, `introspection` and `device_grant` all require `a2a.listen`.
+
+`principals[].id` is `[A-Za-z0-9._@:/+-]{1,128}` and unique across rules.
 
 ## interface — the display clients
 
@@ -126,10 +171,26 @@ The full display vocabulary (unknown items are skipped, not an error):
 `draining`, `active`, `turns`, `tokens`, `tool_calls`, `runs`, `subagents`,
 `conversations`, `screen`, `keys`, `clock`.
 
+## observability
+
+```yaml
+observability:
+  log_level: info
+  status_values: [branch, deploy.state]   # memory keys published in status.values
+```
+
+`status_values` is operator-only: it decides which of the agent's memory every
+status reader is shown.
+
 ## security
 
 ```yaml
 security:
+  policies:
+    - match: { tool: "deploy.*" }
+      action: ask
+      to: { role: operator }   # who may answer; the default. Only with action: ask
+
   exec:                 # needs the `exec` cargo feature; NOT in release binaries
     enabled: false      # …and still off here by default
     workdir: /work

@@ -237,6 +237,11 @@ pub struct InstructionSource {
 #[serde(deny_unknown_fields, default)]
 pub struct Agent {
     pub name: Option<String>,
+    /// What this agent does, in a sentence — the public Agent Card's
+    /// `description`. Operator-only: the card is served to callers nobody has
+    /// authenticated, so a served document must not be able to rewrite what
+    /// it claims to be.
+    pub description: Option<String>,
     /// Static text, or a single-token URI a configured MCP server serves
     /// (read + subscribed) — one field, with the shape deciding which.
     pub instruction: Option<String>,
@@ -264,6 +269,14 @@ pub struct Agent {
     /// ask timeout), or `auto` (an LLM judge answers on the operator's behalf,
     /// conservatively, marked as auto).
     pub ask_human_fallback: AskHumanFallback,
+    /// What an `ask_human` that no caller OWNS does — one raised by a
+    /// schedule, a webhook or a stream rather than by a task somebody sent.
+    ///
+    /// An owned ask always has somebody to answer it: the caller who owns the
+    /// task. An unowned one has nobody unless the operator is willing to be
+    /// asked, and whether they are is a deployment decision, so it is stated
+    /// here rather than inferred from which clients happen to be attached.
+    pub ask_human_unowned: AskHumanUnowned,
     /// What a gate does when a human COULD answer.
     ///
     /// `ask_human_fallback` governs the case where nobody can answer;
@@ -373,6 +386,18 @@ pub enum AskHumanFallback {
     /// An LLM judge answers on the operator's behalf (also fires when an
     /// interface-served gate times out unanswered). `UNDECIDED` ⇒ fail.
     Auto,
+}
+
+/// What an unowned `ask_human` does ([`Agent::ask_human_unowned`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AskHumanUnowned {
+    /// Open a gate on the A2A listener that an operator answers. Needs
+    /// `a2a.listen`: without a listener nobody could ever answer it.
+    Gate,
+    /// Apply `ask_human_fallback`, exactly as when no channel exists.
+    #[default]
+    Fallback,
 }
 
 impl Agent {
@@ -945,6 +970,10 @@ pub const DOCUMENT_MAY_WRITE: &[&str] = &[
     "agent.name",
     "agent.approval",
     "agent.ask_human_fallback",
+    // Whether an ask nobody owns may interrupt the operator is the same kind
+    // of attention policy as `approval`; the listener it needs is still the
+    // operator's (`a2a.listen`), so a document cannot conjure one.
+    "agent.ask_human_unowned",
     "agent.conversation_budget",
     "agent.max_parallel_turns",
     "agent.on_workflow_finished",
@@ -1009,6 +1038,10 @@ pub const OPERATOR_ONLY: &[&str] = &[
     // The second fetched document, by the same argument: it becomes prompt
     // text, and a document may not re-point the text it is delivered with.
     "agent.prompt",
+    // What the unauthenticated public Agent Card says this agent is. A
+    // served document rewriting it would be the document describing itself
+    // to strangers in the operator's name.
+    "agent.description",
     // The tool grant. A fragment naming tools MERGES with the operator's list
     // (arrays concatenate), so a document could only ever widen it.
     "agent.tools",
@@ -1028,10 +1061,15 @@ pub const OPERATOR_ONLY: &[&str] = &[
     // a field added here later lands unclassified, which is the point.
     "a2a.bearer",
     "a2a.conversation_ttl",
+    "a2a.cors",
+    "a2a.device_grant",
+    "a2a.events",
+    "a2a.introspection",
     "a2a.listen",
     "a2a.principals",
     "a2a.push",
     "a2a.tls",
+    "a2a.url",
     // The human control plane: pairing, origins, the observation feed.
     "interface",
     // Inbound sockets and the auth on them. A document declares a ROUTE (an
@@ -1075,6 +1113,8 @@ pub const OPERATOR_ONLY: &[&str] = &[
     "observability.report_file",
     "observability.events_ring",
     "observability.traceparent",
+    // Which of the agent's memory every status reader is shown.
+    "observability.status_values",
     // Where skills are READ FROM: a local folder, or a source whose contents
     // become prompt text. The caps on the loader are the document's.
     "skills.dir",
@@ -2382,15 +2422,23 @@ pub struct Checkpoint {
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct Retention {
-    pub runs: RunRetention,
+    pub runs: TerminalRetention,
+    /// Terminal A2A tasks. A task is kept after it finishes so its caller can
+    /// read the result later, which on a long-lived listener is the same
+    /// unbounded growth as runs — so it takes the same bound, in the same
+    /// shape.
+    pub tasks: TerminalRetention,
 }
 
+/// How many FINISHED records of one kind to keep. One type for every kind, so
+/// "keep the newest N, drop anything older than T" means the same thing
+/// wherever it is written. Neither set keeps everything.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
-pub struct RunRetention {
-    /// Keep at most this many terminal runs (newest first).
+pub struct TerminalRetention {
+    /// Keep at most this many terminal records (newest first).
     pub keep_last: Option<u32>,
-    /// Drop a terminal run older than this.
+    /// Drop a terminal record older than this.
     pub ttl: Option<Dur>,
 }
 
@@ -2806,12 +2854,169 @@ impl Identity {
 #[serde(deny_unknown_fields, default)]
 pub struct A2a {
     pub listen: Option<String>,
+    /// The public origin callers reach this listener at
+    /// (`scheme://host[:port]`) — published as the interface URL on the Agent
+    /// Card and as the OAuth issuer. It is an ORIGIN and nothing more, because
+    /// card discovery and the OAuth metadata are served at the origin root: a
+    /// path here would advertise documents nobody serves.
+    pub url: Option<String>,
     pub tls: A2aTls,
     pub bearer: Option<Secret>,
     pub principals: Vec<Principal>,
     pub peers: Vec<A2aPeer>,
     pub conversation_ttl: Option<Dur>,
     pub push: A2aPush,
+    pub cors: A2aCors,
+    pub device_grant: DeviceGrant,
+    pub events: A2aEvents,
+    pub introspection: A2aIntrospection,
+}
+
+/// Which browser origins may call the listener.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct A2aCors {
+    /// Exact origins (`scheme://host[:port]`). No `*` and no implicit
+    /// loopback trust: any page a local browser loads could otherwise drive
+    /// the daemon, so every origin — a locally served UI's included — is one
+    /// somebody listed.
+    pub origins: Vec<String>,
+}
+
+/// The OAuth 2.0 device authorization grant (RFC 8628) on the listener: a
+/// client shows a short code, an operator approves it, and the client gets a
+/// session token — so a person signs a browser or a terminal in without the
+/// daemon's bearer ever being copied into it.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct DeviceGrant {
+    pub enabled: bool,
+    /// The scopes a client may request. `agent` is not one: an agent
+    /// authenticates with its own credential, never by a person approving a
+    /// code on its behalf.
+    pub scopes: Vec<DeviceScope>,
+    /// Session-token lifetime (default [`DEFAULT_DEVICE_TOKEN_TTL`]).
+    pub token_ttl: Option<Dur>,
+    /// How long a device code waits for approval (default
+    /// [`DEFAULT_DEVICE_CODE_TTL`]).
+    pub code_ttl: Option<Dur>,
+    /// Where the person approving is sent; unset, the listener's own
+    /// verification page.
+    pub verification_uri: Option<String>,
+    /// A `<burst>/<per>s` rate applied to every session principal.
+    pub rate: Option<String>,
+}
+
+impl Default for DeviceGrant {
+    fn default() -> Self {
+        DeviceGrant {
+            enabled: false,
+            // `user`, not `operator`: a code anyone can request should not
+            // default to the role that can approve codes.
+            scopes: vec![DeviceScope::User],
+            token_ttl: None,
+            code_ttl: None,
+            verification_uri: None,
+            rate: None,
+        }
+    }
+}
+
+/// The session-token lifetime when `token_ttl` is unset.
+pub const DEFAULT_DEVICE_TOKEN_TTL: Duration = Duration::from_secs(8 * 3600);
+/// The device-code lifetime when `code_ttl` is unset.
+pub const DEFAULT_DEVICE_CODE_TTL: Duration = Duration::from_secs(10 * 60);
+/// The bounds `token_ttl` must fall within: shorter than five minutes is a
+/// sign-in loop, longer than thirty days is a credential nobody remembers
+/// issuing.
+pub const DEVICE_TOKEN_TTL_BOUNDS: (Duration, Duration) =
+    (Duration::from_secs(5 * 60), Duration::from_secs(30 * 86400));
+/// The bounds `code_ttl` must fall within: long enough for a person to find
+/// the terminal, short enough that a leaked code goes stale.
+pub const DEVICE_CODE_TTL_BOUNDS: (Duration, Duration) =
+    (Duration::from_secs(60), Duration::from_secs(30 * 60));
+
+impl DeviceGrant {
+    pub fn token_ttl(&self) -> Duration {
+        self.token_ttl.map_or(DEFAULT_DEVICE_TOKEN_TTL, |d| d.0)
+    }
+    pub fn code_ttl(&self) -> Duration {
+        self.code_ttl.map_or(DEFAULT_DEVICE_CODE_TTL, |d| d.0)
+    }
+}
+
+/// A scope a device-grant client may request. This enum IS the vocabulary:
+/// the schema, the token endpoint and the approval op all read
+/// [`DeviceScope::ALL`], so there is no second list to fall out of step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DeviceScope {
+    User,
+    Operator,
+}
+
+impl DeviceScope {
+    pub const ALL: &'static [DeviceScope] = &[DeviceScope::User, DeviceScope::Operator];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DeviceScope::User => "user",
+            DeviceScope::Operator => "operator",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<DeviceScope, String> {
+        if let Some(scope) = DeviceScope::ALL.iter().find(|d| d.as_str() == s) {
+            return Ok(*scope);
+        }
+        let want = DeviceScope::ALL
+            .iter()
+            .map(|d| d.as_str())
+            .collect::<Vec<_>>()
+            .join("|");
+        if s == "agent" {
+            // Named, because `agent` is a real role and the natural thing to
+            // try: the refusal should say why it is not a scope, not merely
+            // that it is unknown.
+            return Err(format!(
+                "`agent` is not a device scope (want {want}): an agent authenticates with its own credential, not with a code a person approves"
+            ));
+        }
+        Err(format!("unknown device scope {s:?} (want {want})"))
+    }
+
+    pub fn role(self) -> Role {
+        match self {
+            DeviceScope::User => Role::User,
+            DeviceScope::Operator => Role::Operator,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for DeviceScope {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        DeviceScope::parse(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+/// The observation feed (`https://agentd.dev/a2a/ext/events/v1`).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct A2aEvents {
+    /// Declare the events extension and serve its feed. Restart-only: the
+    /// feed is built at boot, and a switch that could turn on without a feed
+    /// to publish onto would report success and change nothing.
+    pub enabled: bool,
+}
+
+/// Operator-grade introspection: transcripts, per-step run detail, the log
+/// ring and audit records on the feed.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct A2aIntrospection {
+    /// Serve the introspection ops. Independent of `events`, and reloadable:
+    /// it is the switch an operator flips while chasing a problem.
+    pub enabled: bool,
 }
 
 /// **Push notifications**: a caller registers a webhook and agentd POSTs its
@@ -3041,6 +3246,13 @@ impl<'de> Deserialize<'de> for GoalAction {
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Principal {
+    /// The principal id this rule's callers act as (`<role>:<id>`), and what
+    /// their tasks, runs and conversations are owned by. Declared rather than
+    /// derived when the evidence does not name one caller — a shared bearer
+    /// secret has no name of its own — and optional for certificate rules,
+    /// where it collapses every matching certificate into one principal.
+    #[serde(default)]
+    pub id: Option<String>,
     #[serde(rename = "match")]
     pub matcher: PrincipalMatch,
     pub role: Role,
@@ -3126,6 +3338,13 @@ pub struct Observability {
     /// declared stream, so the runtime can react to itself: a tripped breaker,
     /// a shed admission or an unhealthy child becomes an ordinary start node.
     pub runtime_events: Option<RuntimeEvents>,
+    /// Memory keys whose current values the `status` op publishes as
+    /// `status.values` — how a workflow puts a branch, a PR number or a deploy
+    /// state in front of whoever is watching, without the daemon learning to
+    /// compute any of them. Operator-only: the status document is read by
+    /// every caller allowed to see status, so which of the agent's memory it
+    /// discloses is the operator's decision, not a document's.
+    pub status_values: Vec<String>,
 }
 
 /// Which of the daemon's own events reach a stream, and at what rate.
@@ -3225,6 +3444,26 @@ pub struct Policy {
     /// answered has not been approved.
     pub on_timeout: Option<PolicyAction>,
     pub timeout: Option<Dur>,
+    /// Who may answer an `action: ask` gate: a principal-id glob or
+    /// `{id, role, labels}`. Unset, the gate is addressed to `{role:
+    /// operator}` — a policy exists because the operator wanted a say, so the
+    /// caller whose call is being judged does not get to approve it unless
+    /// the operator names them here.
+    #[serde(deserialize_with = "addressee_opt")]
+    pub to: Option<crate::a2a::principals::Addressee>,
+}
+
+/// `to:` parsed with the one addressee parser, so a policy gate and an
+/// `ask_human`/`human` gate accept exactly the same spellings.
+fn addressee_opt<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<crate::a2a::principals::Addressee>, D::Error> {
+    match Option::<Value>::deserialize(d)? {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => crate::a2a::principals::Addressee::parse(&v)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -5831,6 +6070,205 @@ fn validate_auth_block(auth: &Auth, ctx: &str) -> Vec<String> {
 /// startup, naming the ref — the same rule, and the same resolver, the runtime
 /// applies at the moment of use. The message names the ref and never the
 /// resolved value, so a diagnostic cannot leak the credential.
+/// A web origin as a browser sends one: the scheme, the host (lowercased,
+/// IPv6 brackets stripped) and the port with the scheme's default applied — so
+/// `https://H.example` and `https://h.example:443` are the same origin, which
+/// is what an exact-match policy has to mean.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Origin {
+    pub scheme: String,
+    pub host: String,
+    pub port: u16,
+}
+
+/// Parse `scheme://host[:port]` — http or https, no path (not even `/`), no
+/// query, no fragment, no userinfo.
+pub fn parse_origin(s: &str) -> Result<Origin, String> {
+    let want = "want scheme://host[:port]";
+    let (scheme, rest) = s
+        .split_once("://")
+        .ok_or_else(|| format!("not an origin ({want})"))?;
+    let scheme = scheme.to_ascii_lowercase();
+    let default_port = match scheme.as_str() {
+        "http" => 80,
+        "https" => 443,
+        _ => return Err(format!("scheme must be http or https ({want})")),
+    };
+    if rest.contains(['/', '?', '#']) {
+        return Err(format!("an origin has no path, query or fragment ({want})"));
+    }
+    if rest.contains('@') {
+        return Err(format!("an origin carries no credentials ({want})"));
+    }
+    let (host, port) = if let Some(v6) = rest.strip_prefix('[') {
+        let (h, after) = v6
+            .split_once(']')
+            .ok_or_else(|| format!("unclosed IPv6 bracket ({want})"))?;
+        if h.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err(format!("{h:?} is not an IPv6 address"));
+        }
+        match after {
+            "" => (h, None),
+            p => (
+                h,
+                Some(
+                    p.strip_prefix(':')
+                        .ok_or_else(|| format!("junk after the IPv6 address ({want})"))?,
+                ),
+            ),
+        }
+    } else {
+        let (h, p) = match rest.rsplit_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (rest, None),
+        };
+        // An unbracketed colon left in the host is an IPv6 literal written
+        // without its brackets, which no browser sends.
+        if h.is_empty() || h.contains(':') {
+            return Err(format!("no host ({want})"));
+        }
+        (h, p)
+    };
+    let port = match port {
+        None => default_port,
+        Some(p) => p
+            .parse::<u16>()
+            .ok()
+            .filter(|p| *p != 0)
+            .ok_or_else(|| format!("port {p:?} is not 1..=65535"))?,
+    };
+    Ok(Origin {
+        scheme,
+        host: host.to_ascii_lowercase(),
+        port,
+    })
+}
+
+/// `a2a.url`: an origin, with a single trailing `/` tolerated because that is
+/// how a URL is usually written. Errors are whole diagnostics.
+fn validate_a2a_url(url: &str) -> Result<Origin, String> {
+    if url.contains(['?', '#']) {
+        return Err(format!(
+            "a2a.url: {url:?} carries a query or fragment; it is an origin (scheme://host[:port])"
+        ));
+    }
+    let authority_end = url.find("://").map_or(0, |i| i + 3);
+    let bare = match url[authority_end..].find('/') {
+        None => url,
+        Some(i) if authority_end + i == url.len() - 1 => &url[..url.len() - 1],
+        Some(_) => {
+            return Err(
+                "a2a.url must be an origin (scheme://host[:port]); A2A card discovery and OAuth metadata are served at the origin root"
+                    .into(),
+            );
+        }
+    };
+    let o = parse_origin(bare).map_err(|e| format!("a2a.url: {url:?}: {e}"))?;
+    // Everything a client learns from the card — the interface URL, the OAuth
+    // issuer — is only as trustworthy as the channel it arrived on.
+    if o.scheme != "https" && !crate::net::http::is_loopback_host(&o.host) {
+        return Err(format!(
+            "a2a.url: {url:?}: plaintext http:// is allowed for a loopback host only; use https://"
+        ));
+    }
+    Ok(o)
+}
+
+/// The device grant's own rules. The shape rules hold whether or not it is
+/// enabled, so a typo is caught before the day somebody switches it on.
+fn validate_device_grant(a2a: &A2a, listen: Option<&super::ServeTarget>, d: &mut Diagnostics) {
+    let g = &a2a.device_grant;
+    if g.scopes.is_empty() {
+        d.errors
+            .push("a2a.device_grant.scopes is empty: no client could request a session".into());
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for s in &g.scopes {
+        if !seen.insert(*s) {
+            d.errors.push(format!(
+                "a2a.device_grant.scopes lists `{}` twice",
+                s.as_str()
+            ));
+        }
+    }
+    for (field, value, (lo, hi)) in [
+        ("token_ttl", g.token_ttl, DEVICE_TOKEN_TTL_BOUNDS),
+        ("code_ttl", g.code_ttl, DEVICE_CODE_TTL_BOUNDS),
+    ] {
+        if let Some(Dur(v)) = value
+            && (v < lo || v > hi)
+        {
+            d.errors.push(format!(
+                "a2a.device_grant.{field}: {v:?} is outside {lo:?}..={hi:?}"
+            ));
+        }
+    }
+    if let Some(uri) = &g.verification_uri {
+        let ok = uri
+            .split_once("://")
+            .filter(|(scheme, rest)| {
+                let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+                let host = super::serve_host_of(authority);
+                !host.is_empty()
+                    && !rest.contains('#')
+                    && (*scheme == "https"
+                        || (*scheme == "http" && crate::net::http::is_loopback_host(host)))
+            })
+            .is_some();
+        if !ok {
+            d.errors.push(format!(
+                "a2a.device_grant.verification_uri: {uri:?} (want an https:// URL, or http:// on a loopback host, with no fragment)"
+            ));
+        }
+    }
+    if let Some(r) = &g.rate
+        && let Err(e) = crate::supervisor::tree::parse_rate(r)
+    {
+        d.errors.push(format!("a2a.device_grant.rate: {e}"));
+    }
+    if !g.enabled {
+        return;
+    }
+    if a2a.tls.client_ca.is_some() {
+        // With mTLS every caller must present a certificate, which a device
+        // session never has — and certificate-derived principal ids are not
+        // registered against device names, so the two would share one id
+        // namespace unguarded.
+        d.errors.push(
+            "a2a.device_grant.enabled cannot be combined with a2a.tls.client_ca: mTLS demands a client certificate of every caller, and a device session has none".into(),
+        );
+    }
+    if matches!(listen, Some(super::ServeTarget::Unix { .. })) {
+        d.errors.push(
+            "a2a.device_grant.enabled on a unix:// listener: the kernel already vouches for every peer (same uid), so there is nobody a device code could sign in; use an https:// listener".into(),
+        );
+    }
+    // Somebody has to approve the codes, and approval is an operator op. With
+    // no operator credential the grant would issue codes nobody can approve —
+    // or, on a loopback bind, fall back to an implicit operator the grant
+    // itself switches off.
+    let operator_credential = a2a.bearer.is_some()
+        || a2a
+            .principals
+            .iter()
+            .any(|p| p.role == Role::Operator && p.matcher.bearer_ref.is_some());
+    if !operator_credential {
+        d.errors.push(
+            "a2a.device_grant.enabled needs an operator credential to approve device codes: set a2a.bearer or add an a2a.principals rule with role: operator and match.bearer_ref".into(),
+        );
+    }
+}
+
+/// Whether `id` is a legal declared principal id: `[A-Za-z0-9._@:/+-]{1,128}`
+/// — wide enough for an email, a SPIFFE path or a service name, and nothing
+/// that could break an audit line or a label.
+fn principal_id_ok(id: &str) -> bool {
+    (1..=128).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._@:/+-".contains(&b))
+}
+
 fn unresolved_secret_ref(value: &str) -> Option<String> {
     if !crate::sec::secret::has_secret_ref(value) {
         return None;
@@ -6088,6 +6526,14 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             err(
                 &mut d,
                 format!("{at}: `on_timeout: ask` would ask again forever"),
+            );
+        }
+        // `to` has already been parsed by the addressee parser while typing;
+        // what is left is whether anything will ever be addressed.
+        if p.to.is_some() && p.action != PolicyAction::Ask {
+            err(
+                &mut d,
+                format!("{at}: `to` names who answers an `action: ask` gate; this rule never asks"),
             );
         }
     }
@@ -6876,6 +7322,50 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
         }
     }
 
+    // The listener's public face and its sign-in. Each of these configures
+    // something served ON the A2A listener, so without one it would be a
+    // setting that parses and does nothing.
+    let listen_target = s
+        .a2a
+        .listen
+        .as_deref()
+        .and_then(|l| super::ServeTarget::parse(l).ok());
+    for (on, what) in [
+        (s.a2a.events.enabled, "a2a.events.enabled"),
+        (s.a2a.introspection.enabled, "a2a.introspection.enabled"),
+        (s.a2a.device_grant.enabled, "a2a.device_grant.enabled"),
+        (
+            s.agent.ask_human_unowned == AskHumanUnowned::Gate,
+            "agent.ask_human_unowned: gate",
+        ),
+    ] {
+        if on && s.a2a.listen.is_none() {
+            err(
+                &mut d,
+                format!("{what} requires a2a.listen (it is served on the A2A listener)"),
+            );
+        }
+    }
+    if let Some(url) = &s.a2a.url
+        && let Err(e) = validate_a2a_url(url)
+    {
+        err(&mut d, e);
+    }
+    for o in &s.a2a.cors.origins {
+        if o.trim() == "*" {
+            // Named, because `*` is what everyone tries first: it would let
+            // any page a browser loads drive the daemon, and the credential a
+            // UI signs in with does not change which page is asking.
+            err(
+                &mut d,
+                "a2a.cors.origins: `*` is not allowed; list each exact origin (a loopback UI origin must be listed too)".into(),
+            );
+        } else if let Err(e) = parse_origin(o) {
+            err(&mut d, format!("a2a.cors.origins: {o:?}: {e}"));
+        }
+    }
+    validate_device_grant(&s.a2a, listen_target.as_ref(), &mut d);
+
     // interface (the display-client surface — it rides the A2A listener)
     if s.interface.enabled && s.a2a.listen.is_none() {
         err(
@@ -7134,6 +7624,29 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                 format!("a2a.principals[{i}]: `any` cannot grant the operator role"),
             );
         }
+        if let Some(id) = &pr.id {
+            if !principal_id_ok(id) {
+                err(
+                    &mut d,
+                    format!(
+                        "a2a.principals[{i}].id {id:?}: want 1..=128 of A-Z a-z 0-9 . _ @ : / + -"
+                    ),
+                );
+            }
+            // An id names ONE principal. Two rules sharing it would merge two
+            // callers' tasks, conversations and rate bucket into one.
+            if let Some(j) = s.a2a.principals[..i]
+                .iter()
+                .position(|p| p.id.as_deref() == Some(id))
+            {
+                err(
+                    &mut d,
+                    format!(
+                        "a2a.principals[{i}].id {id:?} is already declared by a2a.principals[{j}]; ids are unique across rules"
+                    ),
+                );
+            }
+        }
     }
 
     // observability
@@ -7144,6 +7657,13 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             &mut d,
             format!("observability.log_level: {l:?} (want trace|debug|info|warn|error)"),
         );
+    }
+    // A key that could never be written would publish nothing, forever, and
+    // look like a workflow that has not run yet.
+    for key in &s.observability.status_values {
+        if let Err(e) = crate::context::memory::Memory::check_key(key) {
+            err(&mut d, format!("observability.status_values: {key:?}: {e}"));
+        }
     }
 
     // secrets provenance: the FILE layer must not carry inline secrets
@@ -7471,6 +7991,16 @@ pub const RESTART_ONLY_PATHS: &[&str] = &[
     "a2a.listen",
     "a2a.tls",
     "a2a.bearer",
+    // The advertised origin is also the OAuth issuer, which every session
+    // token and every client's cached metadata is bound to; moving it under
+    // live sessions would strand them.
+    "a2a.url",
+    // The device grant's state — pending codes, issued sessions, their
+    // lifetimes — is built with the listener, like the pairing it replaces.
+    "a2a.device_grant",
+    // The same shape as `interface.enabled` below: the feed exists only if it
+    // was declared at boot.
+    "a2a.events",
     // Arming the observation feed is a startup decision: the `SharedFeed` is
     // built only when `interface.enabled` was true at boot, so turning the
     // interface ON at runtime would pass every settings gate and still have no
@@ -7533,12 +8063,16 @@ pub const RESTART_ONLY_PATHS: &[&str] = &[
 /// refusal an operator can see beats an apply that lied.
 pub const RELOADABLE_PATHS: &[&str] = &[
     "a2a.conversation_ttl",
+    "a2a.cors",
+    "a2a.introspection",
     "a2a.peers",
     "a2a.principals",
     "a2a.push",
     "agent.approval",
     "agent.ask_human_fallback",
+    "agent.ask_human_unowned",
     "agent.conversation_budget",
+    "agent.description",
     "agent.instruction",
     "agent.max_parallel_turns",
     "agent.on_workflow_finished",
@@ -7597,6 +8131,7 @@ pub const RELOADABLE_PATHS: &[&str] = &[
     "observability.log_level",
     "observability.report_file",
     "observability.runtime_events",
+    "observability.status_values",
     "search.server",
     "services",
     "skills.dir",
@@ -7871,6 +8406,10 @@ mod tests {
                 "A2aPeer",
                 json!({"a2a": {"peers": [{"name": "p", "endpoint": "https://x", "__probe__": 1}]}}),
             ),
+            (
+                "Principal",
+                json!({"a2a": {"principals": [{"match": {"any": true}, "role": "user", "__probe__": 1}]}}),
+            ),
         ] {
             assert_eq!(
                 def_props(&schema, def),
@@ -7923,6 +8462,12 @@ mod tests {
             "lifecycle",
             "a2a",
             "a2a.tls",
+            "a2a.cors",
+            "a2a.device_grant",
+            "a2a.events",
+            "a2a.introspection",
+            "store.retention",
+            "store.retention.tasks",
             "observability",
             "observability.otel",
             "observability.audit",
@@ -10062,6 +10607,406 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{e}").contains("lethal-trifecta"), "{e}");
+    }
+
+    // ---- the v1.17 A2A keys ------------------------------------------------
+
+    /// The whole diagnostic a document earns: empty when it loads, else the
+    /// error text. Seeds the one secret the fixtures reference.
+    fn load_errors(yaml: &str) -> String {
+        crate::sec::secret::set_prompted("A2A_TEST_BEARER", "test-bearer".into());
+        match load_doc(&format!(
+            "config_version: \"1\"\nstore: {{kind: memory}}\n{yaml}"
+        )) {
+            Ok(_) => String::new(),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    #[test]
+    fn new_a2a_keys_require_a_listener() {
+        let bearer = "  bearer: \"{{secret:A2A_TEST_BEARER}}\"\n";
+        for (yaml, what) in [
+            (
+                "a2a:\n  events: {enabled: true}\n".to_string(),
+                "a2a.events.enabled",
+            ),
+            (
+                "a2a:\n  introspection: {enabled: true}\n".to_string(),
+                "a2a.introspection.enabled",
+            ),
+            (
+                format!("a2a:\n{bearer}  device_grant: {{enabled: true}}\n"),
+                "a2a.device_grant.enabled",
+            ),
+            (
+                "agent: {ask_human_unowned: gate}\n".to_string(),
+                "agent.ask_human_unowned: gate",
+            ),
+        ] {
+            let e = load_errors(&yaml);
+            assert!(
+                e.contains(&format!("{what} requires a2a.listen")),
+                "{what} without a listener must be refused: {e}"
+            );
+            // The same key with a listener loads.
+            let with = if yaml.starts_with("a2a:") {
+                yaml.replacen("a2a:\n", "a2a:\n  listen: \"http://127.0.0.1:8420\"\n", 1)
+            } else {
+                format!("{yaml}a2a: {{listen: \"http://127.0.0.1:8420\"}}\n")
+            };
+            assert_eq!(load_errors(&with), "", "{what} with a listener");
+        }
+        // `fallback` is the default and needs nothing.
+        assert_eq!(load_errors("agent: {ask_human_unowned: fallback}\n"), "");
+    }
+
+    #[test]
+    fn a2a_url_is_an_origin() {
+        let at = |url: &str| load_errors(&format!("a2a: {{url: \"{url}\"}}\n"));
+        let e = at("https://h/agent");
+        assert!(
+            e.contains("a2a.url must be an origin (scheme://host[:port]); A2A card discovery and OAuth metadata are served at the origin root"),
+            "{e}"
+        );
+        assert_eq!(at("https://h/"), "");
+        assert_eq!(at("https://h"), "");
+        assert_eq!(at("http://127.0.0.1:8420"), "");
+        assert_eq!(at("http://[::1]:8420/"), "");
+        for bad in ["https://h/?q", "https://h?q", "https://h#f", "https://h/#f"] {
+            assert!(at(bad).contains("query or fragment"), "{bad}: {}", at(bad));
+        }
+        let e = at("http://agent.example.com");
+        assert!(
+            e.contains("loopback host only"),
+            "plain http on a public host: {e}"
+        );
+        assert!(at("ftp://h").contains("http or https"), "{}", at("ftp://h"));
+        assert!(
+            at("https://h:0").contains("1..=65535"),
+            "{}",
+            at("https://h:0")
+        );
+    }
+
+    #[test]
+    fn cors_origins_validation() {
+        let at = |o: &str| load_errors(&format!("a2a: {{cors: {{origins: [\"{o}\"]}}}}\n"));
+        assert!(
+            at("*").contains(
+                "a2a.cors.origins: `*` is not allowed; list each exact origin (a loopback UI origin must be listed too)"
+            ),
+            "{}",
+            at("*")
+        );
+        assert!(
+            at("https://ui.example/app").contains("no path"),
+            "{}",
+            at("https://ui.example/app")
+        );
+        assert!(
+            at("https://ui.example/").contains("no path"),
+            "a trailing slash is a path"
+        );
+        assert!(
+            at("ui.example").contains("not an origin"),
+            "{}",
+            at("ui.example")
+        );
+        assert_eq!(at("http://[::1]:4173"), "");
+        assert_eq!(at("http://127.0.0.1:4173"), "");
+        assert_eq!(at("https://ui.example"), "");
+
+        // The parser normalises the way a browser does, so exact matching
+        // means what an operator expects.
+        let o = parse_origin("HTTPS://UI.Example").unwrap();
+        assert_eq!(
+            o,
+            Origin {
+                scheme: "https".into(),
+                host: "ui.example".into(),
+                port: 443
+            }
+        );
+        assert_eq!(parse_origin("http://[::1]:4173").unwrap().host, "::1");
+        assert_eq!(parse_origin("http://h").unwrap().port, 80);
+        assert!(parse_origin("https://u:p@h").is_err());
+    }
+
+    #[test]
+    fn device_grant_validation() {
+        let bearer = "  bearer: \"{{secret:A2A_TEST_BEARER}}\"\n";
+        let loopback = "  listen: \"http://127.0.0.1:8420\"\n";
+        let grant = |extra: &str| {
+            load_errors(&format!(
+                "a2a:\n{loopback}{bearer}  device_grant: {{enabled: true{extra}}}\n"
+            ))
+        };
+        assert_eq!(
+            grant(""),
+            "",
+            "the minimal grant with an operator bearer loads"
+        );
+
+        let e = load_errors(&format!(
+            "a2a:\n  listen: \"https://127.0.0.1:8443\"\n{bearer}  tls: {{cert: /c.pem, key: /k.pem, client_ca: /ca.pem}}\n  device_grant: {{enabled: true}}\n"
+        ));
+        assert!(
+            e.contains("cannot be combined with a2a.tls.client_ca"),
+            "{e}"
+        );
+        #[cfg(unix)]
+        {
+            let e = load_errors(&format!(
+                "a2a:\n  listen: \"unix:///tmp/agentd-dg-test.sock\"\n{bearer}  device_grant: {{enabled: true}}\n"
+            ));
+            assert!(
+                e.contains("device_grant.enabled on a unix:// listener"),
+                "{e}"
+            );
+        }
+        assert!(
+            grant(", scopes: []").contains("scopes is empty"),
+            "{}",
+            grant(", scopes: []")
+        );
+        assert!(
+            grant(", scopes: [user, user]").contains("lists `user` twice"),
+            "{}",
+            grant(", scopes: [user, user]")
+        );
+        let e = grant(", scopes: [agent]");
+        assert!(e.contains("`agent` is not a device scope"), "{e}");
+        assert!(grant(", scopes: [admin]").contains("unknown device scope"));
+        assert_eq!(grant(", scopes: [user, operator]"), "");
+        for (ttl, ok) in [
+            ("token_ttl: 4m", false),
+            ("token_ttl: 5m", true),
+            ("token_ttl: 31d", false),
+            ("token_ttl: 30d", true),
+            ("code_ttl: 30s", false),
+            ("code_ttl: 1m", true),
+            ("code_ttl: 31m", false),
+        ] {
+            let e = grant(&format!(", {ttl}"));
+            assert_eq!(e.is_empty(), ok, "{ttl}: {e}");
+            if !ok {
+                assert!(e.contains("is outside"), "{ttl}: {e}");
+            }
+        }
+        for (uri, ok) in [
+            ("https://id.example/device", true),
+            ("http://127.0.0.1:8420/device", true),
+            ("http://id.example/device", false),
+            ("https:///device", false),
+            ("https://id.example/device#x", false),
+            ("id.example/device", false),
+        ] {
+            let e = grant(&format!(", verification_uri: \"{uri}\""));
+            assert_eq!(e.is_empty(), ok, "{uri}: {e}");
+            if !ok {
+                assert!(e.contains("verification_uri"), "{uri}: {e}");
+            }
+        }
+        assert!(grant(", rate: often").contains("a2a.device_grant.rate"));
+        assert_eq!(grant(", rate: \"20/1s\""), "");
+
+        // No operator credential: nobody could approve a code. On a loopback
+        // bind AND on a wildcard bind — the loopback implicit operator is not
+        // a credential, since the grant itself ends it.
+        let msg = "a2a.device_grant.enabled needs an operator credential to approve device codes: set a2a.bearer or add an a2a.principals rule with role: operator and match.bearer_ref";
+        let e = load_errors(&format!(
+            "a2a:\n{loopback}  device_grant: {{enabled: true}}\n"
+        ));
+        assert!(e.contains(msg), "loopback: {e}");
+        let e = load_errors(
+            "a2a:\n  listen: \"https://0.0.0.0:8443\"\n  tls: {cert: /c.pem, key: /k.pem}\n  device_grant: {enabled: true}\n",
+        );
+        assert!(e.contains(msg), "wildcard: {e}");
+        // A user-role bearer_ref rule is not an operator credential.
+        let e = load_errors(&format!(
+            "a2a:\n{loopback}  principals: [{{id: ci, match: {{bearer_ref: \"{{{{secret:A2A_TEST_BEARER}}}}\"}}, role: user}}]\n  device_grant: {{enabled: true}}\n"
+        ));
+        assert!(e.contains(msg), "a user rule: {e}");
+        // An operator bearer_ref rule is.
+        let e = load_errors(&format!(
+            "a2a:\n{loopback}  principals: [{{id: ops, match: {{bearer_ref: \"{{{{secret:A2A_TEST_BEARER}}}}\"}}, role: operator}}]\n  device_grant: {{enabled: true}}\n"
+        ));
+        assert!(!e.contains(msg), "an operator rule: {e}");
+        // And the grant with a2a.bearer on a non-loopback https bind loads.
+        assert_eq!(
+            load_errors(&format!(
+                "a2a:\n  listen: \"https://0.0.0.0:8443\"\n{bearer}  tls: {{cert: /c.pem, key: /k.pem}}\n  device_grant: {{enabled: true}}\n"
+            )),
+            ""
+        );
+        // Defaults.
+        let g = DeviceGrant::default();
+        assert_eq!(g.scopes, vec![DeviceScope::User]);
+        assert_eq!(g.token_ttl(), DEFAULT_DEVICE_TOKEN_TTL);
+        assert_eq!(g.code_ttl(), DEFAULT_DEVICE_CODE_TTL);
+    }
+
+    #[test]
+    fn principal_ids_are_unique_and_well_formed() {
+        let rules = |a: &str, b: &str| {
+            load_errors(&format!(
+                "a2a:\n  principals:\n    - {{id: \"{a}\", match: {{san: a.example}}, role: user}}\n    - {{id: \"{b}\", match: {{san: b.example}}, role: user}}\n"
+            ))
+        };
+        let e = rules("a", "a");
+        assert!(e.contains("already declared by a2a.principals[0]"), "{e}");
+        assert!(
+            rules("a b", "c").contains("want 1..=128"),
+            "{}",
+            rules("a b", "c")
+        );
+        assert!(rules("", "c").contains("want 1..=128"));
+        assert!(rules(&"x".repeat(129), "c").contains("want 1..=128"));
+        assert_eq!(rules(&"x".repeat(128), "c"), "");
+        assert_eq!(rules("ci-bot@acme.example", "spiffe://acme/ns/x+y"), "");
+        // No prefix is reserved: device sessions are `user:<name>`, never a
+        // `device:` id, so a rule may use one.
+        assert_eq!(rules("device:x", "c"), "");
+    }
+
+    #[test]
+    fn status_values_and_policy_to_validation() {
+        assert_eq!(
+            load_errors("observability: {status_values: [branch, deploy.state]}\n"),
+            ""
+        );
+        for bad in ["_private", "has space", ""] {
+            let e = load_errors(&format!("observability: {{status_values: [\"{bad}\"]}}\n"));
+            assert!(e.contains("observability.status_values"), "{bad:?}: {e}");
+        }
+
+        // `to` on an ask parses with the addressee parser, in both spellings.
+        let l = load_doc(
+            "config_version: \"1\"\nstore: {kind: memory}\nsecurity:\n  policies:\n    - {match: {tool: \"fs.*\"}, action: ask, to: {role: user, labels: {team: fin}}}\n    - {match: {tool: \"db.*\"}, action: ask, to: \"*@fin.example\"}\n",
+        )
+        .unwrap();
+        let p = &l.settings.security.policies;
+        assert_eq!(p[0].to.as_ref().unwrap().role, Some(Role::User));
+        assert_eq!(
+            p[1].to.as_ref().unwrap().id.as_deref(),
+            Some("*@fin.example")
+        );
+        // …and a rule without one stays unaddressed here (the runtime default
+        // is the operator role).
+        let l = load_doc(
+            "config_version: \"1\"\nstore: {kind: memory}\nsecurity: {policies: [{match: {tool: x}, action: ask}]}\n",
+        )
+        .unwrap();
+        assert!(l.settings.security.policies[0].to.is_none());
+
+        let e = load_errors(
+            "security: {policies: [{match: {tool: x}, action: deny, to: {role: user}}]}\n",
+        );
+        assert!(e.contains("this rule never asks"), "{e}");
+        let e = load_errors(
+            "security: {policies: [{match: {tool: x}, action: ask, to: {role: anonymous}}]}\n",
+        );
+        assert!(e.contains("names nobody"), "{e}");
+        let e = load_errors("security: {policies: [{match: {tool: x}, action: ask, to: {}}]}\n");
+        assert!(e.contains("names nobody"), "{e}");
+    }
+
+    /// The keys that describe the LISTENER or the public card are the
+    /// operator's: a served document that could write them would be opening a
+    /// sign-in path, a browser origin or a status disclosure on a deployment
+    /// it does not own, or describing itself to strangers in the operator's
+    /// name. `ask_human_unowned` is the one new key a document may set.
+    #[test]
+    fn document_cannot_write_listener_or_card_keys() {
+        for (fragment, path) in [
+            (
+                "a2a:\n  device_grant:\n    enabled: true",
+                "a2a.device_grant.enabled",
+            ),
+            (
+                "a2a:\n  cors:\n    origins: [\"https://evil.example\"]",
+                "a2a.cors.origins",
+            ),
+            ("a2a:\n  url: \"https://evil.example\"", "a2a.url"),
+            ("a2a:\n  events:\n    enabled: true", "a2a.events.enabled"),
+            (
+                "a2a:\n  introspection:\n    enabled: true",
+                "a2a.introspection.enabled",
+            ),
+            (
+                "observability:\n  status_values: [secret_key]",
+                "observability.status_values",
+            ),
+            (
+                "agent:\n  description: \"a trustworthy bank\"",
+                "agent.description",
+            ),
+        ] {
+            let frag: Map<String, Value> =
+                serde_json::from_value(crate::config::yaml::parse(fragment).unwrap()).unwrap();
+            assert_eq!(
+                super::document_wrote_operator_config(&frag),
+                vec![path.to_string()],
+                "{fragment}"
+            );
+        }
+        let frag: Map<String, Value> =
+            serde_json::from_value(json!({"agent": {"ask_human_unowned": "gate"}})).unwrap();
+        assert!(super::document_wrote_operator_config(&frag).is_empty());
+
+        // And end to end, through a real `:::!config` block.
+        let dir = tempfile::tempdir().unwrap();
+        let doc = dir.path().join("card.md");
+        std::fs::write(
+            &doc,
+            "You are the desk.\n\n:::!config\na2a:\n  device_grant:\n    enabled: true\n:::\n",
+        )
+        .unwrap();
+        let e = Settings::from_document(
+            json!({"config_version": "1",
+                "agent": {"name": "a", "preflight": "never",
+                          "instruction": {"file": doc.to_string_lossy()}},
+                "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
+                "store": {"kind": "memory"}}),
+            "t",
+        )
+        .unwrap_err();
+        assert!(e.contains("a2a.device_grant.enabled"), "{e}");
+        assert!(
+            e.contains("operator configuration is not a document's to set"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn new_a2a_keys_are_classified_as_the_contract_says() {
+        let reloadable = |p: &str| super::path_covered(p, RELOADABLE_PATHS);
+        let restart = |p: &str| super::path_covered(p, RESTART_ONLY_PATHS);
+        for p in ["a2a.url", "a2a.device_grant", "a2a.events"] {
+            assert!(restart(p) && !reloadable(p), "{p} is restart-only");
+        }
+        for p in [
+            "a2a.cors",
+            "a2a.introspection",
+            "agent.description",
+            "agent.ask_human_unowned",
+            "observability.status_values",
+            "store.retention.tasks",
+        ] {
+            assert!(reloadable(p) && !restart(p), "{p} reloads");
+        }
+        assert!(
+            restart("security.policies"),
+            "policies (and their `to`) are restart-only"
+        );
+        assert_eq!(
+            restart_only_diff(
+                &json!({"a2a": {"url": "https://a.example"}}),
+                &json!({"a2a": {"url": "https://b.example"}})
+            ),
+            vec!["a2a.url".to_string()]
+        );
     }
 
     #[test]

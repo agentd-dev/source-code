@@ -11,13 +11,15 @@
 
 mod common;
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+
+use common::{SendMessage, error_of, get_card, rpc_result as rpc};
 
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
@@ -27,75 +29,8 @@ fn free_port() -> u16 {
         .port()
 }
 
-fn post_raw(addr: &str, body: &str) -> String {
-    post_raw_auth(addr, body, None)
-}
-
-fn post_raw_auth(addr: &str, body: &str, bearer: Option<&str>) -> String {
-    let mut s = TcpStream::connect(addr).expect("connect a2a http");
-    s.set_read_timeout(Some(Duration::from_secs(130))).ok();
-    let auth = bearer
-        .map(|b| format!("Authorization: Bearer {b}\r\n"))
-        .unwrap_or_default();
-    let head = format!(
-        "POST / HTTP/1.1\r\nHost: x\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    s.write_all(head.as_bytes()).unwrap();
-    s.write_all(body.as_bytes()).unwrap();
-    s.flush().unwrap();
-    let mut reader = BufReader::new(s);
-    let mut status = String::new();
-    reader.read_line(&mut status).unwrap();
-    loop {
-        let mut l = String::new();
-        reader.read_line(&mut l).unwrap();
-        if l.trim().is_empty() {
-            break;
-        }
-    }
-    let mut b = String::new();
-    reader.read_to_string(&mut b).unwrap();
-    b
-}
-
-fn rpc(addr: &str, id: i64, method: &str, params: Value) -> Value {
-    let body = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string();
-    let resp = post_raw(addr, &body);
-    let v: Value =
-        serde_json::from_str(&resp).unwrap_or_else(|_| panic!("non-JSON A2A response: {resp:?}"));
-    assert!(v.get("error").is_none(), "A2A rpc error for {method}: {v}");
-    v["result"].clone()
-}
-
-/// An rpc that EXPECTS an error; returns (code, message).
-fn rpc_err(addr: &str, id: i64, method: &str, params: Value) -> (i64, String) {
-    let body = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string();
-    let resp = post_raw(addr, &body);
-    let v: Value = serde_json::from_str(&resp).expect("json");
-    let e = v
-        .get("error")
-        .unwrap_or_else(|| panic!("expected error: {v}"));
-    (
-        e["code"].as_i64().unwrap_or(0),
-        e["message"].as_str().unwrap_or("").to_string(),
-    )
-}
-
-/// A command DataPart send.
-fn command(addr: &str, id: i64, op: &str, extra: Value) -> Value {
-    let mut data = json!({"op": op});
-    if let (Value::Object(d), Value::Object(x)) = (&mut data, extra) {
-        for (k, v) in x {
-            d.insert(k, v);
-        }
-    }
-    rpc(
-        addr,
-        id,
-        "SendMessage",
-        json!({"message": {"messageId": format!("m-{id}"), "parts": [{"data": {"agentd": data}}]}}),
-    )
+fn command(addr: &str, op: &str, args: Value) -> Value {
+    SendMessage::command(op, args).result(addr)
 }
 
 struct MockLlm {
@@ -209,30 +144,13 @@ fn iface_config(llm: &str, port: u16, debug: bool, extra: &str) -> String {
 /// `result`) are appended to the shared vec until the connection closes or the
 /// socket read times out.
 fn subscribe_events(addr: &str, from_seq: u64, sink: Arc<Mutex<Vec<Value>>>) {
-    let body = json!({"jsonrpc": "2.0", "id": 77, "method": "SubscribeToEvents", "params": {"fromSeq": from_seq}})
-        .to_string();
-    let mut s = TcpStream::connect(addr).expect("connect sse");
-    s.set_read_timeout(Some(Duration::from_secs(20))).ok();
-    let head = format!(
-        "POST / HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    s.write_all(head.as_bytes()).unwrap();
-    s.write_all(body.as_bytes()).unwrap();
-    let mut reader = BufReader::new(s);
-    loop {
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
-        if let Some(data) = line.strip_prefix("data:")
-            && let Ok(v) = serde_json::from_str::<Value>(data.trim())
-            && let Some(result) = v.get("result")
-        {
+    let mut reader = common::subscribe_feed(addr, from_seq, Duration::from_secs(20));
+    common::read_frames(&mut reader, |v| {
+        if let Some(result) = v.get("result") {
             sink.lock().unwrap().push(result.clone());
         }
-    }
+        true
+    });
 }
 
 fn wait_for<F: Fn(&[Value]) -> bool>(sink: &Arc<Mutex<Vec<Value>>>, secs: u64, pred: F) {
@@ -260,10 +178,10 @@ fn interface_info_and_the_debug_reads_work_over_a2a() {
     let (_daemon, addr, cfg) = spawn_bound(|port| iface_config(&llm.uri, port, true, extra));
 
     // Discovery: enabled + debug + the op list a client keys its panes off.
-    let info = command(&addr, 1, "interface.info", json!({}));
+    let info = command(&addr, "interface.info", json!({}));
     assert_eq!(info["interface"]["enabled"], true, "{info}");
     assert_eq!(info["interface"]["debug"], true);
-    assert_eq!(info["interface"]["feed"]["method"], "SubscribeToEvents");
+    assert_eq!(info["interface"]["feed"]["method"], common::feed_method());
     let ops: Vec<&str> = info["interface"]["ops"]
         .as_array()
         .unwrap()
@@ -276,14 +194,14 @@ fn interface_info_and_the_debug_reads_work_over_a2a() {
     // rather than an empty array — which is exactly what is being asserted.)
     let count = |v: &Value| v["tasks"].as_array().map(Vec::len).unwrap_or(0);
     let tasks_before = count(&rpc(&addr, 2, "ListTasks", json!({})));
-    let _ = command(&addr, 3, "interface.info", json!({}));
+    let _ = command(&addr, "interface.info", json!({}));
     let tasks_after = count(&rpc(&addr, 4, "ListTasks", json!({})));
     assert_eq!(tasks_before, tasks_after, "interface reads are taskless");
 
     // The agent card advertises the surface (public discovery). Position is
     // not the claim — the command vocabulary is declared on every card — so
     // this asks whether the interface extension is THERE.
-    let card = rpc(&addr, 5, "GetAgentCard", json!({}));
+    let card = get_card(&addr);
     let uris: Vec<&str> = card["capabilities"]["extensions"]
         .as_array()
         .expect("the card declares its extensions")
@@ -296,15 +214,10 @@ fn interface_info_and_the_debug_reads_work_over_a2a() {
     );
 
     // A conversation turn, then read its transcript (debug).
-    let sent = rpc(
-        &addr,
-        6,
-        "SendMessage",
-        json!({"message": {"messageId": "m-nl", "parts": [{"text": "Say hello"}]}}),
-    );
+    let sent = SendMessage::text("Say hello").result(&addr);
     let ctx = sent["task"]["contextId"].as_str().unwrap().to_string();
     assert_eq!(sent["task"]["status"]["state"], "TASK_STATE_COMPLETED");
-    let conv = command(&addr, 7, "conversation.get", json!({"id": ctx}));
+    let conv = command(&addr, "conversation.get", json!({"id": ctx}));
     let msgs = conv["conversation"]["messages"].as_array().unwrap();
     assert!(
         msgs.iter()
@@ -317,14 +230,14 @@ fn interface_info_and_the_debug_reads_work_over_a2a() {
     );
 
     // A run with per-step detail (debug).
-    let run_task = command(&addr, 8, "workflow.run", json!({"name": "greet"}));
+    let run_task = command(&addr, "workflow.run", json!({"name": "greet"}));
     let run_task_id = run_task["task"]["id"].as_str().unwrap().to_string();
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut run_id = String::new();
     while Instant::now() < deadline {
         let got = rpc(&addr, 9, "GetTask", json!({"id": run_task_id}));
         if got["status"]["state"] == "TASK_STATE_COMPLETED" {
-            let ws = command(&addr, 10, "workflow.status", json!({}));
+            let ws = command(&addr, "workflow.status", json!({}));
             run_id = ws["task"]["artifacts"][0]["parts"][0]["text"]
                 .as_str()
                 .and_then(|t| serde_json::from_str::<Value>(t).ok())
@@ -335,19 +248,19 @@ fn interface_info_and_the_debug_reads_work_over_a2a() {
         std::thread::sleep(Duration::from_millis(100));
     }
     assert!(!run_id.is_empty(), "workflow.status yielded the run id");
-    let run = command(&addr, 11, "run.get", json!({"run": run_id}));
+    let run = command(&addr, "run.get", json!({"run": run_id}));
     assert_eq!(run["run"]["status"], "completed", "{run}");
     let steps = run["run"]["steps"].as_object().unwrap();
     assert_eq!(steps["f"]["status"], "done", "per-step detail: {steps:?}");
     assert!(steps["f"]["finished"].is_u64());
 
     // The live log ring (debug) has lines, cursored.
-    let ev = command(&addr, 12, "debug.events", json!({"limit": 50}));
+    let ev = command(&addr, "debug.events", json!({"limit": 50}));
     let events = ev["events"].as_array().unwrap();
     assert!(!events.is_empty(), "the event ring is live");
     assert!(events[0]["seq"].is_u64() && events[0]["event"].is_string());
     let newest = ev["newest_seq"].as_u64().unwrap();
-    let again = command(&addr, 13, "debug.events", json!({"after": newest}));
+    let again = command(&addr, "debug.events", json!({"after": newest}));
     assert!(
         again["events"].as_array().unwrap().len() <= events.len(),
         "the cursor advances"
@@ -375,12 +288,7 @@ fn subscribe_to_events_streams_cross_client_activity_and_resumes() {
     }
 
     // Client B: send a prompt on a separate connection (blocking).
-    let sent = rpc(
-        &addr,
-        20,
-        "SendMessage",
-        json!({"message": {"messageId": "m-x", "parts": [{"text": "Ping across clients"}]}}),
-    );
+    let sent = SendMessage::text("Ping across clients").result(&addr);
     assert_eq!(sent["task"]["status"]["state"], "TASK_STATE_COMPLETED");
 
     // Client A observes B's prompt (the `message` event) AND the task reaching
@@ -447,28 +355,17 @@ fn the_interface_is_gated_off_by_default() {
     });
 
     // The command ops refuse…
-    let (code, msg) = rpc_err(
-        &addr,
-        1,
-        "SendMessage",
-        json!({"message": {"messageId": "m1", "parts": [{"data": {"agentd": {"op": "interface.info"}}}]}}),
-    );
+    let (code, msg) = error_of(&SendMessage::command("interface.info", json!({})).post(&addr));
     assert_eq!(code, -32004);
     assert!(msg.contains("interface.enabled"), "{msg}");
     // …debug reads refuse…
-    let (code, _) = rpc_err(
-        &addr,
-        2,
-        "SendMessage",
-        json!({"message": {"messageId": "m2", "parts": [{"data": {"agentd": {"op": "debug.events"}}}]}}),
-    );
+    let (code, _) = error_of(&SendMessage::command("debug.events", json!({})).post(&addr));
     assert_eq!(code, -32004);
     // …the stream refuses (as its SSE terminal frame)…
     let frames: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
     {
-        let body = json!({"jsonrpc": "2.0", "id": 3, "method": "SubscribeToEvents", "params": {}})
-            .to_string();
-        let resp_or_stream = post_raw(&addr, &body);
+        let body = common::rpc_body(3, common::feed_method(), json!({}));
+        let resp_or_stream = common::a2a_post(&addr, &body, &[]).body;
         // Either a plain error body or an SSE stream whose only frame is the error.
         assert!(
             resp_or_stream.contains("-32004") && resp_or_stream.contains("interface.enabled"),
@@ -477,13 +374,13 @@ fn the_interface_is_gated_off_by_default() {
         drop(frames);
     }
     // …and the core surface still answers (status command untouched).
-    let st = command(&addr, 4, "status", json!({}));
+    let st = command(&addr, "status", json!({}));
     assert_eq!(st["task"]["status"]["state"], "TASK_STATE_COMPLETED");
     // The card promises nothing about the interface. Other extensions (the
     // command vocabulary) are still declared — the claim under test is that a
     // surface this instance will NOT serve is never advertised, which is what
     // makes the card a promise.
-    let card = rpc(&addr, 5, "GetAgentCard", json!({}));
+    let card = get_card(&addr);
     let uris: Vec<&str> = card["capabilities"]["extensions"]
         .as_array()
         .map(|a| a.iter().filter_map(|e| e["uri"].as_str()).collect())
@@ -583,33 +480,18 @@ fn a_configured_web_origin_gets_cors_and_others_stay_rejected() {
     assert_eq!(code, 403, "an unconfigured origin must be refused");
 
     // A POST from it → 200 + echo.
-    let body =
-        json!({"jsonrpc": "2.0", "id": 1, "method": "GetAgentCard", "params": {}}).to_string();
-    let (code, headers) = send(format!(
-        "POST / HTTP/1.1\r\nHost: x\r\nOrigin: https://ui.example\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    ));
-    assert_eq!(code, 200);
-    assert!(
-        headers
-            .iter()
-            .any(|(k, v)| k == "access-control-allow-origin" && v == "https://ui.example")
+    let body = common::rpc_body(1, "ListTasks", json!({}));
+    let reply = common::a2a_post(&addr, &body, &[("Origin", "https://ui.example")]);
+    assert_eq!(reply.status, 200);
+    assert_eq!(
+        reply.header("access-control-allow-origin"),
+        Some("https://ui.example")
     );
     // Any other cross-site origin: still the rebind 403.
-    let (code, _) = send(format!(
-        "POST / HTTP/1.1\r\nHost: x\r\nOrigin: https://evil.example\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    ));
-    assert_eq!(code, 403);
+    let reply = common::a2a_post(&addr, &body, &[("Origin", "https://evil.example")]);
+    assert_eq!(reply.status, 403);
 
     std::fs::remove_file(&cfg).ok();
-}
-
-/// A JSON-RPC call with a bearer; returns the whole response value.
-fn rpc_raw_auth(addr: &str, id: i64, method: &str, params: Value, bearer: Option<&str>) -> Value {
-    let body = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string();
-    let resp = post_raw_auth(addr, &body, bearer);
-    serde_json::from_str(&resp).unwrap_or_else(|_| panic!("non-JSON response: {resp:?}"))
 }
 
 #[test]
@@ -647,25 +529,15 @@ fn pairing_exchanges_the_rotating_code_for_a_session_token() {
     );
 
     // 1. Anonymous: the card is public, work is refused.
-    let card = rpc_raw_auth(&addr, 1, "GetAgentCard", json!({}), None);
+    let card = get_card(&addr);
     assert!(card["error"].is_null(), "{card}");
-    let denied = rpc_raw_auth(
-        &addr,
-        2,
-        "SendMessage",
-        json!({"message": {"messageId": "m", "parts": [{"data": {"agentd": {"op": "status"}}}]}}),
-        None,
-    );
+    let denied = SendMessage::command("status", json!({})).post(&addr);
     assert_eq!(denied["error"]["code"], -32003, "{denied}");
 
     // 2. The operator (server bearer) reads the current code…
-    let code_resp = rpc_raw_auth(
-        &addr,
-        3,
-        "SendMessage",
-        json!({"message": {"messageId": "m2", "parts": [{"data": {"agentd": {"op": "pairing.code"}}}]}}),
-        Some("server-secret-bearer"),
-    );
+    let code_resp = SendMessage::command("pairing.code", json!({}))
+        .bearer("server-secret-bearer")
+        .post(&addr);
     let code = code_resp["result"]["pairing"]["code"]
         .as_str()
         .expect("code")
@@ -679,9 +551,9 @@ fn pairing_exchanges_the_rotating_code_for_a_session_token() {
     );
 
     // 3. …a wrong code fails, the right one (ANONYMOUS) mints a session…
-    let wrong = rpc_raw_auth(&addr, 4, "Pair", json!({"code": "000001"}), None);
+    let wrong = common::rpc(&addr, 4, "Pair", json!({"code": "000001"}));
     assert_eq!(wrong["error"]["code"], -32003);
-    let paired = rpc_raw_auth(&addr, 5, "Pair", json!({"code": code}), None);
+    let paired = common::rpc(&addr, 5, "Pair", json!({"code": code}));
     let token = paired["result"]["token"]
         .as_str()
         .expect("token")
@@ -690,26 +562,18 @@ fn pairing_exchanges_the_rotating_code_for_a_session_token() {
     assert_eq!(paired["result"]["role"], "operator");
 
     // 4. …and the session token IS a working operator credential.
-    let st = rpc_raw_auth(
-        &addr,
-        6,
-        "SendMessage",
-        json!({"message": {"messageId": "m3", "parts": [{"data": {"agentd": {"op": "status"}}}]}}),
-        Some(&token),
-    );
+    let st = SendMessage::command("status", json!({}))
+        .bearer(&token)
+        .post(&addr);
     assert!(st["error"].is_null(), "{st}");
     assert_eq!(
         st["result"]["task"]["status"]["state"],
         "TASK_STATE_COMPLETED"
     );
     // interface.info advertises pairing.
-    let info = rpc_raw_auth(
-        &addr,
-        7,
-        "SendMessage",
-        json!({"message": {"messageId": "m4", "parts": [{"data": {"agentd": {"op": "interface.info"}}}]}}),
-        Some(&token),
-    );
+    let info = SendMessage::command("interface.info", json!({}))
+        .bearer(&token)
+        .post(&addr);
     assert_eq!(info["result"]["interface"]["pairing"]["enabled"], true);
 
     std::fs::remove_file(&cfg).ok();
@@ -722,14 +586,9 @@ fn config_set_toggles_debug_live_and_reshapes_the_display() {
     let (_daemon, addr, cfg) = spawn_bound(|port| iface_config(&llm.uri, port, false, ""));
 
     // Debug reads refuse; info says so; the default display is served.
-    let (code, _) = rpc_err(
-        &addr,
-        1,
-        "SendMessage",
-        json!({"message": {"messageId": "m1", "parts": [{"data": {"agentd": {"op": "debug.events"}}}]}}),
-    );
+    let (code, _) = error_of(&SendMessage::command("debug.events", json!({})).post(&addr));
     assert_eq!(code, -32004);
-    let info = command(&addr, 2, "interface.info", json!({}));
+    let info = command(&addr, "interface.info", json!({}));
     assert_eq!(info["interface"]["debug"], false);
     assert!(
         info["interface"]["display"]["bottom"]
@@ -743,36 +602,35 @@ fn config_set_toggles_debug_live_and_reshapes_the_display() {
     // `config.set interface.debug true` flips it at runtime…
     let set = command(
         &addr,
-        3,
         "config.set",
         json!({"path": "interface.debug", "value": true}),
     );
     assert_eq!(set["set"]["value"], true, "{set}");
-    let info = command(&addr, 4, "interface.info", json!({}));
+    let info = command(&addr, "interface.info", json!({}));
     assert_eq!(info["interface"]["debug"], true);
     // …and the debug reads work — including the log ring, installed on toggle.
-    let ev = command(&addr, 5, "debug.events", json!({"limit": 10}));
+    let ev = command(&addr, "debug.events", json!({"limit": 10}));
     assert!(ev["events"].is_array(), "{ev}");
 
     // The display is runtime-shapeable; unknown paths name the whitelist.
     let set = command(
         &addr,
-        6,
         "config.set",
         json!({"path": "interface.display.bottom", "value": ["conn", "model", "tokens"]}),
     );
     assert_eq!(set["set"]["value"], json!(["conn", "model", "tokens"]));
-    let info = command(&addr, 7, "interface.info", json!({}));
+    let info = command(&addr, "interface.info", json!({}));
     assert_eq!(
         info["interface"]["display"]["bottom"],
         json!(["conn", "model", "tokens"])
     );
     assert!(info["interface"]["model"].is_string());
-    let (code, msg) = rpc_err(
-        &addr,
-        8,
-        "SendMessage",
-        json!({"message": {"messageId": "m8", "parts": [{"data": {"agentd": {"op": "config.set", "path": "intelligence.model", "value": "x"}}}]}}),
+    let (code, msg) = error_of(
+        &SendMessage::command(
+            "config.set",
+            json!({"path": "intelligence.model", "value": "x"}),
+        )
+        .post(&addr),
     );
     assert_eq!(code, -32602);
     assert!(msg.contains("not runtime-settable"), "{msg}");
@@ -796,28 +654,19 @@ fn a_live_subagent_is_observable_and_drillable() {
     let (_daemon, addr, cfg) = spawn_bound(|port| iface_config(&llm.uri, port, true, ""));
 
     // Missing handle → non-disclosing not-found.
-    let (code, _) = rpc_err(
-        &addr,
-        1,
-        "SendMessage",
-        json!({"message": {"messageId": "m0", "parts": [{"data": {"agentd": {"op": "subagent.get", "handle": "nope"}}}]}}),
-    );
+    let (code, _) =
+        error_of(&SendMessage::command("subagent.get", json!({"handle": "nope"})).post(&addr));
     assert_eq!(code, -32001);
 
     // Drive the delegating turn (blocking → returns when the tree settles).
-    let sent = rpc(
-        &addr,
-        2,
-        "SendMessage",
-        json!({"message": {"messageId": "m1", "parts": [{"text": "count for me"}]}}),
-    );
+    let sent = SendMessage::text("count for me").result(&addr);
     assert_eq!(
         sent["task"]["status"]["state"], "TASK_STATE_COMPLETED",
         "{sent}"
     );
 
     // The status section lists the subagent; drill into it.
-    let st = command(&addr, 3, "status", json!({}));
+    let st = command(&addr, "status", json!({}));
     let subs = st["task"]["artifacts"][0]["parts"][0]["text"]
         .as_str()
         .and_then(|t| serde_json::from_str::<Value>(t).ok())
@@ -832,7 +681,7 @@ fn a_live_subagent_is_observable_and_drillable() {
     // time we ask" is a timing artifact, not a contract.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let got = loop {
-        let got = command(&addr, 4, "subagent.get", json!({"handle": handle}));
+        let got = command(&addr, "subagent.get", json!({"handle": handle}));
         if got["subagent"]["status"] == "completed" {
             break got;
         }
@@ -880,12 +729,7 @@ fn live_activity_reports_phase_tool_and_tokens_on_the_feed() {
     std::thread::spawn(move || subscribe_events(&addr2, 0, sink));
     wait_for(&frames, 5, |f| f.iter().any(|v| v.get("hello").is_some()));
 
-    let sent = rpc(
-        &addr,
-        1,
-        "SendMessage",
-        json!({"message": {"messageId": "m1", "parts": [{"text": "Remember k=1"}]}}),
-    );
+    let sent = SendMessage::text("Remember k=1").result(&addr);
     assert_eq!(
         sent["task"]["status"]["state"], "TASK_STATE_COMPLETED",
         "{sent}"
@@ -1057,12 +901,7 @@ fn an_immutable_daemon_refuses_the_model_rewriting_its_workflows() {
         )
     });
 
-    let body = json!({"jsonrpc": "2.0", "id": 1, "method": "SendMessage", "params": {
-        "message": {"messageId": "m1", "role": "ROLE_USER",
-                    "parts": [{"text": "add a workflow called sneaky"}]}
-    }})
-    .to_string();
-    let _ = post_raw(&addr, &body);
+    let _ = SendMessage::text("add a workflow called sneaky").post_raw(&addr);
 
     // The refusal is AUDITED, not merely returned to the model — an operator
     // reading the log should see that the agent tried, which is the point of

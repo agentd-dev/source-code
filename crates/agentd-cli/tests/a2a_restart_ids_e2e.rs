@@ -27,12 +27,13 @@
 
 mod common;
 
-use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+
+use common::{SendMessage, rpc_result as rpc};
 
 /// The credentials this suite plants. Distinctive enough that a substring
 /// search over the whole response is meaningful.
@@ -61,51 +62,6 @@ fn free_port() -> u16 {
         .local_addr()
         .unwrap()
         .port()
-}
-
-/// One HTTP POST of a JSON-RPC body; returns the response body once the
-/// connection closes. The read timeout is generous because a blocking
-/// `SendMessage` waits for its task to settle.
-fn post_raw(addr: &str, body: &str) -> String {
-    let mut s = TcpStream::connect(addr).expect("connect a2a http");
-    s.set_read_timeout(Some(Duration::from_secs(60))).ok();
-    let head = format!(
-        "POST / HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    s.write_all(head.as_bytes()).unwrap();
-    s.write_all(body.as_bytes()).unwrap();
-    s.flush().unwrap();
-    let mut reader = BufReader::new(s);
-    let mut status = String::new();
-    reader.read_line(&mut status).unwrap();
-    loop {
-        let mut l = String::new();
-        reader.read_line(&mut l).unwrap();
-        if l.trim().is_empty() {
-            break;
-        }
-    }
-    let mut b = String::new();
-    reader.read_to_string(&mut b).unwrap();
-    b
-}
-
-/// A JSON-RPC call over A2A, returning the RAW response text — the redaction
-/// assertion is about the bytes on the wire, not about a parsed field.
-fn rpc_raw(addr: &str, id: i64, method: &str, params: Value) -> String {
-    let body = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string();
-    post_raw(addr, &body)
-}
-
-/// A JSON-RPC call over A2A; returns the `result` (panics on a transport/RPC
-/// error, surfacing the body for diagnosis).
-fn rpc(addr: &str, id: i64, method: &str, params: Value) -> Value {
-    let resp = rpc_raw(addr, id, method, params);
-    let v: Value =
-        serde_json::from_str(&resp).unwrap_or_else(|_| panic!("non-JSON A2A response: {resp:?}"));
-    assert!(v.get("error").is_none(), "A2A rpc error for {method}: {v}");
-    v["result"].clone()
 }
 
 /// Block until the listener accepts. The daemon comes along so that a failure
@@ -268,9 +224,7 @@ fn a_new_message_after_a_restart_gets_its_own_task_not_a_restored_one() {
     // Life 1: one natural-language message, one durable task.
     let life1 = spawn_daemon(&cfg, &[]);
     wait_ready(&life1, &addr);
-    let params =
-        json!({"message": {"messageId": "m1", "parts": [{"text": "first-life-question"}]}});
-    let first = rpc(&addr, 1, "SendMessage", params)["task"].clone();
+    let first = SendMessage::text("first-life-question").result(&addr)["task"].clone();
     let first_id = first["id"].as_str().unwrap_or_default().to_string();
     assert!(!first_id.is_empty(), "life 1 task: {first}");
     assert!(
@@ -291,9 +245,7 @@ fn a_new_message_after_a_restart_gets_its_own_task_not_a_restored_one() {
     // The failure this guards against: the listener pre-mints the id for this
     // message, and a counter-minted one collides with the restored task above,
     // so the message silently continues THAT task instead of starting its own.
-    let params =
-        json!({"message": {"messageId": "m2", "parts": [{"text": "second-life-question"}]}});
-    let second = rpc(&addr, 3, "SendMessage", params)["task"].clone();
+    let second = SendMessage::text("second-life-question").result(&addr)["task"].clone();
     let second_id = second["id"].as_str().unwrap_or_default().to_string();
     assert_ne!(
         second_id, first_id,
@@ -338,9 +290,10 @@ fn the_config_command_never_echoes_a_credential() {
     let daemon = spawn_daemon(&cfg, &[("AGENTD_INTELLIGENCE_TOKEN", ENV_TOKEN)]);
     wait_ready(&daemon, &addr);
 
-    let params =
-        json!({"message": {"messageId": "m1", "parts": [{"data": {"agentd": {"op": "config"}}}]}});
-    let raw = rpc_raw(&addr, 1, "SendMessage", params);
+    // The redaction assertion is about the bytes on the wire, not a parsed field.
+    let raw = SendMessage::command("config", json!({}))
+        .post_raw(&addr)
+        .body;
     assert!(
         !raw.contains(ENV_TOKEN),
         "the env-supplied intelligence token was echoed over A2A: {raw}"

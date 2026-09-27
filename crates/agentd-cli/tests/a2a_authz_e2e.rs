@@ -37,12 +37,13 @@
 
 mod common;
 
-use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+
+use common::{SendMessage, a2a_post, a2a_post_within, rpc_as, rpc_body};
 
 /// The bearers the two principals present. Literal here, `{{secret:…}}` in the
 /// config — a bearer is a secret, and the config may only carry a reference.
@@ -63,81 +64,6 @@ fn free_port() -> u16 {
         .local_addr()
         .unwrap()
         .port()
-}
-
-/// One HTTP POST, read to the end of the response — status line, headers and
-/// body kept apart.
-///
-/// `budget` bounds the read rather than the connection: a refused subscribe
-/// closes at once, but an *unguarded* one answers with an SSE stream that stays
-/// open, and the test has to be able to say what it received from a stream that
-/// never ends. Reading stops early once a frame has arrived, so the budget is
-/// only ever spent when nothing does.
-fn post(
-    addr: &str,
-    body: &str,
-    extra: &[(&str, &str)],
-    budget: Duration,
-) -> (String, String, String) {
-    let mut s = TcpStream::connect(addr).expect("connect a2a http");
-    s.set_read_timeout(Some(Duration::from_millis(200))).ok();
-    let mut head = format!(
-        "POST / HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
-        body.len()
-    );
-    for (k, v) in extra {
-        head.push_str(&format!("{k}: {v}\r\n"));
-    }
-    head.push_str("\r\n");
-    s.write_all(head.as_bytes()).unwrap();
-    s.write_all(body.as_bytes()).unwrap();
-    s.flush().unwrap();
-
-    let deadline = Instant::now() + budget;
-    let mut raw = Vec::new();
-    let mut buf = [0u8; 8192];
-    while Instant::now() < deadline {
-        match s.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                raw.extend_from_slice(&buf[..n]);
-                // An SSE frame has arrived: whatever the stream would go on to
-                // send, the question the test asks — did anything arrive at
-                // all — is already answered.
-                if raw.windows(6).any(|w| w == b"\ndata:") {
-                    break;
-                }
-            }
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) => {}
-            Err(e) => panic!("read a2a response: {e}"),
-        }
-    }
-    let text = String::from_utf8_lossy(&raw).into_owned();
-    let (head, body) = match text.find("\r\n\r\n") {
-        Some(i) => (text[..i].to_string(), text[i + 4..].to_string()),
-        None => (text.clone(), String::new()),
-    };
-    let status = head.lines().next().unwrap_or("").to_string();
-    (status, head, body)
-}
-
-/// A JSON-RPC call as `bearer`, returning the parsed envelope (result *or*
-/// error — the errors are the point of this suite).
-fn rpc_as(addr: &str, bearer: &str, id: i64, method: &str, params: Value) -> Value {
-    let body = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string();
-    let auth = format!("Bearer {bearer}");
-    let (status, _, body) = post(
-        addr,
-        &body,
-        &[("Authorization", &auth)],
-        Duration::from_secs(60),
-    );
-    serde_json::from_str(&body)
-        .unwrap_or_else(|e| panic!("non-JSON A2A response ({e}) to {method}: {status} {body:?}"))
 }
 
 fn wait_ready(addr: &str) {
@@ -275,13 +201,7 @@ fn one_principals_task_stream_is_not_readable_by_another() {
 
     // A starts a task and it settles, so the fan-out's replay buffer holds A's
     // transitions and its result artifact — the material a replay would leak.
-    let send = rpc_as(
-        &addr,
-        TOKEN_A,
-        1,
-        "SendMessage",
-        json!({"message": {"messageId": "m-a", "parts": [{"text": "hello"}]}}),
-    );
+    let send = SendMessage::text("hello").bearer(TOKEN_A).post(&addr);
     assert!(
         send.get("error").is_none(),
         "A's send should succeed: {send}"
@@ -310,16 +230,19 @@ fn one_principals_task_stream_is_not_readable_by_another() {
     // has ever emitted, which is what makes this deterministic: a live
     // subscription would depend on catching a transition, but a replay is owed
     // the whole buffer the moment it attaches.
-    let subscribe = json!({"jsonrpc": "2.0", "id": 4, "method": "SubscribeToTask",
-                           "params": {"id": task_id}})
-    .to_string();
+    // `a2a_post_within` bounds the read rather than the connection: a refused
+    // subscribe closes at once, but an *unguarded* one answers with an SSE
+    // stream that stays open, and the test has to be able to say what it
+    // received from a stream that never ends.
+    let subscribe = rpc_body(4, "SubscribeToTask", json!({"id": task_id}));
     let auth_b = format!("Bearer {TOKEN_B}");
-    let (status, head, body) = post(
+    let reply = a2a_post_within(
         &addr,
         &subscribe,
         &[("Authorization", &auth_b), ("Last-Event-ID", "0")],
         Duration::from_secs(10),
     );
+    let (status, body) = (reply.status, reply.body.as_str());
 
     // Nothing was delivered. This is the assertion that matters: a refusal that
     // still opened the stream would satisfy every other check here and hand B
@@ -329,7 +252,7 @@ fn one_principals_task_stream_is_not_readable_by_another() {
         "B received stream frames for A's task: {status} / {body}"
     );
     assert!(
-        !body.contains(&task_id) || body.contains("error"),
+        !body.contains(task_id.as_str()) || body.contains("error"),
         "B's response carried A's task id outside an error: {body}"
     );
     assert!(
@@ -340,10 +263,12 @@ fn one_principals_task_stream_is_not_readable_by_another() {
     // And it was refused as "not found" rather than "forbidden", so B cannot
     // learn from the refusal that the task is real.
     assert!(
-        head.contains("application/json"),
-        "a refused subscribe answers with an error, not a stream: {head}"
+        reply
+            .header("content-type")
+            .is_some_and(|t| t.contains("application/json")),
+        "a refused subscribe answers with an error, not a stream: {reply:?}"
     );
-    let refused: Value = serde_json::from_str(&body)
+    let refused: Value = serde_json::from_str(body)
         .unwrap_or_else(|e| panic!("non-JSON refusal ({e}): {status} {body:?}"));
     assert_eq!(
         refused["error"]["code"], -32001,
@@ -353,14 +278,13 @@ fn one_principals_task_stream_is_not_readable_by_another() {
     // The control: the same call, from the owner, does deliver. Without it a
     // subscribe that was broken for everybody would pass the assertions above.
     let auth_a = format!("Bearer {TOKEN_A}");
-    let (a_status, _, a_body) = post(
+    let owner = a2a_post_within(
         &addr,
-        &json!({"jsonrpc": "2.0", "id": 5, "method": "SubscribeToTask",
-                "params": {"id": task_id}})
-        .to_string(),
+        &rpc_body(5, "SubscribeToTask", json!({"id": task_id})),
         &[("Authorization", &auth_a), ("Last-Event-ID", "0")],
         Duration::from_secs(10),
     );
+    let (a_status, a_body) = (owner.status, owner.body);
     assert!(
         a_body.contains("data:") && a_body.contains(&task_id),
         "the owner still receives its own task's events: {a_status} / {a_body}"
@@ -416,9 +340,7 @@ fn a_flood_of_distinct_method_names_does_not_grow_the_daemon() {
 
     let call = |n: u64| {
         let method = format!("{n:08}{}", "m".repeat(NAME));
-        let body = json!({"jsonrpc": "2.0", "id": n, "method": method, "params": {}}).to_string();
-        let (_, _, body) = post(&addr, &body, &[], Duration::from_secs(30));
-        body
+        a2a_post(&addr, &rpc_body(n as i64, &method, json!({})), &[]).body
     };
 
     // Warm up first: the first requests grow the allocator's arenas, the
@@ -472,14 +394,14 @@ fn an_unauthenticated_caller_still_reaches_the_admin_check() {
     // The same request with the header the transport would reject outright —
     // there is none, which is the point: the listener has no credential to
     // require here, so every one of these requests runs the whole dispatch.
-    let (status, _, _) = post(
+    let status = a2a_post(
         &addr,
-        &json!({"jsonrpc": "2.0", "id": 2, "method": "a2a.drainX", "params": {}}).to_string(),
+        &rpc_body(2, "a2a.drainX", json!({})),
         &[("Authorization", "Bearer also-junk")],
-        Duration::from_secs(30),
-    );
+    )
+    .status;
     assert!(
-        status.contains("200"),
+        status == 200,
         "the request is dispatched and answered, not rejected at the door: {status}"
     );
     assert!(daemon.alive(), "daemon still serving: {}", daemon.stderr());
@@ -526,14 +448,9 @@ fn a_reload_demotes_a_principal_and_the_revocation_takes_effect() {
     wait_ready(&addr);
 
     let plan_get = || {
-        rpc_as(
-            &addr,
-            TOKEN_A,
-            1,
-            "SendMessage",
-            json!({"message": {"messageId": "m-plan", "parts": [
-                {"data": {"agentd": {"op": "plan.get"}}}]}}),
-        )
+        SendMessage::command("plan.get", json!({}))
+            .bearer(TOKEN_A)
+            .post(&addr)
     };
 
     // As a user, the command is not refused for want of a grant.

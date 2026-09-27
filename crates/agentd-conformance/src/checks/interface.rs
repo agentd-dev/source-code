@@ -7,13 +7,16 @@
 //! A2A wire still answers — the default-OFF contract, so enabling an
 //! observation plane is always a deliberate act and never a side effect.
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::{BufRead, BufReader};
+use std::net::TcpListener;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use crate::checks::util::{mock_llm, write_file};
+use crate::checks::util::{
+    feed_method, mock_llm, open, rpc, rpc_body, send_command, send_text, text_params, wait_ready,
+    write_file,
+};
 use crate::{Category, Check, Harness, Outcome};
 
 pub fn checks() -> Vec<Check> {
@@ -47,56 +50,6 @@ fn free_port() -> u16 {
         .port()
 }
 
-fn post_raw(addr: &str, body: &str) -> String {
-    let mut s = TcpStream::connect(addr).expect("connect a2a http");
-    s.set_read_timeout(Some(Duration::from_secs(30))).ok();
-    let head = format!(
-        "POST / HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    s.write_all(head.as_bytes()).unwrap();
-    s.write_all(body.as_bytes()).unwrap();
-    s.flush().unwrap();
-    let mut reader = BufReader::new(s);
-    let mut status = String::new();
-    reader.read_line(&mut status).unwrap();
-    loop {
-        let mut l = String::new();
-        reader.read_line(&mut l).unwrap();
-        if l.trim().is_empty() {
-            break;
-        }
-    }
-    let mut b = String::new();
-    reader.read_to_string(&mut b).unwrap();
-    b
-}
-
-fn rpc_value(addr: &str, id: i64, method: &str, params: Value) -> Value {
-    let body = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string();
-    serde_json::from_str(&post_raw(addr, &body)).unwrap_or_else(|_| panic!("non-JSON A2A response"))
-}
-
-fn rpc(addr: &str, id: i64, method: &str, params: Value) -> Value {
-    let v = rpc_value(addr, id, method, params);
-    assert!(v.get("error").is_none(), "A2A rpc error for {method}: {v}");
-    v["result"].clone()
-}
-
-fn wait_ready(addr: &str) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if TcpStream::connect(addr).is_ok() {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "a2a listener never became connectable at {addr}"
-        );
-        std::thread::sleep(Duration::from_millis(25));
-    }
-}
-
 fn config(llm: &str, port: u16, interface: bool) -> String {
     let iface = if interface {
         "interface:\n  enabled: true\n"
@@ -122,26 +75,16 @@ fn default_off(h: &Harness) -> Outcome {
     let _daemon = h.spawn(&["--config", &cfg]);
     wait_ready(&addr);
 
-    let refused = rpc_value(
-        &addr,
-        1,
-        "SendMessage",
-        json!({"message": {"messageId": "m1", "parts": [{"data": {"agentd": {"op": "interface.info"}}}]}}),
-    );
+    let refused = send_command(&addr, 1, "interface.info");
     Outcome::require(
         refused["error"]["code"] == -32004,
         format!("interface.info should refuse with -32004 while disabled: {refused}"),
     )
     .and(|| {
         // The core surface is untouched: status still answers.
-        let st = rpc(
-            &addr,
-            2,
-            "SendMessage",
-            json!({"message": {"messageId": "m2", "parts": [{"data": {"agentd": {"op": "status"}}}]}}),
-        );
+        let st = send_command(&addr, 2, "status");
         Outcome::require(
-            st["task"]["status"]["state"] == "TASK_STATE_COMPLETED",
+            st["result"]["task"]["status"]["state"] == "TASK_STATE_COMPLETED",
             format!("the core status command should still answer: {st}"),
         )
     })
@@ -158,25 +101,15 @@ fn feed_replay(h: &Harness) -> Outcome {
 
     // Create history FIRST, then subscribe from seq 0 — the ring must replay
     // the prompt's `message` event to the late joiner.
-    let sent = rpc(
-        &addr,
-        1,
-        "SendMessage",
-        json!({"message": {"messageId": "m1", "parts": [{"text": "Replay me"}]}}),
+    let sent = send_text(&addr, 1, "Replay me", false);
+    assert_eq!(
+        sent["result"]["task"]["status"]["state"],
+        "TASK_STATE_COMPLETED"
     );
-    assert_eq!(sent["task"]["status"]["state"], "TASK_STATE_COMPLETED");
 
-    let body =
-        json!({"jsonrpc": "2.0", "id": 9, "method": "SubscribeToEvents", "params": {"fromSeq": 0}})
-            .to_string();
-    let mut s = TcpStream::connect(&addr).expect("connect sse");
+    let body = rpc_body(9, feed_method(), json!({"fromSeq": 0}));
+    let s = open(&addr, &body, &[]);
     s.set_read_timeout(Some(Duration::from_secs(10))).ok();
-    let head = format!(
-        "POST / HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    s.write_all(head.as_bytes()).unwrap();
-    s.write_all(body.as_bytes()).unwrap();
     let mut reader = BufReader::new(s);
     let mut saw_hello = false;
     let mut saw_message = false;
@@ -237,8 +170,7 @@ fn hitl_roundtrip(h: &Harness) -> Outcome {
         &addr,
         1,
         "SendMessage",
-        json!({"message": {"messageId": "m1", "parts": [{"text": "Do the thing"}]},
-               "configuration": {"blocking": false}}),
+        text_params("Do the thing", None, true),
     );
     let task_id = sent["task"]["id"].as_str().expect("task id").to_string();
     // The gate appears…
@@ -263,8 +195,7 @@ fn hitl_roundtrip(h: &Harness) -> Outcome {
             &addr,
             3,
             "SendMessage",
-            json!({"message": {"messageId": "m2", "taskId": task_id, "parts": [{"text": "yes"}]},
-                   "configuration": {"blocking": false}}),
+            text_params("yes", Some(&task_id), true),
         );
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {

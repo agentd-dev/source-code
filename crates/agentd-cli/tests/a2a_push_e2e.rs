@@ -9,13 +9,15 @@
 #![cfg(feature = "a2a")]
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
 mod common;
+
+use common::{SendMessage, get_card, rpc};
 
 use std::process::{Child, Command, Stdio};
 
@@ -25,37 +27,6 @@ fn free_port() -> u16 {
         .local_addr()
         .unwrap()
         .port()
-}
-
-fn post_raw(addr: &str, body: &str) -> String {
-    let mut s = TcpStream::connect(addr).expect("connect a2a");
-    s.set_read_timeout(Some(Duration::from_secs(20))).ok();
-    let head = format!(
-        "POST / HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    s.write_all(head.as_bytes()).unwrap();
-    s.write_all(body.as_bytes()).unwrap();
-    s.flush().unwrap();
-    let mut r = BufReader::new(s);
-    let mut line = String::new();
-    r.read_line(&mut line).unwrap();
-    loop {
-        let mut l = String::new();
-        r.read_line(&mut l).unwrap();
-        if l.trim().is_empty() {
-            break;
-        }
-    }
-    let mut b = String::new();
-    r.read_to_string(&mut b).unwrap();
-    b
-}
-
-fn rpc(addr: &str, id: i64, method: &str, params: Value) -> Value {
-    let body = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string();
-    let raw = post_raw(addr, &body);
-    serde_json::from_str(&raw).unwrap_or_else(|_| panic!("non-JSON response: {raw:?}"))
 }
 
 /// One delivery, as the receiver saw it: the headers, then the body.
@@ -229,14 +200,9 @@ fn a_registered_webhook_receives_the_task_and_the_callers_token() {
 
     // A natural-language send that returns as soon as the task exists, so the
     // work is still in flight when the webhook is attached.
-    let sent = rpc(
-        &addr,
-        1,
-        "SendMessage",
-        json!({"message": {"messageId": "m1", "role": "ROLE_USER",
-                           "parts": [{"text": "take your time"}]},
-               "configuration": {"returnImmediately": true}}),
-    );
+    let sent = SendMessage::text("take your time")
+        .return_immediately()
+        .post(&addr);
     let task_id = sent["result"]["task"]["id"]
         .as_str()
         .unwrap_or_else(|| panic!("a task: {sent}"))
@@ -306,13 +272,7 @@ fn a_target_agentd_should_not_reach_is_refused_at_registration() {
     // Enabled, but WITHOUT allow_private: the ordinary production posture.
     let (_daemon, addr, cfg_path) = boot(|p| config(&llm.uri, p, "  push:\n    enabled: true\n"));
 
-    let sent = rpc(
-        &addr,
-        1,
-        "SendMessage",
-        json!({"message": {"messageId": "m1", "role": "ROLE_USER",
-               "parts": [{"data": {"agentd": {"op": "status"}}}]}}),
-    );
+    let sent = SendMessage::command("status", json!({})).post(&addr);
     let task_id = sent["result"]["task"]["id"].as_str().unwrap().to_string();
 
     // The cloud metadata endpoint: the canonical thing a peer would like agentd
@@ -338,19 +298,10 @@ fn push_is_off_unless_an_operator_turns_it_on() {
 
     // The card is a promise: with the feature off it must not claim the
     // capability.
-    let card = rpc(&addr, 1, "GetAgentCard", json!({}));
-    assert_eq!(
-        card["result"]["capabilities"]["pushNotifications"], false,
-        "{card}"
-    );
+    let card = get_card(&addr);
+    assert_eq!(card["capabilities"]["pushNotifications"], false, "{card}");
 
-    let sent = rpc(
-        &addr,
-        2,
-        "SendMessage",
-        json!({"message": {"messageId": "m1", "role": "ROLE_USER",
-               "parts": [{"data": {"agentd": {"op": "status"}}}]}}),
-    );
+    let sent = SendMessage::command("status", json!({})).post(&addr);
     let task_id = sent["result"]["task"]["id"].as_str().unwrap().to_string();
 
     // …and asking anyway is a clean refusal, not a silent no-op.

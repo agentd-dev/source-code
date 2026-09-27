@@ -34,41 +34,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+use common::{SendMessage, rpc_result as rpc};
+
 // ---- A2A client ------------------------------------------------------------
-
-fn post_raw(addr: &str, body: &str) -> String {
-    let mut s = TcpStream::connect(addr).expect("connect a2a http");
-    s.set_read_timeout(Some(Duration::from_secs(130))).ok();
-    let head = format!(
-        "POST / HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    s.write_all(head.as_bytes()).unwrap();
-    s.write_all(body.as_bytes()).unwrap();
-    s.flush().unwrap();
-    let mut reader = BufReader::new(s);
-    let mut status = String::new();
-    reader.read_line(&mut status).unwrap();
-    loop {
-        let mut l = String::new();
-        reader.read_line(&mut l).unwrap();
-        if l.trim().is_empty() {
-            break;
-        }
-    }
-    let mut b = String::new();
-    reader.read_to_string(&mut b).unwrap();
-    b
-}
-
-fn rpc(addr: &str, id: i64, method: &str, params: Value) -> Value {
-    let body = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string();
-    let resp = post_raw(addr, &body);
-    let v: Value =
-        serde_json::from_str(&resp).unwrap_or_else(|_| panic!("non-JSON A2A response: {resp:?}"));
-    assert!(v.get("error").is_none(), "A2A rpc error for {method}: {v}");
-    v["result"].clone()
-}
 
 /// Poll `GetTask` until `pred` holds (returns the task).
 fn wait_task<F: Fn(&Value) -> bool>(addr: &str, id: &str, secs: u64, what: &str, pred: F) -> Value {
@@ -414,13 +382,9 @@ fn an_mcp_elicitation_reaches_the_operator_and_the_server_sees_accept_with_the_c
         None,
     );
 
-    let sent = rpc(
-        &addr,
-        1,
-        "SendMessage",
-        json!({"message": {"messageId": "m1", "parts": [{"text": "Deploy the service"}]},
-               "configuration": {"blocking": false}}),
-    );
+    let sent = SendMessage::text("Deploy the service")
+        .return_immediately()
+        .result(&addr);
     let task_id = sent["task"]["id"].as_str().unwrap().to_string();
 
     // The server's question — not the agent's — is what the operator is shown.
@@ -435,13 +399,10 @@ fn an_mcp_elicitation_reaches_the_operator_and_the_server_sees_accept_with_the_c
         "the server's elicitation message reaches the operator verbatim: {gated}"
     );
 
-    rpc(
-        &addr,
-        2,
-        "SendMessage",
-        json!({"message": {"messageId": "m2", "taskId": task_id, "parts": [{"text": "staging"}]},
-               "configuration": {"blocking": false}}),
-    );
+    SendMessage::text("staging")
+        .task(&task_id)
+        .return_immediately()
+        .result(&addr);
 
     // THE assertion: from the server's side, the elicitation was accepted and
     // carries the operator's answer bound to the property it asked for. A tool

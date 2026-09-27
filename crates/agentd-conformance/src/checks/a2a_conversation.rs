@@ -7,13 +7,14 @@
 //! turn worker and the answer lands as the task's artifact, readable back through
 //! `GetTask` and enumerable through `ListTasks`.
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::time::{Duration, Instant};
+use std::net::TcpListener;
 
 use serde_json::{Value, json};
 
-use crate::checks::util::{mock_llm, write_file};
+use crate::checks::util::{
+    get_card, mock_llm, post, rpc, rpc_body, rpc_value as rpc_raw, send_command, send_text,
+    text_params, wait_ready, write_file,
+};
 use crate::{Category, Check, Harness, Outcome};
 
 pub fn checks() -> Vec<Check> {
@@ -66,66 +67,6 @@ fn free_port() -> u16 {
         .port()
 }
 
-/// One HTTP POST of a JSON-RPC body over loopback; returns the response body.
-fn post_raw(addr: &str, body: &str) -> String {
-    let mut s = TcpStream::connect(addr).expect("connect a2a http");
-    s.set_read_timeout(Some(Duration::from_secs(30))).ok();
-    let head = format!(
-        "POST / HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    s.write_all(head.as_bytes()).unwrap();
-    s.write_all(body.as_bytes()).unwrap();
-    s.flush().unwrap();
-    let mut reader = BufReader::new(s);
-    let mut status = String::new();
-    reader.read_line(&mut status).unwrap();
-    loop {
-        let mut l = String::new();
-        reader.read_line(&mut l).unwrap();
-        if l.trim().is_empty() {
-            break;
-        }
-    }
-    let mut b = String::new();
-    reader.read_to_string(&mut b).unwrap();
-    b
-}
-
-/// A JSON-RPC call over A2A; returns the `result` (panics — caught by
-/// `run_check` and reported as a failure — on a transport / RPC error).
-fn rpc(addr: &str, id: i64, method: &str, params: Value) -> Value {
-    let body = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string();
-    let resp = post_raw(addr, &body);
-    let v: Value =
-        serde_json::from_str(&resp).unwrap_or_else(|_| panic!("non-JSON A2A response: {resp:?}"));
-    assert!(v.get("error").is_none(), "A2A rpc error for {method}: {v}");
-    v["result"].clone()
-}
-
-/// Like [`rpc`], but returns the whole envelope so a check can assert on the
-/// JSON-RPC **error** — the half `rpc` deliberately panics on.
-fn rpc_raw(addr: &str, id: i64, method: &str, params: Value) -> Value {
-    let body = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string();
-    let resp = post_raw(addr, &body);
-    serde_json::from_str(&resp).unwrap_or_else(|_| panic!("non-JSON A2A response: {resp:?}"))
-}
-
-/// Block until the listener accepts a connection, or fail past the deadline.
-fn wait_ready(addr: &str) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if TcpStream::connect(addr).is_ok() {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "a2a listener never became connectable at {addr}"
-        );
-        std::thread::sleep(Duration::from_millis(25));
-    }
-}
-
 fn a2a_config(llm: &str, port: u16, extra: &str) -> String {
     format!(
         "config_version: \"1\"\n\
@@ -162,10 +103,11 @@ fn status_command(h: &Harness) -> Outcome {
     let _daemon = h.spawn(&["--config", &cfg]);
     wait_ready(&addr);
 
-    let params =
-        json!({"message": {"messageId": "m1", "parts": [{"data": {"agentd": {"op": "status"}}}]}});
-    let result = rpc(&addr, 1, "SendMessage", params);
-    let task = &result["task"];
+    let sent = send_command(&addr, 1, "status");
+    if sent.get("error").is_some() {
+        return Outcome::fail(format!("a status command should be answered: {sent}"));
+    }
+    let task = &sent["result"]["task"];
     Outcome::require(
         task["status"]["state"] == "TASK_STATE_COMPLETED",
         format!("a status command should complete: {task}"),
@@ -197,10 +139,8 @@ fn task_shape(h: &Harness) -> Outcome {
     let _daemon = h.spawn(&["--config", &cfg]);
     wait_ready(&addr);
 
-    let params =
-        json!({"message": {"messageId": "m1", "parts": [{"data": {"agentd": {"op": "status"}}}]}});
-    let sent = rpc(&addr, 1, "SendMessage", params);
-    let task = sent["task"].clone();
+    let sent = send_command(&addr, 1, "status");
+    let task = sent["result"]["task"].clone();
     let id = task["id"].as_str().unwrap_or("").to_string();
 
     let listed = rpc(&addr, 2, "ListTasks", json!({}));
@@ -264,7 +204,7 @@ fn agent_card(h: &Harness) -> Outcome {
     let _daemon = h.spawn(&["--config", &cfg]);
     wait_ready(&addr);
 
-    let card = rpc(&addr, 1, "GetAgentCard", json!({}));
+    let card = get_card(&addr);
     Outcome::require(
         card["name"] == "agentd",
         format!("card name should be agentd: {card}"),
@@ -292,7 +232,7 @@ fn card_honesty(h: &Harness) -> Outcome {
     let _daemon = h.spawn(&["--config", &cfg]);
     wait_ready(&addr);
 
-    let card = rpc(&addr, 1, "GetAgentCard", json!({}));
+    let card = get_card(&addr);
     let caps = &card["capabilities"];
 
     // Advertised as available ⇒ it must work. `streaming` is the one the card
@@ -301,12 +241,8 @@ fn card_honesty(h: &Harness) -> Outcome {
         // A streaming send answers with SSE, not a JSON body — so assert on the
         // stream: the spec's update frames must arrive and reach a terminal
         // state, which is exactly what "streaming: true" promises a caller.
-        let body = json!({
-            "jsonrpc": "2.0", "id": 2, "method": "SendStreamingMessage",
-            "params": {"message": {"messageId": "s1", "parts": [{"text": "hi"}]}}
-        })
-        .to_string();
-        let raw = post_raw(&addr, &body);
+        let body = rpc_body(2, "SendStreamingMessage", text_params("hi", None, false));
+        let raw = post(&addr, &body, &[]);
         if raw.contains("\"error\"") {
             return Outcome::fail(format!(
                 "the card advertises streaming but the stream carried an error: {raw}"
@@ -389,8 +325,11 @@ fn nl_message_artifact(h: &Harness) -> Outcome {
 
     // A natural-language message → a conversation turn → a completed task whose
     // artifact carries the model's answer (a blocking send waits for it).
-    let params = json!({"message": {"messageId": "m1", "parts": [{"text": "Say hello"}]}});
-    let result = rpc(&addr, 1, "SendMessage", params);
+    let sent = send_text(&addr, 1, "Say hello", false);
+    let result = &sent["result"];
+    if sent.get("error").is_some() {
+        return Outcome::fail(format!("SendMessage should succeed: {sent}"));
+    }
     let task = &result["task"];
     let task_id = match task["id"].as_str() {
         Some(id) => id.to_string(),

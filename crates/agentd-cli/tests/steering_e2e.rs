@@ -7,63 +7,20 @@
 
 mod common;
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-fn post_raw(addr: &str, body: &str) -> String {
-    let mut s = TcpStream::connect(addr).expect("connect a2a http");
-    s.set_read_timeout(Some(Duration::from_secs(130))).ok();
-    let head = format!(
-        "POST / HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    s.write_all(head.as_bytes()).unwrap();
-    s.write_all(body.as_bytes()).unwrap();
-    s.flush().unwrap();
-    let mut reader = BufReader::new(s);
-    let mut status = String::new();
-    reader.read_line(&mut status).unwrap();
-    loop {
-        let mut l = String::new();
-        reader.read_line(&mut l).unwrap();
-        if l.trim().is_empty() {
-            break;
-        }
-    }
-    let mut b = String::new();
-    reader.read_to_string(&mut b).unwrap();
-    b
-}
+use common::{SendMessage, rpc_result as rpc};
 
-fn rpc(addr: &str, id: i64, method: &str, params: Value) -> Value {
-    let body = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string();
-    let resp = post_raw(addr, &body);
-    let v: Value =
-        serde_json::from_str(&resp).unwrap_or_else(|_| panic!("non-JSON A2A response: {resp:?}"));
-    assert!(v.get("error").is_none(), "A2A rpc error for {method}: {v}");
-    v["result"].clone()
-}
-
-fn command(addr: &str, id: i64, op: &str, extra: Value) -> Value {
-    let mut data = json!({"op": op});
-    if let (Value::Object(d), Value::Object(x)) = (&mut data, extra) {
-        for (k, v) in x {
-            d.insert(k, v);
-        }
-    }
-    rpc(
-        addr,
-        id,
-        "SendMessage",
-        // Non-blocking: command tasks complete inline anyway, and workflow.run
-        // must NOT be polled to terminal — the tests steer runs mid-flight.
-        json!({"message": {"messageId": format!("m-{id}"), "parts": [{"data": {"agentd": data}}]},
-               "configuration": {"blocking": false}}),
-    )
+fn command(addr: &str, op: &str, args: Value) -> Value {
+    // Non-blocking: command tasks complete inline anyway, and workflow.run
+    // must NOT be polled to terminal — the tests steer runs mid-flight.
+    SendMessage::command(op, args)
+        .return_immediately()
+        .result(addr)
 }
 
 /// Parse a command task's JSON artifact.
@@ -83,7 +40,7 @@ fn artifact_json(v: &Value) -> Value {
 fn wait_run_id(addr: &str, secs: u64) -> String {
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
-        let ws = command(addr, 902, "workflow.status", json!({}));
+        let ws = command(addr, "workflow.status", json!({}));
         if let Some(id) = artifact_json(&ws)["runs"][0]["run"].as_str() {
             return id.to_string();
         }
@@ -98,7 +55,7 @@ fn wait_run_id(addr: &str, secs: u64) -> String {
 fn wait_run<F: Fn(&Value) -> bool>(addr: &str, run: &str, secs: u64, what: &str, pred: F) -> Value {
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
-        let ws = command(addr, 901, "workflow.status", json!({"run": run}));
+        let ws = command(addr, "workflow.status", json!({"run": run}));
         let view = artifact_json(&ws)["runs"][0].clone();
         if pred(&view) {
             return view;
@@ -227,7 +184,7 @@ fn a_signal_resumes_a_waiting_run() {
     let extra = "workflows:\n  - name: waiter\n    steps:\n      s: {kind: manual}\n      w: {kind: wait, on: signal, signal: go, depends_on: [s]}\n      f: {kind: finish, depends_on: [w], output: \"released\"}\n";
     let (_daemon, addr, cfg) = spawn_bound(|port| steer_config(&llm.uri, port, extra));
 
-    let started = command(&addr, 1, "workflow.run", json!({"name": "waiter"}));
+    let started = command(&addr, "workflow.run", json!({"name": "waiter"}));
     let task_id = started["task"]["id"].as_str().unwrap().to_string();
     // Find the run id + confirm it parks on the wait.
     let run_id = wait_run_id(&addr, 10);
@@ -238,7 +195,6 @@ fn a_signal_resumes_a_waiting_run() {
     // The steering verb: `workflow.signal` fires the named signal.
     let sig = command(
         &addr,
-        3,
         "workflow.signal",
         json!({"name": "go", "payload": {"by": "e2e"}}),
     );
@@ -260,19 +216,14 @@ fn a_single_run_pauses_and_resumes() {
     let extra = "workflows:\n  - name: slow\n    steps:\n      s: {kind: manual}\n      z: {kind: sleep, duration: 1s, depends_on: [s]}\n      f: {kind: finish, depends_on: [z], output: \"done\"}\n";
     let (_daemon, addr, cfg) = spawn_bound(|port| steer_config(&llm.uri, port, extra));
 
-    command(&addr, 1, "workflow.run", json!({"name": "slow"}));
+    command(&addr, "workflow.run", json!({"name": "slow"}));
     let run_id = wait_run_id(&addr, 10);
 
     // Pause the run mid-flight; it must NOT complete while paused.
-    let paused = artifact_json(&command(&addr, 3, "admin.pause", json!({"run": run_id})));
+    let paused = artifact_json(&command(&addr, "admin.pause", json!({"run": run_id})));
     assert_eq!(paused["paused"], run_id, "{paused}");
     std::thread::sleep(Duration::from_millis(1600)); // past the sleep deadline
-    let view = artifact_json(&command(
-        &addr,
-        4,
-        "workflow.status",
-        json!({"run": run_id}),
-    ))["runs"][0]
+    let view = artifact_json(&command(&addr, "workflow.status", json!({"run": run_id})))["runs"][0]
         .clone();
     assert_ne!(
         view["status"], "completed",
@@ -280,7 +231,7 @@ fn a_single_run_pauses_and_resumes() {
     );
 
     // Resume → completes.
-    let resumed = artifact_json(&command(&addr, 5, "admin.resume", json!({"run": run_id})));
+    let resumed = artifact_json(&command(&addr, "admin.resume", json!({"run": run_id})));
     assert_eq!(resumed["resumed"], run_id, "{resumed}");
     wait_run(&addr, &run_id, 10, "completion after resume", |v| {
         v["status"] == "completed"
@@ -294,18 +245,14 @@ fn a_global_pause_holds_new_work_and_resume_releases_it() {
     let (_daemon, addr, cfg) = spawn_bound(|port| steer_config(&llm.uri, port, ""));
 
     // Pause the instance; intake continues but nothing dispatches.
-    let paused = artifact_json(&command(&addr, 1, "admin.pause", json!({})));
+    let paused = artifact_json(&command(&addr, "admin.pause", json!({})));
     assert_eq!(paused["state"], "paused");
-    let st = command(&addr, 2, "status", json!({}));
+    let st = command(&addr, "status", json!({}));
     assert_eq!(artifact_json(&st)["paused"], true, "{st}");
 
-    let sent = rpc(
-        &addr,
-        3,
-        "SendMessage",
-        json!({"message": {"messageId": "m1", "parts": [{"text": "Hello during the pause"}]},
-               "configuration": {"blocking": false}}),
-    );
+    let sent = SendMessage::text("Hello during the pause")
+        .return_immediately()
+        .result(&addr);
     let task_id = sent["task"]["id"].as_str().unwrap().to_string();
     std::thread::sleep(Duration::from_millis(900));
     let held = rpc(&addr, 4, "GetTask", json!({"id": task_id}));
@@ -315,7 +262,7 @@ fn a_global_pause_holds_new_work_and_resume_releases_it() {
     );
 
     // Resume → the queued turn dispatches and completes.
-    command(&addr, 5, "admin.resume", json!({}));
+    command(&addr, "admin.resume", json!({}));
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let t = rpc(&addr, 6, "GetTask", json!({"id": task_id}));
@@ -349,18 +296,13 @@ fn subagent_send_injects_into_a_warm_subagent_and_plan_get_reads_the_plan() {
     }));
     let (_daemon, addr, cfg) = spawn_bound(|port| steer_config(&llm.uri, port, ""));
 
-    let sent = rpc(
-        &addr,
-        1,
-        "SendMessage",
-        json!({"message": {"messageId": "m1", "parts": [{"text": "Start a warm helper"}]}}),
-    );
+    let sent = SendMessage::text("Start a warm helper").result(&addr);
     assert_eq!(
         sent["task"]["status"]["state"], "TASK_STATE_COMPLETED",
         "{sent}"
     );
     // Find the warm handle.
-    let st = command(&addr, 2, "status", json!({}));
+    let st = command(&addr, "status", json!({}));
     let subs = artifact_json(&st)["subagents"].clone();
     let handle = subs[0]["handle"]
         .as_str()
@@ -370,19 +312,18 @@ fn subagent_send_injects_into_a_warm_subagent_and_plan_get_reads_the_plan() {
     // Steer it: inject a message over A2A.
     let injected = command(
         &addr,
-        3,
         "subagent.send",
         json!({"handle": handle, "message": "focus on the staging cluster"}),
     );
     assert_eq!(artifact_json(&injected)["ok"], true, "{injected}");
 
     // Unknown handle → clean error.
-    let body = json!({"jsonrpc": "2.0", "id": 4, "method": "SendMessage", "params": {"message": {"messageId": "m4", "parts": [{"data": {"agentd": {"op": "subagent.send", "handle": "nope", "message": "x"}}}]}}}).to_string();
-    let resp: Value = serde_json::from_str(&post_raw(&addr, &body)).unwrap();
+    let resp = SendMessage::command("subagent.send", json!({"handle": "nope", "message": "x"}))
+        .post(&addr);
     assert_eq!(resp["error"]["code"], -32602, "{resp}");
 
     // plan.get on the root conversation (operator).
-    let plan = command(&addr, 5, "plan.get", json!({}));
+    let plan = command(&addr, "plan.get", json!({}));
     assert!(
         artifact_json(&plan).get("plan").is_some(),
         "plan.get answers (plan may be null): {plan}"

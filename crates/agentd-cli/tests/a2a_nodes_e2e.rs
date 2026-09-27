@@ -19,11 +19,12 @@
 
 mod common;
 
-use serde_json::{Value, json};
-use std::io::{BufRead, BufReader, Read, Write};
+use serde_json::json;
 use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+
+use common::SendMessage;
 
 fn free_port() -> u16 {
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -78,42 +79,6 @@ fn wait_ready(addr: &str, d: &Daemon) {
     }
 }
 
-fn post(addr: &str, body: &str) -> String {
-    let mut s = TcpStream::connect(addr).expect("connect a2a");
-    s.set_read_timeout(Some(Duration::from_secs(30))).ok();
-    let head = format!(
-        "POST / HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    s.write_all(head.as_bytes()).unwrap();
-    s.write_all(body.as_bytes()).unwrap();
-    s.flush().unwrap();
-    let mut r = BufReader::new(s);
-    let mut line = String::new();
-    r.read_line(&mut line).unwrap();
-    loop {
-        let mut l = String::new();
-        r.read_line(&mut l).unwrap();
-        if l.trim().is_empty() {
-            break;
-        }
-    }
-    let mut b = String::new();
-    r.read_to_string(&mut b).unwrap();
-    b
-}
-
-fn send_message(addr: &str, parts: Value, ctx: Option<&str>) -> Value {
-    let mut message = json!({"messageId": "m-1", "role": "ROLE_USER", "parts": parts});
-    if let Some(c) = ctx {
-        message["contextId"] = json!(c);
-    }
-    let body = json!({"jsonrpc": "2.0", "id": 1, "method": "SendMessage",
-                      "params": {"message": message}})
-    .to_string();
-    serde_json::from_str(&post(addr, &body)).unwrap_or(Value::Null)
-}
-
 fn wait_for(d: &Daemon, needle: &str, secs: u64) -> bool {
     let deadline = Instant::now() + Duration::from_secs(secs);
     while Instant::now() < deadline {
@@ -156,11 +121,9 @@ fn an_a2a_start_node_turns_an_inbound_command_into_a_run() {
     let d = spawn(&cfg);
     wait_ready(&addr, &d);
 
-    let resp = send_message(
-        &addr,
-        json!([{"data": {"agentd": {"op": "review.start"}}}]),
-        Some("conv-a"),
-    );
+    let resp = SendMessage::command("review.start", json!({}))
+        .context("conv-a")
+        .post(&addr);
     assert!(
         resp.get("error").is_none(),
         "the command was refused: {resp}"
@@ -209,11 +172,9 @@ fn a_non_matching_message_is_still_a_conversation() {
     wait_ready(&addr, &d);
 
     // A different command: must NOT fire the start node.
-    send_message(
-        &addr,
-        json!([{"data": {"agentd": {"op": "status"}}}]),
-        Some("conv-b"),
-    );
+    let _ = SendMessage::command("status", json!({}))
+        .context("conv-b")
+        .post_raw(&addr);
     std::thread::sleep(Duration::from_millis(500));
     assert!(
         !d.stderr().contains("\"event\":\"start.a2a.fired\""),
@@ -268,11 +229,9 @@ fn an_a2a_wait_is_woken_by_the_message_it_waits_for() {
     );
 
     // Now say something on that conversation.
-    send_message(
-        &addr,
-        json!([{"text": "here is your answer"}]),
-        Some("conv-w"),
-    );
+    let _ = SendMessage::text("here is your answer")
+        .context("conv-w")
+        .post_raw(&addr);
 
     assert!(
         wait_for(&d, "\"event\":\"a2a.message.delivered\"", 15),
@@ -329,11 +288,9 @@ fn an_a2a_start_can_append_its_command_to_a_stream_instead_of_running() {
     let d = spawn(&cfg);
     wait_ready(&addr, &d);
 
-    let resp = send_message(
-        &addr,
-        json!([{"data": {"agentd": {"op": "telemetry.report"}}}]),
-        Some("conv-into"),
-    );
+    let resp = SendMessage::command("telemetry.report", json!({}))
+        .context("conv-into")
+        .post(&addr);
     assert!(
         resp.get("error").is_none(),
         "the command was refused: {resp}"

@@ -11,12 +11,13 @@
 
 mod common;
 
-use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+
+use common::{SendMessage, get_card, rpc_result as rpc};
 
 fn sigterm(pid: u32) {
     unsafe {
@@ -32,45 +33,6 @@ fn free_port() -> u16 {
         .local_addr()
         .unwrap()
         .port()
-}
-
-/// One HTTP POST of a JSON-RPC body; returns the response body once the
-/// connection closes. No `Origin` header (a non-browser peer is unaffected by
-/// the DNS-rebind guard).
-fn post_raw(addr: &str, body: &str) -> String {
-    let mut s = TcpStream::connect(addr).expect("connect a2a http");
-    s.set_read_timeout(Some(Duration::from_secs(130))).ok();
-    let head = format!(
-        "POST / HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    s.write_all(head.as_bytes()).unwrap();
-    s.write_all(body.as_bytes()).unwrap();
-    s.flush().unwrap();
-    let mut reader = BufReader::new(s);
-    let mut status = String::new();
-    reader.read_line(&mut status).unwrap();
-    loop {
-        let mut l = String::new();
-        reader.read_line(&mut l).unwrap();
-        if l.trim().is_empty() {
-            break;
-        }
-    }
-    let mut b = String::new();
-    reader.read_to_string(&mut b).unwrap();
-    b
-}
-
-/// A JSON-RPC call over A2A; returns the `result` (panics on a transport/RPC
-/// error, surfacing the body for diagnosis).
-fn rpc(addr: &str, id: i64, method: &str, params: Value) -> Value {
-    let body = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string();
-    let resp = post_raw(addr, &body);
-    let v: Value =
-        serde_json::from_str(&resp).unwrap_or_else(|_| panic!("non-JSON A2A response: {resp:?}"));
-    assert!(v.get("error").is_none(), "A2A rpc error for {method}: {v}");
-    v["result"].clone()
 }
 
 /// Wait until the daemon can actually answer, which is NOT the same as its
@@ -211,9 +173,7 @@ fn a_status_command_over_a2a_returns_a_completed_task_without_a_model_turn() {
     wait_ready(&addr, &daemon);
 
     // A `status` command DataPart is answered deterministically.
-    let params =
-        json!({"message": {"messageId": "m1", "parts": [{"data": {"agentd": {"op": "status"}}}]}});
-    let result = rpc(&addr, 1, "SendMessage", params);
+    let result = SendMessage::command("status", json!({})).result(&addr);
     let task = &result["task"];
     assert_eq!(
         task["status"]["state"], "TASK_STATE_COMPLETED",
@@ -228,7 +188,7 @@ fn a_status_command_over_a2a_returns_a_completed_task_without_a_model_turn() {
     );
 
     // The agent card is discoverable without a principal.
-    let card = rpc(&addr, 2, "GetAgentCard", json!({}));
+    let card = get_card(&addr);
     assert_eq!(card["name"], "agentd");
     assert_eq!(card["capabilities"]["streaming"], true);
 
@@ -246,8 +206,7 @@ fn a_natural_language_message_runs_a_turn_and_the_answer_is_the_task_artifact() 
 
     // A natural-language message → a conversation turn → a completed task whose
     // artifact carries the model's answer (blocking send waits for it).
-    let params = json!({"message": {"messageId": "m1", "parts": [{"text": "Say hello"}]}});
-    let result = rpc(&addr, 1, "SendMessage", params);
+    let result = SendMessage::text("Say hello").result(&addr);
     let task = &result["task"];
     let task_id = task["id"].as_str().unwrap().to_string();
     assert_eq!(
@@ -290,8 +249,7 @@ fn a_workflow_run_command_starts_a_run_and_the_task_tracks_it_to_completion() {
     wait_ready(&addr, &daemon);
 
     // A `workflow.run` command DataPart starts the run; its task begins working.
-    let params = json!({"message": {"messageId": "m1", "parts": [{"data": {"agentd": {"op": "workflow.run", "name": "greet"}}}]}});
-    let result = rpc(&addr, 1, "SendMessage", params);
+    let result = SendMessage::command("workflow.run", json!({"name": "greet"})).result(&addr);
     let task_id = result["task"]["id"].as_str().unwrap().to_string();
 
     // Poll GetTask until the run completes and the task tracks it.
@@ -363,9 +321,7 @@ fn a2a_calls_are_audited_when_the_audit_log_sink_is_on() {
     wait_ready(&addr, &daemon);
 
     // A deterministic `status` command drives one A2A call → one audit event.
-    let params =
-        json!({"message": {"messageId": "m1", "parts": [{"data": {"agentd": {"op": "status"}}}]}});
-    let _ = rpc(&addr, 1, "SendMessage", params);
+    let _ = SendMessage::command("status", json!({})).result(&addr);
 
     // The audit line lands on the daemon's JSON-lines stderr.
     let deadline = Instant::now() + Duration::from_secs(3);

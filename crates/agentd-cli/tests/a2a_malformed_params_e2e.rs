@@ -17,7 +17,6 @@
 
 mod common;
 
-use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -40,45 +39,22 @@ fn free_port() -> u16 {
         .port()
 }
 
-/// One HTTP POST of a JSON-RPC body, returning the response body — or the
-/// transport failure as `Err`, because "the listener hung up mid-request" is
+/// A JSON-RPC call whose `params` are handed over verbatim — the point of this
+/// suite is the shapes a typed client could never produce. The transport
+/// failure comes back as `Err`, because "the listener hung up mid-request" is
 /// exactly what the panic looked like from outside and must be reported as a
 /// failed assertion rather than an unwrap in the harness.
-fn post_raw(addr: &str, body: &str) -> Result<String, String> {
-    let mut s = TcpStream::connect(addr).map_err(|e| format!("connect: {e}"))?;
-    s.set_read_timeout(Some(Duration::from_secs(30))).ok();
-    let head = format!(
-        "POST / HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    s.write_all(head.as_bytes()).map_err(|e| e.to_string())?;
-    s.write_all(body.as_bytes()).map_err(|e| e.to_string())?;
-    s.flush().map_err(|e| e.to_string())?;
-    let mut reader = BufReader::new(s);
-    let mut status = String::new();
-    if reader.read_line(&mut status).map_err(|e| e.to_string())? == 0 {
-        return Err("the listener closed the connection without a response".into());
-    }
-    loop {
-        let mut l = String::new();
-        if reader.read_line(&mut l).map_err(|e| e.to_string())? == 0 {
-            break;
-        }
-        if l.trim().is_empty() {
-            break;
-        }
-    }
-    let mut b = String::new();
-    reader.read_to_string(&mut b).map_err(|e| e.to_string())?;
-    Ok(b)
+fn post_rpc(addr: &str, id: i64, method: &str, params: Value) -> Result<Value, String> {
+    parse(common::try_a2a_post(
+        addr,
+        &common::rpc_body(id, method, params),
+        &[],
+    )?)
 }
 
-/// A JSON-RPC call whose `params` are handed over verbatim — the point of this
-/// suite is the shapes a typed client could never produce.
-fn post_rpc(addr: &str, id: i64, method: &str, params: Value) -> Result<Value, String> {
-    let body = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string();
-    let resp = post_raw(addr, &body)?;
-    serde_json::from_str(&resp).map_err(|e| format!("non-JSON response ({e}): {resp:?}"))
+fn parse(reply: common::HttpReply) -> Result<Value, String> {
+    serde_json::from_str(&reply.body)
+        .map_err(|e| format!("non-JSON response ({e}): {:?}", reply.body))
 }
 
 fn wait_ready(addr: &str) {
@@ -161,31 +137,13 @@ fn config(port: u16) -> String {
 /// Open a `SubscribeToEvents` stream from `from_seq` and return the `hello`
 /// frame, then hang up — the frame is the whole contract under test.
 fn hello_frame(addr: &str, from_seq: u64) -> Value {
-    let body = json!({"jsonrpc": "2.0", "id": 77, "method": "SubscribeToEvents",
-                      "params": {"fromSeq": from_seq}})
-    .to_string();
-    let mut s = TcpStream::connect(addr).expect("connect sse");
-    s.set_read_timeout(Some(Duration::from_secs(10))).ok();
-    let head = format!(
-        "POST / HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    s.write_all(head.as_bytes()).unwrap();
-    s.write_all(body.as_bytes()).unwrap();
-    let mut reader = BufReader::new(s);
-    loop {
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => panic!("the feed never sent a hello frame"),
-            Ok(_) => {}
-        }
-        if let Some(data) = line.strip_prefix("data:")
-            && let Ok(v) = serde_json::from_str::<Value>(data.trim())
-            && let Some(hello) = v["result"].get("hello")
-        {
-            return hello.clone();
-        }
-    }
+    let mut reader = common::subscribe_feed(addr, from_seq, Duration::from_secs(10));
+    let mut hello = None;
+    common::read_frames(&mut reader, |v| {
+        hello = v["result"].get("hello").cloned();
+        hello.is_none()
+    });
+    hello.expect("the feed never sent a hello frame")
 }
 
 #[test]
@@ -232,9 +190,9 @@ fn malformed_send_params_are_refused_and_the_daemon_keeps_serving() {
 
     // The half that actually distinguishes a contained error from a dead
     // listener: a well-formed request over a NEW connection is still answered.
-    let status =
-        json!({"message": {"messageId": "m1", "parts": [{"data": {"agentd": {"op": "status"}}}]}});
-    let v = post_rpc(&addr, 1, "SendMessage", status)
+    let v = common::SendMessage::command("status", json!({}))
+        .try_post_raw(&addr)
+        .and_then(parse)
         .unwrap_or_else(|e| panic!("the listener stopped answering after malformed input: {e}"));
     assert_eq!(
         v["result"]["task"]["status"]["state"], "TASK_STATE_COMPLETED",

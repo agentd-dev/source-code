@@ -15,6 +15,11 @@ export interface Endpoint {
   url: string;
   /** Bearer for a listener with `a2a.bearer` / a `bearer_ref` principal. */
   bearer?: string;
+  /**
+   * The `tenant` the selected card interface declares. When set it is written
+   * into the params of every request; the spec requires exactly that value.
+   */
+  tenant?: string;
 }
 
 /** A2A `Task.status.state` values (RFC 0029 §4). */
@@ -196,18 +201,96 @@ export interface MirrorState {
   lastSeq: number;
 }
 
-/** A JSON-RPC error surfaced to the caller. */
+/**
+ * A parsed `WWW-Authenticate` challenge (RFC 7235 / RFC 6750 §3). `error` is
+ * what tells a revoked or expired session (`invalid_token`) from a request
+ * that never carried a credential.
+ */
+export interface BearerChallenge {
+  scheme: string;
+  realm?: string;
+  error?: string;
+  errorDescription?: string;
+  /** RFC 9728 protected-resource metadata URL. */
+  resourceMetadata?: string;
+}
+
+/** What an error carries beyond its code and message. */
+export interface RpcErrorExtra {
+  /** The JSON-RPC `error.data`, verbatim (the `@type`d google.rpc details). */
+  data?: Json;
+  /** The HTTP status the error arrived with. */
+  status?: number;
+  challenge?: BearerChallenge;
+  /** `Retry-After`, in milliseconds. */
+  retryAfterMs?: number;
+}
+
+/**
+ * A JSON-RPC error surfaced to the caller. An HTTP error with no JSON-RPC
+ * body keeps `code = -status`.
+ */
 export class RpcError extends Error {
   code: number;
-  constructor(code: number, message: string) {
+  data?: Json;
+  status?: number;
+  challenge?: BearerChallenge;
+  retryAfterMs?: number;
+  constructor(code: number, message: string, extra: RpcErrorExtra = {}) {
     super(message);
     this.code = code;
     this.name = 'RpcError';
+    if (extra.data !== undefined) this.data = extra.data;
+    if (extra.status !== undefined) this.status = extra.status;
+    if (extra.challenge !== undefined) this.challenge = extra.challenge;
+    if (extra.retryAfterMs !== undefined) this.retryAfterMs = extra.retryAfterMs;
   }
 }
 
-/** The server's "this surface is off" code (UNSUPPORTED_OPERATION). */
+/**
+ * A failure this client decided on its own, without (or before) a JSON-RPC
+ * error from the agent: discovery refusals, extension checks, and replies it
+ * cannot trust.
+ */
+export type ClientErrorKind =
+  | 'discovery'
+  | 'no-interface'
+  | 'cross-origin'
+  | 'required-extension'
+  | 'extension-not-declared'
+  | 'extension-not-activated'
+  | 'op-not-offered'
+  | 'invalid-response'
+  | 'unsupported-scheme'
+  /** The feed ended with goodbye `revoked`: the session is gone. */
+  | 'session-revoked'
+  /** The credential's own expiry passed (there is no refresh token). */
+  | 'session-expired';
+
+export class ClientError extends Error {
+  kind: ClientErrorKind;
+  constructor(kind: ClientErrorKind, message: string) {
+    super(message);
+    this.kind = kind;
+    this.name = 'ClientError';
+  }
+}
+
+// The JSON-RPC and A2A error codes the client acts on (A2A 1.0 §5.4; the
+// -314xx pair is agentd's HTTP-status mirror, outside the reserved range).
+export const PARSE_ERROR = -32700;
+export const INVALID_REQUEST = -32600;
+export const METHOD_NOT_FOUND = -32601;
+export const INVALID_PARAMS = -32602;
+export const INTERNAL_ERROR = -32603;
+export const TASK_NOT_FOUND = -32001;
+/** The server's "this surface is off" code. */
 export const UNSUPPORTED_OPERATION = -32004;
+export const CONTENT_TYPE_NOT_SUPPORTED = -32005;
+export const EXTENSION_SUPPORT_REQUIRED = -32008;
+export const VERSION_NOT_SUPPORTED = -32009;
+export const UNAUTHENTICATED = -31401;
+export const PERMISSION_DENIED = -31403;
 
 /** One step transition, as the observation feed reports it. */
 export type StepRow = {

@@ -8,7 +8,7 @@ import { sseParser, normalizeTask, Mirror } from '../dist/client/index.js';
 
 test('sse parser handles chunk boundaries, multi-line data and comments', () => {
   const got = [];
-  const feed = sseParser((d) => got.push(d));
+  const feed = sseParser((ev) => got.push(ev.data));
   // A frame split across chunks, a keep-alive comment, then two frames at once.
   feed('data: {"a"');
   feed(':1}\n');
@@ -267,11 +267,13 @@ test('a command send announces the extension whose vocabulary it uses', async ()
   const seen = [];
   const realFetch = globalThis.fetch;
   globalThis.fetch = async (url, init) => {
-    seen.push({ url, headers: init.headers, body: JSON.parse(init.body) });
-    return {
-      ok: true,
-      json: async () => ({ jsonrpc: '2.0', id: 1, result: { task: null } }),
-    };
+    const body = JSON.parse(init.body);
+    seen.push({ url, headers: init.headers, body });
+    // A real reply: the transport checks the envelope and the echoed id.
+    return new Response(JSON.stringify({ jsonrpc: '2.0', id: body.id, result: { task: null } }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
   };
   try {
     const c = new AgentdClient({ url: 'http://127.0.0.1:9/' });

@@ -13,11 +13,10 @@ import {
   Json,
   PairedSession,
   PairingCode,
-  RpcError,
   TaskState,
   TaskView,
 } from './types.js';
-import { COMMAND_EXTENSION, INTERFACE_EXTENSION, rpc, rpcStream, StreamFrame } from './wire.js';
+import { COMMAND_EXTENSION, INTERFACE_EXTENSION, rpc, rpcStream } from './wire.js';
 
 /**
  * Epoch milliseconds from either form of timestamp.
@@ -142,7 +141,7 @@ export class AgentdClient {
     };
     if (contextId) message.contextId = contextId;
     // A command DataPart is the command extension's vocabulary — say so.
-    return rpc(this.ep, 'SendMessage', { message }, [COMMAND_EXTENSION]);
+    return rpc(this.ep, 'SendMessage', { message }, { exts: [COMMAND_EXTENSION] });
   }
 
   /**
@@ -320,7 +319,7 @@ export class AgentdClient {
    * Attach to the global observation feed. `onHello`/`onEvent` fire as frames
    * land; resolves with the goodbye cursor when the server ends the stream
    * (deadline — reconnect with `fromSeq`), rejects on transport errors or a
-   * server error frame.
+   * server error (the transport throws both).
    */
   async subscribeEvents(
     fromSeq: number,
@@ -329,43 +328,32 @@ export class AgentdClient {
     signal?: AbortSignal,
   ): Promise<{ seq: number }> {
     let goodbye: { seq: number } = { seq: fromSeq };
-    let errorFrame: { code: number; message: string } | undefined;
     await rpcStream(
       this.ep,
       'SubscribeToEvents',
       { fromSeq },
-      (frame: StreamFrame) => {
-        if (frame.error) {
-          errorFrame = frame.error;
-          return;
-        }
-        const r = frame.result as { [k: string]: Json } | undefined;
-        if (!r) return;
+      (result) => {
+        const r = result as { [k: string]: Json } | null;
+        if (!r || typeof r !== 'object') return;
         if (r.hello) onHello(r.hello as unknown as FeedHello);
         else if (r.event) onEvent(r.event as unknown as FeedEvent);
         else if (r.goodbye) goodbye = { seq: ((r.goodbye as { [k: string]: Json }).seq as number) ?? fromSeq };
       },
-      signal,
-      [INTERFACE_EXTENSION],
+      { signal, exts: [INTERFACE_EXTENSION] },
     );
-    if (errorFrame) throw new RpcError(errorFrame.code, errorFrame.message);
     return goodbye;
   }
 
-  /** Attach to one task's stream (status/artifact frames until terminal). */
+  /**
+   * Attach to one task's stream (status/artifact frames until terminal).
+   * Rejects on an error — a terminal or unknown task is an answer, not an
+   * empty stream.
+   */
   async subscribeTask(
     id: string,
     onFrame: (frame: Json) => void,
     signal?: AbortSignal,
   ): Promise<void> {
-    await rpcStream(
-      this.ep,
-      'SubscribeToTask',
-      { id },
-      (frame) => {
-        if (frame.result) onFrame(frame.result);
-      },
-      signal,
-    );
+    await rpcStream(this.ep, 'SubscribeToTask', { id }, (result) => onFrame(result), { signal });
   }
 }

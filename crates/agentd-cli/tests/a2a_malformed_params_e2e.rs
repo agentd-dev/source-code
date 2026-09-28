@@ -171,10 +171,14 @@ fn malformed_send_params_are_refused_and_the_daemon_keeps_serving() {
         let id = 100 + i as i64;
         let v = post_rpc(&addr, id, "SendMessage", params.clone())
             .unwrap_or_else(|e| panic!("params {params} killed the request: {e}"));
-        assert!(
-            v.get("error").is_some(),
-            "params {params} must be refused, not accepted: {v}"
+        // Invalid params, whichever layer saw it first: the listener's
+        // envelope check for params that are not an object, a2a-rs's typed
+        // read for an object whose `message` is not one.
+        assert_eq!(
+            v["error"]["code"], -32602,
+            "params {params} must be refused as invalid params: {v}"
         );
+        assert_eq!(v["id"], id, "the refusal answers the request: {v}");
         assert!(
             v.get("result").is_none(),
             "params {params} must not produce a result: {v}"
@@ -183,6 +187,23 @@ fn malformed_send_params_are_refused_and_the_daemon_keeps_serving() {
         assert!(
             daemon.alive(),
             "the daemon died on params {params}\nstderr:\n{}",
+            daemon.stderr()
+        );
+    }
+
+    // An envelope that is not a request at all — no id, a batch — is refused
+    // as one, and the daemon stays up for those too.
+    for body in [
+        r#"{"jsonrpc":"2.0","method":"SendMessage","params":{"message":[]}}"#,
+        r#"[{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":[]}]"#,
+    ] {
+        let v = common::try_a2a_post(&addr, body, &[])
+            .and_then(parse)
+            .unwrap_or_else(|e| panic!("{body} killed the request: {e}"));
+        assert_eq!(v["error"]["code"], -32600, "{body}: {v}");
+        assert!(
+            daemon.alive(),
+            "the daemon died on {body}\nstderr:\n{}",
             daemon.stderr()
         );
     }

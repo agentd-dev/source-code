@@ -33,23 +33,34 @@
 //! refused by it. Refusals of callers nobody vouched for are logged once per
 //! source per window rather than once per request ([`limits::DenialLog`]).
 //!
-//! ## Two vocabularies on one endpoint
+//! ## One pipeline, one vocabulary
 //!
-//! Most methods are the specification's. A few are answered here rather than
-//! passed down: the observation feed the display clients read
-//! (`SubscribeToEvents`) is agentd's own, so a2a-rs correctly does not know
-//! it; the public card read (`GetAgentCard`)
-//! is agentd's convenience over a document the spec publishes only at
-//! `.well-known`, and both must answer with the *same* card; and the spec's own
-//! `GetExtendedAgentCard` is served locally too — it is that card plus the
-//! skills this caller may actually run, and a round trip through the SDK's
-//! typed `AgentCard` drops any field it has no place for. Operator admin is not
-//! a method family: `admin.drain`, `admin.pause` and their siblings ride in as
-//! command DataParts on `SendMessage` and are handled in
-//! [`crate::runtime::a2a_server`]. Anything else goes to the protocol layer,
-//! including the methods it implements that agentd does not, so an
-//! unimplemented method is refused with the code the spec assigns rather than a
-//! generic failure.
+//! Every POST goes through the same steps in the same order, and each refusal
+//! is final and plain JSON — never an SSE frame: the origin, the content type,
+//! the caller, the JSON-RPC envelope (an `id` is required: a notification
+//! would be executed with nobody to answer), the `A2A-Version`, admission,
+//! the method, the method's authorization, and the command and task checks
+//! that need the params. `dispatch.rs` carries the order and why each step sits
+//! where it does.
+//!
+//! The method names are the route table's ([`crate::runtime::surface::route_of`]):
+//! the specification's eleven and the extension methods agentd declares,
+//! matched exactly. The public card is not a method — the spec publishes it at
+//! `/.well-known/agent-card.json` — and the old spellings (an `a2a.` prefix,
+//! the 0.3 names, the card read as a call) are `-32601` like any other unknown
+//! name.
+//!
+//! Most of the table is a2a-rs's to answer. A few calls are answered here:
+//! the command ops that reply with a Message (a read has no task for the
+//! protocol layer to frame), the push-config listing (a2a-rs 0.10 drops its
+//! paging), and the observation feed a display client reads, which a2a-rs
+//! correctly does not know. Operator admin is not a method family: `admin.*`
+//! rides in as a command DataPart on `SendMessage` and is handled in
+//! [`crate::runtime::a2a_server`].
+//!
+//! What a2a-rs answers passes back through one filter on the way out, so a
+//! refusal the runtime made reaches the caller as the runtime made it rather
+//! than as a2a-rs reworded it (see [`ports::RequestScope::error`]).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -58,6 +69,7 @@ use axum::Router;
 use axum::routing::{get, post};
 use serde_json::json;
 
+use crate::a2a::Principal;
 use crate::a2a::ports::{self, RuntimePorts};
 use crate::obs::log::Logger;
 use crate::runtime::a2a_server::{A2aBridge, SharedFeed};
@@ -70,7 +82,7 @@ mod identity;
 /// Per-source failure limits and per-principal admission.
 mod limits;
 
-use card::{CardFromRuntime, card};
+use card::{CardFromRuntime, card, card_preflight};
 use cors::preflight;
 use dispatch::rpc;
 pub use identity::{Auth, PeerId};
@@ -143,9 +155,28 @@ struct App {
     /// that kept honouring the old list — the same shape as the webhook
     /// secret that would not rotate.
     cors_origins: OriginList,
+    /// How long a call handed to a2a-rs may take to produce its first byte:
+    /// the fidelity filter waits this long for a stream's first event.
+    request_timeout: Duration,
     stream_deadline: Duration,
+    /// Whether a caller's session is still alive, consulted while its
+    /// requests are in flight. `None` until a session store installs one.
+    liveness: Option<Liveness>,
     log: Logger,
 }
+
+/// For a caller, the check that says whether its session is still alive — or
+/// `None` when the caller holds no session that could end.
+///
+/// A revoked session must not keep what it already opened: a stream a2a-rs
+/// is serving outlives the request that authenticated it, and a unary call
+/// can wait on a turn for minutes. While the check answers `false`, an SSE
+/// body ends within one tick and a unary wait is answered with the 401 a
+/// revoked token gets.
+pub type Liveness = Arc<dyn Fn(&Principal) -> Option<LivenessCheck> + Send + Sync>;
+
+/// One session's liveness: `true` while it may still be served.
+pub type LivenessCheck = Arc<dyn Fn() -> bool + Send + Sync>;
 
 /// Where the listener binds: a TCP authority, or a unix socket path (the
 /// co-located-peer transport — same protocol, kernel-authenticated).
@@ -179,31 +210,10 @@ pub fn spawn(
         runtime.handle().clone(),
         log.clone(),
     ));
-    let ports = RuntimePorts::new(Arc::clone(&bridge), Arc::clone(&updates));
-    let adapter = Arc::new(
-        a2a_rs::adapter::JsonRpcAdapter::with_handler(ports, CardFromRuntime(Arc::clone(&bridge)))
-            .with_streaming_handler(ports::SharedStreaming(updates)),
-    );
-
-    let app = Arc::new(App {
-        protocol: a2a_rs::adapter::jsonrpc_router(adapter),
-        bridge: Arc::clone(&bridge),
-        auth: opts.auth,
-        failures: limits::SourceLimiter::auth_failures(),
-        denials: limits::DenialLog::listener(),
-        rates: limits::PrincipalRates::default(),
-        cors_origins: opts.cors_origins,
-        stream_deadline: opts.stream_deadline,
-        log: log.clone(),
-    });
+    let tls = opts.tls.clone();
+    let app = Arc::new(App::new(bridge, opts, updates, log.clone()));
     let _ = feed;
-
-    let router = Router::new()
-        .route("/", post(rpc).options(preflight))
-        // Discovery: the card is public, by both of its conventional paths.
-        .route("/.well-known/agent-card.json", get(card))
-        .route("/.well-known/agent.json", get(card))
-        .with_state(Arc::clone(&app));
+    let router = router(app);
 
     let bound;
     match &bind {
@@ -215,7 +225,6 @@ pub fn spawn(
                 .local_addr()
                 .map(|a| a.to_string())
                 .unwrap_or_else(|_| authority.clone());
-            let tls = opts.tls;
             runtime.spawn(accept_loop(listener, router, tls, log));
         }
         Bind::Unix(path) => {
@@ -282,6 +291,51 @@ pub fn spawn(
         sink,
         _runtime: runtime,
     })
+}
+
+impl App {
+    /// The listener's state, with a2a-rs wired to the runtime's ports.
+    fn new(
+        bridge: Arc<A2aBridge>,
+        opts: Opts,
+        updates: Arc<a2a_rs::adapter::InMemoryStreamingHandler>,
+        log: Logger,
+    ) -> App {
+        let ports = RuntimePorts::new(Arc::clone(&bridge), Arc::clone(&updates));
+        let adapter = Arc::new(
+            a2a_rs::adapter::JsonRpcAdapter::with_handler(
+                ports,
+                CardFromRuntime(Arc::clone(&bridge)),
+            )
+            .with_streaming_handler(ports::SharedStreaming(updates)),
+        );
+        App {
+            protocol: a2a_rs::adapter::jsonrpc_router(adapter),
+            bridge,
+            auth: opts.auth,
+            failures: limits::SourceLimiter::auth_failures(),
+            denials: limits::DenialLog::listener(),
+            rates: limits::PrincipalRates::default(),
+            cors_origins: opts.cors_origins,
+            request_timeout: opts.request_timeout,
+            stream_deadline: opts.stream_deadline,
+            liveness: None,
+            log,
+        }
+    }
+}
+
+/// The listener's routes. The card has one path: `/.well-known/agent.json`
+/// was the pre-1.0 name, and a client still asking there is told 404 rather
+/// than handed a document it would read with the wrong expectations.
+fn router(app: Arc<App>) -> Router {
+    Router::new()
+        .route("/", post(rpc).options(preflight))
+        .route(
+            "/.well-known/agent-card.json",
+            get(card).options(card_preflight),
+        )
+        .with_state(app)
 }
 
 /// The live browser-origin allowlist, revisable by a reload.
@@ -380,5 +434,588 @@ where
         .await
     {
         log.debug("a2a.conn", json!({"err": e.to_string()}));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::identity::{Peer, PeerId};
+    use super::*;
+    use crate::runtime::a2a_server::A2aRequest;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode, header};
+    use axum::response::Response;
+    use futures_util::StreamExt;
+    use serde_json::Value;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Instant;
+    use tower::ServiceExt;
+
+    /// A listener over a stand-in reactor that answers each request with
+    /// `answer`, each on its own thread so a slow answer holds up no other.
+    /// Loopback-bound with nothing configured, so the test's local caller is
+    /// the implicit operator. Also returns how many requests reached the
+    /// runtime, which is how a refusal proves it cost the runtime nothing.
+    fn listener(
+        answer: impl Fn(&A2aRequest) -> Value + Send + Sync + 'static,
+        liveness: Option<Liveness>,
+    ) -> (Router, Arc<AtomicUsize>) {
+        let resolver = crate::a2a::Resolver::build(
+            &serde_json::from_value(json!({"listen": "http://127.0.0.1:0"})).unwrap(),
+            &|_| None,
+        )
+        .unwrap();
+        let reached = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&reached);
+        let answer = Arc::new(answer);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            while let Ok(crate::runtime::events::Event::A2a(req)) = rx.recv() {
+                counted.fetch_add(1, Ordering::SeqCst);
+                let answer = Arc::clone(&answer);
+                std::thread::spawn(move || {
+                    let _ = req.reply.send(answer(&req));
+                });
+            }
+        });
+        let log = Logger::new(
+            crate::obs::log::LogCtx {
+                run_id: "r".into(),
+                agent_id: "0".into(),
+                agent_path: "0".into(),
+                comp: crate::obs::log::Comp::Supervisor,
+                pid: std::process::id(),
+                trace_id: None,
+            },
+            crate::obs::log::Level::Error,
+        );
+        let opts = Opts {
+            auth: Auth::default(),
+            cors_origins: Arc::default(),
+            tls: None,
+            request_timeout: Duration::from_secs(5),
+            stream_deadline: Duration::from_secs(5),
+        };
+        let updates = Arc::new(a2a_rs::adapter::InMemoryStreamingHandler::new());
+        let mut app = App::new(A2aBridge::new(tx, resolver), opts, updates, log);
+        app.liveness = liveness;
+        let router = router(Arc::new(app))
+            .layer(axum::Extension(PeerId::default()))
+            .layer(axum::Extension(Peer::Tcp(
+                "127.0.0.1:5000".parse().unwrap(),
+            )));
+        (router, reached)
+    }
+
+    /// A POST of `body` with the spec's headers, minus any named in `drop`,
+    /// plus `extra`.
+    async fn post(router: &Router, body: &str, drop: &[&str], extra: &[(&str, &str)]) -> Response {
+        let mut req = Request::builder().method("POST").uri("/");
+        for (k, v) in [("content-type", "application/json"), ("a2a-version", "1.0")] {
+            if !drop.contains(&k) {
+                req = req.header(k, v);
+            }
+        }
+        for (k, v) in extra {
+            req = req.header(*k, *v);
+        }
+        router
+            .clone()
+            .oneshot(req.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap()
+    }
+
+    async fn json_of(resp: Response) -> Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes)
+            .unwrap_or_else(|e| panic!("not JSON ({e}): {}", String::from_utf8_lossy(&bytes)))
+    }
+
+    fn task_not_found() -> Value {
+        json!({"_error": {"code": -32001, "message": "task not found"}})
+    }
+
+    /// Every POST states the protocol it speaks. A missing header, an empty
+    /// one and any version but 1.0 are -32009 at HTTP 200, with the id echoed
+    /// and the version this listener does speak — and nothing reaches the
+    /// runtime. A 1.0 client with any patch is let through.
+    #[tokio::test]
+    async fn version_gate() {
+        let (router, reached) = listener(|_| task_not_found(), None);
+        let body = r#"{"jsonrpc":"2.0","id":"v1","method":"GetTask","params":{"id":"task-1"}}"#;
+        for header in [
+            None,
+            Some(""),
+            Some("0.3"),
+            Some("1.1"),
+            Some("2.0"),
+            Some("1"),
+        ] {
+            let extra: Vec<(&str, &str)> = header.map(|h| ("a2a-version", h)).into_iter().collect();
+            let resp = post(&router, body, &["a2a-version"], &extra).await;
+            assert_eq!(resp.status(), StatusCode::OK, "{header:?}");
+            let v = json_of(resp).await;
+            assert_eq!(v["id"], "v1", "{header:?}: {v}");
+            assert_eq!(v["error"]["code"], -32009, "{header:?}: {v}");
+            let info = &v["error"]["data"][0];
+            assert_eq!(info["reason"], "VERSION_NOT_SUPPORTED", "{v}");
+            assert_eq!(info["domain"], "a2a-protocol.org", "{v}");
+            assert_eq!(info["metadata"]["supportedVersions"], "1.0", "{v}");
+        }
+        // Before the route table: a 0.3 client asking for a 0.3 method is
+        // told about the version, which is what it can act on.
+        let v = json_of(
+            post(
+                &router,
+                r#"{"jsonrpc":"2.0","id":2,"method":"tasks/get"}"#,
+                &["a2a-version"],
+                &[],
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(v["error"]["code"], -32009, "{v}");
+        assert_eq!(
+            reached.load(Ordering::SeqCst),
+            0,
+            "a refusal reached the runtime"
+        );
+
+        for ok in ["1.0", "1.0.3", " 1.0 "] {
+            let v =
+                json_of(post(&router, body, &["a2a-version"], &[("a2a-version", ok)]).await).await;
+            assert_eq!(v["error"]["code"], -32001, "{ok:?} is let through: {v}");
+        }
+        assert!(reached.load(Ordering::SeqCst) > 0);
+    }
+
+    /// Every malformed envelope is refused before it can be anything else,
+    /// and none reaches the runtime. A request with no `id` — a JSON-RPC
+    /// notification — and one with `id: null` are refused rather than run: a
+    /// send nobody can be answered about is a task nobody can find.
+    #[tokio::test]
+    async fn envelope_validation() {
+        let (router, reached) = listener(|_| task_not_found(), None);
+        let cases: &[(&str, i64, Value)] = &[
+            ("not json", -32700, Value::Null),
+            ("[]", -32600, Value::Null),
+            (
+                r#"[{"jsonrpc":"2.0","id":1,"method":"GetTask"}]"#,
+                -32600,
+                Value::Null,
+            ),
+            (r#""GetTask""#, -32600, Value::Null),
+            ("7", -32600, Value::Null),
+            (r#"{"id":1,"method":"GetTask"}"#, -32600, json!(1)),
+            (
+                r#"{"jsonrpc":"1.0","id":1,"method":"GetTask"}"#,
+                -32600,
+                json!(1),
+            ),
+            (
+                r#"{"jsonrpc":2.0,"id":1,"method":"GetTask"}"#,
+                -32600,
+                json!(1),
+            ),
+            (r#"{"jsonrpc":"2.0","id":1}"#, -32600, json!(1)),
+            (r#"{"jsonrpc":"2.0","id":1,"method":""}"#, -32600, json!(1)),
+            (r#"{"jsonrpc":"2.0","id":1,"method":7}"#, -32600, json!(1)),
+            // No id, a null id, and ids JSON-RPC's integer-or-string rule
+            // does not admit.
+            (
+                r#"{"jsonrpc":"2.0","method":"GetTask","params":{"id":"t"}}"#,
+                -32600,
+                Value::Null,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":null,"method":"GetTask"}"#,
+                -32600,
+                Value::Null,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":1.5,"method":"GetTask"}"#,
+                -32600,
+                Value::Null,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":{},"method":"GetTask"}"#,
+                -32600,
+                Value::Null,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":[1],"method":"GetTask"}"#,
+                -32600,
+                Value::Null,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":true,"method":"GetTask"}"#,
+                -32600,
+                Value::Null,
+            ),
+            // Params, when present, are an object.
+            (
+                r#"{"jsonrpc":"2.0","id":"p","method":"GetTask","params":[]}"#,
+                -32602,
+                json!("p"),
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":"p","method":"GetTask","params":"t"}"#,
+                -32602,
+                json!("p"),
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":"p","method":"GetTask","params":null}"#,
+                -32602,
+                json!("p"),
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":3,"method":"SendMessage","params":7}"#,
+                -32602,
+                json!(3),
+            ),
+        ];
+        for (body, code, id) in cases {
+            let resp = post(&router, body, &[], &[]).await;
+            assert_eq!(resp.status(), StatusCode::OK, "{body}");
+            let v = json_of(resp).await;
+            assert_eq!(v["error"]["code"], *code, "{body}: {v}");
+            assert_eq!(v["id"], *id, "{body}: {v}");
+        }
+        let v =
+            json_of(post(&router, r#"{"jsonrpc":"2.0","method":"GetTask"}"#, &[], &[]).await).await;
+        assert_eq!(
+            v["error"]["message"], "A2A requests must carry an id",
+            "{v}"
+        );
+        let v = json_of(post(&router, "[]", &[], &[]).await).await;
+        assert_eq!(
+            v["error"]["message"], "batch requests are not supported",
+            "{v}"
+        );
+
+        // The content type comes first, and its refusal has no body at all.
+        for ct in [
+            None,
+            Some("text/plain"),
+            Some("application/x-www-form-urlencoded"),
+        ] {
+            let extra: Vec<(&str, &str)> = ct.map(|c| ("content-type", c)).into_iter().collect();
+            let resp = post(
+                &router,
+                r#"{"jsonrpc":"2.0","id":1,"method":"GetTask"}"#,
+                &["content-type"],
+                &extra,
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE, "{ct:?}");
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(body.is_empty(), "{ct:?}");
+        }
+        assert_eq!(
+            reached.load(Ordering::SeqCst),
+            0,
+            "a refusal reached the runtime"
+        );
+
+        // With parameters and in any case, JSON is JSON.
+        let v = json_of(
+            post(
+                &router,
+                r#"{"jsonrpc":"2.0","id":1,"method":"GetTask","params":{"id":"t"}}"#,
+                &["content-type"],
+                &[("content-type", "Application/JSON; charset=utf-8")],
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(v["error"]["code"], -32001, "{v}");
+    }
+
+    /// An error envelope as a2a-rs writes it.
+    fn sdk_error(code: i64, message: &str) -> Value {
+        json!({"jsonrpc": "2.0", "id": 1, "error": {"code": code, "message": message,
+            "data": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "JSON_RPC_ERROR", "domain": "a2a-rs"}]}})
+    }
+
+    fn unary_response(v: &Value) -> Response {
+        axum::response::IntoResponse::into_response(axum::Json(v.clone()))
+    }
+
+    fn sse_response(body: &'static str) -> Response {
+        Response::builder()
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    fn fidelity(kept: Option<Value>, bearer_used: bool) -> dispatch::Fidelity {
+        dispatch::Fidelity {
+            kept,
+            bearer_used,
+            list_tasks: false,
+        }
+    }
+
+    async fn filtered(resp: Response, f: dispatch::Fidelity) -> Response {
+        dispatch::faithful(resp, f, Duration::from_secs(5), None).await
+    }
+
+    /// What a2a-rs answers reaches the caller in the runtime's words: the
+    /// runtime's error object replaces a2a-rs's rendering of it byte for
+    /// byte, with the status its code travels with; an error a2a-rs raised
+    /// on its own keeps a2a-rs's answer, minus the codes it invented; and a
+    /// stream that opens with an error is answered as JSON.
+    #[tokio::test]
+    async fn error_fidelity_filter() {
+        let draining = json!({"code": -32603, "message": "the agent is draining",
+            "data": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "DRAINING", "domain": "agentd.dev"}]});
+        let resp = filtered(
+            unary_response(&sdk_error(-32603, "JSON-RPC error: -32603 - x")),
+            fidelity(Some(draining.clone()), false),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = json_of(resp).await;
+        assert_eq!(v["error"], draining, "the runtime's object, whole: {v}");
+        assert_eq!(v["id"], 1);
+
+        // A kept refusal of the caller carries its status and its challenge.
+        let denied = json!({"code": -31403, "message": "admin.drain is not permitted for user:a"});
+        let resp = filtered(
+            unary_response(&sdk_error(-31403, "JSON-RPC error: -31403 - admin.drain")),
+            fidelity(Some(denied.clone()), true),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(
+            resp.headers()[header::WWW_AUTHENTICATE]
+                .to_str()
+                .unwrap()
+                .contains("error=\"insufficient_scope\"")
+        );
+        assert_eq!(json_of(resp).await["error"], denied);
+
+        // a2a-rs's own error: its band of invented codes is folded, and the
+        // rest is left as a2a-rs wrote it.
+        let v = json_of(
+            filtered(
+                unary_response(&sdk_error(-32102, "Context belongs to another principal")),
+                fidelity(None, false),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(v["error"]["code"], -32603, "{v}");
+        let own = sdk_error(-32602, "Invalid params: x");
+        let v = json_of(filtered(unary_response(&own), fidelity(None, false)).await).await;
+        assert_eq!(v, own);
+        // A kept refusal is not borrowed by an error with another code.
+        let v = json_of(
+            filtered(
+                unary_response(&own),
+                fidelity(Some(draining.clone()), false),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(v, own);
+
+        // A stream whose first event is an error is a JSON answer instead.
+        let resp = filtered(
+            sse_response("data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32603,\"message\":\"JSON-RPC error: -32603 - x\"}}\n\n"),
+            fidelity(Some(draining.clone()), false),
+        )
+        .await;
+        assert_eq!(resp.headers()[header::CONTENT_TYPE], "application/json");
+        assert_eq!(json_of(resp).await["error"], draining);
+
+        // A normal first event goes out unchanged, `id:` and all; a later
+        // error frame is restored in place and keeps its own `id:`.
+        let resp = filtered(
+            sse_response(concat!(
+                ":keep-alive\n\n",
+                "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"task\":{\"id\":\"t\"}}}\nid: 3\n\n",
+                "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32102,\"message\":\"Context belongs to another principal\"}}\nid: 4\n\n",
+            )),
+            fidelity(None, false),
+        )
+        .await;
+        assert_eq!(resp.headers()[header::CONTENT_TYPE], "text/event-stream");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            body.starts_with(concat!(
+                ":keep-alive\n\n",
+                "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"task\":{\"id\":\"t\"}}}\nid: 3\n\n",
+            )),
+            "{body}"
+        );
+        let last = body.split("\n\n").nth(2).unwrap();
+        assert!(last.ends_with("\nid: 4"), "{last}");
+        let frame: Value =
+            serde_json::from_str(last.lines().next().unwrap().strip_prefix("data: ").unwrap())
+                .unwrap();
+        assert_eq!(
+            frame["error"],
+            json!({"code": -32603, "message": "internal error"})
+        );
+
+        // The last page of a listing says so, as the spec's response does.
+        let page = json!({"jsonrpc": "2.0", "id": 1, "result": {"pageSize": 50}});
+        let resp = dispatch::faithful(
+            unary_response(&page),
+            dispatch::Fidelity {
+                kept: None,
+                bearer_used: false,
+                list_tasks: true,
+            },
+            Duration::from_secs(5),
+            None,
+        )
+        .await;
+        let v = json_of(resp).await;
+        assert_eq!(v["result"]["nextPageToken"], "", "{v}");
+        assert_eq!(v["result"]["tasks"], json!([]), "{v}");
+        let v = json_of(filtered(unary_response(&page), fidelity(None, false)).await).await;
+        assert_eq!(v, page, "only a listing is completed");
+    }
+
+    /// A subscription is read first, by the listener, as the caller: a task
+    /// the runtime will not show this caller is refused as JSON, and a2a-rs —
+    /// which in 0.10 opens a stream on a task it cannot find — is never asked.
+    /// The stand-in shows the pre-check alone the task as missing, so only
+    /// the listener's own read can be what refuses it.
+    #[tokio::test]
+    async fn a_subscription_is_read_first_as_the_caller() {
+        let reads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&reads);
+        let (router, _) = listener(
+            move |req| {
+                seen.lock().unwrap().push((
+                    req.method.clone(),
+                    req.params.clone(),
+                    req.principal.id.clone(),
+                ));
+                if req.params.get("historyLength").is_some() {
+                    return task_not_found();
+                }
+                json!({"id": req.params["id"], "contextId": "ctx-1",
+                    "status": {"state": "TASK_STATE_WORKING"}})
+            },
+            None,
+        );
+        let resp = post(
+            &router,
+            r#"{"jsonrpc":"2.0","id":9,"method":"SubscribeToTask","params":{"id":"task-1"}}"#,
+            &[],
+            &[],
+        )
+        .await;
+        assert_eq!(resp.headers()[header::CONTENT_TYPE], "application/json");
+        let v = json_of(resp).await;
+        assert_eq!(v["error"]["code"], -32001, "{v}");
+        assert_eq!(v["id"], 9, "{v}");
+        let reads = reads.lock().unwrap().clone();
+        assert_eq!(reads.len(), 1, "only the listener's read: {reads:?}");
+        let (verb, params, who) = &reads[0];
+        assert_eq!(verb, "GetTask");
+        assert_eq!(params, &json!({"id": "task-1", "historyLength": 0}));
+        assert_eq!(who, "operator", "read as the caller");
+    }
+
+    /// A caller whose session dies loses what it already opened: a stream
+    /// a2a-rs is serving ends within a tick, and a unary call still waiting
+    /// on the runtime is answered with the 401 a revoked token gets.
+    #[tokio::test]
+    async fn liveness_hook_ends_streams() {
+        let alive = Arc::new(AtomicBool::new(true));
+        let flag = Arc::clone(&alive);
+        let liveness: Liveness = Arc::new(move |_| {
+            let flag = Arc::clone(&flag);
+            Some(Arc::new(move || flag.load(Ordering::SeqCst)) as LivenessCheck)
+        });
+        let (router, _) = listener(
+            |req| {
+                if req.method == "GetTask" && req.params["id"] == "task-slow" {
+                    std::thread::sleep(Duration::from_secs(3));
+                }
+                json!({"id": req.params["id"], "contextId": "ctx-1",
+                    "status": {"state": "TASK_STATE_WORKING"}})
+            },
+            Some(liveness),
+        );
+
+        // A subscription to a running task: the snapshot, then silence.
+        let resp = post(
+            &router,
+            r#"{"jsonrpc":"2.0","id":1,"method":"SubscribeToTask","params":{"id":"task-1"}}"#,
+            &[],
+            &[],
+        )
+        .await;
+        assert_eq!(resp.headers()[header::CONTENT_TYPE], "text/event-stream");
+        let mut body = resp.into_body().into_data_stream();
+        let first = tokio::time::timeout(Duration::from_secs(5), body.next())
+            .await
+            .expect("the snapshot")
+            .expect("a frame")
+            .unwrap();
+        assert!(String::from_utf8_lossy(&first).contains("task-1"));
+        // Still open while the session lives.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), body.next())
+                .await
+                .is_err(),
+            "the stream ended with its session alive"
+        );
+        alive.store(false, Ordering::SeqCst);
+        let revoked_at = Instant::now();
+        let end = tokio::time::timeout(Duration::from_secs(2), async {
+            while body.next().await.is_some() {}
+        })
+        .await;
+        assert!(end.is_ok(), "the stream outlived its session");
+        assert!(
+            revoked_at.elapsed() <= Duration::from_millis(200),
+            "ended {:?} after the revocation",
+            revoked_at.elapsed()
+        );
+
+        // A unary call waiting on the runtime.
+        alive.store(true, Ordering::SeqCst);
+        let flip = Arc::clone(&alive);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            flip.store(false, Ordering::SeqCst);
+        });
+        let started = Instant::now();
+        let resp = post(
+            &router,
+            r#"{"jsonrpc":"2.0","id":2,"method":"GetTask","params":{"id":"task-slow"}}"#,
+            &[],
+            &[],
+        )
+        .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "it waited out the runtime"
+        );
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let www = resp.headers()[header::WWW_AUTHENTICATE]
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(www.contains("error=\"invalid_token\""), "{www}");
+        assert!(
+            www.contains("the session token is unknown, expired or revoked"),
+            "{www}"
+        );
     }
 }

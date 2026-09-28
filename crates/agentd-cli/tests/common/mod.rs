@@ -195,10 +195,10 @@ pub fn try_a2a_bound(stderr_path: &str, timeout: Duration) -> Option<String> {
 // send the spec's shape, and refuses the legacy spellings anywhere else.
 
 /// The `A2A-Version` every request carries: the protocol version the listener
-/// answers. Spelled as the spec's literal, not read from the daemon, so a test
-/// notices when the server's idea of the version drifts from the one clients
-/// actually send.
-pub const A2A_VERSION: &str = "1.0";
+/// answers, from the one constant the listener's gate and the card read.
+/// `harness_guard` pins it to the spec's literal, so a drift in the constant
+/// fails there rather than passing here unnoticed.
+pub const A2A_VERSION: &str = agentd::runtime::surface::A2A_PROTOCOL_VERSION;
 
 /// How long a plain request may take. A blocking `SendMessage` holds the
 /// connection until its task settles, which is a model turn on a loaded runner.
@@ -234,11 +234,21 @@ impl HttpReply {
 
 /// The request line and headers of one POST to `/`. The ONE place a harness
 /// request head is written, so no helper can leave out the version or the
-/// content type.
-fn post_head(body_len: usize, extra: &[(&str, &str)]) -> String {
-    let mut head = format!(
-        "POST / HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nA2A-Version: {A2A_VERSION}\r\nContent-Length: {body_len}\r\nConnection: close\r\n"
-    );
+/// content type — except by naming it in `omit`, which only a suite proving
+/// the listener refuses such a request does.
+fn post_head(body_len: usize, omit: &[&str], extra: &[(&str, &str)]) -> String {
+    let mut head = String::from("POST / HTTP/1.1\r\nHost: x\r\n");
+    for (k, v) in [
+        ("Content-Type", "application/json"),
+        ("A2A-Version", A2A_VERSION),
+    ] {
+        if !omit.iter().any(|o| o.eq_ignore_ascii_case(k)) {
+            head.push_str(&format!("{k}: {v}\r\n"));
+        }
+    }
+    head.push_str(&format!(
+        "Content-Length: {body_len}\r\nConnection: close\r\n"
+    ));
     for (k, v) in extra {
         head.push_str(&format!("{k}: {v}\r\n"));
     }
@@ -280,11 +290,22 @@ fn exchange(
     budget: Duration,
     done: &dyn Fn(&[u8]) -> bool,
 ) -> Result<HttpReply, String> {
+    send_and_read(addr, &post_head(body.len(), &[], extra), body, budget, done)
+}
+
+/// Write `head` and `body`, then read as [`exchange`] describes.
+fn send_and_read(
+    addr: &str,
+    head: &str,
+    body: &str,
+    budget: Duration,
+    done: &dyn Fn(&[u8]) -> bool,
+) -> Result<HttpReply, String> {
     let mut s = TcpStream::connect(addr).map_err(|e| format!("connect {addr}: {e}"))?;
     // A short poll rather than one long timeout, so `budget` bounds the whole
     // read and a stream that never ends still returns what it sent.
     s.set_read_timeout(Some(Duration::from_millis(200))).ok();
-    s.write_all(post_head(body.len(), extra).as_bytes())
+    s.write_all(head.as_bytes())
         .and_then(|()| s.write_all(body.as_bytes()))
         .and_then(|()| s.flush())
         .map_err(|e| format!("write request: {e}"))?;
@@ -324,6 +345,32 @@ pub fn try_a2a_post(addr: &str, body: &str, extra: &[(&str, &str)]) -> Result<Ht
     exchange(addr, body, extra, REQUEST_BUDGET, &|_| false)
 }
 
+/// [`a2a_post`] WITHOUT the headers named in `omit` (`Content-Type`,
+/// `A2A-Version`). No client should send such a request; this is for the suite
+/// proving the listener refuses one.
+pub fn a2a_post_omitting(
+    addr: &str,
+    body: &str,
+    omit: &[&str],
+    extra: &[(&str, &str)],
+) -> HttpReply {
+    send_and_read(
+        addr,
+        &post_head(body.len(), omit, extra),
+        body,
+        REQUEST_BUDGET,
+        &|_| false,
+    )
+    .unwrap_or_else(|e| panic!("POST to {addr}: {e}"))
+}
+
+/// A plain GET of `path`, whatever it answers.
+pub fn http_get(addr: &str, path: &str) -> HttpReply {
+    let head = format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    send_and_read(addr, &head, "", Duration::from_secs(30), &|_| false)
+        .unwrap_or_else(|e| panic!("GET {path} from {addr}: {e}"))
+}
+
 /// [`a2a_post`] bounded by `budget`, returning as soon as one SSE frame has
 /// arrived. For a stream that may never end: the question is whether anything
 /// was delivered at all, and the first frame answers it.
@@ -349,7 +396,7 @@ pub fn a2a_open(
 ) -> BufReader<TcpStream> {
     let mut s = TcpStream::connect(addr).unwrap_or_else(|e| panic!("connect {addr}: {e}"));
     s.set_read_timeout(Some(read_timeout)).ok();
-    s.write_all(post_head(body.len(), extra).as_bytes())
+    s.write_all(post_head(body.len(), &[], extra).as_bytes())
         .unwrap();
     s.write_all(body.as_bytes()).unwrap();
     s.flush().unwrap();

@@ -9,110 +9,160 @@
 use crate::config::v2::Settings;
 use serde_json::{Value, json};
 
+use super::auth::{configured_url, listener_auth_of};
+use super::{EXTENSION_METHODS, SpecMethod, extensions_of};
+
+/// Every JSON-RPC method this instance answers: the specification's eleven,
+/// then the methods of the extensions it declares.
+///
+/// Derived from the route table and the declaration list, which are the same
+/// two lists the listener routes by and the card declares from. The manifest
+/// used to keep its own copy, and it had drifted: it listed `GetAgentCard`,
+/// which was never a method of the specification, and missed five that were.
+pub fn methods_of(s: &Settings) -> Vec<&'static str> {
+    let declared = extensions_of(s);
+    SpecMethod::ALL
+        .iter()
+        .map(|m| m.name())
+        .chain(
+            EXTENSION_METHODS
+                .iter()
+                .filter(|(_, uri)| declared.contains(uri))
+                .map(|(name, _)| *name),
+        )
+        .collect()
+}
+
 /// What `--capabilities` reports about the A2A listener, or `null` when no
 /// `a2a.listen` is configured.
+///
+/// The auth fields are the listener's posture ([`listener_auth_of`]), the same
+/// value the resolver admits callers by and the card publishes its schemes
+/// from, so a controller reading this cannot be told a different story than a
+/// peer reading the card. `url` is what the settings alone can say
+/// ([`configured_url`]): `null` for a `:0` port or a unix socket, whose URL is
+/// not known until the bind. `cors_origins` is a count, not the list — the
+/// origins are configuration an operator already has, and a launched UI's
+/// origin is not configuration at all.
 pub fn a2a_section(s: &Settings) -> Value {
-    let Some(listen) = s.a2a.listen.as_ref() else {
+    if s.a2a.listen.is_none() {
         return Value::Null;
-    };
-    let principals: Vec<Value> = s
-        .a2a
-        .principals
-        .iter()
-        .map(|p| json!({"role": format!("{:?}", p.role).to_lowercase(), "match": principal_match_desc(&p.matcher), "grants": p.grants}))
-        .collect();
-    // Derived from the list the listener actually dispatches, plus the two
-    // bootstrap calls it answers ahead of the dispatch table. This was a
-    // fourth hand-maintained copy and it had drifted: it omitted
-    // `GetExtendedAgentCard` and the four push-config methods, and listed
-    // `GetAgentCard`, which `METHODS` does not carry.
-    let mut methods: Vec<&str> = super::METHODS
-        .iter()
-        .copied()
-        .filter(|m| *m != "SubscribeToEvents" || s.a2a.events.enabled)
-        .chain(super::LOCAL_METHODS.iter().copied())
-        .collect();
-    methods.sort_unstable();
+    }
+    let posture = listener_auth_of(&s.a2a);
     json!({
-        "listen": listen,
-        "tls": s.a2a.tls.cert.is_some(),
-        "mtls": s.a2a.tls.client_ca.is_some(),
-        "bearer": s.a2a.bearer.is_some(),
-        "methods": methods,
+        "methods": methods_of(s),
         // The command ops come from the ONE list the agent card renders as
         // skills and the extension declares, so the manifest cannot
         // advertise a surface the card denies (they disagreed once: the
         // manifest listed ops the card never mentioned).
         "command_ops": super::command_ops_of(s),
-        "extensions": super::extensions_of(s),
-        "principals": principals,
-        "loopback_operator": s.a2a.principals.is_empty(),
+        "extensions": extensions_of(s),
+        "url": configured_url(s),
+        "auth": {
+            "bearer": posture.bearer,
+            "mtls": posture.mtls,
+            "device": posture.device,
+            "required": posture.required,
+            "implicit_operator": posture.implicit_operator,
+        },
+        "events": s.a2a.events.enabled,
+        "introspection": s.a2a.introspection.enabled,
+        "cors_origins": s.a2a.cors.origins.len(),
     })
-}
-
-/// A redacted description of a principal matcher (secrets never leak here).
-fn principal_match_desc(m: &crate::config::v2::PrincipalMatch) -> Value {
-    if m.any {
-        json!({"any": true})
-    } else if let Some(s) = &m.san {
-        json!({"san": s})
-    } else if let Some(s) = &m.sub {
-        json!({"sub": s})
-    } else if m.bearer_ref.is_some() {
-        json!({"bearer_ref": "***"})
-    } else {
-        json!({})
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::surface::{Route, route_of};
 
-    /// The section moved out of `runtime::capabilities` without changing a
-    /// byte. The expected strings are what the builder in `runtime/mod.rs`
-    /// printed for these settings immediately before the move, so a later
-    /// edit to the section has to change them on purpose rather than by
-    /// accident — and the last assertion keeps the manifest reading its
-    /// `a2a` section from here rather than from a copy.
-    #[test]
-    fn a2a_section_is_byte_identical() {
-        let s = Settings {
-            a2a: serde_json::from_value(json!({
-                "listen": "https://0.0.0.0:8443",
-                "bearer": "{{secret:A2A_BEARER}}",
-                "tls": {"cert": "/tls/cert.pem", "key": "/tls/key.pem", "client_ca": "/tls/ca.pem"},
-                "principals": [
-                    {"match": {"san": "spiffe://corp/ops/*"}, "role": "operator"},
-                    {"match": {"sub": "alice"}, "role": "user", "grants": ["knowledge.*"]},
-                    {"match": {"bearer_ref": "{{secret:PEER}}"}, "role": "agent"},
-                    {"match": {"any": true}, "role": "anonymous"}
-                ],
-                "events": {"enabled": true},
-                "introspection": {"enabled": true}
-            }))
-            .unwrap(),
+    fn settings(a2a: Value) -> Settings {
+        Settings {
+            a2a: serde_json::from_value(a2a).unwrap(),
             ..Settings::default()
-        };
+        }
+    }
+
+    /// The manifest's methods are the route table: every name routes, every
+    /// core method is there, and an extension's method is there exactly when
+    /// the instance declares the extension. Nothing the table refuses — the
+    /// card read as a method, pairing — can be reported as served.
+    #[test]
+    fn manifest_methods_are_the_route_table() {
+        let with_feed =
+            settings(json!({"listen": "http://127.0.0.1:8080", "events": {"enabled": true}}));
+        let without = settings(json!({"listen": "http://127.0.0.1:8080"}));
+        for s in [&with_feed, &without] {
+            let reported = a2a_section(s)["methods"].clone();
+            let reported: Vec<&str> = reported
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m.as_str().unwrap())
+                .collect();
+            assert_eq!(reported, methods_of(s), "the section reports methods_of");
+            for name in &reported {
+                assert!(route_of(name).is_some(), "{name} does not route");
+            }
+            for m in SpecMethod::ALL {
+                assert!(reported.contains(&m.name()), "{m:?} is not reported");
+            }
+            for gone in ["GetAgentCard", "Pair", "interface.pair"] {
+                assert!(!reported.contains(&gone), "{gone} is reported");
+            }
+            let declared = extensions_of(s);
+            for (name, uri) in EXTENSION_METHODS {
+                assert_eq!(
+                    reported.contains(name),
+                    declared.contains(uri),
+                    "{name} is reported iff {uri} is declared"
+                );
+                assert!(matches!(route_of(name), Some(Route::Extension { .. })));
+            }
+        }
+        assert!(
+            methods_of(&with_feed).len() > methods_of(&without).len(),
+            "declaring the feed's extension adds its method"
+        );
+    }
+
+    /// The section's exact shape for two instances, so a later edit changes
+    /// it on purpose rather than by accident — and the last assertion keeps
+    /// the manifest reading its `a2a` section from here rather than from a
+    /// copy.
+    #[test]
+    fn a2a_section_shape() {
+        let s = settings(json!({
+            "listen": "https://0.0.0.0:8443",
+            "url": "https://agent.example.com",
+            "bearer": "{{secret:A2A_BEARER}}",
+            "tls": {"cert": "/tls/cert.pem", "key": "/tls/key.pem", "client_ca": "/tls/ca.pem"},
+            "principals": [
+                {"match": {"san": "spiffe://corp/ops/*"}, "role": "operator"},
+                {"id": "peer", "match": {"bearer_ref": "{{secret:PEER}}"}, "role": "agent"}
+            ],
+            "cors": {"origins": ["https://ui.example.com", "https://ops.example.com"]},
+            "events": {"enabled": true},
+            "introspection": {"enabled": true}
+        }));
         assert_eq!(
             a2a_section(&s).to_string(),
-            r#"{"bearer":true,"command_ops":["status","config","workflow.run","workflow.status","workflow.cancel","workflow.signal","subagent.send","subagent.kill","subagent.status","plan.get","conversation.get","run.get","subagent.get","debug.events","admin.drain","admin.pause","admin.resume","admin.cancel","admin.set"],"extensions":["https://agentd.dev/a2a/ext/command/v1","https://agentd.dev/a2a/ext/interface/v1"],"listen":"https://0.0.0.0:8443","loopback_operator":false,"methods":["CancelTask","CreateTaskPushNotificationConfig","DeleteTaskPushNotificationConfig","GetAgentCard","GetExtendedAgentCard","GetTask","GetTaskPushNotificationConfig","ListTaskPushNotificationConfigs","ListTasks","SendMessage","SendStreamingMessage","SubscribeToEvents","SubscribeToTask"],"mtls":true,"principals":[{"grants":[],"match":{"san":"spiffe://corp/ops/*"},"role":"operator"},{"grants":["knowledge.*"],"match":{"sub":"alice"},"role":"user"},{"grants":[],"match":{"bearer_ref":"***"},"role":"agent"},{"grants":[],"match":{"any":true},"role":"anonymous"}],"tls":true}"#
+            r#"{"auth":{"bearer":true,"device":false,"implicit_operator":false,"mtls":true,"required":true},"command_ops":["status","config","workflow.run","workflow.status","workflow.cancel","workflow.signal","subagent.send","subagent.kill","subagent.status","plan.get","conversation.get","run.get","subagent.get","debug.events","admin.drain","admin.pause","admin.resume","admin.cancel","admin.set"],"cors_origins":2,"events":true,"extensions":["https://agentd.dev/a2a/ext/command/v1","https://agentd.dev/a2a/ext/interface/v1"],"introspection":true,"methods":["SendMessage","SendStreamingMessage","GetTask","ListTasks","CancelTask","SubscribeToTask","CreateTaskPushNotificationConfig","GetTaskPushNotificationConfig","ListTaskPushNotificationConfigs","DeleteTaskPushNotificationConfig","GetExtendedAgentCard","SubscribeToEvents"],"url":"https://agent.example.com"}"#
         );
 
-        let mut t = s.clone();
-        t.a2a.events = Default::default();
-        t.a2a.introspection = Default::default();
-        t.a2a.principals.clear();
-        t.a2a.bearer = None;
-        t.a2a.tls = Default::default();
-        t.a2a.listen = Some("unix:/run/agentd.sock".into());
+        // A unix socket: the kernel authenticates, the caller is the operator,
+        // and there is no URL a remote caller could use.
+        let t = settings(json!({"listen": "unix:/run/agentd.sock"}));
         assert_eq!(
             a2a_section(&t).to_string(),
-            r#"{"bearer":false,"command_ops":["status","config","workflow.run","workflow.status","workflow.cancel","workflow.signal","subagent.send","subagent.kill","subagent.status","plan.get","admin.drain","admin.pause","admin.resume","admin.cancel","admin.set"],"extensions":["https://agentd.dev/a2a/ext/command/v1"],"listen":"unix:/run/agentd.sock","loopback_operator":true,"methods":["CancelTask","CreateTaskPushNotificationConfig","DeleteTaskPushNotificationConfig","GetAgentCard","GetExtendedAgentCard","GetTask","GetTaskPushNotificationConfig","ListTaskPushNotificationConfigs","ListTasks","SendMessage","SendStreamingMessage","SubscribeToTask"],"mtls":false,"principals":[],"tls":false}"#
+            r#"{"auth":{"bearer":false,"device":false,"implicit_operator":true,"mtls":false,"required":false},"command_ops":["status","config","workflow.run","workflow.status","workflow.cancel","workflow.signal","subagent.send","subagent.kill","subagent.status","plan.get","admin.drain","admin.pause","admin.resume","admin.cancel","admin.set"],"cors_origins":0,"events":false,"extensions":["https://agentd.dev/a2a/ext/command/v1"],"introspection":false,"methods":["SendMessage","SendStreamingMessage","GetTask","ListTasks","CancelTask","SubscribeToTask","CreateTaskPushNotificationConfig","GetTaskPushNotificationConfig","ListTaskPushNotificationConfigs","DeleteTaskPushNotificationConfig","GetExtendedAgentCard"],"url":null}"#
         );
 
-        t.a2a.listen = None;
-        assert_eq!(a2a_section(&t), Value::Null, "no listener, no section");
+        assert_eq!(
+            a2a_section(&Settings::default()),
+            Value::Null,
+            "no listener, no section"
+        );
 
         let loaded = crate::config::v2::Loaded {
             settings: s.clone(),

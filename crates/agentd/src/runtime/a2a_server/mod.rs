@@ -53,11 +53,6 @@ pub use super::surface::{
     extensions_of,
 };
 
-/// The JSON-RPC surface, defined in [`crate::runtime::surface`] so the
-/// always-compiled `--capabilities` manifest can read it without the `a2a`
-/// feature. Re-exported here because this is where the dispatch lives.
-pub use crate::runtime::surface::{LOCAL_METHODS, METHODS};
-
 /// A2A error: no such task.
 pub const TASK_NOT_FOUND: i64 = -32001;
 /// A2A error: the operation is not supported over this surface.
@@ -177,9 +172,10 @@ impl A2aBridge {
 // ---- the bridge's verbs ------------------------------------------------------
 
 /// What the transport asks the runtime: the verbs of the bridge between them.
-/// Not the spec's method names — push configs travel as `PushConfig*`, and a
-/// send is preceded by a `NewTaskId` mint — so anything that classifies a
-/// call the runtime answered (the audit mirror) reads THIS, not the spec's
+/// Not the spec's method names — push configs travel as `PushConfig*`, a
+/// send is preceded by a `NewTaskId` mint, and the public card is
+/// `PublicCard` because no wire method reads it — so anything that classifies
+/// a call the runtime answered (the audit mirror) reads THIS, not the spec's
 /// vocabulary, which is how it once listed names that never arrived.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Verb {
@@ -192,7 +188,7 @@ pub(crate) enum Verb {
     PushConfigGet,
     PushConfigList,
     PushConfigDelete,
-    GetAgentCard,
+    PublicCard,
     GetExtendedAgentCard,
 }
 
@@ -209,11 +205,12 @@ impl Verb {
         Verb::PushConfigGet,
         Verb::PushConfigList,
         Verb::PushConfigDelete,
-        Verb::GetAgentCard,
+        Verb::PublicCard,
         Verb::GetExtendedAgentCard,
     ];
 
-    /// The verb a bare method name is, if the runtime answers it.
+    /// The verb `method` names, if the runtime answers it. Matched exactly:
+    /// the listener's route table has already refused every other spelling.
     pub(crate) fn of(method: &str) -> Option<Verb> {
         Some(match method {
             "SendMessage" | "SendStreamingMessage" => Verb::SendMessage,
@@ -225,7 +222,7 @@ impl Verb {
             "PushConfigGet" => Verb::PushConfigGet,
             "PushConfigList" => Verb::PushConfigList,
             "PushConfigDelete" => Verb::PushConfigDelete,
-            "GetAgentCard" => Verb::GetAgentCard,
+            "PublicCard" => Verb::PublicCard,
             "GetExtendedAgentCard" => Verb::GetExtendedAgentCard,
             _ => return None,
         })
@@ -241,7 +238,7 @@ impl Verb {
             | Verb::ListTasks
             | Verb::PushConfigGet
             | Verb::PushConfigList
-            | Verb::GetAgentCard
+            | Verb::PublicCard
             | Verb::GetExtendedAgentCard => true,
             Verb::SendMessage | Verb::CancelTask | Verb::PushConfigSet | Verb::PushConfigDelete => {
                 false
@@ -251,11 +248,6 @@ impl Verb {
 }
 
 // ---- wire helpers ----------------------------------------------------------
-
-/// Strip an optional `a2a.` prefix.
-fn bare(m: &str) -> &str {
-    m.strip_prefix("a2a.").unwrap_or(m)
-}
 
 fn err_obj(code: i64, msg: &str) -> Value {
     json!({"_error": {"code": code, "message": msg}})
@@ -292,7 +284,7 @@ impl Runtime {
             .as_str()
             .filter(|s| !s.is_empty() && !self.tasks.contains_key(*s))
             .map(str::to_string);
-        let out = match Verb::of(bare(&method)) {
+        let out = match Verb::of(&method) {
             Some(Verb::SendMessage) => self.a2a_send(&principal, &params),
             // The listener asks for the id a new task will have BEFORE
             // dispatching the send. The protocol layer subscribes to a task's
@@ -308,11 +300,11 @@ impl Runtime {
             Some(Verb::PushConfigGet) => self.a2a_push_get(&principal, &params),
             Some(Verb::PushConfigList) => self.a2a_push_list(&principal, &params),
             Some(Verb::PushConfigDelete) => self.a2a_push_delete(&principal, &params),
-            Some(Verb::GetAgentCard) => self.a2a_agent_card(),
+            Some(Verb::PublicCard) => self.a2a_agent_card(),
             Some(Verb::GetExtendedAgentCard) => self.a2a_extended_card(&principal),
             None => err_obj(
                 UNSUPPORTED_OPERATION,
-                &format!("unsupported method: {}", bare(&method)),
+                &format!("unsupported method: {method}"),
             ),
         };
         self.reserved_task_id = None;
@@ -331,7 +323,7 @@ impl Runtime {
             .unwrap_or(Value::Null);
         let request_id = params["message"]["messageId"].as_str();
         self.audit_a2a(
-            bare(&method),
+            &method,
             op.as_deref(),
             &principal,
             outcome,
@@ -345,96 +337,6 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Every method agentd answers is spelled the way the SDK spells it, and
-    /// the error codes peers branch on are the SDK's constants.
-    ///
-    /// These two assertions are what the `a2a-oracle` crate was really for.
-    /// The rest of it booted the daemon and deserialized the replies with
-    /// `a2a_rs` — which stopped proving anything the day the listener became
-    /// `a2a_rs`'s own adapter: the same generated types on both ends of the
-    /// round trip agree by construction. These do not need a daemon at all,
-    /// and they still bind agentd's vocabulary to the crate generated from the
-    /// A2A protobuf. The live behaviour the oracle also checked is covered by
-    /// `a2a-conversation/protocol-errors-use-the-specified-codes`.
-    #[test]
-    fn our_method_names_and_error_codes_are_the_sdks() {
-        use a2a_rs::adapter::transport::jsonrpc_wire::methods as m;
-        let spec = [
-            m::SEND_MESSAGE,
-            m::SEND_STREAMING_MESSAGE,
-            m::GET_TASK,
-            m::LIST_TASKS,
-            m::CANCEL_TASK,
-            m::SUBSCRIBE_TO_TASK,
-            m::CREATE_PUSH_CONFIG,
-            m::GET_PUSH_CONFIG,
-            m::LIST_PUSH_CONFIGS,
-            m::DELETE_PUSH_CONFIG,
-            m::GET_EXTENDED_AGENT_CARD,
-        ];
-        // Everything we dispatch is one of theirs, spelled identically — a
-        // method we invented or misspelled is unreachable, and silently so.
-        for name in METHODS {
-            if *name == "SubscribeToEvents" {
-                continue; // ours, declared as an extension rather than claimed
-            }
-            assert!(
-                spec.contains(name),
-                "agentd answers {name:?}, which is not an A2A method: {spec:?}"
-            );
-        }
-        // …and every spec method is one we answer, so the card cannot promise
-        // a surface the dispatcher lacks.
-        for name in spec {
-            assert!(
-                METHODS.contains(&name),
-                "the spec defines {name:?} and agentd does not answer it"
-            );
-        }
-        assert_eq!(a2a_rs::domain::error::TASK_NOT_FOUND, -32001);
-        assert_eq!(a2a_rs::domain::error::UNSUPPORTED_OPERATION, -32004);
-    }
-
-    /// Every method agentd answers is either an A2A method or DECLARED as an
-    /// extension. The oracle checks the first half against an independent
-    /// implementation of the spec; this checks the second, which is the half
-    /// that rots — a method added without a declaration is a private protocol
-    /// no peer can discover, and nothing else would notice.
-    #[test]
-    fn every_non_spec_method_is_declared_as_an_extension() {
-        // The A2A JSON-RPC vocabulary (the oracle pins this against a2a-rs).
-        const SPEC: &[&str] = &[
-            "SendMessage",
-            "SendStreamingMessage",
-            "GetTask",
-            "ListTasks",
-            "CancelTask",
-            "SubscribeToTask",
-            "CreateTaskPushNotificationConfig",
-            "GetTaskPushNotificationConfig",
-            "ListTaskPushNotificationConfigs",
-            "DeleteTaskPushNotificationConfig",
-            "GetExtendedAgentCard",
-        ];
-        let undeclared: Vec<&&str> = METHODS
-            .iter()
-            .filter(|m| !SPEC.contains(m))
-            .filter(|m| !EXTENSION_METHODS.iter().any(|(name, _)| name == *m))
-            .collect();
-        assert!(
-            undeclared.is_empty(),
-            "these methods are neither A2A nor declared under an extension: {undeclared:?}"
-        );
-        // …and every declaration names an extension this build can activate,
-        // so a client that asks for it by URI is actually granted it.
-        for (method, uri) in EXTENSION_METHODS {
-            assert!(
-                EXTENSIONS.contains(uri),
-                "{method:?} is declared under {uri:?}, which is not in EXTENSIONS"
-            );
-        }
-    }
 
     #[cfg(feature = "a2a")]
     #[test]
@@ -486,14 +388,5 @@ mod tests {
             bridge.resolve(&with_san("spiffe://other/x"), false, None),
             Resolution::NoRole
         );
-    }
-
-    /// Callers may address a method with or without the historical `a2a.`
-    /// prefix. (Frame construction and terminal classification moved to
-    /// `a2a::wire` and to a2a-rs respectively.)
-    #[test]
-    fn a_method_may_be_addressed_with_or_without_the_prefix() {
-        assert_eq!(bare("a2a.SendMessage"), "SendMessage");
-        assert_eq!(bare("GetTask"), "GetTask");
     }
 }

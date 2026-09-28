@@ -295,12 +295,12 @@ fn capabilities_describes_the_v2_a2a_surface_without_side_effects() {
     );
     let v: Value = serde_json::from_slice(&out.stdout).expect("capabilities json");
     assert_eq!(v["runtime"], "1");
-    assert_eq!(v["a2a"]["listen"], format!("http://127.0.0.1:{port}"));
+    assert_eq!(v["a2a"]["url"], format!("http://127.0.0.1:{port}/"));
     let methods = v["a2a"]["methods"].as_array().unwrap();
     assert!(methods.iter().any(|m| m == "SendMessage") && methods.iter().any(|m| m == "GetTask"));
     assert!(
-        v["a2a"]["loopback_operator"].as_bool().unwrap(),
-        "no principals ⇒ loopback operator"
+        v["a2a"]["auth"]["implicit_operator"].as_bool().unwrap(),
+        "no principals on a loopback bind ⇒ the implicit operator"
     );
     assert!(
         v["internal_tools"]

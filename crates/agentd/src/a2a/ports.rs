@@ -36,6 +36,7 @@ use futures_util::TryStreamExt;
 use serde_json::{Value, json};
 
 use crate::a2a::Principal;
+use crate::a2a::principals::Via;
 use crate::runtime::a2a_server::A2aBridge;
 
 /// Everything agentd supplies to the protocol layer, in one value.
@@ -63,7 +64,9 @@ impl RuntimePorts {
     /// The reply is either a result value or agentd's JSON-RPC error object;
     /// the latter is turned back into the spec's error type so the protocol
     /// layer maps it to the right code, rather than being passed off as a
-    /// successful result that happens to contain an error.
+    /// successful result that happens to contain an error — and it is
+    /// recorded on the request's [`RequestScope`], because the typed error
+    /// cannot carry it whole (see [`record_error`]).
     ///
     /// An error is recognised under either spelling — the reactor's `_error`
     /// marker, or a plain JSON-RPC `error` member. Fail closed: no reply the
@@ -71,13 +74,29 @@ impl RuntimePorts {
     /// refusal, and reading it as a result would hand a caller whatever else
     /// happened to be in the object.
     async fn call(&self, method: &str, params: Value, who: &Principal) -> Result<Value, A2AError> {
+        let v = self.call_raw(method, params, who).await?;
+        match error_of(&v) {
+            Some(e) => {
+                record_error(e);
+                Err(from_error_object(e))
+            }
+            None => Ok(v),
+        }
+    }
+
+    /// [`Self::call`] without the reading: the reply as the runtime gave it.
+    async fn call_raw(
+        &self,
+        method: &str,
+        params: Value,
+        who: &Principal,
+    ) -> Result<Value, A2AError> {
         let bridge = Arc::clone(&self.bridge);
         let method = method.to_string();
         let who = who.clone();
-        let v = tokio::task::spawn_blocking(move || bridge.call(&method, params, who))
+        tokio::task::spawn_blocking(move || bridge.call(&method, params, who))
             .await
-            .map_err(|e| A2AError::Internal(format!("the runtime call did not complete: {e}")))?;
-        reply_of(v)
+            .map_err(|e| A2AError::Internal(format!("the runtime call did not complete: {e}")))
     }
 
     /// The stream fan-out, for the reactor side to publish into.
@@ -86,19 +105,49 @@ impl RuntimePorts {
     }
 }
 
+/// The request being served, as the ports see it.
+///
+/// The spec's ports take no caller — they were drawn for a server whose store
+/// is not per-principal. agentd's is: a task belongs to whoever started it, and
+/// a non-operator may only see its own. So the request travels out-of-band,
+/// scoped to its tokio task rather than passed down through the port
+/// signatures.
+#[derive(Clone)]
+pub struct RequestScope {
+    /// Who is calling.
+    pub caller: Principal,
+    /// Which evidence named them.
+    pub via: Via,
+    /// The first error object the runtime answered this request with, kept
+    /// whole. The ports hand a2a-rs a typed [`A2AError`], and a2a-rs puts
+    /// ITS rendering of that on the wire — its own message prefix, its own
+    /// `ErrorInfo` under the domain `a2a-rs` — so a refusal agentd's runtime
+    /// made (a draining agent, an op nobody may run) would reach the caller
+    /// reworded, with the runtime's reason gone. The listener reads this back
+    /// and puts the runtime's object on the wire instead
+    /// (`serve::dispatch`'s fidelity filter), so a refusal is the same
+    /// code, message and data whichever path answered it.
+    pub error: Arc<Mutex<Option<Value>>>,
+}
+
+impl RequestScope {
+    /// A scope for `caller`, named by `via`, with nothing recorded yet.
+    pub fn new(caller: Principal, via: Via) -> RequestScope {
+        RequestScope {
+            caller,
+            via,
+            error: Arc::default(),
+        }
+    }
+}
+
 tokio::task_local! {
-    /// Who is making the request currently being served.
-    ///
-    /// The spec's task ports (`get`, `cancel`, `list`) take no caller — they
-    /// were drawn for a server whose store is not per-principal. agentd's is:
-    /// a task belongs to whoever started it, and a non-operator may only see
-    /// its own. So the caller travels out-of-band, scoped to the request's
-    /// tokio task rather than passed down through the port signatures.
+    /// The request currently being served.
     ///
     /// Set once by the transport ([`crate::a2a::serve`]) around the whole
     /// dispatch. Unset means nobody is being served, which reads as anonymous —
     /// the role the authorization matrix refuses everything.
-    static CALLER: Principal;
+    static SCOPE: RequestScope;
 
     /// The tasks this request has *proved* its caller may watch.
     ///
@@ -110,7 +159,7 @@ tokio::task_local! {
     /// as the request goes past and read back at the one place a subscription
     /// is made ([`SharedStreaming::combined_update_stream`]).
     ///
-    /// Scoped alongside [`CALLER`], per request; the entries never outlive it.
+    /// Scoped alongside [`SCOPE`], per request; the entries never outlive it.
     static STREAMABLE: StreamAuthz;
 }
 
@@ -168,10 +217,10 @@ fn streamable() -> Option<StreamAuthz> {
     STREAMABLE.try_with(StreamAuthz::clone).ok()
 }
 
-/// Run `f` with `who` as the caller for the duration of one request.
-/// `in_send` says the request is a `SendMessage`/`SendStreamingMessage`, whose
-/// task comes into existence part-way through (see [`StreamAuthz::in_send`]).
-pub async fn with_caller<F, T>(who: Principal, in_send: bool, f: F) -> T
+/// Run `f` as one request's handling, in `scope`. `in_send` says the request
+/// is a `SendMessage`/`SendStreamingMessage`, whose task comes into existence
+/// part-way through (see [`StreamAuthz::in_send`]).
+pub async fn with_request<F, T>(scope: RequestScope, in_send: bool, f: F) -> T
 where
     F: std::future::Future<Output = T>,
 {
@@ -179,20 +228,48 @@ where
         in_send,
         ..StreamAuthz::default()
     };
-    CALLER.scope(who, STREAMABLE.scope(ledger, f)).await
+    SCOPE.scope(scope, STREAMABLE.scope(ledger, f)).await
 }
 
 /// The caller of the request being served.
 pub fn caller() -> Principal {
-    CALLER
-        .try_with(|p| p.clone())
+    SCOPE
+        .try_with(|s| s.caller.clone())
         .unwrap_or_else(|_| Principal::anonymous())
 }
 
-/// A reactor reply, split into a result or the spec's error (see
+/// Keep `error` — a runtime error object, `{code, message, data?}` — as the
+/// answer to the request being served, unless one is kept already.
+///
+/// The first write wins because the first refusal is the one that ended the
+/// request: a port that fails returns at once, and a2a-rs stops there. Outside
+/// a request it is dropped; there is nobody to answer.
+pub(crate) fn record_error(error: &Value) {
+    let _ = SCOPE.try_with(|s| {
+        if let Ok(mut kept) = s.error.lock()
+            && kept.is_none()
+        {
+            *kept = Some(error.clone());
+        }
+    });
+}
+
+/// Whether the request being served is a send (see [`StreamAuthz::in_send`]).
+fn in_send() -> bool {
+    STREAMABLE.try_with(|s| s.in_send).unwrap_or(false)
+}
+
+/// A reactor reply's error object, under either spelling (see
 /// [`RuntimePorts::call`]).
+pub(crate) fn error_of(v: &Value) -> Option<&Value> {
+    v.get("_error").or_else(|| v.get("error"))
+}
+
+/// A reactor reply, split into a result or the spec's error, recording
+/// nothing — for a reply read outside a request.
+#[cfg(test)]
 fn reply_of(v: Value) -> Result<Value, A2AError> {
-    match v.get("_error").or_else(|| v.get("error")) {
+    match error_of(&v) {
         Some(e) => Err(from_error_object(e)),
         None => Ok(v),
     }
@@ -213,7 +290,7 @@ fn reply_of(v: Value) -> Result<Value, A2AError> {
 /// for — travels as [`A2AError::JsonRpc`] with its number and `data` intact,
 /// rather than collapsing into an internal error that would tell the caller
 /// the wrong thing.
-fn from_error_object(e: &Value) -> A2AError {
+pub(crate) fn from_error_object(e: &Value) -> A2AError {
     use crate::a2a::errors as code;
     let n = e
         .get("code")
@@ -315,8 +392,28 @@ impl AsyncTaskLifecycle for RuntimePorts {
     async fn get(&self, id: &TaskId, history_length: Option<u32>) -> Result<WireTask, A2AError> {
         let who = caller();
         let got = self
-            .call("GetTask", json!({"id": id.as_str()}), &who)
+            .call_raw("GetTask", json!({"id": id.as_str()}), &who)
             .await
+            .and_then(|v| match error_of(&v) {
+                Some(e) => {
+                    // A send's "not found" is not a refusal, for the reason
+                    // `record_read` gives: it is the read a2a-rs makes of the
+                    // id the listener pre-minted, which it expects to find
+                    // nothing and carries on past. Kept, it would win over
+                    // the refusal that really ends the send (the first write
+                    // wins), and the caller would be told "task not found"
+                    // about a message the runtime refused for a different
+                    // reason.
+                    let swallowed = in_send()
+                        && e.get("code").and_then(Value::as_i64)
+                            == Some(crate::a2a::errors::TASK_NOT_FOUND);
+                    if !swallowed {
+                        record_error(e);
+                    }
+                    Err(from_error_object(e))
+                }
+                None => Ok(v),
+            })
             .and_then(task_from)
             .and_then(|t| same_task(id.as_str(), t));
         // The reactor answers a read with the ownership matrix already applied —
@@ -750,6 +847,55 @@ mod tests {
         ports_with(move |_| reply.clone())
     }
 
+    /// An anonymous request's scope.
+    fn scope() -> RequestScope {
+        RequestScope::new(Principal::anonymous(), Via::Implicit)
+    }
+
+    /// The runtime's error object is kept exactly as the runtime answered it —
+    /// code, message and data — because the typed error a2a-rs receives can
+    /// carry none of the data and rewords the message. The first one wins: it
+    /// is the refusal that ended the request.
+    #[tokio::test]
+    async fn a_runtime_refusal_is_kept_whole_and_the_first_wins() {
+        let refusal = json!({"code": -32603, "message": "the agent is draining",
+            "data": [{"reason": "DRAINING", "domain": "agentd.dev"}]});
+        let ports = ports_answering(json!({"_error": refusal}));
+        let s = scope();
+        let kept = Arc::clone(&s.error);
+        let id: TaskId = "task-1".parse().unwrap();
+        with_request(s, false, async {
+            assert!(ports.cancel(&id).await.is_err());
+            // A second refusal in the same request does not replace it.
+            record_error(&json!({"code": -32001, "message": "later"}));
+        })
+        .await;
+        assert_eq!(kept.lock().unwrap().clone(), Some(refusal));
+
+        // Outside a request there is nobody to answer, and nothing is kept.
+        record_error(&json!({"code": -32001, "message": "nobody"}));
+    }
+
+    /// The read a2a-rs makes of a send's pre-minted task id finds nothing,
+    /// and a2a-rs carries on past it — so inside a send it is not kept, or it
+    /// would stand in for the refusal that really ends the send. Outside a
+    /// send the same "not found" is the answer, and is kept.
+    #[tokio::test]
+    async fn a_sends_own_not_found_read_is_not_kept() {
+        let ports =
+            ports_answering(json!({"_error": {"code": -32001, "message": "task not found"}}));
+        let id: TaskId = "task-new".parse().unwrap();
+        for (in_send, kept) in [(true, false), (false, true)] {
+            let s = scope();
+            let error = Arc::clone(&s.error);
+            with_request(s, in_send, async {
+                assert!(ports.get(&id, None).await.is_err());
+            })
+            .await;
+            assert_eq!(error.lock().unwrap().is_some(), kept, "in_send {in_send}");
+        }
+    }
+
     /// a2a-rs hands the listing port no page parameters and has nowhere to put
     /// a next-page token, so the port walks the runtime's pages itself: the
     /// answer is every config, never a first page passed off as all of them.
@@ -841,7 +987,7 @@ mod tests {
     async fn a_read_answering_for_another_task_proves_nothing() {
         let ports = ports_answering(json!({"id": "task-other", "contextId": "c"}));
         let asked: TaskId = "task-asked".parse().unwrap();
-        let (got, verdict) = with_caller(Principal::anonymous(), false, async {
+        let (got, verdict) = with_request(scope(), false, async {
             let got = ports.get(&asked, None).await;
             (got, streamable().and_then(|s| s.verdict("task-asked")))
         })
@@ -850,7 +996,7 @@ mod tests {
         assert_eq!(verdict, Some(false));
 
         let ports = ports_answering(json!({"id": "task-asked", "contextId": "c"}));
-        let verdict = with_caller(Principal::anonymous(), false, async {
+        let verdict = with_request(scope(), false, async {
             ports.get(&asked, None).await.expect("the task asked for");
             streamable().and_then(|s| s.verdict("task-asked"))
         })

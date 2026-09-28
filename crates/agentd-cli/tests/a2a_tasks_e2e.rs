@@ -93,29 +93,25 @@ fn settled_task(addr: &str, ctx: &str, text: &str) -> String {
     task["id"].as_str().expect("a task id").to_string()
 }
 
-/// The ids a listing returned, in order. Proto3 JSON omits an empty repeated
-/// field, so an empty page has no `tasks` member at all.
+/// The ids a listing returned, in order. `tasks` is always present — `[]` on
+/// an empty page — as the spec's response carries it; ProtoJSON would drop an
+/// empty list, and the listener puts it back.
 fn ids(result: &Value) -> Vec<String> {
     assert!(result.is_object(), "a ListTasks result: {result}");
-    result
-        .get("tasks")
-        .map(|t| {
-            t.as_array()
-                .unwrap_or_else(|| panic!("a task list: {result}"))
-        })
-        .into_iter()
-        .flatten()
+    result["tasks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a task list, even when empty: {result}"))
+        .iter()
         .map(|t| t["id"].as_str().unwrap().to_string())
         .collect()
 }
 
-/// The token for the next page. Proto3 JSON omits a string at its default, so
-/// on the wire "no more pages" is an absent `nextPageToken`.
+/// The token for the next page: `""` on the last one, and never absent — a
+/// client reading "no token" as "more to come" must not be left guessing.
 fn next_token(result: &Value) -> String {
-    result
-        .get("nextPageToken")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
+    result["nextPageToken"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a nextPageToken, even on the last page: {result}"))
         .to_string()
 }
 

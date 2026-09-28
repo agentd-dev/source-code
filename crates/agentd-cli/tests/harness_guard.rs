@@ -361,7 +361,7 @@ fn sources(dir: &Path, out: &mut Vec<PathBuf>) {
 /// The suites that may name `GetAgentCard`: a test proving the server REFUSES
 /// the method has to send it. Listed by file name, so each exception is a
 /// deliberate line here rather than a pattern the scan happens to miss.
-const GET_AGENT_CARD_REFUSAL_TESTS: &[&str] = &[];
+const GET_AGENT_CARD_REFUSAL_TESTS: &[&str] = &["a2a_protocol_e2e.rs"];
 
 /// The legacy spellings, refused everywhere but the harness.
 ///

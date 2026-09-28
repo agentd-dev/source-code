@@ -595,22 +595,16 @@ fn credentials_are_challenged_with_401_and_roles_refused_with_403() {
         v
     };
     let auth_b = format!("Bearer {TOKEN_B}");
-    // A method the role may not call at all.
-    let v = forbidden(
-        a2a_post(
-            &addr,
-            &rpc_body(6, "a2a.drainX", json!({})),
-            &[("Authorization", &auth_b)],
-        ),
-        6,
-        "a method outside the role",
+    // A name outside the method table is not a method at all: -32601, as it
+    // is for every caller, before authorization could make the answers
+    // differ — never a 403 that would confirm the name means something.
+    let reply = a2a_post(
+        &addr,
+        &rpc_body(6, "a2a.drainX", json!({})),
+        &[("Authorization", &auth_b)],
     );
-    assert!(
-        v["error"]["message"]
-            .as_str()
-            .is_some_and(|m| m.contains("agent:token-b")),
-        "the refusal names the caller: {v}"
-    );
+    assert_eq!(reply.status, 200, "an unknown method: {reply:?}");
+    assert_eq!(reply.json()["error"]["code"], -32601, "{reply:?}");
     // A command the role is not granted: `plan.get` is a user op, not an
     // agent one. Blocking and streaming both answer with the JSON 403.
     let command = SendMessage::command("plan.get", json!({})).bearer(TOKEN_B);

@@ -2600,7 +2600,7 @@
       "additionalProperties": false,
       "properties": {
         "approval": {
-          "description": "whether a gate asks a person (ask), lets an LLM judge decide (auto), or takes the ask's recommendation (accept); runtime-settable via config.set",
+          "description": "whether a gate asks a person (ask), lets an LLM judge decide (auto), or takes the ask's recommendation (accept); runtime-settable via admin.set",
           "enum": [
             "ask",
             "auto",

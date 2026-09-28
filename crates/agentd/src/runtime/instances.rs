@@ -751,9 +751,29 @@ impl Runtime {
             .and_then(|s| s.socket.as_ref().map(|sock| format!("unix://{sock}")))
     }
 
-    /// Consume a child's `_instance.*` report. Returns true when the event was
-    /// an internal op — consumed either way, because a malformed report is
-    /// control-plane plumbing and is logged rather than surfaced to a model.
+    /// Consume a child's `_instance.*` report, sent to this instance as the
+    /// command op it is. `Ok` is the text of the task that records it.
+    #[cfg(feature = "a2a")]
+    pub(crate) fn instance_op(
+        &mut self,
+        principal: &crate::a2a::Principal,
+        op: InstanceOp,
+        args: &Value,
+    ) -> Result<String, String> {
+        if !speaks_for_child(principal.role) {
+            self.log.warn(
+                "instance.op.refused",
+                json!({"op": op.name(), "principal": principal.id, "note": "only the operator speaks for a child"}),
+            );
+            return Err(format!("{} is operator-only", op.name()));
+        }
+        self.consume_instance_op(op, args)
+    }
+
+    /// An `_instance.*` report that reached the durable inbox. Returns true
+    /// when the event was one — consumed either way, because a malformed
+    /// report is control-plane plumbing and must never reach a model, a wait
+    /// or a start node.
     #[cfg(feature = "a2a")]
     pub(crate) fn handle_instance_op(&mut self, ev: &crate::state::InboxEvent) -> bool {
         let message = json!({"parts": ev.payload.get("parts").cloned().unwrap_or(Value::Null)});
@@ -763,17 +783,29 @@ impl Runtime {
         if !op.starts_with("_instance.") {
             return false;
         }
-        // Only the operator/agent trust levels may speak for a child (a unix
-        // same-uid caller is operator; a bearer-authenticated child is agent).
-        let role = ev.payload["role"].as_str().unwrap_or("");
-        if !matches!(role, "operator" | "agent") {
+        let role: Option<crate::config::v2::Role> =
+            serde_json::from_value(ev.payload["role"].clone()).ok();
+        if !role.is_some_and(speaks_for_child) {
             self.log.warn(
                 "instance.op.refused",
-                json!({"op": op, "role": role, "note": "internal ops need an operator/agent principal"}),
+                json!({"op": op, "role": ev.payload["role"], "note": "only the operator speaks for a child"}),
             );
             return true;
         }
+        let Some(kind) = InstanceOp::of(&op) else {
+            self.log.warn("instance.op.unknown", json!({"op": op}));
+            return true;
+        };
         let args = super::a2a_server::command_data(&message).unwrap_or_else(|| json!({}));
+        if let Err(e) = self.consume_instance_op(kind, &args) {
+            self.log
+                .warn("instance.op.fail", json!({"op": op, "err": e}));
+        }
+        true
+    }
+
+    #[cfg(feature = "a2a")]
+    fn consume_instance_op(&mut self, op: InstanceOp, args: &Value) -> Result<String, String> {
         let handle = args["handle"].as_str().unwrap_or("").to_string();
         let live = self.subagents.get(&handle).is_some_and(|s| {
             s.tier.as_deref() == Some("instance") && !is_terminal_status(&s.status)
@@ -781,12 +813,12 @@ impl Runtime {
         if !live {
             self.log.warn(
                 "instance.op.orphan",
-                json!({"op": op, "handle": handle, "note": "no live instance child by that handle"}),
+                json!({"op": op.name(), "handle": handle, "note": "no live instance child by that handle"}),
             );
-            return true;
+            return Err(format!("no live instance child {handle:?}"));
         }
-        match op.as_str() {
-            "_instance.result" => {
+        match op {
+            InstanceOp::Result => {
                 if let Some(s) = self.subagents.get_mut(&handle) {
                     // First completion wins: a child may report more than once
                     // (a retry, a second run), and the handle's result must
@@ -802,8 +834,9 @@ impl Runtime {
                         self.persist_subagent(&handle);
                     }
                 }
+                Ok(format!("result from {handle} recorded"))
             }
-            "_instance.emit" => {
+            InstanceOp::Emit => {
                 let stream = args["stream"].as_str().unwrap_or("").to_string();
                 let event = args.get("event").cloned().unwrap_or(Value::Null);
                 let subject = event["subject"].as_str().unwrap_or("").to_string();
@@ -825,19 +858,18 @@ impl Runtime {
                             "instance.mirror",
                             json!({"handle": handle, "stream": stream, "seq": seq}),
                         );
+                        Ok(format!("event mirrored into {stream} at {seq}"))
                     }
-                    Err(e) => self.log.warn(
-                        "instance.mirror.fail",
-                        json!({"handle": handle, "stream": stream, "err": e}),
-                    ),
+                    Err(e) => {
+                        self.log.warn(
+                            "instance.mirror.fail",
+                            json!({"handle": handle, "stream": stream, "err": e}),
+                        );
+                        Err(e)
+                    }
                 }
             }
-            other => self.log.warn(
-                "instance.op.unknown",
-                json!({"op": other, "handle": handle}),
-            ),
         }
-        true
     }
 
     /// Budget metering for instance children: a DURABLE child's manifest
@@ -1026,9 +1058,60 @@ fn validate_composed(doc: &Value) -> Result<(), String> {
     }
 }
 
+/// The `_instance.*` ops a child sends home.
+#[cfg(feature = "a2a")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InstanceOp {
+    /// A `mode: sync` child's first result.
+    Result,
+    /// One event of a `mirror_streams` stream.
+    Emit,
+}
+
+#[cfg(feature = "a2a")]
+impl InstanceOp {
+    pub(crate) fn of(op: &str) -> Option<InstanceOp> {
+        match op {
+            "_instance.result" => Some(InstanceOp::Result),
+            "_instance.emit" => Some(InstanceOp::Emit),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            InstanceOp::Result => "_instance.result",
+            InstanceOp::Emit => "_instance.emit",
+        }
+    }
+}
+
+/// Only the operator speaks for a child. A child dials home with the parent's
+/// own operator credential (its unix socket, or the `a2a.bearer` reference it
+/// was composed with), so nothing legitimate arrives as anything else — and an
+/// `agent` that could write a child's result could decide what the parent
+/// believes its own subagent answered.
+#[cfg(feature = "a2a")]
+fn speaks_for_child(role: crate::config::v2::Role) -> bool {
+    role == crate::config::v2::Role::Operator
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "a2a")]
+    #[test]
+    fn only_the_operator_speaks_for_a_child() {
+        use crate::config::v2::Role;
+        assert!(speaks_for_child(Role::Operator));
+        for role in [Role::Agent, Role::User, Role::Anonymous] {
+            assert!(
+                !speaks_for_child(role),
+                "{role:?} must not speak for a child"
+            );
+        }
+    }
 
     #[test]
     fn a_child_manifest_yields_its_lifetime_tokens() {

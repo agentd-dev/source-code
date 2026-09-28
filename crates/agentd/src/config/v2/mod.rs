@@ -7754,6 +7754,20 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                 format!("a2a.principals[{i}]: `any` cannot grant the operator role"),
             );
         }
+        // A grant naming a removed op would load, match nothing and leave the
+        // operator believing the principal still holds the control it named —
+        // refused by name, with what replaced it.
+        for g in &pr.grants {
+            if let Some(hint) = crate::runtime::surface::removed_op(g) {
+                err(
+                    &mut d,
+                    format!(
+                        "a2a.principals[{i}].grants: grant `{g}` was removed in agentd {}: {hint}",
+                        crate::runtime::surface::OPS_REMOVED_IN
+                    ),
+                );
+            }
+        }
         // A certificate names its holder; a shared secret and "anyone" do
         // not. Deriving an id for those produced `user:unknown`, one principal
         // that every such caller's tasks and conversations silently merged
@@ -11095,6 +11109,70 @@ mod tests {
         assert_eq!(g.scopes, vec![DeviceScope::User]);
         assert_eq!(g.token_ttl(), DEFAULT_DEVICE_TOKEN_TTL);
         assert_eq!(g.code_ttl(), DEFAULT_DEVICE_CODE_TTL);
+    }
+
+    /// A removed op is refused BY NAME wherever it can still be written: as
+    /// a principal's grant, which would otherwise load and match nothing, and
+    /// as a workflow's `a2a` start command, which would otherwise answer an
+    /// old client in the operator control's place. The `_instance.` family
+    /// and the reserved names are a workflow's to claim neither.
+    #[test]
+    fn removed_op_names_are_refused_as_grants_and_workflow_commands() {
+        use crate::runtime::surface::REMOVED_OPS;
+        for (op, hint) in REMOVED_OPS {
+            let e = load_errors(&format!(
+                "a2a:\n  principals: [{{id: p, match: {{san: a.example}}, role: user, grants: [\"status\", \"{op}\"]}}]\n"
+            ));
+            assert!(
+                e.contains(&format!(
+                    "a2a.principals[0].grants: grant `{op}` was removed in agentd 1.17.0: {hint}"
+                )),
+                "{op}: {e}"
+            );
+            let errs = crate::engine::model::parse_workflow(&serde_json::json!({
+                "name": "old", "version": 3,
+                "steps": {
+                    "s": {"kind": "a2a", "command": op},
+                    "f": {"kind": "finish", "depends_on": ["s"], "status": "completed"}
+                }
+            }))
+            .err()
+            .unwrap_or_default();
+            assert!(
+                errs.iter().any(|e| e.contains(&format!(
+                    "command `{op}` was removed in agentd 1.17.0: {hint}"
+                ))),
+                "{op}: {errs:?}"
+            );
+        }
+        // A current op, or a pattern that merely covers a removed one, loads.
+        assert_eq!(
+            load_errors(
+                "a2a:\n  principals: [{id: p, match: {san: a.example}, role: user, grants: [\"admin.set\", \"config*\"]}]\n"
+            ),
+            ""
+        );
+        for cmd in [
+            "_instance.result",
+            "_instance.anything",
+            "ask_human",
+            "admin.set",
+        ] {
+            let errs = crate::engine::model::parse_workflow(&serde_json::json!({
+                "name": "shadow", "version": 3,
+                "steps": {
+                    "s": {"kind": "a2a", "command": cmd},
+                    "f": {"kind": "finish", "depends_on": ["s"], "status": "completed"}
+                }
+            }))
+            .err()
+            .unwrap_or_default();
+            assert!(
+                errs.iter()
+                    .any(|e| e.contains(cmd) && e.contains("built-in")),
+                "{cmd}: {errs:?}"
+            );
+        }
     }
 
     #[test]

@@ -1198,6 +1198,24 @@ impl Workflow {
     pub fn start_steps(&self) -> Vec<&Step> {
         self.steps.values().filter(|s| s.is_start()).collect()
     }
+    /// The start node `workflow.run` uses by default: `manual`, else the first.
+    pub fn default_start(&self) -> Option<&Step> {
+        let starts = self.start_steps();
+        starts
+            .iter()
+            .find(|s| s.kind == "manual")
+            .or_else(|| starts.first())
+            .copied()
+    }
+    /// Whether the default start admits a caller of `role`. Only an `a2a`
+    /// start declares `roles:`, and one that declares none admits everyone —
+    /// the same filter the reactor applies when a message fires that start.
+    pub fn default_start_admits(&self, role: &str) -> bool {
+        self.default_start()
+            .and_then(|s| s.spec.get("roles"))
+            .and_then(Value::as_array)
+            .is_none_or(|roles| roles.is_empty() || roles.iter().any(|r| r.as_str() == Some(role)))
+    }
     pub fn step(&self, id: &str) -> Option<&Step> {
         self.steps.get(id)
     }
@@ -1919,20 +1937,28 @@ fn parse_step(
         // The A2A start takes the same `into:` binding as `webhook`.
         "a2a" => {
             check_into(&spec, &at, errs);
-            // …and may not claim a name the built-in command surface owns.
-            // A declared command takes the inbox path, which does not run the
+            // …and may not claim a name the built-in command surface owns —
+            // the `_instance.` family and the reserved names included. A
+            // declared command takes the inbox path, which does not run the
             // per-op authorization the built-ins carry — so a workflow
             // claiming `admin.drain` would shadow an operator's control with a
             // run that anyone its `roles:` admits could trigger. Refused here,
             // at load AND at `workflow.create`, because both reach this
-            // validation.
-            if let Some(cmd) = spec.get("command").and_then(Value::as_str)
-                && crate::runtime::surface::is_builtin_op(cmd)
-            {
-                errs.push(format!(
-                    "{at}: command {cmd:?} is a built-in operation and cannot be \
-                     declared by a workflow — pick a name of your own"
-                ));
+            // validation. A removed op is refused by name too: a workflow
+            // answering `config.set` would look, to a client written for the
+            // old vocabulary, like the operator control it replaced.
+            if let Some(cmd) = spec.get("command").and_then(Value::as_str) {
+                use crate::runtime::surface::{OPS_REMOVED_IN, is_builtin_op, removed_op};
+                if let Some(hint) = removed_op(cmd) {
+                    errs.push(format!(
+                        "{at}: command `{cmd}` was removed in agentd {OPS_REMOVED_IN}: {hint}"
+                    ));
+                } else if is_builtin_op(cmd) {
+                    errs.push(format!(
+                        "{at}: command {cmd:?} is a built-in operation and cannot be \
+                         declared by a workflow — pick a name of your own"
+                    ));
+                }
             }
         }
         // The typed A2A form: `command` carries the op, `args` its payload.

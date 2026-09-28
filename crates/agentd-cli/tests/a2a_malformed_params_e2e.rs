@@ -194,7 +194,7 @@ fn malformed_send_params_are_refused_and_the_daemon_keeps_serving() {
         .and_then(parse)
         .unwrap_or_else(|e| panic!("the listener stopped answering after malformed input: {e}"));
     assert_eq!(
-        v["result"]["task"]["status"]["state"], "TASK_STATE_COMPLETED",
+        v["result"]["message"]["role"], "ROLE_AGENT",
         "a good request after the bad ones: {v}"
     );
     assert!(daemon.alive(), "the daemon survived the whole sequence");

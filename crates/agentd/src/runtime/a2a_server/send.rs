@@ -60,12 +60,10 @@ impl Runtime {
         // inbox event. A registered command therefore skips command dispatch
         // and takes the ordinary message path: written ahead to the durable
         // inbox, then matched against the start nodes (roles included) by the
-        // reactor. A built-in wins, so a workflow cannot shadow `status`.
-        // `_instance.*` ops are the runtime's own children reporting home
-        // (sync results, mirrored stream events). They take the inbox path
-        // like a declared command — the REACTOR consumes them
-        // before start matching; they never reach a model or a workflow.
-        let internal_op = command_op(message).is_some_and(|op| op.starts_with("_instance."));
+        // reactor. A built-in wins, so a workflow cannot shadow `status` — and
+        // the `_instance.*` reports a child sends home are built-ins too, so
+        // they are consumed by their handler and never reach a model, a wait
+        // or a start node.
         // A BUILT-IN always wins, which the paragraph above has always claimed
         // and the code did not do: `declared` was checked first, so a workflow
         // declaring `{kind: a2a, command: "status"}` took the inbox path and
@@ -76,8 +74,7 @@ impl Runtime {
         // refused at validation; this is the second lock.
         let builtin = command_op(message).is_some_and(|op| surface::is_builtin_op(&op));
         let declared = !builtin
-            && (internal_op
-                || command_op(message).is_some_and(|op| self.workflow_declares_a2a_command(&op)));
+            && command_op(message).is_some_and(|op| self.workflow_declares_a2a_command(&op));
         // A declared command with a `schema:` is a CONTRACT: a payload that
         // does not match is refused HERE, synchronously, with the mismatch —
         // not accepted into the inbox to fail later where the caller cannot
@@ -289,7 +286,9 @@ mod tests {
             "subagent.kill",
             "admin.drain",
             "admin.pause",
-            "interface.info",
+            "admin.set",
+            "ask_human",
+            "_instance.result",
         ] {
             assert!(is_builtin_op(op), "{op} is reserved");
         }

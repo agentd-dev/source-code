@@ -272,7 +272,9 @@ fn a_target_agentd_should_not_reach_is_refused_at_registration() {
     // Enabled, but WITHOUT allow_private: the ordinary production posture.
     let (_daemon, addr, cfg_path) = boot(|p| config(&llm.uri, p, "  push:\n    enabled: true\n"));
 
-    let sent = SendMessage::command("status", json!({})).post(&addr);
+    // Any task will do; a natural-language send is the one that makes one
+    // (`status` is a read, and a read creates none).
+    let sent = SendMessage::text("hello").post(&addr);
     let task_id = sent["result"]["task"]["id"].as_str().unwrap().to_string();
 
     // The cloud metadata endpoint: the canonical thing a peer would like agentd
@@ -301,7 +303,9 @@ fn push_is_off_unless_an_operator_turns_it_on() {
     let card = get_card(&addr);
     assert_eq!(card["capabilities"]["pushNotifications"], false, "{card}");
 
-    let sent = SendMessage::command("status", json!({})).post(&addr);
+    // Any task will do; a natural-language send is the one that makes one
+    // (`status` is a read, and a read creates none).
+    let sent = SendMessage::text("hello").post(&addr);
     let task_id = sent["result"]["task"]["id"].as_str().unwrap().to_string();
 
     // …and asking anyway is a clean refusal, not a silent no-op.

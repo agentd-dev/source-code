@@ -142,7 +142,7 @@ fn top_level_properties(
                     "conversation_budget": budget,
                     "ask_human_fallback": { "enum": ["wait", "pause", "idle", "fail", "finish", "stop", "auto"], "description": "what ask_human does with no human channel (and, for auto, on an unanswered gate timeout): wait (park until timeout), fail (default), or auto (an LLM judge answers on the operator's behalf, marked as auto)" },
                     "ask_human_unowned": { "enum": ["gate", "fallback"], "description": "what an ask_human no caller owns (raised by a schedule, webhook or stream) does: gate (an operator answers it on the A2A listener; requires a2a.listen) or fallback (default — ask_human_fallback applies)" },
-                "approval": { "enum": ["ask", "auto", "accept"], "description": "whether a gate asks a person (ask), lets an LLM judge decide (auto), or takes the ask's recommendation (accept); runtime-settable via config.set" },
+                "approval": { "enum": ["ask", "auto", "accept"], "description": "whether a gate asks a person (ask), lets an LLM judge decide (auto), or takes the ask's recommendation (accept); runtime-settable via admin.set" },
                 "document_capabilities": { "type": "array", "items": { "enum": ["material", "knowledge", "interface", "identity", "compute", "infra", "compose"] }, "description": "instruction-document families this agent's instruction may use (the trust ladder). Empty grants only the default rung; naming a family admits its blocks. Fail-closed, restart-only." }
                 }
             }));

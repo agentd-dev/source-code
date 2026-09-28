@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use crate::checks::util::{
-    feed_method, mock_llm, open, rpc, rpc_body, send_command, send_text, text_params, wait_ready,
-    write_file,
+    feed_method, mock_llm, open, post, rpc, rpc_body, send_command, send_text, text_params,
+    wait_ready, write_file,
 };
 use crate::{Category, Check, Harness, Outcome};
 
@@ -24,7 +24,7 @@ pub fn checks() -> Vec<Check> {
         Check {
             id: "interface/default-off-gate",
             category: Category::Interface,
-            desc: "without a2a.events.enabled the surface refuses (-32004) and the core answers",
+            desc: "without a2a.events.enabled the feed refuses (-32004), interface.info is an unknown op, and the core answers",
             run: default_off,
         },
         Check {
@@ -75,17 +75,28 @@ fn default_off(h: &Harness) -> Outcome {
     let _daemon = h.spawn(&["--config", &cfg]);
     wait_ready(&addr);
 
-    let refused = send_command(&addr, 1, "interface.info");
+    // The feed is not served…
+    let feed = post(&addr, &rpc_body(1, feed_method(), json!({})), &[]);
     Outcome::require(
-        refused["error"]["code"] == -32004,
-        format!("interface.info should refuse with -32004 while disabled: {refused}"),
+        feed.contains("-32004"),
+        format!("the feed should refuse with -32004 while disabled: {feed}"),
     )
     .and(|| {
-        // The core surface is untouched: status still answers.
-        let st = send_command(&addr, 2, "status");
+        // …the removed discovery op is an unknown op, whatever the switch…
+        let gone = send_command(&addr, 2, "interface.info");
         Outcome::require(
-            st["result"]["task"]["status"]["state"] == "TASK_STATE_COMPLETED",
-            format!("the core status command should still answer: {st}"),
+            gone["error"]["code"] == -32602,
+            format!("interface.info was removed and should be an unknown op (-32602): {gone}"),
+        )
+    })
+    .and(|| {
+        // …and the core surface is untouched: status still answers, as a
+        // Message carrying the document.
+        let st = send_command(&addr, 3, "status");
+        Outcome::require(
+            st["result"]["message"]["parts"][0]["data"]["runs"].is_array()
+                && st["result"].get("task").is_none(),
+            format!("the core status command should still answer with a Message: {st}"),
         )
     })
 }

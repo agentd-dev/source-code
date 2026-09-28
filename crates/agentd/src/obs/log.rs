@@ -103,7 +103,7 @@ static STDERR_LOCK: Mutex<()> = Mutex::new(());
 // live-tail convenience.
 //
 // It is installed only when the debug tail is wanted (`a2a.introspection.enabled`
-// at startup, or turned on later by `config.set` or a reload); without that, capture is a single relaxed atomic load that short-circuits, so
+// at startup, or turned on later by `admin.set` or a reload); without that, capture is a single relaxed atomic load that short-circuits, so
 // the default build pays nothing.
 // The ring is lossy and bounded by design: an overrun drops the oldest and bumps
 // `dropped`, never blocking — a slow or dead subscriber can never back-pressure
@@ -187,7 +187,7 @@ pub fn take_events_dirty() -> bool {
 
 /// Install the bounded event ring with capacity `cap`. Called by the runtime
 /// when the live log tail is wanted — `a2a.introspection.enabled` at startup,
-/// or turned on later by `config.set` or a reload.
+/// or turned on later by `admin.set` or a reload.
 ///
 /// Idempotent: a ring already installed with this capacity is kept, lines and
 /// cursor both, because introspection can be switched on from several places
@@ -233,6 +233,7 @@ pub fn install_event_ring(cap: usize) {
 /// `families_cover_the_emitted_vocabulary` keeps this honest against the tree.
 pub const EVENT_FAMILIES: &[&str] = &[
     "a2a",
+    "admin",
     "agent",
     "audit",
     "breaker",

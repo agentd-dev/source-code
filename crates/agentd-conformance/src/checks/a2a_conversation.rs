@@ -2,8 +2,8 @@
 //! A2A conversations, principals & commands. The daemon binds the
 //! real A2A listener over plaintext loopback (⇒ the `operator` principal, so no
 //! cert plumbing is needed to exercise the wiring). A JSON-RPC peer drives the
-//! surface: a `status` command DataPart completes deterministically without a
-//! model turn; the agent card is discoverable; a natural-language message runs a
+//! surface: a `status` command DataPart is answered deterministically, as a
+//! Message, without a model turn or a task; the agent card is discoverable; a natural-language message runs a
 //! turn worker and the answer lands as the task's artifact, readable back through
 //! `GetTask` and enumerable through `ListTasks`.
 
@@ -22,7 +22,7 @@ pub fn checks() -> Vec<Check> {
         Check {
             id: "a2a-conversation/status-command-no-model-turn",
             category: Category::A2aConversation,
-            desc: "a `status` command DataPart returns a completed task deterministically",
+            desc: "a `status` command DataPart is answered deterministically with a Message and no task",
             run: status_command,
         },
         Check {
@@ -107,18 +107,26 @@ fn status_command(h: &Harness) -> Outcome {
     if sent.get("error").is_some() {
         return Outcome::fail(format!("a status command should be answered: {sent}"));
     }
-    let task = &sent["result"]["task"];
+    // A read is the spec's immediate reply: a Message, and no task to track.
+    let message = &sent["result"]["message"];
     Outcome::require(
-        task["status"]["state"] == "TASK_STATE_COMPLETED",
-        format!("a status command should complete: {task}"),
+        sent["result"].get("task").is_none() && message["role"] == "ROLE_AGENT",
+        format!("a status command should answer with an agent Message and no task: {sent}"),
     )
     .and(|| {
-        let text = task["status"]["message"]["parts"][0]["text"]
-            .as_str()
-            .unwrap_or("");
+        let doc = &message["parts"][0]["data"];
         Outcome::require(
-            text.contains("conversations") && text.contains("runs"),
-            format!("the status summary should name conversations + runs: {text:?}"),
+            doc["conversations"].is_array() && doc["runs"].is_array(),
+            format!("the status document should list conversations + runs: {doc}"),
+        )
+    })
+    .and(|| {
+        // …so polling it leaves the task list as it found it.
+        let _ = send_command(&addr, 2, "status");
+        let listed = rpc(&addr, 3, "ListTasks", json!({}));
+        Outcome::require(
+            listed["tasks"].as_array().is_none_or(Vec::is_empty),
+            format!("status reads should create no tasks: {listed}"),
         )
     })
 }
@@ -139,7 +147,8 @@ fn task_shape(h: &Harness) -> Outcome {
     let _daemon = h.spawn(&["--config", &cfg]);
     wait_ready(&addr);
 
-    let sent = send_command(&addr, 1, "status");
+    // A natural-language send is what makes a task (a read makes none).
+    let sent = send_text(&addr, 1, "hello", false);
     let task = sent["result"]["task"].clone();
     let id = task["id"].as_str().unwrap_or("").to_string();
 
@@ -186,7 +195,7 @@ fn task_shape(h: &Harness) -> Outcome {
     // The listing envelope carries the paging fields. Proto3 JSON omits a field
     // at its default value, so `nextPageToken` is absent exactly when there is
     // no next page — its absence is the answer, not an omission. The counts are
-    // asserted because they are non-default here: two tasks exist.
+    // asserted because they are non-default here: a task exists.
     if listed["totalSize"].as_u64().unwrap_or(0) == 0 {
         return Outcome::fail(format!(
             "ListTasks should report how many tasks it found: {listed}"

@@ -23,8 +23,12 @@ fn command(addr: &str, op: &str, args: Value) -> Value {
         .result(addr)
 }
 
-/// Parse a command task's JSON artifact.
+/// A command's document: a read's Message data, or a task's JSON artifact.
 fn artifact_json(v: &Value) -> Value {
+    if let Some(doc) = v["message"]["parts"][0].get("data") {
+        assert!(v.get("task").is_none(), "a read creates no task: {v}");
+        return doc.clone();
+    }
     v["task"]["artifacts"][0]["parts"][0]["text"]
         .as_str()
         .and_then(|t| serde_json::from_str(t).ok())
@@ -183,7 +187,7 @@ fn a_signal_resumes_a_waiting_run() {
     let extra = "workflows:\n  - name: waiter\n    steps:\n      s: {kind: manual}\n      w: {kind: wait, on: signal, signal: go, depends_on: [s]}\n      f: {kind: finish, depends_on: [w], output: \"released\"}\n";
     let (_daemon, addr, cfg) = spawn_bound(|port| steer_config(&llm.uri, port, extra));
 
-    let started = command(&addr, "workflow.run", json!({"name": "waiter"}));
+    let started = command(&addr, "workflow.run", json!({"workflow": "waiter"}));
     let task_id = started["task"]["id"].as_str().unwrap().to_string();
     // Find the run id + confirm it parks on the wait.
     let run_id = wait_run_id(&addr, 10);
@@ -215,7 +219,7 @@ fn a_single_run_pauses_and_resumes() {
     let extra = "workflows:\n  - name: slow\n    steps:\n      s: {kind: manual}\n      z: {kind: sleep, duration: 1s, depends_on: [s]}\n      f: {kind: finish, depends_on: [z], output: \"done\"}\n";
     let (_daemon, addr, cfg) = spawn_bound(|port| steer_config(&llm.uri, port, extra));
 
-    command(&addr, "workflow.run", json!({"name": "slow"}));
+    command(&addr, "workflow.run", json!({"workflow": "slow"}));
     let run_id = wait_run_id(&addr, 10);
 
     // Pause the run mid-flight; it must NOT complete while paused.

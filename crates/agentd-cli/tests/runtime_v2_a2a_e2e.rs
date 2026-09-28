@@ -164,7 +164,7 @@ fn text_part_answer(task: &Value) -> String {
 }
 
 #[test]
-fn a_status_command_over_a2a_returns_a_completed_task_without_a_model_turn() {
+fn a_status_command_over_a2a_is_a_message_without_a_task_or_a_model_turn() {
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
@@ -172,19 +172,24 @@ fn a_status_command_over_a2a_returns_a_completed_task_without_a_model_turn() {
     let daemon = spawn_daemon(&cfg);
     wait_ready(&addr, &daemon);
 
-    // A `status` command DataPart is answered deterministically.
+    // A `status` command DataPart is answered deterministically, as the
+    // spec's immediate reply: an agent Message carrying the document, and no
+    // task to track.
     let result = SendMessage::command("status", json!({})).result(&addr);
-    let task = &result["task"];
-    assert_eq!(
-        task["status"]["state"], "TASK_STATE_COMPLETED",
-        "status task: {task}"
-    );
-    let text = task["status"]["message"]["parts"][0]["text"]
-        .as_str()
-        .unwrap_or("");
     assert!(
-        text.contains("conversations") && text.contains("runs"),
-        "status summary: {text:?}"
+        result.get("task").is_none(),
+        "a read creates no task: {result}"
+    );
+    let message = &result["message"];
+    assert_eq!(message["role"], "ROLE_AGENT", "{result}");
+    assert_eq!(
+        message["extensions"][0],
+        agentd::runtime::surface::COMMAND_EXTENSION
+    );
+    let doc = &message["parts"][0]["data"];
+    assert!(
+        doc["conversations"].is_array() && doc["runs"].is_array(),
+        "status document: {doc}"
     );
 
     // The agent card is discoverable without a principal.
@@ -249,7 +254,7 @@ fn a_workflow_run_command_starts_a_run_and_the_task_tracks_it_to_completion() {
     wait_ready(&addr, &daemon);
 
     // A `workflow.run` command DataPart starts the run; its task begins working.
-    let result = SendMessage::command("workflow.run", json!({"name": "greet"})).result(&addr);
+    let result = SendMessage::command("workflow.run", json!({"workflow": "greet"})).result(&addr);
     let task_id = result["task"]["id"].as_str().unwrap().to_string();
 
     // Poll GetTask until the run completes and the task tracks it.

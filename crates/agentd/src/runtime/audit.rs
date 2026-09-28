@@ -27,21 +27,19 @@ impl Runtime {
     /// Emit an audit event to the configured sinks. A no-op when no sink is
     /// configured (`observability.audit.sink`). Cheap on the common path.
     pub(crate) fn audit(&self, ev: AuditEvent<'_>) {
+        self.audit_mirrored(ev, true)
+    }
+
+    /// [`Runtime::audit`], saying whether the event is also mirrored onto the
+    /// observation feed.
+    fn audit_mirrored(&self, ev: AuditEvent<'_>, mirror_to_feed: bool) {
         // Mirror onto the observation feed as operator-visible `audit` events
         // when introspection is on — independent of the sinks, which stay the
-        // durable/system record. The taskless interface READS are
-        // excluded: a display client polls them (debug.events at ~1 Hz), and
-        // mirroring their own audit back onto the feed would feed-loop the
-        // debug pane with its own plumbing. The durable sinks still record
-        // them.
+        // durable/system record and are written either way.
         #[cfg(feature = "a2a")]
-        if let Some(feed) = &self.a2a_feed
+        if mirror_to_feed
+            && let Some(feed) = &self.a2a_feed
             && feed.debug()
-            && !ev.action.ends_with(":interface.info")
-            && !ev.action.ends_with(":conversation.get")
-            && !ev.action.ends_with(":run.get")
-            && !ev.action.ends_with(":subagent.get")
-            && !ev.action.ends_with(":debug.events")
         {
             feed.push(
                 "audit",
@@ -56,6 +54,8 @@ impl Runtime {
                 }),
             );
         }
+        #[cfg(not(feature = "a2a"))]
+        let _ = mirror_to_feed;
         let Some(sinks) = &self.settings.observability.audit.sink else {
             return;
         };
@@ -118,22 +118,89 @@ impl Runtime {
             None => format!("a2a.{method}"),
         };
         let role = format!("{:?}", principal.role).to_lowercase();
-        self.audit(AuditEvent {
-            action: &action,
-            target,
-            outcome,
-            principal: Some(&principal.id),
-            role: Some(&role),
-            request_id,
-        });
+        self.audit_mirrored(
+            AuditEvent {
+                action: &action,
+                target,
+                outcome,
+                principal: Some(&principal.id),
+                role: Some(&role),
+                request_id,
+            },
+            mirror_to_feed(method, op, outcome),
+        );
     }
+}
+
+/// The A2A methods that only read. Their successes are not mirrored onto the
+/// feed (see [`mirror_to_feed`]).
+#[cfg(feature = "a2a")]
+const READ_METHODS: &[&str] = &[
+    "GetTask",
+    "ListTasks",
+    "GetTaskPushNotificationConfig",
+    "ListTaskPushNotificationConfigs",
+    "GetExtendedAgentCard",
+    "SubscribeToTask",
+];
+
+/// Whether an A2A call's audit event is mirrored onto the observation feed.
+///
+/// A successful READ is not: display clients poll reads (a log tail at about
+/// once a second), and echoing each poll back onto the feed they are reading
+/// would fill it with its own plumbing. Everything else is — a refusal of any
+/// call, and every mutation. The op is classified by the op table, not by the
+/// shape of the action string, so an op a workflow declares under a name that
+/// happens to end like a read is still recorded.
+#[cfg(feature = "a2a")]
+fn mirror_to_feed(method: &str, op: Option<&str>, outcome: &str) -> bool {
+    let read = match op {
+        Some(op) => crate::runtime::surface::is_read_op(op),
+        None => READ_METHODS.contains(&method),
+    };
+    !(outcome == "ok" && read)
 }
 
 #[cfg(test)]
 mod tests {
     // The emitter is exercised end-to-end by
     // `runtime_v2_a2a_e2e::a2a_calls_are_audited_when_the_audit_log_sink_is_on`
-    // (a real daemon with `observability.audit.sink: [log]`); a pure-unit test
-    // would only restate the JSON shape. The shape is asserted there against
-    // the log line.
+    // (a real daemon with `observability.audit.sink: [log]`); these pin the
+    // one decision that is made here rather than there.
+    #[cfg(feature = "a2a")]
+    use super::*;
+
+    #[cfg(feature = "a2a")]
+    #[test]
+    fn reads_are_not_mirrored_but_refusals_and_mutations_are() {
+        // Successful reads: a read op, a read method.
+        for op in [
+            "status",
+            "debug.events",
+            "conversation.get",
+            "workflow.status",
+        ] {
+            assert!(!mirror_to_feed("SendMessage", Some(op), "ok"), "{op}");
+        }
+        for m in READ_METHODS {
+            assert!(!mirror_to_feed(m, None, "ok"), "{m}");
+        }
+        // The same reads, refused, are mirrored.
+        assert!(mirror_to_feed("SendMessage", Some("debug.events"), "error"));
+        assert!(mirror_to_feed("GetTask", None, "rate_limited"));
+        // Mutations are mirrored.
+        for op in ["workflow.run", "admin.set", "admin.drain", "subagent.kill"] {
+            assert!(mirror_to_feed("SendMessage", Some(op), "ok"), "{op}");
+        }
+        assert!(mirror_to_feed("SendMessage", None, "ok"));
+        assert!(mirror_to_feed("CancelTask", None, "ok"));
+        // An op outside the table — a workflow's own command — is work, and
+        // no suffix makes it a read.
+        assert!(mirror_to_feed(
+            "SendMessage",
+            Some("audit.debug.events"),
+            "ok"
+        ));
+        assert!(mirror_to_feed("SendMessage", Some("review.start"), "ok"));
+    }
 }

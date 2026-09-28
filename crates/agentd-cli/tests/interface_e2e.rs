@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The **display surface** end to end: a daemon with `a2a.events.enabled`
 //! (+ `a2a.introspection.enabled`) serves the display-client contract over its
-//! real A2A listener — `interface.info` discovery, the global
+//! real A2A listener — the card's extension declarations, the global
 //! `SubscribeToEvents` SSE feed (cross-client transcript sync + cursor resume),
 //! the taskless introspection reads (`conversation.get` with message bodies,
 //! `run.get` with per-step detail, `debug.events` log-ring tail), the
@@ -31,6 +31,14 @@ fn free_port() -> u16 {
 
 fn command(addr: &str, op: &str, args: Value) -> Value {
     SendMessage::command(op, args).result(addr)
+}
+
+/// A read op: its reply is a Message carrying the document, and no task.
+fn read(addr: &str, op: &str, args: Value) -> Value {
+    let r = command(addr, op, args);
+    assert!(r.get("task").is_none(), "{op} created a task: {r}");
+    assert_eq!(r["message"]["role"], "ROLE_AGENT", "{op}: {r}");
+    r["message"]["parts"][0]["data"].clone()
 }
 
 struct MockLlm {
@@ -179,31 +187,20 @@ fn wait_for<F: Fn(&[Value]) -> bool>(sink: &Arc<Mutex<Vec<Value>>>, secs: u64, p
 }
 
 #[test]
-fn interface_info_and_the_debug_reads_work_over_a2a() {
+fn the_introspection_reads_work_over_a2a() {
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "Hello from the mock."}]}));
     let extra = "workflows:\n  - name: greet\n    steps:\n      s: {kind: manual}\n      f: {kind: finish, depends_on: [s], output: \"done\"}\n";
     let (_daemon, addr, cfg) = spawn_bound(|port| iface_config(&llm.uri, port, true, extra));
 
-    // Discovery: enabled + debug + the op list a client keys its panes off.
-    let info = command(&addr, "interface.info", json!({}));
-    assert_eq!(info["interface"]["enabled"], true, "{info}");
-    assert_eq!(info["interface"]["debug"], true);
-    assert_eq!(info["interface"]["feed"]["method"], common::feed_method());
-    let ops: Vec<&str> = info["interface"]["ops"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(Value::as_str)
-        .collect();
-    assert!(ops.contains(&"conversation.get") && ops.contains(&"debug.events"));
-    // Taskless: an interface read creates NO durable task. (Proto3 JSON omits a
-    // field at its default value, so "no tasks" arrives as an absent `tasks`
-    // rather than an empty array — which is exactly what is being asserted.)
+    // Taskless: a read creates NO durable task. (Proto3 JSON omits a field at
+    // its default value, so "no tasks" arrives as an absent `tasks` rather
+    // than an empty array — which is exactly what is being asserted.)
     let count = |v: &Value| v["tasks"].as_array().map(Vec::len).unwrap_or(0);
     let tasks_before = count(&rpc(&addr, 2, "ListTasks", json!({})));
-    let _ = command(&addr, "interface.info", json!({}));
+    let _ = read(&addr, "status", json!({}));
+    let _ = read(&addr, "debug.events", json!({"limit": 1}));
     let tasks_after = count(&rpc(&addr, 4, "ListTasks", json!({})));
-    assert_eq!(tasks_before, tasks_after, "interface reads are taskless");
+    assert_eq!(tasks_before, tasks_after, "reads are taskless");
 
     // The agent card advertises the surface (public discovery). Position is
     // not the claim — the command vocabulary is declared on every card — so
@@ -224,7 +221,7 @@ fn interface_info_and_the_debug_reads_work_over_a2a() {
     let sent = SendMessage::text("Say hello").result(&addr);
     let ctx = sent["task"]["contextId"].as_str().unwrap().to_string();
     assert_eq!(sent["task"]["status"]["state"], "TASK_STATE_COMPLETED");
-    let conv = command(&addr, "conversation.get", json!({"id": ctx}));
+    let conv = read(&addr, "conversation.get", json!({"id": ctx}));
     let msgs = conv["conversation"]["messages"].as_array().unwrap();
     assert!(
         msgs.iter()
@@ -237,37 +234,36 @@ fn interface_info_and_the_debug_reads_work_over_a2a() {
     );
 
     // A run with per-step detail (debug).
-    let run_task = command(&addr, "workflow.run", json!({"name": "greet"}));
+    let run_task = command(&addr, "workflow.run", json!({"workflow": "greet"}));
     let run_task_id = run_task["task"]["id"].as_str().unwrap().to_string();
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut run_id = String::new();
     while Instant::now() < deadline {
         let got = rpc(&addr, 9, "GetTask", json!({"id": run_task_id}));
         if got["status"]["state"] == "TASK_STATE_COMPLETED" {
-            let ws = command(&addr, "workflow.status", json!({}));
-            run_id = ws["task"]["artifacts"][0]["parts"][0]["text"]
+            let ws = read(&addr, "workflow.status", json!({}));
+            run_id = ws["runs"][0]["run"]
                 .as_str()
-                .and_then(|t| serde_json::from_str::<Value>(t).ok())
-                .and_then(|v| v["runs"][0]["run"].as_str().map(str::to_string))
+                .map(str::to_string)
                 .unwrap_or_default();
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
     assert!(!run_id.is_empty(), "workflow.status yielded the run id");
-    let run = command(&addr, "run.get", json!({"run": run_id}));
+    let run = read(&addr, "run.get", json!({"run": run_id}));
     assert_eq!(run["run"]["status"], "completed", "{run}");
     let steps = run["run"]["steps"].as_object().unwrap();
     assert_eq!(steps["f"]["status"], "done", "per-step detail: {steps:?}");
     assert!(steps["f"]["finished"].is_u64());
 
     // The live log ring (debug) has lines, cursored.
-    let ev = command(&addr, "debug.events", json!({"limit": 50}));
+    let ev = read(&addr, "debug.events", json!({"limit": 50}));
     let events = ev["events"].as_array().unwrap();
     assert!(!events.is_empty(), "the event ring is live");
     assert!(events[0]["seq"].is_u64() && events[0]["event"].is_string());
     let newest = ev["newest_seq"].as_u64().unwrap();
-    let again = command(&addr, "debug.events", json!({"after": newest}));
+    let again = read(&addr, "debug.events", json!({"after": newest}));
     assert!(
         again["events"].as_array().unwrap().len() <= events.len(),
         "the cursor advances"
@@ -361,10 +357,10 @@ fn the_interface_is_gated_off_by_default() {
         )
     });
 
-    // The command ops refuse…
+    // The removed discovery op is refused by name, with its replacement…
     let (code, msg) = error_of(&SendMessage::command("interface.info", json!({})).post(&addr));
-    assert_eq!(code, -32004);
-    assert!(msg.contains("a2a.events.enabled"), "{msg}");
+    assert_eq!(code, -32602);
+    assert!(msg.contains("removed") && msg.contains("status"), "{msg}");
     // …introspection reads refuse, naming their own switch…
     let (code, msg) = error_of(&SendMessage::command("debug.events", json!({})).post(&addr));
     assert_eq!(code, -32004);
@@ -382,8 +378,8 @@ fn the_interface_is_gated_off_by_default() {
         drop(frames);
     }
     // …and the core surface still answers (status command untouched).
-    let st = command(&addr, "status", json!({}));
-    assert_eq!(st["task"]["status"]["state"], "TASK_STATE_COMPLETED");
+    let st = read(&addr, "status", json!({}));
+    assert!(st["runs"].is_array(), "{st}");
     // The card promises nothing about the interface. Other extensions (the
     // command vocabulary) are still declared — the claim under test is that a
     // surface this instance will NOT serve is never advertised, which is what
@@ -577,33 +573,27 @@ fn pair_is_gone() {
 }
 
 #[test]
-fn config_set_toggles_introspection_live() {
+fn admin_set_toggles_introspection_live() {
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
     // Introspection starts OFF.
     let (_daemon, addr, cfg) = spawn_bound(|port| iface_config(&llm.uri, port, false, ""));
 
-    // Introspection reads refuse; info says so.
     let (code, _) = error_of(&SendMessage::command("debug.events", json!({})).post(&addr));
     assert_eq!(code, -32004);
-    let info = command(&addr, "interface.info", json!({}));
-    assert_eq!(info["interface"]["debug"], false);
-    // The layout is the client's now: the daemon reports none.
-    assert!(info["interface"].get("display").is_none(), "{info}");
-    assert!(info["interface"].get("pairing").is_none(), "{info}");
 
-    // `config.set a2a.introspection.enabled true` flips it at runtime…
+    // `admin.set a2a.introspection.enabled true` flips it at runtime…
     let set = command(
         &addr,
-        "config.set",
+        "admin.set",
         json!({"path": "a2a.introspection.enabled", "value": true}),
     );
-    assert_eq!(set["set"]["value"], true, "{set}");
-    let info = command(&addr, "interface.info", json!({}));
-    assert_eq!(info["interface"]["debug"], true);
-    assert!(info["interface"]["model"].is_string());
+    assert_eq!(
+        set["task"]["status"]["state"], "TASK_STATE_COMPLETED",
+        "{set}"
+    );
     // …and the introspection reads work — including the log ring, installed on
     // toggle.
-    let ev = command(&addr, "debug.events", json!({"limit": 10}));
+    let ev = read(&addr, "debug.events", json!({"limit": 10}));
     assert!(ev["events"].is_array(), "{ev}");
 
     // The removed paths are not runtime-settable; the error names what is.
@@ -613,7 +603,7 @@ fn config_set_toggles_introspection_live() {
         "intelligence.model",
     ] {
         let (code, msg) = error_of(
-            &SendMessage::command("config.set", json!({"path": path, "value": "x"})).post(&addr),
+            &SendMessage::command("admin.set", json!({"path": path, "value": "x"})).post(&addr),
         );
         assert_eq!(code, -32602, "{path}");
         assert!(
@@ -621,6 +611,16 @@ fn config_set_toggles_introspection_live() {
             "{path}: {msg}"
         );
     }
+    // …and the op it replaced is refused by name.
+    let (code, msg) = error_of(
+        &SendMessage::command(
+            "config.set",
+            json!({"path": "a2a.introspection.enabled", "value": true}),
+        )
+        .post(&addr),
+    );
+    assert_eq!(code, -32602);
+    assert!(msg.contains("admin.set"), "{msg}");
 
     std::fs::remove_file(&cfg).ok();
 }
@@ -653,12 +653,7 @@ fn a_live_subagent_is_observable_and_drillable() {
     );
 
     // The status section lists the subagent; drill into it.
-    let st = command(&addr, "status", json!({}));
-    let subs = st["task"]["artifacts"][0]["parts"][0]["text"]
-        .as_str()
-        .and_then(|t| serde_json::from_str::<Value>(t).ok())
-        .map(|v| v["subagents"].clone())
-        .unwrap_or_default();
+    let subs = read(&addr, "status", json!({}))["subagents"].clone();
     let handle = subs[0]["handle"]
         .as_str()
         .expect("a subagent exists")
@@ -668,7 +663,7 @@ fn a_live_subagent_is_observable_and_drillable() {
     // time we ask" is a timing artifact, not a contract.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let got = loop {
-        let got = command(&addr, "subagent.get", json!({"handle": handle}));
+        let got = read(&addr, "subagent.get", json!({"handle": handle}));
         if got["subagent"]["status"] == "completed" {
             break got;
         }
@@ -933,7 +928,7 @@ fn a_reload_revokes_a_web_origin_and_the_grant_stops() {
 }
 
 /// A reload that turns introspection on arms the log ring the reads tail, as
-/// `config.set` does. Without it the flag flips but `debug.events` answers
+/// `admin.set` does, and tells the feed which paths it moved. Without it the flag flips but `debug.events` answers
 /// that the ring is not installed until the next restart — a reload that
 /// reports success and changes nothing an operator can use.
 #[test]
@@ -943,6 +938,13 @@ fn a_reload_that_turns_introspection_on_arms_the_ring() {
     let (daemon, addr, cfg) = spawn_bound(|port| iface_config(&llm.uri, port, false, ""));
     let (code, _) = error_of(&SendMessage::command("debug.events", json!({})).post(&addr));
     assert_eq!(code, -32004, "introspection starts off");
+
+    // A client watching the feed is told what the reload moved.
+    let frames: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&frames);
+    let addr2 = addr.clone();
+    std::thread::spawn(move || subscribe_events(&addr2, 0, sink));
+    wait_for(&frames, 5, |f| f.iter().any(|v| v.get("hello").is_some()));
 
     let port: u16 = addr.rsplit(':').next().unwrap().parse().unwrap();
     std::fs::write(&cfg, iface_config(&llm.uri, port, true, "")).unwrap();
@@ -958,8 +960,17 @@ fn a_reload_that_turns_introspection_on_arms_the_ring() {
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    let ev = command(&addr, "debug.events", json!({"limit": 10}));
+    let ev = read(&addr, "debug.events", json!({"limit": 10}));
     assert!(ev["events"].is_array(), "{ev}");
+    wait_for(&frames, 5, |f| {
+        f.iter().any(|v| {
+            v["event"]["kind"] == "config"
+                && v["event"]["data"]["source"] == "reload"
+                && v["event"]["data"]["paths"]
+                    .as_array()
+                    .is_some_and(|p| p.iter().any(|x| x == "a2a.introspection.enabled"))
+        })
+    });
 
     std::fs::remove_file(&cfg).ok();
 }

@@ -22,6 +22,13 @@ fn command(addr: &str, op: &str, args: Value) -> Value {
     SendMessage::command(op, args).result(addr)
 }
 
+/// A read op's document: its reply is a Message carrying it, and no task.
+fn read(addr: &str, op: &str, args: Value) -> Value {
+    let r = command(addr, op, args);
+    assert!(r.get("task").is_none(), "{op} created a task: {r}");
+    r["message"]["parts"][0]["data"].clone()
+}
+
 /// Poll GetTask until `pred` holds (returns the task).
 fn wait_task<F: Fn(&Value) -> bool>(addr: &str, id: &str, secs: u64, what: &str, pred: F) -> Value {
     let deadline = Instant::now() + Duration::from_secs(secs);
@@ -215,7 +222,7 @@ fn a_workflow_human_node_gates_the_run_task_and_the_reply_is_the_step_output() {
     let (_daemon, addr, cfg) = spawn_bound(|port| base_config(&llm.uri, port, true, extra));
 
     // Start the workflow; ITS task (linking the run) becomes the gate.
-    let started = command(&addr, "workflow.run", json!({"name": "approve"}));
+    let started = command(&addr, "workflow.run", json!({"workflow": "approve"}));
     let task_id = started["task"]["id"].as_str().unwrap().to_string();
     let gated = wait_task(&addr, &task_id, 10, "run gate", |t| {
         t["status"]["state"] == "TASK_STATE_INPUT_REQUIRED"
@@ -245,13 +252,12 @@ fn a_workflow_human_node_gates_the_run_task_and_the_reply_is_the_step_output() {
         "{done}"
     );
     // Per-step detail (debug read): the gate step is Done with the reply.
-    let ws = command(&addr, "workflow.status", json!({}));
-    let run_id = ws["task"]["artifacts"][0]["parts"][0]["text"]
+    let ws = read(&addr, "workflow.status", json!({}));
+    let run_id = ws["runs"][0]["run"]
         .as_str()
-        .and_then(|t| serde_json::from_str::<Value>(t).ok())
-        .and_then(|v| v["runs"][0]["run"].as_str().map(str::to_string))
+        .map(str::to_string)
         .expect("run id");
-    let run = command(&addr, "run.get", json!({"run": run_id}));
+    let run = read(&addr, "run.get", json!({"run": run_id}));
     assert_eq!(run["run"]["steps"]["gate"]["status"], "done", "{run}");
     assert_eq!(
         run["run"]["steps"]["gate"]["output"], "yes, ship it",
@@ -271,7 +277,7 @@ fn an_operator_answering_someone_elses_gate_is_recorded_as_an_override() {
     let extra = "workflows:\n  - name: approve\n    steps:\n      s: {kind: manual}\n      gate: {kind: human, question: \"Approve the refund?\", to: \"*@finance.example\", depends_on: [s]}\n      f: {kind: finish, depends_on: [gate], output: \"refunded\"}\n";
     let (daemon, addr, cfg) = spawn_bound(|port| base_config(&llm.uri, port, true, extra));
 
-    let started = command(&addr, "workflow.run", json!({"name": "approve"}));
+    let started = command(&addr, "workflow.run", json!({"workflow": "approve"}));
     let task_id = started["task"]["id"].as_str().unwrap().to_string();
     wait_task(&addr, &task_id, 10, "run gate", |t| {
         t["status"]["state"] == "TASK_STATE_INPUT_REQUIRED"
@@ -308,7 +314,7 @@ fn a_gates_addressee_and_schema_are_durable() {
     let extra = "workflows:\n  - name: approve\n    steps:\n      s: {kind: manual}\n      gate: {kind: human, question: \"Approve?\", to: \"*@finance.example\", schema: {type: object, properties: {ok: {type: boolean}}}, depends_on: [s]}\n      f: {kind: finish, depends_on: [gate], output: \"done\"}\n";
     let (_daemon, addr, cfg) = spawn_bound(|port| base_config(&llm.uri, port, true, extra));
 
-    let started = command(&addr, "workflow.run", json!({"name": "approve"}));
+    let started = command(&addr, "workflow.run", json!({"workflow": "approve"}));
     let task_id = started["task"]["id"].as_str().unwrap().to_string();
     wait_task(&addr, &task_id, 10, "run gate", |t| {
         t["status"]["state"] == "TASK_STATE_INPUT_REQUIRED"
@@ -316,13 +322,12 @@ fn a_gates_addressee_and_schema_are_durable() {
 
     // Read the run back: the suspended step's wait record must carry both, or
     // a restart would rebuild a weaker gate than the one that was declared.
-    let ws = command(&addr, "workflow.status", json!({}));
-    let run_id = ws["task"]["artifacts"][0]["parts"][0]["text"]
+    let ws = read(&addr, "workflow.status", json!({}));
+    let run_id = ws["runs"][0]["run"]
         .as_str()
-        .and_then(|t| serde_json::from_str::<Value>(t).ok())
-        .and_then(|v| v["runs"][0]["run"].as_str().map(str::to_string))
+        .map(str::to_string)
         .expect("run id");
-    let run = command(&addr, "run.get", json!({"run": run_id}));
+    let run = read(&addr, "run.get", json!({"run": run_id}));
     let wait = &run["run"]["steps"]["gate"]["wait"];
     assert_eq!(wait["kind"], "human", "{run}");
     assert_eq!(
@@ -493,7 +498,7 @@ fn cancelling_a_gate_unblocks_the_asker_with_an_error() {
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
     let extra = "workflows:\n  - name: gated\n    steps:\n      s: {kind: manual}\n      gate: {kind: human, question: \"Proceed?\", depends_on: [s]}\n      f: {kind: finish, depends_on: [gate], output: \"done\"}\n";
     let (_daemon, addr, cfg) = spawn_bound(|port| base_config(&llm.uri, port, true, extra));
-    let started = command(&addr, "workflow.run", json!({"name": "gated"}));
+    let started = command(&addr, "workflow.run", json!({"workflow": "gated"}));
     let task_id = started["task"]["id"].as_str().unwrap().to_string();
     wait_task(&addr, &task_id, 10, "gate", |t| {
         t["status"]["state"] == "TASK_STATE_INPUT_REQUIRED"
@@ -505,11 +510,10 @@ fn cancelling_a_gate_unblocks_the_asker_with_an_error() {
     );
     // The run resolved (the gate step failed / the run was cancelled) — it is
     // terminal, not stuck.
-    let ws = command(&addr, "workflow.status", json!({}));
-    let status = ws["task"]["artifacts"][0]["parts"][0]["text"]
+    let ws = read(&addr, "workflow.status", json!({}));
+    let status = ws["runs"][0]["status"]
         .as_str()
-        .and_then(|t| serde_json::from_str::<Value>(t).ok())
-        .and_then(|v| v["runs"][0]["status"].as_str().map(str::to_string))
+        .map(str::to_string)
         .expect("run status");
     assert!(
         status == "cancelled" || status == "failed",

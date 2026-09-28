@@ -32,7 +32,7 @@ pub struct SharedFeed {
     inner: Mutex<FeedInner>,
     /// `a2a.introspection.enabled` — gates the introspection event kinds
     /// (audit, logs). Atomic because the operator can toggle it at runtime
-    /// (`config.set`, a reload).
+    /// (`admin.set`, a reload).
     debug: std::sync::atomic::AtomicBool,
 }
 
@@ -56,7 +56,7 @@ impl SharedFeed {
         }
     }
 
-    /// Whether debug event kinds flow (runtime-togglable via `config.set`).
+    /// Whether debug event kinds flow (runtime-togglable via `admin.set`).
     pub fn debug(&self) -> bool {
         self.debug.load(std::sync::atomic::Ordering::Relaxed)
     }

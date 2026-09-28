@@ -67,6 +67,18 @@ impl Runtime {
                     m.lifecycle["config_reloaded_at"] = json!(now_ms());
                 });
                 crate::obs::metrics::set_config_generation(generation);
+                // Tell attached clients what moved, so one that shows a
+                // setting (the introspection panes, say) re-reads it instead
+                // of rendering what the file said before. The same event an
+                // `admin.set` pushes; only the source differs.
+                #[cfg(feature = "a2a")]
+                if changed.iter().any(|c| *c != "nothing") {
+                    self.feed_push(
+                        "config",
+                        crate::runtime::a2a_server::FeedVis::All,
+                        json!({"paths": changed, "source": "reload"}),
+                    );
+                }
             }
             Err(ReloadRefused::Invalid(errs)) => {
                 for e in &errs {
@@ -444,7 +456,7 @@ impl Runtime {
             }
         }
         // `a2a.introspection.enabled` also lives as an atomic on the feed (it
-        // is runtime-settable through `config.set`), so a reload has to move
+        // is runtime-settable through `admin.set`), so a reload has to move
         // BOTH or the two disagree: the settings gate would pass while the
         // feed still filtered introspection frames out. And turning it ON arms
         // the log ring the reads tail, or `debug.events` would answer that the

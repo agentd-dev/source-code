@@ -6,31 +6,10 @@ use crate::a2a::Principal;
 use crate::runtime::reactor::Runtime;
 use serde_json::{Value, json};
 
-/// One line per command op, for the card. A skill without a description is a
-/// skill a caller has to guess at.
+/// One line per command op, for the card, from the op table. A skill without
+/// a description is a skill a caller has to guess at.
 fn command_description(op: &str) -> &'static str {
-    match op {
-        "status" => "Runs, subagents, conversations and budget, as one snapshot",
-        "config" => "The effective configuration, credentials redacted (operator-only)",
-        "workflow.run" => "Start a workflow; the reply is the task it runs under",
-        "workflow.status" => "The status of one run",
-        "workflow.cancel" => "Cancel one run by id",
-        "workflow.signal" => "Deliver a signal a workflow is waiting on",
-        "subagent.send" => "Send a message to a warm subagent",
-        "subagent.kill" => "Stop a subagent",
-        "subagent.status" => "The status of one subagent, or all of them",
-        "plan.get" => "The current plan",
-        "admin.drain" => "Begin a graceful drain, then exit 0 (operator-only)",
-        "admin.lameduck" => "Alias of admin.drain (operator-only)",
-        "admin.pause" => "Hold the instance, or one run, at a safe boundary (operator-only)",
-        "admin.resume" => "Clear a prior pause (operator-only)",
-        "admin.cancel" => "Cancel one run by id (operator-only)",
-        "interface.info" => "What display surface this instance offers",
-        "conversation.get" => "Read one conversation (debug)",
-        "run.get" => "Read one run (debug)",
-        "debug.events" => "The recent event ring (operator-only, debug)",
-        _ => "",
-    }
+    crate::runtime::surface::op_spec(op).map_or("", |s| s.description)
 }
 
 /// The command ops as A2A skills, from settings alone.
@@ -38,7 +17,7 @@ fn command_skills_of(settings: &crate::config::v2::Settings) -> Vec<Value> {
     command_ops_of(settings)
         .into_iter()
         .map(|op| {
-            let tag = if crate::a2a::principals::is_admin_op(op) {
+            let tag = if crate::runtime::surface::is_admin_op(op) {
                 "admin"
             } else {
                 "command"
@@ -92,7 +71,7 @@ impl Runtime {
         let mut skills: Vec<Value> = self
             .workflows
             .values()
-            .filter(|w| principal.may_command(&format!("workflow.run:{}", w.name)))
+            .filter(|w| Runtime::may_run(principal, w))
             .map(|w| json!({"id": w.name, "name": w.name, "description": w.description.clone().unwrap_or_default(), "tags": ["workflow"]}))
             .collect();
         // …and the ops THIS caller may run. An operator sees the admin family;
@@ -149,7 +128,7 @@ fn agent_card_of(
     })];
     // Advertise the interface surface so a display client can discover it
     // before authenticating. The card is public, so only the on/off bit
-    // rides here; `interface.info` is authenticated and carries the rest.
+    // rides here.
     if extensions_of(settings).contains(&INTERFACE_EXTENSION) {
         extensions.push(json!({
             "uri": INTERFACE_EXTENSION,

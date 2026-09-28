@@ -3381,12 +3381,7 @@ impl ToolCaller {
 
 /// The start node `workflow.run` uses by default: `manual`, else the first.
 fn default_start(w: &Workflow) -> Option<String> {
-    let starts = w.start_steps();
-    starts
-        .iter()
-        .find(|s| s.kind == "manual")
-        .or_else(|| starts.first())
-        .map(|s| s.id.clone())
+    w.default_start().map(|s| s.id.clone())
 }
 
 fn node_kind<'a>(w: &'a Workflow, node: &str) -> Option<&'a str> {

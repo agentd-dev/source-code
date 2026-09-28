@@ -176,8 +176,7 @@ fn write_config(tag: &str, yaml: &str) -> String {
     path
 }
 
-/// The text of the task's `.result` artifact (the model's answer, or a
-/// command's JSON result).
+/// The text of the task's `.result` artifact (the model's answer).
 fn result_artifact(task: &Value) -> String {
     task["artifacts"]
         .as_array()
@@ -305,8 +304,8 @@ fn the_config_command_never_echoes_a_credential() {
 
     // The view is still the effective configuration, minus the credentials.
     let v: Value = serde_json::from_str(&raw).unwrap_or_else(|_| panic!("non-JSON: {raw:?}"));
-    let doc: Value = serde_json::from_str(&result_artifact(&v["result"]["task"]))
-        .unwrap_or_else(|e| panic!("the config result is not JSON ({e}): {v}"));
+    // A read: the document is the Message's data part.
+    let doc = v["result"]["message"]["parts"][0]["data"].clone();
     assert_eq!(doc["config"]["intelligence"]["token"], "***", "{doc}");
     assert_eq!(
         doc["config"]["intelligence"]["headers"][HEADER_NAME], "***",

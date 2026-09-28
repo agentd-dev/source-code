@@ -630,16 +630,35 @@ impl Runtime {
     }
 
     /// Fire `signal` start nodes for a named signal. Returns how many fired.
+    ///
+    /// A principal's signal starts new work on that principal's behalf, so it
+    /// fires only the workflows it could have started with `workflow.run` —
+    /// the same [`Runtime::may_run`] — and the runs it starts are its own.
+    /// Otherwise a `workflow.signal` grant would be a way round every
+    /// `workflow.run:` narrowing. A principal the index has not seen fires
+    /// nothing: there are no grants to ask.
     pub(crate) fn fire_signal_starts(
         &mut self,
         name: &str,
         payload: &Value,
         _broadcast: bool,
+        sender: &super::waits::SignalSender,
     ) -> u64 {
+        let (by, may_start) = match sender {
+            super::waits::SignalSender::Runtime => (None, None),
+            super::waits::SignalSender::Principal { id, operator } => (
+                Some(id.clone()),
+                (!operator).then(|| self.principal_index.get(id).cloned()),
+            ),
+        };
         let matches: Vec<(String, String, Map<String, Value>)> = self
             .workflows
             .values()
             .filter(|w| w.armed)
+            .filter(|w| match &may_start {
+                None => true,
+                Some(p) => p.as_ref().is_some_and(|p| Runtime::may_run(p, w)),
+            })
             .flat_map(|w| {
                 w.start_steps()
                     .into_iter()
@@ -660,13 +679,12 @@ impl Runtime {
                     continue;
                 }
             }
-            self.fire_start(
-                &workflow,
-                &node,
-                &spec,
-                json!({"signal": name, "payload": payload}),
-                "signal",
-            );
+            let mut trigger = json!({"signal": name, "payload": payload});
+            // `fire_start` reads the trigger's `principal` as the run's owner.
+            if let Some(id) = &by {
+                trigger["principal"] = json!(id);
+            }
+            self.fire_start(&workflow, &node, &spec, trigger, "signal");
             fired += 1;
         }
         fired

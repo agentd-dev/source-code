@@ -320,10 +320,11 @@ fn subagent_send_injects_into_a_warm_subagent_and_plan_get_reads_the_plan() {
     );
     assert_eq!(artifact_json(&injected)["ok"], true, "{injected}");
 
-    // Unknown handle → clean error.
+    // Unknown handle → not found, the answer a handle that is not the
+    // caller's also gets.
     let resp = SendMessage::command("subagent.send", json!({"handle": "nope", "message": "x"}))
         .post(&addr);
-    assert_eq!(resp["error"]["code"], -32602, "{resp}");
+    assert_eq!(resp["error"]["code"], -32001, "{resp}");
 
     // plan.get on the root conversation (operator).
     let plan = command(&addr, "plan.get", json!({}));

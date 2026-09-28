@@ -796,7 +796,14 @@ impl crate::runtime::reactor::Runtime {
         // the suspended run/step, and unregister the one-shot route.
         if let Some((signal, path)) = callback {
             self.webhook_callbacks.lock().unwrap().remove(&path);
-            let delivered = self.deliver_signal(&signal, payload, None, None);
+            // An operator-configured route: the runtime is the sender.
+            let delivered = self.deliver_signal(
+                &signal,
+                payload,
+                None,
+                None,
+                &super::waits::SignalSender::Runtime,
+            );
             self.log.info(
                 "webhook.callback",
                 json!({"path": path, "resumed": delivered}),
@@ -885,7 +892,13 @@ impl crate::runtime::reactor::Runtime {
                         .unwrap_or_default();
                     match crate::engine::template::render_str(tpl, &data) {
                         Ok(Value::String(name)) if !name.is_empty() => {
-                            let resumed = self.deliver_signal(&name, payload.clone(), None, None);
+                            let resumed = self.deliver_signal(
+                                &name,
+                                payload.clone(),
+                                None,
+                                None,
+                                &super::waits::SignalSender::Runtime,
+                            );
                             self.log.info(
                                 "webhook.signal",
                                 json!({"workflow": workflow, "node": node,

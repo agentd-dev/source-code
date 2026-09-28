@@ -103,6 +103,18 @@ impl Runtime {
                 "subagent.run refused: params for template '{tname}' introduced directive machinery"
             ));
         }
+        // A child reports home over its `parent` peer; one that cannot be
+        // named there would run its work and then have every `_instance.*`
+        // report refused, leaving a sync spawn parked until its timeout.
+        // Refused here instead, before anything is created.
+        let parent_peer = self.parent_peer_entry();
+        if let Some(why) = self.parent_unreachable(parent_peer.as_ref()) {
+            self.log.warn(
+                "instance.spawn.refused",
+                json!({"template": tname, "reason": why}),
+            );
+            return err(format!("subagent.run refused: {why}"));
+        }
         let handle = self.next_id("inst");
         let dir = self.instance_dir(&handle);
         if let Err(e) = std::fs::create_dir_all(&dir) {
@@ -160,6 +172,7 @@ impl Runtime {
             until.as_deref(),
             durable,
             &handle,
+            parent_peer,
         ) {
             Ok(d) => d,
             Err(e) => return err(format!("subagent.run: template '{tname}': {e}")),
@@ -196,6 +209,7 @@ impl Runtime {
             requested_by: Some(
                 json!({"caller": caller.node.map(|n| n.0), "ctx": caller.ctx, "run": caller.run, "step": caller.step, "subagent": caller.subagent, "depth": 0}),
             ),
+            principal: caller.principal.clone(),
             tokens: 0,
             created: now_ms(),
             updated: now_ms(),
@@ -211,6 +225,7 @@ impl Runtime {
             node: None,
             dirty: true,
         };
+        record.principal = self.spawn_principal(&record);
         match self.spawn_instance_process(&config_path, &dir, &t.spec.limits) {
             Ok(pid) => {
                 record.pid = Some(pid);
@@ -258,6 +273,7 @@ impl Runtime {
         until: Option<&str>,
         durable: bool,
         handle: &str,
+        parent_peer: Option<Value>,
     ) -> Result<Value, String> {
         let mut doc = t.fragment.clone();
         if !doc.is_object() {
@@ -341,7 +357,7 @@ impl Runtime {
             json!({"kind": "memory"})
         };
         let mut a2a = json!({"listen": format!("unix://{socket}")});
-        if let Some(peer) = self.parent_peer_entry() {
+        if let Some(peer) = parent_peer {
             a2a["peers"] = json!([peer]);
         }
         doc["a2a"] = a2a;
@@ -434,6 +450,25 @@ impl Runtime {
             }
         }
         Some(peer)
+    }
+
+    /// Why a child could not authenticate to this parent, if it could not.
+    ///
+    /// Every report a child sends home is an `_instance.*` op, which only the
+    /// operator may send. Over a unix listener the kernel names the child's
+    /// uid, and a loopback listener with no auth at all makes any caller the
+    /// operator; anywhere else the child is the operator only by presenting
+    /// the operator's bearer, and [`Self::parent_peer_entry`] writes one only
+    /// when it is a `{{secret:…}}` reference. The posture is read from the
+    /// settings in force NOW, so a reload that added a principal — ending the
+    /// implicit operator — is seen by the next spawn.
+    fn parent_unreachable(&self, peer: Option<&Value>) -> Option<&'static str> {
+        let auth = crate::runtime::surface::auth::listener_auth_of(&self.settings.a2a);
+        let tcp = self.settings.a2a.listen.is_some() && !auth.unix;
+        let authorized = peer.is_some_and(|p| p["headers"].get("Authorization").is_some());
+        (tcp && !auth.implicit_operator && !authorized).then_some(
+            "the child cannot authenticate to its parent: make a2a.bearer a {{secret:…}} reference or use a unix listener",
+        )
     }
 
     /// Spawn the child daemon: same binary, `--config <path>`, config-alias env

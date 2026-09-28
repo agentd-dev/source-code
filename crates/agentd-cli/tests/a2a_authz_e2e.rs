@@ -837,3 +837,470 @@ fn a_reload_demotes_a_principal_and_the_revocation_takes_effect() {
     assert!(daemon.alive(), "the daemon is still serving");
     std::fs::remove_file(&cfg).ok();
 }
+
+// ── Ownership of the objects a command names ────────────────────────────────
+//
+// A task is not the only thing a principal owns: the runs it starts and the
+// subagents its turns spawn are its own too, and every op that names one — by
+// a run id or a handle anyone can guess or read off a log — acts only for the
+// owner. A non-owner is told the object does not exist, exactly as an unknown
+// id is, so it cannot even learn which ids are real. The model driving a
+// user's turn is held to the same line: it acts for that user and no further.
+
+/// Two users on one listener. A owns what it starts; B is granted
+/// `b_grants`, which for most tests is everything a user can be given, and
+/// still owns nothing of A's. `waiter` parks on a signal so A's run stays
+/// live; `all-clear` is the instance's retirement signal.
+fn owners_config(llm: &str, port: u16, b_grants: &str) -> String {
+    format!(
+        "config_version: \"1\"\n\
+         agent:\n  name: a2a-owners\n  instruction: You are a helpful test agent.\n  preflight: never\n\
+         intelligence:\n  endpoints: {llm}\n  model: mock\n\
+         store:\n  kind: memory\n\
+         a2a:\n  listen: http://127.0.0.1:{port}\n  introspection:\n    enabled: true\n\
+         \x20 principals:\n\
+         \x20   - id: token-a\n\
+         \x20     match: {{ bearer_ref: \"{{{{secret:AGENTD_AUTHZ_TOKEN_A}}}}\" }}\n\
+         \x20     role: user\n\
+         \x20     grants: [\"*\"]\n\
+         \x20   - id: token-b\n\
+         \x20     match: {{ bearer_ref: \"{{{{secret:AGENTD_AUTHZ_TOKEN_B}}}}\" }}\n\
+         \x20     role: user\n\
+         \x20     grants: {b_grants}\n\
+         workflows:\n\
+         \x20 - name: waiter\n    steps:\n      s: {{kind: manual}}\n      w: {{kind: wait, on: signal, signal: go, depends_on: [s]}}\n      f: {{kind: finish, depends_on: [w], output: released}}\n\
+         \x20 - name: triage\n    steps:\n      s: {{kind: manual}}\n      w: {{kind: wait, on: signal, signal: never, depends_on: [s]}}\n      f: {{kind: finish, depends_on: [w]}}\n\
+         \x20 - name: triage-kick\n    steps:\n      k: {{kind: signal, name: kick}}\n      f: {{kind: finish, depends_on: [k]}}\n\
+         \x20 - name: deploy-kick\n    steps:\n      k: {{kind: signal, name: kick}}\n      f: {{kind: finish, depends_on: [k]}}\n\
+         \x20 - name: deploy\n    steps:\n      s: {{kind: manual}}\n      w: {{kind: wait, on: signal, signal: never, depends_on: [s]}}\n      f: {{kind: finish, depends_on: [w]}}\n\
+         lifecycle:\n  run_until: drained\n  until_signal: all-clear\n\
+         observability:\n  log_level: info\n"
+    )
+}
+
+/// The document a command answered with: a read's Message data, or the JSON
+/// artifact of the task a piece of work completed.
+fn answer(v: &Value) -> Value {
+    let r = &v["result"];
+    if let Some(doc) = r["message"]["parts"][0].get("data") {
+        return doc.clone();
+    }
+    let part = &r["task"]["artifacts"][0]["parts"][0];
+    part.get("data").cloned().unwrap_or_else(|| {
+        part["text"]
+            .as_str()
+            .and_then(|t| serde_json::from_str(t).ok())
+            .unwrap_or(Value::Null)
+    })
+}
+
+fn command_as(addr: &str, bearer: &str, op: &str, args: Value) -> Value {
+    SendMessage::command(op, args)
+        .bearer(bearer)
+        .return_immediately()
+        .post(addr)
+}
+
+/// The state of `waiter` run `run` as its owner A sees it: the run's status,
+/// and its wait step's — `suspended` while it is parked on the signal.
+fn run_state(addr: &str, run: &str) -> (String, String) {
+    let v = command_as(addr, TOKEN_A, "run.get", json!({"run": run}));
+    let r = &answer(&v)["run"];
+    let status = r["status"]
+        .as_str()
+        .unwrap_or_else(|| panic!("A reads its own run: {v}"));
+    let wait = r["steps"]["w"]["status"].as_str().unwrap_or("");
+    (status.to_string(), wait.to_string())
+}
+
+/// Whether A's run is still where A left it: live, parked on its signal.
+fn parked(addr: &str, run: &str) -> bool {
+    run_state(addr, run) == ("running".to_string(), "suspended".to_string())
+}
+
+/// A's live objects: a run parked on the `go` signal, a warm subagent its
+/// turn spawned, and the conversation that turn ran in.
+struct Owned {
+    run: String,
+    handle: String,
+    ctx: String,
+}
+
+/// Have A start a parked run and, through the model, a warm subagent.
+fn a_owns_a_run_and_a_subagent(addr: &str, daemon: &Daemon) -> Owned {
+    let started = command_as(addr, TOKEN_A, "workflow.run", json!({"workflow": "waiter"}));
+    assert!(started.get("error").is_none(), "A starts a run: {started}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let run = loop {
+        let v = command_as(addr, TOKEN_A, "workflow.status", json!({}));
+        if let Some(r) = answer(&v)["runs"][0]["run"].as_str()
+            && parked(addr, r)
+        {
+            break r.to_string();
+        }
+        assert!(Instant::now() < deadline, "A's run never parked: {v}");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    let sent = SendMessage::text("start a warm helper")
+        .bearer(TOKEN_A)
+        .post(addr);
+    let task = &sent["result"]["task"];
+    assert_eq!(
+        task["status"]["state"], "TASK_STATE_COMPLETED",
+        "A's turn spawned its helper: {sent}"
+    );
+    let ctx = task["contextId"].as_str().unwrap().to_string();
+    // The handle is read off the daemon's own log, as an operator would.
+    let handle = daemon
+        .stderr()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|v| v["event"] == "subagent.spawn")
+        .and_then(|v| v["handle"].as_str().map(str::to_string))
+        .unwrap_or_else(|| panic!("no subagent.spawn line:\n{}", daemon.stderr()));
+    let st = command_as(addr, TOKEN_A, "subagent.status", json!({"handle": handle}));
+    assert_eq!(answer(&st)["status"], "running", "A's helper is warm: {st}");
+    Owned { run, handle, ctx }
+}
+
+/// A playbook whose root turn plays `turns`, while a warm helper — whose
+/// prompt is the subagent default, not this agent's instruction — stands by.
+fn owners_playbook(turns: Value) -> Value {
+    json!({
+        "turns": turns,
+        "match": [
+            {"when_contains": "You are agentd, an autonomous agent.", "content": "standing by"},
+        ],
+    })
+}
+
+/// A's turn: spawn a warm helper, then answer.
+fn a_spawns_a_helper() -> Value {
+    owners_playbook(json!([
+        {"tool_calls": [{"name": "subagent.run", "arguments": {"instruction": "stand by for instructions", "mode": "warm"}}]},
+        {"content": "helper started"},
+    ]))
+}
+
+/// Every op that names a run, a subagent or a conversation answers a
+/// non-owner exactly as it answers an id that does not exist: -32001, one
+/// fixed message per kind of object, and the object untouched. B holds every
+/// grant a user can hold, so nothing here is refused for want of one.
+#[test]
+fn every_command_op_that_names_an_object_is_owner_scoped() {
+    let llm = spawn_mock_llm(&a_spawns_a_helper());
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let cfg = write_config(&owners_config(&llm.uri, port, "[\"*\"]"));
+    let mut daemon = spawn_daemon(&cfg);
+    wait_ready(&addr);
+    let a = a_owns_a_run_and_a_subagent(&addr, &daemon);
+
+    let not_found = |op: &str, args: Value, msg: &str| {
+        let v = command_as(&addr, TOKEN_B, op, args.clone());
+        assert_eq!(v["error"]["code"], -32001, "B's {op} {args}: {v}");
+        assert_eq!(v["error"]["message"], msg, "B's {op} {args}: {v}");
+        v["error"].clone()
+    };
+    let cases = [
+        ("workflow.status", json!({"run": a.run}), "no such run"),
+        ("workflow.cancel", json!({"run": a.run}), "no such run"),
+        (
+            "workflow.signal",
+            json!({"name": "go", "run": a.run}),
+            "no such run",
+        ),
+        (
+            "subagent.send",
+            json!({"handle": a.handle, "message": "hijacked"}),
+            "no such subagent",
+        ),
+        (
+            "subagent.kill",
+            json!({"handle": a.handle}),
+            "no such subagent",
+        ),
+        (
+            "subagent.status",
+            json!({"handle": a.handle}),
+            "no such subagent",
+        ),
+        (
+            "subagent.get",
+            json!({"handle": a.handle}),
+            "no such subagent",
+        ),
+        ("run.get", json!({"run": a.run}), "no such run"),
+        ("plan.get", json!({"id": a.ctx}), "no such conversation"),
+        (
+            "conversation.get",
+            json!({"id": a.ctx}),
+            "no such conversation",
+        ),
+    ];
+    for (op, args, msg) in cases {
+        let theirs = not_found(op, args.clone(), msg);
+        // The same op on an id nobody has: the answers are identical, so B
+        // cannot tell a real id of A's from a guess.
+        let mut unknown = args.clone();
+        for k in ["run", "handle", "id"] {
+            if unknown.get(k).is_some() {
+                unknown[k] = json!("does-not-exist");
+            }
+        }
+        assert_eq!(not_found(op, unknown, msg), theirs, "{op}");
+    }
+
+    // A signal that names no run reaches only B's own runs — none here.
+    let v = command_as(&addr, TOKEN_B, "workflow.signal", json!({"name": "go"}));
+    assert_eq!(
+        answer(&v)["delivered"],
+        0,
+        "B's broadcast woke A's run: {v}"
+    );
+    // The instance's retirement signal, from a user, retires nothing.
+    let v = command_as(
+        &addr,
+        TOKEN_B,
+        "workflow.signal",
+        json!({"name": "all-clear"}),
+    );
+    assert!(v.get("error").is_none(), "{v}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !daemon
+        .stderr()
+        .contains("\"lifecycle.until_signal.refused\"")
+    {
+        assert!(
+            Instant::now() < deadline,
+            "no refusal logged:\n{}",
+            daemon.stderr()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !daemon.stderr().contains("\"lifecycle.until_signal\""),
+        "a user's signal began the drain:\n{}",
+        daemon.stderr()
+    );
+
+    // Everything of A's is as A left it, and A can still use it.
+    assert!(parked(&addr, &a.run), "A's run is untouched");
+    let st = command_as(
+        &addr,
+        TOKEN_A,
+        "subagent.status",
+        json!({"handle": a.handle}),
+    );
+    assert_eq!(
+        answer(&st)["status"],
+        "running",
+        "A's helper is untouched: {st}"
+    );
+    let v = command_as(
+        &addr,
+        TOKEN_A,
+        "workflow.signal",
+        json!({"name": "go", "run": a.run}),
+    );
+    assert_eq!(answer(&v)["delivered"], 1, "the owner's signal lands: {v}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while run_state(&addr, &a.run).0 != "completed" {
+        assert!(Instant::now() < deadline, "A's run never completed");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(daemon.alive(), "daemon still serving: {}", daemon.stderr());
+    std::fs::remove_file(&cfg).ok();
+}
+
+/// The model acts for whoever drives its turn. B cannot cancel A's run over
+/// A2A; B asking the model to do it must fail the same way, or ownership is a
+/// rule about which door a request uses.
+#[test]
+fn the_model_cannot_act_on_another_principals_objects() {
+    let pb = common::unique_path("owners-playbook", "json");
+    std::fs::write(&pb, a_spawns_a_helper().to_string()).unwrap();
+    let llm = spawn_mock_llm_file(&pb);
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let cfg = write_config(&owners_config(&llm.uri, port, "[\"*\"]"));
+    let mut daemon = spawn_daemon(&cfg);
+    wait_ready(&addr);
+    let a = a_owns_a_run_and_a_subagent(&addr, &daemon);
+
+    // B's turn: the model reaches for A's run and A's helper by id.
+    std::fs::write(
+        &pb,
+        owners_playbook(json!([
+            {"tool_calls": [
+                {"name": "workflow.cancel", "arguments": {"run": a.run}},
+                {"name": "workflow.signal", "arguments": {"name": "go", "run": a.run}},
+                {"name": "subagent.kill", "arguments": {"handle": a.handle}},
+            ]},
+            {"content": "tried"},
+        ]))
+        .to_string(),
+    )
+    .unwrap();
+    let sent = SendMessage::text("clean up everything")
+        .bearer(TOKEN_B)
+        .post(&addr);
+    let task = &sent["result"]["task"];
+    assert_eq!(task["status"]["state"], "TASK_STATE_COMPLETED", "{sent}");
+    let b_ctx = task["contextId"].as_str().unwrap().to_string();
+
+    // Nothing of A's moved.
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(parked(&addr, &a.run), "B's model cancelled or woke A's run");
+    let st = command_as(
+        &addr,
+        TOKEN_A,
+        "subagent.status",
+        json!({"handle": a.handle}),
+    );
+    assert_eq!(
+        answer(&st)["status"],
+        "running",
+        "B's model killed A's helper: {st}"
+    );
+
+    // And the model was told what B would have been told.
+    let conv = command_as(&addr, TOKEN_B, "conversation.get", json!({"id": b_ctx}));
+    let results: Vec<String> = answer(&conv)["conversation"]["messages"]
+        .as_array()
+        .unwrap_or_else(|| panic!("B reads its own conversation: {conv}"))
+        .iter()
+        .filter(|m| m["role"] == "tool")
+        .map(|m| m.to_string())
+        .collect();
+    assert_eq!(results.len(), 3, "three tool results: {conv}");
+    let run_ref = format!("no such run \\\"{}\\\"", a.run);
+    let handle_ref = format!("no such subagent \\\"{}\\\"", a.handle);
+    assert_eq!(
+        results.iter().filter(|r| r.contains(&run_ref)).count(),
+        2,
+        "cancel and signal say the run does not exist: {results:?}"
+    );
+    assert!(
+        results.iter().any(|r| r.contains(&handle_ref)),
+        "kill says the subagent does not exist: {results:?}"
+    );
+
+    assert!(daemon.alive(), "daemon still serving: {}", daemon.stderr());
+    std::fs::remove_file(&cfg).ok();
+    std::fs::remove_file(&pb).ok();
+}
+
+/// `grants: [workflow.run:triage*]` narrows what B may run, and neither
+/// asking the model nor sending a signal widens it: the model's
+/// `workflow.run` and a principal's signal starts ask the one predicate the
+/// op and the card ask. What B's signal does start is B's own.
+#[test]
+fn a_narrowed_principal_cannot_run_a_workflow_through_the_model() {
+    let llm = spawn_mock_llm(&json!({"turns": [
+        {"tool_calls": [
+            {"name": "workflow.run", "arguments": {"name": "deploy"}},
+            {"name": "workflow.run", "arguments": {"name": "triage"}},
+        ]},
+        {"content": "started what I could"},
+    ]}));
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let cfg = write_config(&owners_config(
+        &llm.uri,
+        port,
+        "[\"workflow.run:triage*\", \"workflow.signal\"]",
+    ));
+    let mut daemon = spawn_daemon(&cfg);
+    wait_ready(&addr);
+
+    let sent = SendMessage::text("run deploy and triage")
+        .bearer(TOKEN_B)
+        .post(&addr);
+    assert_eq!(
+        sent["result"]["task"]["status"]["state"], "TASK_STATE_COMPLETED",
+        "{sent}"
+    );
+    // Every run B started is B's, so B's own listing is all of them.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let runs = loop {
+        let v = command_as(&addr, TOKEN_B, "workflow.status", json!({}));
+        let runs = answer(&v)["runs"].clone();
+        if runs.as_array().is_some_and(|a| !a.is_empty()) {
+            break runs;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the triage run never appeared: {v}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let names: Vec<&str> = runs
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["workflow"].as_str())
+        .collect();
+    assert_eq!(names, ["triage"], "deploy ran through the model: {runs}");
+
+    // `kick` starts both `*-kick` workflows for the runtime; from B it starts
+    // only the one B may run, and that run is B's.
+    let v = command_as(&addr, TOKEN_B, "workflow.signal", json!({"name": "kick"}));
+    assert!(v.get("error").is_none(), "{v}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let v = command_as(&addr, TOKEN_B, "workflow.status", json!({}));
+        let mine: Vec<String> = answer(&v)["runs"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|r| r["workflow"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if mine.iter().any(|w| w == "triage-kick") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "B's signal start is not B's: {v}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    for refused in ["deploy", "deploy-kick"] {
+        assert!(
+            daemon
+                .stderr()
+                .lines()
+                .all(|l| !(l.contains("\"run.start\"")
+                    && l.contains(&format!("\"workflow\":\"{refused}\"")))),
+            "a {refused} run was started:\n{}",
+            daemon.stderr()
+        );
+    }
+
+    assert!(daemon.alive(), "daemon still serving: {}", daemon.stderr());
+    std::fs::remove_file(&cfg).ok();
+}
+
+/// A mock whose playbook is the file at `path`, re-read on every request, so
+/// a test can script a later turn once it knows the ids that turn names.
+fn spawn_mock_llm_file(path: &str) -> MockLlm {
+    let addr_file = common::unique_path("authz-mock-llm", "addr");
+    let _ = std::fs::remove_file(&addr_file);
+    let child = Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .args(["--internal-mock-llm", &addr_file, &format!("file:{path}")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn mock llm");
+    let addr = common::read_addr_file(&addr_file);
+    MockLlm {
+        child,
+        addr_file,
+        uri: format!("http://{addr}"),
+    }
+}

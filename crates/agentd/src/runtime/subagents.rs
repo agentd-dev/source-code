@@ -30,6 +30,17 @@ impl Runtime {
         args: Value,
     ) -> ToolOutcome {
         let err = |e: String| ToolOutcome::Ready(Value::String(e), true);
+        // A tool that names a subagent acts on it only for its owner: the
+        // model driving a user's turn must not steer, read or kill another
+        // principal's children by guessing a handle, any more than that user
+        // could over A2A. Not-yours reads as unknown, and is asked before
+        // anything that could tell "not running" or "not warm" apart.
+        if let Some(handle) = args.get("handle").and_then(Value::as_str)
+            && name != "subagent.run"
+            && !self.tool_owns_subagent(caller, handle)
+        {
+            return err(format!("no such subagent {handle:?}"));
+        }
         match name {
             "subagent.run" => self.subagent_run(caller, &args),
             "subagent.send" => {
@@ -125,10 +136,15 @@ impl Runtime {
                     Some(_) => ToolOutcome::Deferred(PendingKind::Subagent { handle }),
                 }
             }
-            "subagent.list" => ToolOutcome::Ready(
-                json!({"subagents": self.subagents.values().map(|s| json!({"handle": s.handle, "mode": s.mode, "status": s.status, "instruction": s.instruction.chars().take(80).collect::<String>(), "created": s.created})).collect::<Vec<_>>()}),
-                false,
-            ),
+            "subagent.list" => {
+                let acting = self.acting_principal(caller.principal.as_deref());
+                ToolOutcome::Ready(
+                    json!({"subagents": self.subagents.values()
+                        .filter(|s| acting.as_ref().is_none_or(|p| super::reactor::may_act_on(p, s.principal.as_deref())))
+                        .map(|s| json!({"handle": s.handle, "mode": s.mode, "status": s.status, "instruction": s.instruction.chars().take(80).collect::<String>(), "created": s.created})).collect::<Vec<_>>()}),
+                    false,
+                )
+            }
             _ => err(format!("unknown subagent tool {name}")),
         }
     }
@@ -419,6 +435,7 @@ impl Runtime {
             requested_by: Some(
                 json!({"caller": caller.node.map(|n| n.0), "ctx": caller.ctx, "run": caller.run, "step": caller.step, "subagent": caller.subagent, "depth": depth}),
             ),
+            principal: caller.principal.clone(),
             tokens: 0,
             created: now_ms(),
             updated: now_ms(),
@@ -437,6 +454,7 @@ impl Runtime {
             node: None,
             dirty: true,
         };
+        record.principal = self.spawn_principal(&record);
         match self.children.spawn(
             &payload,
             ChildKind::Subagent {

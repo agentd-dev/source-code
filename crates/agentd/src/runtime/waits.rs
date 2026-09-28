@@ -23,6 +23,50 @@ use serde_json::{Map, Value, json};
 #[cfg(feature = "a2a")]
 use std::time::Duration;
 
+/// Who sent a signal, which decides how far it reaches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SignalSender {
+    /// The runtime itself — a workflow's `workflow.signal` step, an
+    /// operator-configured webhook, a tool call made for nobody. Reaches
+    /// every waiting run, every start, and `lifecycle.until_signal`.
+    Runtime,
+    /// A principal, over A2A or through the model driving its turn. A
+    /// non-operator wakes only its own runs, fires only the starts it may
+    /// run (as their owner), and never retires the instance.
+    Principal { id: String, operator: bool },
+}
+
+impl SignalSender {
+    /// The principal a signal is scoped to: a non-operator's id.
+    fn scope(&self) -> Option<&str> {
+        match self {
+            SignalSender::Principal {
+                id,
+                operator: false,
+            } => Some(id),
+            _ => None,
+        }
+    }
+
+    /// The sender's principal id, when it has one.
+    pub(crate) fn id(&self) -> Option<&str> {
+        match self {
+            SignalSender::Principal { id, .. } => Some(id),
+            SignalSender::Runtime => None,
+        }
+    }
+
+    /// May this signal wake a run owned by `owner`?
+    fn may_wake(&self, owner: Option<&str>) -> bool {
+        self.scope().is_none_or(|id| owner == Some(id))
+    }
+
+    /// May this signal retire the instance as its `lifecycle.until_signal`?
+    fn may_retire(&self) -> bool {
+        self.scope().is_none()
+    }
+}
+
 /// A durable wait record kept in `StepState.wait`.
 /// The message id an `idempotency:` declaration asks for — the step's derived
 /// key, or the declared `value` (an application-level identity, which is
@@ -114,8 +158,15 @@ impl Runtime {
                     .to_string();
                 let payload = spec.get("payload").cloned().unwrap_or(Value::Null);
                 let target_run = spec.get("run").and_then(Value::as_str).map(str::to_string);
-                let delivered =
-                    self.deliver_signal(&name, payload, target_run.as_deref(), Some(run_id));
+                // A workflow's own step signals as the runtime: the operator
+                // wrote it, whoever the run happens to be working for.
+                let delivered = self.deliver_signal(
+                    &name,
+                    payload,
+                    target_run.as_deref(),
+                    Some(run_id),
+                    &SignalSender::Runtime,
+                );
                 self.finish_step_pub(
                     run_id,
                     step_id,
@@ -863,15 +914,28 @@ impl Runtime {
         delivered
     }
 
+    /// The sender of a signal sent for principal `id` (`None`: the runtime).
+    pub(crate) fn signal_sender(&self, id: Option<&str>) -> SignalSender {
+        match self.acting_principal(id) {
+            None => SignalSender::Runtime,
+            Some(p) => SignalSender::Principal {
+                operator: p.is_operator(),
+                id: p.id,
+            },
+        }
+    }
+
     /// Deliver a named signal: to `wait signal` steps (any run, or only the
     /// `run` named as the target), to `signal` start nodes, and into the
-    /// recent-signals view. Returns how many waiting steps were woken.
+    /// recent-signals view. Returns how many waiting steps were woken. How far
+    /// it reaches is the `sender`'s (see [`SignalSender`]).
     pub(crate) fn deliver_signal(
         &mut self,
         name: &str,
         payload: Value,
         target_run: Option<&str>,
         from_run: Option<&str>,
+        sender: &SignalSender,
     ) -> u64 {
         let mut delivered = 0u64;
         let mut hits: Vec<(String, String)> = Vec::new();
@@ -879,6 +943,9 @@ impl Runtime {
             if let Some(t) = target_run
                 && rid != t
             {
+                continue;
+            }
+            if !sender.may_wake(run.principal.as_deref()) {
                 continue;
             }
             for (sid, st) in &run.steps {
@@ -913,12 +980,14 @@ impl Runtime {
             }
         }
         // Signal start nodes.
-        delivered += self.fire_signal_starts(name, &payload, target_run.is_none());
+        delivered += self.fire_signal_starts(name, &payload, target_run.is_none(), sender);
         // When this signal is the configured `lifecycle.until_signal` it is the
         // retirement trigger: stop admitting, drain live runs, exit cleanly.
         // Delivery to whatever was parked on the signal happens first (above),
         // so an all-clear both completes the waiting run and retires the
-        // instance.
+        // instance. Only the runtime and the operator retire it: a grant of
+        // `workflow.signal` is a grant to steer one's own runs, and must not
+        // double as the power to drain everybody's.
         if self
             .settings
             .lifecycle
@@ -926,9 +995,17 @@ impl Runtime {
             .as_deref()
             .is_some_and(|u| u == name)
         {
-            self.log
-                .info("lifecycle.until_signal", json!({"signal": name}));
-            self.begin_drain("until_signal");
+            if sender.may_retire() {
+                self.log
+                    .info("lifecycle.until_signal", json!({"signal": name}));
+                self.begin_drain("until_signal");
+            } else {
+                self.log.warn(
+                    "lifecycle.until_signal.refused",
+                    json!({"signal": name, "principal": sender.id(),
+                           "note": "only the operator or the runtime retires the instance"}),
+                );
+            }
         }
         delivered
     }
@@ -1746,5 +1823,35 @@ impl Runtime {
             json!({"value": output, "ts": now_ms()}),
             None,
         );
+    }
+}
+
+#[cfg(test)]
+mod signal_sender_tests {
+    use super::SignalSender;
+
+    /// `lifecycle.until_signal` retires the whole instance, so only the
+    /// runtime and the operator may send it. A `workflow.signal` grant is a
+    /// grant to steer one's own runs: from a user it wakes that user's runs
+    /// and nothing else, and it never drains the daemon everyone shares.
+    #[test]
+    fn a_non_operator_signal_cannot_retire_the_instance() {
+        let user = SignalSender::Principal {
+            id: "user:bob".into(),
+            operator: false,
+        };
+        let operator = SignalSender::Principal {
+            id: "operator".into(),
+            operator: true,
+        };
+        assert!(!user.may_retire(), "a user's signal does not retire");
+        assert!(operator.may_retire() && SignalSender::Runtime.may_retire());
+
+        assert!(user.may_wake(Some("user:bob")), "its own run");
+        assert!(!user.may_wake(Some("user:alice")), "not another's");
+        assert!(!user.may_wake(None), "not the runtime's");
+        for any in [&operator, &SignalSender::Runtime] {
+            assert!(any.may_wake(Some("user:alice")) && any.may_wake(None));
+        }
     }
 }

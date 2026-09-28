@@ -3144,9 +3144,50 @@ impl Runtime {
         args: Value,
     ) -> ToolOutcome {
         let err = |e: String| ToolOutcome::Ready(Value::String(e), true);
+        // The model acts for whoever drives its turn, and no further: a tool
+        // that names a run acts on it only for the run's owner, exactly as the
+        // A2A op of the same name would for that caller. Not-yours reads as
+        // unknown. `None` is the runtime acting for itself, as before.
+        let acting = self.acting_principal(caller.principal.as_deref());
+        if matches!(
+            name,
+            "workflow.status"
+                | "workflow.cancel"
+                | "workflow.wait"
+                | "workflow.pause"
+                | "workflow.resume"
+                | "workflow.signal"
+        ) && let Some(p) = &acting
+            && let Some(id) = args.get("run").and_then(Value::as_str)
+            && self.owned_run(p, id).is_none()
+        {
+            return err(format!("no such run {id:?}"));
+        }
+        let visible = |r: &RunState| {
+            acting
+                .as_ref()
+                .is_none_or(|p| super::reactor::may_act_on(p, r.principal.as_deref()))
+        };
         match name {
             "workflow.run" => {
                 let wname = args["name"].as_str().unwrap_or("").to_string();
+                // The one predicate the A2A op and the card ask: the grants
+                // allow this workflow and its default start admits the role.
+                // Without it a principal narrowed to `workflow.run:triage`
+                // could run anything by asking the model to. A caller who may
+                // not run a workflow cannot tell it from one that does not
+                // exist, as over A2A.
+                if let Some(p) = &acting
+                    && !self
+                        .workflows
+                        .get(&wname)
+                        .is_some_and(|w| Runtime::may_run(p, w))
+                {
+                    return err(format!(
+                        "workflow.run refused: workflow {wname:?} is not runnable by {}",
+                        p.id
+                    ));
+                }
                 let Some(w) = self.workflows.get(&wname) else {
                     return err(format!("no such workflow {wname:?}"));
                 };
@@ -3206,7 +3247,7 @@ impl Runtime {
                 json!({"workflows": self.workflows.values().map(|w| json!({
                     "name": w.name, "description": w.description, "armed": w.armed, "hash": w.hash,
                     "starts": w.start_steps().iter().map(|s| json!({"node": s.id, "kind": s.kind})).collect::<Vec<_>>(),
-                    "runs": self.runs.values().filter(|r| r.workflow == w.name).map(|r| json!({"id": r.id, "status": r.status})).collect::<Vec<_>>(),
+                    "runs": self.runs.values().filter(|r| r.workflow == w.name && visible(r)).map(|r| json!({"id": r.id, "status": r.status})).collect::<Vec<_>>(),
                 })).collect::<Vec<_>>()}),
                 false,
             ),
@@ -3223,10 +3264,15 @@ impl Runtime {
                     (None, Some(n)) => self
                         .runs
                         .values()
-                        .filter(|r| r.workflow == n)
+                        .filter(|r| r.workflow == n && visible(r))
                         .map(RunState::summary)
                         .collect(),
-                    _ => self.runs.values().map(RunState::summary).collect(),
+                    _ => self
+                        .runs
+                        .values()
+                        .filter(|r| visible(r))
+                        .map(RunState::summary)
+                        .collect(),
                 };
                 ToolOutcome::Ready(json!({"runs": runs}), false)
             }

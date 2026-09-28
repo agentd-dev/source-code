@@ -192,6 +192,14 @@ pub struct SubagentRecord {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_by: Option<Value>,
+    /// The principal this subagent works for: who may steer, read or kill it.
+    /// `requested_by` names WHAT spawned it — a conversation, a run, another
+    /// subagent — and any of those can be gone by the time someone asks, so
+    /// the owner is recorded at spawn. A record written before it was kept
+    /// inherits one at restore ([`inherited_principal`]); `None` is
+    /// operator-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
     #[serde(default)]
     pub tokens: u64,
     #[serde(default)]
@@ -353,6 +361,12 @@ pub struct Runtime {
     pub(crate) principal_budgets: BTreeMap<String, crate::config::v2::Budget>,
     /// Labels an id acts under, for `_meta` and audit.
     pub(crate) principal_labels: BTreeMap<String, BTreeMap<String, String>>,
+    /// Every resolved caller as last seen, by principal id. A turn or a run
+    /// carries only the id of whoever it works for, so this is how the
+    /// model's tools recover that caller's role and grants. Keyed on the id
+    /// alone — never on a credential or session — so one principal's several
+    /// sessions are one owner, and what it owns outlives a re-login.
+    pub(crate) principal_index: BTreeMap<String, crate::a2a::Principal>,
     pub(crate) workflows: BTreeMap<String, std::sync::Arc<Workflow>>,
     pub(crate) runs: BTreeMap<String, RunState>,
     pub(crate) children: Children,
@@ -761,8 +775,17 @@ impl Runtime {
                         .get("from")
                         .and_then(Value::as_str)
                         .map(str::to_string);
-                    let delivered =
-                        self.deliver_signal(&name, payload, target.as_deref(), from.as_deref());
+                    // Recorded with the principal the sending tool call
+                    // acted for, so a replay after a restart is scoped as the
+                    // live delivery would have been.
+                    let sender = self.signal_sender(ev.principal.as_deref());
+                    let delivered = self.deliver_signal(
+                        &name,
+                        payload,
+                        target.as_deref(),
+                        from.as_deref(),
+                        &sender,
+                    );
                     self.log.info(
                         "signal.received",
                         json!({"inbox_event": ev.id, "name": name, "delivered": delivered}),
@@ -1547,6 +1570,156 @@ impl Runtime {
     }
 }
 
+// ---- ownership: who may act on a run or a subagent -------------------------
+
+/// May `principal` act on an object owned by `owner`?
+///
+/// An operator always may. Anyone else only on what their principal ID owns —
+/// the ID and nothing else, never the credential or session that presented it,
+/// so a principal keeps its runs and subagents across a re-login and a token's
+/// expiry, and two sessions of one principal are one owner. An object nobody
+/// owns (a record from before owners were kept, whose spawner is gone) is the
+/// operator's alone.
+pub(crate) fn may_act_on(principal: &crate::a2a::Principal, owner: Option<&str>) -> bool {
+    principal.is_operator() || owner == Some(principal.id.as_str())
+}
+
+/// The principal a subagent record works for: its own, else the owner of the
+/// run that spawned it, else the owner of the conversation, else its parent
+/// subagent's — the order in which `requested_by` narrows who asked. `None`
+/// when the chain ends without anyone, which leaves the subagent to the
+/// operator.
+pub(crate) fn inherited_principal(
+    subagents: &BTreeMap<String, SubagentRecord>,
+    record: &SubagentRecord,
+    run_owner: impl Fn(&str) -> Option<String>,
+    ctx_owner: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    let mut cur = record;
+    // Each hop is a distinct record, so the chain ends within as many hops
+    // as there are records — the bound only guards a cycle.
+    for _ in 0..=subagents.len() {
+        if let Some(p) = &cur.principal {
+            return Some(p.clone());
+        }
+        let by = cur.requested_by.as_ref()?;
+        if let Some(p) = by["run"].as_str().and_then(&run_owner) {
+            return Some(p);
+        }
+        if let Some(p) = by["ctx"].as_str().and_then(&ctx_owner) {
+            return Some(p);
+        }
+        cur = subagents.get(by["subagent"].as_str()?)?;
+    }
+    None
+}
+
+/// Give every record restored without a principal the one it inherits. Run
+/// once the runs and contexts it inherits from are restored; a record that
+/// gains one is re-persisted, so the owner no longer depends on its spawner
+/// surviving the next restart.
+pub(crate) fn backfill_principals(
+    subagents: &mut BTreeMap<String, SubagentRecord>,
+    run_owner: impl Fn(&str) -> Option<String>,
+    ctx_owner: impl Fn(&str) -> Option<String>,
+) {
+    let found: Vec<(String, String)> = subagents
+        .values()
+        .filter(|s| s.principal.is_none())
+        .filter_map(|s| {
+            inherited_principal(subagents, s, &run_owner, &ctx_owner).map(|p| (s.handle.clone(), p))
+        })
+        .collect();
+    for (handle, p) in found {
+        if let Some(s) = subagents.get_mut(&handle) {
+            s.principal = Some(p);
+            s.dirty = s.durable;
+        }
+    }
+}
+
+impl Runtime {
+    /// The run `id`, if `principal` may act on it. Unknown and not-yours are
+    /// one answer, so a caller cannot probe for other principals' run ids.
+    pub(crate) fn owned_run(
+        &self,
+        principal: &crate::a2a::Principal,
+        id: &str,
+    ) -> Option<&RunState> {
+        self.runs
+            .get(id)
+            .filter(|r| may_act_on(principal, r.principal.as_deref()))
+    }
+
+    /// The subagent `handle`, if `principal` may act on it — asked before
+    /// anything that could tell "not running" or "not warm" from "not yours".
+    pub(crate) fn owned_subagent(
+        &self,
+        principal: &crate::a2a::Principal,
+        handle: &str,
+    ) -> Option<&SubagentRecord> {
+        self.subagents
+            .get(handle)
+            .filter(|s| may_act_on(principal, s.principal.as_deref()))
+    }
+
+    /// Who a model's tool call acts for, when it acts for somebody.
+    ///
+    /// `None` is the runtime itself: work no caller asked for (a schedule, a
+    /// webhook, `identity.autonomous_as`), on whose behalf the tools check
+    /// nothing, as they never did. A caller the index has seen is itself,
+    /// with its role and grants. An id the index has NOT seen — a run
+    /// restored before its principal came back — fails closed: it acts as
+    /// nobody but that id, with no role, so it keeps what it owns and can
+    /// reach nothing else, and is never mistaken for the operator.
+    pub(crate) fn acting_principal(&self, id: Option<&str>) -> Option<crate::a2a::Principal> {
+        let id = id?;
+        if let Some(p) = self.principal_index.get(id) {
+            return Some(p.clone());
+        }
+        if id == self.settings.identity.autonomous_id() {
+            return None;
+        }
+        Some(crate::a2a::Principal {
+            id: id.to_string(),
+            ..crate::a2a::Principal::anonymous()
+        })
+    }
+
+    /// Whether the tool call `caller` may act on subagent `handle`.
+    pub(crate) fn tool_owns_subagent(
+        &self,
+        caller: &super::tools::ToolCaller,
+        handle: &str,
+    ) -> bool {
+        match self.acting_principal(caller.principal.as_deref()) {
+            None => true,
+            Some(p) => self.owned_subagent(&p, handle).is_some(),
+        }
+    }
+
+    /// The principal a new subagent `record` works for: the spawning caller's
+    /// own when it has one, else whoever owns what the caller is part of.
+    pub(crate) fn spawn_principal(&self, record: &SubagentRecord) -> Option<String> {
+        inherited_principal(
+            &self.subagents,
+            record,
+            |r| self.runs.get(r).and_then(|r| r.principal.clone()),
+            |c| self.contexts.get(c).and_then(|c| c.principal.clone()),
+        )
+    }
+
+    /// [`backfill_principals`] over the restored state.
+    pub(crate) fn backfill_subagent_principals(&mut self) {
+        let (runs, contexts) = (&self.runs, &self.contexts);
+        backfill_principals(
+            &mut self.subagents,
+            |r| runs.get(r).and_then(|r| r.principal.clone()),
+            |c| contexts.get(c).and_then(|c| c.principal.clone()),
+        );
+    }
+}
+
 pub(crate) fn is_terminal_status(s: &str) -> bool {
     matches!(
         s,
@@ -1582,7 +1755,115 @@ pub fn run_exit_code(r: &RunState) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::Instruction;
+    use super::{Instruction, SubagentRecord, backfill_principals, may_act_on};
+    use crate::a2a::Principal;
+    use crate::config::v2::Role;
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    fn principal(id: &str, role: Role, grants: &[&str], rate: Option<&str>) -> Principal {
+        Principal {
+            id: id.into(),
+            role,
+            grants: grants.iter().map(|g| (*g).to_string()).collect(),
+            rate: rate.map(str::to_string),
+            ..Principal::anonymous()
+        }
+    }
+
+    /// Ownership is the principal ID and nothing else. The same person can
+    /// arrive as two `Principal` values — a second session, a re-login after
+    /// a reload changed their grants or rate — and both must own what either
+    /// started; a different ID owns nothing of theirs, whatever it holds.
+    /// `owned_run` and `owned_subagent` are this predicate over the record's
+    /// owner, and the A2A ops answer its `false` with -32001.
+    #[test]
+    fn ownership_keys_on_the_principal_id() {
+        let first = principal("user:alice", Role::User, &[], None);
+        let again = Principal {
+            labels: [("team".to_string(), "ops".to_string())].into(),
+            ..principal("user:alice", Role::User, &["*"], Some("5/1s"))
+        };
+        for owner in [&first, &again] {
+            for asker in [&first, &again] {
+                assert!(
+                    may_act_on(asker, Some(owner.id.as_str())),
+                    "{asker:?} owns what {owner:?} started"
+                );
+            }
+        }
+        let bob = principal("user:bob", Role::User, &["*"], None);
+        assert!(!may_act_on(&bob, Some("user:alice")), "not bob's");
+        // Holding the owner's grants, or a role that is not operator, is no
+        // ownership; the operator is the one role that acts on anything.
+        let agent_alice = principal("agent:alice", Role::Agent, &["*"], None);
+        assert!(!may_act_on(&agent_alice, Some("user:alice")));
+        let operator = principal("operator", Role::Operator, &[], None);
+        assert!(may_act_on(&operator, Some("user:alice")));
+        // An object nobody owns is the operator's alone.
+        assert!(may_act_on(&operator, None));
+        assert!(!may_act_on(&first, None));
+    }
+
+    fn restored(doc: serde_json::Value) -> SubagentRecord {
+        serde_json::from_value(doc).expect("a record from before `principal` was kept")
+    }
+
+    /// A subagent record persisted before it carried its owner is given one
+    /// at restore: its run's owner first, then its conversation's, then its
+    /// parent subagent's. Without the backfill every such record would be
+    /// operator-only, and its owner would lose it across the upgrade.
+    #[test]
+    fn subagent_principal_is_inherited_at_restore() {
+        let mut subagents = BTreeMap::new();
+        for (handle, by, principal) in [
+            ("s-run", json!({"run": "r1", "ctx": "c1"}), None),
+            ("s-ctx", json!({"ctx": "c1"}), None),
+            ("s-child", json!({"subagent": "s-run"}), None),
+            ("s-own", json!({"run": "r1"}), Some("user:dave")),
+            ("s-orphan", json!({"run": "gone", "ctx": "gone"}), None),
+        ] {
+            let mut doc = json!({"handle": handle, "instruction": "x", "mode": "async",
+                                 "status": "running", "requested_by": by});
+            if let Some(p) = principal {
+                doc["principal"] = json!(p);
+            }
+            subagents.insert(handle.to_string(), restored(doc));
+        }
+        let runs = BTreeMap::from([("r1", "user:alice")]);
+        let ctxs = BTreeMap::from([("c1", "user:carol")]);
+        backfill_principals(
+            &mut subagents,
+            |r| runs.get(r).map(|p| p.to_string()),
+            |c| ctxs.get(c).map(|p| p.to_string()),
+        );
+        let owner = |h: &str| subagents[h].principal.clone();
+        assert_eq!(
+            owner("s-run").as_deref(),
+            Some("user:alice"),
+            "the run first"
+        );
+        assert_eq!(
+            owner("s-ctx").as_deref(),
+            Some("user:carol"),
+            "then the conversation"
+        );
+        assert_eq!(
+            owner("s-child").as_deref(),
+            Some("user:alice"),
+            "then the parent"
+        );
+        assert_eq!(
+            owner("s-own").as_deref(),
+            Some("user:dave"),
+            "a recorded owner stays"
+        );
+        assert_eq!(owner("s-orphan"), None, "nobody left: the operator's");
+        assert!(
+            subagents["s-run"].dirty && !subagents["s-orphan"].dirty,
+            "a record that gained an owner is re-persisted"
+        );
+    }
 
     fn instruction(uri: Option<&str>, server: Option<&str>) -> Instruction {
         Instruction {

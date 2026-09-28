@@ -642,6 +642,7 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
         // operator wrote can only be indexed once someone presents them.
         principal_budgets: BTreeMap::new(),
         principal_labels: BTreeMap::new(),
+        principal_index: BTreeMap::new(),
         exit: None,
         draining: false,
         lifetime_spent: false,
@@ -762,6 +763,9 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
             ),
         }
     }
+    // A record from before subagents kept their owner inherits one from what
+    // spawned it — now, while the runs and conversations it names are here.
+    rt.backfill_subagent_principals();
     #[cfg(feature = "a2a")]
     rt.restore_a2a_tasks(restored.of(Kind::Task));
     if let Some(m) = &restored.manifest {

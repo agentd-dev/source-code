@@ -217,9 +217,7 @@ impl crate::runtime::reactor::Runtime {
     /// every way of starting a workflow on someone's behalf asks, so the card
     /// can never list a workflow the op then refuses. Here rather than beside
     /// the A2A dispatch because the model's tools and signal starts ask it
-    /// too, and they are compiled without the listener — until they do, only
-    /// the listener's builds use it.
-    #[cfg(feature = "a2a")]
+    /// too, and they are compiled without the listener.
     pub(crate) fn may_run(principal: &Principal, wf: &crate::engine::model::Workflow) -> bool {
         let role = serde_json::to_value(principal.role).unwrap_or(Value::Null);
         principal.may_run_workflow(&wf.name)

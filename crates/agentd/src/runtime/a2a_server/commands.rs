@@ -8,14 +8,15 @@
 
 use super::redact::redact_settings;
 use super::send::command_data;
-use super::{FeedVis, TASK_NOT_FOUND, UNSUPPORTED_OPERATION, err_obj, rpc_internal};
+use super::{TASK_NOT_FOUND, UNSUPPORTED_OPERATION, err_obj, rpc_internal};
 use crate::a2a::Principal;
 use crate::a2a::errors::{self, reason};
 use crate::a2a::principals::workflow_name_of;
 use crate::a2a::tasks::{Link, State, Task};
 use crate::runtime::events::kinds;
-use crate::runtime::reactor::Runtime;
+use crate::runtime::reactor::{Runtime, may_act_on};
 use crate::runtime::surface::{self, Gate, Handler, Reply};
+use crate::runtime::waits::SignalSender;
 use serde_json::{Value, json};
 
 /// A refusal carrying agentd's `ErrorInfo`, so a client branches on the
@@ -211,7 +212,10 @@ impl Runtime {
                 Err(e) => Answer::Reply(err_obj(errors::INVALID_PARAMS, &e)),
             },
         };
-        let reply = match answer {
+        // No feed frame of its own: the task this creates carries the command
+        // message in its history, and its `task` frame is what a display
+        // client sees.
+        match answer {
             Answer::Doc(doc) => {
                 debug_assert_eq!(spec.reply, Reply::Message, "{op} answered a document");
                 crate::a2a::reply::read_reply(&ctx, doc)
@@ -228,24 +232,7 @@ impl Runtime {
                 )
             }
             Answer::Reply(v) => v,
-        };
-        // Surface work a caller asked for on the feed, so every attached
-        // display client sees what its peers did — once it ran. Announced
-        // before the handler, a `workflow.run` the handler then refused was
-        // shown to every client as a command the principal ran. Reads stay
-        // off it: they are the observation plumbing itself, and N clients
-        // polling them would spam every transcript.
-        if spec.reply == Reply::Task
-            && matches!(spec.handler, Handler::Workflow | Handler::Subagent)
-            && reply.get("_error").is_none()
-        {
-            self.feed_push(
-                "command",
-                FeedVis::Owner(Some(principal.id.clone())),
-                json!({"op": op, "principal": principal.id, "contextId": ctx}),
-            );
         }
-        reply
     }
 
     /// `status`, `config` and `plan.get`.
@@ -263,14 +250,9 @@ impl Runtime {
                     .map(str::to_string)
                     .unwrap_or_else(|| crate::context::ROOT.to_string());
                 match self.contexts.get(&id) {
-                    Some(c)
-                        if principal.is_operator()
-                            || c.principal.as_deref() == Some(principal.id.as_str()) =>
-                    {
-                        Answer::Doc(
-                            json!({"conversation": id, "plan": c.plan, "progress": c.plan.as_ref().map(|p| p.progress())}),
-                        )
-                    }
+                    Some(c) if may_act_on(principal, c.principal.as_deref()) => Answer::Doc(
+                        json!({"conversation": id, "plan": c.plan, "progress": c.plan.as_ref().map(|p| p.progress())}),
+                    ),
                     _ => Answer::Reply(err_obj(TASK_NOT_FOUND, "no such conversation")),
                 }
             }
@@ -290,25 +272,21 @@ impl Runtime {
             WorkflowOp::Run => Answer::Reply(self.workflow_run(principal, data, ctx)),
             WorkflowOp::Status => {
                 let view: Vec<Value> = match data["run"].as_str() {
-                    Some(id) => self
-                        .runs
-                        .get(id)
-                        .map(|r| vec![run_view(id, r)])
-                        .unwrap_or_default(),
+                    Some(id) => match self.owned_run(principal, id) {
+                        Some(r) => vec![run_view(id, r)],
+                        None => return no_such_run(),
+                    },
                     None => self
                         .runs
                         .iter()
-                        .filter(|(_, r)| {
-                            principal.is_operator()
-                                || r.principal.as_deref() == Some(principal.id.as_str())
-                        })
+                        .filter(|(_, r)| may_act_on(principal, r.principal.as_deref()))
                         .map(|(id, r)| run_view(id, r))
                         .collect(),
                 };
                 Answer::Doc(json!({"runs": view}))
             }
             WorkflowOp::Cancel => match data["run"].as_str() {
-                Some(id) if self.runs.contains_key(id) => {
+                Some(id) if self.owned_run(principal, id).is_some() => {
                     self.cancel_run(id, "cancelled over A2A");
                     Answer::Done {
                         link: Some(Link::Run { id: id.to_string() }),
@@ -316,7 +294,7 @@ impl Runtime {
                         result: None,
                     }
                 }
-                _ => Answer::Reply(err_obj(TASK_NOT_FOUND, "no such run")),
+                _ => no_such_run(),
             },
             // ---- steering: redirect live work without restarting it ------
             WorkflowOp::Signal => {
@@ -329,8 +307,24 @@ impl Runtime {
                 }
                 let payload = data.get("payload").cloned().unwrap_or(Value::Null);
                 let target = data["run"].as_str().map(str::to_string);
-                let delivered =
-                    self.deliver_signal(&name, payload, target.as_deref(), Some(&principal.id));
+                if let Some(id) = &target
+                    && self.owned_run(principal, id).is_none()
+                {
+                    return no_such_run();
+                }
+                // Without a target the signal still reaches only what this
+                // caller owns: `deliver_signal` scopes it to the sender.
+                let sender = SignalSender::Principal {
+                    id: principal.id.clone(),
+                    operator: principal.is_operator(),
+                };
+                let delivered = self.deliver_signal(
+                    &name,
+                    payload,
+                    target.as_deref(),
+                    Some(&principal.id),
+                    &sender,
+                );
                 Answer::Done {
                     link: None,
                     text: Some(format!("signal {name:?} delivered to {delivered}")),
@@ -411,6 +405,12 @@ impl Runtime {
         s: SubagentOp,
         data: &Value,
     ) -> Answer {
+        // Ownership first, before the tool can say "not running" or "not a
+        // warm subagent" about a handle that is someone else's.
+        let handle = data["handle"].as_str().unwrap_or("");
+        if self.owned_subagent(principal, handle).is_none() {
+            return Answer::Reply(err_obj(TASK_NOT_FOUND, "no such subagent"));
+        }
         let tool_caller = crate::runtime::tools::ToolCaller {
             principal: Some(principal.id.clone()),
             ..Default::default()
@@ -431,6 +431,12 @@ impl Runtime {
             _ => Answer::Reply(err_obj(rpc_internal(), "unexpected deferred subagent op")),
         }
     }
+}
+
+/// The answer to a run the caller may not see — unknown or someone else's,
+/// told apart for nobody.
+fn no_such_run() -> Answer {
+    Answer::Reply(err_obj(TASK_NOT_FOUND, "no such run"))
 }
 
 /// A compact run view for `workflow.status`.

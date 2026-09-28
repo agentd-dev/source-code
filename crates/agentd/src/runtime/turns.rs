@@ -820,7 +820,8 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
         scopes
     }
 
-    /// Record a resolved caller's declared budget and labels under their id.
+    /// Record a resolved caller — the principal itself, and its declared
+    /// budget and labels — under their id.
     ///
     /// A principal's id is minted when the caller is resolved, not written in
     /// config, so this is the only moment the operator's declaration and the
@@ -835,6 +836,12 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
         }
         if !p.labels.is_empty() && !self.principal_labels.contains_key(&p.id) {
             self.principal_labels.insert(p.id.clone(), p.labels.clone());
+        }
+        // The whole principal, replaced on every sighting: a reload can
+        // change a principal's role or grants, and the model's tools must act
+        // with the ones in force, not the ones seen first.
+        if self.principal_index.get(&p.id) != Some(p) {
+            self.principal_index.insert(p.id.clone(), p.clone());
         }
     }
 

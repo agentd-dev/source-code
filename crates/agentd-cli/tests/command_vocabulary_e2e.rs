@@ -639,12 +639,14 @@ fn workflow_run_asks_the_grants_and_the_default_starts_roles_before_any_task_exi
         "the operator's card"
     );
 
-    // The feed announced the runs that ran, and none of the refusals — each
-    // of which the audit mirror did record.
+    // The feed carried the task of each run that ran, and nothing for a
+    // refusal — each of which the audit mirror did record. (A command has no
+    // feed kind of its own: its task, which holds the command message, is
+    // what a display client sees.)
     for who in ["user:scoped", "user:plain"] {
-        feed_until(&feed, &format!("{who}'s command event"), |f| {
+        feed_until(&feed, &format!("{who}'s task event"), |f| {
             f.iter()
-                .any(|v| v["event"]["kind"] == "command" && v["event"]["data"]["principal"] == who)
+                .any(|v| v["event"]["kind"] == "task" && v["event"]["data"]["principal"] == who)
         });
     }
     feed_until(&feed, "the refusals' audit events", |f| {
@@ -655,14 +657,20 @@ fn workflow_run_asks_the_grants_and_the_default_starts_roles_before_any_task_exi
             .count()
             >= 5
     });
-    let commands: Vec<Value> = feed_events(&feed, "command")
+    let tasks: std::collections::BTreeSet<(String, String)> = feed_events(&feed, "task")
         .into_iter()
-        .map(|c| c["principal"].clone())
+        .map(|t| {
+            (
+                t["principal"].as_str().unwrap_or_default().to_string(),
+                t["task"]["id"].as_str().unwrap_or_default().to_string(),
+            )
+        })
         .collect();
+    let owners: Vec<&str> = tasks.iter().map(|(p, _)| p.as_str()).collect();
     assert_eq!(
-        commands,
-        vec![json!("user:scoped"), json!("user:plain")],
-        "one per run that ran, none for a refusal"
+        owners,
+        ["user:plain", "user:scoped"],
+        "one task per run that ran, none for a refusal: {tasks:?}"
     );
 }
 

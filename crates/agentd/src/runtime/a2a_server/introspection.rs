@@ -92,12 +92,9 @@ impl Runtime {
     /// exist, as `conversation.get` tells it.
     fn subagent_get(&self, principal: &Principal, data: &Value) -> Result<Value, Value> {
         let handle = data["handle"].as_str().unwrap_or("");
-        let Some(s) = self.subagents.get(handle) else {
+        let Some(s) = self.owned_subagent(principal, handle) else {
             return Err(err_obj(TASK_NOT_FOUND, "no such subagent"));
         };
-        if !principal.is_operator() && self.subagent_owner(handle) != Some(principal.id.as_str()) {
-            return Err(err_obj(TASK_NOT_FOUND, "no such subagent"));
-        }
         Ok(json!({"subagent": {
             "handle": s.handle,
             "mode": s.mode,
@@ -112,32 +109,6 @@ impl Runtime {
             "updated": s.updated,
             "node": s.node.map(|n| n.0),
         }}))
-    }
-
-    /// Whose subagent `handle` is: the principal of the conversation or run
-    /// that spawned it, or — for a subagent's own subagent — its parent's.
-    /// The record names what spawned it, not who, so the owner is read off
-    /// the spawner; a subagent whose spawner is gone is the operator's alone.
-    fn subagent_owner(&self, handle: &str) -> Option<&str> {
-        let mut h = handle;
-        // Each hop is a distinct live record, so the chain ends within as
-        // many hops as there are records — the bound only guards a cycle.
-        for _ in 0..=self.subagents.len() {
-            let by = self.subagents.get(h)?.requested_by.as_ref()?;
-            let from_ctx = by["ctx"]
-                .as_str()
-                .and_then(|c| self.contexts.get(c))
-                .and_then(|c| c.principal.as_deref());
-            let from_run = by["run"]
-                .as_str()
-                .and_then(|r| self.runs.get(r))
-                .and_then(|r| r.principal.as_deref());
-            if let Some(p) = from_ctx.or(from_run) {
-                return Some(p);
-            }
-            h = by["subagent"].as_str()?;
-        }
-        None
     }
 
     /// `conversation.get {id, limit?}`: the conversation transcript — the one
@@ -182,14 +153,9 @@ impl Runtime {
     /// view renders (the plain `workflow.status` stays a histogram).
     fn run_get(&self, principal: &Principal, data: &Value) -> Result<Value, Value> {
         let id = data["run"].as_str().unwrap_or("");
-        let Some(r) = self.runs.get(id) else {
+        let Some(r) = self.owned_run(principal, id) else {
             return Err(err_obj(TASK_NOT_FOUND, "no such run"));
         };
-        let owner_ok =
-            principal.is_operator() || r.principal.as_deref() == Some(principal.id.as_str());
-        if !owner_ok {
-            return Err(err_obj(TASK_NOT_FOUND, "no such run"));
-        }
         let steps: serde_json::Map<String, Value> = r
             .steps
             .iter()

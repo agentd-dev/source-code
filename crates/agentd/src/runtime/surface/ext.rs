@@ -28,7 +28,11 @@ pub const EXTENSION_METHODS: &[(&str, &str)] = &[("SubscribeToEvents", INTERFACE
 /// serve the interface feed still recognises — and echoes back — the header
 /// naming it. Whether the instance DECLARES the extension on its card is
 /// `extensions_of`'s decision, and that one does read `Settings`.
-pub const EXTENSIONS: &[&str] = &[COMMAND_EXTENSION, INTERFACE_EXTENSION];
+pub const EXTENSIONS: &[&str] = &[
+    COMMAND_EXTENSION,
+    INTERFACE_EXTENSION,
+    TASK_ANNOTATIONS_EXTENSION,
+];
 
 /// Every extension THIS instance declares on its card, in card order.
 ///
@@ -41,6 +45,11 @@ pub fn extensions_of(s: &crate::config::v2::Settings) -> Vec<&'static str> {
     if s.a2a.events.enabled {
         v.push(INTERFACE_EXTENSION);
     }
+    // Every task this instance projects carries its annotations under this
+    // URI, whatever the switches: a display client reads a gate's askSchema
+    // and a task's link only when the card names the extension, so leaving it
+    // undeclared hid them from every client that checks before it reads.
+    v.push(TASK_ANNOTATIONS_EXTENSION);
     v
 }
 

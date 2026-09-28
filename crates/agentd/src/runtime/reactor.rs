@@ -1667,11 +1667,14 @@ impl Runtime {
     ///
     /// `None` is the runtime itself: work no caller asked for (a schedule, a
     /// webhook, `identity.autonomous_as`), on whose behalf the tools check
-    /// nothing, as they never did. A caller the index has seen is itself,
-    /// with its role and grants. An id the index has NOT seen — a run
-    /// restored before its principal came back — fails closed: it acts as
-    /// nobody but that id, with no role, so it keeps what it owns and can
-    /// reach nothing else, and is never mistaken for the operator.
+    /// nothing, as they never did. A caller the index knows — the operator
+    /// and every declared rule id from the rules in force, and any other
+    /// caller seen since they last changed — is itself, with its role and
+    /// grants. An id the index does NOT know — one named by its evidence
+    /// alone, whose work was restored, or whose rule a reload removed —
+    /// fails closed: it acts as nobody but that id, with no role, so it keeps
+    /// what it owns and can reach nothing else, and is never mistaken for the
+    /// operator.
     pub(crate) fn acting_principal(&self, id: Option<&str>) -> Option<crate::a2a::Principal> {
         let id = id?;
         if let Some(p) = self.principal_index.get(id) {

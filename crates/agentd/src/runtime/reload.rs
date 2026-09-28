@@ -425,6 +425,13 @@ impl Runtime {
             match crate::a2a::Resolver::build(&new.a2a, &envmap) {
                 Ok(r) => {
                     bridge.set_resolver(r);
+                    // Who the model acts for moves with the rules, in the
+                    // same step: an entry kept from the old rules would let a
+                    // narrowed or removed principal's in-flight work keep its
+                    // old reach until it called again — and a removed one
+                    // never does. Callers named by their evidence alone are
+                    // re-indexed when next seen; until then they fail closed.
+                    self.principal_index = crate::a2a::principals::declared_principals(&new.a2a);
                     changed.push("a2a.principals");
                 }
                 Err(e) => {
@@ -434,6 +441,10 @@ impl Runtime {
                     );
                 }
             }
+        } else if old.a2a.principals != new.a2a.principals {
+            // No listener to swap, but restored work still acts for its
+            // owners through the model, with the rules as they now read.
+            self.principal_index = crate::a2a::principals::declared_principals(&new.a2a);
         }
         // Webhook routes: rebuild from the (already reloaded) workflows and the
         // current `default_auth`, and install them.

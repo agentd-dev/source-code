@@ -357,6 +357,48 @@ impl Compiled {
     }
 }
 
+/// Every principal the rules name before anybody presents anything: the
+/// operator, and each rule with a declared `id`, with the role, grants and
+/// quotas that rule gives it — keyed by principal id.
+///
+/// This is what the runtime acts with for work restored or in flight when no
+/// request has named its owner since the rules last changed. Without it, a
+/// reload that narrowed or removed a rule left the old principal acting
+/// through the model until it happened to call again (a removed one never
+/// does), and a restart left even the operator unknown. What it cannot know
+/// is a caller whose id comes from its evidence — a certificate's CN, a
+/// device session — and those are indexed when they are seen.
+///
+/// Needs no secret: an id is derived from the rule, never from its bearer.
+/// When two rules name the same id, the first wins, as it does in `resolve`.
+pub fn declared_principals(a2a: &v2::A2a) -> std::collections::BTreeMap<String, Principal> {
+    let mut out = std::collections::BTreeMap::new();
+    let op = operator();
+    out.insert(op.id.clone(), op);
+    for p in &a2a.principals {
+        let Some(id) = principal_id(p.role, p.id.as_deref(), None) else {
+            continue;
+        };
+        // An operator rule is `operator`, already present; an anonymous one
+        // names nobody the runtime could act for.
+        if matches!(p.role, Role::Operator | Role::Anonymous) || out.contains_key(&id) {
+            continue;
+        }
+        out.insert(
+            id.clone(),
+            Principal {
+                id,
+                role: p.role,
+                grants: p.grants.clone(),
+                rate: p.quotas.as_ref().and_then(|q| q.rate.clone()),
+                budget: p.quotas.as_ref().and_then(|q| q.budget.clone()),
+                labels: p.labels.clone(),
+            },
+        );
+    }
+    out
+}
+
 fn operator() -> Principal {
     Principal {
         id: "operator".into(),
@@ -469,6 +511,41 @@ mod tests {
             } else {
                 SessionCheck::Invalid
             }
+        }
+    }
+
+    /// The principals known before anyone presents anything are the operator
+    /// and the declared ids, each exactly as `resolve` would name it — so the
+    /// runtime acting for a restored or in-flight owner acts with what a
+    /// request from that owner would carry now.
+    #[test]
+    fn declared_principals_are_what_resolve_would_name() {
+        let settings = a2a(json!({
+            "listen": "https://0.0.0.0:8443",
+            "url": "https://agent.example",
+            "tls": {"cert": "c", "key": "k", "client_ca": "ca"},
+            "principals": [
+                {"match": {"san": "spiffe://corp/team/*"}, "role": "user"},
+                {"id": "peer", "match": {"bearer_ref": "{{secret:PEER}}"}, "role": "agent",
+                 "grants": ["workflow.run:triage*"], "labels": {"team": "ops"}},
+                {"id": "ops", "match": {"san": "spiffe://corp/ops/*"}, "role": "operator"},
+            ]
+        }));
+        let declared = declared_principals(&settings);
+        assert_eq!(
+            declared.keys().collect::<Vec<_>>(),
+            ["agent:peer", "operator"],
+            "{declared:?}"
+        );
+        assert!(declared["operator"].is_operator());
+        let r = Resolver::build(&settings, &secrets).unwrap();
+        let ev = Evidence {
+            bearer: secrets("PEER"),
+            ..Default::default()
+        };
+        match r.resolve(&ev, false, None) {
+            Resolution::Named(p, _) => assert_eq!(declared["agent:peer"], p),
+            other => panic!("the peer's bearer names it: {other:?}"),
         }
     }
 

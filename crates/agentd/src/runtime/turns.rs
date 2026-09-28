@@ -839,7 +839,9 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
         }
         // The whole principal, replaced on every sighting: a reload can
         // change a principal's role or grants, and the model's tools must act
-        // with the ones in force, not the ones seen first.
+        // with the ones in force, not the ones seen first. The reload itself
+        // rebuilds the index from the new rules (`declared_principals`), so
+        // this only ever refreshes an entry, never keeps a stale one alive.
         if self.principal_index.get(&p.id) != Some(p) {
             self.principal_index.insert(p.id.clone(), p.clone());
         }

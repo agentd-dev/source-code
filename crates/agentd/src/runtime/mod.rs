@@ -642,7 +642,10 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
         // operator wrote can only be indexed once someone presents them.
         principal_budgets: BTreeMap::new(),
         principal_labels: BTreeMap::new(),
-        principal_index: BTreeMap::new(),
+        // Seeded from the rules, so work restored with an owner acts with
+        // that owner's role and grants in force now — the operator included
+        // — before anyone has presented anything.
+        principal_index: crate::a2a::principals::declared_principals(&settings.a2a),
         exit: None,
         draining: false,
         lifetime_spent: false,

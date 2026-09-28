@@ -19,6 +19,8 @@ import {
   parseArgs,
   resolveCredential,
   scrubEnv,
+  shownCode,
+  unrevokedNote,
 } from '../dist/tui/args.js';
 import { DEFAULT_LAYOUT } from '../dist/client/index.js';
 import { startFakeA2a } from './fake-a2a.mjs';
@@ -186,4 +188,27 @@ test('sign-in follows what the card offers, and the layout refuses unknown items
   assert.deepEqual(layoutOf({ top: 'name,memory:pr' }, { AGENTD_TUI_BOTTOM: 'conn' }), { top: ['name', 'memory:pr'], bottom: ['conn'] });
   assert.throws(() => layoutOf({ bottom: 'conn,nope' }, {}), /--bottom: unknown chrome item\(s\) "nope"/);
   assert.throws(() => layoutOf({}, { AGENTD_TUI_TOP: 'bogus' }), /AGENTD_TUI_TOP: unknown/);
+});
+
+// The device code and its link come from whatever authorization server the
+// card names, and go straight to a terminal: a control sequence in either is
+// shown as text, never run (a prompt rewritten, a clipboard written).
+test('a device code is shown inert', () => {
+  const shown = shownCode({
+    userCode: 'ABCD\u001b]52;c;cHduZWQ=\u0007',
+    verificationUri: 'https://agent.example/device',
+    verificationUriComplete: 'https://agent.example/device?c=\u001b[2J',
+    expiresIn: 600,
+  });
+  assert.ok(!/[\u0000-\u001f\u007f]/.test(shown.code + shown.uri), JSON.stringify(shown));
+  assert.match(shown.code, /^ABCD\\u001b\]52/);
+  assert.match(shown.uri, /^https:\/\/agent\.example\/device\?c=\\u001b/);
+  assert.equal(shownCode({ userCode: 'WXYZ-1234', verificationUri: 'https://a.example/d', expiresIn: 1 }).uri, 'https://a.example/d');
+});
+
+// A launch session has no expiry, so an unrevoked one is not said to expire.
+test('an unrevoked launch session is not promised an expiry', () => {
+  assert.match(unrevokedNote('launch'), /until the daemon exits/);
+  assert.doesNotMatch(unrevokedNote('launch'), /expires/);
+  assert.match(unrevokedNote('device'), /when it expires/);
 });

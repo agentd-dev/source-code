@@ -633,6 +633,25 @@ impl Registry {
         self.tools.values()
     }
 
+    /// Whether `name` is one of the instance's own controls: an internal tool
+    /// the root agent alone is granted — never a workflow, never a subagent.
+    /// Those tiers are the registry's (`internal::contracts`), fixed at build
+    /// and not configurable, so this set cannot drift from a list kept beside
+    /// it: defining, redefining, deleting and arming workflows, and
+    /// subscribing the agent to instruction changes.
+    ///
+    /// Over A2A every one of these is an operator's control. The model driving
+    /// a turn for anybody else must be held to the same line, which is what
+    /// the runtime asks this for.
+    pub fn instance_wide(&self, name: &str) -> bool {
+        self.tools.get(name).is_some_and(|t| {
+            t.class == ToolClass::Internal
+                && t.grant.root
+                && !t.grant.workflows
+                && !t.grant.subagents
+        })
+    }
+
     /// Whether `caller` may call `name`.
     ///
     /// Fails closed at every step: an unknown tool, or one that is disabled or

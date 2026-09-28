@@ -266,11 +266,16 @@ impl Task {
     }
 
     /// Append to the conversation, dropping the oldest entries until both
-    /// bounds hold again.
+    /// bounds hold again — never the one just appended. A single message over
+    /// the byte bound (the listener accepts bodies well past it) stays alone:
+    /// emptying the history would lose the very prompt that opened the task,
+    /// and that message is already bounded by the request it arrived in.
     fn push_message(&mut self, m: TaskMessage) {
         self.messages.push(m);
         let mut total: usize = self.messages.iter().map(TaskMessage::bytes).sum();
-        while self.messages.len() > MAX_TASK_MESSAGES || total > MAX_TASK_MESSAGE_BYTES {
+        while self.messages.len() > 1
+            && (self.messages.len() > MAX_TASK_MESSAGES || total > MAX_TASK_MESSAGE_BYTES)
+        {
             total -= self.messages.remove(0).bytes();
         }
         self.dirty = true;
@@ -398,6 +403,13 @@ mod tests {
         assert!(total <= MAX_TASK_MESSAGE_BYTES, "{total} bytes kept");
         assert_eq!(t.messages.len(), 4, "four 60 KiB messages fit, five do not");
         assert_eq!(first(&t), json!("big2"));
+
+        // One message over the whole byte bound evicts everything older, and
+        // is itself kept: the newest entry is never dropped.
+        let huge = json!({"messageId": "huge", "parts": [{"text": "x".repeat(MAX_TASK_MESSAGE_BYTES + 1)}]});
+        t.record_inbound(&huge);
+        assert_eq!(t.messages.len(), 1, "{} kept", t.messages.len());
+        assert_eq!(first(&t), json!("huge"));
 
         // Durable: the conversation and the numbering survive a round trip.
         let back: Task = serde_json::from_value(serde_json::to_value(&t).unwrap()).unwrap();

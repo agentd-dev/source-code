@@ -268,15 +268,16 @@ async fn dispatch(
     };
     let name = route.name();
 
-    // The method gate. A refusal here counts against the source, which only
-    // matters to later requests from it that ALSO fail to authenticate.
+    // The method gate. A refusal here is NOT counted against the source: the
+    // caller already proved who it is, so it guessed nothing, and a source
+    // over the failure limit has every bearer refused unchecked — counting
+    // an authenticated principal's refusals would let any narrowed caller
+    // lock out every bearer sharing its address (loopback, a NAT, a proxy),
+    // the operator's included.
     let op = params
         .get("message")
         .and_then(crate::runtime::a2a_server::command_op);
     if !principal.may(name, None) {
-        if let Some(ip) = source {
-            app.failures.failed(ip);
-        }
         let rule = resolver.rule_of(&principal);
         denied(
             &app,

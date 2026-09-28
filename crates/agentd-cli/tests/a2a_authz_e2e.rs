@@ -850,13 +850,20 @@ fn a_reload_demotes_a_principal_and_the_revocation_takes_effect() {
 /// Two users on one listener. A owns what it starts; B is granted
 /// `b_grants`, which for most tests is everything a user can be given, and
 /// still owns nothing of A's. `waiter` parks on a signal so A's run stays
-/// live; `all-clear` is the instance's retirement signal.
+/// live; `all-clear` is the instance's retirement signal. `doors` runs from a
+/// manual start anyone may use, and has a second, operator-only one; `later`
+/// hands its owner's run to the model after a pause long enough to reload or
+/// restart the daemon under it.
 fn owners_config(llm: &str, port: u16, b_grants: &str) -> String {
+    owners_config_on(llm, port, b_grants, "store:\n  kind: memory\n")
+}
+
+fn owners_config_on(llm: &str, port: u16, b_grants: &str, store: &str) -> String {
     format!(
         "config_version: \"1\"\n\
          agent:\n  name: a2a-owners\n  instruction: You are a helpful test agent.\n  preflight: never\n\
          intelligence:\n  endpoints: {llm}\n  model: mock\n\
-         store:\n  kind: memory\n\
+         {store}\
          a2a:\n  listen: http://127.0.0.1:{port}\n  introspection:\n    enabled: true\n\
          \x20 principals:\n\
          \x20   - id: token-a\n\
@@ -873,6 +880,8 @@ fn owners_config(llm: &str, port: u16, b_grants: &str) -> String {
          \x20 - name: triage-kick\n    steps:\n      k: {{kind: signal, name: kick}}\n      f: {{kind: finish, depends_on: [k]}}\n\
          \x20 - name: deploy-kick\n    steps:\n      k: {{kind: signal, name: kick}}\n      f: {{kind: finish, depends_on: [k]}}\n\
          \x20 - name: deploy\n    steps:\n      s: {{kind: manual}}\n      w: {{kind: wait, on: signal, signal: never, depends_on: [s]}}\n      f: {{kind: finish, depends_on: [w]}}\n\
+         \x20 - name: doors\n    steps:\n      s: {{kind: manual}}\n      o: {{kind: a2a, command: doors.open, roles: [operator]}}\n      f: {{kind: finish, depends_on: [s]}}\n\
+         \x20 - name: later\n    steps:\n      s: {{kind: manual}}\n      n: {{kind: sleep, depends_on: [s], duration: 4s}}\n      a: {{kind: agent, depends_on: [n], instruction: \"LATER-STEP: run what you were asked\"}}\n      f: {{kind: finish, depends_on: [a]}}\n\
          lifecycle:\n  run_until: drained\n  until_signal: all-clear\n\
          observability:\n  log_level: info\n"
     )
@@ -1283,6 +1292,268 @@ fn a_narrowed_principal_cannot_run_a_workflow_through_the_model() {
 
     assert!(daemon.alive(), "daemon still serving: {}", daemon.stderr());
     std::fs::remove_file(&cfg).ok();
+}
+
+/// The tool results of the root turn in conversation `ctx`, as `bearer`
+/// (its owner) reads them back.
+fn tool_results(addr: &str, bearer: &str, ctx: &str) -> Vec<String> {
+    let conv = command_as(addr, bearer, "conversation.get", json!({"id": ctx}));
+    answer(&conv)["conversation"]["messages"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the owner reads its conversation: {conv}"))
+        .iter()
+        .filter(|m| m["role"] == "tool")
+        .map(|m| m.to_string())
+        .collect()
+}
+
+/// Send `text` as `bearer` and wait for the turn; the conversation's id.
+fn turn_as(addr: &str, bearer: &str, text: &str) -> String {
+    let sent = SendMessage::text(text).bearer(bearer).post(addr);
+    let task = &sent["result"]["task"];
+    assert_eq!(task["status"]["state"], "TASK_STATE_COMPLETED", "{sent}");
+    task["contextId"].as_str().unwrap().to_string()
+}
+
+/// What the model may list, and what it may change, when it acts for a
+/// principal that is not the operator.
+///
+/// B's model lists runs and subagents and sees none of A's — the ids are
+/// what every object-naming tool takes, so listing them would undo the
+/// not-found answer the tools give. It cannot touch the instance's own
+/// controls either: defining, redefining, deleting or disarming a workflow is
+/// the operator's over A2A, and an armed workflow B's model defined would run
+/// as the runtime, with no owner to check. Nor does it fire a start other than
+/// the default one, which is all `may_run` judged. A's model, meanwhile, sees
+/// what is A's: the filter narrows to the owner, not to nothing.
+#[test]
+fn the_model_lists_only_its_callers_objects_and_leaves_the_instance_alone() {
+    let pb = common::unique_path("owners-playbook", "json");
+    std::fs::write(&pb, a_spawns_a_helper().to_string()).unwrap();
+    let llm = spawn_mock_llm_file(&pb);
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let cfg = write_config(&owners_config(&llm.uri, port, "[\"*\"]"));
+    let mut daemon = spawn_daemon(&cfg);
+    wait_ready(&addr);
+    let a = a_owns_a_run_and_a_subagent(&addr, &daemon);
+
+    let definition = |name: &str| json!({"name": name, "steps": {"s": {"kind": "once"}, "f": {"kind": "finish", "depends_on": ["s"]}}});
+    std::fs::write(
+        &pb,
+        owners_playbook(json!([
+            {"tool_calls": [
+                {"name": "workflow.status", "arguments": {}},
+                {"name": "workflow.list", "arguments": {}},
+                {"name": "subagent.list", "arguments": {}},
+                {"name": "workflow.pause", "arguments": {"name": "waiter"}},
+                {"name": "workflow.create", "arguments": {"definition": definition("b-made")}},
+                {"name": "workflow.update", "arguments": {"name": "deploy", "definition": definition("deploy")}},
+                {"name": "workflow.delete", "arguments": {"name": "deploy"}},
+                {"name": "workflow.run", "arguments": {"name": "doors", "start": "o"}},
+            ]},
+            {"content": "tried"},
+        ]))
+        .to_string(),
+    )
+    .unwrap();
+    let b_ctx = turn_as(&addr, TOKEN_B, "look around and rearrange things");
+    let results = tool_results(&addr, TOKEN_B, &b_ctx);
+    assert_eq!(results.len(), 8, "eight tool results: {results:?}");
+    let all = results.join("\n");
+    assert!(
+        !all.contains(&a.run) && !all.contains(&a.handle),
+        "B's model listed A's objects: {results:?}"
+    );
+    let instance_wide = "acts on the whole instance and is not permitted for user:token-b";
+    assert_eq!(
+        results.iter().filter(|r| r.contains(instance_wide)).count(),
+        4,
+        "pause-by-name, create, update and delete are refused: {results:?}"
+    );
+    assert!(
+        results
+            .iter()
+            .any(|r| r.contains("may run \\\"doors\\\" only from its default start")),
+        "the operator-only start is refused: {results:?}"
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !daemon
+            .stderr()
+            .lines()
+            .any(|l| l.contains("\"run.start\"") && l.contains("\"workflow\":\"doors\"")),
+        "a doors run was started:\n{}",
+        daemon.stderr()
+    );
+    // What B's model tried to change is as it was: `deploy` still runs,
+    // and `waiter` still takes a new run.
+    for workflow in ["deploy", "waiter"] {
+        let v = command_as(
+            &addr,
+            TOKEN_A,
+            "workflow.run",
+            json!({"workflow": workflow}),
+        );
+        assert!(v.get("error").is_none(), "{workflow} is intact: {v}");
+    }
+
+    // A's model sees A's run and A's helper.
+    std::fs::write(
+        &pb,
+        owners_playbook(json!([
+            {"tool_calls": [
+                {"name": "workflow.status", "arguments": {}},
+                {"name": "subagent.list", "arguments": {}},
+            ]},
+            {"content": "listed"},
+        ]))
+        .to_string(),
+    )
+    .unwrap();
+    let a_ctx = turn_as(&addr, TOKEN_A, "what is mine?");
+    let results = tool_results(&addr, TOKEN_A, &a_ctx);
+    assert!(
+        results[0].contains(&a.run),
+        "A's model sees A's run: {results:?}"
+    );
+    assert!(
+        results[1].contains(&a.handle),
+        "A's model sees A's helper: {results:?}"
+    );
+
+    assert!(daemon.alive(), "daemon still serving: {}", daemon.stderr());
+    std::fs::remove_file(&cfg).ok();
+    std::fs::remove_file(&pb).ok();
+}
+
+/// Whether the daemon's log records a run of `workflow` starting.
+fn started(log: &str, workflow: &str) -> bool {
+    log.lines()
+        .any(|l| l.contains("\"run.start\"") && l.contains(&format!("\"workflow\":\"{workflow}\"")))
+}
+
+/// Wait for B's `later` run to finish: its model step has acted by then.
+fn wait_later_done(daemon: &Daemon) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !daemon
+        .stderr()
+        .lines()
+        .any(|l| l.contains("\"run.done\"") && l.contains("\"workflow\":\"later\""))
+    {
+        assert!(
+            Instant::now() < deadline,
+            "B's later run never finished:\n{}",
+            daemon.stderr()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// B starts `later`, whose model step will ask to run `workflow` once the
+/// pause is over.
+fn b_starts_later(addr: &str, daemon: &Daemon) {
+    let v = command_as(addr, TOKEN_B, "workflow.run", json!({"workflow": "later"}));
+    assert!(v.get("error").is_none(), "B starts later: {v}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !started(&daemon.stderr(), "later") {
+        assert!(Instant::now() < deadline, "later never started");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// A reload that narrows a principal narrows what the model does for it at
+/// once — for work already in flight, before that principal calls again.
+///
+/// The model acts with the principal the runtime last indexed for an id. The
+/// index was filled only when a request arrived, so a principal narrowed by
+/// a reload kept its old grants in every turn and step already running for
+/// it until it happened to call — and one whose rule was removed never does.
+#[test]
+#[cfg(feature = "hot-reload")]
+fn a_reload_narrows_what_the_model_does_for_work_in_flight() {
+    let llm = spawn_mock_llm(&json!({"turns": [
+        {"tool_calls": [{"name": "workflow.run", "arguments": {"name": "deploy"}}]},
+        {"content": "asked"},
+    ]}));
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let cfg = write_config(&owners_config(&llm.uri, port, "[\"*\"]"));
+    let mut daemon = spawn_daemon(&cfg);
+    wait_ready(&addr);
+    b_starts_later(&addr, &daemon);
+
+    // Narrow B to `triage*` while its run sleeps, and make no request as B.
+    std::fs::write(
+        &cfg,
+        owners_config(&llm.uri, port, "[\"workflow.run:triage*\"]"),
+    )
+    .unwrap();
+    unsafe { libc::kill(daemon.pid() as i32, libc::SIGHUP) };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !daemon
+        .stderr()
+        .lines()
+        .any(|l| l.contains("\"config.reloaded\"") && l.contains("a2a.principals"))
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the daemon never reloaded:\n{}",
+            daemon.stderr()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    wait_later_done(&daemon);
+    assert!(
+        !started(&daemon.stderr(), "deploy"),
+        "B's model ran deploy with the grants the reload took away:\n{}",
+        daemon.stderr()
+    );
+    assert!(daemon.alive(), "daemon still serving: {}", daemon.stderr());
+    std::fs::remove_file(&cfg).ok();
+}
+
+/// Work restored across a restart acts for its owner with the rules in
+/// force, before that owner has made a request of the new process.
+///
+/// Nothing indexed a principal until it called, so after a restart every
+/// declared principal — the operator too — was unknown, and its restored
+/// model steps failed closed: B's run could no longer run even what B may.
+#[test]
+fn restored_work_acts_for_its_owner_before_the_owner_calls_again() {
+    let llm = spawn_mock_llm(&json!({"turns": [
+        {"tool_calls": [{"name": "workflow.run", "arguments": {"name": "triage"}}]},
+        {"content": "asked"},
+    ]}));
+    let dir = common::unique_path("authz-restart", "d");
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = format!(
+        "store:\n  kind: file\n  file:\n    path: {dir}/state\n  checkpoint:\n    debounce_ms: 0\n"
+    );
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let cfg = write_config(&owners_config_on(&llm.uri, port, "[\"*\"]", &store));
+
+    let first = spawn_daemon(&cfg);
+    wait_ready(&addr);
+    b_starts_later(&addr, &first);
+    // Mid-sleep: no drain, nothing finished.
+    unsafe { libc::kill(first.pid() as i32, libc::SIGKILL) };
+    drop(first);
+
+    // The second life: nobody calls as B.
+    let mut second = spawn_daemon(&cfg);
+    wait_ready(&addr);
+    wait_later_done(&second);
+    assert!(
+        started(&second.stderr(), "triage"),
+        "B's restored run could not run what B may:\n{}",
+        second.stderr()
+    );
+    assert!(second.alive(), "daemon still serving: {}", second.stderr());
+    std::fs::remove_file(&cfg).ok();
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// A mock whose playbook is the file at `path`, re-read on every request, so

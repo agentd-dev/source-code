@@ -87,7 +87,22 @@ pub enum Annotations {
 /// is the task's current status and after it has moved into history, so a
 /// client that rendered it once recognises it in both places.
 pub fn status_message_id(task_id: &str, seq: u64) -> String {
-    format!("{task_id}.status.{seq}")
+    format!("{task_id}{STATUS_ID_INFIX}{seq}")
+}
+
+/// What every agent-authored message id carries, and no caller's may.
+const STATUS_ID_INFIX: &str = ".status.";
+
+/// Whether a caller's `messageId` falls in the agent's own namespace.
+///
+/// A client that rendered an id once recognises it everywhere, and dedupes by
+/// it — so a caller that sent `<task>.status.<n>` first (a continuation knows
+/// its task id, and the numbering is public) would shadow the agent's next
+/// question in every console watching the task. Such an id is re-minted
+/// rather than kept. The whole infix is reserved, not just the addressed
+/// task's: a new task's id is minted by the listener and may be guessable.
+pub fn is_agent_message_id(id: &str) -> bool {
+    id.contains(STATUS_ID_INFIX)
 }
 
 /// A status `Message` the agent authored, addressed to its task and context.
@@ -294,12 +309,17 @@ pub fn task_listed(t: &Task, view: ListView, ann: Annotations) -> WireTask {
 /// The whole current task rather than the event that fired: "the task, as it
 /// now is" is a valid `StreamResponse`, keeps the artifacts, and lets a
 /// receiver check `task.id` against what it registered for. The annotations
-/// are left out — a webhook is a notification to a receiver that is not a
-/// party to the conversation, and agentd's own facts are not the receiver's
-/// to read.
+/// and the history are left out — a webhook is a notification to a receiver
+/// that is not a party to the conversation. Its history holds every party's
+/// messages (an operator's gate answer, a continuation), which are not the
+/// receiver's to read, and re-sending up to the whole bound on every
+/// transition would make each state change a bulk upload. The current
+/// status message still rides in `status`; a party that wants the
+/// conversation reads it with `GetTask`.
 pub fn push_body(t: &Task) -> Value {
     use a2a_rs::domain::generated::{StreamResponse, stream_response::Payload};
-    let w = task(t, Annotations::Omit);
+    let mut w = task(t, Annotations::Omit);
+    w.history.clear();
     let body = StreamResponse {
         payload: Some(Payload::Task(Box::new(w))),
         ..Default::default()
@@ -677,9 +697,15 @@ mod tests {
             Some("user:a"),
             Link::Run { id: "r".into() },
         );
+        t.record_inbound(&json!({"messageId": "m1", "parts": [{"text": "a caller's prompt"}]}));
+        t.transition(State::InputRequired, Some("Proceed?".into()));
+        t.transition(State::Working, Some("going".into()));
         t.set_result(json!("answer"));
         t.transition(State::Completed, None);
+        assert!(!history_of(&t).is_empty(), "the task has a conversation");
         let body = push_body(&t);
+        // The conversation stays with its parties: none of it rides a push.
+        assert!(body["task"].get("history").is_none(), "{body}");
         assert_eq!(body["task"]["id"], "task-7", "{body}");
         assert_eq!(body["task"]["status"]["state"], "TASK_STATE_COMPLETED");
         assert!(body.get("id").is_none(), "not a bare Task: {body}");
@@ -718,5 +744,17 @@ mod tests {
         assert_eq!(env["op"], "status");
         // The text half is unchanged by the command riding alongside it.
         assert_eq!(message_text(&m), "please");
+    }
+
+    /// Every id the agent mints is in the reserved namespace, whatever the
+    /// task is called; an ordinary client id is not.
+    #[test]
+    fn agent_message_ids_are_reserved() {
+        for (task, seq) in [("t", 1), ("a2a-7", 42), ("x.y", 3)] {
+            assert!(is_agent_message_id(&status_message_id(task, seq)));
+        }
+        for id in ["m1", "7f0c-uuid", "status.1", "t.result"] {
+            assert!(!is_agent_message_id(id), "{id}");
+        }
     }
 }

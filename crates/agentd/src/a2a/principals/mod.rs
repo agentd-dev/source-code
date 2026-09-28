@@ -18,7 +18,7 @@ mod resolve;
 pub use addressee::Addressee;
 pub use resolve::{
     CertId, Evidence, Resolution, Resolver, SESSION_TOKEN_PREFIX, SessionCheck, SessionVerifier,
-    Via,
+    Via, declared_principals,
 };
 
 /// A resolved caller.

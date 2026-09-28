@@ -35,6 +35,7 @@ import {
   readLaunchCode,
   resolveCredential,
   scrubEnv,
+  shownCode,
 } from './args.js';
 import { LaunchRefused, classify, describe, deviceLogin, launchExchange, openSession } from '../client/index.js';
 import type { Credential } from '../client/index.js';
@@ -126,11 +127,13 @@ async function main(): Promise<void> {
           flow: choice.flow,
           clientId: TUI_CLIENT_ID,
           scope: source.kind === 'login' ? source.scope : undefined,
-          onCode: (c) =>
+          onCode: (c) => {
+            const { uri, code } = shownCode(c);
             process.stderr.write(
-              `To sign in, open ${c.verificationUriComplete ?? c.verificationUri} and enter ${c.userCode},\n` +
-                `or ask an operator to run: /approve ${c.userCode} <name>\nwaiting for approval…\n`,
-            ),
+              `To sign in, open ${uri} and enter ${code},\n` +
+                `or ask an operator to run: /approve ${code} <name>\nwaiting for approval…\n`,
+            );
+          },
         });
       } catch (e) {
         fail(describe(classify(e)));

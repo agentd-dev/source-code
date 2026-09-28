@@ -44,7 +44,7 @@ a `DataPart`, which exists precisely to carry structured payloads.
 The spec groups extensions into four kinds: **data-only** (information on the
 card), **profile** (extra structure or narrower values on core messages),
 **method** (new RPC methods), and **state machine** (new task states). agentd
-uses the first and the third.
+uses the first three.
 
 ---
 
@@ -54,6 +54,7 @@ uses the first and the third.
 |---|---|---|
 | `https://agentd.dev/a2a/ext/command/v1` | data-only | the **command ops** — structured operations sent as a DataPart on `SendMessage` |
 | `https://agentd.dev/a2a/ext/interface/v1` | method | `SubscribeToEvents`, the instance-wide observation feed |
+| `https://agentd.dev/a2a/ext/task-annotations/v1` | profile | agentd's facts about a task — its link (run, subagent or turn), principal, creation time, status history, a gate's `askSchema`, the command that started it — in `Task.metadata` under this URI. Declared on every card. |
 
 None is `required`. A client that sends no `A2A-Extensions` header at all gets a
 complete, working service: it can converse, run workflows, read tasks and

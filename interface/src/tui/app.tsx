@@ -65,7 +65,7 @@ import { DebugScreen, settable } from './parts/debug.js';
 import { Edge } from './parts/chrome.js';
 import { StatusBar } from './parts/statusbar.js';
 import { SubagentDetail, SubagentList } from './parts/subagents.js';
-import { TUI_CLIENT_ID, chooseSignIn, launchTokenUrl } from './args.js';
+import { TUI_CLIENT_ID, chooseSignIn, launchTokenUrl, shownCode, unrevokedNote } from './args.js';
 
 /** How the credential the TUI holds was obtained; it decides what an ended session says. */
 export type SignIn = 'launch' | 'bearer' | 'device';
@@ -386,11 +386,10 @@ export function App(props: AppProps): React.JSX.Element {
           clientId: TUI_CLIENT_ID,
           scope,
           signal: ac.signal,
-          onCode: (code) =>
-            mirror.note(
-              `to sign in, open ${code.verificationUriComplete ?? code.verificationUri} and enter ${code.userCode} — ` +
-                `or an operator runs /approve ${code.userCode} <name>`,
-            ),
+          onCode: (c) => {
+            const { uri, code } = shownCode(c);
+            mirror.note(`to sign in, open ${uri} and enter ${code} — or an operator runs /approve ${code} <name>`);
+          },
         });
         setCredential(c);
         setSignIn('device');
@@ -427,7 +426,7 @@ export function App(props: AppProps): React.JSX.Element {
     try {
       const url = await revocationEndpointOf(flow);
       if (url === undefined) {
-        mirror.note('signed out here; the daemon lists no revocation endpoint, so the session ends when it expires', 'error');
+        mirror.note(unrevokedNote(signIn === 'launch' ? 'launch' : 'device'), 'error');
         return;
       }
       await revokeToken(url, token, { clientId: TUI_CLIENT_ID });

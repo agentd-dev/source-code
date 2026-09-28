@@ -130,9 +130,12 @@ worth stating, because getting them wrong fails silently in the *peer*:
 
 Streaming assumes the caller can hold a connection open for as long as the work
 takes. A caller that cannot — a serverless function, a queue consumer — registers
-a webhook, and agentd POSTs each of that task's updates to it. The body is the
-`Task`, exactly as a streaming caller would have seen it, so one handler serves
-both ways of being told.
+a webhook, and agentd POSTs each of that task's updates to it. The body is a
+`StreamResponse` carrying the `Task` — its status and its artifacts, as a
+streaming caller would see them — so one handler serves both ways of being told.
+It carries no `history` and no agentd annotations: the receiver is told that the
+task moved, not handed the conversation, which holds every party's messages. A
+party that wants those reads them with `GetTask`.
 
 ```yaml
 a2a:

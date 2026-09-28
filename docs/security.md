@@ -309,6 +309,26 @@ code included (`registry/mod.rs::allowed`). MCP restriction otherwise happens th
 `finish` is granted to root and subagents but not to workflows — a workflow terminates
 with the `finish` step kind instead.
 
+A root turn is offered its tiers whoever drives it, so a turn that an A2A `user` or
+`agent` principal started — and a workflow step in a run one owns — is held to what that
+principal could do itself (`runtime/tools.rs::execute_tool_as`, `runtime/steps.rs`):
+
+- a `ROOT_ONLY` tool is the instance's own control and is refused ("acts on the whole
+  instance and is not permitted for …"); only `workflow.pause` / `resume` naming a `run`
+  goes on, to the owner check below;
+- a tool that names a run or a subagent acts only on that principal's own, and anything
+  else is "no such run" / "no such subagent"; `workflow.list` and `workflow.status`
+  show only its own runs, and `subagent.list` only its own subagents;
+- `workflow.run` runs only what its grants and the default start's `roles:` allow, and
+  only from that default start.
+
+The model acts with the principal as the rules name it now. The runtime knows the
+operator and every rule with a declared `id` from startup, and rebuilds that from the new
+rules on every reload of `a2a.principals`, so narrowing or removing a rule narrows work
+already in flight at once. A caller named only by its evidence (a certificate's CN, a
+device session) is known once it has made a request; until then, work it owns acts with
+no role and reaches only what it owns.
+
 External callers arrive over A2A. The transport supplies a `CallerIdentity` — verified
 mTLS SANs and subject, a bearer reference, an AAuth agent id, a loopback flag — and
 `Resolver::resolve` walks the `a2a.principals` rules first-match, then falls back to

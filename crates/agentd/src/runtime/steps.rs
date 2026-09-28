@@ -3199,7 +3199,21 @@ impl Runtime {
                         "workflow.run refused: {cause}; retry when it clears"
                     ));
                 }
-                let start = match args.get("start").and_then(Value::as_str) {
+                // Anyone but the operator runs a workflow from its DEFAULT
+                // start, as the A2A op does: `may_run` judged that start's
+                // `roles:`, and a sibling — an operator-only `a2a` command,
+                // a webhook's — was never part of what it admitted.
+                let named = args.get("start").and_then(Value::as_str);
+                if let (Some(p), Some(s)) = (&acting, named)
+                    && !p.is_operator()
+                    && default_start(w).as_deref() != Some(s)
+                {
+                    return err(format!(
+                        "workflow.run refused: {} may run {wname:?} only from its default start, not {s:?}",
+                        p.id
+                    ));
+                }
+                let start = match named {
                     Some(s) => match w.step(s) {
                         Some(st) if st.is_start() => s.to_string(),
                         _ => return err(format!("workflow {wname:?} has no start node {s:?}")),

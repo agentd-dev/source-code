@@ -53,11 +53,13 @@ impl Runtime {
         }
         // The caller's message, with the id it is known by from here on: its
         // own `messageId`, or one minted for it. History records it under that
-        // id, so a client finds its prompt again by the id it sent.
+        // id, so a client finds its prompt again by the id it sent. An id in
+        // the agent's namespace is minted over, so no caller can pose as one
+        // of the agent's status messages in history.
         let mut message = params["message"].clone();
         let message_id = message["messageId"]
             .as_str()
-            .filter(|s| !s.is_empty())
+            .filter(|s| !s.is_empty() && !crate::a2a::wire::is_agent_message_id(s))
             .map(str::to_string)
             .unwrap_or_else(|| self.next_id("msg"));
         if let Some(o) = message.as_object_mut() {

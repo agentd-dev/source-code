@@ -50,6 +50,9 @@ struct Daemon {
     stderr_path: String,
 }
 impl Daemon {
+    // Only the reload test reads the log; gated as it is, or the `a2a` row
+    // without `hot-reload` fails -D warnings on a dead method.
+    #[cfg(feature = "hot-reload")]
     fn stderr(&self) -> String {
         std::fs::read_to_string(&self.stderr_path).unwrap_or_default()
     }

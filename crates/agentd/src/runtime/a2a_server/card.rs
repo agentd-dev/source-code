@@ -19,7 +19,8 @@ use crate::engine::model::Workflow;
 use crate::runtime::reactor::Runtime;
 use crate::runtime::surface::auth::{ListenerAuth, listener_auth_of, origin_of, security_of};
 use crate::runtime::surface::{
-    A2A_PROTOCOL_VERSION, RUNTIME_SETTABLE, Reply, UNIX_BINDING, op_spec, static_vocabulary,
+    A2A_PROTOCOL_VERSION, RUNTIME_SETTABLE, Reply, TASK_ANNOTATIONS_EXTENSION, UNIX_BINDING,
+    op_spec, static_vocabulary,
 };
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -276,6 +277,14 @@ fn declaration(uri: &'static str) -> Value {
             "description": "The instance-wide observation feed display clients render. \
                             A2A has no instance feed, so the method is declared here.",
             "params": {"method": method, "schema": schema_of(uri)},
+        })
+    } else if uri == TASK_ANNOTATIONS_EXTENSION {
+        json!({
+            "uri": uri,
+            "description": "agentd's facts about a task — what it is linked to, who started \
+                            it, when, its status history, a gate's answer schema — in the \
+                            task's metadata under this URI.",
+            "params": {"schema": schema_of(uri)},
         })
     } else {
         json!({"uri": uri, "description": uri, "params": {"schema": schema_of(uri)}})
@@ -601,6 +610,21 @@ mod tests {
         fn version_compatible(version: &str) -> bool {
             version.is_empty() || version.split('.').next() == Some("1")
         }
+        // The copy is only as good as the version it was copied from: a
+        // dependency bump fails here until the rule above is re-read against
+        // the new release's negotiator and this pin moved with it.
+        let lock =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock"))
+                .expect("the workspace lockfile");
+        let locked = lock
+            .split("[[package]]")
+            .find(|p| p.contains("\nname = \"a2a-rs\"\n"))
+            .and_then(|p| p.lines().find_map(|l| l.strip_prefix("version = ")))
+            .expect("a2a-rs is locked");
+        assert_eq!(
+            locked, "\"0.10.0\"",
+            "a2a-rs moved: re-check version_compatible against its negotiation.rs"
+        );
         let s = settings(
             json!({"listen": "https://agent.example:8443", "bearer": "{{secret:B}}",
             "tls": {"cert": "c", "key": "k"}, "url": "https://agent.example:8443"}),
@@ -1011,6 +1035,13 @@ mod tests {
             assert!(
                 declared.contains(&COMMAND_EXTENSION),
                 "the command extension is unconditional"
+            );
+            // Every task projection carries the annotations, so the card
+            // names them whatever the switches — a client reads them only
+            // when it does.
+            assert!(
+                declared.contains(&TASK_ANNOTATIONS_EXTENSION),
+                "the task-annotations extension is unconditional"
             );
             // Anything declarable must be activatable, or the handshake would
             // drop a URI the card just advertised.

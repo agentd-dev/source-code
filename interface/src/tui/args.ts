@@ -18,8 +18,8 @@
  */
 
 import { closeSync, readFileSync, readSync } from 'node:fs';
-import { DEFAULT_LAYOUT, join, originOf, parseLayout } from '../client/index.js';
-import type { Layout, LoginOption } from '../client/index.js';
+import { DEFAULT_LAYOUT, inert, join, originOf, parseLayout } from '../client/index.js';
+import type { DeviceCode, Layout, LoginOption } from '../client/index.js';
 
 /** The client_id the TUI names itself by at the daemon's OAuth endpoints. */
 export const TUI_CLIENT_ID = 'agentd-tui';
@@ -234,6 +234,28 @@ export function readLaunchCode(fd: number): string {
  */
 export function launchTokenUrl(endpoint: string): string {
   return join(originOf(endpoint), '/oauth2/token');
+}
+
+/**
+ * A device code as the terminal shows it: the link to open and the code to
+ * enter. Both are the authorization server's words, and that server is
+ * whatever the card names — so they are inert, and a control sequence in
+ * either is shown rather than run by the terminal.
+ */
+export function shownCode(c: DeviceCode): { uri: string; code: string } {
+  return { uri: inert(c.verificationUriComplete ?? c.verificationUri), code: inert(c.userCode) };
+}
+
+/**
+ * What `/logout` says when the daemon offers nowhere to revoke the session.
+ * A device session expires; the launcher's has no expiry, so it stays valid
+ * for as long as the daemon runs — and saying otherwise would be a promise
+ * that never comes true.
+ */
+export function unrevokedNote(signIn: 'device' | 'launch'): string {
+  return signIn === 'launch'
+    ? 'signed out here; the daemon lists no revocation endpoint, so the launch session stays valid until the daemon exits'
+    : 'signed out here; the daemon lists no revocation endpoint, so the session ends when it expires';
 }
 
 /** What a refused launch exchange tells the person (exit 2). */

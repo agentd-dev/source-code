@@ -214,6 +214,27 @@ impl Runtime {
         if let Err(e) = self.registry.validate_args(name, &args) {
             return ToolOutcome::Ready(Value::String(e), true);
         }
+        // The instance's own controls are the operator's, whichever door a
+        // request uses. Every root turn is offered them, including one a
+        // `user` or `agent` principal drives — so without this, a principal
+        // narrowed to one workflow could have the model redefine that
+        // workflow, define an armed one that runs as the runtime, or disarm
+        // somebody else's. A call that names a run (`workflow.pause {run}`)
+        // acts on an object, not the instance, and the tool's own owner check
+        // decides it.
+        if self.registry.instance_wide(name)
+            && args.get("run").is_none()
+            && let Some(p) = self.acting_principal(caller.principal.as_deref())
+            && !p.is_operator()
+        {
+            return ToolOutcome::Ready(
+                Value::String(format!(
+                    "tool {name:?} acts on the whole instance and is not permitted for {}",
+                    p.id
+                )),
+                true,
+            );
+        }
         // The policy verdict, at the one chokepoint every call passes — and
         // deliberately AFTER `validate_args`, so an argument guard judges
         // arguments that already conform to the tool's schema rather than

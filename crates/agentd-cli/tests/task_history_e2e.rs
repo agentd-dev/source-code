@@ -144,7 +144,8 @@ fn history_carries_the_turn() {
     let llm = spawn_mock_llm(&json!({
         "turns": [
             {"tool_calls": [{"name": "ask_human", "arguments": {"question": "Proceed?"}}]},
-            {"content": "Proceeded."}
+            {"content": "Proceeded."},
+            {"content": "Continued."}
         ]
     }));
     let (_daemon, addr) = boot(&llm.uri);
@@ -269,5 +270,37 @@ fn history_carries_the_turn() {
     assert_eq!(
         finished["artifacts"][0]["extensions"],
         json!([agentd::runtime::surface::COMMAND_EXTENSION])
+    );
+
+    // A follow-up on the finished task is recorded too — the continuation
+    // path, neither a new task nor a gate answer. It is sent under the
+    // QUESTION's id: a caller knows its task id and the agent's numbering,
+    // and a console that dedupes by id would otherwise drop the agent's
+    // question or this message as a repeat. The id is minted over instead.
+    let mut follow = SendMessage::text("And again")
+        .task(&task_id)
+        .return_immediately()
+        .params();
+    follow["message"]["messageId"] = json!(question_id);
+    let replied = rpc(&addr, 9, "SendMessage", follow);
+    assert_eq!(replied["task"]["id"], task_id.as_str(), "{replied}");
+    let again = wait_task(&addr, &task_id, "the continuation", |t| {
+        t["status"]["state"] == "TASK_STATE_COMPLETED"
+            && t["history"].to_string().contains("And again")
+    });
+    let ids = history_ids(&again);
+    let follow_up = again["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["parts"][0]["text"] == "And again")
+        .expect("the follow-up is in history");
+    assert_eq!(follow_up["role"], "ROLE_USER", "{again}");
+    assert_eq!(follow_up["taskId"], task_id.as_str());
+    assert_ne!(follow_up["messageId"], question_id.as_str(), "{again}");
+    assert_eq!(
+        ids.iter().filter(|id| **id == question_id).count(),
+        1,
+        "the question's id names the question alone: {again}"
     );
 }

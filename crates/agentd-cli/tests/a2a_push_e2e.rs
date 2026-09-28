@@ -181,11 +181,19 @@ fn wait_for<T>(mut f: impl FnMut() -> Option<T>, secs: u64, what: &str) -> T {
     }
 }
 
+/// The header a delivery carried, by (lower-case) name.
+fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(k, _)| k == name)
+        .map(|(_, v)| v.as_str())
+}
+
 #[test]
-fn a_registered_webhook_receives_the_task_and_the_callers_token() {
-    // A deliberately slow turn, so the webhook is registered while the task is
-    // still working and the transition to `completed` is a real delivery rather
-    // than a race with one.
+fn a_registered_webhook_receives_the_task_and_the_callers_credentials() {
+    // A deliberately slow turn, so the webhooks are registered while the task
+    // is still working and the transition to `completed` is a real delivery
+    // rather than a race with one.
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "done at last", "delay_ms": 2500}]}));
     let hook = spawn_hook();
     // `allow_private` because the receiver in this test is loopback, which is
@@ -208,60 +216,117 @@ fn a_registered_webhook_receives_the_task_and_the_callers_token() {
         .unwrap_or_else(|| panic!("a task: {sent}"))
         .to_string();
 
-    let registered = rpc(
-        &addr,
-        2,
-        "CreateTaskPushNotificationConfig",
-        // The spec's request *is* the config: a flat `TaskPushNotificationConfig`.
-        json!({"taskId": task_id, "url": hook.url, "token": "caller-token"}),
-    );
+    // The spec's request *is* the config: a flat `TaskPushNotificationConfig`,
+    // authentication in the 1.0 shape — one scheme, its credentials.
+    let register = |id: i64, auth: Value| {
+        rpc(
+            &addr,
+            id,
+            "CreateTaskPushNotificationConfig",
+            json!({"taskId": task_id, "url": hook.url, "token": "caller-token", "authentication": auth}),
+        )
+    };
+    let bearer = register(2, json!({"scheme": "Bearer", "credentials": "x"}));
     assert!(
-        registered.get("error").is_none(),
-        "registration should succeed: {registered}"
+        bearer.get("error").is_none(),
+        "registration should succeed: {bearer}"
     );
-    let config_id = registered["result"]["id"]
+    let config_id = bearer["result"]["id"]
         .as_str()
         .expect("a config id")
         .to_string();
+    // The read-back names the scheme it accepted and never the credentials.
+    assert_eq!(
+        bearer["result"]["authentication"],
+        json!({"scheme": "Bearer"}),
+        "{bearer}"
+    );
+    // Any token scheme is honoured, not only Bearer.
+    let basic = register(3, json!({"scheme": "Basic", "credentials": "dTpw"}));
+    assert!(basic.get("error").is_none(), "{basic}");
 
-    // The turn finishes on its own; that transition is what gets delivered.
-    let (headers, body) = wait_for(
-        || hook.seen.lock().unwrap().first().cloned(),
+    // Authentication that cannot be sent as given is refused, never dropped:
+    // dropping it would send the webhook out unauthenticated.
+    for (n, auth) in [
+        json!({"credentials": "no-scheme"}),
+        json!({"scheme": "Bearer x", "credentials": "k"}),
+        json!({"scheme": "Bearer", "credentials": "k\r\nx-evil: 1"}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let refused = register(10 + n as i64, auth.clone());
+        assert_eq!(refused["error"]["code"], -32602, "{auth}: {refused}");
+    }
+
+    // The turn finishes on its own; that transition is what gets delivered —
+    // once to each registered config.
+    let deliveries = wait_for(
+        || {
+            let seen = hook.seen.lock().unwrap();
+            let auths: Vec<String> = seen
+                .iter()
+                .filter_map(|(h, _)| header(h, "authorization").map(str::to_string))
+                .collect();
+            (auths.iter().any(|a| a == "Bearer x") && auths.iter().any(|a| a == "Basic dTpw"))
+                .then(|| seen.clone())
+        },
         20,
-        "a delivery",
+        "a delivery to each config",
     );
-    // The body is the task, in the same shape a streaming caller would see.
-    assert_eq!(body["id"], task_id.as_str(), "{body}");
-    assert!(body["status"]["state"].as_str().is_some(), "{body}");
-    // The caller's token comes back, so the receiver can tell a real delivery
-    // from a stray POST at a URL somebody guessed.
-    assert!(
-        headers
-            .iter()
-            .any(|(k, v)| k == "x-a2a-notification-token" && v == "caller-token"),
-        "{headers:?}"
-    );
+    for (headers, body) in &deliveries {
+        // The body is a `StreamResponse` carrying the task — the union a
+        // streaming caller reads — and the task is the one registered for.
+        assert_eq!(body["task"]["id"], task_id.as_str(), "{body}");
+        assert!(body["task"]["status"]["state"].as_str().is_some(), "{body}");
+        assert_eq!(
+            header(headers, "content-type"),
+            Some("application/a2a+json"),
+            "{headers:?}"
+        );
+        // The caller's token comes back too (the legacy courtesy header), so
+        // the receiver can tell a real delivery from a stray POST.
+        assert_eq!(
+            header(headers, "x-a2a-notification-token"),
+            Some("caller-token"),
+            "{headers:?}"
+        );
+    }
 
-    // Read-back and delete round out the family.
-    let listed = rpc(
-        &addr,
-        4,
-        "ListTaskPushNotificationConfigs",
-        json!({"taskId": task_id}),
-    );
-    assert!(
-        listed["result"]["configs"]
+    // Get and Delete name one config, always. Without an id they are refused —
+    // not read as "any" or, on a delete, as "all of them".
+    let get = |id: i64, params: Value| rpc(&addr, id, "GetTaskPushNotificationConfig", params);
+    let delete =
+        |id: i64, params: Value| rpc(&addr, id, "DeleteTaskPushNotificationConfig", params);
+    let list = |id: i64| {
+        rpc(
+            &addr,
+            id,
+            "ListTaskPushNotificationConfigs",
+            json!({"taskId": task_id}),
+        )["result"]["configs"]
             .as_array()
-            .is_some_and(|a| !a.is_empty()),
-        "{listed}"
+            .map_or(0, Vec::len)
+    };
+    assert_eq!(list(20), 2);
+    assert_eq!(get(21, json!({"taskId": task_id}))["error"]["code"], -32602);
+    assert_eq!(
+        delete(22, json!({"taskId": task_id}))["error"]["code"],
+        -32602
     );
-    let deleted = rpc(
-        &addr,
-        5,
-        "DeleteTaskPushNotificationConfig",
-        json!({"taskId": task_id, "pushNotificationConfigId": config_id}),
-    );
-    assert!(deleted.get("error").is_none(), "{deleted}");
+    assert_eq!(list(23), 2, "an id-less delete removed nothing");
+    // An id the task does not have is "not found", on both.
+    let unknown = json!({"taskId": task_id, "id": "no-such-config"});
+    assert_eq!(get(24, unknown.clone())["error"]["code"], -32001);
+    assert_eq!(delete(25, unknown)["error"]["code"], -32001);
+
+    let named = json!({"taskId": task_id, "id": config_id});
+    let got = get(26, named.clone());
+    assert_eq!(got["result"]["id"], config_id.as_str(), "{got}");
+    assert!(!got.to_string().contains("\"x\""), "no credentials: {got}");
+    let deleted = delete(27, named);
+    assert_eq!(deleted["result"], json!({}), "{deleted}");
+    assert_eq!(list(28), 1, "exactly the named config went");
 
     std::fs::remove_file(&cfg_path).ok();
 }

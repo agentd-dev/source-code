@@ -142,7 +142,7 @@ fn target(url: &str) -> PushTarget {
         id: "pc-1".into(),
         url: url.into(),
         token: "caller-token".into(),
-        bearer: None,
+        auth: None,
     }
 }
 
@@ -206,7 +206,7 @@ fn a_target_the_operator_allowed_still_arrives_with_the_host_header_on_the_name(
         "the Host header stayed on the URL's authority"
     );
     assert!(
-        got.content_type.contains("application/json"),
+        got.content_type.contains("application/a2a+json"),
         "{got:?}",
         got = got.content_type
     );

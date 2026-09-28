@@ -73,8 +73,8 @@ pub enum Link {
 
 /// A webhook a caller registered for this task's updates (A2A push
 /// notifications). `token` is echoed back in `X-A2A-Notification-Token` so the
-/// receiver can tell a real delivery from a stray POST; `bearer` is a
-/// credential agentd presents *to* the receiver.
+/// receiver can tell a real delivery from a stray POST; `auth` is a credential
+/// agentd presents *to* the receiver.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PushTarget {
     pub id: String,
@@ -82,7 +82,20 @@ pub struct PushTarget {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub token: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bearer: Option<String>,
+    pub auth: Option<PushAuth>,
+}
+
+/// The spec's `AuthenticationInfo`: what goes in the `Authorization` header of
+/// every delivery, as `<scheme> <credentials>`.
+///
+/// Any scheme the caller names is honoured, not only `Bearer` — the receiver is
+/// the caller's, and what it accepts is the caller's business. The scheme is
+/// kept exactly as registered; both halves were checked at registration
+/// ([`crate::a2a::push::from_wire`]) so neither can smuggle a second header.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PushAuth {
+    pub scheme: String,
+    pub credentials: String,
 }
 
 /// The durable task record.
@@ -149,6 +162,14 @@ impl Task {
         }
     }
 
+    /// Whether `principal` may see this task at all: an operator sees every
+    /// task, anyone else only the ones it started. Every read of a task —
+    /// get, list, cancel, the push family — asks this one question, so "not
+    /// yours" cannot mean different things on different paths.
+    pub fn is_visible_to(&self, principal: &crate::a2a::Principal) -> bool {
+        principal.is_operator() || self.principal.as_deref() == Some(principal.id.as_str())
+    }
+
     pub fn transition(&mut self, state: State, message: Option<String>) {
         if self.state == state && self.message == message {
             return;
@@ -188,11 +209,11 @@ impl Task {
         serde_json::to_value(crate::a2a::wire::task(self)).unwrap_or(Value::Null)
     }
 
-    /// The light projection `ListTasks` returns: the same `Task` minus the
-    /// artifacts a listing does not resolve.
+    /// The projection `ListTasks` returns: the same `Task`, cut to what the
+    /// caller asked a listing to carry (see [`crate::a2a::wire::ListView`]).
     #[cfg(feature = "a2a")]
-    pub fn summary(&self) -> Value {
-        serde_json::to_value(crate::a2a::wire::task_summary(self)).unwrap_or(Value::Null)
+    pub fn summary(&self, view: crate::a2a::wire::ListView) -> Value {
+        serde_json::to_value(crate::a2a::wire::task_listed(self, view)).unwrap_or(Value::Null)
     }
 }
 #[cfg(test)]
@@ -228,5 +249,24 @@ mod tests {
         assert_eq!(back.state, t.state);
         assert_eq!(back.history.len(), t.history.len());
         assert!(!back.dirty);
+    }
+
+    #[test]
+    fn a_task_is_visible_to_its_owner_and_the_operator_only() {
+        use crate::a2a::Principal;
+        use crate::config::v2::Role;
+        let who = |id: &str, role| Principal {
+            id: id.into(),
+            role,
+            ..Principal::anonymous()
+        };
+        let t = Task::new("t", "c", Some("user:a"), Link::Turn { ctx: "c".into() });
+        assert!(t.is_visible_to(&who("user:a", Role::User)));
+        assert!(t.is_visible_to(&who("operator", Role::Operator)));
+        assert!(!t.is_visible_to(&who("user:b", Role::User)));
+        // An ownerless task is the operator's alone.
+        let orphan = Task::new("o", "c", None, Link::Turn { ctx: "c".into() });
+        assert!(!orphan.is_visible_to(&Principal::anonymous()));
+        assert!(orphan.is_visible_to(&who("operator", Role::Operator)));
     }
 }

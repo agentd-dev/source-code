@@ -302,7 +302,7 @@ impl Runtime {
             // task id (see `new_task_id`).
             Some(Verb::NewTaskId) => json!({"id": new_task_id()}),
             Some(Verb::GetTask) => self.a2a_get_task(&principal, &params),
-            Some(Verb::ListTasks) => self.a2a_list_tasks(&principal),
+            Some(Verb::ListTasks) => self.a2a_list_tasks(&principal, &params),
             Some(Verb::CancelTask) => self.a2a_cancel_task(&principal, &params),
             Some(Verb::PushConfigSet) => self.a2a_push_set(&principal, &params),
             Some(Verb::PushConfigGet) => self.a2a_push_get(&principal, &params),

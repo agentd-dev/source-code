@@ -64,6 +64,12 @@ impl RuntimePorts {
     /// the latter is turned back into the spec's error type so the protocol
     /// layer maps it to the right code, rather than being passed off as a
     /// successful result that happens to contain an error.
+    ///
+    /// An error is recognised under either spelling — the reactor's `_error`
+    /// marker, or a plain JSON-RPC `error` member. Fail closed: no reply the
+    /// runtime answers carries an `error` member as data, so one that does is a
+    /// refusal, and reading it as a result would hand a caller whatever else
+    /// happened to be in the object.
     async fn call(&self, method: &str, params: Value, who: &Principal) -> Result<Value, A2AError> {
         let bridge = Arc::clone(&self.bridge);
         let method = method.to_string();
@@ -71,10 +77,7 @@ impl RuntimePorts {
         let v = tokio::task::spawn_blocking(move || bridge.call(&method, params, who))
             .await
             .map_err(|e| A2AError::Internal(format!("the runtime call did not complete: {e}")))?;
-        match v.get("_error") {
-            Some(e) => Err(from_error_object(e)),
-            None => Ok(v),
-        }
+        reply_of(v)
     }
 
     /// The stream fan-out, for the reactor side to publish into.
@@ -186,6 +189,15 @@ pub fn caller() -> Principal {
         .unwrap_or_else(|_| Principal::anonymous())
 }
 
+/// A reactor reply, split into a result or the spec's error (see
+/// [`RuntimePorts::call`]).
+fn reply_of(v: Value) -> Result<Value, A2AError> {
+    match v.get("_error").or_else(|| v.get("error")) {
+        Some(e) => Err(from_error_object(e)),
+        None => Ok(v),
+    }
+}
+
 /// The reactor's error, read back as the spec's error type.
 ///
 /// The reactor marks a failed answer with an `_error` member rather than
@@ -194,32 +206,62 @@ pub fn caller() -> Principal {
 /// translation — and going through the typed error is what makes the protocol
 /// layer emit the right JSON-RPC code instead of passing an error off as a
 /// successful result that happens to contain one.
+///
+/// The variants are the ones a2a-rs itself branches on (a subscribe treats
+/// "not found" differently from any other failure, for one). Every other code
+/// — agentd's own `-31401`/`-31403`, a spec code this table has no variant
+/// for — travels as [`A2AError::JsonRpc`] with its number and `data` intact,
+/// rather than collapsing into an internal error that would tell the caller
+/// the wrong thing.
 fn from_error_object(e: &Value) -> A2AError {
-    let code = e.get("code").and_then(Value::as_i64).unwrap_or(-32603);
+    use crate::a2a::errors as code;
+    let n = e
+        .get("code")
+        .and_then(Value::as_i64)
+        .unwrap_or(code::INTERNAL_ERROR);
     let msg = e
         .get("message")
         .and_then(Value::as_str)
         .unwrap_or("internal error")
         .to_string();
-    match code as i32 {
-        -32001 => A2AError::TaskNotFound(msg),
-        -32002 => A2AError::TaskNotCancelable(msg),
-        -32003 => A2AError::PushNotificationNotSupported,
-        -32004 => A2AError::UnsupportedOperation(msg),
-        -32601 => A2AError::MethodNotFound(msg),
-        -32602 => A2AError::InvalidParams(msg),
-        _ => A2AError::Internal(msg),
+    match n {
+        code::TASK_NOT_FOUND => A2AError::TaskNotFound(msg),
+        code::TASK_NOT_CANCELABLE => A2AError::TaskNotCancelable(msg),
+        code::PUSH_NOTIFICATION_NOT_SUPPORTED => A2AError::PushNotificationNotSupported,
+        code::UNSUPPORTED_OPERATION => A2AError::UnsupportedOperation(msg),
+        code::CONTENT_TYPE_NOT_SUPPORTED => A2AError::ContentTypeNotSupported(msg),
+        code::EXTENDED_AGENT_CARD_NOT_CONFIGURED => {
+            A2AError::AuthenticatedExtendedCardNotConfigured
+        }
+        code::METHOD_NOT_FOUND => A2AError::MethodNotFound(msg),
+        code::INVALID_PARAMS => A2AError::InvalidParams(msg),
+        other => A2AError::JsonRpc {
+            code: i32::try_from(other).unwrap_or(code::INTERNAL_ERROR as i32),
+            message: msg,
+            data: e.get("data").cloned(),
+        },
     }
 }
 
 /// Read a `Task` out of a reactor reply, which may be the task itself or the
 /// `{task}` envelope a send answers with.
+///
+/// A task with no id is not a task. The spec's type defaults every field, so
+/// `null` — or any object that is not a task at all — deserializes into an
+/// empty one; accepting it would answer a caller with a blank `Task` and call
+/// that success. Refused instead, as the internal error it is.
 fn task_from(v: Value) -> Result<WireTask, A2AError> {
     let body = match v.get("task") {
         Some(t) => t.clone(),
         None => v,
     };
-    serde_json::from_value(body).map_err(A2AError::JsonParse)
+    let t: WireTask = serde_json::from_value(body).map_err(A2AError::JsonParse)?;
+    if t.id.is_empty() {
+        return Err(A2AError::Internal(
+            "the runtime answered without a task".to_string(),
+        ));
+    }
+    Ok(t)
 }
 
 #[async_trait::async_trait]
@@ -272,16 +314,22 @@ impl AsyncTaskLifecycle for RuntimePorts {
 
     async fn get(&self, id: &TaskId, history_length: Option<u32>) -> Result<WireTask, A2AError> {
         let who = caller();
-        let got = self.call("GetTask", json!({"id": id.as_str()}), &who).await;
+        let got = self
+            .call("GetTask", json!({"id": id.as_str()}), &who)
+            .await
+            .and_then(task_from)
+            .and_then(|t| same_task(id.as_str(), t));
         // The reactor answers a read with the ownership matrix already applied —
         // somebody else's task is "not found", so existence is not disclosed —
         // which makes this verdict exactly the one a subscription needs. A
         // `SubscribeToTask` reads the task before it attaches, so recording it
-        // here is what lets the attach refuse. See [`STREAMABLE`].
+        // here is what lets the attach refuse. See [`STREAMABLE`]. Only the
+        // task that was asked for is proof: a reply naming any other id grants
+        // nothing, so a wrong answer can never open a stream.
         if let Some(seen) = streamable() {
             seen.record_read(id.as_str(), got.is_ok());
         }
-        let mut t = task_from(got?)?;
+        let mut t = got?;
         if let Some(n) = history_length {
             t = t.with_limited_history(Some(n));
         }
@@ -302,10 +350,10 @@ impl AsyncTaskLifecycle for RuntimePorts {
 
     async fn cancel(&self, id: &TaskId) -> Result<WireTask, A2AError> {
         let who = caller();
-        task_from(
-            self.call("CancelTask", json!({"id": id.as_str()}), &who)
-                .await?,
-        )
+        let v = self
+            .call("CancelTask", json!({"id": id.as_str()}), &who)
+            .await?;
+        same_task(id.as_str(), task_from(v)?)
     }
 
     async fn exists(&self, id: &TaskId) -> Result<bool, A2AError> {
@@ -317,16 +365,28 @@ impl AsyncTaskLifecycle for RuntimePorts {
     }
 }
 
+/// The task a reply is about must be the task that was asked about. Fail
+/// closed: an answer for some other id is an internal error, never a result.
+fn same_task(want: &str, t: WireTask) -> Result<WireTask, A2AError> {
+    if t.id == want {
+        Ok(t)
+    } else {
+        Err(A2AError::Internal(format!(
+            "the runtime answered for task {:?}, not {want:?}",
+            t.id
+        )))
+    }
+}
+
 #[async_trait::async_trait]
 impl AsyncTaskQuery for RuntimePorts {
-    /// Every task the caller may see. Ownership filtering happens in the
-    /// reactor, which is the only place that knows who owns what.
+    /// One page of the tasks the caller may see. The request crosses whole —
+    /// every filter, the page and the projection are the reactor's to apply,
+    /// because only the reactor knows who owns what, and a parameter dropped
+    /// here would be a filter silently not applied.
     async fn list(&self, params: &ListTasksParams) -> Result<ListTasksResult, A2AError> {
         let who = caller();
-        let mut req = json!({});
-        if let Some(c) = &params.context_id {
-            req["contextId"] = json!(c);
-        }
+        let req = serde_json::to_value(params).map_err(A2AError::JsonParse)?;
         let v = self.call("ListTasks", req, &who).await?;
         serde_json::from_value(v).map_err(A2AError::JsonParse)
     }
@@ -347,10 +407,8 @@ impl AsyncNotificationManager for RuntimePorts {
         config: &TaskPushNotificationConfig,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
         let who = caller();
-        let params = json!({
-            "taskId": config.task_id,
-            "pushNotificationConfig": serde_json::to_value(config).map_err(A2AError::JsonParse)?,
-        });
+        // The spec's request is the config itself, and it crosses as it came.
+        let params = serde_json::to_value(config).map_err(A2AError::JsonParse)?;
         let v = self.call("PushConfigSet", params, &who).await?;
         serde_json::from_value(v).map_err(A2AError::JsonParse)
     }
@@ -360,9 +418,12 @@ impl AsyncNotificationManager for RuntimePorts {
         params: &a2a_rs::domain::GetTaskPushNotificationConfigParams,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
         let who = caller();
+        // a2a-rs names the task `id` and the config `pushNotificationConfigId`;
+        // the runtime takes the spec's own request spelling, `{taskId, id}`.
+        // An absent config id arrives as empty, and the runtime refuses it.
         let req = json!({
             "taskId": params.id,
-            "pushNotificationConfigId": params.push_notification_config_id,
+            "id": params.push_notification_config_id.clone().unwrap_or_default(),
         });
         let v = self.call("PushConfigGet", req, &who).await?;
         serde_json::from_value(v).map_err(A2AError::JsonParse)
@@ -372,11 +433,35 @@ impl AsyncNotificationManager for RuntimePorts {
         &self,
         params: &a2a_rs::domain::ListTaskPushNotificationConfigsParams,
     ) -> Result<Vec<TaskPushNotificationConfig>, A2AError> {
+        // a2a-rs hands this port the task id alone — the request's `pageSize`
+        // and `pageToken` do not reach it, and its answer can carry no
+        // `nextPageToken`. Returning the first page would be a listing that is
+        // silently short, so the port walks every page and answers with all of
+        // them: complete, if unpaged.
         let who = caller();
-        let v = self
-            .call("PushConfigList", json!({"taskId": params.id}), &who)
-            .await?;
-        serde_json::from_value(v["configs"].clone()).map_err(A2AError::JsonParse)
+        let mut out: Vec<TaskPushNotificationConfig> = Vec::new();
+        let mut token = String::new();
+        loop {
+            let req = json!({
+                "taskId": params.id,
+                "pageSize": crate::a2a::wire::MAX_PAGE_SIZE,
+                "pageToken": token,
+            });
+            let v = self.call("PushConfigList", req, &who).await?;
+            let page: Vec<TaskPushNotificationConfig> =
+                serde_json::from_value(v["configs"].clone()).map_err(A2AError::JsonParse)?;
+            out.extend(page);
+            match v["nextPageToken"].as_str() {
+                Some("") => return Ok(out),
+                // A cursor that does not move would loop forever.
+                Some(next) if next != token => token = next.to_string(),
+                _ => {
+                    return Err(A2AError::Internal(
+                        "the runtime's push-config listing did not advance".to_string(),
+                    ));
+                }
+            }
+        }
     }
 
     async fn delete_config(
@@ -386,7 +471,7 @@ impl AsyncNotificationManager for RuntimePorts {
         let who = caller();
         let req = json!({
             "taskId": params.id,
-            "pushNotificationConfigId": params.push_notification_config_id,
+            "id": params.push_notification_config_id,
         });
         self.call("PushConfigDelete", req, &who).await?;
         Ok(())
@@ -559,13 +644,15 @@ impl StreamSink {
         self.spawn_status(task_id.to_string(), ev);
     }
 
-    /// Deliver this task's state to every webhook registered on it.
+    /// Deliver this task's state to every webhook registered on it, as the
+    /// `StreamResponse` the spec says a webhook receives (see
+    /// [`crate::a2a::wire::push_body`]).
     ///
     /// Best-effort and off the reactor: a webhook that is down, slow, or now
     /// pointing somewhere it should not must not affect the task it is
     /// reporting on. Each delivery is one blocking POST on the blocking pool.
     pub fn push(&self, task: &crate::a2a::tasks::Task, allow_private: bool) {
-        let event = serde_json::to_value(crate::a2a::wire::task(task)).unwrap_or_default();
+        let event = crate::a2a::wire::push_body(task);
         for target in &task.push {
             let target = target.clone();
             let event = event.clone();
@@ -636,5 +723,136 @@ mod tests {
         // A read that found the task is proof either way.
         ledger.record_read("task-mine", true);
         assert_eq!(ledger.verdict("task-mine"), Some(true));
+    }
+
+    /// Ports over a stand-in reactor that answers each call with `answer`.
+    fn ports_with(
+        answer: impl Fn(&crate::runtime::a2a_server::A2aRequest) -> Value + Send + 'static,
+    ) -> RuntimePorts {
+        let resolver =
+            crate::a2a::Resolver::build(&crate::config::v2::A2a::default(), &|_| None).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            while let Ok(crate::runtime::events::Event::A2a(req)) = rx.recv() {
+                let _ = req.reply.send(answer(&req));
+            }
+        });
+        RuntimePorts::new(
+            A2aBridge::new(tx, resolver),
+            Arc::new(a2a_rs::adapter::InMemoryStreamingHandler::new()),
+        )
+    }
+
+    /// Ports over a stand-in reactor that answers every call with `reply`.
+    fn ports_answering(reply: Value) -> RuntimePorts {
+        ports_with(move |_| reply.clone())
+    }
+
+    /// a2a-rs hands the listing port no page parameters and has nowhere to put
+    /// a next-page token, so the port walks the runtime's pages itself: the
+    /// answer is every config, never a first page passed off as all of them.
+    #[tokio::test]
+    async fn a_push_config_listing_is_never_silently_short() {
+        let cfg = |id: &str| json!({"taskId": "t", "id": id, "url": "https://h.example/x"});
+        let (a, b) = (cfg("p-a"), cfg("p-b"));
+        let ports = ports_with(move |req| match req.params["pageToken"].as_str() {
+            Some("") => json!({"configs": [a], "nextPageToken": "page-2"}),
+            Some("page-2") => json!({"configs": [b], "nextPageToken": ""}),
+            other => json!({"_error": {"code": -32602, "message": format!("{other:?}")}}),
+        });
+        let params = a2a_rs::domain::ListTaskPushNotificationConfigsParams {
+            id: "t".into(),
+            metadata: None,
+        };
+        let all = ports.list_configs(&params).await.expect("every page");
+        let ids: Vec<&str> = all.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["p-a", "p-b"]);
+
+        // A cursor that does not move is an error, not an endless loop.
+        let stuck = ports_answering(json!({"configs": [], "nextPageToken": "again"}));
+        assert!(stuck.list_configs(&params).await.is_err());
+    }
+
+    /// Every way a reply can fail to be the answer it claims is an error, and
+    /// every code crosses as the code it is.
+    #[tokio::test]
+    async fn fail_closed_and_codes() {
+        // An error under either spelling is an error, never a result.
+        for v in [
+            json!({"_error": {"code": -32001, "message": "task not found"}}),
+            json!({"error": {"code": -32001, "message": "task not found"}}),
+        ] {
+            assert!(
+                matches!(reply_of(v.clone()), Err(A2AError::TaskNotFound(_))),
+                "{v}"
+            );
+        }
+        assert!(reply_of(json!({"tasks": []})).is_ok());
+
+        // A task with no id is not a task — `null` included, which the spec's
+        // all-defaults type would otherwise read as an empty success.
+        for v in [
+            Value::Null,
+            json!({}),
+            json!({"task": null}),
+            json!({"x": 1}),
+        ] {
+            assert!(task_from(v.clone()).is_err(), "{v}");
+        }
+        let t = task_from(json!({"task": {"id": "task-1", "contextId": "c"}})).unwrap();
+        assert_eq!(t.id, "task-1");
+        assert!(same_task("task-2", t).is_err());
+
+        // The codes a2a-rs branches on come back as their variants…
+        let code = |c: i64| from_error_object(&json!({"code": c, "message": "m"}));
+        assert!(matches!(code(-32002), A2AError::TaskNotCancelable(_)));
+        assert!(matches!(
+            code(-32003),
+            A2AError::PushNotificationNotSupported
+        ));
+        assert!(matches!(code(-32005), A2AError::ContentTypeNotSupported(_)));
+        assert!(matches!(
+            code(-32007),
+            A2AError::AuthenticatedExtendedCardNotConfigured
+        ));
+        assert!(matches!(code(-32602), A2AError::InvalidParams(_)));
+        // …and every other code keeps its number and its data rather than
+        // collapsing into an internal error.
+        match from_error_object(&json!({"code": -31403, "message": "no", "data": [1]})) {
+            A2AError::JsonRpc {
+                code,
+                message,
+                data,
+            } => {
+                assert_eq!(code, -31403);
+                assert_eq!(message, "no");
+                assert_eq!(data, Some(json!([1])));
+            }
+            other => panic!("-31403 must stay itself, got {other:?}"),
+        }
+    }
+
+    /// A read proves the caller may watch a task only when the reply is that
+    /// task. A runtime answering for some other id — a bug, a mix-up — must
+    /// not open a stream on the id that was asked about.
+    #[tokio::test]
+    async fn a_read_answering_for_another_task_proves_nothing() {
+        let ports = ports_answering(json!({"id": "task-other", "contextId": "c"}));
+        let asked: TaskId = "task-asked".parse().unwrap();
+        let (got, verdict) = with_caller(Principal::anonymous(), false, async {
+            let got = ports.get(&asked, None).await;
+            (got, streamable().and_then(|s| s.verdict("task-asked")))
+        })
+        .await;
+        assert!(got.is_err(), "the wrong task is not an answer");
+        assert_eq!(verdict, Some(false));
+
+        let ports = ports_answering(json!({"id": "task-asked", "contextId": "c"}));
+        let verdict = with_caller(Principal::anonymous(), false, async {
+            ports.get(&asked, None).await.expect("the task asked for");
+            streamable().and_then(|s| s.verdict("task-asked"))
+        })
+        .await;
+        assert_eq!(verdict, Some(true));
     }
 }

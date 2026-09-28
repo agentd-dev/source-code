@@ -4,7 +4,9 @@
 
 use super::{FeedVis, TASK_NOT_FOUND, err_obj};
 use crate::a2a::Principal;
-use crate::a2a::tasks::{Link, State, Task};
+use crate::a2a::errors::{INVALID_PARAMS, TASK_NOT_CANCELABLE};
+use crate::a2a::tasks::{Link, PushTarget, State, Task};
+use crate::a2a::wire::{DEFAULT_PAGE_SIZE, ListView, MAX_PAGE_SIZE};
 use crate::runtime::reactor::{PendingKind, Runtime};
 use serde_json::{Value, json};
 
@@ -22,39 +24,251 @@ pub(super) fn new_task_id() -> String {
     format!("task-{}", crate::state::ulid::new())
 }
 
+/// A fresh push-config id, for a registration that named none.
+///
+/// A ULID for the same reason as [`new_task_id`]: configs are durable with
+/// their task, and a counter that restarts with the process would mint an id a
+/// restored task already holds — and registering under it REPLACES that
+/// config, silently dropping a webhook somebody else was promised.
+fn new_push_id() -> String {
+    format!("push-{}", crate::state::ulid::new())
+}
+
+/// `-32602` with a reason: a request the caller can fix.
+fn invalid(msg: &str) -> Value {
+    err_obj(INVALID_PARAMS, msg)
+}
+
+/// A listing's `pageSize`: unset is the default, anything outside the spec's
+/// range is refused rather than clamped — a caller that asked for 500 and got
+/// 100 would read a full page as the end of the list.
+fn page_size_of(asked: Option<i64>) -> Result<usize, Value> {
+    match asked {
+        None => Ok(DEFAULT_PAGE_SIZE as usize),
+        Some(n) if (1..=MAX_PAGE_SIZE as i64).contains(&n) => Ok(n as usize),
+        Some(n) => Err(invalid(&format!(
+            "pageSize must be between 1 and {MAX_PAGE_SIZE}, not {n}"
+        ))),
+    }
+}
+
+/// base64url (RFC 4648 §5, unpadded): the page tokens' outer form, so a token
+/// is opaque to the caller and safe in any transport. Decoded with
+/// [`crate::config::envelope::b64url_decode`].
+fn b64url(bytes: &[u8]) -> String {
+    const URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = (chunk[0] as u32) << 16
+            | (chunk.get(1).copied().unwrap_or(0) as u32) << 8
+            | chunk.get(2).copied().unwrap_or(0) as u32;
+        out.push(URL[(n >> 18 & 63) as usize] as char);
+        out.push(URL[(n >> 12 & 63) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(URL[(n >> 6 & 63) as usize] as char);
+        }
+        if chunk.len() > 2 {
+            out.push(URL[(n & 63) as usize] as char);
+        }
+    }
+    out
+}
+
+/// A page token's payload, or `None` for anything this server did not issue.
+fn token_payload(token: &str) -> Option<String> {
+    String::from_utf8(crate::config::envelope::b64url_decode(token)?).ok()
+}
+
+/// A task's place in the listing order: newest status first, ties broken by id
+/// (descending) so the order is total and a cursor names exactly one position.
+fn list_key(t: &Task) -> (u64, &str) {
+    (t.updated, t.id.as_str())
+}
+
+/// The `ListTasks` cursor: where the previous page stopped, as
+/// `<updated_ms>:<id>`. A position in the order, not an index into it — a
+/// task that moves or disappears between pages cannot shift the next one onto
+/// something already seen.
+fn list_cursor(t: &Task) -> String {
+    b64url(format!("{}:{}", t.updated, t.id).as_bytes())
+}
+
+fn parse_list_cursor(token: &str) -> Option<(u64, String)> {
+    let payload = token_payload(token)?;
+    let (ms, id) = payload.split_once(':')?;
+    let ms = ms.parse().ok()?;
+    (!id.is_empty()).then(|| (ms, id.to_string()))
+}
+
+/// An RFC 3339 instant as epoch milliseconds, rounded UP: a task's status time
+/// is whole milliseconds, so `updated >= ceil(t)` is exactly `updated >= t` —
+/// rounding down would admit a task that moved a fraction of a millisecond
+/// before the instant asked for. Parsed by the spec's own `Timestamp`, so every
+/// offset form the proto JSON mapping accepts is accepted here.
+fn instant_ms(s: &str) -> Option<u64> {
+    let t: buffa_types::google::protobuf::Timestamp =
+        serde_json::from_value(Value::String(s.to_string())).ok()?;
+    let ms =
+        t.seconds.saturating_mul(1000) + (u32::try_from(t.nanos).ok()?).div_ceil(1_000_000) as i64;
+    Some(ms.max(0) as u64)
+}
+
+/// One page of `ListTasks` over `tasks`, as `principal` may see them.
+///
+/// `params` is the serde form of the spec's `ListTasksParams`, whole — every
+/// filter the caller named is applied, and one this cannot honour is refused
+/// with `-32602` rather than ignored:
+///
+/// * visibility first: a non-operator sees its own tasks and nothing else, so
+///   `totalSize` counts only what the caller may know exists;
+/// * `contextId`, `status`, and `statusTimestampAfter` (inclusive) narrow it;
+/// * the order is newest status first, then id descending, and `pageToken`
+///   resumes after the task the previous page ended on;
+/// * `historyLength` and `includeArtifacts` shape each task (see [`ListView`]).
+fn list_tasks<'a>(
+    tasks: impl Iterator<Item = &'a Task>,
+    principal: &Principal,
+    params: &Value,
+) -> Result<Value, Value> {
+    let p: a2a_rs::domain::ListTasksParams = serde_json::from_value(params.clone())
+        .map_err(|e| invalid(&format!("ListTasks params: {e}")))?;
+    let page_size = page_size_of(p.page_size.map(i64::from))?;
+    let history_length = match p.history_length {
+        None => None,
+        Some(n) => Some(
+            u32::try_from(n)
+                .map_err(|_| invalid(&format!("historyLength must be >= 0, not {n}")))?,
+        ),
+    };
+    let view = ListView {
+        history_length,
+        include_artifacts: p.include_artifacts == Some(true),
+    };
+    let status = match p.status {
+        Some(a2a_rs::domain::TaskState::TASK_STATE_UNSPECIFIED) => {
+            return Err(invalid("status is not a task state"));
+        }
+        other => other,
+    };
+    let after = match p.status_timestamp_after.as_deref() {
+        None => None,
+        Some(s) => Some(instant_ms(s).ok_or_else(|| {
+            invalid(&format!(
+                "statusTimestampAfter is not an RFC 3339 instant: {s:?}"
+            ))
+        })?),
+    };
+    let cursor = match p.page_token.as_deref() {
+        None | Some("") => None,
+        Some(tok) => Some(
+            parse_list_cursor(tok)
+                .ok_or_else(|| invalid("pageToken is not one this server issued"))?,
+        ),
+    };
+
+    let mut hits: Vec<&Task> = tasks
+        .filter(|t| t.is_visible_to(principal))
+        .filter(|t| p.context_id.as_deref().is_none_or(|c| t.context_id == c))
+        .filter(|t| status.is_none_or(|s| t.state.to_wire() == s))
+        .filter(|t| after.is_none_or(|ms| t.updated >= ms))
+        .collect();
+    hits.sort_by(|a, b| list_key(b).cmp(&list_key(a)));
+    let total = hits.len();
+    let start = match &cursor {
+        None => 0,
+        Some((ms, id)) => hits
+            .iter()
+            .position(|t| list_key(t) < (*ms, id.as_str()))
+            .unwrap_or(total),
+    };
+    let page = &hits[start..(start + page_size).min(total)];
+    let next = match page.last() {
+        Some(last) if start + page.len() < total => list_cursor(last),
+        _ => String::new(),
+    };
+    Ok(json!({
+        "tasks": page.iter().map(|t| t.summary(view)).collect::<Vec<_>>(),
+        // Always present, empty on the last page: the spec's response has it
+        // REQUIRED, and "absent" must never be readable as "there is more".
+        "nextPageToken": next,
+        "pageSize": page_size,
+        "totalSize": total,
+    }))
+}
+
+/// The config a push `Get`/`Delete` names. The spec makes `id` REQUIRED, and it
+/// is refused rather than defaulted: an empty id once matched *any* config on a
+/// read and *every* config on a delete.
+fn config_id(params: &Value) -> Result<&str, Value> {
+    params
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| invalid("id is required"))
+}
+
+/// The push-config cursor: the id the previous page ended on.
+fn push_cursor(id: &str) -> String {
+    b64url(format!("push:{id}").as_bytes())
+}
+
+fn parse_push_cursor(token: &str) -> Option<String> {
+    token_payload(token)?
+        .strip_prefix("push:")
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
+/// One page of a task's push configs. Ordered by id, and the token resumes
+/// after the id the previous page ended on, so a config deleted between pages
+/// cannot shift the next page onto one already seen. `pageSize` is the proto's
+/// plain `int32`, so `0` is "unset" here, not a refusal.
+fn push_page(targets: &[PushTarget], task_id: &str, params: &Value) -> Result<Value, Value> {
+    let asked = params
+        .get("pageSize")
+        .and_then(Value::as_i64)
+        .filter(|n| *n != 0);
+    let page_size = page_size_of(asked)?;
+    let after = match params.get("pageToken").and_then(Value::as_str) {
+        None | Some("") => None,
+        Some(tok) => Some(
+            parse_push_cursor(tok)
+                .ok_or_else(|| invalid("pageToken is not one this server issued"))?,
+        ),
+    };
+    let mut sorted: Vec<&PushTarget> = targets
+        .iter()
+        .filter(|p| after.as_deref().is_none_or(|a| p.id.as_str() > a))
+        .collect();
+    sorted.sort_by(|a, b| a.id.cmp(&b.id));
+    let more = sorted.len() > page_size;
+    sorted.truncate(page_size);
+    let next = match sorted.last() {
+        Some(last) if more => push_cursor(&last.id),
+        _ => String::new(),
+    };
+    Ok(json!({
+        "configs": sorted
+            .iter()
+            .map(|p| crate::a2a::push::to_wire(task_id, p))
+            .collect::<Vec<_>>(),
+        "nextPageToken": next,
+    }))
+}
+
 impl Runtime {
     pub(super) fn a2a_get_task(&self, principal: &Principal, params: &Value) -> Value {
-        let id = params
-            .get("id")
-            .or_else(|| params.get("taskId"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
+        let id = params.get("id").and_then(Value::as_str).unwrap_or("");
         match self.tasks.get(id) {
-            Some(t)
-                if principal.is_operator()
-                    || t.principal.as_deref() == Some(principal.id.as_str()) =>
-            {
-                t.to_a2a()
-            }
+            Some(t) if t.is_visible_to(principal) => t.to_a2a(),
             // Don't disclose existence to a non-owner.
             _ => err_obj(TASK_NOT_FOUND, "task not found"),
         }
     }
 
-    pub(super) fn a2a_list_tasks(&self, principal: &Principal) -> Value {
-        let tasks: Vec<Value> = self
-            .tasks
-            .values()
-            .filter(|t| {
-                principal.is_operator() || t.principal.as_deref() == Some(principal.id.as_str())
-            })
-            .map(|t| t.summary())
-            .collect();
-        // `ListTasksResult` is a fixed shape: a peer's generated type has
-        // `totalSize`/`pageSize`/`nextPageToken` as non-optional. We return the
-        // whole set in one page, so the token is empty and the sizes agree.
-        let n = tasks.len();
-        json!({"tasks": tasks, "totalSize": n, "pageSize": n, "nextPageToken": ""})
+    /// `ListTasks`: see [`list_tasks`].
+    pub(super) fn a2a_list_tasks(&self, principal: &Principal, params: &Value) -> Value {
+        list_tasks(self.tasks.values(), principal, params).unwrap_or_else(|e| e)
     }
 
     // ---- push notifications (the `*TaskPushNotificationConfig` family) -----
@@ -64,18 +278,9 @@ impl Runtime {
     /// "Not yours" and "does not exist" answer identically on purpose: a caller
     /// must not be able to probe for other principals' task ids.
     fn owned_task(&self, principal: &Principal, params: &Value) -> Result<String, Value> {
-        let id = params
-            .get("taskId")
-            .or_else(|| params.get("id"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
+        let id = params.get("taskId").and_then(Value::as_str).unwrap_or("");
         match self.tasks.get(id) {
-            Some(t)
-                if principal.is_operator()
-                    || t.principal.as_deref() == Some(principal.id.as_str()) =>
-            {
-                Ok(id.to_string())
-            }
+            Some(t) if t.is_visible_to(principal) => Ok(id.to_string()),
             _ => Err(err_obj(TASK_NOT_FOUND, "task not found")),
         }
     }
@@ -91,31 +296,29 @@ impl Runtime {
         }
     }
 
-    /// Register (or replace) a webhook for a task.
+    /// Register (or replace) a webhook for a task. `params` is the spec's
+    /// `TaskPushNotificationConfig` itself: `{taskId, id?, url, token?,
+    /// authentication?}`.
     ///
     /// The target is checked here, while the caller is present to be told why —
-    /// a refused URL is a `-32602` with a reason, not a delivery that silently
-    /// never happens.
+    /// a refused URL or an authentication agentd could not send as given is a
+    /// `-32602` with a reason, not a delivery that silently never happens or
+    /// silently goes out without it.
     pub(super) fn a2a_push_set(&mut self, principal: &Principal, params: &Value) -> Value {
         if let Err(e) = self.push_enabled() {
             return e;
         }
-        let cfg = params
-            .get("pushNotificationConfig")
-            .or_else(|| params.get("config"))
-            .cloned()
-            .unwrap_or_else(|| params.clone());
         let task_id = match self.owned_task(principal, params) {
             Ok(id) => id,
             Err(e) => return e,
         };
-        let id = cfg
+        let id = params
             .get("id")
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .map(str::to_string)
-            .unwrap_or_else(|| self.next_id("push"));
-        let target = match crate::a2a::push::from_wire(&cfg, id.clone()) {
+            .unwrap_or_else(new_push_id);
+        let target = match crate::a2a::push::from_wire(params, id.clone()) {
             Ok(t) => t,
             Err(e) => return err_obj(::mcp::rpc::INVALID_PARAMS, &e),
         };
@@ -156,29 +359,31 @@ impl Runtime {
         wire
     }
 
+    /// `{taskId, id}` → that config. Both are required; a config the task
+    /// does not have is `-32001`, the same "not found" as a task.
     pub(super) fn a2a_push_get(&mut self, principal: &Principal, params: &Value) -> Value {
         if let Err(e) = self.push_enabled() {
             return e;
         }
+        let want = match config_id(params) {
+            Ok(id) => id,
+            Err(e) => return e,
+        };
         let task_id = match self.owned_task(principal, params) {
             Ok(id) => id,
             Err(e) => return e,
         };
-        let want = params
-            .get("pushNotificationConfigId")
-            .or_else(|| params.get("configId"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
         match self
             .tasks
             .get(&task_id)
-            .and_then(|t| t.push.iter().find(|p| want.is_empty() || p.id == want))
+            .and_then(|t| t.push.iter().find(|p| p.id == want))
         {
             Some(p) => crate::a2a::push::to_wire(&task_id, p),
             None => err_obj(TASK_NOT_FOUND, "no such push notification config"),
         }
     }
 
+    /// `{taskId, pageSize?, pageToken?}` → one page (see [`push_page`]).
     pub(super) fn a2a_push_list(&mut self, principal: &Principal, params: &Value) -> Value {
         if let Err(e) = self.push_enabled() {
             return e;
@@ -187,37 +392,37 @@ impl Runtime {
             Ok(id) => id,
             Err(e) => return e,
         };
-        let configs: Vec<Value> = self
+        let targets = self
             .tasks
             .get(&task_id)
-            .map(|t| {
-                t.push
-                    .iter()
-                    .map(|p| crate::a2a::push::to_wire(&task_id, p))
-                    .collect()
-            })
+            .map(|t| t.push.as_slice())
             .unwrap_or_default();
-        json!({ "configs": configs })
+        push_page(targets, &task_id, params).unwrap_or_else(|e| e)
     }
 
+    /// `{taskId, id}` → `{}`. Deletes exactly the config named; one the task
+    /// does not have is `-32001`, not a quiet success.
     pub(super) fn a2a_push_delete(&mut self, principal: &Principal, params: &Value) -> Value {
         if let Err(e) = self.push_enabled() {
             return e;
         }
+        let want = match config_id(params) {
+            Ok(id) => id.to_string(),
+            Err(e) => return e,
+        };
         let task_id = match self.owned_task(principal, params) {
             Ok(id) => id,
             Err(e) => return e,
         };
-        let want = params
-            .get("pushNotificationConfigId")
-            .or_else(|| params.get("configId"))
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        if let Some(t) = self.tasks.get_mut(&task_id) {
-            t.push.retain(|p| !want.is_empty() && p.id != want);
-            t.dirty = true;
+        let Some(t) = self.tasks.get_mut(&task_id) else {
+            return err_obj(TASK_NOT_FOUND, "task not found");
+        };
+        let before = t.push.len();
+        t.push.retain(|p| p.id != want);
+        if t.push.len() == before {
+            return err_obj(TASK_NOT_FOUND, "no such push notification config");
         }
+        t.dirty = true;
         self.task_persist(&task_id);
         json!({})
     }
@@ -225,21 +430,21 @@ impl Runtime {
     pub(super) fn a2a_cancel_task(&mut self, principal: &Principal, params: &Value) -> Value {
         let id = params
             .get("id")
-            .or_else(|| params.get("taskId"))
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        let owned = match self.tasks.get(&id) {
-            Some(t) => {
-                principal.is_operator() || t.principal.as_deref() == Some(principal.id.as_str())
-            }
-            None => false,
+        let state = match self.tasks.get(&id) {
+            Some(t) if t.is_visible_to(principal) => t.state,
+            _ => return err_obj(TASK_NOT_FOUND, "task not found"),
         };
-        if !owned {
-            return err_obj(TASK_NOT_FOUND, "task not found");
-        }
-        if self.tasks.get(&id).is_some_and(|t| t.state.is_terminal()) {
-            return self.tasks.get(&id).map(Task::to_a2a).unwrap_or(Value::Null);
+        // A settled task stays settled: the spec's answer is "not cancelable",
+        // and the task is left exactly as it was — rewriting a COMPLETED task
+        // to CANCELED would erase the result its caller is owed.
+        if state.is_terminal() {
+            return err_obj(
+                TASK_NOT_CANCELABLE,
+                &format!("task is already {}", state.wire()),
+            );
         }
         // A live human gate on this task: unblock the asker with an error so
         // the turn or step resolves instead of dangling until its ask timeout.
@@ -469,5 +674,188 @@ mod tests {
         assert!(a.starts_with("task-"), "the id keeps its prefix: {a}");
         assert_eq!(a.len(), "task-".len() + 26, "a 26-char ULID: {a}");
         assert!(a < b, "still time-sortable: {a} < {b}");
+    }
+
+    fn who(id: &str, role: crate::config::v2::Role) -> Principal {
+        Principal {
+            id: id.into(),
+            role,
+            ..Principal::anonymous()
+        }
+    }
+
+    /// A task owned by `owner` in `ctx`, last moved at `updated` ms.
+    fn task(id: &str, ctx: &str, owner: &str, state: State, updated: u64) -> Task {
+        let mut t = Task::new(id, ctx, Some(owner), Link::Turn { ctx: ctx.into() });
+        t.set_result(json!(format!("result of {id}")));
+        t.transition(state, None);
+        t.updated = updated;
+        t
+    }
+
+    fn ids(page: &Value) -> Vec<String> {
+        page["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// Every `ListTasks` field is honoured — the filters, the order, the page,
+    /// the projection — and one that cannot be is refused, never ignored.
+    #[test]
+    fn list_tasks_semantics() {
+        use crate::config::v2::Role;
+        let tasks = [
+            task("t-a", "c1", "user:a", State::Completed, 1_000),
+            task("t-b", "c2", "user:a", State::Working, 3_000),
+            task("t-c", "c2", "user:a", State::Completed, 2_000),
+            task("t-d", "c2", "user:a", State::Completed, 2_000),
+            task("t-z", "c9", "user:z", State::Completed, 9_000),
+        ];
+        let op = who("operator", Role::Operator);
+        let alice = who("user:a", Role::User);
+        let list = |p: &Principal, params: Value| list_tasks(tasks.iter(), p, &params);
+
+        // Newest status first; a tie broken by id, descending. Somebody else's
+        // task is not merely hidden — it is not counted either.
+        let all = list(&alice, json!({})).unwrap();
+        assert_eq!(ids(&all), ["t-b", "t-d", "t-c", "t-a"]);
+        assert_eq!(all["totalSize"], 4);
+        assert_eq!(all["pageSize"], DEFAULT_PAGE_SIZE);
+        assert_eq!(all["nextPageToken"], "", "the last page says so: {all}");
+        assert_eq!(ids(&list(&op, json!({})).unwrap())[0], "t-z");
+
+        // The filters, each one alone and together.
+        let c2 = list(&alice, json!({"contextId": "c2"})).unwrap();
+        assert_eq!(ids(&c2), ["t-b", "t-d", "t-c"]);
+        let done = json!({"contextId": "c2", "status": "TASK_STATE_COMPLETED"});
+        assert_eq!(ids(&list(&alice, done).unwrap()), ["t-d", "t-c"]);
+        let since = crate::a2a::wire::timestamp_string(2_000);
+        let recent = list(&alice, json!({"statusTimestampAfter": since})).unwrap();
+        assert_eq!(
+            ids(&recent),
+            ["t-b", "t-d", "t-c"],
+            "the bound is inclusive"
+        );
+        // A sub-millisecond bound past a task's instant excludes it.
+        let past = json!({"statusTimestampAfter": "1970-01-01T00:00:02.000500Z"});
+        assert_eq!(ids(&list(&alice, past).unwrap()), ["t-b"]);
+
+        // Paging walks the same order to the end, each task exactly once.
+        let mut seen = Vec::new();
+        let mut token = String::new();
+        loop {
+            assert!(seen.len() < 4, "the walk must end: {seen:?}");
+            let page = list(&alice, json!({"pageSize": 1, "pageToken": token})).unwrap();
+            assert_eq!(page["totalSize"], 4);
+            seen.extend(ids(&page));
+            token = page["nextPageToken"].as_str().unwrap().to_string();
+            if token.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(seen, ["t-b", "t-d", "t-c", "t-a"]);
+
+        // The projection: artifacts only when asked for.
+        let bare = list(&alice, json!({"contextId": "c1"})).unwrap();
+        assert!(bare["tasks"][0].get("artifacts").is_none(), "{bare}");
+        let full = list(&alice, json!({"contextId": "c1", "includeArtifacts": true})).unwrap();
+        assert_eq!(
+            full["tasks"][0]["artifacts"][0]["parts"][0]["text"],
+            "result of t-a"
+        );
+
+        // What cannot be honoured is refused with a reason.
+        for bad in [
+            json!({"pageSize": 0}),
+            json!({"pageSize": 101}),
+            json!({"pageSize": -1}),
+            json!({"historyLength": -1}),
+            json!({"pageToken": "!!not-a-token"}),
+            json!({"pageToken": b64url(b"no-colon-here")}),
+            json!({"statusTimestampAfter": "yesterday"}),
+            json!({"status": "TASK_STATE_SLEEPING"}),
+        ] {
+            let e = list(&alice, bad.clone()).expect_err(&bad.to_string());
+            assert_eq!(e["_error"]["code"], INVALID_PARAMS, "{bad}: {e}");
+        }
+        assert!(list(&alice, json!({"pageSize": 100, "historyLength": 0})).is_ok());
+    }
+
+    fn target(id: &str) -> PushTarget {
+        PushTarget {
+            id: id.into(),
+            url: "https://hooks.example/x".into(),
+            token: String::new(),
+            auth: None,
+        }
+    }
+
+    /// Pages walk to the end with nothing twice; the last page's token is
+    /// empty, not missing; a token this server never issued is refused.
+    #[test]
+    fn push_config_listing_pages() {
+        let targets: Vec<PushTarget> = ["p-e", "p-a", "p-c", "p-b", "p-d"]
+            .into_iter()
+            .map(target)
+            .collect();
+        let mut seen = Vec::new();
+        let mut token = String::new();
+        let mut pages = 0;
+        loop {
+            assert!(pages < 3, "the walk must end: {seen:?}");
+            let page = push_page(
+                &targets,
+                "task-1",
+                &json!({"taskId": "task-1", "pageSize": 2, "pageToken": token}),
+            )
+            .unwrap();
+            pages += 1;
+            let configs = page["configs"].as_array().unwrap();
+            assert!(configs.len() <= 2, "{page}");
+            seen.extend(
+                configs
+                    .iter()
+                    .map(|c| c["id"].as_str().unwrap().to_string()),
+            );
+            token = page["nextPageToken"]
+                .as_str()
+                .expect("nextPageToken is always present")
+                .to_string();
+            if token.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(pages, 3);
+        assert_eq!(seen, ["p-a", "p-b", "p-c", "p-d", "p-e"]);
+
+        // The default page holds them all, and still says it is the last.
+        let all = push_page(&targets, "task-1", &json!({"taskId": "task-1"})).unwrap();
+        assert_eq!(all["configs"].as_array().unwrap().len(), 5);
+        assert_eq!(all["nextPageToken"], "");
+
+        for bad in [
+            json!({"pageToken": "garbage!"}),
+            // A ListTasks cursor is not a push-config cursor.
+            json!({"pageToken": b64url(b"2000:t-a")}),
+            json!({"pageSize": 101}),
+        ] {
+            let e = push_page(&targets, "task-1", &bad).expect_err(&bad.to_string());
+            assert_eq!(e["_error"]["code"], INVALID_PARAMS, "{bad}: {e}");
+        }
+    }
+
+    /// Get and Delete name one config, always: an empty id once read as "any"
+    /// on a get and "all" on a delete.
+    #[test]
+    fn a_push_config_id_is_required() {
+        for p in [json!({"taskId": "t"}), json!({"taskId": "t", "id": ""})] {
+            let e = config_id(&p).unwrap_err();
+            assert_eq!(e["_error"]["code"], INVALID_PARAMS);
+            assert_eq!(e["_error"]["message"], "id is required");
+        }
+        assert_eq!(config_id(&json!({"taskId": "t", "id": "p-1"})), Ok("p-1"));
     }
 }

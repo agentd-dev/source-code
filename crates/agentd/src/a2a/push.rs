@@ -26,7 +26,7 @@
 use serde_json::{Value, json};
 use std::time::Duration;
 
-use crate::a2a::tasks::PushTarget;
+use crate::a2a::tasks::{PushAuth, PushTarget};
 
 /// How long one delivery may take. Short: a webhook is a notification, not a
 /// conversation, and a slow receiver must not accumulate threads.
@@ -56,8 +56,12 @@ pub fn check_url(url: &str, allow_private: bool) -> Result<(), String> {
 /// POST one update to a registered target. Blocking; callers run it off the
 /// reactor.
 ///
-/// The receiver gets the event exactly as the streaming caller would have seen
-/// it, so a client can share one handler between the two ways of being told.
+/// `event` is the body as built — a `StreamResponse` for a task delivery (see
+/// [`crate::a2a::wire::push_body`]). The headers are the spec's: the A2A media
+/// type, and `Authorization: <scheme> <credentials>` when the caller registered
+/// authentication (§4.3.3). `X-A2A-Notification-Token` is a legacy courtesy:
+/// 1.0 does not define it, but the official a2a-python 1.x receiver still reads
+/// the caller's token from it, so a registered token keeps travelling there.
 pub fn deliver(target: &PushTarget, event: &Value, allow_private: bool) -> Result<(), String> {
     // Guarded again here, not only at registration: the name resolved once when
     // the caller registered, and nothing stops it resolving elsewhere now. This
@@ -68,7 +72,7 @@ pub fn deliver(target: &PushTarget, event: &Value, allow_private: bool) -> Resul
     let body = serde_json::to_vec(event).map_err(|e| e.to_string())?;
 
     let mut headers: Vec<(String, String)> = vec![
-        ("content-type".into(), "application/json".into()),
+        ("content-type".into(), "application/a2a+json".into()),
         ("user-agent".into(), format!("agentd/{}", crate::VERSION)),
     ];
     if !target.token.is_empty() {
@@ -76,8 +80,11 @@ pub fn deliver(target: &PushTarget, event: &Value, allow_private: bool) -> Resul
         // delivery from anything else that finds the URL.
         headers.push(("x-a2a-notification-token".into(), target.token.clone()));
     }
-    if let Some(b) = &target.bearer {
-        headers.push(("authorization".into(), format!("Bearer {b}")));
+    if let Some(a) = &target.auth {
+        headers.push((
+            "authorization".into(),
+            format!("{} {}", a.scheme, a.credentials),
+        ));
     }
     let refs: Vec<(&str, &str)> = headers
         .iter()
@@ -115,21 +122,31 @@ pub fn deliver(target: &PushTarget, event: &Value, allow_private: bool) -> Resul
 }
 
 /// The wire shape of a registered target, as `GetTaskPushNotificationConfig`
-/// returns it. The bearer agentd presents is deliberately absent: it is a
-/// credential, and a read-back is not a reason to hand it out again.
+/// returns it. The credentials agentd presents are deliberately absent: they
+/// are a secret, and a read-back is not a reason to hand one out again. The
+/// scheme is echoed, so a caller can see what it registered was accepted.
 pub fn to_wire(task_id: &str, t: &PushTarget) -> Value {
     let mut v = json!({"id": t.id, "taskId": task_id, "url": t.url});
     if !t.token.is_empty() {
         v["token"] = json!(t.token);
+    }
+    if let Some(a) = &t.auth {
+        v["authentication"] = json!({"scheme": a.scheme});
     }
     v
 }
 
 /// Read a caller's `TaskPushNotificationConfig` into a target.
 ///
-/// The bearer is taken from `authentication.credentials` when the caller asked
-/// for a bearer scheme — that is the one field of the authentication block
-/// agentd can actually act on.
+/// `authentication` is the spec's `AuthenticationInfo {scheme, credentials}`.
+/// Whatever it holds ends up verbatim in a header line, so it is refused —
+/// never quietly dropped, which would send the webhook out unauthenticated
+/// while the caller believes otherwise — unless it can be sent as-is:
+///
+/// * `scheme` is REQUIRED by the proto and must be an RFC 9110 `token`
+///   (`tchar`s only), so it cannot carry a space, a colon or a line break;
+/// * `credentials` must be non-empty and free of control characters, so a CR
+///   or LF cannot end the header and start another.
 pub fn from_wire(v: &Value, id: String) -> Result<PushTarget, String> {
     let url = v
         .get("url")
@@ -142,29 +159,49 @@ pub fn from_wire(v: &Value, id: String) -> Result<PushTarget, String> {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let auth = v.get("authentication");
-    let schemes = auth
-        .and_then(|a| a.get("schemes"))
-        .and_then(Value::as_array)
-        .map(|s| {
-            s.iter()
-                .filter_map(Value::as_str)
-                .any(|x| x.eq_ignore_ascii_case("bearer"))
-        })
-        .unwrap_or(false);
-    let bearer = if schemes {
-        auth.and_then(|a| a.get("credentials"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-    } else {
-        None
+    let auth = match v.get("authentication") {
+        None | Some(Value::Null) => None,
+        Some(a) => Some(auth_of(a)?),
     };
     Ok(PushTarget {
         id,
         url,
         token,
-        bearer,
+        auth,
     })
+}
+
+/// One `AuthenticationInfo`, checked as [`from_wire`] describes.
+fn auth_of(a: &Value) -> Result<PushAuth, String> {
+    let field = |k: &str| a.get(k).and_then(Value::as_str).unwrap_or_default();
+    let (scheme, credentials) = (field("scheme"), field("credentials"));
+    if scheme.is_empty() {
+        return Err(if credentials.is_empty() {
+            "authentication needs a scheme".into()
+        } else {
+            "authentication credentials need a scheme to be sent under".into()
+        });
+    }
+    if !scheme.bytes().all(is_tchar) {
+        return Err(format!(
+            "authentication scheme {scheme:?} is not an HTTP token (RFC 9110 §5.6.2)"
+        ));
+    }
+    if credentials.is_empty() {
+        return Err("authentication needs credentials".into());
+    }
+    if credentials.chars().any(char::is_control) {
+        return Err("authentication credentials may not contain control characters".into());
+    }
+    Ok(PushAuth {
+        scheme: scheme.to_string(),
+        credentials: credentials.to_string(),
+    })
+}
+
+/// RFC 9110 §5.6.2 `tchar`: the characters an auth-scheme may be made of.
+fn is_tchar(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
 }
 
 #[cfg(test)]
@@ -193,25 +230,82 @@ mod tests {
         assert!(check_url("https://93.184.216.34/agentd", false).is_ok());
     }
 
+    /// The spec's config, as a2a-rs hands it over: parsed into the typed
+    /// `TaskPushNotificationConfig` and serialized back. Going through the
+    /// type is the point — it is what strips any shape the spec does not have,
+    /// so a test that fed raw JSON would pass against fields no caller can
+    /// actually send.
+    fn typed(v: Value) -> Value {
+        let t: a2a_rs::domain::TaskPushNotificationConfig =
+            serde_json::from_value(v).expect("a TaskPushNotificationConfig");
+        serde_json::to_value(t).expect("serialize")
+    }
+
     #[test]
     fn a_config_round_trips_without_leaking_the_credential() {
-        let cfg = json!({
+        let cfg = typed(json!({
+            "taskId": "task-1",
             "url": "https://hooks.example/agentd",
             "token": "caller-token",
-            "authentication": {"schemes": ["Bearer"], "credentials": "secret-bearer"}
-        });
+            "authentication": {"scheme": "Bearer", "credentials": "secret-bearer"}
+        }));
         let t = from_wire(&cfg, "pc-1".into()).expect("a valid config");
         assert_eq!(t.url, "https://hooks.example/agentd");
         assert_eq!(t.token, "caller-token");
-        assert_eq!(t.bearer.as_deref(), Some("secret-bearer"));
+        let auth = t.auth.clone().expect("the 1.0 shape is read, not dropped");
+        assert_eq!(
+            (auth.scheme.as_str(), auth.credentials.as_str()),
+            ("Bearer", "secret-bearer")
+        );
 
-        // Reading it back returns the caller's own token but never the bearer
-        // agentd would present.
+        // Reading it back returns the caller's own token and the scheme it
+        // registered, but never the credentials agentd would present.
         let wire = to_wire("task-1", &t);
         assert_eq!(wire["taskId"], "task-1");
         assert_eq!(wire["token"], "caller-token");
-        assert!(wire.get("authentication").is_none(), "{wire}");
+        assert_eq!(
+            wire["authentication"],
+            json!({"scheme": "Bearer"}),
+            "{wire}"
+        );
         assert!(!wire.to_string().contains("secret-bearer"), "{wire}");
+        // …and the read-back is itself a config the spec's type accepts.
+        typed(wire);
+    }
+
+    #[test]
+    fn any_token_scheme_is_honoured_as_registered() {
+        let cfg = typed(json!({
+            "url": "https://hooks.example/x",
+            "authentication": {"scheme": "Basic", "credentials": "dTpw"}
+        }));
+        let auth = from_wire(&cfg, "p".into()).unwrap().auth.unwrap();
+        assert_eq!(auth.scheme, "Basic");
+        assert_eq!(auth.credentials, "dTpw");
+    }
+
+    #[test]
+    fn authentication_that_cannot_be_sent_as_is_is_refused() {
+        let refused = |auth: Value| {
+            let cfg = typed(json!({"url": "https://hooks.example/x", "authentication": auth}));
+            from_wire(&cfg, "p".into()).expect_err(&format!("{cfg} must be refused"))
+        };
+        // The proto makes the scheme REQUIRED; credentials with nowhere to go
+        // are not quietly sent as something else.
+        assert!(refused(json!({"credentials": "k"})).contains("scheme"));
+        assert!(refused(json!({})).contains("scheme"));
+        // A scheme is an HTTP token: no space, no separator, no line break.
+        refused(json!({"scheme": "Bearer x", "credentials": "k"}));
+        refused(json!({"scheme": "Bea:rer", "credentials": "k"}));
+        refused(json!({"scheme": "Bearer\r\nX-Evil: 1", "credentials": "k"}));
+        // Credentials must exist and must not end the header early.
+        refused(json!({"scheme": "Bearer"}));
+        refused(json!({"scheme": "Bearer", "credentials": ""}));
+        refused(json!({"scheme": "Bearer", "credentials": "k\r\nX-Evil: 1"}));
+        refused(json!({"scheme": "Bearer", "credentials": "k\u{7f}"}));
+        // No `authentication` at all is a config without one, not an error.
+        let bare = typed(json!({"url": "https://hooks.example/x"}));
+        assert!(from_wire(&bare, "p".into()).unwrap().auth.is_none());
     }
 
     #[test]
@@ -220,14 +314,55 @@ mod tests {
         assert!(from_wire(&json!({"url": ""}), "pc-1".into()).is_err());
     }
 
+    /// What a receiver actually sees: the A2A media type, the registered
+    /// authentication as one `Authorization` line, and the legacy token header.
     #[test]
-    fn an_unasked_for_scheme_does_not_become_a_bearer() {
-        // `credentials` without a bearer scheme is not a bearer — presenting it
-        // as one would send a credential somewhere the caller did not ask.
-        let cfg = json!({
-            "url": "https://hooks.example/x",
-            "authentication": {"schemes": ["ApiKey"], "credentials": "k"}
+    fn a_delivery_carries_the_registered_authentication() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/hook", listener.local_addr().unwrap());
+        let seen = std::thread::spawn(move || {
+            let (conn, _) = listener.accept().unwrap();
+            let mut w = conn.try_clone().unwrap();
+            let mut r = BufReader::new(conn);
+            let mut head = Vec::new();
+            let mut len = 0usize;
+            loop {
+                let mut l = String::new();
+                r.read_line(&mut l).unwrap();
+                if l.trim().is_empty() {
+                    break;
+                }
+                if let Some(v) = l.to_ascii_lowercase().strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap();
+                }
+                head.push(l.trim_end().to_string());
+            }
+            let mut body = vec![0u8; len];
+            r.read_exact(&mut body).unwrap();
+            w.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+            (head, body)
         });
-        assert!(from_wire(&cfg, "p".into()).unwrap().bearer.is_none());
+        let target = PushTarget {
+            id: "p".into(),
+            url,
+            token: "caller-token".into(),
+            auth: Some(PushAuth {
+                scheme: "Basic".into(),
+                credentials: "dTpw".into(),
+            }),
+        };
+        // Loopback, so the operator's `allow_private` is what lets it through.
+        deliver(&target, &json!({"task": {"id": "t"}}), true).expect("delivered");
+        let (head, body) = seen.join().unwrap();
+        let has = |h: &str| head.iter().any(|l| l.eq_ignore_ascii_case(h));
+        assert!(has("authorization: Basic dTpw"), "{head:?}");
+        assert!(has("content-type: application/a2a+json"), "{head:?}");
+        assert!(has("x-a2a-notification-token: caller-token"), "{head:?}");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({"task": {"id": "t"}})
+        );
     }
 }

@@ -173,14 +173,59 @@ pub fn task(t: &Task) -> WireTask {
     w
 }
 
-/// The light `Task` a listing carries: the same object without the artifacts,
-/// which a listing does not resolve. It is a `Task` and not a summary shape of
+/// The largest page any listing answers (`ListTasks`,
+/// `ListTaskPushNotificationConfigs`): the spec's bound on `pageSize`.
+pub const MAX_PAGE_SIZE: i32 = 100;
+/// The page a listing answers when the caller named no `pageSize`.
+pub const DEFAULT_PAGE_SIZE: i32 = 50;
+
+/// How a `ListTasks` caller asked to see each task it is handed.
+///
+/// Both halves default to *less*: the spec makes a listing an index, not a
+/// bulk download, so the artifacts and the history are there only when asked
+/// for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ListView {
+    /// `historyLength`: unset omits the history; `n` keeps the newest `n`.
+    pub history_length: Option<u32>,
+    /// `includeArtifacts`: the artifacts ride along only when this is set.
+    pub include_artifacts: bool,
+}
+
+/// A `Task` as a listing carries it: the same object `GetTask` returns, cut to
+/// what the [`ListView`] asked for. It is a `Task` and not a summary shape of
 /// our own — a peer deserializes the array as `Task`s.
-pub fn task_summary(t: &Task) -> WireTask {
-    let mut w = WireTask::new(t.id.clone(), t.context_id.clone());
-    w.status = MessageField::some(status_of(t));
-    w.metadata = metadata(agentd_metadata(t));
+pub fn task_listed(t: &Task, view: ListView) -> WireTask {
+    let mut w = task(t);
+    if !view.include_artifacts {
+        w.artifacts.clear();
+    }
+    match view.history_length {
+        None => w.history.clear(),
+        Some(n) => w = w.with_limited_history(Some(n)),
+    }
     w
+}
+
+/// The body of one push delivery: a `StreamResponse` carrying the task, the
+/// same union a streaming caller reads, so one handler can serve both ways of
+/// being told (spec §4.3.3).
+///
+/// The whole current task rather than the event that fired: "the task, as it
+/// now is" is a valid `StreamResponse`, keeps the artifacts, and lets a
+/// receiver check `task.id` against what it registered for. `metadata` is
+/// dropped — a webhook is a notification to a receiver that is not a party to
+/// the conversation, and agentd's own annotations are not the receiver's to
+/// read.
+pub fn push_body(t: &Task) -> Value {
+    use a2a_rs::domain::generated::{StreamResponse, stream_response::Payload};
+    let mut w = task(t);
+    w.metadata = MessageField::none();
+    let body = StreamResponse {
+        payload: Some(Payload::Task(Box::new(w))),
+        ..Default::default()
+    };
+    serde_json::to_value(body).unwrap_or(Value::Null)
 }
 
 /// A `TaskStatusUpdateEvent` — one frame of a stream.
@@ -307,10 +352,47 @@ mod tests {
 
         // The listing is the same object without artifacts — never a flatter
         // shape a peer would fail to read as a Task.
-        let s = serde_json::to_value(task_summary(&t)).expect("serialize");
+        let s = serde_json::to_value(task_listed(&t, ListView::default())).expect("serialize");
         assert_eq!(s["status"]["state"], v["status"]["state"]);
         assert!(s["state"].is_null());
         assert!(s["artifacts"].is_null());
+        // …and asked for, the artifacts come back exactly as `GetTask` has them.
+        let with = task_listed(
+            &t,
+            ListView {
+                include_artifacts: true,
+                history_length: Some(0),
+            },
+        );
+        let with = serde_json::to_value(with).expect("serialize");
+        assert_eq!(with["artifacts"], v["artifacts"]);
+    }
+
+    /// A delivery is a `StreamResponse` with the task set — what the spec says
+    /// a webhook receives — and it reads back through the spec's own type,
+    /// which is the only proof that counts: a receiver built from the proto
+    /// accepts it.
+    #[test]
+    fn a_push_body_is_a_stream_response_carrying_the_task() {
+        use a2a_rs::domain::generated::{StreamResponse, stream_response::Payload};
+        let mut t = Task::new(
+            "task-7",
+            "ctx-7",
+            Some("user:a"),
+            Link::Run { id: "r".into() },
+        );
+        t.set_result(json!("answer"));
+        t.transition(State::Completed, None);
+        let body = push_body(&t);
+        assert_eq!(body["task"]["id"], "task-7", "{body}");
+        assert_eq!(body["task"]["status"]["state"], "TASK_STATE_COMPLETED");
+        assert!(body.get("id").is_none(), "not a bare Task: {body}");
+        assert!(body["task"].get("metadata").is_none(), "{body}");
+        let back: StreamResponse = serde_json::from_value(body).expect("a StreamResponse");
+        match back.payload {
+            Some(Payload::Task(t)) => assert_eq!(t.id, "task-7"),
+            other => panic!("the task variant, got {other:?}"),
+        }
     }
 
     #[test]

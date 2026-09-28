@@ -121,7 +121,10 @@ fn instant_ms(s: &str) -> Option<u64> {
 ///
 /// * visibility first: a non-operator sees its own tasks and nothing else, so
 ///   `totalSize` counts only what the caller may know exists;
-/// * `contextId`, `status`, and `statusTimestampAfter` (inclusive) narrow it;
+/// * `contextId`, `status`, and `statusTimestampAfter` (inclusive) narrow it —
+///   `contextId` as [`Task::matches_context`] reads it, so an operator finds a
+///   conversation by the runtime's key or by any owner's name for it, and
+///   everyone else by its own name only;
 /// * the order is newest status first, then id descending, and `pageToken`
 ///   resumes after the task the previous page ended on;
 /// * `historyLength` and `includeArtifacts` shape each task (see [`ListView`]).
@@ -167,9 +170,14 @@ fn list_tasks<'a>(
         ),
     };
 
+    let operator = principal.is_operator();
     let mut hits: Vec<&Task> = tasks
         .filter(|t| t.is_visible_to(principal))
-        .filter(|t| p.context_id.as_deref().is_none_or(|c| t.context_id == c))
+        .filter(|t| {
+            p.context_id
+                .as_deref()
+                .is_none_or(|c| t.matches_context(c, operator))
+        })
         .filter(|t| status.is_none_or(|s| t.state.to_wire() == s))
         .filter(|t| after.is_none_or(|ms| t.updated >= ms))
         .collect();
@@ -195,6 +203,48 @@ fn list_tasks<'a>(
         "pageSize": page_size,
         "totalSize": total,
     }))
+}
+
+/// How often the tick applies `store.retention.tasks`. A terminal transition
+/// applies it at once (see [`Runtime::task_sync`]); the tick only has to catch
+/// what no transition does — a `ttl` passing, a reload lowering the bound — and
+/// a second late is nothing to either.
+const TASK_SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The terminal tasks `policy` drops at `now`, by id.
+///
+/// Only a TERMINAL task is a candidate. A working task is someone's answer in
+/// progress, and an input-required one is a question somebody is waiting to
+/// answer; whatever the policy says, neither is dropped. The terminal ones are
+/// ranked newest status first (the listing's order), so `keep_last` keeps a
+/// prefix, and `ttl` counts from the status that finished the task.
+///
+/// `spare` is never returned: it is the task whose transition is being
+/// published, and the reply to the request that moved it is still to be built
+/// from it — dropping it now would answer that caller with nothing. It goes on
+/// the next sweep.
+fn tasks_to_evict<'a>(
+    tasks: impl Iterator<Item = &'a Task>,
+    policy: &crate::config::v2::TerminalRetention,
+    now: u64,
+    spare: Option<&str>,
+) -> Vec<String> {
+    let ttl_ms = policy.ttl.as_ref().map(|d| d.0.as_millis() as u64);
+    if policy.keep_last.is_none() && ttl_ms.is_none() {
+        return Vec::new();
+    }
+    let mut terminal: Vec<&Task> = tasks.filter(|t| t.state.is_terminal()).collect();
+    terminal.sort_by(|a, b| list_key(b).cmp(&list_key(a)));
+    terminal
+        .iter()
+        .enumerate()
+        .filter(|(i, t)| {
+            let over_count = policy.keep_last.is_some_and(|k| *i >= k as usize);
+            let over_age = ttl_ms.is_some_and(|ttl| now.saturating_sub(t.updated) > ttl);
+            (over_count || over_age) && spare != Some(t.id.as_str())
+        })
+        .map(|(_, t)| t.id.clone())
+        .collect()
 }
 
 /// The config a push `Get`/`Delete` names. The spec makes `id` REQUIRED, and it
@@ -587,6 +637,66 @@ impl Runtime {
         self.task_reply(&id)
     }
 
+    /// Publish a task transition, then apply `store.retention.tasks`.
+    ///
+    /// A transition is the only moment the terminal set grows, so this is
+    /// where the bound is kept; the task being published is spared until the
+    /// next sweep (see [`tasks_to_evict`]), after its caller has its answer.
+    pub(crate) fn task_sync(&mut self, id: &str) {
+        self.task_publish(id);
+        self.evict_terminal_tasks(Some(id));
+    }
+
+    /// The tick's share of `store.retention.tasks`: at most once per
+    /// [`TASK_SWEEP_EVERY`], drop what a `ttl` has aged out or a reloaded
+    /// bound no longer keeps. Nothing transitions for either, so without this a
+    /// finished task on a quiet listener would outlive its `ttl` indefinitely.
+    pub(crate) fn sweep_terminal_tasks(&mut self) {
+        if self.tasks_swept.elapsed() < TASK_SWEEP_EVERY {
+            return;
+        }
+        self.tasks_swept = std::time::Instant::now();
+        self.evict_terminal_tasks(None);
+    }
+
+    /// Drop the terminal tasks `store.retention.tasks` no longer keeps (see
+    /// [`tasks_to_evict`]).
+    ///
+    /// Each goes everywhere at once: from the task map, from the inbox-event
+    /// links that would otherwise name it, from the store — so a restart does
+    /// not bring it back — and from every display client, which is told with
+    /// `task.removed` by the same visibility its `task` events had, so the
+    /// owner's view drops it too.
+    pub(crate) fn evict_terminal_tasks(&mut self, spare: Option<&str>) {
+        let drop = tasks_to_evict(
+            self.tasks.values(),
+            &self.settings.store.retention.tasks,
+            crate::state::now_ms(),
+            spare,
+        );
+        for id in drop {
+            let Some(task) = self.tasks.remove(&id) else {
+                continue;
+            };
+            self.event_to_task.retain(|_, t| *t != id);
+            match self.durable.delete(crate::state::Kind::Task, &id) {
+                Ok(()) => self.log.info("a2a.task.evicted", json!({"task": id})),
+                // Gone from memory regardless: the next life restores it and
+                // the first sweep drops it again, which is the most a store
+                // that refused the delete allows.
+                Err(e) => self.log.warn(
+                    "a2a.task.evict.fail",
+                    json!({"task": id, "err": e.to_string()}),
+                ),
+            }
+            self.feed_push(
+                "task.removed",
+                FeedVis::Owner(task.principal.clone()),
+                json!({"id": id}),
+            );
+        }
+    }
+
     /// Publish a task transition: to A2A subscribers, and onto the interface
     /// feed so every attached display client converges without polling.
     ///
@@ -594,7 +704,7 @@ impl Runtime {
     /// waits on this stream rather than polling a snapshot — so a task that
     /// never publishes is a task that never finishes as far as a caller can
     /// tell.
-    pub(crate) fn task_sync(&self, id: &str) {
+    fn task_publish(&self, id: &str) {
         let Some(sink) = &self.a2a_sink else {
             return;
         };
@@ -854,6 +964,88 @@ mod tests {
             assert_eq!(e["_error"]["code"], INVALID_PARAMS, "{bad}: {e}");
         }
         assert!(list(&alice, json!({"pageSize": 100, "historyLength": 0})).is_ok());
+    }
+
+    /// Two owners who both call their conversation `chat1`: the operator
+    /// finds both by that name and either by its key; an owner finds its own
+    /// by its name and nothing by a key the runtime chose.
+    #[test]
+    fn the_context_filter_reads_keys_for_operators_and_names_for_owners() {
+        use crate::config::v2::Role;
+        let mut a = task("t-a", "chat1", "user:a", State::Completed, 1_000);
+        a.set_conversation("ctx-aaaa", "chat1");
+        let mut b = task("t-b", "chat1", "user:b", State::Completed, 2_000);
+        b.set_conversation("ctx-bbbb", "chat1");
+        let tasks = [a, b];
+        let list = |p: &Principal, ctx: &str| {
+            ids(&list_tasks(
+                tasks.iter(),
+                p,
+                &json!({"contextId": ctx}),
+                Annotations::Omit,
+            )
+            .unwrap())
+        };
+        let op = who("operator", Role::Operator);
+        let alice = who("user:a", Role::User);
+        assert_eq!(list(&op, "chat1"), ["t-b", "t-a"]);
+        assert_eq!(list(&op, "ctx-aaaa"), ["t-a"]);
+        assert_eq!(list(&alice, "chat1"), ["t-a"]);
+        assert!(list(&alice, "ctx-aaaa").is_empty());
+    }
+
+    fn retention(
+        keep_last: Option<u32>,
+        ttl_ms: Option<u64>,
+    ) -> crate::config::v2::TerminalRetention {
+        crate::config::v2::TerminalRetention {
+            keep_last,
+            ttl: ttl_ms.map(|ms| crate::config::v2::Dur(std::time::Duration::from_millis(ms))),
+        }
+    }
+
+    /// Retention takes terminal tasks only, newest kept first, and never the
+    /// task whose transition is being published.
+    #[test]
+    fn retention_drops_only_terminal_tasks_past_the_bound() {
+        let tasks = [
+            task("t-old", "c", "u", State::Completed, 1_000),
+            task("t-mid", "c", "u", State::Failed, 2_000),
+            task("t-new", "c", "u", State::Canceled, 3_000),
+            // Older than anything, and never a candidate.
+            task("t-work", "c", "u", State::Working, 10),
+            task("t-ask", "c", "u", State::InputRequired, 20),
+        ];
+        let evict = |policy, now, spare| tasks_to_evict(tasks.iter(), &policy, now, spare);
+
+        assert!(
+            evict(retention(None, None), 99_000, None).is_empty(),
+            "unset keeps"
+        );
+        assert_eq!(
+            evict(retention(Some(1), None), 3_000, None),
+            ["t-mid", "t-old"]
+        );
+        assert_eq!(
+            evict(retention(Some(0), None), 3_000, None),
+            ["t-new", "t-mid", "t-old"]
+        );
+        // The age is strictly past the ttl, counted from the finishing status.
+        assert_eq!(evict(retention(None, Some(1_500)), 3_500, None), ["t-old"]);
+        assert_eq!(
+            evict(retention(None, Some(0)), 99_000, None),
+            ["t-new", "t-mid", "t-old"]
+        );
+        // Either bound drops.
+        assert_eq!(
+            evict(retention(Some(2), Some(1_500)), 3_500, None),
+            ["t-old"]
+        );
+        // The task being published waits for the next sweep.
+        assert_eq!(
+            evict(retention(Some(0), None), 3_000, Some("t-new")),
+            ["t-mid", "t-old"]
+        );
     }
 
     fn target(id: &str) -> PushTarget {

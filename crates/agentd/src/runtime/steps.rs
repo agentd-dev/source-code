@@ -676,6 +676,11 @@ impl Runtime {
 
     /// Every tick: advance every live run.
     pub(crate) fn schedule_runs(&mut self) {
+        // Finished A2A tasks age out on the tick, as runs do on their finish:
+        // a `ttl` passes with no transition to notice it. Ahead of the pause,
+        // because a paused instance still owes its store the bound.
+        #[cfg(feature = "a2a")]
+        self.sweep_terminal_tasks();
         if self.paused {
             return; // operator hold (admin.pause) — steps park until resume
         }

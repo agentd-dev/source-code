@@ -117,20 +117,21 @@ impl FeedKind {
     }
 
     /// Who an event of this kind may reach. Written from the tags the call
-    /// sites push with: a run is its owner's and so is its departure; a step
+    /// sites push with: a run or a task is its owner's and so is its departure
+    /// — an owner shown a task must be told when retention drops it; a step
     /// and a subagent describe the instance's internals.
     pub fn audience(self) -> Audience {
         match self {
             FeedKind::Lifecycle | FeedKind::Config => Audience::All,
             FeedKind::Task
+            | FeedKind::TaskRemoved
             | FeedKind::Run
             | FeedKind::RunRemoved
             | FeedKind::Conversation
             | FeedKind::ConversationRemoved
             | FeedKind::Activity
             | FeedKind::ActivityRemoved => Audience::Owner,
-            FeedKind::TaskRemoved
-            | FeedKind::Step
+            FeedKind::Step
             | FeedKind::Subagent
             | FeedKind::SubagentRemoved
             | FeedKind::Child
@@ -630,6 +631,7 @@ mod tests {
         }
         for k in [
             "task",
+            "task.removed",
             "run",
             "conversation",
             "activity",

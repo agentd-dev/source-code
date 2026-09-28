@@ -673,6 +673,8 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
         #[cfg(feature = "a2a")]
         event_to_task: BTreeMap::new(),
         #[cfg(feature = "a2a")]
+        tasks_swept: Instant::now(),
+        #[cfg(feature = "a2a")]
         conv_index: Default::default(),
         #[cfg(feature = "a2a")]
         #[cfg(feature = "a2a")]

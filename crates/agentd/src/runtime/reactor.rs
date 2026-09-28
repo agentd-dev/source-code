@@ -446,6 +446,11 @@ pub struct Runtime {
     /// Inbox-event id → the A2A task it answers (a conversation turn).
     #[cfg(feature = "a2a")]
     pub(crate) event_to_task: BTreeMap<String, String>,
+    /// When the tick last applied `store.retention.tasks` (see
+    /// `Runtime::sweep_terminal_tasks`): the sweep is rate-limited, because the
+    /// tick that calls it can run many scheduling passes a second.
+    #[cfg(feature = "a2a")]
+    pub(crate) tasks_swept: Instant,
     /// Each non-operator's `contextId`s, bound to the conversations they name
     /// (see `runtime::conversations`). Rebuilt from the tasks and contexts at
     /// restore.

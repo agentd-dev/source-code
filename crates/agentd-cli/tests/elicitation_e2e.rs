@@ -7,7 +7,8 @@
 //! is only kept if the whole chain works — `elicitation/create` → the child's
 //! `ElicitationBridge` → a `ToolRequest` up to the supervisor → `ask_human` →
 //! an `input-required` A2A task an operator can answer → the answer back down
-//! the same wire, shaped to the server's `requestedSchema`.
+//! the same wire, shaped to the server's `requestedSchema`. None of it needs
+//! the observation feed: the caller owns the task, so the gate is core A2A.
 //!
 //! Every link is load-bearing, and the thinnest is `ask_human`'s result: the
 //! bridge lifts `reply` out of it to build the spec's `accept` content, so an
@@ -371,7 +372,7 @@ fn an_mcp_elicitation_reaches_the_operator_and_the_server_sees_accept_with_the_c
                  mcp:\n  servers:\n    - name: ops\n      endpoint: {mcp}\n\
                  store:\n  kind: memory\n\
                  workflows:\n  - name: idle\n    steps:\n      s: {{kind: manual}}\n      f: {{kind: finish, depends_on: [s]}}\n\
-                 a2a:\n  listen: http://127.0.0.1:{port}\n  events:\n    enabled: true\n  introspection:\n    enabled: true\n\
+                 a2a:\n  listen: http://127.0.0.1:{port}\n\
                  lifecycle:\n  run_until: drained\n\
                  observability:\n  log_level: info\n  log_content: true\n",
                 llm = llm.uri,
@@ -457,8 +458,8 @@ fn an_mcp_elicitation_reaches_the_operator_and_the_server_sees_accept_with_the_c
 #[test]
 fn a_gate_whose_asking_child_died_ends_explicitly_instead_of_hanging() {
     // The turn is injected through the inbox seam, so no A2A message owns it:
-    // `ask_human` therefore creates a STANDALONE gate task, whose state is
-    // driven only by the gate itself. Nothing else can terminate it, so what
+    // with `ask_human_unowned: gate`, `ask_human` therefore creates a
+    // STANDALONE gate task, whose state is driven only by the gate itself. Nothing else can terminate it, so what
     // this test observes is the gate's own disposition and nothing else.
     let llm = spawn_mock_llm(&json!({
         "turns": [
@@ -481,12 +482,12 @@ fn a_gate_whose_asking_child_died_ends_explicitly_instead_of_hanging() {
         |port| {
             format!(
                 "config_version: \"1\"\n\
-                 agent:\n  name: orphan-e2e\n  instruction: You ask questions.\n  preflight: never\n\
+                 agent:\n  name: orphan-e2e\n  instruction: You ask questions.\n  preflight: never\n  ask_human_unowned: gate\n\
                  intelligence:\n  endpoints: {llm}\n  model: mock\n\
                  store:\n  kind: memory\n\
                  workflows:\n  - name: idle\n    steps:\n      s: {{kind: manual}}\n      f: {{kind: finish, depends_on: [s]}}\n\
                  limits:\n  run:\n    deadline: 6s\n\
-                 a2a:\n  listen: http://127.0.0.1:{port}\n  events:\n    enabled: true\n  introspection:\n    enabled: true\n\
+                 a2a:\n  listen: http://127.0.0.1:{port}\n\
                  lifecycle:\n  run_until: drained\n\
                  observability:\n  log_level: info\n  log_content: true\n",
                 llm = llm.uri

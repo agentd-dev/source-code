@@ -40,6 +40,10 @@ pub struct Verdict {
     pub question: Option<String>,
     pub on_timeout: PolicyAction,
     pub timeout_ms: Option<u64>,
+    /// Who may answer an `ask` verdict, as the rule declared it (`to:`).
+    /// `None` here is "the rule named nobody"; the gate then addresses the
+    /// operator, never the caller whose call is being judged.
+    pub to: Option<crate::a2a::principals::Addressee>,
 }
 
 /// The tag name an operator writes in `match: {tags: [...]}`.
@@ -128,6 +132,7 @@ pub fn evaluate(policies: &[Policy], call: &Call<'_>) -> Result<Option<Verdict>,
                 question: None,
                 on_timeout: PolicyAction::Deny,
                 timeout_ms: None,
+                to: None,
             }));
         }
         return Ok(Some(Verdict {
@@ -137,6 +142,7 @@ pub fn evaluate(policies: &[Policy], call: &Call<'_>) -> Result<Option<Verdict>,
             // A gate nobody answered has not been approved.
             on_timeout: p.on_timeout.unwrap_or(PolicyAction::Deny),
             timeout_ms: p.timeout.as_ref().map(|d| d.0.as_millis() as u64),
+            to: p.to.clone(),
         }));
     }
     Ok(None)
@@ -317,6 +323,30 @@ mod tests {
             &[],
             PolicyCaller::Subagent
         ));
+    }
+
+    /// An `ask` verdict carries the rule's addressee, so the gate it opens is
+    /// addressed to whom the operator named rather than to whoever holds the
+    /// task — which is usually the caller being judged.
+    #[test]
+    fn an_ask_verdict_carries_the_rules_addressee() {
+        let args = Value::Null;
+        let finance =
+            crate::a2a::principals::Addressee::parse(&serde_json::json!("*@fin.example")).unwrap();
+        let rules = vec![Policy {
+            to: Some(finance.clone()),
+            ..pol(
+                PolicyMatch {
+                    tool: Some("pay.*".into()),
+                    ..Default::default()
+                },
+                PolicyAction::Ask,
+            )
+        }];
+        let v = evaluate(&rules, &call("pay.out", &[], PolicyCaller::Root, &args))
+            .unwrap()
+            .expect("matched");
+        assert_eq!(v.to, Some(finance));
     }
 
     /// An argument guard that will not evaluate is fail-closed. Returning "no

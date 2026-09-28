@@ -713,9 +713,9 @@ impl Runtime {
                 // workflow step finishes through the `finish` kind instead.
                 ok(json!({"ok": true}))
             }
-            // Human-in-the-loop: gate through the interface, or apply the
-            // configured fallback (fail | wait | auto judge) when no human is
-            // attached.
+            // Human-in-the-loop: gate on the A2A task the asker's caller owns
+            // (or, where configured, on a new one), else apply the configured
+            // fallback (fail | wait | auto judge).
             "ask_human" => self.ask_human_tool(caller, args),
             // ---- subagents ----
             "subagent.run" | "subagent.send" | "subagent.kill" | "subagent.status"
@@ -852,48 +852,65 @@ impl Runtime {
                 crate::sec::policy::caller_name(Self::policy_caller(caller)),
             )
             .replace("{{args}}", &args.to_string());
-        // Interim: the feed is where a display client sees the gate, so
-        // `a2a.events.enabled` stands in for "somebody can answer" until
-        // ownership decides that.
+        // The same ownership test `ask_human` uses: the caller who owns the
+        // asking unit is on core A2A and can be put in front of the gate; an
+        // unowned call gates only where the operator said they will be asked.
+        let channel = self.human_channel(caller);
         #[cfg(feature = "a2a")]
-        let available = self.settings.a2a.events.enabled && self.a2a_sink.is_some();
-        #[cfg(not(feature = "a2a"))]
-        let available = false;
-        if available {
-            self.log.info(
-                "tool.policy.ask",
-                json!({"tool": name, "rule": verdict.rule, "caller": caller.label()}),
-            );
-            #[cfg(feature = "a2a")]
-            {
+        {
+            let owned = match &channel {
+                super::human::HumanChannel::Owned(t) => Some(Some(t.clone())),
+                super::human::HumanChannel::Unowned
+                    if self.settings.agent.ask_human_unowned
+                        == crate::config::v2::AskHumanUnowned::Gate =>
+                {
+                    Some(None)
+                }
+                _ => None,
+            };
+            if let Some(owned) = owned {
+                self.log.info(
+                    "tool.policy.ask",
+                    json!({"tool": name, "rule": verdict.rule, "caller": caller.label()}),
+                );
                 let deadline =
                     now_ms() + verdict.timeout_ms.unwrap_or(super::human::ASK_TIMEOUT_MS);
-                // A policy gate has no addressee: it asks whoever is watching.
-                // Naming a decider for an operator-declared tool gate is the
-                // same feature, but it belongs on the policy rule rather than
-                // being invented here.
-                return self.human_gate(caller, question, deadline, None, None);
+                // Addressed to the rule's `to:`, and to the OPERATOR when it
+                // names nobody. The gate usually lands on the task of the very
+                // caller whose call is being judged, and whoever holds a task
+                // may answer an unaddressed gate on it — so an unaddressed
+                // policy gate would be approved by the party it exists to
+                // check. A policy is the operator wanting a say.
+                let to = verdict
+                    .to
+                    .clone()
+                    .unwrap_or_else(|| crate::a2a::principals::Addressee {
+                        role: Some(crate::config::v2::Role::Operator),
+                        ..Default::default()
+                    });
+                return self.human_gate(caller, owned, question, deadline, None, Some(to));
             }
         }
         // Nobody to ask. `on_timeout` decides, and it defaults to deny: a gate
         // that cannot be answered has not been approved, and quietly running
-        // the call because no interface happens to be attached would make the
-        // policy a suggestion.
+        // the call because nobody can be asked would make the policy a
+        // suggestion.
         let fallback = verdict.on_timeout;
+        let why = channel.why_unanswerable();
         // The question goes in the log even though nobody can answer it: an
         // operator reading this needs to know what they were not asked.
         self.log.warn(
             "tool.policy.unanswerable",
             json!({"tool": name, "rule": verdict.rule, "question": question,
                    "fallback": format!("{fallback:?}").to_lowercase(),
-                   "note": "no human channel (a2a.events.enabled is off)"}),
+                   "note": format!("nobody can be asked: {why}")}),
         );
         if fallback == PolicyAction::Allow {
             return ToolOutcome::Ready(Value::Null, false);
         }
         ToolOutcome::Ready(
             Value::String(format!(
-                "denied by security.policies[{}]: a person had to approve this call and no human channel is attached",
+                "denied by security.policies[{}]: a person had to approve this call and nobody can be asked ({why})",
                 verdict.rule
             )),
             true,

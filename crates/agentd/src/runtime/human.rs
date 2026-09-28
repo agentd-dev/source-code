@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! **Human-in-the-loop**: the `ask_human` internal tool and the workflow
-//! `human` node, wired to the interface.
+//! `human` node, served on core A2A.
 //!
 //! The flow: an ask flips (or creates) an A2A task to `input-required` with
-//! the question as its status message — every attached display client renders
-//! an answerable gate — and the asking unit suspends as a
+//! the question as its status message — a blocking `SendMessage` returns on
+//! it, a stream or push delivers it, and a display client renders it as an
+//! answerable gate — and the asking unit suspends as a
 //! [`PendingKind::Human`]. A `SendMessage` carrying that `taskId` resolves the
 //! pending with the reply text: a turn's tool call returns it to the model, a
 //! workflow `human` step completes with it as output. Tasks are durable, so a
@@ -13,12 +14,22 @@
 //! not outlive the process, so there is no tool call left to return into, and
 //! the answer starts a fresh turn carrying it.
 //!
-//! **Fallback** (`agent.ask_human_fallback`) when NO human channel exists
-//! (`a2a.events.enabled` off): `fail` (default — error immediately), `wait`
-//! (park until the ask timeout), or `auto` — an LLM judge answers on the
-//! operator's behalf (also fired when an interface-served gate times out
-//! unanswered). Auto answers are marked as auto in the task, the log and the
-//! audit stream — never mistakable for a human decision.
+//! **Who can answer is decided by ownership** ([`HumanChannel`]), never by
+//! which display features are switched on. An ask whose unit a caller OWNS —
+//! the turn their message started, the run their command started — always
+//! gates while the A2A listener serves: that caller is already waiting on the
+//! task. An ask nobody owns (a schedule, a webhook, a stream) gates only with
+//! `agent.ask_human_unowned: gate`, because whether the operator is willing to
+//! be interrupted by the agent's own work is a deployment decision.
+//!
+//! **Fallback** (`agent.ask_human_fallback`) when an ask does not gate — no
+//! A2A listener, or an unowned ask with `ask_human_unowned: fallback`: `fail`
+//! (default — error immediately), `wait` (park until the ask timeout), or
+//! `auto` — an LLM judge answers on the operator's behalf (also fired when a
+//! gate that names no addressee times out unanswered; an addressed gate, which
+//! every `security.policies` gate is, just times out). Auto answers are marked
+//! as auto in the task, the log and the audit stream — never mistakable for a
+//! human decision.
 
 use super::reactor::{PendingKind, Runtime, Target};
 use crate::config::v2::AskHumanFallback;
@@ -39,7 +50,85 @@ const AUTO_GRACE_MS: u64 = 10 * 60 * 1000;
 /// The judge's "cannot decide" sentinel.
 const UNDECIDED: &str = "UNDECIDED";
 
+/// Who can answer an ask, by who owns the unit asking it.
+///
+/// Ownership, not a display switch, is the test: the caller who owns a task
+/// is on core A2A whether or not any feed is served — their blocking
+/// `SendMessage` returns at `input-required` and a reply carrying the
+/// `taskId` answers it. Deciding availability from a UI flag hid that core
+/// flow behind display configuration.
+pub(crate) enum HumanChannel {
+    /// A live A2A task backs the asking unit — the task behind the asking
+    /// turn, or the one tracking the asking run. Its owner is already
+    /// watching it, so the gate goes there.
+    #[cfg(feature = "a2a")]
+    Owned(String),
+    /// The listener serves, but no caller owns the asking unit (a scheduled
+    /// turn, a webhook, a stream, a timer-started run).
+    #[cfg(feature = "a2a")]
+    Unowned,
+    /// No A2A listener (or a build without one): nobody can be asked at all.
+    None,
+}
+
+impl HumanChannel {
+    /// Why an ask that did not gate took the fallback, in the words of the
+    /// configuration that decided it — the one place an operator looks when a
+    /// gate they expected never appeared.
+    pub(crate) fn why_unanswerable(&self) -> &'static str {
+        match self {
+            #[cfg(feature = "a2a")]
+            HumanChannel::Owned(_) => "the owning caller can answer",
+            #[cfg(feature = "a2a")]
+            HumanChannel::Unowned => {
+                "no A2A caller owns this ask and agent.ask_human_unowned is fallback"
+            }
+            HumanChannel::None => "no A2A listener serves (a2a.listen is unset)",
+        }
+    }
+}
+
 impl Runtime {
+    /// Who can answer an ask raised by `caller` (see [`HumanChannel`]).
+    pub(crate) fn human_channel(&self, caller: &super::tools::ToolCaller) -> HumanChannel {
+        #[cfg(feature = "a2a")]
+        {
+            use super::children::ChildKind;
+            if self.a2a_sink.is_none() {
+                return HumanChannel::None;
+            }
+            // The task this ask belongs to: the A2A task behind the asking
+            // turn, or the task tracking the asking run.
+            let linked: Option<String> = if let Some(node) = caller.node {
+                match self.children.get(node).map(|c| c.kind.clone()) {
+                    Some(ChildKind::RootTurn {
+                        event: Some(ev), ..
+                    }) => self.event_to_task.get(&ev).cloned(),
+                    Some(ChildKind::StepTurn { run, .. }) => {
+                        self.runs.get(&run).and_then(|r| r.task.clone())
+                    }
+                    _ => None,
+                }
+            } else if let Some(run) = &caller.run {
+                self.runs.get(run).and_then(|r| r.task.clone())
+            } else {
+                None
+            };
+            // A settled task has nobody waiting on it any more: its caller got
+            // their answer, so a new ask on that unit is as unowned as one no
+            // caller ever started.
+            match linked.filter(|t| self.tasks.get(t).is_some_and(|t| !t.state.is_terminal())) {
+                Some(t) => HumanChannel::Owned(t),
+                None => HumanChannel::Unowned,
+            }
+        }
+        #[cfg(not(feature = "a2a"))]
+        {
+            let _ = caller;
+            HumanChannel::None
+        }
+    }
+
     /// The `ask_human` internal tool.
     pub(crate) fn ask_human_tool(
         &mut self,
@@ -158,28 +247,34 @@ impl Runtime {
             }
         }
 
-        // A human can answer only through a display client on the feed.
-        // Interim: the feed is where a display client sees the gate, so
-        // `a2a.events.enabled` stands in for "somebody can answer" until
-        // ownership decides that.
+        let channel = self.human_channel(caller);
         #[cfg(feature = "a2a")]
-        let available = self.settings.a2a.events.enabled && self.a2a_sink.is_some();
-        #[cfg(not(feature = "a2a"))]
-        let available = false;
-
-        if available {
-            #[cfg(feature = "a2a")]
-            return self.human_gate(caller, question, deadline_ms, schema, addressee);
+        match channel {
+            HumanChannel::Owned(task) => {
+                return self.human_gate(
+                    caller,
+                    Some(task),
+                    question,
+                    deadline_ms,
+                    schema,
+                    addressee,
+                );
+            }
+            HumanChannel::Unowned
+                if self.settings.agent.ask_human_unowned
+                    == crate::config::v2::AskHumanUnowned::Gate =>
+            {
+                return self.human_gate(caller, None, question, deadline_ms, schema, addressee);
+            }
+            _ => {}
         }
-        let _ = caller;
-        // No channel to ask on: take the configured fallback.
+        let why = channel.why_unanswerable();
+        // Nobody to ask: take the configured fallback.
         match self.settings.agent.ask_human_fallback {
             AskHumanFallback::Fail => ToolOutcome::Ready(
-                Value::String(
-                    "ask_human: no human channel (a2a.events.enabled is off) and \
-                     agent.ask_human_fallback = fail"
-                        .into(),
-                ),
+                Value::String(format!(
+                    "ask_human: nobody can be asked ({why}) and agent.ask_human_fallback = fail"
+                )),
                 true,
             ),
             AskHumanFallback::Wait => {
@@ -189,13 +284,15 @@ impl Runtime {
                     // The `fail` branch above names the cause; this one used to
                     // say only "no human channel", and it is the branch people
                     // actually configure. An integrator lost an hour to the
-                    // asymmetry — the condition is one config key, and the log
+                    // asymmetry — the condition is configuration, and the log
                     // that fires is the one place they look.
                     json!({
                         "ask": ask,
                         "deadline_ms": deadline_ms,
-                        "note": "no human channel (a2a.events.enabled is off); \
-                                 ask_human_fallback = wait — this gate will park until its timeout"
+                        "note": format!(
+                            "nobody can be asked ({why}); ask_human_fallback = wait — \
+                             this gate will park until its timeout"
+                        )
                     }),
                 );
                 ToolOutcome::Deferred(PendingKind::Human {
@@ -224,42 +321,24 @@ impl Runtime {
         }
     }
 
-    /// The interface-served gate: flip (or create) the owning A2A task to
-    /// `input-required` and suspend the asker.
+    /// The A2A gate: flip the owning task (`owned`, from [`HumanChannel`]) to
+    /// `input-required`, or create a gate task when no caller owns the asking
+    /// unit, and suspend the asker.
     #[cfg(feature = "a2a")]
     pub(crate) fn human_gate(
         &mut self,
         caller: &super::tools::ToolCaller,
+        owned: Option<String>,
         question: String,
         deadline_ms: u64,
         schema: Option<Value>,
         addressee: Option<crate::a2a::principals::Addressee>,
     ) -> super::tools::ToolOutcome {
-        use super::children::ChildKind;
         use super::tools::ToolOutcome;
         use crate::a2a::tasks::{Link, State};
 
-        // The task this ask belongs to: the A2A task behind the asking turn,
-        // or the task tracking the asking run.
-        let linked: Option<String> = if let Some(node) = caller.node {
-            match self.children.get(node).map(|c| c.kind.clone()) {
-                Some(ChildKind::RootTurn {
-                    event: Some(ev), ..
-                }) => self.event_to_task.get(&ev).cloned(),
-                Some(ChildKind::StepTurn { run, .. }) => {
-                    self.runs.get(&run).and_then(|r| r.task.clone())
-                }
-                _ => None,
-            }
-        } else if let Some(run) = &caller.run {
-            self.runs.get(run).and_then(|r| r.task.clone())
-        } else {
-            None
-        };
-        let linked = linked.filter(|t| self.tasks.get(t).is_some_and(|t| !t.state.is_terminal()));
-
         // One live gate per task (asks within one unit are sequential anyway).
-        if let Some(t) = &linked
+        if let Some(t) = &owned
             && self
                 .pending
                 .iter()
@@ -271,12 +350,13 @@ impl Runtime {
             );
         }
 
-        let (task_id, standalone) = match linked {
+        let (task_id, standalone) = match owned {
             Some(t) => (t, false),
             None => {
                 // No A2A caller owns this unit (a scheduled turn, a subagent,
-                // a run started by a timer): create the gate task so attached
-                // operators see and answer it.
+                // a run started by a timer): create the gate task, owned by the
+                // caller the unit runs for or else the operator, so they can
+                // find and answer it.
                 let principal_id = caller
                     .principal
                     .clone()
@@ -289,7 +369,12 @@ impl Runtime {
                     budget: None,
                     labels: Default::default(),
                 };
-                if let Some(run) = &caller.run {
+                // A freshly minted id, never the listener's reservation: that
+                // belongs to the task the request being served creates, and a
+                // gate opened while serving it is a different task — taking it
+                // would hand the caller a subscription to someone else's gate.
+                let reserved = self.reserved_task_id.take();
+                let created = if let Some(run) = &caller.run {
                     let run = run.clone();
                     let ctx = format!("run-{run}");
                     let tid = self.task_create(&ctx, &principal, Link::Run { id: run.clone() });
@@ -303,7 +388,9 @@ impl Runtime {
                     let ctx = caller.context_id();
                     let tid = self.task_create(&ctx, &principal, Link::Turn { ctx: ctx.clone() });
                     (tid, true)
-                }
+                };
+                self.reserved_task_id = reserved;
+                created
             }
         };
 
@@ -557,6 +644,7 @@ impl Runtime {
                 task,
                 deadline_ms,
                 auto_fired,
+                addressee,
                 ..
             } = &p.kind
             else {
@@ -600,7 +688,13 @@ impl Runtime {
                 Target::Child(..) => {}
             }
             if now >= *deadline_ms {
-                if auto && !auto_fired {
+                // Never for an ADDRESSED gate, for the reason `ask_human`
+                // never auto-answers one: a model judge standing in for the
+                // person the gate names makes its record a lie. Every
+                // `security.policies` gate is addressed (to the operator unless
+                // the rule names someone), and this is what keeps the agent
+                // from approving the operator's own gate by waiting it out.
+                if auto && !auto_fired && addressee.is_none() {
                     fire_auto.push(p.target.clone());
                 } else {
                     ends.push((p.target.clone(), End::Timeout));

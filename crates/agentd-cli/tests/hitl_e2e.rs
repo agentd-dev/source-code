@@ -1,11 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! **Human-in-the-loop** end to end: the `ask_human` tool and the workflow
-//! `human` node gate through the interface as `input-required` A2A tasks; a
-//! `SendMessage` carrying the `taskId` resolves the suspended asker with the
-//! reply text. With no interface, the configured fallback applies — `fail`
-//! errors the ask immediately (the model carries on), `auto` has an LLM judge
-//! answer on the operator's behalf (marked as auto). A cancelled gate unblocks
-//! its asker with an error.
+//! `human` node gate as `input-required` A2A tasks; a `SendMessage` carrying
+//! the `taskId` resolves the suspended asker with the reply text.
+//!
+//! Ownership decides who can be asked, not any display switch. An ask whose
+//! turn or run a caller OWNS gates on core A2A with the observation feed and
+//! introspection both off — the caller's blocking send returns at the gate.
+//! An ask nobody owns (here: the configured `agent.prompt`, which no caller
+//! sent) gates only with `agent.ask_human_unowned: gate`; otherwise the
+//! configured fallback applies — `fail` errors the ask immediately (the model
+//! carries on), `wait` parks it until its timeout, `auto` has an LLM judge
+//! answer on the operator's behalf (marked as auto). A cancelled gate
+//! unblocks its asker with an error.
 #![cfg(all(unix, feature = "a2a"))]
 
 mod common;
@@ -40,6 +46,45 @@ fn wait_task<F: Fn(&Value) -> bool>(addr: &str, id: &str, secs: u64, what: &str,
         assert!(Instant::now() < deadline, "timeout: {what}; last: {t}");
         std::thread::sleep(Duration::from_millis(80));
     }
+}
+
+/// Poll the daemon's log until `needle` appears (returns the log).
+fn wait_log(daemon: &Daemon, needle: &str, secs: u64) -> String {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        let log = daemon.stderr();
+        if log.contains(needle) {
+            return log;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timeout waiting for {needle}; log:\n{log}"
+        );
+        std::thread::sleep(Duration::from_millis(80));
+    }
+}
+
+/// Every task in `input-required`, by id.
+fn gates(addr: &str) -> Vec<String> {
+    let tasks = rpc(addr, 901, "ListTasks", json!({}));
+    // An empty list is omitted from the wire (proto3 JSON), not sent as `[]`.
+    tasks["tasks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|t| t["status"]["state"] == "TASK_STATE_INPUT_REQUIRED")
+        .map(|t| t["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// The agent section of [`base_config`] with an `agent.prompt` — a turn the
+/// instance starts for itself, so no A2A caller owns it — plus `extra` agent
+/// keys.
+fn unowned(cfg: String, prompt: &str, extra: &str) -> String {
+    cfg.replace(
+        "  preflight: never\n",
+        &format!("  preflight: never\n  prompt: {prompt}\n{extra}"),
+    )
 }
 
 struct MockLlm {
@@ -215,6 +260,119 @@ fn a_turn_ask_gates_as_input_required_and_the_reply_resumes_the_turn() {
     std::fs::remove_file(&cfg).ok();
 }
 
+/// The core A2A flow, with nothing but the listener: no observation feed, no
+/// introspection. The caller who sent the message owns the task, so their
+/// BLOCKING send returns at `input-required` with the question, and a send
+/// carrying the `taskId` answers it and the task completes. Deciding
+/// availability from a display switch refused exactly this caller.
+#[test]
+fn an_owned_ask_gates_on_core_a2a_with_no_events_or_introspection() {
+    let llm = spawn_mock_llm(&json!({
+        "turns": [
+            {"tool_calls": [{"name": "ask_human", "arguments": {"question": "Which region first?"}}]},
+            {"content": "Rolled out to the chosen region."}
+        ]
+    }));
+    let (daemon, addr, cfg) = spawn_bound(|port| base_config(&llm.uri, port, false, ""));
+
+    let gated = SendMessage::text("Roll it out").result(&addr);
+    assert_eq!(
+        gated["task"]["status"]["state"], "TASK_STATE_INPUT_REQUIRED",
+        "a blocking send returns at the gate: {gated}"
+    );
+    assert!(
+        gated["task"]["status"]["message"]["parts"][0]["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Which region first?"),
+        "{gated}"
+    );
+    let task_id = gated["task"]["id"].as_str().unwrap().to_string();
+
+    SendMessage::text("eu-west").task(&task_id).result(&addr);
+    let done = wait_task(&addr, &task_id, 15, "turn completion", |t| {
+        t["status"]["state"] == "TASK_STATE_COMPLETED"
+    });
+    assert!(
+        done["artifacts"][0]["parts"][0]["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("chosen region"),
+        "{done}"
+    );
+    let logs = daemon.stderr();
+    assert!(logs.contains("\"event\":\"human.answered\""), "{logs}");
+    std::fs::remove_file(&cfg).ok();
+}
+
+/// An ask no caller owns has nobody waiting on it, so whether the operator is
+/// asked is the deployment's call: by default it takes the fallback (`fail`
+/// here — the ask errors and the model carries on, and no gate exists), and
+/// with `agent.ask_human_unowned: gate` it opens a gate the operator answers.
+#[test]
+fn an_unowned_ask_takes_the_fallback_unless_ask_human_unowned_is_gate() {
+    // The tool result reaches the model and nowhere else, so the mock reads
+    // it: the reply says whether the error named the setting that chose it.
+    let playbook = json!({
+        "turns": [
+            {"tool_calls": [{"name": "ask_human", "arguments": {"question": "Anyone there?"}}]},
+            {"content": "Carried on."}
+        ],
+        "match": [
+            {"when_contains": "no A2A caller owns this ask and agent.ask_human_unowned is fallback",
+             "content": "Carried on; the fallback named its setting."}
+        ]
+    });
+
+    // Default (`fallback`, with `ask_human_fallback: fail`).
+    let llm = spawn_mock_llm(&playbook);
+    let (daemon, addr, cfg) =
+        spawn_bound(|port| unowned(base_config(&llm.uri, port, false, ""), "Try asking", ""));
+    let logs = wait_log(&daemon, "\"event\":\"turn.reply\"", 15);
+    assert!(
+        logs.contains("the fallback named its setting"),
+        "the ask errored, naming the setting that chose the fallback\n{logs}"
+    );
+    assert!(gates(&addr).is_empty(), "no gate was opened");
+    drop(daemon);
+    std::fs::remove_file(&cfg).ok();
+
+    // `gate`: the operator is asked, and answering completes the gate task.
+    let llm = spawn_mock_llm(&playbook);
+    let (daemon, addr, cfg) = spawn_bound(|port| {
+        unowned(
+            base_config(&llm.uri, port, false, ""),
+            "Try asking",
+            "  ask_human_unowned: gate\n",
+        )
+    });
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let gate = loop {
+        if let Some(g) = gates(&addr).pop() {
+            break g;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no gate opened for the unowned ask\n{}",
+            daemon.stderr()
+        );
+        std::thread::sleep(Duration::from_millis(80));
+    };
+    SendMessage::text("yes, here")
+        .task(&gate)
+        .return_immediately()
+        .result(&addr);
+    wait_task(&addr, &gate, 10, "the gate completes", |t| {
+        t["status"]["state"] == "TASK_STATE_COMPLETED"
+    });
+    let logs = wait_log(&daemon, "\"event\":\"turn.reply\"", 15);
+    assert!(
+        logs.contains("\"text\":\"Carried on.\""),
+        "the answer went back into the asking turn\n{logs}"
+    );
+    std::fs::remove_file(&cfg).ok();
+}
+
 #[test]
 fn a_workflow_human_node_gates_the_run_task_and_the_reply_is_the_step_output() {
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
@@ -341,42 +499,10 @@ fn a_gates_addressee_and_schema_are_durable() {
     std::fs::remove_file(&cfg).ok();
 }
 
+/// An unowned ask with `ask_human_fallback: auto`: nobody is asked, and the
+/// judge answers on the operator's behalf — marked as auto.
 #[test]
-fn fallback_fail_errors_the_ask_immediately_and_the_model_carries_on() {
-    // No observation feed at all (fallback default = fail): the ask errors,
-    // the model still gets its next turn and completes.
-    let llm = spawn_mock_llm(&json!({
-        "turns": [
-            {"tool_calls": [{"name": "ask_human", "arguments": {"question": "Anyone there?"}}]},
-            {"content": "Proceeding without a human."}
-        ]
-    }));
-    let (daemon, addr, cfg) = spawn_bound(|port| base_config(&llm.uri, port, false, ""));
-    let sent = SendMessage::text("Try asking").result(&addr);
-    assert_eq!(sent["task"]["status"]["state"], "TASK_STATE_COMPLETED");
-    assert!(
-        sent["task"]["artifacts"][0]["parts"][0]["text"]
-            .as_str()
-            .unwrap_or("")
-            .contains("Proceeding without a human"),
-        "{sent}"
-    );
-    // No gate ever existed.
-    let tasks = rpc(&addr, 2, "ListTasks", json!({}));
-    assert!(
-        tasks["tasks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|t| t["state"] != "TASK_STATE_INPUT_REQUIRED"),
-        "{tasks}"
-    );
-    assert!(daemon.stderr().contains("ask_human"), "the error is logged");
-    std::fs::remove_file(&cfg).ok();
-}
-
-#[test]
-fn fallback_auto_lets_the_judge_answer_on_the_operators_behalf() {
+fn an_unowned_ask_with_fallback_auto_lets_the_judge_answer_on_the_operators_behalf() {
     // The judge dial hits the same mock: route it by its system prompt.
     let llm = spawn_mock_llm(&json!({
         "turns": [
@@ -387,72 +513,57 @@ fn fallback_auto_lets_the_judge_answer_on_the_operators_behalf() {
             {"when_contains": "answering ON BEHALF OF the unavailable human operator", "content": "blue"}
         ]
     }));
-    let extra = "";
     let (daemon, addr, cfg) = spawn_bound(|port| {
-        base_config(&llm.uri, port, false, extra).replace(
-            "  preflight: never\n",
-            "  preflight: never\n  ask_human_fallback: auto\n",
+        unowned(
+            base_config(&llm.uri, port, false, ""),
+            "Pick a color and proceed",
+            "  ask_human_fallback: auto\n",
         )
     });
-    let sent = SendMessage::text("Pick a color and proceed").result(&addr);
-    assert_eq!(
-        sent["task"]["status"]["state"], "TASK_STATE_COMPLETED",
-        "{sent}"
-    );
-    assert!(
-        sent["task"]["artifacts"][0]["parts"][0]["text"]
-            .as_str()
-            .unwrap_or("")
-            .contains("Went ahead"),
-        "{sent}"
-    );
-    let logs = daemon.stderr();
+    let logs = wait_log(&daemon, "\"event\":\"turn.reply\"", 20);
+    assert!(logs.contains("Went ahead"), "{logs}");
     assert!(logs.contains("human.judge.start"), "{logs}");
     assert!(
         logs.contains("\"via\":\"auto\"") || logs.contains("\"outcome\":\"auto\""),
         "the auto answer is marked: {logs}"
     );
+    assert!(gates(&addr).is_empty(), "nobody was asked");
     std::fs::remove_file(&cfg).ok();
 }
 
+/// An unowned ask with `ask_human_fallback: wait`: it parks, times out (1s
+/// here), errors, and the model carries on.
 #[test]
-fn fallback_wait_parks_the_ask_until_its_timeout() {
-    // No feed + `wait`: the ask parks, times out (1s here), errors, and
-    // the model carries on.
+fn an_unowned_ask_with_fallback_wait_parks_until_its_timeout() {
     let llm = spawn_mock_llm(&json!({
         "turns": [
             {"tool_calls": [{"name": "ask_human", "arguments": {"question": "Waiting?", "timeout": "1s"}}]},
             {"content": "Timed out; proceeding."}
         ]
     }));
-    let (daemon, addr, cfg) = spawn_bound(|port| {
-        base_config(&llm.uri, port, false, "").replace(
-            "  preflight: never\n",
-            "  preflight: never\n  ask_human_fallback: wait\n",
+    let (daemon, _addr, cfg) = spawn_bound(|port| {
+        unowned(
+            base_config(&llm.uri, port, false, ""),
+            "Ask and wait",
+            "  ask_human_fallback: wait\n",
         )
     });
-    let sent = SendMessage::text("Ask and wait").result(&addr);
-    assert_eq!(
-        sent["task"]["status"]["state"], "TASK_STATE_COMPLETED",
-        "{sent}"
-    );
-    assert!(
-        sent["task"]["artifacts"][0]["parts"][0]["text"]
-            .as_str()
-            .unwrap_or("")
-            .contains("Timed out; proceeding"),
-        "{sent}"
-    );
-    let logs = daemon.stderr();
+    let logs = wait_log(&daemon, "\"event\":\"turn.reply\"", 20);
+    assert!(logs.contains("Timed out; proceeding"), "{logs}");
     assert!(logs.contains("human.ask.parked"), "{logs}");
+    assert!(
+        logs.contains("no A2A caller owns this ask"),
+        "the parked note names why nobody was asked\n{logs}"
+    );
     assert!(logs.contains("no answer within the timeout"), "{logs}");
     std::fs::remove_file(&cfg).ok();
 }
 
 #[test]
-fn auto_fires_as_the_safety_net_when_an_interface_gate_times_out_unanswered() {
-    // Interface ON + `auto`: the gate renders for humans, nobody answers
-    // within the (1s) timeout, the judge answers on the operator's behalf.
+fn auto_fires_as_the_safety_net_when_an_owned_gate_times_out_unanswered() {
+    // An owned gate + `auto`, with no feed at all: the gate opens for the
+    // caller, nobody answers within the (1s) timeout, and the judge answers on
+    // the operator's behalf.
     let llm = spawn_mock_llm(&json!({
         "turns": [
             {"tool_calls": [{"name": "ask_human", "arguments": {"question": "Green or blue?", "timeout": "1s"}}]},
@@ -463,7 +574,7 @@ fn auto_fires_as_the_safety_net_when_an_interface_gate_times_out_unanswered() {
         ]
     }));
     let (daemon, addr, cfg) = spawn_bound(|port| {
-        base_config(&llm.uri, port, true, "").replace(
+        base_config(&llm.uri, port, false, "").replace(
             "  preflight: never\n",
             "  preflight: never\n  ask_human_fallback: auto\n",
         )

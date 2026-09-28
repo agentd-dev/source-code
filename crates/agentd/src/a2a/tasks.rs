@@ -98,6 +98,38 @@ pub struct PushAuth {
     pub credentials: String,
 }
 
+/// The most messages a task keeps for its `history`; the oldest go first.
+pub const MAX_TASK_MESSAGES: usize = 64;
+/// The most bytes (serialized) those messages may hold together. A count
+/// alone would let a handful of pasted documents make every task record — and
+/// every `GetTask` — megabytes long.
+pub const MAX_TASK_MESSAGE_BYTES: usize = 256 * 1024;
+
+/// One entry of the conversation a task carries as the spec's `Task.history`.
+///
+/// Kept apart from [`Task::history`], which is the STATE transitions: this is
+/// who said what. The reply is not here — it is the task's result artifact —
+/// and neither is the status message that is current, which the task's
+/// `status` already carries; history holds what came before it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskMessage {
+    /// A caller's `Message`, in its wire form, as received — re-addressed to
+    /// this task (see [`Task::record_inbound`]).
+    Inbound { message: Value },
+    /// A status message the agent authored: an `input-required` question, a
+    /// note a gate settled with. `seq` is what names it on the wire
+    /// (`<task>.status.<seq>`), while it is current and after it is superseded.
+    Status { seq: u64, text: String },
+}
+
+impl TaskMessage {
+    /// What an entry costs against [`MAX_TASK_MESSAGE_BYTES`].
+    fn bytes(&self) -> usize {
+        serde_json::to_vec(self).map(|v| v.len()).unwrap_or(0)
+    }
+}
+
 /// The durable task record.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Task {
@@ -119,9 +151,11 @@ pub struct Task {
     /// for — and the answer is already the right shape when it comes back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ask_schema: Option<Value>,
-    /// Artifact ids delivered on this task.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub artifacts: Vec<String>,
+    /// The command op that opened this task, when a command did (a built-in
+    /// op, or a workflow's declared `a2a` command). What marks the result as
+    /// the command vocabulary's data rather than an answer in prose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
     /// The terminal result (a distillate / output).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
@@ -132,6 +166,16 @@ pub struct Task {
     /// The transition history (state, ts).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub history: Vec<Value>,
+    /// The conversation, oldest first, within [`MAX_TASK_MESSAGES`] and
+    /// [`MAX_TASK_MESSAGE_BYTES`]. Durable with the task, so `GetTask` after a
+    /// restart still shows the prompt that started it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub messages: Vec<TaskMessage>,
+    /// The `seq` of the current status message (`message`); `0` before the
+    /// task has had one. Counted, never reused, so an id a client has already
+    /// rendered keeps naming the same text.
+    #[serde(default)]
+    pub status_seq: u64,
     /// Where to POST this task's updates, for a caller that would rather be
     /// told than hold a stream open. Durable with the task, so a restart keeps
     /// the promise the caller was given.
@@ -152,11 +196,13 @@ impl Task {
             principal: principal.map(str::to_string),
             link,
             message: None,
-            artifacts: Vec::new(),
+            command: None,
             result: None,
             created: now,
             updated: now,
             history: vec![json!({"state": State::Submitted.wire(), "ts": now})],
+            messages: Vec::new(),
+            status_seq: 0,
             push: Vec::new(),
             dirty: true,
         }
@@ -175,8 +221,19 @@ impl Task {
             return;
         }
         self.state = state;
-        if message.is_some() {
-            self.message = message;
+        // A NEW status text is a new message: numbered, and entered into the
+        // conversation now, so it sits in history where it was said rather
+        // than where it was superseded. Repeating the current text is the same
+        // message, and keeps its id.
+        if let Some(text) = message
+            && self.message.as_deref() != Some(text.as_str())
+        {
+            self.status_seq += 1;
+            self.push_message(TaskMessage::Status {
+                seq: self.status_seq,
+                text: text.clone(),
+            });
+            self.message = Some(text);
         }
         self.updated = now_ms();
         self.history
@@ -187,12 +244,36 @@ impl Task {
         self.dirty = true;
     }
 
-    pub fn add_artifact(&mut self, id: &str) {
-        if !self.artifacts.iter().any(|a| a == id) {
-            self.artifacts.push(id.to_string());
-            self.updated = now_ms();
-            self.dirty = true;
+    /// Enter a caller's `Message` into the conversation.
+    ///
+    /// Stored as the caller sent it, with three fields set to this task's: its
+    /// role is `ROLE_USER` (a caller is never the agent, whatever it claimed),
+    /// and its `taskId`/`contextId` name this task — a new task's message
+    /// arrives without them, and history should not say it was addressed
+    /// nowhere. The caller's `messageId` is kept: it is how a client finds its
+    /// own prompt again.
+    pub fn record_inbound(&mut self, message: &Value) {
+        let Some(o) = message.as_object() else {
+            return;
+        };
+        let mut o = o.clone();
+        o.insert("role".into(), json!("ROLE_USER"));
+        o.insert("taskId".into(), json!(self.id));
+        o.insert("contextId".into(), json!(self.context_id));
+        self.push_message(TaskMessage::Inbound {
+            message: Value::Object(o),
+        });
+    }
+
+    /// Append to the conversation, dropping the oldest entries until both
+    /// bounds hold again.
+    fn push_message(&mut self, m: TaskMessage) {
+        self.messages.push(m);
+        let mut total: usize = self.messages.iter().map(TaskMessage::bytes).sum();
+        while self.messages.len() > MAX_TASK_MESSAGES || total > MAX_TASK_MESSAGE_BYTES {
+            total -= self.messages.remove(0).bytes();
         }
+        self.dirty = true;
     }
 
     pub fn set_result(&mut self, v: Value) {
@@ -205,15 +286,19 @@ impl Task {
     /// reply carry. Built from the specification's own types, so the wire
     /// spellings are not ours to get wrong; see [`crate::a2a::wire`].
     #[cfg(feature = "a2a")]
-    pub fn to_a2a(&self) -> Value {
-        serde_json::to_value(crate::a2a::wire::task(self)).unwrap_or(Value::Null)
+    pub fn to_a2a(&self, ann: crate::a2a::wire::Annotations) -> Value {
+        serde_json::to_value(crate::a2a::wire::task(self, ann)).unwrap_or(Value::Null)
     }
 
     /// The projection `ListTasks` returns: the same `Task`, cut to what the
     /// caller asked a listing to carry (see [`crate::a2a::wire::ListView`]).
     #[cfg(feature = "a2a")]
-    pub fn summary(&self, view: crate::a2a::wire::ListView) -> Value {
-        serde_json::to_value(crate::a2a::wire::task_listed(self, view)).unwrap_or(Value::Null)
+    pub fn summary(
+        &self,
+        view: crate::a2a::wire::ListView,
+        ann: crate::a2a::wire::Annotations,
+    ) -> Value {
+        serde_json::to_value(crate::a2a::wire::task_listed(self, view, ann)).unwrap_or(Value::Null)
     }
 }
 #[cfg(test)]
@@ -234,9 +319,6 @@ mod tests {
         t.transition(State::Working, None);
         t.transition(State::Working, None); // idempotent
         assert_eq!(t.history.len(), 2);
-        t.add_artifact("art-9");
-        t.add_artifact("art-9"); // idempotent
-        assert_eq!(t.artifacts.len(), 1);
         t.set_result(json!({"answer": 42}));
         t.transition(State::Completed, Some("done".into()));
         assert!(t.state.is_terminal());
@@ -249,6 +331,78 @@ mod tests {
         assert_eq!(back.state, t.state);
         assert_eq!(back.history.len(), t.history.len());
         assert!(!back.dirty);
+    }
+
+    /// The conversation stays within both bounds by dropping its oldest
+    /// entries, and a status message keeps its number from the moment it is
+    /// said: superseding it, or saying the same thing again, never renumbers
+    /// what a client has already rendered.
+    #[test]
+    fn history_is_bounded_and_status_ids_are_stable() {
+        let mut t = Task::new("t", "c", Some("user:a"), Link::Turn { ctx: "c".into() });
+        let said = |n: usize| json!({"messageId": format!("m{n}"), "role": "ROLE_AGENT", "parts": [{"text": format!("hi {n}")}]});
+
+        // An inbound message is the caller's, addressed to this task.
+        t.record_inbound(&said(0));
+        let TaskMessage::Inbound { message } = &t.messages[0] else {
+            panic!("an inbound entry: {:?}", t.messages);
+        };
+        assert_eq!(message["role"], "ROLE_USER", "a caller is never the agent");
+        assert_eq!(message["taskId"], "t");
+        assert_eq!(message["contextId"], "c");
+        assert_eq!(message["messageId"], "m0", "the caller's id is kept");
+
+        // Status messages are numbered as they are said.
+        t.transition(State::InputRequired, Some("Proceed?".into()));
+        assert_eq!(t.status_seq, 1);
+        t.transition(State::InputRequired, Some("Proceed?".into()));
+        t.transition(State::Working, Some("Proceed?".into()));
+        t.transition(State::Working, None);
+        assert_eq!(t.status_seq, 1, "the same text is the same message");
+        t.record_inbound(&said(1));
+        t.transition(State::Working, Some("answered".into()));
+        assert_eq!(t.status_seq, 2);
+        let seqs: Vec<u64> = t
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                TaskMessage::Status { seq, .. } => Some(*seq),
+                TaskMessage::Inbound { .. } => None,
+            })
+            .collect();
+        assert_eq!(seqs, [1, 2], "numbered where said, never renumbered");
+        assert!(
+            matches!(&t.messages[1], TaskMessage::Status { seq: 1, text } if text == "Proceed?"),
+            "the question sits before the answer: {:?}",
+            t.messages
+        );
+
+        // The count bound: the newest 64 survive.
+        for n in 2..200 {
+            t.record_inbound(&said(n));
+        }
+        assert_eq!(t.messages.len(), MAX_TASK_MESSAGES);
+        let first = |t: &Task| match &t.messages[0] {
+            TaskMessage::Inbound { message } => message["messageId"].clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(first(&t), json!(format!("m{}", 200 - MAX_TASK_MESSAGES)));
+
+        // The byte bound: a few large messages push the oldest out while the
+        // newest stays.
+        let big = |n: usize| json!({"messageId": format!("big{n}"), "parts": [{"text": "x".repeat(60 * 1024)}]});
+        for n in 0..6 {
+            t.record_inbound(&big(n));
+        }
+        let total: usize = t.messages.iter().map(TaskMessage::bytes).sum();
+        assert!(total <= MAX_TASK_MESSAGE_BYTES, "{total} bytes kept");
+        assert_eq!(t.messages.len(), 4, "four 60 KiB messages fit, five do not");
+        assert_eq!(first(&t), json!("big2"));
+
+        // Durable: the conversation and the numbering survive a round trip.
+        let back: Task = serde_json::from_value(serde_json::to_value(&t).unwrap()).unwrap();
+        assert_eq!(back.messages, t.messages);
+        assert_eq!(back.status_seq, 2);
     }
 
     #[test]

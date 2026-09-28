@@ -2,9 +2,9 @@
 //! `SendMessage`: a command DataPart, a declared workflow command, an answer
 //! to an open human gate, or a conversation turn.
 
-use super::{FeedVis, err_obj, rpc_internal};
+use super::{err_obj, rpc_internal};
 use crate::a2a::Principal;
-use crate::a2a::tasks::{Link, State, Task};
+use crate::a2a::tasks::{Link, State};
 use crate::runtime::events::kinds;
 use crate::runtime::reactor::{PendingKind, Runtime};
 use crate::runtime::surface;
@@ -51,7 +51,19 @@ impl Runtime {
         if self.draining {
             return err_obj(-32000, "the agent is draining");
         }
-        let message = &params["message"];
+        // The caller's message, with the id it is known by from here on: its
+        // own `messageId`, or one minted for it. History records it under that
+        // id, so a client finds its prompt again by the id it sent.
+        let mut message = params["message"].clone();
+        let message_id = message["messageId"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| self.next_id("msg"));
+        if let Some(o) = message.as_object_mut() {
+            o.insert("messageId".into(), json!(message_id));
+        }
+        let message = &message;
         // An `a2a` START NODE registers its command. A workflow declaring
         // `{kind: a2a, command: "review.start"}` is what makes `review.start`
         // something a peer may ask for — otherwise the built-in list would be
@@ -109,10 +121,6 @@ impl Runtime {
                 "message has no text or command part",
             );
         }
-        let message_id = message["messageId"]
-            .as_str()
-            .map(str::to_string)
-            .unwrap_or_else(|| self.next_id("msg"));
         // Continue an existing task (answering an input-required gate) or start
         // a fresh conversation. An id for a task that does not exist yet is the
         // listener's reservation, and `task_create` takes it.
@@ -125,7 +133,7 @@ impl Runtime {
         // resolves the suspended asker directly — the tool call returns the
         // text to the model, the `human` step completes with it — instead of
         // becoming a new conversation turn.
-        if let Some((tid, ctx, owner)) = &existing
+        if let Some((tid, _, owner)) = &existing
             && (owner.as_deref() == Some(principal.id.as_str()) || principal.is_operator())
             && let Some(i) = self
                 .pending
@@ -178,20 +186,21 @@ impl Runtime {
                     json!({"task": tid, "by": principal.id, "addressee": a.describe()}),
                 );
             }
-            // Every attached client sees the answer (the cross-client transcript).
-            self.feed_push(
-                "message",
-                FeedVis::Owner(Some(principal.id.clone())),
-                json!({"contextId": ctx, "taskId": tid, "messageId": message_id, "principal": principal.id, "text": text}),
-            );
+            // The answer enters the gate task's history before the gate
+            // settles, so the transition that follows publishes it: every
+            // attached client sees who answered, and with what, on the task.
+            if let Some(t) = self.tasks.get_mut(tid) {
+                t.record_inbound(message);
+            }
             self.human_answer(i, &text, via, Some(&principal.id.clone()));
-            return json!({"task": self.tasks.get(tid).map(Task::to_a2a).unwrap_or(Value::Null)});
+            return self.task_reply(tid);
         }
         let (task_id, ctx_id) = match existing {
             Some((tid, ctx, owner))
                 if owner.as_deref() == Some(principal.id.as_str()) || principal.is_operator() =>
             {
                 if let Some(t) = self.tasks.get_mut(&tid) {
+                    t.record_inbound(message);
                     t.transition(State::Working, None);
                 }
                 (tid, ctx)
@@ -202,7 +211,12 @@ impl Runtime {
                     .filter(|s| !s.is_empty())
                     .map(str::to_string)
                     .unwrap_or_else(|| self.next_id("a2a"));
-                let tid = self.task_create(&ctx, principal, Link::Turn { ctx: ctx.clone() });
+                let tid = self.task_create(
+                    &ctx,
+                    principal,
+                    Link::Turn { ctx: ctx.clone() },
+                    Some(message),
+                );
                 (tid, ctx)
             }
         };
@@ -221,17 +235,15 @@ impl Runtime {
                 if let Some(t) = self.tasks.get_mut(&task_id) {
                     t.transition(State::Working, None);
                 }
+                // The prompt is already in the task's history — durably, so a
+                // continuation's message survives a restart with the task —
+                // and this `task` event is what lets a SECOND display client
+                // render the transcript a first client is driving. The reply
+                // follows as the task's terminal artifact on its later `task`
+                // events.
+                self.task_persist(&task_id);
                 self.task_sync(&task_id);
-                // Surface the prompt on the interface feed: this
-                // is what lets a SECOND display client render the transcript a
-                // first client is driving — the reply follows as the task's
-                // terminal artifact on its `task` events.
-                self.feed_push(
-                    "message",
-                    FeedVis::Owner(Some(principal.id.clone())),
-                    json!({"contextId": ctx_id, "taskId": task_id, "messageId": message_id, "principal": principal.id, "text": text}),
-                );
-                json!({"task": self.tasks.get(&task_id).map(Task::to_a2a).unwrap_or(Value::Null)})
+                self.task_reply(&task_id)
             }
             Err(e) => {
                 self.a2a_task_fail(&task_id, &e);

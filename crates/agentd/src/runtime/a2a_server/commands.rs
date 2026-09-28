@@ -12,7 +12,7 @@ use super::{TASK_NOT_FOUND, UNSUPPORTED_OPERATION, err_obj, rpc_internal};
 use crate::a2a::Principal;
 use crate::a2a::errors::{self, reason};
 use crate::a2a::principals::workflow_name_of;
-use crate::a2a::tasks::{Link, State, Task};
+use crate::a2a::tasks::{Link, State};
 use crate::runtime::events::kinds;
 use crate::runtime::reactor::{Runtime, may_act_on};
 use crate::runtime::surface::{self, Gate, Handler, Reply};
@@ -188,7 +188,7 @@ impl Runtime {
             .unwrap_or_else(|| self.next_id("a2a"));
         let answer = match route {
             Route::Read(r) => self.read_op(principal, r, &data),
-            Route::Workflow(w) => self.workflow_op(principal, w, &data, &ctx),
+            Route::Workflow(w) => self.workflow_op(principal, w, &data, &ctx, message),
             Route::Subagent(s) => self.subagent_op(principal, op, s, &data),
             Route::Admin(a) => match self.a2a_admin(principal, a, &data) {
                 Ok((text, result)) => Answer::Done {
@@ -226,7 +226,7 @@ impl Runtime {
                     &ctx,
                     principal,
                     link.unwrap_or(Link::Turn { ctx: ctx.clone() }),
-                    State::Completed,
+                    message,
                     text,
                     result,
                 )
@@ -267,9 +267,10 @@ impl Runtime {
         op: WorkflowOp,
         data: &Value,
         ctx: &str,
+        message: &Value,
     ) -> Answer {
         match op {
-            WorkflowOp::Run => Answer::Reply(self.workflow_run(principal, data, ctx)),
+            WorkflowOp::Run => Answer::Reply(self.workflow_run(principal, data, ctx, message)),
             WorkflowOp::Status => {
                 let view: Vec<Value> = match data["run"].as_str() {
                     Some(id) => match self.owned_run(principal, id) {
@@ -336,7 +337,13 @@ impl Runtime {
 
     /// `workflow.run {workflow, inputs?}`: the task is linked to the run it
     /// starts, and nothing is created until every refusal has had its say.
-    fn workflow_run(&mut self, principal: &Principal, data: &Value, ctx: &str) -> Value {
+    fn workflow_run(
+        &mut self,
+        principal: &Principal,
+        data: &Value,
+        ctx: &str,
+        message: &Value,
+    ) -> Value {
         let Some(name) = workflow_name_of(data).map(str::to_string) else {
             return err_obj(errors::INVALID_PARAMS, "workflow.run needs {workflow}");
         };
@@ -374,7 +381,12 @@ impl Runtime {
             return err_obj(rpc_internal(), &format!("shedding: {cause}"));
         }
         let run_id = format!("{}-{}", name, crate::state::ulid::new());
-        let task_id = self.task_create(ctx, principal, Link::Run { id: run_id.clone() });
+        let task_id = self.task_create(
+            ctx,
+            principal,
+            Link::Run { id: run_id.clone() },
+            Some(message),
+        );
         let payload = json!({
             "workflow": name,
             "run_id": run_id,
@@ -389,7 +401,7 @@ impl Runtime {
                     t.transition(State::Working, None);
                 }
                 self.task_sync(&task_id);
-                json!({"task": self.tasks.get(&task_id).map(Task::to_a2a).unwrap_or(Value::Null)})
+                self.task_reply(&task_id)
             }
             Err(e) => err_obj(rpc_internal(), &e),
         }

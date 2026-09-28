@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use crate::checks::util::{
-    feed_method, mock_llm, open, post, rpc, rpc_body, send_command, send_text, text_params,
+    feed_method, mock_llm, open, post, rpc, rpc_body, rpc_value, send_command, text_params,
     wait_ready, write_file,
 };
 use crate::{Category, Check, Harness, Outcome};
@@ -30,7 +30,7 @@ pub fn checks() -> Vec<Check> {
         Check {
             id: "interface/feed-hello-and-replay",
             category: Category::Interface,
-            desc: "SubscribeToEvents opens with a hello and replays a prompt's message event from seq 0",
+            desc: "SubscribeToEvents opens with a hello and replays from seq 0 a task event whose history holds the prompt",
             run: feed_replay,
         },
         Check {
@@ -111,8 +111,11 @@ fn feed_replay(h: &Harness) -> Outcome {
     wait_ready(&addr);
 
     // Create history FIRST, then subscribe from seq 0 — the ring must replay
-    // the prompt's `message` event to the late joiner.
-    let sent = send_text(&addr, 1, "Replay me", false);
+    // to the late joiner a `task` event whose history holds the prompt,
+    // identified by the id it was sent with.
+    let params = text_params("Replay me", None, false);
+    let prompt_id = params["message"]["messageId"].clone();
+    let sent = rpc_value(&addr, 1, "SendMessage", params);
     assert_eq!(
         sent["result"]["task"]["status"]["state"],
         "TASK_STATE_COMPLETED"
@@ -123,9 +126,9 @@ fn feed_replay(h: &Harness) -> Outcome {
     s.set_read_timeout(Some(Duration::from_secs(10))).ok();
     let mut reader = BufReader::new(s);
     let mut saw_hello = false;
-    let mut saw_message = false;
+    let mut saw_prompt = false;
     let deadline = Instant::now() + Duration::from_secs(8);
-    while Instant::now() < deadline && !(saw_hello && saw_message) {
+    while Instant::now() < deadline && !(saw_hello && saw_prompt) {
         let mut line = String::new();
         match reader.read_line(&mut line) {
             Ok(0) | Err(_) => break,
@@ -138,12 +141,12 @@ fn feed_replay(h: &Harness) -> Outcome {
             if r.get("hello").is_some() {
                 saw_hello = true;
             }
-            if r["event"]["kind"] == "message"
-                && r["event"]["data"]["text"]
-                    .as_str()
-                    .is_some_and(|t| t.contains("Replay me"))
+            let first = &r["event"]["data"]["task"]["history"][0];
+            if r["event"]["kind"] == "task"
+                && first["messageId"] == prompt_id
+                && first["parts"][0]["text"] == "Replay me"
             {
-                saw_message = true;
+                saw_prompt = true;
             }
         }
     }
@@ -153,8 +156,9 @@ fn feed_replay(h: &Harness) -> Outcome {
     )
     .and(|| {
         Outcome::require(
-            saw_message,
-            "the ring should replay the prompt's message event from seq 0".to_string(),
+            saw_prompt,
+            "the ring should replay, from seq 0, a task event whose history holds the prompt"
+                .to_string(),
         )
     })
 }

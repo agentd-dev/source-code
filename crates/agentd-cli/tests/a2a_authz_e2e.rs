@@ -879,19 +879,13 @@ fn owners_config(llm: &str, port: u16, b_grants: &str) -> String {
 }
 
 /// The document a command answered with: a read's Message data, or the JSON
-/// artifact of the task a piece of work completed.
+/// DataPart artifact of the task a piece of work completed.
 fn answer(v: &Value) -> Value {
     let r = &v["result"];
     if let Some(doc) = r["message"]["parts"][0].get("data") {
         return doc.clone();
     }
-    let part = &r["task"]["artifacts"][0]["parts"][0];
-    part.get("data").cloned().unwrap_or_else(|| {
-        part["text"]
-            .as_str()
-            .and_then(|t| serde_json::from_str(t).ok())
-            .unwrap_or(Value::Null)
-    })
+    r["task"]["artifacts"][0]["parts"][0]["data"].clone()
 }
 
 fn command_as(addr: &str, bearer: &str, op: &str, args: Value) -> Value {
@@ -1054,9 +1048,10 @@ fn every_command_op_that_names_an_object_is_owner_scoped() {
 
     // A signal that names no run reaches only B's own runs — none here.
     let v = command_as(&addr, TOKEN_B, "workflow.signal", json!({"name": "go"}));
+    // A DataPart's number is a `google.protobuf.Value` double on the wire.
     assert_eq!(
         answer(&v)["delivered"],
-        0,
+        0.0,
         "B's broadcast woke A's run: {v}"
     );
     // The instance's retirement signal, from a user, retires nothing.
@@ -1104,7 +1099,11 @@ fn every_command_op_that_names_an_object_is_owner_scoped() {
         "workflow.signal",
         json!({"name": "go", "run": a.run}),
     );
-    assert_eq!(answer(&v)["delivered"], 1, "the owner's signal lands: {v}");
+    assert_eq!(
+        answer(&v)["delivered"],
+        1.0,
+        "the owner's signal lands: {v}"
+    );
     let deadline = Instant::now() + Duration::from_secs(10);
     while run_state(&addr, &a.run).0 != "completed" {
         assert!(Instant::now() < deadline, "A's run never completed");

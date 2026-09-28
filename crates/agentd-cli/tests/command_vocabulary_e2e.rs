@@ -161,15 +161,18 @@ fn spawn(yaml_for: impl Fn(u16) -> String) -> Daemon {
     panic!("the daemon never bound an A2A listener (5 attempts)");
 }
 
-/// A command's document: a read's Message data, or a task's JSON artifact.
+/// A command's document: a read's Message data, or a task's JSON DataPart artifact.
 fn doc_of(result: &Value) -> Value {
     if let Some(doc) = result["message"]["parts"][0].get("data") {
         return doc.clone();
     }
-    result["task"]["artifacts"][0]["parts"][0]["text"]
-        .as_str()
-        .and_then(|t| serde_json::from_str(t).ok())
-        .unwrap_or(Value::Null)
+    result["task"]["artifacts"][0]["parts"][0]["data"].clone()
+}
+
+/// Who owns the task a `task` feed event carries: its task-annotations/v1
+/// `principal`.
+fn owner_of(event_data: &Value) -> &Value {
+    &event_data["task"]["metadata"][agentd::runtime::surface::TASK_ANNOTATIONS_EXTENSION]["principal"]
 }
 
 /// Collect the observation feed in the background, from its first event.
@@ -646,7 +649,7 @@ fn workflow_run_asks_the_grants_and_the_default_starts_roles_before_any_task_exi
     for who in ["user:scoped", "user:plain"] {
         feed_until(&feed, &format!("{who}'s task event"), |f| {
             f.iter()
-                .any(|v| v["event"]["kind"] == "task" && v["event"]["data"]["principal"] == who)
+                .any(|v| v["event"]["kind"] == "task" && *owner_of(&v["event"]["data"]) == who)
         });
     }
     feed_until(&feed, "the refusals' audit events", |f| {
@@ -661,7 +664,7 @@ fn workflow_run_asks_the_grants_and_the_default_starts_roles_before_any_task_exi
         .into_iter()
         .map(|t| {
             (
-                t["principal"].as_str().unwrap_or_default().to_string(),
+                owner_of(&t).as_str().unwrap_or_default().to_string(),
                 t["task"]["id"].as_str().unwrap_or_default().to_string(),
             )
         })

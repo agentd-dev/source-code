@@ -6,7 +6,7 @@ use super::{FeedVis, TASK_NOT_FOUND, err_obj};
 use crate::a2a::Principal;
 use crate::a2a::errors::{INVALID_PARAMS, TASK_NOT_CANCELABLE};
 use crate::a2a::tasks::{Link, PushTarget, State, Task};
-use crate::a2a::wire::{DEFAULT_PAGE_SIZE, ListView, MAX_PAGE_SIZE};
+use crate::a2a::wire::{Annotations, DEFAULT_PAGE_SIZE, ListView, MAX_PAGE_SIZE};
 use crate::runtime::reactor::{PendingKind, Runtime};
 use serde_json::{Value, json};
 
@@ -187,7 +187,9 @@ fn list_tasks<'a>(
         _ => String::new(),
     };
     Ok(json!({
-        "tasks": page.iter().map(|t| t.summary(view)).collect::<Vec<_>>(),
+        // Annotated until the listener knows which extensions the caller
+        // activated; from then on they follow the activation.
+        "tasks": page.iter().map(|t| t.summary(view, Annotations::Include)).collect::<Vec<_>>(),
         // Always present, empty on the last page: the spec's response has it
         // REQUIRED, and "absent" must never be readable as "there is more".
         "nextPageToken": next,
@@ -260,7 +262,7 @@ impl Runtime {
     pub(super) fn a2a_get_task(&self, principal: &Principal, params: &Value) -> Value {
         let id = params.get("id").and_then(Value::as_str).unwrap_or("");
         match self.tasks.get(id) {
-            Some(t) if t.is_visible_to(principal) => t.to_a2a(),
+            Some(t) if t.is_visible_to(principal) => t.to_a2a(Annotations::Include),
             // Don't disclose existence to a non-owner.
             _ => err_obj(TASK_NOT_FOUND, "task not found"),
         }
@@ -471,46 +473,75 @@ impl Runtime {
         }
         self.task_persist(&id);
         self.task_sync(&id);
-        self.tasks.get(&id).map(Task::to_a2a).unwrap_or(Value::Null)
+        self.task_value(&id)
     }
 
     // ---- task lifecycle ----------------------------------------------------
 
+    /// A task as a reply carries it, `Null` when there is no such task.
+    fn task_value(&self, id: &str) -> Value {
+        self.tasks
+            .get(id)
+            .map(|t| t.to_a2a(Annotations::Include))
+            .unwrap_or(Value::Null)
+    }
+
+    /// The `{task}` answer to a send.
+    pub(crate) fn task_reply(&self, id: &str) -> Value {
+        json!({"task": self.task_value(id)})
+    }
+
     /// Create + persist a fresh task; publish it to the shared view.
     /// Create a task, taking the listener's reserved id when the request that
     /// is being served brought one (see [`Runtime::reserved_task_id`]).
-    pub(crate) fn task_create(&mut self, ctx: &str, principal: &Principal, link: Link) -> String {
+    ///
+    /// `inbound` is the caller's message that opened it, when one did: it is
+    /// the first entry of the task's history, and when it carries a command
+    /// the task records which op it runs. A gate's task passes `None` — its
+    /// first message is the agent's question.
+    pub(crate) fn task_create(
+        &mut self,
+        ctx: &str,
+        principal: &Principal,
+        link: Link,
+        inbound: Option<&Value>,
+    ) -> String {
         let id = match self.reserved_task_id.take() {
             Some(id) => id,
             None => new_task_id(),
         };
-        let task = Task::new(&id, ctx, Some(&principal.id), link);
+        let mut task = Task::new(&id, ctx, Some(&principal.id), link);
+        if let Some(m) = inbound {
+            task.command = super::send::command_op(m);
+            task.record_inbound(m);
+        }
         self.tasks.insert(id.clone(), task);
         self.task_persist(&id);
         self.task_sync(&id);
         id
     }
 
-    /// A command that finishes at once: create the task already terminal.
+    /// A command that finishes at once: create its task already completed,
+    /// opened by the command message `inbound`.
     pub(super) fn task_complete_now(
         &mut self,
         ctx: &str,
         principal: &Principal,
         link: Link,
-        state: State,
+        inbound: &Value,
         text: Option<String>,
         result: Option<Value>,
     ) -> Value {
-        let id = self.task_create(ctx, principal, link);
+        let id = self.task_create(ctx, principal, link, Some(inbound));
         if let Some(t) = self.tasks.get_mut(&id) {
             if let Some(r) = result {
                 t.set_result(r);
             }
-            t.transition(state, text);
+            t.transition(State::Completed, text);
         }
         self.task_persist(&id);
         self.task_sync(&id);
-        json!({"task": self.tasks.get(&id).map(Task::to_a2a).unwrap_or(Value::Null)})
+        self.task_reply(&id)
     }
 
     /// Publish a task transition: to A2A subscribers, and onto the interface
@@ -536,24 +567,14 @@ impl Runtime {
                 {
                     sink.artifact(&t.id, &t.context_id, a.clone());
                 }
-                sink.status(
-                    &t.id,
-                    &t.context_id,
-                    t.state.to_wire(),
-                    t.message.as_deref(),
-                    t.updated,
-                );
+                sink.status(t);
                 // A caller that asked to be told rather than to watch. Fired
                 // from here because this is the one place every transition
                 // passes through, whatever caused it.
                 if !t.push.is_empty() {
                     sink.push(t, allow_private);
                 }
-                self.feed_push(
-                    "task",
-                    FeedVis::Owner(t.principal.clone()),
-                    json!({"task": t.to_a2a(), "link": t.link, "principal": t.principal}),
-                );
+                self.feed_task(t);
             }
             None => {
                 self.feed_push("task.removed", FeedVis::Operator, json!({"id": id}));

@@ -23,16 +23,13 @@ fn command(addr: &str, op: &str, args: Value) -> Value {
         .result(addr)
 }
 
-/// A command's document: a read's Message data, or a task's JSON artifact.
+/// A command's document: a read's Message data, or a task's JSON DataPart artifact.
 fn artifact_json(v: &Value) -> Value {
     if let Some(doc) = v["message"]["parts"][0].get("data") {
         assert!(v.get("task").is_none(), "a read creates no task: {v}");
         return doc.clone();
     }
-    v["task"]["artifacts"][0]["parts"][0]["text"]
-        .as_str()
-        .and_then(|t| serde_json::from_str(t).ok())
-        .unwrap_or(Value::Null)
+    v["task"]["artifacts"][0]["parts"][0]["data"].clone()
 }
 
 /// Poll `workflow.status` for one run until `pred` holds; returns the view.
@@ -201,7 +198,8 @@ fn a_signal_resumes_a_waiting_run() {
         "workflow.signal",
         json!({"name": "go", "payload": {"by": "e2e"}}),
     );
-    assert_eq!(artifact_json(&sig)["delivered"], 1, "{sig}");
+    // A DataPart's number is a `google.protobuf.Value` double on the wire.
+    assert_eq!(artifact_json(&sig)["delivered"], 1.0, "{sig}");
 
     wait_run(&addr, &run_id, 10, "run completed after the signal", |v| {
         v["status"] == "completed"

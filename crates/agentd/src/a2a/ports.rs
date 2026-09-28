@@ -730,17 +730,10 @@ impl StreamSink {
         }
     }
 
-    /// Publish a status transition.
-    pub fn status(
-        &self,
-        task_id: &str,
-        context_id: &str,
-        state: TaskState,
-        message: Option<&str>,
-        at_ms: u64,
-    ) {
-        let ev = crate::a2a::wire::status_event(task_id, context_id, state, message, at_ms);
-        self.spawn_status(task_id.to_string(), ev);
+    /// Publish a task's status as it now is.
+    pub fn status(&self, task: &crate::a2a::tasks::Task) {
+        let ev = crate::a2a::wire::status_event(task);
+        self.spawn_status(task.id.clone(), ev);
     }
 
     /// Deliver this task's state to every webhook registered on it, as the

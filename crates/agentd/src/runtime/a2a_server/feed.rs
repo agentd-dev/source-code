@@ -175,6 +175,23 @@ impl Runtime {
         }
     }
 
+    /// Push a task's `task` event: `{task}`, the spec's `Task` and nothing
+    /// beside it, seen by its owner (and operators).
+    ///
+    /// The task carries its recent history — the prompt that opened it, the
+    /// answer to a gate — so a second client watching the same principal
+    /// renders the transcript from the core object, and there is no separate
+    /// event restating what somebody said. What it is linked to and who owns
+    /// it are the task's annotations, not fields of an agentd envelope.
+    pub(crate) fn feed_task(&self, t: &crate::a2a::tasks::Task) {
+        let task = serde_json::to_value(crate::a2a::wire::task_for_feed(t)).unwrap_or(Value::Null);
+        self.feed_push(
+            "task",
+            FeedVis::Owner(t.principal.clone()),
+            json!({ "task": task }),
+        );
+    }
+
     /// The feed's **section diff**: one hook point in the loop
     /// that catches every state transition the explicit pushes don't — runs,
     /// conversations, subagents, OS children and the slim status — by

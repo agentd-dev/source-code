@@ -405,7 +405,8 @@ impl Runtime {
                 let created = if let Some(run) = &caller.run {
                     let run = run.clone();
                     let ctx = format!("run-{run}");
-                    let tid = self.task_create(&ctx, &principal, Link::Run { id: run.clone() });
+                    let tid =
+                        self.task_create(&ctx, &principal, Link::Run { id: run.clone() }, None);
                     // The run's completion drives this task terminal.
                     if let Some(r) = self.runs.get_mut(&run) {
                         r.task = Some(tid.clone());
@@ -414,7 +415,8 @@ impl Runtime {
                     (tid, false)
                 } else {
                     let ctx = caller.context_id();
-                    let tid = self.task_create(&ctx, &principal, Link::Turn { ctx: ctx.clone() });
+                    let tid =
+                        self.task_create(&ctx, &principal, Link::Turn { ctx: ctx.clone() }, None);
                     (tid, true)
                 };
                 self.reserved_task_id = reserved;

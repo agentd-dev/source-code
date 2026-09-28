@@ -291,19 +291,31 @@ fn subscribe_to_events_streams_cross_client_activity_and_resumes() {
     }
 
     // Client B: send a prompt on a separate connection (blocking).
-    let sent = SendMessage::text("Ping across clients").result(&addr);
+    let prompt = SendMessage::text("Ping across clients");
+    let prompt_id = prompt.params()["message"]["messageId"].clone();
+    let sent = prompt.result(&addr);
     assert_eq!(sent["task"]["status"]["state"], "TASK_STATE_COMPLETED");
 
-    // Client A observes B's prompt (the `message` event) AND the task reaching
-    // terminal with the artifact — the cross-client transcript, no polling.
+    // Client A observes B's prompt — in the history of the task it opened,
+    // under the id B sent it with — AND the task reaching terminal with the
+    // artifact: the cross-client transcript from the core Task, no polling and
+    // no event of agentd's own restating what was said.
     wait_for(&frames, 10, |f| {
         f.iter().any(|v| {
-            v["event"]["kind"] == "message"
-                && v["event"]["data"]["text"]
-                    .as_str()
-                    .is_some_and(|t| t.contains("Ping across clients"))
+            let first = &v["event"]["data"]["task"]["history"][0];
+            v["event"]["kind"] == "task"
+                && first["messageId"] == prompt_id
+                && first["role"] == "ROLE_USER"
+                && first["parts"][0]["text"] == "Ping across clients"
         })
     });
+    {
+        let f = frames.lock().unwrap();
+        assert!(
+            !f.iter().any(|v| v["event"]["kind"] == "message"),
+            "the `message` feed kind is gone: {f:#?}"
+        );
+    }
     wait_for(&frames, 10, |f| {
         f.iter().any(|v| {
             v["event"]["kind"] == "task"

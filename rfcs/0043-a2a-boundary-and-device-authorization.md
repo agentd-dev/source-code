@@ -998,7 +998,12 @@ device authorization grant iff `a2a.device_grant.enabled`, on the listener
 
 The user code alphabet is `BCDFGHJKLMNPQRSTVWXZ` (no vowels, so no words). There
 is no refresh token. `/oauth2/device_authorization` is limited per source
-(burst 5, one per 12 s; at most 4 pending per source, 64 in all), and the
+(the TCP peer: an IPv4 address or an IPv6 /64, so behind a reverse proxy every
+device is one source) — burst 5, one per 12 s; at most 4 pending per source, 16
+per network (an IPv6 /48, or the IPv4 address), 64 in all. At the global bound a
+newcomer is not refused while some network holds more than one code beyond its
+own count: that network's oldest code still waiting on an operator is expired
+(its device is told `expired_token`), so a flood displaces only itself. The
 device-code token exchange has its own bucket (burst 30, one per second).
 Codes and tokens are never logged. Every `/oauth2/*` response is `no-store`
 and passes the CORS gate.

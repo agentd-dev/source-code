@@ -523,11 +523,22 @@ fn task_id_rules() {
         done["task"]["status"]["state"], "TASK_STATE_COMPLETED",
         "{done}"
     );
-    let mut blank = SendMessage::text("hello").return_immediately().params();
-    blank["message"]["taskId"] = json!("");
-    let fresh = call(&d, USER_A, 11, "SendMessage", blank).json();
-    let fresh_id = fresh["result"]["task"]["id"].as_str().unwrap_or_default();
-    assert!(is_uuid_v4(fresh_id) && fresh_id != id, "{fresh}");
+    // Empty or blank alike: the listener reads a blank id as a2a-rs does,
+    // as none, so the send is a new task rather than a lookup of the id
+    // generated in its place.
+    for (n, none) in ["", "  "].into_iter().enumerate() {
+        let mut blank = SendMessage::text("hello").return_immediately().params();
+        blank["message"]["taskId"] = json!(none);
+        let fresh = call(&d, USER_A, 20 + n as i64, "SendMessage", blank).json();
+        let fresh_id = fresh["result"]["task"]["id"].as_str().unwrap_or_default();
+        assert!(is_uuid_v4(fresh_id) && fresh_id != id, "{none:?}: {fresh}");
+    }
+    // A command with a blank id names no task either.
+    let status = SendMessage::command("status", json!({}))
+        .task("  ")
+        .bearer(OPERATOR)
+        .post(&d.addr);
+    assert!(status.get("error").is_none(), "{status}");
 
     let before_a = task_count(&d, USER_A);
     let before_b = task_count(&d, AGENT_B);

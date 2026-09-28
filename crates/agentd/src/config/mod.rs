@@ -162,6 +162,16 @@ pub enum ServeTarget {
     Unix { path: String },
 }
 
+/// The socket path a listen or peer spec names, when it names a unix socket
+/// (`unix:///run/a.sock` or `unix:/run/a.sock`). The one statement of the
+/// unix spellings: whatever asks "is this a socket?" asks it here, so a
+/// spelling added later cannot open, on a socket, what only a TCP listener
+/// serves.
+pub fn unix_socket_path(spec: &str) -> Option<&str> {
+    spec.strip_prefix("unix://")
+        .or_else(|| spec.strip_prefix("unix:"))
+}
+
 impl ServeTarget {
     /// Parse a `--serve-mcp` value: `https://host:port` (or loopback
     /// `http://host:port` for dev). Returns a [`ConfigError::Usage`] (exit 2,
@@ -199,10 +209,7 @@ impl ServeTarget {
                 tls,
             });
         }
-        if let Some(path) = spec
-            .strip_prefix("unix://")
-            .or_else(|| spec.strip_prefix("unix:"))
-        {
+        if let Some(path) = unix_socket_path(spec) {
             if path.is_empty() {
                 return Err(usage(format!("unix listener needs a socket path: {spec}")));
             }
@@ -312,10 +319,7 @@ impl A2aEndpoint {
         // protocol over a unix socket, authenticated by the kernel (uid) and
         // the socket file's mode instead of TLS. The client dialer branches on
         // the same string, so the variant stays one.
-        if let Some(path) = spec
-            .strip_prefix("unix://")
-            .or_else(|| spec.strip_prefix("unix:"))
-        {
+        if let Some(path) = unix_socket_path(spec) {
             if path.is_empty() || !cfg!(unix) {
                 return Err(usage(format!(
                     "--a2a-peer: unix: endpoint needs a socket path (unix-only): {spec}"

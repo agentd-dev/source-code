@@ -285,10 +285,31 @@ export function applySuggestion(input: string, sug: Suggestion): string {
 /** A message prepared for sending: routed and interpolated. */
 export interface Prepared {
   text: string;
-  /** A LEADING `#task-…` target — answer/continue that task. */
+  /** A LEADING `#<task id>` target — answer/continue that task. */
   taskId?: string;
   /** A LEADING `#<ctx>` target — address that conversation. */
   contextId?: string;
+}
+
+/**
+ * The one shape a server mints a task id in: a UUIDv4. A client never names
+ * a task — it only continues one — so an id in this shape that the mirror
+ * has not seen (an older task, one another client opened) is a task, while
+ * a free-form name is a conversation the message may start.
+ */
+const SERVER_TASK_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+/**
+ * Where a leading `#<id>` goes: a task the mirror holds, a conversation it
+ * holds, else by shape — a server-minted id is taken for a task (the
+ * caller's conversations are all in the mirror, its older tasks need not be),
+ * and anything else names a conversation. A task id that turns out not to be
+ * one is refused by the server as not found, never sent somewhere else.
+ */
+function targetOf(id: string, s: MirrorState): Pick<Prepared, 'taskId' | 'contextId'> {
+  if (s.tasks.has(id)) return { taskId: id };
+  if (s.conversations.has(id)) return { contextId: id };
+  return SERVER_TASK_ID.test(id) ? { taskId: id } : { contextId: id };
 }
 
 /** Apply the `#` routing and `$` interpolation to an outgoing message. */
@@ -297,9 +318,7 @@ export function prepare(input: string, s: MirrorState): Prepared {
   const out: Prepared = { text };
   const m = /^#(\S+)\s+(.*)$/s.exec(text);
   if (m) {
-    const id = m[1];
-    if (s.tasks.has(id) || id.startsWith('task-')) out.taskId = id;
-    else out.contextId = id;
+    Object.assign(out, targetOf(m[1], s));
     text = m[2];
   }
   // `$name` for KNOWN, published names only; `$$` escapes a literal dollar.

@@ -53,7 +53,29 @@ pub enum SourceKey {
     V6Prefix([u8; 8]),
 }
 
+/// The coarser unit a source belongs to: an IPv4 address still (one is
+/// already scarce), an IPv6 /48 — the allocation a site, or one free tunnel
+/// account, is routinely handed. The /64 sources under it are one party's to
+/// spend, so a bound meant to hold against one party counts them together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NetworkKey {
+    V4([u8; 4]),
+    V6Prefix([u8; 6]),
+}
+
 impl SourceKey {
+    /// The network this source is part of.
+    pub fn network(self) -> NetworkKey {
+        match self {
+            SourceKey::V4(o) => NetworkKey::V4(o),
+            SourceKey::V6Prefix(p) => {
+                let mut prefix = [0u8; 6];
+                prefix.copy_from_slice(&p[..6]);
+                NetworkKey::V6Prefix(prefix)
+            }
+        }
+    }
+
     pub fn of(ip: IpAddr) -> SourceKey {
         match ip.to_canonical() {
             IpAddr::V4(v4) => SourceKey::V4(v4.octets()),
@@ -338,6 +360,14 @@ mod tests {
         let mapped: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
         let v4: IpAddr = "127.0.0.1".parse().unwrap();
         assert_eq!(SourceKey::of(mapped), SourceKey::of(v4));
+    }
+
+    #[test]
+    fn a_network_is_a_v6_slash_48_or_one_v4_address() {
+        let net = |ip: &str| SourceKey::of(ip.parse().unwrap()).network();
+        assert_eq!(net("2001:db8:1:2::1"), net("2001:db8:1:ff::1"));
+        assert_ne!(net("2001:db8:1:2::1"), net("2001:db8:2:2::1"));
+        assert_ne!(net("10.0.0.1"), net("10.0.0.2"));
     }
 
     #[test]

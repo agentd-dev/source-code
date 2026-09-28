@@ -12,7 +12,7 @@ use futures_util::StreamExt;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-use super::cors::{allow_origin, origin_allowed};
+use super::cors::{self, allow_origin};
 use super::feed::feed_stream;
 use super::identity::{
     Peer, PeerId, challenge, evidence_of, forbidden, is_session_token, json_with, too_many,
@@ -112,14 +112,8 @@ async fn dispatch(
     // body is even parsed, so an unauthorised origin reaches no dispatch logic
     // — and never counted as a failure: it guesses nothing, and counting it
     // would let any web page lock the operator's own console out.
-    let origin = headers
-        .get(header::ORIGIN)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
-    if let Some(o) = &origin
-        && !origin_allowed(o, &app.origins())
-    {
-        return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
+    if let Err(refused) = cors::gate(&headers, &app.origins()) {
+        return refused.into_response();
     }
 
     // Authentication, from the headers and the connection alone: a caller
@@ -386,10 +380,13 @@ async fn dispatch(
     // field is not a malformed request — and the task the message names, if
     // any, is what the caller meant: continue that task. Only this layer sees
     // the message as the caller sent it (a2a-rs writes a generated id into an
-    // empty `taskId` before any port runs), so it says so to the ports.
+    // empty `taskId` before any port runs), so it says so to the ports. A
+    // blank id names nothing, by a2a-rs's own rule (`supplied`, which trims):
+    // were the two layers to disagree, a whitespace id would be looked up as
+    // the task a2a-rs generated in its place.
     let named_task = if send {
         match sent_message(&params) {
-            Ok(message) => Some(message.task_id).filter(|t| !t.is_empty()),
+            Ok(message) => Some(message.task_id).filter(|t| !t.trim().is_empty()),
             Err(why) => return err(id, errors::INVALID_PARAMS, &why),
         }
     } else {

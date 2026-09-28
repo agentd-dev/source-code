@@ -35,7 +35,8 @@
 //! appears in the request body answers); otherwise `turns[i]` answers where `i`
 //! is the number of `role: tool` messages already in the transcript (clamped to
 //! the last turn). A turn carries `content` (final text) or `tool_calls`, an
-//! optional `usage`, and an optional `delay_ms`.
+//! optional `usage`, and an optional `delay_ms`; `"echo_tool_result": true`
+//! answers with the content of the last tool result in the transcript.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -347,6 +348,9 @@ fn playbook_response(playbook: &serde_json::Value, body: &str) -> String {
         })
     } else {
         let content = match turn.get("content") {
+            _ if turn.get("echo_tool_result") == Some(&serde_json::Value::Bool(true)) => {
+                last_tool_result(body)
+            }
             Some(serde_json::Value::String(s)) => s.clone(),
             Some(other) => other.to_string(),
             None => "mock-llm done".to_string(),
@@ -360,6 +364,22 @@ fn playbook_response(playbook: &serde_json::Value, body: &str) -> String {
         resp["usage"] = u;
     }
     resp.to_string()
+}
+
+/// The content of the last `role: tool` message in a request body — what an
+/// `echo_tool_result` turn answers with, so a test can read back what a tool
+/// handed a model that is not its own (a subagent's, say) through the answer
+/// that model gives.
+fn last_tool_result(body: &str) -> String {
+    let parsed: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+    parsed["messages"]
+        .as_array()
+        .and_then(|m| m.iter().rev().find(|m| m["role"] == "tool"))
+        .map(|m| match &m["content"] {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        })
+        .unwrap_or_else(|| "mock-llm: no tool result to echo".to_string())
 }
 
 fn final_answer(text: &str) -> String {
@@ -477,6 +497,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(m.text.as_deref(), Some(r#"{"intent":"status"}"#));
+    }
+
+    #[test]
+    fn an_echo_turn_answers_with_the_last_tool_result() {
+        let pb = serde_json::json!({"turns": [{"echo_tool_result": true}]});
+        let body = r#"{"messages":[{"role":"tool","content":"first"},{"role":"assistant","content":null},{"role":"tool","content":"second"}]}"#;
+        let t = openai::parse_response(playbook_response(&pb, body).as_bytes()).unwrap();
+        assert_eq!(t.text.as_deref(), Some("second"));
     }
 
     #[test]

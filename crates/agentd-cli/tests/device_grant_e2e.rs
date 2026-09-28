@@ -591,10 +591,20 @@ fn ownership_survives_re_login() {
 }
 
 /// `as` is required and well formed, never a reserved name and never a name
-/// a configured rule holds; a second approval of one name says so.
+/// a configured rule holds — of any role, in any case; a second approval of
+/// one name says so.
 #[test]
 fn approve_names_are_required_and_well_formed() {
-    let (mut daemon, addr) = loopback(CI_RULE, MEMORY);
+    // An agent-role rule, spelled with capitals: it is `agent:Peer-Bot`, so
+    // only the check against the rules in force stands between it and a
+    // device approved as `peer-bot`.
+    let rules = format!(
+        "{CI_RULE}\
+         \x20   - id: Peer-Bot\n\
+         \x20     match: {{ bearer_ref: \"{{{{secret:AGENTD_DG_PEER}}}}\" }}\n\
+         \x20     role: agent\n"
+    );
+    let (mut daemon, addr) = loopback(&rules, MEMORY);
     let (_, uc, _) = device_code(&addr, "client_id=e2e");
     let long = "a".repeat(65);
     let mut bad: Vec<Value> = vec![
@@ -611,20 +621,20 @@ fn approve_names_are_required_and_well_formed() {
         let v = command_as(&addr, OPS_TOKEN, "auth.device.approve", args.clone());
         assert_eq!(v["error"]["code"], -32602, "{args}: {v}");
     }
-    let v = command_as(
-        &addr,
-        OPS_TOKEN,
-        "auth.device.approve",
-        json!({"user_code": uc, "as": "ci"}),
-    );
-    assert_eq!(v["error"]["code"], -32602, "{v}");
-    assert!(
-        v["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("principal rule"),
-        "the refusal names the rule: {v}"
-    );
+    for (name, rule) in [("ci", "ci"), ("peer-bot", "Peer-Bot")] {
+        let v = command_as(
+            &addr,
+            OPS_TOKEN,
+            "auth.device.approve",
+            json!({"user_code": uc, "as": name}),
+        );
+        assert_eq!(v["error"]["code"], -32602, "{name}: {v}");
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(
+            msg.contains("principal rule") && msg.contains(&format!("id {rule})")),
+            "the refusal names the rule: {v}"
+        );
+    }
     // Nothing above approved it.
     let pending = command_as(&addr, OPS_TOKEN, "auth.device.pending", json!({}));
     assert_eq!(answer(&pending)["pending"][0]["user_code"], uc, "{pending}");

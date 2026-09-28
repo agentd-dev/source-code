@@ -529,7 +529,7 @@ pub fn gate_open(spec: &OpSpec, s: &Settings) -> bool {
             .a2a
             .listen
             .as_deref()
-            .is_some_and(|l| !l.starts_with("unix:")),
+            .is_some_and(|l| crate::config::unix_socket_path(l).is_none()),
     }
 }
 
@@ -605,10 +605,10 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(served(None, false), Vec::<&str>::new());
-        assert_eq!(
-            served(Some("unix:///run/a.sock"), false),
-            Vec::<&str>::new()
-        );
+        // Every spelling the listener parses as a socket.
+        for socket in ["unix:///run/a.sock", "unix:/run/a.sock"] {
+            assert_eq!(served(Some(socket), false), Vec::<&str>::new(), "{socket}");
+        }
         assert_eq!(
             served(Some("http://127.0.0.1:0"), false),
             ["auth.sessions", "auth.sessions.revoke"]

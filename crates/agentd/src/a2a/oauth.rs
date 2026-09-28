@@ -38,7 +38,7 @@ use serde_json::{Value, json};
 
 use crate::a2a::Principal;
 use crate::a2a::principals::{SESSION_TOKEN_PREFIX, SessionCheck, SessionVerifier};
-use crate::a2a::serve::limits::{SourceKey, SourceLimiter};
+use crate::a2a::serve::limits::{NetworkKey, SourceKey, SourceLimiter};
 use crate::config::v2::{self, DeviceScope, Role};
 
 // ---- the constants ----------------------------------------------------------
@@ -93,8 +93,14 @@ pub const TOKEN_BURST: u32 = 30;
 pub const TOKEN_REFILL: Duration = Duration::from_secs(1);
 /// Codes one source may have waiting at once.
 pub const PENDING_PER_SOURCE: usize = 4;
+/// Codes one network (an IPv6 /48; for IPv4, the source itself) may have
+/// waiting at once: a quarter of the table, so the /64s of one allocation —
+/// 65536 of them in a /48 — never fill it between them.
+pub const PENDING_PER_NETWORK: usize = 16;
 /// Codes waiting at once across every source — what bounds the operator's
-/// `auth.device.pending` and this table, however many addresses ask.
+/// `auth.device.pending` and this table, however many addresses ask. A
+/// newcomer at the bound is not refused while some network holds more than
+/// its share: that network's oldest waiting code gives way.
 pub const PENDING_GLOBAL: usize = 64;
 
 /// The current time in epoch milliseconds. Injected so the tests can run a
@@ -216,10 +222,26 @@ impl Session {
         json!({"sid": self.sid, "name": self.name, "principal": self.principal, "reason": reason})
     }
 
-    /// The feed's `auth` event for this session's end.
+    /// The feed's `auth` event for this session's end, in the shape every
+    /// `auth` event has ([`auth_event`]): the session's scope is its role.
     pub fn revoked_event(&self) -> Value {
-        json!({"event": "revoked", "sid": self.sid, "name": self.name, "principal": self.principal})
+        let mut v = auth_event("revoked", &self.client_id, role_name(self.role));
+        v["sid"] = json!(self.sid);
+        if let Some(n) = &self.name {
+            v["name"] = json!(n);
+        }
+        v
     }
+}
+
+/// The skeleton of a feed `auth` event: what it is, and the `client_id` and
+/// `scope` every one of them carries, so an operator's client can say which
+/// device and what reach whatever happened. The optional fields
+/// (`user_code`, `peer`, `sid`, `name`) are added only when there is a value
+/// — never as `null` — and nothing else is: who a session acts as follows
+/// from the scope and the name, and the feed's schema has no room for more.
+pub fn auth_event(event: &str, client_id: &str, scope: &str) -> Value {
+    json!({"event": event, "client_id": client_id, "scope": scope})
 }
 
 fn role_name(r: Role) -> &'static str {
@@ -616,6 +638,26 @@ pub struct PendingView {
 }
 
 impl PendingView {
+    /// The feed's `auth` event for this authorization: `pending` and
+    /// `denied` carry the scope the device asked for.
+    pub fn event(&self, event: &str) -> Value {
+        let mut v = auth_event(event, &self.client_id, self.requested.as_str());
+        v["user_code"] = json!(display_user_code(&self.user_code));
+        if let Some(p) = self.peer {
+            v["peer"] = json!(p.to_string());
+        }
+        v
+    }
+
+    /// The `approved` event: the scope granted, which may be narrower than
+    /// the one asked for, and the name the device now acts under.
+    pub fn approved_event(&self, name: &str, granted: DeviceScope) -> Value {
+        let mut v = self.event("approved");
+        v["scope"] = json!(granted.as_str());
+        v["name"] = json!(name);
+        v
+    }
+
     pub fn view(&self) -> Value {
         json!({
             "user_code": display_user_code(&self.user_code),
@@ -649,6 +691,10 @@ impl Authorization {
     /// flood is what an operator does to make room.
     fn occupies(&self, now: u64) -> bool {
         !self.expired(now) && self.decision != Decision::Denied
+    }
+
+    fn network(&self) -> Option<NetworkKey> {
+        self.source.map(SourceKey::network)
     }
 }
 
@@ -689,6 +735,63 @@ impl DeviceGrant {
     fn prune(&self, table: &mut HashMap<String, Authorization>, now: u64) {
         let grace = ms(self.code_ttl);
         table.retain(|_, a| now < a.expires_ms.saturating_add(grace));
+    }
+
+    /// At the global bound, free a slot for a newcomer from `network`, which
+    /// holds `ours` of them: the network waiting on the most codes gives up
+    /// its oldest one, if it holds more than the newcomer would after. So
+    /// however many networks a flood comes from, a party asking for the first
+    /// time is never refused on its account — the flood only ever displaces
+    /// itself — while shares that are already even stay put.
+    ///
+    /// Only a code still waiting on an operator gives way; an approved one is
+    /// the operator's decision. It is expired, not removed, so its device's
+    /// next poll is told `expired_token` and may start again.
+    fn make_room(
+        t: &mut HashMap<String, Authorization>,
+        now: u64,
+        network: Option<NetworkKey>,
+        ours: usize,
+    ) -> bool {
+        // Per network: how many codes it has waiting, and its oldest one (by
+        // age, then code, so which one gives way among equals is fixed).
+        struct Held<'t> {
+            count: usize,
+            oldest: (u64, &'t str),
+            key: &'t str,
+        }
+        let mut held: HashMap<Option<NetworkKey>, Held<'_>> = HashMap::new();
+        for (key, a) in t.iter() {
+            if !(a.occupies(now) && a.decision == Decision::Pending) {
+                continue;
+            }
+            let age = (a.requested_ms, a.user_code.as_str());
+            let h = held.entry(a.network()).or_insert(Held {
+                count: 0,
+                oldest: age,
+                key,
+            });
+            h.count += 1;
+            if age < h.oldest {
+                (h.oldest, h.key) = (age, key);
+            }
+        }
+        let Some(biggest) = held
+            .iter()
+            .filter(|(n, _)| **n != network)
+            .map(|(_, h)| h)
+            .max_by(|a, b| a.count.cmp(&b.count).then(b.oldest.cmp(&a.oldest)))
+        else {
+            return false;
+        };
+        if biggest.count <= ours + 1 {
+            return false;
+        }
+        let victim = biggest.key.to_string();
+        if let Some(a) = t.get_mut(&victim) {
+            a.expires_ms = now;
+        }
+        true
     }
 
     /// The configured scopes.
@@ -777,8 +880,8 @@ impl DeviceGrant {
     }
 
     /// Refuse the pending authorization `typed` names, or every one when
-    /// `None`; returns the codes refused.
-    pub fn deny(&self, typed: Option<&str>) -> Result<Vec<String>, String> {
+    /// `None`; returns what was refused, oldest first.
+    pub fn deny(&self, typed: Option<&str>) -> Result<Vec<PendingView>, String> {
         let code = match typed {
             Some(t) => {
                 Some(normalize_user_code(t).ok_or_else(|| format!("{t:?} is not a device code"))?)
@@ -794,7 +897,7 @@ impl DeviceGrant {
                 && code.as_deref().is_none_or(|c| c == a.user_code)
             {
                 a.decision = Decision::Denied;
-                out.push(a.user_code.clone());
+                out.push(a.view());
             }
         }
         if let Some(c) = &code
@@ -805,7 +908,7 @@ impl DeviceGrant {
                 display_user_code(c)
             ));
         }
-        out.sort();
+        out.sort_by(|a, b| (a.requested_ms, &a.user_code).cmp(&(b.requested_ms, &b.user_code)));
         Ok(out)
     }
 }
@@ -983,10 +1086,12 @@ impl Authority {
         let source = peer.map(SourceKey::of);
         let mut t = self.device.table();
         self.device.prune(&mut t, now);
+        let network = source.map(SourceKey::network);
         let live = t.values().filter(|a| a.occupies(now));
-        let (mine, all) = live.fold((0, 0), |(m, a), x| {
+        let (mine, ours, all) = live.fold((0, 0, 0), |(m, n, a), x| {
             (
                 m + usize::from(source.is_some() && x.source == source),
+                n + usize::from(network.is_some() && x.network() == network),
                 a + 1,
             )
         });
@@ -996,7 +1101,13 @@ impl Authority {
                 "this source already has as many sign-ins waiting as it may",
             );
         }
-        if all >= PENDING_GLOBAL {
+        if ours >= PENDING_PER_NETWORK {
+            return Reply::limited(
+                AUTHORIZE_REFILL.as_secs(),
+                "this network already has as many sign-ins waiting as it may",
+            );
+        }
+        if all >= PENDING_GLOBAL && !DeviceGrant::make_room(&mut t, now, network, ours) {
             return Reply::limited(
                 AUTHORIZE_REFILL.as_secs(),
                 "too many sign-ins are waiting; retry later",
@@ -1022,21 +1133,20 @@ impl Authority {
             }
         };
         let expires_ms = now.saturating_add(ms(self.device.code_ttl));
-        t.insert(
-            hash(&device_code),
-            Authorization {
-                user_code: user_code.clone(),
-                client_id: client_id.to_string(),
-                requested,
-                peer,
-                source,
-                requested_ms: now,
-                expires_ms,
-                interval_ms: ms(POLL_INTERVAL),
-                last_poll_ms: None,
-                decision: Decision::Pending,
-            },
-        );
+        let authorization = Authorization {
+            user_code: user_code.clone(),
+            client_id: client_id.to_string(),
+            requested,
+            peer,
+            source,
+            requested_ms: now,
+            expires_ms,
+            interval_ms: ms(POLL_INTERVAL),
+            last_poll_ms: None,
+            decision: Decision::Pending,
+        };
+        let pending = authorization.view();
+        t.insert(hash(&device_code), authorization);
         let shown = display_user_code(&user_code);
         let mut r = Reply::json(
             200,
@@ -1048,13 +1158,7 @@ impl Authority {
                 "interval": POLL_INTERVAL.as_secs(),
             }),
         );
-        r.notices.push(Notice::Pending(json!({
-            "event": "pending",
-            "user_code": shown,
-            "client_id": client_id,
-            "scope": requested.as_str(),
-            "peer": peer.map(|p| p.to_string()),
-        })));
+        r.notices.push(Notice::Pending(pending.event("pending")));
         r
     }
 
@@ -1353,6 +1457,103 @@ mod tests {
         }
     }
 
+    /// The feed's `auth` schema, as the FeedKind contract states it:
+    /// `{event, client_id, scope, user_code?, peer?, sid?, name?}`, every
+    /// value a string and nothing else — so the feed's own schema check can
+    /// never trip on an event this module builds.
+    fn meets_the_auth_contract(v: &Value) {
+        let o = v
+            .as_object()
+            .unwrap_or_else(|| panic!("not an object: {v}"));
+        assert!(
+            ["pending", "approved", "denied", "revoked", "launch"]
+                .contains(&o.get("event").and_then(Value::as_str).unwrap_or("")),
+            "event: {v}"
+        );
+        for required in ["client_id", "scope"] {
+            assert!(
+                o.get(required).is_some_and(Value::is_string),
+                "{required}: {v}"
+            );
+        }
+        for (k, val) in o {
+            assert!(
+                [
+                    "event",
+                    "client_id",
+                    "scope",
+                    "user_code",
+                    "peer",
+                    "sid",
+                    "name"
+                ]
+                .contains(&k.as_str()),
+                "{k} is not in the contract: {v}"
+            );
+            assert!(val.is_string(), "{k} is a string when present: {v}");
+        }
+    }
+
+    #[test]
+    fn every_auth_event_meets_the_feed_contract() {
+        let f = Fixture::new(json!({"enabled": true, "scopes": ["user", "operator"]}));
+        // pending: from a peer, and (as a unix-socket-less listener never
+        // is, but the builder must not care) from none.
+        let r = f.authorize_from("10.0.0.7", "client_id=cli&scope=operator");
+        let [Notice::Pending(pending)] = &r.notices[..] else {
+            panic!("one pending notice: {:?}", r.notices);
+        };
+        meets_the_auth_contract(pending);
+        assert_eq!(pending["scope"], "operator", "{pending}");
+        assert_eq!(pending["peer"], "10.0.0.7", "{pending}");
+        let mut quiet = f.auth.device.pending()[0].clone();
+        quiet.peer = None;
+        meets_the_auth_contract(&quiet.event("pending"));
+
+        // approved: the granted scope and the name.
+        let view = f.auth.device.pending()[0].clone();
+        let approved = view.approved_event("alice", DeviceScope::User);
+        meets_the_auth_contract(&approved);
+        assert_eq!(
+            (&approved["scope"], &approved["name"]),
+            (&json!("user"), &json!("alice"))
+        );
+
+        // denied: every one refused, each with who asked and for what.
+        f.code("10.0.0.8", "client_id=other");
+        let denied = f.auth.device.deny(None).unwrap();
+        assert_eq!(denied.len(), 2);
+        for d in &denied {
+            let e = d.event("denied");
+            meets_the_auth_contract(&e);
+            assert_eq!(e["event"], "denied");
+        }
+        let mut who: Vec<Value> = denied
+            .iter()
+            .map(|d| d.event("denied")["client_id"].clone())
+            .collect();
+        who.sort_by_key(Value::to_string);
+        assert_eq!(who, [json!("cli"), json!("other")]);
+
+        // revoked: a named session, and one with no name (a launch's).
+        f.session("10.0.0.9", "bob");
+        let ended = f.auth.sessions().revoke(&Revoke::Name("bob".into()));
+        let [s] = &ended[..] else {
+            panic!("one session: {ended:?}")
+        };
+        let revoked = s.revoked_event();
+        meets_the_auth_contract(&revoked);
+        assert_eq!(
+            (&revoked["sid"], &revoked["name"], &revoked["scope"]),
+            (&json!(s.sid), &json!("bob"), &json!("user"))
+        );
+        let nameless = Session {
+            name: None,
+            ..s.clone()
+        };
+        meets_the_auth_contract(&nameless.revoked_event());
+    }
+
     #[test]
     fn user_code_is_8_chars_of_the_base20_alphabet_and_normalises_input() {
         let f = Fixture::new(json!({"enabled": true}));
@@ -1614,15 +1815,85 @@ mod tests {
             }
         }
         assert_eq!(f.auth.device.pending().len(), PENDING_GLOBAL);
-        let r = f.authorize_from("10.3.0.1", "client_id=cli");
-        assert_eq!(r.status, 429, "a fresh source over the global cap");
-        // Denying frees the slots; expiry does too.
+        // Denying frees a slot.
         let first = f.auth.device.pending()[0].user_code.clone();
         f.auth.device.deny(Some(&first)).unwrap();
         f.code("10.3.0.1", "client_id=cli");
+        // At the cap a source holding fewer takes from one holding the most,
+        // but never past an even share: at 3 against 4 it would only swap.
+        f.code("10.3.0.1", "client_id=cli");
+        f.code("10.3.0.1", "client_id=cli");
+        let r = f.authorize_from("10.3.0.1", "client_id=cli");
+        assert_eq!(r.status, 429, "even shares over the global cap: {r:?}");
+        assert_eq!(f.auth.device.pending().len(), PENDING_GLOBAL);
+        // Expiry frees every slot.
         f.advance(Duration::from_secs(11 * 60));
         assert!(f.auth.device.pending().is_empty());
         f.code("10.3.0.2", "client_id=cli");
+    }
+
+    /// One IPv6 allocation is one party: the /64s under a /48 share a quarter
+    /// of the table between them, however many of them ask.
+    #[test]
+    fn one_v6_allocation_cannot_fill_the_table() {
+        let f = Fixture::new(json!({"enabled": true}));
+        let mut admitted = 0;
+        for s in 0..(PENDING_GLOBAL / PENDING_PER_SOURCE) {
+            for _ in 0..PENDING_PER_SOURCE {
+                let r = f.authorize_from(&format!("2001:db8:7:{s:x}::1"), "client_id=cli");
+                admitted += usize::from(r.status == 200);
+            }
+        }
+        assert_eq!(admitted, PENDING_PER_NETWORK);
+        let r = f.authorize_from("2001:db8:7:ff::1", "client_id=cli");
+        assert_eq!(r.status, 429, "a fresh /64 of the same /48: {r:?}");
+        // Another allocation is untouched by it.
+        f.code("2001:db8:8::1", "client_id=cli");
+    }
+
+    /// A flood from many networks fills the table; a party asking for the
+    /// first time still gets a code, and the flood gives way — the oldest
+    /// waiting code of the network holding the most, whose device is told its
+    /// code expired. An approved code never gives way.
+    #[test]
+    fn a_newcomer_displaces_the_biggest_holder_at_the_global_cap() {
+        let f = Fixture::new(json!({"enabled": true}));
+        let networks = PENDING_GLOBAL / PENDING_PER_NETWORK;
+        // Each network's first code, oldest network first.
+        let mut firsts = Vec::new();
+        for n in 0..networks {
+            for s in 0..(PENDING_PER_NETWORK / PENDING_PER_SOURCE) {
+                for i in 0..PENDING_PER_SOURCE {
+                    let code = f.code(&format!("2001:db8:{n:x}:{s:x}::1"), "client_id=cli");
+                    if s == 0 && i == 0 {
+                        firsts.push(code);
+                    }
+                    f.advance(Duration::from_millis(1));
+                }
+            }
+        }
+        assert_eq!(f.auth.device.pending().len(), PENDING_GLOBAL);
+        // The very oldest is approved: the operator decided, so it stays, and
+        // its network now holds fewer waiting codes than the others.
+        let (approved_dc, approved_uc) = firsts[0].clone();
+        f.approve(&approved_uc, "alice", None);
+        f.code("198.51.100.7", "client_id=newcomer");
+        assert_eq!(
+            f.auth.device.pending().len() + 1,
+            PENDING_GLOBAL,
+            "one waiting code gave way, and the approved one still holds its slot"
+        );
+        // The flood only displaces itself: asking again from the network that
+        // just gave way takes nothing from anyone.
+        let r = f.authorize_from("2001:db8:1:0::1", "client_id=cli");
+        assert_eq!(r.status, 429, "{r:?}");
+        f.advance(POLL_INTERVAL);
+        assert_eq!(f.poll(&approved_dc, "cli").status, 200, "approved survives");
+        // The one that gave way: the oldest code of the networks holding the
+        // most — network 1's first — and its device is told it expired.
+        let (displaced_dc, _) = &firsts[1];
+        let r = f.poll(displaced_dc, "cli");
+        assert_eq!(error_of(&r), "expired_token", "{r:?}");
     }
 
     #[test]

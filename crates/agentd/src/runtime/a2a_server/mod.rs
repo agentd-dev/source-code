@@ -30,8 +30,8 @@ use std::sync::mpsc::{Sender, SyncSender, sync_channel};
 use std::time::Duration;
 
 mod admin;
-/// The `auth.*` command ops. Empty until the device grant lands; declared now so
-/// the units that fill it never have to edit this file.
+/// The `auth.*` command ops: the operator's side of the device grant and the
+/// session list, all on the operator floor.
 mod auth_ops;
 mod card;
 mod commands;

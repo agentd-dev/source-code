@@ -398,10 +398,8 @@ async fn oauth_call(
     use axum::response::IntoResponse;
     let origin = cors::origin_of(headers).map(str::to_string);
     let resp = 'resp: {
-        if let Some(o) = &origin
-            && !cors::origin_allowed(o, &app.origins())
-        {
-            break 'resp (StatusCode::FORBIDDEN, "origin not allowed").into_response();
+        if let Err(refused) = cors::gate(headers, &app.origins()) {
+            break 'resp refused.into_response();
         }
         let Some(authority) = app.auth.authority.as_deref() else {
             break 'resp StatusCode::NOT_FOUND.into_response();

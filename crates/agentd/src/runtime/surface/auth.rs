@@ -106,7 +106,7 @@ enum Listen<'a> {
 
 impl<'a> Listen<'a> {
     fn of(listen: &'a str) -> Listen<'a> {
-        if listen.starts_with("unix:") {
+        if crate::config::unix_socket_path(listen).is_some() {
             return Listen::Unix;
         }
         let (https, rest) = match listen.strip_prefix("https://") {

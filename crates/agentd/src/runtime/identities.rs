@@ -97,9 +97,14 @@ impl Refused {
 }
 
 /// The store key of a principal id: a hash, because a declared id may carry
-/// `/` and `:`, which a file store would read as structure.
+/// `/` and `:`, which a file store would read as structure — of the id with
+/// its ASCII case folded. Approval names are lowercase so that two spellings
+/// never name two principals, but a declared id may carry capitals: keyed as
+/// spelled, a rule `Alice` and a device `alice` would be `user:Alice` and
+/// `user:alice` side by side, one person to a reader of the trail and two to
+/// the ownership checks. Folded, each is the other's collision.
 fn key(principal_id: &str) -> String {
-    crate::sha::sha256_hex(principal_id.as_bytes())
+    crate::sha::sha256_hex(principal_id.to_ascii_lowercase().as_bytes())
 }
 
 /// Who first claimed `principal_id`, if anybody has.
@@ -222,6 +227,28 @@ mod tests {
         // A rule id is never taken over by a device.
         assert!(register_device(&d, "ci-bot").is_err());
         assert_eq!(lookup(&d, "user:ci-bot").unwrap(), Some(Registered::Rule));
+    }
+
+    /// A rule id and a device name that differ only in case are one name:
+    /// whichever claims it first, the other is refused.
+    #[test]
+    fn a_claim_is_one_name_whatever_its_case() {
+        let d = durable();
+        let carol_rule = a2a(json!({"principals": [
+            {"id": "Carol", "match": {"bearer_ref": "{{secret:X}}"}, "role": "user"}
+        ]}));
+        register_rules(&d, &carol_rule).unwrap();
+        assert_eq!(lookup(&d, "user:carol").unwrap(), Some(Registered::Rule));
+        assert!(register_device(&d, "carol").is_err());
+
+        register_device(&d, "dave").unwrap();
+        let dave_rule = a2a(json!({"principals": [
+            {"id": "Dave", "match": {"bearer_ref": "{{secret:X}}"}, "role": "user"}
+        ]}));
+        assert_eq!(
+            register_rules(&d, &dave_rule),
+            Err(Refused::Collision { id: "Dave".into() })
+        );
     }
 
     /// A refused set writes nothing: the collision is found before any of the

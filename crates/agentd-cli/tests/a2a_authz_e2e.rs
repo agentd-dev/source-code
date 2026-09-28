@@ -310,12 +310,12 @@ fn one_principals_task_stream_is_not_readable_by_another() {
 /// to that task's stream.
 ///
 /// a2a-rs 0.10 reads the task a send names, then attaches the send's
-/// subscription to that id, before the message is processed. Inside a send a
-/// read that finds nothing is deliberately not a verdict (the send's own task
-/// does not exist yet), so what keeps B off A's broadcast channel is that the
-/// reactor answers B's send with a fresh task of B's own and the ledger never
-/// records A's id as B's. Nothing else pins that: the subscribe test above
-/// never goes through a send. A's task is held live by a slow model, so a
+/// subscription to that id, before the message is processed. The read is the
+/// reactor's `GetTask`, which answers B "not found" for A's task, and the
+/// ports record that as B's verdict on A's id — so the attach is refused, and
+/// the send is answered -32001 with no task created, exactly as for an id
+/// nobody holds. The subscribe test above never goes through a send, so
+/// nothing else pins this path. A's task is held live by a slow model, so a
 /// stream attached to it would carry A's transitions and its answer.
 #[test]
 fn a_send_naming_another_principals_live_task_streams_none_of_it() {
@@ -347,6 +347,15 @@ fn a_send_naming_another_principals_live_task_streams_none_of_it() {
         "A's task must still be live when B names it: {live}"
     );
 
+    let b_tasks = || {
+        let v = rpc_as(&addr, TOKEN_B, 9, "ListTasks", json!({}));
+        v["result"]["tasks"]
+            .as_array()
+            .unwrap_or_else(|| panic!("B lists its tasks: {v}"))
+            .len()
+    };
+    let b_before = b_tasks();
+
     // B names A's task in a streaming send, and reads until the stream ends or
     // well past the moment A's answer is produced.
     let probe = SendMessage::text("probe from b")
@@ -374,6 +383,20 @@ fn a_send_naming_another_principals_live_task_streams_none_of_it() {
         "B streamed A's answer: {body}"
     );
     assert!(!body.contains(&a_ctx), "B learned A's context: {body}");
+    // The answer is the not-found error, as JSON rather than a stream, and B
+    // has no task for it.
+    let (head, payload) = body
+        .split_once("\r\n\r\n")
+        .unwrap_or_else(|| panic!("an HTTP response: {body}"));
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("content-type: application/json"),
+        "{head}"
+    );
+    let refusal: Value = serde_json::from_str(payload.trim())
+        .unwrap_or_else(|e| panic!("B's send is answered in JSON ({e}): {body}"));
+    assert_eq!(refusal["error"]["code"], -32001, "{refusal}");
+    assert_eq!(b_tasks(), b_before, "B's refused send made a task");
     // A's task id may come back only inside an error (B named it); no frame
     // that is a result may carry it.
     for data in body.lines().filter_map(|l| l.strip_prefix("data:")) {
@@ -1706,6 +1729,81 @@ fn status_is_scoped_to_the_caller() {
         assert!(
             so.get(internal).is_some(),
             "the operator reads {internal}: {so}"
+        );
+    }
+
+    assert!(daemon.alive(), "daemon still serving: {}", daemon.stderr());
+    std::fs::remove_file(&cfg).ok();
+    std::fs::remove_file(&pb).ok();
+}
+
+/// A subagent reads `status` as whoever it works for — never as the runtime.
+///
+/// `status` is granted to subagents, and a subagent's call to a tool a policy
+/// rule could touch comes back to the supervisor to be judged and run there.
+/// A tool caller with no principal is the runtime itself, which reads the
+/// whole instance — so a subagent that carried none would hand a user, one
+/// hop removed, every principal's runs and conversations and the instance's
+/// internals. The subagent echoes what `status` handed it, and B's turn
+/// echoes that back.
+#[test]
+fn a_subagent_reads_status_as_its_owner() {
+    let pb = common::unique_path("status-subagent-playbook", "json");
+    std::fs::write(&pb, a_spawns_a_helper().to_string()).unwrap();
+    let llm = spawn_mock_llm_file(&pb);
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    // An allowing rule is enough to route a subagent's `status` through the
+    // supervisor: a rule that might apply has to be judged where it is held.
+    let cfg = write_config(&owners_config_on(
+        &llm.uri,
+        port,
+        "[\"*\"]",
+        "store:\n  kind: memory\n\
+         security:\n  policies:\n    - match: { tool: status, caller: [subagent] }\n      action: allow\n",
+    ));
+    let mut daemon = spawn_daemon(&cfg);
+    wait_ready(&addr);
+    let a = a_owns_a_run_and_a_subagent(&addr, &daemon);
+
+    // B's turn runs a sync subagent; the subagent (whose prompt is the
+    // subagent default) calls `status`; every model that has a tool result
+    // in front of it answers with that result.
+    std::fs::write(
+        &pb,
+        json!({
+            "turns": [
+                {"tool_calls": [{"name": "subagent.run", "arguments": {"instruction": "report the status", "mode": "sync"}}]},
+                {"content": "unreachable"},
+            ],
+            "match": [
+                {"when_contains": "tool_call_id", "echo_tool_result": true},
+                {"when_contains": "You are agentd, an autonomous agent.", "tool_calls": [{"name": "status", "arguments": {}}]},
+            ],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let b_ctx = turn_as(&addr, TOKEN_B, "have a helper check the agent");
+
+    let seen = tool_results(&addr, TOKEN_B, &b_ctx);
+    assert_eq!(seen.len(), 1, "one subagent.run result: {seen:?}");
+    // The subagent read B's view: B's own conversation is in it…
+    assert!(
+        seen[0].contains(&b_ctx),
+        "the subagent read B's status: {seen:?}"
+    );
+    // …and nothing of A's, nor the instance's internals.
+    for theirs in [&a.run, &a.ctx, &a.handle] {
+        assert!(
+            !seen[0].contains(theirs.as_str()),
+            "B's subagent sees {theirs}: {seen:?}"
+        );
+    }
+    for internal in ["budget", "inbox_pending", "instruction"] {
+        assert!(
+            !seen[0].contains(&format!("\\\"{internal}\\\"")),
+            "{internal} leaked to B's subagent: {seen:?}"
         );
     }
 

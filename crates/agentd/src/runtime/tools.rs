@@ -101,15 +101,28 @@ impl Runtime {
                 msg_depth: self.runs.get(&run).map(|r| r.msg_depth).unwrap_or(0),
                 ..Default::default()
             },
+            // A subagent acts for whoever it works for, exactly as the turn
+            // that spawned it did: a caller with no principal is the runtime,
+            // so leaving it unset would let a user's subagent read and do
+            // what only the operator may (`status` hands the runtime the
+            // whole instance).
             ChildKind::Subagent { handle } => ToolCaller {
                 node: Some(node),
                 req: id,
+                principal: self
+                    .subagents
+                    .get(&handle)
+                    .and_then(|s| s.principal.clone()),
                 subagent: Some(handle),
                 ..Default::default()
             },
             ChildKind::Think { ctx, .. } => ToolCaller {
                 node: Some(node),
                 req: id,
+                principal: ctx
+                    .as_ref()
+                    .and_then(|c| self.contexts.get(c))
+                    .and_then(|c| c.principal.clone()),
                 ctx,
                 ..Default::default()
             },

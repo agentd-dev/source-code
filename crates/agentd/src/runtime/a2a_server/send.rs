@@ -66,7 +66,8 @@ fn named_task(params: &Value) -> Option<&str> {
             .flatten(),
         None => params["message"]["taskId"].as_str(),
     };
-    named.filter(|t| !t.is_empty())
+    // Blank is unnamed, as the listener and a2a-rs both read it.
+    named.filter(|t| !t.trim().is_empty())
 }
 
 impl Runtime {

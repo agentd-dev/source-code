@@ -183,6 +183,18 @@ test('prepare routes leading # targets and interpolates $ values', () => {
   const p2 = prepare('#a2a-7 hello again', s);
   assert.equal(p2.contextId, 'a2a-7');
   assert.equal(p2.text, 'hello again');
+  // A task the mirror has not seen: the server mints task ids as UUIDv4, so
+  // one in that shape continues the task rather than starting a conversation
+  // under its name.
+  const older = '0b7f7c4e-2d1a-4c3b-9e8f-5a6b7c8d9e0f';
+  assert.deepEqual(prepare(`#${older} and then?`, s), { text: 'and then?', taskId: older });
+  // A conversation the mirror holds is one, whatever its shape.
+  const ctxUuid = '6f1e2d3c-4b5a-4987-a6b5-c4d3e2f1a0b9';
+  const m2 = seeded();
+  m2.bootstrap({ conversations: [{ id: ctxUuid }] });
+  assert.deepEqual(prepare(`#${ctxUuid} hi`, m2.getState()), { text: 'hi', contextId: ctxUuid });
+  // Any other unknown name is a conversation the message may start.
+  assert.deepEqual(prepare('#fresh-chat hi', s), { text: 'hi', contextId: 'fresh-chat' });
   // $ interpolation: known names only, $$ escapes, inline # untouched.
   const p3 = prepare('running $model on $instance costs $$5 for issue #42', s);
   assert.equal(p3.text, 'running mock-1 on box-1 costs $5 for issue #42');

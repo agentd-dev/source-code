@@ -72,9 +72,8 @@ pub(super) fn handle(
                 }
             };
             let denied = authority(rt)?.device.deny(target).map_err(bad)?;
-            for code in &denied {
-                let shown = crate::a2a::oauth::display_user_code(code);
-                push(rt, json!({"event": "denied", "user_code": shown}));
+            for d in &denied {
+                push(rt, d.event("denied"));
             }
             audit(rt, principal, op, json!({"denied": denied.len()}));
             Ok(AuthAnswer::Done(
@@ -166,17 +165,17 @@ fn approve(rt: &mut Runtime, principal: &Principal, args: &Value) -> Result<Auth
     // A name a rule declares is that rule's principal (`user:<id>`, or
     // `agent:<id>`, which a reader of the trail would take for the same
     // caller); a device approved under it would inherit what the rule owns.
-    if let Some(rule) = rt
-        .settings
-        .a2a
-        .principals
-        .iter()
-        .find(|p| p.id.as_deref() == Some(name))
-    {
+    // Compared with case folded: a declared id may carry capitals an approval
+    // name cannot, and `Alice` beside `alice` is one name to a reader.
+    if let Some((rule, id)) = rt.settings.a2a.principals.iter().find_map(|p| {
+        p.id.as_deref()
+            .filter(|id| id.eq_ignore_ascii_case(name))
+            .map(|id| (p, id))
+    }) {
         let role = format!("{:?}", rule.role).to_lowercase();
         return Err(Refusal::Args(format!(
             "`as` {name:?} is the id of a configured {role} principal rule \
-             (a2a.principals id {name}); approve the device as another name"
+             (a2a.principals id {id}); approve the device as another name"
         )));
     }
     let pid = format!("user:{name}");
@@ -239,12 +238,7 @@ fn approve(rt: &mut Runtime, principal: &Principal, args: &Value) -> Result<Auth
         "principal": session_principal,
         "existing": existing,
     });
-    push(
-        rt,
-        json!({"event": "approved", "user_code": shown, "name": name,
-            "scope": scope.as_str(), "client_id": view.client_id,
-            "principal": session_principal}),
-    );
+    push(rt, view.approved_event(name, scope));
     audit(
         rt,
         principal,

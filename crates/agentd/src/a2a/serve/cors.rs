@@ -47,6 +47,33 @@ pub(super) fn origin_of(headers: &HeaderMap) -> Option<&str> {
     headers.get(header::ORIGIN).and_then(|v| v.to_str().ok())
 }
 
+/// The origin gate every credentialed route runs before anything else:
+/// `Ok(None)` for a request with no `Origin` (not a browser: nothing to
+/// admit, nothing to grant), `Ok(Some(origin))` for a listed one, and for
+/// every other the one refusal ([`OriginGate`]) — an `Origin` that is present
+/// but unreadable included. A browser never sends one, but the resolver
+/// counts a request that carries the header as a browser's, and a gate that
+/// read it as absent would wave through what identity treats as a page.
+pub(super) fn gate(headers: &HeaderMap, allowed: &[String]) -> Result<Option<String>, OriginGate> {
+    let Some(raw) = headers.get(header::ORIGIN) else {
+        return Ok(None);
+    };
+    match raw.to_str() {
+        Ok(o) if origin_allowed(o, allowed) => Ok(Some(o.to_string())),
+        _ => Err(OriginGate),
+    }
+}
+
+/// The origin gate said no; answered as [`refused`].
+#[derive(Debug)]
+pub(super) struct OriginGate;
+
+impl IntoResponse for OriginGate {
+    fn into_response(self) -> Response {
+        refused()
+    }
+}
+
 /// A CORS preflight. A browser UI served from a configured origin has to be
 /// told it may POST here; every other origin is refused, which is the same
 /// DNS-rebind answer the POST itself gives.
@@ -113,32 +140,39 @@ pub(super) fn wants_private_network(headers: &HeaderMap) -> bool {
 /// grant — so the page that asked cannot even read that it was refused.
 /// `Vary: Origin` still goes out, because a listed origin asking the same
 /// thing is answered differently and a cache must not hand one the other's.
+/// It carries [`OriginRefused`], which is how [`allow_origin`] knows it.
 fn refused() -> Response {
     let mut resp = StatusCode::FORBIDDEN.into_response();
     resp.headers_mut()
         .append(header::VARY, HeaderValue::from_static("Origin"));
+    resp.extensions_mut().insert(OriginRefused);
     resp
 }
+
+/// Marks the origin gate's own refusal. A 403 is otherwise a caller's
+/// refusal, which a listed origin must be able to read; telling the two apart
+/// by anything the response says for itself (its status, its content type)
+/// would strip the next route's 403 of its body and grant without a word.
+#[derive(Debug, Clone, Copy)]
+struct OriginRefused;
 
 /// Grant the caller's origin on a real response, so the browser hands the body
 /// — and the headers a page needs to act on it — to the page that asked.
 ///
 /// Every request that reaches here with an `Origin` has already passed the
-/// origin gate but one: the gate's own refusal, which is the only 403 the
-/// endpoint writes that is not JSON (every refusal of a caller is a JSON-RPC
-/// error). That one is answered as [`refused`] — no grant, no body — so a
-/// refused origin is never told what it was refused, and the 401 or 403 a
-/// LISTED origin gets still carries the grant and its challenge, which is how
-/// a page learns it has to sign in.
+/// origin gate but one: the gate's own refusal ([`gate`]), which goes out as
+/// it is — no grant, no body — so a refused origin is never told what it was
+/// refused, while the 401 or 403 a LISTED origin gets still carries the grant
+/// and its challenge, which is how a page learns it has to sign in.
 pub(super) fn allow_origin(mut resp: Response, origin: Option<&str>) -> Response {
+    if resp.extensions().get::<OriginRefused>().is_some() {
+        return resp;
+    }
     let Some(origin) = origin else {
         resp.headers_mut()
             .append(header::VARY, HeaderValue::from_static("Origin"));
         return resp;
     };
-    if is_origin_refusal(&resp) {
-        return refused();
-    }
     let h = resp.headers_mut();
     h.append(header::VARY, HeaderValue::from_static("Origin"));
     if let Ok(v) = HeaderValue::from_str(origin) {
@@ -148,17 +182,6 @@ pub(super) fn allow_origin(mut resp: Response, origin: Option<&str>) -> Response
         }
     }
     resp
-}
-
-/// The origin gate's refusal, told apart from a caller's: a 403 that is not
-/// a JSON-RPC error.
-fn is_origin_refusal(resp: &Response) -> bool {
-    resp.status() == StatusCode::FORBIDDEN
-        && !resp
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|ct| ct.starts_with("application/json"))
 }
 
 /// Whether `origin` is one of `allowed`, compared as origins: scheme, host
@@ -329,7 +352,21 @@ mod tests {
             "{}",
         )
             .into_response();
-        for resp in [StatusCode::OK.into_response(), challenge, caller_403] {
+        // A caller's 403 in any other shape is still the caller's.
+        let problem_403 = (
+            StatusCode::FORBIDDEN,
+            [(header::CONTENT_TYPE, "application/problem+json")],
+            "{}",
+        )
+            .into_response();
+        let text_403 = (StatusCode::FORBIDDEN, "not yours").into_response();
+        for resp in [
+            StatusCode::OK.into_response(),
+            challenge,
+            caller_403,
+            problem_403,
+            text_403,
+        ] {
             let status = resp.status();
             let resp = allow_origin(resp, Some("https://ui.example"));
             assert_eq!(resp.status(), status);
@@ -345,19 +382,37 @@ mod tests {
             );
             assert!(varies_on_origin(&resp), "{status}");
         }
-        // The origin gate's refusal: no grant, no body.
-        let resp = allow_origin(
-            (StatusCode::FORBIDDEN, "origin not allowed").into_response(),
-            Some("https://evil.example"),
+        // The gate: no Origin passes as no browser, a listed one passes as
+        // itself, and an unlisted one — or one that is present but not
+        // readable, which the resolver still counts as a browser's — gets the
+        // gate's refusal, which goes out with no grant and no body.
+        assert_eq!(gate(&HeaderMap::new(), &allowed).ok(), Some(None));
+        assert_eq!(
+            gate(&headers(&[("origin", "https://ui.example")]), &allowed).ok(),
+            Some(Some("https://ui.example".to_string()))
         );
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-        assert_eq!(header_of(&resp, "access-control-allow-origin"), None);
-        assert_eq!(header_of(&resp, "access-control-expose-headers"), None);
-        assert!(varies_on_origin(&resp));
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        assert!(body.is_empty(), "{body:?}");
+        let mut unreadable = HeaderMap::new();
+        unreadable.insert(
+            header::ORIGIN,
+            HeaderValue::from_bytes(b"https://ui.example\xff").unwrap(),
+        );
+        for (what, h) in [
+            ("unlisted", headers(&[("origin", "https://evil.example")])),
+            ("unreadable", unreadable),
+        ] {
+            let Err(refusal) = gate(&h, &allowed) else {
+                panic!("{what} origin passed the gate");
+            };
+            let resp = allow_origin(refusal.into_response(), origin_of(&h));
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{what}");
+            assert_eq!(header_of(&resp, "access-control-allow-origin"), None);
+            assert_eq!(header_of(&resp, "access-control-expose-headers"), None);
+            assert!(varies_on_origin(&resp), "{what}");
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(body.is_empty(), "{what}: {body:?}");
+        }
         // No Origin: not a browser, nothing to grant.
         let resp = allow_origin(StatusCode::OK.into_response(), None);
         assert_eq!(header_of(&resp, "access-control-allow-origin"), None);

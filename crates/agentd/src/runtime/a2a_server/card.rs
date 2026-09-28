@@ -8,10 +8,7 @@
 //! the next read.
 
 use super::commands::refusal;
-use super::{
-    COMMAND_EXTENSION, EXTENSION_METHODS, FEED_RING, INTERFACE_EXTENSION, UNSUPPORTED_OPERATION,
-    command_ops_of, extensions_of,
-};
+use super::{COMMAND_EXTENSION, FEED_RING, UNSUPPORTED_OPERATION, command_ops_of};
 use crate::a2a::Principal;
 use crate::a2a::errors::{self, reason};
 use crate::config::v2::Settings;
@@ -19,8 +16,8 @@ use crate::engine::model::Workflow;
 use crate::runtime::reactor::Runtime;
 use crate::runtime::surface::auth::{ListenerAuth, listener_auth_of, origin_of, security_of};
 use crate::runtime::surface::{
-    A2A_PROTOCOL_VERSION, RUNTIME_SETTABLE, Reply, TASK_ANNOTATIONS_EXTENSION, UNIX_BINDING,
-    op_spec, static_vocabulary,
+    A2A_PROTOCOL_VERSION, EVENTS_EXTENSION, RUNTIME_SETTABLE, UNIX_BINDING, declarations,
+    op_entries,
 };
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -136,10 +133,7 @@ fn agent_card_of(
                         extended card for its workflows and commands.",
         "tags": ["conversation"],
     })];
-    let mut extensions: Vec<Value> = extensions_of(settings)
-        .into_iter()
-        .map(declaration)
-        .collect();
+    let mut extensions = declarations(settings);
     if let CardView::Extended(caller) = view {
         skills.extend(
             workflows
@@ -226,72 +220,6 @@ fn agent_card_of(
     }
 }
 
-/// The published schema of an extension: served next to its URI.
-fn schema_of(uri: &str) -> String {
-    format!("{uri}/schema.json")
-}
-
-/// How an op answers, as `params.ops` spells it.
-fn reply_of(op: &str) -> &'static str {
-    match op_spec(op).map(|s| s.reply) {
-        Some(Reply::Message) => "message",
-        _ => "task",
-    }
-}
-
-/// `[{op, reply}]` for `ops`.
-fn op_entries(ops: &[&str]) -> Vec<Value> {
-    ops.iter()
-        .map(|op| json!({"op": op, "reply": reply_of(op)}))
-        .collect()
-}
-
-/// An extension's PUBLIC declaration: what it is, and nothing that varies with
-/// this instance's switches, its workflows or its callers.
-///
-/// Everything callable is reachable through `SendMessage` with a command
-/// DataPart, so a client that ignores the extensions can still converse —
-/// none is `required`.
-fn declaration(uri: &'static str) -> Value {
-    if uri == COMMAND_EXTENSION {
-        // The vocabulary agentd CAN answer, not what this instance serves or
-        // this caller may run: the same list on every public card, so it says
-        // nothing about whether introspection is on or who may drain.
-        json!({
-            "uri": uri,
-            "description": "Structured operations invoked as a DataPart on SendMessage: \
-                            {\"data\": {\"agentd\": {\"op\": \"…\", …}}}. \
-                            The ops this caller may run are on the extended card.",
-            "params": {
-                "dataPartKey": "agentd",
-                "schema": schema_of(uri),
-                "ops": op_entries(&static_vocabulary()),
-            },
-        })
-    } else if uri == INTERFACE_EXTENSION {
-        let method = EXTENSION_METHODS
-            .iter()
-            .find(|(_, ext)| *ext == uri)
-            .map_or("", |(m, _)| *m);
-        json!({
-            "uri": uri,
-            "description": "The instance-wide observation feed display clients render. \
-                            A2A has no instance feed, so the method is declared here.",
-            "params": {"method": method, "schema": schema_of(uri)},
-        })
-    } else if uri == TASK_ANNOTATIONS_EXTENSION {
-        json!({
-            "uri": uri,
-            "description": "agentd's facts about a task — what it is linked to, who started \
-                            it, when, its status history, a gate's answer schema — in the \
-                            task's metadata under this URI.",
-            "params": {"schema": schema_of(uri)},
-        })
-    } else {
-        json!({"uri": uri, "description": uri, "params": {"schema": schema_of(uri)}})
-    }
-}
-
 /// Narrow an extension's public declaration to what `caller` may use.
 fn narrow(
     ext: &mut Value,
@@ -316,7 +244,7 @@ fn narrow(
         if caller.may_command("admin.set") {
             ext["params"]["settable"] = json!(RUNTIME_SETTABLE);
         }
-    } else if uri == INTERFACE_EXTENSION {
+    } else if uri == EVENTS_EXTENSION {
         // The replay window: how far behind a reconnecting subscriber may be
         // and still resume rather than re-bootstrap.
         ext["params"]["ring"] = json!(FEED_RING);
@@ -377,10 +305,10 @@ fn workflow_skill(w: &Workflow) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::super::EXTENSIONS;
     use super::super::listener::advertised_url as advertised;
     use super::*;
     use crate::config::v2::{A2a, Role};
+    use crate::runtime::surface::{op_spec, static_vocabulary};
 
     fn settings(a2a: serde_json::Value) -> Settings {
         Settings {
@@ -570,7 +498,7 @@ mod tests {
             }
             // The extensions we declare survive the trip.
             let exts = ours["capabilities"]["extensions"].as_array().unwrap();
-            for uri in extensions_of(&s) {
+            for uri in crate::runtime::surface::extensions_of(&s) {
                 assert!(exts.iter().any(|e| e["uri"] == uri), "{what}: {uri} lost");
             }
         }
@@ -842,7 +770,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .find(|e| e["uri"] == INTERFACE_EXTENSION)
+            .find(|e| e["uri"] == EVENTS_EXTENSION)
             .unwrap();
         // Extension params are a protobuf `Struct`, whose numbers are doubles.
         assert_eq!(feed["params"]["ring"].as_f64(), Some(FEED_RING as f64));
@@ -1016,39 +944,56 @@ mod tests {
         }
     }
 
-    /// The card and `--capabilities` declare the same extensions.
+    /// The card and `--capabilities` declare the same extensions, and the
+    /// listener negotiates against the same set.
     ///
-    /// A peer reads the card; a controller reads the manifest. They came from
-    /// two lists, and disagreed the moment the feed was off: the card
-    /// correctly withheld the interface extension while the manifest
-    /// advertised it unconditionally. Both now read `extensions_of`.
+    /// A peer reads the card; a controller reads the manifest; the listener
+    /// activates. They came from separate lists, and disagreed the moment the
+    /// feed was off: the card withheld the feed's extension while the
+    /// manifest advertised it and the handshake echoed it back. All three now
+    /// read the registry's declared set.
     #[test]
     fn the_card_and_the_manifest_declare_the_same_extensions() {
+        use crate::runtime::surface::{Ext, TASK_ANNOTATIONS_EXTENSION, declared_when};
         for enabled in [false, true] {
-            let mut s = crate::config::v2::Settings::default();
-            s.a2a.events.enabled = enabled;
-            let declared = extensions_of(&s);
+            let s = settings(json!({"listen": "http://127.0.0.1:8080",
+                "events": {"enabled": enabled}}));
+            let on_card: Vec<String> = card(&s, &no_workflows(), CardView::Public)["capabilities"]
+                ["extensions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["uri"].as_str().unwrap().to_string())
+                .collect();
+            let in_manifest: Vec<String> =
+                crate::runtime::surface::manifest::a2a_section(&s)["extensions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|u| u.as_str().unwrap().to_string())
+                    .collect();
+            assert_eq!(on_card, in_manifest, "events={enabled}");
+            let negotiated: Vec<&str> =
+                declared_when(enabled).iter().map(|d| d.ext.uri()).collect();
+            assert_eq!(on_card, negotiated, "events={enabled}");
             assert_eq!(
-                declared.contains(&INTERFACE_EXTENSION),
+                on_card.iter().any(|u| u == EVENTS_EXTENSION),
                 enabled,
-                "the interface extension follows a2a.events.enabled"
+                "the events extension follows a2a.events.enabled"
             );
-            assert!(
-                declared.contains(&COMMAND_EXTENSION),
-                "the command extension is unconditional"
-            );
-            // Every task projection carries the annotations, so the card
-            // names them whatever the switches — a client reads them only
-            // when it does.
-            assert!(
-                declared.contains(&TASK_ANNOTATIONS_EXTENSION),
-                "the task-annotations extension is unconditional"
-            );
-            // Anything declarable must be activatable, or the handshake would
-            // drop a URI the card just advertised.
-            for uri in &declared {
-                assert!(EXTENSIONS.contains(uri), "{uri} is not activatable");
+            // The command and task-annotations extensions are unconditional:
+            // whether a task carries its annotations is the caller's choice,
+            // made by activating the extension, so the card always offers it.
+            for always in [COMMAND_EXTENSION, TASK_ANNOTATIONS_EXTENSION] {
+                assert!(on_card.iter().any(|u| u == always), "{always}");
             }
+            // Registry order, which is the echo's order too.
+            let order: Vec<&str> = Ext::ALL
+                .iter()
+                .map(|e| e.uri())
+                .filter(|u| on_card.iter().any(|c| c == u))
+                .collect();
+            assert_eq!(on_card, order);
         }
     }
 }

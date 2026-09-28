@@ -2,7 +2,8 @@
 //! The **display surface** end to end: a daemon with `a2a.events.enabled`
 //! (+ `a2a.introspection.enabled`) serves the display-client contract over its
 //! real A2A listener — the card's extension declarations, the global
-//! `SubscribeToEvents` SSE feed (cross-client transcript sync + cursor resume),
+//! `agentd.events/SubscribeToEvents` SSE feed (cross-client transcript sync +
+//! cursor resume),
 //! the taskless introspection reads (`conversation.get` with message bodies,
 //! `run.get` with per-step detail, `debug.events` log-ring tail), the
 //! browser-origin CORS path, the disabled-by-default gate, and the removed
@@ -155,7 +156,7 @@ fn with_origins(llm: &str, port: u16, origins: &str) -> String {
     )
 }
 
-/// Open a `SubscribeToEvents` SSE stream; frames (each a JSON-RPC response's
+/// Open an `agentd.events/SubscribeToEvents` SSE stream; frames (each a JSON-RPC response's
 /// `result`) are appended to the shared vec until the connection closes or the
 /// socket read times out.
 fn subscribe_events(addr: &str, from_seq: u64, sink: Arc<Mutex<Vec<Value>>>) {
@@ -204,7 +205,7 @@ fn the_introspection_reads_work_over_a2a() {
 
     // The agent card advertises the surface (public discovery). Position is
     // not the claim — the command vocabulary is declared on every card — so
-    // this asks whether the interface extension is THERE.
+    // this asks whether the events extension is THERE.
     let card = get_card(&addr);
     let uris: Vec<&str> = card["capabilities"]["extensions"]
         .as_array()
@@ -213,8 +214,8 @@ fn the_introspection_reads_work_over_a2a() {
         .filter_map(|e| e["uri"].as_str())
         .collect();
     assert!(
-        uris.contains(&"https://agentd.dev/a2a/ext/interface/v1"),
-        "the interface extension is declared: {uris:?}"
+        uris.contains(&agentd::runtime::surface::EVENTS_EXTENSION),
+        "the events extension is declared: {uris:?}"
     );
 
     // A conversation turn, then read its transcript (debug).
@@ -377,18 +378,21 @@ fn the_interface_is_gated_off_by_default() {
     let (code, msg) = error_of(&SendMessage::command("debug.events", json!({})).post(&addr));
     assert_eq!(code, -32004);
     assert!(msg.contains("a2a.introspection.enabled"), "{msg}");
-    // …the stream refuses (as its SSE terminal frame)…
-    let frames: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
-    {
-        let body = common::rpc_body(3, common::feed_method(), json!({}));
-        let resp_or_stream = common::a2a_post(&addr, &body, &[]).body;
-        // Either a plain error body or an SSE stream whose only frame is the error.
-        assert!(
-            resp_or_stream.contains("-32004") && resp_or_stream.contains("a2a.events.enabled"),
-            "{resp_or_stream}"
-        );
-        drop(frames);
-    }
+    // …the feed is a method this instance does not offer: plain JSON, never
+    // a stream, even to a caller that activates its extension…
+    let body = common::rpc_body(3, common::feed_method(), json!({}));
+    let refused = common::a2a_post(
+        &addr,
+        &body,
+        &[("A2A-Extensions", &common::feed_extensions())],
+    );
+    assert_eq!(refused.header("content-type"), Some("application/json"));
+    let v = refused.json();
+    assert_eq!(v["error"]["code"], -32601, "{v}");
+    assert_eq!(
+        v["error"]["data"][0]["reason"], "EXTENSION_NOT_DECLARED",
+        "{v}"
+    );
     // …and the core surface still answers (status command untouched).
     let st = read(&addr, "status", json!({}));
     assert!(st["runs"].is_array(), "{st}");
@@ -402,11 +406,11 @@ fn the_interface_is_gated_off_by_default() {
         .map(|a| a.iter().filter_map(|e| e["uri"].as_str()).collect())
         .unwrap_or_default();
     assert!(
-        !uris.iter().any(|u| u.contains("interface")),
-        "the feed is off, so no interface extension may be advertised: {uris:?}"
+        !uris.contains(&agentd::runtime::surface::EVENTS_EXTENSION),
+        "the feed is off, so its extension may not be advertised: {uris:?}"
     );
     assert!(
-        uris.contains(&"https://agentd.dev/a2a/ext/command/v1"),
+        uris.contains(&agentd::runtime::surface::COMMAND_EXTENSION),
         "…while what this instance does serve is still declared: {uris:?}"
     );
 

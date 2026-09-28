@@ -133,7 +133,10 @@ fn status_values_and_skill_prefix_are_published() {
     let mut feed = common::a2a_open(
         &addr,
         &common::rpc_body(7, common::feed_method(), json!({"fromSeq": 0})),
-        &[("Authorization", &format!("Bearer {TOKEN_OP}"))],
+        &[
+            ("Authorization", &format!("Bearer {TOKEN_OP}")),
+            ("A2A-Extensions", &common::feed_extensions()),
+        ],
         Duration::from_secs(10),
     );
 

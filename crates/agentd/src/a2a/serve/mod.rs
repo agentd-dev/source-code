@@ -1577,6 +1577,7 @@ mod tests {
             principal,
             Duration::from_secs(30),
             check,
+            crate::runtime::surface::Active::NONE,
         );
         let mut body = resp.into_body().into_data_stream();
         let hello = body.next().await.unwrap().unwrap();

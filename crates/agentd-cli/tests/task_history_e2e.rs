@@ -272,9 +272,18 @@ fn history_carries_the_turn() {
         finished["history"][0]["parts"][0]["data"]["agentd"]["op"],
         "workflow.run"
     );
+    // Which op it runs is a task annotation, carried only for a read that
+    // activates task-annotations/v1.
+    let annotated = common::rpc_activating(
+        &addr,
+        901,
+        "GetTask",
+        json!({"id": run_task}),
+        &[TASK_ANNOTATIONS_EXTENSION],
+    );
     assert_eq!(
-        finished["metadata"][TASK_ANNOTATIONS_EXTENSION]["command"], "workflow.run",
-        "{finished}"
+        annotated["result"]["metadata"][TASK_ANNOTATIONS_EXTENSION]["command"], "workflow.run",
+        "{annotated}"
     );
     let part = &finished["artifacts"][0]["parts"][0];
     assert_eq!(part["data"]["greeting"], "hello", "{finished}");

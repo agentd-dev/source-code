@@ -176,11 +176,11 @@ mod tests {
                 Some(Route::Extension { ext_method: name }),
                 "{name}"
             );
-            // A declaration must name an extension this build can activate,
-            // or a client asking for it by URI could never be granted it.
+            // A declaration must name an extension of the registry, or a
+            // client asking for it by URI could never be granted it.
             assert!(
-                super::super::EXTENSIONS.contains(uri),
-                "{name:?} is declared under {uri:?}, which is not in EXTENSIONS"
+                super::super::Ext::ALL.contains(uri),
+                "{name:?} is declared under {uri:?}, which is not in the registry"
             );
             assert!(
                 route_of(name).is_some_and(|r| !matches!(r, Route::Spec(_))),
@@ -197,6 +197,8 @@ mod tests {
             "a2a.GetTask",
             "a2a.GetAgentCard",
             "a2a.SubscribeToEvents",
+            // The feed's name before events/v1 namespaced it.
+            "SubscribeToEvents",
             // Pairing, deleted with its handler.
             "Pair",
             "interface.pair",

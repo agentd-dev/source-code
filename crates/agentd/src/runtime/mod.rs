@@ -680,6 +680,8 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
         #[cfg(feature = "a2a")]
         reserved_task_id: None,
         #[cfg(feature = "a2a")]
+        a2a_active: surface::Active::NONE,
+        #[cfg(feature = "a2a")]
         a2a_sink: None,
         #[cfg(feature = "a2a")]
         a2a_serving: None,

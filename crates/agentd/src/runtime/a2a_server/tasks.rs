@@ -8,6 +8,7 @@ use crate::a2a::errors::{INVALID_PARAMS, TASK_NOT_CANCELABLE};
 use crate::a2a::tasks::{Link, PushTarget, State, Task};
 use crate::a2a::wire::{Annotations, DEFAULT_PAGE_SIZE, ListView, MAX_PAGE_SIZE};
 use crate::runtime::reactor::{PendingKind, Runtime};
+use crate::runtime::surface::{Active, Ext};
 use serde_json::{Value, json};
 
 /// A fresh durable task id, for a task the runtime opens on its own — a
@@ -128,6 +129,7 @@ fn list_tasks<'a>(
     tasks: impl Iterator<Item = &'a Task>,
     principal: &Principal,
     params: &Value,
+    ann: Annotations,
 ) -> Result<Value, Value> {
     let p: a2a_rs::domain::ListTasksParams = serde_json::from_value(params.clone())
         .map_err(|e| invalid(&format!("ListTasks params: {e}")))?;
@@ -186,9 +188,7 @@ fn list_tasks<'a>(
         _ => String::new(),
     };
     Ok(json!({
-        // Annotated until the listener knows which extensions the caller
-        // activated; from then on they follow the activation.
-        "tasks": page.iter().map(|t| t.summary(view, Annotations::Include)).collect::<Vec<_>>(),
+        "tasks": page.iter().map(|t| t.summary(view, ann)).collect::<Vec<_>>(),
         // Always present, empty on the last page: the spec's response has it
         // REQUIRED, and "absent" must never be readable as "there is more".
         "nextPageToken": next,
@@ -257,11 +257,28 @@ fn push_page(targets: &[PushTarget], task_id: &str, params: &Value) -> Result<Va
     }))
 }
 
+/// Whether a task projected for a request that activated `active` carries
+/// its annotations: only when the request activated task-annotations/v1. An
+/// extension a client did not ask for is not the client's to parse.
+fn annotations_for(active: Active) -> Annotations {
+    if active.contains(Ext::TaskAnnotations) {
+        Annotations::Include
+    } else {
+        Annotations::Omit
+    }
+}
+
 impl Runtime {
+    /// How the request being served sees a task (see [`annotations_for`]).
+    /// Between requests nothing is activated, so nothing is annotated.
+    fn annotations(&self) -> Annotations {
+        annotations_for(self.a2a_active)
+    }
+
     pub(super) fn a2a_get_task(&self, principal: &Principal, params: &Value) -> Value {
         let id = params.get("id").and_then(Value::as_str).unwrap_or("");
         match self.tasks.get(id) {
-            Some(t) if t.is_visible_to(principal) => t.to_a2a(Annotations::Include),
+            Some(t) if t.is_visible_to(principal) => t.to_a2a(self.annotations()),
             // Don't disclose existence to a non-owner.
             _ => err_obj(TASK_NOT_FOUND, "task not found"),
         }
@@ -269,7 +286,7 @@ impl Runtime {
 
     /// `ListTasks`: see [`list_tasks`].
     pub(super) fn a2a_list_tasks(&self, principal: &Principal, params: &Value) -> Value {
-        list_tasks(self.tasks.values(), principal, params).unwrap_or_else(|e| e)
+        list_tasks(self.tasks.values(), principal, params, self.annotations()).unwrap_or_else(|e| e)
     }
 
     // ---- push notifications (the `*TaskPushNotificationConfig` family) -----
@@ -504,7 +521,7 @@ impl Runtime {
     fn task_value(&self, id: &str) -> Value {
         self.tasks
             .get(id)
-            .map(|t| t.to_a2a(Annotations::Include))
+            .map(|t| t.to_a2a(self.annotations()))
             .unwrap_or(Value::Null)
     }
 
@@ -767,7 +784,9 @@ mod tests {
         ];
         let op = who("operator", Role::Operator);
         let alice = who("user:a", Role::User);
-        let list = |p: &Principal, params: Value| list_tasks(tasks.iter(), p, &params);
+        let list = |p: &Principal, params: Value| {
+            list_tasks(tasks.iter(), p, &params, Annotations::Include)
+        };
 
         // Newest status first; a tie broken by id, descending. Somebody else's
         // task is not merely hidden — it is not counted either.

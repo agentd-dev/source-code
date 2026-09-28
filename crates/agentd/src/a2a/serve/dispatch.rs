@@ -23,8 +23,8 @@ use crate::a2a::errors::{self, reason};
 use crate::a2a::ports;
 use crate::a2a::principals::{Resolution, Via};
 use crate::runtime::surface::{
-    A2A_PROTOCOL_VERSION, EXTENSION_METHODS, INTERFACE_EXTENSION, Route, SpecMethod,
-    accepts_version, route_of,
+    A2A_PROTOCOL_VERSION, Active, Route, SpecMethod, accepts_version, negotiate,
+    parse_extension_header, route_of,
 };
 
 pub(super) async fn rpc(
@@ -38,39 +38,25 @@ pub(super) async fn rpc(
         .get(header::ORIGIN)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    // The extension handshake: a client lists the extensions it means to
-    // activate, and the response says which of them actually were.
-    let activated = activated_extensions(&headers);
-    let resp = allow_origin(
+    allow_origin(
         dispatch(app, peer_id, peer, headers, body).await,
         allowed.as_deref(),
-    );
-    with_activated_extensions(resp, &activated)
+    )
 }
 
-/// The `A2A-Extensions` request header, intersected with what this build can
-/// activate. Unknown URIs are ignored rather than refused: the spec's rule is
-/// that a client asks and the response reports what was granted, and none of
-/// agentd's extensions is `required`, so a request naming only unknown ones is
-/// still a perfectly good request.
-fn activated_extensions(headers: &HeaderMap) -> Vec<String> {
-    headers
-        .get("a2a-extensions")
-        .and_then(|v| v.to_str().ok())
-        .map(|raw| {
-            raw.split(',')
-                .map(str::trim)
-                .filter(|u| crate::runtime::a2a_server::EXTENSIONS.contains(u))
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Echo the activated set, as the spec asks a server to.
-fn with_activated_extensions(mut resp: Response, activated: &[String]) -> Response {
-    if !activated.is_empty()
-        && let Ok(v) = axum::http::HeaderValue::from_str(&activated.join(", "))
+/// The extension handshake's answer: `resp` with the `A2A-Extensions` echo
+/// naming what the request activated — set on the response head, so an SSE
+/// answer carries it before its body streams.
+///
+/// Only an answer the handler produced is echoed, and only one sent `200`:
+/// the spec's echo lists what was "successfully activated for that request",
+/// and a refusal — whether the pipeline's or a runtime 401/403 — activated
+/// nothing. An empty set is no header rather than an empty one.
+fn echoed(mut resp: Response, active: Active) -> Response {
+    if resp.status() == StatusCode::OK
+        && let Some(v) = active
+            .echo()
+            .and_then(|e| axum::http::HeaderValue::from_str(&e).ok())
     {
         resp.headers_mut().insert("a2a-extensions", v);
     }
@@ -90,11 +76,14 @@ fn with_activated_extensions(mut resp: Response, activated: &[String]) -> Respon
 /// 6. the `A2A-Version`;
 /// 7. the caller's rate;
 /// 8. the method, from the route table, for every caller alike;
-/// 9. the method's authorization (and the extended card's credential gate);
-/// 10. the checks that need the params: a send's request shape, the task it
+/// 9. the extensions: what the `A2A-Extensions` header activates, and the
+///    refusal of an extension method whose extension it does not;
+/// 10. the method's authorization (and the extended card's credential gate);
+/// 11. the checks that need the params: a send's request shape, the task it
 ///     names and its command op, a subscribe's task;
-/// 11. the answer — here for the few calls answered locally, else a2a-rs's,
-///     filtered back to the runtime's own words on the way out.
+/// 12. the answer — here for the few calls answered locally, else a2a-rs's,
+///     filtered back to the runtime's own words on the way out, and echoing
+///     the extensions it was given under.
 ///
 /// The order is the point. Nothing that costs the runtime anything runs before
 /// the caller is known and has asked in the protocol this listener speaks, and
@@ -261,6 +250,21 @@ async fn dispatch(
     };
     let name = route.name();
 
+    // The extensions, negotiated against what this listener serves: the
+    // header is the only way one is activated, and an extension method is
+    // part of its extension — calling it without declaring and activating
+    // the extension is refused like any unknown method, before authorization.
+    let requested = parse_extension_header(
+        headers
+            .get_all("a2a-extensions")
+            .iter()
+            .map(|v| v.as_bytes()),
+    );
+    let active = match negotiate(&requested, &app.bridge.declared(), route) {
+        Ok(active) => active,
+        Err(e) => return json_response(json!({"jsonrpc": "2.0", "id": id, "error": e})),
+    };
+
     // The method gate. A refusal here is NOT counted against the source: the
     // caller already proved who it is, so it guessed nothing, and a source
     // over the failure limit has every bearer refused unchecked — counting
@@ -289,84 +293,26 @@ async fn dispatch(
         );
     }
 
-    match route {
-        // The spec makes the extended card an authenticated read (§13.3): on
-        // a listener that declares a scheme, a caller the scheme did not name
-        // — an `any` rule, the implicit operator — is asked for a credential
-        // rather than handed it. The card itself is a2a-rs's to serve.
-        Route::Spec(SpecMethod::GetExtendedAgentCard)
-            if posture.declares_any() && !matches!(via, Via::Bearer | Via::Session | Via::Cert) =>
-        {
-            let rule = resolver.rule_of(&principal);
-            denied(
-                &app,
-                unvouched,
-                Some(&principal),
-                rule,
-                Some(name),
-                None,
-                "unauthenticated",
-                401,
-            );
-            return challenge(false, false, false);
-        }
-        // Answered here because a2a-rs 0.10 cannot: its JSON-RPC adapter hands
-        // the port the task id alone, dropping `pageSize` and `pageToken`, and
-        // its response has no `nextPageToken`. Passed down, a caller asking
-        // for two configs would get all of them and a page size of 500 would
-        // be accepted. The caller's request is read with the spec's own type
-        // and crosses whole to the runtime, which pages it and refuses what it
-        // cannot honour — with the same codes the runtime gives every caller.
-        Route::Spec(SpecMethod::ListTaskPushNotificationConfigs) => {
-            let req = match serde_json::from_value::<
-                a2a_rs::domain::generated::ListTaskPushNotificationConfigsRequest,
-            >(params)
-            {
-                Ok(req) => req,
-                Err(e) => return err(id, errors::INVALID_PARAMS, &format!("invalid params: {e}")),
-            };
-            let Ok(params) = serde_json::to_value(&req) else {
-                return err(
-                    id,
-                    errors::INTERNAL_ERROR,
-                    "could not re-encode the listing request",
-                );
-            };
-            return unary(&app, id, "PushConfigList", params, principal, bearer_used).await;
-        }
-        // agentd's own method, which a2a-rs correctly does not know.
-        Route::Extension { ext_method }
-            if extension_of(ext_method) == Some(INTERFACE_EXTENSION) =>
-        {
-            return match &app.bridge.feed() {
-                Some(feed) => {
-                    let alive = app.liveness.as_ref().and_then(|l| l(&principal));
-                    feed_stream(
-                        Arc::clone(feed),
-                        id,
-                        params,
-                        principal,
-                        app.stream_deadline,
-                        alive,
-                    )
-                }
-                None => err(
-                    id,
-                    errors::UNSUPPORTED_OPERATION,
-                    "the observation feed is disabled (set a2a.events.enabled: true)",
-                ),
-            };
-        }
-        // An extension method this build declares but serves no handler for
-        // is not a method it answers.
-        Route::Extension { ext_method } => {
-            return err(
-                id,
-                errors::METHOD_NOT_FOUND,
-                &format!("method not found: {ext_method}"),
-            );
-        }
-        _ => {}
+    // The spec makes the extended card an authenticated read (§13.3): on a
+    // listener that declares a scheme, a caller the scheme did not name — an
+    // `any` rule, the implicit operator — is asked for a credential rather
+    // than handed it. The card itself is a2a-rs's to serve.
+    if route == Route::Spec(SpecMethod::GetExtendedAgentCard)
+        && posture.declares_any()
+        && !matches!(via, Via::Bearer | Via::Session | Via::Cert)
+    {
+        let rule = resolver.rule_of(&principal);
+        denied(
+            &app,
+            unvouched,
+            Some(&principal),
+            rule,
+            Some(name),
+            None,
+            "unauthenticated",
+            401,
+        );
+        return challenge(false, false, false);
     }
 
     let send = matches!(
@@ -430,21 +376,6 @@ async fn dispatch(
         );
     }
 
-    // A read op answers with a Message, not a Task, so there is nothing for
-    // the protocol layer to track or frame — forcing it through a port that
-    // must return a `Task` would mean inventing one. The runtime answers it
-    // here, as one JSON body or, to a caller that asked for a stream, exactly
-    // one frame. Every command that does work is a task like any other
-    // message, and goes to a2a-rs below.
-    if send
-        && op
-            .as_deref()
-            .is_some_and(crate::runtime::surface::is_read_op)
-    {
-        let streamed = route == Route::Spec(SpecMethod::SendStreamingMessage);
-        return message_reply(&app, id, params, principal, streamed, bearer_used).await;
-    }
-
     // a2a-rs 0.10's subscribe reads the task first and, finding nothing,
     // opens a stream anyway — which a caller cannot tell from a task that has
     // yet to speak, and which for someone else's task would say nothing
@@ -457,14 +388,140 @@ async fn dispatch(
         let bridge = Arc::clone(&app.bridge);
         let who = principal.clone();
         let read = json!({"id": task, "historyLength": 0});
-        let v = tokio::task::spawn_blocking(move || bridge.call("GetTask", read, who))
-            .await
-            .unwrap_or_else(
-                |e| json!({"_error": {"code": errors::INTERNAL_ERROR, "message": e.to_string()}}),
-            );
+        let v = tokio::task::spawn_blocking(move || {
+            bridge.call("GetTask", read, who, Active::NONE)
+        })
+        .await
+        .unwrap_or_else(
+            |e| json!({"_error": {"code": errors::INTERNAL_ERROR, "message": e.to_string()}}),
+        );
         if let Some(e) = ports::error_of(&v) {
             return error_response(json!({"jsonrpc": "2.0", "id": id, "error": e}), bearer_used);
         }
+    }
+
+    // Every check has passed: the handler runs, and its answer — only its
+    // answer — echoes what the request activated.
+    let resp = answer(
+        &app,
+        route,
+        Admitted {
+            id,
+            params,
+            body,
+            headers,
+            principal,
+            via,
+            named_task,
+            op,
+            bearer_used,
+            active,
+        },
+    )
+    .await;
+    echoed(resp, active)
+}
+
+/// A request every check has passed, as the answer needs it.
+struct Admitted {
+    id: Value,
+    params: Value,
+    body: Bytes,
+    headers: HeaderMap,
+    principal: Principal,
+    via: Via,
+    /// The task the send's message named (see `ports::RequestScope`).
+    named_task: Option<String>,
+    /// The command op a send carries.
+    op: Option<String>,
+    bearer_used: bool,
+    active: Active,
+}
+
+/// Pipeline step 12: the answer to `route`.
+async fn answer(app: &Arc<App>, route: Route, req: Admitted) -> Response {
+    let Admitted {
+        id,
+        params,
+        body,
+        headers,
+        principal,
+        via,
+        named_task,
+        op,
+        bearer_used,
+        active,
+    } = req;
+    let send = matches!(
+        route,
+        Route::Spec(SpecMethod::SendMessage | SpecMethod::SendStreamingMessage)
+    );
+    match route {
+        // Answered here because a2a-rs 0.10 cannot: its JSON-RPC adapter
+        // hands the port the task id alone, dropping `pageSize` and
+        // `pageToken`, and its response has no `nextPageToken`. Passed
+        // down, a caller asking for two configs would get all of them and
+        // a page size of 500 would be accepted. The caller's request is
+        // read with the spec's own type and crosses whole to the runtime,
+        // which pages it and refuses what it cannot honour — with the same
+        // codes the runtime gives every caller.
+        Route::Spec(SpecMethod::ListTaskPushNotificationConfigs) => {
+            let req = match serde_json::from_value::<
+                a2a_rs::domain::generated::ListTaskPushNotificationConfigsRequest,
+            >(params)
+            {
+                Ok(req) => req,
+                Err(e) => {
+                    return err(id, errors::INVALID_PARAMS, &format!("invalid params: {e}"));
+                }
+            };
+            let Ok(params) = serde_json::to_value(&req) else {
+                return err(
+                    id,
+                    errors::INTERNAL_ERROR,
+                    "could not re-encode the listing request",
+                );
+            };
+            return unary(app, id, "PushConfigList", params, principal, bearer_used).await;
+        }
+        // agentd's own method, which a2a-rs correctly does not know. The
+        // feed is the only extension method, and negotiation has already
+        // refused it wherever the listener holds no feed to serve it from.
+        Route::Extension { ext_method } => {
+            let Some(feed) = app.bridge.feed() else {
+                return err(
+                    id,
+                    errors::METHOD_NOT_FOUND,
+                    &format!("method not found: {ext_method}"),
+                );
+            };
+            let alive = app.liveness.as_ref().and_then(|l| l(&principal));
+            return feed_stream(
+                feed,
+                id,
+                params,
+                principal,
+                app.stream_deadline,
+                alive,
+                active,
+            );
+        }
+        _ => {}
+    }
+
+    // A read op answers with a Message, not a Task, so there is nothing
+    // for the protocol layer to track or frame — forcing it through a
+    // port that must return a `Task` would mean inventing one. The
+    // runtime answers it here, as one JSON body or, to a caller that
+    // asked for a stream, exactly one frame. Every command that does work
+    // is a task like any other message, and goes to a2a-rs below.
+    if send
+        && op
+            .as_deref()
+            .is_some_and(crate::runtime::surface::is_read_op)
+    {
+        let streamed = route == Route::Spec(SpecMethod::SendStreamingMessage);
+        return message_reply(app, id, params, principal, streamed, bearer_used, active).await;
     }
 
     // Everything else is the specification's, and a2a-rs answers it.
@@ -481,7 +538,7 @@ async fn dispatch(
             "agentd".to_string(),
         ));
     let alive = app.liveness.as_ref().and_then(|l| l(&principal));
-    let mut scope = ports::RequestScope::new(principal, via);
+    let mut scope = ports::RequestScope::new(principal, via, active);
     if send {
         scope = scope.send(named_task);
     }
@@ -614,14 +671,6 @@ fn version_gate(headers: &HeaderMap, id: &Value) -> Result<(), Value> {
     ))
 }
 
-/// The extension that declares `method`, if any does.
-fn extension_of(method: &str) -> Option<&'static str> {
-    EXTENSION_METHODS
-        .iter()
-        .find(|(name, _)| *name == method)
-        .map(|(_, uri)| *uri)
-}
-
 /// The audit line for a refusal the listener made: who (when anybody), the
 /// rule that named them, the session they signed in with (when they did),
 /// what they asked for, why, and the status sent.
@@ -688,7 +737,8 @@ async fn unary(
     principal: Principal,
     bearer_used: bool,
 ) -> Response {
-    let envelope = round_trip(app, id, verb, params, principal).await;
+    // No extension applies to what is answered this way.
+    let envelope = round_trip(app, id, verb, params, principal, Active::NONE).await;
     if envelope.get("error").is_some() {
         return error_response(envelope, bearer_used);
     }
@@ -702,10 +752,11 @@ async fn round_trip(
     verb: &str,
     params: Value,
     principal: Principal,
+    active: Active,
 ) -> Value {
     let bridge = Arc::clone(&app.bridge);
     let verb = verb.to_string();
-    let v = tokio::task::spawn_blocking(move || bridge.call(&verb, params, principal))
+    let v = tokio::task::spawn_blocking(move || bridge.call(&verb, params, principal, active))
         .await
         .unwrap_or_else(
             |e| json!({"_error": {"code": errors::INTERNAL_ERROR, "message": e.to_string()}}),
@@ -736,8 +787,9 @@ async fn message_reply(
     principal: Principal,
     streamed: bool,
     bearer_used: bool,
+    active: Active,
 ) -> Response {
-    let envelope = round_trip(app, id, "SendMessage", params, principal).await;
+    let envelope = round_trip(app, id, "SendMessage", params, principal, active).await;
     if envelope.get("error").is_some() {
         return error_response(envelope, bearer_used);
     }

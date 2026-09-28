@@ -458,6 +458,11 @@ pub struct Runtime {
     /// after it — an id belongs to one request only.
     #[cfg(feature = "a2a")]
     pub(crate) reserved_task_id: Option<String>,
+    /// The extensions the request being served activated; `NONE` between
+    /// requests. A task's annotations are projected only while it holds
+    /// task-annotations/v1.
+    #[cfg(feature = "a2a")]
+    pub(crate) a2a_active: super::surface::Active,
     /// Where a task transition is published so A2A subscribers see it.
     #[cfg(feature = "a2a")]
     pub(crate) a2a_sink: Option<std::sync::Arc<crate::a2a::ports::StreamSink>>,

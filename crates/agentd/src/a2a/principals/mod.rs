@@ -73,19 +73,25 @@ impl Principal {
         match self.role {
             Role::Anonymous => false,
             Role::Operator => true,
+            // Every extension method is principal-scoped where it is served —
+            // the feed shows a subscriber only what it may see — so any named
+            // caller may call one. Read from the registry, so a method is
+            // callable by exactly the name the route table serves it under.
+            _ if surface::EXTENSION_METHODS
+                .iter()
+                .any(|(name, _)| *name == method) =>
+            {
+                op.is_none()
+            }
             _ => match method {
                 // The read/task methods every non-anonymous role may use on its
                 // own conversations/tasks (ownership is enforced at the object).
-                // `SubscribeToEvents` is principal-scoped at the feed itself,
-                // so any non-anonymous role may attach and will only see the
-                // frames belonging to it.
                 "SendMessage"
                 | "SendStreamingMessage"
                 | "GetTask"
                 | "CancelTask"
                 | "ListTasks"
                 | "SubscribeToTask"
-                | "SubscribeToEvents"
                 // The push-notification family is scoped to the caller's own
                 // tasks the same way `GetTask` is — ownership is enforced at
                 // the task, so any named caller may manage webhooks on what it
@@ -356,6 +362,24 @@ mod tests {
             Some("a")
         );
         assert_eq!(workflow_name_of(&serde_json::json!({"name": "b"})), None);
+    }
+
+    /// Every extension method the registry declares is callable by any named
+    /// caller and by no anonymous one — under its registered name only: the
+    /// feed's bare pre-namespace name is no method anybody may call.
+    #[test]
+    fn extension_methods_are_any_named_callers_by_their_registered_name() {
+        for (method, _) in surface::EXTENSION_METHODS {
+            for role in [Role::User, Role::Agent, Role::Operator] {
+                assert!(with(role, &[]).may(method, None), "{role:?} {method}");
+            }
+            assert!(!Principal::anonymous().may(method, None), "{method}");
+            // An extension method carries no command op.
+            assert!(!with(Role::User, &["*"]).may(method, Some("admin.drain")));
+        }
+        for role in [Role::User, Role::Agent] {
+            assert!(!with(role, &["*"]).may("SubscribeToEvents", None));
+        }
     }
 
     /// `may_run` is both halves: the grants allow the workflow, AND its

@@ -38,6 +38,7 @@ use serde_json::{Value, json};
 use crate::a2a::Principal;
 use crate::a2a::principals::Via;
 use crate::runtime::a2a_server::A2aBridge;
+use crate::runtime::surface::Active;
 
 /// Everything agentd supplies to the protocol layer, in one value.
 ///
@@ -94,7 +95,11 @@ impl RuntimePorts {
         let bridge = Arc::clone(&self.bridge);
         let method = method.to_string();
         let who = who.clone();
-        tokio::task::spawn_blocking(move || bridge.call(&method, params, who))
+        // What the request activated crosses with every call made for it, so
+        // a task a2a-rs asks for is projected the way the caller asked to see
+        // it — on the first frame of a stream as on a unary read.
+        let active = serving().map_or(Active::NONE, |s| s.active);
+        tokio::task::spawn_blocking(move || bridge.call(&method, params, who, active))
             .await
             .map_err(|e| A2AError::Internal(format!("the runtime call did not complete: {e}")))
     }
@@ -148,12 +153,16 @@ pub struct RequestScope {
     /// instead and crosses with the message, and the runtime checks it and
     /// attaches it to the task the message creates or continues.
     pub pending_push: Arc<Mutex<Vec<TaskPushNotificationConfig>>>,
+    /// The extensions the request activated (pipeline step 9). The ports
+    /// pass it on every runtime call, which projects a task's annotations
+    /// only while task-annotations/v1 is in it.
+    pub active: Active,
 }
 
 impl RequestScope {
-    /// A scope for `caller`, named by `via`, with nothing recorded yet and no
-    /// send in it (see [`Self::send`]).
-    pub fn new(caller: Principal, via: Via) -> RequestScope {
+    /// A scope for `caller`, named by `via`, that activated `active`, with
+    /// nothing recorded yet and no send in it (see [`Self::send`]).
+    pub fn new(caller: Principal, via: Via, active: Active) -> RequestScope {
         RequestScope {
             caller,
             via,
@@ -161,6 +170,7 @@ impl RequestScope {
             named_task: None,
             in_send: false,
             pending_push: Arc::default(),
+            active,
         }
     }
 
@@ -909,6 +919,37 @@ mod tests {
         assert_eq!(got.1, None, "the wrong task is not proved");
     }
 
+    /// What the request activated reaches the runtime with every call the
+    /// ports make for it — a2a-rs's task reads included — and a call made
+    /// outside a request activates nothing.
+    #[tokio::test]
+    async fn the_requests_activation_crosses_with_every_call() {
+        use crate::runtime::surface::{
+            Declaration, Ext, SpecMethod, TASK_ANNOTATIONS_EXTENSION, negotiate,
+        };
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        let ports = ports_with(move |req| {
+            log.lock().unwrap().push(req.active);
+            json!({"id": "task-1", "contextId": "c"})
+        });
+        let active = negotiate(
+            &[TASK_ANNOTATIONS_EXTENSION.to_string()],
+            &[Declaration {
+                ext: Ext::TaskAnnotations,
+                required: false,
+            }],
+            crate::runtime::surface::Route::Spec(SpecMethod::GetTask),
+        )
+        .unwrap();
+        assert!(active.contains(Ext::TaskAnnotations));
+        let id: TaskId = "task-1".parse().unwrap();
+        let s = RequestScope::new(Principal::anonymous(), Via::Implicit, active);
+        with_request(s, async { ports.get(&id, None).await.unwrap() }).await;
+        ports.get(&id, None).await.unwrap();
+        assert_eq!(*seen.lock().unwrap(), [active, Active::NONE]);
+    }
+
     /// Ports over a stand-in reactor that answers each call with `answer`.
     fn ports_with(
         answer: impl Fn(&crate::runtime::a2a_server::A2aRequest) -> Value + Send + 'static,
@@ -934,7 +975,7 @@ mod tests {
 
     /// An anonymous request's scope.
     fn scope() -> RequestScope {
-        RequestScope::new(Principal::anonymous(), Via::Implicit)
+        RequestScope::new(Principal::anonymous(), Via::Implicit, Active::NONE)
     }
 
     /// The runtime's error object is kept exactly as the runtime answered it —

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The display-client interface. A daemon with `a2a.events.enabled` serves the
-//! observation plane on its A2A listener: the `SubscribeToEvents` feed
+//! observation plane on its A2A listener: the `agentd.events/SubscribeToEvents` feed
 //! (hello → events, cursor replay), the taskless reads, and the
 //! human-in-the-loop gate (`ask_human` → `input-required` → a `taskId` reply
 //! resumes the asker). With the interface OFF the surface refuses and the core
@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use crate::checks::util::{
-    feed_method, mock_llm, open, post, rpc, rpc_body, rpc_value, send_command, text_params,
-    wait_ready, write_file,
+    feed_activation, feed_method, mock_llm, open, post, rpc, rpc_body, rpc_value, send_command,
+    text_params, wait_ready, write_file,
 };
 use crate::{Category, Check, Harness, Outcome};
 
@@ -26,13 +26,13 @@ pub fn checks() -> Vec<Check> {
         Check {
             id: "interface/default-off-gate",
             category: Category::Interface,
-            desc: "without a2a.events.enabled the feed refuses (-32004), interface.info is an unknown op, and the core answers",
+            desc: "without a2a.events.enabled the feed's method is not offered (-32601 EXTENSION_NOT_DECLARED), interface.info is an unknown op, and the core answers",
             run: default_off,
         },
         Check {
             id: "interface/feed-hello-and-replay",
             category: Category::Interface,
-            desc: "SubscribeToEvents opens with a hello and replays from seq 0 a task event whose history holds the prompt",
+            desc: "the feed is refused until events/v1 is activated (-32601 EXTENSION_NOT_ACTIVATED), then opens with a hello and replays from seq 0 a task event whose history holds the prompt",
             run: feed_replay,
         },
         Check {
@@ -128,11 +128,16 @@ fn default_off(h: &Harness) -> Outcome {
     let _daemon = h.spawn(&["--config", &cfg]);
     wait_ready(&addr);
 
-    // The feed is not served…
-    let feed = post(&addr, &rpc_body(1, feed_method(), json!({})), &[]);
+    // The feed is not served — not even to a caller activating its
+    // extension, which this instance does not declare…
+    let feed = post(
+        &addr,
+        &rpc_body(1, feed_method(), json!({})),
+        &[("A2A-Extensions", feed_activation())],
+    );
     Outcome::require(
-        feed.contains("-32004"),
-        format!("the feed should refuse with -32004 while disabled: {feed}"),
+        feed.contains("-32601") && feed.contains("EXTENSION_NOT_DECLARED"),
+        format!("the feed should be -32601 EXTENSION_NOT_DECLARED while disabled: {feed}"),
     )
     .and(|| {
         // …the removed discovery op is an unknown op, whatever the switch…
@@ -175,7 +180,14 @@ fn feed_replay(h: &Harness) -> Outcome {
     );
 
     let body = rpc_body(9, feed_method(), json!({"fromSeq": 0}));
-    let s = open(&addr, &body, &[]);
+    // The method belongs to events/v1: without activating it, it is refused.
+    let bare = post(&addr, &body, &[]);
+    if !(bare.contains("-32601") && bare.contains("EXTENSION_NOT_ACTIVATED")) {
+        return Outcome::fail(format!(
+            "the feed without events/v1 activated should be -32601 EXTENSION_NOT_ACTIVATED: {bare}"
+        ));
+    }
+    let s = open(&addr, &body, &[("A2A-Extensions", feed_activation())]);
     s.set_read_timeout(Some(Duration::from_secs(10))).ok();
     let mut reader = BufReader::new(s);
     let mut saw_hello = false;

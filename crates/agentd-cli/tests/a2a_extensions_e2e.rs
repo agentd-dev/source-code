@@ -13,7 +13,9 @@
 //!    scheme is declared;
 //! 3. the `A2A-Extensions` handshake works — a client lists what it means to
 //!    activate and the response echoes what actually was, which is the rule the
-//!    spec states for the header;
+//!    spec states for the header; an extension method is refused unless its
+//!    extension is declared and activated, and a task's annotations ride only
+//!    on an answer to a request that activated them;
 //! 4. the operator admin family is reachable as an ordinary `SendMessage` with
 //!    a command DataPart, so a client that has never heard of agentd can drain
 //!    this instance — and a non-operator still cannot, whatever its grants.
@@ -27,7 +29,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use agentd::runtime::surface::{COMMAND_EXTENSION, static_vocabulary};
+use agentd::runtime::surface::{
+    COMMAND_EXTENSION, EVENTS_EXTENSION, EVENTS_METHOD, TASK_ANNOTATIONS_EXTENSION,
+    static_vocabulary,
+};
 use common::{SendMessage, a2a_post, get_card, rpc_as, rpc_body};
 
 const OPERATOR: &str = "ext-e2e-operator-token";
@@ -406,35 +411,339 @@ fn the_card_follows_a_principals_reload() {
     assert_eq!(ext["capabilities"]["extendedAgentCard"], true, "{ext}");
 }
 
-/// The `A2A-Extensions` handshake: the client asks, the response reports what
-/// was actually activated. An unknown URI is simply not echoed.
+/// POST `body` as `bearer`, sending each of `lines` as its own
+/// `A2A-Extensions` field line.
+fn post_with(addr: &str, bearer: &str, body: &str, lines: &[&str]) -> common::HttpReply {
+    let auth = format!("Bearer {bearer}");
+    let mut extra: Vec<(&str, &str)> = vec![("Authorization", &auth)];
+    extra.extend(lines.iter().map(|l| ("A2A-Extensions", *l)));
+    a2a_post(addr, body, &extra)
+}
+
+/// Start the `greet` workflow as the operator; the id of the task it runs as.
+fn greet_task(addr: &str) -> String {
+    let started = SendMessage::command("workflow.run", json!({"workflow": "greet"}))
+        .bearer(OPERATOR)
+        .result(addr);
+    started["task"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("workflow.run answered no task: {started}"))
+        .to_string()
+}
+
+/// The echo is exactly what was activated — requested ∩ declared ∩ applies
+/// to the method, in registry order, once each — on every answer the handler
+/// produced, and on nothing else.
+///
+/// It used to be the header intersected with a build-wide list: a URI this
+/// instance did not declare came back, so did one the method never used, only
+/// the first header line was read, a duplicate came back twice, and a 401 or
+/// an origin refusal carried it as if something had been activated.
 #[test]
-fn the_extension_header_is_echoed_with_what_was_activated() {
+fn the_echo_is_exactly_what_was_activated() {
+    // Events off: the feed's extension is not declared here.
     let (_d, addr) = boot();
-    // A plain read, so the only extension header on the request is the one
-    // this test writes.
-    let body = rpc_body(1, "ListTasks", json!({}));
-    let auth = format!("Bearer {OPERATOR}");
-    let reply = a2a_post(
+    let task = greet_task(&addr);
+    let get = rpc_body(1, "GetTask", json!({"id": task}));
+    let status = SendMessage::command("status", json!({}));
+
+    // A command send: two field lines, a duplicate, an unknown URI and a
+    // declared extension that does not apply to a send's DataPart all fold to
+    // what applies, in registry order.
+    let reply = post_with(
         &addr,
-        &body,
+        OPERATOR,
+        &status.body(1),
         &[
-            ("Authorization", &auth),
-            (
-                "A2A-Extensions",
-                "https://agentd.dev/a2a/ext/command/v1, https://example.invalid/nope/v1",
-            ),
+            &format!("{TASK_ANNOTATIONS_EXTENSION}, https://example.invalid/nope/v1"),
+            &format!("{COMMAND_EXTENSION}, {COMMAND_EXTENSION}, {EVENTS_EXTENSION}"),
         ],
+    );
+    assert_eq!(reply.status, 200, "{reply:?}");
+    assert!(reply.json().get("result").is_some(), "{reply:?}");
+    assert_eq!(
+        reply.header("a2a-extensions"),
+        Some(format!("{COMMAND_EXTENSION}, {TASK_ANNOTATIONS_EXTENSION}").as_str()),
+        "{reply:?}"
+    );
+
+    // A task read: command/v2 does not apply to it, and events/v1 is not
+    // declared on this instance, so only the annotations are echoed.
+    let reply = post_with(
+        &addr,
+        OPERATOR,
+        &get,
+        &[&format!(
+            "{COMMAND_EXTENSION}, {EVENTS_EXTENSION}, {TASK_ANNOTATIONS_EXTENSION}"
+        )],
     );
     assert_eq!(
         reply.header("a2a-extensions"),
-        Some("https://agentd.dev/a2a/ext/command/v1"),
-        "the activated extension is echoed, and only it: {reply:?}"
+        Some(TASK_ANNOTATIONS_EXTENSION),
+        "{reply:?}"
     );
 
-    // A request that activates nothing gets no header — silence, not an empty one.
-    let reply = a2a_post(&addr, &body, &[("Authorization", &auth)]);
+    // A stream carries the echo on its head, before the body.
+    let streamed = status.clone().streaming().bearer(OPERATOR).post_raw(&addr);
+    assert!(
+        streamed
+            .header("content-type")
+            .is_some_and(|t| t.starts_with("text/event-stream")),
+        "{streamed:?}"
+    );
+    assert_eq!(
+        streamed.header("a2a-extensions"),
+        Some(COMMAND_EXTENSION),
+        "{streamed:?}"
+    );
+
+    // Nothing is echoed where nothing was activated: a method no extension
+    // applies to, a request that named none, an unknown URI alone.
+    let all = format!("{COMMAND_EXTENSION}, {TASK_ANNOTATIONS_EXTENSION}");
+    let card = post_with(
+        &addr,
+        OPERATOR,
+        &rpc_body(2, "GetExtendedAgentCard", json!({})),
+        &[&all],
+    );
+    assert!(card.json().get("result").is_some(), "{card:?}");
+    assert_eq!(card.header("a2a-extensions"), None, "{card:?}");
+    let plain = post_with(&addr, OPERATOR, &get, &[]);
+    assert_eq!(plain.header("a2a-extensions"), None, "{plain:?}");
+    let unknown = post_with(&addr, OPERATOR, &get, &["https://example.invalid/nope/v1"]);
+    assert_eq!(unknown.header("a2a-extensions"), None, "{unknown:?}");
+
+    // Nor on a refusal: a bad credential, an op the caller may not run, a
+    // task the caller may not see, and a request the listener would not read.
+    let bad = post_with(&addr, "not-a-token", &get, &[&all]);
+    assert_eq!(bad.status, 401, "{bad:?}");
+    assert_eq!(bad.header("a2a-extensions"), None, "{bad:?}");
+    let forbidden = post_with(
+        &addr,
+        USER,
+        &SendMessage::command("admin.pause", json!({})).body(3),
+        &[&all],
+    );
+    assert_eq!(forbidden.status, 403, "{forbidden:?}");
+    assert_eq!(forbidden.header("a2a-extensions"), None, "{forbidden:?}");
+    // …a refusal the runtime made after the handler ran: a user may run
+    // workflows, but not one whose start admits only operators.
+    let refused = post_with(
+        &addr,
+        USER,
+        &SendMessage::command("workflow.run", json!({"workflow": "ops-only"})).body(4),
+        &[&all],
+    );
+    assert_eq!(refused.status, 403, "{refused:?}");
+    assert_eq!(refused.header("a2a-extensions"), None, "{refused:?}");
+    let unparsed = post_with(&addr, OPERATOR, "{not json", &[&all]);
+    assert_eq!(unparsed.json()["error"]["code"], -32700, "{unparsed:?}");
+    assert_eq!(unparsed.header("a2a-extensions"), None, "{unparsed:?}");
+}
+
+/// interface/v1 is gone, and its method with it: the feed is
+/// `agentd.events/SubscribeToEvents`, declared by events/v1, and answered
+/// only when that extension is declared AND activated. The old URI activates
+/// nothing, and the old method name is no method.
+#[test]
+fn interface_v1_is_gone() {
+    const INTERFACE_V1: &str = "https://agentd.dev/a2a/ext/interface/v1";
+    const COMMAND_V1: &str = "https://agentd.dev/a2a/ext/command/v1";
+    let feed = rpc_body(7, EVENTS_METHOD, json!({"fromSeq": 0}));
+    let reason = |v: &Value| v["error"]["data"][0]["reason"].as_str().map(str::to_string);
+
+    let (_on, addr) = boot_with(&format!("{PRINCIPALS}  events:\n    enabled: true\n"), "");
+    let card = get_card(&addr);
+    for gone in [INTERFACE_V1, COMMAND_V1] {
+        assert!(
+            !card.to_string().contains(gone),
+            "{gone} is declared: {card}"
+        );
+    }
+    assert_eq!(
+        extension(&card, EVENTS_EXTENSION)["params"]["method"],
+        EVENTS_METHOD
+    );
+
+    // Without the header, the method is refused — as JSON, never a stream —
+    // naming the extension to activate.
+    let bare = post_with(&addr, OPERATOR, &feed, &[]);
+    assert_eq!(bare.header("content-type"), Some("application/json"));
+    let v = bare.json();
+    assert_eq!(v["error"]["code"], -32601, "{v}");
+    assert_eq!(
+        reason(&v).as_deref(),
+        Some("EXTENSION_NOT_ACTIVATED"),
+        "{v}"
+    );
+    assert_eq!(v["error"]["data"][0]["domain"], "agentd.dev", "{v}");
+    assert_eq!(
+        v["error"]["data"][0]["metadata"],
+        json!({"extension": EVENTS_EXTENSION, "method": EVENTS_METHOD}),
+        "{v}"
+    );
+    assert_eq!(
+        v["error"]["message"],
+        format!("method not available: activate {EVENTS_EXTENSION} with the A2A-Extensions header")
+    );
+    assert_eq!(bare.header("a2a-extensions"), None, "{bare:?}");
+
+    // interface/v1 is not a way to activate it.
+    let old = post_with(&addr, OPERATOR, &feed, &[INTERFACE_V1]).json();
+    assert_eq!(
+        reason(&old).as_deref(),
+        Some("EXTENSION_NOT_ACTIVATED"),
+        "{old}"
+    );
+
+    // The pre-namespace name is no method, whatever is activated.
+    for lines in [&[][..], &[EVENTS_EXTENSION][..], &[INTERFACE_V1][..]] {
+        let v = post_with(
+            &addr,
+            OPERATOR,
+            &rpc_body(8, "SubscribeToEvents", json!({})),
+            lines,
+        )
+        .json();
+        assert_eq!(v["error"]["code"], -32601, "{lines:?}: {v}");
+        assert_eq!(
+            reason(&v),
+            None,
+            "an unknown method, not an extension's: {v}"
+        );
+    }
+
+    // Activated, it streams — and says so on the stream's head.
+    let auth = format!("Bearer {OPERATOR}");
+    let opened = common::a2a_post_within(
+        &addr,
+        &feed,
+        &[
+            ("Authorization", &auth),
+            ("A2A-Extensions", EVENTS_EXTENSION),
+        ],
+        Duration::from_secs(10),
+    );
+    assert!(opened.body.contains("\"hello\""), "{opened:?}");
+    assert_eq!(opened.header("a2a-extensions"), Some(EVENTS_EXTENSION));
+
+    // A user may attach too: the feed is scoped per principal, not per role.
+    let user = common::a2a_post_within(
+        &addr,
+        &feed,
+        &[
+            ("Authorization", &format!("Bearer {USER}")),
+            ("A2A-Extensions", EVENTS_EXTENSION),
+        ],
+        Duration::from_secs(10),
+    );
+    assert!(user.body.contains("\"hello\""), "{user:?}");
+
+    // On an instance that serves no feed, activating it does not help: the
+    // extension is not declared, and the refusal says that instead.
+    let (_off, addr) = boot();
+    let v = post_with(&addr, OPERATOR, &feed, &[EVENTS_EXTENSION]).json();
+    assert_eq!(v["error"]["code"], -32601, "{v}");
+    assert_eq!(reason(&v).as_deref(), Some("EXTENSION_NOT_DECLARED"), "{v}");
+    assert_eq!(
+        v["error"]["message"],
+        format!("{EVENTS_EXTENSION} is not offered by this instance")
+    );
+    // And command/v1 activates nothing: a command sent under it is echoed
+    // nothing.
+    let reply = post_with(
+        &addr,
+        OPERATOR,
+        &SendMessage::command("status", json!({})).body(9),
+        &[COMMAND_V1],
+    );
     assert_eq!(reply.header("a2a-extensions"), None, "{reply:?}");
+}
+
+/// A task carries its task-annotations/v1 facts exactly when the request
+/// activated the extension — on a send's answer, a task read, a listing and
+/// the feed's `task` events — and never otherwise. The ring holds one copy
+/// of each event, so the feed strips them per subscriber.
+#[test]
+fn task_annotations_follow_activation() {
+    let (_d, addr) = boot_with(
+        &format!("{PRINCIPALS}  events:\n    enabled: true\n"),
+        WORKFLOWS,
+    );
+    let annotations = |t: &Value| t["metadata"][TASK_ANNOTATIONS_EXTENSION].clone();
+    let with = format!("{COMMAND_EXTENSION}, {TASK_ANNOTATIONS_EXTENSION}");
+
+    // The send's own answer.
+    let run = SendMessage::command("workflow.run", json!({"workflow": "greet"}));
+    let annotated = post_with(&addr, OPERATOR, &run.body(1), &[&with]).json();
+    let task = annotated["result"]["task"].clone();
+    let id = task["id"].as_str().unwrap_or_else(|| panic!("{annotated}"));
+    assert_eq!(annotations(&task)["command"], "workflow.run", "{task}");
+    assert_eq!(annotations(&task)["link"]["kind"], "run", "{task}");
+    let bare = post_with(&addr, OPERATOR, &run.body(2), &[COMMAND_EXTENSION]).json();
+    assert!(
+        bare["result"]["task"].get("metadata").is_none(),
+        "not activated, not annotated: {bare}"
+    );
+
+    // A read, and a listing.
+    let get = rpc_body(3, "GetTask", json!({"id": id}));
+    let read = post_with(&addr, OPERATOR, &get, &[TASK_ANNOTATIONS_EXTENSION]).json();
+    assert_eq!(
+        annotations(&read["result"])["command"],
+        "workflow.run",
+        "{read}"
+    );
+    let read = post_with(&addr, OPERATOR, &get, &[]).json();
+    assert!(read["result"].get("metadata").is_none(), "{read}");
+    let list = rpc_body(4, "ListTasks", json!({}));
+    let listed = post_with(&addr, OPERATOR, &list, &[TASK_ANNOTATIONS_EXTENSION]).json();
+    let tasks = listed["result"]["tasks"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(!tasks.is_empty(), "{listed}");
+    assert!(tasks.iter().all(|t| annotations(t).is_object()), "{listed}");
+    let listed = post_with(&addr, OPERATOR, &list, &[]).json();
+    let tasks = listed["result"]["tasks"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(!tasks.is_empty(), "{listed}");
+    assert!(
+        tasks.iter().all(|t| t.get("metadata").is_none()),
+        "{listed}"
+    );
+
+    // The feed, from the start of the ring, by two subscribers: one with the
+    // annotations activated, one without.
+    let feed = rpc_body(5, EVENTS_METHOD, json!({"fromSeq": 0}));
+    let task_events = |activate: &str| -> Vec<Value> {
+        let auth = format!("Bearer {OPERATOR}");
+        let mut reader = common::a2a_open(
+            &addr,
+            &feed,
+            &[("Authorization", &auth), ("A2A-Extensions", activate)],
+            Duration::from_secs(3),
+        );
+        let mut out = Vec::new();
+        common::read_frames(&mut reader, |v| {
+            let ev = &v["result"]["event"];
+            if ev["kind"] == "task" {
+                out.push(ev["data"]["task"].clone());
+            }
+            out.len() < 2
+        });
+        assert!(!out.is_empty(), "no task event for {activate}");
+        out
+    };
+    for t in task_events(&format!("{EVENTS_EXTENSION}, {TASK_ANNOTATIONS_EXTENSION}")) {
+        assert!(annotations(&t)["link"].is_object(), "{t}");
+    }
+    for t in task_events(EVENTS_EXTENSION) {
+        assert!(t.get("metadata").is_none(), "{t}");
+        assert!(t["id"].is_string(), "the rest of the task is there: {t}");
+    }
 }
 
 /// The operator family, reached with a stock `SendMessage` — and refused for a

@@ -188,10 +188,11 @@ fn watch_feed_as(addr: &str, bearer: Option<&str>) -> Arc<Mutex<Vec<Value>>> {
     let auth = bearer.map(|b| format!("Bearer {b}"));
     std::thread::spawn(move || {
         let body = common::rpc_body(77, common::feed_method(), json!({"fromSeq": 0}));
-        let headers: Vec<(&str, &str)> = auth
-            .as_deref()
-            .map(|a| vec![("Authorization", a)])
-            .unwrap_or_default();
+        let activate = common::feed_extensions();
+        let mut headers: Vec<(&str, &str)> = vec![("A2A-Extensions", &activate)];
+        if let Some(a) = auth.as_deref() {
+            headers.push(("Authorization", a));
+        }
         let mut reader = common::a2a_open(&addr, &body, &headers, Duration::from_secs(60));
         common::read_frames(&mut reader, |v| {
             sink.lock().unwrap().push(v["result"].clone());
@@ -454,8 +455,20 @@ fn introspection_works_without_the_feed_and_follows_admin_set() {
     // No feed, no introspection.
     let d = spawn(config(&llm.uri, "", ""));
 
-    let (code, _) = common::rpc_error(&d.addr, 1, common::feed_method(), json!({}));
-    assert_eq!(code, -32004, "there is no feed");
+    // With the feed off, events/v1 is not declared: the method is refused as
+    // one this instance does not offer, whatever the request activates.
+    let v = common::rpc_activating(
+        &d.addr,
+        1,
+        common::feed_method(),
+        json!({}),
+        &[agentd::runtime::surface::EVENTS_EXTENSION],
+    );
+    assert_eq!(v["error"]["code"], -32601, "there is no feed: {v}");
+    assert_eq!(
+        v["error"]["data"][0]["reason"], "EXTENSION_NOT_DECLARED",
+        "{v}"
+    );
 
     let refused = SendMessage::command("debug.events", json!({})).post(&d.addr);
     assert_eq!(refused["error"]["code"], -32004, "{refused}");

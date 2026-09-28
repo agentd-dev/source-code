@@ -139,9 +139,17 @@ pub fn command_uri(card: &Value) -> String {
         .to_string()
 }
 
-/// The JSON-RPC method of the observation feed, named once for every check.
+/// The JSON-RPC method of the observation feed, named once for every check:
+/// the method agentd's events extension declares.
 pub fn feed_method() -> &'static str {
-    "SubscribeToEvents"
+    "agentd.events/SubscribeToEvents"
+}
+
+/// The `A2A-Extensions` value a display client opens the feed with: the
+/// events extension, which the method belongs to and is refused without, and
+/// task-annotations, which a `task` event carries only when activated.
+pub fn feed_activation() -> &'static str {
+    "https://agentd.dev/a2a/ext/events/v1, https://agentd.dev/a2a/ext/task-annotations/v1"
 }
 
 /// A fresh `messageId`: no two messages the suite sends share one.

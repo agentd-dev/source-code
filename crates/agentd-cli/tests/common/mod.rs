@@ -463,16 +463,48 @@ pub fn get_card(addr: &str) -> Value {
     reply.json()
 }
 
-/// The JSON-RPC method of the observation feed. Named in one place because the
-/// feed is an extension method, and its name is the extension's to decide.
+/// The JSON-RPC method of the observation feed: the events extension's, read
+/// from the daemon's own constant, so the suite calls it by the name the route
+/// table serves.
 pub fn feed_method() -> &'static str {
-    "SubscribeToEvents"
+    agentd::runtime::surface::EVENTS_METHOD
 }
 
-/// Open the observation feed from `from_seq`; the caller reads SSE lines.
+/// The `A2A-Extensions` value a display client opens the feed with: the
+/// events extension, without which the method is refused, and the task
+/// annotations its `task` events carry only when activated.
+pub fn feed_extensions() -> String {
+    use agentd::runtime::surface::{EVENTS_EXTENSION, TASK_ANNOTATIONS_EXTENSION};
+    format!("{EVENTS_EXTENSION}, {TASK_ANNOTATIONS_EXTENSION}")
+}
+
+/// Open the observation feed from `from_seq`, activating [`feed_extensions`];
+/// the caller reads SSE lines.
 pub fn subscribe_feed(addr: &str, from_seq: u64, read_timeout: Duration) -> BufReader<TcpStream> {
     let body = rpc_body(77, feed_method(), json!({"fromSeq": from_seq}));
-    a2a_open(addr, &body, &[], read_timeout)
+    a2a_open(
+        addr,
+        &body,
+        &[("A2A-Extensions", &feed_extensions())],
+        read_timeout,
+    )
+}
+
+/// [`rpc`] activating `extensions` with the `A2A-Extensions` header — a task
+/// read that should carry the task-annotations/v1 facts, say.
+pub fn rpc_activating(
+    addr: &str,
+    id: i64,
+    method: &str,
+    params: Value,
+    extensions: &[&str],
+) -> Value {
+    a2a_post(
+        addr,
+        &rpc_body(id, method, params),
+        &[("A2A-Extensions", &extensions.join(", "))],
+    )
+    .json()
 }
 
 /// Every SSE `data:` payload on `reader` that parses as JSON, until the stream

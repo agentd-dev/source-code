@@ -14,6 +14,7 @@ use super::{App, cors};
 use crate::a2a::Principal;
 use crate::a2a::ports;
 use crate::runtime::a2a_server::A2aBridge;
+use crate::runtime::surface::Active;
 
 /// The agent card, read from the runtime so its skills reflect the workflows
 /// that are actually loaded rather than a snapshot taken at boot.
@@ -44,9 +45,11 @@ impl CardFromRuntime {
         who: Principal,
     ) -> Result<a2a_rs::domain::AgentCard, a2a_rs::domain::A2AError> {
         let bridge = Arc::clone(&self.0);
-        let v = tokio::task::spawn_blocking(move || bridge.call(verb, json!({}), who))
-            .await
-            .map_err(|e| a2a_rs::domain::A2AError::Internal(e.to_string()))?;
+        // No extension applies to a card, so none is ever active for one.
+        let v =
+            tokio::task::spawn_blocking(move || bridge.call(verb, json!({}), who, Active::NONE))
+                .await
+                .map_err(|e| a2a_rs::domain::A2AError::Internal(e.to_string()))?;
         // The runtime's refusal — no extended card for an anonymous caller,
         // say — is recorded whole, like every port's, so the listener answers
         // with the runtime's code and words rather than a2a-rs's rendering.
@@ -84,7 +87,12 @@ pub(super) async fn card(State(app): State<Arc<App>>, headers: HeaderMap) -> Res
     let reply = tokio::time::timeout(
         CARD_TIMEOUT,
         tokio::task::spawn_blocking(move || {
-            bridge.call("PublicCard", json!({}), Principal::anonymous())
+            bridge.call(
+                "PublicCard",
+                json!({}),
+                Principal::anonymous(),
+                Active::NONE,
+            )
         }),
     )
     .await;

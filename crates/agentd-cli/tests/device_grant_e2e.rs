@@ -446,7 +446,10 @@ fn device_grant_end_to_end() {
     let mut feed = a2a_open(
         &addr,
         &rpc_body(77, common::feed_method(), json!({"fromSeq": 0})),
-        &[("Authorization", &auth)],
+        &[
+            ("Authorization", &auth),
+            ("A2A-Extensions", &common::feed_extensions()),
+        ],
         Duration::from_secs(10),
     );
     let mut hello = String::new();

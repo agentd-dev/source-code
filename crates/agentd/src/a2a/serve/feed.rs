@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! `SubscribeToEvents`: the observation feed as an SSE stream.
+//! `agentd.events/SubscribeToEvents`: the observation feed as an SSE stream.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -11,8 +11,9 @@ use serde_json::{Value, json};
 use super::LivenessCheck;
 use crate::a2a::Principal;
 use crate::runtime::a2a_server::SharedFeed;
+use crate::runtime::surface::{Active, Ext, TASK_ANNOTATIONS_EXTENSION};
 
-/// `SubscribeToEvents`: agentd's own stream, not the spec's.
+/// `agentd.events/SubscribeToEvents`: agentd's own stream, not the spec's.
 ///
 /// A `hello` frame states the cursor the client resumed from and whether that
 /// cursor still exists — a cursor evicted from the replay window comes back
@@ -25,6 +26,11 @@ use crate::runtime::a2a_server::SharedFeed;
 /// `goodbye{reason: "revoked"}` within one tick — a revoked session keeps
 /// nothing it already opened, and is told why rather than left to reconnect
 /// with a token that no longer works.
+///
+/// `active` is what the subscriber activated. The ring holds one copy of each
+/// event for every subscriber, so a `task` event is stored annotated and the
+/// annotations are taken off here, per subscriber, unless this one activated
+/// task-annotations/v1.
 pub(super) fn feed_stream(
     feed: Arc<SharedFeed>,
     id: Value,
@@ -32,7 +38,9 @@ pub(super) fn feed_stream(
     principal: Principal,
     deadline: Duration,
     alive: Option<LivenessCheck>,
+    active: Active,
 ) -> Response {
+    let annotated = active.contains(Ext::TaskAnnotations);
     let after = params
         .get("fromSeq")
         .or_else(|| params.get("after"))
@@ -77,7 +85,10 @@ pub(super) fn feed_stream(
             }
             let (events, next) = feed.since(cursor, &who, is_op, 256);
             cursor = next;
-            for ev in events {
+            for mut ev in events {
+                if !annotated {
+                    strip_annotations(&mut ev);
+                }
                 if tx.send(frame(&id, json!({"event": ev}))).await.is_err() {
                     return; // the client went away
                 }
@@ -103,4 +114,53 @@ fn frame(id: &Value, payload: Value) -> axum::response::sse::Event {
         serde_json::to_string(&json!({"jsonrpc": "2.0", "id": id, "result": payload}))
             .unwrap_or_default(),
     )
+}
+
+/// `ev` without the task annotations its task carries, if it carries a task:
+/// the metadata key goes, and the metadata with it when nothing else is in it,
+/// as a task projected without the extension has none.
+fn strip_annotations(ev: &mut Value) {
+    let Some(task) = ev.pointer_mut("/data/task").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let emptied = match task.get_mut("metadata").and_then(Value::as_object_mut) {
+        Some(meta) => {
+            meta.remove(TASK_ANNOTATIONS_EXTENSION);
+            meta.is_empty()
+        }
+        None => false,
+    };
+    if emptied {
+        task.remove("metadata");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A task event loses exactly the annotations: the rest of its task, any
+    /// other metadata, and every other event are untouched.
+    #[test]
+    fn a_task_event_is_stripped_of_its_annotations_and_nothing_else() {
+        let mut ev = json!({"seq": 3, "kind": "task", "data": {"task": {
+            "id": "t", "history": [{"messageId": "m"}],
+            "metadata": {(TASK_ANNOTATIONS_EXTENSION): {"principal": "user:a"}},
+        }}});
+        strip_annotations(&mut ev);
+        assert_eq!(
+            ev,
+            json!({"seq": 3, "kind": "task", "data": {"task": {
+                "id": "t", "history": [{"messageId": "m"}],
+            }}})
+        );
+        let mut other = json!({"data": {"task": {"id": "t", "metadata": {
+            (TASK_ANNOTATIONS_EXTENSION): {}, "urn:x": 1}}}});
+        strip_annotations(&mut other);
+        assert_eq!(other["data"]["task"]["metadata"], json!({"urn:x": 1}));
+        let mut run = json!({"kind": "run", "data": {"id": "r", "metadata": {"k": 1}}});
+        let before = run.clone();
+        strip_annotations(&mut run);
+        assert_eq!(run, before);
+    }
 }

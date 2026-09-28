@@ -47,10 +47,8 @@ pub(crate) use listener::{A2aServing, spawn_a2a_listener};
 pub use send::command_op;
 pub(crate) use send::{command_data, command_names_task};
 
-pub use super::surface::{
-    COMMAND_EXTENSION, EXTENSION_METHODS, EXTENSIONS, INTERFACE_EXTENSION, command_ops_of,
-    extensions_of,
-};
+use super::surface::{Active, Declaration, declared_when};
+pub use super::surface::{COMMAND_EXTENSION, command_ops_of};
 
 /// A2A error: no such task.
 pub const TASK_NOT_FOUND: i64 = -32001;
@@ -68,6 +66,9 @@ pub struct A2aRequest {
     pub method: String,
     pub params: Value,
     pub principal: Principal,
+    /// The extensions the request activated. The runtime projects a task's
+    /// annotations only while task-annotations/v1 is among them.
+    pub active: Active,
     pub reply: SyncSender<Value>,
 }
 
@@ -144,19 +145,24 @@ impl A2aBridge {
         self.feed.clone()
     }
 
-    /// Post a request to the loop and wait for its reply. Blocking — an async
-    /// caller (the A2A ports) runs this on a blocking thread.
-    pub fn call(&self, method: &str, params: Value, principal: Principal) -> Value {
-        self.call_loop(method, params, principal)
+    /// The extensions the listener negotiates against: what it serves. The
+    /// feed is armed at spawn and `a2a.events` is restart-only, so holding a
+    /// feed is the same answer the card reads from the settings — and one
+    /// the listener can give without a round trip to the loop.
+    pub fn declared(&self) -> Vec<Declaration> {
+        declared_when(self.feed.is_some())
     }
 
-    /// Post a request to the loop and wait for its reply.
-    fn call_loop(&self, method: &str, params: Value, principal: Principal) -> Value {
+    /// Post a request to the loop and wait for its reply. Blocking — an async
+    /// caller (the A2A ports) runs this on a blocking thread. `active` is what
+    /// the request activated ([`Active::NONE`] for a call no request made).
+    pub fn call(&self, method: &str, params: Value, principal: Principal, active: Active) -> Value {
         let (reply_tx, reply_rx) = sync_channel(1);
         let req = A2aRequest {
             method: method.to_string(),
             params,
             principal,
+            active,
             reply: reply_tx,
         };
         if self.events_tx.send(Event::A2a(Box::new(req))).is_err() {
@@ -261,8 +267,14 @@ impl Runtime {
             method,
             params,
             principal,
+            active,
             reply,
         } = req;
+        // What this request activated, for every task it projects — however
+        // deep in the handler the projection is made. Cleared with the
+        // reserved id below, so nothing outside a request is ever annotated
+        // for a caller who did not ask.
+        self.a2a_active = active;
         // Index this caller's declared budget and labels the first time they
         // appear, so everything downstream can find them by id alone — the run
         // record, the MCP `_meta` and the audit line all carry the id, never
@@ -297,6 +309,7 @@ impl Runtime {
             ),
         };
         self.reserved_task_id = None;
+        self.a2a_active = Active::NONE;
         // Audit every A2A call: who (principal + role), what (method + command
         // op), and the outcome. This is the record of who authorized what, so
         // it is emitted for refusals as well as successes.

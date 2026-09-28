@@ -2,10 +2,16 @@
 /**
  * The TUI shell: a thin renderer over `the client core`'s {@link Mirror}. All
  * state lives in the daemon; this component holds only view state (which
- * screen, which selection, what's typed). Screens: chat · tasks · subagents ·
- * debug. The chrome (top/bottom edges) renders the client's own layout
- * (chrome.ts); the composer speaks `/` (commands + workflows), `@` (skills),
- * `#` (task/conversation targets) and `$` (live values).
+ * screen, which selection, what's typed), the person's credential, and the
+ * layout. Screens: chat · tasks · subagents · debug. The chrome (top/bottom
+ * edges) renders the client's own layout (chrome.ts); the composer speaks `/`
+ * (the commands the card backs + workflows), `@` (skills), `#`
+ * (task/conversation targets) and `$` (live values).
+ *
+ * A failure retrying cannot fix — the credential refused, the principal not
+ * allowed, an agent this client cannot speak to — stops observation, and a
+ * banner says what happened and what would fix it, instead of a status dot
+ * quietly reading "closed".
  */
 import React, {
   useCallback,
@@ -20,35 +26,61 @@ import { MultilineInput, type EditState } from './parts/input.js';
 import {
   AgentdClient,
   DEFAULT_LAYOUT,
+  DISPLAY_ITEMS,
   Json,
   Mirror,
   Observation,
   RpcError,
+  SYSTEM_COMMANDS,
   Suggestion,
   TERMINAL_STATES,
   activityLine,
   applySuggestion,
   askAnswer,
   askForm,
+  availableCommands,
+  commandHelp,
+  currentGate,
+  describe,
+  deviceLogin,
   introspectionOn,
+  openSession,
+  parseAuthCommand,
+  parseLayout,
   prepare,
+  revocationEndpointOf,
+  revokeToken,
+  routeSend,
+  runAuthCommand,
   suggest,
   workflowNames,
+  DAEMON_KEYS,
 } from '../client/index.js';
-import type { AskForm, Credential } from '../client/index.js';
-import { GatePrompt } from './parts/gate.js';
+import type { Credential, Failure, Layout, LoginOption, MirrorState, TaskView } from '../client/index.js';
+import { GatePrompt, gateOptions, gateRows } from './parts/gate.js';
 import { theme } from './theme.js';
 import { Transcript } from './parts/transcript.js';
 import { TaskList } from './parts/tasks.js';
-import { DebugScreen } from './parts/debug.js';
+import { DebugScreen, settable } from './parts/debug.js';
 import { Edge } from './parts/chrome.js';
+import { StatusBar } from './parts/statusbar.js';
 import { SubagentDetail, SubagentList } from './parts/subagents.js';
+import { TUI_CLIENT_ID, chooseSignIn, launchTokenUrl } from './args.js';
+
+/** How the credential the TUI holds was obtained; it decides what an ended session says. */
+export type SignIn = 'launch' | 'bearer' | 'device';
 
 export interface AppProps {
   /** Where the agent is: its base URL or its card's URL. */
-  endpoint: string;
+  configured: string;
   /** The person's credential for that endpoint. */
   credential?: Credential;
+  /** Where {@link credential} came from. */
+  signIn?: SignIn;
+  /** The chrome (`--top`/`--bottom`); the TUI's default when absent. */
+  layout?: Layout;
+  /** Speak core A2A only (`--no-extensions`). */
+  noExtensions?: boolean;
   /** Ask for the debug screen up front (still gated by the daemon). */
   debug?: boolean;
   /**
@@ -62,6 +94,49 @@ export interface AppProps {
   mirror?: Mirror;
   /** Skip starting the observation loop (tests drive the mirror directly). */
   observe?: boolean;
+}
+
+/** What an ended launch session says: it has no expiry, so it ended because someone ended it. */
+export const LAUNCH_SESSION_ENDED = 'session ended — restart `agentd tui`, or sign in with --login';
+
+/**
+ * The banner for a failure that stopped observation: what happened, then
+ * what would fix it. A launch session is the launcher's to give, so when it
+ * ends the fix is the launcher (or a sign-in of the person's own), not a
+ * retry; a device session can sign in again from here.
+ */
+export function terminalBanner(f: Failure, signIn: SignIn | undefined, login: readonly LoginOption[]): string[] {
+  const device = login.some((o) => o.method === 'device');
+  switch (f.kind) {
+    case 'unauthenticated':
+      if (signIn === 'launch') return [LAUNCH_SESSION_ENDED];
+      if (signIn === 'device') return [describe(f), device ? '/login to sign in again' : 'restart agentd-tui with --login'];
+      if (signIn === 'bearer') {
+        return [describe(f), `the bearer token was refused — check --bearer-file / AGENTD_BEARER${device ? ', or /login' : ''}`];
+      }
+      return [describe(f), device ? '/login to sign in' : 'restart agentd-tui with --bearer-file PATH'];
+    case 'forbidden':
+      return [describe(f), 'this principal is not allowed to observe this agent — an operator can grant it'];
+    default:
+      return [describe(f), 'this client cannot work with this agent — check --endpoint'];
+  }
+}
+
+/** A failed command, as one line: the agent's words and code, or the error's message. */
+function failureText(e: unknown): string {
+  if (e instanceof RpcError) return `${e.message} (${e.code})`;
+  return e instanceof Error ? e.message : String(e);
+}
+
+/** The task a plain reply in conversation `ctx` cannot answer: the newest AUTH_REQUIRED one there. */
+function authWait(s: MirrorState, ctx: string | undefined): TaskView | undefined {
+  if (ctx === undefined) return undefined;
+  let found: TaskView | undefined;
+  for (const t of s.tasks.values()) {
+    if (t.state !== 'TASK_STATE_AUTH_REQUIRED' || t.contextId !== ctx) continue;
+    if (found === undefined || t.updated > found.updated) found = t;
+  }
+  return found;
 }
 
 type Screen = 'chat' | 'tasks' | 'subagents' | 'debug';
@@ -86,6 +161,23 @@ export function App(props: AppProps): React.JSX.Element {
   useSyncExternalStore(mirror.subscribe, mirror.getVersion);
   const s = mirror.getState();
 
+  // The credential is the person's, and /login and /logout change it; the
+  // observation below restarts with whatever it now is.
+  const [credential, setCredential] = useState<Credential | undefined>(props.credential);
+  const [signIn, setSignIn] = useState<SignIn | undefined>(props.signIn);
+  const signInRef = useRef(signIn);
+  signInRef.current = signIn;
+  const loginAbort = useRef<AbortController | null>(null);
+  useEffect(() => () => loginAbort.current?.abort(), []);
+  const [layout, setLayout] = useState<Layout>(
+    () => props.layout ?? { top: [...DEFAULT_LAYOUT.tui.top], bottom: [...DEFAULT_LAYOUT.tui.bottom] },
+  );
+  /** Why observation stopped for good, and what would fix it. */
+  const [banner, setBanner] = useState<string[] | null>(null);
+  /** A yes/no question waiting for one keystroke (an approval). */
+  const [ask, setAsk] = useState<{ question: string; resolve: (yes: boolean) => void } | null>(null);
+  const obsRef = useRef<Observation | null>(null);
+
   const fullscreen = props.fullscreen !== false && isRawModeSupported;
   const { rows, columns } = useWindowSize();
   const [screen, setScreen] = useState<Screen>(props.debug ? 'debug' : 'chat');
@@ -103,19 +195,30 @@ export function App(props: AppProps): React.JSX.Element {
   const [spin, setSpin] = useState(0);
   const [logLines, setLogLines] = useState<Json[]>([]);
   const logCursor = useRef(0);
-  const ctxRef = useRef<string | undefined>(undefined);
-  const inputTaskRef = useRef<string | undefined>(undefined);
+  /** The conversation this person is in; a fresh TUI is in none yet. */
+  const [ctx, setCtx] = useState<string | undefined>(undefined);
 
-  // The observation loop (discovery, then feed-first with a poll fallback).
+  // The observation loop (discovery, then the feed or core polling).
   useEffect(() => {
     if (props.observe === false) return;
+    setBanner(null);
     const obs = new Observation(
-      { configured: props.endpoint, credential: props.credential, onSession: (_, c) => setDiscovered(c) },
+      {
+        configured: props.configured,
+        credential,
+        noExtensions: props.noExtensions,
+        onSession: (_, c) => setDiscovered(c),
+        onTerminal: (f) => setBanner(terminalBanner(f, signInRef.current, mirror.getState().session?.caps.login ?? [])),
+      },
       mirror,
     );
+    obsRef.current = obs;
     obs.start();
-    return () => obs.stop();
-  }, [props.endpoint, props.credential, mirror, props.observe]);
+    return () => {
+      obsRef.current = null;
+      obs.stop();
+    };
+  }, [props.configured, credential, props.noExtensions, mirror, props.observe]);
   const debugOn = introspectionOn(s);
 
   const active = mirror.activeTasks();
@@ -165,12 +268,11 @@ export function App(props: AppProps): React.JSX.Element {
     };
   }, [screen, debugOn, client]);
 
-  // Track the newest input-required gate so a plain reply answers it.
-  const gate = active.find((t) => t.state === 'TASK_STATE_INPUT_REQUIRED');
-  const layout = DEFAULT_LAYOUT.tui;
-  useEffect(() => {
-    inputTaskRef.current = gate?.id;
-  });
+  // The gate a plain reply answers: this conversation's newest INPUT_REQUIRED
+  // task, never another conversation's (routeSend reads the same rule). A
+  // task waiting on AUTH_REQUIRED is shown, but nothing typed answers it.
+  const gate = currentGate(s, ctx);
+  const waiting = gate ?? authWait(s, ctx);
   // The form the gate's schema describes. A gate that declared no schema keeps
   // the old behaviour exactly: type an answer into the composer.
   const gateForm = useMemo(() => askForm(gate?.askSchema), [gate?.id, gate?.askSchema]);
@@ -188,22 +290,17 @@ export function App(props: AppProps): React.JSX.Element {
   // The gate's options sit between the transcript and the composer, so they
   // cost rows the transcript may not also use — one per option, one for the
   // hint, and one more for the free-text line when `other…` is selected.
-  const gateRows =
-    screen === 'chat' && gate && gateForm.kind !== 'text'
-      ? (gateForm.kind === 'bool'
-          ? 2
-          : gateForm.kind === 'one' || gateForm.kind === 'many'
-            ? gateForm.options.length + (gateForm.other ? 1 : 0)
-            : 0) +
-        1 +
-        (gatePick.includes('__other__') ? 1 : 0)
-      : 0;
+  const promptRows = screen === 'chat' && waiting ? gateRows(waiting.state, gateForm, gatePick) : 0;
+  // The banner is boxed: its lines plus the two border rows.
+  const bannerRows = banner ? banner.length + 2 : 0;
   const bodyRows = Math.max(
     3,
     rows -
       (2 +
         composerRows +
-        gateRows +
+        promptRows +
+        bannerRows +
+        (ask ? 1 : 0) +
         (suggestions.length > 0 ? 1 : 0) +
         // The bottom edge wraps to a second line only on a narrow terminal.
         (columns < 100 && layout.bottom.length > 6 ? 1 : 0)),
@@ -220,40 +317,191 @@ export function App(props: AppProps): React.JSX.Element {
         return;
       }
       try {
-        // `#target` routing + `$value` interpolation (shared composer rules).
+        // `#target` routing + `$value` interpolation, then where it goes: a
+        // named task, else this conversation — and its open gate, if any.
         const p = prepare(trimmed, s);
-        const gate = p.taskId ?? inputTaskRef.current;
-        const sent = await need().send(p.text, {
-          contextId: p.contextId ?? ctxRef.current,
-          taskId: gate,
-        });
-        inputTaskRef.current = undefined;
-        if (sent.task) {
-          ctxRef.current = sent.task.contextId || ctxRef.current;
-          mirror.adoptTasks([sent.task]);
-        }
-        mirror.localEcho(sent.messageId, sent.task?.contextId ?? ctxRef.current, p.text, sent.task?.id);
+        const route = routeSend(p, s, ctx);
+        const sent = await need().send(p.text, route);
+        landed(sent, p.text, route.taskId);
       } catch (e) {
-        mirror.note(e instanceof Error ? e.message : String(e), 'error');
+        mirror.note(failureText(e), 'error');
       }
     },
-    [need, mirror, s],
+    [need, mirror, s, ctx],
   );
+
+  /**
+   * A send the agent accepted: echo it, then adopt what came back — the echo
+   * first, so the task's history claims it instead of doubling it. An agent
+   * may answer with a Message instead of a task; that is its reply, and the
+   * conversation it names is where the person now is.
+   */
+  const landed = useCallback(
+    (sent: { task: TaskView | null; reply?: Json; messageId: string }, text: string, taskId?: string) => {
+      const replyCtx = (sent.reply as { contextId?: Json } | undefined)?.contextId;
+      const next = sent.task?.contextId || (typeof replyCtx === 'string' && replyCtx !== '' ? replyCtx : undefined) || ctx;
+      mirror.localEcho(sent.messageId, next, text, sent.task?.id ?? taskId);
+      if (sent.task) {
+        mirror.adoptTasks([sent.task]);
+        // Core mode follows the tasks this client started first.
+        obsRef.current?.track(sent.task.id);
+      }
+      if (sent.reply !== undefined) mirror.applyStream({ message: sent.reply });
+      if (next !== ctx) setCtx(next);
+    },
+    [mirror, ctx],
+  );
+
+  /** Ask a yes/no question on the next keystroke; anything but `y` is no. */
+  const confirm = useCallback(
+    (question: string) => new Promise<boolean>((resolve) => setAsk({ question, resolve })),
+    [],
+  );
+
+  /** Sign in with the device grant the card offers (`/login [user|operator]`). */
+  const login = useCallback(
+    async (scope: string | undefined) => {
+      if (loginAbort.current) {
+        mirror.note('a sign-in is already waiting for approval', 'error');
+        return;
+      }
+      if (scope !== undefined && scope !== 'user' && scope !== 'operator') {
+        mirror.note('usage: /login [user|operator]', 'error');
+        return;
+      }
+      // The card this session came from — or, when observation stopped
+      // before discovery settled, a fresh read of it: sign-in is how a
+      // refused session recovers, so it cannot depend on that session.
+      const caps = s.session?.caps ?? (await openSession(props.configured, { noExtensions: props.noExtensions })).caps;
+      const choice = chooseSignIn(caps.login, true);
+      if (choice.kind !== 'device') {
+        mirror.note(choice.kind === 'refuse' ? choice.reason : 'nothing to sign in to', 'error');
+        return;
+      }
+      const ac = new AbortController();
+      loginAbort.current = ac;
+      try {
+        const c = await deviceLogin({
+          flow: choice.flow,
+          clientId: TUI_CLIENT_ID,
+          scope,
+          signal: ac.signal,
+          onCode: (code) =>
+            mirror.note(
+              `to sign in, open ${code.verificationUriComplete ?? code.verificationUri} and enter ${code.userCode} — ` +
+                `or an operator runs /approve ${code.userCode} <name>`,
+            ),
+        });
+        setCredential(c);
+        setSignIn('device');
+        mirror.note(`signed in${c.scope ? ` (${c.scope})` : ''}`);
+      } finally {
+        loginAbort.current = null;
+      }
+    },
+    [mirror, s, props.configured, props.noExtensions],
+  );
+
+  /**
+   * Sign out: forget the credential and, for a session the daemon issued,
+   * revoke it there (RFC 7009) so it is not left working in anyone's hands.
+   */
+  const logout = useCallback(async () => {
+    if (!credential) {
+      mirror.note('not signed in');
+      return;
+    }
+    const token = credential.token;
+    const issued = signIn === 'device' || signIn === 'launch';
+    setCredential(undefined);
+    setSignIn(undefined);
+    if (!issued) {
+      mirror.note('signed out (a bearer token is the daemon config\'s to revoke)');
+      return;
+    }
+    const device = (s.session?.caps.login ?? []).find((o) => o.method === 'device');
+    const flow =
+      device?.method === 'device'
+        ? { tokenUrl: device.flow.tokenUrl, oauth2MetadataUrl: device.flow.oauth2MetadataUrl }
+        : { tokenUrl: launchTokenUrl(props.configured) };
+    try {
+      const url = await revocationEndpointOf(flow);
+      if (url === undefined) {
+        mirror.note('signed out here; the daemon lists no revocation endpoint, so the session ends when it expires', 'error');
+        return;
+      }
+      await revokeToken(url, token, { clientId: TUI_CLIENT_ID });
+      mirror.note('signed out; the session is revoked');
+    } catch (e) {
+      mirror.note(`signed out here, but revoking the session failed: ${failureText(e)}`, 'error');
+    }
+  }, [credential, signIn, mirror, s, props.configured]);
 
   const runSlash = useCallback(
     async (line: string) => {
       const [cmd, ...rest] = line.slice(1).split(/\s+/);
       const arg = rest.join(' ');
+      // A command whose op the card does not list for this caller is not
+      // sent: the agent would refuse it, and the refusal would only teach
+      // the person to try things.
+      const sys = SYSTEM_COMMANDS.find((c) => c.name === cmd);
+      if (sys?.needs !== undefined && !availableCommands(s).includes(sys)) {
+        mirror.note(`/${cmd} is not offered by this agent to you (its card does not list ${sys.needs})`, 'error');
+        return;
+      }
+      // The sign-in administration commands parse and run in the composer
+      // module, so both display clients answer them alike.
+      if (parseAuthCommand(cmd, rest) !== null) {
+        try {
+          const out = await runAuthCommand(cmd, rest, need(), confirm);
+          if (out !== null) mirror.note(out.text, out.error ? 'error' : 'info');
+        } catch (e) {
+          mirror.note(failureText(e), 'error');
+        }
+        return;
+      }
       try {
         switch (cmd) {
           case 'help':
-            mirror.note(
-              '/new · /tasks · /subagents · /debug · /status · /config [path] · /set · /workflow <name> · /signal <name> · /send <handle> <msg> · /pause [run] · /resume [run] · /plan · /cancel [task] · /drain · /quit — plus @skill, #target, $value in messages',
-            );
+            mirror.note(commandHelp(s));
             break;
           case 'new':
-            ctxRef.current = undefined;
+            setCtx(undefined);
             mirror.note('new conversation');
+            break;
+          case 'layout': {
+            const [edge, items] = rest;
+            if (edge === undefined) {
+              const known = Object.keys(DISPLAY_ITEMS).filter((k) => DISPLAY_ITEMS[k].surfaces.includes('tui'));
+              mirror.note(
+                `top: ${layout.top.join(',')}\nbottom: ${layout.bottom.join(',')}\n` +
+                  `items: ${known.join(', ')}, memory:<key>\n/layout top|bottom <items,…> · /layout reset`,
+              );
+              break;
+            }
+            if (edge === 'reset' && items === undefined) {
+              setLayout({ top: [...DEFAULT_LAYOUT.tui.top], bottom: [...DEFAULT_LAYOUT.tui.bottom] });
+              mirror.note('layout reset');
+              break;
+            }
+            if ((edge !== 'top' && edge !== 'bottom') || items === undefined || rest.length > 2) {
+              mirror.note('usage: /layout [top|bottom <items,…> | reset]', 'error');
+              break;
+            }
+            const parsed = parseLayout(items, 'tui');
+            if (parsed.unknown.length > 0) {
+              mirror.note(`unknown item(s): ${parsed.unknown.join(', ')} — /layout lists them`, 'error');
+              break;
+            }
+            setLayout((cur) => ({ ...cur, [edge]: parsed.items }));
+            mirror.note(`${edge}: ${parsed.items.join(',')}`);
+            break;
+          }
+          case 'login':
+            await login(rest[0]);
+            break;
+          case 'logout':
+            await logout();
             break;
           case 'tasks':
             setScreen('tasks');
@@ -306,6 +554,9 @@ export function App(props: AppProps): React.JSX.Element {
             }
             const r = (await need().adminSet(path, value)) as { [k: string]: Json } | null;
             mirror.note(`set ${path} = ${JSON.stringify(r?.value ?? value)}`);
+            // What the card offers may have moved with it (introspection on,
+            // a new settable path): re-read it.
+            obsRef.current?.refresh();
             break;
           }
           case 'signal': {
@@ -394,11 +645,10 @@ export function App(props: AppProps): React.JSX.Element {
           }
         }
       } catch (e) {
-        const msg = e instanceof RpcError ? `${e.message} (${e.code})` : String(e);
-        mirror.note(msg, 'error');
+        mirror.note(failureText(e), 'error');
       }
     },
-    [need, mirror, exit, active, s],
+    [need, mirror, exit, active, s, confirm, layout, login, logout],
   );
 
   const openSubagent = useCallback(
@@ -417,17 +667,19 @@ export function App(props: AppProps): React.JSX.Element {
 
   useInput(
     (ch, key) => {
+      // A pending yes/no takes the next keystroke, whatever it is: `y` is
+      // yes, anything else is no — an approval is never given by accident.
+      if (ask) {
+        setAsk(null);
+        ask.resolve(ch === 'y' || ch === 'Y');
+        return;
+      }
       // A form-shaped gate takes the number keys, so picking an option is one
       // keystroke instead of typing its wording. Only when the composer is
       // EMPTY: someone mid-sentence typing "1" means the character, and
       // stealing it would be maddening.
       if (screen === 'chat' && gate && gateForm.kind !== 'text' && input.length === 0) {
-        const rows =
-          gateForm.kind === 'bool'
-            ? ['yes', 'no']
-            : gateForm.kind === 'one' || gateForm.kind === 'many'
-              ? [...gateForm.options, ...(gateForm.other ? ['__other__'] : [])]
-              : [];
+        const rows = gateOptions(gateForm);
         const n = Number(ch);
         if (Number.isInteger(n) && n >= 1 && n <= rows.length) {
           const v = rows[n - 1];
@@ -447,11 +699,8 @@ export function App(props: AppProps): React.JSX.Element {
           if (!client) return;
           void client
             .send(text, { taskId: gate.id })
-            .then((sent) => {
-              if (sent.task) mirror.adoptTasks([sent.task]);
-              mirror.localEcho(sent.messageId, sent.task?.contextId ?? '', text, gate.id);
-            })
-            .catch((e: unknown) => mirror.note(String(e), 'error'));
+            .then((sent) => landed(sent, text, gate.id))
+            .catch((e: unknown) => mirror.note(failureText(e), 'error'));
           return;
         }
       }
@@ -572,7 +821,7 @@ export function App(props: AppProps): React.JSX.Element {
   // ---- render ------------------------------------------------------------
 
   const { top, bottom } = layout;
-  const chrome = { s, endpoint: props.endpoint, screen, active: active.length };
+  const chrome = { s, endpoint: props.configured, screen, active: active.length };
   // The live working line (RFC 0032 §17): what the daemon is doing, ticking
   // its own clock off the activity record's `started_ms` (the spinner interval
   // already re-renders us, so elapsed advances for free).
@@ -586,8 +835,10 @@ export function App(props: AppProps): React.JSX.Element {
                 gateForm.kind === 'text'
                 ? 'waiting for your answer'
                 : 'waiting for your choice'
-              : activityLine(mirror.activityFor(active[0].id)) +
-                (active.length > 1 ? ` · ${active.length} tasks` : ''),
+              : active[0].state === 'TASK_STATE_AUTH_REQUIRED'
+                ? 'waiting for authorization'
+                : activityLine(mirror.activityFor(active[0].id)) +
+                  (active.length > 1 ? ` · ${active.length} tasks` : ''),
           frame: spin,
         }
       : null;
@@ -595,11 +846,21 @@ export function App(props: AppProps): React.JSX.Element {
   return (
     <Box flexDirection="column" height={fullscreen ? rows : undefined}>
       <Edge items={top} ctx={chrome} />
+      {banner ? (
+        <Box flexDirection="column" borderStyle="round" borderColor={theme.error} paddingX={1}>
+          {banner.map((line, i) => (
+            <Text key={i} color={i === 0 ? theme.error : undefined} bold={i === 0}>
+              {line}
+            </Text>
+          ))}
+        </Box>
+      ) : null}
       {screen === 'chat' ? (
         <Transcript
           entries={s.transcript}
           working={workingRow}
           viewport={fullscreen ? { rows: bodyRows, columns, offset: scroll } : undefined}
+          gate={gate?.id}
         />
       ) : screen === 'tasks' ? (
         <TaskList tasks={mirror.allTasks()} selected={selected} />
@@ -611,6 +872,7 @@ export function App(props: AppProps): React.JSX.Element {
             summary={s.subagents.get(subDetail.handle) as { [k: string]: Json } | undefined}
             detail={subDetail.detail as { [k: string]: Json } | null}
             debug={debugOn}
+            canSet={settable(s, DAEMON_KEYS.introspection)}
           />
         ) : (
           <SubagentList s={s} selected={selected} />
@@ -618,12 +880,13 @@ export function App(props: AppProps): React.JSX.Element {
       ) : (
         <DebugScreen s={s} logLines={logLines} />
       )}
-      {screen === 'chat' && gate && gateForm.kind !== 'text' ? (
-        <GatePrompt
-          form={gateForm}
-          picked={gatePick}
-          other={input}
-        />
+      {screen === 'chat' && waiting ? (
+        <GatePrompt state={waiting.state} form={gateForm} picked={gatePick} other={input} />
+      ) : null}
+      {ask ? (
+        <Text color={theme.warn} bold>
+          {`? ${ask.question} (y/N)`}
+        </Text>
       ) : null}
       {screen === 'chat' ? (
         isRawModeSupported ? (
@@ -647,6 +910,7 @@ export function App(props: AppProps): React.JSX.Element {
                   }}
                   onSubmit={(v: string) => void submit(v)}
                   ignoreVertical={suggestions.length > 0}
+                  isActive={ask === null}
                 />
               </Box>
             </Box>
@@ -669,7 +933,7 @@ export function App(props: AppProps): React.JSX.Element {
           <Text color={theme.dim}>read-only (no interactive terminal)</Text>
         )
       ) : null}
-      <Edge items={bottom} ctx={chrome} />
+      <StatusBar items={bottom} ctx={chrome} />
     </Box>
   );
 }

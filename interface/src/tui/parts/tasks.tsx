@@ -1,5 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-/** The tasks screen: every task the principal may see, selectable, cancelable. */
+/**
+ * The tasks screen: every task the principal may see, selectable, cancelable.
+ * The `link` column is what task-annotations/v1 says the task belongs to — a
+ * workflow run, a subagent, or a conversation turn — spelled as the daemon
+ * spells the kind, so it can be matched against the other screens and `/…`
+ * commands; without the extension the column is empty, not guessed.
+ */
 import React from 'react';
 import { Box, Text } from 'ink';
 import type { TaskView } from '../../client/index.js';
@@ -19,13 +25,11 @@ export function TaskList({
   return (
     <Box flexDirection="column">
       <Text color={theme.dim} bold>
-        {'  id           state        link              updated'}
+        {'  id           state        link                   updated'}
       </Text>
       {rows.map((t, i) => {
         const st = stateLabel(t.state);
-        const link = t.link
-          ? `${t.link.kind === 'subagent' ? 'sub' : t.link.kind} ${shortId(t.link.id, 12)}`
-          : '';
+        const link = t.link ? `${t.link.kind} ${shortId(t.link.id, 12)}` : '';
         return (
           <Box key={t.id} flexDirection="row">
             <Text color={i === selected ? theme.accent : undefined} bold={i === selected}>
@@ -33,7 +37,7 @@ export function TaskList({
               {shortId(t.id, 12).padEnd(13)}
             </Text>
             <Text color={st.color}>{st.label.padEnd(13)}</Text>
-            <Text color={theme.dim}>{link.padEnd(18)}</Text>
+            <Text color={theme.dim}>{link.padEnd(23)}</Text>
             <Text color={theme.dim}>{ago(t.updated)}</Text>
           </Box>
         );

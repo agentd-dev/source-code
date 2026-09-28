@@ -17,6 +17,12 @@
  * terminal's own way of saying "this block is yours" — and everything else
  * gets a one-character gutter mark. Multi-line text keeps that gutter, so a
  * pasted paragraph stays visually attached to its speaker.
+ *
+ * The rows come from each task's core `history` (the mirror builds them): a
+ * person's prompt from whichever client sent it, the agent's superseded
+ * status messages, a command, and the task's own state last. A task waiting
+ * on a person reads differently by what it waits for — an INPUT_REQUIRED
+ * gate says how to answer it, an AUTH_REQUIRED one says no reply can.
  */
 import React from 'react';
 import { Box, Static, Text } from 'ink';
@@ -66,7 +72,18 @@ function Marked({
   );
 }
 
-function Row({ e, columns }: { e: TranscriptEntry; columns?: number }): React.JSX.Element {
+/**
+ * The line under a waiting row: how to answer an INPUT_REQUIRED gate — a
+ * plain reply when it is the gate this conversation's replies go to, else
+ * addressed to its task — and nothing for AUTH_REQUIRED, whose text already
+ * says it waits outside the conversation.
+ */
+function waitHint(e: TranscriptEntry, gate: string | undefined): string | undefined {
+  if (!e.inputRequired) return undefined;
+  return e.taskId !== undefined && e.taskId !== gate ? `⏎ answer with #${e.taskId} <reply>` : '⏎ reply to continue';
+}
+
+function Row({ e, columns, gate }: { e: TranscriptEntry; columns?: number; gate?: string }): React.JSX.Element {
   switch (e.kind) {
     case 'user': {
       // Inverse: the user's own words, in the terminal's own idiom for
@@ -91,27 +108,35 @@ function Row({ e, columns }: { e: TranscriptEntry; columns?: number }): React.JS
         </Box>
       );
     }
-    case 'agent':
+    case 'agent': {
+      const hint = waitHint(e, gate);
       return (
         <Box flexDirection="column" marginTop={1}>
-          <Marked mark="●" markColor={theme.agent}>
-            {e.text}
-          </Marked>
-          {e.inputRequired ? (
+          {e.authRequired ? (
+            <Marked mark="⚿" markColor={theme.warn} color={theme.warn}>
+              {e.text}
+            </Marked>
+          ) : (
+            <Marked mark="●" markColor={theme.agent}>
+              {e.text}
+            </Marked>
+          )}
+          {hint !== undefined ? (
             <Box marginLeft={GUTTER}>
-              <Text color={theme.warn}>{'⏎ reply to continue'}</Text>
+              <Text color={theme.warn}>{hint}</Text>
             </Box>
           ) : null}
           {/* What the live counter settled at. Without it the number vanishes
               at the moment it became a fact, and "how long did that take?" is
               the question people ask about an agent more than any other. */}
-          {e.ms !== undefined && !e.inputRequired ? (
+          {e.ms !== undefined && !e.inputRequired && !e.authRequired ? (
             <Box marginLeft={GUTTER}>
               <Text color={theme.dim}>{duration(e.ms)}</Text>
             </Box>
           ) : null}
         </Box>
       );
+    }
     case 'command':
       return (
         <Marked mark="▸" markColor={theme.command} color={theme.command}>
@@ -156,6 +181,8 @@ export interface TranscriptProps {
   working?: { text: string; frame: number } | null;
   /** Set in fullscreen: render a windowed viewport instead of scrollback. */
   viewport?: Viewport;
+  /** The task a plain reply in this conversation answers (`currentGate`). */
+  gate?: string;
 }
 
 /**
@@ -168,8 +195,8 @@ function heightOf(e: TranscriptEntry, columns: number): number {
     .split('\n')
     .reduce((n, line) => n + Math.max(1, Math.ceil(line.length / width)), 0);
   const spacer = e.kind === 'user' || e.kind === 'agent' || e.kind === 'error' ? 1 : 0;
-  const gate = e.kind === 'agent' && e.inputRequired ? 1 : 0;
-  return body + spacer + gate;
+  const hint = e.kind === 'agent' && e.inputRequired ? 1 : 0;
+  return body + spacer + hint;
 }
 
 /**
@@ -203,7 +230,7 @@ export function windowEntries(
   return first.above > 0 ? fit(Math.max(1, rows - 1)) : first;
 }
 
-export function Transcript({ entries, working, viewport }: TranscriptProps): React.JSX.Element {
+export function Transcript({ entries, working, viewport, gate }: TranscriptProps): React.JSX.Element {
   // Fullscreen: a windowed viewport, bottom-anchored, clipped — the alternate
   // screen has no scrollback of its own, so the app owns the scroll.
   if (viewport) {
@@ -218,7 +245,7 @@ export function Transcript({ entries, working, viewport }: TranscriptProps): Rea
           </Text>
         ) : null}
         {visible.map((e) => (
-          <Row key={e.key} e={e} columns={viewport.columns} />
+          <Row key={e.key} e={e} columns={viewport.columns} gate={gate} />
         ))}
         {working ? (
           <Text color={theme.accent}>
@@ -230,13 +257,15 @@ export function Transcript({ entries, working, viewport }: TranscriptProps): Rea
   }
   // Inline: settled rows go to terminal scrollback (never re-rendered);
   // anything still moving stays in the dynamic region.
-  const settled = entries.filter((e) => !e.pending && !e.inputRequired);
-  const live = entries.filter((e) => e.pending || e.inputRequired);
+  // A waiting row changes when the task moves on, so it is not settled yet.
+  const moving = (e: TranscriptEntry): boolean => e.pending === true || e.inputRequired === true || e.authRequired === true;
+  const settled = entries.filter((e) => !moving(e));
+  const live = entries.filter(moving);
   return (
     <Box flexDirection="column">
       <Static items={settled}>{(e) => <Row key={e.key} e={e} />}</Static>
       {live.map((e) => (
-        <Row key={e.key} e={e} />
+        <Row key={e.key} e={e} gate={gate} />
       ))}
       {working ? (
         <Text color={theme.accent}>

@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 /**
  * The debug screen ("extra information") — rendered only when the DAEMON says
- * so (the introspection reads, from its card or the feed's hello): the live feed tail,
- * runs with step progress, the subagent/child tables, and the log-ring tail.
+ * so: the introspection reads, offered to this caller by its extended card,
+ * or — when the cards cannot tell — by the feed's hello (`introspectionOn`).
+ * The live feed tail, runs with step progress, the subagent/child tables,
+ * and the log-ring tail. Off, it says which daemon key turns it on, and
+ * offers `/set` for it only when the card lets this caller set it.
  */
 import React from 'react';
 import { Box, Text } from 'ink';
-import { DAEMON_KEYS, duration, introspectionOn } from '../../client/index.js';
+import { DAEMON_KEYS, OPS, duration, introspectionOn } from '../../client/index.js';
 import type { FeedEvent, Json, MirrorState } from '../../client/index.js';
 import { ago, shortId, theme } from '../theme.js';
 
@@ -150,6 +153,12 @@ function LogTail({ lines }: { lines: Json[] }): React.JSX.Element {
   );
 }
 
+/** The card offers this caller `admin.set` on `path`. */
+export function settable(s: MirrorState, path: string): boolean {
+  const cmd = s.session?.caps.command;
+  return cmd !== null && cmd !== undefined && cmd.ops.has(OPS.adminSet) && cmd.settable.includes(path);
+}
+
 export function DebugScreen({
   s,
   logLines,
@@ -160,7 +169,8 @@ export function DebugScreen({
   if (!introspectionOn(s)) {
     return (
       <Text color={theme.dim}>
-        debug is off on this daemon — set {DAEMON_KEYS.introspection}: true
+        {`debug is off on this daemon — it needs ${DAEMON_KEYS.introspection}: true` +
+          (settable(s, DAEMON_KEYS.introspection) ? ` (/set ${DAEMON_KEYS.introspection} true)` : ' in its config')}
       </Text>
     );
   }

@@ -2,11 +2,14 @@
 /**
  * The subagents screen: the live list (feed-driven), a selectable row, and a
  * drill-down detail view (`subagent.get` — instruction, result, attempts) with
- * a way back. Details need `interface.debug`; without it the list still shows
- * the summary the feed carries.
+ * a way back. The detail is an introspection read, offered only while the
+ * daemon runs with `a2a.introspection.enabled` (the card or the feed's hello
+ * says which — `introspectionOn`); without it the list still shows the
+ * summary the feed carries.
  */
 import React from 'react';
 import { Box, Text } from 'ink';
+import { DAEMON_KEYS } from '../../client/index.js';
 import type { Json, MirrorState } from '../../client/index.js';
 import { ago, theme } from '../theme.js';
 
@@ -79,12 +82,16 @@ export function SubagentDetail({
   summary,
   detail,
   debug,
+  canSet = false,
   killAsk = false,
 }: {
   handle: string;
   summary: { [k: string]: Json } | undefined;
   detail: { [k: string]: Json } | null;
+  /** The daemon offers the introspection reads (`introspectionOn`). */
   debug: boolean;
+  /** The card lets this caller turn introspection on with `admin.set`. */
+  canSet?: boolean;
   /** Waiting for confirmation that this subagent should be stopped. */
   killAsk?: boolean;
 }): React.JSX.Element {
@@ -116,7 +123,8 @@ export function SubagentDetail({
       {line('requested_by', d.requested_by)}
       {!debug ? (
         <Text color={theme.dim}>
-          (summary only — enable interface.debug, or /set interface.debug true, for instruction/result)
+          {`(summary only — instruction and result need ${DAEMON_KEYS.introspection}` +
+            (canSet ? `: /set ${DAEMON_KEYS.introspection} true)` : ' in the daemon config)')}
         </Text>
       ) : null}
       {killAsk ? (

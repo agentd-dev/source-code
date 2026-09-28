@@ -4,8 +4,8 @@
 // It answers the way a stock A2A server does, not the way agentd happens to:
 // the card at the well-known path with an ETag, `Cache-Control` and 304s;
 // JSON-RPC on POST at the interface path; SSE framed with CRLF, as the
-// official Python SDK (sse-starlette) frames it; and a stub of the OAuth
-// device grant. Every request is recorded, headers included, so a test can
+// official Python SDK (sse-starlette) frames it; and stubs of the OAuth
+// device grant and of agentd's launch grant. Every request is recorded, headers included, so a test can
 // assert what the client sent — and what it did not.
 //
 //   const fake = await startFakeA2a();
@@ -19,6 +19,8 @@ import http from 'node:http';
 import { createHash } from 'node:crypto';
 
 const CARD_PATH = '/.well-known/agent-card.json';
+/** The daemon's `surface::launch::LAUNCH_GRANT_TYPE`. */
+const LAUNCH_GRANT_TYPE = 'https://agentd.dev/oauth/grant-type/launch/v1';
 
 /** A public card for an agent at `origin`, JSON-RPC 1.0 at `origin/`. */
 export function defaultCard(origin) {
@@ -98,6 +100,12 @@ export async function startFakeA2a(opts = {}) {
     tasks,
     /** The device grant: approved once `approve()` ran. */
     device: { approved: false, token: 'fake-device-token', polls: 0 },
+    /**
+     * The launch grant, as a launcher's slot answers it: `code` is redeemable
+     * once, and only without an Origin header (a NoOrigin code); anything else
+     * is `invalid_grant`. Unset `code` means no code was minted.
+     */
+    launch: { code: undefined, token: `agentd_at_${'f'.repeat(64)}`, used: false },
     url: '',
     origin: '',
     /** JSON-RPC calls, optionally of one method. */
@@ -246,6 +254,14 @@ export async function startFakeA2a(opts = {}) {
         expires_in: 600,
         interval: 1,
       });
+    }
+    if (path === '/oauth2/token' && form.get('grant_type') === LAUNCH_GRANT_TYPE) {
+      const l = fake.launch;
+      const ok = l.code !== undefined && !l.used && form.get('code') === l.code && req.headers.origin === undefined;
+      // Any presentation of a live code consumes it, as the daemon's slot does.
+      if (form.get('code') === l.code) l.used = true;
+      if (!ok || !form.get('client_id')) return json(400, { error: 'invalid_grant' });
+      return json(200, { access_token: l.token, token_type: 'Bearer', scope: 'operator' });
     }
     if (path === '/oauth2/token') {
       if (form.get('grant_type') !== 'urn:ietf:params:oauth:grant-type:device_code') {

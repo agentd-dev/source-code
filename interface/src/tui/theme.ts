@@ -24,6 +24,8 @@ export function stateLabel(state: string): { label: string; color: string } {
       return { label: 'working', color: theme.accent };
     case 'TASK_STATE_INPUT_REQUIRED':
       return { label: 'needs input', color: theme.warn };
+    case 'TASK_STATE_AUTH_REQUIRED':
+      return { label: 'needs auth', color: theme.warn };
     case 'TASK_STATE_COMPLETED':
       return { label: 'done', color: theme.agent };
     case 'TASK_STATE_FAILED':

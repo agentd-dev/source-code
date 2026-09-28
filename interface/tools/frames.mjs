@@ -3,19 +3,56 @@
  * Render real TUI frames for the documentation.
  *
  * The frames are produced by the actual App against a Mirror driven with
- * daemon-shaped events — the same harness the render tests use. That matters:
- * a screenshot mocked up by hand drifts from the product the moment either
- * changes, while these are regenerated from the code that ships.
+ * daemon-shaped events — the same harness the render tests use, and the same
+ * fake agent's card (test/fake-a2a.mjs), here declaring agentd's extensions
+ * the way agentd's own card does. That matters: a screenshot mocked up by hand
+ * drifts from the product the moment either changes, while these are
+ * regenerated from the code that ships.
  *
  *   node tools/frames.mjs > ../docs/_generated/tui-frames.json
  */
 import './_force_color.mjs';
 import React from 'react';
 import { render } from 'ink-testing-library';
-import { Mirror } from '../dist/client/index.js';
+import {
+  COMMAND_EXTENSION,
+  EVENTS_EXTENSION,
+  INTROSPECTION_OPS,
+  Mirror,
+  OPS,
+  TASK_ANNOTATIONS_EXTENSION,
+  capabilitiesOf,
+} from '../dist/client/index.js';
 import { App } from '../dist/tui/app.js';
+import { defaultCard } from '../test/fake-a2a.mjs';
 
 const tick = (ms = 40) => new Promise((r) => setTimeout(r, ms));
+const ENDPOINT = 'http://127.0.0.1:8420';
+/** An RFC 3339 timestamp `s` seconds into a fixed day. */
+const at = (s) => new Date(Date.UTC(2026, 8, 1, 9, 0, s)).toISOString();
+
+/**
+ * The card: the fake agent's, declaring what an agentd with the feed and
+ * introspection on declares to its operator.
+ */
+function card() {
+  const c = defaultCard(ENDPOINT);
+  c.name = 'agentd';
+  c.capabilities.extensions = [
+    { uri: COMMAND_EXTENSION, params: { ops: [...Object.values(OPS)], settable: [] } },
+    { uri: EVENTS_EXTENSION, params: { ring: 1024, kinds: ['task', 'run', 'step', 'subagent'] } },
+    { uri: TASK_ANNOTATIONS_EXTENSION, params: {} },
+  ];
+  return c;
+}
+
+function session() {
+  const c = card();
+  // Read as an operator's extended card, so the introspection ops are known on.
+  const caps = capabilitiesOf(c, c);
+  if (!INTROSPECTION_OPS.every((op) => caps.command?.ops.has(op))) throw new Error('the fixture card lost the introspection ops');
+  return { cardUrl: `${ENDPOINT}/.well-known/agent-card.json`, card: c, extended: c, ep: { url: `${ENDPOINT}/` }, caps, warnings: [] };
+}
 
 /** A stand-in daemon: the App calls these on user actions. */
 const client = {
@@ -32,47 +69,64 @@ const client = {
   }),
   subagentKill: async () => ({ ok: true }),
   subagentSend: async () => ({ ok: true }),
+  // A prompt typed into the composer opens a task in conversation c1.
+  send: async (text) => ({
+    task: {
+      id: 't-ship', contextId: 'c1', state: 'TASK_STATE_WORKING', artifacts: [], artifactData: [], updated: Date.now(),
+      history: [{ messageId: 'typed', role: 'ROLE_USER', text, data: [] }],
+    },
+    messageId: 'typed',
+  }),
 };
 
 function boot(cols = 92, rows = 26) {
   const mirror = new Mirror();
   const ui = render(
-    React.createElement(App, { endpoint: 'http://127.0.0.1:8420', client, mirror, observe: false }),
+    React.createElement(App, { configured: ENDPOINT, client, mirror, observe: false }),
     { columns: cols, rows },
   );
   return { mirror, ui };
 }
 
-const INFO = {
-  enabled: true, debug: true, version: '1.7.0', instance: 'triage-1', model: 'gpt-5.1',
-  protocol: 1, feed: { ring: 1024, method: 'SubscribeToEvents' }, ops: [],
-};
+/** The feed's sequence: every event is numbered after the one before it, as the daemon numbers them. */
+let seq = 0;
+const feed = (m, kind, data) => m.apply({ seq: ++seq, ts: seq, kind, data });
 
 /** A daemon mid-flight: a run stepping, two subagents, one in trouble. */
 function populate(mirror) {
-  mirror.setCard({ name: 'agentd' });
-  mirror.setInfo(INFO);
+  seq = 0;
+  mirror.setSession(session());
+  mirror.bootstrap({ version: '1.17.0', instance: 'triage-1', model: 'gpt-5.1' });
+  mirror.onHello({ seq: 0, resume: 0, resync: false, introspection: true, version: '1.17.0' });
   mirror.setConn('ready');
-  mirror.apply({ seq: 1, ts: 1, kind: 'run', data: { id: 'pipeline-01M0C0', workflow: 'pipeline', status: 'running', steps: '3/7' } });
-  const step = (n, s, extra = {}) => mirror.apply({ seq: n, ts: n, kind: 'step', data: { run: 'pipeline-01M0C0', step: s, ...extra } });
+  feed(mirror, 'run', { id: 'pipeline-01M0C0', workflow: 'pipeline', status: 'running', steps: '3/7' });
+  const step = (s, extra = {}) => feed(mirror, 'step', { run: 'pipeline-01M0C0', step: s, ...extra });
   // Durations are measured from the events the client sees, so the fixture has
   // to actually take time — otherwise every step documents itself as `0ms` and
   // the column looks broken rather than fast.
-  step(2, 'fetch', { kind: 'mcp.tool', phase: 'start' });
-  step(4, 'triage', { kind: 'extract', phase: 'start', attempt: 1 });
-  step(6, 'notify', { kind: 'a2a.send', phase: 'start' });
+  step('fetch', { kind: 'mcp.tool', phase: 'start' });
+  step('triage', { kind: 'extract', phase: 'start', attempt: 1 });
+  step('notify', { kind: 'a2a.send', phase: 'start' });
   return mirror;
 }
 
 /** Finish the two steps that complete, after real elapsed time. */
 async function settle(mirror) {
-  const step = (n, s, extra = {}) => mirror.apply({ seq: n, ts: n, kind: 'step', data: { run: 'pipeline-01M0C0', step: s, ...extra } });
+  const step = (s, extra = {}) => feed(mirror, 'step', { run: 'pipeline-01M0C0', step: s, ...extra });
   await tick(140);
-  step(3, 'fetch', { phase: 'done', status: 'done', tokens: 0 });
+  step('fetch', { phase: 'done', status: 'done', tokens: 0 });
   await tick(900);
-  step(5, 'triage', { phase: 'done', status: 'done', tokens: 1840 });
-  mirror.apply({ seq: 7, ts: 7, kind: 'subagent', data: { handle: 'sa-review', mode: 'supervised', status: 'running', tokens: 4120, updated: Date.now() } });
-  mirror.apply({ seq: 8, ts: 8, kind: 'subagent', data: { handle: 'sa-lint', mode: 'detached', status: 'failed', tokens: 260, updated: Date.now() } });
+  step('triage', { phase: 'done', status: 'done', tokens: 1840 });
+  feed(mirror, 'subagent', { handle: 'sa-review', mode: 'supervised', status: 'running', tokens: 4120, updated: Date.now() });
+  feed(mirror, 'subagent', { handle: 'sa-lint', mode: 'detached', status: 'failed', tokens: 260, updated: Date.now() });
+}
+
+/** Type a line into the composer and send it. */
+async function type(ui, line) {
+  ui.stdin.write(line);
+  await tick();
+  ui.stdin.write('\r');
+  await tick(80);
 }
 
 const frames = {};
@@ -87,8 +141,12 @@ async function capture(name, setup, cols = 92, rows = 26) {
 await capture('chat', async (m) => {
   populate(m);
   await settle(m);
-  m.apply({ seq: 20, ts: 20, kind: 'message', data: { messageId: 'm1', contextId: 'c1', principal: 'operator', text: 'Triage the newest issue' } });
-  m.apply({ seq: 21, ts: 21, kind: 'task', data: { task: { id: 't1', contextId: 'c1', status: { state: 'TASK_STATE_WORKING', timestamp: 21 } } } });
+  // Another client's prompt, as the task's history carries it.
+  feed(m, 'task', { task: {
+    id: 't1', contextId: 'c1',
+    status: { state: 'TASK_STATE_WORKING', timestamp: at(21) },
+    history: [{ role: 'ROLE_USER', messageId: 'm1', parts: [{ text: 'Triage the newest issue' }] }],
+  } });
   await tick();
 });
 
@@ -130,31 +188,41 @@ await capture('debug', async (m, ui) => {
   for (let i = 0; i < 3; i++) { ui.stdin.write('\t'); await tick(); }
 });
 
+/**
+ * A gate in the conversation this console is in: the task the person's prompt
+ * opened stops to ask. Stamped after the prompt, as the daemon would.
+ */
+async function gate(m, ui, text, askSchema) {
+  await type(ui, 'Ship the release?');
+  feed(m, 'task', { task: {
+    id: 't-ship', contextId: 'c1',
+    status: {
+      state: 'TASK_STATE_INPUT_REQUIRED',
+      timestamp: new Date(Date.now() + 1000).toISOString(),
+      message: { role: 'ROLE_AGENT', messageId: 'ask-1', parts: [{ text }] },
+    },
+    history: [{ role: 'ROLE_USER', messageId: 'typed', parts: [{ text: 'Ship the release?' }] }],
+    metadata: { [TASK_ANNOTATIONS_EXTENSION]: { askSchema } },
+  } });
+  await tick(80);
+}
+
 // A gate whose schema says "one of these three" — the form, not a text box.
-await capture('gate-choice', async (m) => {
+await capture('gate-choice', async (m, ui) => {
   populate(m);
   await settle(m);
-  m.apply({ seq: 30, ts: 30, kind: 'message', data: { messageId: 'g1', contextId: 'c1', principal: 'operator', text: 'Ship the release?' } });
-  m.apply({ seq: 31, ts: 31, kind: 'task', data: { task: {
-    id: 'gate1', contextId: 'c1',
-    status: { state: 'TASK_STATE_INPUT_REQUIRED', timestamp: 31,
-              message: { parts: [{ text: 'Candidate sa-review found 3 regressions. How should I proceed?' }] } },
-    metadata: { 'agentd/ask_schema': { type: 'string', enum: ['ship anyway', 'hold for fixes', 'roll back'] } },
-  } } });
-  await tick(80);
+  await gate(m, ui, 'Candidate sa-review found 3 regressions. How should I proceed?', {
+    type: 'string', enum: ['ship anyway', 'hold for fixes', 'roll back'],
+  });
 });
 
 // A multi-select with an "other" escape hatch.
-await capture('gate-multi', async (m) => {
+await capture('gate-multi', async (m, ui) => {
   populate(m);
   await settle(m);
-  m.apply({ seq: 32, ts: 32, kind: 'task', data: { task: {
-    id: 'gate2', contextId: 'c1',
-    status: { state: 'TASK_STATE_INPUT_REQUIRED', timestamp: 32,
-              message: { parts: [{ text: 'Which checks should I run before merging?' }] } },
-    metadata: { 'agentd/ask_schema': { type: 'array', items: { anyOf: [{ enum: ['unit', 'integration', 'e2e'] }, { type: 'string' }] } } },
-  } } });
-  await tick(80);
+  await gate(m, ui, 'Which checks should I run before merging?', {
+    type: 'array', items: { anyOf: [{ enum: ['unit', 'integration', 'e2e'] }, { type: 'string' }] },
+  });
 });
 
 process.stdout.write(JSON.stringify(frames, null, 2));

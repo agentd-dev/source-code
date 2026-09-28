@@ -7,21 +7,23 @@ import { Mirror, suggest, applySuggestion, prepare, triggerToken } from '../dist
 
 function seeded() {
   const m = new Mirror();
-  m.setInfo({ enabled: true, debug: false, version: '2.1.0', instance: 'box-1', model: 'mock-1', protocol: 1, feed: { ring: 1024, method: 'SubscribeToEvents' }, ops: [] });
   m.bootstrap({
+    version: '2.1.0',
+    instance: 'box-1',
+    model: 'mock-1',
     workflows: [{ name: 'deploy' }, { name: 'triage' }],
     skills: ['release-notes', 'oncall'],
     counters: { turns: 4, tokens_in: 120, tokens_out: 60 },
     conversations: [{ id: 'a2a-7' }],
   });
-  m.apply({ seq: 1, ts: 1, kind: 'task', data: { task: { id: 'task-9', contextId: 'c', updated: 1, status: { state: 'TASK_STATE_INPUT_REQUIRED', timestamp: 1, message: { parts: [{ text: 'which?' }] } } } } });
+  m.apply({ seq: 1, ts: 1, kind: 'task', data: { task: { id: 'task-9', contextId: 'c', status: { state: 'TASK_STATE_INPUT_REQUIRED', timestamp: '2026-09-01T00:00:01Z', message: { parts: [{ text: 'which?' }] } } } } });
   return m;
 }
 
 test('slash suggests system commands first, then workflows', () => {
   const s = seeded().getState();
   const all = suggest('/', s, 50).map((x) => x.label);
-  assert.ok(all.includes('/help') && all.includes('/pair') && all.includes('/set'));
+  assert.ok(all.includes('/help') && all.includes('/set'));
   const wf = suggest('/dep', s);
   assert.deepEqual(wf.map((x) => [x.label, x.hint]), [['/deploy', 'workflow']]);
   // Only at line start — a mid-sentence slash is not a command.
@@ -67,13 +69,13 @@ test('prepare routes leading # targets and interpolates $ values', () => {
   assert.equal(prepare('price is $unknownvar', s).text, 'price is $unknownvar');
 });
 
-test('a config feed event updates the live info every surface renders from', () => {
+test('a config feed event is noted, and $ values read the status document', () => {
   const m = seeded();
-  m.apply({ seq: 5, ts: 5, kind: 'config', data: { path: 'interface.debug', value: true } });
-  assert.equal(m.getState().info.debug, true);
-  m.apply({ seq: 6, ts: 6, kind: 'config', data: { path: 'interface.display.bottom', value: ['conn', 'model'] } });
-  assert.deepEqual(m.getState().info.display.bottom, ['conn', 'model']);
-  assert.ok(m.getState().transcript.some((e) => e.kind === 'info' && e.text.includes('interface.debug')));
+  m.apply({ seq: 5, ts: 5, kind: 'config', data: { path: 'agent.approval', value: 'ask' } });
+  assert.ok(m.getState().transcript.some((e) => e.kind === 'info' && e.text.includes('agent.approval = "ask"')));
+  // The live status wins over the bootstrap once the feed publishes one.
+  m.apply({ seq: 6, ts: 6, kind: 'status', data: { model: 'mock-2' } });
+  assert.equal(prepare('on $model', m.getState()).text, 'on mock-2');
 });
 
 test('the activity line says what the agent is doing, for how long, at what cost', async () => {

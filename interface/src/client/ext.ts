@@ -2,10 +2,9 @@
 /**
  * agentd's extension vocabulary, in one place: every extension URI, the one
  * extension method, the command envelope key and the op names the client
- * reaches for. This is meant to be their only home — a URI or op that changes
- * version changes here and nowhere else. The older transport in `wire.ts`
- * still spells two URIs of its own until it moves onto this module; the guard
- * test that holds the rule arrives with that move.
+ * reaches for. This is their only home — a URI or op that changes version
+ * changes here and nowhere else, and a source scan in client.test.mjs fails
+ * the build when another file under src/ spells one.
  *
  * Everything here is an A2A extension (or, for {@link UNIX_BINDING}, a custom
  * binding) that agentd DECLARES on its card. The client uses one only when the
@@ -67,25 +66,57 @@ export const EVENTS_METHOD = 'agentd.events/SubscribeToEvents';
 export const COMMAND_DATA_KEY = 'agentd';
 
 /**
+ * Every command/v2 op the client sends, keyed by the `AgentdClient` method
+ * that sends it. Whether an agent SERVES one is its card's business
+ * (`params.ops`); this is only the spelling.
+ */
+export const OPS = Object.freeze({
+  status: 'status',
+  config: 'config',
+  workflowRun: 'workflow.run',
+  workflowStatus: 'workflow.status',
+  workflowCancel: 'workflow.cancel',
+  workflowSignal: 'workflow.signal',
+  subagentSend: 'subagent.send',
+  subagentKill: 'subagent.kill',
+  subagentStatus: 'subagent.status',
+  planGet: 'plan.get',
+  conversationGet: 'conversation.get',
+  runGet: 'run.get',
+  subagentGet: 'subagent.get',
+  debugEvents: 'debug.events',
+  adminDrain: 'admin.drain',
+  adminPause: 'admin.pause',
+  adminResume: 'admin.resume',
+  adminCancel: 'admin.cancel',
+  adminSet: 'admin.set',
+  authDevicePending: 'auth.device.pending',
+  authDeviceApprove: 'auth.device.approve',
+  authDeviceDeny: 'auth.device.deny',
+  authSessions: 'auth.sessions',
+  authSessionsRevoke: 'auth.sessions.revoke',
+} as const);
+
+/**
  * The slash commands that are command/v2 ops, keyed by the word a person
  * types. A slash command is offered only while the card lists its op.
  */
 export const SLASH_OPS: Readonly<Record<string, string>> = Object.freeze({
-  status: 'status',
-  config: 'config',
-  set: 'admin.set',
-  workflow: 'workflow.run',
-  signal: 'workflow.signal',
-  send: 'subagent.send',
-  pause: 'admin.pause',
-  resume: 'admin.resume',
-  plan: 'plan.get',
-  drain: 'admin.drain',
-  approve: 'auth.device.approve',
-  deny: 'auth.device.deny',
-  devices: 'auth.device.pending',
-  sessions: 'auth.sessions',
-  revoke: 'auth.sessions.revoke',
+  status: OPS.status,
+  config: OPS.config,
+  set: OPS.adminSet,
+  workflow: OPS.workflowRun,
+  signal: OPS.workflowSignal,
+  send: OPS.subagentSend,
+  pause: OPS.adminPause,
+  resume: OPS.adminResume,
+  plan: OPS.planGet,
+  drain: OPS.adminDrain,
+  approve: OPS.authDeviceApprove,
+  deny: OPS.authDeviceDeny,
+  devices: OPS.authDevicePending,
+  sessions: OPS.authSessions,
+  revoke: OPS.authSessionsRevoke,
 });
 
 /**
@@ -94,8 +125,8 @@ export const SLASH_OPS: Readonly<Record<string, string>> = Object.freeze({
  * is on — so the card listing any of them is what turns those views on.
  */
 export const INTROSPECTION_OPS: readonly string[] = Object.freeze([
-  'conversation.get',
-  'run.get',
-  'subagent.get',
-  'debug.events',
+  OPS.conversationGet,
+  OPS.runGet,
+  OPS.subagentGet,
+  OPS.debugEvents,
 ]);

@@ -5,10 +5,20 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import React from 'react';
 import { render } from 'ink-testing-library';
-import { Mirror } from '../dist/client/index.js';
+import { COMMAND_EXTENSION, Mirror, capabilitiesOf } from '../dist/client/index.js';
 import { App } from '../dist/tui/app.js';
 
 const tick = () => new Promise((r) => setTimeout(r, 30));
+/** An RFC 3339 timestamp `s` seconds into a fixed day. */
+const at = (s) => new Date(Date.UTC(2026, 8, 1, 0, 0, s)).toISOString();
+
+/**
+ * What discovery settles for a public card declaring the command vocabulary:
+ * whether introspection is on is not something that card can tell.
+ */
+function session(card = { name: 'agentd', capabilities: { extensions: [{ uri: COMMAND_EXTENSION, params: { ops: [] } }] } }) {
+  return { cardUrl: 'http://127.0.0.1:1/.well-known/agent-card.json', card, extended: null, ep: { url: 'http://127.0.0.1:1/' }, caps: capabilitiesOf(card, null), warnings: [] };
+}
 
 function boot() {
   const mirror = new Mirror();
@@ -29,37 +39,41 @@ test('renders the connecting state, then daemon identity from the mirror', async
   const { mirror, ui } = boot();
   await tick();
   assert.match(ui.lastFrame(), /connecting/);
-  mirror.setCard({ name: 'agentd' });
-  mirror.setInfo({ enabled: true, debug: false, version: '9.9.9', instance: 'box-1', protocol: 1, feed: { ring: 1024, method: 'SubscribeToEvents' }, ops: [] });
+  mirror.setSession(session());
+  mirror.bootstrap({ version: '9.9.9', instance: 'box-1' });
   mirror.setConn('ready');
   await tick();
   const frame = ui.lastFrame();
-  // The chrome renders the daemon-declared display items in order.
+  // The name comes from the card, the rest from the status document, in the
+  // client's own default order.
   assert.match(frame, /agentd 9\.9\.9 box-1/);
   assert.match(frame, /● live/);
   ui.unmount();
 });
 
-test('the daemon reshapes the chrome via interface.display / config events', async () => {
+test('the chrome is the client layout; the daemon only fills it in', async () => {
   const { mirror, ui } = boot();
   mirror.setConn('ready');
-  mirror.setInfo({
-    enabled: true, debug: false, version: '2.1.0', instance: 'box-2', model: 'mock-9', protocol: 1,
-    feed: { ring: 1024, method: 'SubscribeToEvents' }, ops: [],
-    display: { top: ['name', 'model'], bottom: ['conn', 'tokens'] },
-  });
-  mirror.bootstrap({ counters: { turns: 2, tokens_in: 11, tokens_out: 5 } });
+  mirror.setSession(session());
+  mirror.bootstrap({ version: '2.1.0', instance: 'box-2', model: 'mock-9', counters: { turns: 2, tokens_in: 11, tokens_out: 5 } });
   await tick();
   let frame = ui.lastFrame();
-  assert.match(frame, /agentd mock-9/, 'top = name + model');
+  assert.match(frame, /agentd 2\.1\.0 box-2/, 'the default top');
+  assert.doesNotMatch(frame, /mock-9/, 'model is not in the default layout');
   assert.match(frame, /11\/5 tok/, 'bottom includes tokens');
-  assert.doesNotMatch(frame, /tab:screens/, 'keys not in the configured bottom');
-  // A runtime config.set from ANOTHER client re-shapes this one too.
-  mirror.apply({ seq: 9, ts: 9, kind: 'config', data: { path: 'interface.display.bottom', value: ['conn', 'runs'] } });
+  assert.match(frame, /tab:screens/, 'and the key hints');
+  assert.doesNotMatch(frame, /\bdebug\b/, 'no introspection known yet');
+  // The cards cannot tell (no extended card): the feed's hello says the
+  // introspection reads are on, so the badge shows.
+  mirror.onHello({ seq: 0, resume: 0, resync: false, introspection: true, version: '2.1.0' });
+  await tick();
+  assert.match(ui.lastFrame(), /\bdebug\b/);
+  // A config event from ANOTHER client is news, not a layout: nothing moves.
+  mirror.apply({ seq: 9, ts: 9, kind: 'config', data: { path: 'agent.approval', value: 'ask' } });
   await tick();
   frame = ui.lastFrame();
-  assert.match(frame, /0 runs/);
-  assert.doesNotMatch(frame, /11\/5 tok/);
+  assert.match(frame, /11\/5 tok/);
+  assert.doesNotMatch(frame, /\d+ runs/);
   ui.unmount();
 });
 
@@ -85,7 +99,7 @@ test('a cross-client conversation renders: prompt, working, reply', async () => 
   mirror.setConn('ready');
   // Another client's prompt arrives on the feed…
   mirror.apply({ seq: 1, ts: 10, kind: 'message', data: { messageId: 'm1', contextId: 'c1', taskId: 't1', principal: 'user:web', text: 'What is up?' } });
-  mirror.apply({ seq: 2, ts: 20, kind: 'task', data: { task: { id: 't1', contextId: 'c1', status: { state: 'TASK_STATE_WORKING', timestamp: 20 } } } });
+  mirror.apply({ seq: 2, ts: 20, kind: 'task', data: { task: { id: 't1', contextId: 'c1', status: { state: 'TASK_STATE_WORKING', timestamp: at(20) } } } });
   await tick();
   let frame = ui.lastFrame();
   // Authorship is treatment, not a label: the user's line carries the
@@ -113,7 +127,7 @@ test('a cross-client conversation renders: prompt, working, reply', async () => 
   await tick();
   assert.match(ui.lastFrame(), /read_file/);
   // …and the reply lands as the task's terminal artifact.
-  mirror.apply({ seq: 3, ts: 30, kind: 'task', data: { task: { id: 't1', contextId: 'c1', updated: 30, status: { state: 'TASK_STATE_COMPLETED', timestamp: 30 }, artifacts: [{ parts: [{ text: 'All good.' }] }] } } });
+  mirror.apply({ seq: 3, ts: 30, kind: 'task', data: { task: { id: 't1', contextId: 'c1', status: { state: 'TASK_STATE_COMPLETED', timestamp: at(30) }, artifacts: [{ parts: [{ text: 'All good.' }] }] } } });
   await tick();
   frame = ui.lastFrame();
   assert.match(frame, /● All good\./);
@@ -124,7 +138,7 @@ test('a cross-client conversation renders: prompt, working, reply', async () => 
 test('draining and input-required surface prominently', async () => {
   const { mirror, ui } = boot();
   mirror.setConn('ready');
-  mirror.apply({ seq: 1, ts: 10, kind: 'task', data: { task: { id: 't2', contextId: 'c2', updated: 10, status: { state: 'TASK_STATE_INPUT_REQUIRED', timestamp: 10, message: { parts: [{ text: 'Which env?' }] } } } } });
+  mirror.apply({ seq: 1, ts: 10, kind: 'task', data: { task: { id: 't2', contextId: 'c2', status: { state: 'TASK_STATE_INPUT_REQUIRED', timestamp: at(10), message: { parts: [{ text: 'Which env?' }] } } } } });
   mirror.apply({ seq: 2, ts: 20, kind: 'lifecycle', data: { draining: true, reason: 'operator' } });
   await tick();
   const frame = ui.lastFrame();

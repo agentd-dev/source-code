@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 /**
  * The debug screen ("extra information") — rendered only when the DAEMON says
- * so (`interface.debug`, learned from `interface.info`): the live feed tail,
+ * so (the introspection reads, from its card or the feed's hello): the live feed tail,
  * runs with step progress, the subagent/child tables, and the log-ring tail.
  */
 import React from 'react';
 import { Box, Text } from 'ink';
-import { duration } from '../../client/index.js';
+import { DAEMON_KEYS, duration, introspectionOn } from '../../client/index.js';
 import type { FeedEvent, Json, MirrorState } from '../../client/index.js';
 import { ago, shortId, theme } from '../theme.js';
 
@@ -157,10 +157,10 @@ export function DebugScreen({
   s: MirrorState;
   logLines: Json[];
 }): React.JSX.Element {
-  if (!s.info?.debug) {
+  if (!introspectionOn(s)) {
     return (
       <Text color={theme.dim}>
-        debug is off on this daemon — set interface.debug: true (or run agentd tui --debug)
+        debug is off on this daemon — set {DAEMON_KEYS.introspection}: true
       </Text>
     );
   }

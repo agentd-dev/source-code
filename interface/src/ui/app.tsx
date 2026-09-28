@@ -3,14 +3,16 @@
  * The web UI, in the format of the TUI: the same the client core Mirror the
  * terminal renders, projected to the DOM. Open it beside the TUI — both stay
  * in sync because both watch the same daemon feed; neither holds truth.
- * The chrome renders whatever `interface.display` declares; the composer
- * speaks `/` `@` `#` `$` via the shared composer rules; pairing-code login
- * (RFC 0032 §13) is the no-bearer way in.
+ * The chrome renders the client's own layout (chrome.ts); the composer
+ * speaks `/` `@` `#` `$` via the shared composer rules.
  */
 import React, { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import {
   AgentdClient,
+  DAEMON_KEYS,
+  DEFAULT_LAYOUT,
   Json,
+  MEMORY_PREFIX,
   Mirror,
   Observation,
   Suggestion,
@@ -22,6 +24,7 @@ import {
   askAnswer,
   askForm,
   duration,
+  introspectionOn,
   prepare,
   suggest,
   workflowNames,
@@ -30,8 +33,6 @@ import type { AskForm } from '../client/index.js';
 
 type Screen = 'chat' | 'tasks' | 'subagents' | 'debug';
 
-const DEFAULT_TOP = ['name', 'version', 'instance', 'debug'];
-const DEFAULT_BOTTOM = ['conn', 'endpoint', 'draining', 'active', 'turns', 'tokens'];
 
 function stateClass(state: string): string {
   switch (state) {
@@ -59,6 +60,18 @@ function counters(m: Mirror):
     ?.counters;
 }
 
+/** A field of the `status` document: the live one, else the bootstrap. */
+function fact(m: Mirror, key: string): Json | undefined {
+  const s = m.getState();
+  const read = (d: Json | undefined): Json | undefined =>
+    d !== null && typeof d === 'object' && !Array.isArray(d) ? d[key] : undefined;
+  return read(s.status) ?? read(s.bootstrap);
+}
+
+function text(v: Json | undefined): string | undefined {
+  return typeof v === 'string' && v.length > 0 ? v : undefined;
+}
+
 /** One display item for the top/bottom edges (RFC 0032 §12). */
 function EdgeItem({ name, mirror, endpoint, active }: { name: string; mirror: Mirror; endpoint: string; active: number }): React.JSX.Element | null {
   const s = mirror.getState();
@@ -66,20 +79,31 @@ function EdgeItem({ name, mirror, endpoint, active }: { name: string; mirror: Mi
   // state. The client renders it without knowing what it means, which is what
   // makes the status line extensible without the daemon learning to compute
   // anything. An unset key renders nothing rather than a blank slot.
-  if (name.startsWith('memory:')) {
-    const v = s.info?.display?.values?.[name];
+  if (name.startsWith(MEMORY_PREFIX)) {
+    const values = fact(mirror, 'values');
+    const k = name.slice(MEMORY_PREFIX.length);
+    const v =
+      values !== null && typeof values === 'object' && !Array.isArray(values) && Object.hasOwn(values, k)
+        ? values[k]
+        : undefined;
     if (v === undefined || v === null || v === '') return null;
     return <span className="chip-mem">{typeof v === 'string' ? v : JSON.stringify(v)}</span>;
   }
   switch (name) {
     case 'name':
-      return <span className="name">{((s.card as { name?: string } | undefined)?.name ?? 'agentd') as string}</span>;
-    case 'version':
-      return s.info ? <span className="dim">{s.info.version}</span> : null;
-    case 'instance':
-      return s.info ? <span className="name">{s.info.instance}</span> : null;
-    case 'model':
-      return s.info?.model ? <span className="dim">{s.info.model}</span> : null;
+      return <span className="name">{text(s.session?.card.name) ?? 'agentd'}</span>;
+    case 'version': {
+      const v = text(fact(mirror, 'version'));
+      return v ? <span className="dim">{v}</span> : null;
+    }
+    case 'instance': {
+      const v = text(fact(mirror, 'instance'));
+      return v ? <span className="name">{v}</span> : null;
+    }
+    case 'model': {
+      const v = text(fact(mirror, 'model'));
+      return v ? <span className="dim">{v}</span> : null;
+    }
     case 'endpoint':
       return <span className="dim">{endpoint}</span>;
     case 'conn':
@@ -89,7 +113,7 @@ function EdgeItem({ name, mirror, endpoint, active }: { name: string; mirror: Mi
         </span>
       );
     case 'debug':
-      return s.info?.debug ? <span className="badge">debug</span> : null;
+      return introspectionOn(s) ? <span className="badge">debug</span> : null;
     case 'draining':
       return s.draining ? (
         <span className="drain">DRAINING</span>
@@ -306,7 +330,7 @@ function Tasks({ mirror, client }: { mirror: Mirror; client: AgentdClient }): Re
                 <tr key={t.id}>
                   <td>{t.id}</td>
                   <td className={stateClass(t.state)}>{stateShort(t.state)}</td>
-                  <td>{t.link ? Object.keys(t.link)[0] : ''}</td>
+                  <td>{t.link?.kind ?? ''}</td>
                   <td>{t.principal ?? ''}</td>
                   <td>{(t.artifacts[0] ?? t.message ?? '').slice(0, 80)}</td>
                   <td>
@@ -430,10 +454,9 @@ function Subagents({ mirror, client }: { mirror: Mirror; client: AgentdClient })
         {field('result', d.result)}
         {field('error', d.error, 'err')}
         {field('requested_by', d.requested_by)}
-        {!s.info?.debug ? (
+        {!introspectionOn(s) ? (
           <div className="row note">
-            summary only — enable interface.debug (or /set interface.debug true) for
-            instruction and result
+            summary only — enable {DAEMON_KEYS.introspection} for instruction and result
           </div>
         ) : null}
 
@@ -511,8 +534,9 @@ function Debug({ mirror, client }: { mirror: Mirror; client: AgentdClient }): Re
   const s = mirror.getState();
   const [log, setLog] = useState<{ [k: string]: Json }[]>([]);
   const cursor = useRef(0);
+  const on = introspectionOn(s);
   useEffect(() => {
-    if (!s.info?.debug) return;
+    if (!on) return;
     let alive = true;
     const tick = async () => {
       try {
@@ -533,12 +557,12 @@ function Debug({ mirror, client }: { mirror: Mirror; client: AgentdClient }): Re
       alive = false;
       clearInterval(t);
     };
-  }, [s.info?.debug, client]);
-  if (!s.info?.debug)
+  }, [on, client]);
+  if (!on)
     return (
       <div className="pane">
         <div className="scroll">
-          <div className="row note">debug is off on this daemon — /set interface.debug true (operator) or set it in the config</div>
+          <div className="row note">debug is off on this daemon — set {DAEMON_KEYS.introspection} in its config</div>
         </div>
       </div>
     );
@@ -664,23 +688,9 @@ function Connect({ onConnect, stored }: { onConnect: (d: Defaults) => void; stor
     typeof location !== 'undefined' &&
     !/^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname);
   const [bearer, setBearer] = useState('');
-  const [code, setCode] = useState('');
-  const [err, setErr] = useState('');
-  const go = async () => {
-    setErr('');
+  const go = () => {
     const ep = endpoint.trim();
-    let credential = bearer.trim() || undefined;
-    // A pairing code (RFC 0032 §13) exchanges for a session token — no bearer
-    // to copy: read the 6 digits off the operator's screen (/pair).
-    if (!credential && code.trim()) {
-      try {
-        const session = await new AgentdClient({ url: ep }).pair(code.trim());
-        credential = session.token;
-      } catch (e) {
-        setErr(e instanceof Error ? e.message : String(e));
-        return;
-      }
-    }
+    const credential = bearer.trim() || undefined;
     const d = { endpoint: ep, bearer: credential };
     localStorage.setItem('agentd-ui', JSON.stringify(d));
     onConnect(d);
@@ -715,17 +725,14 @@ function Connect({ onConnect, stored }: { onConnect: (d: Defaults) => void; stor
         <form
           onSubmit={(e) => {
             e.preventDefault();
-            void go();
+            go();
           }}
         >
           <label>endpoint (a2a.listen)</label>
           <input value={endpoint} onChange={(e) => setEndpoint(e.target.value)} placeholder="http://127.0.0.1:8420" />
-          <label>pairing code — ask the operator for /pair (rotates every minute)</label>
-          <input value={code} onChange={(e) => setCode(e.target.value)} placeholder="123456" inputMode="numeric" autoComplete="one-time-code" />
-          <label>or a bearer (only if a2a.bearer is configured)</label>
+          <label>a bearer (only if a2a.bearer is configured)</label>
           <input value={bearer} onChange={(e) => setBearer(e.target.value)} type="password" />
           <button type="submit">connect</button>
-          {err ? <div className="err">{err}</div> : null}
         </form>
       </div>
     </div>
@@ -733,17 +740,28 @@ function Connect({ onConnect, stored }: { onConnect: (d: Defaults) => void; stor
 }
 
 function Connected({ conn, onDisconnect }: { conn: Defaults; onDisconnect: () => void }): React.JSX.Element {
-  const client = useMemo(
-    () => new AgentdClient({ url: conn.endpoint as string, bearer: conn.bearer }),
-    [conn.endpoint, conn.bearer],
-  );
-  const mirror = useMemo(() => new Mirror(), [client]);
+  // The client exists once discovery settled where JSON-RPC goes and what
+  // the card lets this client call; until then a command has nowhere to go.
+  const [client, setClient] = useState<AgentdClient | null>(null);
+  const mirror = useMemo(() => new Mirror(), [conn.endpoint, conn.bearer]);
   useSyncExternalStore(mirror.subscribe, mirror.getVersion);
   useEffect(() => {
-    const obs = new Observation(client, mirror);
+    setClient(null);
+    const obs = new Observation(
+      {
+        configured: conn.endpoint as string,
+        credential: conn.bearer ? { token: conn.bearer } : undefined,
+        onSession: (_, c) => setClient(c),
+      },
+      mirror,
+    );
     obs.start();
     return () => obs.stop();
-  }, [client, mirror]);
+  }, [conn.endpoint, conn.bearer, mirror]);
+  const need = useCallback((): AgentdClient => {
+    if (!client) throw new Error('not connected yet');
+    return client;
+  }, [client]);
   const [screen, setScreen] = useState<Screen>('chat');
   const s = mirror.getState();
   const ctxRef = useRef<string | undefined>(undefined);
@@ -757,17 +775,17 @@ function Connected({ conn, onDisconnect }: { conn: Defaults; onDisconnect: () =>
             const [cmd, ...rest] = text.slice(1).split(/\s+/);
             const arg = rest.join(' ');
             if (cmd === 'help')
-              mirror.note('/new · /tasks · /subagents · /debug · /status · /config [path] · /set · /workflow · /signal · /send · /pause [run] · /resume [run] · /plan · /cancel · /pair · /drain · /disconnect — plus @skill, #target, $value');
+              mirror.note('/new · /tasks · /subagents · /debug · /status · /config [path] · /set · /workflow · /signal · /send · /pause [run] · /resume [run] · /plan · /cancel · /drain · /disconnect — plus @skill, #target, $value');
             else if (cmd === 'new') {
               ctxRef.current = undefined;
               mirror.note('new conversation');
             } else if (cmd === 'tasks' || cmd === 'subagents' || cmd === 'debug' || cmd === 'chat') setScreen(cmd as Screen);
             else if (cmd === 'status') {
-              const st = (await client.status()) as { [k: string]: Json };
+              const st = (await need().status()) as { [k: string]: Json };
               mirror.bootstrap(st);
               mirror.note(`runs ${Array.isArray(st.runs) ? st.runs.length : 0} · subagents ${Array.isArray(st.subagents) ? st.subagents.length : 0} · draining ${st.draining}`);
             } else if (cmd === 'config') {
-              const cfg = await client.config();
+              const cfg = await need().config();
               if (arg) {
                 let v: Json = (cfg as { config?: Json }).config ?? cfg;
                 for (const part of arg.split('.')) v = (v as { [k: string]: Json } | null)?.[part] ?? null;
@@ -787,20 +805,20 @@ function Connected({ conn, onDisconnect }: { conn: Defaults; onDisconnect: () =>
               } catch {
                 value = valueParts.join(' ');
               }
-              await client.configSet(path, value);
+              await need().adminSet(path, value);
             } else if (cmd === 'signal') {
               const [name, run] = rest;
-              const r = (await client.signal(name, undefined, run)) as { delivered?: number };
-              mirror.note(`signal ${name} → delivered ${r.delivered ?? '?'}`);
+              const r = (await need().signal(name, undefined, run)) as { delivered?: number } | null;
+              mirror.note(`signal ${name} → delivered ${r?.delivered ?? '?'}`);
             } else if (cmd === 'send') {
               const [handle, ...msg] = rest;
-              await client.subagentSend(handle, msg.join(' '));
+              await need().subagentSend(handle, msg.join(' '));
               mirror.note(`sent to ${handle}`);
             } else if (cmd === 'pause') {
-              await client.pause(rest[0]);
+              await need().pause(rest[0]);
               mirror.note(rest[0] ? `paused ${rest[0]}` : 'instance paused — /resume to release');
             } else if (cmd === 'resume') {
-              await client.resume(rest[0]);
+              await need().resume(rest[0]);
               mirror.note(rest[0] ? `resumed ${rest[0]}` : 'instance resumed');
             } else if (cmd === 'conversations') {
               const convs = [...mirror.getState().conversations.values()] as { [k: string]: Json }[];
@@ -810,30 +828,27 @@ function Connected({ conn, onDisconnect }: { conn: Defaults; onDisconnect: () =>
                   : `conversations:\n${convs.map((c) => `#${c.id}  ${c.messages ?? 0} msgs · ${c.turns ?? 0} turns`).join('\n')}\nstart a message with #<id> to address one`,
               );
             } else if (cmd === 'plan') {
-              const p = (await client.planGet(rest[0])) as { plan?: Json };
-              mirror.note(`plan: ${JSON.stringify(p.plan ?? null).slice(0, 800)}`);
-            } else if (cmd === 'pair') {
-              const p = await client.pairingCode();
-              mirror.note(`pairing code: ${p.code} (valid ${Math.ceil(p.expires_in_ms / 1000)}s, role ${p.role}, ${p.sessions} sessions)`);
+              const p = (await need().planGet(rest[0])) as { plan?: Json } | null;
+              mirror.note(`plan: ${JSON.stringify(p?.plan ?? null).slice(0, 800)}`);
             } else if (cmd === 'workflow') {
-              const r = await client.workflowRun(arg);
+              const r = await need().workflowRun(arg);
               mirror.note(`workflow → ${r.task?.id ?? '?'}`);
             } else if (cmd === 'cancel') {
               const id = rest[0] ?? mirror.activeTasks()[0]?.id;
-              if (id) await client.cancelTask(id);
+              if (id) await need().cancelTask(id);
             } else if (cmd === 'drain') {
-              await client.drain();
+              await need().drain();
               mirror.note('draining requested');
             } else if (cmd === 'disconnect') onDisconnect();
             else if (workflowNames(s).includes(cmd)) {
-              const r = await client.workflowRun(cmd);
+              const r = await need().workflowRun(cmd);
               mirror.note(`workflow ${cmd} → ${r.task?.id ?? '?'}`);
             } else mirror.note(`unknown command /${cmd} — /help`, 'error');
             return;
           }
           const p = prepare(text, s);
           const gate = p.taskId ?? mirror.activeTasks().find((t) => t.state === 'TASK_STATE_INPUT_REQUIRED')?.id;
-          const sent = await client.send(p.text, { contextId: p.contextId ?? ctxRef.current, taskId: gate });
+          const sent = await need().send(p.text, { contextId: p.contextId ?? ctxRef.current, taskId: gate });
           if (sent.task) {
             ctxRef.current = sent.task.contextId || ctxRef.current;
             mirror.adoptTasks([sent.task]);
@@ -844,14 +859,12 @@ function Connected({ conn, onDisconnect }: { conn: Defaults; onDisconnect: () =>
         }
       })();
     },
-    [client, mirror, onDisconnect, s],
+    [need, mirror, onDisconnect, s],
   );
 
-  const info = s.info;
   const active = mirror.activeTasks().length;
-  const top = info?.display?.top ?? DEFAULT_TOP;
-  const bottom = info?.display?.bottom ?? DEFAULT_BOTTOM;
-  const edge = (items: string[]) =>
+  const { top, bottom } = DEFAULT_LAYOUT.web;
+  const edge = (items: readonly string[]) =>
     items.map((n, i) => (
       <React.Fragment key={`${n}${i}`}>
         <EdgeItem name={n} mirror={mirror} endpoint={conn.endpoint as string} active={active} />
@@ -863,7 +876,7 @@ function Connected({ conn, onDisconnect }: { conn: Defaults; onDisconnect: () =>
         {edge(top)}
         <span className="tabs">
           {(['chat', 'tasks', 'subagents', 'debug'] as Screen[])
-            .filter((t) => t !== 'debug' || info?.debug)
+            .filter((t) => t !== 'debug' || introspectionOn(s))
             .map((t) => (
               <button key={t} className={screen === t ? 'on' : ''} onClick={() => setScreen(t)}>
                 {t}
@@ -874,6 +887,12 @@ function Connected({ conn, onDisconnect }: { conn: Defaults; onDisconnect: () =>
       <div className="main">
         {screen === 'chat' ? (
           <Chat mirror={mirror} onSend={onSend} />
+        ) : !client ? (
+          <div className="pane">
+            <div className="scroll">
+              <div className="row note">connecting…</div>
+            </div>
+          </div>
         ) : screen === 'tasks' ? (
           <Tasks mirror={mirror} client={client} />
         ) : screen === 'subagents' ? (

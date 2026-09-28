@@ -24,11 +24,7 @@ export function TaskList({
       {rows.map((t, i) => {
         const st = stateLabel(t.state);
         const link = t.link
-          ? 'run' in t.link
-            ? `run ${shortId(t.link.run.id, 12)}`
-            : 'subagent' in t.link
-              ? `sub ${shortId(t.link.subagent.handle, 12)}`
-              : `turn ${shortId((t.link as { turn: { ctx: string } }).turn.ctx, 12)}`
+          ? `${t.link.kind === 'subagent' ? 'sub' : t.link.kind} ${shortId(t.link.id, 12)}`
           : '';
         return (
           <Box key={t.id} flexDirection="row">

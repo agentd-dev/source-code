@@ -14,7 +14,6 @@ import {
   ConnState,
   FeedEvent,
   FeedHello,
-  InterfaceInfo,
   Json,
   MirrorState,
   StepRow,
@@ -22,6 +21,7 @@ import {
   TaskView,
   TranscriptEntry,
 } from './types.js';
+import type { Session } from './discovery.js';
 
 const FEED_LOG_CAP = 500;
 const TRANSCRIPT_CAP = 1000;
@@ -88,13 +88,9 @@ export class Mirror {
     this.bump();
   }
 
-  setInfo(info: InterfaceInfo): void {
-    this.state.info = info;
-    this.bump();
-  }
-
-  setCard(card: Json): void {
-    this.state.card = card;
+  /** Adopt what discovery settled: the card(s) and what they declare. */
+  setSession(session: Session): void {
+    this.state.session = session;
     this.bump();
   }
 
@@ -220,11 +216,7 @@ export class Mirror {
     switch (ev.kind) {
       case 'task': {
         const t = normalizeTask((data.task as Json) ?? null);
-        if (t) {
-          if (!t.link && data.link) t.link = data.link as TaskView['link'];
-          if (!t.principal && typeof data.principal === 'string') t.principal = data.principal;
-          this.putTask(t);
-        }
+        if (t) this.putTask(t);
         break;
       }
       case 'task.removed': {
@@ -358,19 +350,9 @@ export class Mirror {
         break;
       }
       case 'config': {
-        // A runtime `config.set` (possibly from ANOTHER client) — fold it into
-        // the live info so every surface re-renders its chrome/debug panes.
-        const path = data.path as string;
-        const value = data.value;
-        const info = this.state.info;
-        if (info) {
-          if (path === 'interface.debug' && typeof value === 'boolean') info.debug = value;
-          if (path === 'interface.display.top' && Array.isArray(value))
-            (info.display ??= { top: [], bottom: [] }).top = value as string[];
-          if (path === 'interface.display.bottom' && Array.isArray(value))
-            (info.display ??= { top: [], bottom: [] }).bottom = value as string[];
-        }
-        this.note(`config: ${path} = ${JSON.stringify(value)}`);
+        // A runtime `admin.set` or a reload (possibly from ANOTHER client).
+        // The layout is this client's own, so nothing here reshapes it.
+        this.note(`config: ${data.path as string} = ${JSON.stringify(data.value)}`);
         break;
       }
       case 'pairing': {
@@ -390,8 +372,7 @@ export class Mirror {
   private putTask(t: TaskView): void {
     this.state.tasks.set(t.id, t);
     const terminal = TERMINAL_STATES.has(t.state);
-    const link = t.link as { turn?: { ctx: string } } | undefined;
-    const isTurn = link?.turn !== undefined || t.contextId.length > 0;
+    const isTurn = t.link?.kind === 'turn' || t.contextId.length > 0;
     if (!isTurn) return;
     // A task becomes a transcript row only when its PROMPT is known (a user
     // entry / message event carries its taskId, or the row already exists).
@@ -419,9 +400,8 @@ export class Mirror {
       // duration rather than a number measured from when we happened to look.
       const started =
         this.state.transcript.find((e) => e.taskId === t.id && e.kind === 'user')?.ts ??
-        (Array.isArray(t.history) && t.history.length > 0
-          ? ((t.history[0] as { ts?: number })?.ts ?? 0)
-          : 0);
+        t.statusHistory?.[0]?.ts ??
+        0;
       const text = t.artifacts[0] ?? t.message ?? (failed ? whyItEnded(t.state) : '');
       if (text.length > 0) {
         this.upsertEntry({
@@ -480,4 +460,16 @@ export class Mirror {
   allTasks(): TaskView[] {
     return [...this.state.tasks.values()].sort((a, b) => b.updated - a.updated);
   }
+}
+
+/**
+ * The introspection reads are on for this client. The extended card says so
+ * for this caller when one was read; when the cards cannot tell (`null` — an
+ * agent with no listener auth serves no extended card) the feed's
+ * `hello.introspection` decides. `null` is "unknown", not "off".
+ */
+export function introspectionOn(s: MirrorState): boolean {
+  const caps = s.session?.caps.introspection;
+  if (caps === true || caps === false) return caps;
+  return s.hello?.introspection === true;
 }

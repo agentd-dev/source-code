@@ -52,13 +52,20 @@ export const SYSTEM_COMMANDS: ReadonlyArray<[string, string]> = [
 
 /** The `$` values a client can interpolate, with their reader. */
 const DOLLAR_VARS: ReadonlyArray<[string, (s: MirrorState) => string]> = [
-  ['model', (s) => s.info?.model ?? ''],
-  ['instance', (s) => s.info?.instance ?? ''],
-  ['version', (s) => s.info?.version ?? ''],
+  ['model', (s) => fact(s, 'model')],
+  ['instance', (s) => fact(s, 'instance')],
+  ['version', (s) => fact(s, 'version')],
   ['turns', (s) => String(counters(s)?.turns ?? 0)],
   ['tokens', (s) => `${counters(s)?.tokens_in ?? 0}/${counters(s)?.tokens_out ?? 0}`],
   ['tasks', (s) => String(s.tasks.size)],
 ];
+
+/** A string fact of the `status` document: the live one, else the bootstrap. */
+function fact(s: MirrorState, key: string): string {
+  const read = (d: unknown): unknown => (d !== null && typeof d === 'object' ? (d as Record<string, unknown>)[key] : undefined);
+  const v = read(s.status) ?? read(s.bootstrap);
+  return typeof v === 'string' ? v : '';
+}
 
 function counters(s: MirrorState):
   | { turns?: number; tokens_in?: number; tokens_out?: number }

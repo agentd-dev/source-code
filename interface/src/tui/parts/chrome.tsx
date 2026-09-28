@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 /**
- * The daemon-driven chrome (RFC 0032 §12): the top (header) and bottom
- * (status bar) edges render exactly the item list `interface.display`
- * declares — the DAEMON decides what its operators see; every attached client
- * lays out the same. Unknown items are skipped (forward compatibility).
+ * The chrome: the top (header) and bottom (status bar) edges render the item
+ * lists the app hands them — the client's own layout (chrome.ts). Unknown
+ * items are skipped (forward compatibility).
  */
 import React from 'react';
 import { Box, Text } from 'ink';
-import type { MirrorState } from '../../client/index.js';
+import { introspectionOn, MEMORY_PREFIX } from '../../client/index.js';
+import type { Json, MirrorState } from '../../client/index.js';
 import { theme } from '../theme.js';
 
 export interface ChromeCtx {
@@ -24,6 +24,17 @@ function counters(s: MirrorState):
     ?.counters;
 }
 
+/** A field of the `status` document: the live one, else the bootstrap. */
+function fact(s: MirrorState, key: string): Json | undefined {
+  const read = (d: Json | undefined): Json | undefined =>
+    d !== null && typeof d === 'object' && !Array.isArray(d) ? d[key] : undefined;
+  return read(s.status) ?? read(s.bootstrap);
+}
+
+function text(v: Json | undefined): string | undefined {
+  return typeof v === 'string' && v.length > 0 ? v : undefined;
+}
+
 /** Render one display item (null ⇒ skip). */
 function item(name: string, c: ChromeCtx): React.JSX.Element | null {
   const { s } = c;
@@ -32,8 +43,13 @@ function item(name: string, c: ChromeCtx): React.JSX.Element | null {
   // deploy state. The client does not know what it means and does not need to:
   // it renders the value the daemon resolved. An unset key renders nothing at
   // all rather than an empty slot, because a blank status reads as broken.
-  if (name.startsWith('memory:')) {
-    const v = s.info?.display?.values?.[name];
+  if (name.startsWith(MEMORY_PREFIX)) {
+    const values = fact(s, 'values');
+    const k = name.slice(MEMORY_PREFIX.length);
+    const v =
+      values !== null && typeof values === 'object' && !Array.isArray(values) && Object.hasOwn(values, k)
+        ? values[k]
+        : undefined;
     if (v === undefined || v === null || v === '') return null;
     return (
       <Text key={key} color={theme.command}>
@@ -45,15 +61,21 @@ function item(name: string, c: ChromeCtx): React.JSX.Element | null {
     case 'name':
       return (
         <Text key={key} color={theme.accent} bold>
-          {((s.card as { name?: string } | undefined)?.name ?? 'agentd') as string}
+          {text(s.session?.card.name) ?? 'agentd'}
         </Text>
       );
-    case 'version':
-      return s.info ? <Text key={key} color={theme.dim}>{s.info.version}</Text> : null;
-    case 'instance':
-      return s.info ? <Text key={key} color={theme.accent}>{s.info.instance}</Text> : null;
-    case 'model':
-      return s.info?.model ? <Text key={key} color={theme.dim}>{s.info.model}</Text> : null;
+    case 'version': {
+      const v = text(fact(s, 'version'));
+      return v ? <Text key={key} color={theme.dim}>{v}</Text> : null;
+    }
+    case 'instance': {
+      const v = text(fact(s, 'instance'));
+      return v ? <Text key={key} color={theme.accent}>{v}</Text> : null;
+    }
+    case 'model': {
+      const v = text(fact(s, 'model'));
+      return v ? <Text key={key} color={theme.dim}>{v}</Text> : null;
+    }
     case 'endpoint':
       return <Text key={key} color={theme.dim}>{c.endpoint}</Text>;
     case 'conn': {
@@ -72,7 +94,7 @@ function item(name: string, c: ChromeCtx): React.JSX.Element | null {
       );
     }
     case 'debug':
-      return s.info?.debug ? (
+      return introspectionOn(s) ? (
         <Text key={key} color={theme.warn}>
           debug
         </Text>
@@ -148,15 +170,3 @@ export function Edge({ items, ctx }: { items: string[]; ctx: ChromeCtx }): React
     </Box>
   );
 }
-
-export const DEFAULT_TOP = ['name', 'version', 'instance', 'debug'];
-export const DEFAULT_BOTTOM = [
-  'conn',
-  'endpoint',
-  'draining',
-  'active',
-  'turns',
-  'tokens',
-  'screen',
-  'keys',
-];

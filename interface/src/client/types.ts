@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 /**
- * Wire + view types for the agentd interface surface (RFC 0032).
+ * Wire + view types for the display clients (RFC 0032, RFC 0043 §15).
  *
  * agentd is the single source of truth: everything here is a *projection* of
  * daemon state — the client never derives truth of its own.
  */
+
+import type { Session } from './discovery.js';
 
 /** A JSON value (what the wire carries). */
 export type Json = null | boolean | number | string | Json[] | { [k: string]: Json };
@@ -22,11 +24,13 @@ export interface Endpoint {
   tenant?: string;
 }
 
-/** A2A `Task.status.state` values (RFC 0029 §4). */
+/** A2A 1.0 `TaskState` values. */
 export type TaskState =
+  | 'TASK_STATE_UNSPECIFIED'
   | 'TASK_STATE_SUBMITTED'
   | 'TASK_STATE_WORKING'
   | 'TASK_STATE_INPUT_REQUIRED'
+  | 'TASK_STATE_AUTH_REQUIRED'
   | 'TASK_STATE_COMPLETED'
   | 'TASK_STATE_FAILED'
   | 'TASK_STATE_CANCELED'
@@ -39,39 +43,68 @@ export const TERMINAL_STATES: ReadonlySet<TaskState> = new Set([
   'TASK_STATE_REJECTED',
 ]);
 
-/** What a task is attached to. */
-export type TaskLink =
-  | { run: { id: string } }
-  | { subagent: { handle: string } }
-  | { turn: { ctx: string } };
+/**
+ * The states in which a task has stopped to wait for someone: an answer
+ * (input) or a credential (auth). Neither is terminal, and neither is working.
+ */
+export const INTERRUPTED_STATES: ReadonlySet<TaskState> = new Set([
+  'TASK_STATE_INPUT_REQUIRED',
+  'TASK_STATE_AUTH_REQUIRED',
+]);
+
+/** What a task is attached to (task-annotations/v1 `link`). */
+export interface TaskLink {
+  kind: 'run' | 'subagent' | 'turn';
+  id: string;
+}
+
+/** One message of a task's core `history`, flattened. */
+export interface HistoryMessage {
+  messageId: string;
+  role: 'ROLE_USER' | 'ROLE_AGENT';
+  /** Every text part, joined with '\n'. */
+  text: string;
+  /** Every data part's `data`. */
+  data: Json[];
+}
 
 /**
- * The client's normalized task view. The wire is an A2A `Task` in both the full
- * (GetTask/SendMessage/feed) and light (ListTasks) form, so `state` is always
- * under `status` and agentd's own facts under `metadata` — flattened here once,
- * at the edge, with fallbacks for daemons that predate that shape.
+ * The client's view of one A2A `Task`, flattened once at the edge. The core
+ * fields come from the Task itself; agentd's own facts (`link` … `askSchema`)
+ * come ONLY from `metadata[task-annotations/v1]`, and only while that
+ * extension is active — there is no other key and no flat fallback.
  */
 export interface TaskView {
   id: string;
   contextId: string;
   state: TaskState;
-  /** The status message (input-required prompts, terminal explanations). */
+  /** Every text part of the status message, joined with '\n'. */
   message?: string;
-  /** The terminal artifact texts (the reply / command result). */
+  /** The artifacts' text parts (the reply, a string result). */
   artifacts: string[];
+  /** The artifacts' data parts (a command's structured result). */
+  artifactData: Json[];
+  /** The core `Task.history`: who said what, including other clients. */
+  history: HistoryMessage[];
   link?: TaskLink;
   principal?: string;
-  updated: number;
-  history?: Json[];
+  /** The command/v2 op this task runs, when a command opened it. */
+  command?: string;
+  /** Epoch ms the task was created. */
+  created?: number;
+  /** Each state the task passed through, with when (epoch ms). */
+  statusHistory?: { state: TaskState; ts: number }[];
   /** The shape a gate's answer must take, if the gate declared one. */
   askSchema?: Json;
+  /** Epoch ms of `status.timestamp`; 0 when the task carries none. */
+  updated: number;
 }
 
-/** One `SubscribeToEvents` feed event (RFC 0032 §4). */
+/** One events/v1 feed event. */
 export interface FeedEvent {
   seq: number;
   ts: number;
-  kind: string; // task | task.removed | message | command | run | conversation | subagent | child | status | lifecycle | audit | *.removed
+  kind: string; // task | run | step | conversation | subagent | child | activity | status | lifecycle | config | audit | auth | *.removed
   data: Json;
 }
 
@@ -81,42 +114,16 @@ export interface FeedHello {
   resume: number;
   /** The cursor predates the replay window — re-bootstrap via `status`. */
   resync: boolean;
-  debug: boolean;
+  /** The daemon serves the introspection reads right now. */
+  introspection: boolean;
+  /** The agentd build, not a protocol number: the version is in the URI. */
   version: string;
 }
 
-/** `interface.info` (RFC 0032 §5). */
-export interface InterfaceInfo {
-  enabled: boolean;
-  debug: boolean;
-  version: string;
-  instance: string;
-  model?: string;
-  protocol: number;
-  feed: { ring: number; method: string };
-  ops: string[];
-  /** The daemon-decided chrome layout (RFC 0032 §12). */
-  display?: { top: string[]; bottom: string[] ; /** Resolved values for `memory:<key>` items in the layout. */
-    values?: { [item: string]: Json }};
-  pairing?: { enabled: boolean };
-}
-
-/** `pairing.code` (operator; RFC 0032 §13). */
-export interface PairingCode {
-  code: string;
-  expires_in_ms: number;
-  window_ms: number;
-  role: string;
-  sessions: number;
-  url?: string;
-}
-
-/** `Pair` result: the minted session credential. */
-export interface PairedSession {
-  token: string;
-  expiresAt: number;
-  role: string;
-  agent: { name: string; instance: string; version: string };
+/** Why the feed ended, and where to resume. */
+export interface FeedGoodbye {
+  seq: number;
+  reason: string;
 }
 
 /**
@@ -164,8 +171,19 @@ export interface TranscriptEntry {
   ms?: number;
 }
 
-/** Connection lifecycle of the observation channel. */
-export type ConnState = 'connecting' | 'ready' | 'polling' | 'error' | 'closed';
+/**
+ * Connection lifecycle of the observation channel. The last three are
+ * terminal: retrying cannot help, so the client stops and says why.
+ */
+export type ConnState =
+  | 'connecting'
+  | 'ready'
+  | 'polling'
+  | 'error'
+  | 'closed'
+  | 'unauthenticated'
+  | 'forbidden'
+  | 'incompatible';
 
 /** The mirror's full state — everything a renderer needs, nothing it owns. */
 export interface MirrorState {
@@ -173,8 +191,8 @@ export interface MirrorState {
   /** Last connection error (conn === 'error'). */
   error?: string;
   hello?: FeedHello;
-  info?: InterfaceInfo;
-  card?: Json;
+  /** What discovery settled: the card(s), the interface and the capabilities. */
+  session?: Session;
   /** The full `status` command document from the last bootstrap. */
   bootstrap?: Json;
   /** The slim live status (feed `status` events). */
@@ -260,6 +278,8 @@ export type ClientErrorKind =
   | 'extension-not-declared'
   | 'extension-not-activated'
   | 'op-not-offered'
+  /** A call the client refuses to make as asked: a required argument is missing. */
+  | 'invalid-argument'
   | 'invalid-response'
   | 'unsupported-scheme'
   /** A credential would travel in the clear: plain http to a non-loopback host. */

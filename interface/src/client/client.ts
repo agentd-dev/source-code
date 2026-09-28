@@ -1,269 +1,386 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 /**
- * `AgentdClient` — every operation a display client can ask of agentd, and
- * nothing else. Thin by design (RFC 0032): the daemon hosts state, tools and
- * secrets; this class only forwards intent and reads projections.
+ * `AgentdClient` — agentd's declared extensions on top of the core A2A client.
+ *
+ * {@link A2aClient} speaks what any A2A 1.0 agent understands. This class adds
+ * command/v2 (structured ops as a DataPart), events/v1 (the observation feed)
+ * and task-annotations/v1 (agentd's facts about a task) — each only when the
+ * card this session was opened from DECLARES it. A call the card does not
+ * back is refused here, before anything reaches the wire: a command DataPart
+ * sent to an agent that never promised to read one as a command is just a
+ * message, and a model on the other end may act on it.
+ *
+ * Thin by design (RFC 0032): the daemon hosts state, tools and secrets; this
+ * class only forwards intent and reads projections.
  */
 
 import {
+  ClientError,
   Endpoint,
   FeedEvent,
+  FeedGoodbye,
   FeedHello,
-  InterfaceInfo,
+  HistoryMessage,
   Json,
-  PairedSession,
-  PairingCode,
+  TaskLink,
   TaskState,
   TaskView,
 } from './types.js';
-import { COMMAND_EXTENSION, INTERFACE_EXTENSION, rpc, rpcStream } from './wire.js';
+import { CallOptions, rpcStream } from './wire.js';
+import { A2aClient, commandMessage, ListQuery, userMessage } from './a2a.js';
+import type { Capabilities } from './discovery.js';
+import { COMMAND_EXTENSION, EVENTS_EXTENSION, EVENTS_METHOD, OPS, TASK_ANNOTATIONS_EXTENSION } from './ext.js';
+
+type Obj = { [k: string]: Json };
+
+function obj(v: Json | undefined): Obj | undefined {
+  return v !== null && v !== undefined && typeof v === 'object' && !Array.isArray(v) ? v : undefined;
+}
+
+function str(v: Json | undefined): string | undefined {
+  return typeof v === 'string' && v.length > 0 ? v : undefined;
+}
+
+/** Epoch ms of an RFC 3339 timestamp (how ProtoJSON spells a Timestamp). */
+function epochMs(v: Json | undefined): number | undefined {
+  if (typeof v !== 'string') return undefined;
+  const ms = Date.parse(v);
+  return Number.isNaN(ms) ? undefined : ms;
+}
+
+/** The text parts of a part list, joined; and its data parts. */
+function partsOf(parts: Json | undefined): { text: string[]; data: Json[] } {
+  const text: string[] = [];
+  const data: Json[] = [];
+  for (const raw of Array.isArray(parts) ? parts : []) {
+    const p = obj(raw);
+    if (!p) continue;
+    if (typeof p.text === 'string' && p.text.length > 0) text.push(p.text);
+    else if (p.data !== undefined) data.push(p.data);
+  }
+  return { text, data };
+}
+
+const LINK_KINDS: ReadonlySet<string> = new Set(['run', 'subagent', 'turn']);
+
+/** Read the task-annotations/v1 object into the view's annotation fields. */
+function annotationsOf(a: Obj): Partial<TaskView> {
+  const out: Partial<TaskView> = {};
+  const link = obj(a.link);
+  const kind = str(link?.kind);
+  const id = str(link?.id);
+  if (kind !== undefined && LINK_KINDS.has(kind) && id !== undefined) {
+    out.link = { kind: kind as TaskLink['kind'], id };
+  }
+  const principal = str(a.principal);
+  if (principal !== undefined) out.principal = principal;
+  const command = str(a.command);
+  if (command !== undefined) out.command = command;
+  const created = epochMs(a.created);
+  if (created !== undefined) out.created = created;
+  if (Array.isArray(a.statusHistory)) {
+    const hist: { state: TaskState; ts: number }[] = [];
+    for (const raw of a.statusHistory) {
+      const h = obj(raw);
+      const state = str(h?.state);
+      const ts = epochMs(h?.ts);
+      if (state !== undefined && ts !== undefined) hist.push({ state: state as TaskState, ts });
+    }
+    out.statusHistory = hist;
+  }
+  if (a.askSchema !== undefined && a.askSchema !== null) out.askSchema = a.askSchema;
+  return out;
+}
+
+/** How {@link normalizeTask} reads a task. */
+export interface NormalizeOptions {
+  /**
+   * Read `metadata[task-annotations/v1]`. False when the reply showed the
+   * extension was not active for the call: what sits under the key then was
+   * not written under the extension's contract, so it is not read as such.
+   */
+  annotations?: boolean;
+}
 
 /**
- * Epoch milliseconds from either form of timestamp.
- *
- * `TaskStatus.timestamp` is a `google.protobuf.Timestamp`, so on the wire it is
- * an RFC 3339 string — but everything downstream sorts and subtracts it. A raw
- * number is accepted too, for daemons that predate the fix.
+ * Flatten an A2A `Task` into the client view. Core fields come from the Task;
+ * agentd's own facts only from `metadata[<task-annotations/v1 URI>]`. The old
+ * `agentd/*` metadata keys and the flat top-level fields are not read: a
+ * v1.17 daemon writes neither, and reading them would keep a private shape
+ * alive in every client that copied this one.
  */
-function epochMs(v: Json | undefined): number | undefined {
-  if (typeof v === 'number') return v;
-  if (typeof v === 'string') {
-    const ms = Date.parse(v);
-    return Number.isNaN(ms) ? undefined : ms;
+export function normalizeTask(t: Json, o: NormalizeOptions = {}): TaskView | null {
+  const task = obj(t);
+  const id = str(task?.id);
+  if (!task || id === undefined) return null;
+  const status = obj(task.status);
+  const artifacts: string[] = [];
+  const artifactData: Json[] = [];
+  for (const raw of Array.isArray(task.artifacts) ? task.artifacts : []) {
+    const p = partsOf(obj(raw)?.parts);
+    artifacts.push(...p.text);
+    artifactData.push(...p.data);
+  }
+  const history: HistoryMessage[] = [];
+  for (const raw of Array.isArray(task.history) ? task.history : []) {
+    const m = obj(raw);
+    const role = m?.role;
+    const messageId = str(m?.messageId);
+    if (!m || messageId === undefined || (role !== 'ROLE_USER' && role !== 'ROLE_AGENT')) continue;
+    const p = partsOf(m.parts);
+    history.push({ messageId, role, text: p.text.join('\n'), data: p.data });
+  }
+  const message = partsOf(obj(status?.message)?.parts).text;
+  const view: TaskView = {
+    id,
+    contextId: str(task.contextId) ?? '',
+    state: (str(status?.state) ?? 'TASK_STATE_UNSPECIFIED') as TaskState,
+    artifacts,
+    artifactData,
+    history,
+    updated: epochMs(status?.timestamp) ?? 0,
+  };
+  if (message.length > 0) view.message = message.join('\n');
+  const ann = o.annotations === false ? undefined : obj(obj(task.metadata)?.[TASK_ANNOTATIONS_EXTENSION]);
+  return ann ? { ...view, ...annotationsOf(ann) } : view;
+}
+
+/** A command's reply: a read answers with a Message, work with a Task. */
+export type CommandReply =
+  | { kind: 'message'; message: Json; data: Json | undefined }
+  | { kind: 'task'; task: TaskView; data: Json | undefined };
+
+/** The first DataPart's `data` in a part list. */
+function firstData(parts: Json | undefined): Json | undefined {
+  for (const raw of Array.isArray(parts) ? parts : []) {
+    const p = obj(raw);
+    if (p && p.data !== undefined) return p.data;
   }
   return undefined;
 }
 
-/** Normalize either wire task shape into the client view. */
-export function normalizeTask(t: Json): TaskView | null {
-  if (t === null || typeof t !== 'object' || Array.isArray(t)) return null;
-  const o = t as { [k: string]: Json };
-  const id = typeof o.id === 'string' ? o.id : '';
-  if (!id) return null;
-  const status = (o.status ?? null) as { [k: string]: Json } | null;
-  const state = ((status?.state as string) ?? (o.state as string) ?? 'TASK_STATE_SUBMITTED') as TaskState;
-  const msgParts = (status?.message as { [k: string]: Json } | undefined)?.parts;
-  const message = Array.isArray(msgParts)
-    ? ((msgParts[0] as { [k: string]: Json } | undefined)?.text as string | undefined)
-    : undefined;
-  const artifacts: string[] = [];
-  if (Array.isArray(o.artifacts)) {
-    for (const a of o.artifacts) {
-      const parts = (a as { [k: string]: Json }).parts;
-      if (Array.isArray(parts)) {
-        for (const p of parts) {
-          const text = (p as { [k: string]: Json }).text;
-          if (typeof text === 'string' && text.length > 0) artifacts.push(text);
-        }
-      }
-    }
+/**
+ * Read a command's `SendMessageResponse`, which is exactly one of:
+ * - `{message}` — a read op's answer: `data` is its first DataPart;
+ * - `{task}` — work: `data` is the first DataPart of the result artifact
+ *   (`<task>.result`), else of the first artifact; a task still working has
+ *   none yet.
+ * Anything else is not a command reply, and is refused rather than guessed at.
+ */
+export function commandReply(result: Json, o: NormalizeOptions = {}): CommandReply {
+  const r = obj(result);
+  const message = obj(r?.message);
+  if (message) return { kind: 'message', message, data: firstData(message.parts) };
+  const task = normalizeTask(r?.task ?? null, o);
+  if (task) {
+    const arts = Array.isArray(obj(r?.task)?.artifacts) ? (obj(r?.task)?.artifacts as Json[]) : [];
+    const result = arts.map(obj).find((a) => str(a?.artifactId)?.endsWith('.result')) ?? obj(arts[0]);
+    return { kind: 'task', task, data: firstData(result?.parts) };
   }
-  // The facts the A2A spec has no field for travel under `metadata`, namespaced.
-  // The flat fallbacks are for daemons that predate that move.
-  const meta = (o.metadata ?? null) as { [k: string]: Json } | null;
-  const history = meta?.['agentd/statusHistory'] ?? o.history;
-  return {
-    id,
-    contextId: (o.contextId as string) ?? '',
-    state,
-    message,
-    artifacts,
-    link: ((meta?.['agentd/link'] ?? o.link) as TaskView['link']) ?? undefined,
-    principal: ((meta?.['agentd/principal'] ?? o.principal) as string) ?? undefined,
-    updated: epochMs(status?.timestamp) ?? epochMs(o.updated) ?? 0,
-    history: Array.isArray(history) ? history : undefined,
-    // A gate's answer shape, when the daemon declared one. It is what lets a
-    // client offer the actual choices instead of a text box the person has to
-    // guess the wording for.
-    askSchema: (meta?.['agentd/ask_schema'] as Json) ?? undefined,
-  };
+  throw new ClientError('invalid-response', 'command reply is neither a Task nor a Message');
 }
 
 /** The message envelope for a natural-language send. */
 export interface SendOptions {
-  /** Continue this conversation (omit to open a new one). */
+  /** Continue this conversation (omit to open a new one). Ignored with `taskId`. */
   contextId?: string;
   /** Answer this task's input-required gate / continue it. */
   taskId?: string;
   /** Client-chosen message id (defaults to a fresh one). */
   messageId?: string;
-  /** Block until terminal (default FALSE here — the feed carries progress). */
-  blocking?: boolean;
+  /**
+   * Hand back the task at once (default true): progress arrives on the feed
+   * or a task stream, and a display client must not freeze for a whole turn.
+   */
+  returnImmediately?: boolean;
 }
+
+/** Who `authSessionsRevoke` ends. */
+export type RevokeTarget = { sid: string } | { name: string } | { all: true };
 
 export class AgentdClient {
   readonly ep: Endpoint;
-  constructor(ep: Endpoint) {
+  /** What the card this client was opened from declares. */
+  readonly caps: Capabilities;
+  private readonly a2a: A2aClient;
+
+  constructor(ep: Endpoint, caps: Capabilities) {
     this.ep = ep;
+    this.caps = caps;
+    this.a2a = new A2aClient(ep);
   }
 
-  private nextMsg = 1;
-  private msgId(): string {
-    return `ui-${Date.now().toString(36)}-${this.nextMsg++}`;
+  /** The card offers `op` to this caller (a built-in op or a workflow command). */
+  offers(op: string): boolean {
+    const c = this.caps.command;
+    return c !== null && (c.ops.has(op) || c.commands.some((x) => x.op === op));
   }
 
-  // ---- discovery ---------------------------------------------------------
-
-  /** The public agent card. */
-  async agentCard(): Promise<Json> {
-    return rpc(this.ep, 'GetAgentCard', {});
+  /**
+   * task-annotations/v1 rides every call that returns tasks, when declared —
+   * it is what carries a task's link, principal and gate schema.
+   */
+  private annotated(): string[] {
+    return this.caps.annotations ? [TASK_ANNOTATIONS_EXTENSION] : [];
   }
 
-  /** `interface.info` — throws UNSUPPORTED_OPERATION when the surface is off. */
-  async interfaceInfo(): Promise<InterfaceInfo> {
-    const r = (await this.command('interface.info', {})) as { [k: string]: Json };
-    return r.interface as unknown as InterfaceInfo;
+  /** Options for a core task call: annotations only, depended on by nothing. */
+  private core(signal?: AbortSignal): CallOptions {
+    return { exts: this.annotated(), signal };
+  }
+
+  /**
+   * Whether a reply may be read for annotations: yes unless the server
+   * echoed `A2A-Extensions` and left the extension out of it. An absent echo
+   * is advisory (it is a SHOULD), and then the card governs.
+   */
+  private annotationsIn(echo: string[] | null): NormalizeOptions {
+    return { annotations: this.caps.annotations && (echo === null || echo.includes(TASK_ANNOTATIONS_EXTENSION)) };
   }
 
   // ---- conversation ------------------------------------------------------
 
   /**
-   * Send a natural-language message. Returns the created/continued task
-   * immediately (`blocking` defaults to false — watch the feed or the task).
+   * Send a natural-language message. An agent may answer with a task (the
+   * usual case) or directly with a message (`reply`).
    */
-  async send(text: string, opts: SendOptions = {}): Promise<{ task: TaskView | null; messageId: string }> {
-    const messageId = opts.messageId ?? this.msgId();
-    const message: { [k: string]: Json } = { messageId, parts: [{ text }] };
-    if (opts.contextId) message.contextId = opts.contextId;
-    if (opts.taskId) message.taskId = opts.taskId;
-    const r = (await rpc(this.ep, 'SendMessage', {
-      message,
-      configuration: { blocking: opts.blocking ?? false },
-    })) as { [k: string]: Json };
-    return { task: normalizeTask(r.task ?? null), messageId };
-  }
-
-  /** Send a command DataPart (`{op, …args}`); returns the raw result. */
-  async command(op: string, args: { [k: string]: Json }, contextId?: string): Promise<Json> {
-    const message: { [k: string]: Json } = {
-      messageId: this.msgId(),
-      parts: [{ data: { agentd: { op, ...args } } }],
-    };
-    if (contextId) message.contextId = contextId;
-    // A command DataPart is the command extension's vocabulary — say so.
-    return rpc(this.ep, 'SendMessage', { message }, { exts: [COMMAND_EXTENSION] });
+  async send(
+    text: string,
+    opts: SendOptions = {},
+  ): Promise<{ task: TaskView | null; reply?: Json; messageId: string }> {
+    const message = userMessage(text, opts);
+    const messageId = message.messageId as string;
+    const r = await this.a2a.sendMessage(message, { returnImmediately: opts.returnImmediately ?? true }, this.core());
+    const task = r.task ? normalizeTask(r.task, this.annotationsIn(r.echo)) : null;
+    return r.message ? { task, reply: r.message, messageId } : { task, messageId };
   }
 
   /**
-   * A command whose result rides the task's terminal artifact as JSON text
-   * (`status`, `config`, `workflow.status`): parse it back out.
+   * Send one command/v2 op. Refused locally — no request is made — when the
+   * card declares no command extension or does not offer `op`. The call
+   * activates command/v2 and REQUIRES it: a present echo without it means the
+   * agent did not run this as a command, and its answer is not trusted.
    */
-  async commandResult(op: string, args: { [k: string]: Json } = {}): Promise<Json> {
-    const r = (await this.command(op, args)) as { [k: string]: Json };
-    const task = normalizeTask(r.task ?? null);
-    const text = task?.artifacts[0];
-    if (typeof text !== 'string') return r;
-    try {
-      return JSON.parse(text) as Json;
-    } catch {
-      return text;
+  async command(
+    op: string,
+    args: Obj = {},
+    o: { contextId?: string; returnImmediately?: boolean; signal?: AbortSignal } = {},
+  ): Promise<CommandReply> {
+    if (this.caps.command === null) {
+      throw new ClientError('extension-not-declared', `${op}: this agent does not declare ${COMMAND_EXTENSION}`);
     }
+    if (!this.offers(op)) {
+      throw new ClientError('op-not-offered', `${op} is not offered by this agent (its card does not list the op)`);
+    }
+    const message = commandMessage(op, args, { contextId: o.contextId });
+    const r = await this.a2a.sendMessage(
+      message,
+      { returnImmediately: o.returnImmediately ?? false },
+      { exts: [COMMAND_EXTENSION, ...this.annotated()], require: [COMMAND_EXTENSION], signal: o.signal },
+    );
+    return commandReply(r.task ? { task: r.task } : { message: r.message ?? null }, this.annotationsIn(r.echo));
+  }
+
+  /** A command's structured answer: the reply's DataPart, or null. */
+  private async data(op: string, args: Obj = {}): Promise<Json> {
+    return (await this.command(op, args)).data ?? null;
   }
 
   // ---- tasks -------------------------------------------------------------
 
-  async getTask(id: string): Promise<TaskView | null> {
-    return normalizeTask(await rpc(this.ep, 'GetTask', { id }));
+  async getTask(id: string, historyLength?: number): Promise<TaskView | null> {
+    return normalizeTask(await this.a2a.getTask(id, historyLength, this.core()), this.annotationsIn(null));
   }
 
-  async listTasks(): Promise<TaskView[]> {
-    const r = (await rpc(this.ep, 'ListTasks', {})) as { [k: string]: Json };
-    const tasks = Array.isArray(r.tasks) ? r.tasks : [];
-    return tasks.map(normalizeTask).filter((t): t is TaskView => t !== null);
+  /** Every page of ListTasks (see {@link A2aClient.listTasks}). */
+  async listTasks(q: ListQuery = {}): Promise<{ tasks: TaskView[]; truncated: boolean }> {
+    const r = await this.a2a.listTasks(q, this.core());
+    const o = this.annotationsIn(null);
+    return { tasks: r.tasks.map((t) => normalizeTask(t, o)).filter((t): t is TaskView => t !== null), truncated: r.truncated };
   }
 
   async cancelTask(id: string): Promise<TaskView | null> {
-    return normalizeTask(await rpc(this.ep, 'CancelTask', { id }));
+    return normalizeTask(await this.a2a.cancelTask(id, this.core()), this.annotationsIn(null));
   }
 
-  // ---- the reads (RFC 0032 §5; taskless) ---------------------------------
+  // ---- reads (Message replies; no task is created) -----------------------
 
-  /** The full `status` document (the bootstrap read). */
+  /** The `status` document (the bootstrap read). */
   async status(): Promise<Json> {
-    return this.commandResult('status');
+    return this.data(OPS.status);
   }
 
   /** The effective config (operator). */
   async config(): Promise<Json> {
-    return this.commandResult('config');
-  }
-
-  async workflowRun(name: string, inputs?: Json): Promise<{ task: TaskView | null }> {
-    const r = (await this.command('workflow.run', inputs !== undefined ? { name, inputs } : { name })) as {
-      [k: string]: Json;
-    };
-    return { task: normalizeTask(r.task ?? null) };
+    return this.data(OPS.config);
   }
 
   async workflowStatus(run?: string): Promise<Json> {
-    return this.commandResult('workflow.status', run ? { run } : {});
+    return this.data(OPS.workflowStatus, run ? { run } : {});
+  }
+
+  /** A subagent's status (served without introspection, unlike `.get`). */
+  async subagentStatus(handle: string): Promise<Json> {
+    return this.data(OPS.subagentStatus, { handle });
+  }
+
+  /** A conversation's working plan. */
+  async planGet(id?: string): Promise<Json> {
+    return this.data(OPS.planGet, id ? { id } : {});
+  }
+
+  // Introspection: served only while the daemon has it on.
+
+  /** A conversation's stored transcript. */
+  async conversationGet(id: string, limit?: number): Promise<Json> {
+    return this.data(OPS.conversationGet, limit ? { id, limit } : { id });
+  }
+
+  /** A run with per-step detail. */
+  async runGet(run: string): Promise<Json> {
+    return this.data(OPS.runGet, { run });
+  }
+
+  /** One subagent's detail (instruction, result, attempts…). */
+  async subagentGet(handle: string): Promise<Json> {
+    return this.data(OPS.subagentGet, { handle });
+  }
+
+  /** The live log ring, cursored. */
+  async debugEvents(after = 0, limit = 200, level?: string): Promise<Json> {
+    const args: Obj = { after, limit };
+    if (level) args.level = level;
+    return this.data(OPS.debugEvents, args);
+  }
+
+  // ---- work (Task replies) -----------------------------------------------
+
+  /**
+   * Run a workflow. It hands back the WORKING task at once: a run can take
+   * minutes, and its progress arrives on the feed or a task stream.
+   */
+  async workflowRun(workflow: string, inputs?: Json): Promise<{ task: TaskView | null }> {
+    const r = await this.command(OPS.workflowRun, inputs !== undefined ? { workflow, inputs } : { workflow }, {
+      returnImmediately: true,
+    });
+    return { task: r.kind === 'task' ? r.task : null };
   }
 
   async workflowCancel(run: string): Promise<Json> {
-    return this.command('workflow.cancel', { run });
+    return this.data(OPS.workflowCancel, { run });
   }
-
-  /** Debug: a conversation's transcript (message bodies — `interface.debug`). */
-  async conversationGet(id: string, limit?: number): Promise<Json> {
-    const r = (await this.command('conversation.get', limit ? { id, limit } : { id })) as {
-      [k: string]: Json;
-    };
-    return r.conversation ?? null;
-  }
-
-  /** Debug: a run with per-step detail. */
-  async runGet(run: string): Promise<Json> {
-    const r = (await this.command('run.get', { run })) as { [k: string]: Json };
-    return r.run ?? null;
-  }
-
-  /** Debug: the live log ring, cursored. */
-  async debugEvents(after = 0, limit = 200, level?: string): Promise<Json> {
-    const args: { [k: string]: Json } = { after, limit };
-    if (level) args.level = level;
-    return this.command('debug.events', args);
-  }
-
-  /** Debug: one subagent's detail (instruction, result, attempts…). */
-  async subagentGet(handle: string): Promise<Json> {
-    const r = (await this.command('subagent.get', { handle })) as { [k: string]: Json };
-    return r.subagent ?? null;
-  }
-
-  /** Operator: runtime-set a whitelisted config knob (RFC 0032 §14). */
-  async configSet(path: string, value: Json): Promise<Json> {
-    return this.command('config.set', { path, value });
-  }
-
-  // ---- pairing (RFC 0032 §13) --------------------------------------------
-
-  /** Operator: the current rotating pairing code (read it out to a joiner). */
-  async pairingCode(): Promise<PairingCode> {
-    const r = (await this.command('pairing.code', {})) as { [k: string]: Json };
-    return r.pairing as unknown as PairingCode;
-  }
-
-  /**
-   * Exchange a pairing code for a session token (works UNAUTHENTICATED —
-   * this IS the login). Use the returned token as the endpoint bearer.
-   */
-  async pair(code: string): Promise<PairedSession> {
-    return (await rpc(this.ep, 'Pair', { code })) as unknown as PairedSession;
-  }
-
-  // ---- steering (RFC 0029 §5/§7) -----------------------------------------
 
   /** Fire a named workflow signal (resumes `wait: {on: signal}` steps). */
   async signal(name: string, payload?: Json, run?: string): Promise<Json> {
-    const args: { [k: string]: Json } = { name };
+    const args: Obj = { name };
     if (payload !== undefined) args.payload = payload;
     if (run) args.run = run;
-    return this.commandResult('workflow.signal', args);
+    return this.data(OPS.workflowSignal, args);
   }
 
   /** Inject a message into a WARM subagent. */
   async subagentSend(handle: string, message: string): Promise<Json> {
-    return this.commandResult('subagent.send', { handle, message });
+    return this.data(OPS.subagentSend, { handle, message });
   }
 
   /**
@@ -274,86 +391,132 @@ export class AgentdClient {
    * it from a UI at all.
    */
   async subagentKill(handle: string, reason?: string): Promise<Json> {
-    return this.commandResult('subagent.kill', reason ? { handle, reason } : { handle });
+    return this.data(OPS.subagentKill, reason ? { handle, reason } : { handle });
   }
 
-  /** A subagent's status (works without `interface.debug`, unlike `.get`). */
-  async subagentStatus(handle: string): Promise<Json> {
-    return this.commandResult('subagent.status', { handle });
-  }
-
-  /** A conversation's working plan. */
-  async planGet(id?: string): Promise<Json> {
-    return this.commandResult('plan.get', id ? { id } : {});
-  }
-
-  // ---- admin -------------------------------------------------------------
-  //
-  // Operator-only, and sent the way every other operation is: a `SendMessage`
-  // carrying a command DataPart. The older `a2a.*` JSON-RPC methods are gone,
-  // not deprecated: they were never A2A methods, so a client that used them
-  // was speaking a private protocol.
+  // ---- admin (operator) --------------------------------------------------
 
   async drain(reason = 'requested from the interface'): Promise<Json> {
-    return this.commandResult('admin.drain', { reason });
+    return this.data(OPS.adminDrain, { reason });
   }
 
   /** Pause one run, or (no arg) hold the whole instance. Reversible. */
   async pause(run?: string): Promise<Json> {
-    return this.commandResult('admin.pause', run ? { run } : {});
+    return this.data(OPS.adminPause, run ? { run } : {});
   }
 
   /** Resume a paused run / the instance. */
   async resume(run?: string): Promise<Json> {
-    return this.commandResult('admin.resume', run ? { run } : {});
+    return this.data(OPS.adminResume, run ? { run } : {});
   }
 
   /** Cancel one run by id. */
   async cancelRun(run: string, reason?: string): Promise<Json> {
-    return this.commandResult('admin.cancel', reason ? { run, reason } : { run });
+    return this.data(OPS.adminCancel, reason ? { run, reason } : { run });
+  }
+
+  /**
+   * Runtime-set one of the paths the card lists as settable (until the next
+   * reload). Answers `{path, value}` as the daemon parsed it.
+   */
+  async adminSet(path: string, value: Json): Promise<Json> {
+    return this.data(OPS.adminSet, { path, value });
+  }
+
+  // ---- sign-in administration (operator) ---------------------------------
+
+  /** Device sign-ins waiting for an operator's decision. */
+  async authDevicePending(): Promise<Json> {
+    return this.data(OPS.authDevicePending);
+  }
+
+  /**
+   * Approve a device sign-in as `name`. The name is required: it becomes the
+   * principal the device acts as (`user:<name>`), and every session approved
+   * under one name shares that principal's tasks — so it is chosen on
+   * purpose, never defaulted. `scope` raises it to another configured scope.
+   */
+  async authDeviceApprove(userCode: string, name: string, scope?: string): Promise<Json> {
+    if (name.trim() === '') {
+      throw new ClientError('invalid-argument', `approving ${userCode} needs the name it signs in as`);
+    }
+    const args: Obj = { user_code: userCode, as: name };
+    if (scope !== undefined) args.scope = scope;
+    return this.data(OPS.authDeviceApprove, args);
+  }
+
+  /** Refuse one pending device sign-in, or all of them. */
+  async authDeviceDeny(target: { userCode: string } | { all: true }): Promise<Json> {
+    return this.data(OPS.authDeviceDeny, 'all' in target ? { all: true } : { user_code: target.userCode });
+  }
+
+  /** The live browser/terminal sessions (device and launch). */
+  async authSessions(): Promise<Json> {
+    return this.data(OPS.authSessions);
+  }
+
+  /** End one session by id, every session approved under a name, or all. */
+  async authSessionsRevoke(target: RevokeTarget): Promise<Json> {
+    const args: Obj = 'sid' in target ? { sid: target.sid } : 'name' in target ? { name: target.name } : { all: true };
+    return this.data(OPS.authSessionsRevoke, args);
   }
 
   // ---- streams -----------------------------------------------------------
 
   /**
-   * Attach to the global observation feed. `onHello`/`onEvent` fire as frames
-   * land; resolves with the goodbye cursor when the server ends the stream
-   * (deadline — reconnect with `fromSeq`), rejects on transport errors or a
-   * server error (the transport throws both).
+   * Attach to the events/v1 observation feed. `onHello`/`onEvent` fire as
+   * frames land. Resolves with the goodbye — the cursor to resume from and
+   * why the server ended the stream — or `undefined` when the stream ended
+   * without one. Rejects on a transport or server error (the transport
+   * throws both), and locally, with no request, when the card declares no
+   * feed.
    */
   async subscribeEvents(
     fromSeq: number,
     onHello: (h: FeedHello) => void,
     onEvent: (e: FeedEvent) => void,
     signal?: AbortSignal,
-  ): Promise<{ seq: number }> {
-    let goodbye: { seq: number } = { seq: fromSeq };
+  ): Promise<FeedGoodbye | undefined> {
+    if (this.caps.events === null) {
+      throw new ClientError('extension-not-declared', `this agent does not declare ${EVENTS_EXTENSION}`);
+    }
+    let goodbye: FeedGoodbye | undefined;
     await rpcStream(
       this.ep,
-      'SubscribeToEvents',
+      EVENTS_METHOD,
       { fromSeq },
       (result) => {
-        const r = result as { [k: string]: Json } | null;
-        if (!r || typeof r !== 'object') return;
+        const r = obj(result);
+        if (!r) return;
         if (r.hello) onHello(r.hello as unknown as FeedHello);
         else if (r.event) onEvent(r.event as unknown as FeedEvent);
-        else if (r.goodbye) goodbye = { seq: ((r.goodbye as { [k: string]: Json }).seq as number) ?? fromSeq };
+        else if (r.goodbye) {
+          const g = obj(r.goodbye);
+          if (typeof g?.seq === 'number') goodbye = { seq: g.seq, reason: str(g.reason) ?? '' };
+        }
       },
-      { signal, exts: [INTERFACE_EXTENSION] },
+      { signal, exts: [EVENTS_EXTENSION, ...this.annotated()], require: [EVENTS_EXTENSION] },
     );
     return goodbye;
   }
 
   /**
-   * Attach to one task's stream (status/artifact frames until terminal).
+   * Attach to one task's stream (status/artifact frames until it stops).
    * Rejects on an error — a terminal or unknown task is an answer, not an
-   * empty stream.
+   * empty stream — and locally when the card does not declare streaming.
+   * `lastEventId` resumes after that SSE id.
    */
   async subscribeTask(
     id: string,
-    onFrame: (frame: Json) => void,
+    onFrame: (frame: Json, sseId?: string) => void,
     signal?: AbortSignal,
+    lastEventId?: string,
   ): Promise<void> {
-    await rpcStream(this.ep, 'SubscribeToTask', { id }, (result) => onFrame(result), { signal });
+    if (!this.caps.streaming) {
+      throw new ClientError('op-not-offered', 'this agent does not stream (its card leaves capabilities.streaming off)');
+    }
+    const o = this.core(signal);
+    if (lastEventId !== undefined) o.lastEventId = lastEventId;
+    await this.a2a.subscribeToTask(id, onFrame, o);
   }
 }

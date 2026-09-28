@@ -3,8 +3,8 @@
  * The TUI shell: a thin renderer over `the client core`'s {@link Mirror}. All
  * state lives in the daemon; this component holds only view state (which
  * screen, which selection, what's typed). Screens: chat · tasks · subagents ·
- * debug. The chrome (top/bottom edges) renders whatever `interface.display`
- * declares; the composer speaks `/` (commands + workflows), `@` (skills),
+ * debug. The chrome (top/bottom edges) renders the client's own layout
+ * (chrome.ts); the composer speaks `/` (commands + workflows), `@` (skills),
  * `#` (task/conversation targets) and `$` (live values).
  */
 import React, {
@@ -19,6 +19,7 @@ import { Box, Text, useApp, useInput, useStdin, useWindowSize } from 'ink';
 import { MultilineInput, type EditState } from './parts/input.js';
 import {
   AgentdClient,
+  DEFAULT_LAYOUT,
   Json,
   Mirror,
   Observation,
@@ -29,22 +30,25 @@ import {
   applySuggestion,
   askAnswer,
   askForm,
+  introspectionOn,
   prepare,
   suggest,
   workflowNames,
 } from '../client/index.js';
-import type { AskForm } from '../client/index.js';
+import type { AskForm, Credential } from '../client/index.js';
 import { GatePrompt } from './parts/gate.js';
 import { theme } from './theme.js';
 import { Transcript } from './parts/transcript.js';
 import { TaskList } from './parts/tasks.js';
 import { DebugScreen } from './parts/debug.js';
-import { DEFAULT_BOTTOM, DEFAULT_TOP, Edge } from './parts/chrome.js';
+import { Edge } from './parts/chrome.js';
 import { SubagentDetail, SubagentList } from './parts/subagents.js';
 
 export interface AppProps {
+  /** Where the agent is: its base URL or its card's URL. */
   endpoint: string;
-  bearer?: string;
+  /** The person's credential for that endpoint. */
+  credential?: Credential;
   /** Ask for the debug screen up front (still gated by the daemon). */
   debug?: boolean;
   /**
@@ -53,7 +57,7 @@ export interface AppProps {
    * `--inline` turns this off and hands history back to the terminal.
    */
   fullscreen?: boolean;
-  /** Injection seam for tests. */
+  /** Injection seam for tests (otherwise the client comes from discovery). */
   client?: AgentdClient;
   mirror?: Mirror;
   /** Skip starting the observation loop (tests drive the mirror directly). */
@@ -70,10 +74,14 @@ export function App(props: AppProps): React.JSX.Element {
   // pipe, and `useInput` skips only on a strict `false` — coerce.
   const { isRawModeSupported: rawMode } = useStdin();
   const isRawModeSupported = rawMode === true;
-  const client = useMemo(
-    () => props.client ?? new AgentdClient({ url: props.endpoint, bearer: props.bearer }),
-    [props.client, props.endpoint, props.bearer],
-  );
+  // The client exists once discovery settled where JSON-RPC goes and what
+  // the card lets this client call; until then a command has nowhere to go.
+  const [discovered, setDiscovered] = useState<AgentdClient | null>(null);
+  const client = props.client ?? discovered;
+  const need = useCallback((): AgentdClient => {
+    if (!client) throw new Error('not connected yet');
+    return client;
+  }, [client]);
   const mirror = useMemo(() => props.mirror ?? new Mirror(), [props.mirror]);
   useSyncExternalStore(mirror.subscribe, mirror.getVersion);
   const s = mirror.getState();
@@ -98,13 +106,17 @@ export function App(props: AppProps): React.JSX.Element {
   const ctxRef = useRef<string | undefined>(undefined);
   const inputTaskRef = useRef<string | undefined>(undefined);
 
-  // The observation loop (feed-first, poll fallback).
+  // The observation loop (discovery, then feed-first with a poll fallback).
   useEffect(() => {
     if (props.observe === false) return;
-    const obs = new Observation(client, mirror);
+    const obs = new Observation(
+      { configured: props.endpoint, credential: props.credential, onSession: (_, c) => setDiscovered(c) },
+      mirror,
+    );
     obs.start();
     return () => obs.stop();
-  }, [client, mirror, props.observe]);
+  }, [props.endpoint, props.credential, mirror, props.observe]);
+  const debugOn = introspectionOn(s);
 
   const active = mirror.activeTasks();
   const suggestions: Suggestion[] = screen === 'chat' ? suggest(input, s) : [];
@@ -130,7 +142,7 @@ export function App(props: AppProps): React.JSX.Element {
 
   // The debug log tail: poll the ring (cursored) while the pane is visible.
   useEffect(() => {
-    if (screen !== 'debug' || !s.info?.debug) return;
+    if (screen !== 'debug' || !debugOn || !client) return;
     let alive = true;
     const tick = async () => {
       try {
@@ -151,10 +163,11 @@ export function App(props: AppProps): React.JSX.Element {
       alive = false;
       clearInterval(t);
     };
-  }, [screen, s.info?.debug, client]);
+  }, [screen, debugOn, client]);
 
   // Track the newest input-required gate so a plain reply answers it.
   const gate = active.find((t) => t.state === 'TASK_STATE_INPUT_REQUIRED');
+  const layout = DEFAULT_LAYOUT.tui;
   useEffect(() => {
     inputTaskRef.current = gate?.id;
   });
@@ -193,7 +206,7 @@ export function App(props: AppProps): React.JSX.Element {
         gateRows +
         (suggestions.length > 0 ? 1 : 0) +
         // The bottom edge wraps to a second line only on a narrow terminal.
-        (columns < 100 && (s.info?.display?.bottom?.length ?? 8) > 6 ? 1 : 0)),
+        (columns < 100 && layout.bottom.length > 6 ? 1 : 0)),
   );
 
   const submit = useCallback(
@@ -210,7 +223,7 @@ export function App(props: AppProps): React.JSX.Element {
         // `#target` routing + `$value` interpolation (shared composer rules).
         const p = prepare(trimmed, s);
         const gate = p.taskId ?? inputTaskRef.current;
-        const sent = await client.send(p.text, {
+        const sent = await need().send(p.text, {
           contextId: p.contextId ?? ctxRef.current,
           taskId: gate,
         });
@@ -224,7 +237,7 @@ export function App(props: AppProps): React.JSX.Element {
         mirror.note(e instanceof Error ? e.message : String(e), 'error');
       }
     },
-    [client, mirror, s],
+    [need, mirror, s],
   );
 
   const runSlash = useCallback(
@@ -235,7 +248,7 @@ export function App(props: AppProps): React.JSX.Element {
         switch (cmd) {
           case 'help':
             mirror.note(
-              '/new · /tasks · /subagents · /debug · /status · /config [path] · /set · /workflow <name> · /signal <name> · /send <handle> <msg> · /pause [run] · /resume [run] · /plan · /cancel [task] · /pair · /drain · /quit — plus @skill, #target, $value in messages',
+              '/new · /tasks · /subagents · /debug · /status · /config [path] · /set · /workflow <name> · /signal <name> · /send <handle> <msg> · /pause [run] · /resume [run] · /plan · /cancel [task] · /drain · /quit — plus @skill, #target, $value in messages',
             );
             break;
           case 'new':
@@ -255,7 +268,7 @@ export function App(props: AppProps): React.JSX.Element {
             setScreen('chat');
             break;
           case 'status': {
-            const st = (await client.status()) as { [k: string]: Json };
+            const st = (await need().status()) as { [k: string]: Json };
             mirror.bootstrap(st);
             mirror.note(
               `runs ${Array.isArray(st.runs) ? st.runs.length : 0} · conversations ${Array.isArray(st.conversations) ? st.conversations.length : 0} · subagents ${Array.isArray(st.subagents) ? st.subagents.length : 0} · draining ${st.draining}`,
@@ -263,7 +276,7 @@ export function App(props: AppProps): React.JSX.Element {
             break;
           }
           case 'config': {
-            const cfg = await client.config();
+            const cfg = await need().config();
             if (arg) {
               // One path: walk the effective document.
               let v: Json = (cfg as { config?: Json }).config ?? cfg;
@@ -281,7 +294,7 @@ export function App(props: AppProps): React.JSX.Element {
           case 'set': {
             const [path, ...valueParts] = rest;
             if (!path || valueParts.length === 0) {
-              mirror.note('usage: /set <path> <value> — e.g. /set interface.debug true', 'error');
+              mirror.note('usage: /set <path> <value> — one of the paths the agent lists as settable', 'error');
               break;
             }
             const rawVal = valueParts.join(' ');
@@ -291,8 +304,8 @@ export function App(props: AppProps): React.JSX.Element {
             } catch {
               value = rawVal;
             }
-            const r = (await client.configSet(path, value)) as { [k: string]: Json };
-            mirror.note(`set ${path} = ${JSON.stringify((r.set as { [k: string]: Json })?.value ?? value)}`);
+            const r = (await need().adminSet(path, value)) as { [k: string]: Json } | null;
+            mirror.note(`set ${path} = ${JSON.stringify(r?.value ?? value)}`);
             break;
           }
           case 'signal': {
@@ -301,8 +314,8 @@ export function App(props: AppProps): React.JSX.Element {
               mirror.note('usage: /signal <name> [run]', 'error');
               break;
             }
-            const r = (await client.signal(name, undefined, run)) as { [k: string]: Json };
-            mirror.note(`signal ${name} → delivered ${(r as { delivered?: number }).delivered ?? '?'}`);
+            const r = (await need().signal(name, undefined, run)) as { [k: string]: Json };
+            mirror.note(`signal ${name} → delivered ${(r as { delivered?: number } | null)?.delivered ?? '?'}`);
             break;
           }
           case 'send': {
@@ -311,18 +324,17 @@ export function App(props: AppProps): React.JSX.Element {
               mirror.note('usage: /send <handle> <message>', 'error');
               break;
             }
-            await client.subagentSend(handle, msg.join(' '));
+            await need().subagentSend(handle, msg.join(' '));
             mirror.note(`sent to ${handle}`);
             break;
           }
           case 'pause': {
-            const r = (await client.pause(arg || undefined)) as { [k: string]: Json };
+            await need().pause(arg || undefined);
             mirror.note(arg ? `paused ${arg}` : 'instance paused — /resume to release');
-            void r;
             break;
           }
           case 'resume': {
-            await client.resume(arg || undefined);
+            await need().resume(arg || undefined);
             mirror.note(arg ? `resumed ${arg}` : 'instance resumed');
             break;
           }
@@ -339,15 +351,8 @@ export function App(props: AppProps): React.JSX.Element {
             break;
           }
           case 'plan': {
-            const p = (await client.planGet(arg || undefined)) as { [k: string]: Json };
-            mirror.note(`plan: ${JSON.stringify(p.plan ?? null).slice(0, 800)}`);
-            break;
-          }
-          case 'pair': {
-            const p = await client.pairingCode();
-            mirror.note(
-              `pairing code: ${p.code}  (valid ${Math.ceil(p.expires_in_ms / 1000)}s, role ${p.role}, ${p.sessions} live sessions)\nconnect with: agentd-tui --endpoint ${props.endpoint} --code ${p.code}  ·  or enter it in the web UI`,
-            );
+            const p = (await need().planGet(arg || undefined)) as { [k: string]: Json } | null;
+            mirror.note(`plan: ${JSON.stringify(p?.plan ?? null).slice(0, 800)}`);
             break;
           }
           case 'workflow': {
@@ -355,7 +360,7 @@ export function App(props: AppProps): React.JSX.Element {
               mirror.note('usage: /workflow <name>', 'error');
               break;
             }
-            const r = await client.workflowRun(arg);
+            const r = await need().workflowRun(arg);
             mirror.note(`workflow ${arg} → ${r.task?.id ?? '?'}`);
             break;
           }
@@ -365,13 +370,13 @@ export function App(props: AppProps): React.JSX.Element {
               mirror.note('nothing to cancel');
               break;
             }
-            const t = await client.cancelTask(id);
+            const t = await need().cancelTask(id);
             if (t) mirror.adoptTasks([t]);
             mirror.note(`cancelled ${id}`);
             break;
           }
           case 'drain':
-            await client.drain();
+            await need().drain();
             mirror.note('draining requested');
             break;
           case 'quit':
@@ -381,7 +386,7 @@ export function App(props: AppProps): React.JSX.Element {
           default: {
             // Not a system command: a workflow shortcut (`/deploy` ⇒ run it).
             if (workflowNames(s).includes(cmd)) {
-              const r = await client.workflowRun(cmd);
+              const r = await need().workflowRun(cmd);
               mirror.note(`workflow ${cmd} → ${r.task?.id ?? '?'}`);
             } else {
               mirror.note(`unknown command /${cmd} — /help`, 'error');
@@ -393,12 +398,13 @@ export function App(props: AppProps): React.JSX.Element {
         mirror.note(msg, 'error');
       }
     },
-    [client, mirror, exit, active, s, props.endpoint],
+    [need, mirror, exit, active, s],
   );
 
   const openSubagent = useCallback(
     (handle: string) => {
       setSubDetail({ handle, detail: null });
+      if (!client) return;
       void client
         .subagentGet(handle)
         .then((d) => setSubDetail((cur) => (cur?.handle === handle ? { handle, detail: d } : cur)))
@@ -438,6 +444,7 @@ export function App(props: AppProps): React.JSX.Element {
           const answer = askAnswer(gateForm, gatePick, '');
           const text = typeof answer === 'string' ? answer : JSON.stringify(answer);
           setGatePick([]);
+          if (!client) return;
           void client
             .send(text, { taskId: gate.id })
             .then((sent) => {
@@ -484,7 +491,7 @@ export function App(props: AppProps): React.JSX.Element {
       }
       if (key.tab) {
         setScreen((cur) => {
-          const order: Screen[] = s.info?.debug
+          const order: Screen[] = debugOn
             ? ['chat', 'tasks', 'subagents', 'debug']
             : ['chat', 'tasks', 'subagents'];
           setSubDetail(null);
@@ -499,7 +506,7 @@ export function App(props: AppProps): React.JSX.Element {
           return;
         }
         const newest = active[0];
-        if (newest && !TERMINAL_STATES.has(newest.state)) {
+        if (client && newest && !TERMINAL_STATES.has(newest.state)) {
           void client.cancelTask(newest.id).then(
             (t) => {
               if (t) mirror.adoptTasks([t]);
@@ -516,7 +523,7 @@ export function App(props: AppProps): React.JSX.Element {
         else if (key.downArrow) setSelected((i) => Math.min(all.length - 1, i + 1));
         else if (ch === 'c') {
           const t = all[selected];
-          if (t) void client.cancelTask(t.id).catch(() => {});
+          if (t && client) void client.cancelTask(t.id).catch(() => {});
         } else if (key.return) {
           const t = all[selected];
           if (t) {
@@ -549,7 +556,7 @@ export function App(props: AppProps): React.JSX.Element {
           setCursor(pre.length);
           setSubDetail(null);
         } else if (ch === 'k') setKillAsk(subDetail.handle);
-        else if (killAsk && (ch === 'y' || ch === 'Y')) {
+        else if (killAsk && (ch === 'y' || ch === 'Y') && client) {
           const h = killAsk;
           setKillAsk(null);
           void client
@@ -564,9 +571,7 @@ export function App(props: AppProps): React.JSX.Element {
 
   // ---- render ------------------------------------------------------------
 
-  const info = s.info;
-  const top = info?.display?.top ?? DEFAULT_TOP;
-  const bottom = info?.display?.bottom ?? DEFAULT_BOTTOM;
+  const { top, bottom } = layout;
   const chrome = { s, endpoint: props.endpoint, screen, active: active.length };
   // The live working line (RFC 0032 §17): what the daemon is doing, ticking
   // its own clock off the activity record's `started_ms` (the spinner interval
@@ -605,7 +610,7 @@ export function App(props: AppProps): React.JSX.Element {
             killAsk={killAsk === subDetail.handle}
             summary={s.subagents.get(subDetail.handle) as { [k: string]: Json } | undefined}
             detail={subDetail.detail as { [k: string]: Json } | null}
-            debug={info?.debug === true}
+            debug={debugOn}
           />
         ) : (
           <SubagentList s={s} selected={selected} />

@@ -23,16 +23,6 @@ export const A2A_VERSION = '1.0';
 
 let nextId = 1;
 
-/**
- * The A2A extensions agentd declares on its card. A client names the ones it
- * intends to use in `A2A-Extensions`; the response echoes what was actually
- * activated. Neither is `required`, so sending the header is an announcement,
- * not a precondition — but announcing lets the peer confirm the vocabulary
- * instead of inferring it from the payload.
- */
-export const COMMAND_EXTENSION = 'https://agentd.dev/a2a/ext/command/v1';
-export const INTERFACE_EXTENSION = 'https://agentd.dev/a2a/ext/interface/v1';
-
 /** A unary success body is capped here; a larger one is not a JSON-RPC reply we can use. */
 const MAX_BODY = 16 << 20;
 /** An error body is only read for its envelope or a line of text, so far less is kept. */

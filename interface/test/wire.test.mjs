@@ -35,8 +35,24 @@ import {
   NoLauncher,
 } from '../dist/client/auth.js';
 import { AgentdClient } from '../dist/client/index.js';
+import { capabilitiesOf } from '../dist/client/discovery.js';
+import { COMMAND_EXTENSION, EVENTS_EXTENSION, EVENTS_METHOD } from '../dist/client/ext.js';
 
 const EP = { url: 'http://agent.test/' };
+// What a card declaring the feed, streaming and the `status` op grants: the
+// AgentdClient refuses anything its card does not back, before the wire.
+const CAPS = capabilitiesOf(
+  {
+    capabilities: {
+      streaming: true,
+      extensions: [
+        { uri: COMMAND_EXTENSION, params: { ops: [{ op: 'status', reply: 'message' }] } },
+        { uri: EVENTS_EXTENSION },
+      ],
+    },
+  },
+  null,
+);
 const X = 'https://example.test/ext/x/v1';
 const Y = 'https://example.test/ext/y/v1';
 
@@ -177,7 +193,7 @@ test('sse parser caps one event at 8 MiB', () => {
 
 test('every request carries a2a-version, tenant and content-type', async (t) => {
   const calls = stubFetch(t, (req) => {
-    if (req.body.method === 'SubscribeToEvents') {
+    if (req.body.method === EVENTS_METHOD) {
       return sse([frame({ hello: { seq: 0 } }), frame({ goodbye: { seq: 3 } })]);
     }
     if (req.body.method === 'SubscribeToTask') return sse([frame({ task: { id: 't' } })]);
@@ -188,7 +204,7 @@ test('every request carries a2a-version, tenant and content-type', async (t) => 
 
   for (const ep of [{ ...EP, tenant: 't1' }, EP]) {
     calls.length = 0;
-    const c = new AgentdClient(ep);
+    const c = new AgentdClient(ep, CAPS);
     await c.send('hi');
     await c.command('status', {});
     await c.getTask('t');
@@ -207,7 +223,7 @@ test('every request carries a2a-version, tenant and content-type', async (t) => 
       assert.equal(r.init.cache, 'no-store');
       if (ep.tenant) assert.equal(r.body.params.tenant, 't1', r.body.method);
       else assert.ok(!('tenant' in r.body.params), r.body.method);
-      const streaming = r.body.method === 'SubscribeToTask' || r.body.method === 'SubscribeToEvents';
+      const streaming = r.body.method === 'SubscribeToTask' || r.body.method === EVENTS_METHOD;
       assert.equal(r.headers.accept, streaming ? 'text/event-stream' : 'application/json', r.body.method);
     }
   }
@@ -418,10 +434,10 @@ test('stream errors throw', async (t) => {
   // The client-level wrappers reject too, rather than resolving as if the
   // stream had simply ended.
   next = (req) => json({ jsonrpc: '2.0', id: req.body.id, error: { code: -32004, message: 'terminal' } });
-  await rejects(new AgentdClient(EP).subscribeTask('t', () => {}), (e) => assert.equal(e.code, -32004));
+  await rejects(new AgentdClient(EP, CAPS).subscribeTask('t', () => {}), (e) => assert.equal(e.code, -32004));
   next = () => sse([`data: ${JSON.stringify({ jsonrpc: '2.0', id: 1, error: { code: -32603, message: 'x' } })}\n\n`]);
   await rejects(
-    new AgentdClient(EP).subscribeEvents(0, () => {}, () => {}),
+    new AgentdClient(EP, CAPS).subscribeEvents(0, () => {}, () => {}),
     (e) => assert.equal(e.code, -32603),
   );
 

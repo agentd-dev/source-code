@@ -171,8 +171,7 @@ fn steer_config(llm: &str, port: u16, extra: &str) -> String {
          agent:\n  name: steer-e2e\n  instruction: Test agent.\n  preflight: never\n\
          intelligence:\n  endpoints: {llm}\n  model: mock\n\
          store:\n  kind: memory\n\
-         a2a:\n  listen: http://127.0.0.1:{port}\n\
-         interface:\n  enabled: true\n  debug: true\n\
+         a2a:\n  listen: http://127.0.0.1:{port}\n  events:\n    enabled: true\n  introspection:\n    enabled: true\n\
          lifecycle:\n  run_until: drained\n{extra}"
     )
 }

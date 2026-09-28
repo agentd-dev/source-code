@@ -93,12 +93,11 @@ streams:
 # authenticated session on the box, and a voice is not.
 a2a:
   listen: "http://127.0.0.1:8420"
+  events:
+    enabled: true
   peers:
     - name: hands
       endpoint: unix:///run/agentd/hands.sock
-
-interface:
-  enabled: true
 
 # Push-to-talk from a phone, and the barge-in relay. Loopback only: the mic
 # host is this machine.

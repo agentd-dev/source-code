@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The **interface surface** end to end: a daemon with `interface.enabled`
-//! (+ `debug`) serves the display-client contract over its real A2A listener —
-//! `interface.info` discovery, the global `SubscribeToEvents` SSE feed
-//! (cross-client transcript sync + cursor resume), the taskless debug reads
-//! (`conversation.get` with message bodies, `run.get` with per-step detail,
-//! `debug.events` log-ring tail), the browser-origin CORS path, the
-//! disabled-by-default gate, and the `agentd tui` passthrough (client spawn +
-//! tied lifetimes) with a stub client binary.
+//! The **display surface** end to end: a daemon with `a2a.events.enabled`
+//! (+ `a2a.introspection.enabled`) serves the display-client contract over its
+//! real A2A listener — `interface.info` discovery, the global
+//! `SubscribeToEvents` SSE feed (cross-client transcript sync + cursor resume),
+//! the taskless introspection reads (`conversation.get` with message bodies,
+//! `run.get` with per-step detail, `debug.events` log-ring tail), the
+//! browser-origin CORS path, the disabled-by-default gate, and the removed
+//! pairing exchange. The `agentd tui|ui` launcher lives in `launcher_e2e`.
 #![cfg(all(unix, feature = "a2a"))]
 
 mod common;
@@ -125,18 +125,25 @@ fn spawn_bound_with(
     panic!("the daemon never bound an A2A listener (5 attempts)");
 }
 
-/// A loopback daemon (⇒ operator) with the interface on; `debug` + `extra`
-/// shape each test.
+/// A loopback daemon (⇒ operator) with the feed on; `debug` (introspection) +
+/// `extra` shape each test.
 fn iface_config(llm: &str, port: u16, debug: bool, extra: &str) -> String {
     format!(
         "config_version: \"1\"\n\
          agent:\n  name: iface-e2e\n  instruction: You are a helpful test agent.\n  preflight: never\n\
          intelligence:\n  endpoints: {llm}\n  model: mock\n\
          store:\n  kind: memory\n\
-         a2a:\n  listen: http://127.0.0.1:{port}\n\
-         interface:\n  enabled: true\n  debug: {debug}\n\
+         a2a:\n  listen: http://127.0.0.1:{port}\n  events:\n    enabled: true\n  introspection:\n    enabled: {debug}\n\
          lifecycle:\n  run_until: drained\n\
          observability:\n  log_level: info\n  log_content: true\n{extra}"
+    )
+}
+
+/// [`iface_config`] with `a2a.cors.origins: [<origins>]`.
+fn with_origins(llm: &str, port: u16, origins: &str) -> String {
+    iface_config(llm, port, false, "").replace(
+        "  events:\n    enabled: true\n",
+        &format!("  cors:\n    origins: [{origins}]\n  events:\n    enabled: true\n"),
     )
 }
 
@@ -341,7 +348,7 @@ fn subscribe_to_events_streams_cross_client_activity_and_resumes() {
 #[test]
 fn the_interface_is_gated_off_by_default() {
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
-    // NO interface block: the surface must refuse, the core must be untouched.
+    // Neither switch: the surface must refuse, the core must be untouched.
     let (_daemon, addr, cfg) = spawn_bound(|port| {
         format!(
             "config_version: \"1\"\n\
@@ -357,10 +364,11 @@ fn the_interface_is_gated_off_by_default() {
     // The command ops refuse…
     let (code, msg) = error_of(&SendMessage::command("interface.info", json!({})).post(&addr));
     assert_eq!(code, -32004);
-    assert!(msg.contains("interface.enabled"), "{msg}");
-    // …debug reads refuse…
-    let (code, _) = error_of(&SendMessage::command("debug.events", json!({})).post(&addr));
+    assert!(msg.contains("a2a.events.enabled"), "{msg}");
+    // …introspection reads refuse, naming their own switch…
+    let (code, msg) = error_of(&SendMessage::command("debug.events", json!({})).post(&addr));
     assert_eq!(code, -32004);
+    assert!(msg.contains("a2a.introspection.enabled"), "{msg}");
     // …the stream refuses (as its SSE terminal frame)…
     let frames: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
     {
@@ -368,7 +376,7 @@ fn the_interface_is_gated_off_by_default() {
         let resp_or_stream = common::a2a_post(&addr, &body, &[]).body;
         // Either a plain error body or an SSE stream whose only frame is the error.
         assert!(
-            resp_or_stream.contains("-32004") && resp_or_stream.contains("interface.enabled"),
+            resp_or_stream.contains("-32004") && resp_or_stream.contains("a2a.events.enabled"),
             "{resp_or_stream}"
         );
         drop(frames);
@@ -387,7 +395,7 @@ fn the_interface_is_gated_off_by_default() {
         .unwrap_or_default();
     assert!(
         !uris.iter().any(|u| u.contains("interface")),
-        "the interface is off, so no interface extension may be advertised: {uris:?}"
+        "the feed is off, so no interface extension may be advertised: {uris:?}"
     );
     assert!(
         uris.contains(&"https://agentd.dev/a2a/ext/command/v1"),
@@ -400,13 +408,8 @@ fn the_interface_is_gated_off_by_default() {
 #[test]
 fn a_configured_web_origin_gets_cors_and_others_stay_rejected() {
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
-    let extra = "  origins: [\"https://ui.example\"]\n";
-    let (_daemon, addr, cfg) = spawn_bound(|port| {
-        iface_config(&llm.uri, port, false, "").replace(
-            "interface:\n  enabled: true\n  debug: false\n",
-            &format!("interface:\n  enabled: true\n  debug: false\n{extra}"),
-        )
-    });
+    let (_daemon, addr, cfg) =
+        spawn_bound(|port| with_origins(&llm.uri, port, "\"https://ui.example\""));
 
     let send = |req: String| -> (u16, Vec<(String, String)>) {
         let mut s = TcpStream::connect(&addr).unwrap();
@@ -504,21 +507,42 @@ fn a_configured_web_origin_gets_cors_and_others_stay_rejected() {
     std::fs::remove_file(&cfg).ok();
 }
 
+/// The pairing exchange is gone, under every name it answered to.
+///
+/// `Pair` was an anonymous, undeclared JSON-RPC method that minted operator
+/// session tokens; `a2a.device_grant` replaced it. What is pinned here is that
+/// no spelling issues a credential — on a no-auth loopback daemon, where the
+/// caller is the operator and reaches the dispatcher, and on a bearer-protected
+/// one, where the anonymous admission that let a code holder in is gone too.
+/// (Which error code a removed method gets is the listener's vocabulary, and
+/// is pinned where that is.)
 #[test]
-fn pairing_exchanges_the_rotating_code_for_a_session_token() {
+fn pair_is_gone() {
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
-    // A bearer-PROTECTED listener with pairing on: uncredentialed callers are
-    // anonymous (may call exactly Pair + the card), the server bearer is the
-    // operator, and a paired session becomes a first-class credential.
+    let names = ["Pair", "interface.pair", "a2a.Pair", "a2a.interface.pair"];
+
+    let (_daemon, addr, cfg) = spawn_bound(|port| iface_config(&llm.uri, port, false, ""));
+    for (i, name) in names.iter().enumerate() {
+        let reply = common::rpc(&addr, i as i64 + 1, name, json!({"code": "000000"}));
+        assert!(
+            reply.get("error").is_some() && reply.get("result").is_none(),
+            "{name} answered: {reply}"
+        );
+        assert!(
+            !reply.to_string().contains("pat-") && !reply.to_string().contains("token"),
+            "{name} issued a credential: {reply}"
+        );
+    }
+    std::fs::remove_file(&cfg).ok();
+
     let (_daemon, addr, cfg) = spawn_bound_with(
         |port| {
             format!(
                 "config_version: \"1\"\n\
-         agent:\n  name: pair-e2e\n  instruction: Test.\n  preflight: never\n\
+         agent:\n  name: pair-gone\n  instruction: Test.\n  preflight: never\n\
          intelligence:\n  endpoints: {}\n  model: mock\n\
          store:\n  kind: memory\n\
          a2a:\n  listen: http://127.0.0.1:{port}\n  bearer: \"{{{{secret:PAIRB}}}}\"\n\
-         interface:\n  enabled: true\n  pairing:\n    enabled: true\n\
          lifecycle:\n  run_until: drained\n",
                 llm.uri
             )
@@ -537,113 +561,66 @@ fn pairing_exchanges_the_rotating_code_for_a_session_token() {
             Daemon { child, stderr_path }
         },
     );
-
-    // 1. Anonymous: the card is public, work is refused.
-    let card = get_card(&addr);
-    assert!(card["error"].is_null(), "{card}");
-    let denied = SendMessage::command("status", json!({})).post(&addr);
-    assert_eq!(denied["error"]["code"], -32003, "{denied}");
-
-    // 2. The operator (server bearer) reads the current code…
-    let code_resp = SendMessage::command("pairing.code", json!({}))
-        .bearer("server-secret-bearer")
-        .post(&addr);
-    let code = code_resp["result"]["pairing"]["code"]
-        .as_str()
-        .expect("code")
-        .to_string();
-    assert_eq!(code.len(), 6);
-    assert!(
-        code_resp["result"]["pairing"]["expires_in_ms"]
-            .as_u64()
-            .unwrap()
-            <= 60_000
-    );
-
-    // 3. …a wrong code fails, the right one (ANONYMOUS) mints a session…
-    let wrong = common::rpc(&addr, 4, "Pair", json!({"code": "000001"}));
-    assert_eq!(wrong["error"]["code"], -32003);
-    let paired = common::rpc(&addr, 5, "Pair", json!({"code": code}));
-    let token = paired["result"]["token"]
-        .as_str()
-        .expect("token")
-        .to_string();
-    assert!(token.starts_with("pat-"));
-    assert_eq!(paired["result"]["role"], "operator");
-
-    // 4. …and the session token IS a working operator credential.
-    let st = SendMessage::command("status", json!({}))
-        .bearer(&token)
-        .post(&addr);
-    assert!(st["error"].is_null(), "{st}");
-    assert_eq!(
-        st["result"]["task"]["status"]["state"],
-        "TASK_STATE_COMPLETED"
-    );
-    // interface.info advertises pairing.
-    let info = SendMessage::command("interface.info", json!({}))
-        .bearer(&token)
-        .post(&addr);
-    assert_eq!(info["result"]["interface"]["pairing"]["enabled"], true);
-
+    for (i, name) in names.iter().enumerate() {
+        let reply = common::a2a_post(
+            &addr,
+            &common::rpc_body(i as i64 + 1, name, json!({"code": "000000"})),
+            &[],
+        );
+        assert_eq!(
+            reply.status, 401,
+            "an uncredentialed {name} is refused before any dispatch: {}",
+            reply.body
+        );
+    }
     std::fs::remove_file(&cfg).ok();
 }
 
 #[test]
-fn config_set_toggles_debug_live_and_reshapes_the_display() {
+fn config_set_toggles_introspection_live() {
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
-    // Debug starts OFF.
+    // Introspection starts OFF.
     let (_daemon, addr, cfg) = spawn_bound(|port| iface_config(&llm.uri, port, false, ""));
 
-    // Debug reads refuse; info says so; the default display is served.
+    // Introspection reads refuse; info says so.
     let (code, _) = error_of(&SendMessage::command("debug.events", json!({})).post(&addr));
     assert_eq!(code, -32004);
     let info = command(&addr, "interface.info", json!({}));
     assert_eq!(info["interface"]["debug"], false);
-    assert!(
-        info["interface"]["display"]["bottom"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|v| v == "conn"),
-        "{info}"
-    );
+    // The layout is the client's now: the daemon reports none.
+    assert!(info["interface"].get("display").is_none(), "{info}");
+    assert!(info["interface"].get("pairing").is_none(), "{info}");
 
-    // `config.set interface.debug true` flips it at runtime…
+    // `config.set a2a.introspection.enabled true` flips it at runtime…
     let set = command(
         &addr,
         "config.set",
-        json!({"path": "interface.debug", "value": true}),
+        json!({"path": "a2a.introspection.enabled", "value": true}),
     );
     assert_eq!(set["set"]["value"], true, "{set}");
     let info = command(&addr, "interface.info", json!({}));
     assert_eq!(info["interface"]["debug"], true);
-    // …and the debug reads work — including the log ring, installed on toggle.
+    assert!(info["interface"]["model"].is_string());
+    // …and the introspection reads work — including the log ring, installed on
+    // toggle.
     let ev = command(&addr, "debug.events", json!({"limit": 10}));
     assert!(ev["events"].is_array(), "{ev}");
 
-    // The display is runtime-shapeable; unknown paths name the whitelist.
-    let set = command(
-        &addr,
-        "config.set",
-        json!({"path": "interface.display.bottom", "value": ["conn", "model", "tokens"]}),
-    );
-    assert_eq!(set["set"]["value"], json!(["conn", "model", "tokens"]));
-    let info = command(&addr, "interface.info", json!({}));
-    assert_eq!(
-        info["interface"]["display"]["bottom"],
-        json!(["conn", "model", "tokens"])
-    );
-    assert!(info["interface"]["model"].is_string());
-    let (code, msg) = error_of(
-        &SendMessage::command(
-            "config.set",
-            json!({"path": "intelligence.model", "value": "x"}),
-        )
-        .post(&addr),
-    );
-    assert_eq!(code, -32602);
-    assert!(msg.contains("not runtime-settable"), "{msg}");
+    // The removed paths are not runtime-settable; the error names what is.
+    for path in [
+        "interface.debug",
+        "interface.display.bottom",
+        "intelligence.model",
+    ] {
+        let (code, msg) = error_of(
+            &SendMessage::command("config.set", json!({"path": path, "value": "x"})).post(&addr),
+        );
+        assert_eq!(code, -32602, "{path}");
+        assert!(
+            msg.contains("not runtime-settable") && msg.contains("a2a.introspection.enabled"),
+            "{path}: {msg}"
+        );
+    }
 
     std::fs::remove_file(&cfg).ok();
 }
@@ -805,81 +782,6 @@ fn live_activity_reports_phase_tool_and_tokens_on_the_feed() {
     std::fs::remove_file(&cfg).ok();
 }
 
-#[test]
-fn the_tui_passthrough_spawns_the_client_and_ties_lifetimes() {
-    let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
-    // The one case that needs a FIXED port: the test asserts the endpoint the
-    // passthrough derives and hands to the client, and `:0` is refused there
-    // by design (a client cannot dial an ephemeral port it never learns).
-    let port = free_port();
-    // The stub "TUI": record the handed endpoint, then exit — which must drain
-    // the daemon (client-exit ⇒ SIGTERM ⇒ graceful exit 0).
-    let out = common::unique_path("iface-stub-out", "txt");
-    let stub = common::unique_path("iface-stub", "sh");
-    std::fs::write(
-        &stub,
-        format!("#!/bin/sh\nprintf '%s %s' \"$AGENTD_ENDPOINT\" \"$1 $2\" > {out}\nexit 0\n"),
-    )
-    .unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-    let cfg = write_config(&format!(
-        "config_version: \"1\"\n\
-         agent:\n  name: tui-pass\n  instruction: Test.\n  preflight: never\n\
-         intelligence:\n  endpoints: {}\n  model: mock\n\
-         store:\n  kind: memory\n\
-         a2a:\n  listen: http://127.0.0.1:{port}\n\
-         lifecycle:\n  run_until: drained\n  drain_timeout: 2s\n",
-        llm.uri
-    ));
-    let daemon_log = common::unique_path("iface-pass-daemon", "log");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_agentd"))
-        .args(["tui", "--config", &cfg])
-        .env("AGENTD_TUI_BIN", &stub)
-        .env("AGENTD_INTERFACE_LOG", &daemon_log)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn agentd tui");
-
-    // The whole assembly winds down by itself: stub exits ⇒ daemon drains ⇒ 0.
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let status = loop {
-        if let Ok(Some(st)) = child.try_wait() {
-            break st;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "agentd tui did not exit after the client did; log: {}",
-            std::fs::read_to_string(&daemon_log).unwrap_or_default()
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    };
-    assert!(status.success(), "clean drain exit: {status:?}");
-
-    // The stub got the derived loopback endpoint + the --endpoint arg.
-    let recorded = std::fs::read_to_string(&out).expect("stub ran");
-    assert!(
-        recorded.contains(&format!("http://127.0.0.1:{port}")),
-        "endpoint handed to the client: {recorded}"
-    );
-    assert!(recorded.contains("--endpoint"), "{recorded}");
-    // The daemon's telemetry went to the log file, with the interface forced on.
-    let dlog = std::fs::read_to_string(&daemon_log).unwrap_or_default();
-    assert!(dlog.contains("a2a.listen"), "daemon logged to the file");
-    assert!(
-        dlog.contains("\"interface\":true"),
-        "the subcommand forced interface.enabled"
-    );
-
-    let _ = std::fs::remove_file(&stub);
-    let _ = std::fs::remove_file(&out);
-    let _ = std::fs::remove_file(&daemon_log);
-    std::fs::remove_file(&cfg).ok();
-}
-
 /// `security.workflows.immutable`: the agent may RUN its workflows, never
 /// rewrite them.
 ///
@@ -940,7 +842,7 @@ fn an_immutable_daemon_refuses_the_model_rewriting_its_workflows() {
 
 /// A reload REVISES the CORS allowlist — the third instance of the same defect.
 ///
-/// `interface.origins` was captured into the listener's app state at spawn and
+/// The origin list (then `interface.origins`, now `a2a.cors.origins`) was captured into the listener's app state at spawn and
 /// never re-read, and it was not restart-only either: an operator who removed
 /// an origin to revoke a web client's access got `config.reloaded` success and
 /// a listener that kept granting the old origin. Found while classifying the
@@ -954,12 +856,6 @@ fn an_immutable_daemon_refuses_the_model_rewriting_its_workflows() {
 #[cfg(feature = "hot-reload")]
 fn a_reload_revokes_a_web_origin_and_the_grant_stops() {
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
-    fn with_origins(llm: &str, port: u16, origins: &str) -> String {
-        iface_config(llm, port, false, "").replace(
-            "interface:\n  enabled: true\n  debug: false\n",
-            &format!("interface:\n  enabled: true\n  debug: false\n  origins: [{origins}]\n"),
-        )
-    }
     let (daemon, addr, cfg) =
         spawn_bound(|port| with_origins(&llm.uri, port, "\"https://ui.example\""));
 
@@ -1019,13 +915,46 @@ fn a_reload_revokes_a_web_origin_and_the_grant_stops() {
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    // The revocation is live. Before the fix this still answered with the
-    // grant, because the listener held the list it was spawned with.
-    let (_, granted) = preflight("https://ui.example");
+    // The revocation is live — the next preflight is refused outright. Before
+    // the fix this still answered with the grant, because the listener held
+    // the list it was spawned with.
+    let (code, granted) = preflight("https://ui.example");
+    assert_eq!(code, 403, "the revoked origin is refused");
     assert!(!granted, "the revoked origin is no longer granted");
     // And the newly named one is.
     let (_, granted) = preflight("https://other.example");
     assert!(granted, "the newly allowed origin is granted");
+
+    std::fs::remove_file(&cfg).ok();
+}
+
+/// A reload that turns introspection on arms the log ring the reads tail, as
+/// `config.set` does. Without it the flag flips but `debug.events` answers
+/// that the ring is not installed until the next restart — a reload that
+/// reports success and changes nothing an operator can use.
+#[test]
+fn a_reload_that_turns_introspection_on_arms_the_ring() {
+    let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
+    let (daemon, addr, cfg) = spawn_bound(|port| iface_config(&llm.uri, port, false, ""));
+    let (code, _) = error_of(&SendMessage::command("debug.events", json!({})).post(&addr));
+    assert_eq!(code, -32004, "introspection starts off");
+
+    let port: u16 = addr.rsplit(':').next().unwrap().parse().unwrap();
+    std::fs::write(&cfg, iface_config(&llm.uri, port, true, "")).unwrap();
+    unsafe { libc::kill(daemon.child.id() as i32, libc::SIGHUP) };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let stderr = || std::fs::read_to_string(&daemon.stderr_path).unwrap_or_default();
+    while !stderr().contains("\"event\":\"config.reloaded\"") {
+        assert!(
+            Instant::now() < deadline,
+            "the daemon never reloaded:\n{}",
+            stderr()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let ev = command(&addr, "debug.events", json!({"limit": 10}));
+    assert!(ev["events"].is_array(), "{ev}");
 
     std::fs::remove_file(&cfg).ok();
 }

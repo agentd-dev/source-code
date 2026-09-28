@@ -80,12 +80,11 @@ webhooks:
 
 a2a:
   listen: http://127.0.0.1:8446
+  events:
+    enabled: true
   peers:
     - name: outbox
       endpoint: http://127.0.0.1:8447
-
-interface:
-  enabled: true
 
 limits:
   max_runs: 20

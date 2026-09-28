@@ -11,8 +11,8 @@ use agentd::config::ConfigError;
 use agentd::exit;
 use serde_json::json;
 
-#[cfg(unix)]
-mod interface;
+#[cfg(all(unix, feature = "a2a"))]
+mod launcher;
 
 fn main() {
     std::process::exit(run());
@@ -21,19 +21,22 @@ fn main() {
 fn run() -> i32 {
     let argv: Vec<String> = std::env::args().collect();
 
-    // `agentd tui …` / `agentd ui …`: run the daemon with the interface forced
-    // on AND spawn its display client (`agentd-tui` / `agentd-ui`) beside it,
-    // lifetimes tied so neither survives the other.
+    // `agentd tui …` / `agentd ui …`: the thin launcher — the daemon exactly as
+    // `agentd …` would run it, plus a display client beside it that is handed
+    // nothing but its endpoint, lifetimes tied so neither survives the other.
     if let Some(sub @ ("tui" | "ui")) = argv.get(1).map(String::as_str) {
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "a2a"))]
         {
             let env: Vec<(String, String)> = std::env::vars().collect();
-            return interface::run(sub, &argv[2..], &env);
+            return launcher::run(sub, &argv[2..], &env);
         }
-        #[cfg(not(unix))]
+        // The launcher hands its fds to the client (unix) and dials the A2A
+        // listener (the `a2a` feature); without either there is nothing it
+        // could launch against.
+        #[cfg(not(all(unix, feature = "a2a")))]
         {
             eprintln!(
-                "agentd {sub}: the tui/ui passthrough is unix-only; run `agentd-{sub} --endpoint <url>` against a separately started daemon"
+                "agentd {sub}: this build has no launcher (it needs unix and the a2a feature); start the daemon with `agentd -c …`, then run `agentd-{sub} --endpoint <url>` against it"
             );
             return exit::USAGE;
         }
@@ -83,125 +86,32 @@ fn run() -> i32 {
     run_v2(&argv[1..], &env)
 }
 
+/// A loaded daemon invocation: the configuration, what was asked of it, and
+/// the arguments and environment it was loaded from — the per-process intents
+/// (`--fresh`, `--prompt-missing`, `--env`) already consumed.
+pub(crate) struct Invocation {
+    pub loaded: agentd::config::v2::Loaded,
+    pub ask: agentd::config::v2::Ask,
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+}
+
 /// The agentd supervisor: load + validate the configuration and run it (or
 /// answer an early-exit ask). A flat-schema (or `--mode`) configuration is
 /// rejected with a migration hint; `v2::load` emits the precise per-key
 /// diagnostics that say which entries are unrecognized.
 fn run_v2(args: &[String], env: &[(String, String)]) -> i32 {
-    use agentd::config::v2::{self, Ask, Detected};
-    // `--fresh` is an intent for *this* process's life, not a
-    // setting: it has no document path, and a file or env var that pinned an
-    // instance to never resuming would be a footgun. So it is consumed here,
-    // before the settings model ever sees the argv (which would reject it as an
-    // unknown argument), and recorded where `state::Durable::restore` reads it.
-    let fresh = args.iter().any(|a| a == "--fresh");
-    // `--prompt-missing` is the same kind of flag: an intent for THIS process's
-    // life (ask me for the secrets the preflight finds missing), not a setting
-    // a file could pin. Consumed here, recorded where the startup preflight
-    // reads it.
-    let prompt_missing = args.iter().any(|a| a == "--prompt-missing");
-    // `--env <FILE>` (repeatable): load dotenv files into THIS process's
-    // environment before anything reads it. Same family again — an input to
-    // this invocation, not a setting. Applied with real-environment-wins (a
-    // deployment override beats the checked-in file), then the layered config
-    // env is rebuilt so `AGENTD_*` keys from a file work like any other.
-    let mut env_files: Vec<String> = Vec::new();
-    {
-        let mut it = args.iter();
-        while let Some(a) = it.next() {
-            if let Some(v) = a.strip_prefix("--env=") {
-                env_files.push(v.to_string());
-            } else if a == "--env" {
-                match it.next() {
-                    Some(v) => env_files.push(v.clone()),
-                    None => {
-                        eprintln!("agentd: --env needs a file path");
-                        return exit::USAGE;
-                    }
-                }
-            }
-        }
-    }
-    let mut args2: Vec<String> = Vec::new();
-    {
-        let mut skip = false;
-        for a in args {
-            if skip {
-                skip = false;
-                continue;
-            }
-            if a == "--env" {
-                skip = true;
-                continue;
-            }
-            if a == "--fresh" || a == "--prompt-missing" || a.starts_with("--env=") {
-                continue;
-            }
-            args2.push(a.clone());
-        }
-    }
-    let args = args2.as_slice();
-    let env: Vec<(String, String)> = if env_files.is_empty() {
-        env.to_vec()
-    } else {
-        match agentd::config::envfile::load_files(&env_files) {
-            Ok(pairs) => {
-                for (k, v) in pairs {
-                    if std::env::var_os(&k).is_none() {
-                        // Single-threaded here — before signals, threads, or
-                        // any config read — which is what makes set_var sound.
-                        unsafe { std::env::set_var(&k, &v) };
-                    }
-                }
-                std::env::vars().collect()
-            }
-            Err(e) => {
-                eprintln!("agentd: {e}");
-                return exit::USAGE;
-            }
-        }
+    use agentd::config::v2::{self, Ask};
+    let Invocation {
+        loaded,
+        ask,
+        args,
+        env,
+    } = match load_invocation(args, env) {
+        Ok(inv) => inv,
+        Err(code) => return code,
     };
-    let env = env.as_slice();
-    if fresh {
-        agentd::state::request_fresh();
-    }
-    if prompt_missing {
-        agentd::config::prompt::request_prompt_missing();
-    }
-    let detected = match v2::probe(args, env) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("{e}");
-            return exit::USAGE;
-        }
-    };
-    if detected == Detected::V1 {
-        eprintln!(
-            "agentd: this configuration uses the flat schema, which agentd does not accept. \
-Migrate to `config_version: \"1\"` with sections (agent / intelligence / a2a / workflows); \
-see docs/configuration.md."
-        );
-        return exit::USAGE;
-    }
-    let (loaded, ask) = match v2::load(args, env) {
-        Ok(x) => x,
-        Err(ConfigError::Validate(Ok(line))) => {
-            eprintln!("{line}");
-            return exit::SUCCESS;
-        }
-        Err(ConfigError::Validate(Err(lines))) => {
-            eprintln!("{lines}");
-            return exit::USAGE;
-        }
-        Err(ConfigError::Usage(s)) => {
-            eprintln!("{s}");
-            return exit::USAGE;
-        }
-        Err(other) => {
-            eprintln!("{other:?}");
-            return exit::USAGE;
-        }
-    };
+    let (args, env) = (args.as_slice(), env.as_slice());
     match ask {
         Ask::Help => {
             // `--fresh` never reaches the settings model, so it is not in the
@@ -360,4 +270,134 @@ see docs/configuration.md."
             agentd::runtime::run(&loaded, args, env)
         }
     }
+}
+
+/// Load a daemon invocation the one way both the supervisor and the `agentd
+/// tui|ui` launcher do: consume the per-process intents, apply `--env` files,
+/// refuse the flat schema, then load and validate. `Err` carries the exit code,
+/// its diagnostic already printed.
+pub(crate) fn load_invocation(
+    args: &[String],
+    env: &[(String, String)],
+) -> Result<Invocation, i32> {
+    use agentd::config::v2::{self, Detected};
+    // `--fresh` is an intent for *this* process's life, not a
+    // setting: it has no document path, and a file or env var that pinned an
+    // instance to never resuming would be a footgun. So it is consumed here,
+    // before the settings model ever sees the argv (which would reject it as an
+    // unknown argument), and recorded where `state::Durable::restore` reads it.
+    let fresh = args.iter().any(|a| a == "--fresh");
+    // `--prompt-missing` is the same kind of flag: an intent for THIS process's
+    // life (ask me for the secrets the preflight finds missing), not a setting
+    // a file could pin. Consumed here, recorded where the startup preflight
+    // reads it.
+    let prompt_missing = args.iter().any(|a| a == "--prompt-missing");
+    // `--env <FILE>` (repeatable): load dotenv files into THIS process's
+    // environment before anything reads it. Same family again — an input to
+    // this invocation, not a setting. Applied with real-environment-wins (a
+    // deployment override beats the checked-in file), then the layered config
+    // env is rebuilt so `AGENTD_*` keys from a file work like any other.
+    let mut env_files: Vec<String> = Vec::new();
+    {
+        let mut it = args.iter();
+        while let Some(a) = it.next() {
+            if let Some(v) = a.strip_prefix("--env=") {
+                env_files.push(v.to_string());
+            } else if a == "--env" {
+                match it.next() {
+                    Some(v) => env_files.push(v.clone()),
+                    None => {
+                        eprintln!("agentd: --env needs a file path");
+                        return Err(exit::USAGE);
+                    }
+                }
+            }
+        }
+    }
+    let mut args2: Vec<String> = Vec::new();
+    {
+        let mut skip = false;
+        for a in args {
+            if skip {
+                skip = false;
+                continue;
+            }
+            if a == "--env" {
+                skip = true;
+                continue;
+            }
+            if a == "--fresh" || a == "--prompt-missing" || a.starts_with("--env=") {
+                continue;
+            }
+            args2.push(a.clone());
+        }
+    }
+    let args = args2.as_slice();
+    let env: Vec<(String, String)> = if env_files.is_empty() {
+        env.to_vec()
+    } else {
+        match agentd::config::envfile::load_files(&env_files) {
+            Ok(pairs) => {
+                for (k, v) in pairs {
+                    if std::env::var_os(&k).is_none() {
+                        // Single-threaded here — before signals, threads, or
+                        // any config read — which is what makes set_var sound.
+                        unsafe { std::env::set_var(&k, &v) };
+                    }
+                }
+                std::env::vars().collect()
+            }
+            Err(e) => {
+                eprintln!("agentd: {e}");
+                return Err(exit::USAGE);
+            }
+        }
+    };
+    let env = env.as_slice();
+    if fresh {
+        agentd::state::request_fresh();
+    }
+    if prompt_missing {
+        agentd::config::prompt::request_prompt_missing();
+    }
+    let detected = match v2::probe(args, env) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return Err(exit::USAGE);
+        }
+    };
+    if detected == Detected::V1 {
+        eprintln!(
+            "agentd: this configuration uses the flat schema, which agentd does not accept. \
+Migrate to `config_version: \"1\"` with sections (agent / intelligence / a2a / workflows); \
+see docs/configuration.md."
+        );
+        return Err(exit::USAGE);
+    }
+    let (loaded, ask) = match v2::load(args, env) {
+        Ok(x) => x,
+        Err(ConfigError::Validate(Ok(line))) => {
+            eprintln!("{line}");
+            return Err(exit::SUCCESS);
+        }
+        Err(ConfigError::Validate(Err(lines))) => {
+            eprintln!("{lines}");
+            return Err(exit::USAGE);
+        }
+        Err(ConfigError::Usage(s)) => {
+            eprintln!("{s}");
+            return Err(exit::USAGE);
+        }
+        Err(other) => {
+            eprintln!("{other:?}");
+            return Err(exit::USAGE);
+        }
+    };
+    Ok(Invocation {
+        loaded,
+        ask,
+        args: args.to_vec(),
+        env: env.to_vec(),
+    })
 }

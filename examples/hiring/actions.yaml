@@ -69,6 +69,11 @@ store:
 
 a2a:
   listen: "https://0.0.0.0:8444"
+  # The bind is every interface, which is no address a caller can dial; this
+  # is the origin the card and the OAuth issuer publish.
+  url: "https://hiring-actions.internal:8444"
+  events:
+    enabled: true
   tls:
     cert: /etc/agentd/tls/actions-crt.pem
     key: /etc/agentd/tls/actions-key.pem
@@ -80,9 +85,6 @@ a2a:
     # A human operator can drive it directly when something needs unsticking.
     - match: { san: "talent-ops@example.com" }
       role: operator
-
-interface:
-  enabled: true
 
 limits:
   max_runs: 8

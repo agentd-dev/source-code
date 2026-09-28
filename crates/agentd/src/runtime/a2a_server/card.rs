@@ -214,7 +214,7 @@ mod tests {
     fn the_card_round_trips_through_the_sdks_typed_agent_card() {
         let mut s = crate::config::v2::Settings::default();
         s.a2a.listen = Some("https://agent.example:8443".into());
-        s.interface.enabled = true;
+        s.a2a.events.enabled = true;
         let ours = agent_card_of(&s, Vec::new(), command_skills_of(&s));
 
         // The card IS the SDK's serialization now, so it must parse back into
@@ -270,19 +270,19 @@ mod tests {
     /// The card and `--capabilities` declare the same extensions.
     ///
     /// A peer reads the card; a controller reads the manifest. They came from
-    /// two lists, and disagreed the moment `interface.enabled` was off: the
-    /// card correctly withheld the interface extension while the manifest
+    /// two lists, and disagreed the moment the feed was off: the card
+    /// correctly withheld the interface extension while the manifest
     /// advertised it unconditionally. Both now read `extensions_of`.
     #[test]
     fn the_card_and_the_manifest_declare_the_same_extensions() {
         for enabled in [false, true] {
             let mut s = crate::config::v2::Settings::default();
-            s.interface.enabled = enabled;
+            s.a2a.events.enabled = enabled;
             let declared = extensions_of(&s);
             assert_eq!(
                 declared.contains(&INTERFACE_EXTENSION),
                 enabled,
-                "the interface extension follows interface.enabled"
+                "the interface extension follows a2a.events.enabled"
             );
             assert!(
                 declared.contains(&COMMAND_EXTENSION),

@@ -85,19 +85,72 @@ pub fn resolve(template: &str, env: &dyn Fn(&str) -> Option<String>) -> Result<S
         return Ok(template.to_string());
     }
     let mut out = String::with_capacity(template.len());
+    scan(template, &mut |piece| {
+        match piece {
+            Piece::Text(t) => out.push_str(t),
+            Piece::Token(token) => out.push_str(&resolve_one(token, env)?),
+        }
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// One piece of a template: literal text, or the trimmed body of a `{{…}}`.
+enum Piece<'a> {
+    Text(&'a str),
+    Token(&'a str),
+}
+
+/// Split `template` into text and `{{…}}` token bodies, in order — the ONE
+/// parser, so what [`resolve`] materializes and what [`secret_env_names`]
+/// reports are the same references by construction.
+fn scan<'a>(
+    template: &'a str,
+    on: &mut dyn FnMut(Piece<'a>) -> Result<(), String>,
+) -> Result<(), String> {
     let mut rest = template;
     while let Some(open) = rest.find("{{") {
-        out.push_str(&rest[..open]);
+        on(Piece::Text(&rest[..open]))?;
         let after = &rest[open + 2..];
         let close = after
             .find("}}")
             .ok_or_else(|| "unterminated secret ref '{{' (want '{{secret:NAME}}')".to_string())?;
-        let token = after[..close].trim();
-        out.push_str(&resolve_one(token, env)?);
+        on(Piece::Token(after[..close].trim()))?;
         rest = &after[close + 2..];
     }
-    out.push_str(rest);
-    Ok(out)
+    on(Piece::Text(rest))
+}
+
+/// Every `NAME` a `{{secret:NAME}}` reference anywhere in `doc` names, sorted
+/// and deduplicated.
+///
+/// These are environment variables the daemon reads as credentials, which is
+/// why the `agentd tui|ui` launcher removes them from the environment it hands
+/// its display client. A malformed template contributes the names before the
+/// fault — the loader refuses such a document anyway, and a scrub should err
+/// on the side of removing.
+pub fn secret_env_names(doc: &serde_json::Value) -> Vec<String> {
+    fn walk(v: &serde_json::Value, out: &mut std::collections::BTreeSet<String>) {
+        match v {
+            serde_json::Value::String(s) => {
+                let _ = scan(s, &mut |piece| {
+                    if let Piece::Token(token) = piece
+                        && let Some(name) = token.strip_prefix("secret:")
+                        && !name.trim().is_empty()
+                    {
+                        out.insert(name.trim().to_string());
+                    }
+                    Ok(())
+                });
+            }
+            serde_json::Value::Array(items) => items.iter().for_each(|x| walk(x, out)),
+            serde_json::Value::Object(map) => map.values().for_each(|x| walk(x, out)),
+            _ => {}
+        }
+    }
+    let mut out = std::collections::BTreeSet::new();
+    walk(doc, &mut out);
+    out.into_iter().collect()
 }
 
 /// Resolve a single `secret:NAME` / `secret-file:PATH` token body (without the
@@ -225,6 +278,29 @@ mod tests {
         assert!(resolve("{{secret:", &env).is_err());
         assert!(resolve("{{secret:}}", &env).is_err());
         assert!(resolve("{{secret-file:}}", &env).is_err());
+    }
+
+    #[test]
+    fn secret_env_names_are_the_names_resolve_reads() {
+        let doc = serde_json::json!({
+            "a2a": {"bearer": "{{secret:A2A_TOKEN}}"},
+            "intelligence": {"headers": {"x-api-key": "k={{ secret: LLM_KEY }};{{secret-file:/run/k}}"}},
+            "list": ["{{secret:A2A_TOKEN}}", 3, {"deep": "{{secret:DEEP}}"}],
+            "plain": "no refs here"
+        });
+        assert_eq!(
+            secret_env_names(&doc),
+            vec!["A2A_TOKEN", "DEEP", "LLM_KEY"],
+            "every env name, sorted and once; a secret-file path is not one"
+        );
+        // …exactly the names `resolve` consults.
+        let asked = std::sync::Mutex::new(Vec::new());
+        let env = |k: &str| {
+            asked.lock().unwrap().push(k.to_string());
+            Some("v".to_string())
+        };
+        let _ = resolve("a {{secret:A2A_TOKEN}} b {{ secret: LLM_KEY }}", &env);
+        assert_eq!(*asked.lock().unwrap(), vec!["A2A_TOKEN", "LLM_KEY"]);
     }
 
     #[test]

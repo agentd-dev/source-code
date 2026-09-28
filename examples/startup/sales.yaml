@@ -80,14 +80,13 @@ webhooks:
 
 a2a:
   listen: http://127.0.0.1:8445
+  events:
+    enabled: true
   peers:
     - name: outbox
       endpoint: http://127.0.0.1:8447
     - name: finance
       endpoint: http://127.0.0.1:8446
-
-interface:
-  enabled: true
 
 limits:
   max_runs: 24

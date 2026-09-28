@@ -140,9 +140,9 @@ fn spawn_bound_with(
     panic!("the daemon never bound an A2A listener (5 attempts)");
 }
 
-fn base_config(llm: &str, port: u16, interface: bool, extra: &str) -> String {
-    let iface = if interface {
-        "interface:\n  enabled: true\n  debug: true\n"
+fn base_config(llm: &str, port: u16, feed: bool, extra: &str) -> String {
+    let feed = if feed {
+        "  events:\n    enabled: true\n  introspection:\n    enabled: true\n"
     } else {
         ""
     };
@@ -151,8 +151,8 @@ fn base_config(llm: &str, port: u16, interface: bool, extra: &str) -> String {
          agent:\n  name: hitl-e2e\n  instruction: You are a helpful test agent.\n  preflight: never\n\
          intelligence:\n  endpoints: {llm}\n  model: mock\n\
          store:\n  kind: memory\n\
-         a2a:\n  listen: http://127.0.0.1:{port}\n\
-         {iface}lifecycle:\n  run_until: drained\n\
+         a2a:\n  listen: http://127.0.0.1:{port}\n{feed}\
+         lifecycle:\n  run_until: drained\n\
          observability:\n  log_level: info\n  log_content: true\n{extra}"
     )
 }
@@ -338,7 +338,7 @@ fn a_gates_addressee_and_schema_are_durable() {
 
 #[test]
 fn fallback_fail_errors_the_ask_immediately_and_the_model_carries_on() {
-    // No interface block at all (fallback default = fail): the ask errors,
+    // No observation feed at all (fallback default = fail): the ask errors,
     // the model still gets its next turn and completes.
     let llm = spawn_mock_llm(&json!({
         "turns": [
@@ -412,7 +412,7 @@ fn fallback_auto_lets_the_judge_answer_on_the_operators_behalf() {
 
 #[test]
 fn fallback_wait_parks_the_ask_until_its_timeout() {
-    // No interface + `wait`: the ask parks, times out (1s here), errors, and
+    // No feed + `wait`: the ask parks, times out (1s here), errors, and
     // the model carries on.
     let llm = spawn_mock_llm(&json!({
         "turns": [

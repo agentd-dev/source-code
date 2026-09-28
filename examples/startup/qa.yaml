@@ -59,12 +59,11 @@ mcp:
 
 a2a:
   listen: http://127.0.0.1:8443
+  events:
+    enabled: true
   peers:
     - name: engineering
       endpoint: http://127.0.0.1:8442
-
-interface:
-  enabled: true
 
 limits:
   max_runs: 6

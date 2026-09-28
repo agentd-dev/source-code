@@ -109,6 +109,8 @@ webhooks:
 
 a2a:
   listen: http://127.0.0.1:8450
+  events:
+    enabled: true
   peers:
     # Account records + logs, behind structured commands (see the header).
     - name: backoffice
@@ -116,9 +118,6 @@ a2a:
     # The L2 ticket desk — unresolved cases land there.
     - name: support
       endpoint: http://127.0.0.1:8441
-
-interface:
-  enabled: true
 
 limits:
   max_runs: 24

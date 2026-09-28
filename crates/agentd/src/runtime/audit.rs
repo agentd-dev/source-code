@@ -27,8 +27,8 @@ impl Runtime {
     /// Emit an audit event to the configured sinks. A no-op when no sink is
     /// configured (`observability.audit.sink`). Cheap on the common path.
     pub(crate) fn audit(&self, ev: AuditEvent<'_>) {
-        // Mirror onto the interface feed as operator-visible `audit` events
-        // when debug is on — independent of the sinks, which stay the
+        // Mirror onto the observation feed as operator-visible `audit` events
+        // when introspection is on — independent of the sinks, which stay the
         // durable/system record. The taskless interface READS are
         // excluded: a display client polls them (debug.events at ~1 Hz), and
         // mirroring their own audit back onto the feed would feed-loop the
@@ -42,7 +42,6 @@ impl Runtime {
             && !ev.action.ends_with(":run.get")
             && !ev.action.ends_with(":subagent.get")
             && !ev.action.ends_with(":debug.events")
-            && !ev.action.ends_with(":pairing.code")
         {
             feed.push(
                 "audit",

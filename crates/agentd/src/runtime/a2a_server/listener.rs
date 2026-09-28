@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Binding the listener: the identity posture and TLS it is spawned with.
 
-use super::{A2aBridge, PairingState, SharedFeed};
+use super::{A2aBridge, SharedFeed};
 use crate::a2a::Resolver;
 use crate::obs::log::Logger;
 use crate::runtime::events::Event;
@@ -10,12 +10,11 @@ use std::sync::Arc;
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 
-/// What [`spawn_a2a_listener`] hands the runtime: the interface feed (when `interface.enabled`), the pairing state (when
-/// `interface.pairing.enabled`), and the live listener — which must be kept,
-/// because dropping it stops serving.
+/// What [`spawn_a2a_listener`] hands the runtime: the observation feed (when
+/// `a2a.events.enabled`) and the live listener — which must be kept, because
+/// dropping it stops serving.
 pub(crate) struct A2aServing {
     pub feed: Option<Arc<SharedFeed>>,
-    pub pairing: Option<Arc<PairingState>>,
     pub listener: crate::a2a::serve::Listener,
     /// Kept so a reload can swap the principal rules into the live listener.
     pub bridge: Arc<A2aBridge>,
@@ -31,7 +30,6 @@ pub(crate) struct A2aServing {
 /// TLS identity that makes a client certificate readable in the first place.
 pub(crate) fn spawn_a2a_listener(
     a2a: &crate::config::v2::A2a,
-    interface: &crate::config::v2::Interface,
     events_tx: Sender<Event>,
     resolver: Resolver,
     env: &dyn Fn(&str) -> Option<String>,
@@ -55,31 +53,7 @@ pub(crate) fn spawn_a2a_listener(
         }
         None => None,
     };
-    // Pairing-code login is armed with the interface. On a
-    // NON-loopback listener it also counts as "client auth exists" — an
-    // uncredentialed caller then gets through as anonymous (able to call
-    // exactly `Pair` + the public card) instead of 401.
-    let pairing = if interface.enabled && interface.pairing.enabled {
-        let role = interface
-            .pairing
-            .role
-            .unwrap_or(crate::config::v2::Role::Operator);
-        let ttl = interface
-            .pairing
-            .ttl
-            .map(|d| d.0)
-            .unwrap_or(Duration::from_secs(12 * 3600));
-        Some(Arc::new(
-            PairingState::new(role, ttl).map_err(|e| format!("interface.pairing: {e}"))?,
-        ))
-    } else {
-        None
-    };
-    let loopback_listener =
-        unix_listener || crate::net::http::is_loopback_host(crate::config::serve_host_of(&bind));
-    let require_auth = a2a.tls.client_ca.is_some()
-        || server_bearer.is_some()
-        || (pairing.is_some() && !loopback_listener);
+    let require_auth = a2a.tls.client_ca.is_some() || server_bearer.is_some();
 
     let tls = if tls_scheme {
         let cert = a2a
@@ -110,13 +84,16 @@ pub(crate) fn spawn_a2a_listener(
         None
     };
 
-    // The interface feed exists only while `interface.enabled`.
-    let feed = interface
+    // The observation feed exists only while `a2a.events.enabled`; whether it
+    // carries the introspection kinds (audit, logs) is the separate,
+    // reloadable `a2a.introspection.enabled`.
+    let feed = a2a
+        .events
         .enabled
-        .then(|| Arc::new(SharedFeed::new(interface.debug)));
+        .then(|| Arc::new(SharedFeed::new(a2a.introspection.enabled)));
     // Shared with the listener so a reload can revise the CORS allowlist.
     let origins: crate::a2a::serve::OriginList =
-        Arc::new(std::sync::RwLock::new(interface.origins.clone()));
+        Arc::new(std::sync::RwLock::new(a2a.cors.origins.clone()));
     let bridge = A2aBridge::with_feed(events_tx, resolver, feed.clone());
 
     let listener = crate::a2a::serve::spawn(
@@ -129,9 +106,8 @@ pub(crate) fn spawn_a2a_listener(
             auth: crate::a2a::serve::Auth {
                 require_auth,
                 server_bearer,
-                pairing: pairing.clone(),
             },
-            extra_origins: Arc::clone(&origins),
+            cors_origins: Arc::clone(&origins),
             tls,
             request_timeout: bridge.request_timeout,
             stream_deadline: bridge.stream_deadline,
@@ -141,10 +117,9 @@ pub(crate) fn spawn_a2a_listener(
         log.clone(),
     )?;
 
-    log.info("a2a.listen", json!({"authority": listen, "bound": listener.bound, "tls": tls_scheme, "mtls": a2a.tls.client_ca.is_some(), "require_auth": require_auth, "interface": interface.enabled, "interface_debug": interface.enabled && interface.debug, "pairing": pairing.is_some()}));
+    log.info("a2a.listen", json!({"authority": listen, "bound": listener.bound, "tls": tls_scheme, "mtls": a2a.tls.client_ca.is_some(), "require_auth": require_auth, "events": a2a.events.enabled, "introspection": a2a.introspection.enabled}));
     Ok(A2aServing {
         feed,
-        pairing,
         listener,
         bridge,
         origins,

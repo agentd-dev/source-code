@@ -443,29 +443,35 @@ impl Runtime {
                 ),
             }
         }
-        // `interface.debug` also lives as an atomic on the feed (it is
-        // runtime-settable through `config.set`), so a reload has to move BOTH
-        // or the two disagree: the settings gate would pass while the feed
-        // still filtered debug frames out.
+        // `a2a.introspection.enabled` also lives as an atomic on the feed (it
+        // is runtime-settable through `config.set`), so a reload has to move
+        // BOTH or the two disagree: the settings gate would pass while the
+        // feed still filtered introspection frames out. And turning it ON arms
+        // the log ring the reads tail, or `debug.events` would answer that the
+        // ring is not installed until the next restart.
         #[cfg(feature = "a2a")]
-        if old.interface.debug != new.interface.debug
-            && let Some(feed) = &self.a2a_feed
-        {
-            feed.set_debug(new.interface.debug);
-            changed.push("interface.debug");
+        if old.a2a.introspection.enabled != new.a2a.introspection.enabled {
+            let on = new.a2a.introspection.enabled;
+            if let Some(feed) = &self.a2a_feed {
+                feed.set_debug(on);
+            }
+            if on {
+                self.arm_introspection_ring();
+            }
+            changed.push("a2a.introspection.enabled");
         }
         // The browser CORS allowlist: replaced in the live listener.
         //
-        // `interface.origins` was neither rebuilt nor restart-only, so removing
-        // an origin to revoke a web client reported success and revoked
-        // nothing. The list has no external source to re-read, so unlike the
-        // principals and the routes it is simply swapped.
+        // The origin list was once neither rebuilt nor restart-only, so
+        // removing an origin to revoke a web client reported success and
+        // revoked nothing. The list has no external source to re-read, so
+        // unlike the principals and the routes it is simply swapped.
         #[cfg(feature = "a2a")]
-        if old.interface.origins != new.interface.origins
+        if old.a2a.cors.origins != new.a2a.cors.origins
             && let Some(origins) = &self.a2a_origins
         {
-            *origins.write().unwrap_or_else(|e| e.into_inner()) = new.interface.origins.clone();
-            changed.push("interface.origins");
+            *origins.write().unwrap_or_else(|e| e.into_inner()) = new.a2a.cors.origins.clone();
+            changed.push("a2a.cors.origins");
         }
         if changed.is_empty() {
             changed.push("nothing");

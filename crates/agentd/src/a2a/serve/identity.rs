@@ -39,12 +39,10 @@ pub(super) struct Peer(pub(super) SocketAddr);
 
 /// Resolve the caller, or `None` for "present a credential".
 ///
-/// The order is the order of trust: a pairing session names its own role; a
-/// verified certificate and the server bearer are the operator; any other bearer
-/// may still match a configured principal rule; and an uncredentialed request is
-/// refused unless the listener has no credentials to require, or pairing is
-/// armed — in which case it arrives as anonymous, able to call exactly `Pair`
-/// and read the public card, which is how a code holder logs in.
+/// The order is the order of trust: a verified certificate and the server
+/// bearer are the operator; any other bearer may still match a configured
+/// principal rule; and an uncredentialed request is refused unless the
+/// listener has no credentials to require.
 pub(super) fn resolve(
     app: &Arc<App>,
     peer_id: &PeerId,
@@ -52,11 +50,6 @@ pub(super) fn resolve(
     bearer: Option<&str>,
 ) -> Option<Principal> {
     let a = &app.auth;
-    if let (Some(p), Some(b)) = (&a.pairing, bearer)
-        && let Some(role) = p.check_bearer(b)
-    {
-        return Some(crate::runtime::a2a_server::paired_principal(role));
-    }
     let loopback = peer.ip().is_loopback();
     let mgmt = (!a.require_auth && loopback) || peer_id.presented || is_server_bearer(a, bearer);
     if !a.require_auth {
@@ -67,7 +60,7 @@ pub(super) fn resolve(
             peer_id.sans.clone(),
         ));
     }
-    if !mgmt && bearer.is_none() && a.pairing.is_none() {
+    if !mgmt && bearer.is_none() {
         return None;
     }
     Some(

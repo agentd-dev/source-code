@@ -663,8 +663,6 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
         #[cfg(feature = "a2a")]
         a2a_feed: None,
         #[cfg(feature = "a2a")]
-        a2a_pairing: None,
-        #[cfg(feature = "a2a")]
         reserved_task_id: None,
         #[cfg(feature = "a2a")]
         a2a_sink: None,
@@ -1120,7 +1118,6 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
         let write_timeout = rt.settings.lifecycle.drain_timeout();
         match a2a_server::spawn_a2a_listener(
             &rt.settings.a2a,
-            &rt.settings.interface,
             rt.events_tx.clone(),
             resolver,
             &envmap,
@@ -1129,25 +1126,18 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
         ) {
             Ok(serving) => {
                 rt.a2a_feed = serving.feed;
-                rt.a2a_pairing = serving.pairing;
                 rt.a2a_sink = Some(std::sync::Arc::clone(&serving.listener.sink));
                 // The listener stops the moment it is dropped, so the runtime
                 // holds it for as long as it is serving.
                 rt.a2a_listener = Some(serving.listener);
                 rt.a2a_bridge = Some(serving.bridge);
                 rt.a2a_origins = Some(serving.origins);
-                // The interface debug reads tail the live log ring. Install
-                // the ring only when debug is on, so the ordinary build keeps
-                // its zero-cost logging hot path.
-                if rt.settings.interface.enabled && rt.settings.interface.debug {
-                    let cap = rt
-                        .settings
-                        .observability
-                        .events_ring
-                        .map(|n| n as usize)
-                        .unwrap_or(crate::obs::log::EVENTS_RING_DEFAULT);
-                    crate::obs::log::install_event_ring(cap);
-                    log.info("interface.debug", json!({"events_ring": cap}));
+                // The introspection reads tail the live log ring. Install the
+                // ring only when introspection is on, so the ordinary build
+                // keeps its zero-cost logging hot path.
+                if rt.settings.a2a.introspection.enabled {
+                    rt.arm_introspection_ring();
+                    log.info("a2a.introspection", json!({"enabled": true}));
                 }
                 // Publish restored tasks now that the shared view exists.
                 for id in rt.tasks.keys().cloned().collect::<Vec<_>>() {
@@ -1319,7 +1309,6 @@ pub fn capabilities(loaded: &Loaded) -> Value {
         "search": {"server": s.search.server},
         "skills": {"sources": s.skills.sources.len()},
         "a2a": crate::runtime::surface::manifest::a2a_section(s),
-        "interface": {"enabled": s.interface.enabled, "debug": s.interface.debug, "origins": s.interface.origins.len(), "pairing": s.interface.pairing.enabled, "display": {"top": s.interface.display.top, "bottom": s.interface.display.bottom}},
         "store": format!("{:?}", s.store.kind).to_lowercase(),
         // For the file adapter the kind alone under-reports: what an operator
         // actually gets depends on the directory it lands in, and on whether

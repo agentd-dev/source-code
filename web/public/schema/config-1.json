@@ -394,7 +394,7 @@
           "type": "array"
         },
         "id": {
-          "description": "the principal id this rule's callers act as (<role>:<id>) and own their work by; unique across rules",
+          "description": "the principal id this rule's callers act as (<role>:<id>) and own their work by; unique across rules. Required for bearer_ref and any rules; without it a certificate rule derives <role>:cn=<CN> or <role>:san=<first SAN>",
           "pattern": "^[A-Za-z0-9._@:/+-]{1,128}$",
           "type": "string"
         },
@@ -408,9 +408,6 @@
         "match": {
           "additionalProperties": false,
           "properties": {
-            "aauth_agent": {
-              "type": "string"
-            },
             "any": {
               "type": "boolean"
             },
@@ -2593,7 +2590,7 @@
           "type": "object"
         },
         "url": {
-          "description": "the public origin callers reach this listener at (scheme://host[:port], no path, query or fragment; https unless the host is loopback) — the Agent Card's interface URL and the OAuth issuer. Restart-only",
+          "description": "the public origin callers reach this listener at (scheme://host[:port], no path, query or fragment; https unless the host is loopback) — the Agent Card's interface URL and the OAuth issuer. Required when a2a.listen binds a wildcard host (0.0.0.0, ::). Restart-only",
           "type": "string"
         }
       },
@@ -3420,73 +3417,6 @@
         },
         "token_file": {
           "type": "string"
-        }
-      },
-      "type": "object"
-    },
-    "interface": {
-      "additionalProperties": false,
-      "description": "The display-client (TUI/web-UI) surface, served on the A2A listener. Default-OFF.",
-      "properties": {
-        "debug": {
-          "description": "expose extra debug information (transcripts, run step detail, the log ring, audit feed events); runtime-togglable via the config.set op",
-          "type": "boolean"
-        },
-        "display": {
-          "additionalProperties": false,
-          "description": "what clients render in their chrome — ordered item lists for the top (header) and bottom (status bar) edges; unknown items are skipped",
-          "properties": {
-            "bottom": {
-              "items": {
-                "type": "string"
-              },
-              "type": "array"
-            },
-            "top": {
-              "items": {
-                "type": "string"
-              },
-              "type": "array"
-            }
-          },
-          "type": "object"
-        },
-        "enabled": {
-          "description": "serve the interface methods (SubscribeToEvents, interface.info, …)",
-          "type": "boolean"
-        },
-        "origins": {
-          "description": "extra allowed browser origins (scheme://host[:port]) for a hosted web UI; loopback origins never need listing",
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        "pairing": {
-          "additionalProperties": false,
-          "description": "pairing-code login: a rotating 6-digit code (shown to operators) a client exchanges for a session token — the low-friction alternative to copying a bearer",
-          "properties": {
-            "enabled": {
-              "type": "boolean"
-            },
-            "role": {
-              "description": "the role a paired session gets (operator or user; default operator)",
-              "enum": [
-                "operator",
-                "user",
-                "agent",
-                "anonymous"
-              ]
-            },
-            "ttl": {
-              "description": "session-token lifetime (default 12h)",
-              "type": [
-                "string",
-                "integer"
-              ]
-            }
-          },
-          "type": "object"
         }
       },
       "type": "object"

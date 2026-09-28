@@ -50,6 +50,8 @@ store:
 
 a2a:
   listen: http://127.0.0.1:8448
+  events:
+    enabled: true
   peers:
     - name: support
       endpoint: http://127.0.0.1:8441
@@ -71,9 +73,6 @@ a2a:
       endpoint: http://127.0.0.1:8450
     - name: backoffice
       endpoint: http://127.0.0.1:8451
-
-interface:
-  enabled: true
 
 limits:
   max_runs: 4

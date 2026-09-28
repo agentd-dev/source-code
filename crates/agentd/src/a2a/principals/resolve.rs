@@ -14,9 +14,6 @@ pub struct CallerIdentity {
     pub subject: Option<String>,
     /// A verified bearer subject (post token check), if the transport resolved it.
     pub bearer_ref: Option<String>,
-    /// The verified AAuth agent id, set only when an inbound AAuth verifier
-    /// established one; an `aauth_agent` principal rule matches against it.
-    pub aauth_agent: Option<String>,
     /// Whether the connection is loopback (dev operator default).
     pub loopback: bool,
     /// Whether the framework already authenticated the peer as management
@@ -38,6 +35,8 @@ pub struct Resolver {
 }
 
 struct Compiled {
+    /// The rule's declared `id`, which names its callers when set.
+    id: Option<String>,
     matcher: v2::PrincipalMatch,
     role: Role,
     grants: Vec<String>,
@@ -60,6 +59,7 @@ impl Resolver {
                 None => None,
             };
             principals.push(Compiled {
+                id: p.id.clone(),
                 matcher: p.matcher.clone(),
                 role: p.role,
                 grants: p.grants.clone(),
@@ -121,15 +121,18 @@ impl Compiled {
                 (Some(secret), Some(got)) => ct_eq(secret.as_bytes(), got.as_bytes()),
                 _ => false,
             }
-        } else if let Some(agent) = &m.aauth_agent {
-            id.aauth_agent.as_deref().is_some_and(|a| glob(agent, a))
         } else {
             false
         };
         if !hit {
             return None;
         }
-        let pid = principal_id(self.role, id, m);
+        // Evidence that names nobody, under a rule that names nobody, is not a
+        // caller this rule can own work for. Validation requires an `id` on
+        // every rule whose evidence is anonymous, so this is the backstop that
+        // keeps `user:unknown` — one principal every such caller merged into —
+        // impossible rather than merely unconfigured.
+        let pid = principal_id(self.role, self.id.as_deref(), id)?;
         Some(Principal {
             id: pid,
             role: self.role,
@@ -152,21 +155,30 @@ fn operator() -> Principal {
     }
 }
 
-fn principal_id(role: Role, id: &CallerIdentity, m: &v2::PrincipalMatch) -> String {
-    let sub = id
-        .subject
-        .clone()
-        .or_else(|| id.sans.first().cloned())
-        .or_else(|| id.bearer_ref.clone())
-        .or_else(|| id.aauth_agent.clone())
-        .or_else(|| m.sub.clone())
-        .unwrap_or_else(|| "unknown".into());
-    match role {
-        Role::Operator => "operator".into(),
-        Role::User => format!("user:{sub}"),
-        Role::Agent => format!("agent:{sub}"),
-        Role::Anonymous => "anonymous".into(),
-    }
+/// The principal id a matched rule's caller acts as.
+///
+/// A declared id wins: it is what the operator chose to own this caller's
+/// tasks, conversations and rate bucket by. Without one, a certificate names
+/// its holder — but as `cn=<CN>` or `san=<SAN>`, never bare. `=` is in neither
+/// the declared-id charset nor a device-approval name's, so a certificate whose
+/// CN happens to equal a declared id (`deploy-bot`) can never spell
+/// `user:deploy-bot` and inherit that principal's work.
+fn principal_id(role: Role, declared: Option<&str>, id: &CallerIdentity) -> Option<String> {
+    let role_name = match role {
+        Role::Operator => return Some("operator".into()),
+        Role::Anonymous => return Some("anonymous".into()),
+        Role::User => "user",
+        Role::Agent => "agent",
+    };
+    let name = match declared {
+        Some(d) => d.to_string(),
+        None => match (&id.subject, id.sans.first()) {
+            (Some(cn), _) => format!("cn={cn}"),
+            (None, Some(san)) => format!("san={san}"),
+            (None, None) => return None,
+        },
+    };
+    Some(format!("{role_name}:{name}"))
 }
 
 fn matcher_desc(m: &v2::PrincipalMatch) -> Value {
@@ -178,8 +190,6 @@ fn matcher_desc(m: &v2::PrincipalMatch) -> Value {
         json!({"sub": s})
     } else if m.bearer_ref.is_some() {
         json!({"bearer_ref": "***"})
-    } else if let Some(a) = &m.aauth_agent {
-        json!({"aauth_agent": a})
     } else {
         json!({})
     }
@@ -222,8 +232,8 @@ mod tests {
                 "principals": [
                     {"match": {"san": "spiffe://ops/*"}, "role": "operator"},
                     {"match": {"san": "spiffe://team/*"}, "role": "user", "grants": ["knowledge.*"]},
-                    {"match": {"bearer_ref": "{{secret:PEER}}"}, "role": "agent"},
-                    {"match": {"any": true}, "role": "anonymous"}
+                    {"id": "peer", "match": {"bearer_ref": "{{secret:PEER}}"}, "role": "agent"},
+                    {"id": "anyone", "match": {"any": true}, "role": "anonymous"}
                 ]
             })),
             &|k| (k == "PEER").then(|| "s3cr3t".to_string()),
@@ -234,7 +244,7 @@ mod tests {
         assert!(op.may("SendMessage", Some("a2a.Drain")) || op.may_command("workflow.delete"));
         let user = r.resolve(&ident(&["spiffe://team/alice"], None, true, false), None);
         assert_eq!(user.role, Role::User);
-        assert_eq!(user.id, "user:spiffe://team/alice");
+        assert_eq!(user.id, "user:san=spiffe://team/alice");
         assert!(user.may("SendMessage", None), "NL is allowed");
         assert!(
             user.may_command("status")
@@ -248,6 +258,10 @@ mod tests {
         assert!(!user.may("a2a.Drain", None), "admin is operator-only");
         let agent = r.resolve(&ident(&[], None, false, false), Some("s3cr3t"));
         assert_eq!(agent.role, Role::Agent);
+        assert_eq!(
+            agent.id, "agent:peer",
+            "a bearer rule acts as its declared id"
+        );
         assert!(agent.may_command("workflow.run") && !agent.may_command("subagent.send"));
         assert!(
             r.resolve(&ident(&[], None, false, false), Some("wrong"))
@@ -278,5 +292,56 @@ mod tests {
                 .is_operator()
         );
         assert!(glob("a*c", "abc") && glob("*", "x") && !glob("a*c", "abx"));
+    }
+    /// A certificate can never spell a declared principal id.
+    ///
+    /// The rule `{id: deploy-bot, match: {bearer_ref}}` owns everything its
+    /// bearer started. A certificate whose CN — or first SAN — is `deploy-bot`,
+    /// admitted by an unrelated `san` rule without an id, used to resolve to
+    /// `user:deploy-bot` as well, and so read and cancelled that principal's
+    /// tasks and conversations and shared its rate bucket. The `cn=`/`san=`
+    /// marker keeps derived ids in a namespace no declared id can enter.
+    #[test]
+    fn a_certificate_id_never_collides_with_a_declared_one() {
+        let r = Resolver::build(
+            &a2a(json!({
+                "principals": [
+                    {"id": "deploy-bot", "match": {"bearer_ref": "{{secret:DEPLOY}}"}, "role": "user"},
+                    {"match": {"san": "*.corp"}, "role": "user"}
+                ]
+            })),
+            &|k| (k == "DEPLOY").then(|| "d3pl0y".to_string()),
+        )
+        .unwrap();
+        let declared = r.resolve(&ident(&[], None, false, false), Some("d3pl0y"));
+        assert_eq!(declared.id, "user:deploy-bot");
+        // CN `deploy-bot`, admitted by the san rule through a SAN it matches.
+        let by_cn = r.resolve(&ident(&["x.corp"], Some("deploy-bot"), true, false), None);
+        assert_eq!(by_cn.id, "user:cn=deploy-bot");
+        // No CN; the first SAN is `deploy-bot` and a later one matches the rule.
+        let by_san = r.resolve(&ident(&["deploy-bot", "x.corp"], None, true, false), None);
+        assert_eq!(by_san.id, "user:san=deploy-bot");
+        for p in [&by_cn, &by_san] {
+            assert_ne!(p.id, declared.id, "a certificate inherited a declared id");
+        }
+    }
+
+    /// The backstop behind the validation that requires `id` on bearer_ref
+    /// and any rules: a rule that names nobody, matched by evidence that names
+    /// nobody, does not match at all. Built past validation on purpose — this
+    /// is the line that holds when validation is not what built the rules.
+    #[test]
+    fn evidence_that_names_nobody_never_becomes_user_unknown() {
+        let r = Resolver::build(
+            &a2a(json!({"principals": [{"match": {"any": true}, "role": "user"}]})),
+            &|_| None,
+        )
+        .unwrap();
+        let p = r.resolve(&ident(&[], None, false, false), None);
+        assert_eq!(p.role, Role::Anonymous, "{}", p.id);
+        assert_ne!(p.id, "user:unknown");
+        // The same rule still names a certificate holder by its CN.
+        let cert = r.resolve(&ident(&[], Some("alice"), false, false), None);
+        assert_eq!(cert.id, "user:cn=alice");
     }
 }

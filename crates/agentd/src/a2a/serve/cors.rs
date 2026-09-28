@@ -26,7 +26,7 @@ use super::App;
 /// The grant is deliberately narrow: it rides on the SAME origin allow-list as
 /// everything else, so answering it says only "the origin you already
 /// configured may reach this daemon", never "any website may". An origin that
-/// is not in `interface.origins` is refused before this header is ever
+/// is not in `a2a.cors.origins` is refused before this header is ever
 /// considered.
 pub(super) async fn preflight(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
     let origin = headers

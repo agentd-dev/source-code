@@ -307,7 +307,7 @@ fn top_level_properties(
                     "rate": { "type": "string", "description": "`<burst>/<per>s` applied to every session principal" } } });
     m.insert("a2a".to_string(), json!({ "type": "object", "additionalProperties": false, "properties": {
                 "listen": { "type": "string", "description": "https://host:port (loopback http:// for dev)" },
-                "url": { "type": "string", "description": "the public origin callers reach this listener at (scheme://host[:port], no path, query or fragment; https unless the host is loopback) — the Agent Card's interface URL and the OAuth issuer. Restart-only" },
+                "url": { "type": "string", "description": "the public origin callers reach this listener at (scheme://host[:port], no path, query or fragment; https unless the host is loopback) — the Agent Card's interface URL and the OAuth issuer. Required when a2a.listen binds a wildcard host (0.0.0.0, ::). Restart-only" },
                 "cors": { "type": "object", "additionalProperties": false, "properties": {
                     "origins": { "type": "array", "items": { "type": "string" }, "description": "browser origins (scheme://host[:port]) allowed to call the listener, matched exactly; `*` and paths are refused, and a loopback UI origin must be listed too" } } },
                 "device_grant": device_grant,
@@ -326,23 +326,6 @@ fn top_level_properties(
                     "properties": {
                     "enabled": { "type": "boolean", "description": "accept CreateTaskPushNotificationConfig and deliver on transitions" },
                     "allow_private": { "type": "boolean", "description": "permit webhook targets on private / loopback addresses (a separate and larger decision — a peer could otherwise reach agentd's own surfaces or a cloud metadata endpoint)" } } } } }));
-    m.insert("interface".to_string(), json!({ "type": "object", "additionalProperties": false,
-                "description": "The display-client (TUI/web-UI) surface, served on the A2A listener. Default-OFF.",
-                "properties": {
-                "enabled": { "type": "boolean", "description": "serve the interface methods (SubscribeToEvents, interface.info, …)" },
-                "debug": { "type": "boolean", "description": "expose extra debug information (transcripts, run step detail, the log ring, audit feed events); runtime-togglable via the config.set op" },
-                "origins": { "type": "array", "items": { "type": "string" }, "description": "extra allowed browser origins (scheme://host[:port]) for a hosted web UI; loopback origins never need listing" },
-                "display": { "type": "object", "additionalProperties": false,
-                    "description": "what clients render in their chrome — ordered item lists for the top (header) and bottom (status bar) edges; unknown items are skipped",
-                    "properties": {
-                    "top": { "type": "array", "items": { "type": "string" } },
-                    "bottom": { "type": "array", "items": { "type": "string" } } } },
-                "pairing": { "type": "object", "additionalProperties": false,
-                    "description": "pairing-code login: a rotating 6-digit code (shown to operators) a client exchanges for a session token — the low-friction alternative to copying a bearer",
-                    "properties": {
-                    "enabled": { "type": "boolean" },
-                    "role": { "enum": ["operator", "user", "agent", "anonymous"], "description": "the role a paired session gets (operator or user; default operator)" },
-                    "ttl": { "type": ["string", "integer"], "description": "session-token lifetime (default 12h)" } } } } }));
     m.insert("webhooks".to_string(), json!({ "type": "object", "additionalProperties": false, "properties": {
                 "listen": { "type": "string", "description": "https://host:port (loopback http:// for dev) — the inbound webhook surface" },
                 "tls": { "type": "object", "additionalProperties": false, "properties": {
@@ -548,9 +531,9 @@ fn defs_properties(
         }
     }
     m.insert("Principal".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["match", "role"], "properties": {
-                "id": { "type": "string", "pattern": "^[A-Za-z0-9._@:/+-]{1,128}$", "description": "the principal id this rule's callers act as (<role>:<id>) and own their work by; unique across rules" },
+                "id": { "type": "string", "pattern": "^[A-Za-z0-9._@:/+-]{1,128}$", "description": "the principal id this rule's callers act as (<role>:<id>) and own their work by; unique across rules. Required for bearer_ref and any rules; without it a certificate rule derives <role>:cn=<CN> or <role>:san=<first SAN>" },
                 "match": { "type": "object", "additionalProperties": false, "properties": {
-                    "san": { "type": "string" }, "sub": { "type": "string" }, "bearer_ref": { "type": "string" }, "aauth_agent": { "type": "string" }, "any": { "type": "boolean" } } },
+                    "san": { "type": "string" }, "sub": { "type": "string" }, "bearer_ref": { "type": "string" }, "any": { "type": "boolean" } } },
                 "role": { "enum": ["operator", "user", "agent", "anonymous"] },
                 "grants": { "type": "array", "items": { "type": "string" } },
                 "quotas": { "type": "object", "additionalProperties": false, "properties": {

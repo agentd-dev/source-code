@@ -371,8 +371,7 @@ fn an_mcp_elicitation_reaches_the_operator_and_the_server_sees_accept_with_the_c
                  mcp:\n  servers:\n    - name: ops\n      endpoint: {mcp}\n\
                  store:\n  kind: memory\n\
                  workflows:\n  - name: idle\n    steps:\n      s: {{kind: manual}}\n      f: {{kind: finish, depends_on: [s]}}\n\
-                 a2a:\n  listen: http://127.0.0.1:{port}\n\
-                 interface:\n  enabled: true\n  debug: true\n\
+                 a2a:\n  listen: http://127.0.0.1:{port}\n  events:\n    enabled: true\n  introspection:\n    enabled: true\n\
                  lifecycle:\n  run_until: drained\n\
                  observability:\n  log_level: info\n  log_content: true\n",
                 llm = llm.uri,
@@ -487,8 +486,7 @@ fn a_gate_whose_asking_child_died_ends_explicitly_instead_of_hanging() {
                  store:\n  kind: memory\n\
                  workflows:\n  - name: idle\n    steps:\n      s: {{kind: manual}}\n      f: {{kind: finish, depends_on: [s]}}\n\
                  limits:\n  run:\n    deadline: 6s\n\
-                 a2a:\n  listen: http://127.0.0.1:{port}\n\
-                 interface:\n  enabled: true\n  debug: true\n\
+                 a2a:\n  listen: http://127.0.0.1:{port}\n  events:\n    enabled: true\n  introspection:\n    enabled: true\n\
                  lifecycle:\n  run_until: drained\n\
                  observability:\n  log_level: info\n  log_content: true\n",
                 llm = llm.uri

@@ -16,7 +16,7 @@ use crate::config::v2::Settings;
 pub fn is_builtin_op(op: &str) -> bool {
     // Every op any build can serve, not just this instance's enabled subset:
     // reserving a name only while a feature is on would make the collision
-    // appear the day `interface.enabled` flipped.
+    // appear the day `a2a.events.enabled` flipped.
     const ALL: &[&str] = &[
         "status",
         "config",
@@ -40,7 +40,6 @@ pub fn is_builtin_op(op: &str) -> bool {
         "conversation.get",
         "run.get",
         "debug.events",
-        "pairing.code",
     ];
     ALL.contains(&op)
 }
@@ -74,25 +73,26 @@ pub fn command_ops_of(s: &Settings) -> Vec<&'static str> {
 /// The ops the DISPLAY surface owns, in the order `interface.info` reports them.
 ///
 /// Split out only because `interface.info` answers with this subset while the
-/// card wants the whole set — one list, not two. `config.set`, `subagent.get`
-/// and `pairing.code` were dispatched by the listener and advertised nowhere
-/// until this existed, which is exactly the under-reporting the "one list feeds
-/// three views" invariant is supposed to prevent.
+/// card wants the whole set — one list, not two. `config.set` and
+/// `subagent.get` were dispatched by the listener and advertised nowhere until
+/// this existed, which is exactly the under-reporting the "one list feeds three
+/// views" invariant is supposed to prevent.
+///
+/// The feed switch and the introspection switch are independent, so each
+/// gates its own ops: the reads that expose internals follow
+/// `a2a.introspection.enabled` alone, whether or not a feed is served.
 pub fn interface_ops_of(s: &crate::config::v2::Settings) -> Vec<&'static str> {
-    if !s.interface.enabled {
-        return Vec::new();
+    let mut ops = Vec::new();
+    if s.a2a.events.enabled {
+        ops.extend(["interface.info", "config.set"]);
     }
-    let mut ops = vec!["interface.info", "config.set"];
-    if s.interface.debug {
+    if s.a2a.introspection.enabled {
         ops.extend([
             "conversation.get",
             "run.get",
             "subagent.get",
             "debug.events",
         ]);
-    }
-    if s.interface.pairing.enabled {
-        ops.push("pairing.code");
     }
     ops
 }

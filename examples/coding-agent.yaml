@@ -52,12 +52,12 @@ store:
 # operator with no credential. Binding non-loopback REQUIRES client auth.
 a2a:
   listen: http://127.0.0.1:8420
-
-interface:
-  enabled: true
+  events:
+    enabled: true
   # Internals (transcripts, per-step run detail, the log ring) stay closed
-  # until you ask: `/set interface.debug true` opens them live.
-  debug: false
+  # until you ask: `/set a2a.introspection.enabled true` opens them live.
+  introspection:
+    enabled: false
 
 security:
   exec:

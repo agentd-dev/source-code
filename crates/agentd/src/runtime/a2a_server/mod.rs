@@ -26,10 +26,6 @@
 //! SPIFFE X.509-SVID's `spiffe://…` arrives as a URI SAN. A listener that
 //! declares no principals at all falls back to "any verified cert is an
 //! operator", which is why declaring even one principal turns the allowlist on.
-//!
-//! Inbound AAuth-agent attribution (`aauth_agent`) is not populated: agentd
-//! signs AAuth outbound but does not verify it inbound, so no inbound request
-//! carries a trusted AAuth agent identity.
 
 use crate::a2a::{CallerIdentity, Principal, Resolver};
 use crate::runtime::events::Event;
@@ -48,14 +44,12 @@ mod commands;
 mod feed;
 mod introspection;
 mod listener;
-mod pairing;
 mod redact;
 mod send;
 mod tasks;
 
 pub use feed::{FeedVis, SharedFeed};
 pub(crate) use listener::spawn_a2a_listener;
-pub use pairing::{PairingState, paired_principal};
 pub(crate) use send::command_data;
 pub use send::command_op;
 use tasks::new_task_id;
@@ -92,7 +86,7 @@ pub struct A2aRequest {
 /// The transport's post-office into the loop + the shared view.
 pub struct A2aBridge {
     events_tx: Sender<Event>,
-    /// The interface event feed — `None` unless `interface.enabled`.
+    /// The observation feed — `None` unless `a2a.events.enabled`.
     feed: Option<Arc<SharedFeed>>,
     /// Swappable, so a reload can rebuild the principal rules without a
     /// restart. Read once per inbound request and written only by a reload,
@@ -109,7 +103,7 @@ impl A2aBridge {
         Self::with_feed(events_tx, resolver, None)
     }
 
-    /// [`A2aBridge::new`] with the interface feed attached.
+    /// [`A2aBridge::new`] with the observation feed attached.
     pub fn with_feed(
         events_tx: Sender<Event>,
         resolver: Resolver,
@@ -167,7 +161,7 @@ impl A2aBridge {
         *self.resolver.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(resolver);
     }
 
-    /// The interface observation feed, when `interface.enabled` armed one.
+    /// The observation feed, when `a2a.events.enabled` armed one.
     pub fn feed(&self) -> Option<Arc<SharedFeed>> {
         self.feed.clone()
     }
@@ -273,7 +267,6 @@ impl Runtime {
             "PushConfigDelete" => self.a2a_push_delete(&principal, &params),
             "GetAgentCard" => self.a2a_agent_card(),
             "GetExtendedAgentCard" => self.a2a_extended_card(&principal),
-            "Pair" => self.a2a_pair(&params),
             other => err_obj(
                 UNSUPPORTED_OPERATION,
                 &format!("unsupported method: {other}"),
@@ -439,7 +432,7 @@ mod tests {
         // team trust path → the user role, labelled by its SAN.
         let p = bridge.principal_of(true, None, None, vec!["spiffe://corp/team/alice".into()]);
         assert_eq!(p.role, crate::config::v2::Role::User);
-        assert_eq!(p.id, "user:spiffe://corp/team/alice");
+        assert_eq!(p.id, "user:san=spiffe://corp/team/alice");
         // A cert under the ops path → operator (a different rule).
         let op = bridge.principal_of(true, None, None, vec!["spiffe://corp/ops/root".into()]);
         assert!(op.is_operator());

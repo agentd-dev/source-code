@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The display-client interface. A daemon with `interface.enabled` serves the
+//! The display-client interface. A daemon with `a2a.events.enabled` serves the
 //! observation plane on its A2A listener: the `SubscribeToEvents` feed
 //! (hello → events, cursor replay), the taskless reads, and the
 //! human-in-the-loop gate (`ask_human` → `input-required` → a `taskId` reply
@@ -24,7 +24,7 @@ pub fn checks() -> Vec<Check> {
         Check {
             id: "interface/default-off-gate",
             category: Category::Interface,
-            desc: "without interface.enabled the surface refuses (-32004) and the core answers",
+            desc: "without a2a.events.enabled the surface refuses (-32004) and the core answers",
             run: default_off,
         },
         Check {
@@ -50,9 +50,9 @@ fn free_port() -> u16 {
         .port()
 }
 
-fn config(llm: &str, port: u16, interface: bool) -> String {
-    let iface = if interface {
-        "interface:\n  enabled: true\n"
+fn config(llm: &str, port: u16, feed: bool) -> String {
+    let feed = if feed {
+        "  events:\n    enabled: true\n"
     } else {
         ""
     };
@@ -61,8 +61,8 @@ fn config(llm: &str, port: u16, interface: bool) -> String {
          agent:\n  name: iface-conf\n  instruction: You are a helpful test agent.\n  preflight: never\n\
          intelligence:\n  endpoints: {llm}\n  model: mock\n\
          store:\n  kind: memory\n\
-         a2a:\n  listen: http://127.0.0.1:{port}\n\
-         {iface}lifecycle:\n  run_until: drained\n"
+         a2a:\n  listen: http://127.0.0.1:{port}\n{feed}\
+         lifecycle:\n  run_until: drained\n"
     )
 }
 

@@ -855,8 +855,11 @@ impl Runtime {
                 crate::sec::policy::caller_name(Self::policy_caller(caller)),
             )
             .replace("{{args}}", &args.to_string());
+        // Interim: the feed is where a display client sees the gate, so
+        // `a2a.events.enabled` stands in for "somebody can answer" until
+        // ownership decides that.
         #[cfg(feature = "a2a")]
-        let available = self.settings.interface.enabled && self.a2a_sink.is_some();
+        let available = self.settings.a2a.events.enabled && self.a2a_sink.is_some();
         #[cfg(not(feature = "a2a"))]
         let available = false;
         if available {
@@ -886,7 +889,7 @@ impl Runtime {
             "tool.policy.unanswerable",
             json!({"tool": name, "rule": verdict.rule, "question": question,
                    "fallback": format!("{fallback:?}").to_lowercase(),
-                   "note": "no human channel (interface.enabled is off)"}),
+                   "note": "no human channel (a2a.events.enabled is off)"}),
         );
         if fallback == PolicyAction::Allow {
             return ToolOutcome::Ready(Value::Null, false);

@@ -70,9 +70,11 @@ fn boot() -> (Daemon, String) {
              store:\n  kind: memory\n\
              a2a:\n  listen: http://127.0.0.1:{port}\n\
              \x20 principals:\n\
-             \x20   - match: {{ bearer_ref: \"{{{{secret:AGENTD_EXT_OPERATOR}}}}\" }}\n\
+             \x20   - id: ext-operator\n\
+             \x20     match: {{ bearer_ref: \"{{{{secret:AGENTD_EXT_OPERATOR}}}}\" }}\n\
              \x20     role: operator\n\
-             \x20   - match: {{ bearer_ref: \"{{{{secret:AGENTD_EXT_USER}}}}\" }}\n\
+             \x20   - id: ext-user\n\
+             \x20     match: {{ bearer_ref: \"{{{{secret:AGENTD_EXT_USER}}}}\" }}\n\
              \x20     role: user\n\
              \x20     grants: [\"*\"]\n\
              lifecycle:\n  run_until: drained\n\

@@ -181,9 +181,11 @@ fn two_principal_config(llm: &str, port: u16) -> String {
          store:\n  kind: memory\n\
          a2a:\n  listen: http://127.0.0.1:{port}\n\
          \x20 principals:\n\
-         \x20   - match: {{ bearer_ref: \"{{{{secret:AGENTD_AUTHZ_TOKEN_A}}}}\" }}\n\
+         \x20   - id: token-a\n\
+         \x20     match: {{ bearer_ref: \"{{{{secret:AGENTD_AUTHZ_TOKEN_A}}}}\" }}\n\
          \x20     role: user\n\
-         \x20   - match: {{ bearer_ref: \"{{{{secret:AGENTD_AUTHZ_TOKEN_B}}}}\" }}\n\
+         \x20   - id: token-b\n\
+         \x20     match: {{ bearer_ref: \"{{{{secret:AGENTD_AUTHZ_TOKEN_B}}}}\" }}\n\
          \x20     role: agent\n\
          lifecycle:\n  run_until: drained\n\
          observability:\n  log_level: info\n"
@@ -433,9 +435,11 @@ fn a_reload_demotes_a_principal_and_the_revocation_takes_effect() {
              store:\n  kind: memory\n\
              a2a:\n  listen: http://127.0.0.1:{port}\n\
              \x20 principals:\n\
-             \x20   - match: {{ bearer_ref: \"{{{{secret:AGENTD_AUTHZ_TOKEN_A}}}}\" }}\n\
+             \x20   - id: token-a\n\
+             \x20     match: {{ bearer_ref: \"{{{{secret:AGENTD_AUTHZ_TOKEN_A}}}}\" }}\n\
              \x20     role: {role}\n\
-             \x20   - match: {{ bearer_ref: \"{{{{secret:AGENTD_AUTHZ_TOKEN_B}}}}\" }}\n\
+             \x20   - id: token-b\n\
+             \x20     match: {{ bearer_ref: \"{{{{secret:AGENTD_AUTHZ_TOKEN_B}}}}\" }}\n\
              \x20     role: agent\n\
              lifecycle:\n  run_until: drained\n\
              observability:\n  log_level: info\n",

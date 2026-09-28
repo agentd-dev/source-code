@@ -102,9 +102,8 @@ static STDERR_LOCK: Mutex<()> = Mutex::new(());
 // second telemetry path: stderr stays the source of truth; the ring is the
 // live-tail convenience.
 //
-// It is installed only when the debug tail is wanted (`interface.enabled` plus
-// `interface.debug`, at startup or when `config.set` turns debug on later);
-// without that, capture is a single relaxed atomic load that short-circuits, so
+// It is installed only when the debug tail is wanted (`a2a.introspection.enabled`
+// at startup, or turned on later by `config.set` or a reload); without that, capture is a single relaxed atomic load that short-circuits, so
 // the default build pays nothing.
 // The ring is lossy and bounded by design: an overrun drops the oldest and bumps
 // `dropped`, never blocking — a slow or dead subscriber can never back-pressure
@@ -187,12 +186,19 @@ pub fn take_events_dirty() -> bool {
 }
 
 /// Install the bounded event ring with capacity `cap`. Called by the runtime
-/// when the live log tail is wanted — `interface.enabled` plus `interface.debug`
-/// at startup, or `config.set interface.debug` later. Idempotent — a second
-/// call resizes and clears. Never fatal: telemetry must not crash the run, so a
-/// poisoned lock is recovered rather than propagated.
+/// when the live log tail is wanted — `a2a.introspection.enabled` at startup,
+/// or turned on later by `config.set` or a reload.
+///
+/// Idempotent: a ring already installed with this capacity is kept, lines and
+/// cursor both, because introspection can be switched on from several places
+/// and an operator tailing the log should not lose it to a second switch. A
+/// different capacity replaces the ring. Never fatal: telemetry must not crash
+/// the run, so a poisoned lock is recovered rather than propagated.
 pub fn install_event_ring(cap: usize) {
     let mut g = EVENT_RING.lock().unwrap_or_else(|e| e.into_inner());
+    if g.as_ref().is_some_and(|r| r.cap == cap.max(1)) {
+        return;
+    }
     *g = Some(EventRing::new(cap));
     RING_INSTALLED.store(1, Ordering::Relaxed);
 }
@@ -206,9 +212,8 @@ pub fn install_event_ring(cap: usize) {
 // globbing, filters and dedup those already have.
 //
 // It is NOT the event ring. The ring is an explicitly lossy oldest-evicted
-// buffer, installed only when the interface debug tail is on
-// (`interface.enabled` plus `interface.debug`, at startup or when `config.set`
-// turns debug on later); teeing it into a durable stream would produce silent
+// buffer, installed only when introspection is on (`a2a.introspection.enabled`,
+// at startup or turned on later); teeing it into a durable stream would produce silent
 // gaps in exactly the consumer being sold, and in the default deployment —
 // where the ring is never installed at all — would do nothing. This taps the
 // emission itself — every `log.info`/`warn`/`error` call site — and is opt-in

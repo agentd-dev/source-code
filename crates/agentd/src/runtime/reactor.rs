@@ -378,9 +378,6 @@ pub struct Runtime {
     /// The interface event feed. `None` means the interface is disabled.
     #[cfg(feature = "a2a")]
     pub(crate) a2a_feed: Option<std::sync::Arc<super::a2a_server::SharedFeed>>,
-    /// Pairing-code login state. `None` means pairing is disabled.
-    #[cfg(feature = "a2a")]
-    pub(crate) a2a_pairing: Option<std::sync::Arc<super::a2a_server::PairingState>>,
     /// The id the listener reserved for the task the request being served will
     /// create. Taken by the first `task_create` of that request, and cleared
     /// after it — an id belongs to one request only.
@@ -579,7 +576,7 @@ impl Runtime {
             }
             // 10.5. The interface feed's section diff: publish
             // run/conversation/subagent/child/status deltas to attached display
-            // clients. A no-op unless `interface.enabled`; rate-limited inside.
+            // clients. A no-op unless `a2a.events.enabled`; rate-limited inside.
             #[cfg(feature = "a2a")]
             self.feed_tick();
             // 11. Signals + lifecycle.

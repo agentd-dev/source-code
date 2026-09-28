@@ -32,13 +32,13 @@ pub const EXTENSIONS: &[&str] = &[COMMAND_EXTENSION, INTERFACE_EXTENSION];
 
 /// Every extension THIS instance declares on its card, in card order.
 ///
-/// The card is a promise, so an instance with the interface surface off must
+/// The card is a promise, so an instance that serves no observation feed must
 /// not advertise it — and the `--capabilities` manifest must say the same
 /// thing, since a controller reads one and a peer reads the other. They had
 /// already drifted once over the command ops; this is the second list.
 pub fn extensions_of(s: &crate::config::v2::Settings) -> Vec<&'static str> {
     let mut v = vec![COMMAND_EXTENSION];
-    if s.interface.enabled {
+    if s.a2a.events.enabled {
         v.push(INTERFACE_EXTENSION);
     }
     v

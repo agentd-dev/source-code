@@ -25,7 +25,6 @@ key rather than a setting that silently does nothing.
 | `tools` | tool overrides, renames, routing |
 | `security` | the `exec` fence, trifecta allowance, TLS CA, AAuth, cgroups |
 | `a2a` | the HTTP listener, its public URL, peers, principals, TLS/bearer client auth, browser origins, device sign-in, the event feed |
-| `interface` | the TUI/web-UI surface: enable, debug, chrome, pairing |
 | `workflows` | durable DAGs and their triggers |
 | `webhooks` | inbound HTTP triggers |
 | `observability` | log level, metrics, OTLP, health/report files |
@@ -116,10 +115,11 @@ Unset retention keeps every finished record.
 a2a:
   listen: http://127.0.0.1:8420    # loopback ⇒ caller is the operator, no credential
   url: https://agent.example.com   # the public origin: card interface URL + OAuth issuer
-  bearer: "{{secret:A2A_TOKEN}}"   # REQUIRED (or mTLS/pairing) for non-loopback
+  bearer: "{{secret:A2A_TOKEN}}"   # REQUIRED (or mTLS) for non-loopback
   tls: { cert: …, key: …, client_ca: … }
   principals:
-    - id: ci-bot                   # the principal id it acts as (user:ci-bot); unique
+    - id: ci-bot                   # the principal id it acts as (user:ci-bot); unique;
+                                   # required for bearer_ref and any rules
       match: { bearer_ref: "{{secret:CI_TOKEN}}" }
       role: user
   cors:
@@ -136,7 +136,9 @@ a2a:
 Plaintext `http://` is loopback-only by design. `:0` is refused — bind an
 explicit host:port.
 
-`url` is an origin — `scheme://host[:port]`, no path, query or fragment, and
+`url` is required when `listen` binds a wildcard host (`0.0.0.0`, `::`),
+which is no address a caller can dial. It is an origin —
+`scheme://host[:port]`, no path, query or fragment, and
 `https://` unless the host is loopback — because card discovery and the OAuth
 metadata are served at the origin root. It is published as the OAuth issuer,
 which clients compare as text, so it must be written canonically: lowercase,
@@ -154,28 +156,31 @@ refused together with `a2a.tls.client_ca` and on a `unix://` listener.
 require `a2a.listen`.
 
 `principals[].id` is `[A-Za-z0-9._@:/+-]{1,128}` and unique across rules.
-Each rule's `match` sets exactly one of `san`, `sub`, `bearer_ref`,
-`aauth_agent` or `any`.
+Each rule's `match` sets exactly one of `san`, `sub`, `bearer_ref` or `any`.
+A `bearer_ref` or `any` rule needs an `id` — a shared secret names no caller.
+A certificate rule without one acts as `<role>:cn=<CN>` (or
+`<role>:san=<first SAN>`), which can never equal a declared id.
 
-## interface — the display clients
+## Removed in 1.17.0
 
-```yaml
-interface:
-  enabled: false        # default OFF; `agentd tui|ui` sets it for you
-  debug: false          # opens transcripts, per-step run detail, the log ring
-  origins: []           # extra allowed browser origins for the web UI
-  display:              # which chrome items render, in order. Defaults:
-    top:    [name, version, instance, debug]
-    bottom: [conn, endpoint, draining, active, turns, tokens, screen, keys]
-  pairing:
-    enabled: false      # rotating 6-digit code instead of copying a bearer
-    role: operator      # operator | user | agent — what a paired session gets
-```
+These keys are refused by name — in a file, a flag, an `AGENTD_` variable or
+a `:::!config` fragment — with the replacement (`agentd --help` lists them):
 
-The full display vocabulary (unknown items are skipped, not an error):
-`name`, `version`, `instance`, `model`, `endpoint`, `conn`, `debug`,
-`draining`, `active`, `turns`, `tokens`, `tool_calls`, `runs`, `subagents`,
-`conversations`, `screen`, `keys`, `clock`.
+| removed | use instead |
+|---|---|
+| `interface.enabled` | `a2a.events.enabled` |
+| `interface.debug` | `a2a.introspection.enabled` (reloadable) |
+| `interface.origins` | `a2a.cors.origins` |
+| `interface.pairing` | `a2a.device_grant` |
+| `interface.display` | the client's own layout (`agentd-tui --top/--bottom`, `/layout`) |
+| `a2a.principals[].match.aauth_agent` | `san`, `sub` or `bearer_ref` |
+| `AGENTD_INTERFACE_LOG` | `agentd tui --daemon-log PATH` (or `agentd ui`) |
+
+`agentd tui` / `agentd ui` are a thin launcher: the daemon loads exactly as
+`agentd <args>` would (the launcher sets nothing — put `a2a.events.enabled`
+in the config), and the client gets only its endpoint, never `a2a.bearer`.
+They need a loopback `http(s)` listener on a fixed port without `client_ca`;
+their `--debug` and `--inline` flags are refused.
 
 ## observability
 

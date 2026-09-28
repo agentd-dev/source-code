@@ -14,7 +14,7 @@
 //! the answer starts a fresh turn carrying it.
 //!
 //! **Fallback** (`agent.ask_human_fallback`) when NO human channel exists
-//! (`interface.enabled` off): `fail` (default — error immediately), `wait`
+//! (`a2a.events.enabled` off): `fail` (default — error immediately), `wait`
 //! (park until the ask timeout), or `auto` — an LLM judge answers on the
 //! operator's behalf (also fired when an interface-served gate times out
 //! unanswered). Auto answers are marked as auto in the task, the log and the
@@ -158,9 +158,12 @@ impl Runtime {
             }
         }
 
-        // A human can answer only through the interface surface.
+        // A human can answer only through a display client on the feed.
+        // Interim: the feed is where a display client sees the gate, so
+        // `a2a.events.enabled` stands in for "somebody can answer" until
+        // ownership decides that.
         #[cfg(feature = "a2a")]
-        let available = self.settings.interface.enabled && self.a2a_sink.is_some();
+        let available = self.settings.a2a.events.enabled && self.a2a_sink.is_some();
         #[cfg(not(feature = "a2a"))]
         let available = false;
 
@@ -173,7 +176,7 @@ impl Runtime {
         match self.settings.agent.ask_human_fallback {
             AskHumanFallback::Fail => ToolOutcome::Ready(
                 Value::String(
-                    "ask_human: no human channel (interface.enabled is off) and \
+                    "ask_human: no human channel (a2a.events.enabled is off) and \
                      agent.ask_human_fallback = fail"
                         .into(),
                 ),
@@ -191,7 +194,7 @@ impl Runtime {
                     json!({
                         "ask": ask,
                         "deadline_ms": deadline_ms,
-                        "note": "no human channel (interface.enabled is off); \
+                        "note": "no human channel (a2a.events.enabled is off); \
                                  ask_human_fallback = wait — this gate will park until its timeout"
                     }),
                 );

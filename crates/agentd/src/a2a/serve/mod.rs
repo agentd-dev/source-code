@@ -10,23 +10,21 @@
 //!
 //! ## Identity
 //!
-//! Four kinds of evidence, in the order they are trusted:
+//! Three kinds of evidence, in the order they are trusted:
 //!
-//! 1. a **pairing session token** — the code-for-token exchange that logs a
-//!    display client in;
-//! 2. a **verified client certificate** — subject CN and SANs, so a `san`/`sub`
+//! 1. a **verified client certificate** — subject CN and SANs, so a `san`/`sub`
 //!    principal rule matches a cert directly (a SPIFFE X.509-SVID's
 //!    `spiffe://…` arrives as a URI SAN);
-//! 3. the configured **server bearer**;
-//! 4. **loopback with nothing configured**, which is the single-operator dev
+//! 2. the configured **server bearer**;
+//! 3. **loopback with nothing configured**, which is the single-operator dev
 //!    posture and the only case where absent credentials mean trust.
 //!
 //! ## Two vocabularies on one endpoint
 //!
 //! Most methods are the specification's. A few are answered here rather than
 //! passed down: the observation feed the display clients read
-//! (`SubscribeToEvents`) and the pairing exchange (`Pair`) are agentd's own, so
-//! a2a-rs correctly does not know them; the public card read (`GetAgentCard`)
+//! (`SubscribeToEvents`) is agentd's own, so a2a-rs correctly does not know
+//! it; the public card read (`GetAgentCard`)
 //! is agentd's convenience over a document the spec publishes only at
 //! `.well-known`, and both must answer with the *same* card; and the spec's own
 //! `GetExtendedAgentCard` is served locally too — it is that card plus the
@@ -49,7 +47,7 @@ use serde_json::json;
 
 use crate::a2a::ports::{self, RuntimePorts};
 use crate::obs::log::Logger;
-use crate::runtime::a2a_server::{A2aBridge, PairingState, SharedFeed};
+use crate::runtime::a2a_server::{A2aBridge, SharedFeed};
 
 mod card;
 mod cors;
@@ -72,22 +70,19 @@ pub struct Auth {
     pub require_auth: bool,
     /// The resolved server bearer; presenting it is the operator.
     pub server_bearer: Option<String>,
-    /// Pairing-code login, present only when the interface arms it. `None`
-    /// means the `Pair` exchange is unavailable and no session token is
-    /// accepted as evidence of identity.
-    pub pairing: Option<Arc<PairingState>>,
 }
 
 /// Everything the listener needs that is not the bridge.
 pub struct Opts {
     pub auth: Auth,
-    /// Origins a browser UI may be served from, beyond loopback. Any other
-    /// `Origin` is refused outright, which is what stops a page the operator
-    /// never authorised from driving this endpoint through their browser.
+    /// `a2a.cors.origins`: the origins a browser UI may be served from. Any
+    /// other `Origin` is refused outright, which is what stops a page the
+    /// operator never authorised from driving this endpoint through their
+    /// browser.
     ///
     /// Shared rather than owned so a reload can revise the list in place; see
     /// [`OriginList`].
-    pub extra_origins: OriginList,
+    pub cors_origins: OriginList,
     /// TLS, when the listen URL is `https://` — a PROVIDER consulted per
     /// connection, not a snapshot taken at spawn.
     ///
@@ -118,7 +113,7 @@ pub struct Listener {
 impl App {
     /// The origin allowlist in force for this request.
     fn origins(&self) -> Vec<String> {
-        self.extra_origins
+        self.cors_origins
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
@@ -136,7 +131,7 @@ struct App {
     /// revoke a web client's access got a successful reload and a listener
     /// that kept honouring the old list — the same shape as the webhook
     /// secret that would not rotate.
-    extra_origins: OriginList,
+    cors_origins: OriginList,
     stream_deadline: Duration,
     log: Logger,
 }
@@ -183,7 +178,7 @@ pub fn spawn(
         protocol: a2a_rs::adapter::jsonrpc_router(adapter),
         bridge: Arc::clone(&bridge),
         auth: opts.auth,
-        extra_origins: opts.extra_origins,
+        cors_origins: opts.cors_origins,
         stream_deadline: opts.stream_deadline,
         log: log.clone(),
     });

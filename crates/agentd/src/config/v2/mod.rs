@@ -176,9 +176,6 @@ pub struct Settings {
     /// defaults, and the freeform-spawn switch.
     pub subagents: Subagents,
     pub a2a: A2a,
-    /// The display-client surface: opt-in TUI/web-UI methods on the A2A
-    /// listener (the global `SubscribeToEvents` feed + interface read ops).
-    pub interface: Interface,
     /// The inbound webhook HTTP surface: a dedicated listener for `webhook`
     /// start nodes and `wait: {on: webhook}` callbacks.
     pub webhooks: Webhooks,
@@ -1070,8 +1067,6 @@ pub const OPERATOR_ONLY: &[&str] = &[
     "a2a.push",
     "a2a.tls",
     "a2a.url",
-    // The human control plane: pairing, origins, the observation feed.
-    "interface",
     // Inbound sockets and the auth on them. A document declares a ROUTE (an
     // `:::endpoint` block, gated by the `interface` family); the listener the
     // route is served on is the operator's.
@@ -3045,87 +3040,6 @@ pub struct A2aTls {
     pub client_ca: Option<String>,
 }
 
-/// The **display-client interface**: the opt-in surface a thin TUI/web-UI
-/// client rides — the global `SubscribeToEvents` feed and the
-/// `interface.*`/debug read ops, served on the existing A2A listener (no new
-/// socket). Default-OFF: with `enabled: false` those methods answer
-/// UNSUPPORTED_OPERATION and the core A2A surface is byte-identical. `debug`
-/// additionally exposes internals (conversation transcripts, per-step run
-/// detail, the live log ring, audit records on the feed) — operator-grade
-/// information; leave it off in production unless you need it. `origins` lets a
-/// hosted web UI (a non-loopback browser origin) through the DNS-rebind guard
-/// with CORS; loopback origins are always accepted.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields, default)]
-pub struct Interface {
-    /// Serve the interface methods (`SubscribeToEvents`, `interface.info`, …).
-    pub enabled: bool,
-    /// Expose extra debug information (transcripts, run step detail, the log
-    /// ring, audit feed events). Clients render their debug panes only when
-    /// this is on. Runtime-togglable over the wire via `config.set` (operator).
-    pub debug: bool,
-    /// Extra allowed browser origins (`scheme://host[:port]`, exact match) for
-    /// a hosted web UI. Loopback origins never need listing.
-    pub origins: Vec<String>,
-    /// What the display clients render in their chrome. The daemon decides,
-    /// so every attached client renders the same layout.
-    pub display: Display,
-    /// Pairing-code login: a rotating short code shown to the operator that a
-    /// client exchanges for a session token — the low-friction alternative to
-    /// copying a bearer around.
-    pub pairing: Pairing,
-}
-
-/// The client-chrome layout: ordered item lists for the top (header) and
-/// bottom (status bar) edges. `None` ⇒ the built-in default. Clients skip an
-/// item they do not recognise instead of erroring, so a newer daemon can name
-/// items an older client has never heard of. The vocabulary is
-/// [`DISPLAY_ITEMS`].
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields, default)]
-pub struct Display {
-    pub top: Option<Vec<String>>,
-    pub bottom: Option<Vec<String>>,
-}
-
-/// The display items a client knows how to render.
-pub const DISPLAY_ITEMS: &[&str] = &[
-    "name",     // agent name (card)
-    "version",  // agentd version
-    "instance", // instance identity
-    "model",    // intelligence.model
-    "endpoint", // the endpoint the client dialed
-    "conn",     // connection state (live/polling/error)
-    "debug",    // the debug badge
-    "draining", // the DRAINING notice
-    "active",   // active task count
-    "turns",    // counter
-    "tokens",   // tokens in/out
-    "tool_calls",
-    "runs",          // run count
-    "subagents",     // subagent count
-    "conversations", // conversation count
-    "screen",        // current screen name (tui)
-    "keys",          // key hints (tui)
-    "clock",         // local time
-];
-
-/// Pairing-code login. The code is a 6-digit value derived
-/// from a per-process random seed and the current 60-second window — shown
-/// only to operators (`pairing.code`), verified with the previous window's
-/// grace, rate-limited, and exchanged (`Pair`) for a high-entropy session
-/// token that lives in memory until `ttl` (or restart).
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields, default)]
-pub struct Pairing {
-    pub enabled: bool,
-    /// The role a paired session gets: `operator` (default — whoever can read
-    /// the code can already see the operator console) or `user`.
-    pub role: Option<Role>,
-    /// Session-token lifetime (default 12h).
-    pub ttl: Option<Dur>,
-}
-
 /// The webhook inbound HTTP surface: a dedicated listener serving the
 /// `webhook` start nodes and `wait: {on: webhook}` callbacks. Auth is **per
 /// node** — each `webhook` declares its own verification — so one permissive
@@ -3247,10 +3161,12 @@ impl<'de> Deserialize<'de> for GoalAction {
 #[serde(deny_unknown_fields)]
 pub struct Principal {
     /// The principal id this rule's callers act as (`<role>:<id>`), and what
-    /// their tasks, runs and conversations are owned by. Declared rather than
-    /// derived when the evidence does not name one caller — a shared bearer
-    /// secret has no name of its own — and optional for certificate rules,
-    /// where it collapses every matching certificate into one principal.
+    /// their tasks, runs and conversations are owned by. REQUIRED for
+    /// `bearer_ref` and `any` rules, whose evidence does not name one caller —
+    /// a shared bearer secret has no name of its own. Optional for certificate
+    /// rules, where it collapses every matching certificate into one
+    /// principal; without it the id is derived from the certificate as
+    /// `<role>:cn=<CN>` or `<role>:san=<first SAN>`.
     #[serde(default)]
     pub id: Option<String>,
     #[serde(rename = "match")]
@@ -3277,7 +3193,6 @@ pub struct PrincipalMatch {
     pub san: Option<String>,
     pub sub: Option<String>,
     pub bearer_ref: Option<String>,
-    pub aauth_agent: Option<String>,
     pub any: bool,
 }
 
@@ -3805,6 +3720,7 @@ impl Settings {
     /// arriving from files, URLs and directories can be treated identically to
     /// inline ones.
     pub fn from_document(mut doc: Value, source: &str) -> Result<Settings, String> {
+        refuse_removed_keys(&doc, source)?;
         let vars: BTreeMap<String, Value> = doc
             .get("vars")
             .and_then(Value::as_object)
@@ -4207,6 +4123,12 @@ impl Settings {
                     if let Some(a) = doc.get_mut("agent").and_then(Value::as_object_mut) {
                         a.insert("instruction".into(), Value::String(ex.cleaned.clone()));
                     }
+                    // Before the boundary check, which would call a removed
+                    // key "operator configuration" and name no replacement.
+                    refuse_removed_keys(
+                        &Value::Object(ex.config.clone()),
+                        &format!("{source}: the instruction's :::!config"),
+                    )?;
                     let forbidden = document_wrote_operator_config(&ex.config);
                     if !forbidden.is_empty() {
                         return Err(format!(
@@ -4418,9 +4340,13 @@ pub fn detect(doc: &Value) -> Detected {
     let version = obj.get("config_version").and_then(Value::as_str);
     let intel_is_object = obj.get("intelligence").is_some_and(Value::is_object);
     let intel_is_string = obj.get("intelligence").is_some_and(Value::is_string);
+    // A removed top-level section is still this schema's vocabulary: judged
+    // v1 instead, a file holding only `interface:` would get the flat-schema
+    // migration message rather than the refusal that names its replacement.
     let has_v2 = version == Some(schema::CONFIG_VERSION) || intel_is_object || {
         let v2 = v2_keys();
-        obj.keys().any(|k| v2.iter().any(|v| v == k))
+        obj.keys()
+            .any(|k| v2.iter().any(|v| v == k) || REMOVED_KEYS.iter().any(|(path, _)| path == k))
     };
     let has_v1 = intel_is_string
         || obj.keys().any(|k| V1_KEYS.contains(&k.as_str()))
@@ -4868,6 +4794,168 @@ pub const REMOVED_FLAGS: &[(&str, &str)] = &[
     ),
 ];
 
+/// The release that removed the [`REMOVED_KEYS`], as every refusal names it.
+pub const KEYS_REMOVED_IN: &str = "1.17.0";
+
+/// Configuration keys agentd no longer accepts, each paired with the hint that
+/// replaces it. `[]` stands for any element of a list.
+///
+/// Refused BY NAME on every layer that can carry one — each file, the merged
+/// document, a `:::!config` fragment, a `--<path>` flag and an `AGENTD_<PATH>`
+/// variable — because each of them would otherwise fail differently or not at
+/// all: a file with `deny_unknown_fields` says "unknown field", a flag says
+/// "unknown argument", a fragment says "operator configuration", and an
+/// environment variable that binds no path is silently ignored. An operator
+/// upgrading needs the replacement, not four different shrugs.
+///
+/// Ordered most specific first: a lookup takes the first entry that matches,
+/// so `interface.enabled` gets its own replacement while the catch-all
+/// `interface` answers for everything else under it — `AGENTD_INTERFACE_LOG`,
+/// which the launcher used to read, included.
+pub const REMOVED_KEYS: &[(&str, &str)] = &[
+    (
+        "interface.enabled",
+        "use a2a.events.enabled — it declares the events extension and serves the observation feed (docs/configuration.md#removed-in-1-17-0)",
+    ),
+    (
+        "interface.debug",
+        "use a2a.introspection.enabled — reloadable, and independent of the feed (docs/configuration.md#removed-in-1-17-0)",
+    ),
+    (
+        "interface.display",
+        "the layout is the client's: agentd-tui --top/--bottom, AGENTD_TUI_TOP/AGENTD_TUI_BOTTOM, or /layout in the web UI; the memory values a status line shows are observability.status_values",
+    ),
+    (
+        "interface.origins",
+        "use a2a.cors.origins — exact origins, and a loopback UI origin has to be listed too",
+    ),
+    (
+        "interface.pairing",
+        "use a2a.device_grant — a client shows a code and an operator approves it with auth.device.approve",
+    ),
+    (
+        "interface",
+        "the display-client section is gone: the feed is a2a.events.enabled, introspection a2a.introspection.enabled, browser origins a2a.cors.origins, sign-in a2a.device_grant, and the launcher's log path is `agentd tui|ui --daemon-log PATH` (docs/configuration.md#removed-in-1-17-0)",
+    ),
+    (
+        "a2a.principals[].match.aauth_agent",
+        "match on san, sub or bearer_ref instead — nothing verified an inbound AAuth agent, so the rule matched nobody",
+    ),
+];
+
+/// A binding for `path`, so a removed key's flag and variable names are spelled
+/// by the same [`Binding`] methods that spell a live key's — a second
+/// derivation here would be a second spelling to fall out of step.
+fn removed_binding(path: &str) -> Binding {
+    Binding {
+        path: path.to_string(),
+        kind: paths::Kind::Any,
+        description: None,
+        entry_kind: None,
+    }
+}
+
+/// The first [`REMOVED_KEYS`] entry `doc` sets.
+pub fn removed_key_in(doc: &Value) -> Option<(&'static str, &'static str)> {
+    fn sets(v: &Value, segs: &[&str]) -> bool {
+        let Some((head, rest)) = segs.split_first() else {
+            return true;
+        };
+        match head.strip_suffix("[]") {
+            Some(key) => v
+                .get(key)
+                .and_then(Value::as_array)
+                .is_some_and(|items| items.iter().any(|e| sets(e, rest))),
+            None => v.get(*head).is_some_and(|child| sets(child, rest)),
+        }
+    }
+    REMOVED_KEYS
+        .iter()
+        .copied()
+        .find(|(path, _)| sets(doc, &path.split('.').collect::<Vec<_>>()))
+}
+
+/// The refusal for a removed key, in the one shape every layer uses.
+fn removed_key_error(source: &str, path: &str, hint: &str) -> String {
+    format!("{source}: `{path}` was removed in agentd {KEYS_REMOVED_IN}: {hint}")
+}
+
+/// Refuse a document — a file, the merged document, a fragment — that sets a
+/// removed key.
+pub fn refuse_removed_keys(doc: &Value, source: &str) -> Result<(), String> {
+    match removed_key_in(doc) {
+        Some((path, hint)) => Err(removed_key_error(source, path, hint)),
+        None => Ok(()),
+    }
+}
+
+/// The removed key a `--<path>` flag names, in any of its spellings. An entry
+/// reaching into a list (`[]`) has no flag — list elements are not addressable
+/// by path — and is caught on the document the whole-list flag sets instead.
+fn removed_key_of_flag(arg: &str) -> Option<(&'static str, &'static str)> {
+    let flag = removed_binding(arg.strip_prefix("--")?).flag();
+    REMOVED_KEYS
+        .iter()
+        .copied()
+        .filter(|(path, _)| !path.contains("[]"))
+        .find(|(path, _)| {
+            let want = removed_binding(path).flag();
+            flag == want || flag.starts_with(&format!("{want}-"))
+        })
+}
+
+/// The removed key an environment variable names: the branded spelling of the
+/// entry, or anything under it. Checked after debranding, so the neutral
+/// `AGENT_` spelling is refused too; the bare spelling is not, because
+/// `INTERFACE_*` is too generic a name to claim for agentd.
+fn removed_key_of_env(name: &str) -> Option<(&'static str, &'static str)> {
+    REMOVED_KEYS
+        .iter()
+        .copied()
+        .filter(|(path, _)| !path.contains("[]"))
+        .find(|(path, _)| {
+            let names = removed_binding(path).env_names();
+            let branded = &names[0];
+            name == branded || name.starts_with(&format!("{branded}_"))
+        })
+}
+
+/// The environment names one [`ENV_ALIASES`] entry is read under, most
+/// specific first — the same prefixes a derived path name takes.
+fn alias_env_names(alias: &str) -> Vec<String> {
+    paths::ENV_PREFIXES
+        .iter()
+        .map(|p| format!("{p}{alias}"))
+        .collect()
+}
+
+/// Every variable in `env` the config loader would read.
+///
+/// The launcher's scrub: `agentd tui|ui` hands its display client its own
+/// environment minus these, so a variable that set `a2a.bearer`
+/// (`SERVE_BEARER` under any prefix) or any other setting never reaches a
+/// process that has no business with the daemon's configuration. Derived from
+/// the tables the ENV layer itself iterates — every path's
+/// [`Binding::env_names`] and every [`ENV_ALIASES`] entry under every
+/// [`paths::ENV_PREFIXES`] spelling — so an alias added there is scrubbed here
+/// without a second list.
+pub fn consumed_env_names(env: &[(String, String)]) -> Vec<String> {
+    let bindings = paths::bindings_of(&schema::schema());
+    let read: std::collections::HashSet<String> = bindings
+        .iter()
+        .flat_map(Binding::env_names)
+        .chain(
+            ENV_ALIASES
+                .iter()
+                .flat_map(|(name, _)| alias_env_names(name)),
+        )
+        .collect();
+    env.iter()
+        .filter(|(k, _)| read.contains(k))
+        .map(|(k, _)| k.clone())
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Load pipeline
 // ---------------------------------------------------------------------------
@@ -4993,6 +5081,9 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
         (Value::Object(Map::new()), Vec::new())
     } else {
         file::read_documents_checked(&config_paths, &|doc, source| {
+            // A removed key names ITS file whatever else the file is, so an
+            // upgrade finds the line to change rather than a migration hint.
+            refuse_removed_keys(doc, source)?;
             // A v1/mixed file is judged after the merge (a clear migration
             // message); a v2 file is typed here so an unknown key names ITS file.
             match detect(doc) {
@@ -5077,13 +5168,18 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
     // --- ENV layer: derived path names, then the short aliases. A path name
     // wins over an alias for the same field, since it names the field exactly
     // and cannot be a coincidence. ---
+    // A variable naming a removed key would bind no path and be silently
+    // ignored, so it is refused before anything reads the environment.
+    let mut env_names: Vec<&str> = envmap.keys().copied().collect();
+    env_names.sort_unstable();
+    for name in env_names {
+        if let Some((path, hint)) = removed_key_of_env(name) {
+            return Err(usage(removed_key_error(name, path, hint)));
+        }
+    }
     let mut env_doc = Value::Object(Map::new());
     for (name, path) in ENV_ALIASES {
-        let candidates = [
-            format!("AGENTD_{name}"),
-            format!("AGENT_{name}"),
-            (*name).to_string(),
-        ];
+        let candidates = alias_env_names(name);
         if let Some(raw) = candidates.iter().find_map(|k| envmap.get(k.as_str())) {
             let binding = binding_for(&bindings, path)
                 .ok_or_else(|| usage(format!("internal: alias path {path} not in schema")))?;
@@ -5138,6 +5234,9 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
                 crate::config::ConfigFlag::Inline(_)
             ) => {}
             _ => {
+                if let Some((path, hint)) = removed_key_of_flag(a) {
+                    return Err(usage(removed_key_error(a, path, hint)));
+                }
                 if let Some((flag, hint)) = REMOVED_FLAGS.iter().find(|(f, _)| *f == a) {
                     return Err(usage(format!("{flag} was removed in agentd: {hint}")));
                 }
@@ -6340,6 +6439,12 @@ fn principal_id_ok(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"._@:/+-".contains(&b))
 }
 
+/// Whether a bind host is a wildcard — every address of the host rather than
+/// one a caller can dial (`0.0.0.0`, `::`, or an empty host).
+pub fn is_wildcard_host(host: &str) -> bool {
+    matches!(host, "" | "0.0.0.0" | "::" | "[::]")
+}
+
 /// Why a declared header value's `{{secret:NAME}}` / `{{secret-file:PATH}}` ref
 /// does not resolve, or `None` when it does (or when the value carries no ref).
 ///
@@ -7370,12 +7475,20 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                         "a2a.listen is https:// but a2a.tls.cert / a2a.tls.key are not set".into(),
                     );
                 }
-                if !loopback
-                    && s.a2a.tls.client_ca.is_none()
-                    && s.a2a.bearer.is_none()
-                    && !s.interface.pairing.enabled
-                {
-                    err(&mut d, "a2a.listen on a non-loopback address needs client auth: a2a.bearer, interface.pairing, or a2a.tls.client_ca (mTLS — then EVERY caller needs a client certificate, bearer-only and paired included)".into());
+                if !loopback && s.a2a.tls.client_ca.is_none() && s.a2a.bearer.is_none() {
+                    err(&mut d, "a2a.listen on a non-loopback address needs client auth: a2a.bearer or a2a.tls.client_ca (mTLS — then EVERY caller needs a client certificate, bearer-only included)".into());
+                }
+                // A wildcard names no address anybody can dial. What the card
+                // and the OAuth issuer publish is `a2a.url`, and guessing it
+                // from the bind would advertise `0.0.0.0` — or a loopback
+                // rewrite that is wrong for every caller not on this host.
+                if is_wildcard_host(super::serve_host_of(&bind)) && s.a2a.url.is_none() {
+                    err(
+                        &mut d,
+                        format!(
+                            "a2a.listen binds a wildcard host ({l}), which is no address a caller can reach: set a2a.url to the origin callers use (e.g. https://agent.example.com:8443) — the card and the OAuth issuer publish it"
+                        ),
+                    );
                 }
                 if !tls && !loopback {
                     err(
@@ -7448,85 +7561,6 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
         }
     }
     validate_device_grant(&s.a2a, listen_target.as_ref(), &mut d);
-
-    // interface (the display-client surface — it rides the A2A listener)
-    if s.interface.enabled && s.a2a.listen.is_none() {
-        err(
-            &mut d,
-            "interface.enabled requires a2a.listen (the interface is served on the A2A listener)"
-                .into(),
-        );
-    }
-    if s.interface.debug && !s.interface.enabled {
-        d.warnings
-            .push("interface.debug has no effect while interface.enabled is false".into());
-    }
-    for o in &s.interface.origins {
-        // An origin is `scheme://host[:port]` — no path, no trailing slash.
-        let ok = o
-            .split_once("://")
-            .map(|(scheme, rest)| {
-                matches!(scheme, "http" | "https") && !rest.is_empty() && !rest.contains('/')
-            })
-            .unwrap_or(false);
-        if !ok {
-            err(
-                &mut d,
-                format!(
-                    "interface.origins: {o:?} is not an origin (want scheme://host[:port], no path)"
-                ),
-            );
-        }
-    }
-    // Display items: unknown names are skipped by clients — warn, don't refuse
-    // (forward compatibility across client versions).
-    for (edge, items) in [
-        ("top", &s.interface.display.top),
-        ("bottom", &s.interface.display.bottom),
-    ] {
-        for item in items.iter().flatten() {
-            // `memory:<key>` renders whatever a WORKFLOW wrote to that key —
-            // the extension point that lets the status line show a branch, a PR
-            // number or a deploy state without the daemon learning to compute
-            // any of them. The key still has to be a legal memory key, so a
-            // typo is caught here rather than silently never rendering.
-            if let Some(key) = item.strip_prefix("memory:") {
-                if key.is_empty() {
-                    d.errors.push(format!(
-                        "interface.display.{edge}: {item:?} names no memory key"
-                    ));
-                } else if let Err(e) = crate::context::memory::Memory::check_key(key) {
-                    d.errors
-                        .push(format!("interface.display.{edge}: {item:?}: {e}"));
-                }
-                continue;
-            }
-            if !DISPLAY_ITEMS.contains(&item.as_str()) {
-                d.warnings.push(format!(
-                    "interface.display.{edge}: unknown item {item:?} (clients skip it); known: {}, \
-                     or memory:<key> for a value a workflow maintains",
-                    DISPLAY_ITEMS.join(", ")
-                ));
-            }
-        }
-    }
-    // Pairing-code login.
-    if s.interface.pairing.enabled {
-        if !s.interface.enabled {
-            err(
-                &mut d,
-                "interface.pairing.enabled requires interface.enabled (pairing rides the interface surface)".into(),
-            );
-        }
-        if let Some(role) = s.interface.pairing.role
-            && !matches!(role, Role::Operator | Role::User)
-        {
-            err(
-                &mut d,
-                "interface.pairing.role must be operator or user".into(),
-            );
-        }
-    }
 
     // webhooks (the inbound HTTP surface)
     let uses_webhook = s.workflows.iter().any(workflow_uses_webhook);
@@ -7692,7 +7726,6 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             m.san.is_some(),
             m.sub.is_some(),
             m.bearer_ref.is_some(),
-            m.aauth_agent.is_some(),
             m.any,
         ]
         .into_iter()
@@ -7701,9 +7734,7 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
         if set == 0 {
             err(
                 &mut d,
-                format!(
-                    "a2a.principals[{i}]: match needs one of san | sub | bearer_ref | aauth_agent | any"
-                ),
+                format!("a2a.principals[{i}]: match needs one of san | sub | bearer_ref | any"),
             );
         } else if set > 1 {
             // The resolver consults exactly one matcher per rule (by a fixed
@@ -7713,7 +7744,7 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             err(
                 &mut d,
                 format!(
-                    "a2a.principals[{i}]: match sets more than one of san | sub | bearer_ref | aauth_agent | any; a rule matches one way — write one rule per matcher"
+                    "a2a.principals[{i}]: match sets more than one of san | sub | bearer_ref | any; a rule matches one way — write one rule per matcher"
                 ),
             );
         }
@@ -7721,6 +7752,18 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             err(
                 &mut d,
                 format!("a2a.principals[{i}]: `any` cannot grant the operator role"),
+            );
+        }
+        // A certificate names its holder; a shared secret and "anyone" do
+        // not. Deriving an id for those produced `user:unknown`, one principal
+        // that every such caller's tasks and conversations silently merged
+        // into, so the id is stated where the evidence cannot supply it.
+        if (m.bearer_ref.is_some() || m.any) && pr.id.is_none() {
+            err(
+                &mut d,
+                format!(
+                    "a2a.principals[{i}]: a bearer_ref/any rule names one caller, so it needs `id:` — the principal id its tasks and conversations are owned by (e.g. id: ci-bot)"
+                ),
             );
         }
         if let Some(id) = &pr.id {
@@ -8095,20 +8138,15 @@ pub const RESTART_ONLY_PATHS: &[&str] = &[
     // live sessions would strand them.
     "a2a.url",
     // The device grant's state — pending codes, issued sessions, their
-    // lifetimes — is built with the listener, like the pairing it replaces.
+    // lifetimes — is built with the listener.
     "a2a.device_grant",
-    // The same shape as `interface.enabled` below: the feed exists only if it
-    // was declared at boot.
-    "a2a.events",
     // Arming the observation feed is a startup decision: the `SharedFeed` is
-    // built only when `interface.enabled` was true at boot, so turning the
-    // interface ON at runtime would pass every settings gate and still have no
-    // feed to publish onto. (Turning it OFF does work, because those gates are
-    // read live — but a knob that reloads in one direction only is worse than
-    // one that plainly refuses.) Pairing state is likewise built at boot and
-    // handed to the listener's `Auth`.
-    "interface.enabled",
-    "interface.pairing",
+    // built only when `a2a.events.enabled` was true at boot, so turning the
+    // feed ON at runtime would pass every settings gate and still have no
+    // feed to publish onto. (Turning it OFF would work, because those gates
+    // are read live — but a knob that reloads in one direction only is worse
+    // than one that plainly refuses.)
+    "a2a.events",
     // `store.max_value_bytes` rides the `Policy` built once at startup and
     // handed to the `Durable` layer, which the reload does not rebuild — the
     // same shape as the rest of `store.*`. Listed rather than silently
@@ -8118,7 +8156,7 @@ pub const RESTART_ONLY_PATHS: &[&str] = &[
     "store.max_value_bytes",
     // The instruction-document trust ladder. A capability an operator believes
     // they revoked must not stay live in a running process (the same rule as
-    // interface.enabled), so widening or narrowing the grant set is a restart —
+    // a2a.events), so widening or narrowing the grant set is a restart —
     // the document is re-read against the new grants at boot.
     "agent.document_capabilities",
     // Pinned trust for signed documents: widening what a source may attest, or
@@ -8148,7 +8186,7 @@ pub const RESTART_ONLY_PATHS: &[&str] = &[
 /// [`every_config_path_is_classified`] enforces against the generated schema.
 /// That test is the point of this list: a config field that is in neither list
 /// is not "probably fine", it is **unexamined** — and three shipped defects
-/// (`a2a.principals`, the webhook routes, `interface.origins`) were all fields
+/// (`a2a.principals`, the webhook routes, the CORS origins) were all fields
 /// nobody had classified. Each reported a successful reload and changed
 /// nothing, because the value was copied into a long-lived structure at
 /// startup that the reload never rebuilt.
@@ -8207,9 +8245,6 @@ pub const RELOADABLE_PATHS: &[&str] = &[
     "intelligence.timeout",
     "intelligence.token",
     "intelligence.token_file",
-    "interface.debug",
-    "interface.display",
-    "interface.origins",
     "knowledge.auto_context",
     "knowledge.server",
     "lifecycle.idle_grace",
@@ -8315,7 +8350,7 @@ pub fn help_text() -> String {
          \x20 agentd --config <settings.yaml> [--config <overlay.yaml> …] [--<path> <value> …]\n\
          \x20 agentd --prompt <TEXT> --intelligence <URL>                    # one-shot: ask, answer, exit\n\
          \x20 agentd --instruction <TEXT> --intelligence <URL> [--mcp name=endpoint …]   # one-shot sugar\n\
-         \x20 agentd tui|ui --config <settings.yaml> [--<path> <value> …]   # + a display client\n\
+         \x20 agentd tui|ui [launcher flags] --config <settings.yaml> [--<path> <value> …]   # + a display client\n\
          \n\
          Every setting is a document path (YAML/JSON file, AGENTD_<PATH> env, --<path> flag);\n\
          several files merge in order (later wins). Precedence: built-in < files < env < flags.\n\
@@ -8333,13 +8368,19 @@ pub fn help_text() -> String {
         out.push_str(&format!("  {:<32} {} → {}\n", a.flag, shape, a.path));
     }
     out.push_str(
-        "\nSUBCOMMANDS (run the daemon with a display client attached):\n\
-         \x20 tui                        + the terminal UI (fullscreen; --inline for in-place)\n\
-         \x20 ui                         + the web UI, opened in a browser\n\
-         \x20                            both need `interface.enabled: true`, which the\n\
-         \x20                            subcommand sets for you; the client exits with the daemon.\n\
-         \x20                            Detached instead: run `agentd -c …`, then `agentd-tui\n\
-         \x20                            --endpoint <url>` (npm i -g @agentd-dev/cli).\n\
+        "\nSUBCOMMANDS (a thin launcher: the daemon, plus a display client beside it):\n\
+         \x20 tui [--daemon-log PATH]    + the terminal UI (agentd-tui, or $AGENTD_TUI_BIN)\n\
+         \x20 ui [--port N] [--no-open] [--daemon-log PATH]\n\
+         \x20                            + the web UI (agentd-ui, or $AGENTD_UI_BIN) on\n\
+         \x20                            127.0.0.1:<port, default 4173>, opened in a browser\n\
+         \x20                            The daemon args load exactly as `agentd <args>` would:\n\
+         \x20                            the launcher adds no setting (put a2a.events.enabled and\n\
+         \x20                            a2a.introspection.enabled in the config). The client gets\n\
+         \x20                            only its endpoint, never a2a.bearer or a config secret;\n\
+         \x20                            it needs a loopback http(s) listener with a fixed port and\n\
+         \x20                            no client_ca, and each exits with the other. Daemon logs go\n\
+         \x20                            to --daemon-log (default $XDG_RUNTIME_DIR/agentd-<sub>-<pid>.log).\n\
+         \x20                            Anything else: run `agentd -c …`, then `agentd-<sub> --endpoint <url>`.\n\
          \nCONTROL:\n\
          \x20 -c, --config <PATH>        a settings file (repeatable; `=` form too; or AGENT_CONFIG=a.yaml:b.yaml)\n\
          \x20 --validate-config          load+validate everything, print the verdict, exit 0/2\n\
@@ -8358,6 +8399,16 @@ pub fn help_text() -> String {
     );
     for (flag, hint) in REMOVED_FLAGS {
         out.push_str(&format!("  {flag:<32} {hint}\n"));
+    }
+    out.push_str("\nREMOVED LAUNCHER FLAGS (agentd tui|ui):\n");
+    for (flag, hint) in crate::runtime::surface::launch::REMOVED_LAUNCHER_FLAGS {
+        out.push_str(&format!("  {flag:<32} {hint}\n"));
+    }
+    out.push_str(&format!(
+        "\nREMOVED KEYS (refused in a file, a flag, an AGENTD_ variable or a :::!config fragment; removed in {KEYS_REMOVED_IN}):\n"
+    ));
+    for (path, hint) in REMOVED_KEYS {
+        out.push_str(&format!("  {path:<32} {hint}\n"));
     }
     out.push('\n');
     out.push_str(&help_section());
@@ -9960,9 +10011,9 @@ mod tests {
             ),
             // It opened the human control plane and an inbound socket.
             (
-                "iface.md",
-                "interface:\n  enabled: true",
-                "interface.enabled",
+                "feed.md",
+                "a2a:\n  events:\n    enabled: true",
+                "a2a.events",
             ),
             (
                 "hook.md",
@@ -11007,7 +11058,7 @@ mod tests {
         ));
         assert!(e.contains(msg), "loopback: {e}");
         let e = load_errors(
-            "a2a:\n  listen: \"https://0.0.0.0:8443\"\n  tls: {cert: /c.pem, key: /k.pem}\n  device_grant: {enabled: true}\n",
+            "a2a:\n  listen: \"https://0.0.0.0:8443\"\n  url: \"https://agent.example:8443\"\n  tls: {cert: /c.pem, key: /k.pem}\n  device_grant: {enabled: true}\n",
         );
         assert!(e.contains(msg), "wildcard: {e}");
         // A user-role bearer_ref rule is not an operator credential.
@@ -11027,13 +11078,15 @@ mod tests {
             "a2a:\n{loopback}  principals: [{{id: ops, match: {{san: x.example, bearer_ref: \"{{{{secret:A2A_TEST_BEARER}}}}\"}}, role: operator}}]\n  device_grant: {{enabled: true}}\n"
         ));
         assert!(
-            e.contains("a2a.principals[0]: match sets more than one of san | sub | bearer_ref | aauth_agent | any"),
+            e.contains(
+                "a2a.principals[0]: match sets more than one of san | sub | bearer_ref | any"
+            ),
             "{e}"
         );
         // And the grant with a2a.bearer on a non-loopback https bind loads.
         assert_eq!(
             load_errors(&format!(
-                "a2a:\n  listen: \"https://0.0.0.0:8443\"\n{bearer}  tls: {{cert: /c.pem, key: /k.pem}}\n  device_grant: {{enabled: true}}\n"
+                "a2a:\n  listen: \"https://0.0.0.0:8443\"\n  url: \"https://agent.example:8443\"\n{bearer}  tls: {{cert: /c.pem, key: /k.pem}}\n  device_grant: {{enabled: true}}\n"
             )),
             ""
         );
@@ -11069,12 +11122,359 @@ mod tests {
         for m in [
             "{san: a.example, sub: s}",
             "{sub: s, any: true}",
-            "{san: a.example, aauth_agent: \"https://a.example\"}",
+            "{san: a.example, bearer_ref: \"{{secret:A2A_TEST_BEARER}}\"}",
         ] {
             let e = load_errors(&format!(
                 "a2a:\n  principals:\n    - {{id: a, match: {m}, role: user}}\n"
             ));
             assert!(e.contains("match sets more than one of"), "{m}: {e}");
+        }
+    }
+
+    /// A shared secret and "anyone" name no caller, so the rule has to: the
+    /// derived `user:unknown` merged every such caller's work into one
+    /// principal.
+    #[test]
+    fn a_bearer_or_any_rule_needs_an_id() {
+        let want = "a bearer_ref/any rule names one caller, so it needs `id:`";
+        for (rule, needs) in [
+            (
+                "{match: {bearer_ref: \"{{secret:A2A_TEST_BEARER}}\"}, role: user}",
+                true,
+            ),
+            ("{match: {any: true}, role: user}", true),
+            ("{match: {any: true}, role: anonymous}", true),
+            (
+                "{id: ci-bot, match: {bearer_ref: \"{{secret:A2A_TEST_BEARER}}\"}, role: agent}",
+                false,
+            ),
+            ("{id: anyone, match: {any: true}, role: user}", false),
+            // A certificate names its holder; the id stays optional.
+            ("{match: {san: a.example}, role: user}", false),
+            ("{match: {sub: alice}, role: user}", false),
+        ] {
+            let e = load_errors(&format!("a2a:\n  principals:\n    - {rule}\n"));
+            assert_eq!(
+                e.contains(&format!("a2a.principals[0]: {want}")),
+                needs,
+                "{rule}: {e}"
+            );
+        }
+    }
+
+    /// A wildcard bind is no address a caller can dial, so what the card and
+    /// the issuer publish has to be stated.
+    #[test]
+    fn a_wildcard_bind_needs_a2a_url() {
+        let a2a = |listen: &str, url: &str| {
+            load_errors(&format!(
+                "a2a:\n  listen: \"{listen}\"\n{url}  bearer: \"{{{{secret:A2A_TEST_BEARER}}}}\"\n  tls: {{cert: /c.pem, key: /k.pem}}\n"
+            ))
+        };
+        let want = "binds a wildcard host";
+        for listen in ["https://0.0.0.0:8443", "https://[::]:8443"] {
+            let e = a2a(listen, "");
+            assert!(
+                e.contains(want) && e.contains("set a2a.url"),
+                "{listen}: {e}"
+            );
+            assert_eq!(
+                a2a(listen, "  url: \"https://agent.example:8443\"\n"),
+                "",
+                "{listen} with a2a.url"
+            );
+        }
+        // A concrete host names itself.
+        assert_eq!(a2a("https://127.0.0.1:8443", ""), "");
+        assert_eq!(a2a("https://10.0.0.5:8443", ""), "");
+    }
+
+    /// A document setting `path` (`[]` = one element of the list) to `true`.
+    fn document_setting(path: &str) -> Value {
+        fn build(segs: &[&str]) -> Value {
+            let Some((head, rest)) = segs.split_first() else {
+                return json!(true);
+            };
+            match head.strip_suffix("[]") {
+                Some(key) => json!({ key: [build(rest)] }),
+                None => json!({ *head: build(rest) }),
+            }
+        }
+        build(&path.split('.').collect::<Vec<_>>())
+    }
+
+    /// The same document in block YAML, for a `:::!config` fragment.
+    fn yaml_setting(path: &str) -> String {
+        let mut out = String::new();
+        let mut indent = 0;
+        let mut item = false;
+        for seg in path.split('.') {
+            let (key, list) = match seg.strip_suffix("[]") {
+                Some(k) => (k, true),
+                None => (seg, false),
+            };
+            let lead = if item { "- " } else { "" };
+            out.push_str(&format!("{}{lead}{key}:\n", " ".repeat(indent)));
+            // A list item's keys sit past its `- `.
+            indent += if item { 4 } else { 2 };
+            item = list;
+        }
+        out.pop();
+        out.push_str(" true");
+        out
+    }
+
+    /// A removed key is refused BY NAME on every layer — a file, a flag, an
+    /// `AGENTD_` variable, a `:::!config` fragment — with the release and the
+    /// replacement, instead of "unknown field", "unknown argument",
+    /// "operator configuration" or, for a variable, silence.
+    #[test]
+    fn removed_keys_are_refused_by_name_everywhere() {
+        // The promised entries, spelled out so deleting a row fails here even
+        // though every loop below would shrink with the table.
+        for promised in [
+            "interface",
+            "interface.enabled",
+            "interface.debug",
+            "interface.display",
+            "interface.origins",
+            "interface.pairing",
+            "a2a.principals[].match.aauth_agent",
+        ] {
+            assert!(
+                REMOVED_KEYS.iter().any(|(k, _)| *k == promised),
+                "{promised} left REMOVED_KEYS"
+            );
+        }
+        let refused = |e: String, path: &str, hint: &str, layer: &str| {
+            assert!(
+                e.contains(&format!("`{path}` was removed in agentd 1.17.0: {hint}")),
+                "{layer} did not refuse {path} by name: {e}"
+            );
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let base = ["--store.kind", "memory"];
+        for (i, (path, hint)) in REMOVED_KEYS.iter().enumerate() {
+            let doc = document_setting(path);
+            // A FILE — alone, where it used to read as the flat schema, and
+            // beside a legacy flat key, where it used to read as a mixed one.
+            for (n, body) in [doc.clone(), {
+                let mut mixed = doc.clone();
+                mixed["model"] = json!("m");
+                mixed
+            }]
+            .into_iter()
+            .enumerate()
+            {
+                let f = dir.path().join(format!("removed-{i}-{n}.yaml"));
+                std::fs::write(&f, body.to_string()).unwrap();
+                let f = f.to_str().unwrap();
+                let e = load(&args(&["--config", f]), &[]).unwrap_err().to_string();
+                refused(e.clone(), path, hint, "a file");
+                assert!(e.contains(f), "the refusal names its file: {e}");
+                if n == 0 {
+                    assert_eq!(
+                        probe(&args(&["--config", f]), &[]).unwrap(),
+                        Detected::V2,
+                        "{path}: a file of just a removed section is this schema's"
+                    );
+                }
+            }
+            // A FRAGMENT, before the operator-configuration boundary names it
+            // something else.
+            let instr = dir.path().join(format!("removed-{i}.md"));
+            std::fs::write(
+                &instr,
+                format!(
+                    "You are the desk.\n\n:::!config\n{}\n:::\n",
+                    yaml_setting(path)
+                ),
+            )
+            .unwrap();
+            let e = Settings::from_document(
+                json!({"config_version": "1",
+                    "agent": {"name": "a", "preflight": "never",
+                              "instruction": {"file": instr.to_str().unwrap()}},
+                    "store": {"kind": "memory"}}),
+                "t",
+            )
+            .unwrap_err();
+            refused(e.clone(), path, hint, "a fragment");
+            assert!(e.contains(":::!config"), "{e}");
+            if path.contains("[]") {
+                // No flag or variable addresses a list element; the whole
+                // list does, and the merged document is refused.
+                let list = path.split("[]").next().unwrap();
+                let value = document_setting(path)
+                    .pointer(&format!("/{}", list.replace('.', "/")))
+                    .unwrap()
+                    .to_string();
+                let flag = format!("--{list}");
+                let mut a = args(&base);
+                a.extend(args(&[&flag, &value]));
+                refused(
+                    load(&a, &[]).unwrap_err().to_string(),
+                    path,
+                    hint,
+                    "a list flag",
+                );
+                let var = format!("AGENTD_{}", list.to_ascii_uppercase().replace('.', "_"));
+                refused(
+                    load(&args(&base), &[(var, value)]).unwrap_err().to_string(),
+                    path,
+                    hint,
+                    "a list variable",
+                );
+                continue;
+            }
+            // Every FLAG spelling the loader canonicalizes.
+            for flag in [
+                format!("--{path}"),
+                format!("--{}", path.replace('.', "-")),
+                format!("--{}", path.replace('.', "_")),
+            ] {
+                let mut a = args(&base);
+                a.extend(args(&[&flag, "true"]));
+                let e = load(&a, &[]).unwrap_err().to_string();
+                refused(e.clone(), path, hint, "a flag");
+                assert!(
+                    e.starts_with(&format!("agentd: {flag}:")),
+                    "the refusal names the flag: {e}"
+                );
+            }
+            // The VARIABLE, branded and neutral.
+            let upper = path.to_ascii_uppercase().replace('.', "_");
+            for var in [format!("AGENTD_{upper}"), format!("AGENT_{upper}")] {
+                let e = load(&args(&base), &[(var.clone(), "true".into())])
+                    .unwrap_err()
+                    .to_string();
+                refused(e, path, hint, &var);
+            }
+        }
+        // The catch-all answers for what nothing more specific names —
+        // including the launcher's old log-path variable and flag.
+        let (_, catch_all) = REMOVED_KEYS
+            .iter()
+            .find(|(k, _)| *k == "interface")
+            .unwrap();
+        let e = load(
+            &args(&base),
+            &[("AGENTD_INTERFACE_LOG".into(), "/tmp/x.log".into())],
+        )
+        .unwrap_err()
+        .to_string();
+        refused(e, "interface", catch_all, "AGENTD_INTERFACE_LOG");
+        let mut a = args(&base);
+        a.extend(args(&["--interface.anything", "1"]));
+        refused(
+            load(&a, &[]).unwrap_err().to_string(),
+            "interface",
+            catch_all,
+            "a flag under the catch-all",
+        );
+        // The bare spelling is too generic to claim, and is left alone.
+        assert!(load(&args(&base), &[("INTERFACE_LOG".into(), "x".into())]).is_ok());
+        // `--help` lists every removed key.
+        let help = help_text();
+        for (path, _) in REMOVED_KEYS {
+            assert!(help.contains(path), "--help omits {path}");
+        }
+    }
+
+    /// Whether `path` (`[]` = the list's items) resolves in the schema.
+    fn schema_has(schema: &Value, path: &str) -> bool {
+        let defs = &schema["$defs"];
+        let deref = |v: &Value| -> Value {
+            match v.get("$ref").and_then(Value::as_str) {
+                Some(r) => defs[r.trim_start_matches("#/$defs/")].clone(),
+                None => v.clone(),
+            }
+        };
+        let mut node = schema.clone();
+        for seg in path.split('.') {
+            let (key, list) = match seg.strip_suffix("[]") {
+                Some(k) => (k, true),
+                None => (seg, false),
+            };
+            let Some(child) = node.get("properties").and_then(|p| p.get(key)) else {
+                return false;
+            };
+            node = deref(child);
+            if list {
+                node = deref(&node["items"]);
+            }
+        }
+        true
+    }
+
+    /// A removed key is gone from the schema that generates every flag and
+    /// variable — and every key a hint sends the operator to is live.
+    #[test]
+    fn removed_keys_are_not_live_schema_paths() {
+        let schema = schema::schema();
+        // The walker itself: it finds a live list-element key and a nested one.
+        assert!(schema_has(&schema, "a2a.principals[].match.san"));
+        assert!(schema_has(&schema, "a2a.events.enabled"));
+        for (path, hint) in REMOVED_KEYS {
+            assert!(!schema_has(&schema, path), "{path} is still in the schema");
+            for word in hint.split(|c: char| c.is_whitespace() || c == ',' || c == ';') {
+                let word = word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_');
+                if word.starts_with("a2a.") || word.starts_with("observability.") {
+                    assert!(
+                        schema_has(&schema, word),
+                        "the hint for {path} names {word}, which is not a setting"
+                    );
+                }
+            }
+        }
+        let bindings = paths::bindings_of(&schema);
+        assert!(
+            !bindings.iter().any(|b| b.path.starts_with("interface")),
+            "an interface path still binds a flag or a variable"
+        );
+    }
+
+    /// The launcher's environment scrub reads the loader's own tables: every
+    /// alias under every prefix, and every path's names.
+    #[test]
+    fn consumed_env_names_cover_every_alias() {
+        let one = |name: &str| consumed_env_names(&[(name.to_string(), "x".to_string())]);
+        for (alias, _) in ENV_ALIASES {
+            for prefix in paths::ENV_PREFIXES {
+                let name = format!("{prefix}{alias}");
+                assert_eq!(
+                    one(&name),
+                    vec![name.clone()],
+                    "{name} is read by the loader"
+                );
+            }
+        }
+        // `a2a.bearer` travels under this alias, so all three spellings must go.
+        for name in ["SERVE_BEARER", "AGENTD_SERVE_BEARER", "AGENT_SERVE_BEARER"] {
+            assert_eq!(one(name), vec![name.to_string()]);
+        }
+        let bindings = paths::bindings_of(&schema::schema());
+        for b in bindings.iter().step_by(11) {
+            for name in b.env_names() {
+                assert_eq!(one(&name), vec![name.clone()], "{} via {name}", b.path);
+            }
+        }
+        for ignored in ["HOME", "PATH", "AGENTD_NOT_A_SETTING", "LLM_KEY"] {
+            assert!(one(ignored).is_empty(), "{ignored} is not the loader's");
+        }
+        // …and the ENV layer really reads an alias under each prefix, so the
+        // two cannot disagree about what "consumed" means.
+        for prefix in paths::ENV_PREFIXES {
+            let (l, _) = load(
+                &args(&["--store.kind", "memory"]),
+                &[(format!("{prefix}LOG_LEVEL"), "debug".into())],
+            )
+            .unwrap();
+            assert_eq!(
+                l.settings.observability.log_level.as_deref(),
+                Some("debug"),
+                "{prefix}LOG_LEVEL"
+            );
         }
     }
 

@@ -30,8 +30,9 @@ pub enum FeedVis {
 /// only read.
 pub struct SharedFeed {
     inner: Mutex<FeedInner>,
-    /// `interface.debug` — gates the debug event kinds (audit, logs). Atomic
-    /// because the operator can toggle it at runtime (`config.set`).
+    /// `a2a.introspection.enabled` — gates the introspection event kinds
+    /// (audit, logs). Atomic because the operator can toggle it at runtime
+    /// (`config.set`, a reload).
     debug: std::sync::atomic::AtomicBool,
 }
 
@@ -167,7 +168,7 @@ fn fingerprint(v: &Value) -> u64 {
 }
 
 impl Runtime {
-    /// Push an event onto the interface feed (a no-op unless `interface.enabled`).
+    /// Push an event onto the observation feed (a no-op unless `a2a.events.enabled`).
     pub(crate) fn feed_push(&self, kind: &str, vis: FeedVis, data: Value) {
         if let Some(feed) = &self.a2a_feed {
             feed.push(kind, vis, data);

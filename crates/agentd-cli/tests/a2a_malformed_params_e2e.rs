@@ -119,7 +119,7 @@ fn spawn_daemon(config: &str) -> Daemon {
 /// A daemon serving A2A over plaintext loopback (⇒ operator). The intelligence
 /// endpoint is deliberately dead: no turn is ever run here, and `preflight:
 /// never` means nothing dials it, which keeps the test to one process. The
-/// interface is armed because the observation feed is the other surface a
+/// feed is armed because the observation feed is the other surface a
 /// caller-supplied cursor is handed to.
 fn config(port: u16) -> String {
     format!(
@@ -127,8 +127,7 @@ fn config(port: u16) -> String {
          agent:\n  name: a2a-malformed\n  instruction: You are a test agent.\n  preflight: never\n\
          intelligence:\n  endpoints: https://127.0.0.1:9\n  model: mock\n\
          store:\n  kind: memory\n\
-         a2a:\n  listen: http://127.0.0.1:{port}\n\
-         interface:\n  enabled: true\n  debug: false\n\
+         a2a:\n  listen: http://127.0.0.1:{port}\n  events:\n    enabled: true\n\
          lifecycle:\n  run_until: drained\n\
          observability:\n  log_level: info\n"
     )

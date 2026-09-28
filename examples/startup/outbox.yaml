@@ -67,9 +67,8 @@ mcp:
 
 a2a:
   listen: http://127.0.0.1:8447
-
-interface:
-  enabled: true
+  events:
+    enabled: true
 
 limits:
   max_runs: 16

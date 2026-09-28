@@ -29,7 +29,7 @@ pub fn a2a_section(s: &Settings) -> Value {
     let mut methods: Vec<&str> = super::METHODS
         .iter()
         .copied()
-        .filter(|m| *m != "SubscribeToEvents" || s.interface.enabled)
+        .filter(|m| *m != "SubscribeToEvents" || s.a2a.events.enabled)
         .chain(super::LOCAL_METHODS.iter().copied())
         .collect();
     methods.sort_unstable();
@@ -60,8 +60,6 @@ fn principal_match_desc(m: &crate::config::v2::PrincipalMatch) -> Value {
         json!({"sub": s})
     } else if m.bearer_ref.is_some() {
         json!({"bearer_ref": "***"})
-    } else if let Some(a) = &m.aauth_agent {
-        json!({"aauth_agent": a})
     } else {
         json!({})
     }
@@ -79,7 +77,7 @@ mod tests {
     /// `a2a` section from here rather than from a copy.
     #[test]
     fn a2a_section_is_byte_identical() {
-        let mut s = Settings {
+        let s = Settings {
             a2a: serde_json::from_value(json!({
                 "listen": "https://0.0.0.0:8443",
                 "bearer": "{{secret:A2A_BEARER}}",
@@ -88,30 +86,29 @@ mod tests {
                     {"match": {"san": "spiffe://corp/ops/*"}, "role": "operator"},
                     {"match": {"sub": "alice"}, "role": "user", "grants": ["knowledge.*"]},
                     {"match": {"bearer_ref": "{{secret:PEER}}"}, "role": "agent"},
-                    {"match": {"aauth_agent": "agent://*"}, "role": "agent"},
                     {"match": {"any": true}, "role": "anonymous"}
-                ]
+                ],
+                "events": {"enabled": true},
+                "introspection": {"enabled": true}
             }))
             .unwrap(),
             ..Settings::default()
         };
-        s.interface.enabled = true;
-        s.interface.debug = true;
-        s.interface.pairing.enabled = true;
         assert_eq!(
             a2a_section(&s).to_string(),
-            r#"{"bearer":true,"command_ops":["status","config","workflow.run","workflow.status","workflow.cancel","workflow.signal","subagent.send","subagent.kill","subagent.status","plan.get","admin.drain","admin.lameduck","admin.pause","admin.resume","admin.cancel","interface.info","config.set","conversation.get","run.get","subagent.get","debug.events","pairing.code"],"extensions":["https://agentd.dev/a2a/ext/command/v1","https://agentd.dev/a2a/ext/interface/v1"],"listen":"https://0.0.0.0:8443","loopback_operator":false,"methods":["CancelTask","CreateTaskPushNotificationConfig","DeleteTaskPushNotificationConfig","GetAgentCard","GetExtendedAgentCard","GetTask","GetTaskPushNotificationConfig","ListTaskPushNotificationConfigs","ListTasks","Pair","SendMessage","SendStreamingMessage","SubscribeToEvents","SubscribeToTask"],"mtls":true,"principals":[{"grants":[],"match":{"san":"spiffe://corp/ops/*"},"role":"operator"},{"grants":["knowledge.*"],"match":{"sub":"alice"},"role":"user"},{"grants":[],"match":{"bearer_ref":"***"},"role":"agent"},{"grants":[],"match":{"aauth_agent":"agent://*"},"role":"agent"},{"grants":[],"match":{"any":true},"role":"anonymous"}],"tls":true}"#
+            r#"{"bearer":true,"command_ops":["status","config","workflow.run","workflow.status","workflow.cancel","workflow.signal","subagent.send","subagent.kill","subagent.status","plan.get","admin.drain","admin.lameduck","admin.pause","admin.resume","admin.cancel","interface.info","config.set","conversation.get","run.get","subagent.get","debug.events"],"extensions":["https://agentd.dev/a2a/ext/command/v1","https://agentd.dev/a2a/ext/interface/v1"],"listen":"https://0.0.0.0:8443","loopback_operator":false,"methods":["CancelTask","CreateTaskPushNotificationConfig","DeleteTaskPushNotificationConfig","GetAgentCard","GetExtendedAgentCard","GetTask","GetTaskPushNotificationConfig","ListTaskPushNotificationConfigs","ListTasks","SendMessage","SendStreamingMessage","SubscribeToEvents","SubscribeToTask"],"mtls":true,"principals":[{"grants":[],"match":{"san":"spiffe://corp/ops/*"},"role":"operator"},{"grants":["knowledge.*"],"match":{"sub":"alice"},"role":"user"},{"grants":[],"match":{"bearer_ref":"***"},"role":"agent"},{"grants":[],"match":{"any":true},"role":"anonymous"}],"tls":true}"#
         );
 
         let mut t = s.clone();
-        t.interface = Default::default();
+        t.a2a.events = Default::default();
+        t.a2a.introspection = Default::default();
         t.a2a.principals.clear();
         t.a2a.bearer = None;
         t.a2a.tls = Default::default();
         t.a2a.listen = Some("unix:/run/agentd.sock".into());
         assert_eq!(
             a2a_section(&t).to_string(),
-            r#"{"bearer":false,"command_ops":["status","config","workflow.run","workflow.status","workflow.cancel","workflow.signal","subagent.send","subagent.kill","subagent.status","plan.get","admin.drain","admin.lameduck","admin.pause","admin.resume","admin.cancel"],"extensions":["https://agentd.dev/a2a/ext/command/v1"],"listen":"unix:/run/agentd.sock","loopback_operator":true,"methods":["CancelTask","CreateTaskPushNotificationConfig","DeleteTaskPushNotificationConfig","GetAgentCard","GetExtendedAgentCard","GetTask","GetTaskPushNotificationConfig","ListTaskPushNotificationConfigs","ListTasks","Pair","SendMessage","SendStreamingMessage","SubscribeToTask"],"mtls":false,"principals":[],"tls":false}"#
+            r#"{"bearer":false,"command_ops":["status","config","workflow.run","workflow.status","workflow.cancel","workflow.signal","subagent.send","subagent.kill","subagent.status","plan.get","admin.drain","admin.lameduck","admin.pause","admin.resume","admin.cancel"],"extensions":["https://agentd.dev/a2a/ext/command/v1"],"listen":"unix:/run/agentd.sock","loopback_operator":true,"methods":["CancelTask","CreateTaskPushNotificationConfig","DeleteTaskPushNotificationConfig","GetAgentCard","GetExtendedAgentCard","GetTask","GetTaskPushNotificationConfig","ListTaskPushNotificationConfigs","ListTasks","SendMessage","SendStreamingMessage","SubscribeToTask"],"mtls":false,"principals":[],"tls":false}"#
         );
 
         t.a2a.listen = None;

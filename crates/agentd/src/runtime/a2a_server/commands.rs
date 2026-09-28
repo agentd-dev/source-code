@@ -36,7 +36,6 @@ impl Runtime {
             "run.get" => return self.interface_run_get(principal, &data),
             "subagent.get" => return self.interface_subagent_get(&data),
             "debug.events" => return self.interface_debug_events(&data),
-            "pairing.code" => return self.interface_pairing_code(),
             "config.set" => return self.interface_config_set(&data),
             _ => {}
         }

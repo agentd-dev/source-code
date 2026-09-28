@@ -144,12 +144,6 @@ async fn dispatch(
             }
             return unary(&app, id, "GetExtendedAgentCard", json!({}), principal).await;
         }
-        // The one method an anonymous caller may use: exchanging the rotating
-        // code for a session token IS the login, so requiring a principal here
-        // would make pairing impossible.
-        "Pair" | "interface.pair" => {
-            return unary(&app, id, "Pair", params, principal).await;
-        }
         "SubscribeToEvents" => {
             return match &app.bridge.feed() {
                 Some(feed) => {
@@ -161,7 +155,7 @@ async fn dispatch(
                 None => err(
                     id,
                     -32004,
-                    "the interface surface is disabled (set interface.enabled: true)",
+                    "the observation feed is disabled (set a2a.events.enabled: true)",
                 ),
             };
         }

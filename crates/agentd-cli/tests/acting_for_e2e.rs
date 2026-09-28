@@ -113,7 +113,7 @@ fn a_malformed_rate_quota_is_refused_at_startup() {
     let (code, log) = run(&format!(
         "{BASE}agent: {{ name: a }}\n\
          a2a:\n  principals:\n\
-        \x20   - match: {{ any: true }}\n      role: user\n\
+        \x20   - id: anyone\n      match: {{ any: true }}\n      role: user\n\
         \x20     quotas: {{ rate: \"not-a-rate\" }}\n{WF}"
     ));
     assert_eq!(code, Some(2), "{log}");

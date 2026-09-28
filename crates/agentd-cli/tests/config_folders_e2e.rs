@@ -573,7 +573,7 @@ fn validate_refuses_every_credential_reference_startup_refuses() {
         ),
         (
             "principal bearer_ref",
-            "intelligence: { endpoints: \"https://x/v1\", model: m }\na2a: { listen: \"http://127.0.0.1:8477\", principals: [ { match: { bearer_ref: \"{{secret:ABSENT_ONE}}\" }, role: user } ] }\n",
+            "intelligence: { endpoints: \"https://x/v1\", model: m }\na2a: { listen: \"http://127.0.0.1:8477\", principals: [ { id: ci-bot, match: { bearer_ref: \"{{secret:ABSENT_ONE}}\" }, role: user } ] }\n",
         ),
     ];
     for (what, body) in cases {

@@ -56,9 +56,10 @@ internal-mocks = ["agentd/internal-mocks"]
 agentd = { package = "agentd-core", path = "../agentd", version = "1.16.0", default-features = false }
 serde_json = "1"
 
-# The `agentd tui`/`agentd ui` passthrough: fd plumbing (hand the
-# tty to the client child, redirect daemon logs) + signal-driven lifetime tie.
-# Within the 3-dependency moat (libc is a core dependency already).
+# The `agentd tui`/`agentd ui` launcher: descriptor plumbing (close-on-exec
+# copies of the terminal for the client, the web UI's socket delivered as fd 3
+# in the client alone, the daemon log opened O_NOFOLLOW) and the signal-driven
+# lifetime tie. Within the 3-dependency moat (libc is a core dependency already).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

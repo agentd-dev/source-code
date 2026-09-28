@@ -2,11 +2,11 @@
 //! The JSON-RPC methods the listener answers.
 
 /// Calls answered by the listener BEFORE the dispatch table, so they never
-/// appear in [`METHODS`]: the public card read, and the interface pairing
-/// handshake. Both are served — `--capabilities` reports them — and both are
-/// deliberately outside the spec-method assertions, which is why they need a
-/// name of their own rather than an exception buried in three test files.
-pub const LOCAL_METHODS: &[&str] = &["GetAgentCard", "Pair"];
+/// appear in [`METHODS`]: the public card read. It is served — `--capabilities`
+/// reports it — and deliberately outside the spec-method assertions, which is
+/// why it needs a name of its own rather than an exception buried in three
+/// test files.
+pub const LOCAL_METHODS: &[&str] = &["GetAgentCard"];
 
 /// Every JSON-RPC method the A2A listener dispatches.
 ///

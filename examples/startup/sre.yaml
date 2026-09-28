@@ -86,12 +86,11 @@ webhooks:
 
 a2a:
   listen: http://127.0.0.1:8444
+  events:
+    enabled: true
   peers:
     - name: engineering
       endpoint: http://127.0.0.1:8442
-
-interface:
-  enabled: true
 
 limits:
   max_runs: 10

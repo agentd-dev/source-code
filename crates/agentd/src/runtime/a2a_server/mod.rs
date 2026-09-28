@@ -44,9 +44,8 @@ mod tasks;
 
 pub use feed::{FeedVis, SharedFeed};
 pub(crate) use listener::{A2aServing, spawn_a2a_listener};
-pub(crate) use send::command_data;
 pub use send::command_op;
-use tasks::new_task_id;
+pub(crate) use send::{command_data, command_names_task};
 
 pub use super::surface::{
     COMMAND_EXTENSION, EXTENSION_METHODS, EXTENSIONS, INTERFACE_EXTENSION, command_ops_of,
@@ -172,15 +171,14 @@ impl A2aBridge {
 // ---- the bridge's verbs ------------------------------------------------------
 
 /// What the transport asks the runtime: the verbs of the bridge between them.
-/// Not the spec's method names — push configs travel as `PushConfig*`, a
-/// send is preceded by a `NewTaskId` mint, and the public card is
-/// `PublicCard` because no wire method reads it — so anything that classifies
+/// Not the spec's method names — push configs travel as `PushConfig*`, and
+/// the public card is `PublicCard` because no wire method reads it — so
+/// anything that classifies
 /// a call the runtime answered (the audit mirror) reads THIS, not the spec's
 /// vocabulary, which is how it once listed names that never arrived.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Verb {
     SendMessage,
-    NewTaskId,
     GetTask,
     ListTasks,
     CancelTask,
@@ -197,7 +195,6 @@ impl Verb {
     #[cfg(test)]
     pub(crate) const ALL: &[Verb] = &[
         Verb::SendMessage,
-        Verb::NewTaskId,
         Verb::GetTask,
         Verb::ListTasks,
         Verb::CancelTask,
@@ -214,7 +211,6 @@ impl Verb {
     pub(crate) fn of(method: &str) -> Option<Verb> {
         Some(match method {
             "SendMessage" | "SendStreamingMessage" => Verb::SendMessage,
-            "NewTaskId" => Verb::NewTaskId,
             "GetTask" => Verb::GetTask,
             "ListTasks" => Verb::ListTasks,
             "CancelTask" => Verb::CancelTask,
@@ -228,13 +224,11 @@ impl Verb {
         })
     }
 
-    /// Whether the verb changes nothing a caller can observe. A mint is
-    /// plumbing the transport issues before every send, not a change. One
-    /// exhaustive match, so a new verb cannot be left unclassified.
+    /// Whether the verb changes nothing a caller can observe. One exhaustive
+    /// match, so a new verb cannot be left unclassified.
     pub(crate) fn reads(self) -> bool {
         match self {
-            Verb::NewTaskId
-            | Verb::GetTask
+            Verb::GetTask
             | Verb::ListTasks
             | Verb::PushConfigGet
             | Verb::PushConfigList
@@ -275,24 +269,19 @@ impl Runtime {
         // the whole principal. (The declared rate is admission, and the
         // listener applies it before a request reaches this loop.)
         self.note_principal(&principal);
-        // The listener pre-mints the id of the task this request will create,
-        // because the protocol layer subscribes to a task's updates before the
-        // work starts. Whichever path creates it — a conversation turn or a
+        // A send that creates a task creates it under the id a2a-rs generated
+        // for it, because the protocol layer subscribed to that id before the
+        // work started. Whichever path creates it — a conversation turn or a
         // command — takes the id from here, so the caller is watching the task
-        // it is actually given.
-        self.reserved_task_id = params["message"]["taskId"]
-            .as_str()
+        // it is actually given. Only a new task's id is reserved: the id a
+        // caller named is for a task that must already exist (see `a2a_send`).
+        self.reserved_task_id = (params["newTask"] == json!(true))
+            .then(|| params["taskId"].as_str())
+            .flatten()
             .filter(|s| !s.is_empty() && !self.tasks.contains_key(*s))
             .map(str::to_string);
         let out = match Verb::of(&method) {
             Some(Verb::SendMessage) => self.a2a_send(&principal, &params),
-            // The listener asks for the id a new task will have BEFORE
-            // dispatching the send. The protocol layer subscribes to a task's
-            // updates first and processes the message second, so that no
-            // transition is missed — which means the id has to exist before the
-            // work does. Minting stays here so one place owns the shape of a
-            // task id (see `new_task_id`).
-            Some(Verb::NewTaskId) => json!({"id": new_task_id()}),
             Some(Verb::GetTask) => self.a2a_get_task(&principal, &params),
             Some(Verb::ListTasks) => self.a2a_list_tasks(&principal, &params),
             Some(Verb::CancelTask) => self.a2a_cancel_task(&principal, &params),

@@ -1038,10 +1038,9 @@ fn live_activity_reports_phase_tool_and_tokens_on_the_feed() {
     wait_for(&frames, 10, |f| {
         activity(f).iter().any(|a| a["phase"] == "thinking")
     });
+    let task_id = sent["task"]["id"].as_str().unwrap_or_default().to_string();
     wait_for(&frames, 10, |f| {
-        activity(f)
-            .iter()
-            .any(|a| a["task"].as_str().is_some_and(|t| t.starts_with("task-")))
+        activity(f).iter().any(|a| a["task"] == task_id.as_str())
     });
     // …and the unit's record disappears when the turn ends.
     wait_for(&frames, 10, |f| {
@@ -1057,7 +1056,7 @@ fn live_activity_reports_phase_tool_and_tokens_on_the_feed() {
     );
     let bound = acts
         .iter()
-        .find(|a| a["task"].as_str().is_some_and(|t| t.starts_with("task-")))
+        .find(|a| a["task"] == task_id.as_str())
         .expect("the A2A turn's activity binds to its task");
     // The conversation is the one the task names. A send that names none gets
     // the id a2a-rs mints for it (a UUIDv4), so the check is against

@@ -422,9 +422,12 @@ fn a_subagents_gate_is_unowned_even_under_an_owned_turn() {
 ///
 /// The path: a `workflow.signal` releases a wait inside a `foreach` body, and
 /// the body's next step — a call an `ask` policy gates, in a run nobody owns
-/// — opens its gate before the signal command's own task is created. Had the
-/// gate taken the reservation, the caller would be answered with a task it
-/// never asked for, and handed a subscription to someone else's gate.
+/// — opens its gate before the signal command's own task is created. The
+/// reservation is the id a2a-rs generated for the command's task and has
+/// already subscribed to; a caller cannot name it (a command carries no task
+/// id). Had the gate taken it, the command's task would come back under an id
+/// nobody is watching — and the send refuses to answer with any task but the
+/// one a2a-rs watches, so the caller would get an error instead of its task.
 #[test]
 fn a_gate_opened_mid_request_never_takes_the_requests_task_id() {
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
@@ -465,15 +468,17 @@ fn a_gate_opened_mid_request_never_takes_the_requests_task_id() {
         std::thread::sleep(Duration::from_millis(80));
     }
 
-    let reserved = "task-signal-probe";
-    let sent = SendMessage::command("workflow.signal", json!({"name": "go"}))
-        .task(reserved)
-        .result(&addr);
+    let sent = SendMessage::command("workflow.signal", json!({"name": "go"})).post(&addr);
+    let task = &sent["result"]["task"];
+    let signal_task = task["id"].as_str().unwrap_or_else(|| {
+        panic!(
+            "the signal's task lost its id to the gate it opened: {sent}\n{}",
+            daemon.stderr()
+        )
+    });
     assert_eq!(
-        sent["task"]["id"],
-        reserved,
-        "the signal's task lost its id to the gate it opened: {sent}\n{}",
-        daemon.stderr()
+        task["history"][0]["parts"][0]["data"]["agentd"]["op"], "workflow.signal",
+        "the caller got the signal's own task: {sent}"
     );
     let open = gates(&addr);
     assert_eq!(
@@ -482,7 +487,7 @@ fn a_gate_opened_mid_request_never_takes_the_requests_task_id() {
         "the body's gate opened: {open:?}\n{}",
         daemon.stderr()
     );
-    assert_ne!(open[0], reserved, "the gate took the reservation");
+    assert_ne!(open[0], signal_task, "the gate took the reservation");
     std::fs::remove_file(&cfg).ok();
 }
 

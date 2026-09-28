@@ -754,7 +754,6 @@ fn reads_are_audited_but_not_mirrored_onto_the_feed() {
         "a2a.ListTasks ok",
         "a2a.GetTask ok",
         "a2a.GetExtendedAgentCard ok",
-        "a2a.NewTaskId ok",
     ] {
         assert!(
             !actions.iter().any(|a| a == read),

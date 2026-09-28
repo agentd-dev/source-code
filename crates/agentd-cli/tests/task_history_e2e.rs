@@ -144,8 +144,7 @@ fn history_carries_the_turn() {
     let llm = spawn_mock_llm(&json!({
         "turns": [
             {"tool_calls": [{"name": "ask_human", "arguments": {"question": "Proceed?"}}]},
-            {"content": "Proceeded."},
-            {"content": "Continued."}
+            {"content": "Proceeded."}
         ]
     }));
     let (_daemon, addr) = boot(&llm.uri);
@@ -181,21 +180,34 @@ fn history_carries_the_turn() {
         .to_string();
 
     // The answer resumes the turn; afterwards history reads prompt, question,
-    // answer — the question under the id it had while it was the status.
-    let answer = SendMessage::text("yes").task(&task_id).return_immediately();
-    let answer_id = answer.params()["message"]["messageId"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    answer.result(&addr);
+    // answer — the question under the id it had while it was the status. The
+    // answer is sent under the QUESTION's id: a caller knows its task id and
+    // the agent's numbering, and a console that dedupes by id would otherwise
+    // drop the agent's question or this message as a repeat. The answer's id
+    // is minted over instead.
+    let mut answer = SendMessage::text("yes")
+        .task(&task_id)
+        .return_immediately()
+        .params();
+    answer["message"]["messageId"] = json!(question_id);
+    rpc(&addr, 4, "SendMessage", answer);
     let done = wait_task(&addr, &task_id, "completion", |t| {
         t["status"]["state"] == "TASK_STATE_COMPLETED"
     });
     let ids = history_ids(&done);
     assert_eq!(
-        ids[..3],
-        [prompt_id.as_str(), question_id.as_str(), answer_id.as_str()],
+        ids[..2],
+        [prompt_id.as_str(), question_id.as_str()],
         "{done}"
+    );
+    assert!(
+        !ids[2].is_empty() && ids[2] != question_id,
+        "the answer's id was minted over: {done}"
+    );
+    assert_eq!(
+        ids.iter().filter(|id| **id == question_id).count(),
+        1,
+        "the question's id names the question alone: {done}"
     );
     assert_eq!(done["history"][1]["role"], "ROLE_AGENT");
     assert_eq!(done["history"][1]["parts"][0]["text"], "Proceed?");
@@ -272,35 +284,19 @@ fn history_carries_the_turn() {
         json!([agentd::runtime::surface::COMMAND_EXTENSION])
     );
 
-    // A follow-up on the finished task is recorded too — the continuation
-    // path, neither a new task nor a gate answer. It is sent under the
-    // QUESTION's id: a caller knows its task id and the agent's numbering,
-    // and a console that dedupes by id would otherwise drop the agent's
-    // question or this message as a repeat. The id is minted over instead.
-    let mut follow = SendMessage::text("And again")
+    // A finished task takes no more messages: a follow-up is refused, and
+    // nothing joins its history.
+    let follow = SendMessage::text("And again")
         .task(&task_id)
         .return_immediately()
-        .params();
-    follow["message"]["messageId"] = json!(question_id);
-    let replied = rpc(&addr, 9, "SendMessage", follow);
-    assert_eq!(replied["task"]["id"], task_id.as_str(), "{replied}");
-    let again = wait_task(&addr, &task_id, "the continuation", |t| {
-        t["status"]["state"] == "TASK_STATE_COMPLETED"
-            && t["history"].to_string().contains("And again")
-    });
-    let ids = history_ids(&again);
-    let follow_up = again["history"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|m| m["parts"][0]["text"] == "And again")
-        .expect("the follow-up is in history");
-    assert_eq!(follow_up["role"], "ROLE_USER", "{again}");
-    assert_eq!(follow_up["taskId"], task_id.as_str());
-    assert_ne!(follow_up["messageId"], question_id.as_str(), "{again}");
+        .post(&addr);
+    assert_eq!(follow["error"]["code"], -32004, "{follow}");
     assert_eq!(
-        ids.iter().filter(|id| **id == question_id).count(),
-        1,
-        "the question's id names the question alone: {again}"
+        follow["error"]["message"],
+        format!("task {task_id} is TASK_STATE_COMPLETED; it accepts no further messages"),
+        "{follow}"
     );
+    let after = rpc(&addr, 9, "GetTask", json!({"id": task_id}));
+    assert_eq!(history_ids(&after), ids, "{after}");
+    assert_eq!(after["status"]["state"], "TASK_STATE_COMPLETED", "{after}");
 }

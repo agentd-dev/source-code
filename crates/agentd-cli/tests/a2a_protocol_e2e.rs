@@ -16,7 +16,13 @@
 //! * a subscription to a task the caller cannot see is refused as JSON
 //!   before any stream is opened;
 //! * a refusal the RUNTIME made reaches the caller in the runtime's words,
-//!   even when a2a-rs was the layer that answered.
+//!   even when a2a-rs was the layer that answered — a draining agent's above
+//!   all, which is the same object whichever path the send took;
+//! * a task id is the server's: a message names a task only to continue it,
+//!   and a new task's id is generated, never the caller's;
+//! * a message is the spec's `SendMessageRequest`, spoken as a user, with
+//!   parts of the media types the card accepts — and a field it does not know
+//!   is ignored, not refused.
 #![cfg(all(unix, feature = "a2a"))]
 
 mod common;
@@ -44,12 +50,17 @@ impl Drop for MockLlm {
     }
 }
 
-/// A mock model that answers every turn with one line.
+/// A mock model that answers every turn with one line — slowly, when the
+/// conversation asks for it, so a task can be held open.
 fn spawn_mock_llm() -> MockLlm {
     let pb = common::unique_path("protocol-playbook", "json");
     std::fs::write(
         &pb,
-        json!({"turns": [{"content": "an answer"}]}).to_string(),
+        json!({
+            "turns": [{"content": "an answer"}],
+            "match": [{"when_contains": "slowly", "content": "a slow answer", "delay_ms": 4000}],
+        })
+        .to_string(),
     )
     .unwrap();
     let addr_file = common::unique_path("protocol-mock-llm", "addr");
@@ -92,6 +103,11 @@ impl Drop for Daemon {
 /// A daemon with three principals: an operator, a user and an agent, each
 /// named by its bearer — so the two non-operators are two owners.
 fn boot() -> Daemon {
+    boot_with("")
+}
+
+/// [`boot`] with `extra` appended to the config.
+fn boot_with(extra: &str) -> Daemon {
     let llm = spawn_mock_llm();
     let cfg = common::unique_path("a2a-protocol", "yaml");
     std::fs::write(
@@ -112,10 +128,11 @@ fn boot() -> Daemon {
              \x20   - id: agent-b\n\
              \x20     match: {{ bearer_ref: \"{{{{secret:PROTOCOL_E2E_B}}}}\" }}\n\
              \x20     role: agent\n\
-             lifecycle:\n  run_until: drained\n\
-             observability:\n  log_level: info\n",
+             lifecycle:\n  run_until: drained\n  drain_timeout: 60s\n\
+             observability:\n  log_level: info\n{}",
             llm.uri,
-            common::free_port()
+            common::free_port(),
+            extra
         ),
     )
     .unwrap();
@@ -382,7 +399,7 @@ fn stream_shapes() {
         &rpc_body(
             33,
             "SendStreamingMessage",
-            json!({"message": {"role": "ROLE_USER", "messageId": "m-empty", "parts": [{"data": {"k": 1}}]},
+            json!({"message": {"role": "ROLE_USER", "messageId": "m-empty", "parts": [{"text": " "}]},
                    "configuration": {"returnImmediately": false}}),
         ),
         &[("Authorization", &auth(USER_A))],
@@ -421,8 +438,8 @@ fn runtime_refusals_survive_the_sdk() {
     let d = boot();
     // A message with nothing a turn could be made of: the runtime refuses the
     // turn, on the natural-language path a2a-rs serves.
-    let empty = json!({"message": {"role": "ROLE_USER", "messageId": "m-data-only",
-        "parts": [{"data": {"k": 1}}]}, "configuration": {"returnImmediately": true}});
+    let empty = json!({"message": {"role": "ROLE_USER", "messageId": "m-blank",
+        "parts": [{"text": " "}]}, "configuration": {"returnImmediately": true}});
     for method in ["SendMessage", "SendStreamingMessage"] {
         let reply = call(&d, USER_A, 71, method, empty.clone());
         assert!(is_json(&reply), "{method}: {reply:?}");
@@ -461,4 +478,300 @@ fn runtime_refusals_survive_the_sdk() {
     assert_eq!(error["data"][0]["reason"], "UNKNOWN_OP", "{v}");
     assert_eq!(error["data"][0]["domain"], "agentd.dev", "{v}");
     no_sdk_domain(error);
+}
+
+/// Whether `id` is a UUIDv4 in its canonical lower-case form — the id a2a-rs
+/// generates, and so the shape of every task id a send creates.
+fn is_uuid_v4(id: &str) -> bool {
+    id.len() == 36
+        && id.as_bytes()[14] == b'4'
+        && id.char_indices().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => c == '-',
+            _ => c.is_ascii_hexdigit() && !c.is_ascii_uppercase(),
+        })
+}
+
+/// The task a send refused must not exist, for its caller or anyone: the
+/// operator lists every task.
+fn assert_no_task_named(d: &Daemon, id: &str) {
+    let v = call(d, OPERATOR, 901, "ListTasks", json!({"pageSize": 100})).json();
+    let tasks = v["result"]["tasks"].as_array().cloned().unwrap_or_default();
+    assert!(
+        tasks.iter().all(|t| t["id"] != id),
+        "a task was created under the caller's id {id}: {v}"
+    );
+}
+
+/// A task id is the server's (A2A 1.0 §3.4.2).
+///
+/// - A send that names no task — or names it empty — gets a new task under an
+///   id a2a-rs generated.
+/// - A named task must exist and be the caller's: an unknown id and another
+///   principal's task are "not found", and no task is created under the id.
+/// - A settled task takes no further messages.
+/// - A task still open continues under its own id.
+/// - A command names no task; and a context that is not the task's own is
+///   refused.
+#[test]
+fn task_id_rules() {
+    let d = boot();
+
+    let done = SendMessage::text("hello").bearer(USER_A).result(&d.addr);
+    let id = done["task"]["id"].as_str().expect("a task id").to_string();
+    assert!(is_uuid_v4(&id), "a generated id: {done}");
+    assert_eq!(
+        done["task"]["status"]["state"], "TASK_STATE_COMPLETED",
+        "{done}"
+    );
+    let mut blank = SendMessage::text("hello").return_immediately().params();
+    blank["message"]["taskId"] = json!("");
+    let fresh = call(&d, USER_A, 11, "SendMessage", blank).json();
+    let fresh_id = fresh["result"]["task"]["id"].as_str().unwrap_or_default();
+    assert!(is_uuid_v4(fresh_id) && fresh_id != id, "{fresh}");
+
+    let before_a = task_count(&d, USER_A);
+    let before_b = task_count(&d, AGENT_B);
+    for streaming in [false, true] {
+        let with = |s: SendMessage| if streaming { s.streaming() } else { s };
+        // An id nobody holds: never the id of a new task.
+        let reply =
+            with(SendMessage::text("hi").task("my-own-id").bearer(USER_A)).post_raw(&d.addr);
+        assert!(is_json(&reply), "{reply:?}");
+        let v = reply.json();
+        assert_eq!(v["error"]["code"], -32001, "streaming {streaming}: {v}");
+        assert_no_task_named(&d, "my-own-id");
+        // Another principal's task: the same answer, so its existence is not
+        // disclosed — and not a fresh task of the caller's own either.
+        let v = with(SendMessage::text("hi").task(&id).bearer(AGENT_B)).post(&d.addr);
+        assert_eq!(v["error"]["code"], -32001, "streaming {streaming}: {v}");
+        // A settled task.
+        let v = with(SendMessage::text("again").task(&id).bearer(USER_A)).post(&d.addr);
+        assert_eq!(
+            v["error"],
+            json!({"code": -32004,
+                   "message": format!("task {id} is TASK_STATE_COMPLETED; it accepts no further messages")}),
+            "streaming {streaming}: {v}"
+        );
+    }
+    assert_eq!(
+        task_count(&d, USER_A),
+        before_a,
+        "a refused send made a task"
+    );
+    assert_eq!(
+        task_count(&d, AGENT_B),
+        before_b,
+        "a refused send made a task"
+    );
+    let still = call(&d, USER_A, 12, "GetTask", json!({"id": id})).json();
+    assert_eq!(
+        still["result"]["status"]["state"], "TASK_STATE_COMPLETED",
+        "a settled task stays settled: {still}"
+    );
+
+    // A command starts its own task, on either path it can take — refused
+    // before anything reads the task it names, so the answer is the same for
+    // a task that exists and one that does not.
+    for (op, task) in [
+        ("status", id.as_str()),
+        ("workflow.run", id.as_str()),
+        ("workflow.run", "my-own-id"),
+    ] {
+        for streaming in [false, true] {
+            let mut s = SendMessage::command(op, json!({"workflow": "none"}))
+                .task(task)
+                .bearer(OPERATOR);
+            if streaming {
+                s = s.streaming();
+            }
+            let reply = s.post_raw(&d.addr);
+            assert!(is_json(&reply), "{op}: {reply:?}");
+            let v = reply.json();
+            assert_eq!(v["error"]["code"], -32602, "{op} {task}: {v}");
+            assert_eq!(
+                v["error"]["data"][1]["reason"], "COMMAND_TASK_ID",
+                "{op}: {v}"
+            );
+            assert_eq!(
+                v["error"]["data"][0]["fieldViolations"][0]["field"], "message.taskId",
+                "{op}: {v}"
+            );
+        }
+    }
+
+    // A task still open continues under its own id.
+    let open = SendMessage::text("answer slowly")
+        .return_immediately()
+        .bearer(USER_A)
+        .result(&d.addr);
+    let open_id = open["task"]["id"].as_str().expect("a task id").to_string();
+    let ctx = open["task"]["contextId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let more = SendMessage::text("and one more thing")
+        .task(&open_id)
+        .return_immediately()
+        .bearer(USER_A)
+        .result(&d.addr);
+    assert_eq!(more["task"]["id"], open_id.as_str(), "{more}");
+    assert_eq!(more["task"]["contextId"], ctx.as_str(), "{more}");
+    // …but not from another conversation.
+    let v = SendMessage::text("elsewhere")
+        .task(&open_id)
+        .context("not-the-tasks-context")
+        .return_immediately()
+        .bearer(USER_A)
+        .post(&d.addr);
+    assert_eq!(v["error"]["code"], -32602, "{v}");
+}
+
+/// What a message may carry. A file — bytes or a URL — is no media type the
+/// card accepts, and refuses the whole message with `-32005`, naming what was
+/// sent and what is accepted; nothing is created for it. The message is a
+/// user's: any other role is `-32602`.
+#[test]
+fn errors_codes() {
+    let d = boot();
+    let before = task_count(&d, USER_A);
+    let file = |part: Value| {
+        json!({"message": {"role": "ROLE_USER", "messageId": "m-file",
+            "parts": [{"text": "look at this"}, part]},
+            "configuration": {"returnImmediately": true}})
+    };
+    for method in ["SendMessage", "SendStreamingMessage"] {
+        let reply = call(
+            &d,
+            USER_A,
+            21,
+            method,
+            file(json!({"url": "https://files.example/cat.png", "mediaType": "image/png"})),
+        );
+        assert!(is_json(&reply), "{method}: {reply:?}");
+        let v = reply.json();
+        assert_eq!(v["error"]["code"], -32005, "{method}: {v}");
+        assert_eq!(
+            v["error"]["message"],
+            "media type image/png is not supported; accepted: text/plain, application/json",
+            "{method}: {v}"
+        );
+        assert_eq!(
+            v["error"]["data"][0]["reason"], "CONTENT_TYPE_NOT_SUPPORTED",
+            "{v}"
+        );
+        no_sdk_domain(&v["error"]);
+    }
+    let v = call(&d, USER_A, 22, "SendMessage", file(json!({"raw": "aGk="}))).json();
+    assert_eq!(v["error"]["code"], -32005, "{v}");
+    assert_eq!(
+        v["error"]["message"],
+        "media type unspecified is not supported; accepted: text/plain, application/json",
+        "{v}"
+    );
+    assert_eq!(
+        task_count(&d, USER_A),
+        before,
+        "a refused message made a task"
+    );
+
+    // The spec's roles: a caller speaks as the user, never as the agent, and
+    // says so.
+    for role in [json!("ROLE_AGENT"), json!("ROLE_UNSPECIFIED"), Value::Null] {
+        let mut params = SendMessage::text("hello").return_immediately().params();
+        params["message"]["role"] = role.clone();
+        let v = call(&d, USER_A, 23, "SendMessage", params).json();
+        assert_eq!(v["error"]["code"], -32602, "role {role}: {v}");
+    }
+    assert_eq!(
+        task_count(&d, USER_A),
+        before,
+        "a refused message made a task"
+    );
+
+    // A JSON DataPart is accepted: the card lists application/json.
+    let mut params = SendMessage::text("with data").return_immediately().params();
+    params["message"]["parts"] = json!([{"text": "the numbers:"}, {"data": {"k": [1, 2]}}]);
+    let v = call(&d, USER_A, 24, "SendMessage", params).json();
+    assert!(v["result"]["task"]["id"].is_string(), "{v}");
+}
+
+/// A field the spec's types do not know is ignored — on the request and on
+/// the message — as ProtoJSON says a reader must; a newer client is not a
+/// malformed one.
+#[test]
+fn unknown_fields_are_ignored() {
+    let d = boot();
+    let mut params = SendMessage::text("hello").return_immediately().params();
+    params["futureField"] = json!({"x": 1});
+    params["message"]["futureField"] = json!("from a later version");
+    let v = call(&d, USER_A, 81, "SendMessage", params).json();
+    assert!(v.get("error").is_none(), "{v}");
+    assert!(v["result"]["task"]["id"].is_string(), "{v}");
+}
+
+/// While the agent drains, every send is refused with one object — code,
+/// message and reason — whichever path answers it: a2a-rs's for a message and
+/// for a command that does work, the listener's own for a read. A stream asked
+/// for is answered as JSON: a refusal is never a frame.
+#[test]
+fn draining_is_identical_on_both_paths() {
+    // A shutdown workflow that waits for a signal nobody sends holds the drain
+    // open, so the listener is still answering while the agent refuses work.
+    let d = boot_with(
+        "workflows:\n\
+         \x20 - name: linger\n    steps:\n\
+         \x20     bye: {kind: event, on: lifecycle.shutdown}\n\
+         \x20     hold: {kind: wait, on: signal, signal: never, depends_on: [bye]}\n\
+         \x20     f: {kind: finish, depends_on: [hold]}\n\
+         \x20 - name: greet\n    steps:\n\
+         \x20     s: {kind: manual}\n\
+         \x20     f: {kind: finish, depends_on: [s]}\n",
+    );
+    SendMessage::command("admin.drain", json!({"reason": "the test"}))
+        .bearer(OPERATOR)
+        .result(&d.addr);
+
+    let expected = |v: &Value, what: &str| {
+        let error = &v["error"];
+        assert_eq!(error["code"], -32603, "{what}: {v}");
+        assert_eq!(error["message"], "the agent is draining", "{what}: {v}");
+        assert_eq!(error["data"][0]["reason"], "DRAINING", "{what}: {v}");
+        assert_eq!(error["data"][0]["domain"], "agentd.dev", "{what}: {v}");
+        no_sdk_domain(error);
+        error.clone()
+    };
+    let words = SendMessage::text("hello").bearer(USER_A).post(&d.addr);
+    let one = expected(&words, "a message");
+    let run = SendMessage::command("workflow.run", json!({"workflow": "greet"}))
+        .bearer(OPERATOR)
+        .post(&d.addr);
+    assert_eq!(expected(&run, "workflow.run"), one, "{run}");
+    let read = SendMessage::command("status", json!({}))
+        .bearer(OPERATOR)
+        .post(&d.addr);
+    assert_eq!(expected(&read, "a read"), one, "{read}");
+
+    let streamed = SendMessage::text("hello")
+        .streaming()
+        .bearer(USER_A)
+        .post_raw(&d.addr);
+    assert!(is_json(&streamed), "a refusal is JSON: {streamed:?}");
+    assert_eq!(expected(&streamed.json(), "a stream"), one);
+}
+
+/// The listener once rewrote sends for the protocol layer: a task id minted
+/// ahead of the message, and the 0.3 `configuration.blocking` translated to
+/// 1.0's field. Both are gone — a task id is a2a-rs's to generate, and a
+/// field 1.0 does not have means nothing — and they stay gone.
+#[test]
+fn the_listener_rewrites_no_send() {
+    let src = include_str!("../../agentd/src/a2a/serve/dispatch.rs");
+    assert!(
+        !src.contains("\"blocking\""),
+        "serve/dispatch.rs reads configuration.blocking again"
+    );
+    assert!(
+        !src.contains("NewTaskId"),
+        "serve/dispatch.rs mints task ids again"
+    );
 }

@@ -173,16 +173,15 @@ mod tests {
             assert!(!mirror_to_feed("SendMessage", Some(op), "ok"), "{op}");
         }
         // Every verb the runtime answers, by the name it is audited under: a
-        // read is not mirrored, anything else is. The push-config reads and
-        // the mint that precedes every send are the ones a list of spec
-        // names missed.
+        // read is not mirrored, anything else is. The push-config reads are
+        // the ones a list of spec names missed.
         use crate::runtime::a2a_server::Verb;
         for v in Verb::ALL {
             let name = format!("{v:?}");
             assert_eq!(Verb::of(&name), Some(*v), "{name} is dispatched");
             assert_eq!(mirror_to_feed(&name, None, "ok"), !v.reads(), "{name}");
         }
-        for m in ["PushConfigGet", "PushConfigList", "NewTaskId", "GetTask"] {
+        for m in ["PushConfigGet", "PushConfigList", "GetTask"] {
             assert!(!mirror_to_feed(m, None, "ok"), "{m}");
         }
         // The same reads, refused, are mirrored.

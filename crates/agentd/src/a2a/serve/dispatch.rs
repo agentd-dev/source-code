@@ -22,7 +22,6 @@ use crate::a2a::Principal;
 use crate::a2a::errors::{self, reason};
 use crate::a2a::ports;
 use crate::a2a::principals::{Resolution, Via};
-use crate::runtime::a2a_server::A2aBridge;
 use crate::runtime::surface::{
     A2A_PROTOCOL_VERSION, EXTENSION_METHODS, INTERFACE_EXTENSION, Route, SpecMethod,
     accepts_version, route_of,
@@ -92,8 +91,8 @@ fn with_activated_extensions(mut resp: Response, activated: &[String]) -> Respon
 /// 7. the caller's rate;
 /// 8. the method, from the route table, for every caller alike;
 /// 9. the method's authorization (and the extended card's credential gate);
-/// 10. the checks that need the params: a send's command op, a subscribe's
-///     task;
+/// 10. the checks that need the params: a send's request shape, the task it
+///     names and its command op, a subscribe's task;
 /// 11. the answer — here for the few calls answered locally, else a2a-rs's,
 ///     filtered back to the runtime's own words on the way out.
 ///
@@ -373,6 +372,32 @@ async fn dispatch(
         Route::Spec(SpecMethod::SendMessage | SpecMethod::SendStreamingMessage)
     );
 
+    // A send's params are the spec's `SendMessageRequest`, read with its own
+    // type before anything is done on the caller's behalf. What the type does
+    // not know is ignored, as ProtoJSON says it must be — a newer client's
+    // field is not a malformed request — and the task the message names, if
+    // any, is what the caller meant: continue that task. Only this layer sees
+    // the message as the caller sent it (a2a-rs writes a generated id into an
+    // empty `taskId` before any port runs), so it says so to the ports.
+    let named_task = if send {
+        match sent_message(&params) {
+            Ok(message) => Some(message.task_id).filter(|t| !t.is_empty()),
+            Err(why) => return err(id, errors::INVALID_PARAMS, &why),
+        }
+    } else {
+        None
+    };
+    // A command starts its own task. One that names a task would be a command
+    // run inside somebody's conversation — or a caller choosing the id of the
+    // task the command creates — and neither is something a command means.
+    if let (Some(op), Some(task)) = (&op, &named_task) {
+        let refusal = crate::runtime::a2a_server::command_names_task(op, task);
+        return error_response(
+            json!({"jsonrpc": "2.0", "id": id, "error": refusal}),
+            bearer_used,
+        );
+    }
+
     // The command-op gate: the op's floor and the caller's grants, checked
     // before anything is created on the caller's behalf. Which workflow a
     // `workflow.run` may start is the runtime's to judge — it alone holds the
@@ -437,20 +462,6 @@ async fn dispatch(
         }
     }
 
-    // A send with no task id yet gets one now. The protocol layer subscribes to
-    // a task's updates *before* it processes the message — so that a fast
-    // transition cannot be missed — and it can only do that if the id exists
-    // first. Without this, a blocking send would never see the task settle and
-    // a streaming send would be refused outright for want of an id.
-    let body = if send {
-        match normalize_send(&app.bridge, &req, &params).await {
-            Some(rewritten) => Bytes::from(rewritten),
-            None => body,
-        }
-    } else {
-        body
-    };
-
     // Everything else is the specification's, and a2a-rs answers it.
     let mut request = axum::http::Request::builder()
         .method("POST")
@@ -465,10 +476,13 @@ async fn dispatch(
             "agentd".to_string(),
         ));
     let alive = app.liveness.as_ref().and_then(|l| l(&principal));
-    let scope = ports::RequestScope::new(principal, via);
+    let mut scope = ports::RequestScope::new(principal, via);
+    if send {
+        scope = scope.send(named_task);
+    }
     let kept = Arc::clone(&scope.error);
     let protocol = app.protocol.clone();
-    let answered = ports::with_request(scope, send, async move {
+    let answered = ports::with_request(scope, async move {
         protocol
             .oneshot(request)
             .await
@@ -635,79 +649,23 @@ fn denied(
     app.log.warn("a2a.denied", line);
 }
 
-/// Prepare a send for the protocol layer, returning a rewritten request body —
-/// or `None` when nothing needed changing.
-///
-/// Two adjustments:
-///
-/// * **The task id.** A send that names no task is given one here, because the
-///   protocol layer subscribes to a task's updates *before* it processes the
-///   message — so a fast transition cannot be missed — and it can only do that
-///   if the id exists first.
-/// * **`blocking` → `returnImmediately`.** agentd's own clients ask not to wait
-///   with `configuration.blocking: false`; the spec spells the same thing
-///   `returnImmediately: true`. Translating here lets those clients keep their
-///   spelling against a server that speaks only the specification's field.
-///
-/// Both rewrites write *into* `params`, which is whatever a remote caller put on
-/// the wire. Neither is attempted unless the params carry the shape the spec
-/// requires — an object with an object `message` — because the only way to write
-/// into a `Value` is through a path of objects, and serde_json's `IndexMut`
-/// *panics* rather than declining when the value under the path is a string, a
-/// number or an array (`params: []`, `params: {"message": "hi"}`). The release
-/// profile is `panic = "abort"`, so one malformed request would take the whole
-/// daemon down. A shape that cannot be rewritten is passed through untouched
-/// instead, and a2a-rs refuses it with the spec's -32602.
-async fn normalize_send(bridge: &Arc<A2aBridge>, req: &Value, params: &Value) -> Option<Vec<u8>> {
-    if !params.is_object() || !params.get("message").is_some_and(Value::is_object) {
-        return None;
+/// A send's message, read as the spec's `SendMessageRequest`, or why it is
+/// not one. The message is a user's: `ROLE_AGENT` is the agent's own voice,
+/// and a caller does not get to speak in it.
+fn sent_message(params: &Value) -> Result<a2a_rs::domain::Message, String> {
+    let req =
+        serde_json::from_value::<a2a_rs::domain::generated::SendMessageRequest>(params.clone())
+            .map_err(|e| format!("invalid params: {e}"))?;
+    let Some(message) = req.message.into_option() else {
+        return Err("invalid params: a send carries a message".to_string());
+    };
+    if message.role != a2a_rs::domain::Role::ROLE_USER {
+        return Err(format!(
+            "invalid params: message.role must be ROLE_USER, not {}",
+            message.role
+        ));
     }
-
-    let mut req = req.clone();
-    let mut changed = false;
-
-    if params["message"]["taskId"]
-        .as_str()
-        .unwrap_or("")
-        .is_empty()
-    {
-        let bridge = Arc::clone(bridge);
-        if let Ok(v) = tokio::task::spawn_blocking(move || {
-            bridge.call("NewTaskId", json!({}), Principal::anonymous())
-        })
-        .await
-            && let Some(id) = v.get("id").and_then(Value::as_str)
-            && let Some(message) = param_object(&mut req, "message")
-        {
-            message.insert("taskId".to_string(), json!(id));
-            changed = true;
-        }
-    }
-
-    if let Some(blocking) = params["configuration"]["blocking"].as_bool()
-        && params["configuration"]["returnImmediately"].is_null()
-        && let Some(config) = param_object(&mut req, "configuration")
-    {
-        config.insert("returnImmediately".to_string(), json!(!blocking));
-        changed = true;
-    }
-
-    changed.then(|| serde_json::to_vec(&req).ok()).flatten()
-}
-
-/// `req.params.<field>` as a map to write into, or `None` when anything along
-/// that path is not an object. Every rewrite goes through here rather than
-/// through `IndexMut`, whose failure mode on a caller-controlled shape is a
-/// panic in the listener rather than a request that gets refused.
-fn param_object<'a>(
-    req: &'a mut Value,
-    field: &str,
-) -> Option<&'a mut serde_json::Map<String, Value>> {
-    req.as_object_mut()?
-        .get_mut("params")?
-        .as_object_mut()?
-        .get_mut(field)?
-        .as_object_mut()
+    Ok(message)
 }
 
 /// One reactor round trip, answered as a JSON-RPC envelope.
@@ -1122,75 +1080,4 @@ fn json_response(v: Value) -> Response {
 
 fn err(id: Value, code: i64, message: &str) -> Response {
     json_response(json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}}))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A bridge with a stand-in for the reactor: it answers `NewTaskId` with an
-    /// id, because a bridge whose loop is missing fails fast and would leave
-    /// the rewrite unreached — making these tests pass without ever exercising
-    /// the code path they exist to guard.
-    fn stub_bridge() -> Arc<A2aBridge> {
-        let resolver =
-            crate::a2a::Resolver::build(&crate::config::v2::A2a::default(), &|_| None).unwrap();
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            while let Ok(crate::runtime::events::Event::A2a(req)) = rx.recv() {
-                let _ = req.reply.send(json!({"id": "task-stub"}));
-            }
-        });
-        A2aBridge::new(tx, resolver)
-    }
-
-    /// Params are remote input, and a send whose params are not the shape the
-    /// spec requires must never reach serde_json's `IndexMut`, which panics the
-    /// listener — under the release profile's `panic = "abort"` that is a dead
-    /// daemon from one curl. Every one of these must come back "nothing to
-    /// rewrite" so the body travels on and a2a-rs answers it with -32602.
-    #[tokio::test]
-    async fn malformed_send_params_are_left_alone_rather_than_panicking() {
-        let bridge = stub_bridge();
-        for params in [
-            json!([]),
-            json!({"message": "hi"}),
-            json!({"message": 3}),
-            json!({"message": []}),
-            Value::Null,
-            json!("send"),
-            json!({}),
-        ] {
-            let req = json!({"jsonrpc": "2.0", "id": 1, "method": "SendMessage", "params": params});
-            // Exactly how `dispatch` derives the params it passes in.
-            let p = req.get("params").cloned().unwrap_or_else(|| json!({}));
-            assert_eq!(
-                normalize_send(&bridge, &req, &p).await,
-                None,
-                "params {p} must not be rewritten"
-            );
-        }
-    }
-
-    /// The other half of the guard: a well-formed send must still be normalised
-    /// — both rewrites — because refusing every shape would "fix" the panic by
-    /// breaking the send path the protocol layer depends on.
-    #[tokio::test]
-    async fn a_well_formed_send_is_still_normalised() {
-        let bridge = stub_bridge();
-        let req = json!({"jsonrpc": "2.0", "id": 1, "method": "SendMessage", "params": {
-            "message": {"messageId": "m1", "role": "user", "parts": [{"kind": "text", "text": "hi"}]},
-            "configuration": {"blocking": false},
-        }});
-        let params = req["params"].clone();
-        let out = normalize_send(&bridge, &req, &params)
-            .await
-            .expect("a well-formed send is rewritten");
-        let v: Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(v["params"]["message"]["taskId"], json!("task-stub"));
-        assert_eq!(
-            v["params"]["configuration"]["returnImmediately"],
-            json!(true)
-        );
-    }
 }

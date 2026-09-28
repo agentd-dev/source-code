@@ -10,24 +10,23 @@ use crate::a2a::wire::{Annotations, DEFAULT_PAGE_SIZE, ListView, MAX_PAGE_SIZE};
 use crate::runtime::reactor::{PendingKind, Runtime};
 use serde_json::{Value, json};
 
-/// A fresh durable task id.
+/// A fresh durable task id, for a task the runtime opens on its own — a
+/// gate's. A task a send creates takes the id a2a-rs generated for it instead,
+/// and this is the same generator, so every task id has one shape.
 ///
-/// A ULID, not the reactor's `seq` counter: `seq` starts at 0 in every life
-/// while tasks are RESTORED from the store, so a counter-minted id names a task
-/// from a PREVIOUS life. That collision is not benign — an id that already
-/// exists makes `a2a_send` read the message as a continuation, so the caller is
-/// handed someone else's task (and its history) while an unrelated message
-/// advances that task's state. ULID is what every other durable id in the store
-/// is minted from (runs, inbox events, artifacts) for exactly this reason, and
-/// it keeps ids time-sortable.
+/// Never the reactor's `seq` counter: `seq` starts at 0 in every life while
+/// tasks are RESTORED from the store, so a counter-minted id names a task from
+/// a PREVIOUS life — and a message naming it would be read as a continuation,
+/// handing the caller someone else's task and history. A random UUIDv4 cannot
+/// collide with an id already in the store.
 pub(super) fn new_task_id() -> String {
-    format!("task-{}", crate::state::ulid::new())
+    a2a_rs::domain::TaskId::generate().into_string()
 }
 
 /// A fresh push-config id, for a registration that named none.
 ///
-/// A ULID for the same reason as [`new_task_id`]: configs are durable with
-/// their task, and a counter that restarts with the process would mint an id a
+/// A ULID for the same reason [`new_task_id`] is random: configs are durable
+/// with their task, and a counter that restarts with the process would mint an id a
 /// restored task already holds — and registering under it REPLACES that
 /// config, silently dropping a webhook somebody else was promised.
 fn new_push_id() -> String {
@@ -287,7 +286,7 @@ impl Runtime {
         }
     }
 
-    fn push_enabled(&self) -> Result<(), Value> {
+    pub(super) fn push_enabled(&self) -> Result<(), Value> {
         if self.settings.a2a.push.enabled {
             Ok(())
         } else {
@@ -314,22 +313,33 @@ impl Runtime {
             Ok(id) => id,
             Err(e) => return e,
         };
+        let target = match self.push_target(params) {
+            Ok(t) => t,
+            Err(e) => return e,
+        };
+        let wire = crate::a2a::push::to_wire(&task_id, &target);
+        self.attach_push(&task_id, target, principal);
+        wire
+    }
+
+    /// The webhook a registration describes — `{id?, url, token?,
+    /// authentication?}` — checked. Shared by the registration method and a
+    /// send's inline config, which must refuse exactly the same targets.
+    pub(super) fn push_target(&self, params: &Value) -> Result<PushTarget, Value> {
         let id = params
             .get("id")
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .unwrap_or_else(new_push_id);
-        let target = match crate::a2a::push::from_wire(params, id.clone()) {
-            Ok(t) => t,
-            Err(e) => return err_obj(::mcp::rpc::INVALID_PARAMS, &e),
-        };
+        let target = crate::a2a::push::from_wire(params, id)
+            .map_err(|e| err_obj(::mcp::rpc::INVALID_PARAMS, &e))?;
         let allow_private = self.settings.a2a.push.allow_private;
         if let Err(e) = crate::a2a::push::check_url(&target.url, allow_private) {
-            return err_obj(
+            return Err(err_obj(
                 ::mcp::rpc::INVALID_PARAMS,
                 &format!("push url refused: {e}"),
-            );
+            ));
         }
         // In `closed` mode a caller-chosen push target must clear the service
         // catalog as well as the SSRF check above. The two guards answer
@@ -342,23 +352,35 @@ impl Runtime {
             crate::config::v2::ServiceKind::Http,
             &target.url,
         ) {
-            return err_obj(
+            return Err(err_obj(
                 ::mcp::rpc::INVALID_PARAMS,
                 &format!("push url refused: {e}"),
-            );
+            ));
         }
-        let wire = crate::a2a::push::to_wire(&task_id, &target);
-        if let Some(t) = self.tasks.get_mut(&task_id) {
+        Ok(target)
+    }
+
+    /// Register `target` on the task, replacing a config of the same id.
+    pub(super) fn attach_push(&mut self, task_id: &str, target: PushTarget, principal: &Principal) {
+        let id = target.id.clone();
+        if let Some(t) = self.tasks.get_mut(task_id) {
             t.push.retain(|p| p.id != id);
             t.push.push(target);
             t.dirty = true;
         }
-        self.task_persist(&task_id);
+        self.task_persist(task_id);
         self.log.info(
             "a2a.push.registered",
             json!({"task": task_id, "config": id, "principal": principal.id}),
         );
-        wire
+    }
+
+    /// Tell a task's webhooks the state it is in now, without a transition —
+    /// for a config attached after the task had already moved.
+    pub(super) fn push_now(&self, task_id: &str) {
+        if let (Some(sink), Some(t)) = (&self.a2a_sink, self.tasks.get(task_id)) {
+            sink.push(t, self.settings.a2a.push.allow_private);
+        }
     }
 
     /// `{taskId, id}` → that config. Both are required; a config the task
@@ -686,15 +708,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn task_ids_are_ulids_so_two_lives_cannot_mint_the_same_one() {
-        // The whole point of the ULID: `seq` restarts at 0 with the process,
-        // and the ids of a previous life are still in the store.
+    fn task_ids_are_random_so_two_lives_cannot_mint_the_same_one() {
+        // `seq` restarts at 0 with the process, and the ids of a previous life
+        // are still in the store; a gate's id is a2a-rs's UUIDv4, the shape
+        // of every task id a send creates.
         let a = new_task_id();
         let b = new_task_id();
         assert_ne!(a, b);
-        assert!(a.starts_with("task-"), "the id keeps its prefix: {a}");
-        assert_eq!(a.len(), "task-".len() + 26, "a 26-char ULID: {a}");
-        assert!(a < b, "still time-sortable: {a} < {b}");
+        let v4 = |id: &str| {
+            id.len() == 36
+                && id.as_bytes()[14] == b'4'
+                && id
+                    .chars()
+                    .all(|c| c == '-' || c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        };
+        assert!(v4(&a) && v4(&b), "{a} / {b}");
     }
 
     fn who(id: &str, role: crate::config::v2::Role) -> Principal {

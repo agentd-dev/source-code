@@ -111,7 +111,8 @@ impl RuntimePorts {
 /// is not per-principal. agentd's is: a task belongs to whoever started it, and
 /// a non-operator may only see its own. So the request travels out-of-band,
 /// scoped to its tokio task rather than passed down through the port
-/// signatures.
+/// signatures — and so does what the caller meant by it, which a port cannot
+/// tell from the arguments a2a-rs hands it.
 #[derive(Clone)]
 pub struct RequestScope {
     /// Who is calling.
@@ -128,16 +129,47 @@ pub struct RequestScope {
     /// (`serve::dispatch`'s fidelity filter), so a refusal is the same
     /// code, message and data whichever path answered it.
     pub error: Arc<Mutex<Option<Value>>>,
+    /// The task the caller's message named (`message.taskId`), when it named
+    /// one. a2a-rs hands [`AsyncMessageHandler::process_message`] a task id
+    /// either way — the caller's, or one it generated because there was none —
+    /// and the two mean opposite things: continue a task that must already
+    /// exist, or create one under a server-chosen id. Only the listener saw
+    /// which, so it says so here, and a caller-chosen id can never become the
+    /// id of a new task.
+    pub named_task: Option<String>,
+    /// Whether the request is a `SendMessage`/`SendStreamingMessage`. A
+    /// push config a2a-rs registers while serving one is the send's own
+    /// (`configuration.taskPushNotificationConfig`), for a task that may not
+    /// exist yet — see [`Self::pending_push`].
+    pub in_send: bool,
+    /// The push config a send carried inline. a2a-rs registers it BEFORE it
+    /// processes the message, which for a new task is before the task
+    /// exists, so the runtime could only answer "not found". It is held here
+    /// instead and crosses with the message, and the runtime checks it and
+    /// attaches it to the task the message creates or continues.
+    pub pending_push: Arc<Mutex<Vec<TaskPushNotificationConfig>>>,
 }
 
 impl RequestScope {
-    /// A scope for `caller`, named by `via`, with nothing recorded yet.
+    /// A scope for `caller`, named by `via`, with nothing recorded yet and no
+    /// send in it (see [`Self::send`]).
     pub fn new(caller: Principal, via: Via) -> RequestScope {
         RequestScope {
             caller,
             via,
             error: Arc::default(),
+            named_task: None,
+            in_send: false,
+            pending_push: Arc::default(),
         }
+    }
+
+    /// This scope serving a send whose message named `named_task` (`None`
+    /// when it named none).
+    pub fn send(mut self, named_task: Option<String>) -> RequestScope {
+        self.in_send = true;
+        self.named_task = named_task;
+        self
     }
 }
 
@@ -171,34 +203,20 @@ tokio::task_local! {
 #[derive(Clone, Default)]
 struct StreamAuthz {
     seen: Arc<Mutex<HashMap<String, bool>>>,
-    /// Whether the request is a send. A send's own task does not exist until
-    /// the message is processed, so a read that finds nothing *before* then is
-    /// not a verdict — see [`StreamAuthz::record_read`].
-    in_send: bool,
 }
 
 impl StreamAuthz {
     /// Record the reactor's verdict on one task.
+    ///
+    /// Every read is a verdict, a send's included: a2a-rs reads only the task
+    /// a send NAMES (to learn its context), and a named task must already
+    /// exist and be the caller's — a send never creates a task under an id the
+    /// caller chose. A new task's id is generated and never read before the
+    /// message is processed, so its verdict comes from
+    /// [`AsyncMessageHandler::process_message`].
     fn record(&self, task_id: &str, allowed: bool) {
         if let Ok(mut seen) = self.seen.lock() {
             seen.insert(task_id.to_string(), allowed);
-        }
-    }
-
-    /// Record what a task *read* found.
-    ///
-    /// A read that found the task is proof in any request. A read that found
-    /// nothing is proof only outside a send: a2a-rs (0.10) reads the task a
-    /// send names before it attaches — to learn its context — and that id is
-    /// the one the listener pre-minted for the task this very send is about to
-    /// create. Taking "not found" as a refusal there fails the attach, so a
-    /// blocking send stops waiting (it answers `WORKING`) and a streaming send
-    /// is refused outright. Left unrecorded, the attach falls back to the
-    /// verdict at first poll, which [`AsyncMessageHandler::process_message`]
-    /// has supplied by then — exactly the rule a send had before the read.
-    fn record_read(&self, task_id: &str, found: bool) {
-        if found || !self.in_send {
-            self.record(task_id, found);
         }
     }
 
@@ -217,18 +235,14 @@ fn streamable() -> Option<StreamAuthz> {
     STREAMABLE.try_with(StreamAuthz::clone).ok()
 }
 
-/// Run `f` as one request's handling, in `scope`. `in_send` says the request
-/// is a `SendMessage`/`SendStreamingMessage`, whose task comes into existence
-/// part-way through (see [`StreamAuthz::in_send`]).
-pub async fn with_request<F, T>(scope: RequestScope, in_send: bool, f: F) -> T
+/// Run `f` as one request's handling, in `scope`.
+pub async fn with_request<F, T>(scope: RequestScope, f: F) -> T
 where
     F: std::future::Future<Output = T>,
 {
-    let ledger = StreamAuthz {
-        in_send,
-        ..StreamAuthz::default()
-    };
-    SCOPE.scope(scope, STREAMABLE.scope(ledger, f)).await
+    SCOPE
+        .scope(scope, STREAMABLE.scope(StreamAuthz::default(), f))
+        .await
 }
 
 /// The caller of the request being served.
@@ -254,9 +268,9 @@ pub(crate) fn record_error(error: &Value) {
     });
 }
 
-/// Whether the request being served is a send (see [`StreamAuthz::in_send`]).
-fn in_send() -> bool {
-    STREAMABLE.try_with(|s| s.in_send).unwrap_or(false)
+/// The request being served, when one is.
+fn serving() -> Option<RequestScope> {
+    SCOPE.try_with(RequestScope::clone).ok()
 }
 
 /// A reactor reply's error object, under either spelling (see
@@ -346,10 +360,13 @@ impl AsyncMessageHandler for RuntimePorts {
     /// A message becomes runtime work: a conversation turn, or — when it carries
     /// agentd's command DataPart — a registry action. Which one it is, and the
     /// durable task that results, is the reactor's decision; this only carries
-    /// the message across.
+    /// the message across, with what the caller meant by it.
     ///
-    /// `task_id` is empty for a new task (the caller did not name one), and the
-    /// reactor mints the id in that case.
+    /// `task_id` is never empty: a2a-rs generates one when the message named
+    /// none, and it has already subscribed to that id. So the reactor is told
+    /// which it is (`newTask`) — a new task takes exactly this id, and a named
+    /// one must already exist — and a push config the send carried inline
+    /// crosses with it (see [`RequestScope::pending_push`]).
     async fn process_message(
         &self,
         task_id: &str,
@@ -360,18 +377,29 @@ impl AsyncMessageHandler for RuntimePorts {
         // source, so a port that has no context reads the same value.
         let _ = ctx;
         let who = caller();
-        let mut params =
-            json!({"message": serde_json::to_value(message).map_err(A2AError::JsonParse)?});
-        if !task_id.is_empty() {
-            params["taskId"] = json!(task_id);
+        let scope = serving();
+        let named = scope.as_ref().and_then(|s| s.named_task.clone());
+        let mut params = json!({
+            "message": serde_json::to_value(message).map_err(A2AError::JsonParse)?,
+            "taskId": task_id,
+            "newTask": named.is_none(),
+        });
+        let push = scope
+            .as_ref()
+            .and_then(|s| s.pending_push.lock().ok()?.pop());
+        if let Some(push) = push {
+            params["push"] = serde_json::to_value(push).map_err(A2AError::JsonParse)?;
         }
-        let task = task_from(self.call("SendMessage", params, &who).await?)?;
-        // The task the reactor made for this message belongs to this caller —
-        // and it is the *only* task this send authorizes. A send that named
-        // somebody else's task id does not continue it (the reactor starts a
-        // fresh one instead), so the id it named stays unrecorded and the
-        // subscription the protocol layer opened on it ahead of this call
-        // never delivers. See [`STREAMABLE`].
+        // The task that answers must be the task a2a-rs is watching: it
+        // subscribed to `task_id` before this call, and a send answered with
+        // any other task would settle — or stream — someone else's.
+        let task = same_task(
+            task_id,
+            task_from(self.call("SendMessage", params, &who).await?)?,
+        )?;
+        // The task the reactor made or continued for this message is the
+        // caller's — and it is the only task this send authorizes. See
+        // [`STREAMABLE`].
         if let Some(seen) = streamable() {
             seen.record(&task.id, true);
         }
@@ -392,39 +420,20 @@ impl AsyncTaskLifecycle for RuntimePorts {
     async fn get(&self, id: &TaskId, history_length: Option<u32>) -> Result<WireTask, A2AError> {
         let who = caller();
         let got = self
-            .call_raw("GetTask", json!({"id": id.as_str()}), &who)
+            .call("GetTask", json!({"id": id.as_str()}), &who)
             .await
-            .and_then(|v| match error_of(&v) {
-                Some(e) => {
-                    // A send's "not found" is not a refusal, for the reason
-                    // `record_read` gives: it is the read a2a-rs makes of the
-                    // id the listener pre-minted, which it expects to find
-                    // nothing and carries on past. Kept, it would win over
-                    // the refusal that really ends the send (the first write
-                    // wins), and the caller would be told "task not found"
-                    // about a message the runtime refused for a different
-                    // reason.
-                    let swallowed = in_send()
-                        && e.get("code").and_then(Value::as_i64)
-                            == Some(crate::a2a::errors::TASK_NOT_FOUND);
-                    if !swallowed {
-                        record_error(e);
-                    }
-                    Err(from_error_object(e))
-                }
-                None => Ok(v),
-            })
             .and_then(task_from)
             .and_then(|t| same_task(id.as_str(), t));
         // The reactor answers a read with the ownership matrix already applied —
         // somebody else's task is "not found", so existence is not disclosed —
         // which makes this verdict exactly the one a subscription needs. A
-        // `SubscribeToTask` reads the task before it attaches, so recording it
-        // here is what lets the attach refuse. See [`STREAMABLE`]. Only the
-        // task that was asked for is proof: a reply naming any other id grants
-        // nothing, so a wrong answer can never open a stream.
+        // `SubscribeToTask` reads the task before it attaches, and so does a
+        // send that names one, so recording it here is what lets the attach
+        // refuse. See [`STREAMABLE`]. Only the task that was asked for is
+        // proof: a reply naming any other id grants nothing, so a wrong answer
+        // can never open a stream.
         if let Some(seen) = streamable() {
-            seen.record_read(id.as_str(), got.is_ok());
+            seen.record(id.as_str(), got.is_ok());
         }
         let mut t = got?;
         if let Some(n) = history_length {
@@ -503,6 +512,16 @@ impl AsyncNotificationManager for RuntimePorts {
         &self,
         config: &TaskPushNotificationConfig,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
+        // A send's inline config: held for the message, which carries it to
+        // the runtime (see [`RequestScope::pending_push`]). Nothing is
+        // registered unless the message is accepted, so a refused send leaves
+        // no webhook behind on a task it never reached.
+        if let Some(scope) = serving().filter(|s| s.in_send) {
+            if let Ok(mut pending) = scope.pending_push.lock() {
+                pending.push(config.clone());
+            }
+            return Ok(config.clone());
+        }
         let who = caller();
         // The spec's request is the config itself, and it crosses as it came.
         let params = serde_json::to_value(config).map_err(A2AError::JsonParse)?;
@@ -665,13 +684,12 @@ impl AsyncStreamingHandler for SharedStreaming {
     ///   gave it — a non-owner must not learn from the difference that the task
     ///   exists.
     /// * A **send** attaches *before* the message is processed, deliberately, so
-    ///   that a task settling immediately cannot be missed. Nothing is known
-    ///   about the id at that moment — it came off the wire, and the read
-    ///   a2a-rs makes of it first finds nothing for a task not yet created
-    ///   (see [`StreamAuthz::record_read`]) — so the subscription is made
-    ///   anyway and the verdict applied at the first poll, by which time the
-    ///   send has recorded the task it really created. Anything still unproved
-    ///   by then delivers nothing.
+    ///   that a task settling immediately cannot be missed. A send that named
+    ///   its task has had it read already, like a subscribe. A new task's id
+    ///   was generated a moment ago and names nothing yet, so the subscription
+    ///   is made anyway and the verdict applied at the first poll, by which
+    ///   time the send has recorded the task it created under that id.
+    ///   Anything still unproved by then delivers nothing.
     async fn combined_update_stream(
         &self,
         task_id: &str,
@@ -793,28 +811,102 @@ pub fn status_of(ev: &TaskStatusUpdateEvent) -> &TaskStatus {
 mod tests {
     use super::*;
 
-    /// Outside a send a read that finds nothing is a refusal, which is what
-    /// lets a stranger's `SubscribeToTask` be turned away before it attaches.
-    #[test]
-    fn a_failed_read_refuses_outside_a_send() {
-        let ledger = StreamAuthz::default();
-        ledger.record_read("task-x", false);
-        assert_eq!(ledger.verdict("task-x"), Some(false));
+    /// A read that finds nothing is a refusal, in a send as anywhere: a send
+    /// reads only the task it names, and a named task that is not there is
+    /// not the send's to create.
+    #[tokio::test]
+    async fn a_failed_read_refuses_in_a_send_too() {
+        let ports =
+            ports_answering(json!({"_error": {"code": -32001, "message": "task not found"}}));
+        let id: TaskId = "task-named".parse().unwrap();
+        for s in [scope(), scope().send(Some("task-named".into()))] {
+            let error = Arc::clone(&s.error);
+            let verdict = with_request(s, async {
+                assert!(ports.get(&id, None).await.is_err());
+                streamable().and_then(|l| l.verdict("task-named"))
+            })
+            .await;
+            assert_eq!(verdict, Some(false));
+            assert!(error.lock().unwrap().is_some(), "the refusal is kept");
+        }
     }
 
-    /// Inside a send it is not a verdict at all: the id is the one the send is
-    /// about to create, so the attach must wait for `process_message` to say.
-    #[test]
-    fn a_failed_read_inside_a_send_leaves_the_verdict_open() {
-        let ledger = StreamAuthz {
-            in_send: true,
-            ..StreamAuthz::default()
+    /// What the caller meant crosses with the message: a new task under the
+    /// id a2a-rs generated, or the task the caller named — and the push config
+    /// the send carried, which is held rather than registered on a task that
+    /// does not exist yet.
+    #[tokio::test]
+    async fn a_send_crosses_with_its_intent_and_its_inline_push() {
+        let calls: Arc<Mutex<Vec<(String, Value)>>> = Arc::default();
+        let seen = Arc::clone(&calls);
+        let ports = ports_with(move |req| {
+            seen.lock()
+                .unwrap()
+                .push((req.method.clone(), req.params.clone()));
+            let id = req.params["taskId"].as_str().unwrap_or("task-x");
+            json!({"task": {"id": id, "contextId": "c"}})
+        });
+        let message = Message {
+            message_id: "m-1".into(),
+            ..Default::default()
         };
-        ledger.record_read("task-new", false);
-        assert_eq!(ledger.verdict("task-new"), None);
-        // A read that found the task is proof either way.
-        ledger.record_read("task-mine", true);
-        assert_eq!(ledger.verdict("task-mine"), Some(true));
+        let push = TaskPushNotificationConfig {
+            task_id: "task-gen".into(),
+            url: "https://hooks.example/x".into(),
+            ..Default::default()
+        };
+
+        let ctx = RequestContext::anonymous();
+        with_request(scope().send(None), async {
+            let held = ports.set_config(&push).await.expect("held");
+            assert_eq!(held.url, push.url);
+            let t = ports.process_message("task-gen", &message, &ctx).await;
+            assert_eq!(t.expect("the new task").id, "task-gen");
+            // The task it created is the one this send may watch.
+            assert_eq!(streamable().and_then(|l| l.verdict("task-gen")), Some(true));
+        })
+        .await;
+        with_request(scope().send(Some("task-named".into())), async {
+            let t = ports.process_message("task-named", &message, &ctx).await;
+            assert_eq!(t.expect("the named task").id, "task-named");
+        })
+        .await;
+        // Outside a send, a config is a registration like any other.
+        with_request(scope(), async {
+            let _ = ports.set_config(&push).await;
+        })
+        .await;
+
+        let calls = calls.lock().unwrap().clone();
+        let methods: Vec<&str> = calls.iter().map(|(m, _)| m.as_str()).collect();
+        assert_eq!(methods, ["SendMessage", "SendMessage", "PushConfigSet"]);
+        let (new, named) = (&calls[0].1, &calls[1].1);
+        assert_eq!(new["taskId"], "task-gen");
+        assert_eq!(new["newTask"], true);
+        assert_eq!(new["push"]["url"], "https://hooks.example/x", "{new}");
+        assert_eq!(named["taskId"], "task-named");
+        assert_eq!(named["newTask"], false);
+        assert!(named.get("push").is_none(), "{named}");
+    }
+
+    /// The task a send is answered with is the task a2a-rs subscribed to, or
+    /// the send fails: any other would settle — or stream — somebody else's.
+    #[tokio::test]
+    async fn a_send_answered_with_another_task_fails() {
+        let ports = ports_answering(json!({"task": {"id": "task-other", "contextId": "c"}}));
+        let got = with_request(scope().send(None), async {
+            let got = ports
+                .process_message(
+                    "task-gen",
+                    &Message::default(),
+                    &RequestContext::anonymous(),
+                )
+                .await;
+            (got, streamable().and_then(|l| l.verdict("task-other")))
+        })
+        .await;
+        assert!(got.0.is_err(), "{:?}", got.0);
+        assert_eq!(got.1, None, "the wrong task is not proved");
     }
 
     /// Ports over a stand-in reactor that answers each call with `answer`.
@@ -857,7 +949,7 @@ mod tests {
         let s = scope();
         let kept = Arc::clone(&s.error);
         let id: TaskId = "task-1".parse().unwrap();
-        with_request(s, false, async {
+        with_request(s, async {
             assert!(ports.cancel(&id).await.is_err());
             // A second refusal in the same request does not replace it.
             record_error(&json!({"code": -32001, "message": "later"}));
@@ -867,26 +959,6 @@ mod tests {
 
         // Outside a request there is nobody to answer, and nothing is kept.
         record_error(&json!({"code": -32001, "message": "nobody"}));
-    }
-
-    /// The read a2a-rs makes of a send's pre-minted task id finds nothing,
-    /// and a2a-rs carries on past it — so inside a send it is not kept, or it
-    /// would stand in for the refusal that really ends the send. Outside a
-    /// send the same "not found" is the answer, and is kept.
-    #[tokio::test]
-    async fn a_sends_own_not_found_read_is_not_kept() {
-        let ports =
-            ports_answering(json!({"_error": {"code": -32001, "message": "task not found"}}));
-        let id: TaskId = "task-new".parse().unwrap();
-        for (in_send, kept) in [(true, false), (false, true)] {
-            let s = scope();
-            let error = Arc::clone(&s.error);
-            with_request(s, in_send, async {
-                assert!(ports.get(&id, None).await.is_err());
-            })
-            .await;
-            assert_eq!(error.lock().unwrap().is_some(), kept, "in_send {in_send}");
-        }
     }
 
     /// a2a-rs hands the listing port no page parameters and has nowhere to put
@@ -980,7 +1052,7 @@ mod tests {
     async fn a_read_answering_for_another_task_proves_nothing() {
         let ports = ports_answering(json!({"id": "task-other", "contextId": "c"}));
         let asked: TaskId = "task-asked".parse().unwrap();
-        let (got, verdict) = with_request(scope(), false, async {
+        let (got, verdict) = with_request(scope(), async {
             let got = ports.get(&asked, None).await;
             (got, streamable().and_then(|s| s.verdict("task-asked")))
         })
@@ -989,7 +1061,7 @@ mod tests {
         assert_eq!(verdict, Some(false));
 
         let ports = ports_answering(json!({"id": "task-asked", "contextId": "c"}));
-        let verdict = with_request(scope(), false, async {
+        let verdict = with_request(scope(), async {
             ports.get(&asked, None).await.expect("the task asked for");
             streamable().and_then(|s| s.verdict("task-asked"))
         })

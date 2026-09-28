@@ -476,3 +476,165 @@ fn push_is_off_unless_an_operator_turns_it_on() {
 
     std::fs::remove_file(&cfg_path).ok();
 }
+
+/// Every task id the operator can list — which is every task there is.
+fn task_ids(addr: &str) -> Vec<String> {
+    let v = rpc(addr, 950, "ListTasks", json!({"pageSize": 100}));
+    v["result"]["tasks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|t| t["id"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// A send's params with `config` as its inline webhook.
+fn with_push(send: SendMessage, config: Value) -> Value {
+    let mut params = send.params();
+    params["configuration"]["taskPushNotificationConfig"] = config;
+    params
+}
+
+/// A webhook given WITH the send (`configuration.taskPushNotificationConfig`)
+/// is registered on the task that send creates — which does not exist yet
+/// when the protocol layer hands the config over, so the registration once
+/// failed "task not found" for every new task and no task was made.
+///
+/// It is checked like any registration, and a refused one refuses the send:
+/// no task is created with a webhook quietly missing.
+#[test]
+fn inline_push_config() {
+    let llm = spawn_mock_llm(&json!({"turns": [{"content": "done at last", "delay_ms": 1500}]}));
+    let hook = spawn_hook();
+    let (_daemon, addr, cfg_path) = boot(|p| {
+        config(
+            &llm.uri,
+            p,
+            "  push:\n    enabled: true\n    allow_private: true\n",
+        )
+    });
+
+    let params = with_push(
+        SendMessage::text("take your time").return_immediately(),
+        json!({"url": hook.url, "token": "inline-token",
+               "authentication": {"scheme": "Bearer", "credentials": "inline"}}),
+    );
+    let sent = rpc(&addr, 1, "SendMessage", params);
+    let task_id = sent["result"]["task"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a new task, webhook and all: {sent}"))
+        .to_string();
+
+    // Registered on that task, as a registration would have been.
+    let listed = rpc(
+        &addr,
+        2,
+        "ListTaskPushNotificationConfigs",
+        json!({"taskId": task_id}),
+    );
+    let configs = listed["result"]["configs"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(configs.len(), 1, "{listed}");
+    assert_eq!(configs[0]["url"], hook.url.as_str(), "{listed}");
+    assert_eq!(configs[0]["taskId"], task_id.as_str(), "{listed}");
+
+    // And delivered to: the turn finishing is a transition the webhook hears,
+    // with the caller's credentials.
+    let settled = wait_for(
+        || {
+            hook.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(_, body)| {
+                    body["task"]["id"] == task_id.as_str()
+                        && body["task"]["status"]["state"] == "TASK_STATE_COMPLETED"
+                })
+                .cloned()
+        },
+        20,
+        "the completed task at the inline webhook",
+    );
+    assert_eq!(header(&settled.0, "authorization"), Some("Bearer inline"));
+    assert_eq!(
+        header(&settled.0, "x-a2a-notification-token"),
+        Some("inline-token")
+    );
+
+    // A command that finishes inside the send it came with has settled before
+    // its webhook is attached — and is still told, once, where it ended.
+    let resume = SendMessage::command("admin.resume", json!({}));
+    let headers = resume.headers();
+    let extra: Vec<(&str, &str)> = headers
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let body = common::rpc_body(
+        3,
+        "SendMessage",
+        with_push(resume.return_immediately(), json!({"url": hook.url})),
+    );
+    let ran = common::a2a_post(&addr, &body, &extra).json();
+    let run_task = ran["result"]["task"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the command's task: {ran}"))
+        .to_string();
+    assert_eq!(
+        ran["result"]["task"]["status"]["state"], "TASK_STATE_COMPLETED",
+        "{ran}"
+    );
+    wait_for(
+        || {
+            hook.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, body)| {
+                    body["task"]["id"] == run_task.as_str()
+                        && body["task"]["status"]["state"] == "TASK_STATE_COMPLETED"
+                })
+                .then_some(())
+        },
+        10,
+        "the settled command's state at its webhook",
+    );
+
+    // A target agentd will not reach refuses the send itself; the task it
+    // would have opened is never made.
+    let before = task_ids(&addr);
+    for (n, config) in [
+        json!({"url": "http://169.254.169.254/latest/meta-data/"}),
+        json!({"url": hook.url, "authentication": {"credentials": "no-scheme"}}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let params = with_push(
+            SendMessage::text("hello").return_immediately(),
+            config.clone(),
+        );
+        let refused = rpc(&addr, 10 + n as i64, "SendMessage", params);
+        assert_eq!(refused["error"]["code"], -32602, "{config}: {refused}");
+    }
+    assert_eq!(task_ids(&addr), before, "a refused send made a task");
+
+    std::fs::remove_file(&cfg_path).ok();
+}
+
+/// With push off, a send carrying a webhook is refused as a registration
+/// would be — never accepted with its webhook dropped.
+#[test]
+fn inline_push_is_refused_when_push_is_off() {
+    let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
+    let (_daemon, addr, cfg_path) = boot(|p| config(&llm.uri, p, ""));
+    let params = with_push(
+        SendMessage::text("hello").return_immediately(),
+        json!({"url": "https://hooks.example/x"}),
+    );
+    let refused = rpc(&addr, 1, "SendMessage", params);
+    assert_eq!(refused["error"]["code"], -32003, "{refused}");
+    assert!(task_ids(&addr).is_empty(), "a refused send made a task");
+    std::fs::remove_file(&cfg_path).ok();
+}

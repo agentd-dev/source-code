@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! `SendMessage`: a command DataPart, a declared workflow command, an answer
-//! to an open human gate, or a conversation turn.
+//! to an open human gate, or a conversation turn — and the rules every one of
+//! them is held to first: which task a message may name, what its parts may
+//! carry, and whether the agent is still taking work.
 
-use super::{err_obj, rpc_internal};
+use super::commands::refusal;
+use super::{TASK_NOT_FOUND, UNSUPPORTED_OPERATION, err_obj, rpc_internal};
 use crate::a2a::Principal;
+use crate::a2a::errors::{self, reason};
 use crate::a2a::tasks::{Link, State};
 use crate::runtime::events::kinds;
 use crate::runtime::reactor::{PendingKind, Runtime};
@@ -29,34 +33,143 @@ pub(crate) fn command_data(message: &Value) -> Option<Value> {
         .find_map(|p| p.get("data").and_then(|d| d.get("agentd")).cloned())
 }
 
-/// The concatenated text of a message's text parts.
-fn message_text(message: &Value) -> String {
-    message["parts"]
-        .as_array()
-        .map(|parts| {
-            parts
-                .iter()
-                .filter_map(|p| p.get("text").and_then(Value::as_str))
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .unwrap_or_default()
+/// The refusal of a command that names a task, as a JSON-RPC error object.
+///
+/// A command starts its own task. One that names a task would be a command run
+/// inside somebody's conversation, or a caller choosing the id of the task the
+/// command creates — and a task id is the server's to mint. Shared by the
+/// listener, which refuses it before anything else happens, and the runtime,
+/// which refuses it again for whatever reaches it another way.
+pub(crate) fn command_names_task(op: &str, task: &str) -> Value {
+    json!({
+        "code": errors::INVALID_PARAMS,
+        "message": format!("command {op:?} starts its own task; it cannot name one (taskId {task:?})"),
+        "data": [
+            errors::bad_request(&[("message.taskId", "a command message carries no taskId")]),
+            errors::error_info(errors::AGENTD_DOMAIN, reason::COMMAND_TASK_ID, &[("op", op)]),
+        ],
+    })
+}
+
+/// The task a send names, when it names one.
+///
+/// Through the protocol layer `taskId` is always set — a2a-rs generates one
+/// for a message that named none — so `newTask` says which it is (see
+/// `ports::RequestScope::named_task`); anything but `true` is read as named,
+/// so a malformed bridge request can never create a task under an id it did
+/// not reserve. A read op the listener answers itself carries the message
+/// exactly as the caller sent it.
+fn named_task(params: &Value) -> Option<&str> {
+    let named = match params.get("newTask") {
+        Some(new) => (new.as_bool() != Some(true))
+            .then(|| params["taskId"].as_str())
+            .flatten(),
+        None => params["message"]["taskId"].as_str(),
+    };
+    named.filter(|t| !t.is_empty())
 }
 
 impl Runtime {
     /// `SendMessage`/`SendStreamingMessage`: a command DataPart routes to the
     /// registry; natural language becomes a conversation turn. Either way a
     /// durable task tracks it.
+    ///
+    /// Before anything is created, the message is held to the rules a caller
+    /// can be told about while it is still there:
+    ///
+    /// - a draining agent takes no new work (`-32603`, `DRAINING`) — the same
+    ///   object on every path, which the listener's fidelity filter keeps
+    ///   whole when a2a-rs answered;
+    /// - a task id is the server's: a message that names a task continues it,
+    ///   and one it cannot see is "not found" (`-32001`) rather than a new task
+    ///   under the caller's id; a settled task takes no more (`-32004`); a
+    ///   command names none (`-32602`);
+    /// - a part that is no media type the card accepts refuses the message
+    ///   (`-32005`);
+    /// - a push config sent inline is checked like a registration, and
+    ///   attached to the task only once the message is accepted.
     pub(super) fn a2a_send(&mut self, principal: &Principal, params: &Value) -> Value {
         if self.draining {
-            return err_obj(-32000, "the agent is draining");
+            return refusal(
+                errors::INTERNAL_ERROR,
+                reason::DRAINING,
+                "the agent is draining",
+                &[],
+            );
         }
+        let message = &params["message"];
+        let named = named_task(params);
+        if let (Some(op), Some(task)) = (command_op(message), named) {
+            return json!({"_error": command_names_task(&op, task)});
+        }
+        let text = match crate::a2a::wire::message_input(message) {
+            Ok(text) => text,
+            Err(part) => {
+                return refusal(
+                    errors::CONTENT_TYPE_NOT_SUPPORTED,
+                    reason::CONTENT_TYPE_NOT_SUPPORTED,
+                    &part.to_string(),
+                    &[],
+                );
+            }
+        };
+        if let Some(tid) = named {
+            match self.tasks.get(tid) {
+                Some(t) if t.is_visible_to(principal) => {
+                    if t.state.is_terminal() {
+                        return err_obj(
+                            UNSUPPORTED_OPERATION,
+                            &format!(
+                                "task {tid} is {}; it accepts no further messages",
+                                t.state.wire()
+                            ),
+                        );
+                    }
+                }
+                // "Not yours" and "does not exist" answer alike, so no caller
+                // can probe for another principal's task ids.
+                _ => return err_obj(TASK_NOT_FOUND, "task not found"),
+            }
+        }
+        let push = match params.get("push").filter(|p| !p.is_null()) {
+            None => None,
+            Some(config) => match self.push_enabled().and_then(|()| self.push_target(config)) {
+                Ok(target) => Some(target),
+                Err(e) => return e,
+            },
+        };
+        let out = self.a2a_message(principal, message, &text, named);
+        // Attached at once, within the send that created (or continued) the
+        // task: no other request runs on the loop between the two, and the
+        // webhook is told the state the task is in now — which is where every
+        // transition it would have heard about so far has led.
+        if let Some(target) = push
+            && out.get("_error").is_none()
+            && let Some(tid) = out["task"]["id"].as_str().map(str::to_string)
+        {
+            self.attach_push(&tid, target, principal);
+            self.push_now(&tid);
+        }
+        out
+    }
+
+    /// The message, accepted: routed to the registry, a gate, or a turn.
+    /// `text` is what [`crate::a2a::wire::message_input`] made of its parts,
+    /// and `named` the task it continues — already found, visible to the
+    /// caller and still open.
+    fn a2a_message(
+        &mut self,
+        principal: &Principal,
+        message: &Value,
+        text: &str,
+        named: Option<&str>,
+    ) -> Value {
         // The caller's message, with the id it is known by from here on: its
         // own `messageId`, or one minted for it. History records it under that
         // id, so a client finds its prompt again by the id it sent. An id in
         // the agent's namespace is minted over, so no caller can pose as one
         // of the agent's status messages in history.
-        let mut message = params["message"].clone();
+        let mut message = message.clone();
         let message_id = message["messageId"]
             .as_str()
             .filter(|s| !s.is_empty() && !crate::a2a::wire::is_agent_message_id(s))
@@ -115,7 +228,6 @@ impl Runtime {
         if !declared && let Some(op) = command_op(message) {
             return self.a2a_command(principal, &op, message);
         }
-        let text = message_text(message);
         // A command DataPart carries no text, and that is not an empty message.
         if text.trim().is_empty() && !declared {
             return err_obj(
@@ -123,20 +235,18 @@ impl Runtime {
                 "message has no text or command part",
             );
         }
-        // Continue an existing task (answering an input-required gate) or start
-        // a fresh conversation. An id for a task that does not exist yet is the
-        // listener's reservation, and `task_create` takes it.
-        let existing = message["taskId"].as_str().and_then(|tid| {
+        // Continue the named task (answering an input-required gate) or start
+        // a fresh conversation under the id this send reserved.
+        let existing = named.and_then(|tid| {
             self.tasks
                 .get(tid)
-                .map(|t| (tid.to_string(), t.context_id.clone(), t.principal.clone()))
+                .map(|t| (tid.to_string(), t.context_id.clone()))
         });
         // A LIVE human gate on the addressed task: the reply
         // resolves the suspended asker directly — the tool call returns the
         // text to the model, the `human` step completes with it — instead of
         // becoming a new conversation turn.
-        if let Some((tid, _, owner)) = &existing
-            && (owner.as_deref() == Some(principal.id.as_str()) || principal.is_operator())
+        if let Some((tid, _)) = &existing
             && let Some(i) = self
                 .pending
                 .iter()
@@ -194,20 +304,18 @@ impl Runtime {
             if let Some(t) = self.tasks.get_mut(tid) {
                 t.record_inbound(message);
             }
-            self.human_answer(i, &text, via, Some(&principal.id.clone()));
+            self.human_answer(i, text, via, Some(&principal.id.clone()));
             return self.task_reply(tid);
         }
         let (task_id, ctx_id) = match existing {
-            Some((tid, ctx, owner))
-                if owner.as_deref() == Some(principal.id.as_str()) || principal.is_operator() =>
-            {
+            Some((tid, ctx)) => {
                 if let Some(t) = self.tasks.get_mut(&tid) {
                     t.record_inbound(message);
                     t.transition(State::Working, None);
                 }
                 (tid, ctx)
             }
-            _ => {
+            None => {
                 let ctx = message["contextId"]
                     .as_str()
                     .filter(|s| !s.is_empty())
@@ -348,15 +456,56 @@ mod tests {
         );
     }
 
+    /// Which task a send names. Through the protocol layer `taskId` is always
+    /// set, and only `newTask: true` makes it a reservation rather than a
+    /// name — anything else continues a task that must exist, so a bridge
+    /// request that says less than it should can never create a task under an
+    /// id nobody reserved. A read the listener answers carries the caller's
+    /// message as it was sent.
+    #[test]
+    fn the_task_a_send_names() {
+        let msg = json!({"taskId": "t-msg"});
+        let cases = [
+            (
+                json!({"message": msg, "taskId": "t-gen", "newTask": true}),
+                None,
+            ),
+            (
+                json!({"message": msg, "taskId": "t-named", "newTask": false}),
+                Some("t-named"),
+            ),
+            (
+                json!({"message": msg, "taskId": "t-odd", "newTask": "yes"}),
+                Some("t-odd"),
+            ),
+            (json!({"message": msg}), Some("t-msg")),
+            (json!({"message": {"taskId": ""}}), None),
+            (json!({"message": {}}), None),
+        ];
+        for (params, want) in cases {
+            assert_eq!(named_task(&params), want, "{params}");
+        }
+    }
+
+    /// A command naming a task is refused in the shape the listener and the
+    /// runtime share: the field, and the reason.
+    #[test]
+    fn a_command_naming_a_task_is_refused_with_its_field() {
+        let e = command_names_task("workflow.run", "t-1");
+        assert_eq!(e["code"], errors::INVALID_PARAMS);
+        assert_eq!(
+            e["data"][0]["fieldViolations"][0]["field"],
+            "message.taskId"
+        );
+        assert_eq!(e["data"][1]["reason"], reason::COMMAND_TASK_ID);
+        assert_eq!(e["data"][1]["domain"], errors::AGENTD_DOMAIN);
+    }
+
     #[test]
     fn command_and_text_extraction() {
         let m = json!({"parts": [{"text": "please"}, {"data": {"agentd": {"op": "workflow.run", "name": "x"}}}]});
         assert_eq!(command_op(&m), Some("workflow.run".to_string()));
         assert_eq!(command_data(&m).unwrap()["name"], "x");
-        assert_eq!(
-            message_text(&json!({"parts": [{"text": "a"}, {"text": "b"}]})),
-            "a\nb"
-        );
         assert_eq!(command_op(&json!({"parts": [{"text": "hi"}]})), None);
     }
 }

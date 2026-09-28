@@ -194,7 +194,8 @@ fn agent_card_of(
              "protocolVersion": A2A_PROTOCOL_VERSION}
         ],
         "capabilities": capabilities,
-        "defaultInputModes": ["text/plain", "application/json"],
+        // What a message may carry is what `a2a_send` accepts: one list.
+        "defaultInputModes": crate::a2a::wire::INPUT_MODES,
         "defaultOutputModes": ["text/plain", "application/json"],
         "skills": skills,
     });

@@ -100,9 +100,91 @@ const STATUS_ID_INFIX: &str = ".status.";
 /// its task id, and the numbering is public) would shadow the agent's next
 /// question in every console watching the task. Such an id is re-minted
 /// rather than kept. The whole infix is reserved, not just the addressed
-/// task's: a new task's id is minted by the listener and may be guessable.
+/// task's: which task a message will open is not the caller's to know.
 pub fn is_agent_message_id(id: &str) -> bool {
     id.contains(STATUS_ID_INFIX)
+}
+
+/// The media types a caller's message may carry — the card's
+/// `defaultInputModes`, and the list a refusal names.
+pub const INPUT_MODES: &[&str] = &["text/plain", "application/json"];
+
+/// A message part agentd cannot take: its declared media type, if it named
+/// one. The whole message is refused for it (`-32005`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsupportedPart(pub Option<String>);
+
+impl std::fmt::Display for UnsupportedPart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "media type {} is not supported; accepted: {}",
+            self.0.as_deref().unwrap_or("unspecified"),
+            INPUT_MODES.join(", ")
+        )
+    }
+}
+
+/// What a caller's message says, as the text of a turn.
+///
+/// - A text part is taken as written; several are joined by newlines.
+/// - A DataPart is `application/json`, which the card accepts, so it is
+///   rendered for the model as a fenced JSON block — not dropped, which left a
+///   JSON-only message "empty" and a mixed one silently short of its data.
+///   agentd's own command envelope (`data.agentd`) is the exception: it is a
+///   command, not words, and carries no text.
+/// - A file — bytes or a URL — is no media type agentd takes, and refuses the
+///   WHOLE message: answering a message with its file quietly removed would be
+///   answering a different message.
+///
+/// The message is read with the spec's own `Message`; a shape that is not one
+/// has no parts to read.
+pub fn message_input(message: &Value) -> Result<String, UnsupportedPart> {
+    use a2a_rs::domain::part::Content;
+    let parts = serde_json::from_value::<Message>(message.clone())
+        .map(|m| m.parts)
+        .unwrap_or_default();
+    let mut out: Vec<String> = Vec::new();
+    for part in parts {
+        match part.content {
+            Some(Content::Text(text)) => out.push(text),
+            Some(Content::Data(data)) => {
+                let data = whole_numbers(serde_json::to_value(&*data).unwrap_or(Value::Null));
+                if data.get("agentd").is_none() {
+                    let pretty = serde_json::to_string_pretty(&data).unwrap_or_default();
+                    out.push(format!("```json\n{pretty}\n```"));
+                }
+            }
+            Some(Content::Raw(_) | Content::Url(_)) => {
+                return Err(UnsupportedPart(
+                    Some(part.media_type).filter(|t| !t.is_empty()),
+                ));
+            }
+            None => {}
+        }
+    }
+    Ok(out.join("\n"))
+}
+
+/// `v` with every integral number written as an integer.
+///
+/// A DataPart's payload is a `google.protobuf.Value`, whose only number is a
+/// double, so the `1` a caller sent comes back `1.0`. JSON has one number type
+/// and the caller wrote an integer; a model reading `1.0` for a count or an id
+/// is reading something the caller did not say.
+fn whole_numbers(v: Value) -> Value {
+    const EXACT: f64 = 9_007_199_254_740_992.0; // 2^53
+    match v {
+        Value::Number(n) => match n.as_f64() {
+            Some(f) if n.is_f64() && f.fract() == 0.0 && f.abs() < EXACT => json!(f as i64),
+            _ => Value::Number(n),
+        },
+        Value::Array(a) => Value::Array(a.into_iter().map(whole_numbers).collect()),
+        Value::Object(o) => {
+            Value::Object(o.into_iter().map(|(k, v)| (k, whole_numbers(v))).collect())
+        }
+        other => other,
+    }
 }
 
 /// A status `Message` the agent authored, addressed to its task and context.
@@ -409,6 +491,41 @@ pub fn is_from_caller(m: &Message) -> bool {
 mod tests {
     use super::*;
     use crate::a2a::tasks::Link;
+
+    /// A message's parts, as a turn reads them: text as written, JSON data as
+    /// a fenced block, the command envelope as no text at all — and a file,
+    /// anywhere in the message, refuses all of it with the media type it named.
+    #[test]
+    fn message_input_parts() {
+        let m = |parts: Value| json!({"role": "ROLE_USER", "messageId": "m", "parts": parts});
+        assert_eq!(
+            message_input(&m(json!([{"text": "a"}, {"text": "b"}]))),
+            Ok("a\nb".to_string())
+        );
+        assert_eq!(
+            message_input(&m(json!([{"text": "look:"}, {"data": {"k": [1, 2.5]}}]))),
+            Ok("look:\n```json\n{\n  \"k\": [\n    1,\n    2.5\n  ]\n}\n```".to_string())
+        );
+        assert_eq!(
+            message_input(&m(json!([{"data": {"agentd": {"op": "status"}}}]))),
+            Ok(String::new())
+        );
+        assert_eq!(message_input(&m(json!([]))), Ok(String::new()));
+
+        let url = json!({"url": "https://h.example/cat.png", "mediaType": "image/png"});
+        let refused = message_input(&m(json!([{"text": "see"}, url]))).unwrap_err();
+        assert_eq!(refused, UnsupportedPart(Some("image/png".into())));
+        assert_eq!(
+            refused.to_string(),
+            "media type image/png is not supported; accepted: text/plain, application/json"
+        );
+        // Bytes, with no media type named, anywhere in the message.
+        let raw = message_input(&m(json!([{"raw": "aGk="}, {"text": "after"}]))).unwrap_err();
+        assert_eq!(
+            raw.to_string(),
+            "media type unspecified is not supported; accepted: text/plain, application/json"
+        );
+    }
 
     /// The whole point of building the wire from their types: the spellings the
     /// spec fixes come out right without us naming them.

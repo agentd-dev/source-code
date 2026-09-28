@@ -43,7 +43,7 @@
 mod common;
 
 use std::io::BufRead;
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -64,28 +64,15 @@ fn sigterm(pid: u32) {
     }
 }
 
-/// A free loopback port (bind :0, read the port, drop). A tiny TOCTOU window —
-/// agentd rebinds within milliseconds.
+/// A free loopback port (bind :0, read the port, drop). Only a candidate: the
+/// port is free when probed, not when the daemon binds it — see
+/// [`respawn`].
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
         .unwrap()
         .port()
-}
-
-fn wait_ready(addr: &str) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if TcpStream::connect(addr).is_ok() {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "a2a listener never became connectable"
-        );
-        std::thread::sleep(Duration::from_millis(25));
-    }
 }
 
 struct MockLlm {
@@ -122,6 +109,11 @@ fn spawn_mock_llm(playbook: &Value) -> MockLlm {
 struct Daemon {
     child: Child,
     stderr_path: String,
+    /// The port its config named, for a test that rewrites the config to
+    /// reload it: `a2a.listen` is restart-only, so the rewrite must keep it.
+    port: u16,
+    /// The authority THIS daemon bound, read from its own `a2a.listen` line.
+    addr: String,
 }
 impl Daemon {
     fn pid(&self) -> u32 {
@@ -150,29 +142,57 @@ impl Drop for Daemon {
     }
 }
 
-/// Spawn the daemon, handing it the two bearers through the environment — the
-/// config names them by reference, so the secrets never touch a file.
-fn spawn_daemon(config: &str) -> Daemon {
-    let stderr_path = common::unique_path("a2a-authz-daemon", "log");
-    let errf = std::fs::File::create(&stderr_path).unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_agentd"))
-        .args(["--config", config])
-        .env("AGENTD_AUTHZ_TOKEN_A", TOKEN_A)
-        .env("AGENTD_AUTHZ_TOKEN_B", TOKEN_B)
-        .env("AGENTD_AUTHZ_TOKEN_C", TOKEN_C)
-        .env("AGENTD_AUTHZ_TOKEN_OP", TOKEN_OP)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(errf))
-        .spawn()
-        .expect("spawn agentd a2a daemon");
-    Daemon { child, stderr_path }
+/// Spawn the daemon from the config `cfg_for` renders for a free port, written
+/// to a fresh path that is returned beside it, once it is serving.
+fn spawn_daemon(cfg_for: impl Fn(u16) -> String) -> (Daemon, String) {
+    let cfg = common::unique_path("a2a-authz", "yaml");
+    (respawn(&cfg, cfg_for), cfg)
 }
 
-fn write_config(yaml: &str) -> String {
-    let path = common::unique_path("a2a-authz", "yaml");
-    std::fs::write(&path, yaml).unwrap();
-    path
+/// Start the daemon from `cfg` — rewritten by `cfg_for` for a free port — and
+/// return once it has bound that port, handing it the bearers through the
+/// environment: the config names them by reference, so the secrets never touch
+/// a file.
+///
+/// Readiness is the daemon's OWN `a2a.listen` line, never a connect to the
+/// port. A probed port is free when probed, not when the daemon binds it, and
+/// the tests in this binary boot daemons in parallel: when two probes draw the
+/// same port, one daemon loses the bind and exits, while a connect still
+/// succeeds — against the winner. The loser's test is then answered by another
+/// test's config ("workflow `waiter` is not runnable by user:token-a", on a
+/// config where it plainly is). A lost bind is retried on a fresh port instead.
+fn respawn(cfg: &str, cfg_for: impl Fn(u16) -> String) -> Daemon {
+    let mut last = String::new();
+    for _ in 0..5 {
+        let port = free_port();
+        std::fs::write(cfg, cfg_for(port)).unwrap();
+        let stderr_path = common::unique_path("a2a-authz-daemon", "log");
+        let errf = std::fs::File::create(&stderr_path).unwrap();
+        let child = Command::new(env!("CARGO_BIN_EXE_agentd"))
+            .args(["--config", cfg])
+            .env("AGENTD_AUTHZ_TOKEN_A", TOKEN_A)
+            .env("AGENTD_AUTHZ_TOKEN_B", TOKEN_B)
+            .env("AGENTD_AUTHZ_TOKEN_C", TOKEN_C)
+            .env("AGENTD_AUTHZ_TOKEN_OP", TOKEN_OP)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(errf))
+            .spawn()
+            .expect("spawn agentd a2a daemon");
+        // Owned before the wait, so a daemon that never binds is still reaped.
+        let mut daemon = Daemon {
+            child,
+            stderr_path,
+            port,
+            addr: String::new(),
+        };
+        if let Some(addr) = common::try_a2a_bound(&daemon.stderr_path, Duration::from_secs(20)) {
+            daemon.addr = addr;
+            return daemon;
+        }
+        last = daemon.stderr();
+    }
+    panic!("the daemon never bound an A2A listener (5 attempts); last stderr:\n{last}")
 }
 
 /// Two principals on one listener.
@@ -205,11 +225,8 @@ fn two_principal_config(llm: &str, port: u16) -> String {
 #[test]
 fn one_principals_task_stream_is_not_readable_by_another() {
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "the private answer"}]}));
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-    let cfg = write_config(&two_principal_config(&llm.uri, port));
-    let mut daemon = spawn_daemon(&cfg);
-    wait_ready(&addr);
+    let (mut daemon, cfg) = spawn_daemon(|port| two_principal_config(&llm.uri, port));
+    let addr = daemon.addr.clone();
 
     // A starts a task and it settles, so the fan-out's replay buffer holds A's
     // transitions and its result artifact — the material a replay would leak.
@@ -323,11 +340,8 @@ fn a_send_naming_another_principals_live_task_streams_none_of_it() {
         "turns": [{"content": "B's own answer"}],
         "match": [{"when_contains": "the victim's question", "content": "the private answer", "delay_ms": 3000}],
     }));
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-    let cfg = write_config(&two_principal_config(&llm.uri, port));
-    let mut daemon = spawn_daemon(&cfg);
-    wait_ready(&addr);
+    let (mut daemon, cfg) = spawn_daemon(|port| two_principal_config(&llm.uri, port));
+    let addr = daemon.addr.clone();
 
     // A starts a task and does not wait for it: the model is still thinking.
     let started = SendMessage::text("the victim's question")
@@ -471,11 +485,8 @@ fn a_flood_of_distinct_method_names_does_not_grow_the_daemon() {
     /// magnitude, which is why a threshold works here at all.
     const FLOOD: u64 = 250;
 
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-    let cfg = write_config(&loopback_config(port));
-    let mut daemon = spawn_daemon(&cfg);
-    wait_ready(&addr);
+    let (mut daemon, cfg) = spawn_daemon(loopback_config);
+    let addr = daemon.addr.clone();
 
     let call = |n: u64| {
         let method = format!("{n:08}{}", "m".repeat(NAME));
@@ -534,11 +545,8 @@ fn json_refusal(reply: &common::HttpReply) -> (u16, Value) {
 #[test]
 fn credentials_are_challenged_with_401_and_roles_refused_with_403() {
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-    let cfg = write_config(&two_principal_config(&llm.uri, port));
-    let mut daemon = spawn_daemon(&cfg);
-    wait_ready(&addr);
+    let (mut daemon, cfg) = spawn_daemon(|port| two_principal_config(&llm.uri, port));
+    let addr = daemon.addr.clone();
 
     let unauthenticated = |reply: common::HttpReply, presented: bool, what: &str| {
         let challenge = reply.header("www-authenticate").map(str::to_string);
@@ -689,10 +697,9 @@ fn credentials_are_challenged_with_401_and_roles_refused_with_403() {
 #[test]
 fn extended_card_needs_a_declared_scheme_credential() {
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "hello pub"}]}));
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-    let cfg = write_config(&format!(
-        "config_version: \"1\"\n\
+    let (mut daemon, cfg) = spawn_daemon(|port| {
+        format!(
+            "config_version: \"1\"\n\
          agent:\n  name: a2a-authz\n  instruction: You are a helpful test agent.\n  preflight: never\n\
          intelligence:\n  endpoints: {llm}\n  model: mock\n\
          store:\n  kind: memory\n\
@@ -704,10 +711,10 @@ fn extended_card_needs_a_declared_scheme_credential() {
          \x20     role: user\n\
          lifecycle:\n  run_until: drained\n\
          observability:\n  log_level: info\n",
-        llm = llm.uri
-    ));
-    let mut daemon = spawn_daemon(&cfg);
-    wait_ready(&addr);
+            llm = llm.uri
+        )
+    });
+    let addr = daemon.addr.clone();
 
     let card = a2a_post(&addr, &rpc_body(1, "GetExtendedAgentCard", json!({})), &[]);
     let (status, v) = json_refusal(&card);
@@ -749,14 +756,13 @@ fn extended_card_needs_a_declared_scheme_credential() {
 /// operator it always was.
 #[test]
 fn a_browser_origin_is_never_the_implicit_operator() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-    let cfg = write_config(&loopback_config(port).replace(
-        "  listen: ",
-        "  cors:\n    origins: [\"http://127.0.0.1:4173\"]\n  listen: ",
-    ));
-    let mut daemon = spawn_daemon(&cfg);
-    wait_ready(&addr);
+    let (mut daemon, cfg) = spawn_daemon(|port| {
+        loopback_config(port).replace(
+            "  listen: ",
+            "  cors:\n    origins: [\"http://127.0.0.1:4173\"]\n  listen: ",
+        )
+    });
+    let addr = daemon.addr.clone();
 
     let body = rpc_body(1, "ListTasks", json!({}));
     let browser = a2a_post(&addr, &body, &[("Origin", "http://127.0.0.1:4173")]);
@@ -797,12 +803,9 @@ fn a_browser_origin_is_never_the_implicit_operator() {
 #[cfg(feature = "hot-reload")]
 fn a_reload_demotes_a_principal_and_the_revocation_takes_effect() {
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "ok"}]}));
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-
     // `plan.get` is a USER grant and not an AGENT one, so it is exactly the
     // privilege a demotion is meant to remove.
-    let cfg_for = |role: &str| {
+    let cfg_for = |role: &str, port: u16| {
         format!(
             "config_version: \"1\"\n\
              agent:\n  name: a2a-authz\n  instruction: You are a helpful test agent.\n  preflight: never\n\
@@ -822,9 +825,8 @@ fn a_reload_demotes_a_principal_and_the_revocation_takes_effect() {
         )
     };
 
-    let cfg = write_config(&cfg_for("user"));
-    let mut daemon = spawn_daemon(&cfg);
-    wait_ready(&addr);
+    let (mut daemon, cfg) = spawn_daemon(|port| cfg_for("user", port));
+    let addr = daemon.addr.clone();
 
     let plan_get = || {
         SendMessage::command("plan.get", json!({}))
@@ -842,7 +844,7 @@ fn a_reload_demotes_a_principal_and_the_revocation_takes_effect() {
     assert!(!refused(&before), "a user may plan.get: {before}");
 
     // Demote A to `agent` and reload.
-    std::fs::write(&cfg, cfg_for("agent")).unwrap();
+    std::fs::write(&cfg, cfg_for("agent", daemon.port)).unwrap();
     unsafe { libc::kill(daemon.pid() as i32, libc::SIGHUP) };
     let deadline = Instant::now() + Duration::from_secs(10);
     while !daemon.stderr().contains("\"event\":\"config.reloaded\"") {
@@ -1020,11 +1022,8 @@ fn a_spawns_a_helper() -> Value {
 #[test]
 fn every_command_op_that_names_an_object_is_owner_scoped() {
     let llm = spawn_mock_llm(&a_spawns_a_helper());
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-    let cfg = write_config(&owners_config(&llm.uri, port, "[\"*\"]"));
-    let mut daemon = spawn_daemon(&cfg);
-    wait_ready(&addr);
+    let (mut daemon, cfg) = spawn_daemon(|port| owners_config(&llm.uri, port, "[\"*\"]"));
+    let addr = daemon.addr.clone();
     let a = a_owns_a_run_and_a_subagent(&addr, &daemon);
 
     let not_found = |op: &str, args: Value, msg: &str| {
@@ -1158,11 +1157,8 @@ fn the_model_cannot_act_on_another_principals_objects() {
     let pb = common::unique_path("owners-playbook", "json");
     std::fs::write(&pb, a_spawns_a_helper().to_string()).unwrap();
     let llm = spawn_mock_llm_file(&pb);
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-    let cfg = write_config(&owners_config(&llm.uri, port, "[\"*\"]"));
-    let mut daemon = spawn_daemon(&cfg);
-    wait_ready(&addr);
+    let (mut daemon, cfg) = spawn_daemon(|port| owners_config(&llm.uri, port, "[\"*\"]"));
+    let addr = daemon.addr.clone();
     let a = a_owns_a_run_and_a_subagent(&addr, &daemon);
 
     // B's turn: the model reaches for A's run and A's helper by id.
@@ -1241,15 +1237,14 @@ fn a_narrowed_principal_cannot_run_a_workflow_through_the_model() {
         ]},
         {"content": "started what I could"},
     ]}));
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-    let cfg = write_config(&owners_config(
-        &llm.uri,
-        port,
-        "[\"workflow.run:triage*\", \"workflow.signal\"]",
-    ));
-    let mut daemon = spawn_daemon(&cfg);
-    wait_ready(&addr);
+    let (mut daemon, cfg) = spawn_daemon(|port| {
+        owners_config(
+            &llm.uri,
+            port,
+            "[\"workflow.run:triage*\", \"workflow.signal\"]",
+        )
+    });
+    let addr = daemon.addr.clone();
 
     let sent = SendMessage::text("run deploy and triage")
         .bearer(TOKEN_B)
@@ -1358,11 +1353,8 @@ fn the_model_lists_only_its_callers_objects_and_leaves_the_instance_alone() {
     let pb = common::unique_path("owners-playbook", "json");
     std::fs::write(&pb, a_spawns_a_helper().to_string()).unwrap();
     let llm = spawn_mock_llm_file(&pb);
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-    let cfg = write_config(&owners_config(&llm.uri, port, "[\"*\"]"));
-    let mut daemon = spawn_daemon(&cfg);
-    wait_ready(&addr);
+    let (mut daemon, cfg) = spawn_daemon(|port| owners_config(&llm.uri, port, "[\"*\"]"));
+    let addr = daemon.addr.clone();
     let a = a_owns_a_run_and_a_subagent(&addr, &daemon);
 
     let definition = |name: &str| json!({"name": name, "steps": {"s": {"kind": "once"}, "f": {"kind": "finish", "depends_on": ["s"]}}});
@@ -1503,17 +1495,14 @@ fn a_reload_narrows_what_the_model_does_for_work_in_flight() {
         {"tool_calls": [{"name": "workflow.run", "arguments": {"name": "deploy"}}]},
         {"content": "asked"},
     ]}));
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-    let cfg = write_config(&owners_config(&llm.uri, port, "[\"*\"]"));
-    let mut daemon = spawn_daemon(&cfg);
-    wait_ready(&addr);
+    let (mut daemon, cfg) = spawn_daemon(|port| owners_config(&llm.uri, port, "[\"*\"]"));
+    let addr = daemon.addr.clone();
     b_starts_later(&addr, &daemon);
 
     // Narrow B to `triage*` while its run sleeps, and make no request as B.
     std::fs::write(
         &cfg,
-        owners_config(&llm.uri, port, "[\"workflow.run:triage*\"]"),
+        owners_config(&llm.uri, daemon.port, "[\"workflow.run:triage*\"]"),
     )
     .unwrap();
     unsafe { libc::kill(daemon.pid() as i32, libc::SIGHUP) };
@@ -1558,20 +1547,17 @@ fn restored_work_acts_for_its_owner_before_the_owner_calls_again() {
     let store = format!(
         "store:\n  kind: file\n  file:\n    path: {dir}/state\n  checkpoint:\n    debounce_ms: 0\n"
     );
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-    let cfg = write_config(&owners_config_on(&llm.uri, port, "[\"*\"]", &store));
+    let cfg_for = |port| owners_config_on(&llm.uri, port, "[\"*\"]", &store);
 
-    let first = spawn_daemon(&cfg);
-    wait_ready(&addr);
+    let (first, cfg) = spawn_daemon(cfg_for);
+    let addr = first.addr.clone();
     b_starts_later(&addr, &first);
     // Mid-sleep: no drain, nothing finished.
     unsafe { libc::kill(first.pid() as i32, libc::SIGKILL) };
     drop(first);
 
     // The second life: nobody calls as B.
-    let mut second = spawn_daemon(&cfg);
-    wait_ready(&addr);
+    let mut second = respawn(&cfg, cfg_for);
     wait_later_done(&second);
     assert!(
         started(&second.stderr(), "triage"),
@@ -1615,11 +1601,9 @@ fn status_is_scoped_to_the_caller() {
     let pb = common::unique_path("status-playbook", "json");
     std::fs::write(&pb, a_spawns_a_helper().to_string()).unwrap();
     let llm = spawn_mock_llm_file(&pb);
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-    let cfg = write_config(&with_operator(&owners_config(&llm.uri, port, "[\"*\"]")));
-    let mut daemon = spawn_daemon(&cfg);
-    wait_ready(&addr);
+    let (mut daemon, cfg) =
+        spawn_daemon(|port| with_operator(&owners_config(&llm.uri, port, "[\"*\"]")));
+    let addr = daemon.addr.clone();
     let a = a_owns_a_run_and_a_subagent(&addr, &daemon);
 
     // B's turn asks the model how the agent is doing.
@@ -1751,19 +1735,18 @@ fn a_subagent_reads_status_as_its_owner() {
     let pb = common::unique_path("status-subagent-playbook", "json");
     std::fs::write(&pb, a_spawns_a_helper().to_string()).unwrap();
     let llm = spawn_mock_llm_file(&pb);
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     // An allowing rule is enough to route a subagent's `status` through the
     // supervisor: a rule that might apply has to be judged where it is held.
-    let cfg = write_config(&owners_config_on(
-        &llm.uri,
-        port,
-        "[\"*\"]",
-        "store:\n  kind: memory\n\
+    let (mut daemon, cfg) = spawn_daemon(|port| {
+        owners_config_on(
+            &llm.uri,
+            port,
+            "[\"*\"]",
+            "store:\n  kind: memory\n\
          security:\n  policies:\n    - match: { tool: status, caller: [subagent] }\n      action: allow\n",
-    ));
-    let mut daemon = spawn_daemon(&cfg);
-    wait_ready(&addr);
+        )
+    });
+    let addr = daemon.addr.clone();
     let a = a_owns_a_run_and_a_subagent(&addr, &daemon);
 
     // B's turn runs a sync subagent; the subagent (whose prompt is the
@@ -1822,10 +1805,9 @@ fn a_subagent_reads_status_as_its_owner() {
 /// a2a-rs path that serves a Task-reply command.
 #[test]
 fn listed_workflows_are_exactly_the_runnable_ones() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-    let cfg = write_config(&format!(
-        "config_version: \"1\"\n\
+    let (mut daemon, cfg) = spawn_daemon(|port| {
+        format!(
+            "config_version: \"1\"\n\
          agent:\n  name: a2a-runnable\n  instruction: You are a test agent.\n  preflight: never\n\
          intelligence:\n  endpoints: https://127.0.0.1:9\n  model: mock\n\
          store:\n  kind: memory\n\
@@ -1851,9 +1833,9 @@ fn listed_workflows_are_exactly_the_runnable_ones() {
          \x20 - name: ops-only\n    steps:\n      s: {{kind: a2a, command: ops.go, roles: [operator]}}\n      f: {{kind: finish, depends_on: [s]}}\n\
          lifecycle:\n  run_until: drained\n\
          observability:\n  log_level: info\n"
-    ));
-    let mut daemon = spawn_daemon(&cfg);
-    wait_ready(&addr);
+        )
+    });
+    let addr = daemon.addr.clone();
 
     let all = ["triage", "deploy", "user-only", "ops-only"];
     // Written out as well as compared, so the two sides cannot agree by

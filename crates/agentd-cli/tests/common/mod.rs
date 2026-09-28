@@ -142,11 +142,11 @@ pub fn wait_for_file(path: &str) {
 
 /// The A2A authority a daemon ACTUALLY bound, read from its telemetry.
 ///
-/// Tests configure `a2a.listen: http://127.0.0.1:0` and learn the port here,
-/// instead of pre-picking one with a bind-and-drop probe: under parallel load
-/// another process can take that port in the gap, and the test then talks to a
-/// stranger's listener (or to nothing). The daemon logs the bound authority on
-/// its `a2a.listen` line, which is the only race-free source.
+/// `a2a.listen` refuses port 0, so a test hands the daemon a probed free port
+/// — and must learn here whether the daemon got it: under parallel load
+/// another process can take that port in the gap, and a bare connect then
+/// talks to a stranger's listener (or to nothing). The daemon logs the bound
+/// authority on its `a2a.listen` line, which is the only race-free source.
 pub fn wait_a2a_bound(stderr_path: &str) -> String {
     try_a2a_bound(stderr_path, Duration::from_secs(20)).unwrap_or_else(|| {
         let log = std::fs::read_to_string(stderr_path).unwrap_or_default();

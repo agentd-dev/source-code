@@ -12,7 +12,7 @@
 //
 // Served from loopback, the page's Origin is loopback — allowed by agentd's
 // rebind guard with CORS out of the box. A HOSTED copy of dist/ instead needs
-// its origin listed in the daemon's `interface.origins`.
+// its origin listed in the daemon's `a2a.cors.origins`.
 import http from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
@@ -104,6 +104,16 @@ const server = http.createServer(async (req, res) => {
 });
 
 const listening = () => {
+  // An inherited socket is whatever the parent bound. The Host check above is
+  // no access control — any peer can send that Host — so a socket on a
+  // wildcard or public address would serve this page, and config.js, to the
+  // network. Only 127.0.0.1 is served: it is the address printed below and
+  // the one the Host check names.
+  const bound = server.address()?.address;
+  if (listenFd !== undefined && bound !== '127.0.0.1') {
+    process.stderr.write(`agentd-ui: the socket on fd ${listenFd} is bound to ${bound}, not loopback; refusing to serve it\n`);
+    process.exit(2);
+  }
   const url = `http://127.0.0.1:${servedPort()}/`;
   process.stdout.write(`agentd-ui: serving on ${url}${endpoint ? ` → ${endpoint}` : ''}\n`);
   if (open) {

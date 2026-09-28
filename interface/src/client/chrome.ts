@@ -17,7 +17,7 @@
  * which tone, and each surface maps the tone to its own colours.
  */
 
-import type { Json } from './types.js';
+import { CONTROL, type Json } from './types.js';
 
 /** Which client draws a chrome. */
 export type Surface = 'tui' | 'web';
@@ -187,23 +187,16 @@ function num(v: Json | undefined): number | undefined {
 }
 
 /**
- * C0 and C1 control characters, DEL included. Chrome text comes from places a
- * model can write — memory values, the card's name, an error message — and a
- * terminal obeys what it is sent: an ESC sequence could retitle the window,
- * set the clipboard (OSC 52) or dress a link as another (OSC 8), and a newline
- * breaks a one-line bar.
- */
-const CONTROL = /[\u0000-\u001f\u007f-\u009f]+/g;
-
-/**
  * What `name` shows, or `null` for nothing at all. An item with nothing to say
  * (an unset memory key, counters a non-operator is not shown, no active
  * units) takes no slot rather than an empty one, because a blank reads as
  * broken. An unknown name is `null` too, so a layout written for a newer
  * client still draws the rest.
  *
- * Every item is one line of inert text: control characters become a space,
- * and an item left with nothing visible takes no slot.
+ * Every item is one line of inert text: control characters ({@link CONTROL} —
+ * chrome text comes from places a model can write, and a newline breaks a
+ * one-line bar) become a space, and an item left with nothing visible takes
+ * no slot.
  */
 export function itemValue(name: string, c: ChromeInput): ItemValue | null {
   const v = rawItemValue(name, c);

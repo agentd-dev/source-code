@@ -68,13 +68,20 @@ export async function startFakeA2a(opts = {}) {
     requests,
     /** The public card; replace or edit it freely. */
     card: null,
-    /** The extended card GetExtendedAgentCard returns (null: -32004). */
+    /**
+     * The extended card GetExtendedAgentCard returns. When the public card
+     * does not declare one the call answers -32004 (agentd's answer when no
+     * listener auth is configured); when it is declared but this is null,
+     * -32007 ExtendedAgentCardNotConfigured, as A2A 1.0 names that case.
+     */
     extendedCard: null,
     cacheControl: opts.cacheControl ?? 'public, max-age=60',
     /** When set, the card route answers this status and no card. */
     cardStatus: undefined,
     /** When set, the card route serves these bytes instead of `card`. */
     cardBody: undefined,
+    /** When set, the card route answers 302 to this Location. */
+    cardRedirect: undefined,
     bearer: opts.bearer,
     tasks,
     /** The device grant: approved once `approve()` ran. */
@@ -146,9 +153,10 @@ export async function startFakeA2a(opts = {}) {
       return { tasks: page, nextPageToken: next, pageSize, totalSize: all.length };
     },
     GetExtendedAgentCard: () => {
-      if (!fake.card.capabilities?.extendedAgentCard || !fake.extendedCard) {
+      if (!fake.card.capabilities?.extendedAgentCard) {
         throw new RpcFailure(-32004, 'the extended agent card is not offered');
       }
+      if (!fake.extendedCard) throw new RpcFailure(-32007, 'the extended agent card is not configured');
       return fake.extendedCard;
     },
     // Streams answer with an array of frames.
@@ -178,6 +186,10 @@ export async function startFakeA2a(opts = {}) {
   // The card route records the status it answered, so a test can tell a 304
   // from a 200 without trusting the client's account of it.
   const cardRoute = (req, res, rec) => {
+    if (fake.cardRedirect !== undefined) {
+      rec.status = 302;
+      return send(res, 302, { location: fake.cardRedirect, 'content-type': 'text/plain' }, 'moved');
+    }
     if (fake.cardStatus !== undefined) {
       rec.status = fake.cardStatus;
       return send(res, fake.cardStatus, { 'content-type': 'text/plain' }, 'no card');

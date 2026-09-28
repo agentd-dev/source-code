@@ -2,8 +2,10 @@
 /**
  * agentd's extension vocabulary, in one place: every extension URI, the one
  * extension method, the command envelope key and the op names the client
- * reaches for. Nothing else under src/ spells any of these — a URI or op that
- * changes version changes here and nowhere else, and a guard test holds that.
+ * reaches for. This is meant to be their only home — a URI or op that changes
+ * version changes here and nowhere else. The older transport in `wire.ts`
+ * still spells two URIs of its own until it moves onto this module; the guard
+ * test that holds the rule arrives with that move.
  *
  * Everything here is an A2A extension (or, for {@link UNIX_BINDING}, a custom
  * binding) that agentd DECLARES on its card. The client uses one only when the

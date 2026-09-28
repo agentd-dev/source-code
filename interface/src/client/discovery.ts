@@ -13,9 +13,22 @@
  * The card is public: it is fetched with no credential and no custom header,
  * and kept in memory for as long as its `Cache-Control: max-age` allows, then
  * revalidated with its ETag.
+ *
+ * Everything a card says is someone else's text. Whatever of it reaches an
+ * error or a warning goes through {@link inert} first, because the TUI
+ * prints those to a terminal.
  */
 
-import { ClientError, Endpoint, Json, METHOD_NOT_FOUND, RpcError, UNSUPPORTED_OPERATION } from './types.js';
+import {
+  ClientError,
+  Endpoint,
+  EXTENDED_CARD_NOT_CONFIGURED,
+  inert,
+  Json,
+  METHOD_NOT_FOUND,
+  RpcError,
+  UNSUPPORTED_OPERATION,
+} from './types.js';
 import { A2A_VERSION } from './wire.js';
 import { A2aClient } from './a2a.js';
 import {
@@ -61,6 +74,12 @@ export function cardUrlOf(configured: string): string {
     u = new URL(configured);
   } catch {
     throw new ClientError('discovery', `${JSON.stringify(configured)} is not a URL`);
+  }
+  // A credential in the URL would ride every request as userinfo, and fetch
+  // refuses such a URL with an error that quotes it — onto the terminal and
+  // into any log that keeps errors. Refused here, without echoing it.
+  if (u.username !== '' || u.password !== '') {
+    throw new ClientError('discovery', `the endpoint URL carries credentials (${u.protocol}//…@${u.host}); use --bearer-file or sign in instead`);
   }
   if (u.pathname.endsWith(CARD_PATH)) {
     u.hash = '';
@@ -108,19 +127,26 @@ export const cardCache = new CardCache();
 
 /**
  * How long a response may be used, in seconds, from its `Cache-Control`:
- * `undefined` for `no-store` (never keep it), else `max-age`, else 0 — a card
- * without a lifetime is still kept for its ETag, but revalidated every time.
+ * `undefined` for `no-store` (never keep it), else 0 for `no-cache`, else
+ * `max-age`, else 0 — a card without a lifetime is still kept for its ETag,
+ * but revalidated every time.
+ *
+ * Every directive is read before deciding: `no-cache, no-store` is a common
+ * spelling, and stopping at `no-cache` would keep what `no-store` forbids.
  */
 function maxAgeOf(h: string | null): number | undefined {
   let age = 0;
+  let noCache = false;
+  let noStore = false;
   for (const raw of (h ?? '').split(',')) {
     const d = raw.trim().toLowerCase();
-    if (d === 'no-store') return undefined;
-    if (d === 'no-cache') return 0;
+    if (d === 'no-store') noStore = true;
+    else if (d === 'no-cache') noCache = true;
     const m = /^max-age\s*=\s*"?(\d+)"?$/.exec(d);
     if (m) age = Number(m[1]);
   }
-  return age;
+  if (noStore) return undefined;
+  return noCache ? 0 : age;
 }
 
 /** Read at most {@link MAX_CARD} bytes; `undefined` when the body is larger. */
@@ -160,6 +186,12 @@ export interface FetchCardOptions {
  * a cross-origin card sees no ETag (not a CORS-safelisted response header),
  * so it never sends the non-safelisted `If-None-Match` either; it just asks
  * again once `max-age` runs out.
+ *
+ * A redirect is refused, not followed. Everything after this — which
+ * interface is "same-origin" and so gets the person's credential, the tenant,
+ * the login options — is judged against the URL the person named; a card
+ * fetched from wherever that URL redirects would be judged as that origin's
+ * own.
  */
 export async function fetchCard(cardUrl: string, o: FetchCardOptions = {}): Promise<AgentCard> {
   const cache = o.cache ?? cardCache;
@@ -176,7 +208,18 @@ export async function fetchCard(cardUrl: string, o: FetchCardOptions = {}): Prom
     // This cache decides; a browser's HTTP cache answering underneath it would
     // make the revalidation above unobservable.
     cache: 'no-store',
+    redirect: 'manual',
   });
+  // A browser reports a redirect it did not follow as an opaque response
+  // (status 0, no Location); Node reports the 3xx itself.
+  if (res.type === 'opaqueredirect' || (res.status >= 300 && res.status < 400 && res.status !== 304)) {
+    await res.body?.cancel().catch(() => {});
+    const to = res.headers.get('location');
+    throw new ClientError(
+      'discovery',
+      `${cardUrl} redirects${to ? ` to ${inert(to)}` : ''}; point the client at the agent's own URL`,
+    );
+  }
   const age = maxAgeOf(res.headers.get('cache-control'));
   const etag = res.headers.get('etag') ?? undefined;
 
@@ -233,22 +276,63 @@ function isWildcardHost(host: string): boolean {
 }
 
 /**
+ * How close to the person a host is, as far as its spelling says: 0 public,
+ * 1 their network (RFC 1918, link-local, IPv6 unique-local and link-local),
+ * 2 their machine (loopback, `localhost`, `*.localhost`).
+ */
+type Reach = 0 | 1 | 2;
+
+/**
+ * The {@link Reach} of `host`. An IPv4-mapped IPv6 address (which the URL
+ * parser has already turned to hex) counts as this machine: it can map
+ * loopback, and nothing a card needs is spelled that way. A NAME that
+ * resolves to a private address is not caught — only a browser's own
+ * private-network rules could see that — but a card that wants to aim a
+ * client at the person's own machine has to spell it, and these are the
+ * spellings.
+ */
+function reachOf(host: string): Reach {
+  const h = host.replace(/^\[/, '').replace(/\]$/, '').toLowerCase();
+  if (isLoopbackHost(h) || h.endsWith('.localhost') || h.startsWith('::ffff:')) return 2;
+  const v4 = /^(\d{1,3})\.(\d{1,3})\.\d{1,3}\.\d{1,3}$/.exec(h);
+  if (v4) {
+    const a = Number(v4[1]);
+    const b = Number(v4[2]);
+    const net = a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254);
+    return net ? 1 : 0;
+  }
+  return /^f[cd][0-9a-f]{0,2}:/.test(h) || /^fe[89ab][0-9a-f]?:/.test(h) ? 1 : 0;
+}
+
+/**
  * Pick the interface (A2A 1.0 §8.3.2): the first `supportedInterfaces` entry
  * whose binding is JSON-RPC and whose protocol version is this client's
  * Major.Minor, and whose URL is one `fetch` can reach. A unix-socket binding,
- * a `unix:` URL and a wildcard host are passed over by name; when nothing is
- * left the agent is refused with everything it did offer.
+ * a `unix:` URL, a wildcard host and a URL carrying credentials are passed
+ * over by name; when nothing is left the agent is refused with everything it
+ * did offer.
  *
- * An interface on another origin than the card is followed only when no
- * credential of the person's is in play and the hop cannot be read on the
- * wire (https, or http on loopback). A card is data from whoever answered
- * the configured URL, and a token must never follow it somewhere the person
- * did not name.
+ * An interface on another origin than the card is followed only when
+ *  - no credential of the person's is in play — a card is data from whoever
+ *    answered the configured URL, and a token must never follow it somewhere
+ *    the person did not name;
+ *  - the hop cannot be read on the wire (https, or http on loopback);
+ *  - and it does not lead closer in than the card came from: from a public
+ *    card into the person's network or machine, or from their network onto
+ *    their machine. Loopback is a privilege boundary as well as a private
+ *    wire — a daemon there may admit any local process as its operator — so
+ *    a remote card naming `http://127.0.0.1:…` would have this client drive
+ *    the person's own agent while they believe they are talking to someone
+ *    else's.
+ * A cross-origin entry refused for one of these is passed over like any
+ * other unusable entry; the refusal is thrown only when no later entry works.
  */
 export function selectInterface(card: AgentCard, cardUrl: string, userCredential: boolean): SelectedInterface {
-  const configuredOrigin = new URL(cardUrl).origin;
-  const name = str(card.name) ?? cardUrl;
+  const configured = new URL(cardUrl);
+  const configuredReach = reachOf(configured.hostname);
+  const name = inert(str(card.name) ?? cardUrl);
   const found: string[] = [];
+  let crossOriginRefusal: string | undefined;
   const list = Array.isArray(card.supportedInterfaces) ? card.supportedInterfaces : [];
   for (const raw of list) {
     const i = obj(raw);
@@ -256,7 +340,7 @@ export function selectInterface(card: AgentCard, cardUrl: string, userCredential
     const binding = str(i.protocolBinding) ?? '?';
     const version = str(i.protocolVersion) ?? '?';
     const url = str(i.url) ?? '';
-    const label = `${binding}@${version}`;
+    const label = inert(`${binding}@${version}`);
     if (binding === UNIX_BINDING) {
       found.push(`${label} (a unix socket, not reachable from this client)`);
       continue;
@@ -269,30 +353,36 @@ export function selectInterface(card: AgentCard, cardUrl: string, userCredential
     try {
       u = new URL(url);
     } catch {
-      found.push(`${label} at ${JSON.stringify(url)} (not an absolute URL)`);
+      found.push(`${label} at ${inert(JSON.stringify(url))} (not an absolute URL)`);
       continue;
     }
     if (u.protocol !== 'http:' && u.protocol !== 'https:') {
-      found.push(`${label} at ${u.href} (${u.protocol}// is not reachable from this client)`);
+      found.push(`${label} at ${inert(u.href)} (${inert(u.protocol)}// is not reachable from this client)`);
+      continue;
+    }
+    if (u.username !== '' || u.password !== '') {
+      found.push(`${label} at ${u.protocol}//…@${u.host} (carries credentials in the URL)`);
       continue;
     }
     if (isWildcardHost(u.hostname)) {
-      found.push(`${label} at ${u.href} (a wildcard address, not a host)`);
+      found.push(`${label} at ${inert(u.href)} (a wildcard address, not a host)`);
       continue;
     }
-    const crossOrigin = u.origin !== configuredOrigin;
+    const crossOrigin = u.origin !== configured.origin;
     if (crossOrigin) {
+      const at = `the card at ${cardUrl} points JSON-RPC at ${inert(u.href)}`;
+      let refusal: string | undefined;
       if (userCredential) {
-        throw new ClientError(
-          'cross-origin',
-          `the card at ${cardUrl} points JSON-RPC at ${u.href} (another origin); re-run with --endpoint ${u.origin} to trust it`,
-        );
+        refusal = `${at} (another origin); connect to ${inert(u.origin)} directly to trust it with your credential`;
+      } else if (u.protocol !== 'https:' && !isLoopbackHost(u.hostname)) {
+        refusal = `${at}: another origin, over plain http`;
+      } else if (reachOf(u.hostname) > configuredReach) {
+        refusal = `${at}: closer to this machine than the card itself is; connect to ${inert(u.origin)} directly if that is the agent you mean`;
       }
-      if (u.protocol !== 'https:' && !isLoopbackHost(u.hostname)) {
-        throw new ClientError(
-          'cross-origin',
-          `the card at ${cardUrl} points JSON-RPC at ${u.href}: another origin, over plain http`,
-        );
+      if (refusal !== undefined) {
+        crossOriginRefusal ??= refusal;
+        found.push(`${label} at ${inert(u.href)} (refused: another origin)`);
+        continue;
       }
     }
     const out: SelectedInterface = { url: u.href, protocolVersion: version, crossOrigin };
@@ -300,6 +390,7 @@ export function selectInterface(card: AgentCard, cardUrl: string, userCredential
     if (tenant !== undefined) out.tenant = tenant;
     return out;
   }
+  if (crossOriginRefusal !== undefined) throw new ClientError('cross-origin', crossOriginRefusal);
   throw new ClientError(
     'no-interface',
     `${name} advertises no JSON-RPC A2A ${A2A_VERSION} interface (found: ${found.length > 0 ? found.join(', ') : 'none'})`,
@@ -362,11 +453,15 @@ export interface Capabilities {
   /** task-annotations/v1 is declared. */
   annotations: boolean;
   /**
-   * The introspection reads are offered to this caller. Known only from the
-   * extended card: the public vocabulary names them whether or not this agent
-   * has introspection on, so it cannot say.
+   * The introspection reads are offered to this caller: `true` or `false` when
+   * the extended card said so, or when no command vocabulary is declared at
+   * all; `null` when the cards cannot tell. The public vocabulary names the
+   * reads whether or not this agent has introspection on, and an agent with
+   * no listener auth serves no extended card — so `null` is the common case
+   * on a loopback daemon, and the feed's `hello.introspection` is where the
+   * answer is then read. `null` is not "off".
    */
-  introspection: boolean;
+  introspection: boolean | null;
   /** Workflows this caller may run (skills tagged `workflow` on the extended card). */
   workflows: string[];
   /** The ways in, from the public card's security declarations. */
@@ -438,7 +533,7 @@ export function capabilitiesOf(pub: AgentCard, ext: AgentCard | null, o: { noExt
     events,
     command,
     annotations: find(TASK_ANNOTATIONS_EXTENSION) !== undefined,
-    introspection: ext !== null && command !== null && INTROSPECTION_OPS.some((op) => command.ops.has(op)),
+    introspection: command === null ? false : ext === null ? null : INTROSPECTION_OPS.some((op) => command.ops.has(op)),
     workflows,
     login,
     authRequired: !login.some((l) => l.method === 'none'),
@@ -469,6 +564,13 @@ export interface OpenOptions {
   cache?: CardCache;
 }
 
+/** The answers to GetExtendedAgentCard that mean "declared, but not served". */
+const EXTENDED_CARD_UNSERVED: ReadonlySet<number> = new Set([
+  EXTENDED_CARD_NOT_CONFIGURED,
+  UNSUPPORTED_OPERATION,
+  METHOD_NOT_FOUND,
+]);
+
 /** A URI without its trailing `/vN`: two versions of one extension share it. */
 function unversioned(uri: string): string {
   return uri.replace(/\/v\d+$/, '');
@@ -488,18 +590,21 @@ function unversioned(uri: string): string {
 export async function openSession(configured: string, o: OpenOptions = {}): Promise<Session> {
   const cardUrl = cardUrlOf(configured);
   const card = await fetchCard(cardUrl, { signal: o.signal, cache: o.cache });
-  const name = str(card.name) ?? cardUrl;
-  const missing = requiredUnsupported(card, o.noExtensions);
-  if (missing.length > 0) {
-    throw new ClientError(
-      'required-extension',
-      `${name} requires extensions this client ${o.noExtensions ? 'was told not to use' : 'does not speak'}: ${missing.join(', ')}`,
-    );
-  }
+  const name = inert(str(card.name) ?? cardUrl);
+  const refuseRequired = (c: AgentCard): void => {
+    const missing = requiredUnsupported(c, o.noExtensions);
+    if (missing.length > 0) {
+      throw new ClientError(
+        'required-extension',
+        `${name} requires extensions this client ${o.noExtensions ? 'was told not to use' : 'does not speak'}: ${missing.map(inert).join(', ')}`,
+      );
+    }
+  };
+  refuseRequired(card);
   const iface = selectInterface(card, cardUrl, o.credential !== undefined);
   const warnings: string[] = [];
   if (iface.crossOrigin) {
-    warnings.push(`the card at ${cardUrl} points JSON-RPC at ${iface.url} (another origin); following it without a credential`);
+    warnings.push(`the card at ${cardUrl} points JSON-RPC at ${inert(iface.url)} (another origin); following it without a credential`);
   }
   const ep: Endpoint = { url: iface.url };
   if (iface.tenant !== undefined) ep.tenant = iface.tenant;
@@ -514,16 +619,22 @@ export async function openSession(configured: string, o: OpenOptions = {}): Prom
       if (extended === null) warnings.push('the extended agent card is not an object; using the public card');
     } catch (e) {
       // An agent that declares the extended card but does not serve it is
-      // wrong, not unusable: the public card still describes it.
-      if (!(e instanceof RpcError) || (e.code !== METHOD_NOT_FOUND && e.code !== UNSUPPORTED_OPERATION)) throw e;
-      warnings.push(`the agent declares an extended card but does not serve it (${e.message}); using the public card`);
+      // wrong, not unusable: the public card still describes it. A2A 1.0
+      // names that case -32007; agentd answers -32004 when nothing on its
+      // listener authenticates a caller, and an older server -32601.
+      if (!(e instanceof RpcError) || !EXTENDED_CARD_UNSERVED.has(e.code)) throw e;
+      warnings.push(`the agent declares an extended card but does not serve it (${inert(e.message)}); using the public card`);
     }
   }
+  // The extended card describes the same agent for this caller and its
+  // declarations win, so an extension it REQUIRES binds as much as one the
+  // public card requires.
+  if (extended !== null) refuseRequired(extended);
 
   const caps = capabilitiesOf(card, extended, { noExtensions: o.noExtensions });
   for (const uri of caps.ignored) {
     const ours = [...CLIENT_EXTENSIONS].find((c) => unversioned(c) === unversioned(uri));
-    if (ours !== undefined) warnings.push(`agent offers ${uri}; this client speaks ${ours}`);
+    if (ours !== undefined) warnings.push(`agent offers ${inert(uri)}; this client speaks ${ours}`);
   }
   return { cardUrl, card, extended, ep, caps, warnings };
 }

@@ -77,12 +77,16 @@ export function userMessage(text: string, to: MessageTarget = {}): Obj {
  * `{agentd: {op, …args}}`, marked in `Message.extensions` so the peer knows the
  * DataPart is a command and not data for a model to read. A command opens its
  * own task, so it never carries a `taskId`.
+ *
+ * `op` is written last: args can come from a form a workflow declared, and a
+ * field that happens to be named `op` must not send a different op than the
+ * one the person chose.
  */
 export function commandMessage(op: string, args: Obj = {}, to: { messageId?: string; contextId?: string } = {}): Obj {
   const m: Obj = {
     role: 'ROLE_USER',
     messageId: to.messageId ?? newMessageId(),
-    parts: [{ data: { [COMMAND_DATA_KEY]: { op, ...args } }, mediaType: 'application/json' }],
+    parts: [{ data: { [COMMAND_DATA_KEY]: { ...args, op } }, mediaType: 'application/json' }],
     extensions: [COMMAND_EXTENSION],
   };
   if (to.contextId) m.contextId = to.contextId;

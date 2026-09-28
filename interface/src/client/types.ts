@@ -269,6 +269,24 @@ export type ClientErrorKind =
   /** The credential's own expiry passed (there is no refresh token). */
   | 'session-expired';
 
+/**
+ * C0 and C1 control characters, DEL included. Text that reaches a terminal
+ * from a place someone else writes — a card, a memory value, an error message
+ * — must not carry them: a terminal obeys what it is sent, and an ESC
+ * sequence could retitle the window, set the clipboard (OSC 52) or dress a
+ * link as another (OSC 8).
+ */
+export const CONTROL = /[\u0000-\u001f\u007f-\u009f]+/g;
+
+/**
+ * `s` as inert text for an error or warning: every control character spelled
+ * as its `\uXXXX` escape, so what a hostile value tried is visible and does
+ * nothing.
+ */
+export function inert(s: string): string {
+  return s.replace(CONTROL, (run) => [...run].map((c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`).join(''));
+}
+
 export class ClientError extends Error {
   kind: ClientErrorKind;
   constructor(kind: ClientErrorKind, message: string) {
@@ -288,6 +306,8 @@ export const INTERNAL_ERROR = -32603;
 export const TASK_NOT_FOUND = -32001;
 /** The server's "this surface is off" code. */
 export const UNSUPPORTED_OPERATION = -32004;
+/** The agent declares an extended card but has none configured (A2A 1.0). */
+export const EXTENDED_CARD_NOT_CONFIGURED = -32007;
 export const CONTENT_TYPE_NOT_SUPPORTED = -32005;
 export const EXTENSION_SUPPORT_REQUIRED = -32008;
 export const VERSION_NOT_SUPPORTED = -32009;

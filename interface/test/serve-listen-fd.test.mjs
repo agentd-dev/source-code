@@ -55,13 +55,47 @@ function listeningPorts(pid) {
   return ports;
 }
 
-test('--listen-fd serves on the inherited socket', async (t) => {
+/**
+ * A temporary copy of serve.mjs beside a stub dist/web. Every case runs from
+ * one: serve.mjs also exits 2 when dist/ is not built, which is the state CI
+ * tests in, so a refusal asserted against the real bin/ could pass for that
+ * reason alone.
+ */
+function stubRoot(t) {
   const root = mkdtempSync(join(tmpdir(), 'agentd-ui-fd-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   mkdirSync(join(root, 'bin'));
   mkdirSync(join(root, 'dist', 'web'), { recursive: true });
   copyFileSync(join(here, '..', 'bin', 'serve.mjs'), join(root, 'bin', 'serve.mjs'));
   writeFileSync(join(root, 'dist', 'web', 'index.html'), '<!doctype html><title>stub</title>');
+  return root;
+}
+
+/**
+ * Run the stub copy to exit; resolves {code, err}. `fd3` is inherited as fd 3.
+ * A refusal is immediate, so a server still running after a few seconds is
+ * one that served what it should have refused: killed, and reported as such.
+ */
+function runToExit(root, args, fd3) {
+  return new Promise((resolve) => {
+    const stdio = ['ignore', 'pipe', 'pipe'];
+    if (fd3 !== undefined) stdio.push(fd3);
+    const c = spawn(process.execPath, [join(root, 'bin', 'serve.mjs'), ...args], { stdio });
+    let err = '';
+    c.stderr.on('data', (d) => (err += d));
+    const timer = setTimeout(() => {
+      err += '\n(still serving after 5s; killed)';
+      c.kill();
+    }, 5000);
+    c.on('exit', (code) => {
+      clearTimeout(timer);
+      resolve({ code, err });
+    });
+  });
+}
+
+test('--listen-fd serves on the inherited socket', async (t) => {
+  const root = stubRoot(t);
 
   // The launcher's half: bind 127.0.0.1:0 and hand the socket over as fd 3.
   const listener = net.createServer();
@@ -99,21 +133,26 @@ test('--listen-fd serves on the inherited socket', async (t) => {
   if (process.platform === 'linux') assert.deepEqual(listeningPorts(child.pid), [port]);
 });
 
-test('--listen-fd refuses what it cannot serve on', async () => {
-  const run = (args) =>
-    new Promise((resolve) => {
-      const c = spawn(process.execPath, [join(here, '..', 'bin', 'serve.mjs'), ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
-      let err = '';
-      c.stderr.on('data', (d) => (err += d));
-      c.on('exit', (code) => resolve({ code, err }));
-    });
+test('--listen-fd refuses what it cannot serve on', async (t) => {
+  const root = stubRoot(t);
+  const run = (args, fd3) => runToExit(root, args, fd3);
   // A bare flag or a non-number never falls back to binding a port.
   let r = await run(['--listen-fd']);
   assert.equal(r.code, 2);
   assert.match(r.err, /--listen-fd takes a file descriptor number/);
   r = await run(['--listen-fd', 'three']);
   assert.equal(r.code, 2);
+  assert.match(r.err, /--listen-fd takes a file descriptor number, got "three"/);
   r = await run(['--listen-fd', '3', '--port', '4173']);
   assert.equal(r.code, 2);
   assert.match(r.err, /exclusive/);
+
+  // A socket bound to every address is not served: the Host check is no
+  // access control, and the page and config.js would be on the network.
+  const wide = net.createServer();
+  await new Promise((resolve) => wide.listen(0, '0.0.0.0', resolve));
+  t.after(() => wide.close());
+  r = await run(['--endpoint', 'http://127.0.0.1:8420', '--listen-fd', '3'], wide._handle.fd);
+  assert.equal(r.code, 2);
+  assert.match(r.err, /bound to 0\.0\.0\.0, not loopback/);
 });

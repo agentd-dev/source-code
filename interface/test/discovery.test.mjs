@@ -87,6 +87,10 @@ test('reads the well-known card and picks JSONRPC 1.0', async (t) => {
   assert.equal(cardUrlOf('http://127.0.0.1:8420/'), 'http://127.0.0.1:8420/.well-known/agent-card.json');
   assert.equal(cardUrlOf('https://agent.example/.well-known/agent-card.json'), CARD);
   throwsKind(() => cardUrlOf('not a url'), 'discovery');
+  // A URL carrying credentials is refused, without repeating them: fetch
+  // would otherwise throw an error that quotes the whole URL.
+  const userinfo = throwsKind(() => cardUrlOf('https://op:sekrit@agent.example/'), 'discovery', /carries credentials/);
+  assert.doesNotMatch(userinfo.message, /sekrit|op:/);
 
   // The first JSONRPC entry at Major.Minor 1.0 wins; other bindings and
   // versions are passed over, and a patch version is still 1.0.
@@ -123,17 +127,59 @@ test('reads the well-known card and picks JSONRPC 1.0', async (t) => {
     /found: JSONRPC@0\.3/,
   );
   throwsKind(() => selectInterface(card(undefined), CARD, false), 'no-interface', /found: none/);
+  // An interface URL with credentials in it is passed over, and not echoed.
+  const withCreds = throwsKind(
+    () => selectInterface(card([{ url: 'https://op:sekrit@agent.example/rpc', protocolBinding: 'JSONRPC', protocolVersion: '1.0' }]), CARD, false),
+    'no-interface',
+    /carries credentials/,
+  );
+  assert.doesNotMatch(withCreds.message, /sekrit/);
+
+  // Card text is someone else's: control characters in anything that reaches
+  // an error are spelled out, never sent to the terminal.
+  const hostile = throwsKind(
+    () => selectInterface({ name: '\u001b]0;pwned\u0007', supportedInterfaces: [{ protocolBinding: '\u001b[31mX', protocolVersion: '1\u009b' }] }, CARD, false),
+    'no-interface',
+  );
+  assert.doesNotMatch(hostile.message, /[\u0000-\u001f\u007f-\u009f]/);
+  assert.match(hostile.message, /\\u001b\]0;pwned\\u0007 advertises/);
+  assert.match(hostile.message, /\\u001b\[31mX@1\\u009b/);
 
   // Another origin: never with the person's credential…
   const elsewhere = card([{ url: 'https://rpc.example/a2a', protocolBinding: 'JSONRPC', protocolVersion: '1.0' }]);
-  throwsKind(() => selectInterface(elsewhere, CARD, true), 'cross-origin', /re-run with --endpoint https:\/\/rpc\.example/);
-  // …followed without one over https or loopback http…
+  throwsKind(() => selectInterface(elsewhere, CARD, true), 'cross-origin', /connect to https:\/\/rpc\.example directly/);
+  // …followed without one over https, or loopback http from a loopback card…
   assert.equal(selectInterface(elsewhere, CARD, false).crossOrigin, true);
+  const LOCAL_CARD = 'http://127.0.0.1:8420/.well-known/agent-card.json';
   const loop = card([{ url: 'http://127.0.0.1:9000/', protocolBinding: 'JSONRPC', protocolVersion: '1.0' }]);
-  assert.equal(selectInterface(loop, CARD, false).crossOrigin, true);
-  // …and never over plain http to another host.
+  assert.equal(selectInterface(loop, LOCAL_CARD, false).crossOrigin, true);
+  // …never over plain http to another host…
   const plain = card([{ url: 'http://rpc.example/', protocolBinding: 'JSONRPC', protocolVersion: '1.0' }]);
   throwsKind(() => selectInterface(plain, CARD, false), 'cross-origin', /plain http/);
+  // …and never closer in than the card came from: a public card cannot aim
+  // this client at the person's own machine (where a daemon may take any
+  // local process for its operator) or their network, and a card on their
+  // network cannot aim it at their machine.
+  const inward = (url, from) =>
+    throwsKind(
+      () => selectInterface(card([{ url, protocolBinding: 'JSONRPC', protocolVersion: '1.0' }]), from, false),
+      'cross-origin',
+      /closer to this machine than the card itself is/,
+    );
+  for (const url of ['http://127.0.0.1:8420/', 'http://localhost:8420/', 'https://[::1]:8420/', 'https://[::ffff:127.0.0.1]:8420/', 'https://agentd.localhost/', 'https://192.168.1.5/', 'https://10.0.0.2/', 'https://169.254.169.254/', 'https://[fd12:3456::1]/']) {
+    inward(url, CARD);
+  }
+  const LAN_CARD = 'https://192.168.1.5/.well-known/agent-card.json';
+  inward('http://127.0.0.1:8420/', LAN_CARD);
+  assert.equal(selectInterface(card([{ url: 'https://10.0.0.2/', protocolBinding: 'JSONRPC', protocolVersion: '1.0' }]), LAN_CARD, false).crossOrigin, true);
+  // A cross-origin entry this client may not use is passed over like any
+  // other: a later entry on the card's own origin still wins.
+  const thenHome = card([
+    { url: 'https://rpc.example/a2a', protocolBinding: 'JSONRPC', protocolVersion: '1.0' },
+    { url: 'http://127.0.0.1:9/', protocolBinding: 'JSONRPC', protocolVersion: '1.0' },
+    { url: 'https://agent.example/rpc', protocolBinding: 'JSONRPC', protocolVersion: '1.0' },
+  ]);
+  assert.deepEqual(selectInterface(thenHome, CARD, true), { url: 'https://agent.example/rpc', protocolVersion: '1.0', crossOrigin: false });
 
   // A required extension this client does not speak stops it; a required one
   // it speaks does not — unless extensions are off.
@@ -193,6 +239,20 @@ test('reads the well-known card and picks JSONRPC 1.0', async (t) => {
     assert.match(e.message, /other\.example\/ext\/x\/v1/);
   });
 
+  // A card URL that redirects is refused, not followed: the card would be
+  // judged as the configured origin's own, and its "same-origin" interface
+  // handed the person's credential.
+  const h = await fake(t);
+  h.card.supportedInterfaces = [{ url: f.url, protocolBinding: 'JSONRPC', protocolVersion: '1.0', tenant: 'attacker' }];
+  f.cardRedirect = `${h.origin}/.well-known/agent-card.json`;
+  await rejects(openSession(f.url, { credential: { token: 'tok' }, cache: new CardCache() }), (e) => {
+    assert.ok(e instanceof ClientError, String(e));
+    assert.equal(e.kind, 'discovery');
+    assert.match(e.message, /redirects to http:\/\/127\.0\.0\.1:\d+\/\.well-known\/agent-card\.json/);
+  });
+  assert.equal(h.cardGets().length, 0, 'the redirect target was never asked');
+  f.cardRedirect = undefined;
+
   // No card, a card that is not JSON, and one too big to be a card.
   f.cardStatus = 404;
   await rejects(fetchCard(`${f.origin}/.well-known/agent-card.json`, { cache: new CardCache() }), (e) => {
@@ -209,6 +269,14 @@ test('reads the well-known card and picks JSONRPC 1.0', async (t) => {
     assert.equal(e.kind, 'discovery');
     assert.match(e.message, /exceeds 1 MiB/);
   });
+  // A 304 to a request that asked nothing conditional has no card to keep.
+  f.cardBody = undefined;
+  f.cardStatus = 304;
+  await rejects(fetchCard(`${f.origin}/.well-known/agent-card.json`, { cache: new CardCache() }), (e) => {
+    assert.equal(e.kind, 'discovery');
+    assert.match(e.message, /not conditional/);
+  });
+  f.cardStatus = undefined;
 });
 
 // ---- the cache ---------------------------------------------------------------
@@ -256,6 +324,27 @@ test('honours Cache-Control and ETag', async (t) => {
   await fetchCard(url, { cache });
   assert.equal(f.cardGets().length, 5);
   assert.equal(f.cardGets()[4].headers['if-none-match'], undefined);
+
+  // …also when `no-cache` comes first, the common spelling of "never keep".
+  f.cacheControl = 'no-cache, no-store, must-revalidate';
+  await fetchCard(url, { cache });
+  assert.equal(cache.get(url), undefined, 'no-store after no-cache must not be kept');
+  await fetchCard(url, { cache });
+  assert.equal(f.cardGets()[6].headers['if-none-match'], undefined);
+
+  // No Cache-Control, or `no-cache` beside a max-age: kept for the ETag, and
+  // revalidated at once rather than trusted for the max-age.
+  for (const cc of ['', 'no-cache, max-age=60']) {
+    f.cacheControl = cc;
+    const fresh = new CardCache(() => now);
+    const before = f.cardGets().length;
+    await fetchCard(url, { cache: fresh });
+    await fetchCard(url, { cache: fresh });
+    const gets = f.cardGets().slice(before);
+    assert.equal(gets.length, 2, `${JSON.stringify(cc)}: revalidated at once`);
+    assert.match(gets[1].headers['if-none-match'] ?? '', /^"[0-9a-f]{32}"$/, JSON.stringify(cc));
+    assert.equal(gets[1].status, 304, JSON.stringify(cc));
+  }
 });
 
 // ---- capabilities ------------------------------------------------------------
@@ -302,7 +391,7 @@ test('capabilities come from the card', async (t) => {
   assert.equal(f.rpcCalls('GetExtendedAgentCard').length, 0);
   assert.equal(anon.caps.extendedCard, false);
   assert.deepEqual(anon.caps.command.ops, statics);
-  assert.equal(anon.caps.introspection, false, 'the static list cannot say introspection is on');
+  assert.equal(anon.caps.introspection, null, 'the static list cannot say whether introspection is on — not "off"');
   assert.equal(anon.caps.authRequired, true);
   assert.deepEqual(anon.caps.workflows, []);
 
@@ -332,6 +421,7 @@ test('capabilities come from the card', async (t) => {
   assert.equal(plain.caps.annotations, true);
   assert.deepEqual(plain.caps.events, { kinds: [] });
   assert.equal(plain.caps.streaming, true);
+  assert.equal(plain.caps.introspection, null);
 
   // --no-extensions: core A2A only.
   const core = await openSession(f.url, { credential: { token: 'tok' }, noExtensions: true, cache: new CardCache() });
@@ -347,11 +437,49 @@ test('capabilities come from the card', async (t) => {
     assert.ok(e instanceof RpcError);
     assert.equal(classify(e).kind, 'unauthenticated');
   });
-  // Declared but not served (-32004): a warning, and the public card.
+  // The extended card says introspection is off for this caller: false.
+  const narrowed = f.extendedCard;
+  f.extendedCard = {
+    ...narrowed,
+    capabilities: { ...narrowed.capabilities, extensions: [{ uri: COMMAND_EXTENSION, params: { ops: [{ op: 'status', reply: 'message' }] } }] },
+  };
+  const off = await openSession(f.url, { credential: { token: 'tok' }, cache: new CardCache() });
+  assert.equal(off.caps.introspection, false);
+
+  // Declared but not served: a warning, and the public card. A2A 1.0 names
+  // that case -32007 (a stock server's answer, and the fake's when no
+  // extended card is configured); agentd answers -32004.
+  f.extendedCard = null;
+  const unconfigured = await openSession(f.url, { credential: { token: 'tok' }, cache: new CardCache() });
+  assert.equal(unconfigured.caps.extendedCard, false);
+  assert.match(unconfigured.warnings.join('\n'), /does not serve it \(the extended agent card is not configured\)/);
+  f.extendedCard = narrowed;
   f.fail('GetExtendedAgentCard', { code: -32004, message: 'not offered', times: 1 });
   const unserved = await openSession(f.url, { credential: { token: 'tok' }, cache: new CardCache() });
   assert.equal(unserved.caps.extendedCard, false);
   assert.match(unserved.warnings.join('\n'), /does not serve it/);
+  // Anything else is not papered over.
+  f.fail('GetExtendedAgentCard', { code: -32603, message: 'boom', times: 1 });
+  await rejects(openSession(f.url, { credential: { token: 'tok' }, cache: new CardCache() }), (e) => {
+    assert.ok(e instanceof RpcError);
+    assert.equal(e.code, -32603);
+  });
+  // An extended card that is not an object: a warning, and the public card.
+  f.extendedCard = ['not', 'a', 'card'];
+  const notObj = await openSession(f.url, { credential: { token: 'tok' }, cache: new CardCache() });
+  assert.equal(notObj.caps.extendedCard, false);
+  assert.match(notObj.warnings.join('\n'), /not an object/);
+  // An extension the EXTENDED card requires binds like one the public card
+  // requires: the client stops rather than carry on without it.
+  f.extendedCard = {
+    ...narrowed,
+    capabilities: { ...narrowed.capabilities, extensions: [...narrowed.capabilities.extensions, { uri: 'https://other.example/ext/z/v1', required: true }] },
+  };
+  await rejects(openSession(f.url, { credential: { token: 'tok' }, cache: new CardCache() }), (e) => {
+    assert.equal(e.kind, 'required-extension');
+    assert.match(e.message, /other\.example\/ext\/z\/v1/);
+  });
+  f.extendedCard = narrowed;
 
   // An agentd extension at a version this client does not speak is ignored,
   // with a note naming both; a foreign one is ignored silently.
@@ -399,6 +527,9 @@ test('a2a.ts messages', async (t) => {
     contextId: 'c1',
   });
   assert.equal('taskId' in cmd, false);
+  // An argument named `op` never replaces the op the caller named.
+  const shadow = commandMessage('ship', { op: 'admin.drain', x: 1 }, { messageId: 'm4' });
+  assert.deepEqual(shadow.parts[0].data[COMMAND_DATA_KEY], { op: 'ship', x: 1 });
 
   const f = await fake(t);
   const c = new A2aClient({ url: f.url });

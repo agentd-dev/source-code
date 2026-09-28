@@ -150,7 +150,7 @@ impl Runtime {
             Setting::Introspection(on) => {
                 self.settings.a2a.introspection.enabled = on;
                 if let Some(feed) = &self.a2a_feed {
-                    feed.set_debug(on);
+                    feed.set_introspection(on);
                 }
                 if on {
                     // The introspection reads tail the log ring. Idempotent, so

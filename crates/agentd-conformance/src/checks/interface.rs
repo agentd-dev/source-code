@@ -32,7 +32,7 @@ pub fn checks() -> Vec<Check> {
         Check {
             id: "interface/feed-hello-and-replay",
             category: Category::Interface,
-            desc: "the feed is refused until events/v1 is activated (-32601 EXTENSION_NOT_ACTIVATED), then opens with a hello and replays from seq 0 a task event whose history holds the prompt",
+            desc: "the feed is refused until events/v1 is activated (-32601 EXTENSION_NOT_ACTIVATED) and takes only {fromSeq} (`after` is -32602), then opens with a hello {seq, resume, resync, introspection, version} and replays from seq 0 a task event whose history holds the prompt",
             run: feed_replay,
         },
         Check {
@@ -187,9 +187,22 @@ fn feed_replay(h: &Harness) -> Outcome {
             "the feed without events/v1 activated should be -32601 EXTENSION_NOT_ACTIVATED: {bare}"
         ));
     }
+    // Its params are `{fromSeq?}` and nothing else: the cursor's earlier
+    // name is refused, as plain JSON, rather than replayed from the start.
+    let after = post(
+        &addr,
+        &rpc_body(10, feed_method(), json!({"after": 0})),
+        &[("A2A-Extensions", feed_activation())],
+    );
+    if !(after.contains("-32602") && after.contains("params.after")) || after.contains("data:") {
+        return Outcome::fail(format!(
+            "the feed given `after` should be a plain -32602 naming params.after: {after}"
+        ));
+    }
     let s = open(&addr, &body, &[("A2A-Extensions", feed_activation())]);
     s.set_read_timeout(Some(Duration::from_secs(10))).ok();
     let mut reader = BufReader::new(s);
+    let mut hello = Value::Null;
     let mut saw_hello = false;
     let mut saw_prompt = false;
     let deadline = Instant::now() + Duration::from_secs(8);
@@ -203,8 +216,9 @@ fn feed_replay(h: &Harness) -> Outcome {
             && let Ok(v) = serde_json::from_str::<Value>(data.trim())
         {
             let r = &v["result"];
-            if r.get("hello").is_some() {
+            if let Some(h) = r.get("hello") {
                 saw_hello = true;
+                hello = h.clone();
             }
             let first = &r["event"]["data"]["task"]["history"][0];
             if r["event"]["kind"] == "task"
@@ -219,6 +233,21 @@ fn feed_replay(h: &Harness) -> Outcome {
         saw_hello,
         "the stream should open with a hello frame".to_string(),
     )
+    .and(|| {
+        // Exactly the five fields, the switch as it stands (off here) and the
+        // build's version — nothing under an earlier name.
+        let mut fields: Vec<&str> = hello
+            .as_object()
+            .map(|o| o.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        fields.sort_unstable();
+        Outcome::require(
+            fields == ["introspection", "resume", "resync", "seq", "version"]
+                && hello["introspection"] == false
+                && hello["version"].as_str().is_some_and(|v| !v.is_empty()),
+            format!("the hello should be {{seq, resume, resync, introspection, version}}: {hello}"),
+        )
+    })
     .and(|| {
         Outcome::require(
             saw_prompt,

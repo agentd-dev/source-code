@@ -10,8 +10,10 @@ use serde_json::{Value, json};
 
 use super::LivenessCheck;
 use crate::a2a::Principal;
+use crate::a2a::errors;
 use crate::runtime::a2a_server::SharedFeed;
-use crate::runtime::surface::{Active, Ext, TASK_ANNOTATIONS_EXTENSION};
+use crate::runtime::surface::events::params_schema;
+use crate::runtime::surface::{Active, EVENTS_METHOD, Ext, TASK_ANNOTATIONS_EXTENSION};
 
 /// `agentd.events/SubscribeToEvents`: agentd's own stream, not the spec's.
 ///
@@ -31,6 +33,9 @@ use crate::runtime::surface::{Active, Ext, TASK_ANNOTATIONS_EXTENSION};
 /// event for every subscriber, so a `task` event is stored annotated and the
 /// annotations are taken off here, per subscriber, unless this one activated
 /// task-annotations/v1.
+///
+/// The params are held to the published schema before anything is streamed:
+/// a refusal is a plain JSON `-32602`, never an SSE response.
 pub(super) fn feed_stream(
     feed: Arc<SharedFeed>,
     id: Value,
@@ -41,11 +46,10 @@ pub(super) fn feed_stream(
     active: Active,
 ) -> Response {
     let annotated = active.contains(Ext::TaskAnnotations);
-    let after = params
-        .get("fromSeq")
-        .or_else(|| params.get("after"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
+    let after = match from_seq(&params) {
+        Ok(after) => after,
+        Err(violations) => return refuse_params(id, &violations),
+    };
     let (newest, oldest, dropped) = feed.bounds();
     // The cursor predates the replay window: events were evicted past it, so
     // replay from the window start and tell the client to re-bootstrap.
@@ -67,7 +71,9 @@ pub(super) fn feed_stream(
             "seq": newest,
             "resume": after,
             "resync": resync,
-            "debug": feed.debug(),
+            "introspection": feed.introspection(),
+            // The agentd build, so a client can say what it is attached to;
+            // the protocol's version is in the extension's URI.
             "version": crate::VERSION,
         }});
         if tx.send(frame(&id, hello)).await.is_err() {
@@ -109,6 +115,70 @@ pub(super) fn feed_stream(
         .into_response()
 }
 
+/// The cursor `params` resume from, held to [`params_schema`]: absent params
+/// and an absent `fromSeq` are the start, and anything else the schema does
+/// not name — `after`, the cursor's earlier name, included — is refused
+/// rather than ignored, because ignoring it would replay from the start a
+/// client that meant to resume.
+///
+/// `Err` holds each violation as `(field, why)`.
+fn from_seq(params: &Value) -> Result<u64, Vec<(String, String)>> {
+    let params = if params.is_null() { &json!({}) } else { params };
+    if let Err(errs) = crate::jsonschema::validate(&params_schema(), params) {
+        return Err(errs
+            .iter()
+            .map(|e| {
+                // The validator says `<pointer>: <why>`. An unknown member is
+                // reported at the object holding it, so its name is read
+                // from the reason: the field a client must fix is `after`,
+                // not the params as a whole.
+                let (at, why) = e.split_once(": ").unwrap_or(("/", e));
+                let member = why
+                    .strip_prefix("unknown property ")
+                    .and_then(|name| serde_json::from_str::<String>(name).ok());
+                let path = at.trim_start_matches('/').replace('/', ".");
+                let field = match (path.as_str(), member) {
+                    ("", None) => "params".to_string(),
+                    ("", Some(m)) => format!("params.{m}"),
+                    (p, None) => format!("params.{p}"),
+                    (p, Some(m)) => format!("params.{p}.{m}"),
+                };
+                (field, why.to_string())
+            })
+            .collect());
+    }
+    match params.get("fromSeq") {
+        None => Ok(0),
+        // The schema's `integer` admits 3.0 and 2^64; a cursor is neither.
+        Some(v) => v.as_u64().ok_or_else(|| {
+            vec![(
+                "params.fromSeq".to_string(),
+                "must be an unsigned 64-bit integer".to_string(),
+            )]
+        }),
+    }
+}
+
+/// `-32602`, naming each field the params got wrong.
+fn refuse_params(id: Value, violations: &[(String, String)]) -> Response {
+    let fields: Vec<(&str, &str)> = violations
+        .iter()
+        .map(|(f, w)| (f.as_str(), w.as_str()))
+        .collect();
+    let list = violations
+        .iter()
+        .map(|(f, w)| format!("{f}: {w}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let body = errors::rpc_error(
+        id,
+        errors::INVALID_PARAMS,
+        &format!("invalid params for {EVENTS_METHOD} (it takes only fromSeq): {list}"),
+        vec![errors::bad_request(&fields)],
+    );
+    super::identity::json_with(axum::http::StatusCode::OK, &body)
+}
+
 fn frame(id: &Value, payload: Value) -> axum::response::sse::Event {
     axum::response::sse::Event::default().data(
         serde_json::to_string(&json!({"jsonrpc": "2.0", "id": id, "result": payload}))
@@ -138,6 +208,32 @@ fn strip_annotations(ev: &mut Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The params are `{fromSeq?}` and nothing else: absent params, absent
+    /// cursor and a cursor are accepted; the cursor's earlier name, a
+    /// stranger, a negative or fractional cursor and a non-object are each
+    /// refused naming the field.
+    #[test]
+    fn the_params_are_strict() {
+        assert_eq!(from_seq(&Value::Null), Ok(0));
+        assert_eq!(from_seq(&json!({})), Ok(0));
+        assert_eq!(from_seq(&json!({"fromSeq": 42})), Ok(42));
+        assert_eq!(from_seq(&json!({"fromSeq": u64::MAX})), Ok(u64::MAX));
+        let field = |p: Value| -> Vec<String> {
+            from_seq(&p)
+                .expect_err("refused")
+                .into_iter()
+                .map(|(f, _)| f)
+                .collect()
+        };
+        assert_eq!(field(json!({"after": 3})), ["params.after"]);
+        assert_eq!(field(json!({"fromSeq": 1, "limit": 2})), ["params.limit"]);
+        assert_eq!(field(json!({"fromSeq": -1})), ["params.fromSeq"]);
+        assert_eq!(field(json!({"fromSeq": 1.5})), ["params.fromSeq"]);
+        assert_eq!(field(json!({"fromSeq": 2.0})), ["params.fromSeq"]);
+        assert_eq!(field(json!({"fromSeq": "3"})), ["params.fromSeq"]);
+        assert_eq!(field(json!([1])), ["params"]);
+    }
 
     /// A task event loses exactly the annotations: the rest of its task, any
     /// other metadata, and every other event are untouched.

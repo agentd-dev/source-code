@@ -248,6 +248,12 @@ fn narrow(
         // The replay window: how far behind a reconnecting subscriber may be
         // and still resume rather than re-bootstrap.
         ext["params"]["ring"] = json!(FEED_RING);
+        // The kinds this caller's subscription can carry, from the one table
+        // the feed's push is checked against.
+        ext["params"]["kinds"] = json!(crate::runtime::surface::events::kinds_for(
+            caller.is_operator(),
+            settings.a2a.introspection.enabled,
+        ));
     }
 }
 
@@ -774,8 +780,32 @@ mod tests {
             .unwrap();
         // Extension params are a protobuf `Struct`, whose numbers are doubles.
         assert_eq!(feed["params"]["ring"].as_f64(), Some(FEED_RING as f64));
+        // Introspection is off: the operator is told of every kind but audit.
+        let kinds = |c: &Value| -> Vec<String> {
+            let feed = c["capabilities"]["extensions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["uri"] == EVENTS_EXTENSION)
+                .unwrap();
+            serde_json::from_value(feed["params"]["kinds"].clone()).unwrap()
+        };
+        assert_eq!(
+            kinds(&op),
+            crate::runtime::surface::events::kinds_for(true, false)
+        );
+        assert!(kinds(&op).iter().any(|k| k == "auth"));
+        assert!(!kinds(&op).iter().any(|k| k == "audit"));
 
         let us = card(&s, &wfs, CardView::Extended(&user));
+        // A user is told only of what can reach it.
+        assert_eq!(
+            kinds(&us),
+            crate::runtime::surface::events::kinds_for(false, false)
+        );
+        for never in ["auth", "audit", "status", "step"] {
+            assert!(!kinds(&us).iter().any(|k| k == never), "{never}");
+        }
         assert_eq!(
             skill_ids(&us),
             vec!["conversation", "workflow:greet", "workflow:report"]

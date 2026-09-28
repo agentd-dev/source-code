@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The interface observation feed: the ring the loop pushes state changes
+//! The events/v1 observation feed: the ring the loop pushes state changes
 //! onto, and the section diff that finds the changes nobody pushed.
 
 use super::FEED_RING;
@@ -45,10 +45,10 @@ impl FeedVis {
 /// only read.
 pub struct SharedFeed {
     inner: Mutex<FeedInner>,
-    /// `a2a.introspection.enabled` — gates the introspection event kinds
-    /// (audit, logs). Atomic because the operator can toggle it at runtime
-    /// (`admin.set`, a reload).
-    debug: std::sync::atomic::AtomicBool,
+    /// `a2a.introspection.enabled` — gates the `audit` kind, and is what
+    /// every `hello` tells a subscriber. Atomic because the operator can
+    /// toggle it at runtime (`admin.set`, a reload).
+    introspection: std::sync::atomic::AtomicBool,
 }
 
 struct FeedInner {
@@ -62,27 +62,43 @@ struct FeedInner {
 }
 
 impl SharedFeed {
-    pub fn new(debug: bool) -> SharedFeed {
+    pub fn new(introspection: bool) -> SharedFeed {
         SharedFeed {
             inner: Mutex::new(FeedInner {
                 seq: 0,
                 buf: std::collections::VecDeque::with_capacity(FEED_RING),
                 dropped: 0,
             }),
-            debug: std::sync::atomic::AtomicBool::new(debug),
+            introspection: std::sync::atomic::AtomicBool::new(introspection),
         }
     }
 
-    /// Whether debug event kinds flow (runtime-togglable via `admin.set`).
-    pub fn debug(&self) -> bool {
-        self.debug.load(std::sync::atomic::Ordering::Relaxed)
+    /// Whether introspection is on right now (runtime-togglable via
+    /// `admin.set` and a reload): the `audit` kind flows only while it is.
+    pub fn introspection(&self) -> bool {
+        self.introspection
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
-    pub fn set_debug(&self, on: bool) {
-        self.debug.store(on, std::sync::atomic::Ordering::Relaxed);
+    pub fn set_introspection(&self, on: bool) {
+        self.introspection
+            .store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Append one event; returns its `seq`.
+    ///
+    /// A debug build refuses, loudly, an event events/v1 does not define: a
+    /// kind outside [`FeedKind::ALL`], data off its kind's schema, or a
+    /// visibility the kind may not carry. Every e2e runs a debug daemon, so a
+    /// push that drifted from the published contract stops the suite at the
+    /// push rather than reaching a client that trusted the schema. A release
+    /// build does not pay for the check.
+    ///
+    /// [`FeedKind::ALL`]: crate::runtime::surface::events::FeedKind::ALL
     pub fn push(&self, kind: &str, vis: FeedVis, data: Value) -> u64 {
+        #[cfg(debug_assertions)]
+        if let Err(why) = conforms(kind, &vis, &data) {
+            panic!("feed push outside events/v1: {why}");
+        }
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.seq += 1;
         let seq = g.seq;
@@ -133,6 +149,29 @@ impl SharedFeed {
             .and_then(|(_, e)| e["seq"].as_u64())
             .unwrap_or(g.seq);
         (g.seq, oldest, g.dropped)
+    }
+}
+
+/// Whether an event is one events/v1 defines: its kind, its data against the
+/// kind's schema, and its visibility against who the kind may reach.
+#[cfg(debug_assertions)]
+fn conforms(kind: &str, vis: &FeedVis, data: &Value) -> Result<(), String> {
+    use crate::runtime::surface::events::{Audience, check_event};
+    let k = check_event(kind, data)?;
+    let fits = match k.audience() {
+        Audience::All => *vis == FeedVis::All,
+        // An owned item with no owner is the operator's, and an item whose
+        // owner cannot be found (activity for a vanished task) is too.
+        Audience::Owner => matches!(vis, FeedVis::Owner(_) | FeedVis::Operator),
+        Audience::Operator => *vis == FeedVis::Operator,
+    };
+    if fits {
+        Ok(())
+    } else {
+        Err(format!(
+            "{kind} pushed as {vis:?}, but it reaches {:?}",
+            k.audience()
+        ))
     }
 }
 
@@ -292,6 +331,11 @@ mod tests {
     use super::super::introspection::truncate_strings;
     use super::*;
 
+    /// A `task` event's data: the smallest Task events/v1 accepts.
+    fn task_data(id: &str) -> Value {
+        json!({"task": {"id": id, "contextId": "c", "status": {"state": "TASK_STATE_WORKING"}}})
+    }
+
     #[test]
     fn the_feed_scopes_replays_and_evicts() {
         let f = SharedFeed::new(true);
@@ -300,11 +344,11 @@ mod tests {
         f.push(
             "task",
             FeedVis::Owner(Some("user:a".into())),
-            json!({"n": 1}),
+            task_data("t1"),
         );
-        f.push("status", FeedVis::Operator, json!({"n": 2}));
-        f.push("lifecycle", FeedVis::All, json!({"n": 3}));
-        f.push("task", FeedVis::Owner(None), json!({"n": 4})); // ownerless ⇒ operator
+        f.push("task.removed", FeedVis::Operator, json!({"id": "t0"}));
+        f.push("lifecycle", FeedVis::All, json!({"paused": false}));
+        f.push("task", FeedVis::Owner(None), task_data("t4")); // ownerless ⇒ operator
         let (op, cursor) = f.since(0, "operator", true, 100);
         assert_eq!(op.len(), 4, "operator sees all: {op:?}");
         assert_eq!(cursor, 4);
@@ -319,8 +363,8 @@ mod tests {
         assert_eq!(resumed.len(), 2);
         assert_eq!(resumed[0]["seq"], 3);
         // Eviction: overflow the ring and confirm bounds/dropped move.
-        for i in 0..(FEED_RING + 8) {
-            f.push("task", FeedVis::All, json!({"i": i}));
+        for _ in 0..(FEED_RING + 8) {
+            f.push("lifecycle", FeedVis::All, json!({"paused": false}));
         }
         let (newest, oldest, dropped) = f.bounds();
         assert_eq!(newest, 4 + (FEED_RING as u64) + 8);
@@ -421,6 +465,46 @@ mod tests {
         );
         assert!(kinds("user:b", false).is_empty(), "a stranger sees none");
         assert_eq!(kinds("operator", true).len(), 4, "the operator sees all");
+    }
+
+    /// A debug build refuses every push events/v1 does not define — an
+    /// unknown or removed kind, data off its schema, a kind pushed to an
+    /// audience it may not reach — and stores none of them; a conforming
+    /// push goes through.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn a_malformed_push_panics_in_debug_builds() {
+        let f = SharedFeed::new(true);
+        let refused = |kind: &str, vis: FeedVis, data: Value| {
+            let why =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f.push(kind, vis, data)))
+                    .expect_err("the push should have panicked");
+            let why = why.downcast_ref::<String>().cloned().unwrap_or_default();
+            assert!(why.contains("outside events/v1"), "{kind}: {why}");
+        };
+        refused("message", FeedVis::All, json!({"text": "hi"}));
+        refused("pairing", FeedVis::Operator, json!({}));
+        refused("run.removed", FeedVis::Operator, json!({"id": 7}));
+        refused(
+            "auth",
+            FeedVis::Operator,
+            json!({"event": "launch", "sid": "ls_1", "client_id": "agentd-tui"}),
+        );
+        refused(
+            "auth",
+            FeedVis::All,
+            json!({"event": "launch", "sid": "ls_1", "client_id": "agentd-tui", "scope": "operator"}),
+        );
+        refused("task", FeedVis::All, task_data("t"));
+        assert_eq!(f.bounds(), (0, 0, 0), "nothing refused was stored");
+        assert_eq!(
+            f.push(
+                "task",
+                FeedVis::Owner(Some("user:a".into())),
+                task_data("t")
+            ),
+            1
+        );
     }
 
     #[test]

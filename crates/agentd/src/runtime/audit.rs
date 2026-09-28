@@ -45,7 +45,7 @@ impl Runtime {
         #[cfg(feature = "a2a")]
         if mirror_to_feed
             && let Some(feed) = &self.a2a_feed
-            && feed.debug()
+            && feed.introspection()
         {
             let mut data = json!({
                 "ts": now_ms(),

@@ -507,7 +507,7 @@ impl Runtime {
         if old.a2a.introspection.enabled != new.a2a.introspection.enabled {
             let on = new.a2a.introspection.enabled;
             if let Some(feed) = &self.a2a_feed {
-                feed.set_debug(on);
+                feed.set_introspection(on);
             }
             if on {
                 self.arm_introspection_ring();

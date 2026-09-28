@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The **display surface** end to end: a daemon with `a2a.events.enabled`
-//! (+ `a2a.introspection.enabled`) serves the display-client contract over its
-//! real A2A listener — the card's extension declarations, the global
-//! `agentd.events/SubscribeToEvents` SSE feed (cross-client transcript sync +
-//! cursor resume),
-//! the taskless introspection reads (`conversation.get` with message bodies,
+//! **events/v1** end to end, and the display surface around it: a daemon with
+//! `a2a.events.enabled` (+ `a2a.introspection.enabled`) serves the display-client
+//! contract over its real A2A listener — the card's extension declarations, the
+//! `agentd.events/SubscribeToEvents` feed (its method gate, strict params,
+//! `hello`, replay of a task's history, per-principal kinds, cross-client
+//! transcript sync and cursor resume), the taskless introspection reads (`conversation.get` with message bodies,
 //! `run.get` with per-step detail, `debug.events` log-ring tail), the
 //! browser-origin CORS path, the disabled-by-default gate, and the removed
 //! pairing exchange. The `agentd tui|ui` launcher lives in `launcher_e2e`.
@@ -287,7 +287,7 @@ fn subscribe_to_events_streams_cross_client_activity_and_resumes() {
     {
         let f = frames.lock().unwrap();
         let hello = f.iter().find(|v| v.get("hello").is_some()).unwrap();
-        assert_eq!(hello["hello"]["debug"], false);
+        assert_eq!(hello["hello"]["introspection"], false);
         assert_eq!(hello["hello"]["resync"], false);
     }
 
@@ -350,6 +350,175 @@ fn subscribe_to_events_streams_cross_client_activity_and_resumes() {
             "no replayed event at or before the cursor: {f:#?}"
         );
     }
+
+    std::fs::remove_file(&cfg).ok();
+}
+
+/// Two principals by bearer, and the feed and introspection on: the audit
+/// mirror flows, and who may see it is what is under test.
+const FEED_OP: &str = "events-e2e-operator-bearer";
+const FEED_USER: &str = "events-e2e-user-bearer";
+
+fn two_principal_feed(llm: &str, port: u16) -> String {
+    iface_config(llm, port, true, "").replace(
+        "  events:\n",
+        "  principals:\n\
+         \x20   - id: op\n\
+         \x20     match: { bearer_ref: \"{{secret:FEED_OP}}\" }\n\
+         \x20     role: operator\n\
+         \x20   - id: alice\n\
+         \x20     match: { bearer_ref: \"{{secret:FEED_USER}}\" }\n\
+         \x20     role: user\n\
+         \x20 events:\n",
+    )
+}
+
+fn spawn_with_bearers(config: &str) -> Daemon {
+    let stderr_path = common::unique_path("events-daemon", "log");
+    let errf = std::fs::File::create(&stderr_path).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .args(["--config", config])
+        .env("FEED_OP", FEED_OP)
+        .env("FEED_USER", FEED_USER)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(errf))
+        .spawn()
+        .expect("spawn agentd daemon");
+    Daemon { child, stderr_path }
+}
+
+/// [`subscribe_events`] presenting `bearer`.
+fn subscribe_as(addr: &str, bearer: &str, sink: Arc<Mutex<Vec<Value>>>) {
+    let body = common::rpc_body(78, common::feed_method(), json!({"fromSeq": 0}));
+    let auth = format!("Bearer {bearer}");
+    let mut reader = common::a2a_open(
+        addr,
+        &body,
+        &[
+            ("Authorization", &auth),
+            ("A2A-Extensions", &common::feed_extensions()),
+        ],
+        Duration::from_secs(20),
+    );
+    common::read_frames(&mut reader, |v| {
+        if let Some(result) = v.get("result") {
+            sink.lock().unwrap().push(result.clone());
+        }
+        true
+    });
+}
+
+/// The events/v1 contract on the wire.
+///
+/// * The method is the extension's: without `A2A-Extensions` it is `-32601`,
+///   as plain JSON.
+/// * The params are `{fromSeq?}`, strictly: `after` — the cursor's earlier
+///   name — is `-32602` naming `params.after`, as plain JSON and never a
+///   stream, rather than a silent replay from the start.
+/// * The stream opens with a `hello` carrying whether introspection is on and
+///   the agentd build's version.
+/// * A subscriber from seq 0 is replayed a `task` event whose history holds
+///   the prompt sent before it attached.
+/// * `audit` reaches operators only: with introspection on, the operator's
+///   stream carries the audit mirror, and a user's carries no audit — nor any
+///   other operator-only kind, nor another principal's task.
+#[test]
+fn feed_contract() {
+    let llm = spawn_mock_llm(&json!({"turns": [{"content": "Answered."}]}));
+    let (_daemon, addr, cfg) = spawn_bound_with(
+        |port| two_principal_feed(&llm.uri, port),
+        spawn_with_bearers,
+    );
+    let op_auth = format!("Bearer {FEED_OP}");
+
+    // No header: not a method this request may call.
+    let body = common::rpc_body(1, common::feed_method(), json!({"fromSeq": 0}));
+    let bare = common::a2a_post(&addr, &body, &[("Authorization", &op_auth)]);
+    assert_eq!(bare.header("content-type"), Some("application/json"));
+    let v = bare.json();
+    assert_eq!(v["error"]["code"], -32601, "{v}");
+    assert_eq!(
+        v["error"]["data"][0]["reason"], "EXTENSION_NOT_ACTIVATED",
+        "{v}"
+    );
+
+    // `after`: refused by name, not streamed.
+    let body = common::rpc_body(2, common::feed_method(), json!({"after": 0}));
+    let ext = common::feed_extensions();
+    let after = common::a2a_post(
+        &addr,
+        &body,
+        &[("Authorization", &op_auth), ("A2A-Extensions", &ext)],
+    );
+    assert_eq!(after.header("content-type"), Some("application/json"));
+    let v = after.json();
+    assert_eq!(v["error"]["code"], -32602, "{v}");
+    assert_eq!(
+        v["error"]["data"][0]["fieldViolations"][0]["field"], "params.after",
+        "{v}"
+    );
+
+    // History first, so the subscribers below are replayed it.
+    let prompt = SendMessage::text("Replay me").bearer(FEED_OP);
+    let prompt_id = prompt.params()["message"]["messageId"].clone();
+    let sent = prompt.result(&addr);
+    assert_eq!(sent["task"]["status"]["state"], "TASK_STATE_COMPLETED");
+    let mine = SendMessage::text("Mine alone")
+        .bearer(FEED_USER)
+        .result(&addr);
+    assert_eq!(mine["task"]["status"]["state"], "TASK_STATE_COMPLETED");
+
+    let op_frames: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let user_frames: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    for (sink, bearer) in [(&op_frames, FEED_OP), (&user_frames, FEED_USER)] {
+        let sink = Arc::clone(sink);
+        let addr = addr.clone();
+        std::thread::spawn(move || subscribe_as(&addr, bearer, sink));
+    }
+
+    let has_task_with = |f: &[Value], text: &str| {
+        f.iter().any(|v| {
+            v["event"]["kind"] == "task"
+                && v["event"]["data"]["task"]["history"]
+                    .as_array()
+                    .is_some_and(|h| h.iter().any(|m| m["parts"][0]["text"] == text))
+        })
+    };
+    wait_for(&op_frames, 10, |f| {
+        f.iter().any(|v| {
+            let first = &v["event"]["data"]["task"]["history"][0];
+            v["event"]["kind"] == "task"
+                && first["messageId"] == prompt_id
+                && first["parts"][0]["text"] == "Replay me"
+        }) && f.iter().any(|v| v["event"]["kind"] == "audit")
+    });
+    wait_for(&user_frames, 10, |f| has_task_with(f, "Mine alone"));
+    // Let anything the user should not see have its chance to arrive.
+    std::thread::sleep(Duration::from_millis(600));
+
+    for (who, frames) in [("operator", &op_frames), ("user", &user_frames)] {
+        let f = frames.lock().unwrap();
+        let hello = &f[0]["hello"];
+        assert_eq!(hello["introspection"], true, "{who}: {hello}");
+        assert_eq!(hello["version"], agentd::VERSION, "{who}: {hello}");
+        assert!(hello.get("debug").is_none(), "{who}: {hello}");
+    }
+    let user = user_frames.lock().unwrap();
+    let kinds: Vec<&str> = user
+        .iter()
+        .filter_map(|v| v["event"]["kind"].as_str())
+        .collect();
+    for never in ["audit", "auth", "status", "step", "subagent", "child"] {
+        assert!(
+            !kinds.contains(&never),
+            "a user was sent {never}: {kinds:?}"
+        );
+    }
+    assert!(
+        !has_task_with(&user, "Replay me"),
+        "a user was sent the operator's task: {user:#?}"
+    );
 
     std::fs::remove_file(&cfg).ok();
 }

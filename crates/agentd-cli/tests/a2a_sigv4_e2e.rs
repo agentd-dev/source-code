@@ -13,14 +13,15 @@ use std::time::{Duration, Instant};
 use agentd::config::A2aEndpoint;
 use agentd::mcp::a2a_client::{DelegateOutcome, PeerAuth, delegate};
 
-/// A mock A2A peer: captures the first request's head, then replies with a
-/// unary (`application/json`) terminal COMPLETED Task carrying a distillate — so
-/// `delegate` finishes after one signed request.
+/// A mock A2A peer with no agent card (its well-known GET is a 404): captures
+/// the send's head, then replies with a unary (`application/json`) terminal
+/// COMPLETED Task carrying a distillate — so `delegate` finishes after one
+/// signed send.
 fn spawn_peer(captured: Arc<Mutex<String>>) -> String {
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = l.local_addr().unwrap();
     std::thread::spawn(move || {
-        if let Some(Ok(mut s)) = l.incoming().next() {
+        for mut s in l.incoming().flatten() {
             s.set_read_timeout(Some(Duration::from_secs(3))).ok();
             let mut r = BufReader::new(s.try_clone().unwrap());
             let mut head = String::new();
@@ -39,6 +40,12 @@ fn spawn_peer(captured: Arc<Mutex<String>>) -> String {
             }
             let mut body = vec![0u8; clen];
             let _ = r.read_exact(&mut body);
+            if head.starts_with("GET ") {
+                let _ = s.write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                continue;
+            }
             *captured.lock().unwrap() = head;
 
             let task = r#"{"id":"t-1","contextId":"ctx","status":{"state":"TASK_STATE_COMPLETED","timestamp":"1970-01-01T00:00:00.000Z"},"artifacts":[{"artifactId":"t-1.d","parts":[{"text":"signed ok"}]}]}"#;
@@ -49,6 +56,7 @@ fn spawn_peer(captured: Arc<Mutex<String>>) -> String {
             );
             let _ = s.write_all(resp.as_bytes());
             let _ = s.flush();
+            break;
         }
     });
     format!("http://{addr}")

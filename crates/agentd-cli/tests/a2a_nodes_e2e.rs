@@ -410,3 +410,266 @@ fn an_emit_forwarded_to_a_peer_lands_on_that_peers_stream() {
     std::fs::remove_dir_all(&dir_a).ok();
     std::fs::remove_dir_all(&dir_b).ok();
 }
+
+/// The daemon's events named `event`, parsed from its JSON log.
+fn events(d: &Daemon, event: &str) -> Vec<serde_json::Value> {
+    d.stderr()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|e| e["event"] == event)
+        .collect()
+}
+
+/// **A plain-text `a2a.send` reaches an agentd peer.**
+///
+/// The send used to spell its message by hand with the 0.3 role `"user"`,
+/// which every A2A 1.0 server refuses as an unknown enum name — agentd's own
+/// included. Nothing caught it: the only send the suite exercised peer to peer
+/// was a stream forward, whose command part the listener routed around the
+/// typed parse. This one is a conversational message, so it goes through the
+/// same parse any peer's would, and B's waiting step is woken by it.
+#[test]
+fn plain_text_send_to_agentd_peer() {
+    let b_port = free_port();
+    let b_addr = format!("127.0.0.1:{b_port}");
+    let cfg_b = common::unique_path("send-b", "yaml");
+    std::fs::write(
+        &cfg_b,
+        format!(
+            "config_version: \"1\"\n\
+             agent:\n  name: listener\n  instruction: test\n  preflight: never\n\
+             intelligence:\n  endpoints: http://127.0.0.1:1/v1\n  model: mock\n\
+             store:\n  kind: memory\n\
+             a2a:\n  listen: http://127.0.0.1:{b_port}\n\
+             lifecycle:\n  run_until: drained\n\
+             observability:\n  log_level: info\n  log_content: true\n\
+             workflows:\n\
+             \x20 - name: awaiter\n\
+             \x20   steps:\n\
+             \x20     go:    {{kind: once}}\n\
+             \x20     reply: {{kind: a2a.wait, depends_on: [go], conversation: \"conv-p\", timeout: 10m}}\n\
+             \x20     fin:   {{kind: finish, depends_on: [reply], status: completed, output: \"heard {{{{steps.reply.output.message.text}}}}\"}}\n"
+        ),
+    )
+    .unwrap();
+    let b = spawn(&cfg_b);
+    wait_ready(&b_addr, &b);
+    assert!(
+        wait_for(&b, "\"event\":\"run.start\"", 15),
+        "B's run never started:\n{}",
+        b.stderr()
+    );
+    // The run parks on its wait just after it starts; a message that lands
+    // before the wait exists is a conversational turn instead.
+    std::thread::sleep(Duration::from_millis(500));
+
+    let cfg_a = common::unique_path("send-a", "yaml");
+    std::fs::write(
+        &cfg_a,
+        format!(
+            "config_version: \"1\"\n\
+             agent:\n  name: sender\n  instruction: test\n  preflight: never\n\
+             intelligence:\n  endpoints: http://127.0.0.1:1/v1\n  model: mock\n\
+             store:\n  kind: memory\n\
+             a2a:\n  peers:\n    - name: b\n      endpoint: http://127.0.0.1:{b_port}\n\
+             lifecycle:\n  run_until: idle\n  idle_grace: 900ms\n\
+             observability:\n  log_level: info\n\
+             workflows:\n\
+             \x20 - name: teller\n\
+             \x20   steps:\n\
+             \x20     s:    {{kind: once, policy: always}}\n\
+             \x20     tell: {{kind: a2a.send, depends_on: [s], to: b, parts: \"hello from A\", context: \"conv-p\"}}\n\
+             \x20     f:    {{kind: finish, depends_on: [tell], status: completed}}\n"
+        ),
+    )
+    .unwrap();
+    let a = spawn(&cfg_a);
+
+    assert!(
+        wait_for(&a, "\"event\":\"run.done\"", 20),
+        "A's run never finished:\n{}",
+        a.stderr()
+    );
+    let tell = events(&a, "step.done")
+        .into_iter()
+        .find(|e| e["step"] == "tell")
+        .unwrap_or_else(|| panic!("A logged no step.done for the send:\n{}", a.stderr()));
+    assert_eq!(
+        tell["status"],
+        "done",
+        "B refused the send: {tell}\nB:\n{}",
+        b.stderr()
+    );
+    assert!(
+        wait_for(&b, "\"event\":\"a2a.message.delivered\"", 15),
+        "B's waiting step was not woken:\n{}",
+        b.stderr()
+    );
+    assert!(
+        wait_for(&b, "heard hello from A", 15),
+        "B's run did not read A's text:\n{}",
+        b.stderr()
+    );
+
+    std::fs::remove_file(&cfg_a).ok();
+    std::fs::remove_file(&cfg_b).ok();
+}
+
+/// One request the fixture peer below received.
+struct PeerRequest {
+    head: String,
+    body: serde_json::Value,
+}
+
+/// **Delegating to a peer that does not stream.**
+///
+/// A 1.0 peer whose card does not claim `streaming` must answer the streaming
+/// methods with UnsupportedOperation, so a client that always opened a stream
+/// failed every delegation to it. The peer here is a spec-shaped fixture: it
+/// publishes a card without streaming, refuses `SendStreamingMessage` with
+/// `-32004`, and answers `SendMessage` with a working task it completes on the
+/// first `GetTask`. agentd must read the card, send unary with
+/// `returnImmediately`, poll, and hand the step the artifact.
+#[test]
+fn delegation_to_non_streaming_peer() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::sync::{Arc, Mutex};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let peer_url = format!("http://{}", listener.local_addr().unwrap());
+    let seen: Arc<Mutex<Vec<PeerRequest>>> = Arc::default();
+    {
+        let seen = Arc::clone(&seen);
+        let card = json!({
+            "name": "plain-peer",
+            "description": "a peer that does not stream",
+            "version": "1",
+            "supportedInterfaces": [
+                {"url": format!("{peer_url}/"), "protocolBinding": "JSONRPC", "protocolVersion": "1.0"}
+            ],
+            "capabilities": {"streaming": false},
+            "defaultInputModes": ["text/plain"],
+            "defaultOutputModes": ["text/plain"],
+            "skills": [],
+        });
+        std::thread::spawn(move || {
+            for mut s in listener.incoming().flatten() {
+                s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                let mut r = BufReader::new(s.try_clone().unwrap());
+                let mut head = String::new();
+                let mut len = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if r.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                        break;
+                    }
+                    if let Some((k, v)) = line.split_once(':')
+                        && k.trim().eq_ignore_ascii_case("content-length")
+                    {
+                        len = v.trim().parse().unwrap_or(0);
+                    }
+                    head.push_str(&line);
+                }
+                let mut body = vec![0u8; len];
+                let _ = r.read_exact(&mut body);
+                let body: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+                let id = body["id"].clone();
+                let reply = if head.starts_with("GET /.well-known/agent-card.json ") {
+                    card.to_string()
+                } else {
+                    let result = |r: serde_json::Value| {
+                        json!({"jsonrpc": "2.0", "id": id, "result": r}).to_string()
+                    };
+                    match body["method"].as_str() {
+                        Some("SendMessage") => result(json!({"task": {
+                            "id": "np-1", "contextId": "np-ctx",
+                            "status": {"state": "TASK_STATE_WORKING"}
+                        }})),
+                        Some("GetTask") => result(json!({
+                            "id": "np-1", "contextId": "np-ctx",
+                            "status": {"state": "TASK_STATE_COMPLETED"},
+                            "artifacts": [{"artifactId": "np-1.result", "parts": [{"text": "non-streaming answer"}]}]
+                        })),
+                        _ => json!({"jsonrpc": "2.0", "id": id, "error": {
+                            "code": -32004, "message": "streaming is not supported"
+                        }})
+                        .to_string(),
+                    }
+                };
+                seen.lock().unwrap().push(PeerRequest { head, body });
+                let _ = s.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                        reply.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+    }
+
+    let cfg = common::unique_path("np-delegate", "yaml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "config_version: \"1\"\n\
+             agent:\n  name: delegator\n  instruction: test\n  preflight: never\n\
+             intelligence:\n  endpoints: http://127.0.0.1:1/v1\n  model: mock\n\
+             store:\n  kind: memory\n\
+             a2a:\n  peers:\n    - name: plain\n      endpoint: {peer_url}\n\
+             lifecycle:\n  run_until: idle\n  idle_grace: 900ms\n\
+             observability:\n  log_level: info\n  log_content: true\n\
+             workflows:\n\
+             \x20 - name: asker\n\
+             \x20   steps:\n\
+             \x20     s:    {{kind: once, policy: always}}\n\
+             \x20     del:  {{kind: a2a.delegate, depends_on: [s], peer: plain, objective: \"answer plainly\", timeout: 30s}}\n\
+             \x20     note: {{kind: assign, depends_on: [del], value: \"peer said {{{{steps.del.output}}}}\"}}\n\
+             \x20     f:    {{kind: finish, depends_on: [note], status: completed, output: \"{{{{steps.note.output}}}}\"}}\n"
+        ),
+    )
+    .unwrap();
+    let d = spawn(&cfg);
+    assert!(
+        wait_for(&d, "peer said non-streaming answer", 20),
+        "the delegation did not complete through the unary path:\n{}",
+        d.stderr()
+    );
+
+    let seen = seen.lock().unwrap();
+    let calls: Vec<String> = seen
+        .iter()
+        .map(|r| {
+            r.body["method"]
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| r.head.lines().next().unwrap_or("").to_string())
+        })
+        .collect();
+    assert!(
+        !calls.iter().any(|c| c == "SendStreamingMessage"),
+        "the card said the peer does not stream: {calls:?}"
+    );
+    assert!(
+        calls[0].starts_with("GET /.well-known/agent-card.json"),
+        "the card is read first: {calls:?}"
+    );
+    let send = seen
+        .iter()
+        .find(|r| r.body["method"] == "SendMessage")
+        .expect("a unary send");
+    assert_eq!(send.body["params"]["message"]["role"], "ROLE_USER");
+    assert_eq!(
+        send.body["params"]["configuration"]["returnImmediately"],
+        true
+    );
+    assert!(calls.iter().any(|c| c == "GetTask"), "{calls:?}");
+    for r in seen.iter() {
+        assert!(
+            r.head.to_ascii_lowercase().contains("a2a-version: 1.0\r\n"),
+            "every request states the version:\n{}",
+            r.head
+        );
+    }
+    std::fs::remove_file(&cfg).ok();
+}

@@ -140,6 +140,14 @@ fn agent_card_of(
     }
     capabilities["extensions"] = json!(extensions);
     let url = settings.a2a.listen.clone().unwrap_or_default();
+    // A unix socket is not JSON-RPC-over-HTTP at a URL a stock client can
+    // dial, so it declares agentd's own binding; a peer's client selects an
+    // interface by binding and version (A2A 1.0) before it sends anything.
+    let binding = if url.starts_with("unix:") {
+        crate::runtime::surface::UNIX_BINDING
+    } else {
+        "JSONRPC"
+    };
     let card = json!({
         "name": "agentd",
         "description": "A durable agent (agentd) — conversations, workflows, and subagents over A2A.",
@@ -150,7 +158,8 @@ fn agent_card_of(
         // is in neither the message nor anything that reads a card in this
         // repository, and was dropped by every typed round trip anyway.
         "supportedInterfaces": [
-            {"url": url, "protocolBinding": "JSONRPC", "protocolVersion": "0.3.0"}
+            {"url": url, "protocolBinding": binding,
+             "protocolVersion": crate::runtime::surface::A2A_PROTOCOL_VERSION}
         ],
         "capabilities": capabilities,
         "defaultInputModes": ["text/plain", "application/json"],

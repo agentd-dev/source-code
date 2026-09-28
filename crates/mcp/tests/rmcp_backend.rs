@@ -6,9 +6,15 @@
 //! wired wrong: that the revision on the wire is the one the SDK declares (not
 //! one we picked), that declared capabilities reach the handshake, and that
 //! tools and resources come back in agentd's own wire types.
+//!
+//! It also pins the one SDK default agentd turns off: the SEP-2549 client
+//! response cache. A read here is a request to the server, every time, and a
+//! server that is gone or says no is an error — never the last answer replayed.
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -272,4 +278,223 @@ fn a_tool_call_round_trips() {
         .call_tool("echo", Some(json!({"s": "hi"})))
         .expect("tools/call");
     assert_eq!(out["content"][0]["text"], "echoed");
+}
+
+/// A server that offers a long `ttlMs` on every cacheable result, the way the
+/// registry does, and counts what actually reached it.
+#[derive(Default)]
+struct TtlState {
+    /// Calls per JSON-RPC method, counted on the server side — the arbiter of
+    /// whether a read happened, whatever the client reports.
+    calls: Mutex<HashMap<String, usize>>,
+    /// Answer `resources/read` with "not found" (a withdrawn instruction).
+    fail_reads: AtomicBool,
+}
+
+impl TtlState {
+    fn calls(&self, method: &str) -> usize {
+        self.calls.lock().unwrap().get(method).copied().unwrap_or(0)
+    }
+}
+
+/// Stops a [`spawn_ttl_server`]: afterwards nothing listens on its port, so a
+/// request is refused rather than answered.
+struct Stopper {
+    stop: Arc<AtomicBool>,
+    addr: std::net::SocketAddr,
+}
+
+impl Stopper {
+    fn stop(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+        // `accept` blocks; one dial wakes it so the loop sees the flag, breaks,
+        // and drops the listener.
+        let _ = TcpStream::connect(self.addr);
+        // The loop is gone once the port refuses.
+        for _ in 0..100 {
+            if TcpStream::connect(self.addr).is_err() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the server on {} did not stop", self.addr);
+    }
+}
+
+/// An hour, as the server's own offer of reuse — far past any test.
+const TTL: u64 = 3_600_000;
+
+fn spawn_ttl_server(state: Arc<TtlState>) -> (String, Stopper) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&stop);
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            if flag.load(Ordering::SeqCst) {
+                break;
+            }
+            let Ok(conn) = conn else { continue };
+            let state = Arc::clone(&state);
+            std::thread::spawn(move || {
+                conn.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                let mut w = conn.try_clone().unwrap();
+                let mut r = BufReader::new(conn);
+                let Some((start, body)) = read_http(&mut r) else {
+                    return;
+                };
+                if start.starts_with("GET") || start.starts_with("DELETE") {
+                    let _ = w
+                        .write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n");
+                    return;
+                }
+                let msg: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+                if msg.get("id").is_none() {
+                    let _ = w.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n");
+                    return;
+                }
+                let id = msg["id"].clone();
+                let n = {
+                    let mut calls = state.calls.lock().unwrap();
+                    let n = calls.entry(method.to_string()).or_default();
+                    *n += 1;
+                    *n
+                };
+                let result = match method {
+                    "initialize" => json!({
+                        "protocolVersion": msg["params"]["protocolVersion"],
+                        "capabilities": {"tools": {}, "resources": {"subscribe": true}, "prompts": {}},
+                        "serverInfo": {"name": "ttl", "version": "0"}
+                    }),
+                    "resources/read" if state.fail_reads.load(Ordering::SeqCst) => {
+                        respond(
+                            &mut w,
+                            &json!({
+                                "jsonrpc": "2.0", "id": id,
+                                "error": {"code": -32002, "message": "Resource not found"}
+                            }),
+                        );
+                        return;
+                    }
+                    // The text changes with every read, so a client that shows
+                    // the previous text did not ask.
+                    "resources/read" => json!({
+                        "contents": [{"uri": msg["params"]["uri"], "mimeType": "text/plain", "text": format!("v{n}")}],
+                        "ttlMs": TTL, "cacheScope": "private"
+                    }),
+                    "tools/list" => json!({
+                        "tools": [{"name": "echo", "inputSchema": {"type": "object"}}],
+                        "ttlMs": TTL, "cacheScope": "private"
+                    }),
+                    "resources/list" => json!({
+                        "resources": [{"uri": "file:///a.txt", "name": "a"}],
+                        "ttlMs": TTL, "cacheScope": "private"
+                    }),
+                    "prompts/list" => json!({
+                        "prompts": [{"name": "p"}],
+                        "ttlMs": TTL, "cacheScope": "private"
+                    }),
+                    "resources/templates/list" => json!({
+                        "resourceTemplates": [{"uriTemplate": "file:///{p}", "name": "t"}],
+                        "ttlMs": TTL, "cacheScope": "private"
+                    }),
+                    _ => json!({}),
+                };
+                respond(
+                    &mut w,
+                    &json!({"jsonrpc": "2.0", "id": id, "result": result}),
+                );
+            });
+        }
+    });
+    (format!("http://{addr}/mcp"), Stopper { stop, addr })
+}
+
+#[test]
+fn every_read_reaches_the_server_even_when_it_offers_a_ttl() {
+    // The server offers an hour of reuse on everything. rmcp's default would
+    // take it: every call after the first answered from memory, no request on
+    // the wire. agentd reads because it needs the current answer, so each call
+    // must be one request — counted where it lands, on the server.
+    let state: Arc<TtlState> = Arc::default();
+    let (ep, _stop) = spawn_ttl_server(Arc::clone(&state));
+    let client = RmcpBuilder::new("ttl", &ep, vec![], Duration::from_secs(5))
+        .connect()
+        .expect("connect");
+
+    for i in 1..=3 {
+        let read = client
+            .read_resource("instruction://ins_x@stable")
+            .expect("read");
+        assert_eq!(
+            read.text(),
+            format!("v{i}"),
+            "read {i} was not the server's current answer"
+        );
+    }
+    for _ in 0..2 {
+        client.list_tools().expect("tools/list");
+        client.list_resources().expect("resources/list");
+        client.list_prompts().expect("prompts/list");
+        client
+            .list_resource_templates()
+            .expect("resources/templates/list");
+    }
+    assert_eq!(state.calls("resources/read"), 3);
+    assert_eq!(state.calls("tools/list"), 2);
+    assert_eq!(state.calls("resources/list"), 2);
+    assert_eq!(state.calls("prompts/list"), 2);
+    assert_eq!(state.calls("resources/templates/list"), 2);
+}
+
+#[test]
+fn a_read_against_a_stopped_server_fails_instead_of_replaying_the_last_answer() {
+    // The §7.7 freshness watch rests on this: a registry that is gone must be
+    // a failed read, or `unavailable` never fires. rmcp's default serves the
+    // cached answer while it is fresh and the expired one when a re-fetch
+    // fails — either way a dead server "answers".
+    let state: Arc<TtlState> = Arc::default();
+    let (ep, stopper) = spawn_ttl_server(Arc::clone(&state));
+    let client = RmcpBuilder::new("ttl", &ep, vec![], Duration::from_secs(5))
+        .connect()
+        .expect("connect");
+    let uri = "instruction://ins_x@stable";
+    assert_eq!(client.read_resource(uri).expect("read").text(), "v1");
+    client.list_tools().expect("tools/list");
+
+    stopper.stop();
+
+    match client.read_resource(uri) {
+        Err(mcp::client::McpError::Transport(m)) => {
+            assert!(m.contains(&format!("resources/read {uri}")), "{m}")
+        }
+        other => panic!("a stopped server answered resources/read: {other:?}"),
+    }
+    match client.list_tools() {
+        Err(mcp::client::McpError::Transport(m)) => assert!(m.contains("tools/list"), "{m}"),
+        other => panic!("a stopped server answered tools/list: {other:?}"),
+    }
+}
+
+#[test]
+fn a_refusal_from_the_server_is_not_masked_by_an_earlier_answer() {
+    // A withdrawn instruction: the registry is up and says "not found". That
+    // is the strongest signal there is, and a cache that answers with the
+    // last good copy turns it into a confirmation.
+    let state: Arc<TtlState> = Arc::default();
+    let (ep, _stop) = spawn_ttl_server(Arc::clone(&state));
+    let client = RmcpBuilder::new("ttl", &ep, vec![], Duration::from_secs(5))
+        .connect()
+        .expect("connect");
+    let uri = "instruction://ins_x@stable";
+    assert_eq!(client.read_resource(uri).expect("read").text(), "v1");
+
+    state.fail_reads.store(true, Ordering::SeqCst);
+
+    let err = client
+        .read_resource(uri)
+        .expect_err("the server refused, the client must say so");
+    assert!(err.to_string().contains("Resource not found"), "{err}");
+    assert_eq!(state.calls("resources/read"), 2);
 }

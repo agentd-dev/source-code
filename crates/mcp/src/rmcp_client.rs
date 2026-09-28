@@ -24,6 +24,17 @@
 //! picks up the stateless revision automatically on the release that promotes
 //! it. Everything version-dependent here (notably [`RmcpClient::subscribe`])
 //! therefore branches on the *negotiated* version, never on a hard-coded era.
+//!
+//! **No response cache.** SEP-2549 lets a client reuse a `resources/read` or
+//! list result for the server's `ttlMs`, and serve an expired one when a
+//! re-fetch fails; rmcp does both by default. agentd switches that off on every
+//! connection. It reads because it needs the server's *current* answer — the
+//! §7.7 freshness watch, notify-then-read, signing-key resolution — and a copy
+//! from memory reported as a read is the "reports success, did nothing" defect:
+//! a registry that was down, or that answered "not found" to a withdrawn
+//! instruction, went on confirming it. So every read and list is one request on
+//! the wire, and a failure is an `Err`, never an earlier answer. There is no knob
+//! to turn it back on; `refresh`/`freshness` is the lever for registry load.
 
 use crate::client::McpError;
 use crate::inbound;
@@ -320,6 +331,16 @@ impl RmcpBuilder {
                 handler.serve(transport).await
             })
             .map_err(|e| McpError::Transport(format!("mcp server '{name}': {e}")))?;
+        // Before any request can be issued (`initialize` itself is not cached):
+        // the cache is per peer and the peer only exists once `serve` returns.
+        // With it on, a read inside the server's `ttlMs` never reaches the
+        // server, and a failed read past it is answered with the expired copy —
+        // so a dead or refusing registry would keep "confirming" freshness.
+        rt.block_on(
+            service
+                .peer()
+                .set_response_cache_config(rmcp::ClientCacheConfig::disabled()),
+        );
 
         let info = service.peer_info();
         let protocol_version = info.as_ref().map(|i| i.protocol_version.to_string());

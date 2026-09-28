@@ -395,11 +395,13 @@ impl Runtime {
                 json!({"text": self.instruction.text, "source": self.instruction.source, "uri": self.instruction.uri, "version": self.instruction.version.to_string()}),
             ),
             "instruction.subscribe" => {
+                // No uri given: re-read from the server that served the
+                // instruction, not whichever connected server answers the uri.
                 let uri = args
                     .get("uri")
                     .and_then(Value::as_str)
                     .map(str::to_string)
-                    .or_else(|| self.instruction.uri.clone());
+                    .or_else(|| self.instruction.source_ref());
                 match uri {
                     None => err(
                         "instruction.subscribe: the instruction is static text; give a uri".into(),

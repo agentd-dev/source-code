@@ -2071,11 +2071,7 @@ impl Runtime {
                 }
             }
         }
-        if updated_instruction && let Some(uri) = self.instruction.uri.clone() {
-            let full = match &self.instruction.server {
-                Some(s) => format!("mcp://{s}/{uri}"),
-                None => uri,
-            };
+        if updated_instruction && let Some(full) = self.instruction.source_ref() {
             let before = self.instruction.version;
             if self.subscribe_instruction(&full).is_ok() && self.instruction.version != before {
                 self.log.info(

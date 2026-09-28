@@ -164,6 +164,11 @@ fn handle_request(req: Request, state: &State) -> (Response, bool) {
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("")
                 .to_string();
+            // Every read that REACHED the server, logged like `MOCK_BINDINGS`,
+            // so an e2e can count reads on this side instead of trusting the
+            // consumer's own `instruction.loaded` — the server log is the
+            // arbiter of whether a read happened.
+            eprintln!("MOCK_READ {asked}");
             // A REGISTRY-shaped instruction: the document plus the
             // `md.instruction/*` alignment metadata a registry serves
             // (RFC-0028 §3.3), signed with a FIXED test seed when the `sign`
@@ -586,8 +591,19 @@ const MOCK_PUBLISHER_KID: &str = "mock-1";
 const MOCK_DELIVERY_KID: &str = "delivery";
 const MOCK_DELIVERY_KEYS_URI: &str = "instruction://delivery-keys.json";
 
-/// `resources/read` for an `instruction://…` uri: contents + `_meta`.
+/// `resources/read` for an `instruction://…` uri: contents + `_meta`, plus
+/// the SEP-2549 reuse offer (`ttlMs`, `cacheScope`) the registry sends. That
+/// offer is what makes an SDK response cache reachable in CI: without it rmcp
+/// never stores an entry, so a consumer that answered re-reads from memory
+/// passed every test here while confirming a dead registry in production.
 fn registry_read(uri: &str) -> serde_json::Value {
+    let mut out = registry_contents(uri);
+    out["ttlMs"] = json!(3_600_000);
+    out["cacheScope"] = json!("private");
+    out
+}
+
+fn registry_contents(uri: &str) -> serde_json::Value {
     // The publisher's JWKS, for key discovery.
     if uri == MOCK_DELIVERY_KEYS_URI {
         return json!({"contents": [{"uri": uri, "mimeType": "application/json",

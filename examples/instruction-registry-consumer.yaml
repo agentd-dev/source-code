@@ -16,19 +16,21 @@
 #  - exposes the current versionId in agentd's status
 #    (`instruction.version_id`).
 #
-# Update cadence: the gateway does not push resource-updated notifications for
-# template URIs yet, so the §7.7 freshness watch re-reads on the interval below
-# (subscribe stays on for when notifications land — both paths converge on the
-# same apply boundary). Pick the cadence from the registry's cache hint
-# (`md.instruction/cache.maxAge`, 30s on the dev gateway).
+# Update cadence: the gateway DOES push `notifications/resources/updated` for
+# template URIs as of mcpg beta.36 (measured on beta.39: publish→applied p50
+# 59 ms, p95 85 ms, over a 30-MINUTE poll, so the notification is what carried
+# it). The §7.7 freshness watch is the floor underneath that, not the primary
+# path — both converge on the same apply boundary. Pick the cadence from the
+# registry's cache hint (`md.instruction/cache.maxAge`, 30s on the dev gateway).
 config_version: "1"
 
 agent:
   name: loop-demo
   preflight: never
   instruction:
-    # Replace with your instruction id; `@stable` follows the ref. Add
-    # `server: gateway` if more than one connected server could serve it.
+    # Replace with your instruction id; `@stable` follows the ref. There is no
+    # `server:` key here: to pin which connected server serves it, write the
+    # uri as `mcp://<server>/instruction://<id>@<ref>`.
     mcp: "instruction://ins_01M1SSQR9NG8AYS34KWRMGY4E1@stable"
     # `auto` would poll every 5m and rely on the server's notifications; the
     # loop demo wants a tighter, predictable cadence to measure against.

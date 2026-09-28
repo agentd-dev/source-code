@@ -234,6 +234,25 @@ pub struct Instruction {
     pub delivered_digest: Option<String>,
 }
 
+impl Instruction {
+    /// Where to re-read THIS instruction from: the server that served it
+    /// (`mcp://<server>/<uri>`), never whichever connected server happens to
+    /// answer the same uri. A bare uri fans out to every server, so once the
+    /// serving registry died an unrelated server — or a mirror holding an older
+    /// signed copy — would confirm freshness for it. `oci://` and a uri with no
+    /// serving server recorded stay as they are; static text has none.
+    ///
+    /// The one derivation the freshness poll, the notification re-read and the
+    /// `instruction.subscribe` tool all use.
+    pub(crate) fn source_ref(&self) -> Option<String> {
+        let uri = self.uri.as_deref()?;
+        Some(match &self.server {
+            Some(s) => format!("mcp://{s}/{uri}"),
+            None => uri.to_string(),
+        })
+    }
+}
+
 /// Counters for status/reports.
 #[derive(Debug, Default, Clone)]
 pub struct Counters {
@@ -1536,5 +1555,35 @@ pub fn run_exit_code(r: &RunState) -> i32 {
         }
         RunStatus::Cancelled => crate::exit::GENERIC,
         _ => crate::exit::PARTIAL,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Instruction;
+
+    fn instruction(uri: Option<&str>, server: Option<&str>) -> Instruction {
+        Instruction {
+            text: "x".into(),
+            source: "resource",
+            uri: uri.map(str::to_string),
+            server: server.map(str::to_string),
+            version: 1,
+            version_id: None,
+            delivered_digest: None,
+        }
+    }
+
+    #[test]
+    fn a_served_instruction_re_reads_from_the_server_that_served_it() {
+        assert_eq!(
+            instruction(Some("instruction://ins_x@stable"), Some("registry")).source_ref(),
+            Some("mcp://registry/instruction://ins_x@stable".to_string())
+        );
+        assert_eq!(
+            instruction(Some("oci://h/r:t"), None).source_ref(),
+            Some("oci://h/r:t".to_string())
+        );
+        assert_eq!(instruction(None, None).source_ref(), None);
     }
 }

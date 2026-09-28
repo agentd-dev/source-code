@@ -585,6 +585,9 @@ impl McpClient {
         }
     }
 
+    /// `resources/read`. Always one request to the server: the SDK's response
+    /// cache is disabled at connect, so an unreachable server or a JSON-RPC error
+    /// is an `Err`, never an earlier answer.
     pub fn read_resource(&self, uri: &str) -> Result<ReadResourceResult, McpError> {
         self.read_resource_within(uri, self.timeout)
     }
@@ -597,7 +600,9 @@ impl McpClient {
     /// (act on empty / skip), so a transient slow read is recovered on the next
     /// `updated` notification or re-read. The read is served by the SDK
     /// connection, whose own request bound applies; `timeout` is accepted for
-    /// call-site symmetry.
+    /// call-site symmetry. Always one request to the server: the SDK's response
+    /// cache is disabled at connect, so an unreachable server or a JSON-RPC error
+    /// is an `Err`, never an earlier answer.
     pub fn read_resource_within(
         &self,
         uri: &str,

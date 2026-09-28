@@ -73,9 +73,11 @@ impl super::reactor::Runtime {
             P::Auto => P::Keep,
             other => other,
         };
+        // `uri` stays bare — it is what the pins above and an operator's
+        // `trust[].uri` name — and `server` says which server stopped answering.
         self.log.warn(
             "instruction.unavailable",
-            json!({"uri": uri, "err": err,
+            json!({"uri": uri, "server": self.instruction.server, "err": err,
                    "policy": format!("{policy:?}").to_lowercase(),
                    "trust_pinned": pinned}),
         );
@@ -154,16 +156,24 @@ impl super::reactor::Runtime {
     }
 
     /// A freshness timer fired: re-read the instruction source. A successful
-    /// re-read resets the deadline and clears any freeze; a source unreachable
-    /// past the deadline freezes new work. Always re-arms the next check — a
-    /// daemon keeps watching.
+    /// re-read — the server that served the instruction answered THIS poll —
+    /// resets the deadline and clears any freeze; a source unreachable past the
+    /// deadline applies the `unavailable` policy. Always re-arms the next check
+    /// — a daemon keeps watching.
     pub(crate) fn on_freshness_check(&mut self, _payload: &Value) {
         let Some(every) = self.min_freshness_ms() else {
             return;
         };
         let now = now_ms();
-        if let Some(uri) = self.instruction.uri.clone() {
-            match self.subscribe_instruction(&uri) {
+        // Read from the serving server (`source_ref`), not the bare uri: a bare
+        // uri is answered by any connected server that has it, so a dead
+        // registry would be "confirmed" by whichever other server still does.
+        // The policy and its pin match take the bare uri, as `trust[].uri`
+        // names it.
+        if let (Some(target), Some(uri)) =
+            (self.instruction.source_ref(), self.instruction.uri.clone())
+        {
+            match self.subscribe_instruction(&target) {
                 Ok(()) => {
                     self.freshness_deadline_ms = Some(now + every);
                     if self.freshness_frozen {

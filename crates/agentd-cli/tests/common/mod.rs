@@ -17,11 +17,15 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-/// A running mock HTTP MCP server. Killed (and its addr-file removed) on drop.
+/// A running mock HTTP MCP server. Killed (and its addr-file and log removed)
+/// on drop.
 pub struct MockMcp {
     child: Child,
     addr_file: String,
     addr: String,
+    /// The mock's stderr: its `MOCK_*` lines are the server side's own record
+    /// of what reached it.
+    log_path: String,
 }
 
 impl MockMcp {
@@ -33,13 +37,30 @@ impl MockMcp {
     pub fn mcp_arg(&self, name: &str) -> String {
         format!("{name}=http://{}", self.addr)
     }
+    /// Everything the mock wrote to stderr so far.
+    pub fn log(&self) -> String {
+        std::fs::read_to_string(&self.log_path).unwrap_or_default()
+    }
+    /// How many `resources/read` calls for exactly `uri` reached the mock —
+    /// counted by the server, so a read the client answered from anywhere else
+    /// does not count.
+    pub fn reads(&self, uri: &str) -> usize {
+        let want = format!("MOCK_READ {uri}");
+        self.log().lines().filter(|l| *l == want).count()
+    }
+    /// Stop the server mid-test: afterwards its port refuses connections.
+    /// Idempotent — a second call (or the drop) is a no-op on a reaped child.
+    pub fn stop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 impl Drop for MockMcp {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.stop();
         let _ = std::fs::remove_file(&self.addr_file);
+        let _ = std::fs::remove_file(&self.log_path);
     }
 }
 
@@ -59,10 +80,12 @@ pub fn spawn_mock_mcp(uri: &str, emit: bool) -> MockMcp {
     if !emit {
         args.push("--no-emit".to_string());
     }
+    let log_path = unique_path("mock-mcp", "log");
+    let log = std::fs::File::create(&log_path).expect("mock log");
     let child = Command::new(exe)
         .args(&args)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(log)
         .spawn()
         .expect("spawn mock http mcp");
     let addr = read_addr_file(&addr_file);
@@ -70,6 +93,7 @@ pub fn spawn_mock_mcp(uri: &str, emit: bool) -> MockMcp {
         child,
         addr_file,
         addr,
+        log_path,
     }
 }
 

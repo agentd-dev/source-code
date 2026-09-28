@@ -294,9 +294,9 @@ export class AgentdClient {
     return normalizeTask(r.result, this.annotationsIn(r.echo));
   }
 
-  /** Every page of ListTasks (see {@link A2aClient.listTasks}). */
-  async listTasks(q: ListQuery = {}): Promise<{ tasks: TaskView[]; truncated: boolean }> {
-    const r = await this.a2a.listTasks(q, this.core());
+  /** Every page of ListTasks, up to `maxPages` (see {@link A2aClient.listTasks}). */
+  async listTasks(q: ListQuery = {}, maxPages?: number): Promise<{ tasks: TaskView[]; truncated: boolean }> {
+    const r = await this.a2a.listTasks(q, this.core(), maxPages);
     const tasks = r.tasks.map(({ task, echo }) => normalizeTask(task, this.annotationsIn(echo)));
     return { tasks: tasks.filter((t): t is TaskView => t !== null), truncated: r.truncated };
   }

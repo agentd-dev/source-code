@@ -11,6 +11,10 @@
 //   const fake = await startFakeA2a();
 //   … fake.url, fake.card, fake.fail('GetTask', {code: -32001}), fake.requests …
 //   await fake.close();
+//
+// A handler may answer `{stream: [frames], hold}`: the frames are written at
+// once and the stream stays open until the `hold` promise settles (or the
+// client goes away), so a test can see how many streams a client holds.
 import http from 'node:http';
 import { createHash } from 'node:crypto';
 
@@ -64,7 +68,7 @@ export async function startFakeA2a(opts = {}) {
   let seq = 0;
 
   const fake = {
-    /** Every request: {method, path, headers, body, rpc?, params?}. */
+    /** Every request: {method, path, headers, body, at (epoch ms), rpc?, params?}. */
     requests,
     /** The public card; replace or edit it freely. */
     card: null,
@@ -83,6 +87,14 @@ export async function startFakeA2a(opts = {}) {
     /** When set, the card route answers 302 to this Location. */
     cardRedirect: undefined,
     bearer: opts.bearer,
+    /**
+     * Echo `A2A-Extensions` the way the spec says a server SHOULD: the
+     * requested URIs the card declares. Off by default (the echo is optional).
+     */
+    echo: false,
+    /** Streams open right now, and the most ever open at once, by method. */
+    open: {},
+    maxOpen: {},
     tasks,
     /** The device grant: approved once `approve()` ran. */
     device: { approved: false, token: 'fake-device-token', polls: 0 },
@@ -103,6 +115,7 @@ export async function startFakeA2a(opts = {}) {
     /**
      * Make the next `times` calls of `method` fail with a JSON-RPC error
      * `{code, message, data}` under HTTP `status` (default 200) and `headers`.
+     * The method `'*'` fails every call that has no failure of its own.
      */
     fail(method, { code, message = 'injected', data, status = 200, headers = {}, times = Infinity }) {
       failures.set(method, { code, message, data, status, headers, times });
@@ -145,10 +158,23 @@ export async function startFakeA2a(opts = {}) {
       t.status = { ...t.status, state: 'TASK_STATE_CANCELED' };
       return t;
     },
-    ListTasks: ({ pageSize = 50, pageToken = '' }) => {
-      const all = [...tasks.values()];
+    // The filters and projections of A2A 1.0 ListTasks: `status`,
+    // `statusTimestampAfter` (inclusive), `includeArtifacts` (default false)
+    // and `historyLength` (unset: all).
+    ListTasks: ({ pageSize = 50, pageToken = '', status, statusTimestampAfter, includeArtifacts = false, historyLength }) => {
+      const after = statusTimestampAfter === undefined ? undefined : Date.parse(statusTimestampAfter);
+      const all = [...tasks.values()].filter(
+        (t) =>
+          (status === undefined || t.status?.state === status) &&
+          (after === undefined || Date.parse(t.status?.timestamp ?? '') >= after),
+      );
       const from = pageToken === '' ? 0 : Number(pageToken);
-      const page = all.slice(from, from + pageSize);
+      const page = all.slice(from, from + pageSize).map((t) => {
+        const out = { ...t };
+        if (!includeArtifacts) delete out.artifacts;
+        if (historyLength !== undefined) out.history = historyLength === 0 ? undefined : (t.history ?? []).slice(-historyLength);
+        return out;
+      });
       const next = from + pageSize < all.length ? String(from + pageSize) : '';
       return { tasks: page, nextPageToken: next, pageSize, totalSize: all.length };
     },
@@ -235,7 +261,7 @@ export async function startFakeA2a(opts = {}) {
   const server = http.createServer(async (req, res) => {
     const path = new URL(req.url ?? '/', 'http://x').pathname;
     const raw = await readBody(req);
-    const rec = { method: req.method, path, headers: { ...req.headers }, body: raw };
+    const rec = { method: req.method, path, headers: { ...req.headers }, body: raw, at: Date.now() };
     requests.push(rec);
 
     if (path === CARD_PATH && (req.method === 'GET' || req.method === 'HEAD')) return cardRoute(req, res, rec);
@@ -263,7 +289,8 @@ export async function startFakeA2a(opts = {}) {
     if (req.headers['a2a-version'] !== '1.0') {
       return rpcError(res, env.id, { code: -32009, message: 'A2A-Version 1.0 required', status: 200, headers: {} });
     }
-    const f = failures.get(env.method);
+    const own = failures.get(env.method);
+    const f = own && own.times > 0 ? own : failures.get('*');
     if (f && f.times > 0) {
       f.times--;
       return rpcError(res, env.id, f);
@@ -277,15 +304,28 @@ export async function startFakeA2a(opts = {}) {
       if (e instanceof RpcFailure) return rpcError(res, env.id, e);
       return rpcError(res, env.id, { code: -32603, message: String(e?.message ?? e), status: 500, headers: {} });
     }
+    const echoed = {};
+    if (fake.echo) {
+      const declared = new Set((fake.card.capabilities?.extensions ?? []).map((e) => e.uri));
+      const asked = (req.headers['a2a-extensions'] ?? '').split(',').map((u) => u.trim()).filter((u) => declared.has(u));
+      echoed['a2a-extensions'] = asked.join(', ');
+    }
     if (result && Array.isArray(result.stream)) {
       // CRLF framing, one `data:` line per frame, as sse-starlette sends it.
-      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store' });
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store', ...echoed });
+      const m = env.method;
+      fake.open[m] = (fake.open[m] ?? 0) + 1;
+      fake.maxOpen[m] = Math.max(fake.maxOpen[m] ?? 0, fake.open[m]);
       result.stream.forEach((frame, i) => {
         res.write(`id: ${i + 1}\r\ndata: ${JSON.stringify({ jsonrpc: '2.0', id: env.id, result: frame })}\r\n\r\n`);
       });
+      if (result.hold) {
+        await Promise.race([result.hold.catch(() => {}), new Promise((r) => res.on('close', r))]);
+      }
+      fake.open[m]--;
       return res.end();
     }
-    return send(res, 200, { 'content-type': 'application/json' }, JSON.stringify({ jsonrpc: '2.0', id: env.id, result }));
+    return send(res, 200, { 'content-type': 'application/json', ...echoed }, JSON.stringify({ jsonrpc: '2.0', id: env.id, result }));
   });
 
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));

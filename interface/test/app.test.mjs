@@ -69,7 +69,7 @@ test('the chrome is the client layout; the daemon only fills it in', async () =>
   await tick();
   assert.match(ui.lastFrame(), /\bdebug\b/);
   // A config event from ANOTHER client is news, not a layout: nothing moves.
-  mirror.apply({ seq: 9, ts: 9, kind: 'config', data: { path: 'agent.approval', value: 'ask' } });
+  mirror.apply({ seq: 9, ts: 9, kind: 'config', data: { paths: ['agent.approval'], source: 'admin.set' } });
   await tick();
   frame = ui.lastFrame();
   assert.match(frame, /11\/5 tok/);
@@ -97,9 +97,9 @@ test('the subagents screen lists live subagents from the feed', async () => {
 test('a cross-client conversation renders: prompt, working, reply', async () => {
   const { mirror, ui } = boot();
   mirror.setConn('ready');
-  // Another client's prompt arrives on the feed…
-  mirror.apply({ seq: 1, ts: 10, kind: 'message', data: { messageId: 'm1', contextId: 'c1', taskId: 't1', principal: 'user:web', text: 'What is up?' } });
-  mirror.apply({ seq: 2, ts: 20, kind: 'task', data: { task: { id: 't1', contextId: 'c1', status: { state: 'TASK_STATE_WORKING', timestamp: at(20) } } } });
+  // Another client's prompt arrives on the feed, in the task's history…
+  const history = [{ role: 'ROLE_USER', messageId: 'm1', parts: [{ text: 'What is up?' }] }];
+  mirror.apply({ seq: 2, ts: 20, kind: 'task', data: { task: { id: 't1', contextId: 'c1', status: { state: 'TASK_STATE_WORKING', timestamp: at(20) }, history } } });
   await tick();
   let frame = ui.lastFrame();
   // Authorship is treatment, not a label: the user's line carries the
@@ -127,7 +127,7 @@ test('a cross-client conversation renders: prompt, working, reply', async () => 
   await tick();
   assert.match(ui.lastFrame(), /read_file/);
   // …and the reply lands as the task's terminal artifact.
-  mirror.apply({ seq: 3, ts: 30, kind: 'task', data: { task: { id: 't1', contextId: 'c1', status: { state: 'TASK_STATE_COMPLETED', timestamp: at(30) }, artifacts: [{ parts: [{ text: 'All good.' }] }] } } });
+  mirror.apply({ seq: 5, ts: 30, kind: 'task', data: { task: { id: 't1', contextId: 'c1', status: { state: 'TASK_STATE_COMPLETED', timestamp: at(30) }, history, artifacts: [{ parts: [{ text: 'All good.' }] }] } } });
   await tick();
   frame = ui.lastFrame();
   assert.match(frame, /● All good\./);
@@ -183,7 +183,8 @@ test('fullscreen renders a scroll hint instead of terminal scrollback', async ()
   );
   mirror.setConn('ready');
   for (let i = 0; i < 40; i++) {
-    mirror.apply({ seq: i + 1, ts: i, kind: 'message', data: { messageId: `m${i}`, contextId: 'c', text: `msg ${i}` } });
+    const task = { id: `t${i}`, contextId: 'c', status: { state: 'TASK_STATE_COMPLETED', timestamp: at(i) }, history: [{ role: 'ROLE_USER', messageId: `m${i}`, parts: [{ text: `msg ${i}` }] }] };
+    mirror.apply({ seq: i + 1, ts: i, kind: 'task', data: { task } });
   }
   await tick();
   const frame = ui.lastFrame();

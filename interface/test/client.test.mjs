@@ -471,16 +471,18 @@ test('the mirror converges tasks, sections and the cross-client transcript', () 
   assert.equal(s.runs.get('r1').workflow, 'greet');
   assert.equal(s.children.get('7').pid, 123);
 
-  // ANOTHER client's prompt arrives on the feed → transcript entry.
-  m.apply({ seq: 1, ts: 100, kind: 'message', data: { messageId: 'mA', contextId: 'c9', taskId: 't9', principal: 'operator', text: 'Hello from the web UI' } });
+  // ANOTHER client's prompt arrives in the task's core history → transcript entry.
+  const prompt = { role: 'ROLE_USER', messageId: 'mA', parts: [{ text: 'Hello from the web UI' }] };
+  m.apply({ seq: 1, ts: 100, kind: 'task', data: { task: { id: 't9', contextId: 'c9', status: { state: 'TASK_STATE_SUBMITTED', timestamp: at(0) }, history: [prompt] } } });
   assert.equal(s.transcript.length, 1);
   assert.equal(s.transcript[0].kind, 'user');
   assert.match(s.transcript[0].text, /web UI/);
 
   // The task works, then completes with the reply → agent entry, prompt settles.
-  m.apply({ seq: 2, ts: 110, kind: 'task', data: { task: { id: 't9', contextId: 'c9', status: { state: 'TASK_STATE_WORKING', timestamp: at(1) } } } });
+  m.apply({ seq: 2, ts: 110, kind: 'task', data: { task: { id: 't9', contextId: 'c9', status: { state: 'TASK_STATE_WORKING', timestamp: at(1) }, history: [prompt] } } });
   assert.equal(m.activeTasks().length, 1);
-  m.apply({ seq: 3, ts: 120, kind: 'task', data: { task: { id: 't9', contextId: 'c9', status: { state: 'TASK_STATE_COMPLETED', timestamp: at(2) }, artifacts: [{ parts: [{ text: 'Hi!' }] }] } } });
+  m.apply({ seq: 3, ts: 120, kind: 'task', data: { task: { id: 't9', contextId: 'c9', status: { state: 'TASK_STATE_COMPLETED', timestamp: at(2) }, history: [prompt], artifacts: [{ parts: [{ text: 'Hi!' }] }] } } });
+  assert.equal(s.transcript.length, 2, 'one prompt row, one reply row');
   assert.equal(m.activeTasks().length, 0);
   const agent = s.transcript.find((e) => e.kind === 'agent');
   assert.equal(agent.text, 'Hi!');
@@ -497,29 +499,49 @@ test('the mirror converges tasks, sections and the cross-client transcript', () 
   assert.ok(notified > 3, 'listeners fire');
 });
 
-test('the local echo reconciles with its feed message (no duplicate rows)', () => {
+test('a task whose start this client never saw stays OFF the transcript', () => {
   const m = new Mirror();
-  m.localEcho('m-1', 'ctx', 'my prompt', 't-1');
-  assert.equal(m.getState().transcript.length, 1);
-  assert.equal(m.getState().transcript[0].pending, true);
-  // The daemon's message event for the SAME messageId lands (as every other
-  // client sees it) — same row, now settled, not a duplicate.
-  m.apply({ seq: 10, ts: Date.now(), kind: 'message', data: { messageId: 'm-1', contextId: 'ctx', taskId: 't-1', text: 'my prompt' } });
-  assert.equal(m.getState().transcript.length, 1);
-  assert.equal(m.getState().transcript[0].pending, false);
-});
-
-test('command-result tasks stay OFF the transcript (no prompt → no row)', () => {
-  const m = new Mirror();
-  // A command completes as a task with a result artifact — but no prompt
-  // ever carried its taskId, so the conversation stays clean.
+  // A task completes with a result artifact, but nothing says what started
+  // it — no history, no echo — so the conversation stays clean.
   m.apply({ seq: 1, ts: 10, kind: 'task', data: { task: { id: 't-cmd', contextId: 'a2a-7', status: { state: 'TASK_STATE_COMPLETED', timestamp: at(1) }, artifacts: [{ artifactId: 't-cmd.result', parts: [{ text: 'paused' }] }] } } });
   assert.equal(m.getState().transcript.length, 0);
   assert.ok(m.getState().tasks.has('t-cmd'), 'still on the Tasks screen');
-  // Whereas a task WITH a known prompt renders its reply.
-  m.apply({ seq: 2, ts: 20, kind: 'message', data: { messageId: 'm1', contextId: 'c', taskId: 't-nl', text: 'hi' } });
-  m.apply({ seq: 3, ts: 30, kind: 'task', data: { task: { id: 't-nl', contextId: 'c', status: { state: 'TASK_STATE_COMPLETED', timestamp: at(3) }, artifacts: [{ parts: [{ text: 'hello' }] }] } } });
+  // Whereas a task whose history carries its prompt renders its reply.
+  m.apply({ seq: 2, ts: 30, kind: 'task', data: { task: { id: 't-nl', contextId: 'c', status: { state: 'TASK_STATE_COMPLETED', timestamp: at(3) }, history: [{ role: 'ROLE_USER', messageId: 'm1', parts: [{ text: 'hi' }] }], artifacts: [{ parts: [{ text: 'hello' }] }] } } });
   assert.equal(m.getState().transcript.filter((e) => e.kind === 'agent').length, 1);
+});
+
+test('feed cases: lifecycle, config and auth notes; the deleted kinds are not read', () => {
+  const m = new Mirror();
+  const s = m.getState();
+  let refreshed = 0;
+  m.onConfig(() => refreshed++);
+  m.apply({ seq: 1, ts: 1, kind: 'lifecycle', data: { draining: true, reason: 'deploy' } });
+  m.apply({ seq: 2, ts: 2, kind: 'config', data: { paths: ['agent.approval'], source: 'admin.set' } });
+  assert.equal(refreshed, 1, 'a live config change re-reads the session');
+  // Operator-only sign-in events. The client_id is whatever the requester
+  // chose, so a control sequence in it arrives as inert text.
+  m.apply({ seq: 3, ts: 3, kind: 'auth', data: { event: 'pending', user_code: 'ABCD-EFGH', client_id: 'evil\u001b]0;pwned\u0007', scope: 'user', peer: '10.0.0.7' } });
+  m.apply({ seq: 4, ts: 4, kind: 'auth', data: { event: 'approved', user_code: 'ABCD-EFGH', client_id: 'agentd-ui', scope: 'user', name: 'alice', sid: 'ds_1' } });
+  m.apply({ seq: 5, ts: 5, kind: 'auth', data: { event: 'revoked', client_id: 'agentd-ui', scope: 'user', sid: 'ds_1', name: 'alice' } });
+  m.apply({ seq: 6, ts: 6, kind: 'auth', data: { event: 'launch', client_id: 'agentd-tui', scope: 'operator', sid: 'ls_1' } });
+  const text = s.transcript.map((e) => e.text);
+  assert.deepEqual(text, [
+    'agentd is draining (deploy)',
+    'config changed: agent.approval (admin.set)',
+    'device ABCD-EFGH (evil\\u001b]0;pwned\\u0007, 10.0.0.7) requests user access — /approve ABCD-EFGH <name>',
+    'device ABCD-EFGH approved as alice (user)',
+    'session ds_1 (alice) revoked',
+    'agentd-tui signed in through the launcher (session ls_1)',
+  ]);
+  assert.deepEqual(s.transcript.map((e) => e.key), [1, 2, 3, 4, 5, 6].map((n) => `feed-0-${n}`));
+  // The pre-1.17 kinds make no row: a prompt is in the task's history now,
+  // and the command/pairing surfaces are gone.
+  m.apply({ seq: 7, ts: 7, kind: 'message', data: { messageId: 'm1', contextId: 'c', text: 'old shape' } });
+  m.apply({ seq: 8, ts: 8, kind: 'command', data: { op: 'status' } });
+  m.apply({ seq: 9, ts: 9, kind: 'pairing', data: { sessions: 2 } });
+  assert.equal(s.transcript.length, 6);
+  assert.equal(s.feedLog.length, 9, 'every kind still reaches the feed log');
 });
 
 test('input-required surfaces as an answerable agent row', () => {
@@ -569,7 +591,7 @@ test('step events collapse into one row per step and carry state', () => {
 test('a run with many steps stays bounded in client memory', () => {
   const m = new Mirror();
   for (let i = 0; i < 300; i++) {
-    m.apply({ seq: i, ts: i, kind: 'step', data: { run: 'big', step: `s${i}`, phase: 'start' } });
+    m.apply({ seq: i + 1, ts: i, kind: 'step', data: { run: 'big', step: `s${i}`, phase: 'start' } });
   }
   assert.ok(m.state.steps.get('big').length <= 200, 'the ring is capped');
 });

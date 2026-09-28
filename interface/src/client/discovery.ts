@@ -40,6 +40,7 @@ import {
   UNIX_BINDING,
 } from './ext.js';
 import { Credential, isLoopbackHost, LoginOption, loginOptions } from './auth.js';
+import { parseRetryAfter } from './errors.js';
 
 /** An Agent Card, as ProtoJSON. Only the fields read here are interpreted. */
 export type AgentCard = { [k: string]: Json };
@@ -229,6 +230,17 @@ export async function fetchCard(cardUrl: string, o: FetchCardOptions = {}): Prom
     if (age === undefined) cache.delete(cardUrl);
     else cache.set(cardUrl, { card: cached.card, etag: etag ?? cached.etag, freshUntil: cache.now() + age * 1000 });
     return cached.card;
+  }
+  if (res.status === 429 || res.status >= 500) {
+    // The agent is there and says "not now" — a card endpoint answers 503
+    // while it cannot build the card. That is the server's passing state,
+    // not a missing agent, so it carries its status (and Retry-After) and
+    // `classify` sorts it as a wait instead of a reason to give up.
+    await res.body?.cancel().catch(() => {});
+    const extra: { status: number; retryAfterMs?: number } = { status: res.status };
+    const wait = parseRetryAfter(res.headers.get('retry-after'));
+    if (wait !== undefined) extra.retryAfterMs = wait;
+    throw new RpcError(-res.status, `the agent card at ${cardUrl} is unavailable (HTTP ${res.status})`, extra);
   }
   if (res.status !== 200) {
     await res.body?.cancel().catch(() => {});

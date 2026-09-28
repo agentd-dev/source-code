@@ -71,8 +71,8 @@ test('prepare routes leading # targets and interpolates $ values', () => {
 
 test('a config feed event is noted, and $ values read the status document', () => {
   const m = seeded();
-  m.apply({ seq: 5, ts: 5, kind: 'config', data: { path: 'agent.approval', value: 'ask' } });
-  assert.ok(m.getState().transcript.some((e) => e.kind === 'info' && e.text.includes('agent.approval = "ask"')));
+  m.apply({ seq: 5, ts: 5, kind: 'config', data: { paths: ['agent.approval'], source: 'admin.set' } });
+  assert.ok(m.getState().transcript.some((e) => e.kind === 'info' && e.text.includes('agent.approval')));
   // The live status wins over the bootstrap once the feed publishes one.
   m.apply({ seq: 6, ts: 6, kind: 'status', data: { model: 'mock-2' } });
   assert.equal(prepare('on $model', m.getState()).text, 'on mock-2');

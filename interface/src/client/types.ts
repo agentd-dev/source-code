@@ -161,6 +161,11 @@ export interface TranscriptEntry {
   /** The task stopped at input-required — answer it to continue. */
   inputRequired?: boolean;
   /**
+   * The task stopped at auth-required: it waits for a credential given out
+   * of band, and a reply in the conversation cannot answer it.
+   */
+  authRequired?: boolean;
+  /**
    * How long the turn took, once it is over.
    *
    * The live row already counts up while the agent works; this is what the
@@ -215,8 +220,17 @@ export interface MirrorState {
   transcript: TranscriptEntry[];
   /** Bounded feed tail for the debug pane. */
   feedLog: FeedEvent[];
-  /** The resume cursor (highest feed seq seen). */
+  /**
+   * The highest feed seq applied in this feed epoch. An event at or below it
+   * is a replay and is not applied again; a `resync` hello resets it to 0.
+   */
   lastSeq: number;
+  /**
+   * Bumped by every `resync` hello: a restarted daemon numbers its feed from
+   * 1 again, so a seq alone does not name one event across a restart. Rows
+   * derived from feed events are keyed by epoch and seq together.
+   */
+  epoch: number;
 }
 
 /**

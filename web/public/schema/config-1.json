@@ -1395,10 +1395,13 @@
       "a2a.wait": {
         "fields": [
           "conversation",
+          "from",
           "timeout"
         ],
         "implemented": true,
-        "required": [],
+        "required": [
+          "from"
+        ],
         "start": false
       },
       "agent": {
@@ -2222,6 +2225,7 @@
           "run",
           "subagent",
           "conversation",
+          "from",
           "webhook",
           "stream",
           "subject",

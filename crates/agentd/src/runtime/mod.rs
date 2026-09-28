@@ -673,6 +673,8 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
         #[cfg(feature = "a2a")]
         event_to_task: BTreeMap::new(),
         #[cfg(feature = "a2a")]
+        conv_index: Default::default(),
+        #[cfg(feature = "a2a")]
         #[cfg(feature = "a2a")]
         a2a_feed: None,
         #[cfg(feature = "a2a")]
@@ -771,7 +773,20 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
     // spawned it — now, while the runs and conversations it names are here.
     rt.backfill_subagent_principals();
     #[cfg(feature = "a2a")]
-    rt.restore_a2a_tasks(restored.of(Kind::Task));
+    {
+        rt.restore_a2a_tasks(restored.of(Kind::Task));
+        // A task recorded before a conversation's key and its name were told
+        // apart was kept under its name, so that is its key.
+        for t in rt.tasks.values_mut() {
+            if t.conversation.is_empty() {
+                t.conversation = t.context_id.clone();
+            }
+        }
+        // Every caller's `contextId`s still name the conversations they
+        // named: a message after the restart continues one, rather than
+        // being bound to a fresh one beside it.
+        rt.conv_index = conversations::ConversationIndex::rebuild(&rt.contexts, &rt.tasks);
+    }
     if let Some(m) = &restored.manifest {
         rt.governor.restore(&m.budget, now_ms());
     }

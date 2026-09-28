@@ -57,11 +57,14 @@
     "category": "orchestration",
     "fields": [
       "conversation",
+      "from",
       "timeout"
     ],
     "implemented": true,
     "kind": "a2a.wait",
-    "required": [],
+    "required": [
+      "from"
+    ],
     "start": false
   },
   "agent": {
@@ -1012,6 +1015,7 @@
       "run",
       "subagent",
       "conversation",
+      "from",
       "webhook",
       "stream",
       "subject",

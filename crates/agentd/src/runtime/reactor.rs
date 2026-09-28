@@ -145,6 +145,11 @@ pub struct TurnJob {
     /// A message from a person is depth 0; one a `message` step delivered
     /// carries that step's depth, and anything this turn starts inherits it.
     pub msg_depth: u32,
+    /// A caller asked for this turn over the A2A listener, so it may run only
+    /// in a conversation that caller owns (an operator's in any). Work the
+    /// runtime itself delivers — a `message` step, the prompt — is not held
+    /// to that: it is the instance talking to itself.
+    pub from_listener: bool,
 }
 
 impl TurnJob {
@@ -167,11 +172,17 @@ impl TurnJob {
             knowledge_done: false,
             knowledge: None,
             msg_depth: 0,
+            from_listener: false,
         }
     }
     /// The same job, carrying a delivered message's hop depth.
     pub fn at_depth(mut self, depth: u32) -> TurnJob {
         self.msg_depth = depth;
+        self
+    }
+    /// The same job, marked as asked for over the listener (or not).
+    pub fn via_listener(mut self, from_listener: bool) -> TurnJob {
+        self.from_listener = from_listener;
         self
     }
 }
@@ -432,6 +443,11 @@ pub struct Runtime {
     /// Inbox-event id → the A2A task it answers (a conversation turn).
     #[cfg(feature = "a2a")]
     pub(crate) event_to_task: BTreeMap<String, String>,
+    /// Each non-operator's `contextId`s, bound to the conversations they name
+    /// (see `runtime::conversations`). Rebuilt from the tasks and contexts at
+    /// restore.
+    #[cfg(feature = "a2a")]
+    pub(crate) conv_index: super::conversations::ConversationIndex,
     /// The task snapshot the A2A listener threads read (None ⇒ not serving).
     #[cfg(feature = "a2a")]
     /// The interface event feed. `None` means the interface is disabled.
@@ -831,6 +847,12 @@ impl Runtime {
             .as_str()
             .unwrap_or("default")
             .to_string();
+        // The name the sender used for the conversation — the key itself for
+        // an operator, a `message` step, and a record written before the two
+        // were told apart.
+        let wire = ev.payload["wire_id"].as_str().unwrap_or(&ctx).to_string();
+        // Only the listener writes a message ahead with the task it answers.
+        let from_listener = ev.payload["task"].is_string();
         let text = ev.payload["text"]
             .as_str()
             .map(str::to_string)
@@ -859,7 +881,7 @@ impl Runtime {
         //    message}`) — the reply half of an asynchronous exchange.
         let msg = json!({"parts": ev.payload.get("parts").cloned().unwrap_or(Value::Null),
                          "text": text, "message_id": ev.payload.get("message_id").cloned()});
-        if self.deliver_a2a_message(&ctx, &msg, principal.as_deref()) > 0 {
+        if self.deliver_a2a_message(&ctx, &wire, &msg, principal.as_deref()) > 0 {
             self.log.info(
                 "a2a.message.delivered",
                 json!({"inbox_event": ev.id, "conversation": ctx}),
@@ -884,7 +906,8 @@ impl Runtime {
                 skills,
                 text,
             )
-            .at_depth(depth),
+            .at_depth(depth)
+            .via_listener(from_listener),
         );
     }
 
@@ -1542,20 +1565,14 @@ impl Runtime {
     }
 
     /// The conversations as `status` and the feed show them, each with the
-    /// `contextId` a client addresses it by — today the id itself.
+    /// `contextId` its owner addresses it by beside the `id` it is kept under
+    /// (the same, unless the owner is not an operator).
     fn conversation_views(&self) -> Vec<Value> {
-        let mut out = Vec::new();
-        for mut c in self
-            .contexts
+        self.contexts
             .status()
             .as_array()
             .cloned()
             .unwrap_or_default()
-        {
-            c["contextId"] = c["id"].clone();
-            out.push(c);
-        }
-        out
     }
 
     /// `observability.status_values`: the current value of each listed memory

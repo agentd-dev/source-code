@@ -280,6 +280,30 @@ impl Runtime {
     /// they finish.
     fn start_root_turn(&mut self, mut job: TurnJob) -> Result<(), TurnDefer> {
         let ctx_id = job.ctx.clone();
+        // A caller's turn runs in a conversation that caller owns. Ingress
+        // already bound its `contextId` to one (`runtime::conversations`);
+        // this is the second lock, for a job that reached the queue some
+        // other way — a record written before the namespace existed, say —
+        // so it still cannot read, extend or charge somebody else's.
+        if job.from_listener
+            && let Err(why) = self.listener_may_turn(&job)
+        {
+            self.log.warn(
+                "turn.refused.not_owner",
+                json!({"ctx": ctx_id, "principal": job.principal, "reason": why}),
+            );
+            #[cfg(feature = "a2a")]
+            self.a2a_task_for_event(
+                job.event.as_deref(),
+                crate::a2a::State::Failed,
+                Some("this conversation is not available".into()),
+                None,
+            );
+            if let Some(ev) = &job.event {
+                self.inbox_done(ev);
+            }
+            return Err(TurnDefer::Dropped);
+        }
         // Append the message + preload skills (once).
         if job.message.is_some() || !job.skills.is_empty() {
             let unknown = self.preload_skills(&ctx_id, &job.skills, job.principal.as_deref());
@@ -789,6 +813,34 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
         job.knowledge = block;
         job.knowledge_done = true;
         self.turn_queue.push_back(job);
+    }
+
+    /// Whether the caller behind a listener's turn may run it in its context:
+    /// an operator anywhere, anyone else only in a conversation of its own —
+    /// created for it here, under the name it used, when the turn is its
+    /// first ([`crate::context::Contexts::conversation_for`]).
+    fn listener_may_turn(&mut self, job: &TurnJob) -> Result<(), String> {
+        if self
+            .acting_principal(job.principal.as_deref())
+            .is_some_and(|p| p.is_operator())
+        {
+            return Ok(());
+        }
+        let Some(principal) = job.principal.as_deref() else {
+            return Err("a caller's turn names no caller".into());
+        };
+        #[cfg(feature = "a2a")]
+        let wire = Some(self.conversation_wire(&job.ctx));
+        #[cfg(not(feature = "a2a"))]
+        let wire: Option<String> = None;
+        let window = self.model_window();
+        let c = self
+            .contexts
+            .conversation_for(&job.ctx, principal, wire.as_deref())?;
+        if c.model_window == 0 {
+            c.model_window = window;
+        }
+        Ok(())
     }
 
     /// The budget scopes a conversation turn is charged to: the conversation's

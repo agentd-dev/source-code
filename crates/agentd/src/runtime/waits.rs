@@ -67,6 +67,39 @@ impl SignalSender {
     }
 }
 
+/// The conversation a message wait names to hear from any of them.
+pub(crate) const ANY_CONVERSATION: &str = "*";
+
+/// Whether a message on conversation `key` — called `wire` by its sender —
+/// from `sender` (`None`: the runtime) wakes the message wait `w` of a run
+/// owned by `owner`.
+///
+/// Both halves must hold. The CONVERSATION: the one the wait names, by key or
+/// by name, or any for `*`; a record naming none (armed before a missing one
+/// meant the run's own) listens to nothing, never to everything. The SENDER:
+/// whoever the wait's `from` names; without one, the run's own principal, an
+/// operator, or the runtime itself — never another caller who merely named
+/// the conversation.
+pub(crate) fn message_wait_matches(
+    w: &Value,
+    key: &str,
+    wire: &str,
+    sender: Option<&crate::a2a::Principal>,
+    owner: Option<&str>,
+) -> bool {
+    let want = w["conversation"].as_str().unwrap_or("");
+    if want.is_empty() || !(want == ANY_CONVERSATION || want == key || want == wire) {
+        return false;
+    }
+    match w.get("from").filter(|f| !f.is_null()) {
+        Some(from) => match (crate::a2a::principals::Addressee::parse(from), sender) {
+            (Ok(who), Some(p)) => who.matches(p),
+            _ => false,
+        },
+        None => sender.is_none_or(|p| p.is_operator() || owner == Some(p.id.as_str())),
+    }
+}
+
 /// A durable wait record kept in `StepState.wait`.
 /// The message id an `idempotency:` declaration asks for — the step's derived
 /// key, or the declared `value` (an application-level identity, which is
@@ -373,19 +406,22 @@ impl Runtime {
             // exists because a workflow that sent with `a2a.send` reads better
             // awaiting with `a2a.wait` than with a generic `wait`.
             "a2a.wait" => {
-                let conv = spec
-                    .get("conversation")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
                 let timeout = spec
                     .get("timeout")
                     .and_then(crate::engine::model::duration_ms_opt);
-                self.suspend_wait(
-                    run_id,
-                    step_id,
-                    wait_record("message", json!({"conversation": conv}), timeout),
-                );
+                match self.message_wait(run_id, spec, true) {
+                    Ok(rec) => {
+                        self.suspend_wait(run_id, step_id, wait_record("message", rec, timeout))
+                    }
+                    Err(e) => self.finish_step_pub(
+                        run_id,
+                        step_id,
+                        StepStatus::Failed,
+                        None,
+                        Some(format!("a2a.wait: {e}")),
+                        0,
+                    ),
+                }
             }
             "classify" | "extract" | "summarize" | "judge" | "route" => {
                 self.step_preset(run_id, step_id, step, spec, data)
@@ -466,10 +502,10 @@ impl Runtime {
                 let handle = spec.get("subagent").and_then(Value::as_str).unwrap_or("").to_string();
                 self.suspend_wait(run_id, step_id, wait_record("subagent", json!({"handle": handle}), timeout));
             }
-            "message" => {
-                let conv = spec.get("conversation").and_then(Value::as_str).map(str::to_string).or_else(|| self.runs.get(run_id).and_then(|r| r.conversation.clone()));
-                self.suspend_wait(run_id, step_id, wait_record("message", json!({"conversation": conv}), timeout));
-            }
+            "message" => match self.message_wait(run_id, spec, false) {
+                Ok(rec) => self.suspend_wait(run_id, step_id, wait_record("message", rec, timeout)),
+                Err(e) => self.finish_step_pub(run_id, step_id, StepStatus::Failed, None, Some(format!("wait on: message: {e}")), 0),
+            },
             // Park on the durable log. This is the one edge in the system that
             // is ordered, replayable and correlated, and until now it could
             // only START a run — so every pattern past "one run per event"
@@ -509,6 +545,45 @@ impl Runtime {
             }
             other => self.finish_step_pub(run_id, step_id, StepStatus::Failed, None, Some(format!("wait: on must be resource|condition|signal|run|subagent|message|event|webhook (got {other:?})")), 0),
         }
+    }
+
+    /// The durable record of a message wait (`wait {on: message}`,
+    /// `a2a.wait`): the conversation it listens on, and whom it listens to.
+    ///
+    /// A missing `conversation` is the run's own; a run that has none fails
+    /// the step rather than listening everywhere — "any conversation" is the
+    /// explicit `*`. `from` is re-read here for the same reason it was checked
+    /// at load: a record that could not be read back as an addressee would
+    /// listen to nobody, or, worse, be taken for one that listens to anyone.
+    /// `a2a.wait` must name its sender: the reply it waits for is a peer's.
+    fn message_wait(
+        &self,
+        run_id: &str,
+        spec: &Map<String, Value>,
+        from_required: bool,
+    ) -> Result<Value, String> {
+        let conversation = spec
+            .get("conversation")
+            .and_then(Value::as_str)
+            .filter(|c| !c.trim().is_empty())
+            .map(str::to_string)
+            .or_else(|| self.runs.get(run_id).and_then(|r| r.conversation.clone()))
+            .ok_or("no conversation to wait on: this run has none of its own — name one, or `*` for any")?;
+        let mut rec = json!({"conversation": conversation});
+        match spec.get("from").filter(|f| !f.is_null()) {
+            Some(from) => {
+                let who = crate::a2a::principals::Addressee::parse(from)
+                    .map_err(|e| format!("from: {e}"))?;
+                rec["from"] = who.to_json();
+            }
+            None if from_required => {
+                return Err(
+                    "`from` is required: name the principal whose message this waits for".into(),
+                );
+            }
+            None => {}
+        }
+        Ok(rec)
     }
 
     /// Every tick: resolve `wait {on: event}` steps against the durable log.
@@ -868,30 +943,38 @@ impl Runtime {
     ///
     /// This is what makes the asynchronous half of an A2A conversation
     /// expressible: `wait {on: message}` and `a2a.wait` both suspend on a
-    /// `{kind: message, conversation}` record, and without a resolver they
-    /// could only ever end by timing out — a workflow could send but never be
-    /// woken by the reply.
+    /// `{kind: message, conversation, from?}` record, and without a resolver
+    /// they could only ever end by timing out — a workflow could send but
+    /// never be woken by the reply.
     ///
-    /// A wait with an EMPTY conversation matches any conversation, which is how
-    /// a workflow awaits "the next thing anyone says" without knowing the id in
-    /// advance.
+    /// `conversation` is the key the message is kept under and `wire` the
+    /// `contextId` its sender used (the same, unless the sender is a
+    /// non-operator); a wait names either. Which messages wake it is
+    /// [`message_wait_matches`]'s rule — the conversation AND the sender, so
+    /// nobody wakes somebody else's run by naming its conversation.
     pub(crate) fn deliver_a2a_message(
         &mut self,
         conversation: &str,
+        wire: &str,
         message: &Value,
         principal: Option<&str>,
     ) -> u64 {
+        let sender = self.acting_principal(principal);
         let mut hits: Vec<(String, String)> = Vec::new();
         for (rid, run) in &self.runs {
             for (sid, st) in &run.steps {
                 if st.status == StepStatus::Suspended
                     && let Some(w) = &st.wait
                     && w["kind"] == "message"
+                    && message_wait_matches(
+                        w,
+                        conversation,
+                        wire,
+                        sender.as_ref(),
+                        run.principal.as_deref(),
+                    )
                 {
-                    let want = w["conversation"].as_str().unwrap_or("");
-                    if want.is_empty() || want == conversation {
-                        hits.push((rid.clone(), sid.clone()));
-                    }
+                    hits.push((rid.clone(), sid.clone()));
                 }
             }
         }
@@ -902,8 +985,10 @@ impl Runtime {
                 &rid,
                 &sid,
                 StepStatus::Done,
+                // The conversation as its sender named it: what the wait was
+                // written against, and what a reply to a peer must carry.
                 Some(json!({
-                    "conversation": conversation,
+                    "conversation": wire,
                     "message": message,
                     "principal": principal,
                 })),
@@ -1853,5 +1938,152 @@ mod signal_sender_tests {
         for any in [&operator, &SignalSender::Runtime] {
             assert!(any.may_wake(Some("user:alice")) && any.may_wake(None));
         }
+    }
+}
+
+#[cfg(test)]
+mod message_wait_tests {
+    use super::{message_wait_matches, wait_record};
+    use crate::a2a::Principal;
+    use crate::config::v2::Role;
+    use serde_json::json;
+
+    fn who(id: &str, role: Role) -> Principal {
+        Principal {
+            id: id.into(),
+            role,
+            ..Principal::anonymous()
+        }
+    }
+
+    /// A message wakes a wait only when both the conversation and the sender
+    /// are the ones it waits for. Naming a run's conversation is not enough
+    /// for another caller to answer it; `*` widens the conversation, never
+    /// the sender; and a record that names no conversation hears nothing.
+    #[test]
+    fn a_message_wait_hears_its_conversation_and_its_sender() {
+        let alice = who("user:alice", Role::User);
+        let mallory = who("user:mallory", Role::User);
+        let op = who("operator", Role::Operator);
+        let peer = who("agent:peer", Role::Agent);
+        let on = |conv: &str| wait_record("message", json!({"conversation": conv}), None);
+
+        // No `from`: the run's owner, an operator, the runtime.
+        let w = on("chat");
+        let owner = Some("user:alice");
+        assert!(message_wait_matches(
+            &w,
+            "ctx-1",
+            "chat",
+            Some(&alice),
+            owner
+        ));
+        assert!(message_wait_matches(&w, "chat", "chat", Some(&op), owner));
+        assert!(message_wait_matches(&w, "chat", "chat", None, owner));
+        assert!(
+            !message_wait_matches(&w, "ctx-2", "chat", Some(&mallory), owner),
+            "another caller naming the conversation does not answer it"
+        );
+        assert!(
+            !message_wait_matches(&w, "ctx-2", "chat", Some(&mallory), None),
+            "nor a run nobody owns"
+        );
+        // The conversation, by key or by name — and only that one.
+        assert!(message_wait_matches(
+            &on("ctx-1"),
+            "ctx-1",
+            "chat",
+            Some(&alice),
+            owner
+        ));
+        assert!(!message_wait_matches(
+            &w,
+            "ctx-1",
+            "other",
+            Some(&alice),
+            owner
+        ));
+        // `*`: any conversation, the same senders.
+        assert!(message_wait_matches(
+            &on("*"),
+            "ctx-9",
+            "x",
+            Some(&alice),
+            owner
+        ));
+        assert!(!message_wait_matches(
+            &on("*"),
+            "ctx-9",
+            "x",
+            Some(&mallory),
+            owner
+        ));
+        // A record naming no conversation hears nothing at all.
+        for empty in [json!({"kind": "message"}), on("")] {
+            assert!(!message_wait_matches(
+                &empty,
+                "chat",
+                "chat",
+                Some(&op),
+                owner
+            ));
+            assert!(!message_wait_matches(&empty, "chat", "chat", None, owner));
+        }
+
+        // `from`: exactly who it names. The runtime is nobody it could name,
+        // and an operator is not waved through a wait that named a peer.
+        let from = |f| {
+            wait_record(
+                "message",
+                json!({"conversation": "conv-p", "from": f}),
+                None,
+            )
+        };
+        let w = from(json!("agent:peer"));
+        assert!(message_wait_matches(
+            &w,
+            "ctx-3",
+            "conv-p",
+            Some(&peer),
+            None
+        ));
+        assert!(!message_wait_matches(
+            &w,
+            "ctx-4",
+            "conv-p",
+            Some(&mallory),
+            None
+        ));
+        assert!(!message_wait_matches(
+            &w,
+            "conv-p",
+            "conv-p",
+            Some(&op),
+            None
+        ));
+        assert!(!message_wait_matches(&w, "conv-p", "conv-p", None, None));
+        let by_role = from(json!({"role": "agent"}));
+        assert!(message_wait_matches(
+            &by_role,
+            "k",
+            "conv-p",
+            Some(&peer),
+            None
+        ));
+        assert!(!message_wait_matches(
+            &by_role,
+            "k",
+            "conv-p",
+            Some(&alice),
+            None
+        ));
+        // A `from` that does not read back as an addressee hears nobody.
+        assert!(!message_wait_matches(
+            &from(json!(7)),
+            "k",
+            "conv-p",
+            Some(&peer),
+            None
+        ));
     }
 }

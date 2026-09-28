@@ -181,11 +181,19 @@ impl Runtime {
                 &[("op", op)],
             );
         }
-        let ctx = message["contextId"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| self.next_id("a2a"));
+        // The same namespace a conversational message is held to: a command
+        // runs in a conversation its caller may address, claimed before any
+        // work is done. A read starts nothing there, so it binds nothing — a
+        // caller polling `status` must not grow the index — and its reply
+        // names the conversation the caller's way.
+        let wire = super::send::context_wire(message);
+        let ctx = match route {
+            Route::Read(_) | Route::Introspection(_) => wire.clone(),
+            _ => match self.resolve_context(principal, &wire) {
+                Ok(key) => key,
+                Err(e) => return e,
+            },
+        };
         let answer = match route {
             Route::Read(r) => self.read_op(principal, r, &data),
             Route::Workflow(w) => self.workflow_op(principal, w, &data, &ctx, message),
@@ -226,7 +234,7 @@ impl Runtime {
         match answer {
             Answer::Doc(doc) => {
                 debug_assert_eq!(spec.reply, Reply::Message, "{op} answered a document");
-                crate::a2a::reply::read_reply(&ctx, doc)
+                crate::a2a::reply::read_reply(&wire, doc)
             }
             Answer::Done { link, text, result } => {
                 debug_assert_eq!(spec.reply, Reply::Task, "{op} answered a task");
@@ -259,7 +267,10 @@ impl Runtime {
                     .as_str()
                     .map(str::to_string)
                     .unwrap_or_else(|| crate::context::ROOT.to_string());
-                match self.contexts.get(&id) {
+                // A non-operator names a conversation the way it sent it, in
+                // its own namespace; only an operator uses the runtime's keys.
+                let key = self.conversation_named(principal, &id);
+                match key.and_then(|k| self.contexts.get(&k)) {
                     Some(c) if may_act_on(principal, c.principal.as_deref()) => Answer::Doc(
                         json!({"conversation": id, "plan": c.plan, "progress": c.plan.as_ref().map(|p| p.progress())}),
                     ),

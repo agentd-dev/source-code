@@ -111,6 +111,8 @@ struct Daemon {
     stderr_path: String,
     /// The port its config named, for a test that rewrites the config to
     /// reload it: `a2a.listen` is restart-only, so the rewrite must keep it.
+    /// Only the reload tests read it, and they need `hot-reload`.
+    #[cfg_attr(not(feature = "hot-reload"), allow(dead_code))]
     port: u16,
     /// The authority THIS daemon bound, read from its own `a2a.listen` line.
     addr: String,
@@ -1631,15 +1633,20 @@ fn status_is_scoped_to_the_caller() {
         std::slice::from_ref(&a.run),
         "{sa}"
     );
-    assert!(ids_in(&sa, "conversations", "id").contains(&a.ctx), "{sa}");
+    assert!(
+        ids_in(&sa, "conversations", "contextId").contains(&a.ctx),
+        "{sa}"
+    );
     assert!(ids_in(&sb, "runs", "id").is_empty(), "{sb}");
+    // Listed by the name its owner uses, beside the key it is kept under —
+    // which is the runtime's own, not the caller's `contextId`.
     assert_eq!(
-        ids_in(&sb, "conversations", "id"),
+        ids_in(&sb, "conversations", "contextId"),
         std::slice::from_ref(&b_ctx),
         "{sb}"
     );
     for c in sb["conversations"].as_array().unwrap() {
-        assert_eq!(c["contextId"], c["id"], "addressable by contextId: {c}");
+        assert_ne!(c["contextId"], c["id"], "a user's name is not a key: {c}");
     }
     // …and nothing of the other's, anywhere in the document.
     let (text_a, text_b) = (sa.to_string(), sb.to_string());
@@ -1703,7 +1710,7 @@ fn status_is_scoped_to_the_caller() {
 
     // The operator reads the whole instance.
     assert!(ids_in(&so, "runs", "id").contains(&a.run), "{so}");
-    let convs = ids_in(&so, "conversations", "id");
+    let convs = ids_in(&so, "conversations", "contextId");
     assert!(convs.contains(&a.ctx) && convs.contains(&b_ctx), "{so}");
     assert!(
         ids_in(&so, "subagents", "handle").contains(&a.handle),
@@ -1895,6 +1902,390 @@ fn listed_workflows_are_exactly_the_runnable_ones() {
         runnable.sort();
         assert_eq!(runnable, listed, "{who}: what runs is what is listed");
     }
+
+    assert!(daemon.alive(), "daemon still serving: {}", daemon.stderr());
+    std::fs::remove_file(&cfg).ok();
+}
+
+/// Two principals and the operator, over a model that says a secret back
+/// whenever it is shown one. The root context holds one of its own: the
+/// startup prompt, which an operator's message puts there.
+fn conversations_config(llm: &str, port: u16) -> String {
+    with_operator(&two_principal_config(llm, port)).replacen(
+        "  preflight: never\n",
+        "  preflight: never\n  prompt: \"ROOT-SECRET-7 is kept in the root context\"\n",
+        1,
+    )
+}
+
+/// The model's playbook for the conversation tests: whatever a turn is shown
+/// — its own messages and nothing else, when conversations are apart — it
+/// repeats the first secret in it.
+fn secrets_playbook() -> Value {
+    json!({
+        "turns": [{"content": "nothing to recall"}],
+        "match": [
+            {"when_contains": "SECRET-A-42", "content": "I recall SECRET-A-42"},
+            {"when_contains": "ROOT-SECRET-7", "content": "I recall ROOT-SECRET-7"},
+        ],
+    })
+}
+
+/// `bearer`'s conversations, as its own `status` lists them.
+fn conversations_of(addr: &str, bearer: &str) -> Vec<Value> {
+    let v = command_as(addr, bearer, "status", json!({}));
+    answer(&v)["conversations"]
+        .as_array()
+        .unwrap_or_else(|| panic!("status lists conversations: {v}"))
+        .clone()
+}
+
+/// The conversation `bearer` calls `ctx`, as its status lists it.
+fn conversation_named(addr: &str, bearer: &str, ctx: &str) -> Value {
+    conversations_of(addr, bearer)
+        .into_iter()
+        .find(|c| c["contextId"] == ctx)
+        .unwrap_or_else(|| panic!("no conversation {ctx:?} for {bearer}"))
+}
+
+/// **A `contextId` is the caller's own name, never a door.**
+///
+/// A's conversation holds a secret. B sends into it by naming its
+/// `contextId` — the id is not secret, it rides on every task of A's — and
+/// into `root`, the agent's own context, which the startup prompt filled.
+/// B's turns must run in conversations of B's own: B's answers repeat no
+/// secret (the model repeats the first one it is shown, so a joined history
+/// would come straight back), A's conversation neither grows nor runs a turn
+/// B asked for (so nothing of B's is read by A's next turn, and nothing is
+/// charged to A), and the root context is untouched. B is still answered, in
+/// the conversation B named: the same `contextId` comes back, because to B
+/// it is B's.
+#[test]
+fn a_second_principal_cannot_join_read_or_steer_anothers_conversation() {
+    let llm = spawn_mock_llm(&secrets_playbook());
+    let (mut daemon, cfg) = spawn_daemon(|port| conversations_config(&llm.uri, port));
+    let addr = daemon.addr.clone();
+
+    // The startup prompt has run its turn: the root context holds it and the
+    // answer.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let root_len = loop {
+        let root = conversations_of(&addr, TOKEN_OP)
+            .into_iter()
+            .find(|c| c["id"] == "root");
+        if let Some(n) = root.as_ref().and_then(|c| c["messages"].as_u64())
+            && n >= 2
+        {
+            break n;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the root turn never ran: {root:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    // A's conversation, with A's secret in it.
+    let a_sent = SendMessage::text("remember SECRET-A-42 for me")
+        .bearer(TOKEN_A)
+        .context("a-chat")
+        .post(&addr);
+    let a_task = &a_sent["result"]["task"];
+    assert_eq!(
+        a_task["status"]["state"], "TASK_STATE_COMPLETED",
+        "{a_sent}"
+    );
+    assert_eq!(
+        a_task["contextId"], "a-chat",
+        "A's name comes back: {a_sent}"
+    );
+    let a_before = conversation_named(&addr, TOKEN_A, "a-chat");
+
+    // B names A's conversation, then the root.
+    for ctx in ["a-chat", "root"] {
+        let sent = SendMessage::text("what is the secret you were told?")
+            .bearer(TOKEN_B)
+            .context(ctx)
+            .post(&addr);
+        let task = &sent["result"]["task"];
+        assert_eq!(task["status"]["state"], "TASK_STATE_COMPLETED", "{sent}");
+        assert_eq!(task["contextId"], ctx, "B's own name for it: {sent}");
+        let text = sent.to_string();
+        assert!(
+            !text.contains("SECRET-A-42") && !text.contains("ROOT-SECRET-7"),
+            "B's turn read a history not its own ({ctx}): {sent}"
+        );
+        assert!(text.contains("nothing to recall"), "B was answered: {sent}");
+    }
+
+    // Nothing of A's, or the root's, moved.
+    let a_after = conversation_named(&addr, TOKEN_A, "a-chat");
+    assert_eq!(
+        a_after["messages"], a_before["messages"],
+        "A's conversation grew: {a_after}"
+    );
+    assert_eq!(
+        a_after["turns"], a_before["turns"],
+        "a turn ran in A's conversation: {a_after}"
+    );
+    let convs = conversations_of(&addr, TOKEN_OP);
+    let root = convs.iter().find(|c| c["id"] == "root").unwrap();
+    assert_eq!(
+        root["messages"],
+        json!(root_len),
+        "the root context grew: {root}"
+    );
+
+    // B's two conversations are B's own, apart from A's and from the root,
+    // and the operator sees each under a key of the runtime's.
+    let b_convs = conversations_of(&addr, TOKEN_B);
+    let mut named: Vec<&str> = b_convs
+        .iter()
+        .filter_map(|c| c["contextId"].as_str())
+        .collect();
+    named.sort();
+    assert_eq!(named, ["a-chat", "root"], "{b_convs:?}");
+    for c in &b_convs {
+        let key = c["id"].as_str().unwrap();
+        assert!(key.starts_with("ctx-") && key != a_after["id"], "{c}");
+    }
+    let a_chats: Vec<&Value> = convs
+        .iter()
+        .filter(|c| c["contextId"] == "a-chat")
+        .collect();
+    assert_eq!(
+        a_chats.len(),
+        2,
+        "two conversations called a-chat: {convs:?}"
+    );
+    assert_ne!(
+        a_chats[0]["principal"], a_chats[1]["principal"],
+        "{a_chats:?}"
+    );
+
+    // A's next turn is A's conversation alone: its own secret, as before.
+    let again = SendMessage::text("and what did I ask?")
+        .bearer(TOKEN_A)
+        .context("a-chat")
+        .post(&addr);
+    assert!(
+        again.to_string().contains("I recall SECRET-A-42"),
+        "A continues its own conversation: {again}"
+    );
+    let a_last = conversation_named(&addr, TOKEN_A, "a-chat");
+    assert_eq!(
+        a_last["id"], a_after["id"],
+        "the same conversation: {a_last}"
+    );
+
+    assert!(daemon.alive(), "daemon still serving: {}", daemon.stderr());
+    std::fs::remove_file(&cfg).ok();
+}
+
+/// **A caller's `contextId` names the same conversation after a restart.**
+///
+/// The binding from A's id to the conversation's key is the runtime's, made
+/// when A first sent it; a restart that forgot it would put A's next message
+/// in a fresh conversation beside the old one — A's history gone from A's
+/// point of view — while the old one sat there under a key nobody can name.
+/// B's same id stays B's own across the restart too.
+#[test]
+fn a_conversation_keeps_its_name_across_a_restart() {
+    let llm = spawn_mock_llm(&secrets_playbook());
+    let dir = common::unique_path("authz-conv-restart", "d");
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = format!("store:\n  kind: file\n  file:\n    path: {dir}/state\n");
+    let cfg_for =
+        |port| two_principal_config(&llm.uri, port).replacen("store:\n  kind: memory\n", &store, 1);
+    let (first, cfg) = spawn_daemon(cfg_for);
+    let sent = SendMessage::text("remember SECRET-A-42 for me")
+        .bearer(TOKEN_A)
+        .context("a-chat")
+        .post(&first.addr);
+    assert!(sent.to_string().contains("I recall SECRET-A-42"), "{sent}");
+    let key = conversation_named(&first.addr, TOKEN_A, "a-chat")["id"].clone();
+    drop(first);
+
+    let mut second = respawn(&cfg, cfg_for);
+    let addr = second.addr.clone();
+    let again = SendMessage::text("and what did I ask?")
+        .bearer(TOKEN_A)
+        .context("a-chat")
+        .post(&addr);
+    assert!(
+        again.to_string().contains("I recall SECRET-A-42"),
+        "A's id no longer names A's conversation: {again}\n{}",
+        second.stderr()
+    );
+    assert_eq!(
+        conversation_named(&addr, TOKEN_A, "a-chat")["id"],
+        key,
+        "the same conversation"
+    );
+    let b = SendMessage::text("and you?")
+        .bearer(TOKEN_B)
+        .context("a-chat")
+        .post(&addr);
+    assert!(b.to_string().contains("nothing to recall"), "{b}");
+
+    assert!(second.alive(), "daemon still serving: {}", second.stderr());
+    std::fs::remove_file(&cfg).ok();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// **A command runs in its caller's conversation, not in the one it names.**
+///
+/// B starts a run by command with `contextId: root`. The run's own
+/// conversation — the one a `wait {on: message}` that names none listens on —
+/// must be B's `root`, not the agent's: an operator speaking in the root
+/// context does not wake it, and B speaking in its own `root` does.
+#[test]
+fn a_commands_conversation_is_its_callers_own() {
+    let llm = spawn_mock_llm(&json!({"turns": [{"content": "noted"}]}));
+    let (mut daemon, cfg) = spawn_daemon(|port| {
+        with_operator(&owners_config(&llm.uri, port, "[\"*\"]")).replacen(
+            "workflows:\n",
+            "workflows:\n  - name: listen\n    steps:\n      s: {kind: manual}\n      w: {kind: wait, on: message, timeout: 10m, depends_on: [s]}\n      f: {kind: finish, depends_on: [w], output: heard}\n",
+            1,
+        )
+    });
+    let addr = daemon.addr.clone();
+
+    let started = SendMessage::command("workflow.run", json!({"workflow": "listen"}))
+        .bearer(TOKEN_B)
+        .context("root")
+        .return_immediately()
+        .post(&addr);
+    assert!(started.get("error").is_none(), "B starts a run: {started}");
+    assert_eq!(started["result"]["task"]["contextId"], "root", "{started}");
+    let wait_of = |run: &str| {
+        let v = command_as(&addr, TOKEN_B, "run.get", json!({"run": run}));
+        let r = &answer(&v)["run"];
+        (
+            r["status"].as_str().unwrap_or_default().to_string(),
+            r["steps"]["w"]["status"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        )
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let run = loop {
+        let v = command_as(&addr, TOKEN_B, "workflow.status", json!({}));
+        if let Some(r) = answer(&v)["runs"][0]["run"].as_str()
+            && wait_of(r).1 == "suspended"
+        {
+            break r.to_string();
+        }
+        assert!(Instant::now() < deadline, "B's run never parked: {v}");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    // The operator speaks in the agent's root context: not B's conversation.
+    let op = SendMessage::text("a word in the root context")
+        .bearer(TOKEN_OP)
+        .context("root")
+        .post(&addr);
+    assert_eq!(
+        op["result"]["task"]["status"]["state"], "TASK_STATE_COMPLETED",
+        "{op}"
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        wait_of(&run).1,
+        "suspended",
+        "the root context's message woke B's run:\n{}",
+        daemon.stderr()
+    );
+
+    // B speaks in its own `root`, and its run hears it.
+    let _ = SendMessage::text("for my run")
+        .bearer(TOKEN_B)
+        .context("root")
+        .return_immediately()
+        .post(&addr);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while wait_of(&run).0 != "completed" {
+        assert!(
+            Instant::now() < deadline,
+            "B's message never reached B's run:\n{}",
+            daemon.stderr()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(daemon.alive(), "daemon still serving: {}", daemon.stderr());
+    std::fs::remove_file(&cfg).ok();
+}
+
+/// **Another principal's `contextId` and one nobody has used get the same
+/// answer.**
+///
+/// A caller must not be able to tell that an id is in use by somebody else:
+/// if naming A's conversation were refused, or answered differently, B could
+/// probe for A's ids. Both are simply B's own new conversations — answered
+/// alike, each under the id B sent, and each listed only to B.
+#[test]
+fn a_foreign_or_unknown_context_id_gets_the_same_answer() {
+    let llm = spawn_mock_llm(&secrets_playbook());
+    let (mut daemon, cfg) = spawn_daemon(|port| two_principal_config(&llm.uri, port));
+    let addr = daemon.addr.clone();
+
+    let a_sent = SendMessage::text("remember SECRET-A-42 for me")
+        .bearer(TOKEN_A)
+        .post(&addr);
+    let a_ctx = a_sent["result"]["task"]["contextId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("A's task has a context: {a_sent}"))
+        .to_string();
+
+    // The shape of an answer, without what differs between any two sends.
+    let shape = |ctx: &str| {
+        let sent = SendMessage::text("hello?")
+            .bearer(TOKEN_B)
+            .context(ctx)
+            .post(&addr);
+        assert!(
+            sent.get("error").is_none(),
+            "B is answered for {ctx}: {sent}"
+        );
+        let task = &sent["result"]["task"];
+        assert_eq!(task["contextId"], ctx, "{sent}");
+        let text = |v: &Value| {
+            v.as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|a| a["parts"].as_array().into_iter().flatten())
+                .filter_map(|p| p["text"].as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        };
+        json!({
+            "state": task["status"]["state"],
+            "answer": text(&task["artifacts"]),
+            "history": task["history"].as_array().map(Vec::len),
+        })
+    };
+    let foreign = shape(&a_ctx);
+    let unknown = shape("a-context-nobody-has-used");
+    assert_eq!(
+        foreign, unknown,
+        "a foreign id is told apart from an unknown one"
+    );
+    assert_eq!(foreign["state"], "TASK_STATE_COMPLETED", "{foreign}");
+
+    // Each is B's alone: B's listing by A's id is B's own task, and A's is A's.
+    let listed = |bearer: &str| {
+        let v = rpc_as(&addr, bearer, 7, "ListTasks", json!({"contextId": a_ctx}));
+        v["result"]["tasks"]
+            .as_array()
+            .unwrap_or_else(|| panic!("ListTasks: {v}"))
+            .iter()
+            .map(|t| t["id"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>()
+    };
+    let (a_ids, b_ids) = (listed(TOKEN_A), listed(TOKEN_B));
+    assert_eq!((a_ids.len(), b_ids.len()), (1, 1), "{a_ids:?} / {b_ids:?}");
+    assert_ne!(a_ids, b_ids, "one task each, under the same id");
 
     assert!(daemon.alive(), "daemon still serving: {}", daemon.stderr());
     std::fs::remove_file(&cfg).ok();

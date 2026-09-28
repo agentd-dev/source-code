@@ -51,6 +51,17 @@ pub(crate) fn command_names_task(op: &str, task: &str) -> Value {
     })
 }
 
+/// The `contextId` a message names, as its sender knows it. a2a-rs stamps
+/// one on every message it forwards, so only a path around it arrives
+/// without; that one gets an id minted the way a2a-rs would have.
+pub(super) fn context_wire(message: &Value) -> String {
+    message["contextId"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| a2a_rs::domain::ContextId::generate().to_string())
+}
+
 /// The task a send names, when it names one.
 ///
 /// Through the protocol layer `taskId` is always set — a2a-rs generates one
@@ -71,6 +82,39 @@ fn named_task(params: &Value) -> Option<&str> {
 }
 
 impl Runtime {
+    /// The key of the conversation `principal`'s `contextId` (`wire`, see
+    /// [`context_wire`]) names.
+    ///
+    /// The one ingress rule, for a conversational message and a command
+    /// alike (see `runtime::conversations`). An operator's `contextId` IS the
+    /// key — root included. Anyone else's is bound in its own namespace, so it
+    /// reaches only a conversation it started, and never errors on, reads or
+    /// charges one it did not: another principal's id, the root's and one
+    /// nobody has used all get the same fresh conversation.
+    pub(super) fn resolve_context(
+        &mut self,
+        principal: &Principal,
+        wire: &str,
+    ) -> Result<String, Value> {
+        if principal.is_operator() {
+            return Ok(wire.to_string());
+        }
+        match self.conv_index.claim(&principal.id, wire) {
+            Ok(key) => Ok(key),
+            // No randomness, no key: refused, with nothing bound or written.
+            Err(e) => {
+                self.log.warn(
+                    "a2a.context.unavailable",
+                    json!({"principal": principal.id, "err": e.to_string()}),
+                );
+                Err(err_obj(
+                    rpc_internal(),
+                    "the conversation could not be opened; try again",
+                ))
+            }
+        }
+    }
+
     /// `SendMessage`/`SendStreamingMessage`: a command DataPart routes to the
     /// registry; natural language becomes a conversation turn. Either way a
     /// durable task tracks it.
@@ -241,7 +285,7 @@ impl Runtime {
         let existing = named.and_then(|tid| {
             self.tasks
                 .get(tid)
-                .map(|t| (tid.to_string(), t.context_id.clone()))
+                .map(|t| (tid.to_string(), t.conversation.clone()))
         });
         // A LIVE human gate on the addressed task: the reply
         // resolves the suspended asker directly — the tool call returns the
@@ -317,11 +361,10 @@ impl Runtime {
                 (tid, ctx)
             }
             None => {
-                let ctx = message["contextId"]
-                    .as_str()
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-                    .unwrap_or_else(|| self.next_id("a2a"));
+                let ctx = match self.resolve_context(principal, &context_wire(message)) {
+                    Ok(key) => key,
+                    Err(e) => return e,
+                };
                 let tid = self.task_create(
                     &ctx,
                     principal,
@@ -332,7 +375,10 @@ impl Runtime {
             }
         };
         // Write-ahead the message; the loop turns it into a conversation turn.
-        let payload = json!({"context_id": ctx_id, "text": text, "parts": message["parts"],
+        // `context_id` is the conversation's key; `wire_id` what the caller
+        // called it, which is what a waiting step was written against.
+        let wire_id = self.conversation_wire(&ctx_id);
+        let payload = json!({"context_id": ctx_id, "wire_id": wire_id, "text": text, "parts": message["parts"],
         "task": task_id, "message_id": message_id,
         "role": match principal.role {
             crate::config::v2::Role::Operator => "operator",

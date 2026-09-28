@@ -299,6 +299,13 @@ pub struct ContextState {
     pub model_window: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub principal: Option<String>,
+    /// The `contextId` the owner addresses this conversation by, when that is
+    /// not the key it is stored under: a non-operator's id is bound to a key
+    /// of the runtime's own at ingress, so two callers who pick the same id
+    /// hold two conversations. `None` when the key is the id. Durable, so the
+    /// binding is rebuilt from the contexts at restore.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_id: Option<String>,
     /// The A2A task the conversation's current work is attached to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<String>,
@@ -326,6 +333,7 @@ impl ContextState {
             est_tokens: 0,
             model_window,
             principal: None,
+            wire_id: None,
             task: None,
             turns: 0,
             created: now_ms(),
@@ -490,6 +498,38 @@ impl Contexts {
         }
         c
     }
+    /// The conversation `id` for a caller who must OWN it: `principal`'s own,
+    /// created for it (as `wire`, its name for it) when there is none yet.
+    ///
+    /// The owner-checked twin of [`Contexts::conversation`], for work a
+    /// caller asked for over A2A. A context somebody else owns is refused
+    /// rather than joined; so is one nobody owns, which a caller could
+    /// otherwise adopt, and so is the root context, which is the agent's own
+    /// and no caller's conversation. An operator, who may address any
+    /// conversation, uses the unchecked accessors.
+    pub fn conversation_for(
+        &mut self,
+        id: &str,
+        principal: &str,
+        wire: Option<&str>,
+    ) -> Result<&mut ContextState, String> {
+        if id == ROOT {
+            return Err(format!(
+                "{ROOT:?} is the agent's own context, not a conversation"
+            ));
+        }
+        let w = self.model_window;
+        let c = self.map.entry(id.to_string()).or_insert_with(|| {
+            let mut c = ContextState::new(ContextKind::Conversation, w);
+            c.principal = Some(principal.to_string());
+            c.wire_id = wire.filter(|w| *w != id).map(str::to_string);
+            c
+        });
+        if c.principal.as_deref() != Some(principal) {
+            return Err(format!("conversation {id:?} is not {principal}'s"));
+        }
+        Ok(c)
+    }
     pub fn ids(&self) -> Vec<String> {
         self.map.keys().cloned().collect()
     }
@@ -538,7 +578,7 @@ impl Contexts {
                 .iter()
                 .map(|(id, c)| {
                     json!({
-                        "id": id, "kind": c.kind, "version": c.version, "messages": c.messages.len(),
+                        "id": id, "contextId": c.wire_id.as_deref().unwrap_or(id), "kind": c.kind, "version": c.version, "messages": c.messages.len(),
                         "est_tokens": c.est_tokens, "turns": c.turns, "principal": c.principal,
                         "skills": c.skills.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
                         "plan": c.plan.as_ref().map(|p| p.progress()),
@@ -615,6 +655,55 @@ mod tests {
         assert_eq!(c.principal.as_deref(), Some("user:a"));
         assert!(!c.dirty);
         assert!(c.est_tokens > 0);
+    }
+
+    /// The owner-checked accessor: a caller gets its own conversation, made
+    /// for it under its name the first time, and never somebody else's, an
+    /// unowned one, or the root.
+    #[test]
+    fn conversation_for_is_the_owners_alone() {
+        let mut cs = Contexts::new(100_000);
+        let c = cs
+            .conversation_for("ctx-a", "user:a", Some("mine"))
+            .expect("a new conversation is the caller's");
+        c.append(Msg::user("SECRET-A-42", Some("user:a".into())));
+        assert_eq!(c.principal.as_deref(), Some("user:a"));
+        assert_eq!(c.wire_id.as_deref(), Some("mine"));
+        assert_eq!(
+            cs.status()[0]["contextId"],
+            "mine",
+            "listed by the owner's name"
+        );
+        // The owner comes back to it.
+        let again = cs
+            .conversation_for("ctx-a", "user:a", Some("mine"))
+            .unwrap();
+        assert_eq!(again.messages.len(), 1);
+        // Another caller is refused, and the conversation is untouched.
+        assert!(
+            cs.conversation_for("ctx-a", "user:b", Some("mine"))
+                .is_err()
+        );
+        assert_eq!(cs.get("ctx-a").unwrap().messages.len(), 1);
+        assert_eq!(
+            cs.get("ctx-a").unwrap().principal.as_deref(),
+            Some("user:a")
+        );
+        // Nobody's conversation is nobody's to adopt.
+        cs.conversation("orphan", None);
+        assert!(cs.conversation_for("orphan", "user:b", None).is_err());
+        assert!(cs.get("orphan").unwrap().principal.is_none());
+        // The root context is no caller's conversation — not even before it
+        // exists, when claiming it would make it that caller's.
+        assert!(cs.conversation_for(ROOT, "user:b", Some(ROOT)).is_err());
+        assert!(cs.get(ROOT).is_none(), "nothing was created");
+        cs.root();
+        assert!(cs.conversation_for(ROOT, "user:b", Some(ROOT)).is_err());
+        // A key that IS the name records no second name.
+        let op = cs
+            .conversation_for("plain", "user:c", Some("plain"))
+            .unwrap();
+        assert!(op.wire_id.is_none());
     }
 
     #[test]

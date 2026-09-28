@@ -134,7 +134,18 @@ impl TaskMessage {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Task {
     pub id: String,
+    /// The `contextId` the task's OWNER addressed its conversation by — what
+    /// the wire says, always. Two principals may use the same one and still
+    /// hold two conversations (see [`Task::conversation`]).
     pub context_id: String,
+    /// The conversation the runtime keeps this task's turns in: the internal
+    /// key a non-operator's `contextId` was bound to at ingress
+    /// (`runtime::conversations`), or the id itself for an operator, a run
+    /// and the root agent. Never on the wire. A record from before the two
+    /// were told apart leaves it empty, and restore fills it with
+    /// `context_id` — which is what the key was then.
+    #[serde(default)]
+    pub conversation: String,
     #[serde(default)]
     pub state: State,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -192,6 +203,7 @@ impl Task {
             ask_schema: None,
             id: id.to_string(),
             context_id: context_id.to_string(),
+            conversation: context_id.to_string(),
             state: State::Submitted,
             principal: principal.map(str::to_string),
             link,
@@ -214,6 +226,32 @@ impl Task {
     /// yours" cannot mean different things on different paths.
     pub fn is_visible_to(&self, principal: &crate::a2a::Principal) -> bool {
         principal.is_operator() || self.principal.as_deref() == Some(principal.id.as_str())
+    }
+
+    /// Put the task in conversation `key`, which its owner knows as `wire`.
+    ///
+    /// A turn's link names the conversation too, and says it the owner's way:
+    /// the link is shown to the owner, and the key is the runtime's.
+    pub fn set_conversation(&mut self, key: &str, wire: &str) {
+        self.conversation = key.to_string();
+        self.context_id = wire.to_string();
+        if let Link::Turn { ctx } = &mut self.link
+            && ctx == key
+        {
+            *ctx = wire.to_string();
+        }
+        self.dirty = true;
+    }
+
+    /// Whether a `contextId` filter names this task's conversation.
+    ///
+    /// An operator addresses conversations by the runtime's key — the one the
+    /// `status` op lists — and may also use the id an owner sent, so either
+    /// matches. Anyone else has only its own ids: its task matches the
+    /// `contextId` it sent, and no internal key does, so a caller cannot
+    /// reach a conversation through a name the runtime chose.
+    pub fn matches_context(&self, id: &str, operator: bool) -> bool {
+        self.context_id == id || (operator && self.conversation == id)
     }
 
     pub fn transition(&mut self, state: State, message: Option<String>) {
@@ -415,6 +453,46 @@ mod tests {
         let back: Task = serde_json::from_value(serde_json::to_value(&t).unwrap()).unwrap();
         assert_eq!(back.messages, t.messages);
         assert_eq!(back.status_seq, 2);
+    }
+
+    /// A `contextId` filter: an operator matches a task by the runtime's key
+    /// or by the owner's id; the owner by its own id only — the key the
+    /// runtime bound it to is not a name the owner can use.
+    #[test]
+    fn matches_context_for_operators_and_owners() {
+        let mut t = Task::new(
+            "t",
+            "mine",
+            Some("user:a"),
+            Link::Turn {
+                ctx: "ctx-k".into(),
+            },
+        );
+        assert_eq!(t.conversation, "mine", "a new task's key is its id");
+        t.set_conversation("ctx-k", "mine");
+        assert_eq!(t.context_id, "mine", "the wire says the owner's id");
+        assert_eq!(t.conversation, "ctx-k");
+        assert_eq!(
+            t.link,
+            Link::Turn { ctx: "mine".into() },
+            "the link says it the owner's way"
+        );
+        // The operator: either name.
+        assert!(t.matches_context("ctx-k", true));
+        assert!(t.matches_context("mine", true));
+        assert!(!t.matches_context("other", true));
+        // The owner: its own id only.
+        assert!(t.matches_context("mine", false));
+        assert!(
+            !t.matches_context("ctx-k", false),
+            "a key is no owner's name"
+        );
+        // A record from before the two were told apart reads back without a
+        // key, which restore fills from the id.
+        let mut v = serde_json::to_value(&t).unwrap();
+        v.as_object_mut().unwrap().remove("conversation");
+        let back: Task = serde_json::from_value(v).unwrap();
+        assert!(back.conversation.is_empty());
     }
 
     #[test]

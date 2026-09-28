@@ -272,3 +272,166 @@ fn on_workflow_finished_think_starts_a_turn_where_note_only_appends() {
         "think should actually cause a turn\n{think_log}"
     );
 }
+
+/// A message wait that names no conversation listens on its run's own — and a
+/// run started by nobody's message has none. That is a broken wait, and the
+/// step says so, rather than listening to every conversation there is (which
+/// is what an empty conversation once meant; "any" is now the explicit `*`).
+#[test]
+fn a_message_wait_with_no_conversation_to_hear_fails() {
+    let (code, log) = run(&format!(
+        "{BASE}agent: {{ name: m }}\n\
+         intelligence: {{ endpoints: \"mock:final\", model: mock }}\n\
+         lifecycle: {{ run_until: idle, idle_grace: 1s }}\n\
+         workflows:\n\
+        \x20 - name: deaf\n    steps:\n\
+        \x20     s: {{ kind: once }}\n\
+        \x20     w: {{ kind: wait, on: message, timeout: 3s, depends_on: [s] }}\n\
+        \x20     f: {{ kind: finish, depends_on: [w], status: completed }}\n"
+    ));
+    assert!(
+        log.contains("no conversation to wait on"),
+        "the wait should have been refused, naming why\n{log}"
+    );
+    assert_eq!(code, Some(1), "a refused wait fails its run\n{log}");
+}
+
+/// **A message wait wakes for its sender, not for whoever names its
+/// conversation.**
+///
+/// Alice's run waits on `wait {on: message, conversation: shared}`, and both
+/// callers send with `contextId: shared` — so the conversation's name cannot
+/// be what tells them apart. Mallory speaks first and must not wake it: her
+/// message is an ordinary turn in a `shared` of her own, and Alice's run is
+/// still parked. Then Alice speaks, and her run hears exactly her — matched
+/// by the name she used, although the runtime keeps her conversation under a
+/// key of its own.
+#[cfg(feature = "a2a")]
+#[test]
+fn a_message_wait_wakes_only_for_its_sender() {
+    use common::SendMessage;
+    use serde_json::{Value, json};
+    use std::time::{Duration, Instant};
+
+    const ALICE: &str = "message-wait-token-alice";
+    const MALLORY: &str = "message-wait-token-mallory";
+    let dir = common::unique_path("msg-sender", "d");
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = format!("{dir}/c.yaml");
+    let errf = format!("{dir}/err.log");
+    // A probed port is free when probed, not when the daemon binds it; a
+    // lost bind is retried on a fresh one.
+    let (mut child, addr) = 'bound: {
+        for _ in 0..5 {
+            let port = common::free_port();
+            std::fs::write(
+                &cfg,
+                format!(
+                    "{BASE}agent: {{ name: m, preflight: never }}\n\
+                     intelligence: {{ endpoints: \"mock:final\", model: mock }}\n\
+                     lifecycle: {{ run_until: drained }}\n\
+                     a2a:\n  listen: http://127.0.0.1:{port}\n  introspection: {{ enabled: true }}\n  principals:\n\
+                     \x20   - {{ id: alice, role: user, grants: [\"*\"], match: {{ bearer_ref: \"{{{{secret:MSG_TOKEN_ALICE}}}}\" }} }}\n\
+                     \x20   - {{ id: mallory, role: user, grants: [\"*\"], match: {{ bearer_ref: \"{{{{secret:MSG_TOKEN_MALLORY}}}}\" }} }}\n\
+                     workflows:\n\
+                    \x20 - name: listener\n    steps:\n\
+                    \x20     s: {{ kind: manual }}\n\
+                    \x20     w: {{ kind: wait, on: message, conversation: shared, timeout: 10m, depends_on: [s] }}\n\
+                    \x20     f: {{ kind: finish, depends_on: [w], status: completed, output: \"heard {{{{steps.w.output.message.text}}}} from {{{{steps.w.output.principal}}}}\" }}\n"
+                )
+                .replace("__STATE__", &format!("{dir}/state")),
+            )
+            .unwrap();
+            let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_agentd"))
+                .args(["--config", &cfg])
+                .env("MSG_TOKEN_ALICE", ALICE)
+                .env("MSG_TOKEN_MALLORY", MALLORY)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::from(std::fs::File::create(&errf).unwrap()))
+                .spawn()
+                .expect("spawn");
+            if let Some(addr) = common::try_a2a_bound(&errf, Duration::from_secs(20)) {
+                break 'bound (child, addr);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        panic!(
+            "the daemon never bound its listener:\n{}",
+            std::fs::read_to_string(&errf).unwrap_or_default()
+        );
+    };
+    let log = || std::fs::read_to_string(&errf).unwrap_or_default();
+    let as_ = |bearer: &str, op: &str, args: Value| {
+        SendMessage::command(op, args)
+            .bearer(bearer)
+            .return_immediately()
+            .post(&addr)
+    };
+    let doc = |v: &Value| v["result"]["message"]["parts"][0]["data"].clone();
+
+    // Alice's run parks on its wait.
+    let started = as_(ALICE, "workflow.run", json!({"workflow": "listener"}));
+    assert!(started.get("error").is_none(), "Alice starts: {started}");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let run = loop {
+        let v = as_(ALICE, "workflow.status", json!({}));
+        if let Some(r) = doc(&v)["runs"][0]["run"].as_str() {
+            let got = as_(ALICE, "run.get", json!({"run": r}));
+            if doc(&got)["run"]["steps"]["w"]["status"] == "suspended" {
+                break r.to_string();
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the run never parked: {v}\n{}",
+            log()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let parked = || {
+        let got = as_(ALICE, "run.get", json!({"run": run}));
+        doc(&got)["run"]["steps"]["w"]["status"] == "suspended"
+    };
+
+    // Mallory speaks. Her message becomes her own turn — answered — and
+    // Alice's run hears nothing of it.
+    let heard = SendMessage::text("mallory was here")
+        .bearer(MALLORY)
+        .context("shared")
+        .post(&addr);
+    assert_eq!(
+        heard["result"]["task"]["status"]["state"], "TASK_STATE_COMPLETED",
+        "Mallory's message is a turn of her own: {heard}"
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(parked(), "Mallory woke Alice's wait:\n{}", log());
+    assert!(!log().contains("\"a2a.message.delivered\""), "{}", log());
+
+    // Alice speaks, and her run hears her.
+    let _ = SendMessage::text("alice answers")
+        .bearer(ALICE)
+        .context("shared")
+        .return_immediately()
+        .post(&addr);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !log().contains("\"event\":\"run.done\"") {
+        assert!(
+            Instant::now() < deadline,
+            "Alice's run never finished:\n{}",
+            log()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(log().contains("\"a2a.message.delivered\""), "{}", log());
+    assert!(
+        log().contains("heard alice answers from user:alice"),
+        "the run heard Alice, and only Alice:\n{}",
+        log()
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+}

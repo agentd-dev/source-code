@@ -117,7 +117,12 @@ impl Runtime {
     fn conversation_get(&self, principal: &Principal, data: &Value) -> Result<Value, Value> {
         let id = data["id"].as_str().unwrap_or("");
         let limit = data["limit"].as_u64().unwrap_or(200).min(1000) as usize;
-        let Some(c) = self.contexts.get(id) else {
+        // Named the caller's way: its own `contextId`, or any key for an
+        // operator (see `runtime::conversations`).
+        let Some(c) = self
+            .conversation_named(principal, id)
+            .and_then(|key| self.contexts.get(&key))
+        else {
             return Err(err_obj(TASK_NOT_FOUND, "no such conversation"));
         };
         let owner_ok =

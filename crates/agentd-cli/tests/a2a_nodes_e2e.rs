@@ -189,7 +189,9 @@ fn a_non_matching_message_is_still_a_conversation() {
 /// The failure this guards against: a `wait {on: message}` that suspends on a
 /// conversation with nothing to resolve it can only ever time out. The workflow
 /// below suspends immediately and must complete as soon as a message lands on
-/// its conversation — well inside the generous timeout.
+/// its conversation — well inside the generous timeout. The sender is the
+/// loopback listener's implicit operator, which is who the wait's `from`
+/// names.
 #[test]
 fn an_a2a_wait_is_woken_by_the_message_it_waits_for() {
     let port = free_port();
@@ -209,7 +211,7 @@ fn an_a2a_wait_is_woken_by_the_message_it_waits_for() {
              \x20 - name: awaiter\n\
              \x20   steps:\n\
              \x20     go:    {{kind: once}}\n\
-             \x20     reply: {{kind: a2a.wait, depends_on: [go], conversation: \"conv-w\", timeout: 10m}}\n\
+             \x20     reply: {{kind: a2a.wait, depends_on: [go], conversation: \"conv-w\", from: operator, timeout: 10m}}\n\
              \x20     fin:   {{kind: finish, depends_on: [reply], status: completed}}\n"
         ),
     )
@@ -447,7 +449,7 @@ fn plain_text_send_to_agentd_peer() {
              \x20 - name: awaiter\n\
              \x20   steps:\n\
              \x20     go:    {{kind: once}}\n\
-             \x20     reply: {{kind: a2a.wait, depends_on: [go], conversation: \"conv-p\", timeout: 10m}}\n\
+             \x20     reply: {{kind: a2a.wait, depends_on: [go], conversation: \"conv-p\", from: operator, timeout: 10m}}\n\
              \x20     fin:   {{kind: finish, depends_on: [reply], status: completed, output: \"heard {{{{steps.reply.output.message.text}}}}\"}}\n"
         ),
     )

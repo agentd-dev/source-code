@@ -302,6 +302,7 @@ pub const KINDS: &[KindInfo] = &[
             "run",
             "subagent",
             "conversation",
+            "from",
             "webhook",
             "stream",
             "subject",
@@ -544,8 +545,8 @@ pub const KINDS: &[KindInfo] = &[
     k(
         "a2a.wait",
         false,
-        &["conversation", "timeout"],
-        &[],
+        &["conversation", "from", "timeout"],
+        &["from"],
         true,
         false,
     ),
@@ -1977,6 +1978,22 @@ fn parse_step(
                 errs.push(format!("{at}: `args` needs `command`"));
             }
         }
+        // WHO a message wait listens to. A conversation id is the sender's to
+        // choose, so the conversation alone would let anyone who names it
+        // answer the wait; `from` says whose answer it is, in the addressee
+        // syntax a `human` gate uses. `a2a.wait` must say (the table requires
+        // it): the reply it waits for is a peer's, and no default names a
+        // peer. A malformed one is a load error, not a wait that hears no one.
+        "a2a.wait" | "wait" => {
+            if let Some(v) = spec.get("from") {
+                if kind == "wait" && spec.get("on").and_then(Value::as_str) != Some("message") {
+                    errs.push(format!("{at}: `from` belongs to `wait {{on: message}}`"));
+                }
+                if let Err(e) = crate::a2a::principals::Addressee::parse(v) {
+                    errs.push(format!("{at}: {kind}.from: {e}"));
+                }
+            }
+        }
         // A subagent step needs exactly one definition — freeform prose or a
         // declared template, never both, never neither. Both would leave the
         // child's grant ambiguous; neither leaves nothing to run.
@@ -2838,6 +2855,59 @@ mod tests {
 
     fn wf(doc: Value) -> Result<Workflow, Vec<String>> {
         parse_workflow(&doc)
+    }
+
+    /// A message wait says whose message it waits for. `a2a.wait` must — a
+    /// peer's reply has no default sender — and `wait {on: message}` may; a
+    /// `from` that is not an addressee, or on a wait for something other than
+    /// a message, is refused at load rather than armed to hear nobody.
+    #[test]
+    fn a_message_wait_names_its_sender() {
+        let with = |step: Value| {
+            wf(serde_json::json!({
+                "name": "w",
+                "steps": {
+                    "go": {"kind": "once"},
+                    "w": step,
+                    "fin": {"kind": "finish", "depends_on": ["w"], "status": "completed"}
+                }
+            }))
+        };
+        let refused = |step: Value, needle: &str| {
+            let errs = with(step.clone()).err().unwrap_or_default();
+            assert!(
+                errs.iter().any(|e| e.contains(needle)),
+                "{step} should be refused naming {needle:?}: {errs:?}"
+            );
+        };
+        refused(
+            serde_json::json!({"kind": "a2a.wait", "depends_on": ["go"], "conversation": "c"}),
+            "requires field \"from\"",
+        );
+        refused(
+            serde_json::json!({"kind": "a2a.wait", "depends_on": ["go"], "from": {"role": "anonymous"}}),
+            "a2a.wait.from",
+        );
+        refused(
+            serde_json::json!({"kind": "wait", "depends_on": ["go"], "on": "signal", "signal": "s", "from": "agent:x"}),
+            "belongs to `wait {on: message}`",
+        );
+        refused(
+            serde_json::json!({"kind": "wait", "depends_on": ["go"], "on": "message", "from": ""}),
+            "wait.from",
+        );
+        for ok in [
+            serde_json::json!({"kind": "a2a.wait", "depends_on": ["go"], "conversation": "c", "from": "agent:peer"}),
+            serde_json::json!({"kind": "a2a.wait", "depends_on": ["go"], "from": {"role": "agent", "labels": {"team": "ops"}}}),
+            serde_json::json!({"kind": "wait", "depends_on": ["go"], "on": "message", "conversation": "*"}),
+            serde_json::json!({"kind": "wait", "depends_on": ["go"], "on": "message", "from": "user:*"}),
+        ] {
+            assert!(
+                with(ok.clone()).is_ok(),
+                "{ok}: {:?}",
+                with(ok.clone()).err()
+            );
+        }
     }
 
     /// `workflow.run` starts a workflow at its default start, so that start's

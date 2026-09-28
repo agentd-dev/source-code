@@ -16,7 +16,10 @@ mod addressee;
 mod resolve;
 
 pub use addressee::Addressee;
-pub use resolve::{CallerIdentity, Resolver};
+pub use resolve::{
+    CertId, Evidence, Resolution, Resolver, SESSION_TOKEN_PREFIX, SessionCheck, SessionVerifier,
+    Via,
+};
 
 /// A resolved caller.
 #[derive(Debug, Clone, PartialEq)]

@@ -189,3 +189,107 @@ fn two_instances_connect_and_delegate_over_a_unix_socket() {
     drop(b);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// One HTTP POST over the unix socket at `sock`, read to the end.
+fn unix_post(sock: &str, body: &str, extra: &[(&str, &str)]) -> (u16, Value) {
+    use std::io::{Read, Write};
+    let mut s = std::os::unix::net::UnixStream::connect(sock)
+        .unwrap_or_else(|e| panic!("connect {sock}: {e}"));
+    s.set_read_timeout(Some(Duration::from_secs(30))).ok();
+    let mut head = format!(
+        "POST / HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nA2A-Version: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+        common::A2A_VERSION,
+        body.len()
+    );
+    for (k, v) in extra {
+        head.push_str(&format!("{k}: {v}\r\n"));
+    }
+    head.push_str("\r\n");
+    s.write_all(head.as_bytes()).unwrap();
+    s.write_all(body.as_bytes()).unwrap();
+    let mut raw = String::new();
+    s.read_to_string(&mut raw).ok();
+    let status = raw
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    let body = raw.split_once("\r\n\r\n").map_or("", |(_, b)| b);
+    let v = serde_json::from_str(body).unwrap_or_else(|e| panic!("non-JSON ({e}): {raw}"));
+    (status, v)
+}
+
+/// A unix-socket peer of the daemon's own uid is the operator, even where
+/// principal rules exist.
+///
+/// The kernel already named the caller: `SO_PEERCRED` let only the daemon's
+/// own uid (or root) through the accept, and the socket file is 0600. Rules
+/// written for the network — here a bearer the TCP world would need — do not
+/// demote the person who owns the process.
+#[test]
+fn a_same_uid_unix_caller_is_operator_even_with_principals() {
+    let dir = common::unique_path("agentd-uds-op", "d");
+    std::fs::create_dir_all(&dir).unwrap();
+    let sock = format!("{dir}/op.sock");
+    let cfg = format!("{dir}/op.yaml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "config_version: \"1\"\n\
+             agent:\n  name: uds-op\n  instruction: Test.\n  preflight: never\n\
+             intelligence:\n  endpoints: https://127.0.0.1:9\n  model: mock\n\
+             store:\n  kind: memory\n\
+             a2a:\n  listen: \"unix://{sock}\"\n\
+             \x20 principals:\n\
+             \x20   - id: ci\n\
+             \x20     match: {{ bearer_ref: \"{{{{secret:AGENTD_UDS_CI}}}}\" }}\n\
+             \x20     role: user\n\
+             lifecycle:\n  run_until: drained\n\
+             observability:\n  log_level: info\n"
+        ),
+    )
+    .unwrap();
+    let stderr_path = common::unique_path("uds-op-daemon", "log");
+    let errf = std::fs::File::create(&stderr_path).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .args(["--config", &cfg])
+        .env("AGENTD_UDS_CI", "ci-secret")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(errf))
+        .spawn()
+        .expect("spawn daemon");
+    let d = Daemon { child, stderr_path };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::fs::metadata(&sock).is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "never bound its socket:\n{}",
+            d.stderr()
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    // `config` is an operator-floor op: no grant reaches it, only the role.
+    let command = common::SendMessage::command("config", json!({}));
+    let headers = command.headers();
+    let extra: Vec<(&str, &str)> = headers
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let (status, v) = unix_post(&sock, &command.body(1), &extra);
+    assert_eq!(status, 200, "{v}\n{}", d.stderr());
+    assert!(
+        v.get("error").is_none(),
+        "the socket's owner is the operator: {v}"
+    );
+    // Even a junk bearer does not demote it: the uid decided before any
+    // header was read.
+    let mut junk = extra.clone();
+    junk.push(("Authorization", "Bearer not-the-ci-secret"));
+    let (status, v) = unix_post(&sock, &command.body(2), &junk);
+    assert_eq!((status, v.get("error")), (200, None), "{v}");
+
+    drop(d);
+    let _ = std::fs::remove_dir_all(&dir);
+}

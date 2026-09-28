@@ -10,14 +10,23 @@
 //!
 //! ## Identity
 //!
-//! Three kinds of evidence, in the order they are trusted:
+//! Every request is resolved from its headers and its connection, before a
+//! byte of its body is read, by the resolver the bridge holds — one snapshot
+//! per request, which supplies both the rules and the listener's posture:
 //!
-//! 1. a **verified client certificate** — subject CN and SANs, so a `san`/`sub`
-//!    principal rule matches a cert directly (a SPIFFE X.509-SVID's
-//!    `spiffe://…` arrives as a URI SAN);
-//! 2. the configured **server bearer**;
-//! 3. **loopback with nothing configured**, which is the single-operator dev
-//!    posture and the only case where absent credentials mean trust.
+//! 1. a **unix-socket peer** of the daemon's own uid is the operator;
+//! 2. a presented **bearer** — the server bearer, a `bearer_ref` rule, or a
+//!    session token — decides, and one that matches nothing is a 401;
+//! 3. a **verified client certificate** matches the `san`/`sub` rules (a
+//!    SPIFFE X.509-SVID's `spiffe://…` arrives as a URI SAN), and is the
+//!    operator only while no rule exists;
+//! 4. an **`any` rule** names whoever is left;
+//! 5. a local, non-browser caller of a **loopback listener with nothing
+//!    configured** is the operator — the single-operator dev posture, and the
+//!    only case where absent credentials mean trust.
+//!
+//! A request that fails to authenticate after presenting something counts
+//! against its source ([`limits`]); one that presented nothing never does.
 //!
 //! ## Two vocabularies on one endpoint
 //!
@@ -37,7 +46,6 @@
 //! unimplemented method is refused with the code the spec assigns rather than a
 //! generic failure.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -54,23 +62,14 @@ mod cors;
 mod dispatch;
 mod feed;
 mod identity;
-/// Per-source request limits. Empty until the listener grows them; declared
-/// now so the units that fill it never have to edit this file.
+/// Per-source failure limits and per-principal admission.
 mod limits;
 
 use card::{CardFromRuntime, card};
 use cors::preflight;
 use dispatch::rpc;
-pub use identity::PeerId;
+pub use identity::{Auth, PeerId};
 use identity::{Peer, peer_identity};
-
-/// How the listener decides whether a caller is credentialed.
-pub struct Auth {
-    /// The listener requires a credential (a client CA or a server bearer).
-    pub require_auth: bool,
-    /// The resolved server bearer; presenting it is the operator.
-    pub server_bearer: Option<String>,
-}
 
 /// Everything the listener needs that is not the bridge.
 pub struct Opts {
@@ -125,6 +124,12 @@ struct App {
     protocol: Router,
     bridge: Arc<A2aBridge>,
     auth: Auth,
+    /// Failed authentications per source: consulted only for a request that
+    /// is already failing, so it slows a guesser without ever refusing a
+    /// caller that authenticates.
+    failures: limits::SourceLimiter,
+    /// Per-principal admission, from each rule's declared rate.
+    rates: limits::PrincipalRates,
     /// The browser CORS allowlist, shared so a reload can revise it.
     ///
     /// Frozen at spawn until v1.4.0: an operator who REMOVED an origin to
@@ -178,6 +183,8 @@ pub fn spawn(
         protocol: a2a_rs::adapter::jsonrpc_router(adapter),
         bridge: Arc::clone(&bridge),
         auth: opts.auth,
+        failures: limits::SourceLimiter::auth_failures(),
+        rates: limits::PrincipalRates::default(),
         cors_origins: opts.cors_origins,
         stream_deadline: opts.stream_deadline,
         log: log.clone(),
@@ -307,12 +314,12 @@ async fn accept_loop(
                     match acceptor.accept(sock).await {
                         Ok(stream) => {
                             let peer_id = peer_identity(stream.get_ref().1);
-                            serve_conn(stream, router, peer_id, peer, log).await;
+                            serve_conn(stream, router, peer_id, Peer::Tcp(peer), log).await;
                         }
                         Err(e) => log.debug("a2a.tls", json!({"err": e.to_string()})),
                     }
                 }
-                None => serve_conn(sock, router, PeerId::default(), peer, log).await,
+                None => serve_conn(sock, router, PeerId::default(), Peer::Tcp(peer), log).await,
             }
         });
     }
@@ -321,8 +328,8 @@ async fn accept_loop(
 /// Accept unix-socket connections forever. No TLS layer: the KERNEL is the
 /// authenticator — `SO_PEERCRED` names the calling process's uid, and only the
 /// daemon's own user (or root) gets past this gate. That is strictly stronger
-/// than loopback TCP (which every local user can dial), so the connection gets
-/// the loopback trust posture; a configured bearer still applies on top.
+/// than loopback TCP (which every local user can dial), so every connection
+/// that gets through is the operator, whatever else is configured.
 async fn accept_loop_unix(listener: tokio::net::UnixListener, router: Router, log: Logger) {
     let me = unsafe { libc::geteuid() };
     loop {
@@ -343,20 +350,19 @@ async fn accept_loop_unix(listener: tokio::net::UnixListener, router: Router, lo
         let router = router.clone();
         let log = log.clone();
         tokio::spawn(async move {
-            let peer: SocketAddr = "127.0.0.1:0".parse().expect("static addr");
-            serve_conn(sock, router, PeerId::default(), peer, log).await;
+            serve_conn(sock, router, PeerId::default(), Peer::Unix, log).await;
         });
     }
 }
 
-async fn serve_conn<S>(stream: S, router: Router, peer_id: PeerId, peer: SocketAddr, log: Logger)
+async fn serve_conn<S>(stream: S, router: Router, peer_id: PeerId, peer: Peer, log: Logger)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     // Every request on this connection carries the connection's evidence.
     let router = router
         .layer(axum::Extension(peer_id))
-        .layer(axum::Extension(Peer(peer)));
+        .layer(axum::Extension(peer));
     let svc = hyper_util::service::TowerToHyperService::new(
         router.into_service::<hyper::body::Incoming>(),
     );

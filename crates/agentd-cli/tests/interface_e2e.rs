@@ -488,10 +488,14 @@ fn a_configured_web_origin_gets_cors_and_others_stay_rejected() {
     );
     assert_eq!(code, 403, "an unconfigured origin must be refused");
 
-    // A POST from it → 200 + echo.
+    // A POST from it is admitted past the origin gate — and then asked to
+    // sign in, because a browser is never the implicit operator, even of a
+    // no-auth loopback daemon. The 401 still carries the grant, so the UI can
+    // read why it was refused.
     let body = common::rpc_body(1, "ListTasks", json!({}));
     let reply = common::a2a_post(&addr, &body, &[("Origin", "https://ui.example")]);
-    assert_eq!(reply.status, 200);
+    assert_eq!(reply.status, 401, "{reply:?}");
+    assert_eq!(reply.json()["error"]["code"], -31401);
     assert_eq!(
         reply.header("access-control-allow-origin"),
         Some("https://ui.example")

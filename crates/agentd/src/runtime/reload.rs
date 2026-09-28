@@ -411,9 +411,14 @@ impl Runtime {
         // `{{secret:…}}`, a malformed matcher — must not take the listener's
         // working rules away, so the old resolver stays and the reload says so
         // rather than falling open on an empty rule set.
+        //
+        // The listener's posture is part of the resolver, so this one swap also
+        // moves it: a no-auth loopback daemon given its first rule stops
+        // treating local callers as the operator on the very next request.
+        // Nothing else holds a posture for a reload to miss.
         #[cfg(feature = "a2a")]
         if old.a2a.principals != new.a2a.principals
-            && let Some(bridge) = &self.a2a_bridge
+            && let Some(bridge) = self.a2a_serving.as_ref().map(|s| &s.bridge)
         {
             let env = self.env.clone();
             let envmap = move |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
@@ -487,7 +492,7 @@ impl Runtime {
         // unlike the principals and the routes it is simply swapped.
         #[cfg(feature = "a2a")]
         if old.a2a.cors.origins != new.a2a.cors.origins
-            && let Some(origins) = &self.a2a_origins
+            && let Some(origins) = self.a2a_serving.as_ref().map(|s| &s.origins)
         {
             *origins.write().unwrap_or_else(|e| e.into_inner()) = new.a2a.cors.origins.clone();
             changed.push("a2a.cors.origins");

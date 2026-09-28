@@ -14,20 +14,14 @@
 //! are served by the transport thread polling a **shared task-snapshot map**
 //! the loop keeps current.
 //!
-//! Identity note: `PeerOrigin` carries only two values, so the caller's full
-//! evidence — the presented bearer AND the verified mTLS leaf identity, subject
-//! CN plus SANs — is threaded from `authenticate` to `dispatch` through
-//! per-connection **thread-locals**. That is sound only because one connection
-//! is one thread serving one request; nothing here may be reused across
-//! connections.
-//!
-//! The serve framework surfaces the client-cert subject and SANs (`net::x509`),
-//! so `san`/`sub` principal rules match a client certificate directly — a
-//! SPIFFE X.509-SVID's `spiffe://…` arrives as a URI SAN. A listener that
-//! declares no principals at all falls back to "any verified cert is an
-//! operator", which is why declaring even one principal turns the allowlist on.
+//! Identity: the listener reads the request's evidence — its bearer, its
+//! verified client certificate, whether the peer is local, whether a browser
+//! sent it — and the bridge's [`Resolver`] names the caller from it. The
+//! resolver is also where the listener's posture lives, so a reload that
+//! rebuilds the rules replaces the posture in the same swap.
 
-use crate::a2a::{CallerIdentity, Principal, Resolver};
+use crate::a2a::principals::{Evidence, Resolution, SessionVerifier};
+use crate::a2a::{Principal, Resolver};
 use crate::runtime::events::Event;
 use crate::runtime::reactor::Runtime;
 use serde_json::{Value, json};
@@ -49,7 +43,7 @@ mod send;
 mod tasks;
 
 pub use feed::{FeedVis, SharedFeed};
-pub(crate) use listener::spawn_a2a_listener;
+pub(crate) use listener::{A2aServing, spawn_a2a_listener};
 pub(crate) use send::command_data;
 pub use send::command_op;
 use tasks::new_task_id;
@@ -118,34 +112,24 @@ impl A2aBridge {
         })
     }
 
-    /// Resolve the caller from the transport's evidence: the verified mTLS
-    /// identity (subject CN + SANs) and the presented bearer.
+    /// Resolve one request's evidence under the rules in force now.
     ///
-    /// The resolver tries the configured `san`/`sub` principal rules FIRST and
-    /// only then the management/loopback operator fallback, so a certificate
-    /// that matches a declared rule gets that rule's role rather than being
-    /// promoted by the fallback. A listener that declares no principals at all
-    /// keeps the "any verified cert is an operator" default.
-    pub fn principal_of(
+    /// The listener itself takes a [`resolver`](Self::resolver) snapshot
+    /// instead, because it reads the posture from the same snapshot; this is
+    /// the one-shot form for a caller that needs only the answer.
+    pub fn resolve(
         &self,
-        mgmt: bool,
-        bearer: Option<&str>,
-        subject: Option<String>,
-        sans: Vec<String>,
-    ) -> Principal {
-        let id = CallerIdentity {
-            management: mgmt,
-            loopback: mgmt,
-            subject,
-            sans,
-            ..Default::default()
-        };
-        let resolver = self.resolver().clone();
-        resolver.resolve(&id, bearer)
+        ev: &Evidence,
+        unix: bool,
+        sessions: Option<&dyn SessionVerifier>,
+    ) -> Resolution {
+        self.resolver().resolve(ev, unix, sessions)
     }
 
-    /// The current principal rules.
-    fn resolver(&self) -> Arc<Resolver> {
+    /// The rules — and the posture built with them — in force now. One
+    /// snapshot per request: a reload that lands mid-request cannot pair new
+    /// rules with an old posture, because the two are one value.
+    pub fn resolver(&self) -> Arc<Resolver> {
         self.resolver
             .read()
             .unwrap_or_else(|e| e.into_inner())
@@ -293,29 +277,12 @@ impl Runtime {
             principal,
             reply,
         } = req;
-        // Index this caller's declared quotas and labels the first time they
+        // Index this caller's declared budget and labels the first time they
         // appear, so everything downstream can find them by id alone — the run
         // record, the MCP `_meta` and the audit line all carry the id, never
-        // the whole principal.
+        // the whole principal. (The declared rate is admission, and the
+        // listener applies it before a request reaches this loop.)
         self.note_principal(&principal);
-        // The per-principal arrival quota. `a2a.principals[].quotas.rate` was
-        // parsed, validated and read by nothing, which made a per-caller limit
-        // a setting that did not do what it said.
-        if let Some(retry_after) = self.principal_rate_refusal(&principal) {
-            self.audit_a2a(
-                &method,
-                None,
-                &principal,
-                "rate_limited",
-                json!({"retry_after_s": retry_after}),
-                None,
-            );
-            let _ = reply.send(json!({"error": {
-                "code": -32029,
-                "message": format!("rate limit for {}: retry in about {retry_after}s", principal.id),
-            }}));
-            return;
-        }
         // The listener pre-mints the id of the task this request will create,
         // because the protocol layer subscribes to a task's updates before the
         // work starts. Whichever path creates it — a conversation turn or a
@@ -473,10 +440,8 @@ mod tests {
     #[test]
     fn mtls_san_resolves_to_the_matched_principal_role() {
         // The client-cert SAN/subject drives the principal: a SPIFFE URI SAN
-        // matches a `san` rule, and that rule's role wins over the bare
-        // management/operator fallback.
-        use crate::a2a::Resolver;
-        use crate::obs::log::{Comp, Level, LogCtx, Logger};
+        // matches a `san` rule, and that rule's role is the caller's.
+        use crate::a2a::principals::{CertId, Via};
 
         let resolver = Resolver::build(
             &serde_json::from_value(json!({
@@ -489,36 +454,37 @@ mod tests {
             &|_| None,
         )
         .unwrap();
-        let log = Logger::new(
-            LogCtx {
-                run_id: "t".into(),
-                agent_id: "0".into(),
-                agent_path: "0".into(),
-                comp: Comp::Agent,
-                pid: 0,
-                trace_id: None,
-            },
-            Level::Warn,
-        );
         let (tx, _rx) = std::sync::mpsc::channel();
-        let _ = log;
         let bridge = A2aBridge::new(tx, resolver);
+        let with_san = |san: &str| Evidence {
+            cert: Some(CertId {
+                subject: None,
+                sans: vec![san.into()],
+            }),
+            ..Default::default()
+        };
 
         // A SPIFFE X.509-SVID (empty subject; identity in the URI SAN) under the
         // team trust path → the user role, labelled by its SAN.
-        let p = bridge.principal_of(true, None, None, vec!["spiffe://corp/team/alice".into()]);
+        let Resolution::Named(p, Via::Cert) =
+            bridge.resolve(&with_san("spiffe://corp/team/alice"), false, None)
+        else {
+            panic!("the team SVID named nobody");
+        };
         assert_eq!(p.role, crate::config::v2::Role::User);
         assert_eq!(p.id, "user:san=spiffe://corp/team/alice");
         // A cert under the ops path → operator (a different rule).
-        let op = bridge.principal_of(true, None, None, vec!["spiffe://corp/ops/root".into()]);
+        let Resolution::Named(op, _) =
+            bridge.resolve(&with_san("spiffe://corp/ops/root"), false, None)
+        else {
+            panic!("the ops SVID named nobody");
+        };
         assert!(op.is_operator());
-        // A cert matching NO rule, with principals configured, is NOT
-        // operator: declaring any principal rule turns the allowlist on, so
-        // the management fallback stops blanket-granting operator.
-        let anon = bridge.principal_of(true, None, None, vec!["spiffe://other/x".into()]);
-        assert!(
-            anon.is_anonymous(),
-            "unmatched cert is denied, not operator"
+        // A cert matching NO rule, with principals configured, has no role:
+        // declaring any principal rule turns the allowlist on.
+        assert_eq!(
+            bridge.resolve(&with_san("spiffe://other/x"), false, None),
+            Resolution::NoRole
         );
     }
 

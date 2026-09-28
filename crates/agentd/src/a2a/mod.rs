@@ -32,5 +32,5 @@ pub mod tasks;
 #[cfg(feature = "a2a")]
 pub mod wire;
 
-pub use principals::{CallerIdentity, Principal, Resolver};
+pub use principals::{Evidence, Principal, Resolution, Resolver, Via};
 pub use tasks::{Link, State, Task};

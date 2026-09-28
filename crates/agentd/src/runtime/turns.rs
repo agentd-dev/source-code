@@ -820,7 +820,7 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
         scopes
     }
 
-    /// Record a resolved caller's declared quotas and labels under their id.
+    /// Record a resolved caller's declared budget and labels under their id.
     ///
     /// A principal's id is minted when the caller is resolved, not written in
     /// config, so this is the only moment the operator's declaration and the
@@ -836,31 +836,6 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
         if !p.labels.is_empty() && !self.principal_labels.contains_key(&p.id) {
             self.principal_labels.insert(p.id.clone(), p.labels.clone());
         }
-        if let Some(rate) = &p.rate
-            && !self.principal_rates.contains_key(&p.id)
-            && let Ok((burst, per_sec)) = crate::supervisor::tree::parse_rate(rate)
-        {
-            self.principal_rates.insert(
-                p.id.clone(),
-                crate::supervisor::tree::TokenBucket::new(burst, burst as f64 / per_sec),
-            );
-        }
-    }
-
-    /// `Some(retry_after_seconds)` when this caller has spent their arrival
-    /// quota. Operators are never rate-limited: locking the person who
-    /// administers the daemon out of it during an incident is worse than the
-    /// load they could generate.
-    #[cfg_attr(not(feature = "a2a"), allow(dead_code))]
-    pub(crate) fn principal_rate_refusal(&mut self, p: &crate::a2a::Principal) -> Option<u64> {
-        if p.is_operator() {
-            return None;
-        }
-        let bucket = self.principal_rates.get_mut(&p.id)?;
-        if bucket.try_take() {
-            return None;
-        }
-        Some(1)
     }
 
     /// The labels an id acts under (empty when none were declared).

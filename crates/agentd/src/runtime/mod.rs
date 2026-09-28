@@ -641,7 +641,6 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
         // resolved (`user:<sub>`), not declared in config, so the quotas an
         // operator wrote can only be indexed once someone presents them.
         principal_budgets: BTreeMap::new(),
-        principal_rates: BTreeMap::new(),
         principal_labels: BTreeMap::new(),
         exit: None,
         draining: false,
@@ -677,13 +676,9 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
         #[cfg(feature = "a2a")]
         a2a_sink: None,
         #[cfg(feature = "a2a")]
-        a2a_listener: None,
-        #[cfg(feature = "a2a")]
-        a2a_bridge: None,
+        a2a_serving: None,
         #[cfg(feature = "a2a")]
         webhook_handler: None,
-        #[cfg(feature = "a2a")]
-        a2a_origins: None,
         activity: BTreeMap::new(),
         last_root_reply: None,
         #[cfg(feature = "a2a")]
@@ -1120,7 +1115,7 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
             Err(e) => {
                 log.error(
                     "proc.exit",
-                    json!({"code": crate::exit::USAGE, "err": format!("a2a principals: {e}")}),
+                    json!({"code": crate::exit::USAGE, "err": format!("a2a identity: {e}")}),
                 );
                 return crate::exit::USAGE;
             }
@@ -1130,18 +1125,15 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
             &rt.settings.a2a,
             rt.events_tx.clone(),
             resolver,
-            &envmap,
             write_timeout,
             log.clone(),
         ) {
             Ok(serving) => {
-                rt.a2a_feed = serving.feed;
+                rt.a2a_feed = serving.feed.clone();
                 rt.a2a_sink = Some(std::sync::Arc::clone(&serving.listener.sink));
                 // The listener stops the moment it is dropped, so the runtime
                 // holds it for as long as it is serving.
-                rt.a2a_listener = Some(serving.listener);
-                rt.a2a_bridge = Some(serving.bridge);
-                rt.a2a_origins = Some(serving.origins);
+                rt.a2a_serving = Some(serving);
                 // The introspection reads tail the live log ring. Install the
                 // ring only when introspection is on, so the ordinary build
                 // keeps its zero-cost logging hot path.

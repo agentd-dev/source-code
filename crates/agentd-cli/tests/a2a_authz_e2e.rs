@@ -25,14 +25,19 @@
 //! ## A method name is remote input, and must never be leaked
 //!
 //! `principals::bare` must not lowercase the JSON-RPC `method` and `leak()` the
-//! copy to hand back a `&'static str`. The name is attacker-chosen, unbounded in
-//! length, and reached *before* the caller is known to be anybody: an
-//! `Authorization: Bearer <junk>` header resolves to the anonymous principal
-//! rather than a 401, and every request passes the admin check on its way to
-//! being refused. One leak per request is an RSS climb driven from off the box
-//! with a `curl` loop. The second test asserts the daemon's own RSS, because a
-//! leak has no other observable: the requests all succeed (as errors), and only
-//! the memory behind them differs.
+//! copy to hand back a `&'static str`. The name is attacker-chosen and
+//! unbounded in length. One leak per request is an RSS climb driven with a
+//! `curl` loop, so the flood test asserts the daemon's own RSS, because a leak
+//! has no other observable: the requests all succeed (as errors), and only the
+//! memory behind them differs.
+//!
+//! ## Who you are is a 401; what you may do is a 403
+//!
+//! A caller the listener cannot name gets HTTP 401 with a `WWW-Authenticate`
+//! challenge before a byte of its body is parsed — a junk bearer included,
+//! which once resolved to "anonymous" and ran the whole dispatch to be refused
+//! with the spec's push-notification code. A named caller refused a method or a
+//! command gets HTTP 403. Both are JSON, whatever the method promised.
 #![cfg(all(unix, feature = "a2a"))]
 
 mod common;
@@ -44,7 +49,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use common::{SendMessage, a2a_open, a2a_post, a2a_post_within, rpc_as, rpc_body};
+use common::{SendMessage, a2a_open, a2a_post, a2a_post_within, rpc, rpc_as, rpc_body};
 
 /// The bearers the two principals present. Literal here, `{{secret:…}}` in the
 /// config — a bearer is a secret, and the config may only carry a reference.
@@ -478,14 +483,29 @@ fn a_flood_of_distinct_method_names_does_not_grow_the_daemon() {
     std::fs::remove_file(&cfg).ok();
 }
 
-/// The leak-prone path is reached *before* the caller is anybody: a junk bearer
-/// is not a 401, it is an anonymous principal refused several checks later
-/// — after the admin check has already run. Asserted separately because the
-/// flood above measures the daemon that treats its caller as the operator, and
-/// the claim that matters for exposure is about the caller who has no
-/// credentials at all.
+/// The error envelope and status of a refusal that must be JSON.
+fn json_refusal(reply: &common::HttpReply) -> (u16, Value) {
+    assert!(
+        reply
+            .header("content-type")
+            .is_some_and(|t| t.contains("application/json")),
+        "a refusal is JSON, never a stream: {reply:?}"
+    );
+    (reply.status, reply.json())
+}
+
+/// Every way a request can be refused for WHO sent it, and for what it asked.
+///
+/// - no credential, or one that matches nothing, is HTTP 401 with a challenge
+///   (`invalid_token` when one was presented), code -31401, id null — the
+///   body was never parsed;
+/// - a named caller asking for a method its role may not call, or a command
+///   its grants do not cover, is HTTP 403, code -31403, its id echoed, and a
+///   bearer caller is told the token lacks the scope;
+/// - the extended card is an authenticated read, so it gets the 401 too;
+/// - a streaming send refused either way is JSON, not an SSE frame.
 #[test]
-fn an_unauthenticated_caller_still_reaches_the_admin_check() {
+fn credentials_are_challenged_with_401_and_roles_refused_with_403() {
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
@@ -493,24 +513,253 @@ fn an_unauthenticated_caller_still_reaches_the_admin_check() {
     let mut daemon = spawn_daemon(&cfg);
     wait_ready(&addr);
 
-    let refused = rpc_as(&addr, "not-a-real-token", 1, "GetTask", json!({"id": "t1"}));
-    assert_eq!(
-        refused["error"]["code"], -32003,
-        "a junk bearer is refused by the matrix, not by a 401: {refused}"
+    let unauthenticated = |reply: common::HttpReply, presented: bool, what: &str| {
+        let challenge = reply.header("www-authenticate").map(str::to_string);
+        let (status, v) = json_refusal(&reply);
+        assert_eq!(status, 401, "{what}: {v}");
+        assert_eq!(v["error"]["code"], -31401, "{what}: {v}");
+        assert_eq!(v["id"], Value::Null, "{what}: the body was never read: {v}");
+        assert_eq!(
+            v["error"]["data"][0]["reason"], "UNAUTHENTICATED",
+            "{what}: {v}"
+        );
+        let challenge = challenge.unwrap_or_else(|| panic!("{what}: no challenge"));
+        assert!(
+            challenge.starts_with("Bearer realm=\"agentd\""),
+            "{what}: {challenge}"
+        );
+        assert_eq!(
+            challenge.contains("error=\"invalid_token\""),
+            presented,
+            "{what}: {challenge}"
+        );
+    };
+
+    // Nothing presented.
+    unauthenticated(
+        a2a_post(&addr, &rpc_body(1, "ListTasks", json!({})), &[]),
+        false,
+        "no credential",
     );
-    // The same request with the header the transport would reject outright —
-    // there is none, which is the point: the listener has no credential to
-    // require here, so every one of these requests runs the whole dispatch.
-    let status = a2a_post(
+    // A bearer that matches nothing: a failed credential, not "anonymous".
+    unauthenticated(
+        a2a_post(
+            &addr,
+            &rpc_body(2, "GetTask", json!({"id": "t1"})),
+            &[("Authorization", "Bearer not-a-real-token")],
+        ),
+        true,
+        "junk bearer",
+    );
+    // A session token nobody issued.
+    let reply = a2a_post(
         &addr,
-        &rpc_body(2, "a2a.drainX", json!({})),
-        &[("Authorization", "Bearer also-junk")],
-    )
-    .status;
-    assert!(
-        status == 200,
-        "the request is dispatched and answered, not rejected at the door: {status}"
+        &rpc_body(3, "ListTasks", json!({})),
+        &[("Authorization", "Bearer agentd_at_nobody")],
     );
+    assert!(
+        reply
+            .header("www-authenticate")
+            .is_some_and(|c| c.contains("unknown, expired or revoked")),
+        "a dead session token is named as one: {reply:?}"
+    );
+    unauthenticated(reply, true, "dead session token");
+    // The extended card is an authenticated read.
+    unauthenticated(
+        a2a_post(&addr, &rpc_body(4, "GetExtendedAgentCard", json!({})), &[]),
+        false,
+        "uncredentialed extended card",
+    );
+    // A streaming send is refused as JSON, not as a one-frame stream.
+    let stream = SendMessage::text("hi").streaming();
+    unauthenticated(
+        a2a_post(&addr, &stream.body(5), &[]),
+        false,
+        "uncredentialed stream",
+    );
+
+    let forbidden = |reply: common::HttpReply, id: i64, what: &str| {
+        let challenge = reply.header("www-authenticate").map(str::to_string);
+        let (status, v) = json_refusal(&reply);
+        assert_eq!(status, 403, "{what}: {v}");
+        assert_eq!(v["error"]["code"], -31403, "{what}: {v}");
+        assert_eq!(v["id"], json!(id), "{what}: the id is echoed: {v}");
+        assert_eq!(
+            v["error"]["data"][0]["reason"], "PERMISSION_DENIED",
+            "{what}: {v}"
+        );
+        assert!(
+            challenge.is_some_and(|c| c.contains("error=\"insufficient_scope\"")),
+            "{what}: a bearer caller is told the scope is short"
+        );
+        v
+    };
+    let auth_b = format!("Bearer {TOKEN_B}");
+    // A method the role may not call at all.
+    let v = forbidden(
+        a2a_post(
+            &addr,
+            &rpc_body(6, "a2a.drainX", json!({})),
+            &[("Authorization", &auth_b)],
+        ),
+        6,
+        "a method outside the role",
+    );
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("agent:token-b")),
+        "the refusal names the caller: {v}"
+    );
+    // A command the role is not granted: `plan.get` is a user op, not an
+    // agent one. Blocking and streaming both answer with the JSON 403.
+    let command = SendMessage::command("plan.get", json!({})).bearer(TOKEN_B);
+    let headers = command.headers();
+    let extra: Vec<(&str, &str)> = headers
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    forbidden(
+        a2a_post(&addr, &command.body(7), &extra),
+        7,
+        "an ungranted command",
+    );
+    let streamed = command.clone().streaming();
+    forbidden(
+        a2a_post(&addr, &streamed.body(8), &extra),
+        8,
+        "an ungranted command, streamed",
+    );
+    // The runtime's own refusal — a workflow this user may not run, which only
+    // the runtime can judge — travels with its status too, as JSON, even to
+    // a caller that asked for a stream.
+    let run = SendMessage::command("workflow.run", json!({"workflow": "nope"}))
+        .bearer(TOKEN_A)
+        .streaming();
+    let headers = run.headers();
+    let extra: Vec<(&str, &str)> = headers
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let (status, v) = json_refusal(&a2a_post(&addr, &run.body(9), &extra));
+    assert_eq!((status, &v["error"]["code"]), (403, &json!(-31403)), "{v}");
+    assert_eq!(v["id"], 9, "{v}");
+
+    // The denial is audited with the rule that named the caller.
+    let log = daemon.stderr();
+    assert!(
+        log.lines().any(|l| l.contains("\"a2a.denied\"")
+            && l.contains("\"rule\":\"token-b\"")
+            && l.contains("\"status\":403")),
+        "no a2a.denied line naming the rule:\n{log}"
+    );
+
+    assert!(daemon.alive(), "daemon still serving: {}", daemon.stderr());
+    std::fs::remove_file(&cfg).ok();
+}
+
+/// The extended card needs a credential of a scheme the card DECLARES.
+///
+/// An `any` rule makes every uncredentialed caller somebody (`user:pub`), which
+/// is enough to talk to the agent — but the spec makes the extended card an
+/// authenticated read (§13.3), and a caller nobody authenticated is not that.
+/// On a listener that declares a bearer, the uncredentialed caller is asked for
+/// one; with the bearer, the card is served.
+#[test]
+fn extended_card_needs_a_declared_scheme_credential() {
+    let llm = spawn_mock_llm(&json!({"turns": [{"content": "hello pub"}]}));
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let cfg = write_config(&format!(
+        "config_version: \"1\"\n\
+         agent:\n  name: a2a-authz\n  instruction: You are a helpful test agent.\n  preflight: never\n\
+         intelligence:\n  endpoints: {llm}\n  model: mock\n\
+         store:\n  kind: memory\n\
+         a2a:\n  listen: http://127.0.0.1:{port}\n\
+         \x20 bearer: \"{{{{secret:AGENTD_AUTHZ_TOKEN_A}}}}\"\n\
+         \x20 principals:\n\
+         \x20   - id: pub\n\
+         \x20     match: {{ any: true }}\n\
+         \x20     role: user\n\
+         lifecycle:\n  run_until: drained\n\
+         observability:\n  log_level: info\n",
+        llm = llm.uri
+    ));
+    let mut daemon = spawn_daemon(&cfg);
+    wait_ready(&addr);
+
+    let card = a2a_post(&addr, &rpc_body(1, "GetExtendedAgentCard", json!({})), &[]);
+    let (status, v) = json_refusal(&card);
+    assert_eq!((status, &v["error"]["code"]), (401, &json!(-31401)), "{v}");
+
+    let sent = SendMessage::text("hello").post(&addr);
+    assert!(
+        sent.get("error").is_none(),
+        "an uncredentialed send under the any rule is served: {sent}"
+    );
+    // …as `user:pub`, the rule's principal — never the operator: an
+    // operator-only op is refused, naming who asked.
+    let config = SendMessage::command("config", json!({})).post(&addr);
+    assert_eq!(config["error"]["code"], -31403, "{config}");
+    assert!(
+        config["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.ends_with("for user:pub")),
+        "{config}"
+    );
+
+    let card = rpc_as(&addr, TOKEN_A, 2, "GetExtendedAgentCard", json!({}));
+    assert!(
+        card.get("error").is_none() && card["result"].is_object(),
+        "with the bearer the card is served: {card}"
+    );
+
+    assert!(daemon.alive(), "daemon still serving: {}", daemon.stderr());
+    std::fs::remove_file(&cfg).ok();
+}
+
+/// A browser is never the implicit operator — not even of a no-auth loopback
+/// daemon that lists its origin.
+///
+/// Any page a local browser loads can make it POST to 127.0.0.1, and listing an
+/// origin in `a2a.cors.origins` admits a UI, it does not vouch for the person
+/// behind it. So the request that carries `Origin` is asked to sign in, and is
+/// told how; the same request without it — a terminal, `curl` — is the
+/// operator it always was.
+#[test]
+fn a_browser_origin_is_never_the_implicit_operator() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let cfg = write_config(&loopback_config(port).replace(
+        "  listen: ",
+        "  cors:\n    origins: [\"http://127.0.0.1:4173\"]\n  listen: ",
+    ));
+    let mut daemon = spawn_daemon(&cfg);
+    wait_ready(&addr);
+
+    let body = rpc_body(1, "ListTasks", json!({}));
+    let browser = a2a_post(&addr, &body, &[("Origin", "http://127.0.0.1:4173")]);
+    let (status, v) = json_refusal(&browser);
+    assert_eq!(status, 401, "{v}");
+    assert_eq!(v["error"]["code"], -31401, "{v}");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.starts_with("browser requests must authenticate")),
+        "the browser is told how to sign in: {v}"
+    );
+    assert_eq!(
+        browser.header("access-control-allow-origin"),
+        Some("http://127.0.0.1:4173"),
+        "the listed origin can read the refusal"
+    );
+
+    let terminal = rpc(&addr, 2, "ListTasks", json!({}));
+    assert!(
+        terminal.get("error").is_none(),
+        "the same request without Origin is the operator: {terminal}"
+    );
+
     assert!(daemon.alive(), "daemon still serving: {}", daemon.stderr());
     std::fs::remove_file(&cfg).ok();
 }
@@ -564,11 +813,11 @@ fn a_reload_demotes_a_principal_and_the_revocation_takes_effect() {
 
     // As a user, the command is not refused for want of a grant.
     let before = plan_get();
-    // The authorization refusal is code -32003, from whichever gate catches it
-    // first: the method-level `may(SendMessage, Some(op))` check rejects a
-    // command the role cannot run before `a2a_command` is ever reached, so
-    // matching on the inner "not granted" text would miss the real denial.
-    let refused = |r: &Value| r["error"]["code"].as_i64() == Some(-32003);
+    // The authorization refusal is -31403, from whichever gate catches it
+    // first: the listener's command-op gate rejects a command the role cannot
+    // run before `a2a_command` is ever reached, so matching on the inner "not
+    // granted" text would miss the real denial.
+    let refused = |r: &Value| r["error"]["code"].as_i64() == Some(-31403);
     assert!(!refused(&before), "a user may plan.get: {before}");
 
     // Demote A to `agent` and reload.

@@ -327,14 +327,11 @@ pub struct Runtime {
     pub(crate) artifacts: Artifacts,
     pub(crate) skills: skills::Catalogue,
     pub(crate) governor: Governor,
-    /// Per-principal budgets and rate quotas, indexed by principal id when one
-    /// is first seen. `a2a.principals[].quotas` parsed and validated for a
-    /// long time without anything reading it; these are its readers.
+    /// Per-principal budgets, indexed by principal id when one is first seen.
+    /// `a2a.principals[].quotas` parsed and validated for a long time without
+    /// anything reading it; this is the budget's reader. (The rate is
+    /// admission, and the listener applies it.)
     pub(crate) principal_budgets: BTreeMap<String, crate::config::v2::Budget>,
-    /// Only the A2A listener admits callers, so a build without it has
-    /// nowhere to spend an arrival quota.
-    #[cfg_attr(not(feature = "a2a"), allow(dead_code))]
-    pub(crate) principal_rates: BTreeMap<String, crate::supervisor::tree::TokenBucket>,
     /// Labels an id acts under, for `_meta` and audit.
     pub(crate) principal_labels: BTreeMap<String, BTreeMap<String, String>>,
     pub(crate) workflows: BTreeMap<String, std::sync::Arc<Workflow>>,
@@ -415,18 +412,14 @@ pub struct Runtime {
     /// Where a task transition is published so A2A subscribers see it.
     #[cfg(feature = "a2a")]
     pub(crate) a2a_sink: Option<std::sync::Arc<crate::a2a::ports::StreamSink>>,
-    /// The live listener. Held, not used: dropping it stops serving.
+    /// The live listener, its bridge (so a reload can swap rebuilt principal
+    /// rules — and the posture with them — in), its CORS allowlist and the URL
+    /// it is published at. Held while serving: dropping it stops the listener.
     #[cfg(feature = "a2a")]
-    pub(crate) a2a_listener: Option<crate::a2a::serve::Listener>,
-    /// The listener's bridge, so a reload can swap rebuilt principal rules in.
-    #[cfg(feature = "a2a")]
-    pub(crate) a2a_bridge: Option<std::sync::Arc<super::a2a_server::A2aBridge>>,
+    pub(crate) a2a_serving: Option<super::a2a_server::A2aServing>,
     /// The webhook listener's handler, so a reload can swap rebuilt routes in.
     #[cfg(feature = "a2a")]
     pub(crate) webhook_handler: Option<std::sync::Arc<super::webhooks::WebhookHandler>>,
-    /// The listener's live CORS allowlist, so a reload can revise it.
-    #[cfg(feature = "a2a")]
-    pub(crate) a2a_origins: Option<crate::a2a::serve::OriginList>,
     /// Live per-unit activity, keyed by child node id.
     pub(crate) activity: BTreeMap<u64, super::activity::Activity>,
     /// The newest root-context reply, so a `--prompt` job can print its answer

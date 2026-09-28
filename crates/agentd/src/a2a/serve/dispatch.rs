@@ -2,7 +2,6 @@
 //! The JSON-RPC endpoint: agentd's own vocabulary answered here, everything
 //! else handed to a2a-rs with the authenticated principal attached.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
@@ -15,15 +14,19 @@ use tower::ServiceExt;
 use super::App;
 use super::cors::{allow_origin, origin_allowed};
 use super::feed::feed_stream;
-use super::identity::{Peer, PeerId, resolve};
+use super::identity::{
+    Peer, PeerId, challenge, evidence_of, forbidden, is_session_token, json_with, too_many,
+};
 use crate::a2a::Principal;
+use crate::a2a::errors;
 use crate::a2a::ports;
+use crate::a2a::principals::{Resolution, Via};
 use crate::runtime::a2a_server::A2aBridge;
 
 pub(super) async fn rpc(
     State(app): State<Arc<App>>,
     axum::Extension(peer_id): axum::Extension<PeerId>,
-    axum::Extension(Peer(peer)): axum::Extension<Peer>,
+    axum::Extension(peer): axum::Extension<Peer>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -73,13 +76,15 @@ fn with_activated_extensions(mut resp: Response, activated: &[String]) -> Respon
 async fn dispatch(
     app: Arc<App>,
     peer_id: PeerId,
-    peer: SocketAddr,
+    peer: Peer,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     // A browser page on an unexpected origin must not be able to drive this
     // endpoint through a victim's browser (DNS rebinding). Checked before the
-    // body is even parsed, so an unauthorised origin reaches no dispatch logic.
+    // body is even parsed, so an unauthorised origin reaches no dispatch logic
+    // — and never counted as a failure: it guesses nothing, and counting it
+    // would let any web page lock the operator's own console out.
     let origin = headers
         .get(header::ORIGIN)
         .and_then(|v| v.to_str().ok())
@@ -89,6 +94,62 @@ async fn dispatch(
     {
         return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
     }
+
+    // Authentication, from the headers and the connection alone: a caller
+    // who is nobody gets no byte of its body parsed. ONE resolver snapshot
+    // answers both who this is and what the listener's posture is, so a
+    // reload landing mid-request can never pair new rules with an old
+    // posture.
+    let resolver = app.bridge.resolver();
+    let posture = resolver.posture();
+    let ev = evidence_of(&headers, &peer_id, &peer);
+    let source = peer.source();
+    let sessions = app
+        .auth
+        .sessions
+        .as_deref()
+        .map(|s| s as &dyn crate::a2a::principals::SessionVerifier);
+    let (principal, via) = match resolver.resolve(&ev, peer.is_unix(), sessions) {
+        Resolution::Named(p, via) => (p, via),
+        // Nothing presented: a challenge, never counted. An uncredentialed
+        // browser lands here, and so does every sign-in's first request.
+        Resolution::Unauthenticated { presented: false } => {
+            // Refused only for being a browser: the same request without
+            // `Origin` would have been the implicit operator.
+            let browser = ev.origin && ev.local && posture.implicit_operator;
+            denied(&app, None, None, None, None, "unauthenticated", 401);
+            return challenge(false, false, browser);
+        }
+        // A credential that failed: counted against its source, and past the
+        // limit answered 429 instead — the throttle sits here, inside the
+        // failure, so a request that authenticates is never refused by it.
+        refused @ (Resolution::Unauthenticated { presented: true } | Resolution::NoRole) => {
+            if let Some(ip) = source {
+                if let Some(retry) = app.failures.over(ip) {
+                    denied(&app, None, None, None, None, "auth_failures_limited", 429);
+                    return too_many(
+                        Value::Null,
+                        &format!(
+                            "too many failed authentications from this source: retry in about {retry}s"
+                        ),
+                        retry,
+                    );
+                }
+                app.failures.failed(ip);
+            }
+            return if refused == Resolution::NoRole {
+                denied(&app, None, None, None, None, "no_role", 403);
+                forbidden(Value::Null, "no role for this identity", false)
+            } else {
+                denied(&app, None, None, None, None, "invalid_credential", 401);
+                challenge(true, is_session_token(&ev), false)
+            };
+        }
+    };
+    // The response carries this when the credential was a bearer, so a
+    // refused caller learns its token lacks the scope rather than that it is
+    // bad.
+    let bearer_used = matches!(via, Via::Bearer | Via::Session);
 
     let Ok(req) = serde_json::from_slice::<Value>(&body) else {
         return err(Value::Null, -32700, "invalid JSON");
@@ -101,55 +162,90 @@ async fn dispatch(
         .to_string();
     let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
 
-    let bearer = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|h| {
-            h.strip_prefix("Bearer ")
-                .or_else(|| h.strip_prefix("bearer "))
-        })
-        .map(str::to_string);
-
-    let Some(principal) = resolve(&app, &peer_id, peer, bearer.as_deref()) else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            [(header::WWW_AUTHENTICATE, "Bearer")],
-            "",
-        )
-            .into_response();
-    };
+    // Admission: one token per request from a principal whose rule declares a
+    // rate. A refusal here is not a result — nothing reaches the runtime, so
+    // no task is created and nothing is charged.
+    if let Err(retry) = app.rates.admit(&principal) {
+        let rule = resolver.rule_of(&principal);
+        denied(
+            &app,
+            Some(&principal.id),
+            rule,
+            Some(&method),
+            None,
+            "rate_limited",
+            429,
+        );
+        return too_many(
+            id,
+            &format!("rate limit for {}: retry in about {retry}s", principal.id),
+            retry,
+        );
+    }
 
     // agentd's own vocabulary, which the protocol layer does not know.
     let bare = method.strip_prefix("a2a.").unwrap_or(&method).to_string();
-    match bare.as_str() {
-        // Discovery. The spec's JSON-RPC binding has no method for the *public*
-        // card — it is fetched from `.well-known` — but every agentd client asks
-        // for it here, so both ways work and both are unauthenticated.
-        "GetAgentCard" | "agent/card" => {
-            return unary(&app, id, "GetAgentCard", json!({}), principal).await;
+    // Discovery. The spec's JSON-RPC binding has no method for the *public*
+    // card — it is fetched from `.well-known` — but every agentd client asks
+    // for it here, so both ways work.
+    if matches!(bare.as_str(), "GetAgentCard" | "agent/card") {
+        return unary(&app, id, "GetAgentCard", json!({}), principal).await;
+    }
+
+    // The method gate. A refusal here counts against the source, which only
+    // matters to later requests from it that ALSO fail to authenticate.
+    let op = params
+        .get("message")
+        .and_then(crate::runtime::a2a_server::command_op);
+    if !principal.may(&bare, None) {
+        if let Some(ip) = source {
+            app.failures.failed(ip);
         }
+        let rule = resolver.rule_of(&principal);
+        denied(
+            &app,
+            Some(&principal.id),
+            rule,
+            Some(&bare),
+            op.as_deref(),
+            "not_permitted",
+            403,
+        );
+        return forbidden(
+            id,
+            &format!("{bare} is not permitted for {}", principal.id),
+            bearer_used,
+        );
+    }
+
+    match bare.as_str() {
         // Served here rather than passed down for the same reason as the public
         // card: a round trip through the SDK's typed `AgentCard` drops any field
         // it has no place for. Unlike the public card this one is SCOPED — the
-        // skills are the ones this caller may actually run, and it sets
-        // `supportsAuthenticatedExtendedCard` — so the two are deliberately not
-        // the same document.
+        // skills are the ones this caller may actually run — so the two are
+        // deliberately not the same document. The spec makes it an
+        // authenticated read (§13.3): on a listener that declares a scheme, a
+        // caller the scheme did not name — an `any` rule, the implicit
+        // operator — is asked for a credential rather than handed it.
         "GetExtendedAgentCard" | "agent/getAuthenticatedExtendedCard" => {
-            if principal.is_anonymous() {
-                return err(
-                    id,
-                    -32007,
-                    "the extended card requires an authenticated caller",
+            if posture.declares_any() && !matches!(via, Via::Bearer | Via::Session | Via::Cert) {
+                let rule = resolver.rule_of(&principal);
+                denied(
+                    &app,
+                    Some(&principal.id),
+                    rule,
+                    Some(&bare),
+                    None,
+                    "unauthenticated",
+                    401,
                 );
+                return challenge(false, false, false);
             }
             return unary(&app, id, "GetExtendedAgentCard", json!({}), principal).await;
         }
         "SubscribeToEvents" => {
             return match &app.bridge.feed() {
                 Some(feed) => {
-                    if !principal.may("SubscribeToEvents", None) {
-                        return err(id, -32003, "not authorized");
-                    }
                     feed_stream(Arc::clone(feed), id, params, principal, app.stream_deadline)
                 }
                 None => err(
@@ -161,18 +257,31 @@ async fn dispatch(
         }
         _ => {}
     }
-    // Authorization for the spec's methods: natural language is open to any
-    // non-anonymous role; a command DataPart is checked against the role's
-    // command grants.
-    let op = params
-        .get("message")
-        .and_then(crate::runtime::a2a_server::command_op);
-    if !principal.may(&bare, op.as_deref()) {
-        app.log.warn(
-            "a2a.denied",
-            json!({"principal": principal.id, "method": bare, "op": op}),
+
+    // The command-op gate: the op's floor and the caller's grants, checked
+    // before anything is created on the caller's behalf. Which workflow a
+    // `workflow.run` may start is the runtime's to judge — it alone holds the
+    // workflows and their start roles — and its refusal comes back as the same
+    // 403, recorded by the audit mirror.
+    if matches!(bare.as_str(), "SendMessage" | "SendStreamingMessage")
+        && let Some(op) = &op
+        && !principal.may_command(op)
+    {
+        let rule = resolver.rule_of(&principal);
+        denied(
+            &app,
+            Some(&principal.id),
+            rule,
+            Some(&bare),
+            Some(op),
+            "not_permitted",
+            403,
         );
-        return err(id, -32003, "not authorized");
+        return forbidden(
+            id,
+            &format!("{op} is not permitted for {}", principal.id),
+            bearer_used,
+        );
     }
 
     // A command DataPart is agentd's own vocabulary riding the spec's data
@@ -180,11 +289,18 @@ async fn dispatch(
     // without creating a task at all. Forcing those through a port that must
     // return a `Task` would mean inventing one. So they go straight to the
     // runtime, and its answer — task or not — is returned as it stands.
-    if matches!(bare.as_str(), "SendMessage" | "SendStreamingMessage")
-        && crate::runtime::a2a_server::command_op(&params["message"]).is_some()
-    {
+    if matches!(bare.as_str(), "SendMessage" | "SendStreamingMessage") && op.is_some() {
         let streaming = bare == "SendStreamingMessage";
-        return unary_maybe_streamed(&app, id, "SendMessage", params, principal, streaming).await;
+        return unary_maybe_streamed(
+            &app,
+            id,
+            "SendMessage",
+            params,
+            principal,
+            streaming,
+            bearer_used,
+        )
+        .await;
     }
 
     // A send with no task id yet gets one now. The protocol layer subscribes to
@@ -226,6 +342,23 @@ async fn dispatch(
             .unwrap_or_else(|_| err(Value::Null, -32603, "dispatch failed"))
     })
     .await
+}
+
+/// The audit line for a refusal the listener made: who (when anybody), the
+/// rule that named them, what they asked for, why, and the status sent.
+fn denied(
+    app: &App,
+    principal: Option<&str>,
+    rule: Option<&str>,
+    method: Option<&str>,
+    op: Option<&str>,
+    reason: &str,
+    status: u16,
+) {
+    app.log.warn(
+        "a2a.denied",
+        json!({"principal": principal, "rule": rule, "method": method, "op": op, "reason": reason, "status": status}),
+    );
 }
 
 /// Prepare a send for the protocol layer, returning a rewritten request body —
@@ -311,7 +444,7 @@ async fn unary(
     params: Value,
     principal: Principal,
 ) -> Response {
-    unary_maybe_streamed(app, id, method, params, principal, false).await
+    unary_maybe_streamed(app, id, method, params, principal, false, false).await
 }
 
 /// [`unary`], but able to answer as a one-frame SSE stream.
@@ -321,6 +454,12 @@ async fn unary(
 /// runtime in one step, so there is exactly one frame to send — but a caller
 /// that asked for a stream and received a JSON body would fail to parse it,
 /// which is a worse answer than a short stream.
+///
+/// The exception is a refusal of the caller itself — the runtime's second lock
+/// on a command (-31403), or an unauthenticated answer (-31401). Those travel
+/// with their HTTP status as plain JSON, never as a frame: a proxy, a browser
+/// and a plain HTTP client all read a 403 as a 403, and none of them reads the
+/// status of an SSE frame.
 async fn unary_maybe_streamed(
     app: &Arc<App>,
     id: Value,
@@ -328,6 +467,7 @@ async fn unary_maybe_streamed(
     params: Value,
     principal: Principal,
     streamed: bool,
+    bearer_used: bool,
 ) -> Response {
     let bridge = Arc::clone(&app.bridge);
     let method = method.to_string();
@@ -338,6 +478,22 @@ async fn unary_maybe_streamed(
         Some(e) => json!({"jsonrpc": "2.0", "id": id, "error": e}),
         None => json!({"jsonrpc": "2.0", "id": id, "result": v}),
     };
+    let code = envelope["error"]["code"].as_i64();
+    if let Some(code) = code
+        && let Ok(status) = StatusCode::from_u16(errors::http_status_of(code))
+        && status != StatusCode::OK
+    {
+        let mut resp = json_with(status, &envelope);
+        if code == errors::PERMISSION_DENIED && bearer_used {
+            resp.headers_mut().insert(
+                header::WWW_AUTHENTICATE,
+                axum::http::HeaderValue::from_static(
+                    "Bearer realm=\"agentd\", error=\"insufficient_scope\"",
+                ),
+            );
+        }
+        return resp;
+    }
     if !streamed {
         return json_response(envelope);
     }
@@ -351,12 +507,7 @@ async fn unary_maybe_streamed(
 }
 
 fn json_response(v: Value) -> Response {
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/json")],
-        serde_json::to_vec(&v).unwrap_or_default(),
-    )
-        .into_response()
+    json_with(StatusCode::OK, &v)
 }
 
 fn err(id: Value, code: i64, message: &str) -> Response {

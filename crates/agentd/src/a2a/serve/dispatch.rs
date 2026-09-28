@@ -23,8 +23,8 @@ use crate::a2a::errors::{self, reason};
 use crate::a2a::ports;
 use crate::a2a::principals::{Resolution, Via};
 use crate::runtime::surface::{
-    A2A_PROTOCOL_VERSION, Active, Ext, Route, SpecMethod, accepts_version, negotiate, owner_of,
-    parse_extension_header, route_of,
+    A2A_PROTOCOL_VERSION, Active, Command, Ext, Reply, Route, SpecMethod, accepts_version,
+    check_command, negotiate, owner_of, parse_extension_header, route_of,
 };
 
 pub(super) async fn rpc(
@@ -80,7 +80,8 @@ fn echoed(mut resp: Response, active: Active) -> Response {
 ///    refusal of an extension method whose extension it does not;
 /// 10. the method's authorization (and the extended card's credential gate);
 /// 11. the checks that need the params: a send's request shape, the task it
-///     names and its command op, a subscribe's task;
+///     names, its command envelope and the caller's reach to the op, a
+///     subscribe's task;
 /// 12. the answer — here for the few calls answered locally, else a2a-rs's,
 ///     filtered back to the runtime's own words on the way out, and echoing
 ///     the extensions it was given under.
@@ -338,24 +339,38 @@ async fn dispatch(
     } else {
         None
     };
-    // A command starts its own task. One that names a task would be a command
-    // run inside somebody's conversation — or a caller choosing the id of the
-    // task the command creates — and neither is something a command means.
-    if let (Some(op), Some(task)) = (&op, &named_task) {
-        let refusal = crate::runtime::a2a_server::command_names_task(op, task);
-        return error_response(
-            json!({"jsonrpc": "2.0", "id": id, "error": refusal}),
-            bearer_used,
-        );
-    }
+    // The command the send carries, held to command/v2 before anything is
+    // done with it: activated by the header and marked on the message, one
+    // envelope, no task of its own choosing, an answer the caller accepts,
+    // an op something serves and arguments that match its published schema.
+    // A DataPart under `agentd` sent without the extension is refused rather
+    // than read as data — the runtime would find the envelope and run it all
+    // the same. The runtime asks the same function again, so a path around
+    // this one is refused alike.
+    let command = if send {
+        match check_command(
+            &params,
+            named_task.as_deref(),
+            active.contains(Ext::Command),
+        ) {
+            Ok(command) => command,
+            Err(e) => {
+                return error_response(
+                    json!({"jsonrpc": "2.0", "id": id, "error": e}),
+                    bearer_used,
+                );
+            }
+        }
+    } else {
+        None
+    };
 
     // The command-op gate: the op's floor and the caller's grants, checked
     // before anything is created on the caller's behalf. Which workflow a
     // `workflow.run` may start is the runtime's to judge — it alone holds the
     // workflows and their start roles — and its refusal comes back as the same
     // 403, recorded by the audit mirror.
-    if send
-        && let Some(op) = &op
+    if let Some(op) = command.as_ref().map(|c| c.op.as_str())
         && !principal.may_command(op)
     {
         let rule = resolver.rule_of(&principal);
@@ -413,7 +428,7 @@ async fn dispatch(
             principal,
             via,
             named_task,
-            op,
+            command,
             bearer_used,
             active,
         },
@@ -432,8 +447,8 @@ struct Admitted {
     via: Via,
     /// The task the send's message named (see `ports::RequestScope`).
     named_task: Option<String>,
-    /// The command op a send carries.
-    op: Option<String>,
+    /// The command a send carries, held to command/v2.
+    command: Option<Command>,
     bearer_used: bool,
     active: Active,
 }
@@ -448,7 +463,7 @@ async fn answer(app: &Arc<App>, route: Route, req: Admitted) -> Response {
         principal,
         via,
         named_task,
-        op,
+        command,
         bearer_used,
         active,
     } = req;
@@ -525,9 +540,10 @@ async fn answer(app: &Arc<App>, route: Route, req: Admitted) -> Response {
     // asked for a stream, exactly one frame. Every command that does work
     // is a task like any other message, and goes to a2a-rs below.
     if send
-        && op
-            .as_deref()
-            .is_some_and(crate::runtime::surface::is_read_op)
+        && command
+            .as_ref()
+            .and_then(|c| c.spec)
+            .is_some_and(|spec| spec.reply == Reply::Message)
     {
         let streamed = route == Route::Spec(SpecMethod::SendStreamingMessage);
         return message_reply(app, id, params, principal, streamed, bearer_used, active).await;

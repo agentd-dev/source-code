@@ -11,7 +11,7 @@ use crate::a2a::errors::{self, reason};
 use crate::a2a::tasks::{Link, State};
 use crate::runtime::events::kinds;
 use crate::runtime::reactor::{PendingKind, Runtime};
-use crate::runtime::surface;
+use crate::runtime::surface::{self, Command, Ext};
 use serde_json::{Value, json};
 
 /// A command DataPart's op (`{"data": {"agentd": {"op": "<tool>", …}}}`).
@@ -31,24 +31,6 @@ pub(crate) fn command_data(message: &Value) -> Option<Value> {
         .as_array()?
         .iter()
         .find_map(|p| p.get("data").and_then(|d| d.get("agentd")).cloned())
-}
-
-/// The refusal of a command that names a task, as a JSON-RPC error object.
-///
-/// A command starts its own task. One that names a task would be a command run
-/// inside somebody's conversation, or a caller choosing the id of the task the
-/// command creates — and a task id is the server's to mint. Shared by the
-/// listener, which refuses it before anything else happens, and the runtime,
-/// which refuses it again for whatever reaches it another way.
-pub(crate) fn command_names_task(op: &str, task: &str) -> Value {
-    json!({
-        "code": errors::INVALID_PARAMS,
-        "message": format!("command {op:?} starts its own task; it cannot name one (taskId {task:?})"),
-        "data": [
-            errors::bad_request(&[("message.taskId", "a command message carries no taskId")]),
-            errors::error_info(errors::AGENTD_DOMAIN, reason::COMMAND_TASK_ID, &[("op", op)]),
-        ],
-    })
 }
 
 /// The `contextId` a message names, as its sender knows it. a2a-rs stamps
@@ -132,13 +114,37 @@ impl Runtime {
     ///   whole when a2a-rs answered;
     /// - a task id is the server's: a message that names a task continues it,
     ///   and one it cannot see is "not found" (`-32001`) rather than a new task
-    ///   under the caller's id; a settled task takes no more (`-32004`); a
-    ///   command names none (`-32602`);
+    ///   under the caller's id; a settled task takes no more (`-32004`);
     /// - a part that is no media type the card accepts refuses the message
     ///   (`-32005`);
     /// - a push config sent inline is checked like a registration, and
     ///   attached to the task only once the message is accepted.
+    ///
+    /// A command is held first to what the listener already held it to —
+    /// the envelope ([`surface::check_command`]), then the caller's reach
+    /// ([`Principal::authorize_command`]) — so a path into the runtime that
+    /// skips the listener cannot skip either, and nothing a refused command
+    /// asked for is created, queued or charged: an `_instance.*` report from
+    /// anyone but the operator is a 403 here and now, never an inbox event
+    /// the reactor drops later where its sender cannot see.
     pub(super) fn a2a_send(&mut self, principal: &Principal, params: &Value) -> Value {
+        let message = &params["message"];
+        let named = named_task(params);
+        let activated = self.a2a_active.contains(Ext::Command);
+        let command = match surface::check_command(params, named, activated) {
+            Ok(command) => command,
+            Err(e) => return json!({"_error": e}),
+        };
+        if let Some(c) = &command
+            && let Err(why) = principal.authorize_command(&c.op, &c.envelope)
+        {
+            return refusal(
+                errors::PERMISSION_DENIED,
+                reason::PERMISSION_DENIED,
+                &why,
+                &[("op", &c.op)],
+            );
+        }
         if self.draining {
             return refusal(
                 errors::INTERNAL_ERROR,
@@ -146,11 +152,6 @@ impl Runtime {
                 "the agent is draining",
                 &[],
             );
-        }
-        let message = &params["message"];
-        let named = named_task(params);
-        if let (Some(op), Some(task)) = (command_op(message), named) {
-            return json!({"_error": command_names_task(&op, task)});
         }
         let text = match crate::a2a::wire::message_input(message) {
             Ok(text) => text,
@@ -188,7 +189,7 @@ impl Runtime {
                 Err(e) => return e,
             },
         };
-        let out = self.a2a_message(principal, message, &text, named);
+        let out = self.a2a_message(principal, message, &text, named, command.as_ref());
         // Attached at once, within the send that created (or continued) the
         // task: no other request runs on the loop between the two, and the
         // webhook is told the state the task is in now — which is where every
@@ -205,14 +206,16 @@ impl Runtime {
 
     /// The message, accepted: routed to the registry, a gate, or a turn.
     /// `text` is what [`crate::a2a::wire::message_input`] made of its parts,
-    /// and `named` the task it continues — already found, visible to the
-    /// caller and still open.
+    /// `named` the task it continues — already found, visible to the caller
+    /// and still open — and `command` the command it carries, already held
+    /// to its envelope and the caller's reach.
     fn a2a_message(
         &mut self,
         principal: &Principal,
         message: &Value,
         text: &str,
         named: Option<&str>,
+        command: Option<&Command>,
     ) -> Value {
         // The caller's message, with the id it is known by from here on: its
         // own `messageId`, or one minted for it. History records it under that
@@ -232,51 +235,29 @@ impl Runtime {
         // An `a2a` START NODE registers its command. A workflow declaring
         // `{kind: a2a, command: "review.start"}` is what makes `review.start`
         // something a peer may ask for — otherwise the built-in list would be
-        // the entire command surface and a start node could never be reached,
-        // because an unknown op is refused before the message ever becomes an
-        // inbox event. A registered command therefore skips command dispatch
-        // and takes the ordinary message path: written ahead to the durable
-        // inbox, then matched against the start nodes (roles included) by the
-        // reactor. A built-in wins, so a workflow cannot shadow `status` — and
-        // the `_instance.*` reports a child sends home are built-ins too, so
-        // they are consumed by their handler and never reach a model, a wait
+        // the entire command surface and a start node could never be reached.
+        // A registered command skips command dispatch and takes the ordinary
+        // message path: its payload held to the start node's `schema` here,
+        // synchronously, then written ahead to the durable inbox and matched
+        // against the start nodes (roles included) by the reactor.
+        //
+        // A BUILT-IN always wins: only an op no row of the table holds is
+        // looked up among the workflows (`spec` is `None`), so a workflow
+        // declaring `status` or `admin.drain` — refused at validation — could
+        // not shadow it here either, and the `_instance.*` reports a child
+        // sends home are consumed by their handler, never by a model, a wait
         // or a start node.
-        // A BUILT-IN always wins, which the paragraph above has always claimed
-        // and the code did not do: `declared` was checked first, so a workflow
-        // declaring `{kind: a2a, command: "status"}` took the inbox path and
-        // skipped `a2a_command` — and with it `may_command`. Harmless for a
-        // read; not harmless once `admin.*` joined the built-in surface, where
-        // a declared collision would shadow an operator's drain control with a
-        // workflow anyone the start node admits could trigger. Declaring one is
-        // refused at validation; this is the second lock.
-        let builtin = command_op(message).is_some_and(|op| surface::is_builtin_op(&op));
-        let declared = !builtin
-            && command_op(message).is_some_and(|op| self.workflow_declares_a2a_command(&op));
-        // A declared command with a `schema:` is a CONTRACT: a payload that
-        // does not match is refused HERE, synchronously, with the mismatch —
-        // not accepted into the inbox to fail later where the caller cannot
-        // see it. This is what makes cross-agent commands as typed as tool
-        // calls.
-        if declared
-            && let Some(op) = command_op(message)
-            && let Some(schema) = self.a2a_command_schema(&op)
+        let declared = match command {
+            Some(c) if c.spec.is_none() => match self.check_declared(c) {
+                Ok(declared) => declared,
+                Err(e) => return json!({"_error": e}),
+            },
+            _ => false,
+        };
+        if let Some(c) = command
+            && !declared
         {
-            let mut payload = command_data(message).unwrap_or_else(|| json!({}));
-            if let Some(o) = payload.as_object_mut() {
-                o.remove("op");
-            }
-            if let Err(errs) = crate::jsonschema::validate(&schema, &payload) {
-                return err_obj(
-                    ::mcp::rpc::INVALID_PARAMS,
-                    &format!(
-                        "command {op:?} payload does not match its declared schema: {}",
-                        errs.join("; ")
-                    ),
-                );
-            }
-        }
-        if !declared && let Some(op) = command_op(message) {
-            return self.a2a_command(principal, &op, message);
+            return self.a2a_command(principal, c, message);
         }
         // A command DataPart carries no text, and that is not an empty message.
         if text.trim().is_empty() && !declared {
@@ -413,28 +394,6 @@ impl Runtime {
             }
         }
     }
-
-    /// Whether any loaded workflow has an `a2a` start node declaring `op` as its
-    /// command. This is what turns a start node into a registered part of the
-    /// A2A command surface (see the call site in `a2a_send`).
-    fn workflow_declares_a2a_command(&self, op: &str) -> bool {
-        self.workflows.values().any(|w| {
-            w.start_steps().into_iter().any(|s| {
-                s.kind == "a2a" && s.spec.get("command").and_then(Value::as_str) == Some(op)
-            })
-        })
-    }
-
-    /// The declared `schema` of a registered command's `a2a` start, if any.
-    fn a2a_command_schema(&self, op: &str) -> Option<Value> {
-        self.workflows.values().find_map(|w| {
-            w.start_steps().into_iter().find_map(|s| {
-                (s.kind == "a2a" && s.spec.get("command").and_then(Value::as_str) == Some(op))
-                    .then(|| s.spec.get("schema").cloned())
-                    .flatten()
-            })
-        })
-    }
 }
 
 #[cfg(test)]
@@ -537,20 +496,6 @@ mod tests {
         for (params, want) in cases {
             assert_eq!(named_task(&params), want, "{params}");
         }
-    }
-
-    /// A command naming a task is refused in the shape the listener and the
-    /// runtime share: the field, and the reason.
-    #[test]
-    fn a_command_naming_a_task_is_refused_with_its_field() {
-        let e = command_names_task("workflow.run", "t-1");
-        assert_eq!(e["code"], errors::INVALID_PARAMS);
-        assert_eq!(
-            e["data"][0]["fieldViolations"][0]["field"],
-            "message.taskId"
-        );
-        assert_eq!(e["data"][1]["reason"], reason::COMMAND_TASK_ID);
-        assert_eq!(e["data"][1]["domain"], errors::AGENTD_DOMAIN);
     }
 
     #[test]

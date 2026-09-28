@@ -475,8 +475,8 @@ fn runtime_refusals_survive_the_sdk() {
     let error = &v["error"];
     assert_eq!(error["code"], -32602, "{v}");
     assert_eq!(error["message"], "unknown command \"no.such.op\"", "{v}");
-    assert_eq!(error["data"][0]["reason"], "UNKNOWN_OP", "{v}");
-    assert_eq!(error["data"][0]["domain"], "agentd.dev", "{v}");
+    assert_eq!(error["data"][1]["reason"], "UNKNOWN_OP", "{v}");
+    assert_eq!(error["data"][1]["domain"], "agentd.dev", "{v}");
     no_sdk_domain(error);
 }
 

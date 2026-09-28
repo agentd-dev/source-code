@@ -24,7 +24,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use agentd::runtime::surface::{Floor, OPS, RUNTIME_SETTABLE, Reply};
+use agentd::runtime::surface::{Floor, Handler, INSTANCE_OPS, OPS, RUNTIME_SETTABLE, Reply};
 use serde_json::{Value, json};
 
 use common::{SendMessage, error_of, rpc_as, rpc_result};
@@ -512,17 +512,26 @@ fn a_user_with_every_grant_cannot_reach_operator_controls() {
         "workflows:\n  - name: waiter\n    steps:\n      s: {kind: manual}\n      w: {kind: wait, on: signal, signal: go, depends_on: [s]}\n      f: {kind: finish, depends_on: [w], output: \"released\"}\n",
     ));
 
+    // Every operator-floor op something serves; `ask_human`, held in reserve
+    // and served to nobody, is unknown to every caller (below).
     let floor: Vec<&str> = OPS
         .iter()
-        .filter(|s| s.floor == Floor::Operator)
+        .filter(|s| s.floor == Floor::Operator && s.handler != Handler::Reserved)
         .map(|s| s.name)
         .filter(|n| !n.ends_with('.'))
-        .chain(["_instance.result", "_instance.emit"])
+        .chain(INSTANCE_OPS.iter().map(|m| m.name))
         .collect();
     assert!(floor.contains(&"admin.set") && floor.contains(&"config"));
     for op in &floor {
+        // Arguments each op's schema accepts: the envelope is checked before
+        // the floor, so what is refused here is the caller, not the call.
         let args = match *op {
             "admin.set" => json!({"path": "agent.approval", "value": "accept"}),
+            "admin.cancel" => json!({"run": "waiter-1"}),
+            "auth.device.approve" => json!({"user_code": "WDJB-MJHT", "as": "greedy"}),
+            "auth.device.deny" | "auth.sessions.revoke" => json!({"all": true}),
+            "_instance.result" => json!({"handle": "c1"}),
+            "_instance.emit" => json!({"handle": "c1", "stream": "s", "event": {}}),
             _ => json!({}),
         };
         let v = SendMessage::command(op, args)
@@ -534,6 +543,11 @@ fn a_user_with_every_grant_cannot_reach_operator_controls() {
             "a user holding every grant reached {op}: {v}"
         );
     }
+
+    let held = SendMessage::command("ask_human", json!({}))
+        .bearer(USER_TOKEN)
+        .post(&d.addr);
+    assert_eq!(held["error"]["data"][1]["reason"], "UNKNOWN_OP", "{held}");
 
     // Nothing moved: the instance is not draining or paused.
     let st = SendMessage::command("status", json!({}))

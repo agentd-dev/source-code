@@ -1073,18 +1073,22 @@ fn admin_set_toggles_introspection_live() {
     let ev = read(&addr, "debug.events", json!({"limit": 10}));
     assert!(ev["events"].is_array(), "{ev}");
 
-    // The removed paths are not runtime-settable; the error names what is.
+    // The removed paths are not runtime-settable: the op's published schema
+    // refuses them, and the error names what is.
     for path in [
         "interface.debug",
         "interface.display.bottom",
         "intelligence.model",
     ] {
-        let (code, msg) = error_of(
-            &SendMessage::command("admin.set", json!({"path": path, "value": "x"})).post(&addr),
-        );
+        let v = SendMessage::command("admin.set", json!({"path": path, "value": "x"})).post(&addr);
+        let (code, msg) = error_of(&v);
         assert_eq!(code, -32602, "{path}");
+        assert_eq!(
+            v["error"]["data"][1]["reason"], "INVALID_COMMAND_ARGS",
+            "{v}"
+        );
         assert!(
-            msg.contains("not runtime-settable") && msg.contains("a2a.introspection.enabled"),
+            msg.contains("agent.approval") && msg.contains("a2a.introspection.enabled"),
             "{path}: {msg}"
         );
     }

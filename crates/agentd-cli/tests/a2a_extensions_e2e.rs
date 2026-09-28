@@ -17,8 +17,13 @@
 //!    extension is declared and activated, and a task's annotations ride only
 //!    on an answer to a request that activated them;
 //! 4. the operator admin family is reachable as an ordinary `SendMessage` with
-//!    a command DataPart, so a client that has never heard of agentd can drain
-//!    this instance — and a non-operator still cannot, whatever its grants.
+//!    a command DataPart — and a non-operator still cannot reach it, whatever
+//!    its grants;
+//! 5. a command is one only when command/v2 is activated and marked, its op
+//!    is one agentd serves (a removed one named with its replacement) and its
+//!    arguments match the published schema; nothing refused runs, and a
+//!    child's `_instance.*` reports are the operator's alone, refused to
+//!    anyone else on the request itself.
 #![cfg(all(unix, feature = "a2a"))]
 
 mod common;
@@ -798,5 +803,283 @@ fn admin_is_a_command_datapart_and_stays_operator_only() {
     assert!(
         serde_json::to_string(&resumed).unwrap().contains("running"),
         "and resume brings it back: {resumed}"
+    );
+}
+
+/// How many tasks `bearer`'s principal can list.
+fn task_count(addr: &str, bearer: &str) -> usize {
+    let v = rpc_as(addr, bearer, 9, "ListTasks", json!({"pageSize": 100}));
+    assert!(v.get("error").is_none(), "ListTasks: {v}");
+    v["result"]["tasks"].as_array().map_or(0, Vec::len)
+}
+
+/// The `status` document, read as `bearer` through an activated command.
+fn status_doc(addr: &str, bearer: &str) -> Value {
+    let v = SendMessage::command("status", json!({}))
+        .bearer(bearer)
+        .result(addr);
+    v["message"]["parts"][0]["data"].clone()
+}
+
+/// A command is a command only when the request activates command/v2 and the
+/// message is marked with it; anything less is refused with a reason that
+/// says which, and nothing it asked for happens — no pause, no run, no task.
+///
+/// It used to be enough for a DataPart to carry `agentd.op`: a client that
+/// had never negotiated the extension drove the instance through it, and the
+/// echo told it nothing had been activated.
+#[test]
+fn a_command_without_activation_is_refused_and_not_run() {
+    let (_d, addr) = boot();
+    let before = task_count(&addr, OPERATOR);
+    let auth = format!("Bearer {OPERATOR}");
+
+    // Marked on the message, but the header never asked for it.
+    for (op, args) in [
+        ("admin.pause", json!({"reason": "unasked"})),
+        ("workflow.run", json!({"workflow": "greet"})),
+        ("report.make", json!({"x": 1})),
+    ] {
+        let body = SendMessage::command(op, args).body(1);
+        let reply = a2a_post(&addr, &body, &[("Authorization", &auth)]);
+        assert_eq!(reply.status, 200, "{op}: {reply:?}");
+        let v = reply.json();
+        assert_eq!(v["error"]["code"], -32602, "{op}: {v}");
+        assert_eq!(
+            v["error"]["data"][1]["reason"], "EXTENSION_NOT_ACTIVATED",
+            "{op}: {v}"
+        );
+        assert_eq!(
+            v["error"]["data"][0]["fieldViolations"][0]["field"], "message.parts[0].data.agentd",
+            "{op}: {v}"
+        );
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(COMMAND_EXTENSION),
+            "the refusal names the extension to activate: {v}"
+        );
+        assert_eq!(reply.header("a2a-extensions"), None, "{reply:?}");
+    }
+
+    // Activated by the header, but the message does not say it is a command.
+    let mut unmarked = SendMessage::command("admin.pause", json!({})).params();
+    unmarked["message"]
+        .as_object_mut()
+        .unwrap()
+        .remove("extensions");
+    let reply = post_with(
+        &addr,
+        OPERATOR,
+        &rpc_body(2, "SendMessage", unmarked),
+        &[COMMAND_EXTENSION],
+    );
+    let v = reply.json();
+    assert_eq!(v["error"]["code"], -32602, "{v}");
+    assert_eq!(
+        v["error"]["data"][1]["reason"], "EXTENSION_NOT_MARKED",
+        "{v}"
+    );
+    assert_eq!(
+        v["error"]["data"][0]["fieldViolations"][0]["field"],
+        "message.extensions"
+    );
+
+    // A streaming send is refused the same way, as JSON rather than a frame.
+    let streamed = a2a_post(
+        &addr,
+        &SendMessage::command("admin.pause", json!({}))
+            .streaming()
+            .body(3),
+        &[("Authorization", &auth)],
+    );
+    assert!(
+        streamed
+            .header("content-type")
+            .is_some_and(|t| t.starts_with("application/json")),
+        "{streamed:?}"
+    );
+    assert_eq!(
+        streamed.json()["error"]["data"][1]["reason"],
+        "EXTENSION_NOT_ACTIVATED"
+    );
+
+    // Nothing happened: the instance is not paused, and no task was made.
+    assert_eq!(status_doc(&addr, OPERATOR)["paused"], false);
+    assert_eq!(
+        task_count(&addr, OPERATOR),
+        before,
+        "a refused command made a task"
+    );
+
+    // With both, the same command runs.
+    let paused = SendMessage::command("admin.pause", json!({"reason": "asked"}))
+        .bearer(OPERATOR)
+        .result(&addr);
+    assert_eq!(
+        paused["task"]["status"]["state"], "TASK_STATE_COMPLETED",
+        "{paused}"
+    );
+    assert_eq!(status_doc(&addr, OPERATOR)["paused"], true);
+}
+
+/// An op agentd no longer serves is refused by name, with what replaced it,
+/// and an argument the op does not take is refused rather than ignored — so
+/// a client written against the old vocabulary is told what to change.
+#[test]
+fn a_removed_op_names_its_replacement() {
+    let (_d, addr) = boot();
+    for (op, args, hint) in [
+        (
+            "config.set",
+            json!({"path": "agent.approval", "value": "auto"}),
+            "use admin.set {path, value}",
+        ),
+        (
+            "interface.info",
+            json!({}),
+            "read the agent card and the `status` op",
+        ),
+        ("admin.lameduck", json!({}), "use admin.drain"),
+        (
+            "pairing.code",
+            json!({}),
+            "auth.device.approve {user_code, as}",
+        ),
+    ] {
+        let v = SendMessage::command(op, args).bearer(OPERATOR).post(&addr);
+        assert_eq!(v["error"]["code"], -32602, "{op}: {v}");
+        assert_eq!(v["error"]["data"][1]["reason"], "UNKNOWN_OP", "{op}: {v}");
+        assert_eq!(v["error"]["data"][1]["metadata"]["op"], op, "{v}");
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(
+            msg.contains(&format!("command `{op}` was removed in agentd 1.17.0"))
+                && msg.contains(hint),
+            "{op}: {msg}"
+        );
+    }
+    // The canonical names only: `workflow.run` takes `workflow`, not the
+    // `name` an earlier version accepted beside it.
+    let v = SendMessage::command("workflow.run", json!({"name": "greet"}))
+        .bearer(OPERATOR)
+        .post(&addr);
+    assert_eq!(v["error"]["code"], -32602, "{v}");
+    assert_eq!(
+        v["error"]["data"][1]["reason"], "INVALID_COMMAND_ARGS",
+        "{v}"
+    );
+
+    // A declared command's payload is held to the schema its start node
+    // declares, refused in the same shape as a built-in's arguments.
+    let typed = format!(
+        "{WORKFLOWS}\
+         \x20 - name: typed\n\
+         \x20   steps:\n\
+         \x20     s: {{kind: a2a, command: typed.go, schema: {{type: object, required: [n], \
+         properties: {{n: {{type: integer}}}}}}}}\n\
+         \x20     f: {{kind: finish, depends_on: [s], output: \"done\"}}\n"
+    );
+    let (_t, taddr) = boot_with(PRINCIPALS, &typed);
+    let v = SendMessage::command("typed.go", json!({"n": "seven"}))
+        .bearer(OPERATOR)
+        .post(&taddr);
+    assert_eq!(v["error"]["code"], -32602, "{v}");
+    assert_eq!(
+        v["error"]["data"][1]["reason"], "INVALID_COMMAND_ARGS",
+        "{v}"
+    );
+    assert_eq!(v["error"]["data"][1]["metadata"]["op"], "typed.go", "{v}");
+    assert_eq!(
+        v["error"]["data"][0]["fieldViolations"][0]["field"], "message.parts[0].data.agentd.n",
+        "{v}"
+    );
+    assert_eq!(
+        task_count(&taddr, OPERATOR),
+        0,
+        "a refused command made a task"
+    );
+    let v = SendMessage::command("typed.go", json!({"n": 7}))
+        .bearer(OPERATOR)
+        .return_immediately()
+        .post(&taddr);
+    assert!(v.get("error").is_none(), "{v}");
+
+    // Every read answers with the document its published schema describes.
+    for op in ["status", "config", "workflow.status", "auth.sessions"] {
+        let v = SendMessage::command(op, json!({}))
+            .bearer(OPERATOR)
+            .result(&addr);
+        let doc = &v["message"]["parts"][0]["data"];
+        let schema = agentd::runtime::surface::result_schema_of(op).unwrap();
+        agentd::jsonschema::validate(&schema, doc)
+            .unwrap_or_else(|e| panic!("{op} answers off its schema: {e:?}\n{doc}"));
+    }
+    let v = SendMessage::command("status", json!({}))
+        .bearer(USER)
+        .result(&addr);
+    let schema = agentd::runtime::surface::result_schema_of("status").unwrap();
+    agentd::jsonschema::validate(&schema, &v["message"]["parts"][0]["data"])
+        .unwrap_or_else(|e| panic!("a user's status is off its schema: {e:?}"));
+}
+
+/// A child's reports are the operator's alone, and a non-operator is told so
+/// at once: a 403 on the request itself, whatever its grants — never a task
+/// that is accepted into the inbox and silently dropped there. Nothing is
+/// created on its behalf.
+#[test]
+fn instance_ops_are_refused_synchronously_for_non_operators() {
+    let (_d, addr) = boot();
+    for (op, args) in [
+        (
+            "_instance.result",
+            json!({"handle": "c1", "status": "completed", "output": "forged"}),
+        ),
+        (
+            "_instance.emit",
+            json!({"handle": "c1", "stream": "orders", "event": {"subject": "x"}}),
+        ),
+    ] {
+        for streaming in [false, true] {
+            let mut s = SendMessage::command(op, args.clone()).bearer(USER);
+            if streaming {
+                s = s.streaming();
+            }
+            let reply = s.post_raw(&addr);
+            assert_eq!(reply.status, 403, "{op}: {reply:?}");
+            let v = reply.json();
+            assert_eq!(v["error"]["code"], -31403, "{op}: {v}");
+            assert_eq!(v["id"], 1, "answered to the request itself: {v}");
+        }
+    }
+    assert_eq!(task_count(&addr, USER), 0, "a refused report made a task");
+
+    // The operator is heard — and told there is no such child, rather than
+    // the report vanishing.
+    let v = SendMessage::command("_instance.result", json!({"handle": "c1"}))
+        .bearer(OPERATOR)
+        .post(&addr);
+    assert_eq!(v["error"]["code"], -32602, "{v}");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no live instance child"),
+        "{v}"
+    );
+    // A report that does not exist is unknown, for anyone; one off its
+    // schema is refused before the operator floor is asked.
+    for bearer in [OPERATOR, USER] {
+        let v = SendMessage::command("_instance.nope", json!({}))
+            .bearer(bearer)
+            .post(&addr);
+        assert_eq!(v["error"]["data"][1]["reason"], "UNKNOWN_OP", "{v}");
+    }
+    let v = SendMessage::command("_instance.emit", json!({"handle": "c1"}))
+        .bearer(OPERATOR)
+        .post(&addr);
+    assert_eq!(
+        v["error"]["data"][1]["reason"], "INVALID_COMMAND_ARGS",
+        "{v}"
     );
 }

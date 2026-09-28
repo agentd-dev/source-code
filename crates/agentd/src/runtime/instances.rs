@@ -788,6 +788,11 @@ impl Runtime {
 
     /// Consume a child's `_instance.*` report, sent to this instance as the
     /// command op it is. `Ok` is the text of the task that records it.
+    ///
+    /// The listener and `a2a_send` have both refused a non-operator by now;
+    /// this is asked all the same, because consuming a report takes the
+    /// [`Admitted`] only [`admit`] hands out — so no path to a child's
+    /// result, present or future, can get there without the question.
     #[cfg(feature = "a2a")]
     pub(crate) fn instance_op(
         &mut self,
@@ -795,14 +800,14 @@ impl Runtime {
         op: InstanceOp,
         args: &Value,
     ) -> Result<String, String> {
-        if !speaks_for_child(principal.role) {
+        let admitted = admit(principal.role, op).map_err(|refused| {
             self.log.warn(
-                "instance.op.refused",
-                json!({"op": op.name(), "principal": principal.id, "note": "only the operator speaks for a child"}),
+                refused.event,
+                json!({"op": op.name(), "principal": principal.id, "note": refused.note}),
             );
-            return Err(format!("{} is operator-only", op.name()));
-        }
-        self.consume_instance_op(op, args)
+            format!("{} is operator-only", op.name())
+        })?;
+        self.consume_instance_op(admitted, args)
     }
 
     /// An `_instance.*` report that reached the durable inbox. Returns true
@@ -813,17 +818,18 @@ impl Runtime {
     pub(crate) fn handle_instance_op(&mut self, ev: &crate::state::InboxEvent) -> bool {
         match inbox_report(ev) {
             None => false,
-            Some(Ok((kind, args))) => {
-                if let Err(e) = self.consume_instance_op(kind, &args) {
+            Some(Ok((admitted, args))) => {
+                let op = admitted.op();
+                if let Err(e) = self.consume_instance_op(admitted, &args) {
                     self.log
-                        .warn("instance.op.fail", json!({"op": kind.name(), "err": e}));
+                        .warn("instance.op.fail", json!({"op": op.name(), "err": e}));
                 }
                 true
             }
-            Some(Err(InboxRefusal::NotOperator(op))) => {
+            Some(Err(InboxRefusal::NotOperator(op, refused))) => {
                 self.log.warn(
-                    "instance.op.refused",
-                    json!({"op": op, "role": ev.payload["role"], "note": "only the operator speaks for a child"}),
+                    refused.event,
+                    json!({"op": op, "role": ev.payload["role"], "note": refused.note}),
                 );
                 true
             }
@@ -835,7 +841,8 @@ impl Runtime {
     }
 
     #[cfg(feature = "a2a")]
-    fn consume_instance_op(&mut self, op: InstanceOp, args: &Value) -> Result<String, String> {
+    fn consume_instance_op(&mut self, admitted: Admitted, args: &Value) -> Result<String, String> {
+        let op = admitted.op();
         let handle = args["handle"].as_str().unwrap_or("").to_string();
         let live = self.subagents.get(&handle).is_some_and(|s| {
             s.tier.as_deref() == Some("instance") && !is_terminal_status(&s.status)
@@ -1116,12 +1123,63 @@ impl InstanceOp {
     }
 }
 
+/// Who may send a child's report, as a pure function of the caller's role and
+/// the report: the one rule every path that consumes one asks, and the only
+/// source of the [`Admitted`] that consuming takes.
+#[cfg(feature = "a2a")]
+mod admission {
+    use super::InstanceOp;
+    use crate::config::v2::Role;
+
+    /// A report [`admit`] let through. Its field is private to this module,
+    /// so nothing outside it can make one: a consumer that takes an
+    /// `Admitted` cannot be reached without asking.
+    #[derive(Debug, PartialEq)]
+    pub(crate) struct Admitted(InstanceOp);
+
+    impl Admitted {
+        pub(crate) fn op(&self) -> InstanceOp {
+            self.0
+        }
+    }
+
+    /// Why a report was refused: the log event it is recorded under, and
+    /// what the line says.
+    #[derive(Debug, PartialEq)]
+    pub(crate) struct Refused {
+        pub(crate) event: &'static str,
+        pub(crate) note: &'static str,
+    }
+
+    /// Only the operator speaks for a child: an `agent` that could write a
+    /// child's result could decide what the parent believes its own subagent
+    /// answered. A child dials home with the parent's own operator credential
+    /// (its unix socket, or the `a2a.bearer` reference it was composed with)
+    /// — but the resolver tries the configured principal rules first, so on
+    /// a parent with a catch-all `any` rule that credential resolves to the
+    /// rule's role, and the child's reports are refused here with
+    /// `instance.op.refused`. Refusing such a spawn up front, by name, is the
+    /// spawn's job, not this check's.
+    pub(crate) fn admit(role: Role, op: InstanceOp) -> Result<Admitted, Refused> {
+        if role == Role::Operator {
+            Ok(Admitted(op))
+        } else {
+            Err(Refused {
+                event: "instance.op.refused",
+                note: "only the operator speaks for a child",
+            })
+        }
+    }
+}
+#[cfg(feature = "a2a")]
+use admission::{Admitted, Refused, admit};
+
 /// Why an `_instance.*` report in the inbox is consumed without effect.
 #[cfg(feature = "a2a")]
 #[derive(Debug, PartialEq)]
 enum InboxRefusal {
     /// The caller it arrived from was not the operator.
-    NotOperator(String),
+    NotOperator(String, Refused),
     /// No such report.
     Unknown(String),
 }
@@ -1131,54 +1189,51 @@ enum InboxRefusal {
 /// is refused. Separate from the consuming so the refusal is testable without
 /// a runtime.
 #[cfg(feature = "a2a")]
-fn inbox_report(
-    ev: &crate::state::InboxEvent,
-) -> Option<Result<(InstanceOp, Value), InboxRefusal>> {
+fn inbox_report(ev: &crate::state::InboxEvent) -> Option<Result<(Admitted, Value), InboxRefusal>> {
+    use crate::config::v2::Role;
     let message = json!({"parts": ev.payload.get("parts").cloned().unwrap_or(Value::Null)});
     let op = super::a2a_server::command_op(&message)?;
     if !op.starts_with("_instance.") {
         return None;
     }
-    let role: Option<crate::config::v2::Role> =
-        serde_json::from_value(ev.payload["role"].clone()).ok();
-    if !role.is_some_and(speaks_for_child) {
-        return Some(Err(InboxRefusal::NotOperator(op)));
-    }
+    // A role the event does not name is nobody's, and refused as one.
+    let role: Role = serde_json::from_value(ev.payload["role"].clone()).unwrap_or(Role::Anonymous);
     let Some(kind) = InstanceOp::of(&op) else {
-        return Some(Err(InboxRefusal::Unknown(op)));
+        // Asked of the role first all the same, so a non-operator is told
+        // it may not report rather than which reports exist.
+        return Some(Err(match admit(role, InstanceOp::Result) {
+            Err(refused) => InboxRefusal::NotOperator(op, refused),
+            Ok(_) => InboxRefusal::Unknown(op),
+        }));
+    };
+    let admitted = match admit(role, kind) {
+        Ok(admitted) => admitted,
+        Err(refused) => return Some(Err(InboxRefusal::NotOperator(op, refused))),
     };
     let args = super::a2a_server::command_data(&message).unwrap_or_else(|| json!({}));
-    Some(Ok((kind, args)))
-}
-
-/// Only the operator speaks for a child: an `agent` that could write a
-/// child's result could decide what the parent believes its own subagent
-/// answered. A child dials home with the parent's own operator credential
-/// (its unix socket, or the `a2a.bearer` reference it was composed with) —
-/// but the resolver tries the configured principal rules first, so on a
-/// parent with a catch-all `any` rule that credential resolves to the rule's
-/// role, and the child's reports are refused here with `instance.op.refused`.
-/// Refusing such a spawn up front, by name, is the spawn's job, not this
-/// check's.
-#[cfg(feature = "a2a")]
-fn speaks_for_child(role: crate::config::v2::Role) -> bool {
-    role == crate::config::v2::Role::Operator
+    Some(Ok((admitted, args)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Only the operator speaks for a child, from one pure rule that every
+    /// consumer asks: `admit` refuses each report for an agent, a user and a
+    /// caller nobody named — as `instance.op.refused` — and admits it for the
+    /// operator. Consuming a report takes the `Admitted` only `admit` makes,
+    /// so `instance_op` cannot consume one without asking, whatever the
+    /// listener and `a2a_send` refused before it.
     #[cfg(feature = "a2a")]
     #[test]
     fn only_the_operator_speaks_for_a_child() {
         use crate::config::v2::Role;
-        assert!(speaks_for_child(Role::Operator));
-        for role in [Role::Agent, Role::User, Role::Anonymous] {
-            assert!(
-                !speaks_for_child(role),
-                "{role:?} must not speak for a child"
-            );
+        for op in [InstanceOp::Result, InstanceOp::Emit] {
+            assert_eq!(admit(Role::Operator, op).map(|a| a.op()), Ok(op));
+            for role in [Role::Agent, Role::User, Role::Anonymous] {
+                let refused = admit(role, op).expect_err("refused");
+                assert_eq!(refused.event, "instance.op.refused", "{role:?} {op:?}");
+            }
         }
         // …and the inbox path asks it: a report that reached the inbox from
         // anyone but the operator is consumed as a refusal, never as the
@@ -1193,26 +1248,75 @@ mod tests {
                 }),
             )
         };
+        let refused = |op: &str| match inbox_report(&report("agent", op)) {
+            Some(Err(InboxRefusal::NotOperator(o, r))) => (o, r.event),
+            other => panic!("{op}: {other:?}"),
+        };
         for role in ["agent", "user", "anonymous", "nonsense"] {
-            assert_eq!(
-                inbox_report(&report(role, "_instance.result")).map(|r| r.map(|_| ())),
-                Some(Err(InboxRefusal::NotOperator("_instance.result".into()))),
-                "{role}"
-            );
+            match inbox_report(&report(role, "_instance.result")) {
+                Some(Err(InboxRefusal::NotOperator(op, r))) => {
+                    assert_eq!(
+                        (op.as_str(), r.event),
+                        ("_instance.result", "instance.op.refused")
+                    );
+                }
+                other => panic!("{role}: {other:?}"),
+            }
         }
-        let Some(Ok((op, args))) = inbox_report(&report("operator", "_instance.result")) else {
+        // An op that is no report is refused for its sender first.
+        assert_eq!(
+            refused("_instance.nope"),
+            ("_instance.nope".to_string(), "instance.op.refused")
+        );
+        let Some(Ok((admitted, args))) = inbox_report(&report("operator", "_instance.result"))
+        else {
             panic!("the operator's report is read");
         };
         assert_eq!(
-            (op, args["handle"].as_str()),
+            (admitted.op(), args["handle"].as_str()),
             (InstanceOp::Result, Some("c1"))
         );
-        assert_eq!(
-            inbox_report(&report("operator", "_instance.nope")).map(|r| r.map(|_| ())),
-            Some(Err(InboxRefusal::Unknown("_instance.nope".into())))
-        );
+        assert!(matches!(
+            inbox_report(&report("operator", "_instance.nope")),
+            Some(Err(InboxRefusal::Unknown(op))) if op == "_instance.nope"
+        ));
         // Ordinary traffic is not a report at all.
         assert!(inbox_report(&report("agent", "review.start")).is_none());
+
+        // And `instance_op` asks it of the caller's own role. End to end the
+        // listener and `a2a_send` refuse a non-operator first, so no request
+        // can show this line missing, and a runtime cannot be built in a unit
+        // test; `Admitted` stops a consumer that skips the question from
+        // compiling, and this pins the one it must ask — with the principal's
+        // role, not one of its choosing.
+        let src = include_str!("instances.rs");
+        let body = src
+            .split("pub(crate) fn instance_op(")
+            .nth(1)
+            .and_then(|rest| rest.split("pub(crate) fn handle_instance_op(").next())
+            .expect("instance_op");
+        assert!(
+            body.contains("admit(principal.role, op)"),
+            "instance_op must admit the caller's own role"
+        );
+    }
+
+    /// The reports this handler consumes are exactly the members the op table
+    /// publishes under `$defs.reserved`: a report added on one side only would
+    /// be served without a schema, or published and never served.
+    #[cfg(feature = "a2a")]
+    #[test]
+    fn the_published_reports_are_the_consumed_ones() {
+        use crate::runtime::surface::INSTANCE_OPS;
+        let published: Vec<&str> = INSTANCE_OPS.iter().map(|m| m.name).collect();
+        let consumed: Vec<&str> = [InstanceOp::Result, InstanceOp::Emit]
+            .iter()
+            .map(|op| op.name())
+            .collect();
+        assert_eq!(published, consumed);
+        for name in published {
+            assert_eq!(InstanceOp::of(name).map(InstanceOp::name), Some(name));
+        }
     }
 
     #[test]

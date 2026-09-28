@@ -44,8 +44,8 @@ mod tasks;
 
 pub use feed::{FeedVis, SharedFeed};
 pub(crate) use listener::{A2aServing, spawn_a2a_listener};
+pub(crate) use send::command_data;
 pub use send::command_op;
-pub(crate) use send::{command_data, command_names_task};
 
 use super::surface::{Active, Declaration, declared_when};
 pub use super::surface::{COMMAND_EXTENSION, command_ops_of};

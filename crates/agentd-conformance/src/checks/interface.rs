@@ -6,9 +6,11 @@
 //! resumes the asker). With the interface OFF the surface refuses and the core
 //! A2A wire still answers — the default-OFF contract, so enabling an
 //! observation plane is always a deliberate act and never a side effect.
+//! And the browser path: CORS admits exactly the listed origins, admission is
+//! not trust, and the public card is readable from any origin.
 
-use std::io::{BufRead, BufReader};
-use std::net::TcpListener;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -39,6 +41,12 @@ pub fn checks() -> Vec<Check> {
             desc: "ask_human gates the task as input-required; a taskId reply resumes the turn",
             run: hitl_roundtrip,
         },
+        Check {
+            id: "interface/cors-exact-origins",
+            category: Category::Interface,
+            desc: "only a listed origin is granted (a2a-version preflighted, the challenge readable); an unlisted one — loopback too — is 403 with no grant; the card is public (ACAO *)",
+            run: cors_exact_origins,
+        },
     ]
 }
 
@@ -48,6 +56,51 @@ fn free_port() -> u16 {
         .local_addr()
         .expect("local_addr")
         .port()
+}
+
+/// One raw HTTP exchange; `(status, headers lowercased, body)`. By hand,
+/// because a browser's request — its `Origin`, its preflight — is the thing
+/// under test.
+fn exchange(
+    addr: &str,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> (u16, Vec<(String, String)>, String) {
+    let mut req = format!("{method} {path} HTTP/1.1\r\nHost: x\r\n");
+    for (k, v) in headers {
+        req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    req.push_str(&format!(
+        "Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    ));
+    let mut s = TcpStream::connect(addr).expect("connect a2a http");
+    s.set_read_timeout(Some(Duration::from_secs(30))).ok();
+    s.write_all(req.as_bytes()).expect("write request");
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw).ok();
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+    let mut lines = head.lines();
+    let code = lines
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    let headers = lines
+        .filter_map(|l| l.split_once(':'))
+        .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+        .collect();
+    (code, headers, body.to_string())
+}
+
+fn header<'h>(headers: &'h [(String, String)], name: &str) -> Option<&'h str> {
+    headers
+        .iter()
+        .find(|(k, _)| k == name)
+        .map(|(_, v)| v.as_str())
 }
 
 fn config(llm: &str, port: u16, feed: bool) -> String {
@@ -228,5 +281,104 @@ fn hitl_roundtrip(h: &Harness) -> Outcome {
             }
             std::thread::sleep(Duration::from_millis(80));
         }
+    })
+}
+
+/// The browser path under the strict policy, on a no-auth loopback daemon that
+/// lists one UI origin: the listed origin is granted and preflighted with
+/// `a2a-version`; its uncredentialed POST is challenged (a browser is never
+/// the implicit operator) with the grant and the challenge exposed; another
+/// loopback port is refused like any foreign site; and the card is readable
+/// from anywhere.
+fn cors_exact_origins(h: &Harness) -> Outcome {
+    const UI: &str = "http://127.0.0.1:4173";
+    let tmp = h.tempdir();
+    let llm = mock_llm(h, &tmp, &json!({"turns": [{"content": "unused"}]}));
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let cfg = config(&llm.uri, port, false).replace(
+        "  listen: ",
+        &format!("  cors:\n    origins: [\"{UI}\"]\n  listen: "),
+    );
+    let cfg = write_file(&tmp, "agentd.yaml", &cfg);
+    let _daemon = h.spawn(&["--config", &cfg]);
+    wait_ready(&addr);
+
+    let preflight = |origin: &str| {
+        exchange(
+            &addr,
+            "OPTIONS",
+            "/",
+            &[
+                ("Origin", origin),
+                ("Access-Control-Request-Method", "POST"),
+                (
+                    "Access-Control-Request-Headers",
+                    "content-type, a2a-version",
+                ),
+            ],
+            "",
+        )
+    };
+    let body = rpc_body(1, "ListTasks", json!({}));
+    let post = |origin: &str| {
+        exchange(
+            &addr,
+            "POST",
+            "/",
+            &[
+                ("Origin", origin),
+                ("Content-Type", "application/json"),
+                ("A2A-Version", "1.0"),
+            ],
+            &body,
+        )
+    };
+
+    let (code, hs, _) = preflight(UI);
+    Outcome::require(
+        code == 204
+            && header(&hs, "access-control-allow-origin") == Some(UI)
+            && header(&hs, "access-control-allow-headers")
+                .is_some_and(|v| v.split(',').any(|h| h.trim() == "a2a-version")),
+        format!("the listed origin's preflight should be granted with a2a-version: {code} {hs:?}"),
+    )
+    .and(|| {
+        let (code, hs, reply) = post(UI);
+        let exposed = header(&hs, "access-control-expose-headers").unwrap_or("");
+        Outcome::require(
+            code == 401
+                && reply.contains("-31401")
+                && header(&hs, "access-control-allow-origin") == Some(UI)
+                && exposed.split(',').any(|h| h.trim() == "www-authenticate"),
+            format!("a listed origin without a credential should get a readable 401 challenge: {code} {hs:?} {reply}"),
+        )
+    })
+    .and(|| {
+        for origin in ["http://127.0.0.1:9999", "https://evil.example", "null"] {
+            for (what, (code, hs, _)) in [("preflight", preflight(origin)), ("POST", post(origin))] {
+                if code != 403 || header(&hs, "access-control-allow-origin").is_some() {
+                    return Outcome::fail(format!(
+                        "an unlisted origin's {what} ({origin}) should be 403 with no grant: {code} {hs:?}"
+                    ));
+                }
+            }
+        }
+        Outcome::pass()
+    })
+    .and(|| {
+        let (code, hs, _) = exchange(
+            &addr,
+            "GET",
+            "/.well-known/agent-card.json",
+            &[("Origin", "https://evil.example")],
+            "",
+        );
+        Outcome::require(
+            code == 200
+                && header(&hs, "access-control-allow-origin") == Some("*")
+                && header(&hs, "access-control-allow-credentials").is_none(),
+            format!("the public card should be readable from any origin, without credentials: {code} {hs:?}"),
+        )
     })
 }

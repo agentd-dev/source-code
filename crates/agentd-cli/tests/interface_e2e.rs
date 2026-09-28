@@ -11,7 +11,7 @@
 
 mod common;
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -413,110 +413,398 @@ fn the_interface_is_gated_off_by_default() {
     std::fs::remove_file(&cfg).ok();
 }
 
-#[test]
-fn a_configured_web_origin_gets_cors_and_others_stay_rejected() {
-    let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
-    let (_daemon, addr, cfg) =
-        spawn_bound(|port| with_origins(&llm.uri, port, "\"https://ui.example\""));
+/// One raw HTTP exchange: `method path` with `headers` and `body`; the status,
+/// the headers (names lowercased) and the body. Written by hand because a
+/// browser's requests — a preflight, a POST with `Origin` — are what is under
+/// test, and no helper should add or drop a header behind the test's back.
+fn exchange(
+    addr: &str,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> (u16, Vec<(String, String)>, String) {
+    use std::io::Read;
+    let mut req = format!("{method} {path} HTTP/1.1\r\nHost: x\r\n");
+    for (k, v) in headers {
+        req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    req.push_str(&format!(
+        "Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    ));
+    let mut s = TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(30))).ok();
+    s.write_all(req.as_bytes()).unwrap();
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw).ok();
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+    let mut lines = head.lines();
+    let code = lines
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    let headers = lines
+        .filter_map(|l| l.split_once(':'))
+        .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+        .collect();
+    (code, headers, body.to_string())
+}
 
-    let send = |req: String| -> (u16, Vec<(String, String)>) {
-        let mut s = TcpStream::connect(&addr).unwrap();
-        s.write_all(req.as_bytes()).unwrap();
-        s.set_read_timeout(Some(Duration::from_secs(5))).ok();
-        let mut reader = BufReader::new(s);
-        let mut status = String::new();
-        reader.read_line(&mut status).unwrap();
-        let code = status
-            .split_whitespace()
-            .nth(1)
-            .and_then(|c| c.parse().ok())
-            .unwrap_or(0);
-        let mut headers = Vec::new();
-        loop {
-            let mut l = String::new();
-            if reader.read_line(&mut l).unwrap_or(0) == 0 {
-                break;
-            }
-            if l.trim().is_empty() {
-                break;
-            }
-            if let Some((k, v)) = l.split_once(':') {
-                headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
-            }
+fn header<'h>(headers: &'h [(String, String)], name: &str) -> Option<&'h str> {
+    headers
+        .iter()
+        .find(|(k, _)| k == name)
+        .map(|(_, v)| v.as_str())
+}
+
+fn varies_on_origin(headers: &[(String, String)]) -> bool {
+    headers.iter().any(|(k, v)| {
+        k == "vary"
+            && v.split(',')
+                .any(|v| v.trim().eq_ignore_ascii_case("origin"))
+    })
+}
+
+const UI_BEARER: &str = "iface-cors-bearer";
+
+/// [`iface_config`] with `a2a.cors.origins: [<origins>]` and `a2a.bearer`.
+fn with_origins_and_bearer(llm: &str, port: u16, origins: &str) -> String {
+    with_origins(llm, port, origins).replace(
+        "  cors:\n",
+        "  bearer: \"{{secret:IFACE_CORS_BEARER}}\"\n  cors:\n",
+    )
+}
+
+fn spawn_daemon_with_bearer(config: &str) -> Daemon {
+    let stderr_path = common::unique_path("iface-daemon", "log");
+    let errf = std::fs::File::create(&stderr_path).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .args(["--config", config])
+        .env("IFACE_CORS_BEARER", UI_BEARER)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(errf))
+        .spawn()
+        .expect("spawn agentd daemon");
+    Daemon { child, stderr_path }
+}
+
+/// The browser path end to end, under the strict origin policy.
+///
+/// A listed origin's preflight is granted with every header a call carries
+/// (`a2a-version` included) and PNA when asked; any other origin — another
+/// loopback port as much as a foreign site, and `Origin: null` — is refused
+/// 403 with no grant and no body. A listed origin's POST is granted, with the
+/// headers a page must read exposed, whether it succeeds (with the bearer)
+/// or is challenged (without one: a browser is never the implicit operator,
+/// and the page has to be able to read why). And a body sent as anything but
+/// JSON is 415, which is what makes every browser call preflighted.
+#[test]
+fn cors_and_content_type() {
+    let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
+    let (_daemon, addr, cfg) = spawn_bound_with(
+        |port| with_origins_and_bearer(&llm.uri, port, "\"https://ui.example\""),
+        spawn_daemon_with_bearer,
+    );
+    let preflight = |origin: &str, pna: bool| {
+        let mut h = vec![
+            ("Origin", origin),
+            ("Access-Control-Request-Method", "POST"),
+            (
+                "Access-Control-Request-Headers",
+                "content-type, authorization, a2a-version",
+            ),
+        ];
+        if pna {
+            h.push(("Access-Control-Request-Private-Network", "true"));
         }
-        (code, headers)
+        exchange(&addr, "OPTIONS", "/", &h, "")
     };
 
     // Preflight from the configured origin → 204 + grant.
-    let (code, headers) = send(
-        "OPTIONS / HTTP/1.1\r\nHost: x\r\nOrigin: https://ui.example\r\nAccess-Control-Request-Method: POST\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
-    );
-    assert_eq!(code, 204);
-    assert!(
-        headers
-            .iter()
-            .any(|(k, v)| k == "access-control-allow-origin" && v == "https://ui.example"),
-        "{headers:?}"
-    );
-    // Every request the TS clients make carries `a2a-version` (a missing one
-    // means 0.3 to a 1.0 server), and it is not a CORS-safelisted header: a
-    // preflight that does not allow it fails every browser call.
-    assert!(
-        headers
-            .iter()
-            .any(|(k, v)| k == "access-control-allow-headers"
-                && v.split(',').any(|h| h.trim() == "a2a-version")),
-        "the preflight must allow a2a-version: {headers:?}"
-    );
-    // Private Network Access: a page on a PUBLIC origin reaching a daemon on
-    // loopback is the shape Chrome gates. It sends this header on the preflight
-    // and drops the real request unless the answer grants it — so a hosted UI
-    // at code.agentd.dev fails with an unexplained CORS error without this.
-    let (code, headers) = send(
-        "OPTIONS / HTTP/1.1\r\nHost: x\r\nOrigin: https://ui.example\r\nAccess-Control-Request-Method: POST\r\nAccess-Control-Request-Private-Network: true\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
-    );
-    assert_eq!(code, 204);
-    assert!(
-        headers
-            .iter()
-            .any(|(k, v)| k == "access-control-allow-private-network" && v == "true"),
-        "the PNA grant must be present when asked for: {headers:?}"
-    );
-    // It is NOT volunteered when the browser did not ask — a header nobody
-    // requested is noise, and this one names a capability.
-    let (_, headers) = send(
-        "OPTIONS / HTTP/1.1\r\nHost: x\r\nOrigin: https://ui.example\r\nAccess-Control-Request-Method: POST\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
-    );
-    assert!(
-        !headers
-            .iter()
-            .any(|(k, _)| k == "access-control-allow-private-network"),
-        "{headers:?}"
-    );
-    // And an origin that is NOT configured gets nothing, PNA request or not:
-    // the grant rides the existing allow-list rather than widening it.
-    let (code, _) = send(
-        "OPTIONS / HTTP/1.1\r\nHost: x\r\nOrigin: https://evil.example\r\nAccess-Control-Request-Method: POST\r\nAccess-Control-Request-Private-Network: true\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
-    );
-    assert_eq!(code, 403, "an unconfigured origin must be refused");
-
-    // A POST from it is admitted past the origin gate — and then asked to
-    // sign in, because a browser is never the implicit operator, even of a
-    // no-auth loopback daemon. The 401 still carries the grant, so the UI can
-    // read why it was refused.
-    let body = common::rpc_body(1, "ListTasks", json!({}));
-    let reply = common::a2a_post(&addr, &body, &[("Origin", "https://ui.example")]);
-    assert_eq!(reply.status, 401, "{reply:?}");
-    assert_eq!(reply.json()["error"]["code"], -31401);
+    let (code, headers, _) = preflight("https://ui.example", false);
+    assert_eq!(code, 204, "{headers:?}");
     assert_eq!(
-        reply.header("access-control-allow-origin"),
+        header(&headers, "access-control-allow-origin"),
         Some("https://ui.example")
     );
-    // Any other cross-site origin: still the rebind 403.
-    let reply = common::a2a_post(&addr, &body, &[("Origin", "https://evil.example")]);
-    assert_eq!(reply.status, 403);
+    assert!(varies_on_origin(&headers), "{headers:?}");
+    // Every request the TS clients make carries `a2a-version`, and it is not
+    // a CORS-safelisted header: a preflight that does not allow it fails
+    // every browser call.
+    let allowed: Vec<&str> = header(&headers, "access-control-allow-headers")
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .collect();
+    for h in [
+        "content-type",
+        "authorization",
+        "last-event-id",
+        "a2a-extensions",
+        "a2a-version",
+    ] {
+        assert!(
+            allowed.contains(&h),
+            "the preflight must allow {h}: {headers:?}"
+        );
+    }
+    // Exposure is read from the actual response; on a preflight it is noise.
+    assert_eq!(header(&headers, "access-control-expose-headers"), None);
+    // PNA is not volunteered…
+    assert_eq!(
+        header(&headers, "access-control-allow-private-network"),
+        None
+    );
+    // …but a page on a PUBLIC origin reaching a daemon on loopback is the
+    // shape Chrome gates, so it is granted when asked for.
+    let (code, headers, _) = preflight("https://ui.example", true);
+    assert_eq!(code, 204);
+    assert_eq!(
+        header(&headers, "access-control-allow-private-network"),
+        Some("true")
+    );
+
+    // Anything unlisted is refused, PNA request or not — loopback included:
+    // no local port is trusted for being local.
+    for origin in [
+        "https://evil.example",
+        "http://127.0.0.1:4173",
+        "http://localhost:4173",
+        "null",
+    ] {
+        let (code, headers, body) = preflight(origin, true);
+        assert_eq!(code, 403, "{origin}: {headers:?}");
+        assert_eq!(
+            header(&headers, "access-control-allow-origin"),
+            None,
+            "{origin}"
+        );
+        assert_eq!(
+            header(&headers, "access-control-allow-private-network"),
+            None,
+            "{origin}"
+        );
+        assert!(varies_on_origin(&headers), "{origin}: {headers:?}");
+        assert!(body.is_empty(), "{origin}: {body:?}");
+    }
+
+    let body = common::rpc_body(1, "ListTasks", json!({}));
+    let post = |origin: &str, bearer: bool, ct: &str| {
+        let auth = format!("Bearer {UI_BEARER}");
+        let mut h = vec![
+            ("Origin", origin),
+            ("Content-Type", ct),
+            ("A2A-Version", common::A2A_VERSION),
+        ];
+        if bearer {
+            h.push(("Authorization", auth.as_str()));
+        }
+        exchange(&addr, "POST", "/", &h, &body)
+    };
+    let exposed = |headers: &[(String, String)]| -> Vec<String> {
+        header(headers, "access-control-expose-headers")
+            .unwrap_or("")
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .collect()
+    };
+
+    // The listed origin with the bearer: served, and granted.
+    let (code, headers, reply) = post("https://ui.example", true, "application/json");
+    assert_eq!(code, 200, "{reply}");
+    let v: Value = serde_json::from_str(&reply).unwrap();
+    assert!(v.get("error").is_none(), "{v}");
+    assert_eq!(
+        header(&headers, "access-control-allow-origin"),
+        Some("https://ui.example")
+    );
+    assert!(varies_on_origin(&headers), "{headers:?}");
+    for h in ["a2a-extensions", "retry-after", "www-authenticate"] {
+        assert!(exposed(&headers).iter().any(|e| e == h), "{h}: {headers:?}");
+    }
+
+    // Without a credential: challenged — and the page can read the challenge.
+    let (code, headers, reply) = post("https://ui.example", false, "application/json");
+    assert_eq!(code, 401, "{reply}");
+    let v: Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(v["error"]["code"], -31401, "{v}");
+    assert!(
+        header(&headers, "www-authenticate").is_some(),
+        "{headers:?}"
+    );
+    assert_eq!(
+        header(&headers, "access-control-allow-origin"),
+        Some("https://ui.example")
+    );
+    for h in ["a2a-extensions", "retry-after", "www-authenticate"] {
+        assert!(exposed(&headers).iter().any(|e| e == h), "{h}: {headers:?}");
+    }
+
+    // Any other origin: the rebind 403, bearer or not — nothing granted,
+    // nothing said.
+    for origin in ["https://evil.example", "http://127.0.0.1:4173", "null"] {
+        let (code, headers, reply) = post(origin, true, "application/json");
+        assert_eq!(code, 403, "{origin}: {reply}");
+        assert_eq!(
+            header(&headers, "access-control-allow-origin"),
+            None,
+            "{origin}"
+        );
+        assert_eq!(header(&headers, "access-control-expose-headers"), None);
+        assert!(varies_on_origin(&headers), "{origin}: {headers:?}");
+        assert!(reply.is_empty(), "{origin}: {reply:?}");
+    }
+
+    // The content type: `text/plain` is what a page may POST cross-origin
+    // without a preflight, so it is refused — before anything is parsed.
+    for ct in ["text/plain", "application/x-www-form-urlencoded"] {
+        let (code, _, reply) = post("https://ui.example", true, ct);
+        assert_eq!(code, 415, "{ct}: {reply}");
+        assert!(reply.is_empty(), "{ct}: {reply:?}");
+    }
 
     std::fs::remove_file(&cfg).ok();
+}
+
+/// The card at the spec's one discovery path.
+///
+/// Read anonymously from a bearer-protected daemon, it is a 200 whose body is
+/// an `AgentCard`, with an ETag and `Cache-Control`; asking again with that
+/// ETag is a 304. The tag follows the card, not the daemon: a reload that
+/// changes what the card says changes it, a reload that only changes the
+/// loaded workflows (which the public card does not list) leaves it alone.
+/// And the pre-1.0 path is simply not there.
+#[test]
+#[cfg(feature = "hot-reload")]
+fn well_known_card() {
+    let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
+    let wf_dir = common::unique_path("iface-card-workflows", "d");
+    std::fs::create_dir_all(&wf_dir).unwrap();
+    let wf = |name: &str| {
+        format!(
+            "name: {name}\nsteps:\n  s: {{ kind: manual }}\n  \
+             f: {{ kind: finish, depends_on: [s], status: completed }}\n"
+        )
+    };
+    std::fs::write(format!("{wf_dir}/a.yaml"), wf("first")).unwrap();
+    let config = |port: u16, description: &str| {
+        with_origins_and_bearer(&llm.uri, port, "\"https://ui.example\"").replace(
+            "  name: iface-e2e\n",
+            &format!("  name: iface-e2e\n  description: {description}\n"),
+        ) + &format!("workflows:\n  - dir: {{ path: \"{wf_dir}\", glob: \"*.yaml\" }}\n")
+    };
+    let (daemon, addr, cfg) =
+        spawn_bound_with(|port| config(port, "Before."), spawn_daemon_with_bearer);
+    let port: u16 = addr.rsplit(':').next().unwrap().parse().unwrap();
+    let path = "/.well-known/agent-card.json";
+    let get = |extra: &[(&str, &str)]| exchange(&addr, "GET", path, extra, "");
+
+    let (code, headers, body) = get(&[("Accept", "application/json")]);
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(header(&headers, "content-type"), Some("application/json"));
+    assert_eq!(
+        header(&headers, "cache-control"),
+        Some("public, max-age=60")
+    );
+    let card: Value = serde_json::from_str(&body).unwrap();
+    // The spec's required AgentCard fields, as the SDK's type names them.
+    assert_eq!(card["name"], "iface-e2e", "{card}");
+    assert_eq!(card["description"], "Before.", "{card}");
+    for field in [
+        "version",
+        "capabilities",
+        "defaultInputModes",
+        "defaultOutputModes",
+        "skills",
+    ] {
+        assert!(card.get(field).is_some(), "{field}: {card}");
+    }
+    let iface = &card["supportedInterfaces"][0];
+    assert_eq!(iface["protocolBinding"], "JSONRPC", "{card}");
+    assert_eq!(iface["protocolVersion"], "1.0", "{card}");
+    assert!(
+        iface["url"].as_str().is_some_and(|u| u.starts_with("http")),
+        "{card}"
+    );
+    let etag = header(&headers, "etag").expect("an ETag").to_string();
+
+    // Same card, same tag; the tag asked back is a 304 with no body.
+    let (code, again, _) = get(&[]);
+    assert_eq!(code, 200);
+    assert_eq!(header(&again, "etag"), Some(etag.as_str()));
+    let (code, headers, body) = get(&[("If-None-Match", &etag)]);
+    assert_eq!(code, 304, "{body}");
+    assert!(body.is_empty(), "{body:?}");
+    assert_eq!(header(&headers, "etag"), Some(etag.as_str()));
+    // HEAD answers as GET does, without the body.
+    let (code, headers, body) = exchange(&addr, "HEAD", path, &[], "");
+    assert_eq!(code, 200);
+    assert_eq!(header(&headers, "etag"), Some(etag.as_str()));
+    assert!(body.is_empty(), "{body:?}");
+
+    let reloads = || {
+        std::fs::read_to_string(&daemon.stderr_path)
+            .unwrap_or_default()
+            .matches("\"event\":\"config.reloaded\"")
+            .count()
+    };
+    let reload = || {
+        let before = reloads();
+        unsafe { libc::kill(daemon.child.id() as i32, libc::SIGHUP) };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while reloads() == before {
+            assert!(
+                Instant::now() < deadline,
+                "the daemon never reloaded:\n{}",
+                std::fs::read_to_string(&daemon.stderr_path).unwrap_or_default()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+
+    // A workflow-only reload: the public card does not list workflows, so
+    // the card — and its tag — are unchanged.
+    std::fs::write(format!("{wf_dir}/b.yaml"), wf("second")).unwrap();
+    reload();
+    let log = std::fs::read_to_string(&daemon.stderr_path).unwrap_or_default();
+    assert!(
+        log.lines()
+            .any(|l| l.contains("\"event\":\"workflow.loaded\"")
+                && l.contains("\"name\":\"second\""))
+            && log
+                .lines()
+                .any(|l| l.contains("\"event\":\"config.reloaded\"")
+                    && l.contains("\"changed\":[\"workflows\"]")),
+        "the reload was not a workflow-only one that loaded the new workflow, so it proves nothing:\n{log}"
+    );
+    let (code, headers, _) = get(&[]);
+    assert_eq!(code, 200);
+    assert_eq!(
+        header(&headers, "etag"),
+        Some(etag.as_str()),
+        "a workflow reload changed the public card"
+    );
+
+    // A reload that changes what the card says changes the tag, and the old
+    // tag is no longer a 304.
+    std::fs::write(&cfg, config(port, "After.")).unwrap();
+    reload();
+    let (code, headers, body) = get(&[("If-None-Match", &etag)]);
+    assert_eq!(code, 200, "the old tag still matched");
+    let card: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(card["description"], "After.", "{card}");
+    assert_ne!(header(&headers, "etag"), Some(etag.as_str()));
+
+    // The 0.2.x path is gone.
+    let (code, _, _) = exchange(&addr, "GET", "/.well-known/agent.json", &[], "");
+    assert_eq!(code, 404);
+
+    std::fs::remove_file(&cfg).ok();
+    std::fs::remove_dir_all(&wf_dir).ok();
 }
 
 /// The pairing exchange is gone, under every name it answered to.
@@ -875,33 +1163,20 @@ fn a_reload_revokes_a_web_origin_and_the_grant_stops() {
         spawn_bound(|port| with_origins(&llm.uri, port, "\"https://ui.example\""));
 
     let preflight = |origin: &str| -> (u16, bool) {
-        let mut s = TcpStream::connect(&addr).unwrap();
-        s.write_all(format!(
-            "OPTIONS / HTTP/1.1\r\nHost: x\r\nOrigin: {origin}\r\nAccess-Control-Request-Method: POST\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-        ).as_bytes()).unwrap();
-        s.set_read_timeout(Some(Duration::from_secs(5))).ok();
-        let mut reader = BufReader::new(s);
-        let mut status = String::new();
-        reader.read_line(&mut status).unwrap();
-        let code = status
-            .split_whitespace()
-            .nth(1)
-            .and_then(|c| c.parse().ok())
-            .unwrap_or(0);
-        let mut granted = false;
-        loop {
-            let mut l = String::new();
-            if reader.read_line(&mut l).unwrap_or(0) == 0 || l.trim().is_empty() {
-                break;
-            }
-            if let Some((k, v)) = l.split_once(':')
-                && k.trim().eq_ignore_ascii_case("access-control-allow-origin")
-                && v.trim() == origin
-            {
-                granted = true;
-            }
-        }
-        (code, granted)
+        let (code, headers, _) = exchange(
+            &addr,
+            "OPTIONS",
+            "/",
+            &[
+                ("Origin", origin),
+                ("Access-Control-Request-Method", "POST"),
+            ],
+            "",
+        );
+        (
+            code,
+            header(&headers, "access-control-allow-origin") == Some(origin),
+        )
     };
 
     let (code, granted) = preflight("https://ui.example");

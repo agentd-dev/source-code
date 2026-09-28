@@ -1902,7 +1902,20 @@ impl Runtime {
         name: &str,
         args: Value,
     ) {
-        match self.execute_tool(caller, name, args) {
+        let outcome = self.execute_tool(caller, name, args);
+        self.step_tool_outcome(run_id, step_id, name, outcome);
+    }
+
+    /// Deliver a step's tool outcome: finish the step, suspend it on the wait
+    /// the tool parked on, or leave it to the executor thread.
+    pub(crate) fn step_tool_outcome(
+        &mut self,
+        run_id: &str,
+        step_id: &str,
+        name: &str,
+        outcome: ToolOutcome,
+    ) {
+        match outcome {
             ToolOutcome::Ready(v, is_error) => {
                 let err = is_error.then(|| match &v {
                     Value::String(s) => s.clone(),
@@ -1935,10 +1948,31 @@ impl Runtime {
                     } => {
                         json!({"kind": "await", "condition": condition, "deadline_ms": deadline_ms})
                     }
+                    // A gate's ENFORCEMENT travels in the durable record, as
+                    // the `human` node's does: a restart rebuilds the pending
+                    // ask from it, so what is left out here is dropped then —
+                    // a policy gate would lose its addressee, its answer
+                    // shape, and the call an approval must run.
                     PendingKind::Human {
-                        task, deadline_ms, ..
+                        task,
+                        deadline_ms,
+                        schema,
+                        addressee,
+                        policy,
+                        ..
                     } => {
-                        json!({"kind": "human", "task": task, "deadline_ms": deadline_ms})
+                        let mut w =
+                            json!({"kind": "human", "task": task, "deadline_ms": deadline_ms});
+                        if let Some(schema) = schema {
+                            w["schema"] = schema.clone();
+                        }
+                        if let Some(to) = addressee {
+                            w["to"] = to.to_json();
+                        }
+                        if let Some(call) = policy {
+                            w["policy"] = super::human::policy_call_json(call);
+                        }
+                        w
                     }
                 };
                 self.runs
@@ -1960,6 +1994,34 @@ impl Runtime {
                     .insert(format!("{run_id}/{step_id}"), std::time::Instant::now());
             }
         }
+    }
+
+    /// A step suspended on a policy gate whose call was just approved: put it
+    /// back to running — the call now runs as the step's own work, and a step
+    /// left suspended on an answered gate would be re-armed, or stranded, by
+    /// a restart — and return the caller the call runs as. `None` when the
+    /// run or step is gone.
+    pub(crate) fn resume_gated_step(&mut self, run_id: &str, step_id: &str) -> Option<ToolCaller> {
+        let run = self.runs.get_mut(run_id)?;
+        let attempt = {
+            let st = run.steps.get_mut(step_id)?;
+            st.status = StepStatus::Running;
+            st.wait = None;
+            st.attempt
+        };
+        if !run.status.is_terminal() {
+            run.status = RunStatus::Running;
+        }
+        run.touch();
+        Some(ToolCaller {
+            run: Some(run_id.to_string()),
+            step: Some(step_id.to_string()),
+            req: attempt as u64,
+            principal: run.principal.clone(),
+            ctx: run.conversation.clone(),
+            msg_depth: run.msg_depth,
+            ..Default::default()
+        })
     }
 
     pub(crate) fn step_turn_pub(

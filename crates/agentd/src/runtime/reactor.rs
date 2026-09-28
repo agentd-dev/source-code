@@ -96,7 +96,26 @@ pub enum PendingKind {
         /// reason the schema is: a gate that names a decider and then accepts
         /// anyone records something that did not happen.
         addressee: Option<crate::a2a::principals::Addressee>,
+        /// Set when this gate is a `security.policies` `action: ask` verdict:
+        /// the call it is holding. The answer is then a DECISION about that
+        /// call, not a result for it — an approval runs it and the asker gets
+        /// its real result, a refusal is an error. Without this the approver's
+        /// words came back as the tool's result, and a tool that never ran
+        /// read as one that had.
+        policy: Option<PolicyCall>,
     },
+}
+
+/// The tool call a `security.policies` `action: ask` gate holds (see
+/// [`PendingKind::Human`]).
+#[derive(Debug, Clone)]
+pub struct PolicyCall {
+    pub tool: String,
+    pub args: Value,
+    /// The index of the rule that asked, for every message about it.
+    pub rule: usize,
+    /// What the rule said an unanswered gate becomes.
+    pub on_timeout: crate::config::v2::PolicyAction,
 }
 
 /// A queued root/conversation turn, waiting for a worker slot and for its

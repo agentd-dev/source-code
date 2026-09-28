@@ -260,14 +260,18 @@ pub struct Agent {
     pub tools: AgentTools,
     pub max_parallel_turns: Option<u32>,
     pub conversation_budget: Option<Budget>,
-    /// What `ask_human` does when NO human channel can answer — the interface
-    /// is disabled — and, for `auto`, when a gate times out unanswered
-    /// `fail` (default; the ask errors immediately), `wait` (park until the
-    /// ask timeout), or `auto` (an LLM judge answers on the operator's behalf,
-    /// conservatively, marked as auto).
+    /// What `ask_human` does when it does not gate — no A2A listener, or an
+    /// unowned ask under `ask_human_unowned: fallback` — and, for `auto`,
+    /// when a gate that names no addressee times out unanswered: `fail`
+    /// (default; the ask errors immediately), `wait` (park until the ask
+    /// timeout), or `auto` (an LLM judge answers on the operator's behalf,
+    /// conservatively, marked as auto). An ADDRESSED gate — every
+    /// `security.policies` gate is one — is never judged: it times out.
     pub ask_human_fallback: AskHumanFallback,
-    /// What an `ask_human` that no caller OWNS does — one raised by a
-    /// schedule, a webhook or a stream rather than by a task somebody sent.
+    /// What an ask that no caller OWNS does — an `ask_human`, or a
+    /// `security.policies` gate, raised by a schedule, a webhook, a stream or
+    /// a subagent rather than by a task somebody sent. A subagent is unowned
+    /// even when the turn that spawned it is a caller's: it is its own unit.
     ///
     /// An owned ask always has somebody to answer it: the caller who owns the
     /// task. An unowned one has nobody unless the operator is willing to be
@@ -380,8 +384,9 @@ pub enum AskHumanFallback {
     #[default]
     #[serde(alias = "finish", alias = "stop")]
     Fail,
-    /// An LLM judge answers on the operator's behalf (also fires when an
-    /// interface-served gate times out unanswered). `UNDECIDED` ⇒ fail.
+    /// An LLM judge answers on the operator's behalf (also fires when a gate
+    /// that names no addressee times out unanswered; an addressed gate, which
+    /// every `security.policies` gate is, just times out). `UNDECIDED` ⇒ fail.
     Auto,
 }
 
@@ -389,7 +394,9 @@ pub enum AskHumanFallback {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum AskHumanUnowned {
-    /// Open a gate on the A2A listener that an operator answers. Needs
+    /// Open a gate task on the A2A listener, owned by the principal the
+    /// asking unit works for or, when it works for nobody, the operator — and
+    /// answered by that owner (or by the addressee the gate names). Needs
     /// `a2a.listen`: without a listener nobody could ever answer it.
     Gate,
     /// Apply `ask_human_fallback`, exactly as when no channel exists.

@@ -27,6 +27,11 @@
 //!
 //! A request that fails to authenticate after presenting something counts
 //! against its source ([`limits`]); one that presented nothing never does.
+//! Past the limit, the source's bearers are refused 429 without being
+//! checked, so a guesser's rate is the limiter's refill rate — while the
+//! implicit operator and an `any` rule, which present nothing, are never
+//! refused by it. Refusals of callers nobody vouched for are logged once per
+//! source per window rather than once per request ([`limits::DenialLog`]).
 //!
 //! ## Two vocabularies on one endpoint
 //!
@@ -124,10 +129,11 @@ struct App {
     protocol: Router,
     bridge: Arc<A2aBridge>,
     auth: Auth,
-    /// Failed authentications per source: consulted only for a request that
-    /// is already failing, so it slows a guesser without ever refusing a
-    /// caller that authenticates.
+    /// Failed authentications per source. Once a source is over, its bearers
+    /// are refused unchecked; a request presenting nothing never is.
     failures: limits::SourceLimiter,
+    /// The refusal lines written, bounded per source and overall.
+    denials: limits::DenialLog,
     /// Per-principal admission, from each rule's declared rate.
     rates: limits::PrincipalRates,
     /// The browser CORS allowlist, shared so a reload can revise it.
@@ -184,6 +190,7 @@ pub fn spawn(
         bridge: Arc::clone(&bridge),
         auth: opts.auth,
         failures: limits::SourceLimiter::auth_failures(),
+        denials: limits::DenialLog::listener(),
         rates: limits::PrincipalRates::default(),
         cors_origins: opts.cors_origins,
         stream_deadline: opts.stream_deadline,

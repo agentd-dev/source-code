@@ -202,54 +202,83 @@ fn a_gate_that_would_ask_forever_is_refused() {
     assert!(log.contains("ask again forever"), "{log}");
 }
 
-/// An `ask` rule that names nobody is addressed to the operator. The gate
-/// lands on the task of the very caller whose call is being judged, and
-/// whoever holds a task may answer an unaddressed gate on it — so without the
-/// default the requesting peer would approve its own gated call. It is told
-/// why and the gate stays open; the operator's answer is what closes it.
+/// A daemon whose model calls `memory.set` (gated by an `ask` rule that names
+/// nobody), then reads the key back with `memory.get` and says what it found:
+/// `PRESENT` or `MISSING`. The final answer is how a test sees whether the
+/// gated call actually RAN — a gate that returned the approver's words in its
+/// place would leave the key missing while the turn read as a success.
 #[cfg(feature = "a2a")]
-#[test]
-fn a_policy_gate_is_answered_by_an_operator_not_by_the_caller() {
-    use common::{SendMessage, rpc_as};
-    use serde_json::{Value, json};
-    use std::time::{Duration, Instant};
+struct GatedDaemon {
+    _llm: std::process::Child,
+    daemon: std::process::Child,
+    addr: String,
+    log_path: String,
+    dir: String,
+    playbook: String,
+}
 
-    const OPERATOR: &str = "policy-e2e-operator-bearer";
-    const ALICE: &str = "policy-e2e-alice-bearer";
-
-    struct Proc(std::process::Child);
-    impl Drop for Proc {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
+#[cfg(feature = "a2a")]
+impl Drop for GatedDaemon {
+    fn drop(&mut self) {
+        for c in [&mut self._llm, &mut self.daemon] {
+            let _ = c.kill();
+            let _ = c.wait();
         }
+        let _ = std::fs::remove_dir_all(&self.dir);
+        let _ = std::fs::remove_file(&self.playbook);
+    }
+}
+
+#[cfg(feature = "a2a")]
+const POLICY_OPERATOR: &str = "policy-e2e-operator-bearer";
+#[cfg(feature = "a2a")]
+const POLICY_ALICE: &str = "policy-e2e-alice-bearer";
+
+#[cfg(feature = "a2a")]
+impl GatedDaemon {
+    fn start() -> GatedDaemon {
+        GatedDaemon::start_with("")
     }
 
-    let pb = common::unique_path("pol-playbook", "json");
-    std::fs::write(
-        &pb,
-        json!({"turns": [
-            {"tool_calls": [{"name": "memory.set", "arguments": {"key": "k", "value": 1}}]},
-            {"content": "Saved."}
-        ]})
-        .to_string(),
-    )
-    .unwrap();
-    let llm_addr = common::unique_path("pol-mock-llm", "addr");
-    let _llm = Proc(
-        Command::new(env!("CARGO_BIN_EXE_agentd"))
-            .args(["--internal-mock-llm", &llm_addr, &format!("file:{pb}")])
+    /// [`GatedDaemon::start`], with `extra` YAML appended to the config.
+    fn start_with(extra: &str) -> GatedDaemon {
+        use serde_json::json;
+        use std::time::Duration;
+
+        let playbook = common::unique_path("pol-playbook", "json");
+        std::fs::write(
+            &playbook,
+            json!({
+                "turns": [
+                    {"tool_calls": [{"name": "memory.set", "arguments": {"key": "k", "value": 1}}]},
+                    {"tool_calls": [{"name": "memory.get", "arguments": {"key": "k"}}]},
+                    {"content": "unreachable"}
+                ],
+                "match": [
+                    {"when_contains": "found\\\":true", "content": "PRESENT"},
+                    {"when_contains": "found\\\":false", "content": "MISSING"}
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let llm_addr = common::unique_path("pol-mock-llm", "addr");
+        let llm_child = Command::new(env!("CARGO_BIN_EXE_agentd"))
+            .args([
+                "--internal-mock-llm",
+                &llm_addr,
+                &format!("file:{playbook}"),
+            ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .expect("spawn mock llm"),
-    );
-    let llm = format!("http://{}", common::read_addr_file(&llm_addr));
+            .expect("spawn mock llm");
+        let llm = format!("http://{}", common::read_addr_file(&llm_addr));
 
-    let dir = common::unique_path("pol-gate", "d");
-    std::fs::create_dir_all(&dir).unwrap();
-    let (daemon, addr, log_path) = (0..5)
-        .find_map(|_| {
+        let dir = common::unique_path("pol-gate", "d");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut llm_child = Some(llm_child);
+        for _ in 0..5 {
             let cfg = format!("{dir}/c.yaml");
             std::fs::write(
                 &cfg,
@@ -267,57 +296,125 @@ fn a_policy_gate_is_answered_by_an_operator_not_by_the_caller() {
                      \x20     match: {{ bearer_ref: \"{{{{secret:AGENTD_POLICY_ALICE}}}}\" }}\n\
                      \x20     role: user\n\
                      security:\n  policies:\n\
-                     \x20   - match: {{ tool: \"memory.set\" }}\n      action: ask\n      question: \"may {{{{caller}}}} write memory?\"\n",
+                     \x20   - match: {{ tool: \"memory.set\" }}\n      action: ask\n      question: \"may {{{{caller}}}} write memory?\"\n\
+                     {extra}",
                     port = common::free_port()
                 ),
             )
             .unwrap();
             let log_path = common::unique_path("pol-gate", "log");
-            let child = Command::new(env!("CARGO_BIN_EXE_agentd"))
+            let mut daemon = Command::new(env!("CARGO_BIN_EXE_agentd"))
                 .args(["--config", &cfg])
-                .env("AGENTD_POLICY_OPERATOR", OPERATOR)
-                .env("AGENTD_POLICY_ALICE", ALICE)
+                .env("AGENTD_POLICY_OPERATOR", POLICY_OPERATOR)
+                .env("AGENTD_POLICY_ALICE", POLICY_ALICE)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(std::fs::File::create(&log_path).unwrap())
                 .spawn()
                 .expect("spawn agentd");
-            let daemon = Proc(child);
-            common::try_a2a_bound(&log_path, Duration::from_secs(15))
-                .map(|addr| (daemon, addr, log_path))
-        })
-        .expect("the daemon never bound an A2A listener (5 attempts)");
-    let log = || std::fs::read_to_string(&log_path).unwrap_or_default();
-    let state_of = |id: &str| -> Value {
-        rpc_as(&addr, ALICE, 9, "GetTask", json!({"id": id}))["result"]["status"]["state"].clone()
-    };
-    let wait_state = |id: &str, want: &str| {
+            match common::try_a2a_bound(&log_path, Duration::from_secs(15)) {
+                Some(addr) => {
+                    return GatedDaemon {
+                        _llm: llm_child.take().unwrap(),
+                        daemon,
+                        addr,
+                        log_path,
+                        dir,
+                        playbook,
+                    };
+                }
+                None => {
+                    let _ = daemon.kill();
+                    let _ = daemon.wait();
+                }
+            }
+        }
+        panic!("the daemon never bound an A2A listener (5 attempts)");
+    }
+
+    fn log(&self) -> String {
+        std::fs::read_to_string(&self.log_path).unwrap_or_default()
+    }
+
+    fn task(&self, id: &str) -> serde_json::Value {
+        common::rpc_as(
+            &self.addr,
+            POLICY_ALICE,
+            9,
+            "GetTask",
+            serde_json::json!({"id": id}),
+        )["result"]
+            .clone()
+    }
+
+    fn wait_state(&self, id: &str, want: &str) -> serde_json::Value {
+        use std::time::{Duration, Instant};
         let deadline = Instant::now() + Duration::from_secs(15);
-        while state_of(id) != want {
-            assert!(Instant::now() < deadline, "never reached {want}\n{}", log());
+        loop {
+            let t = self.task(id);
+            if t["status"]["state"] == want {
+                return t;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "never reached {want}: {t}\n{}",
+                self.log()
+            );
             std::thread::sleep(Duration::from_millis(80));
         }
-    };
+    }
 
-    // Alice's message makes the model call the gated tool: her task gates.
-    let sent = SendMessage::text("save k")
-        .bearer(ALICE)
-        .return_immediately()
-        .result(&addr);
-    let task = sent["task"]["id"].as_str().expect("task id").to_string();
-    wait_state(&task, "TASK_STATE_INPUT_REQUIRED");
+    /// Alice's message makes the model call the gated tool: her task gates.
+    fn gate(&self) -> String {
+        let sent = common::SendMessage::text("save k")
+            .bearer(POLICY_ALICE)
+            .return_immediately()
+            .result(&self.addr);
+        let task = sent["task"]["id"].as_str().expect("task id").to_string();
+        self.wait_state(&task, "TASK_STATE_INPUT_REQUIRED");
+        task
+    }
+
+    fn answer(&self, task: &str, bearer: &str, text: &str) -> serde_json::Value {
+        common::SendMessage::text(text)
+            .bearer(bearer)
+            .task(task)
+            .return_immediately()
+            .post(&self.addr)
+    }
+}
+
+/// The artifact text a finished task carries.
+#[cfg(feature = "a2a")]
+fn said(task: &serde_json::Value) -> String {
+    task["artifacts"][0]["parts"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// An `ask` rule that names nobody is addressed to the operator. The gate
+/// lands on the task of the very caller whose call is being judged, and
+/// whoever holds a task may answer an unaddressed gate on it — so without the
+/// default the requesting peer would approve its own gated call. It is told
+/// why and the gate stays open; the operator's answer is what closes it.
+///
+/// And the answer is a DECISION about the call, in a declared shape: "yes"
+/// is asked again rather than guessed at, and `approve` runs the call — the
+/// model reads back the key the gated `memory.set` wrote.
+#[cfg(feature = "a2a")]
+#[test]
+fn a_policy_gate_is_answered_by_an_operator_not_by_the_caller() {
+    let d = GatedDaemon::start();
+    let task = d.gate();
 
     // Alice holds the task, and still cannot approve her own gated call.
-    let own = SendMessage::text("yes")
-        .bearer(ALICE)
-        .task(&task)
-        .return_immediately()
-        .post(&addr);
+    let own = d.answer(&task, POLICY_ALICE, "approve");
     assert_eq!(
         own["error"]["code"],
         -32602,
         "the caller being judged must not approve its own call: {own}\n{}",
-        log()
+        d.log()
     );
     assert!(
         own["error"]["message"]
@@ -326,30 +423,121 @@ fn a_policy_gate_is_answered_by_an_operator_not_by_the_caller() {
             .contains("role operator"),
         "and is told whose decision it is: {own}"
     );
+    let open = d.task(&task);
     assert_eq!(
-        state_of(&task),
-        "TASK_STATE_INPUT_REQUIRED",
+        open["status"]["state"], "TASK_STATE_INPUT_REQUIRED",
         "the gate stays open"
     );
+    assert!(
+        open["status"]["message"].to_string().contains("approve"),
+        "the question says how to answer: {open}"
+    );
 
-    // The operator's answer closes it, as the addressee — not as an override.
-    let op = SendMessage::text("yes")
-        .bearer(OPERATOR)
-        .task(&task)
-        .return_immediately()
-        .post(&addr);
+    // An answer that is not a decision is asked again, not read as one.
+    let vague = d.answer(&task, POLICY_OPERATOR, "yes");
+    assert!(vague.get("error").is_none(), "{vague}");
+    let reasked = d.task(&task);
+    assert_eq!(
+        reasked["status"]["state"], "TASK_STATE_INPUT_REQUIRED",
+        "{reasked}"
+    );
+    assert!(
+        reasked["status"]["message"]
+            .to_string()
+            .contains("previous answer rejected"),
+        "{reasked}"
+    );
+
+    // The operator's approval closes it, as the addressee — not as an
+    // override — and the call RUNS: the model finds the key it wrote.
+    let op = d.answer(&task, POLICY_OPERATOR, "approve");
     assert!(op.get("error").is_none(), "the operator answers: {op}");
-    wait_state(&task, "TASK_STATE_COMPLETED");
-    let log = log();
+    let done = d.wait_state(&task, "TASK_STATE_COMPLETED");
+    assert_eq!(
+        said(&done),
+        "PRESENT",
+        "the approved call never ran: {done}\n{}",
+        d.log()
+    );
+    let log = d.log();
     assert!(
         log.contains("\"event\":\"human.answer.not_addressed\""),
         "{log}"
     );
-    assert!(log.contains("\"event\":\"human.answered\""), "{log}");
+    assert!(log.contains("\"event\":\"tool.policy.decided\""), "{log}");
     assert!(!log.contains("operator_override"), "{log}");
-    drop(daemon);
-    let _ = std::fs::remove_dir_all(&dir);
-    let _ = std::fs::remove_file(&pb);
+}
+
+/// A workflow step's gated call runs on approval too — as the step's own
+/// work, so the steps after it see what it did. The step is suspended on the
+/// gate, and it is the approval, not the approver's words, that finishes it.
+#[cfg(feature = "a2a")]
+#[test]
+fn an_approved_policy_gate_runs_a_workflow_steps_call() {
+    use serde_json::json;
+    let d = GatedDaemon::start_with(
+        "workflows:\n\
+         \x20 - name: w\n    steps:\n\
+         \x20     s: { kind: manual }\n\
+         \x20     m: { kind: memory.set, key: k, value: v, depends_on: [s] }\n\
+         \x20     g: { kind: memory.get, key: k, depends_on: [m] }\n\
+         \x20     f: { kind: finish, depends_on: [g], output: \"found={{ steps.g.output.found }}\" }\n",
+    );
+    let started = common::SendMessage::command("workflow.run", json!({"workflow": "w"}))
+        .bearer(POLICY_OPERATOR)
+        .result(&d.addr);
+    let task = started["task"]["id"].as_str().expect("task id").to_string();
+    let wait = |want: &str| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let t = common::rpc_as(&d.addr, POLICY_OPERATOR, 9, "GetTask", json!({"id": task}))
+                ["result"]
+                .clone();
+            if t["status"]["state"] == want {
+                return t;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "never reached {want}: {t}\n{}",
+                d.log()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(80));
+        }
+    };
+    wait("TASK_STATE_INPUT_REQUIRED");
+    let op = d.answer(&task, POLICY_OPERATOR, "approve");
+    assert!(op.get("error").is_none(), "the operator answers: {op}");
+    let done = wait("TASK_STATE_COMPLETED");
+    assert!(
+        done.to_string().contains("found=true"),
+        "the approved step's call never ran: {done}\n{}",
+        d.log()
+    );
+}
+
+/// A refusal is an error for the call, and the call does not run: the model
+/// is told it was denied and finds nothing written.
+#[cfg(feature = "a2a")]
+#[test]
+fn a_denied_policy_gate_refuses_the_call_it_holds() {
+    let d = GatedDaemon::start();
+    let task = d.gate();
+    let op = d.answer(&task, POLICY_OPERATOR, "deny");
+    assert!(op.get("error").is_none(), "the operator answers: {op}");
+    let done = d.wait_state(&task, "TASK_STATE_COMPLETED");
+    assert_eq!(
+        said(&done),
+        "MISSING",
+        "the denied call ran: {done}\n{}",
+        d.log()
+    );
+    let log = d.log();
+    assert!(
+        log.lines()
+            .any(|l| l.contains("\"event\":\"tool.policy.decided\"")
+                && l.contains("\"approved\":false")),
+        "{log}"
+    );
 }
 
 /// A policy gate nobody answers in time is NOT handed to the `auto` judge,

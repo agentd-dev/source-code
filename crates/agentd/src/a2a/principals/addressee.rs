@@ -102,6 +102,28 @@ impl Addressee {
         }
     }
 
+    /// The declaration [`Addressee::parse`] reads back as this addressee —
+    /// for a durable record that must survive a restart unweakened.
+    pub fn to_json(&self) -> Value {
+        let mut o = serde_json::Map::new();
+        if let Some(id) = &self.id {
+            o.insert("id".into(), Value::String(id.clone()));
+        }
+        if let Some(r) = self.role {
+            o.insert(
+                "role".into(),
+                serde_json::to_value(r).unwrap_or(Value::Null),
+            );
+        }
+        if !self.labels.is_empty() {
+            o.insert(
+                "labels".into(),
+                serde_json::to_value(&self.labels).unwrap_or(Value::Null),
+            );
+        }
+        Value::Object(o)
+    }
+
     fn is_empty(&self) -> bool {
         self.id.is_none() && self.role.is_none() && self.labels.is_empty()
     }
@@ -161,6 +183,21 @@ mod tests {
                 .iter()
                 .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
                 .collect(),
+        }
+    }
+
+    /// A durable gate record stores `to_json` and a restart reads it back with
+    /// `parse`: every form must come back as the addressee it was, or a
+    /// restart would widen the gate.
+    #[test]
+    fn an_addressee_survives_its_own_record() {
+        for decl in [
+            json!("*@finance.example"),
+            json!({"role": "operator"}),
+            json!({"id": "lead", "role": "user", "labels": {"team": "finance", "tier": "a"}}),
+        ] {
+            let a = Addressee::parse(&decl).unwrap();
+            assert_eq!(Addressee::parse(&a.to_json()).unwrap(), a, "{decl}");
         }
     }
 

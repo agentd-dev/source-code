@@ -71,8 +71,19 @@ impl Runtime {
     /// A child asked for an internal tool.
     pub(crate) fn on_tool_request(&mut self, node: NodeId, id: u64, name: &str, args: Value) {
         self.counters.tool_calls += 1;
-        let caller = match self.children.get(node).map(|c| c.kind.clone()) {
-            Some(ChildKind::RootTurn { ctx, msg_depth, .. }) => ToolCaller {
+        let Some(caller) = self.child_caller(node, id) else {
+            return;
+        };
+        self.log.info("tool.request", json!({"node": node.0, "req": id, "tool": name, "caller": caller.label(), "args": if self.log.content_capture() { args.clone() } else { Value::Null }}));
+        let outcome = self.execute_tool(&caller, name, args);
+        self.child_tool_outcome(node, id, name, outcome);
+    }
+
+    /// Who a child's tool request `id` is from, by the kind of child asking;
+    /// `None` when the child is gone.
+    fn child_caller(&self, node: NodeId, id: u64) -> Option<ToolCaller> {
+        Some(match self.children.get(node).map(|c| c.kind.clone())? {
+            ChildKind::RootTurn { ctx, msg_depth, .. } => ToolCaller {
                 node: Some(node),
                 req: id,
                 ctx: Some(ctx.clone()),
@@ -80,7 +91,7 @@ impl Runtime {
                 msg_depth,
                 ..Default::default()
             },
-            Some(ChildKind::StepTurn { run, step, .. }) => ToolCaller {
+            ChildKind::StepTurn { run, step, .. } => ToolCaller {
                 node: Some(node),
                 req: id,
                 run: Some(run.clone()),
@@ -90,22 +101,25 @@ impl Runtime {
                 msg_depth: self.runs.get(&run).map(|r| r.msg_depth).unwrap_or(0),
                 ..Default::default()
             },
-            Some(ChildKind::Subagent { handle }) => ToolCaller {
+            ChildKind::Subagent { handle } => ToolCaller {
                 node: Some(node),
                 req: id,
                 subagent: Some(handle),
                 ..Default::default()
             },
-            Some(ChildKind::Think { ctx, .. }) => ToolCaller {
+            ChildKind::Think { ctx, .. } => ToolCaller {
                 node: Some(node),
                 req: id,
                 ctx,
                 ..Default::default()
             },
-            None => return,
-        };
-        self.log.info("tool.request", json!({"node": node.0, "req": id, "tool": name, "caller": caller.label(), "args": if self.log.content_capture() { args.clone() } else { Value::Null }}));
-        match self.execute_tool(&caller, name, args) {
+        })
+    }
+
+    /// Deliver a child's tool outcome: answer it now, park it, or leave it to
+    /// the executor thread that will.
+    fn child_tool_outcome(&mut self, node: NodeId, id: u64, name: &str, outcome: ToolOutcome) {
+        match outcome {
             ToolOutcome::Ready(v, err) => self.reply_tool(node, id, v, err),
             ToolOutcome::Deferred(kind) => {
                 // Report the unit as parked on a wait, not thinking, so the
@@ -163,6 +177,19 @@ impl Runtime {
         name: &str,
         args: Value,
     ) -> ToolOutcome {
+        self.execute_tool_as(caller, name, args, true)
+    }
+
+    /// [`Runtime::execute_tool`], with the policy verdict applied or — for a
+    /// call a policy gate's addressee has just approved — not applied again:
+    /// the grant, the argument schema and the result schema still are.
+    fn execute_tool_as(
+        &mut self,
+        caller: &ToolCaller,
+        name: &str,
+        args: Value,
+        policed: bool,
+    ) -> ToolOutcome {
         // Grant + availability.
         let allowed = match (&caller.subagent, &caller.run) {
             (Some(_), _) => self
@@ -191,7 +218,8 @@ impl Runtime {
         // deliberately AFTER `validate_args`, so an argument guard judges
         // arguments that already conform to the tool's schema rather than
         // whatever the model happened to emit.
-        if !self.settings.security.policies.is_empty()
+        if policed
+            && !self.settings.security.policies.is_empty()
             && let Some(outcome) = self.apply_policy(caller, name, &args)
         {
             return outcome;
@@ -818,24 +846,30 @@ impl Runtime {
                 };
                 Some(ToolOutcome::Ready(Value::String(msg), true))
             }
-            PolicyAction::Ask => Some(self.policy_gate(caller, name, args, &verdict)),
+            PolicyAction::Ask => self.policy_gate(caller, name, args, &verdict),
         }
     }
 
-    /// An `action: ask` verdict: put it to a person.
+    /// An `action: ask` verdict: put it to a person. `None` means proceed —
+    /// only when nobody can be asked and the rule's `on_timeout` is `allow`.
     ///
     /// Deliberately NOT routed through `agent.approval`. That setting decides
     /// how asks the MODEL requested are handled, and its `auto` mode answers
     /// them with a model judge — letting the agent approve the operator's own
     /// security gate. An operator-declared gate goes to a human or it does not
     /// pass.
+    ///
+    /// The gate holds the call itself ([`super::reactor::PolicyCall`]) and
+    /// asks for a decision in a declared shape: `approve` runs the call and
+    /// the asker gets its real result ([`Runtime::policy_settle`]); `deny` is
+    /// an error; anything else is asked again.
     fn policy_gate(
         &mut self,
         caller: &ToolCaller,
         name: &str,
         args: &Value,
         verdict: &crate::sec::policy::Verdict,
-    ) -> ToolOutcome {
+    ) -> Option<ToolOutcome> {
         use crate::config::v2::PolicyAction;
         let question = verdict
             .question
@@ -888,7 +922,26 @@ impl Runtime {
                         role: Some(crate::config::v2::Role::Operator),
                         ..Default::default()
                     });
-                return self.human_gate(caller, owned, question, deadline, None, Some(to));
+                let held = super::reactor::PolicyCall {
+                    tool: name.to_string(),
+                    args: args.clone(),
+                    rule: verdict.rule,
+                    on_timeout: verdict.on_timeout,
+                };
+                let question = format!(
+                    "{question}\n\nAnswer `{}` to run this call or `{}` to refuse it.",
+                    super::human::POLICY_APPROVE,
+                    super::human::POLICY_DENY
+                );
+                return Some(self.human_gate(
+                    caller,
+                    owned,
+                    question,
+                    deadline,
+                    Some(super::human::policy_answer_schema()),
+                    Some(to),
+                    Some(held),
+                ));
             }
         }
         // Nobody to ask. `on_timeout` decides, and it defaults to deny: a gate
@@ -905,16 +958,70 @@ impl Runtime {
                    "fallback": format!("{fallback:?}").to_lowercase(),
                    "note": format!("nobody can be asked: {why}")}),
         );
+        // `allow` PROCEEDS: the call runs and its own result is returned. A
+        // bare success in its place would be a result for a call that never
+        // ran — the fabricated observation `shadow` refuses to produce.
         if fallback == PolicyAction::Allow {
-            return ToolOutcome::Ready(Value::Null, false);
+            return None;
         }
-        ToolOutcome::Ready(
+        Some(ToolOutcome::Ready(
             Value::String(format!(
                 "denied by security.policies[{}]: a person had to approve this call and nobody can be asked ({why})",
                 verdict.rule
             )),
             true,
-        )
+        ))
+    }
+
+    /// A policy gate was decided: run the call it held and hand the asker its
+    /// result, or refuse it. `by` names who decided (the answering principal,
+    /// or `on_timeout` when the rule's fallback did).
+    pub(crate) fn policy_settle(
+        &mut self,
+        target: &Target,
+        call: &super::reactor::PolicyCall,
+        approved: bool,
+        by: &str,
+    ) {
+        self.log.info(
+            "tool.policy.decided",
+            json!({"tool": call.tool, "rule": call.rule, "approved": approved, "by": by}),
+        );
+        self.audit(super::audit::AuditEvent {
+            action: "tool.policy",
+            target: json!({"tool": call.tool, "rule": call.rule}),
+            outcome: if approved { "approved" } else { "refused" },
+            principal: Some(by),
+            role: None,
+            request_id: None,
+        });
+        if !approved {
+            let msg = format!(
+                "denied by security.policies[{}]: {by} refused this call — it was NOT executed",
+                call.rule
+            );
+            self.reply(target, Value::String(msg), true);
+            return;
+        }
+        match target {
+            Target::Child(node, req) => {
+                let (node, req) = (*node, *req);
+                // The asker was checked to be alive when the answer landed.
+                let Some(caller) = self.child_caller(node, req) else {
+                    return;
+                };
+                let outcome = self.execute_tool_as(&caller, &call.tool, call.args.clone(), false);
+                self.child_tool_outcome(node, req, &call.tool, outcome);
+            }
+            Target::Step(run, step) => {
+                let (run, step) = (run.clone(), step.clone());
+                let Some(caller) = self.resume_gated_step(&run, &step) else {
+                    return;
+                };
+                let outcome = self.execute_tool_as(&caller, &call.tool, call.args.clone(), false);
+                self.step_tool_outcome(&run, &step, &call.tool, outcome);
+            }
+        }
     }
 
     /// `message.send`: deliver into one of this instance's own conversations.

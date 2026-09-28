@@ -337,6 +337,32 @@ pub fn describe(state: TaskState) -> &'static str {
     }
 }
 
+/// Whether two endpoint URLs name the same place: the scheme, the host (in
+/// any case), the port (the scheme's default filled in) and the path (a
+/// trailing `/` ignored) — or, for `unix:` endpoints, the socket path.
+fn same_endpoint(a: &str, b: &str) -> bool {
+    fn socket(u: &str) -> Option<&str> {
+        u.strip_prefix("unix://")
+            .or_else(|| u.strip_prefix("unix:"))
+    }
+    match (socket(a), socket(b)) {
+        (Some(x), Some(y)) => x == y,
+        (None, None) => match (
+            crate::net::http::Url::parse(a),
+            crate::net::http::Url::parse(b),
+        ) {
+            (Ok(x), Ok(y)) => {
+                x.is_tls() == y.is_tls()
+                    && x.host.eq_ignore_ascii_case(&y.host)
+                    && x.port == y.port
+                    && x.path.trim_end_matches('/') == y.path.trim_end_matches('/')
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 /// `major.minor` of a protocol version; a patch component is ignored, as the
 /// listener's `A2A-Version` gate ignores it.
 fn major_minor(v: &str) -> Option<(&str, &str)> {
@@ -356,16 +382,25 @@ impl PeerCard {
         serde_json::from_slice(body).ok().map(PeerCard)
     }
 
-    /// The first interface this client can speak to the configured endpoint:
-    /// JSON-RPC at A2A 1.0 for an `http(s)://` peer, and agentd's declared unix
-    /// binding at 1.0 for a `unix://` one — a unix socket is never labelled
-    /// JSONRPC, and an HTTP peer's unix interface is not one we can dial.
+    /// The interface this client speaks to the endpoint the operator
+    /// `configured`: JSON-RPC at A2A 1.0 for an `http(s)://` peer, and agentd's
+    /// declared unix binding at 1.0 for a `unix://` one — a unix socket is
+    /// never labelled JSONRPC, and an HTTP peer's unix interface is not one we
+    /// can dial. Among several, the one whose `url` IS the configured endpoint
+    /// wins, else the first: a card listing one interface per tenant must
+    /// deliver the objective — with the operator's credential — under the
+    /// tenant the operator pointed at, not whichever the card lists first.
     ///
-    /// The interface's `url` selects nothing: agentd always dials the URL the
-    /// operator configured, so a card cannot redirect a delegation (or the
-    /// credentials it carries) somewhere else. What the selection decides is
-    /// whether the peer speaks this protocol at all, and under which tenant.
-    pub fn select_interface(&self, unix: bool) -> Result<&AgentInterface, String> {
+    /// The interface's `url` never chooses where agentd connects: the dial
+    /// always goes to the URL the operator configured, so a card cannot
+    /// redirect a delegation (or the credentials it carries) somewhere else.
+    /// What the selection decides is whether the peer speaks this protocol at
+    /// all, and under which tenant.
+    pub fn select_interface(
+        &self,
+        unix: bool,
+        configured: &str,
+    ) -> Result<&AgentInterface, String> {
         let want_binding = if unix {
             UNIX_BINDING
         } else {
@@ -373,13 +408,21 @@ impl PeerCard {
         };
         let want_version = major_minor(A2A_PROTOCOL_VERSION);
         let mut found = Vec::new();
+        let mut first = None;
         for i in &self.0.supported_interfaces {
             if i.protocol_binding == want_binding
                 && major_minor(&i.protocol_version) == want_version
             {
-                return Ok(i);
+                if same_endpoint(&i.url, configured) {
+                    return Ok(i);
+                }
+                first.get_or_insert(i);
+                continue;
             }
             found.push(format!("{}@{}", i.protocol_binding, i.protocol_version));
+        }
+        if let Some(i) = first {
+            return Ok(i);
         }
         Err(format!(
             "a2a: peer card advertises no {want_binding} interface at A2A {A2A_PROTOCOL_VERSION} (found: {})",
@@ -537,5 +580,30 @@ mod tests {
         let garbage = json!({"nope": true});
         assert_eq!(task_state_of(&garbage), TaskState::TASK_STATE_UNSPECIFIED);
         assert!(!is_terminal(task_state_of(&garbage)));
+    }
+
+    /// What counts as "the configured endpoint" when a card names several:
+    /// the place, not its spelling.
+    #[test]
+    fn an_endpoint_is_the_place_not_its_spelling() {
+        for (a, b) in [
+            ("http://127.0.0.1:8080/", "http://127.0.0.1:8080"),
+            (
+                "https://Agent.Example/a2a/",
+                "https://agent.example:443/a2a",
+            ),
+            ("unix:///run/a.sock", "unix:/run/a.sock"),
+        ] {
+            assert!(same_endpoint(a, b), "{a} = {b}");
+        }
+        for (a, b) in [
+            ("https://agent.example/t/a", "https://agent.example/t/b"),
+            ("http://agent.example", "https://agent.example"),
+            ("https://agent.example:8443", "https://agent.example"),
+            ("unix:///run/a.sock", "http://localhost/"),
+            ("not a url", "not a url"),
+        ] {
+            assert!(!same_endpoint(a, b), "{a} != {b}");
+        }
     }
 }

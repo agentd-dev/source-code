@@ -70,12 +70,16 @@ pub fn listener_auth_of(a2a: &A2a) -> ListenerAuth {
             && a2a.principals.is_empty()
             && a2a.tls.client_ca.is_none()
             && !device);
-    // An `any` rule with the anonymous role admits nobody (the resolver
-    // counts it as unauthenticated), so it opens nothing here either.
+    // The FIRST `any` rule is the one the resolver applies (step 3 stops at
+    // it), so it alone decides: an anonymous one admits nobody — the
+    // resolver counts it as unauthenticated — whatever `any` rules follow it.
+    // Reading "some rule" here instead would have the card say no credential
+    // is needed while every uncredentialed request got a 401.
     let any_rule = a2a
         .principals
         .iter()
-        .any(|p| p.matcher.any && p.role != Role::Anonymous);
+        .find(|p| p.matcher.any)
+        .is_some_and(|p| p.role != Role::Anonymous);
     ListenerAuth {
         bearer,
         mtls,
@@ -225,6 +229,22 @@ mod tests {
                 "any rule",
                 a2a(json!({"listen": "http://127.0.0.1:8080", "principals": [
                     {"id": "pub", "match": {"any": true}, "role": "user"}
+                ]})),
+                false,
+            ),
+            (
+                "an anonymous any rule before a user one",
+                a2a(json!({"listen": "http://127.0.0.1:8080", "principals": [
+                    {"id": "nobody", "match": {"any": true}, "role": "anonymous"},
+                    {"id": "pub", "match": {"any": true}, "role": "user"}
+                ]})),
+                true,
+            ),
+            (
+                "a user any rule before an anonymous one",
+                a2a(json!({"listen": "http://127.0.0.1:8080", "principals": [
+                    {"id": "pub", "match": {"any": true}, "role": "user"},
+                    {"id": "nobody", "match": {"any": true}, "role": "anonymous"}
                 ]})),
                 false,
             ),

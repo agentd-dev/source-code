@@ -2608,7 +2608,7 @@
           ]
         },
         "ask_human_fallback": {
-          "description": "what ask_human does with no human channel (and, for auto, on an unanswered gate timeout): wait (park until timeout), fail (default), or auto (an LLM judge answers on the operator's behalf, marked as auto)",
+          "description": "what ask_human does when it does not gate — no A2A listener, or an unowned ask under ask_human_unowned: fallback — and, for auto, when a gate that names no addressee times out: wait (park until timeout), fail (default), or auto (an LLM judge answers on the operator's behalf, marked as auto). An addressed gate, which every security.policies gate is, is never judged: it times out",
           "enum": [
             "wait",
             "pause",
@@ -2620,7 +2620,7 @@
           ]
         },
         "ask_human_unowned": {
-          "description": "what an ask_human no caller owns (raised by a schedule, webhook or stream) does: gate (an operator answers it on the A2A listener; requires a2a.listen) or fallback (default — ask_human_fallback applies)",
+          "description": "what an ask no caller owns — an ask_human or a security.policies gate raised by a schedule, webhook, stream or subagent (a subagent is unowned even under a caller's turn) — does: gate (a gate task on the A2A listener, owned by the principal the unit works for or else the operator, who answers it; requires a2a.listen) or fallback (default — ask_human_fallback applies; a policy gate takes its on_timeout)",
           "enum": [
             "gate",
             "fallback"

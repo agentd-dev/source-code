@@ -6,11 +6,12 @@
 //! * a principal's declared rate is ADMISSION — a request over it is answered
 //!   429 at the door and reaches nothing, rather than being turned into a
 //!   refused result by the runtime;
-//! * failed authentications are limited per source, and only failures: past
-//!   the limit a guesser gets 429, while a request that authenticates is never
-//!   refused by the same limiter — so nothing a web page makes a browser send
-//!   (a refused origin, an uncredentialed request) can lock the operator's own
-//!   console out;
+//! * failed authentications are limited per source, and only failures are
+//!   counted: past the limit the source's bearers are refused unchecked, so a
+//!   guesser is slowed to the refill rate rather than told which guess was
+//!   right — while nothing a web page makes a browser send (a refused origin,
+//!   an uncredentialed request) is counted, or logged line for line, so it
+//!   can neither lock the operator's own console out nor fill its log;
 //! * the posture follows the rules: a reload that gives a no-auth loopback
 //!   daemon its first principal ends the implicit operator on the next
 //!   request.
@@ -223,13 +224,16 @@ fn rate_limits_are_admission_not_results() {
     assert!(daemon.alive(), "daemon still serving: {}", daemon.stderr());
 }
 
-/// A source that keeps failing to authenticate is slowed down; a caller that
-/// authenticates never is.
+/// A source that keeps failing to authenticate is slowed down — every bearer
+/// it presents, not just the wrong ones.
 ///
 /// Twenty-one junk bearers are answered 401 and the twenty-second 429, with a
-/// `Retry-After` — while the valid bearer, from the very same source in the
-/// very same window, is served. A limiter consulted before resolution would
-/// refuse that last request too; no limiter at all would never answer 429.
+/// `Retry-After`. From then on the source's bearers are refused unchecked:
+/// the VALID bearer is refused too, because a limiter that still checked it
+/// would answer a right guess 200 and a wrong one 429 — no slower for the
+/// guesser, and an oracle besides. A request presenting nothing is not
+/// refused by it (401, not 429), and the refused bearers are not counted: one
+/// refill later the source is under the limit and the valid bearer is served.
 #[test]
 fn auth_failures_are_limited_per_source() {
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
@@ -250,28 +254,49 @@ fn auth_failures_are_limited_per_source() {
     let v = json_of(&limited);
     assert_eq!(v["error"]["data"][0]["reason"], "RATE_LIMITED", "{v}");
 
+    let valid = [("Authorization", format!("Bearer {OPS_TOKEN}"))];
+    let valid: Vec<(&str, &str)> = valid.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let right_guess = a2a_post(&addr, &body, &valid);
+    assert_eq!(
+        right_guess.status, 429,
+        "a throttled source's right guess is refused like its wrong ones: {right_guess:?}"
+    );
+    let nothing = a2a_post(&addr, &body, &[]);
+    assert_eq!(
+        nothing.status, 401,
+        "a request presenting nothing is never throttled: {nothing:?}"
+    );
+
+    // One failure drains per three seconds. Had the two refused bearers been
+    // counted, the source would still be over after one refill.
+    std::thread::sleep(Duration::from_millis(3300));
     let ok = rpc_as(&addr, OPS_TOKEN, 2, "ListTasks", json!({}));
     assert!(
         ok.get("error").is_none(),
-        "the valid bearer from the throttled source is served: {ok}"
+        "one refill later the valid bearer is served: {ok}"
     );
 
     assert!(daemon.alive(), "daemon still serving: {}", daemon.stderr());
 }
 
-/// Nothing a web page can make a browser send locks the console out.
+/// Nothing a web page can make a browser send locks the console out, or
+/// fills the log.
 ///
 /// A page on another site POSTs with its own `Origin` (refused at the origin
 /// gate), and a page on the listed UI origin POSTs without a credential
 /// (refused 401) — hundreds of each, from 127.0.0.1, the same source the
-/// operator's terminal uses. Neither is counted, so the terminal's next
-/// request is the operator, not a 429.
+/// operator's terminal uses. Neither is counted: had either been, the source
+/// would be over the limit and the terminal's next bearer — a wrong one
+/// here, which the limiter DOES count — would be refused 429 unchecked rather
+/// than answered 401, and the operator's own bearer refused after it. And
+/// the two hundred 401s leave a line or two in the log, not two hundred.
 #[test]
 fn browsers_cannot_lock_out_the_local_console() {
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
     let (mut daemon, addr) = spawn(
         &llm.uri,
-        "\x20 cors:\n    origins: [\"http://127.0.0.1:4173\"]\n",
+        "\x20 bearer: \"{{secret:AGENTD_ADMISSION_OPS}}\"\n\
+         \x20 cors:\n    origins: [\"http://127.0.0.1:4173\"]\n",
     );
     let body = rpc_body(1, "ListTasks", json!({}));
 
@@ -284,14 +309,25 @@ fn browsers_cannot_lock_out_the_local_console() {
         assert_eq!(r.status, 401, "uncredentialed browser #{n}: {r:?}");
     }
 
-    let console = a2a_post(&addr, &body, &[]);
+    let typo = a2a_post(&addr, &body, &[("Authorization", "Bearer typo")]);
     assert_eq!(
-        console.status, 200,
-        "the console was locked out: {console:?}"
+        typo.status, 401,
+        "the browsers' requests put the source over the limit: {typo:?}"
     );
+    let console = rpc_as(&addr, OPS_TOKEN, 2, "ListTasks", json!({}));
     assert!(
-        json_of(&console).get("error").is_none(),
-        "the console is the operator: {console:?}"
+        console.get("error").is_none(),
+        "the console was locked out: {console}"
+    );
+
+    let log = daemon.stderr();
+    let lines = log
+        .lines()
+        .filter(|l| l.contains("\"event\":\"a2a.denied\""))
+        .count();
+    assert!(
+        lines <= 3,
+        "two hundred free refusals wrote {lines} log lines:\n{log}"
     );
 
     assert!(daemon.alive(), "daemon still serving: {}", daemon.stderr());

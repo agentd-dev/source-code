@@ -104,6 +104,34 @@ async fn dispatch(
     let posture = resolver.posture();
     let ev = evidence_of(&headers, &peer_id, &peer);
     let source = peer.source();
+    // A source past its failure limit presents no more bearers: they are
+    // refused before they are checked. Checking them — throttling only the
+    // ones that turned out wrong — would leave a guesser's rate untouched
+    // and hand it an oracle besides: a right guess answered 200 at full
+    // speed, a wrong one 429. A bearer is the only thing that can be
+    // guessed; a certificate is proven in the handshake, and a request that
+    // presents nothing guesses nothing, so neither is refused here — the
+    // implicit operator and an `any` rule are never locked out by a flood.
+    if let Some(ip) = source
+        && ev.bearer.is_some()
+        && let Some(retry) = app.failures.over(ip)
+    {
+        denied(
+            &app,
+            source,
+            None,
+            None,
+            None,
+            None,
+            "auth_failures_limited",
+            429,
+        );
+        return too_many(
+            Value::Null,
+            &format!("too many failed authentications from this source: retry in about {retry}s"),
+            retry,
+        );
+    }
     let sessions = app
         .auth
         .sessions
@@ -117,31 +145,29 @@ async fn dispatch(
             // Refused only for being a browser: the same request without
             // `Origin` would have been the implicit operator.
             let browser = ev.origin && ev.local && posture.implicit_operator;
-            denied(&app, None, None, None, None, "unauthenticated", 401);
+            denied(&app, source, None, None, None, None, "unauthenticated", 401);
             return challenge(false, false, browser);
         }
-        // A credential that failed: counted against its source, and past the
-        // limit answered 429 instead — the throttle sits here, inside the
-        // failure, so a request that authenticates is never refused by it.
+        // A credential that failed: counted against its source, whose next
+        // bearer, once it is over the limit, is refused unchecked (above).
         refused @ (Resolution::Unauthenticated { presented: true } | Resolution::NoRole) => {
             if let Some(ip) = source {
-                if let Some(retry) = app.failures.over(ip) {
-                    denied(&app, None, None, None, None, "auth_failures_limited", 429);
-                    return too_many(
-                        Value::Null,
-                        &format!(
-                            "too many failed authentications from this source: retry in about {retry}s"
-                        ),
-                        retry,
-                    );
-                }
                 app.failures.failed(ip);
             }
             return if refused == Resolution::NoRole {
-                denied(&app, None, None, None, None, "no_role", 403);
+                denied(&app, source, None, None, None, None, "no_role", 403);
                 forbidden(Value::Null, "no role for this identity", false)
             } else {
-                denied(&app, None, None, None, None, "invalid_credential", 401);
+                denied(
+                    &app,
+                    source,
+                    None,
+                    None,
+                    None,
+                    None,
+                    "invalid_credential",
+                    401,
+                );
                 challenge(true, is_session_token(&ev), false)
             };
         }
@@ -150,6 +176,9 @@ async fn dispatch(
     // refused caller learns its token lacks the scope rather than that it is
     // bad.
     let bearer_used = matches!(via, Via::Bearer | Via::Session);
+    // Whose refusals are free: a principal no credential named — an `any`
+    // rule's — can be anyone, so its refusals are logged like a stranger's.
+    let unvouched = source.filter(|_| !matches!(via, Via::Bearer | Via::Session | Via::Cert));
 
     let Ok(req) = serde_json::from_slice::<Value>(&body) else {
         return err(Value::Null, -32700, "invalid JSON");
@@ -169,6 +198,7 @@ async fn dispatch(
         let rule = resolver.rule_of(&principal);
         denied(
             &app,
+            source,
             Some(&principal.id),
             rule,
             Some(&method),
@@ -204,6 +234,7 @@ async fn dispatch(
         let rule = resolver.rule_of(&principal);
         denied(
             &app,
+            unvouched,
             Some(&principal.id),
             rule,
             Some(&bare),
@@ -232,6 +263,7 @@ async fn dispatch(
                 let rule = resolver.rule_of(&principal);
                 denied(
                     &app,
+                    unvouched,
                     Some(&principal.id),
                     rule,
                     Some(&bare),
@@ -242,6 +274,26 @@ async fn dispatch(
                 return challenge(false, false, false);
             }
             return unary(&app, id, "GetExtendedAgentCard", json!({}), principal).await;
+        }
+        // Answered here because a2a-rs 0.10 cannot: its JSON-RPC adapter hands
+        // the port the task id alone, dropping `pageSize` and `pageToken`, and
+        // its response has no `nextPageToken`. Passed down, a caller asking
+        // for two configs would get all of them and a page size of 500 would
+        // be accepted. The caller's request is read with the spec's own type
+        // and crosses whole to the runtime, which pages it and refuses what it
+        // cannot honour — with the same codes the runtime gives every caller.
+        "ListTaskPushNotificationConfigs" => {
+            let req = match serde_json::from_value::<
+                a2a_rs::domain::generated::ListTaskPushNotificationConfigsRequest,
+            >(params)
+            {
+                Ok(req) => req,
+                Err(e) => return err(id, -32602, &format!("invalid params: {e}")),
+            };
+            let Ok(params) = serde_json::to_value(&req) else {
+                return err(id, -32603, "could not re-encode the listing request");
+            };
+            return unary(&app, id, "PushConfigList", params, principal).await;
         }
         "SubscribeToEvents" => {
             return match &app.bridge.feed() {
@@ -270,6 +322,7 @@ async fn dispatch(
         let rule = resolver.rule_of(&principal);
         denied(
             &app,
+            unvouched,
             Some(&principal.id),
             rule,
             Some(&bare),
@@ -346,19 +399,34 @@ async fn dispatch(
 
 /// The audit line for a refusal the listener made: who (when anybody), the
 /// rule that named them, what they asked for, why, and the status sent.
+///
+/// `source` is given for the refusals any caller can provoke for free — no
+/// credential, a bad one, a source over its limit, a rate already spent, a
+/// gate refusing a principal only an `any` rule named — and those go through
+/// the [`super::limits::DenialLog`]: one line per source and reason per window, which
+/// says how many it stands for. A refusal of a principal a credential named
+/// is written every time (`source` is `None`): it is attributable, and its
+/// requests are that principal's to account for.
+#[allow(clippy::too_many_arguments)]
 fn denied(
     app: &App,
+    source: Option<std::net::IpAddr>,
     principal: Option<&str>,
     rule: Option<&str>,
     method: Option<&str>,
     op: Option<&str>,
-    reason: &str,
+    reason: &'static str,
     status: u16,
 ) {
-    app.log.warn(
-        "a2a.denied",
-        json!({"principal": principal, "rule": rule, "method": method, "op": op, "reason": reason, "status": status}),
-    );
+    let mut line = json!({"principal": principal, "rule": rule, "method": method, "op": op, "reason": reason, "status": status});
+    if let Some(ip) = source {
+        match app.denials.admit(ip, reason) {
+            None => return,
+            Some(0) => {}
+            Some(n) => line["suppressed"] = json!(n),
+        }
+    }
+    app.log.warn("a2a.denied", line);
 }
 
 /// Prepare a send for the protocol layer, returning a rewritten request body —

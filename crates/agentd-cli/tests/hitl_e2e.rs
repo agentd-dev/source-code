@@ -7,11 +7,11 @@
 //! turn or run a caller OWNS gates on core A2A with the observation feed and
 //! introspection both off — the caller's blocking send returns at the gate.
 //! An ask nobody owns (here: the configured `agent.prompt`, which no caller
-//! sent) gates only with `agent.ask_human_unowned: gate`; otherwise the
-//! configured fallback applies — `fail` errors the ask immediately (the model
-//! carries on), `wait` parks it until its timeout, `auto` has an LLM judge
-//! answer on the operator's behalf (marked as auto). A cancelled gate
-//! unblocks its asker with an error.
+//! sent, and a subagent's policy gate) gates only with
+//! `agent.ask_human_unowned: gate`; otherwise the configured fallback applies
+//! — `fail` errors the ask immediately (the model carries on), `wait` parks it
+//! until its timeout, `auto` has an LLM judge answer on the operator's behalf
+//! (marked as auto). A cancelled gate unblocks its asker with an error.
 #![cfg(all(unix, feature = "a2a"))]
 
 mod common;
@@ -370,6 +370,119 @@ fn an_unowned_ask_takes_the_fallback_unless_ask_human_unowned_is_gate() {
         logs.contains("\"text\":\"Carried on.\""),
         "the answer went back into the asking turn\n{logs}"
     );
+    std::fs::remove_file(&cfg).ok();
+}
+
+/// A SUBAGENT's gate is unowned, even when the turn that spawned it is a
+/// caller's: the subagent is its own unit, working for whichever unit spawned
+/// it — possibly long after that unit's caller got its answer — so a policy
+/// gate on its call opens only with `ask_human_unowned: gate`. By default it
+/// takes the fallback (the rule's deny), and the caller's task never stops at
+/// a gate it did not ask for.
+#[test]
+fn a_subagents_gate_is_unowned_even_under_an_owned_turn() {
+    // Rule order matters: the child's later rounds still carry its system
+    // prompt, so the fallback's words are matched first. The child is told
+    // apart by its own system prompt, which the root's transcript never holds.
+    let llm = spawn_mock_llm(&json!({
+        "turns": [
+            {"tool_calls": [{"name": "subagent.run", "arguments": {"instruction": "note it down", "mode": "sync"}}]},
+            {"content": "unreachable"}
+        ],
+        "match": [
+            {"when_contains": "no A2A caller owns this ask and agent.ask_human_unowned is fallback",
+             "content": "SUB_FELL_BACK"},
+            {"when_contains": "SUB_FELL_BACK", "content": "the subagent's gate took the fallback"},
+            {"when_contains": "You are agentd, an autonomous agent.",
+             "tool_calls": [{"name": "memory.set", "arguments": {"key": "k", "value": 1}}]}
+        ]
+    }));
+    let policy = "security:\n  policies:\n\
+                  \x20   - match: { tool: \"memory.set\", caller: [subagent] }\n      action: ask\n";
+    let (daemon, addr, cfg) = spawn_bound(|port| base_config(&llm.uri, port, false, policy));
+
+    // A blocking send: had the subagent's gate opened on this task, it would
+    // return at `input-required`.
+    let done = SendMessage::text("Delegate it").result(&addr);
+    assert_eq!(
+        done["task"]["status"]["state"], "TASK_STATE_COMPLETED",
+        "the caller's task stopped at the subagent's gate: {done}"
+    );
+    assert_eq!(
+        done["task"]["artifacts"][0]["parts"][0]["text"],
+        "the subagent's gate took the fallback",
+        "{done}\n{}",
+        daemon.stderr()
+    );
+    std::fs::remove_file(&cfg).ok();
+}
+
+/// A gate opened WHILE a request is being served never takes the task id
+/// that request reserved for its own task.
+///
+/// The path: a `workflow.signal` releases a wait inside a `foreach` body, and
+/// the body's next step — a call an `ask` policy gates, in a run nobody owns
+/// — opens its gate before the signal command's own task is created. Had the
+/// gate taken the reservation, the caller would be answered with a task it
+/// never asked for, and handed a subscription to someone else's gate.
+#[test]
+fn a_gate_opened_mid_request_never_takes_the_requests_task_id() {
+    let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
+    let extra = "workflows:\n  - name: probe\n    steps:\n\
+                 \x20     s: {kind: once}\n\
+                 \x20     each: {kind: foreach, depends_on: [s], over: [1],\n\
+                 \x20            body: {steps: {w: {kind: wait, on: signal, signal: go},\n\
+                 \x20                           m: {kind: memory.set, key: k, value: v, depends_on: [w]}}}}\n\
+                 \x20     f: {kind: finish, depends_on: [each]}\n\
+                 security:\n  policies:\n\
+                 \x20   - match: { tool: \"memory.set\" }\n      action: ask\n";
+    let (daemon, addr, cfg) = spawn_bound(|port| {
+        unowned(
+            base_config(&llm.uri, port, true, extra),
+            "hello",
+            "  ask_human_unowned: gate\n",
+        )
+        .replace("  prompt: hello\n", "")
+    });
+    // The run is parked on the signal before it is sent.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let ws = read(&addr, "workflow.status", json!({}));
+        let run = ws["runs"][0]["run"]
+            .as_str()
+            .map(|id| read(&addr, "run.get", json!({"run": id})));
+        if run
+            .as_ref()
+            .is_some_and(|r| r["run"]["steps"]["each[0].w"]["status"] == "suspended")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the run never parked: {run:?}\n{}",
+            daemon.stderr()
+        );
+        std::thread::sleep(Duration::from_millis(80));
+    }
+
+    let reserved = "task-signal-probe";
+    let sent = SendMessage::command("workflow.signal", json!({"name": "go"}))
+        .task(reserved)
+        .result(&addr);
+    assert_eq!(
+        sent["task"]["id"],
+        reserved,
+        "the signal's task lost its id to the gate it opened: {sent}\n{}",
+        daemon.stderr()
+    );
+    let open = gates(&addr);
+    assert_eq!(
+        open.len(),
+        1,
+        "the body's gate opened: {open:?}\n{}",
+        daemon.stderr()
+    );
+    assert_ne!(open[0], reserved, "the gate took the reservation");
     std::fs::remove_file(&cfg).ok();
 }
 

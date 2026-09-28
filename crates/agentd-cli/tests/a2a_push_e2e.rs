@@ -331,6 +331,95 @@ fn a_registered_webhook_receives_the_task_and_the_callers_credentials() {
     std::fs::remove_file(&cfg_path).ok();
 }
 
+/// `ListTaskPushNotificationConfigs` pages on the wire, not only inside the
+/// runtime: a2a-rs 0.10 drops the request's `pageSize` and `pageToken`, so a
+/// listing passed down to it would answer everything to a caller that asked
+/// for two, accept a page size of 101, and never say whether more remained.
+#[test]
+fn push_configs_page_on_the_wire() {
+    let llm = spawn_mock_llm(&json!({"turns": [{"content": "ok"}]}));
+    let (_daemon, addr, cfg_path) = boot(|p| {
+        config(
+            &llm.uri,
+            p,
+            "  push:\n    enabled: true\n    allow_private: true\n",
+        )
+    });
+    let sent = SendMessage::text("hello").return_immediately().post(&addr);
+    let task_id = sent["result"]["task"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a task: {sent}"))
+        .to_string();
+    let mut registered = Vec::new();
+    for n in 0..5 {
+        let r = rpc(
+            &addr,
+            100 + n,
+            "CreateTaskPushNotificationConfig",
+            json!({"taskId": task_id, "id": format!("pc-{n}"), "url": "http://127.0.0.1:9/hook"}),
+        );
+        assert!(r.get("error").is_none(), "{r}");
+        registered.push(format!("pc-{n}"));
+    }
+    let list = |id: i64, extra: Value| {
+        let mut params = json!({"taskId": task_id});
+        params
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        rpc(&addr, id, "ListTaskPushNotificationConfigs", params)
+    };
+
+    let mut seen = Vec::new();
+    let mut sizes = Vec::new();
+    let mut token = String::new();
+    for page in 0.. {
+        assert!(page < 5, "the listing never ended: {seen:?}");
+        let r = list(200 + page, json!({"pageSize": 2, "pageToken": token}));
+        let result = &r["result"];
+        let configs = result["configs"]
+            .as_array()
+            .unwrap_or_else(|| panic!("configs: {r}"));
+        sizes.push(configs.len());
+        seen.extend(
+            configs
+                .iter()
+                .map(|c| c["id"].as_str().unwrap().to_string()),
+        );
+        token = result["nextPageToken"]
+            .as_str()
+            .unwrap_or_else(|| panic!("nextPageToken is always present: {r}"))
+            .to_string();
+        if token.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(sizes, [2, 2, 1], "pages of the size asked for");
+    seen.sort();
+    assert_eq!(seen, registered, "every config once, no duplicates");
+
+    let all = list(300, json!({}));
+    assert_eq!(
+        all["result"]["configs"].as_array().map(Vec::len),
+        Some(5),
+        "{all}"
+    );
+    assert_eq!(all["result"]["nextPageToken"], "", "{all}");
+    for (n, bad) in [
+        json!({"pageSize": 101}),
+        json!({"pageSize": -1}),
+        json!({"pageToken": "not-a-token"}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let r = list(310 + n as i64, bad.clone());
+        assert_eq!(r["error"]["code"], -32602, "{bad}: {r}");
+    }
+
+    std::fs::remove_file(&cfg_path).ok();
+}
+
 #[test]
 fn a_target_agentd_should_not_reach_is_refused_at_registration() {
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));

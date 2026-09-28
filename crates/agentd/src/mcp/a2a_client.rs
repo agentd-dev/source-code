@@ -14,12 +14,15 @@
 //!
 //!   1. **read the peer's card** — `GET /.well-known/agent-card.json` on the
 //!      configured origin, cached for the response's `max-age` (at most five
-//!      minutes; one when it names none). The card says whether the peer
-//!      speaks A2A 1.0 on this kind of endpoint at all, under which tenant,
-//!      whether it streams, and which extensions it will not work without — a
-//!      peer requiring one agentd does not implement is refused before
-//!      anything is sent. A peer that serves no card is still dialled,
-//!      streaming first.
+//!      minutes; one when it names none; five seconds for a peer on this
+//!      host, whose port or socket may belong to a different child by the
+//!      next delegation), per origin AND credential, and dropped whenever a
+//!      delegation using it fails. The card says whether the peer speaks A2A
+//!      1.0 on this kind of endpoint at all, under which tenant (that of the
+//!      interface whose URL is the configured one, else the first), whether it
+//!      streams, and which extensions it will not work without — a peer
+//!      requiring one agentd does not implement is refused before anything is
+//!      sent. A peer that serves no card is still dialled, streaming first.
 //!   2. **send the objective** — `SendStreamingMessage` when the peer streams,
 //!      whose frames carry the run to its end (working → artifact → terminal
 //!      state); `SendMessage` with `returnImmediately` when it does not, or,
@@ -80,6 +83,12 @@ const CARD_TTL_DEFAULT: Duration = Duration::from_secs(60);
 /// The longest a card is trusted whatever its `max-age` says, so a peer that
 /// stops streaming or starts requiring an extension is noticed within minutes.
 const CARD_TTL_MAX: Duration = Duration::from_secs(300);
+
+/// The longest a card from THIS host is trusted: a loopback port or a socket
+/// path changes hands as instance children come and go, and a card cached for
+/// the child that held it last would be applied to the one that holds it now.
+/// Re-reading a local card costs one local round trip.
+const CARD_TTL_LOCAL: Duration = Duration::from_secs(5);
 
 /// The bound on a card fetch. Discovery is one small GET; a peer that cannot
 /// answer it promptly is dialled without its card rather than being allowed to
@@ -161,34 +170,45 @@ pub fn delegate(
                     .map(str::to_string)
                     .unwrap_or_else(mint_message_id),
             };
-            // No card is not a refusal: the spec permits configuring a peer
-            // directly, and a card is how a client DISCOVERS what a peer
-            // offers, not a precondition for talking to it. Such a peer is
-            // dialled streaming first, and a `-32004` still lands on the
-            // unary path below.
-            let streams = match conn.card(deadline) {
-                Some(card) => match conn.adopt(&card) {
-                    Ok(()) => card.streams(),
-                    Err(e) => return DelegateOutcome::Error(e),
-                },
-                None => true,
-            };
-            if !streams {
-                return delegate_unary(&mut conn, &objective, deadline);
+            let outcome = delegate_on(&mut conn, &objective, deadline);
+            // A failed delegation drops the card it used, so the next one reads
+            // the peer as it is now: the card may be why it failed — a peer
+            // that changed its terms, or a local port that changed hands.
+            if matches!(outcome, DelegateOutcome::Error(_)) {
+                conn.forget_card();
             }
-            match conn.call_streaming(&objective, deadline) {
-                Err(e) => DelegateOutcome::Error(e),
-                Ok(StreamOutcome::Done(outcome)) => outcome,
-                Ok(StreamOutcome::Recover(task_id)) => {
-                    let tenant = conn.tenant.clone();
-                    poll_task(&mut conn, &task_id, tenant.as_deref(), deadline)
-                }
-                // Nothing started: the peer refused the method, not the
-                // message. One unary attempt with the same message, and no
-                // more — a peer that refuses that too has answered.
-                Ok(StreamOutcome::Unsupported) => delegate_unary(&mut conn, &objective, deadline),
-            }
+            outcome
         }
+    }
+}
+
+/// [`delegate`] over an open connection: the card, then the send.
+fn delegate_on(conn: &mut HttpConn, objective: &Objective, deadline: Instant) -> DelegateOutcome {
+    // No card is not a refusal: the spec permits configuring a peer directly,
+    // and a card is how a client DISCOVERS what a peer offers, not a
+    // precondition for talking to it. Such a peer is dialled streaming first,
+    // and a `-32004` still lands on the unary path below.
+    let streams = match conn.card(deadline) {
+        Some(card) => match conn.adopt(&card) {
+            Ok(()) => card.streams(),
+            Err(e) => return DelegateOutcome::Error(e),
+        },
+        None => true,
+    };
+    if !streams {
+        return delegate_unary(conn, objective, deadline);
+    }
+    match conn.call_streaming(objective, deadline) {
+        Err(e) => DelegateOutcome::Error(e),
+        Ok(StreamOutcome::Done(outcome)) => outcome,
+        Ok(StreamOutcome::Recover(task_id)) => {
+            let tenant = conn.tenant.clone();
+            poll_task(conn, &task_id, tenant.as_deref(), deadline)
+        }
+        // Nothing started: the peer refused the method, not the message. One
+        // unary attempt with the same message, and no more — a peer that
+        // refuses that too has answered.
+        Ok(StreamOutcome::Unsupported) => delegate_unary(conn, objective, deadline),
     }
 }
 
@@ -358,6 +378,9 @@ fn terminal_outcome(task: &Value) -> Option<DelegateOutcome> {
 
 /// A resolved HTTP(S) A2A peer endpoint: the dial coordinates + framing.
 struct HttpEp {
+    /// The endpoint as the operator configured it — what the card's
+    /// interfaces are matched against.
+    url: String,
     host: String,
     port: u16,
     path: String,
@@ -378,6 +401,7 @@ impl HttpEp {
                 return Err(format!("a2a: unix peer needs a socket path: {url}"));
             }
             return Ok(HttpEp {
+                url: url.to_string(),
                 host: String::new(),
                 port: 0,
                 path: "/".to_string(),
@@ -394,6 +418,7 @@ impl HttpEp {
             u.path.clone()
         };
         Ok(HttpEp {
+            url: url.to_string(),
             host_header: u.host_header(),
             tls: u.is_tls(),
             host: u.host,
@@ -403,8 +428,13 @@ impl HttpEp {
         })
     }
 
-    /// The origin a card is published on, and cached under: the scheme and
-    /// authority for TCP, the socket path for unix.
+    /// Whether the peer is on this host: a unix socket, or a loopback address.
+    fn local(&self) -> bool {
+        self.socket.is_some() || crate::net::http::is_loopback_host(&self.host)
+    }
+
+    /// The origin a card is published on: the scheme and authority for TCP,
+    /// the socket path for unix.
     fn origin(&self) -> String {
         match &self.socket {
             Some(socket) => format!("unix:{socket}"),
@@ -417,8 +447,8 @@ impl HttpEp {
     }
 }
 
-/// The cards read so far, by origin, with the instant each stops being
-/// trusted.
+/// The cards read so far, by origin and credential ([`HttpConn::card_key`]),
+/// with the instant each stops being trusted.
 type CardCache = HashMap<String, (Instant, Arc<PeerCard>)>;
 
 /// The process-wide [`CardCache`]. Process-wide because every delegation is
@@ -430,8 +460,15 @@ fn card_cache() -> &'static Mutex<CardCache> {
 }
 
 /// How long a card may be reused, from its response's `Cache-Control`:
-/// `max-age` capped at [`CARD_TTL_MAX`], [`CARD_TTL_DEFAULT`] when none is
-/// named, and not at all when the peer says `no-store` or `no-cache`.
+/// `max-age` capped at [`CARD_TTL_MAX`] ([`CARD_TTL_LOCAL`] for a peer on this
+/// host), [`CARD_TTL_DEFAULT`] when none is named, and not at all when the
+/// peer says `no-store` or `no-cache`.
+fn card_ttl_for(local: bool, cache_control: Option<&str>) -> Duration {
+    let ttl = card_ttl(cache_control);
+    if local { ttl.min(CARD_TTL_LOCAL) } else { ttl }
+}
+
+/// [`card_ttl_for`] a remote peer.
 fn card_ttl(cache_control: Option<&str>) -> Duration {
     let mut ttl = CARD_TTL_DEFAULT;
     for directive in cache_control.unwrap_or_default().split(',') {
@@ -549,29 +586,72 @@ impl HttpConn {
         }
     }
 
+    /// What this connection's card is cached under — `None` when it is not
+    /// cached at all.
+    ///
+    /// The origin, AND the credential it is read with: a gated peer may show
+    /// different callers different cards, so two peers configured on one
+    /// origin with different bearers never share one. A card read under a
+    /// per-request signature or a client certificate is not cached: neither
+    /// identity can be told apart here, and one extra GET is cheaper than
+    /// handing one identity's card to another.
+    fn card_key(&self) -> Option<String> {
+        #[cfg(feature = "tls")]
+        if self.auth.identity.is_some() {
+            return None;
+        }
+        if self.auth.signer.is_some() {
+            return None;
+        }
+        let mut credential = String::new();
+        for (k, v) in &self.auth.headers {
+            credential.push_str(&k.to_ascii_lowercase());
+            credential.push(':');
+            credential.push_str(v);
+            credential.push('\n');
+        }
+        Some(format!(
+            "{} {}",
+            self.ep.origin(),
+            crate::sha::sha256_hex(credential.as_bytes())
+        ))
+    }
+
     /// The peer's card: from the cache while it is fresh, otherwise fetched
     /// from the configured origin. `None` when the peer serves none (or none
     /// this client can read), which the caller treats as "dial it anyway".
     fn card(&self, deadline: Instant) -> Option<Arc<PeerCard>> {
-        let origin = self.ep.origin();
+        let key = self.card_key();
         let now = Instant::now();
-        if let Ok(cache) = card_cache().lock()
-            && let Some((until, card)) = cache.get(&origin)
+        if let Some(key) = &key
+            && let Ok(cache) = card_cache().lock()
+            && let Some((until, card)) = cache.get(key)
             && *until > now
         {
             return Some(Arc::clone(card));
         }
         let (card, ttl) = self.fetch_card(deadline)?;
         let card = Arc::new(card);
-        if !ttl.is_zero()
+        if let Some(key) = key
+            && !ttl.is_zero()
             && let Ok(mut cache) = card_cache().lock()
         {
             // Expired entries go on every insert, so a daemon that talks to
             // many short-lived instance children does not keep all their cards.
             cache.retain(|_, (until, _)| *until > now);
-            cache.insert(origin, (now + ttl, Arc::clone(&card)));
+            cache.insert(key, (now + ttl, Arc::clone(&card)));
         }
         Some(card)
+    }
+
+    /// Drop this connection's cached card, so the next delegation reads it
+    /// afresh.
+    fn forget_card(&self) {
+        if let Some(key) = self.card_key()
+            && let Ok(mut cache) = card_cache().lock()
+        {
+            cache.remove(&key);
+        }
     }
 
     /// One `GET` of the card, with the version, the credential and the
@@ -595,14 +675,17 @@ impl HttpConn {
             return None;
         }
         let card = PeerCard::parse(&resp.body)?;
-        Some((card, card_ttl(resp.header("cache-control"))))
+        Some((
+            card,
+            card_ttl_for(self.ep.local(), resp.header("cache-control")),
+        ))
     }
 
     /// Take the card's terms, or refuse them: an interface this client speaks
     /// for this kind of endpoint (its tenant is echoed from here on), and no
     /// required extension this client does not implement.
     fn adopt(&mut self, card: &PeerCard) -> Result<(), String> {
-        let interface = card.select_interface(self.ep.socket.is_some())?;
+        let interface = card.select_interface(self.ep.socket.is_some(), &self.ep.url)?;
         if let Some(uri) = card.requires_unknown_extension(CLIENT_EXTENSIONS) {
             return Err(format!(
                 "a2a: peer requires the extension {uri}, which agentd does not implement"
@@ -1558,6 +1641,129 @@ mod tests {
             assert_eq!(card_ttl(Some("max-age=86400")), Duration::from_secs(300));
             assert_eq!(card_ttl(Some("no-store")), Duration::ZERO);
             assert_eq!(card_ttl(Some("max-age=60, no-cache")), Duration::ZERO);
+        }
+
+        /// A card listing one interface per tenant delivers under the tenant
+        /// of the interface the operator configured — not the one listed
+        /// first — while the dial still goes to the configured URL.
+        #[test]
+        fn the_configured_interface_decides_the_tenant() {
+            // The fixture's URL is known only once it is bound, so the card
+            // names it through a slot filled right after.
+            let me: Arc<Mutex<String>> = Arc::default();
+            let named = Arc::clone(&me);
+            let (url, log) = serve(move |req| {
+                if is_card_get(req) {
+                    let mine = named.lock().unwrap().clone();
+                    return serve_card(&card_of(
+                        json!([
+                            interface("JSONRPC", "1.0", "t-first"),
+                            {"url": format!("{mine}/"), "protocolBinding": "JSONRPC",
+                             "protocolVersion": "1.0", "tenant": "t-mine"},
+                        ]),
+                        false,
+                        json!([]),
+                    ));
+                }
+                match req.body["method"].as_str() {
+                    Some("GetTask") => {
+                        result(task("t-1", TaskState::TASK_STATE_COMPLETED, Some("done")))
+                    }
+                    _ => working(),
+                }
+            });
+            *me.lock().unwrap() = url.clone();
+            assert_eq!(answer_of(delegated(&url)), "done");
+            assert_eq!(
+                requests(&log, "SendMessage")[0].body["params"]["tenant"],
+                "t-mine"
+            );
+            assert_eq!(
+                requests(&log, "GetTask")[0].body["params"]["tenant"],
+                "t-mine"
+            );
+        }
+
+        /// A delegation that fails drops the card it used: the next one reads
+        /// the peer as it is now, although the card said it could be kept.
+        #[test]
+        fn a_failed_delegation_drops_its_card() {
+            let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = Arc::clone(&reads);
+            let (url, log) = serve(move |req| {
+                if is_card_get(req) {
+                    // First read: a peer requiring an extension nobody knows.
+                    // After that: the peer as it now is.
+                    let n = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let extensions = if n == 0 {
+                        json!([{"uri": "https://example.com/ext/unknown", "required": true}])
+                    } else {
+                        json!([])
+                    };
+                    let card = card_of(json!([interface("JSONRPC", "1.0", "")]), false, extensions);
+                    return Answer::Http(
+                        200,
+                        vec![("Cache-Control", "max-age=60".to_string())],
+                        card.to_string(),
+                    );
+                }
+                result(json!({"task": task("t-1", TaskState::TASK_STATE_COMPLETED, Some("done"))}))
+            });
+            let e = error_of(delegated(&url));
+            assert!(e.contains("https://example.com/ext/unknown"), "{e}");
+            assert_eq!(answer_of(delegated(&url)), "done");
+            assert_eq!(
+                reads.load(std::sync::atomic::Ordering::SeqCst),
+                2,
+                "the refused card was read again: {:?}",
+                calls(&log)
+            );
+        }
+
+        /// Two callers of one origin with different credentials never share
+        /// a card: a gated peer may show them different ones.
+        #[test]
+        fn a_card_is_cached_per_credential() {
+            let card = unary_card();
+            let (url, log) = serve(move |req| {
+                if is_card_get(req) {
+                    return Answer::Http(
+                        200,
+                        vec![("Cache-Control", "max-age=60".to_string())],
+                        card.to_string(),
+                    );
+                }
+                result(json!({"task": task("t-1", TaskState::TASK_STATE_COMPLETED, Some("done"))}))
+            });
+            let as_bearer = |b: &str| {
+                let ep = A2aEndpoint::parse(&url).unwrap();
+                let auth = PeerAuth {
+                    headers: vec![("Authorization".into(), format!("Bearer {b}"))],
+                    ..Default::default()
+                };
+                let deadline = Instant::now() + Duration::from_secs(5);
+                answer_of(delegate(&ep, auth, "obj", None, None, None, deadline))
+            };
+            as_bearer("alice");
+            as_bearer("alice");
+            as_bearer("bob");
+            let reads = calls(&log).iter().filter(|c| c.starts_with("GET")).count();
+            assert_eq!(reads, 2, "one read per credential: {:?}", calls(&log));
+        }
+
+        /// A card from this host is kept for seconds, not minutes: the port or
+        /// socket it came from may hold another child by the next delegation.
+        #[test]
+        fn a_local_card_is_kept_for_seconds() {
+            assert_eq!(card_ttl_for(true, Some("max-age=60")), CARD_TTL_LOCAL);
+            assert_eq!(
+                card_ttl_for(false, Some("max-age=60")),
+                Duration::from_secs(60)
+            );
+            assert_eq!(card_ttl_for(true, Some("no-store")), Duration::ZERO);
+            assert!(HttpEp::parse("http://127.0.0.1:8080").unwrap().local());
+            assert!(HttpEp::parse("unix:///run/a.sock").unwrap().local());
+            assert!(!HttpEp::parse("https://agent.example").unwrap().local());
         }
 
         /// The first interface at JSON-RPC 1.x.0 decides the tenant, which is

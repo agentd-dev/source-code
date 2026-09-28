@@ -8,7 +8,10 @@
 //! answerable gate — and the asking unit suspends as a
 //! [`PendingKind::Human`]. A `SendMessage` carrying that `taskId` resolves the
 //! pending with the reply text: a turn's tool call returns it to the model, a
-//! workflow `human` step completes with it as output. Tasks are durable, so a
+//! workflow `human` step completes with it as output. A `security.policies`
+//! gate is answered with a DECISION about the call it holds — `approve` runs
+//! that call and the asker gets its real result, `deny` is an error — never
+//! with words standing in for a result. Tasks are durable, so a
 //! run's gate survives a restart (rebuilt from the suspended step). A turn's
 //! gate degrades to conversation continuation instead: the asking child does
 //! not outlive the process, so there is no tool call left to return into, and
@@ -18,9 +21,13 @@
 //! which display features are switched on. An ask whose unit a caller OWNS —
 //! the turn their message started, the run their command started — always
 //! gates while the A2A listener serves: that caller is already waiting on the
-//! task. An ask nobody owns (a schedule, a webhook, a stream) gates only with
-//! `agent.ask_human_unowned: gate`, because whether the operator is willing to
-//! be interrupted by the agent's own work is a deployment decision.
+//! task. An ask nobody owns (a schedule, a webhook, a stream, a subagent)
+//! gates only with `agent.ask_human_unowned: gate`, because whether the
+//! operator is willing to be interrupted by the agent's own work is a
+//! deployment decision. A subagent counts as unowned even when the turn that
+//! spawned it is a caller's: it is its own unit, and it may still be working
+//! long after that caller got its answer — so a policy gate on a subagent's
+//! call (the common `caller: [subagent]` rule) takes the fallback by default.
 //!
 //! **Fallback** (`agent.ask_human_fallback`) when an ask does not gate — no
 //! A2A listener, or an unowned ask with `ask_human_unowned: fallback`: `fail`
@@ -64,7 +71,8 @@ pub(crate) enum HumanChannel {
     #[cfg(feature = "a2a")]
     Owned(String),
     /// The listener serves, but no caller owns the asking unit (a scheduled
-    /// turn, a webhook, a stream, a timer-started run).
+    /// turn, a webhook, a stream, a timer-started run, a subagent — whatever
+    /// spawned it).
     #[cfg(feature = "a2a")]
     Unowned,
     /// No A2A listener (or a build without one): nobody can be asked at all.
@@ -230,6 +238,7 @@ impl Runtime {
                     auto_fired: true,
                     schema,
                     addressee: None,
+                    policy: None,
                 });
             }
             crate::config::v2::Approval::Auto => {
@@ -243,6 +252,7 @@ impl Runtime {
                     auto_fired: true,
                     schema,
                     addressee: None,
+                    policy: None,
                 });
             }
         }
@@ -258,13 +268,22 @@ impl Runtime {
                     deadline_ms,
                     schema,
                     addressee,
+                    None,
                 );
             }
             HumanChannel::Unowned
                 if self.settings.agent.ask_human_unowned
                     == crate::config::v2::AskHumanUnowned::Gate =>
             {
-                return self.human_gate(caller, None, question, deadline_ms, schema, addressee);
+                return self.human_gate(
+                    caller,
+                    None,
+                    question,
+                    deadline_ms,
+                    schema,
+                    addressee,
+                    None,
+                );
             }
             _ => {}
         }
@@ -303,6 +322,7 @@ impl Runtime {
                     auto_fired: false,
                     schema: schema.clone(),
                     addressee: addressee.clone(),
+                    policy: None,
                 })
             }
             AskHumanFallback::Auto => {
@@ -316,6 +336,7 @@ impl Runtime {
                     auto_fired: true,
                     schema: schema.clone(),
                     addressee: None,
+                    policy: None,
                 })
             }
         }
@@ -323,8 +344,10 @@ impl Runtime {
 
     /// The A2A gate: flip the owning task (`owned`, from [`HumanChannel`]) to
     /// `input-required`, or create a gate task when no caller owns the asking
-    /// unit, and suspend the asker.
+    /// unit, and suspend the asker. `policy` is the call a `security.policies`
+    /// gate holds (see [`PendingKind::Human`]).
     #[cfg(feature = "a2a")]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn human_gate(
         &mut self,
         caller: &super::tools::ToolCaller,
@@ -333,6 +356,7 @@ impl Runtime {
         deadline_ms: u64,
         schema: Option<Value>,
         addressee: Option<crate::a2a::principals::Addressee>,
+        policy: Option<super::reactor::PolicyCall>,
     ) -> super::tools::ToolOutcome {
         use super::tools::ToolOutcome;
         use crate::a2a::tasks::{Link, State};
@@ -373,6 +397,10 @@ impl Runtime {
                 // belongs to the task the request being served creates, and a
                 // gate opened while serving it is a different task — taking it
                 // would hand the caller a subscription to someone else's gate.
+                // It happens: a `workflow.signal` releases a wait inside a
+                // `foreach` body, and the body's next step — a call an `ask`
+                // policy gates — is dispatched before the signal's own task is
+                // created.
                 let reserved = self.reserved_task_id.take();
                 let created = if let Some(run) = &caller.run {
                     let run = run.clone();
@@ -424,6 +452,7 @@ impl Runtime {
             auto_fired: false,
             schema,
             addressee,
+            policy,
         })
     }
 
@@ -469,12 +498,13 @@ impl Runtime {
             standalone,
             schema,
             question,
+            policy,
             ..
         } = &p.kind
         else {
             return;
         };
-        let (task, standalone) = (task.clone(), *standalone);
+        let (task, standalone, policy) = (task.clone(), *standalone, policy.clone());
         self.fire_event_starts(
             "human.answered",
             &serde_json::json!({"task": task, "via": via}),
@@ -484,6 +514,7 @@ impl Runtime {
         // `{decision: "file"|"hold"}` and the run would proceed on "maybe
         // later". Check it here — and re-ask rather than fail, because the
         // person is still there and a second try is cheaper than a dead run.
+        let mut shaped: Option<Value> = None;
         if let Some(schema) = schema.clone() {
             let value = match crate::mcp::elicit::shape_reply(&json!(text), &schema) {
                 ::mcp::inbound::Answer::Accept(v) => v,
@@ -491,6 +522,7 @@ impl Runtime {
                 // shape, which is a real answer, not a validation failure.
                 _ => json!(text),
             };
+            shaped = Some(value.clone());
             if let Err(errs) = crate::jsonschema::validate(&schema, &value) {
                 let q = question.clone();
                 self.log.info(
@@ -538,26 +570,12 @@ impl Runtime {
             });
             return;
         }
-        #[cfg(feature = "a2a")]
-        if self.tasks.contains_key(&task) {
-            use crate::a2a::tasks::State;
-            let note = if via == "auto" {
-                "auto-answered (no human reply)"
-            } else {
-                "answered"
-            };
-            if let Some(t) = self.tasks.get_mut(&task) {
-                if standalone {
-                    // The Q&A was this task's whole purpose.
-                    t.transition(State::Completed, Some(note.to_string()));
-                } else {
-                    t.transition(State::Working, Some(note.to_string()));
-                }
-            }
-            self.task_persist(&task);
-            self.task_sync(&task);
-        }
-        let _ = standalone;
+        let note = if via == "auto" {
+            "auto-answered (no human reply)"
+        } else {
+            "answered"
+        };
+        self.human_task_settle(&task, standalone, note);
         self.log.info(
             "human.answered",
             json!({"task": task, "via": via, "by": answered_by}),
@@ -584,6 +602,18 @@ impl Runtime {
         // A workflow `human` step is NOT a tool result: the answer itself is
         // the step's output, and later steps template on
         // `steps.<gate>.output`, so a step keeps the bare reply.
+        //
+        // A policy gate's answer is neither: it is a decision about the call
+        // the gate holds, and the asker is owed that call's own result.
+        if let Some(call) = policy {
+            let approved = shaped
+                .as_ref()
+                .and_then(|v| v.get("decision"))
+                .and_then(Value::as_str)
+                == Some(POLICY_APPROVE);
+            self.policy_settle(&p.target, &call, approved, answered_by.unwrap_or(via));
+            return;
+        }
         let result = match &p.target {
             Target::Child(..) => json!({"reply": text, "timed_out": false, "via": via}),
             Target::Step(..) => Value::String(text.to_string()),
@@ -594,14 +624,65 @@ impl Runtime {
     /// Fail pending ask `i` (timeout / cancel / judge failure).
     pub(crate) fn human_fail(&mut self, i: usize, msg: &str) {
         let p = self.pending.remove(i);
-        let PendingKind::Human { task, .. } = &p.kind else {
+        let PendingKind::Human { task, policy, .. } = &p.kind else {
             return;
         };
         let task = task.clone();
         self.human_task_fail(&task, msg);
         self.log
             .warn("human.ask.failed", json!({"task": task, "err": msg}));
-        self.reply(&p.target, Value::String(msg.to_string()), true);
+        // A policy gate that ends unanswered refuses its call, and says so in
+        // the rule's words: the asker must not read "no answer" as "done".
+        let msg = match policy {
+            Some(call) => format!(
+                "denied by security.policies[{}]: {msg} — the call was NOT executed",
+                call.rule
+            ),
+            None => msg.to_string(),
+        };
+        self.reply(&p.target, Value::String(msg), true);
+    }
+
+    /// A policy gate's deadline passed with `on_timeout: allow`: close the
+    /// gate and run the call, as the rule said an unanswered gate should.
+    fn policy_timeout_allows(&mut self, i: usize) {
+        let p = self.pending.remove(i);
+        let PendingKind::Human {
+            task,
+            standalone,
+            policy: Some(call),
+            ..
+        } = &p.kind
+        else {
+            return;
+        };
+        self.human_task_settle(
+            task,
+            *standalone,
+            "no answer in time; the rule allows the call",
+        );
+        self.policy_settle(&p.target, call, true, "on_timeout");
+    }
+
+    /// Move the gate task on once its ask is settled: a task that existed only
+    /// for the ask completes, one that tracks other work goes back to working.
+    fn human_task_settle(&mut self, task: &str, standalone: bool, note: &str) {
+        #[cfg(feature = "a2a")]
+        if self.tasks.contains_key(task) {
+            use crate::a2a::tasks::State;
+            if let Some(t) = self.tasks.get_mut(task) {
+                if standalone {
+                    // The Q&A was this task's whole purpose.
+                    t.transition(State::Completed, Some(note.to_string()));
+                } else {
+                    t.transition(State::Working, Some(note.to_string()));
+                }
+            }
+            self.task_persist(task);
+            self.task_sync(task);
+        }
+        #[cfg(not(feature = "a2a"))]
+        let _ = (task, standalone, note);
     }
 
     /// Fail the gate task itself (a no-op when no A2A task backs the ask).
@@ -750,7 +831,18 @@ impl Runtime {
                         .warn("human.ask.pruned", json!({"task": task, "err": why}));
                     self.human_task_fail(&task, why);
                 }
-                End::Timeout => self.human_fail(i, "ask_human: no answer within the timeout"),
+                End::Timeout => {
+                    let allow = matches!(
+                        &self.pending[i].kind,
+                        PendingKind::Human { policy: Some(call), .. }
+                            if call.on_timeout == crate::config::v2::PolicyAction::Allow
+                    );
+                    if allow {
+                        self.policy_timeout_allows(i);
+                    } else {
+                        self.human_fail(i, "ask_human: no answer within the timeout");
+                    }
+                }
             }
         }
     }
@@ -813,7 +905,7 @@ impl Runtime {
     #[cfg(feature = "a2a")]
     pub(crate) fn rebuild_human_asks(&mut self) {
         use crate::a2a::tasks::{Link, State};
-        // (task, run, step, question, deadline, schema, addressee)
+        // (task, run, step, question, deadline, schema, addressee, policy)
         type RestoredGate = (
             String,
             String,
@@ -822,6 +914,7 @@ impl Runtime {
             u64,
             Option<Value>,
             Option<crate::a2a::principals::Addressee>,
+            Option<super::reactor::PolicyCall>,
         );
         let gates: Vec<RestoredGate> = self
             .tasks
@@ -847,6 +940,10 @@ impl Runtime {
                         .get("to")
                         .filter(|v| !v.is_null())
                         .and_then(|v| crate::a2a::principals::Addressee::parse(v).ok());
+                    // …and the call a policy gate holds, so an approval after
+                    // a restart runs it rather than completing the step with
+                    // the approver's words.
+                    let policy = wait.get("policy").and_then(policy_call_of);
                     Some((
                         t.id.clone(),
                         id.clone(),
@@ -855,12 +952,13 @@ impl Runtime {
                         deadline_ms,
                         schema,
                         addressee,
+                        policy,
                     ))
                 }
                 _ => None,
             })
             .collect();
-        for (task, run, step, question, deadline_ms, schema, addressee) in gates {
+        for (task, run, step, question, deadline_ms, schema, addressee, policy) in gates {
             self.log.info(
                 "human.ask.restored",
                 json!({"task": task, "run": run, "step": step}),
@@ -876,11 +974,66 @@ impl Runtime {
                     auto_fired: false,
                     schema,
                     addressee,
+                    policy,
                 },
                 started_ms: now_ms(),
             });
         }
     }
+}
+
+/// The answer a policy gate approves its call with; anything else its schema
+/// admits ([`POLICY_DENY`]) refuses it.
+pub(crate) const POLICY_APPROVE: &str = "approve";
+/// The answer a policy gate refuses its call with.
+#[cfg(feature = "a2a")]
+pub(crate) const POLICY_DENY: &str = "deny";
+
+/// The shape a policy gate's answer must take: a decision, and nothing a
+/// reader could mistake for one. "yes", "ok" or "sure" are re-asked rather
+/// than guessed at, because the gate exists to record exactly what was
+/// decided.
+#[cfg(feature = "a2a")]
+pub(crate) fn policy_answer_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {"decision": {"type": "string", "enum": [POLICY_APPROVE, POLICY_DENY]}},
+        "required": ["decision"],
+    })
+}
+
+/// A policy call as a durable wait record carries it (the inverse of
+/// [`policy_call_json`]).
+#[cfg(feature = "a2a")]
+fn policy_call_of(v: &Value) -> Option<super::reactor::PolicyCall> {
+    Some(super::reactor::PolicyCall {
+        tool: v.get("tool")?.as_str()?.to_string(),
+        args: v.get("args").cloned().unwrap_or(Value::Null),
+        rule: usize::try_from(v.get("rule")?.as_u64()?).ok()?,
+        // An unreadable fallback is the default one, deny: a restart must
+        // never turn a refusal into an approval.
+        on_timeout: v
+            .get("on_timeout")
+            .cloned()
+            .and_then(|a| serde_json::from_value(a).ok())
+            .unwrap_or(crate::config::v2::PolicyAction::Deny),
+    })
+}
+
+/// A policy call as the durable wait record of the step it suspends.
+pub(crate) fn policy_call_json(call: &super::reactor::PolicyCall) -> Value {
+    use crate::config::v2::PolicyAction;
+    json!({
+        "tool": call.tool,
+        "args": call.args,
+        "rule": call.rule,
+        "on_timeout": match call.on_timeout {
+            PolicyAction::Allow => "allow",
+            PolicyAction::Deny => "deny",
+            PolicyAction::Ask => "ask",
+            PolicyAction::Shadow => "shadow",
+        },
+    })
 }
 
 /// The auto-judge intel dial: answer `question` on the operator's behalf.
@@ -930,5 +1083,65 @@ UNDECIDED.";
     match client.complete(&req) {
         Ok(resp) => json!({"answer": resp.text.unwrap_or_default()}),
         Err(e) => json!({"error": format!("intel: {e}")}),
+    }
+}
+
+#[cfg(all(test, feature = "a2a"))]
+mod tests {
+    use super::*;
+    use crate::config::v2::PolicyAction;
+
+    /// A step's policy gate is rebuilt from its wait record after a restart,
+    /// and the call it holds must come back whole — an approval then runs the
+    /// call it approved, and an `on_timeout` of deny is never read back as
+    /// allow.
+    #[test]
+    fn a_held_call_survives_its_own_record() {
+        for on_timeout in [
+            PolicyAction::Allow,
+            PolicyAction::Deny,
+            PolicyAction::Shadow,
+        ] {
+            let call = super::super::reactor::PolicyCall {
+                tool: "memory.set".into(),
+                args: json!({"key": "k", "value": 1}),
+                rule: 3,
+                on_timeout,
+            };
+            let back = policy_call_of(&policy_call_json(&call)).expect("read back");
+            assert_eq!(
+                (back.tool.as_str(), &back.args, back.rule, back.on_timeout),
+                ("memory.set", &call.args, 3, on_timeout)
+            );
+        }
+        // A record whose fallback cannot be read denies.
+        let unreadable = json!({"tool": "t", "args": {}, "rule": 0, "on_timeout": "maybe"});
+        assert_eq!(
+            policy_call_of(&unreadable).unwrap().on_timeout,
+            PolicyAction::Deny
+        );
+    }
+
+    /// The answer shape a policy gate declares admits exactly the two
+    /// decisions, whatever a person types.
+    #[test]
+    fn a_policy_gate_takes_a_decision_and_nothing_else() {
+        let schema = policy_answer_schema();
+        let shaped = |text: &str| match crate::mcp::elicit::shape_reply(&json!(text), &schema) {
+            ::mcp::inbound::Answer::Accept(v) => v,
+            _ => json!(text),
+        };
+        for ok in [POLICY_APPROVE, POLICY_DENY] {
+            assert!(
+                crate::jsonschema::validate(&schema, &shaped(ok)).is_ok(),
+                "{ok}"
+            );
+        }
+        for no in ["yes", "ok", "Approve please", ""] {
+            assert!(
+                crate::jsonschema::validate(&schema, &shaped(no)).is_err(),
+                "{no:?}"
+            );
+        }
     }
 }

@@ -5,13 +5,19 @@
 //!
 //! * [`SourceLimiter`] counts FAILURES from one network source — a presented
 //!   credential that did not authenticate, a role that was refused — and says
-//!   when a source has failed too often. It is consulted only for a request
-//!   that is already failing, so it can slow a guesser down but never refuse a
-//!   request that authenticates: the TUI, a launched tab or `curl` on the
-//!   operator's own machine is never locked out because a web page made the
-//!   browser send junk.
+//!   when a source has failed too often. Only failures are counted, so what a
+//!   web page can make a browser send — a refused origin, a request with no
+//!   credential — never puts a source over. Once a source IS over, every
+//!   request from it that presents a bearer is refused before the bearer is
+//!   checked: a limiter that still checked each guess would slow nobody down,
+//!   it would only change the status of a wrong guess from 401 to 429 while a
+//!   right one sailed through. A request that presents nothing (the implicit
+//!   operator, an `any` rule) is never refused by it.
 //! * [`PrincipalRates`] is admission: one token per request from a named
 //!   principal, from the rate its rule declares.
+//! * [`DenialLog`] bounds what refusals cost the operator's log: a caller who
+//!   is nobody pays nothing per request, so one log line per request would let
+//!   anyone fill the disk at line rate.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -28,6 +34,15 @@ pub const AUTH_FAILURE_BURST: u32 = 20;
 pub const AUTH_FAILURE_REFILL: Duration = Duration::from_secs(3);
 /// The most sources tracked at once; the least recently seen is dropped.
 pub const SOURCE_ENTRIES: usize = 4096;
+/// How often one source's refusals of one kind reach the log: the first in a
+/// window is written, the rest are counted and reported with the next.
+pub const DENIAL_LOG_WINDOW: Duration = Duration::from_secs(60);
+/// Refusal lines across every source: at most this many at once…
+pub const DENIAL_LOG_BURST: u32 = 20;
+/// …and one more per interval after that, however many sources there are —
+/// an IPv6 guesser has a /64 per address it controls, and a per-source window
+/// alone would give each of them a line.
+pub const DENIAL_LOG_REFILL: Duration = Duration::from_secs(1);
 
 /// The unit a source is counted as: an IPv4 address, or an IPv6 /64 — one
 /// host is routinely handed a whole /64, so counting single v6 addresses
@@ -137,6 +152,109 @@ impl SourceLimiter {
     }
 }
 
+/// Which refusals are written to the log.
+///
+/// A refusal of a caller who is nobody — no credential, a bad one, a source
+/// already over its failure limit — costs that caller nothing, so a line per
+/// refusal is a line per request anyone can send. Each (source, reason) pair
+/// is written once per [`DENIAL_LOG_WINDOW`], and the next line it gets says
+/// how many were left out; a global drain caps the lines across all sources.
+pub struct DenialLog {
+    window: Duration,
+    capacity: usize,
+    burst: f64,
+    drain_per_sec: f64,
+    state: Mutex<DenialState>,
+}
+
+#[derive(Default)]
+struct DenialState {
+    seen: HashMap<(SourceKey, &'static str), Seen>,
+    /// The global line budget, spent one per written line.
+    spent: Option<Count>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Seen {
+    /// When this pair last got a line; `None` while it never has.
+    logged: Option<Instant>,
+    /// When this pair was last refused, for eviction.
+    last: Instant,
+    /// Refusals since its last line that got none.
+    suppressed: u64,
+}
+
+impl DenialLog {
+    pub fn new(window: Duration, burst: u32, refill: Duration, capacity: usize) -> DenialLog {
+        DenialLog {
+            window,
+            capacity: capacity.max(1),
+            burst: f64::from(burst),
+            drain_per_sec: 1.0 / refill.as_secs_f64().max(f64::MIN_POSITIVE),
+            state: Mutex::new(DenialState::default()),
+        }
+    }
+
+    /// The listener's refusal log.
+    pub fn listener() -> DenialLog {
+        DenialLog::new(
+            DENIAL_LOG_WINDOW,
+            DENIAL_LOG_BURST,
+            DENIAL_LOG_REFILL,
+            SOURCE_ENTRIES,
+        )
+    }
+
+    /// `Some(suppressed)` when this refusal of `source` for `reason` should
+    /// be written — `suppressed` being how many of the same were left out
+    /// since the last line — and `None` when it is one of those.
+    pub fn admit(&self, source: IpAddr, reason: &'static str) -> Option<u64> {
+        self.admit_at(source, reason, Instant::now())
+    }
+
+    pub(crate) fn admit_at(
+        &self,
+        source: IpAddr,
+        reason: &'static str,
+        now: Instant,
+    ) -> Option<u64> {
+        let key = (SourceKey::of(source), reason);
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !st.seen.contains_key(&key)
+            && st.seen.len() >= self.capacity
+            && let Some(oldest) = st.seen.iter().min_by_key(|(_, s)| s.last).map(|(k, _)| *k)
+        {
+            st.seen.remove(&oldest);
+        }
+        let window = self.window;
+        let seen = st.seen.entry(key).or_insert(Seen {
+            logged: None,
+            last: now,
+            suppressed: 0,
+        });
+        seen.last = now;
+        let due = seen
+            .logged
+            .is_none_or(|at| now.saturating_duration_since(at) >= window);
+        let seen = *seen;
+        let budget = st.spent.map_or(0.0, |c| c.at(now, self.drain_per_sec));
+        if due && budget + 1.0 <= self.burst {
+            st.spent = Some(Count {
+                level: budget + 1.0,
+                last: now,
+            });
+            let s = st.seen.get_mut(&key).expect("inserted above");
+            s.logged = Some(now);
+            s.suppressed = 0;
+            return Some(seen.suppressed);
+        }
+        if let Some(s) = st.seen.get_mut(&key) {
+            s.suppressed += 1;
+        }
+        None
+    }
+}
+
 /// Per-principal admission, from the rate each principal's rule declares.
 ///
 /// Keyed by the principal id AND the spec, so a reload that changes a rule's
@@ -236,6 +354,64 @@ mod tests {
             l.over_at(ip("10.0.0.1"), t0 + Duration::from_secs(2)),
             None,
             "the oldest source was forgotten"
+        );
+    }
+
+    /// One line per source and reason per window, carrying the count of
+    /// what it left out; a new window writes again; another reason or source
+    /// has its own line.
+    #[test]
+    fn a_refusal_flood_writes_one_line_per_source_and_window() {
+        let log = DenialLog::new(Duration::from_secs(60), 100, Duration::from_secs(1), 16);
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let t0 = Instant::now();
+        assert_eq!(log.admit_at(ip, "unauthenticated", t0), Some(0));
+        for _ in 0..500 {
+            assert_eq!(log.admit_at(ip, "unauthenticated", t0), None);
+        }
+        assert_eq!(
+            log.admit_at(ip, "invalid_credential", t0),
+            Some(0),
+            "another reason has its own line"
+        );
+        let other: IpAddr = "10.0.0.9".parse().unwrap();
+        assert_eq!(log.admit_at(other, "unauthenticated", t0), Some(0));
+        assert_eq!(
+            log.admit_at(ip, "unauthenticated", t0 + Duration::from_secs(60)),
+            Some(500),
+            "the next window's line reports what the last one left out"
+        );
+        assert_eq!(
+            log.admit_at(ip, "unauthenticated", t0 + Duration::from_secs(61)),
+            None
+        );
+    }
+
+    /// However many sources a flood comes from, the lines across all of them
+    /// are bounded by the global drain.
+    #[test]
+    fn many_sources_share_one_line_budget() {
+        let log = DenialLog::new(Duration::from_secs(60), 5, Duration::from_secs(1), 4096);
+        let t0 = Instant::now();
+        let written = (0..1000u32)
+            .filter(|n| {
+                let ip = IpAddr::from([10, 0, (n >> 8) as u8, *n as u8]);
+                log.admit_at(ip, "unauthenticated", t0).is_some()
+            })
+            .count();
+        assert_eq!(written, 5, "the burst, and no more");
+        let ip = IpAddr::from([10, 9, 9, 9]);
+        assert_eq!(
+            log.admit_at(ip, "unauthenticated", t0 + Duration::from_secs(1)),
+            Some(0),
+            "the budget refills"
+        );
+        // A source left out for want of budget is still due: its line comes
+        // with the next budget, carrying the refusals it missed.
+        let starved = IpAddr::from([10, 0, 0, 7]);
+        assert_eq!(
+            log.admit_at(starved, "unauthenticated", t0 + Duration::from_secs(2)),
+            Some(1)
         );
     }
 

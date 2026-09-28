@@ -435,9 +435,11 @@ impl AsyncNotificationManager for RuntimePorts {
     ) -> Result<Vec<TaskPushNotificationConfig>, A2AError> {
         // a2a-rs hands this port the task id alone — the request's `pageSize`
         // and `pageToken` do not reach it, and its answer can carry no
-        // `nextPageToken`. Returning the first page would be a listing that is
-        // silently short, so the port walks every page and answers with all of
-        // them: complete, if unpaged.
+        // `nextPageToken` — which is why the listener answers the wire method
+        // itself (`serve::dispatch`) and a caller's paging never comes here.
+        // Whatever still does gets a listing that is complete rather than
+        // silently short: the port walks every page and answers with all of
+        // them.
         let who = caller();
         let mut out: Vec<TaskPushNotificationConfig> = Vec::new();
         let mut token = String::new();

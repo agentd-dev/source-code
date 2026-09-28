@@ -147,6 +147,11 @@ pub fn to_wire(task_id: &str, t: &PushTarget) -> Value {
 ///   (`tchar`s only), so it cannot carry a space, a colon or a line break;
 /// * `credentials` must be non-empty and free of control characters, so a CR
 ///   or LF cannot end the header and start another.
+///
+/// The legacy `token` rides in a header line too (`x-a2a-notification-token`),
+/// so it is held to the same rule: the transport refuses a CR or LF in a
+/// header, and a token carrying one would fail every delivery silently —
+/// delivery is best-effort — where refusing it here tells the caller.
 pub fn from_wire(v: &Value, id: String) -> Result<PushTarget, String> {
     let url = v
         .get("url")
@@ -159,6 +164,9 @@ pub fn from_wire(v: &Value, id: String) -> Result<PushTarget, String> {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    if token.chars().any(char::is_control) {
+        return Err("token may not contain control characters".into());
+    }
     let auth = match v.get("authentication") {
         None | Some(Value::Null) => None,
         Some(a) => Some(auth_of(a)?),
@@ -303,6 +311,12 @@ mod tests {
         refused(json!({"scheme": "Bearer", "credentials": ""}));
         refused(json!({"scheme": "Bearer", "credentials": "k\r\nX-Evil: 1"}));
         refused(json!({"scheme": "Bearer", "credentials": "k\u{7f}"}));
+        // The legacy token is a header value too.
+        for token in ["t\r\nX-Evil: 1", "t\n", "t\u{0}"] {
+            let cfg = typed(json!({"url": "https://hooks.example/x", "token": token}));
+            let e = from_wire(&cfg, "p".into()).expect_err(&format!("{cfg} must be refused"));
+            assert!(e.contains("token"), "{e}");
+        }
         // No `authentication` at all is a config without one, not an error.
         let bare = typed(json!({"url": "https://hooks.example/x"}));
         assert!(from_wire(&bare, "p".into()).unwrap().auth.is_none());

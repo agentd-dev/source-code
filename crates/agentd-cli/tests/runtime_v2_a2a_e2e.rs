@@ -194,7 +194,7 @@ fn a_status_command_over_a2a_is_a_message_without_a_task_or_a_model_turn() {
 
     // The agent card is discoverable without a principal.
     let card = get_card(&addr);
-    assert_eq!(card["name"], "agentd");
+    assert_eq!(card["name"], "a2a-e2e", "the configured agent.name");
     assert_eq!(card["capabilities"]["streaming"], true);
 
     std::fs::remove_file(&cfg).ok();

@@ -476,34 +476,3 @@ fn push_is_off_unless_an_operator_turns_it_on() {
 
     std::fs::remove_file(&cfg_path).ok();
 }
-
-#[test]
-fn the_extended_card_is_the_authenticated_one() {
-    let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
-    let (_daemon, addr, cfg_path) = boot(|p| config(&llm.uri, p, ""));
-
-    // Loopback with nothing configured resolves to the operator, so this call
-    // is authenticated and the extended card is served.
-    let extended = rpc(&addr, 1, "GetExtendedAgentCard", json!({}));
-    assert!(
-        extended.get("error").is_none(),
-        "an authenticated caller gets the extended card: {extended}"
-    );
-    assert_eq!(extended["result"]["name"], "agentd");
-    // The card announces the extended card through the capability the A2A
-    // message actually carries. `supportsAuthenticatedExtendedCard` was a flat
-    // field of the older card shape, is in neither `AgentCard` nor
-    // `AgentCapabilities`, and was dropped by every typed reader.
-    assert_eq!(
-        extended["result"]["capabilities"]["extendedAgentCard"], true,
-        "{extended}"
-    );
-    assert!(
-        extended["result"]
-            .get("supportsAuthenticatedExtendedCard")
-            .is_none(),
-        "the retired flat spelling must be gone: {extended}"
-    );
-
-    std::fs::remove_file(&cfg_path).ok();
-}

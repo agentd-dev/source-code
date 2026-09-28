@@ -184,8 +184,147 @@ pub fn join(origin: &str, path: &str) -> String {
     )
 }
 
+/// What the card tells a caller about authenticating: the schemes it may
+/// present (`securitySchemes`) and the combinations that admit it
+/// (`securityRequirements` — the array is OR, each entry AND).
+#[cfg(feature = "a2a")]
+#[derive(Debug, Clone, PartialEq)]
+pub struct CardSecurity {
+    pub schemes: std::collections::HashMap<String, a2a_rs::domain::SecurityScheme>,
+    pub requirements: Vec<a2a_rs::domain::SecurityRequirement>,
+}
+
+/// The card's security fields, from the posture the listener enforces and the
+/// origin it is published at — `None` when there is nothing to declare, and
+/// then the card carries neither field.
+///
+/// A2A 1.0 §3.1.11: a client MUST authenticate with a scheme the PUBLIC card
+/// declares. So every mechanism the listener accepts is declared here, and
+/// nothing it does not: a unix socket declares none (the kernel names the
+/// peer), and a loopback daemon with no mechanism declares none (the caller is
+/// the operator by the bind). Built with the SDK's constructors, so the typed
+/// round trip the card goes through keeps every field.
+#[cfg(feature = "a2a")]
+pub fn security_of(
+    posture: &ListenerAuth,
+    origin: Option<&str>,
+    scopes: &[crate::config::v2::DeviceScope],
+) -> Option<CardSecurity> {
+    use a2a_rs::domain::{
+        DeviceCodeOAuthFlow, OAuthFlows, SecurityRequirement, SecurityScheme, StringList,
+    };
+    if !posture.declares_any() {
+        return None;
+    }
+    let mut schemes = std::collections::HashMap::new();
+    // A device-grant session token is presented as a bearer, so the grant
+    // implies the bearer scheme even when no static bearer is configured.
+    let bearer = posture.bearer || posture.device;
+    if bearer {
+        let how = if posture.device {
+            "An `Authorization: Bearer` credential: a token the operator issued, or the session \
+             token the device authorization grant (`device_code`) issues"
+        } else {
+            "An `Authorization: Bearer` credential the operator issued"
+        };
+        schemes.insert(
+            "bearer".to_string(),
+            SecurityScheme::http("Bearer".into(), None, Some(how.into())),
+        );
+    }
+    // The grant's endpoints live at the origin root, which is why `a2a.url` is
+    // an origin: a card published at a URL with no origin (it cannot happen
+    // while `declares_any` excludes unix) declares no endpoint to sign in at.
+    if posture.device
+        && let Some(origin) = origin
+    {
+        let flow = DeviceCodeOAuthFlow {
+            device_authorization_url: join(origin, "/oauth2/device_authorization"),
+            token_url: join(origin, "/oauth2/token"),
+            scopes: scopes
+                .iter()
+                .map(|s| (s.as_str().to_string(), scope_description(*s).to_string()))
+                .collect(),
+            ..Default::default()
+        };
+        // RFC 8414 metadata is only worth pointing at over TLS: a client that
+        // trusts discovery over plaintext trusts whoever answers it.
+        let metadata = origin
+            .starts_with("https://")
+            .then(|| join(origin, "/.well-known/oauth-authorization-server"));
+        schemes.insert(
+            "device_code".to_string(),
+            SecurityScheme::oauth2(
+                OAuthFlows::device_code(flow),
+                Some(
+                    "Sign in with the OAuth 2.0 device authorization grant (RFC 8628); an \
+                     operator approves the code"
+                        .into(),
+                ),
+                metadata,
+            ),
+        );
+    }
+    if posture.mtls {
+        schemes.insert(
+            "mtls".to_string(),
+            SecurityScheme::mutual_tls(Some(
+                "A client certificate that chains to this agent's client CA".into(),
+            )),
+        );
+    }
+    let all_of = |names: &[&str]| SecurityRequirement {
+        schemes: names
+            .iter()
+            .map(|n| (n.to_string(), StringList::default()))
+            .collect(),
+        ..Default::default()
+    };
+    let requirements = if posture.mtls {
+        // The handshake demands the certificate before any header is read, so
+        // every alternative carries it; a bearer rides on top of it, never
+        // instead of it. No anonymous alternative: there is no request
+        // without a certificate.
+        let mut r = vec![all_of(&["mtls"])];
+        if bearer {
+            r.push(all_of(&["mtls", "bearer"]));
+        }
+        r
+    } else {
+        let mut names: Vec<&str> = schemes.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        let mut r: Vec<SecurityRequirement> = names.iter().map(|n| all_of(&[n])).collect();
+        // The empty alternative says "or nothing at all" — true only when an
+        // `any` rule names the caller who presents nothing. The implicit
+        // operator is not it: once a scheme is declared the bind no longer
+        // makes anybody the operator.
+        if posture.any_rule {
+            r.push(all_of(&[]));
+        }
+        r
+    };
+    Some(CardSecurity {
+        schemes,
+        requirements,
+    })
+}
+
+/// What granting a device scope lets the signed-in client do, for the card.
+#[cfg(feature = "a2a")]
+fn scope_description(scope: crate::config::v2::DeviceScope) -> &'static str {
+    use crate::config::v2::DeviceScope;
+    match scope {
+        DeviceScope::User => "Act as a user of this agent: converse, and run what you are granted",
+        DeviceScope::Operator => {
+            "Operate this agent: approve sign-ins, drain, pause and change runtime settings"
+        }
+    }
+}
+
+// `pub(crate)` so the card's tests run its security fields over the same
+// posture table this module's tests hold the resolver to.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::a2a::Resolver;
     use crate::a2a::principals::{Evidence, Resolution, Via};
@@ -206,7 +345,7 @@ mod tests {
     /// The postures the table covers: a name, the settings, and whether a
     /// caller must present something — written out here rather than computed,
     /// so the formula has something to be wrong against.
-    fn postures() -> Vec<(&'static str, A2a, bool)> {
+    pub(crate) fn postures() -> Vec<(&'static str, A2a, bool)> {
         vec![
             (
                 "loopback, nothing configured",

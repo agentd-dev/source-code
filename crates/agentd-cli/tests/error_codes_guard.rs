@@ -57,7 +57,6 @@ const RULES: &[Rule] = &[
 ];
 
 #[test]
-#[ignore = "activated by U21"]
 fn spec_codes_are_not_reused_for_auth() {
     let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../agentd");
     let mut files = Vec::new();
@@ -83,8 +82,8 @@ fn spec_codes_are_not_reused_for_auth() {
     );
 }
 
-/// The scanner itself, on sources written to trip it. Runs now, so the guard
-/// U21 switches on is already known to see what it must and nothing else.
+/// The scanner itself, on sources written to trip it, so the guard above is
+/// known to see what it must and nothing else.
 #[test]
 fn the_scanner_sees_code_and_only_code() {
     let src = r##"

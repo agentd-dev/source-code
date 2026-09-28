@@ -214,14 +214,26 @@ fn agent_card(h: &Harness) -> Outcome {
     wait_ready(&addr);
 
     let card = get_card(&addr);
+    // The name is the one the operator configured (`agent.name`), not the
+    // product's: a registry listing several agents must tell them apart.
     Outcome::require(
-        card["name"] == "agentd",
-        format!("card name should be agentd: {card}"),
+        card["name"] == "a2a-conf",
+        format!("the card name should be the configured agent.name: {card}"),
     )
     .and(|| {
         Outcome::require(
             card["capabilities"]["streaming"] == true,
             format!("the card should advertise streaming: {card}"),
+        )
+    })
+    .and(|| {
+        // The interface declares the protocol version it actually serves, as
+        // Major.Minor: a 1.0 client selects an interface by binding and
+        // version, and passes over one that claims another.
+        let iface = &card["supportedInterfaces"][0];
+        Outcome::require(
+            iface["protocolBinding"] == "JSONRPC" && iface["protocolVersion"] == "1.0",
+            format!("the interface should be JSONRPC at A2A 1.0: {card}"),
         )
     })
 }

@@ -233,13 +233,15 @@ fn task_count_as(addr: &str, bearer: &str) -> usize {
     v["result"]["tasks"].as_array().map(Vec::len).unwrap_or(0)
 }
 
-/// The skill ids `bearer`'s principal is offered on the extended card.
+/// The workflows `bearer`'s principal is offered on the extended card (a
+/// workflow's skill id is `workflow:<name>`).
 fn skills_as(addr: &str, bearer: &str) -> Vec<String> {
     rpc_as(addr, bearer, 5, "GetExtendedAgentCard", json!({}))["result"]["skills"]
         .as_array()
         .map(|a| {
             a.iter()
-                .filter_map(|s| s["id"].as_str().map(str::to_string))
+                .filter_map(|s| s["id"].as_str()?.strip_prefix("workflow:"))
+                .map(str::to_string)
                 .collect()
         })
         .unwrap_or_default()

@@ -46,6 +46,11 @@ pub enum Kind {
     /// refresh token with its expiry, keyed by a hash of (endpoint, provider,
     /// principal). Redaction-excluded — never logged, audited, or read-surfaced.
     Cred,
+    /// A name a principal is known by, and whether a configured rule or an
+    /// approved device first claimed it (`runtime::identities`), keyed by a
+    /// hash of the principal id. Durable because ownership is: a name that
+    /// outlived a restart still owns its history, so the claim must too.
+    Identity,
 }
 
 impl Kind {
@@ -63,6 +68,7 @@ impl Kind {
             Kind::Event => "event",
             Kind::Audit => "audit",
             Kind::Cred => "cred",
+            Kind::Identity => "identity",
         }
     }
     pub fn parse(s: &str) -> Option<Kind> {
@@ -79,16 +85,18 @@ impl Kind {
             "timer" => Kind::Timer,
             "audit" => Kind::Audit,
             "cred" => Kind::Cred,
+            "identity" => Kind::Identity,
             _ => return None,
         })
     }
     /// Kinds the manifest indexes (restorable without `list`). Memory keys keep
     /// their own index record; audit records are append-only history; cred records
-    /// are a self-keyed credential cache (not manifest-indexed).
+    /// are a self-keyed credential cache (not manifest-indexed); identity
+    /// records are looked up by the id they claim, never restored as a set.
     pub fn indexed(self) -> bool {
         !matches!(
             self,
-            Kind::Manifest | Kind::Memory | Kind::Audit | Kind::Cred | Kind::Event
+            Kind::Manifest | Kind::Memory | Kind::Audit | Kind::Cred | Kind::Event | Kind::Identity
         )
     }
 }

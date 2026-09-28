@@ -353,6 +353,7 @@ impl Compiled {
             rate: self.rate.clone(),
             budget: self.budget.clone(),
             labels: self.labels.clone(),
+            session: None,
         })
     }
 }
@@ -393,6 +394,7 @@ pub fn declared_principals(a2a: &v2::A2a) -> std::collections::BTreeMap<String, 
                 rate: p.quotas.as_ref().and_then(|q| q.rate.clone()),
                 budget: p.quotas.as_ref().and_then(|q| q.budget.clone()),
                 labels: p.labels.clone(),
+                session: None,
             },
         );
     }
@@ -407,6 +409,7 @@ fn operator() -> Principal {
         rate: None,
         budget: None,
         labels: Default::default(),
+        session: None,
     }
 }
 

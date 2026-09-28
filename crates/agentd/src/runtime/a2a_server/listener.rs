@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Binding the listener: the TLS it is spawned with, and the URL it is reached
-//! at. Its identity posture is not here — it lives in the bridge's resolver, so
-//! a reload that changes the rules changes the posture with them.
+//! Binding the listener: the TLS it is spawned with, the URL it is reached at,
+//! and the sessions it issues. Its identity posture is not here — it lives in
+//! the bridge's resolver, so a reload that changes the rules changes the
+//! posture with them.
 
 use super::{A2aBridge, SharedFeed};
 use crate::a2a::Resolver;
@@ -31,6 +32,13 @@ pub(crate) struct A2aServing {
     pub bound: String,
     /// The URL this listener is published at: [`advertised_url`].
     pub advertised_url: String,
+    /// The sessions this listener has issued. On every TCP listener, device
+    /// grant or not — `auth.sessions` lists them and the resolver routes
+    /// every `agentd_at_` bearer to them — and held here, outside the
+    /// authority, for that reason. `None` on a unix socket, which issues none.
+    pub sessions: Option<Arc<crate::a2a::oauth::Sessions>>,
+    /// The authorization server, when `a2a.device_grant.enabled`.
+    pub authority: Option<Arc<crate::a2a::oauth::Authority>>,
 }
 
 /// The URL a caller reaches this listener at, once it is bound.
@@ -77,15 +85,27 @@ pub(crate) fn advertised_url(a2a: &crate::config::v2::A2a, bound: &str) -> Strin
 /// assembled here is the TLS identity that makes a client certificate readable
 /// in the first place, and the bridge that carries the resolver — the rules and
 /// the posture — every request is resolved under.
+///
+/// Before anything binds, every rule id is recorded in the identity registry
+/// ([`crate::runtime::identities`]), and a `user`-role id that an approved
+/// device already owns refuses the start: the two would be one principal, and
+/// the rule would inherit the device's history.
 pub(crate) fn spawn_a2a_listener(
     a2a: &crate::config::v2::A2a,
     events_tx: Sender<Event>,
     resolver: Resolver,
+    durable: &crate::state::Durable,
     _write_timeout: Duration,
     log: Logger,
 ) -> Result<A2aServing, String> {
     use std::path::Path;
     let listen = a2a.listen.as_deref().ok_or("a2a.listen is not set")?;
+    if let Err(refused) = crate::runtime::identities::register_rules(durable, a2a) {
+        if let Some(line) = refused.collision_line() {
+            log.error("identity.collision", line);
+        }
+        return Err(refused.to_string());
+    }
     let target =
         crate::config::ServeTarget::parse(listen).map_err(|e| format!("a2a.listen: {e}"))?;
     let (bind, tls_scheme) = match &target {
@@ -139,6 +159,26 @@ pub(crate) fn spawn_a2a_listener(
     let origins: crate::a2a::serve::OriginList =
         Arc::new(std::sync::RwLock::new(a2a.cors.origins.clone()));
     let bridge = A2aBridge::with_feed(events_tx, resolver, feed.clone());
+    // Sessions on every TCP listener; the authority that issues into them
+    // only with the grant. A unix socket's peers are the kernel's to name.
+    let sessions = (!unix_listener).then(|| {
+        Arc::new(crate::a2a::oauth::Sessions::new(
+            crate::a2a::oauth::system_clock(),
+        ))
+    });
+    let authority = sessions
+        .as_ref()
+        .filter(|_| a2a.device_grant.enabled)
+        .map(|s| {
+            Arc::new(crate::a2a::oauth::Authority::new(
+                crate::a2a::oauth::DeviceGrant::new(
+                    &a2a.device_grant,
+                    crate::a2a::oauth::system_clock(),
+                    crate::a2a::oauth::os_mint(),
+                ),
+                Arc::clone(s),
+            ))
+        });
 
     let listener = crate::a2a::serve::spawn(
         if unix_listener {
@@ -147,9 +187,10 @@ pub(crate) fn spawn_a2a_listener(
             crate::a2a::serve::Bind::Tcp(bind.clone())
         },
         crate::a2a::serve::Opts {
-            // No session store is installed yet, so every session token is
-            // refused as unknown.
-            auth: crate::a2a::serve::Auth::default(),
+            auth: crate::a2a::serve::Auth {
+                sessions: sessions.clone(),
+                authority: authority.clone(),
+            },
             cors_origins: Arc::clone(&origins),
             tls,
             request_timeout: bridge.request_timeout,
@@ -161,17 +202,28 @@ pub(crate) fn spawn_a2a_listener(
     )?;
 
     let bound = listener.bound.clone();
+    let advertised = advertised_url(a2a, &bound);
+    // The issuer is the advertised ORIGIN — known only now that a `:0` port
+    // has been given one — and every endpoint URL is built from it, so the
+    // metadata, the card and the verification URI can never disagree.
+    if let Some(a) = &authority
+        && let Some(origin) = crate::runtime::surface::auth::origin_of(&advertised)
+    {
+        a.set_issuer(&origin);
+    }
     let serving = A2aServing {
         feed,
-        advertised_url: advertised_url(a2a, &bound),
+        advertised_url: advertised,
         bound,
         listener,
         bridge,
         origins,
+        sessions,
+        authority,
     };
     log.info(
         "a2a.listen",
-        json!({"authority": listen, "bound": serving.bound, "url": serving.advertised_url, "tls": tls_scheme, "mtls": posture.mtls, "required": posture.required, "implicit_operator": posture.implicit_operator, "events": a2a.events.enabled, "introspection": a2a.introspection.enabled}),
+        json!({"authority": listen, "bound": serving.bound, "url": serving.advertised_url, "tls": tls_scheme, "mtls": posture.mtls, "required": posture.required, "implicit_operator": posture.implicit_operator, "device_grant": a2a.device_grant.enabled, "events": a2a.events.enabled, "introspection": a2a.introspection.enabled}),
     );
     Ok(serving)
 }

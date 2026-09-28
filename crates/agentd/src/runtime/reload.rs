@@ -52,6 +52,7 @@ impl Runtime {
             principal: Some("operator"),
             role: Some("operator"),
             request_id: None,
+            sid: None,
         });
         match outcome {
             Ok(changed) => {
@@ -416,13 +417,31 @@ impl Runtime {
         // moves it: a no-auth loopback daemon given its first rule stops
         // treating local callers as the operator on the very next request.
         // Nothing else holds a posture for a reload to miss.
+        //
+        // The new rule ids are claimed in the identity registry before the
+        // swap, and a `user`-role id an approved device already owns refuses
+        // the change exactly as a failed rebuild does: the rule would be that
+        // device's principal and inherit its history. The registry is
+        // durable, so this holds for a name whose sessions are long gone, and
+        // across a restart between the approval and the declaration.
         #[cfg(feature = "a2a")]
         if old.a2a.principals != new.a2a.principals
             && let Some(bridge) = self.a2a_serving.as_ref().map(|s| &s.bridge)
         {
             let env = self.env.clone();
             let envmap = move |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
-            match crate::a2a::Resolver::build(&new.a2a, &envmap) {
+            // Built first, so a set that cannot compile claims no names.
+            let built = crate::a2a::Resolver::build(&new.a2a, &envmap).and_then(|r| {
+                crate::runtime::identities::register_rules(&self.durable, &new.a2a)
+                    .map(|()| r)
+                    .map_err(|refused| {
+                        if let Some(line) = refused.collision_line() {
+                            self.log.warn("identity.collision", line);
+                        }
+                        refused.to_string()
+                    })
+            });
+            match built {
                 Ok(r) => {
                     bridge.set_resolver(r);
                     // Who the model acts for moves with the rules, in the

@@ -8,6 +8,7 @@ use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 
+use super::LivenessCheck;
 use crate::a2a::Principal;
 use crate::runtime::a2a_server::SharedFeed;
 
@@ -18,12 +19,19 @@ use crate::runtime::a2a_server::SharedFeed;
 /// `resync`, meaning re-bootstrap. Then the events the principal may see, and
 /// finally a `goodbye` carrying the cursor to resume from, so a reconnect is a
 /// continuation rather than a restart.
+///
+/// `alive` is the caller's session check, when it signed in with one: once it
+/// answers `false` the stream sends no further event and ends with
+/// `goodbye{reason: "revoked"}` within one tick — a revoked session keeps
+/// nothing it already opened, and is told why rather than left to reconnect
+/// with a token that no longer works.
 pub(super) fn feed_stream(
     feed: Arc<SharedFeed>,
     id: Value,
     params: Value,
     principal: Principal,
     deadline: Duration,
+    alive: Option<LivenessCheck>,
 ) -> Response {
     let after = params
         .get("fromSeq")
@@ -60,6 +68,13 @@ pub(super) fn feed_stream(
         let mut cursor = start;
         let end = Instant::now() + deadline;
         loop {
+            // Asked before anything is read, so a revoked caller is sent
+            // nothing past the revocation.
+            if alive.as_ref().is_some_and(|check| !check()) {
+                let bye = json!({"goodbye": {"seq": cursor, "reason": "revoked"}});
+                let _ = tx.send(frame(&id, bye)).await;
+                return;
+            }
             let (events, next) = feed.since(cursor, &who, is_op, 256);
             cursor = next;
             for ev in events {

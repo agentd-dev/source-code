@@ -35,6 +35,12 @@ pub struct Principal {
     /// Operator-declared attributes that travel with everything this
     /// principal causes (the run, the MCP `_meta`, the audit line).
     pub labels: std::collections::BTreeMap<String, String>,
+    /// The session this caller signed in with (`ds_…`), when it presented a
+    /// session token. NEVER part of [`id`](Self::id): several sessions
+    /// approved under one name are one principal, sharing what it owns, so
+    /// ownership survives a re-login. The sid is what one of them is revoked
+    /// by, and what the audit trail tells them apart with.
+    pub session: Option<String>,
 }
 
 impl Principal {
@@ -46,6 +52,7 @@ impl Principal {
             rate: None,
             budget: None,
             labels: Default::default(),
+            session: None,
         }
     }
 

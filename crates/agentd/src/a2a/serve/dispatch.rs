@@ -240,7 +240,7 @@ async fn dispatch(
         denied(
             &app,
             source,
-            Some(&principal.id),
+            Some(&principal),
             rule,
             Some(&method),
             None,
@@ -281,7 +281,7 @@ async fn dispatch(
         denied(
             &app,
             unvouched,
-            Some(&principal.id),
+            Some(&principal),
             rule,
             Some(name),
             op.as_deref(),
@@ -307,7 +307,7 @@ async fn dispatch(
             denied(
                 &app,
                 unvouched,
-                Some(&principal.id),
+                Some(&principal),
                 rule,
                 Some(name),
                 None,
@@ -346,7 +346,15 @@ async fn dispatch(
         {
             return match &app.bridge.feed() {
                 Some(feed) => {
-                    feed_stream(Arc::clone(feed), id, params, principal, app.stream_deadline)
+                    let alive = app.liveness.as_ref().and_then(|l| l(&principal));
+                    feed_stream(
+                        Arc::clone(feed),
+                        id,
+                        params,
+                        principal,
+                        app.stream_deadline,
+                        alive,
+                    )
                 }
                 None => err(
                     id,
@@ -411,7 +419,7 @@ async fn dispatch(
         denied(
             &app,
             unvouched,
-            Some(&principal.id),
+            Some(&principal),
             rule,
             Some(name),
             Some(op),
@@ -618,7 +626,8 @@ fn extension_of(method: &str) -> Option<&'static str> {
 }
 
 /// The audit line for a refusal the listener made: who (when anybody), the
-/// rule that named them, what they asked for, why, and the status sent.
+/// rule that named them, the session they signed in with (when they did),
+/// what they asked for, why, and the status sent.
 ///
 /// `source` is given for the refusals any caller can provoke for free — no
 /// credential, a bad one, a source over its limit, a rate already spent, a
@@ -631,14 +640,19 @@ fn extension_of(method: &str) -> Option<&'static str> {
 fn denied(
     app: &App,
     source: Option<std::net::IpAddr>,
-    principal: Option<&str>,
+    principal: Option<&Principal>,
     rule: Option<&str>,
     method: Option<&str>,
     op: Option<&str>,
     reason: &'static str,
     status: u16,
 ) {
-    let mut line = json!({"principal": principal, "rule": rule, "method": method, "op": op, "reason": reason, "status": status});
+    let mut line = json!({"principal": principal.map(|p| &p.id), "rule": rule, "method": method, "op": op, "reason": reason, "status": status});
+    // Several sessions share a principal id by design; the sid says which
+    // of them was refused.
+    if let Some(sid) = principal.and_then(|p| p.session.as_deref()) {
+        line["sid"] = json!(sid);
+    }
     if let Some(ip) = source {
         match app.denials.admit(ip, reason) {
             None => return,

@@ -791,6 +791,7 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
             principal: Some("system"),
             role: Some("system"),
             request_id: None,
+            sid: None,
         });
     }
 
@@ -1133,6 +1134,7 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
             &rt.settings.a2a,
             rt.events_tx.clone(),
             resolver,
+            &rt.durable,
             write_timeout,
             log.clone(),
         ) {

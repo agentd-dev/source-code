@@ -59,7 +59,9 @@ pub enum Gate {
     Introspection,
     /// `a2a.device_grant.enabled`.
     DeviceGrant,
-    /// A listener is configured (`a2a.listen`).
+    /// A TCP listener is configured (`a2a.listen`, not `unix://`): the
+    /// sessions a TCP listener holds are what these ops list and end, and a
+    /// unix socket issues none.
     Listener,
 }
 
@@ -345,6 +347,56 @@ pub const OPS: &[OpSpec] = &[
         "Set a runtime-settable path (agent.approval, a2a.introspection.enabled) until the next reload",
     ),
     op(
+        "auth.device.pending",
+        Message,
+        Operator,
+        &[],
+        Scope::Instance,
+        Gate::DeviceGrant,
+        Handler::Auth,
+        "Device sign-ins waiting for an operator's decision",
+    ),
+    op(
+        "auth.device.approve",
+        Task,
+        Operator,
+        &[],
+        Scope::Instance,
+        Gate::DeviceGrant,
+        Handler::Auth,
+        "Approve a device sign-in {user_code, as, scope?}; every session approved as one name is one principal",
+    ),
+    op(
+        "auth.device.deny",
+        Task,
+        Operator,
+        &[],
+        Scope::Instance,
+        Gate::DeviceGrant,
+        Handler::Auth,
+        "Refuse a pending device sign-in {user_code}, or all of them {all: true}",
+    ),
+    op(
+        "auth.sessions",
+        Message,
+        Operator,
+        &[],
+        Scope::Instance,
+        Gate::Listener,
+        Handler::Auth,
+        "The signed-in sessions: kind, name, principal and expiry",
+    ),
+    op(
+        "auth.sessions.revoke",
+        Task,
+        Operator,
+        &[],
+        Scope::Instance,
+        Gate::Listener,
+        Handler::Auth,
+        "End one session {sid}, every session of a name {name}, or all {all: true}",
+    ),
+    op(
         "_instance.",
         Task,
         Operator,
@@ -387,6 +439,39 @@ pub const OPS_REMOVED_IN: &str = crate::config::v2::KEYS_REMOVED_IN;
 /// The replacement hint for a removed op.
 pub fn removed_op(op: &str) -> Option<&'static str> {
     REMOVED_OPS.iter().find(|(n, _)| *n == op).map(|(_, h)| *h)
+}
+
+/// The names `auth.device.approve` refuses as `as`: each is already how the
+/// audit trail and the labels spell someone else — the operator, a caller
+/// nobody named, the launcher, the runtime acting on its own — so a device
+/// approved as one would read as that party in every line it caused. The one
+/// list the approval handler and the op's published argument schema read.
+pub const RESERVED_APPROVAL_NAMES: &[&str] = &[
+    "operator",
+    "anonymous",
+    "unknown",
+    "launcher",
+    "runtime",
+    "system",
+];
+
+/// The shape of an approval name, as a pattern: lowercase, so two spellings
+/// never name two principals, and without `=` or `:`, so it can never spell a
+/// certificate-derived id or another role's. [`approval_name_ok`] is this
+/// pattern, checked without a regex engine; a client that checks a name before
+/// sending it holds its copy to this string.
+pub const APPROVAL_NAME_PATTERN: &str = "^[a-z0-9][a-z0-9._-]{0,63}$";
+
+/// Whether `name` matches [`APPROVAL_NAME_PATTERN`] — its shape alone; the
+/// reserved names are a separate refusal with its own reason.
+pub fn approval_name_ok(name: &str) -> bool {
+    let b = name.as_bytes();
+    let first = |c: u8| c.is_ascii_lowercase() || c.is_ascii_digit();
+    (1..=64).contains(&b.len())
+        && first(b[0])
+        && b[1..]
+            .iter()
+            .all(|&c| first(c) || matches!(c, b'.' | b'_' | b'-'))
 }
 
 /// The paths `admin.set` may change. Everything else is the config file plus
@@ -440,7 +525,11 @@ pub fn gate_open(spec: &OpSpec, s: &Settings) -> bool {
         Gate::Always => true,
         Gate::Introspection => s.a2a.introspection.enabled,
         Gate::DeviceGrant => s.a2a.device_grant.enabled,
-        Gate::Listener => s.a2a.listen.is_some(),
+        Gate::Listener => s
+            .a2a
+            .listen
+            .as_deref()
+            .is_some_and(|l| !l.starts_with("unix:")),
     }
 }
 
@@ -467,4 +556,89 @@ pub fn command_ops_of(s: &Settings) -> Vec<&'static str> {
 /// answer and nothing about what this instance does.
 pub fn static_vocabulary() -> Vec<&'static str> {
     listable().map(|spec| spec.name).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::a2a::Principal;
+
+    /// Every `auth.*` row answers to the operator role alone: `grants: ["*"]`
+    /// on a user or an agent — or a grant naming the op — reaches none of
+    /// them. They approve sign-ins and end sessions; a grant that reached them
+    /// would let a signed-in user approve themselves an operator.
+    #[test]
+    fn auth_ops_are_operator_only_even_with_star_grants() {
+        let auth: Vec<&OpSpec> = OPS.iter().filter(|s| s.handler == Handler::Auth).collect();
+        assert_eq!(auth.len(), 5, "the five auth ops");
+        let who = |role, grants: &[&str]| Principal {
+            role,
+            grants: grants.iter().map(|g| (*g).to_string()).collect(),
+            ..Principal::anonymous()
+        };
+        for spec in auth {
+            assert_eq!(spec.floor, Floor::Operator, "{}", spec.name);
+            assert!(who(Role::Operator, &[]).may_command(spec.name));
+            for role in [Role::User, Role::Agent] {
+                for grants in [&["*"][..], &[spec.name], &["auth.*"]] {
+                    assert!(
+                        !who(role, grants).may_command(spec.name),
+                        "{role:?} {grants:?} must not {}",
+                        spec.name
+                    );
+                }
+            }
+        }
+    }
+
+    /// The device ops are served with the grant; the session ops on any TCP
+    /// listener, and on no unix socket, which issues no session.
+    #[test]
+    fn auth_ops_are_gated_by_the_grant_and_a_tcp_listener() {
+        let served = |listen: Option<&str>, device: bool| {
+            let mut s = Settings::default();
+            s.a2a.listen = listen.map(str::to_string);
+            s.a2a.device_grant.enabled = device;
+            command_ops_of(&s)
+                .into_iter()
+                .filter(|o| o.starts_with("auth."))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(served(None, false), Vec::<&str>::new());
+        assert_eq!(
+            served(Some("unix:///run/a.sock"), false),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            served(Some("http://127.0.0.1:0"), false),
+            ["auth.sessions", "auth.sessions.revoke"]
+        );
+        assert_eq!(served(Some("https://0.0.0.0:8443"), true).len(), 5);
+    }
+
+    #[test]
+    fn approval_names_are_the_pattern() {
+        for ok in ["alice", "a", "0", "ci-bot", "a.b_c-d", &"a".repeat(64)] {
+            assert!(approval_name_ok(ok), "{ok:?}");
+        }
+        for bad in [
+            "",
+            "Alice",
+            "-a",
+            ".a",
+            "_a",
+            "a b",
+            "a:b",
+            "a=b",
+            "a/b",
+            "é",
+            &"a".repeat(65),
+        ] {
+            assert!(!approval_name_ok(bad), "{bad:?}");
+        }
+        // Every reserved name has the shape, so it needs its own refusal.
+        for r in RESERVED_APPROVAL_NAMES {
+            assert!(approval_name_ok(r), "{r}");
+        }
+    }
 }

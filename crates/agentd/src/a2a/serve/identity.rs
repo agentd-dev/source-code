@@ -10,7 +10,7 @@ use axum::response::{IntoResponse, Response};
 use serde_json::Value;
 
 use crate::a2a::errors::{self, reason};
-use crate::a2a::principals::{CertId, Evidence, SESSION_TOKEN_PREFIX, SessionVerifier};
+use crate::a2a::principals::{CertId, Evidence, SESSION_TOKEN_PREFIX};
 
 /// The verified identity of the client certificate, when one was presented.
 #[derive(Clone, Default, Debug)]
@@ -64,9 +64,15 @@ impl Peer {
 /// How the listener checks credentials beyond the rules the resolver holds.
 #[derive(Default)]
 pub struct Auth {
-    /// The session store `agentd_at_` tokens are checked against. `None`
-    /// until a store is installed, and then every session token fails.
-    pub sessions: Option<Arc<dyn SessionVerifier + Send + Sync>>,
+    /// The sessions `agentd_at_` tokens are checked against — every TCP
+    /// listener has them, and a unix socket, which issues none, does not;
+    /// with none, every session token fails as unknown. The same store
+    /// answers whether a caller's session is still alive while its requests
+    /// are in flight.
+    pub sessions: Option<Arc<crate::a2a::oauth::Sessions>>,
+    /// The authorization server, when `a2a.device_grant.enabled`: its routes
+    /// are served only while it is here.
+    pub authority: Option<Arc<crate::a2a::oauth::Authority>>,
 }
 
 /// The request's evidence: its bearer, its verified certificate, whether the

@@ -2,7 +2,8 @@
 //! The **audit stream**: an append-only
 //! record of *who did what* — every A2A call, every principal-driven tool/command,
 //! config reloads, restores, store conflicts, and kills. Each event is
-//! `{ts, principal, role, action, target, outcome, request_id, trace, instance}`,
+//! `{ts, principal, role, action, target, outcome, request_id, trace, instance}`
+//! — plus `sid` when the caller signed in with a session,
 //! emitted to the configured sinks: `log` (a closed-vocabulary `audit` log line)
 //! and/or `store` (a durable, append-only `Kind::Audit` record, ULID-keyed — never
 //! CAS'd, never listed, so it cannot be rewritten). Audit is security telemetry:
@@ -21,6 +22,11 @@ pub(crate) struct AuditEvent<'a> {
     pub principal: Option<&'a str>,
     pub role: Option<&'a str>,
     pub request_id: Option<&'a str>,
+    /// The session the caller signed in with ([`crate::a2a::Principal::session`]).
+    /// Several sessions share one principal id by design — ownership is by
+    /// name — so this is the only thing in the trail that says WHICH of them
+    /// acted, and it is what a revocation names.
+    pub sid: Option<&'a str>,
 }
 
 impl Runtime {
@@ -41,18 +47,18 @@ impl Runtime {
             && let Some(feed) = &self.a2a_feed
             && feed.debug()
         {
-            feed.push(
-                "audit",
-                super::a2a_server::FeedVis::Operator,
-                json!({
-                    "ts": now_ms(),
-                    "principal": ev.principal,
-                    "role": ev.role,
-                    "action": ev.action,
-                    "target": ev.target,
-                    "outcome": ev.outcome,
-                }),
-            );
+            let mut data = json!({
+                "ts": now_ms(),
+                "principal": ev.principal,
+                "role": ev.role,
+                "action": ev.action,
+                "target": ev.target,
+                "outcome": ev.outcome,
+            });
+            if let Some(sid) = ev.sid {
+                data["sid"] = json!(sid);
+            }
+            feed.push("audit", super::a2a_server::FeedVis::Operator, data);
         }
         #[cfg(not(feature = "a2a"))]
         let _ = mirror_to_feed;
@@ -62,7 +68,7 @@ impl Runtime {
         if sinks.is_empty() {
             return;
         }
-        let record = json!({
+        let mut record = json!({
             "ts": now_ms(),
             "instance": self.instance,
             "principal": ev.principal,
@@ -73,6 +79,9 @@ impl Runtime {
             "request_id": ev.request_id,
             "trace": self.trace_id,
         });
+        if let Some(sid) = ev.sid {
+            record["sid"] = json!(sid);
+        }
         if sinks.iter().any(|s| matches!(s, AuditSink::Log)) {
             // A single closed-vocabulary `audit` event (never content-suppressed —
             // an audit trail is metadata, not conversation content).
@@ -126,6 +135,7 @@ impl Runtime {
                 principal: Some(&principal.id),
                 role: Some(&role),
                 request_id,
+                sid: principal.session.as_deref(),
             },
             mirror_to_feed(method, op, outcome),
         );

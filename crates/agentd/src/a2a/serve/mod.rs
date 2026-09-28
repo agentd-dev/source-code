@@ -61,6 +61,19 @@
 //! What a2a-rs answers passes back through one filter on the way out, so a
 //! refusal the runtime made reaches the caller as the runtime made it rather
 //! than as a2a-rs reworded it (see [`ports::RequestScope::error`]).
+//!
+//! ## Signing in
+//!
+//! With `a2a.device_grant.enabled`, the listener origin is also an OAuth 2.0
+//! authorization server ([`crate::a2a::oauth`]): the device grant's endpoints
+//! under `/oauth2/`, and its RFC 8414 metadata at the root. They sit behind
+//! the same origin gate as `POST /`, and every answer is `no-store`. Without
+//! the grant they are not routes at all.
+//!
+//! The session a sign-in issues is checked on every request, and while a
+//! caller's requests are in flight: a revoked session loses the streams it
+//! already opened — by its own sid, so a sibling session approved under the
+//! same name keeps its own.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -80,7 +93,7 @@ mod dispatch;
 mod feed;
 mod identity;
 /// Per-source failure limits and per-principal admission.
-mod limits;
+pub(crate) mod limits;
 
 use card::{CardFromRuntime, card, card_preflight};
 use cors::preflight;
@@ -160,7 +173,7 @@ struct App {
     request_timeout: Duration,
     stream_deadline: Duration,
     /// Whether a caller's session is still alive, consulted while its
-    /// requests are in flight. `None` until a session store installs one.
+    /// requests are in flight. `None` on a listener with no sessions.
     liveness: Option<Liveness>,
     log: Logger,
 }
@@ -309,6 +322,13 @@ impl App {
             )
             .with_streaming_handler(ports::SharedStreaming(updates)),
         );
+        // The liveness hook comes from the sessions: a caller holding one is
+        // served only while that session — its sid — lives.
+        let liveness = opts
+            .auth
+            .sessions
+            .as_ref()
+            .map(|s| crate::a2a::oauth::Sessions::liveness(Arc::clone(s)));
         App {
             protocol: a2a_rs::adapter::jsonrpc_router(adapter),
             bridge,
@@ -319,7 +339,7 @@ impl App {
             cors_origins: opts.cors_origins,
             request_timeout: opts.request_timeout,
             stream_deadline: opts.stream_deadline,
-            liveness: None,
+            liveness,
             log,
         }
     }
@@ -328,14 +348,181 @@ impl App {
 /// The listener's routes. The card has one path: `/.well-known/agent.json`
 /// was the pre-1.0 name, and a client still asking there is told 404 rather
 /// than handed a document it would read with the wrong expectations.
+///
+/// The authorization server's routes exist only while the device grant does:
+/// a listener that issues nothing does not answer as if it might.
 fn router(app: Arc<App>) -> Router {
-    Router::new()
+    use crate::a2a::oauth;
+    let mut r = Router::new()
         .route("/", post(rpc).options(preflight))
         .route(
             "/.well-known/agent-card.json",
             get(card).options(card_preflight),
-        )
-        .with_state(app)
+        );
+    if app.auth.authority.is_some() {
+        r = r
+            .route(
+                oauth::DEVICE_AUTHORIZATION_PATH,
+                post(oauth_device_authorization).options(preflight),
+            )
+            .route(oauth::TOKEN_PATH, post(oauth_token).options(preflight))
+            .route(oauth::REVOKE_PATH, post(oauth_revoke).options(preflight))
+            .route(
+                oauth::VERIFICATION_PATH,
+                get(oauth_verification).options(preflight),
+            )
+            .route(oauth::METADATA_PATH, get(oauth_metadata).options(preflight));
+    }
+    r.with_state(app)
+}
+
+// ---- the authorization server's routes --------------------------------------
+
+/// One OAuth endpoint, as HTTP: the origin gate `POST /` has, a body read to
+/// at most [`crate::a2a::oauth::FORM_MAX`] bytes, the endpoint's answer, and
+/// `Cache-Control: no-store` on every response — a device code, a token or a
+/// refusal of either is never something a cache may keep. What the operator
+/// should hear about goes to the feed, and a revocation to the log.
+async fn oauth_call(
+    app: &App,
+    headers: &axum::http::HeaderMap,
+    body: Option<axum::body::Body>,
+    endpoint: impl FnOnce(
+        &crate::a2a::oauth::Authority,
+        Option<&str>,
+        &[u8],
+    ) -> crate::a2a::oauth::Reply,
+) -> axum::response::Response {
+    use crate::a2a::oauth::{Notice, OAuthError, Reply, ReplyBody};
+    use axum::http::{HeaderValue, StatusCode, header};
+    use axum::response::IntoResponse;
+    let origin = cors::origin_of(headers).map(str::to_string);
+    let resp = 'resp: {
+        if let Some(o) = &origin
+            && !cors::origin_allowed(o, &app.origins())
+        {
+            break 'resp (StatusCode::FORBIDDEN, "origin not allowed").into_response();
+        }
+        let Some(authority) = app.auth.authority.as_deref() else {
+            break 'resp StatusCode::NOT_FOUND.into_response();
+        };
+        let bytes = match body {
+            Some(b) => match axum::body::to_bytes(b, crate::a2a::oauth::FORM_MAX).await {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    let e = OAuthError::new(
+                        "invalid_request",
+                        format!("the body is over {} bytes", crate::a2a::oauth::FORM_MAX),
+                    );
+                    break 'resp identity::json_with(
+                        StatusCode::BAD_REQUEST,
+                        &json!({"error": e.error, "error_description": e.description}),
+                    );
+                }
+            },
+            None => Default::default(),
+        };
+        let content_type = headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok());
+        let Reply {
+            status,
+            body,
+            retry_after,
+            notices,
+        } = endpoint(authority, content_type, &bytes);
+        for notice in notices {
+            match notice {
+                Notice::Pending(event) => push_auth_event(app, event),
+                Notice::Revoked(s) => {
+                    app.log
+                        .info("auth.session.revoked", s.revoked_line("oauth2_revoke"));
+                    push_auth_event(app, s.revoked_event());
+                }
+            }
+        }
+        let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let mut resp = match body {
+            ReplyBody::Json(v) => identity::json_with(status, &v),
+            ReplyBody::Empty => status.into_response(),
+            ReplyBody::Text(t) => (
+                status,
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                t,
+            )
+                .into_response(),
+        };
+        if let Some(secs) = retry_after
+            && let Ok(v) = HeaderValue::from_str(&secs.to_string())
+        {
+            resp.headers_mut().insert(header::RETRY_AFTER, v);
+        }
+        resp
+    };
+    let mut resp = cors::allow_origin(resp, origin.as_deref());
+    resp.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    resp.headers_mut()
+        .insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    resp
+}
+
+/// An `auth` event on the observation feed, for operators only: sign-ins
+/// waiting on them, and sessions that ended.
+fn push_auth_event(app: &App, event: serde_json::Value) {
+    if let Some(feed) = app.bridge.feed() {
+        feed.push("auth", crate::runtime::a2a_server::FeedVis::Operator, event);
+    }
+}
+
+/// The address a request is limited by: a TCP peer's.
+fn peer_ip(peer: &Peer) -> Option<std::net::IpAddr> {
+    peer.source()
+}
+
+async fn oauth_device_authorization(
+    axum::extract::State(app): axum::extract::State<Arc<App>>,
+    axum::Extension(peer): axum::Extension<Peer>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Body,
+) -> axum::response::Response {
+    let ip = peer_ip(&peer);
+    oauth_call(&app, &headers, Some(body), |a, ct, b| {
+        a.device_authorization(ct, b, ip)
+    })
+    .await
+}
+
+async fn oauth_token(
+    axum::extract::State(app): axum::extract::State<Arc<App>>,
+    axum::Extension(peer): axum::Extension<Peer>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Body,
+) -> axum::response::Response {
+    let ip = peer_ip(&peer);
+    oauth_call(&app, &headers, Some(body), |a, ct, b| a.token(ct, b, ip)).await
+}
+
+async fn oauth_revoke(
+    axum::extract::State(app): axum::extract::State<Arc<App>>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Body,
+) -> axum::response::Response {
+    oauth_call(&app, &headers, Some(body), |a, ct, b| a.revoke(ct, b)).await
+}
+
+async fn oauth_metadata(
+    axum::extract::State(app): axum::extract::State<Arc<App>>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    oauth_call(&app, &headers, None, |a, _, _| a.metadata()).await
+}
+
+async fn oauth_verification(
+    axum::extract::State(app): axum::extract::State<Arc<App>>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    oauth_call(&app, &headers, None, |a, _, _| a.verification()).await
 }
 
 /// The live browser-origin allowlist, revisable by a reload.
@@ -460,6 +647,18 @@ mod tests {
         answer: impl Fn(&A2aRequest) -> Value + Send + Sync + 'static,
         liveness: Option<Liveness>,
     ) -> (Router, Arc<AtomicUsize>) {
+        listener_with(answer, Auth::default(), Vec::new(), liveness)
+    }
+
+    /// [`listener`] with the sessions and authorization server `auth` holds,
+    /// and a browser origin allowlist. The liveness hook is the one the
+    /// sessions install, unless `liveness` overrides it.
+    fn listener_with(
+        answer: impl Fn(&A2aRequest) -> Value + Send + Sync + 'static,
+        auth: Auth,
+        origins: Vec<String>,
+        liveness: Option<Liveness>,
+    ) -> (Router, Arc<AtomicUsize>) {
         let resolver = crate::a2a::Resolver::build(
             &serde_json::from_value(json!({"listen": "http://127.0.0.1:0"})).unwrap(),
             &|_| None,
@@ -490,15 +689,17 @@ mod tests {
             crate::obs::log::Level::Error,
         );
         let opts = Opts {
-            auth: Auth::default(),
-            cors_origins: Arc::default(),
+            auth,
+            cors_origins: Arc::new(std::sync::RwLock::new(origins)),
             tls: None,
             request_timeout: Duration::from_secs(5),
             stream_deadline: Duration::from_secs(5),
         };
         let updates = Arc::new(a2a_rs::adapter::InMemoryStreamingHandler::new());
         let mut app = App::new(A2aBridge::new(tx, resolver), opts, updates, log);
-        app.liveness = liveness;
+        if liveness.is_some() {
+            app.liveness = liveness;
+        }
         let router = router(Arc::new(app))
             .layer(axum::Extension(PeerId::default()))
             .layer(axum::Extension(Peer::Tcp(
@@ -1017,5 +1218,394 @@ mod tests {
             www.contains("the session token is unknown, expired or revoked"),
             "{www}"
         );
+    }
+
+    // ---- the authorization server and its sessions ----------------------
+
+    use crate::a2a::oauth::{self, Authority, DeviceGrant, Session, SessionKind, Sessions};
+
+    /// An authority over fresh sessions, issuing at `issuer`.
+    fn authority(cfg: Value, issuer: &str) -> Arc<Authority> {
+        let cfg: crate::config::v2::DeviceGrant = serde_json::from_value(cfg).unwrap();
+        let sessions = Arc::new(Sessions::new(oauth::system_clock()));
+        let a = Arc::new(Authority::new(
+            DeviceGrant::new(&cfg, oauth::system_clock(), oauth::os_mint()),
+            sessions,
+        ));
+        a.set_issuer(issuer);
+        a
+    }
+
+    fn device_session(sid: &str, name: &str) -> Session {
+        Session {
+            sid: sid.into(),
+            kind: SessionKind::Device,
+            name: Some(name.into()),
+            role: crate::config::v2::Role::User,
+            principal: format!("user:{name}"),
+            client_id: "cli".into(),
+            created_ms: crate::state::now_ms(),
+            expires_ms: None,
+            approved_by: "operator".into(),
+            approved_rule: None,
+            rate: None,
+        }
+    }
+
+    async fn send(router: &Router, req: Request<Body>) -> Response {
+        router.clone().oneshot(req).await.unwrap()
+    }
+
+    fn form_post(path: &str, body: &str, origin: Option<&str>) -> Request<Body> {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/x-www-form-urlencoded");
+        if let Some(o) = origin {
+            req = req.header("origin", o);
+        }
+        req.body(Body::from(body.to_string())).unwrap()
+    }
+
+    /// A session token the sessions no longer hold is the session variant of
+    /// the 401 — `invalid_token`, "unknown, expired or revoked" — and nothing
+    /// reaches the runtime. A live one is its session's principal, with its
+    /// sid, and stops being one the moment it is revoked.
+    #[tokio::test]
+    async fn dead_session_token_is_401_invalid_token() {
+        let sessions = Arc::new(Sessions::new(oauth::system_clock()));
+        sessions.insert(
+            "agentd_at_live",
+            device_session("ds_0123456789abcdef", "alice"),
+        );
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let who = Arc::clone(&seen);
+        let (router, reached) = listener_with(
+            move |req| {
+                who.lock()
+                    .unwrap()
+                    .push((req.principal.id.clone(), req.principal.session.clone()));
+                task_not_found()
+            },
+            Auth {
+                sessions: Some(Arc::clone(&sessions)),
+                authority: None,
+            },
+            Vec::new(),
+            None,
+        );
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"GetTask","params":{"id":"t"}}"#;
+        let v = json_of(
+            post(
+                &router,
+                body,
+                &[],
+                &[("authorization", "Bearer agentd_at_live")],
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            v["error"]["code"], -32001,
+            "the live session is let in: {v}"
+        );
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            (
+                "user:alice".to_string(),
+                Some("ds_0123456789abcdef".to_string())
+            )
+        );
+        sessions.revoke(&oauth::Revoke::Sid("ds_0123456789abcdef".into()));
+        for token in ["agentd_at_live", "agentd_at_never"] {
+            let auth = format!("Bearer {token}");
+            let resp = post(&router, body, &[], &[("authorization", &auth)]).await;
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{token}");
+            let www = resp.headers()[header::WWW_AUTHENTICATE]
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert!(www.contains("error=\"invalid_token\""), "{www}");
+            assert!(www.contains("unknown, expired or revoked"), "{www}");
+        }
+        assert_eq!(
+            reached.load(Ordering::SeqCst),
+            1,
+            "only the live call reached the runtime"
+        );
+    }
+
+    /// The authorization server's routes sit behind the origin gate `POST /`
+    /// has — an unlisted origin is refused with no grant and no body, a
+    /// listed one gets its grant — and every answer, a refusal included, is
+    /// `no-store`. Without the grant they are not routes.
+    #[tokio::test]
+    async fn oauth_routes_share_the_origin_gate_and_are_no_store() {
+        let a = authority(json!({"enabled": true}), "https://agent.example");
+        let (router, reached) = listener_with(
+            |_| task_not_found(),
+            Auth {
+                sessions: Some(Arc::clone(a.sessions())),
+                authority: Some(Arc::clone(&a)),
+            },
+            vec!["https://ui.example".into()],
+            None,
+        );
+        let no_store = |r: &Response| {
+            assert_eq!(
+                r.headers()
+                    .get(header::CACHE_CONTROL)
+                    .map(|v| v.to_str().unwrap()),
+                Some("no-store"),
+                "{:?}",
+                r.headers()
+            );
+        };
+        let posts = [
+            oauth::DEVICE_AUTHORIZATION_PATH,
+            oauth::TOKEN_PATH,
+            oauth::REVOKE_PATH,
+        ];
+        let gets = [oauth::METADATA_PATH, oauth::VERIFICATION_PATH];
+        let req = |path: &str, origin: Option<&str>| {
+            if gets.contains(&path) {
+                let mut r = Request::builder().uri(path);
+                if let Some(o) = origin {
+                    r = r.header("origin", o);
+                }
+                r.body(Body::empty()).unwrap()
+            } else {
+                form_post(path, "client_id=cli", origin)
+            }
+        };
+        for path in posts.iter().chain(gets.iter()) {
+            // An origin nobody listed: 403, no grant, no body.
+            let r = send(&router, req(path, Some("https://evil.example"))).await;
+            assert_eq!(r.status(), StatusCode::FORBIDDEN, "{path}");
+            assert!(
+                r.headers()
+                    .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                    .is_none(),
+                "{path}"
+            );
+            no_store(&r);
+            let body = axum::body::to_bytes(r.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(body.is_empty(), "{path}");
+            // A listed one: answered, granted, not cached.
+            let r = send(&router, req(path, Some("https://ui.example"))).await;
+            assert_ne!(r.status(), StatusCode::FORBIDDEN, "{path}");
+            assert_eq!(
+                r.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+                "https://ui.example",
+                "{path}"
+            );
+            no_store(&r);
+            // No origin at all: a terminal client.
+            let r = send(&router, req(path, None)).await;
+            assert_ne!(r.status(), StatusCode::NOT_FOUND, "{path}");
+            no_store(&r);
+            // The preflight follows the same list.
+            let pre = |o: &str| {
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri(*path)
+                    .header("origin", o)
+                    .header("access-control-request-method", "POST")
+                    .body(Body::empty())
+                    .unwrap()
+            };
+            assert_eq!(
+                send(&router, pre("https://ui.example")).await.status(),
+                StatusCode::NO_CONTENT
+            );
+            assert_eq!(
+                send(&router, pre("https://evil.example")).await.status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        // A device authorization is a JSON answer; the page is plain text.
+        let r = send(
+            &router,
+            form_post(oauth::DEVICE_AUTHORIZATION_PATH, "client_id=cli", None),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let v = json_of(r).await;
+        assert_eq!(
+            v["verification_uri"], "https://agent.example/oauth2/device",
+            "{v}"
+        );
+        let r = send(&router, req(oauth::VERIFICATION_PATH, None)).await;
+        assert!(
+            r.headers()[header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("text/plain")
+        );
+        // A body over the cap is refused as the form rules say.
+        let big = format!("client_id=cli&pad={}", "x".repeat(oauth::FORM_MAX));
+        let r = send(
+            &router,
+            form_post(oauth::DEVICE_AUTHORIZATION_PATH, &big, None),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        no_store(&r);
+        assert_eq!(json_of(r).await["error"], "invalid_request");
+        assert_eq!(
+            reached.load(Ordering::SeqCst),
+            0,
+            "sign-in never reaches the runtime"
+        );
+
+        // Without the grant: not routes.
+        let (plain, _) = listener(|_| task_not_found(), None);
+        for path in posts.iter().chain(gets.iter()) {
+            let r = send(&plain, req(path, None)).await;
+            assert_eq!(r.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+    }
+
+    /// RFC 8414 round trip from the card: the `oauth2MetadataUrl` an https
+    /// card publishes is the issuer's well-known path, the document there
+    /// names that issuer — the listener origin — and every endpoint in it is
+    /// the issuer joined with its path, the same URLs the card's flow names.
+    #[tokio::test]
+    async fn metadata_round_trips_rfc8414() {
+        let a2a: crate::config::v2::A2a = serde_json::from_value(json!({
+            "listen": "https://0.0.0.0:8443", "url": "https://agent.example:8443",
+            "tls": {"cert": "c", "key": "k"}, "bearer": "{{secret:B}}",
+            "device_grant": {"enabled": true, "scopes": ["user", "operator"]}}))
+        .unwrap();
+        let origin = crate::runtime::surface::auth::origin_of(a2a.url.as_deref().unwrap()).unwrap();
+        let posture = crate::runtime::surface::auth::listener_auth_of(&a2a);
+        let security = crate::runtime::surface::auth::security_of(
+            &posture,
+            Some(&origin),
+            &a2a.device_grant.scopes,
+        )
+        .expect("a declared scheme");
+        let scheme = serde_json::to_value(&security.schemes["device_code"]).unwrap();
+        fn find<'v>(v: &'v Value, key: &str) -> Option<&'v Value> {
+            match v {
+                Value::Object(m) => m.get(key).or_else(|| m.values().find_map(|x| find(x, key))),
+                Value::Array(a) => a.iter().find_map(|x| find(x, key)),
+                _ => None,
+            }
+        }
+        let metadata_url = find(&scheme, "oauth2MetadataUrl")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("no metadata URL on an https card: {scheme}"))
+            .to_string();
+
+        let a = authority(
+            json!({"enabled": true, "scopes": ["user", "operator"]}),
+            &origin,
+        );
+        let (router, _) = listener_with(
+            |_| task_not_found(),
+            Auth {
+                sessions: Some(Arc::clone(a.sessions())),
+                authority: Some(a),
+            },
+            Vec::new(),
+            None,
+        );
+        let path = metadata_url
+            .strip_prefix(&origin)
+            .expect("the card's URL is on the origin");
+        let r = send(
+            &router,
+            Request::builder().uri(path).body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let m = json_of(r).await;
+        let issuer = m["issuer"].as_str().unwrap();
+        assert_eq!(issuer, origin);
+        assert_eq!(
+            crate::runtime::surface::auth::join(issuer, oauth::METADATA_PATH),
+            metadata_url
+        );
+        for (field, path) in [
+            (
+                "device_authorization_endpoint",
+                oauth::DEVICE_AUTHORIZATION_PATH,
+            ),
+            ("token_endpoint", oauth::TOKEN_PATH),
+            ("revocation_endpoint", oauth::REVOKE_PATH),
+        ] {
+            assert_eq!(
+                m[field].as_str(),
+                Some(crate::runtime::surface::auth::join(issuer, path).as_str()),
+                "{field}: {m}"
+            );
+        }
+        assert_eq!(
+            find(&scheme, "deviceAuthorizationUrl"),
+            Some(&m["device_authorization_endpoint"]),
+            "{scheme}"
+        );
+        assert_eq!(
+            find(&scheme, "tokenUrl"),
+            Some(&m["token_endpoint"]),
+            "{scheme}"
+        );
+    }
+
+    /// The feed ends a revoked caller's stream with `goodbye{reason:
+    /// "revoked"}` within a tick — through the hook the sessions install.
+    #[tokio::test]
+    async fn a_revoked_session_is_said_goodbye_on_the_feed() {
+        let feed = Arc::new(crate::runtime::a2a_server::SharedFeed::new(false));
+        let sessions = Arc::new(Sessions::new(oauth::system_clock()));
+        sessions.insert(
+            "agentd_at_feed",
+            device_session("ds_feedfeedfeedfeed", "bob"),
+        );
+        let alive = Sessions::liveness(Arc::clone(&sessions));
+        let principal =
+            match crate::a2a::principals::SessionVerifier::verify(&*sessions, "agentd_at_feed") {
+                crate::a2a::principals::SessionCheck::Valid(p) => p,
+                _ => unreachable!(),
+            };
+        let check = alive(&principal);
+        let resp = feed::feed_stream(
+            feed,
+            json!(7),
+            json!({}),
+            principal,
+            Duration::from_secs(30),
+            check,
+        );
+        let mut body = resp.into_body().into_data_stream();
+        let hello = body.next().await.unwrap().unwrap();
+        assert!(String::from_utf8_lossy(&hello).contains("hello"));
+        sessions.revoke(&oauth::Revoke::Name("bob".into()));
+        let at = Instant::now();
+        let bye = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let chunk = body
+                    .next()
+                    .await
+                    .expect("a goodbye before the end")
+                    .unwrap();
+                let text = String::from_utf8_lossy(&chunk).to_string();
+                if text.contains("goodbye") {
+                    return text;
+                }
+            }
+        })
+        .await
+        .expect("the stream outlived its session");
+        assert!(bye.contains("\"reason\":\"revoked\""), "{bye}");
+        assert!(
+            at.elapsed() <= Duration::from_millis(200),
+            "{:?}",
+            at.elapsed()
+        );
+        assert!(body.next().await.is_none(), "nothing after the goodbye");
     }
 }

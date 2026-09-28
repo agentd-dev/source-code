@@ -202,7 +202,15 @@ impl Runtime {
                 Ok(doc) => Answer::Doc(doc),
                 Err(e) => Answer::Reply(e),
             },
-            Route::Auth => Answer::Reply(super::auth_ops::handle(self, principal, op, &data)),
+            Route::Auth => match super::auth_ops::handle(self, principal, op, &data) {
+                Ok(super::auth_ops::AuthAnswer::Doc(doc)) => Answer::Doc(doc),
+                Ok(super::auth_ops::AuthAnswer::Done(text, result)) => Answer::Done {
+                    link: None,
+                    text: Some(text),
+                    result: Some(result),
+                },
+                Err(e) => Answer::Reply(e),
+            },
             Route::Instance(i) => match self.instance_op(principal, i, &data) {
                 Ok(text) => Answer::Done {
                     link: None,

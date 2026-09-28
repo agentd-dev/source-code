@@ -222,6 +222,7 @@ impl Runtime {
                         principal: Some("policy"),
                         role: None,
                         request_id: None,
+                        sid: None,
                     });
                     return ToolOutcome::Ready(
                         json!({"reply": text, "timed_out": false, "via": "accept"}),
@@ -392,6 +393,7 @@ impl Runtime {
                     rate: None,
                     budget: None,
                     labels: Default::default(),
+                    session: None,
                 };
                 // A freshly minted id, never the listener's reservation: that
                 // belongs to the task the request being served creates, and a
@@ -445,6 +447,7 @@ impl Runtime {
             principal: caller.principal.as_deref(),
             role: None,
             request_id: None,
+            sid: None,
         });
         ToolOutcome::Deferred(PendingKind::Human {
             task: task_id,
@@ -569,6 +572,7 @@ impl Runtime {
                 principal: answered_by.or(Some(via)),
                 role: None,
                 request_id: None,
+                sid: None,
             });
             return;
         }
@@ -592,6 +596,7 @@ impl Runtime {
             principal: answered_by.or(Some(via)),
             role: None,
             request_id: None,
+            sid: None,
         });
         // A tool result must match `ask_human`'s DECLARED output shape,
         // `{reply, timed_out}` (see `registry/internal.rs`). Consumers read

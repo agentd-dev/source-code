@@ -851,6 +851,7 @@ impl Runtime {
                     principal: caller.principal.as_deref(),
                     role: None,
                     request_id: None,
+                    sid: None,
                 });
                 // Shadow mode says plainly that the call was HELD, never
                 // returning a synthetic success. A schema-conformant fake is
@@ -1016,6 +1017,7 @@ impl Runtime {
             principal: Some(by),
             role: None,
             request_id: None,
+            sid: None,
         });
         if !approved {
             let msg = format!(

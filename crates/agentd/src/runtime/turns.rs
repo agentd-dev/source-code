@@ -658,17 +658,9 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
                 // asks back without acting.
                 match intent.as_str() {
                     "status" => {
-                        let status = self.status_value();
-                        let text = format!(
-                            "Status: {} runs, {} subagents, {} conversations, budget active: {}",
-                            status["runs"].as_array().map(|a| a.len()).unwrap_or(0),
-                            status["subagents"].as_array().map(|a| a.len()).unwrap_or(0),
-                            status["conversations"]
-                                .as_array()
-                                .map(|a| a.len())
-                                .unwrap_or(0),
-                            status["budget"]["active"]
-                        );
+                        // The asker's own view, and a count of only that.
+                        let status = self.status_for(job.principal.as_deref());
+                        let text = super::reactor::status_summary(&status);
                         self.deliver_reply(ctx_id, &text, job.event.as_deref());
                         return;
                     }

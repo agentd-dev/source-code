@@ -19,6 +19,21 @@ pub enum FeedVis {
     Owner(Option<String>),
 }
 
+impl FeedVis {
+    /// Whether the caller `principal` (an operator or not) may see what this
+    /// tags. The ONE visibility rule: the feed filters a subscriber's events
+    /// with it and the `status` op filters a caller's document with it, so
+    /// what a principal can poll and what it can watch are the same thing and
+    /// cannot drift apart.
+    pub fn admits(&self, principal: &str, is_operator: bool) -> bool {
+        match self {
+            FeedVis::All => true,
+            FeedVis::Operator | FeedVis::Owner(None) => is_operator,
+            FeedVis::Owner(Some(owner)) => is_operator || owner == principal,
+        }
+    }
+}
+
 /// The global observation feed: a bounded ring of state-change events the loop
 /// pushes and the `SubscribeToEvents` transport threads drain.
 ///
@@ -38,7 +53,9 @@ pub struct SharedFeed {
 
 struct FeedInner {
     seq: u64,
-    buf: std::collections::VecDeque<Value>,
+    /// Each event beside who may see it — kept out of the event itself, so
+    /// nothing can serve an event with its tag still on.
+    buf: std::collections::VecDeque<(FeedVis, Value)>,
     /// Events evicted to date (a subscriber whose cursor predates the window
     /// learns it fell behind).
     dropped: u64,
@@ -66,21 +83,15 @@ impl SharedFeed {
 
     /// Append one event; returns its `seq`.
     pub fn push(&self, kind: &str, vis: FeedVis, data: Value) -> u64 {
-        let vis_tag = match vis {
-            FeedVis::All => json!("all"),
-            FeedVis::Operator => json!("op"),
-            FeedVis::Owner(None) => json!("op"),
-            FeedVis::Owner(Some(p)) => json!(p),
-        };
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.seq += 1;
         let seq = g.seq;
-        let ev = json!({"seq": seq, "ts": crate::state::now_ms(), "kind": kind, "data": data, "_vis": vis_tag});
+        let ev = json!({"seq": seq, "ts": crate::state::now_ms(), "kind": kind, "data": data});
         if g.buf.len() == FEED_RING {
             g.buf.pop_front();
             g.dropped += 1;
         }
-        g.buf.push_back(ev);
+        g.buf.push_back((vis, ev));
         seq
     }
 
@@ -97,7 +108,7 @@ impl SharedFeed {
         let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let mut out = Vec::new();
         let mut cursor = after;
-        for ev in g.buf.iter() {
+        for (vis, ev) in g.buf.iter() {
             let seq = ev["seq"].as_u64().unwrap_or(0);
             if seq <= after {
                 continue;
@@ -106,18 +117,8 @@ impl SharedFeed {
                 break;
             }
             cursor = seq;
-            let visible = match ev["_vis"].as_str() {
-                Some("all") => true,
-                Some("op") => is_operator,
-                Some(owner) => is_operator || owner == principal,
-                None => is_operator,
-            };
-            if visible {
-                let mut e = ev.clone();
-                if let Value::Object(o) = &mut e {
-                    o.remove("_vis");
-                }
-                out.push(e);
+            if vis.admits(principal, is_operator) {
+                out.push(ev.clone());
             }
         }
         (out, cursor)
@@ -129,7 +130,7 @@ impl SharedFeed {
         let oldest = g
             .buf
             .front()
-            .and_then(|e| e["seq"].as_u64())
+            .and_then(|(_, e)| e["seq"].as_u64())
             .unwrap_or(g.seq);
         (g.seq, oldest, g.dropped)
     }
@@ -198,6 +199,10 @@ impl Runtime {
     /// fingerprinting each item and emitting an event when it changed (or
     /// left). Rate-limited to 4 Hz; fingerprints exclude the always-moving
     /// fields (`age_ms`, `uptime_ms`) so quiet state stays quiet.
+    ///
+    /// The items are the status document's own ([`Runtime::status_items`]),
+    /// each tagged with who may see it, so a principal watches exactly what
+    /// it can poll.
     pub(crate) fn feed_tick(&mut self) {
         if self.a2a_feed.is_none() {
             return;
@@ -206,89 +211,80 @@ impl Runtime {
             return;
         }
         self.feed_last = Instant::now();
-        let mut fresh: Vec<(String, &'static str, FeedVis, Value)> = Vec::new();
-        for (id, r) in &self.runs {
-            fresh.push((
-                format!("run:{id}"),
-                "run",
-                FeedVis::Owner(r.principal.clone()),
-                r.summary(),
-            ));
-        }
-        for c in self.contexts.status().as_array().into_iter().flatten() {
-            let id = c["id"].as_str().unwrap_or("").to_string();
-            let owner = c["principal"].as_str().map(str::to_string);
-            fresh.push((
-                format!("conv:{id}"),
-                "conversation",
-                FeedVis::Owner(owner),
-                c.clone(),
-            ));
-        }
-        for (h, s) in &self.subagents {
-            fresh.push((
-                format!("sub:{h}"),
-                "subagent",
-                FeedVis::Operator,
-                json!({"handle": s.handle, "mode": s.mode, "status": s.status, "tokens": s.tokens, "error": s.error, "updated": s.updated}),
-            ));
-        }
-        for c in self.children.status().as_array().into_iter().flatten() {
-            let node = c["node"].as_u64().unwrap_or(0);
-            fresh.push((
-                format!("child:{node}"),
-                "child",
-                FeedVis::Operator,
-                c.clone(),
-            ));
-        }
-        fresh.push((
-            "status".into(),
-            "status",
-            FeedVis::Operator,
-            json!({
-                "instance": self.instance,
-                "model": self.model,
-                "draining": self.draining,
-                "inbox_pending": self.inbox_queue.len(),
-                "counters": {"turns": self.counters.turns, "tool_calls": self.counters.tool_calls, "runs_started": self.counters.runs_started, "runs_finished": self.counters.runs_finished, "tokens_in": self.counters.tokens_in, "tokens_out": self.counters.tokens_out},
-                "budget": self.governor.status(crate::state::now_ms()),
-                "store": {"kind": self.durable.store_kind(), "degraded": self.durable.is_degraded()},
-            }),
-        ));
-        // Diff against the marks; emit changed items, then departures.
-        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        let mut pushes: Vec<(&'static str, FeedVis, Value)> = Vec::new();
-        for (key, kind, vis, data) in fresh {
-            let mark = fingerprint(&data);
-            seen.insert(key.clone());
-            if self.feed_marks.get(&key) != Some(&mark) {
-                self.feed_marks.insert(key, mark);
-                pushes.push((kind, vis, data));
-            }
-        }
-        let gone: Vec<String> = self
-            .feed_marks
-            .keys()
-            .filter(|k| !seen.contains(*k))
-            .cloned()
-            .collect();
-        for key in gone {
-            self.feed_marks.remove(&key);
-            if let Some((section, id)) = key.split_once(':') {
-                let kind: &'static str = match section {
-                    "run" => "run.removed",
-                    "conv" => "conversation.removed",
-                    "sub" => "subagent.removed",
-                    _ => "child.removed",
-                };
-                pushes.push((kind, FeedVis::Operator, json!({"id": id})));
-            }
-        }
-        for (kind, vis, data) in pushes {
+        // Activity is pushed as it happens (`activity.rs`), filtered to the
+        // changes worth a frame; diffing it here would re-send it on every
+        // token the unit spends.
+        let items = self
+            .status_items()
+            .into_iter()
+            .filter(|i| i.kind != "activity");
+        for (kind, vis, data) in diff_items(&mut self.feed_marks, items) {
             self.feed_push(kind, vis, data);
         }
     }
+
+    /// Who may see the activity of a unit answering `task`: the task's owner
+    /// (and operators), else operators only — for its updates and for its
+    /// departure alike.
+    pub(crate) fn activity_vis(&self, task: Option<&str>) -> FeedVis {
+        match task
+            .and_then(|t| self.tasks.get(t))
+            .and_then(|t| t.principal.clone())
+        {
+            Some(p) => FeedVis::Owner(Some(p)),
+            None => FeedVis::Operator,
+        }
+    }
+}
+
+/// The event a departed item of `kind` announces.
+fn removed_kind(kind: &str) -> &'static str {
+    match kind {
+        "run" => "run.removed",
+        "conversation" => "conversation.removed",
+        "subagent" => "subagent.removed",
+        "activity" => "activity.removed",
+        _ => "child.removed",
+    }
+}
+
+/// Diff `items` against `marks` (key → fingerprint, kind, visibility): the
+/// events for every item that changed, then a `*.removed` for every item
+/// that left, and the marks brought up to date.
+///
+/// A departure is seen by whoever could see the item: the mark remembers the
+/// item's visibility for exactly this. Sending every departure to operators
+/// alone left an owner's client holding a run or a conversation that was
+/// gone — and sending it to everyone would name another principal's ids.
+fn diff_items(
+    marks: &mut std::collections::BTreeMap<String, (u64, &'static str, FeedVis)>,
+    items: impl IntoIterator<Item = crate::runtime::reactor::StatusItem>,
+) -> Vec<(&'static str, FeedVis, Value)> {
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut pushes: Vec<(&'static str, FeedVis, Value)> = Vec::new();
+    for item in items {
+        let print = fingerprint(&item.data);
+        seen.insert(item.key.clone());
+        // The visibility is compared too, so the mark a departure inherits
+        // is always the item's latest.
+        if marks.get(&item.key).map(|m| (m.0, &m.2)) != Some((print, &item.vis)) {
+            marks.insert(item.key, (print, item.kind, item.vis.clone()));
+            pushes.push((item.kind, item.vis, item.data));
+        }
+    }
+    let gone: Vec<String> = marks
+        .keys()
+        .filter(|k| !seen.contains(*k))
+        .cloned()
+        .collect();
+    for key in gone {
+        if let Some((_, kind, vis)) = marks.remove(&key)
+            && let Some((_, id)) = key.split_once(':')
+        {
+            pushes.push((removed_kind(kind), vis, json!({"id": id})));
+        }
+    }
+    pushes
 }
 
 #[cfg(test)]
@@ -330,6 +326,101 @@ mod tests {
         assert_eq!(newest, 4 + (FEED_RING as u64) + 8);
         assert_eq!(dropped, 12, "4 seed + 8 overflow evicted");
         assert_eq!(oldest, newest - (FEED_RING as u64) + 1);
+    }
+
+    /// An item that leaves is announced to whoever saw it: its owner's
+    /// client drops the run it was showing, and no other principal learns
+    /// the id. Operators see every departure.
+    #[test]
+    fn departures_inherit_visibility() {
+        use crate::runtime::reactor::StatusItem;
+        let item = |key: &str, kind: &'static str, vis: FeedVis| StatusItem {
+            key: key.into(),
+            kind,
+            vis,
+            data: json!({"id": key}),
+        };
+        let mut marks = std::collections::BTreeMap::new();
+        let first = diff_items(
+            &mut marks,
+            [
+                item("run:r1", "run", FeedVis::Owner(Some("user:a".into()))),
+                item(
+                    "conv:c1",
+                    "conversation",
+                    FeedVis::Owner(Some("user:a".into())),
+                ),
+                item("sub:s1", "subagent", FeedVis::Operator),
+                item(
+                    "activity:7",
+                    "activity",
+                    FeedVis::Owner(Some("user:a".into())),
+                ),
+            ],
+        );
+        assert_eq!(first.len(), 4, "every new item is an event: {first:?}");
+        assert!(
+            diff_items(
+                &mut marks,
+                [
+                    item("run:r1", "run", FeedVis::Owner(Some("user:a".into()))),
+                    item(
+                        "conv:c1",
+                        "conversation",
+                        FeedVis::Owner(Some("user:a".into()))
+                    ),
+                    item("sub:s1", "subagent", FeedVis::Operator),
+                    item(
+                        "activity:7",
+                        "activity",
+                        FeedVis::Owner(Some("user:a".into()))
+                    ),
+                ],
+            )
+            .is_empty(),
+            "quiet state is quiet"
+        );
+
+        // Everything leaves.
+        let gone = diff_items(&mut marks, []);
+        assert!(marks.is_empty(), "the marks are dropped with the items");
+        let by_kind = |k: &str| {
+            gone.iter()
+                .find(|(kind, _, _)| *kind == k)
+                .unwrap_or_else(|| panic!("no {k}: {gone:?}"))
+                .clone()
+        };
+        for (kind, id) in [
+            ("run.removed", "r1"),
+            ("conversation.removed", "c1"),
+            ("activity.removed", "7"),
+        ] {
+            let (_, vis, data) = by_kind(kind);
+            assert_eq!(vis, FeedVis::Owner(Some("user:a".into())), "{kind}");
+            assert_eq!(data, json!({"id": id}), "{kind}");
+        }
+        assert_eq!(by_kind("subagent.removed").1, FeedVis::Operator);
+
+        // Through the ring: the owner sees its departures, a stranger none.
+        let f = SharedFeed::new(false);
+        for (kind, vis, data) in gone {
+            f.push(kind, vis, data);
+        }
+        let kinds = |who: &str, op: bool| -> Vec<String> {
+            f.since(0, who, op, 100)
+                .0
+                .iter()
+                .map(|e| e["kind"].as_str().unwrap_or("").to_string())
+                .collect()
+        };
+        let mut owner = kinds("user:a", false);
+        owner.sort();
+        assert_eq!(
+            owner,
+            ["activity.removed", "conversation.removed", "run.removed"]
+        );
+        assert!(kinds("user:b", false).is_empty(), "a stranger sees none");
+        assert_eq!(kinds("operator", true).len(), 4, "the operator sees all");
     }
 
     #[test]

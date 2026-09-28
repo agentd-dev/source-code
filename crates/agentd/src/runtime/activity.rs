@@ -167,14 +167,18 @@ impl Runtime {
 
     /// The unit finished: drop the record and tell clients it is gone.
     pub(crate) fn activity_end(&mut self, node: NodeId) {
-        if self.activity.remove(&node.0).is_some() {
-            #[cfg(feature = "a2a")]
+        let gone = self.activity.remove(&node.0);
+        // Told to whoever was told of the unit — its task's owner too.
+        #[cfg(feature = "a2a")]
+        if let Some(gone) = gone {
             self.feed_push(
                 "activity.removed",
-                crate::runtime::a2a_server::FeedVis::Operator,
+                self.activity_vis(gone.task.as_deref()),
                 json!({"id": node.0.to_string()}),
             );
         }
+        #[cfg(not(feature = "a2a"))]
+        let _ = gone;
     }
 
     /// The A2A task + conversation a child answers, when it has one. Without
@@ -210,15 +214,7 @@ impl Runtime {
         #[cfg(feature = "a2a")]
         {
             v["id"] = json!(node.0.to_string());
-            // Owner-scoped when the unit answers a task; else operator-only.
-            let owner = v["task"]
-                .as_str()
-                .and_then(|t| self.tasks.get(t))
-                .and_then(|t| t.principal.clone());
-            let vis = match owner {
-                Some(p) => crate::runtime::a2a_server::FeedVis::Owner(Some(p)),
-                None => crate::runtime::a2a_server::FeedVis::Operator,
-            };
+            let vis = self.activity_vis(v["task"].as_str());
             self.feed_push("activity", vis, v);
         }
     }

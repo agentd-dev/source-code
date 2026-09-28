@@ -55,6 +55,8 @@ use common::{SendMessage, a2a_open, a2a_post, a2a_post_within, rpc, rpc_as, rpc_
 /// config — a bearer is a secret, and the config may only carry a reference.
 const TOKEN_A: &str = "authz-token-for-principal-a";
 const TOKEN_B: &str = "authz-token-for-principal-b";
+const TOKEN_C: &str = "authz-token-for-principal-c";
+const TOKEN_OP: &str = "authz-token-for-the-operator";
 
 fn sigterm(pid: u32) {
     unsafe {
@@ -157,6 +159,8 @@ fn spawn_daemon(config: &str) -> Daemon {
         .args(["--config", config])
         .env("AGENTD_AUTHZ_TOKEN_A", TOKEN_A)
         .env("AGENTD_AUTHZ_TOKEN_B", TOKEN_B)
+        .env("AGENTD_AUTHZ_TOKEN_C", TOKEN_C)
+        .env("AGENTD_AUTHZ_TOKEN_OP", TOKEN_OP)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(errf))
@@ -1554,6 +1558,266 @@ fn restored_work_acts_for_its_owner_before_the_owner_calls_again() {
     assert!(second.alive(), "daemon still serving: {}", second.stderr());
     std::fs::remove_file(&cfg).ok();
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `cfg` with one more principal: the operator, by its own bearer.
+fn with_operator(cfg: &str) -> String {
+    cfg.replacen(
+        "  principals:\n",
+        "  principals:\n    - id: op\n      match: { bearer_ref: \"{{secret:AGENTD_AUTHZ_TOKEN_OP}}\" }\n      role: operator\n",
+        1,
+    )
+}
+
+/// The ids of a status document's `section`.
+fn ids_in(doc: &Value, section: &str, field: &str) -> Vec<String> {
+    doc[section]
+        .as_array()
+        .unwrap_or_else(|| panic!("no {section} in {doc}"))
+        .iter()
+        .filter_map(|v| v[field].as_str().map(str::to_string))
+        .collect()
+}
+
+/// `status` is granted to every named caller, so it answers each with what
+/// that caller may see: the instance's facts, the workflows it may run, and
+/// its OWN runs, conversations and activity — the same line the feed draws.
+/// Another principal's run ids, conversation ids and subagent handles are
+/// exactly what the owner-scoped ops refuse to confirm, so a `status` that
+/// listed them would undo that; the instance's internals (subagents, budget,
+/// the instruction, the store) are the operator's. The model, acting for a
+/// caller, reads that caller's view. The operator still reads everything.
+#[test]
+fn status_is_scoped_to_the_caller() {
+    let pb = common::unique_path("status-playbook", "json");
+    std::fs::write(&pb, a_spawns_a_helper().to_string()).unwrap();
+    let llm = spawn_mock_llm_file(&pb);
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let cfg = write_config(&with_operator(&owners_config(&llm.uri, port, "[\"*\"]")));
+    let mut daemon = spawn_daemon(&cfg);
+    wait_ready(&addr);
+    let a = a_owns_a_run_and_a_subagent(&addr, &daemon);
+
+    // B's turn asks the model how the agent is doing.
+    std::fs::write(
+        &pb,
+        owners_playbook(json!([
+            {"tool_calls": [{"name": "status", "arguments": {}}]},
+            {"content": "looked"},
+        ]))
+        .to_string(),
+    )
+    .unwrap();
+    let b_ctx = turn_as(&addr, TOKEN_B, "how is the agent doing?");
+
+    let status = |bearer: &str| {
+        let v = command_as(&addr, bearer, "status", json!({}));
+        assert!(v.get("error").is_none(), "status: {v}");
+        answer(&v)
+    };
+    let (sa, sb, so) = (status(TOKEN_A), status(TOKEN_B), status(TOKEN_OP));
+
+    // Each user sees its own work…
+    assert_eq!(
+        ids_in(&sa, "runs", "id"),
+        std::slice::from_ref(&a.run),
+        "{sa}"
+    );
+    assert!(ids_in(&sa, "conversations", "id").contains(&a.ctx), "{sa}");
+    assert!(ids_in(&sb, "runs", "id").is_empty(), "{sb}");
+    assert_eq!(
+        ids_in(&sb, "conversations", "id"),
+        std::slice::from_ref(&b_ctx),
+        "{sb}"
+    );
+    for c in sb["conversations"].as_array().unwrap() {
+        assert_eq!(c["contextId"], c["id"], "addressable by contextId: {c}");
+    }
+    // …and nothing of the other's, anywhere in the document.
+    let (text_a, text_b) = (sa.to_string(), sb.to_string());
+    for theirs in [&a.run, &a.ctx, &a.handle] {
+        assert!(!text_b.contains(theirs.as_str()), "B sees {theirs}: {sb}");
+    }
+    assert!(!text_a.contains(&b_ctx), "A sees B's conversation: {sa}");
+    for doc in [&sa, &sb] {
+        for kept in [
+            "instance",
+            "uptime_ms",
+            "draining",
+            "paused",
+            "model",
+            "version",
+            "skills",
+            "skill_prefix",
+            "values",
+            "workflows",
+            "activity",
+        ] {
+            assert!(doc.get(kept).is_some(), "{kept} is a fact: {doc}");
+        }
+        for internal in [
+            "subagents",
+            "children",
+            "timers",
+            "budget",
+            "counters",
+            "inbox_pending",
+            "tools",
+            "store",
+            "instruction",
+            "run_id",
+            "job_shape",
+        ] {
+            assert!(doc.get(internal).is_none(), "{internal} leaked: {doc}");
+        }
+        for w in doc["workflows"].as_array().unwrap() {
+            assert_eq!(
+                w.as_object().map(|o| o.len()),
+                Some(1),
+                "a workflow is its name: {w}"
+            );
+        }
+    }
+
+    // The model acting for B was answered with B's view.
+    let seen = tool_results(&addr, TOKEN_B, &b_ctx);
+    assert_eq!(seen.len(), 1, "one status result: {seen:?}");
+    assert!(
+        seen[0].contains(&b_ctx),
+        "B's model sees B's work: {seen:?}"
+    );
+    for theirs in [&a.run, &a.ctx, &a.handle] {
+        assert!(
+            !seen[0].contains(theirs.as_str()),
+            "B's model sees {theirs}: {seen:?}"
+        );
+    }
+
+    // The operator reads the whole instance.
+    assert!(ids_in(&so, "runs", "id").contains(&a.run), "{so}");
+    let convs = ids_in(&so, "conversations", "id");
+    assert!(convs.contains(&a.ctx) && convs.contains(&b_ctx), "{so}");
+    assert!(
+        ids_in(&so, "subagents", "handle").contains(&a.handle),
+        "{so}"
+    );
+    for internal in ["budget", "instruction", "counters", "store"] {
+        assert!(
+            so.get(internal).is_some(),
+            "the operator reads {internal}: {so}"
+        );
+    }
+
+    assert!(daemon.alive(), "daemon still serving: {}", daemon.stderr());
+    std::fs::remove_file(&cfg).ok();
+    std::fs::remove_file(&pb).ok();
+}
+
+/// What the extended card lists is exactly what `workflow.run` runs.
+///
+/// Both ask `Runtime::may_run` — the grants AND the default start's roles —
+/// so a caller is never offered a workflow the op then refuses, nor refused
+/// one it was never told of by a different answer than a stranger gets.
+/// Every name off the caller's card is HTTP 403 with PERMISSION_DENIED, the
+/// start-roles refusal the runtime makes included, carried out through the
+/// a2a-rs path that serves a Task-reply command.
+#[test]
+fn listed_workflows_are_exactly_the_runnable_ones() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let cfg = write_config(&format!(
+        "config_version: \"1\"\n\
+         agent:\n  name: a2a-runnable\n  instruction: You are a test agent.\n  preflight: never\n\
+         intelligence:\n  endpoints: https://127.0.0.1:9\n  model: mock\n\
+         store:\n  kind: memory\n\
+         a2a:\n  listen: http://127.0.0.1:{port}\n\
+         \x20 principals:\n\
+         \x20   - id: op\n\
+         \x20     match: {{ bearer_ref: \"{{{{secret:AGENTD_AUTHZ_TOKEN_OP}}}}\" }}\n\
+         \x20     role: operator\n\
+         \x20   - id: token-a\n\
+         \x20     match: {{ bearer_ref: \"{{{{secret:AGENTD_AUTHZ_TOKEN_A}}}}\" }}\n\
+         \x20     role: user\n\
+         \x20   - id: token-b\n\
+         \x20     match: {{ bearer_ref: \"{{{{secret:AGENTD_AUTHZ_TOKEN_B}}}}\" }}\n\
+         \x20     role: agent\n\
+         \x20   - id: token-c\n\
+         \x20     match: {{ bearer_ref: \"{{{{secret:AGENTD_AUTHZ_TOKEN_C}}}}\" }}\n\
+         \x20     role: agent\n\
+         \x20     grants: [\"workflow.run:triage\"]\n\
+         workflows:\n\
+         \x20 - name: triage\n    steps:\n      s: {{kind: manual}}\n      f: {{kind: finish, depends_on: [s]}}\n\
+         \x20 - name: deploy\n    steps:\n      s: {{kind: manual}}\n      f: {{kind: finish, depends_on: [s]}}\n\
+         \x20 - name: user-only\n    steps:\n      s: {{kind: a2a, command: user.go, roles: [user]}}\n      f: {{kind: finish, depends_on: [s]}}\n\
+         \x20 - name: ops-only\n    steps:\n      s: {{kind: a2a, command: ops.go, roles: [operator]}}\n      f: {{kind: finish, depends_on: [s]}}\n\
+         lifecycle:\n  run_until: drained\n\
+         observability:\n  log_level: info\n"
+    ));
+    let mut daemon = spawn_daemon(&cfg);
+    wait_ready(&addr);
+
+    let all = ["triage", "deploy", "user-only", "ops-only"];
+    // Written out as well as compared, so the two sides cannot agree by
+    // both being wrong (an empty card and a refusing op agree perfectly).
+    let callers: [(&str, &str, &[&str]); 4] = [
+        (
+            "the default user",
+            TOKEN_A,
+            &["deploy", "triage", "user-only"],
+        ),
+        ("the default agent", TOKEN_B, &["deploy", "triage"]),
+        ("an agent granted workflow.run:triage", TOKEN_C, &["triage"]),
+        // The start's roles bind the operator too: `user-only` starts from an
+        // a2a start that admits users alone.
+        ("the operator", TOKEN_OP, &["deploy", "ops-only", "triage"]),
+    ];
+    for (who, bearer, expected) in callers {
+        let card = rpc_as(&addr, bearer, 1, "GetExtendedAgentCard", json!({}));
+        let mut listed: Vec<String> = card["result"]["skills"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{who}: no extended card: {card}"))
+            .iter()
+            .filter(|s| {
+                s["tags"]
+                    .as_array()
+                    .is_some_and(|t| t.contains(&json!("workflow")))
+            })
+            .filter_map(|s| {
+                s["id"]
+                    .as_str()?
+                    .strip_prefix("workflow:")
+                    .map(str::to_string)
+            })
+            .collect();
+        listed.sort();
+        assert_eq!(listed, expected, "{who}'s card");
+
+        let mut runnable = Vec::new();
+        for name in all {
+            let reply = SendMessage::command("workflow.run", json!({"workflow": name}))
+                .bearer(bearer)
+                .return_immediately()
+                .post_raw(&addr);
+            let v = reply.json();
+            if reply.status == 200 && v.get("error").is_none() {
+                assert!(v["result"]["task"].is_object(), "{who} runs {name}: {v}");
+                runnable.push(name.to_string());
+                continue;
+            }
+            assert_eq!(reply.status, 403, "{who} runs {name}: {v}");
+            assert_eq!(v["error"]["code"], -31403, "{who} runs {name}: {v}");
+            assert_eq!(
+                v["error"]["data"][0]["reason"], "PERMISSION_DENIED",
+                "{who} runs {name}: {v}"
+            );
+        }
+        runnable.sort();
+        assert_eq!(runnable, listed, "{who}: what runs is what is listed");
+    }
+
+    assert!(daemon.alive(), "daemon still serving: {}", daemon.stderr());
+    std::fs::remove_file(&cfg).ok();
 }
 
 /// A mock whose playbook is the file at `path`, re-read on every request, so

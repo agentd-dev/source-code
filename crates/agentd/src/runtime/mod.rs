@@ -689,6 +689,7 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
         feed_marks: BTreeMap::new(),
         #[cfg(feature = "a2a")]
         feed_last: Instant::now(),
+        status_values_cache: std::sync::Mutex::new(None),
         #[cfg(feature = "a2a")]
         webhook_callbacks: std::sync::Arc::new(std::sync::Mutex::new(
             std::collections::HashMap::new(),

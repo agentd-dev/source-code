@@ -458,9 +458,16 @@ pub struct Runtime {
     /// The newest root-context reply, so a `--prompt` job can print its answer
     /// (a prompt runs as a turn, not as a `once` run with an output).
     pub(crate) last_root_reply: Option<String>,
-    /// Per-item fingerprints behind the feed's section diffing (`feed_tick`).
+    /// Per-item marks behind the feed's section diffing (`feed_tick`): the
+    /// item's fingerprint, its kind and who may see it — the last two so its
+    /// departure reaches exactly the principals its updates did.
     #[cfg(feature = "a2a")]
-    pub(crate) feed_marks: BTreeMap<String, u64>,
+    pub(crate) feed_marks: BTreeMap<String, (u64, &'static str, super::a2a_server::FeedVis)>,
+    /// The `observability.status_values` last resolved: when, for which keys,
+    /// and to what. `status` and the feed's status item both publish them, so
+    /// without it a client polling `status` would be a store read per key per
+    /// poll. Behind a lock only because the status view is built from `&self`.
+    pub(crate) status_values_cache: std::sync::Mutex<Option<(Instant, Vec<String>, Value)>>,
     /// The last section-diff pass (rate-limits `feed_tick`).
     #[cfg(feature = "a2a")]
     pub(crate) feed_last: Instant,
@@ -1484,31 +1491,240 @@ impl Runtime {
 
     // ---- status ------------------------------------------------------------
 
-    /// `status` tool / `agent://status`.
+    /// `status` tool / `agent://status`: the whole document, as an operator
+    /// sees it. A caller who is not the operator is answered from
+    /// [`Runtime::status_value_for`].
     pub(crate) fn status_value(&self) -> Value {
-        json!({
-            "instance": self.instance,
+        let mut doc = self.status_facts();
+        let full = json!({
             "run_id": self.run_id,
-            "uptime_ms": self.started.elapsed().as_millis() as u64,
             "job_shape": self.job_shape,
-            "draining": self.draining,
-            "paused": self.paused,
             "store": {"kind": self.durable.store_kind(), "degraded": self.durable.is_degraded(), "generation": self.durable.manifest().generation},
             "workflows": self.workflows.values().map(|w| json!({"name": w.name, "hash": w.hash, "armed": w.armed, "starts": w.start_steps().iter().map(|s| s.kind.clone()).collect::<Vec<_>>()})).collect::<Vec<_>>(),
             "runs": self.runs.values().map(RunState::summary).collect::<Vec<_>>(),
-            "conversations": self.contexts.status(),
+            "conversations": self.conversation_views(),
             "subagents": self.subagents.values().map(|s| json!({"handle": s.handle, "mode": s.mode, "status": s.status, "tokens": s.tokens, "template": s.template, "tier": s.tier, "pid": s.pid, "retire_at": s.retire_at})).collect::<Vec<_>>(),
             "children": self.children.status(),
             "timers": self.timers.status(),
             "inbox_pending": self.inbox_queue.len(),
             "budget": self.governor.status(now_ms()),
             "tools": self.registry.len(),
-            "skills": self.skills.names(),
-            "counters": {"turns": self.counters.turns, "tool_calls": self.counters.tool_calls, "runs_started": self.counters.runs_started, "runs_finished": self.counters.runs_finished, "tokens_in": self.counters.tokens_in, "tokens_out": self.counters.tokens_out},
+            "counters": self.counters_value(),
             "instruction": {"source": self.instruction.source, "uri": self.instruction.uri, "version": self.instruction.version, "version_id": self.instruction.version_id, "delivered_digest": self.instruction.delivered_digest, "bytes": self.instruction.text.len()},
-            "model": self.model,
             "activity": self.activity_value(),
+        });
+        if let (Value::Object(doc), Value::Object(full)) = (&mut doc, full) {
+            doc.extend(full);
+        }
+        doc
+    }
+
+    /// The facts about the instance itself that every caller of `status` is
+    /// told: that it is up and how, and what a client needs to talk to it —
+    /// the skills, the prefix that preloads one, and the values the operator
+    /// chose to publish. Nothing here is anyone's work.
+    fn status_facts(&self) -> Value {
+        json!({
+            "instance": self.instance,
+            "uptime_ms": self.started.elapsed().as_millis() as u64,
+            "draining": self.draining,
+            "paused": self.paused,
+            "model": self.model,
+            "version": crate::VERSION,
+            "skills": self.skills.names(),
+            "skill_prefix": self.skills.prefix,
+            "values": self.status_values(),
         })
+    }
+
+    fn counters_value(&self) -> Value {
+        json!({"turns": self.counters.turns, "tool_calls": self.counters.tool_calls, "runs_started": self.counters.runs_started, "runs_finished": self.counters.runs_finished, "tokens_in": self.counters.tokens_in, "tokens_out": self.counters.tokens_out})
+    }
+
+    /// The conversations as `status` and the feed show them, each with the
+    /// `contextId` a client addresses it by — today the id itself.
+    fn conversation_views(&self) -> Vec<Value> {
+        let mut out = Vec::new();
+        for mut c in self
+            .contexts
+            .status()
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+        {
+            c["contextId"] = c["id"].clone();
+            out.push(c);
+        }
+        out
+    }
+
+    /// `observability.status_values`: the current value of each listed memory
+    /// key, for a client's `memory:<key>` chrome item. A key never written, or
+    /// whose TTL has run out, is left out — an empty slot reads as broken,
+    /// and an expired value still showing reads as current when the workflow
+    /// that kept it fresh has stopped.
+    ///
+    /// Resolved at most once a second: `status` is polled, and the feed asks
+    /// four times a second. Straight to the store rather than through
+    /// `Memory`, which caches behind `&mut` — a read for display must not be
+    /// able to disturb anything.
+    pub(crate) fn status_values(&self) -> Value {
+        const FRESH_FOR: Duration = Duration::from_secs(1);
+        let keys = &self.settings.observability.status_values;
+        if keys.is_empty() {
+            return json!({});
+        }
+        let mut cache = self
+            .status_values_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // The keys are part of the cache's identity: a reload that changes
+        // the list is answered for the new list at once.
+        if let Some((at, cached_keys, v)) = &*cache
+            && at.elapsed() < FRESH_FOR
+            && cached_keys == keys
+        {
+            return v.clone();
+        }
+        let now = now_ms();
+        let mut out = serde_json::Map::new();
+        for key in keys {
+            if let Ok(Some(env)) = self.durable.get(Kind::Memory, key)
+                && let Ok(rec) = serde_json::from_value::<crate::context::memory::Record>(env.state)
+                && !rec.expired(now)
+            {
+                out.insert(key.clone(), rec.value);
+            }
+        }
+        let v = Value::Object(out);
+        *cache = Some((Instant::now(), keys.clone(), v.clone()));
+        v
+    }
+
+    /// The status document for whoever a model's tool call or a turn acts
+    /// for: the principal's own view ([`Runtime::status_value_for`]) when
+    /// someone asked, the whole document when the runtime itself did.
+    pub(crate) fn status_for(&self, principal: Option<&str>) -> Value {
+        #[cfg(feature = "a2a")]
+        if let Some(p) = self.acting_principal(principal) {
+            return self.status_value_for(&p);
+        }
+        #[cfg(not(feature = "a2a"))]
+        let _ = principal;
+        self.status_value()
+    }
+
+    /// The status document `principal` may read.
+    ///
+    /// The operator reads it all. Anyone else gets the instance's facts, the
+    /// workflows it may run, and — from [`Runtime::status_items`], through
+    /// the one visibility rule the feed applies — its own runs,
+    /// conversations and activity. Every other principal's work, and the
+    /// instance's internals (subagents, children, timers, budget, counters,
+    /// the store, the instruction), stay out: `status` is granted to every
+    /// named caller, so what it returns is exactly what may be shown to any
+    /// of them.
+    #[cfg(feature = "a2a")]
+    pub(crate) fn status_value_for(&self, principal: &crate::a2a::Principal) -> Value {
+        if principal.is_operator() {
+            return self.status_value();
+        }
+        let items = self.status_items();
+        let section = |kind: &str| -> Vec<Value> {
+            items
+                .iter()
+                .filter(|i| i.kind == kind && i.vis.admits(&principal.id, false))
+                .map(|i| i.data.clone())
+                .collect()
+        };
+        let mut doc = self.status_facts();
+        doc["workflows"] = json!(
+            self.workflows
+                .values()
+                .filter(|w| Runtime::may_run(principal, w))
+                .map(|w| json!({"name": w.name}))
+                .collect::<Vec<_>>()
+        );
+        doc["runs"] = json!(section("run"));
+        doc["conversations"] = json!(section("conversation"));
+        doc["activity"] = json!(section("activity"));
+        doc
+    }
+
+    /// Every item of the status document that belongs to somebody, tagged
+    /// with who may see it: runs and conversations (their owner's), subagents
+    /// and OS children (the operator's), the activity of each unit at work
+    /// (its task owner's) and the slim status (the operator's).
+    ///
+    /// The feed's section diff and the `status` op both read these, so what
+    /// a principal can watch and what it can poll come from one list with
+    /// one tag per item.
+    #[cfg(feature = "a2a")]
+    pub(crate) fn status_items(&self) -> Vec<StatusItem> {
+        use super::a2a_server::FeedVis;
+        let mut items = Vec::new();
+        for (id, r) in &self.runs {
+            items.push(StatusItem {
+                key: format!("run:{id}"),
+                kind: "run",
+                vis: FeedVis::Owner(r.principal.clone()),
+                data: r.summary(),
+            });
+        }
+        for c in self.conversation_views() {
+            let id = c["id"].as_str().unwrap_or("").to_string();
+            let owner = c["principal"].as_str().map(str::to_string);
+            items.push(StatusItem {
+                key: format!("conv:{id}"),
+                kind: "conversation",
+                vis: FeedVis::Owner(owner),
+                data: c,
+            });
+        }
+        for (h, s) in &self.subagents {
+            items.push(StatusItem {
+                key: format!("sub:{h}"),
+                kind: "subagent",
+                vis: FeedVis::Operator,
+                data: json!({"handle": s.handle, "mode": s.mode, "status": s.status, "tokens": s.tokens, "error": s.error, "updated": s.updated}),
+            });
+        }
+        for c in self.children.status().as_array().into_iter().flatten() {
+            let node = c["node"].as_u64().unwrap_or(0);
+            items.push(StatusItem {
+                key: format!("child:{node}"),
+                kind: "child",
+                vis: FeedVis::Operator,
+                data: c.clone(),
+            });
+        }
+        for a in self.activity_value().as_array().into_iter().flatten() {
+            let id = a["id"].as_str().unwrap_or("").to_string();
+            items.push(StatusItem {
+                key: format!("activity:{id}"),
+                kind: "activity",
+                vis: self.activity_vis(a["task"].as_str()),
+                data: a.clone(),
+            });
+        }
+        items.push(StatusItem {
+            key: "status".into(),
+            kind: "status",
+            vis: FeedVis::Operator,
+            data: json!({
+                "instance": self.instance,
+                "model": self.model,
+                "version": crate::VERSION,
+                "draining": self.draining,
+                "inbox_pending": self.inbox_queue.len(),
+                "counters": self.counters_value(),
+                "budget": self.governor.status(now_ms()),
+                "store": {"kind": self.durable.store_kind(), "degraded": self.durable.is_degraded()},
+                "values": self.status_values(),
+                "skill_prefix": self.skills.prefix,
+            }),
+        });
+        items
     }
 
     /// The shortest time until the next time-based wake (a timer, an armed
@@ -1568,6 +1784,39 @@ impl Runtime {
         }
         tokens::window_for_model(&self.model)
     }
+}
+
+/// One item of the status document, tagged with who may see it: the unit
+/// the feed diffs and the `status` op filters.
+#[cfg(feature = "a2a")]
+pub(crate) struct StatusItem {
+    /// Stable across ticks (`run:<id>`, `conv:<id>`, …): the feed's mark key,
+    /// whose part after the `:` a departure names.
+    pub(crate) key: String,
+    /// The feed event kind (`run`, `conversation`, …).
+    pub(crate) kind: &'static str,
+    pub(crate) vis: super::a2a_server::FeedVis,
+    pub(crate) data: Value,
+}
+
+/// A one-line summary of a status document, counting only what the document
+/// holds — so a caller shown its own runs is not told how many there are in
+/// all.
+pub(crate) fn status_summary(status: &Value) -> String {
+    let mut parts = Vec::new();
+    for (section, noun) in [
+        ("runs", "runs"),
+        ("subagents", "subagents"),
+        ("conversations", "conversations"),
+    ] {
+        if let Some(a) = status[section].as_array() {
+            parts.push(format!("{} {noun}", a.len()));
+        }
+    }
+    if let Some(active) = status["budget"].get("active") {
+        parts.push(format!("budget active: {active}"));
+    }
+    format!("Status: {}", parts.join(", "))
 }
 
 // ---- ownership: who may act on a run or a subagent -------------------------
@@ -1758,7 +2007,7 @@ pub fn run_exit_code(r: &RunState) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Instruction, SubagentRecord, backfill_principals, may_act_on};
+    use super::{Instruction, SubagentRecord, backfill_principals, may_act_on, status_summary};
     use crate::a2a::Principal;
     use crate::config::v2::Role;
     use serde_json::json;
@@ -1909,6 +2158,23 @@ mod tests {
         assert_eq!(
             instruction(None, None).subscribe_target(&serde_json::json!({})),
             None
+        );
+    }
+
+    /// The one-line status a turn answers with counts what the asker's
+    /// document holds and nothing else: a section the caller may not read is
+    /// not counted as zero, it is not mentioned at all.
+    #[test]
+    fn a_status_summary_counts_only_the_returned_arrays() {
+        let scoped = json!({"runs": [{"id": "r1"}], "conversations": [{"id": "c1"}, {"id": "c2"}]});
+        assert_eq!(status_summary(&scoped), "Status: 1 runs, 2 conversations");
+        let full = json!({
+            "runs": [], "subagents": [{"handle": "h"}], "conversations": [],
+            "budget": {"active": true},
+        });
+        assert_eq!(
+            status_summary(&full),
+            "Status: 0 runs, 1 subagents, 0 conversations, budget active: true"
         );
     }
 }

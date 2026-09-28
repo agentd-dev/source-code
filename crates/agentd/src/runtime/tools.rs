@@ -687,7 +687,8 @@ impl Runtime {
                 ok(json!({"ok": c.unload_skill(args["name"].as_str().unwrap_or(""))}))
             }
             // ---- status ----
-            "status" => ok(self.status_value()),
+            // The model is its caller's deputy: it reads what that caller may.
+            "status" => ok(self.status_for(caller.principal.as_deref())),
             // ---- time ----
             "sleep" => {
                 let d = match crate::config::parse_duration(args["duration"].as_str().unwrap_or(""))

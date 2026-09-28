@@ -238,7 +238,9 @@ impl Runtime {
     /// `status`, `config` and `plan.get`.
     fn read_op(&mut self, principal: &Principal, op: ReadOp, data: &Value) -> Answer {
         match op {
-            ReadOp::Status => Answer::Doc(self.status_value()),
+            // Granted to every named caller, so scoped to the caller: its own
+            // work, and the instance's facts.
+            ReadOp::Status => Answer::Doc(self.status_value_for(principal)),
             // The effective merged configuration. Redacted on the way out: the
             // merged doc carries env/flag-supplied credentials INLINE, and
             // operator-only is not the same as public (see `redact_settings`).

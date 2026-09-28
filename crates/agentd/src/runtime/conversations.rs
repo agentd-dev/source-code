@@ -65,6 +65,18 @@ impl ConversationIndex {
         self.by_key.get(key).map(|(_, wire)| wire.as_str())
     }
 
+    /// The principal whose `contextId` the key is bound from, when it is.
+    pub fn owner_of(&self, key: &str) -> Option<&str> {
+        self.by_key.get(key).map(|(owner, _)| owner.as_str())
+    }
+
+    /// Forget the binding of `key`, both ways.
+    fn release(&mut self, key: &str) {
+        if let Some(name) = self.by_key.remove(key) {
+            self.by_wire.remove(&name);
+        }
+    }
+
     /// Record a binding; the first one recorded for a name or a key stands.
     fn bind(&mut self, principal: &str, wire: &str, key: &str) {
         self.by_wire
@@ -101,6 +113,38 @@ impl ConversationIndex {
         index
     }
 
+    /// [`ConversationIndex::claim`], adopting first a conversation from
+    /// before the namespace existed.
+    ///
+    /// Up to 1.16 a caller's conversation was kept under the very id it
+    /// sent, and records no `wire_id`, so nothing binds it and a plain claim
+    /// would start a fresh one beside its history. It is adopted — bound
+    /// under that id, to itself — when it is `principal`'s own: an owned
+    /// conversation, not the root, and not already some binding's key. An id
+    /// that names another principal's conversation, the root, or nothing gets
+    /// the fresh key any unknown id gets, so the answer still reveals nothing.
+    /// Done here, when the name is used, rather than at restore: the rule is
+    /// then the same before a restart and after one.
+    pub fn claim_or_adopt(
+        &mut self,
+        contexts: &Contexts,
+        principal: &str,
+        wire: &str,
+    ) -> std::io::Result<String> {
+        if self.key_of(principal, wire).is_none()
+            && wire != crate::context::ROOT
+            && !self.by_key.contains_key(wire)
+            && contexts.get(wire).is_some_and(|c| {
+                c.kind == crate::context::ContextKind::Conversation
+                    && c.wire_id.is_none()
+                    && c.principal.as_deref() == Some(principal)
+            })
+        {
+            self.bind(principal, wire, wire);
+        }
+        self.claim(principal, wire)
+    }
+
     pub fn len(&self) -> usize {
         self.by_wire.len()
     }
@@ -129,10 +173,31 @@ impl Runtime {
             .map(str::to_string)
     }
 
-    /// The `contextId` the owner of conversation `key` knows it by: the name
-    /// it was bound from, or the key itself when it is nobody's binding.
-    pub(crate) fn conversation_wire(&self, key: &str) -> String {
-        self.conv_index.wire_of(key).unwrap_or(key).to_string()
+    /// Drop the binding of `key` when nothing records it — no context holds
+    /// the conversation and no task names it — so a claim that ended in a
+    /// refusal leaves nothing behind that a restart would not also forget.
+    #[cfg(feature = "a2a")]
+    pub(crate) fn release_unused_conversation(&mut self, key: &str) {
+        if self.contexts.get(key).is_none() && !self.tasks.values().any(|t| t.conversation == key) {
+            self.conv_index.release(key);
+        }
+    }
+
+    /// The `contextId` principal `who` knows conversation `key` by: the name
+    /// it was bound from when `who` is the one who bound it, else the key.
+    ///
+    /// Only the owner has a name of its own for a bound conversation. Anyone
+    /// else who reaches it — an operator joining by the key `status` lists —
+    /// addressed it by that key, and must be answered in it: handed the
+    /// owner's name instead, a client following the task's `contextId` would
+    /// land in a different conversation spelled like it (an operator's name IS
+    /// a key), and a continuation naming both would be refused as a mismatch.
+    pub(crate) fn conversation_wire(&self, who: &str, key: &str) -> String {
+        match self.conv_index.owner_of(key) {
+            Some(owner) if owner == who => self.conv_index.wire_of(key).unwrap_or(key),
+            _ => key,
+        }
+        .to_string()
     }
 }
 
@@ -220,5 +285,47 @@ mod tests {
         let mut back = back;
         assert_eq!(back.claim("user:a", "chat").unwrap(), a);
         assert_eq!(back.claim("agent:b", ROOT).unwrap(), b_root);
+    }
+
+    /// A conversation kept under its caller's own id before the namespace
+    /// existed (no `wire_id`) is its owner's to continue by that id — and
+    /// nobody else's: another principal, the root and a context that is
+    /// already some binding's key all get a fresh conversation instead.
+    #[test]
+    fn a_conversation_from_before_the_namespace_is_its_owners_by_its_old_id() {
+        let mut contexts = Contexts::new(1000);
+        contexts
+            .conversation("chat", Some("user:a"))
+            .append(Msg::user("SECRET-A-42", Some("user:a".into())));
+        contexts.conversation("orphan", None);
+        contexts.root();
+        let mut index = ConversationIndex::default();
+        let bound = index.claim("user:a", "bound").unwrap();
+        // Its context was made without the name (a delivery, say), so only
+        // the binding says whose key it is.
+        contexts.conversation(&bound, Some("user:a"));
+
+        assert_eq!(
+            index.claim_or_adopt(&contexts, "user:a", "chat").unwrap(),
+            "chat",
+            "the owner continues its old conversation by its old id"
+        );
+        assert_eq!(
+            index.claim_or_adopt(&contexts, "user:a", "chat").unwrap(),
+            "chat"
+        );
+        assert_eq!(index.wire_of("chat"), Some("chat"));
+
+        let b = index.claim_or_adopt(&contexts, "user:b", "chat").unwrap();
+        assert!(is_key(&b), "another principal's old id is not a door: {b}");
+        let orphan = index.claim_or_adopt(&contexts, "user:a", "orphan").unwrap();
+        assert!(
+            is_key(&orphan),
+            "a conversation nobody owns is nobody's to adopt"
+        );
+        let root = index.claim_or_adopt(&contexts, "user:a", ROOT).unwrap();
+        assert!(is_key(&root), "the root is no caller's conversation");
+        let again = index.claim_or_adopt(&contexts, "user:a", &bound).unwrap();
+        assert_ne!(again, bound, "a key is no one's name, even its owner's");
     }
 }

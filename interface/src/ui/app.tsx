@@ -48,6 +48,7 @@ import {
   availableCommands,
   cardUrlOf,
   commandHelp,
+  conversationsNote,
   currentGate,
   describe,
   deviceLogin,
@@ -1454,15 +1455,9 @@ function Connected({
           await need().resume(arg || undefined);
           mirror.note(arg ? `resumed ${arg}` : 'instance resumed');
           return;
-        case 'conversations': {
-          const convs = [...s.conversations.values()] as { [k: string]: Json }[];
-          mirror.note(
-            convs.length === 0
-              ? 'no conversations yet'
-              : `conversations:\n${convs.map((c) => `#${c.id}  ${c.messages ?? 0} msgs · ${c.turns ?? 0} turns`).join('\n')}\nstart a message with #<id> to address one`,
-          );
+        case 'conversations':
+          mirror.note(conversationsNote(s));
           return;
-        }
         case 'plan': {
           const p = (await need().planGet(arg || undefined)) as { plan?: Json } | null;
           mirror.note(`plan: ${JSON.stringify(p?.plan ?? null).slice(0, 800)}`);

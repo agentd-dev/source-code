@@ -2291,6 +2291,258 @@ fn a_foreign_or_unknown_context_id_gets_the_same_answer() {
     std::fs::remove_file(&cfg).ok();
 }
 
+/// **An operator is answered in the conversation it named.**
+///
+/// An operator joins another principal's conversation by the key `status`
+/// lists. Its task must come back under that key: handed the owner's name
+/// instead, a client following the task's `contextId` lands in some other
+/// conversation spelled like it (an operator's name IS a key), and a
+/// continuation naming the task and the key it sent is refused as a
+/// mismatch between the two. The owner's own name never reaches it, and
+/// nothing is created beside the conversation it joined.
+#[test]
+fn an_operator_joins_a_conversation_by_its_key_and_is_answered_in_it() {
+    let mut playbook = secrets_playbook();
+    // A turn the model is slow on, so the operator's task is still open when
+    // the operator continues it. First, so it wins over the secrets.
+    playbook["match"].as_array_mut().unwrap().insert(
+        0,
+        json!({"when_contains": "SLOW-OP", "content": "slowly", "delay_ms": 3000}),
+    );
+    let llm = spawn_mock_llm(&playbook);
+    let (mut daemon, cfg) =
+        spawn_daemon(|port| with_operator(&two_principal_config(&llm.uri, port)));
+    let addr = daemon.addr.clone();
+
+    let a_sent = SendMessage::text("remember SECRET-A-42 for me")
+        .bearer(TOKEN_A)
+        .context("a-chat")
+        .post(&addr);
+    assert_eq!(
+        a_sent["result"]["task"]["status"]["state"], "TASK_STATE_COMPLETED",
+        "{a_sent}"
+    );
+    let key = conversation_named(&addr, TOKEN_A, "a-chat")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let a_len = || {
+        conversation_named(&addr, TOKEN_A, "a-chat")["messages"]
+            .as_u64()
+            .unwrap()
+    };
+    let listed = conversations_of(&addr, TOKEN_OP).len();
+
+    // The operator joins by the key, and is answered under it — from A's
+    // history, so the turn ran where it was sent.
+    let joined = SendMessage::text("what were you told?")
+        .bearer(TOKEN_OP)
+        .context(&key)
+        .post(&addr);
+    let task = &joined["result"]["task"];
+    assert_eq!(task["status"]["state"], "TASK_STATE_COMPLETED", "{joined}");
+    assert_eq!(
+        task["contextId"],
+        key.as_str(),
+        "the operator's name comes back: {joined}"
+    );
+    assert!(
+        joined.to_string().contains("I recall SECRET-A-42"),
+        "{joined}"
+    );
+    assert!(
+        !joined.to_string().contains("a-chat"),
+        "A's name is A's: {joined}"
+    );
+
+    // Following what came back continues the same conversation.
+    let before = a_len();
+    let next = task["contextId"].as_str().unwrap().to_string();
+    let again = SendMessage::text("and what else?")
+        .bearer(TOKEN_OP)
+        .context(&next)
+        .post(&addr);
+    assert!(
+        again.to_string().contains("I recall SECRET-A-42"),
+        "{again}"
+    );
+    assert!(a_len() > before, "the follow-up went somewhere else");
+
+    // A live task continued by its id and the contextId it carries.
+    let slow = SendMessage::text("SLOW-OP think about it")
+        .bearer(TOKEN_OP)
+        .context(&key)
+        .return_immediately()
+        .post(&addr);
+    let slow_task = &slow["result"]["task"];
+    assert_eq!(slow_task["contextId"], key.as_str(), "{slow}");
+    assert_ne!(
+        slow_task["status"]["state"], "TASK_STATE_COMPLETED",
+        "{slow}"
+    );
+    let cont = SendMessage::text("one more thing")
+        .bearer(TOKEN_OP)
+        .task(slow_task["id"].as_str().unwrap())
+        .context(&key)
+        .return_immediately()
+        .post(&addr);
+    assert!(
+        cont.get("error").is_none(),
+        "the continuation is accepted: {cont}"
+    );
+    assert_eq!(cont["result"]["task"]["contextId"], key.as_str(), "{cont}");
+
+    assert_eq!(
+        conversations_of(&addr, TOKEN_OP).len(),
+        listed,
+        "a conversation was made beside the one the operator joined"
+    );
+    assert!(daemon.alive(), "daemon still serving: {}", daemon.stderr());
+    std::fs::remove_file(&cfg).ok();
+}
+
+/// **Polling binds nothing.**
+///
+/// A caller's `contextId` is bound to a conversation of its own when it
+/// starts work there. An op that answers with a Message — `workflow.status`,
+/// `subagent.status` — starts nothing, and a task op the handler refused made
+/// nothing; a poll carrying no `contextId` gets a fresh one each time, so a
+/// binding per request would be memory any named caller could grow for as
+/// long as the daemon lives. The operator's `status` counts them.
+#[test]
+fn a_poll_or_a_refused_command_binds_no_conversation() {
+    let llm = spawn_mock_llm(&json!({"turns": [{"content": "ok"}]}));
+    let (mut daemon, cfg) =
+        spawn_daemon(|port| with_operator(&two_principal_config(&llm.uri, port)));
+    let addr = daemon.addr.clone();
+    let bindings = || {
+        let v = command_as(&addr, TOKEN_OP, "status", json!({}));
+        answer(&v)["conversation_bindings"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("the operator's status counts bindings: {v}"))
+    };
+    let _ = SendMessage::text("hello")
+        .bearer(TOKEN_A)
+        .context("mine")
+        .post(&addr);
+    let start = bindings();
+    assert_eq!(start, 1, "A's conversation is bound");
+
+    for i in 0..4 {
+        for (bearer, op, args) in [
+            (TOKEN_A, "workflow.status", json!({})),
+            (TOKEN_B, "workflow.status", json!({})),
+            (
+                TOKEN_A,
+                "subagent.status",
+                json!({"handle": "no-such-handle"}),
+            ),
+            (
+                TOKEN_A,
+                "workflow.run",
+                json!({"workflow": "no-such-workflow"}),
+            ),
+        ] {
+            let _ = command_as(&addr, bearer, op, args.clone());
+            let _ = SendMessage::command(op, args)
+                .bearer(bearer)
+                .context(&format!("fresh-{i}"))
+                .return_immediately()
+                .post(&addr);
+        }
+    }
+    assert_eq!(bindings(), start, "polls and refusals bound conversations");
+
+    assert!(daemon.alive(), "daemon still serving: {}", daemon.stderr());
+    std::fs::remove_file(&cfg).ok();
+}
+
+/// **A caller's model cannot message its way into a conversation the caller
+/// may not send to.**
+///
+/// `message.send` delivers into one of the instance's conversations, by key,
+/// with no key the root. A turn B drives is B speaking, whatever its model
+/// chose to name: aimed at the root or at A's conversation, the delivery is
+/// held to the owner rule a message B sent itself is held to, and refused at
+/// the turn it would start. Neither the root nor A's conversation grows.
+#[test]
+fn a_callers_model_cannot_message_into_the_root_or_anothers_conversation() {
+    let pb = common::unique_path("relay-playbook", "json");
+    std::fs::write(&pb, secrets_playbook().to_string()).unwrap();
+    let llm = spawn_mock_llm_file(&pb);
+    let (mut daemon, cfg) = spawn_daemon(|port| conversations_config(&llm.uri, port));
+    let addr = daemon.addr.clone();
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let root_len = || {
+        conversations_of(&addr, TOKEN_OP)
+            .into_iter()
+            .find(|c| c["id"] == "root")
+            .and_then(|c| c["messages"].as_u64())
+            .unwrap_or(0)
+    };
+    while root_len() < 2 {
+        assert!(Instant::now() < deadline, "the root turn never ran");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let root_before = root_len();
+    let _ = SendMessage::text("remember SECRET-A-42 for me")
+        .bearer(TOKEN_A)
+        .context("a-chat")
+        .post(&addr);
+    let a_chat = conversation_named(&addr, TOKEN_A, "a-chat");
+    let a_key = a_chat["id"].as_str().unwrap().to_string();
+
+    // B's model relays into both.
+    std::fs::write(
+        &pb,
+        json!({"turns": [
+            {"tool_calls": [
+                {"name": "message.send", "arguments": {"to": "root", "text": "B-WAS-HERE"}},
+                {"name": "message.send", "arguments": {"to": a_key, "text": "B-WAS-HERE"}},
+            ]},
+            {"content": "relayed"},
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    let sent = SendMessage::text("relay this").bearer(TOKEN_B).post(&addr);
+    assert_eq!(
+        sent["result"]["task"]["status"]["state"], "TASK_STATE_COMPLETED",
+        "{sent}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while daemon
+        .stderr()
+        .matches("\"turn.refused.not_owner\"")
+        .count()
+        < 2
+    {
+        assert!(
+            Instant::now() < deadline,
+            "both deliveries were not refused:\n{}",
+            daemon.stderr()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        root_len(),
+        root_before,
+        "B's model steered the root context"
+    );
+    let a_after = conversation_named(&addr, TOKEN_A, "a-chat");
+    assert_eq!(
+        (&a_after["messages"], &a_after["turns"]),
+        (&a_chat["messages"], &a_chat["turns"]),
+        "B's model steered A's conversation: {a_after}"
+    );
+
+    assert!(daemon.alive(), "daemon still serving: {}", daemon.stderr());
+    std::fs::remove_file(&cfg).ok();
+    std::fs::remove_file(&pb).ok();
+}
+
 /// A mock whose playbook is the file at `path`, re-read on every request, so
 /// a test can script a later turn once it knows the ids that turn names.
 fn spawn_mock_llm_file(path: &str) -> MockLlm {

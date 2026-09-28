@@ -26,6 +26,8 @@ export {
   applySuggestion,
   availableCommands,
   commandHelp,
+  conversationAddress,
+  conversationsNote,
   currentGate,
   elapsed,
   parseAuthCommand,

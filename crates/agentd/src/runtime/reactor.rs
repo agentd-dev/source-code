@@ -145,11 +145,13 @@ pub struct TurnJob {
     /// A message from a person is depth 0; one a `message` step delivered
     /// carries that step's depth, and anything this turn starts inherits it.
     pub msg_depth: u32,
-    /// A caller asked for this turn over the A2A listener, so it may run only
-    /// in a conversation that caller owns (an operator's in any). Work the
-    /// runtime itself delivers — a `message` step, the prompt — is not held
-    /// to that: it is the instance talking to itself.
-    pub from_listener: bool,
+    /// A caller asked for this turn — over the A2A listener, or through the
+    /// `message.send` of a turn it drives — so it may run only in a
+    /// conversation that caller owns (an operator's in any). Work the
+    /// runtime itself delivers — a `message` step, the prompt, a subagent or
+    /// a timer acting for nobody — is not held to that: it is the instance
+    /// talking to itself.
+    pub owner_checked: bool,
 }
 
 impl TurnJob {
@@ -172,7 +174,7 @@ impl TurnJob {
             knowledge_done: false,
             knowledge: None,
             msg_depth: 0,
-            from_listener: false,
+            owner_checked: false,
         }
     }
     /// The same job, carrying a delivered message's hop depth.
@@ -180,9 +182,10 @@ impl TurnJob {
         self.msg_depth = depth;
         self
     }
-    /// The same job, marked as asked for over the listener (or not).
-    pub fn via_listener(mut self, from_listener: bool) -> TurnJob {
-        self.from_listener = from_listener;
+    /// The same job, marked as asked for by a caller who must own its
+    /// conversation (or not).
+    pub fn owner_checked(mut self, checked: bool) -> TurnJob {
+        self.owner_checked = checked;
         self
     }
 }
@@ -856,8 +859,11 @@ impl Runtime {
         // an operator, a `message` step, and a record written before the two
         // were told apart.
         let wire = ev.payload["wire_id"].as_str().unwrap_or(&ctx).to_string();
-        // Only the listener writes a message ahead with the task it answers.
-        let from_listener = ev.payload["task"].is_string();
+        // Only the listener writes a message ahead with the task it answers;
+        // a caller's own `message.send` says it is one (`owner_checked`).
+        // Either way the turn is the caller's, and held to its conversations.
+        let owner_checked =
+            ev.payload["task"].is_string() || ev.payload["owner_checked"] == Value::Bool(true);
         let text = ev.payload["text"]
             .as_str()
             .map(str::to_string)
@@ -912,7 +918,7 @@ impl Runtime {
                 text,
             )
             .at_depth(depth)
-            .via_listener(from_listener),
+            .owner_checked(owner_checked),
         );
     }
 
@@ -1543,6 +1549,13 @@ impl Runtime {
         });
         if let (Value::Object(doc), Value::Object(full)) = (&mut doc, full) {
             doc.extend(full);
+        }
+        // How many `contextId`s callers have bound: memory the listener holds
+        // on their behalf, so its growth is visible to the one who must bound
+        // it.
+        #[cfg(feature = "a2a")]
+        {
+            doc["conversation_bindings"] = json!(self.conv_index.len());
         }
         doc
     }

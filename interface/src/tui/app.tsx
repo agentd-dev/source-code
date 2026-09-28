@@ -40,6 +40,7 @@ import {
   askForm,
   availableCommands,
   commandHelp,
+  conversationsNote,
   currentGate,
   describe,
   deviceLogin,
@@ -588,18 +589,9 @@ export function App(props: AppProps): React.JSX.Element {
             mirror.note(arg ? `resumed ${arg}` : 'instance resumed');
             break;
           }
-          case 'conversations': {
-            const convs = [...s.conversations.values()] as { [k: string]: Json }[];
-            if (convs.length === 0) {
-              mirror.note('no conversations yet');
-              break;
-            }
-            const lines = convs
-              .map((c) => `#${c.id}  ${c.messages ?? 0} msgs · ${c.turns ?? 0} turns${c.principal ? ` · ${c.principal}` : ''}`)
-              .join('\n');
-            mirror.note(`conversations:\n${lines}\nstart a message with #<id> to address one`);
+          case 'conversations':
+            mirror.note(conversationsNote(s));
             break;
-          }
           case 'plan': {
             const p = (await need().planGet(arg || undefined)) as { [k: string]: Json } | null;
             mirror.note(`plan: ${JSON.stringify(p?.plan ?? null).slice(0, 800)}`);

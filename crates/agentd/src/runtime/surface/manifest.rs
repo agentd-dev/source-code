@@ -27,8 +27,8 @@ pub fn methods_of(s: &Settings) -> Vec<&'static str> {
         .chain(
             EXTENSION_METHODS
                 .iter()
-                .filter(|(_, ext)| declared.iter().any(|d| d.ext == *ext))
-                .map(|(name, _)| *name),
+                .filter(|(_, ext, _)| declared.iter().any(|d| d.ext == *ext))
+                .map(|(name, ..)| *name),
         )
         .collect()
 }
@@ -111,7 +111,7 @@ mod tests {
                 assert!(!reported.contains(&gone), "{gone} is reported");
             }
             let declared = extensions_of(s);
-            for (name, ext) in EXTENSION_METHODS {
+            for (name, ext, _) in EXTENSION_METHODS {
                 assert_eq!(
                     reported.contains(name),
                     declared.contains(&ext.uri()),

@@ -90,6 +90,13 @@ worth thinking about should not block on the agent it just woke. It also
 refuses to deliver into the conversation its own caller is running in, which is
 a turn talking to itself whichever way the reply goes.
 
+A turn a non-operator principal drives delivers as that principal. The turn the
+delivery starts is held to the rule a message the principal sent itself is held
+to: it runs only in a conversation that principal owns. Aimed at `root`, or at
+another principal's conversation, it is refused (`turn.refused.not_owner`) and
+nothing is appended. An operator's turn, and work acting for nobody (the startup
+prompt, a timer), still reach any conversation.
+
 The chain is bounded by hop depth rather than volume — see
 [Message loops](node-registry.md#message-loops).
 

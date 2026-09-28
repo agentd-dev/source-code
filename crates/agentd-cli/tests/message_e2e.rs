@@ -337,7 +337,7 @@ fn a_message_wait_wakes_only_for_its_sender() {
                     \x20 - name: listener\n    steps:\n\
                     \x20     s: {{ kind: manual }}\n\
                     \x20     w: {{ kind: wait, on: message, conversation: shared, timeout: 10m, depends_on: [s] }}\n\
-                    \x20     f: {{ kind: finish, depends_on: [w], status: completed, output: \"heard {{{{steps.w.output.message.text}}}} from {{{{steps.w.output.principal}}}}\" }}\n"
+                    \x20     f: {{ kind: finish, depends_on: [w], status: completed, output: \"heard {{{{steps.w.output.message.text}}}} from {{{{steps.w.output.principal}}}} as {{{{steps.w.output.contextId}}}} in {{{{steps.w.output.conversation}}}}\" }}\n"
                 )
                 .replace("__STATE__", &format!("{dir}/state")),
             )
@@ -428,6 +428,15 @@ fn a_message_wait_wakes_only_for_its_sender() {
     assert!(
         log().contains("heard alice answers from user:alice"),
         "the run heard Alice, and only Alice:\n{}",
+        log()
+    );
+    // The step names the conversation both ways: the sender's `contextId`,
+    // and the runtime's key that a `message {to:}` in the same run must take
+    // to answer in it — never the sender's name, which inside the instance
+    // would be some other context spelled the same.
+    assert!(
+        log().contains("heard alice answers from user:alice as shared in ctx-"),
+        "the output carries the key beside the sender's name:\n{}",
         log()
     );
 

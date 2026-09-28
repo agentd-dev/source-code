@@ -90,7 +90,9 @@ impl Runtime {
     /// key — root included. Anyone else's is bound in its own namespace, so it
     /// reaches only a conversation it started, and never errors on, reads or
     /// charges one it did not: another principal's id, the root's and one
-    /// nobody has used all get the same fresh conversation.
+    /// nobody has used all get the same fresh conversation. A conversation of
+    /// its own kept from before the namespace is adopted under its old id
+    /// ([`crate::runtime::conversations::ConversationIndex::claim_or_adopt`]).
     pub(super) fn resolve_context(
         &mut self,
         principal: &Principal,
@@ -99,7 +101,10 @@ impl Runtime {
         if principal.is_operator() {
             return Ok(wire.to_string());
         }
-        match self.conv_index.claim(&principal.id, wire) {
+        match self
+            .conv_index
+            .claim_or_adopt(&self.contexts, &principal.id, wire)
+        {
             Ok(key) => Ok(key),
             // No randomness, no key: refused, with nothing bound or written.
             Err(e) => {
@@ -377,7 +382,7 @@ impl Runtime {
         // Write-ahead the message; the loop turns it into a conversation turn.
         // `context_id` is the conversation's key; `wire_id` what the caller
         // called it, which is what a waiting step was written against.
-        let wire_id = self.conversation_wire(&ctx_id);
+        let wire_id = self.conversation_wire(&principal.id, &ctx_id);
         let payload = json!({"context_id": ctx_id, "wire_id": wire_id, "text": text, "parts": message["parts"],
         "task": task_id, "message_id": message_id,
         "role": match principal.role {

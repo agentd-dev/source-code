@@ -283,9 +283,10 @@ impl Runtime {
         // A caller's turn runs in a conversation that caller owns. Ingress
         // already bound its `contextId` to one (`runtime::conversations`);
         // this is the second lock, for a job that reached the queue some
-        // other way — a record written before the namespace existed, say —
-        // so it still cannot read, extend or charge somebody else's.
-        if job.from_listener
+        // other way — a `message.send` its own turn's model aimed at the
+        // root or at another's key, a record written before the namespace
+        // existed — so it still cannot read, extend or charge somebody else's.
+        if job.owner_checked
             && let Err(why) = self.listener_may_turn(&job)
         {
             self.log.warn(
@@ -830,7 +831,7 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
             return Err("a caller's turn names no caller".into());
         };
         #[cfg(feature = "a2a")]
-        let wire = Some(self.conversation_wire(&job.ctx));
+        let wire = Some(self.conversation_wire(principal, &job.ctx));
         #[cfg(not(feature = "a2a"))]
         let wire: Option<String> = None;
         let window = self.model_window();

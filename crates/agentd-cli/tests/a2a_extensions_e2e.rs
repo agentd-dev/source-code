@@ -483,6 +483,26 @@ fn the_echo_is_exactly_what_was_activated() {
         "{reply:?}"
     );
 
+    // A handler's JSON-RPC error is still an answer the handler gave: at
+    // HTTP 200, echoed. A task the caller may not see answers exactly as one
+    // nobody holds — the same -32001, the same echo — so the header cannot
+    // tell the two apart either.
+    for id in [task.as_str(), "00000000-0000-4000-8000-000000000000"] {
+        let hidden = post_with(
+            &addr,
+            USER,
+            &rpc_body(1, "GetTask", json!({"id": id})),
+            &[TASK_ANNOTATIONS_EXTENSION],
+        );
+        assert_eq!(hidden.status, 200, "{hidden:?}");
+        assert_eq!(hidden.json()["error"]["code"], -32001, "{hidden:?}");
+        assert_eq!(
+            hidden.header("a2a-extensions"),
+            Some(TASK_ANNOTATIONS_EXTENSION),
+            "{hidden:?}"
+        );
+    }
+
     // A stream carries the echo on its head, before the body.
     let streamed = status.clone().streaming().bearer(OPERATOR).post_raw(&addr);
     assert!(
@@ -513,8 +533,9 @@ fn the_echo_is_exactly_what_was_activated() {
     let unknown = post_with(&addr, OPERATOR, &get, &["https://example.invalid/nope/v1"]);
     assert_eq!(unknown.header("a2a-extensions"), None, "{unknown:?}");
 
-    // Nor on a refusal: a bad credential, an op the caller may not run, a
-    // task the caller may not see, and a request the listener would not read.
+    // Nor on a refusal the listener made before any handler ran: a bad
+    // credential, an op the caller may not run, and a request the listener
+    // would not read.
     let bad = post_with(&addr, "not-a-token", &get, &[&all]);
     assert_eq!(bad.status, 401, "{bad:?}");
     assert_eq!(bad.header("a2a-extensions"), None, "{bad:?}");

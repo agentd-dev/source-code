@@ -550,8 +550,10 @@ impl Runtime {
             None => new_task_id(),
         };
         let mut task = Task::new(&id, ctx, Some(&principal.id), link);
-        // `ctx` is the conversation's key; the wire says it the owner's way.
-        task.set_conversation(ctx, &self.conversation_wire(ctx));
+        // `ctx` is the conversation's key; the wire says it the way the task's
+        // own caller addressed it — the owner's name, or the key an operator
+        // joined by.
+        task.set_conversation(ctx, &self.conversation_wire(&principal.id, ctx));
         if let Some(m) = inbound {
             task.command = super::send::command_op(m);
             task.record_inbound(m);

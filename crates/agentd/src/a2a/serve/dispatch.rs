@@ -23,7 +23,7 @@ use crate::a2a::errors::{self, reason};
 use crate::a2a::ports;
 use crate::a2a::principals::{Resolution, Via};
 use crate::runtime::surface::{
-    A2A_PROTOCOL_VERSION, Active, Route, SpecMethod, accepts_version, negotiate,
+    A2A_PROTOCOL_VERSION, Active, Ext, Route, SpecMethod, accepts_version, negotiate, owner_of,
     parse_extension_header, route_of,
 };
 
@@ -484,10 +484,12 @@ async fn answer(app: &Arc<App>, route: Route, req: Admitted) -> Response {
             };
             return unary(app, id, "PushConfigList", params, principal, bearer_used).await;
         }
-        // agentd's own method, which a2a-rs correctly does not know. The
-        // feed is the only extension method, and negotiation has already
-        // refused it wherever the listener holds no feed to serve it from.
-        Route::Extension { ext_method } => {
+        // agentd's own method, which a2a-rs correctly does not know.
+        // Negotiation has already refused it wherever the listener holds no
+        // feed to serve it from. Served only as the events extension's own:
+        // a method some other extension declares is not the feed, and until
+        // it has a handler of its own it is a method nobody answers.
+        Route::Extension { ext_method } if owner_of(ext_method) == Some(Ext::Events) => {
             let Some(feed) = app.bridge.feed() else {
                 return err(
                     id,
@@ -504,6 +506,13 @@ async fn answer(app: &Arc<App>, route: Route, req: Admitted) -> Response {
                 app.stream_deadline,
                 alive,
                 active,
+            );
+        }
+        Route::Extension { ext_method } => {
+            return err(
+                id,
+                errors::METHOD_NOT_FOUND,
+                &format!("method not found: {ext_method}"),
             );
         }
         _ => {}

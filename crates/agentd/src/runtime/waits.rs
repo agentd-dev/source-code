@@ -985,10 +985,16 @@ impl Runtime {
                 &rid,
                 &sid,
                 StepStatus::Done,
-                // The conversation as its sender named it: what the wait was
-                // written against, and what a reply to a peer must carry.
+                // Both names. `conversation` is the runtime's key — what every
+                // address inside the instance takes (`message {to:}`,
+                // `plan.get`) — so a step that answers in the same
+                // conversation reaches the sender's, never a context that
+                // merely shares the spelling of its name (a caller's `root`
+                // is not the root). `contextId` is the conversation as its
+                // sender named it: what a reply to a peer over A2A carries.
                 Some(json!({
-                    "conversation": wire,
+                    "conversation": conversation,
+                    "contextId": wire,
                     "message": message,
                     "principal": principal,
                 })),

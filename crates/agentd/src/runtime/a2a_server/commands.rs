@@ -183,16 +183,22 @@ impl Runtime {
         }
         // The same namespace a conversational message is held to: a command
         // runs in a conversation its caller may address, claimed before any
-        // work is done. A read starts nothing there, so it binds nothing — a
-        // caller polling `status` must not grow the index — and its reply
-        // names the conversation the caller's way.
+        // work is done. An op that answers with a Message starts nothing in
+        // any conversation — `status`, `workflow.status`, `subagent.status`,
+        // the sign-in listings — so it binds nothing: asked of the row, not of
+        // the handler family, because a poll with no `contextId` gets a fresh
+        // one every time, and each would otherwise be a binding kept for good.
+        // Its reply names the conversation the caller's way.
         let wire = super::send::context_wire(message);
-        let ctx = match route {
-            Route::Read(_) | Route::Introspection(_) => wire.clone(),
-            _ => match self.resolve_context(principal, &wire) {
+        let unbound =
+            !principal.is_operator() && self.conv_index.key_of(&principal.id, &wire).is_none();
+        let ctx = if spec.reply == Reply::Message {
+            wire.clone()
+        } else {
+            match self.resolve_context(principal, &wire) {
                 Ok(key) => key,
                 Err(e) => return e,
-            },
+            }
         };
         let answer = match route {
             Route::Read(r) => self.read_op(principal, r, &data),
@@ -247,7 +253,17 @@ impl Runtime {
                     result,
                 )
             }
-            Answer::Reply(v) => v,
+            Answer::Reply(v) => {
+                // A task op its handler refused (an unknown workflow, a role,
+                // shedding) created nothing that records the binding it was
+                // given, so nothing would ever release it either: the claim is
+                // dropped again when it was this request's own. One the task a
+                // handler did create (`workflow.run`) keeps it.
+                if unbound && spec.reply == Reply::Task {
+                    self.release_unused_conversation(&ctx);
+                }
+                v
+            }
         }
     }
 

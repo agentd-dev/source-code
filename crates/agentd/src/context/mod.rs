@@ -528,6 +528,15 @@ impl Contexts {
         if c.principal.as_deref() != Some(principal) {
             return Err(format!("conversation {id:?} is not {principal}'s"));
         }
+        // A context made some other way first (a delivery, a record from
+        // before the namespace) learns its owner's name now, so the binding
+        // outlives the tasks that are all that record it until then.
+        if c.wire_id.is_none()
+            && let Some(w) = wire.filter(|w| *w != id)
+        {
+            c.wire_id = Some(w.to_string());
+            c.dirty = true;
+        }
         Ok(c)
     }
     pub fn ids(&self) -> Vec<String> {
@@ -704,6 +713,22 @@ mod tests {
             .conversation_for("plain", "user:c", Some("plain"))
             .unwrap();
         assert!(op.wire_id.is_none());
+        // A context its owner's first turn did not create learns the name
+        // then, so the binding outlives the tasks that were all that held it.
+        cs.conversation("ctx-d", Some("user:d"));
+        let late = cs
+            .conversation_for("ctx-d", "user:d", Some("notes"))
+            .unwrap();
+        assert_eq!(late.wire_id.as_deref(), Some("notes"));
+        assert!(late.dirty, "and is checkpointed with it");
+        let kept = cs
+            .conversation_for("ctx-d", "user:d", Some("other"))
+            .unwrap();
+        assert_eq!(
+            kept.wire_id.as_deref(),
+            Some("notes"),
+            "the first name stands"
+        );
     }
 
     #[test]

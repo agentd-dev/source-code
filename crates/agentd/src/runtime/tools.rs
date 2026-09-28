@@ -1104,7 +1104,19 @@ impl Runtime {
                 "message.send refused: {depth} chained deliveries exceeds limits.max_message_depth ({cap})"
             ));
         }
-        let payload = json!({"text": text, "context_id": ctx, "msg_depth": depth});
+        // A turn a principal drives is that principal speaking, whatever its
+        // model chose for `to`: a caller who may not send into the root, or
+        // into a conversation it does not own, must not reach one by asking
+        // its model to. So the delivery is held to the owner rule a listener
+        // message is, at the turn it would start. An operator's reach is any
+        // conversation, and work acting for nobody is the instance's own.
+        let owner_checked = self
+            .acting_principal(caller.principal.as_deref())
+            .is_some_and(|p| !p.is_operator());
+        let mut payload = json!({"text": text, "context_id": ctx, "msg_depth": depth});
+        if owner_checked {
+            payload["owner_checked"] = Value::Bool(true);
+        }
         match self.accept_event(
             super::events::kinds::A2A_MESSAGE,
             caller.principal.clone(),

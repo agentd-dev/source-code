@@ -73,15 +73,14 @@ impl Principal {
         match self.role {
             Role::Anonymous => false,
             Role::Operator => true,
-            // Every extension method is principal-scoped where it is served —
-            // the feed shows a subscriber only what it may see — so any named
-            // caller may call one. Read from the registry, so a method is
-            // callable by exactly the name the route table serves it under.
-            _ if surface::EXTENSION_METHODS
-                .iter()
-                .any(|(name, _)| *name == method) =>
-            {
-                op.is_none()
+            // An extension method is callable by whoever its registry row's
+            // floor admits — the feed's is any named caller, since it shows a
+            // subscriber only what it may see. Read from the registry, so a
+            // method is callable by exactly the name the route table serves
+            // it under, and a new row must say who may call it. No grant
+            // reaches one: the grants name command ops, not methods.
+            _ if let Some(floor) = surface::extension_floor(method) => {
+                self.may_extension_method(floor, op)
             }
             _ => match method {
                 // The read/task methods every non-anonymous role may use on its
@@ -139,6 +138,20 @@ impl Principal {
                     // the op, narrowed to the workflows it names.
                     || (op == "workflow.run" && self.scoped_run_grants().next().is_some())
             }
+        }
+    }
+
+    /// May this principal call an extension method whose registry row has
+    /// `floor`? An extension method carries no command op, and no grant
+    /// reaches it; the floor alone decides.
+    fn may_extension_method(&self, floor: Floor, op: Option<&str>) -> bool {
+        if self.is_anonymous() || op.is_some() {
+            return false;
+        }
+        match floor {
+            Floor::Operator => self.is_operator(),
+            Floor::AnyNamed => true,
+            Floor::Granted => self.is_operator(),
         }
     }
 
@@ -369,9 +382,13 @@ mod tests {
     /// feed's bare pre-namespace name is no method anybody may call.
     #[test]
     fn extension_methods_are_any_named_callers_by_their_registered_name() {
-        for (method, _) in surface::EXTENSION_METHODS {
+        for (method, _, floor) in surface::EXTENSION_METHODS {
             for role in [Role::User, Role::Agent, Role::Operator] {
-                assert!(with(role, &[]).may(method, None), "{role:?} {method}");
+                assert_eq!(
+                    with(role, &[]).may(method, None),
+                    role == Role::Operator || *floor == Floor::AnyNamed,
+                    "{role:?} {method}"
+                );
             }
             assert!(!Principal::anonymous().may(method, None), "{method}");
             // An extension method carries no command op.
@@ -379,6 +396,25 @@ mod tests {
         }
         for role in [Role::User, Role::Agent] {
             assert!(!with(role, &["*"]).may("SubscribeToEvents", None));
+        }
+    }
+
+    /// An extension method is admitted by its row's floor and nothing else:
+    /// an operator-floor method is the operator's even against a `*` grant,
+    /// so a row added for one cannot open it to every named caller.
+    #[test]
+    fn an_extension_methods_floor_decides_who_calls_it() {
+        for role in [Role::User, Role::Agent] {
+            let p = with(role, &["*"]);
+            assert!(p.may_extension_method(Floor::AnyNamed, None), "{role:?}");
+            assert!(!p.may_extension_method(Floor::Operator, None), "{role:?}");
+            assert!(!p.may_extension_method(Floor::Granted, None), "{role:?}");
+        }
+        let op = with(Role::Operator, &[]);
+        for floor in [Floor::AnyNamed, Floor::Operator, Floor::Granted] {
+            assert!(op.may_extension_method(floor, None), "{floor:?}");
+            assert!(!op.may_extension_method(floor, Some("status")), "{floor:?}");
+            assert!(!Principal::anonymous().may_extension_method(floor, None));
         }
     }
 

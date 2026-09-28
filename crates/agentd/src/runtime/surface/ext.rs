@@ -6,7 +6,7 @@
 use serde_json::{Value, json};
 
 use super::methods::{Route, SpecMethod};
-use super::ops::{Reply, op_spec, static_vocabulary};
+use super::ops::{Floor, Reply, op_spec, static_vocabulary};
 use crate::a2a::errors::{self, reason};
 use crate::config::v2::Settings;
 
@@ -154,17 +154,28 @@ impl Ext {
 }
 
 /// The methods agentd answers that A2A does not define, each paired with the
-/// extension that declares it. Nothing may be served off this list: the route
-/// table reads it, and negotiation refuses each method unless its extension is
-/// declared AND activated.
-pub const EXTENSION_METHODS: &[(&str, Ext)] = &[(EVENTS_METHOD, Ext::Events)];
+/// extension that declares it and who may call it. Nothing may be served off
+/// this list: the route table reads it, negotiation refuses each method unless
+/// its extension is declared AND activated, and the authorization matrix
+/// admits each caller by the row's floor — a row has to say who may call its
+/// method, so adding one cannot open it to every named caller by default.
+pub const EXTENSION_METHODS: &[(&str, Ext, Floor)] =
+    &[(EVENTS_METHOD, Ext::Events, Floor::AnyNamed)];
 
 /// The extension that declares `method`, if one does.
-fn owner_of(method: &str) -> Option<Ext> {
+pub fn owner_of(method: &str) -> Option<Ext> {
     EXTENSION_METHODS
         .iter()
-        .find(|(name, _)| *name == method)
-        .map(|(_, ext)| *ext)
+        .find(|(name, ..)| *name == method)
+        .map(|(_, ext, _)| *ext)
+}
+
+/// Who may call extension method `method`, if it is one.
+pub fn extension_floor(method: &str) -> Option<Floor> {
+    EXTENSION_METHODS
+        .iter()
+        .find(|(name, ..)| *name == method)
+        .map(|(.., floor)| *floor)
 }
 
 /// One extension as an instance declares it.
@@ -409,7 +420,7 @@ mod tests {
         let methods: Vec<&str> = SpecMethod::ALL
             .iter()
             .map(|m| m.name())
-            .chain(EXTENSION_METHODS.iter().map(|(m, _)| *m))
+            .chain(EXTENSION_METHODS.iter().map(|(m, ..)| *m))
             .collect();
         for events in [false, true] {
             let declared = declared_when(events);
@@ -563,7 +574,7 @@ mod tests {
     /// the request named.
     #[test]
     fn an_extension_method_needs_its_extension() {
-        for (method, owner) in EXTENSION_METHODS {
+        for (method, owner, _) in EXTENSION_METHODS {
             let r = route(method);
             let uri = owner.uri();
             let on = declared_when(true);
@@ -632,7 +643,7 @@ mod tests {
             assert_eq!(Ext::of_uri(gone), None, "{gone}");
         }
         // Each extension method is namespaced under its extension's name.
-        for (method, owner) in EXTENSION_METHODS {
+        for (method, owner, _) in EXTENSION_METHODS {
             let (ns, _) = method.split_once('/').expect("a namespaced method");
             let name = owner.uri().rsplit('/').nth(1).unwrap();
             assert_eq!(ns, format!("agentd.{name}"), "{method}");

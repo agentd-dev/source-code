@@ -257,7 +257,8 @@ $ curl -sS --cert ops.crt --key ops.key --cacert ca.crt https://agent.internal:8
 **`status`** answers with the instance view: `instance`, `run_id`, `uptime_ms`,
 `draining`, `paused`, the durable `store` (kind, degraded flag, generation), the
 armed `workflows`, live `runs`, `conversations`, `subagents`, OS `children`,
-`timers`, `inbox_pending`, the token `budget`, registered `tools`, loaded
+`timers`, `inbox_pending`, `conversation_bindings` (how many callers'
+`contextId`s are bound to a conversation), the token `budget`, registered `tools`, loaded
 `skills`, the lifetime `counters`, the current `instruction` (source/version/size,
 never the text), the active `model`, and recent `activity`.
 

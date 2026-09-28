@@ -19,9 +19,9 @@ import { CORE_METHODS } from '../dist/client/a2a.js';
 const here = dirname(fileURLToPath(import.meta.url));
 const surface = join(here, '..', '..', 'crates', 'agentd', 'src', 'runtime', 'surface');
 
-/** The body of `pub const <name>: <type> = &[ … ];` in a Rust source. */
+/** The body of `pub const <name>: <type> = &[ … ];` in a Rust source (rustfmt may break the line at `=`). */
 function constBody(src, name) {
-  const m = new RegExp(`pub const ${name}: [^=]+= &\\[([\\s\\S]*?)\\];`).exec(src);
+  const m = new RegExp(`pub const ${name}: [^=]+=\\s*&\\[([\\s\\S]*?)\\];`).exec(src);
   assert.ok(m, `pub const ${name} not found`);
   return m[1];
 }
@@ -46,9 +46,16 @@ function specMethods(src) {
 
 test('CORE_METHODS is what the daemon routes as core, and no extension method', () => {
   const core = specMethods(readFileSync(join(surface, 'methods.rs'), 'utf8'));
-  // `(method, extension URI)` pairs: the method is each tuple's first literal.
-  const extBody = constBody(readFileSync(join(surface, 'ext.rs'), 'utf8'), 'EXTENSION_METHODS');
-  const extension = [...extBody.matchAll(/\(\s*"([^"\\]*)"/g)].map((m) => m[1]);
+  // `(method, extension, floor)` rows: the method is each row's first
+  // element, a string literal or a `&str` constant of the same file.
+  const extSrc = readFileSync(join(surface, 'ext.rs'), 'utf8');
+  const extBody = constBody(extSrc, 'EXTENSION_METHODS');
+  const extension = [...extBody.matchAll(/\(\s*("([^"\\]*)"|[A-Z_][A-Z0-9_]*)/g)].map((m) => {
+    if (m[2] !== undefined) return m[2];
+    const c = new RegExp(`pub const ${m[1]}: &str = "([^"\\\\]*)";`).exec(extSrc);
+    assert.ok(c, `const ${m[1]} not found in ext.rs`);
+    return c[1];
+  });
   assert.ok(core.length > 0 && extension.length > 0, 'the daemon lists were read');
   for (const m of extension) {
     assert.ok(!core.includes(m), `extension method ${m} is never a core one`);

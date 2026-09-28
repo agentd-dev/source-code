@@ -121,6 +121,44 @@ function text(v: Json | undefined): string | undefined {
 }
 
 /**
+ * The name a conversation of the `status` list (or a feed `conversation`
+ * event) is addressed by: its `contextId` — the name its owner sent — else
+ * its `id`. The `id` is the runtime's key. Only an operator addresses a
+ * conversation by the key, and then only one it joins that is not its own
+ * (an operator's own conversation is keyed by its name); to anyone else the
+ * key names nothing, and a message sent to it starts a new, empty
+ * conversation. Everything a person sees and picks from lists this name.
+ */
+export function conversationAddress(c: Json | undefined): string | undefined {
+  return text(field(c, 'contextId')) ?? text(field(c, 'id'));
+}
+
+/**
+ * The `/conversations` note: each conversation by the name it is addressed
+ * by, and — where the runtime keys it otherwise — the key an operator joins
+ * it by.
+ */
+export function conversationsNote(s: MirrorState): string {
+  const lines = [...s.conversations.values()].map((c) => {
+    const addr = conversationAddress(c) ?? '';
+    const id = text(field(c, 'id'));
+    const who = text(field(c, 'principal'));
+    return (
+      `#${addr}  ${field(c, 'messages') ?? 0} msgs · ${field(c, 'turns') ?? 0} turns` +
+      (who ? ` · ${who}` : '') +
+      (id !== undefined && id !== addr ? ` · key ${id}` : '')
+    );
+  });
+  return lines.length === 0 ? 'no conversations yet' : `conversations:\n${lines.join('\n')}\nstart a message with #<id> to address one`;
+}
+
+/** Whether the mirror lists a conversation addressed as `name`. */
+function holdsConversation(s: MirrorState, name: string): boolean {
+  for (const c of s.conversations.values()) if (conversationAddress(c) === name) return true;
+  return false;
+}
+
+/**
  * A fact of the `status` document: the live one (feed `status` events), else
  * the bootstrap read. The live one wins because it is what a reload changed.
  */
@@ -263,8 +301,8 @@ export function suggest(input: string, s: MirrorState, max = 6): Suggestion[] {
           insert: `#${tk.id} `,
           hint: tk.state === 'TASK_STATE_INPUT_REQUIRED' ? 'answer this task' : TERMINAL_STATES.has(tk.state) ? 'continue task' : 'task',
         }));
-      const ctxs = [...s.conversations.keys()]
-        .filter(starts)
+      const ctxs = [...new Set([...s.conversations.values()].map(conversationAddress))]
+        .filter((id): id is string => id !== undefined && starts(id))
         .map((id) => ({ label: `#${id}`, insert: `#${id} `, hint: 'conversation' }));
       return [...tasks, ...ctxs].slice(0, max);
     }
@@ -301,14 +339,18 @@ const SERVER_TASK_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-
 
 /**
  * Where a leading `#<id>` goes: a task the mirror holds, a conversation it
- * holds, else by shape — a server-minted id is taken for a task (the
- * caller's conversations are all in the mirror, its older tasks need not be),
- * and anything else names a conversation. A task id that turns out not to be
- * one is refused by the server as not found, never sent somewhere else.
+ * holds (by the name it is addressed by — {@link conversationAddress} — or,
+ * for an operator joining another's, by its key), else by shape — a
+ * server-minted id is taken for a task (the caller's conversations are all in
+ * the mirror, its older tasks need not be), and anything else names a
+ * conversation. A task id that turns out not to be one is refused by the
+ * server as not found, never sent somewhere else. The names are checked
+ * before the shape because a conversation a client never named was named by
+ * the server, in the same UUID shape as a task id.
  */
 function targetOf(id: string, s: MirrorState): Pick<Prepared, 'taskId' | 'contextId'> {
   if (s.tasks.has(id)) return { taskId: id };
-  if (s.conversations.has(id)) return { contextId: id };
+  if (holdsConversation(s, id) || s.conversations.has(id)) return { contextId: id };
   return SERVER_TASK_ID.test(id) ? { taskId: id } : { contextId: id };
 }
 

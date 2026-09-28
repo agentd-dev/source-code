@@ -99,8 +99,8 @@ pub fn route_of(method: &str) -> Option<Route> {
     }
     EXTENSION_METHODS
         .iter()
-        .find(|(name, _)| *name == method)
-        .map(|(name, _)| Route::Extension { ext_method: name })
+        .find(|(name, ..)| *name == method)
+        .map(|(name, ..)| Route::Extension { ext_method: name })
 }
 
 /// Whether an `A2A-Version` header value names a version this listener
@@ -170,7 +170,7 @@ mod tests {
             assert_eq!(route_of(m.name()), Some(Route::Spec(*m)), "{m:?}");
             assert_eq!(Route::Spec(*m).name(), m.name());
         }
-        for (name, uri) in EXTENSION_METHODS {
+        for (name, uri, _) in EXTENSION_METHODS {
             assert_eq!(
                 route_of(name),
                 Some(Route::Extension { ext_method: name }),

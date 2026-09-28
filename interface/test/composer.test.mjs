@@ -13,6 +13,7 @@ import {
   availableCommands,
   capabilitiesOf,
   commandHelp,
+  conversationsNote,
   currentGate,
   parseAuthCommand,
   prepare,
@@ -193,6 +194,24 @@ test('prepare routes leading # targets and interpolates $ values', () => {
   const m2 = seeded();
   m2.bootstrap({ conversations: [{ id: ctxUuid }] });
   assert.deepEqual(prepare(`#${ctxUuid} hi`, m2.getState()), { text: 'hi', contextId: ctxUuid });
+  // A conversation is addressed by the name its owner sent, not by the
+  // runtime's key: `#` offers the name, and the name routes to it even when
+  // it is server-minted in a task id's shape.
+  const m3 = seeded();
+  m3.bootstrap({
+    conversations: [
+      { id: 'ctx-k', contextId: 'mine', messages: 2, turns: 1 },
+      { id: 'ctx-u', contextId: ctxUuid, messages: 1, turns: 0 },
+    ],
+  });
+  const s3 = m3.getState();
+  const offered = suggest('#', s3, 10).filter((x) => x.hint === 'conversation').map((x) => x.label);
+  assert.deepEqual(offered.sort(), [`#${ctxUuid}`, '#mine'].sort());
+  assert.deepEqual(prepare('#mine hi', s3), { text: 'hi', contextId: 'mine' });
+  assert.deepEqual(prepare(`#${ctxUuid} hi`, s3), { text: 'hi', contextId: ctxUuid });
+  const note = conversationsNote(s3);
+  assert.ok(note.includes('#mine  2 msgs · 1 turns · key ctx-k'), note);
+  assert.ok(!note.includes('#ctx-k'), note);
   // Any other unknown name is a conversation the message may start.
   assert.deepEqual(prepare('#fresh-chat hi', s), { text: 'hi', contextId: 'fresh-chat' });
   // $ interpolation: known names only, $$ escapes, inline # untouched.

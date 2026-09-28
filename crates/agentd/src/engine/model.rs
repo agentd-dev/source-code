@@ -2840,6 +2840,35 @@ mod tests {
         parse_workflow(&doc)
     }
 
+    /// `workflow.run` starts a workflow at its default start, so that start's
+    /// `roles:` decide who may run it — the same filter a message firing the
+    /// start meets. Only an `a2a` start carries roles, and one that lists
+    /// none (or lists an empty set) admits everyone.
+    #[test]
+    fn the_default_start_admits_the_roles_it_names() {
+        let with_start = |start: Value| {
+            wf(json!({"name": "w", "steps": {
+                "s": start,
+                "f": {"kind": "finish", "depends_on": ["s"], "status": "completed"}}}))
+            .unwrap()
+        };
+        let manual = with_start(json!({"kind": "manual"}));
+        let gated = with_start(json!({"kind": "a2a", "command": "x", "roles": ["operator"]}));
+        let open = with_start(json!({"kind": "a2a", "command": "x"}));
+        let empty = with_start(json!({"kind": "a2a", "command": "x", "roles": []}));
+        for role in ["operator", "user", "agent"] {
+            assert!(manual.default_start_admits(role), "manual admits {role}");
+            assert!(open.default_start_admits(role), "no roles admits {role}");
+            assert!(
+                empty.default_start_admits(role),
+                "empty roles admits {role}"
+            );
+        }
+        assert!(gated.default_start_admits("operator"));
+        assert!(!gated.default_start_admits("user"));
+        assert!(!gated.default_start_admits("agent"));
+    }
+
     /// The schema and the parser must accept the SAME workflow fields.
     ///
     /// They had drifted: `priority`, `unload`, `file` and `uri` were accepted

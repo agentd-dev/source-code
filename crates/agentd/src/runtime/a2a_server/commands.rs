@@ -8,14 +8,14 @@
 
 use super::redact::redact_settings;
 use super::send::command_data;
-use super::{FeedVis, TASK_NOT_FOUND, err_obj, rpc_internal};
+use super::{FeedVis, TASK_NOT_FOUND, UNSUPPORTED_OPERATION, err_obj, rpc_internal};
 use crate::a2a::Principal;
 use crate::a2a::errors::{self, reason};
 use crate::a2a::principals::workflow_name_of;
 use crate::a2a::tasks::{Link, State, Task};
 use crate::runtime::events::kinds;
 use crate::runtime::reactor::Runtime;
-use crate::runtime::surface::{self, Handler, Reply};
+use crate::runtime::surface::{self, Gate, Handler, Reply};
 use serde_json::{Value, json};
 
 /// A refusal carrying agentd's `ErrorInfo`, so a client branches on the
@@ -151,6 +151,22 @@ impl Runtime {
         let Some((spec, route)) = route(op) else {
             return unknown_op(op);
         };
+        // The row's switch, asked here for every row: an op behind a closed
+        // gate never reaches its handler, so no handler has to remember to
+        // re-check it. Introspection says why, since `admin.set` can open it;
+        // any other closed gate answers as the unknown op the card, which
+        // does not list it, already told the caller it was.
+        if !surface::gate_open(spec, &self.settings) {
+            return match spec.gate {
+                Gate::Introspection => refusal(
+                    UNSUPPORTED_OPERATION,
+                    reason::INTROSPECTION_DISABLED,
+                    "introspection is disabled (set a2a.introspection.enabled: true, or admin.set it)",
+                    &[("op", op)],
+                ),
+                _ => unknown_op(op),
+            };
+        }
         let data = command_data(message).unwrap_or_else(|| json!({}));
         // The listener authorized the op already; this is the second lock, so
         // a path into the runtime that skips the listener cannot skip the
@@ -169,19 +185,6 @@ impl Runtime {
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| self.next_id("a2a"));
-        // Surface work a caller asked for on the feed, so every attached
-        // display client sees what its peers did. Reads stay off it — they
-        // are the observation plumbing itself, and N clients polling them
-        // would spam every transcript.
-        if spec.reply == Reply::Task
-            && matches!(spec.handler, Handler::Workflow | Handler::Subagent)
-        {
-            self.feed_push(
-                "command",
-                FeedVis::Owner(Some(principal.id.clone())),
-                json!({"op": op, "principal": principal.id, "contextId": ctx}),
-            );
-        }
         let answer = match route {
             Route::Read(r) => self.read_op(principal, r, &data),
             Route::Workflow(w) => self.workflow_op(principal, w, &data, &ctx),
@@ -208,7 +211,7 @@ impl Runtime {
                 Err(e) => Answer::Reply(err_obj(errors::INVALID_PARAMS, &e)),
             },
         };
-        match answer {
+        let reply = match answer {
             Answer::Doc(doc) => {
                 debug_assert_eq!(spec.reply, Reply::Message, "{op} answered a document");
                 crate::a2a::reply::read_reply(&ctx, doc)
@@ -225,7 +228,24 @@ impl Runtime {
                 )
             }
             Answer::Reply(v) => v,
+        };
+        // Surface work a caller asked for on the feed, so every attached
+        // display client sees what its peers did — once it ran. Announced
+        // before the handler, a `workflow.run` the handler then refused was
+        // shown to every client as a command the principal ran. Reads stay
+        // off it: they are the observation plumbing itself, and N clients
+        // polling them would spam every transcript.
+        if spec.reply == Reply::Task
+            && matches!(spec.handler, Handler::Workflow | Handler::Subagent)
+            && reply.get("_error").is_none()
+        {
+            self.feed_push(
+                "command",
+                FeedVis::Owner(Some(principal.id.clone())),
+                json!({"op": op, "principal": principal.id, "contextId": ctx}),
+            );
         }
+        reply
     }
 
     /// `status`, `config` and `plan.get`.
@@ -326,20 +346,28 @@ impl Runtime {
         let Some(name) = workflow_name_of(data).map(str::to_string) else {
             return err_obj(errors::INVALID_PARAMS, "workflow.run needs {workflow}");
         };
-        let Some(wf) = self.workflows.get(&name) else {
-            return err_obj(
-                errors::INVALID_PARAMS,
-                &format!("no such workflow {name:?}"),
-            );
+        // A caller who may not run a workflow cannot tell it from one that
+        // does not exist: the extended card hides the workflows it may not
+        // run, and two different refusals would name them anyway. Only the
+        // operator, whose card lists every workflow, hears that a name is
+        // unknown.
+        let wf = match self.workflows.get(&name) {
+            Some(wf) if Runtime::may_run(principal, wf) => wf,
+            None if principal.is_operator() => {
+                return err_obj(
+                    errors::INVALID_PARAMS,
+                    &format!("no such workflow {name:?}"),
+                );
+            }
+            _ => {
+                return refusal(
+                    errors::PERMISSION_DENIED,
+                    reason::PERMISSION_DENIED,
+                    &format!("workflow {name:?} is not runnable by {}", principal.id),
+                    &[("op", "workflow.run")],
+                );
+            }
         };
-        if !Runtime::may_run(principal, wf) {
-            return refusal(
-                errors::PERMISSION_DENIED,
-                reason::PERMISSION_DENIED,
-                &format!("workflow {name:?} is not runnable by {}", principal.id),
-                &[("op", "workflow.run")],
-            );
-        }
         // Same admission gate as every other way of starting work: a
         // durable run begins with checkpoint writes, which is exactly
         // what a full disk cannot absorb. Refuse before creating the

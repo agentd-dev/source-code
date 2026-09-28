@@ -132,18 +132,6 @@ impl Runtime {
     }
 }
 
-/// The A2A methods that only read. Their successes are not mirrored onto the
-/// feed (see [`mirror_to_feed`]).
-#[cfg(feature = "a2a")]
-const READ_METHODS: &[&str] = &[
-    "GetTask",
-    "ListTasks",
-    "GetTaskPushNotificationConfig",
-    "ListTaskPushNotificationConfigs",
-    "GetExtendedAgentCard",
-    "SubscribeToTask",
-];
-
 /// Whether an A2A call's audit event is mirrored onto the observation feed.
 ///
 /// A successful READ is not: display clients poll reads (a log tail at about
@@ -151,12 +139,14 @@ const READ_METHODS: &[&str] = &[
 /// would fill it with its own plumbing. Everything else is — a refusal of any
 /// call, and every mutation. The op is classified by the op table, not by the
 /// shape of the action string, so an op a workflow declares under a name that
-/// happens to end like a read is still recorded.
+/// happens to end like a read is still recorded. A call is classified by the
+/// bridge verb the runtime answered, which is what `method` is.
 #[cfg(feature = "a2a")]
 fn mirror_to_feed(method: &str, op: Option<&str>, outcome: &str) -> bool {
+    use crate::runtime::a2a_server::Verb;
     let read = match op {
         Some(op) => crate::runtime::surface::is_read_op(op),
-        None => READ_METHODS.contains(&method),
+        None => Verb::of(method).is_some_and(Verb::reads),
     };
     !(outcome == "ok" && read)
 }
@@ -182,7 +172,17 @@ mod tests {
         ] {
             assert!(!mirror_to_feed("SendMessage", Some(op), "ok"), "{op}");
         }
-        for m in READ_METHODS {
+        // Every verb the runtime answers, by the name it is audited under: a
+        // read is not mirrored, anything else is. The push-config reads and
+        // the mint that precedes every send are the ones a list of spec
+        // names missed.
+        use crate::runtime::a2a_server::Verb;
+        for v in Verb::ALL {
+            let name = format!("{v:?}");
+            assert_eq!(Verb::of(&name), Some(*v), "{name} is dispatched");
+            assert_eq!(mirror_to_feed(&name, None, "ok"), !v.reads(), "{name}");
+        }
+        for m in ["PushConfigGet", "PushConfigList", "NewTaskId", "GetTask"] {
             assert!(!mirror_to_feed(m, None, "ok"), "{m}");
         }
         // The same reads, refused, are mirrored.

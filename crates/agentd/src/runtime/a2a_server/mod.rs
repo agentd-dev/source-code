@@ -190,6 +190,82 @@ impl A2aBridge {
     }
 }
 
+// ---- the bridge's verbs ------------------------------------------------------
+
+/// What the transport asks the runtime: the verbs of the bridge between them.
+/// Not the spec's method names — push configs travel as `PushConfig*`, and a
+/// send is preceded by a `NewTaskId` mint — so anything that classifies a
+/// call the runtime answered (the audit mirror) reads THIS, not the spec's
+/// vocabulary, which is how it once listed names that never arrived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Verb {
+    SendMessage,
+    NewTaskId,
+    GetTask,
+    ListTasks,
+    CancelTask,
+    PushConfigSet,
+    PushConfigGet,
+    PushConfigList,
+    PushConfigDelete,
+    GetAgentCard,
+    GetExtendedAgentCard,
+}
+
+impl Verb {
+    /// Every verb, for the tests that hold a classification to all of them.
+    #[cfg(test)]
+    pub(crate) const ALL: &[Verb] = &[
+        Verb::SendMessage,
+        Verb::NewTaskId,
+        Verb::GetTask,
+        Verb::ListTasks,
+        Verb::CancelTask,
+        Verb::PushConfigSet,
+        Verb::PushConfigGet,
+        Verb::PushConfigList,
+        Verb::PushConfigDelete,
+        Verb::GetAgentCard,
+        Verb::GetExtendedAgentCard,
+    ];
+
+    /// The verb a bare method name is, if the runtime answers it.
+    pub(crate) fn of(method: &str) -> Option<Verb> {
+        Some(match method {
+            "SendMessage" | "SendStreamingMessage" => Verb::SendMessage,
+            "NewTaskId" => Verb::NewTaskId,
+            "GetTask" => Verb::GetTask,
+            "ListTasks" => Verb::ListTasks,
+            "CancelTask" => Verb::CancelTask,
+            "PushConfigSet" => Verb::PushConfigSet,
+            "PushConfigGet" => Verb::PushConfigGet,
+            "PushConfigList" => Verb::PushConfigList,
+            "PushConfigDelete" => Verb::PushConfigDelete,
+            "GetAgentCard" => Verb::GetAgentCard,
+            "GetExtendedAgentCard" => Verb::GetExtendedAgentCard,
+            _ => return None,
+        })
+    }
+
+    /// Whether the verb changes nothing a caller can observe. A mint is
+    /// plumbing the transport issues before every send, not a change. One
+    /// exhaustive match, so a new verb cannot be left unclassified.
+    pub(crate) fn reads(self) -> bool {
+        match self {
+            Verb::NewTaskId
+            | Verb::GetTask
+            | Verb::ListTasks
+            | Verb::PushConfigGet
+            | Verb::PushConfigList
+            | Verb::GetAgentCard
+            | Verb::GetExtendedAgentCard => true,
+            Verb::SendMessage | Verb::CancelTask | Verb::PushConfigSet | Verb::PushConfigDelete => {
+                false
+            }
+        }
+    }
+}
+
 // ---- wire helpers ----------------------------------------------------------
 
 /// Strip an optional `a2a.` prefix.
@@ -249,27 +325,27 @@ impl Runtime {
             .as_str()
             .filter(|s| !s.is_empty() && !self.tasks.contains_key(*s))
             .map(str::to_string);
-        let out = match bare(&method) {
-            "SendMessage" | "SendStreamingMessage" => self.a2a_send(&principal, &params),
+        let out = match Verb::of(bare(&method)) {
+            Some(Verb::SendMessage) => self.a2a_send(&principal, &params),
             // The listener asks for the id a new task will have BEFORE
             // dispatching the send. The protocol layer subscribes to a task's
             // updates first and processes the message second, so that no
             // transition is missed — which means the id has to exist before the
             // work does. Minting stays here so one place owns the shape of a
             // task id (see `new_task_id`).
-            "NewTaskId" => json!({"id": new_task_id()}),
-            "GetTask" => self.a2a_get_task(&principal, &params),
-            "ListTasks" => self.a2a_list_tasks(&principal),
-            "CancelTask" => self.a2a_cancel_task(&principal, &params),
-            "PushConfigSet" => self.a2a_push_set(&principal, &params),
-            "PushConfigGet" => self.a2a_push_get(&principal, &params),
-            "PushConfigList" => self.a2a_push_list(&principal, &params),
-            "PushConfigDelete" => self.a2a_push_delete(&principal, &params),
-            "GetAgentCard" => self.a2a_agent_card(),
-            "GetExtendedAgentCard" => self.a2a_extended_card(&principal),
-            other => err_obj(
+            Some(Verb::NewTaskId) => json!({"id": new_task_id()}),
+            Some(Verb::GetTask) => self.a2a_get_task(&principal, &params),
+            Some(Verb::ListTasks) => self.a2a_list_tasks(&principal),
+            Some(Verb::CancelTask) => self.a2a_cancel_task(&principal, &params),
+            Some(Verb::PushConfigSet) => self.a2a_push_set(&principal, &params),
+            Some(Verb::PushConfigGet) => self.a2a_push_get(&principal, &params),
+            Some(Verb::PushConfigList) => self.a2a_push_list(&principal, &params),
+            Some(Verb::PushConfigDelete) => self.a2a_push_delete(&principal, &params),
+            Some(Verb::GetAgentCard) => self.a2a_agent_card(),
+            Some(Verb::GetExtendedAgentCard) => self.a2a_extended_card(&principal),
+            None => err_obj(
                 UNSUPPORTED_OPERATION,
-                &format!("unsupported method: {other}"),
+                &format!("unsupported method: {}", bare(&method)),
             ),
         };
         self.reserved_task_id = None;

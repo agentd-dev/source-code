@@ -11,7 +11,11 @@
 //! * `admin.set` accepts exactly what the config file accepts for its path;
 //! * introspection follows its own switch, with no feed, and `admin.set`;
 //! * a `user` holding every grant still reaches none of the operator controls
-//!   — the escalation the table exists to close.
+//!   — the escalation the table exists to close;
+//! * `workflow.run` asks the grants AND the default start's `roles:`, and
+//!   refuses before any task exists — and the extended card agrees;
+//! * `subagent.get` answers the subagent's owner and the operator only;
+//! * a reload that puts back what `admin.set` changed says so.
 #![cfg(all(unix, feature = "a2a"))]
 
 mod common;
@@ -20,13 +24,32 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use agentd::runtime::surface::{Floor, OPS, Reply};
+use agentd::runtime::surface::{Floor, OPS, RUNTIME_SETTABLE, Reply};
 use serde_json::{Value, json};
 
 use common::{SendMessage, error_of, rpc_as, rpc_result};
 
 /// The bearer the `user` principal presents; the config names it by reference.
 const USER_TOKEN: &str = "vocabulary-user-token";
+/// A second `user`'s bearer, for the rules that scope one user's grants.
+const SCOPED_TOKEN: &str = "vocabulary-scoped-token";
+/// The operator's bearer. Declaring any principal rule turns the loopback
+/// operator default off, so a test that declares users names its operator.
+const OPS_TOKEN: &str = "vocabulary-ops-token";
+
+/// The `principals:` rules (under `a2a:`) for an operator `ops` and a plain
+/// `user` named `plain`, plus `more` rules.
+fn principals(more: &str) -> String {
+    format!(
+        "\x20 principals:\n\
+         \x20   - id: ops\n\
+         \x20     match: {{ bearer_ref: \"{{{{secret:AGENTD_VOCAB_OPS_TOKEN}}}}\" }}\n\
+         \x20     role: operator\n\
+         \x20   - id: plain\n\
+         \x20     match: {{ bearer_ref: \"{{{{secret:AGENTD_VOCAB_USER_TOKEN}}}}\" }}\n\
+         \x20     role: user\n{more}"
+    )
+}
 
 struct MockLlm {
     child: Child,
@@ -41,8 +64,11 @@ impl Drop for MockLlm {
     }
 }
 fn spawn_mock_llm() -> MockLlm {
+    spawn_mock_llm_with(&json!({"turns": [{"content": "unused"}]}))
+}
+fn spawn_mock_llm_with(playbook: &Value) -> MockLlm {
     let pb = common::unique_path("vocab-playbook", "json");
-    std::fs::write(&pb, json!({"turns": [{"content": "unused"}]}).to_string()).unwrap();
+    std::fs::write(&pb, playbook.to_string()).unwrap();
     let addr_file = common::unique_path("vocab-mock-llm", "addr");
     let child = Command::new(env!("CARGO_BIN_EXE_agentd"))
         .args(["--internal-mock-llm", &addr_file, &format!("file:{pb}")])
@@ -114,6 +140,8 @@ fn spawn(yaml_for: impl Fn(u16) -> String) -> Daemon {
         let child = Command::new(env!("CARGO_BIN_EXE_agentd"))
             .args(["--config", &cfg])
             .env("AGENTD_VOCAB_USER_TOKEN", USER_TOKEN)
+            .env("AGENTD_VOCAB_SCOPED_TOKEN", SCOPED_TOKEN)
+            .env("AGENTD_VOCAB_OPS_TOKEN", OPS_TOKEN)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(errf))
@@ -146,11 +174,22 @@ fn doc_of(result: &Value) -> Value {
 
 /// Collect the observation feed in the background, from its first event.
 fn watch_feed(addr: &str) -> Arc<Mutex<Vec<Value>>> {
+    watch_feed_as(addr, None)
+}
+
+/// [`watch_feed`], presenting `bearer`.
+fn watch_feed_as(addr: &str, bearer: Option<&str>) -> Arc<Mutex<Vec<Value>>> {
     let frames: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&frames);
     let addr = addr.to_string();
+    let auth = bearer.map(|b| format!("Bearer {b}"));
     std::thread::spawn(move || {
-        let mut reader = common::subscribe_feed(&addr, 0, Duration::from_secs(60));
+        let body = common::rpc_body(77, common::feed_method(), json!({"fromSeq": 0}));
+        let headers: Vec<(&str, &str)> = auth
+            .as_deref()
+            .map(|a| vec![("Authorization", a)])
+            .unwrap_or_default();
+        let mut reader = common::a2a_open(&addr, &body, &headers, Duration::from_secs(60));
         common::read_frames(&mut reader, |v| {
             sink.lock().unwrap().push(v["result"].clone());
             true
@@ -184,6 +223,39 @@ fn task_count(addr: &str) -> usize {
         .as_array()
         .map(Vec::len)
         .unwrap_or(0)
+}
+
+/// How many tasks `bearer`'s principal can list (an empty list is omitted
+/// from the reply, as proto3 JSON omits every empty repeated field).
+fn task_count_as(addr: &str, bearer: &str) -> usize {
+    let v = rpc_as(addr, bearer, 91, "ListTasks", json!({}));
+    assert!(v["result"].is_object(), "ListTasks failed: {v}");
+    v["result"]["tasks"].as_array().map(Vec::len).unwrap_or(0)
+}
+
+/// The skill ids `bearer`'s principal is offered on the extended card.
+fn skills_as(addr: &str, bearer: &str) -> Vec<String> {
+    rpc_as(addr, bearer, 5, "GetExtendedAgentCard", json!({}))["result"]["skills"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s["id"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Wait until `pred` holds over the feed frames collected so far.
+fn feed_until(frames: &Arc<Mutex<Vec<Value>>>, what: &str, pred: impl Fn(&[Value]) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !pred(&frames.lock().unwrap()) {
+        assert!(
+            Instant::now() < deadline,
+            "the feed never carried {what}: {:?}",
+            frames.lock().unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 #[test]
@@ -473,4 +545,305 @@ fn a_user_with_every_grant_cannot_reach_operator_controls() {
         .bearer(USER_TOKEN)
         .post(&d.addr);
     assert!(sig.get("error").is_none(), "{sig}");
+}
+
+#[test]
+fn workflow_run_asks_the_grants_and_the_default_starts_roles_before_any_task_exists() {
+    let llm = spawn_mock_llm();
+    let d = spawn(config(
+        &llm.uri,
+        &format!(
+            "  events:\n    enabled: true\n  introspection:\n    enabled: true\n{}",
+            principals(
+                "\x20   - id: scoped\n\
+                 \x20     match: { bearer_ref: \"{{secret:AGENTD_VOCAB_SCOPED_TOKEN}}\" }\n\
+                 \x20     role: user\n\
+                 \x20     grants: [\"workflow.run:deploy-*\"]\n"
+            )
+        ),
+        "workflows:\n\
+         \x20 - name: deploy-web\n    steps:\n      s: {kind: manual}\n      f: {kind: finish, depends_on: [s], output: \"deployed\"}\n\
+         \x20 - name: wipe\n    steps:\n      s: {kind: manual}\n      f: {kind: finish, depends_on: [s], output: \"wiped\"}\n\
+         \x20 - name: ops-only\n    steps:\n      s: {kind: a2a, command: ops-only.go, roles: [operator]}\n      f: {kind: finish, depends_on: [s], output: \"ran\"}\n",
+    ));
+    let feed = watch_feed_as(&d.addr, Some(OPS_TOKEN));
+    let denied = |v: &Value, what: &str| {
+        let (code, _) = error_of(v);
+        assert_eq!(code, agentd::a2a::errors::PERMISSION_DENIED, "{what}: {v}");
+        assert_eq!(
+            v["error"]["data"][0]["reason"], "PERMISSION_DENIED",
+            "{what}: {v}"
+        );
+    };
+    let run = |bearer: &str, wf: &str| {
+        SendMessage::command("workflow.run", json!({"workflow": wf}))
+            .bearer(bearer)
+            .post(&d.addr)
+    };
+
+    // The default start admits operators only: a user may not start it by
+    // name, and nothing is created on the way to saying so.
+    denied(&run(USER_TOKEN, "ops-only"), "the default start's roles");
+    assert_eq!(
+        task_count_as(&d.addr, USER_TOKEN),
+        0,
+        "no task for a refusal"
+    );
+    // A scoped grant replaces the role default: `wipe` is outside it.
+    denied(&run(SCOPED_TOKEN, "wipe"), "the scoped grant");
+    denied(&run(SCOPED_TOKEN, "ops-only"), "the scope and the roles");
+    assert_eq!(task_count_as(&d.addr, SCOPED_TOKEN), 0);
+    // A name that does not exist reads, to anyone who may not run
+    // everything, exactly like one they may not run — the card hides the
+    // second, and a different refusal would name it anyway.
+    let ghost = run(USER_TOKEN, "ghost");
+    denied(&ghost, "a missing workflow");
+    let gated = run(USER_TOKEN, "ops-only");
+    assert_eq!(
+        error_of(&ghost).1.replace("ghost", "X"),
+        error_of(&gated).1.replace("ops-only", "X"),
+        "one refusal for missing and forbidden"
+    );
+    // The operator hears which it is.
+    let (code, msg) = error_of(&run(OPS_TOKEN, "ghost"));
+    assert_eq!(code, -32602, "{msg}");
+
+    // What the caller may run does run.
+    let ok = SendMessage::command("workflow.run", json!({"workflow": "deploy-web"}))
+        .bearer(SCOPED_TOKEN)
+        .result(&d.addr);
+    assert!(ok["task"]["id"].is_string(), "{ok}");
+    assert_eq!(task_count_as(&d.addr, SCOPED_TOKEN), 1);
+    let ok = SendMessage::command("workflow.run", json!({"workflow": "wipe"}))
+        .bearer(USER_TOKEN)
+        .result(&d.addr);
+    assert!(ok["task"]["id"].is_string(), "{ok}");
+
+    // The extended card lists exactly what each caller may run.
+    let plain = skills_as(&d.addr, USER_TOKEN);
+    assert!(
+        plain.contains(&"deploy-web".into()) && plain.contains(&"wipe".into()),
+        "{plain:?}"
+    );
+    assert!(!plain.contains(&"ops-only".into()), "{plain:?}");
+    let scoped = skills_as(&d.addr, SCOPED_TOKEN);
+    assert!(scoped.contains(&"deploy-web".into()), "{scoped:?}");
+    assert!(
+        !scoped.contains(&"wipe".into()) && !scoped.contains(&"ops-only".into()),
+        "{scoped:?}"
+    );
+    assert!(
+        skills_as(&d.addr, OPS_TOKEN).contains(&"ops-only".into()),
+        "the operator's card"
+    );
+
+    // The feed announced the runs that ran, and none of the refusals — each
+    // of which the audit mirror did record.
+    for who in ["user:scoped", "user:plain"] {
+        feed_until(&feed, &format!("{who}'s command event"), |f| {
+            f.iter()
+                .any(|v| v["event"]["kind"] == "command" && v["event"]["data"]["principal"] == who)
+        });
+    }
+    feed_until(&feed, "the refusals' audit events", |f| {
+        f.iter()
+            .filter(|v| v["event"]["kind"] == "audit")
+            .filter(|v| v["event"]["data"]["action"] == "a2a.SendMessage:workflow.run")
+            .filter(|v| v["event"]["data"]["outcome"] == "error")
+            .count()
+            >= 5
+    });
+    let commands: Vec<Value> = feed_events(&feed, "command")
+        .into_iter()
+        .map(|c| c["principal"].clone())
+        .collect();
+    assert_eq!(
+        commands,
+        vec![json!("user:scoped"), json!("user:plain")],
+        "one per run that ran, none for a refusal"
+    );
+}
+
+#[test]
+fn reads_are_audited_but_not_mirrored_onto_the_feed() {
+    let llm = spawn_mock_llm();
+    let d = spawn(config(
+        &llm.uri,
+        &format!(
+            "  events:\n    enabled: true\n  introspection:\n    enabled: true\n{}",
+            principals("")
+        ),
+        "workflows:\n  - name: greet\n    steps:\n      s: {kind: manual}\n      f: {kind: finish, depends_on: [s], output: \"done\"}\n",
+    ));
+    let feed = watch_feed_as(&d.addr, Some(OPS_TOKEN));
+
+    // A display client's polling: reads by op and by method, a few times.
+    for _ in 0..3 {
+        SendMessage::command("status", json!({}))
+            .bearer(OPS_TOKEN)
+            .result(&d.addr);
+        SendMessage::command("debug.events", json!({"limit": 1}))
+            .bearer(OPS_TOKEN)
+            .result(&d.addr);
+        assert!(rpc_as(&d.addr, OPS_TOKEN, 7, "ListTasks", json!({}))["result"].is_object());
+        skills_as(&d.addr, OPS_TOKEN);
+    }
+    // A refusal the runtime makes, and a mutation — the latter preceded by
+    // the mint every send is (which is plumbing, not a change).
+    let refused = SendMessage::command("workflow.run", json!({"workflow": "ghost"}))
+        .bearer(USER_TOKEN)
+        .post(&d.addr);
+    assert!(refused.get("error").is_some(), "{refused}");
+    let run = SendMessage::command("workflow.run", json!({"workflow": "greet"}))
+        .bearer(OPS_TOKEN)
+        .result(&d.addr);
+    let task = run["task"]["id"].as_str().expect("a task").to_string();
+    let got = rpc_as(&d.addr, OPS_TOKEN, 8, "GetTask", json!({"id": task}));
+    assert!(got["result"].is_object(), "{got}");
+    // A conversational send is minted an id first, which is not a change.
+    SendMessage::text("hello").bearer(OPS_TOKEN).result(&d.addr);
+    feed_until(&feed, "the send's audit event", |f| {
+        f.iter().any(|v| {
+            v["event"]["kind"] == "audit" && v["event"]["data"]["action"] == "a2a.SendMessage"
+        })
+    });
+
+    feed_until(&feed, "the run's and the refusal's audit events", |f| {
+        f.iter()
+            .filter(|v| {
+                v["event"]["kind"] == "audit"
+                    && v["event"]["data"]["action"] == "a2a.SendMessage:workflow.run"
+            })
+            .count()
+            >= 2
+    });
+    let actions: Vec<String> = feed_events(&feed, "audit")
+        .iter()
+        .map(|a| {
+            format!(
+                "{} {}",
+                a["action"].as_str().unwrap_or(""),
+                a["outcome"].as_str().unwrap_or("")
+            )
+        })
+        .collect();
+    assert!(
+        actions.contains(&"a2a.SendMessage:workflow.run error".to_string()),
+        "the refusal is mirrored: {actions:?}"
+    );
+    assert!(
+        actions.contains(&"a2a.SendMessage:workflow.run ok".to_string()),
+        "the mutation is mirrored: {actions:?}"
+    );
+    for read in [
+        "a2a.SendMessage:status ok",
+        "a2a.SendMessage:debug.events ok",
+        "a2a.ListTasks ok",
+        "a2a.GetTask ok",
+        "a2a.GetExtendedAgentCard ok",
+        "a2a.NewTaskId ok",
+    ] {
+        assert!(
+            !actions.iter().any(|a| a == read),
+            "a successful read was mirrored ({read}): {actions:?}"
+        );
+    }
+}
+
+#[test]
+fn subagent_get_answers_the_owner_and_the_operator_only() {
+    // The operator's conversation delegates to a sync subagent (mock
+    // tool_calls); the subagent is the operator's.
+    let llm = spawn_mock_llm_with(&json!({
+        "turns": [
+            {"tool_calls": [{"name": "subagent.run", "arguments": {"instruction": "count to three", "mode": "sync"}}]},
+            {"content": "delegated and done"}
+        ],
+        "match": [
+            {"when_contains": "You are agentd, an autonomous agent.", "content": "three"}
+        ]
+    }));
+    let d = spawn(config(
+        &llm.uri,
+        &format!("  introspection:\n    enabled: true\n{}", principals("")),
+        "",
+    ));
+    let sent = SendMessage::text("count for me")
+        .bearer(OPS_TOKEN)
+        .result(&d.addr);
+    assert_eq!(
+        sent["task"]["status"]["state"], "TASK_STATE_COMPLETED",
+        "{sent}"
+    );
+    let st = doc_of(
+        &SendMessage::command("status", json!({}))
+            .bearer(OPS_TOKEN)
+            .result(&d.addr),
+    );
+    let handle = st["subagents"][0]["handle"]
+        .as_str()
+        .expect("a subagent exists")
+        .to_string();
+
+    let theirs = SendMessage::command("subagent.get", json!({"handle": handle}))
+        .bearer(USER_TOKEN)
+        .post(&d.addr);
+    assert_eq!(
+        theirs["error"]["code"], -32001,
+        "another principal's subagent: {theirs}"
+    );
+    let nope = SendMessage::command("subagent.get", json!({"handle": "nope"}))
+        .bearer(USER_TOKEN)
+        .post(&d.addr);
+    assert_eq!(
+        theirs["error"]["message"], nope["error"]["message"],
+        "not told it exists"
+    );
+    let mine = SendMessage::command("subagent.get", json!({"handle": handle}))
+        .bearer(OPS_TOKEN)
+        .result(&d.addr);
+    assert!(
+        doc_of(&mine)["subagent"]["instruction"]
+            .as_str()
+            .is_some_and(|i| i.contains("count to three")),
+        "{mine}"
+    );
+}
+
+#[test]
+fn a_reload_announces_what_it_put_back_after_admin_set() {
+    let llm = spawn_mock_llm();
+    let d = spawn(config(&llm.uri, "  events:\n    enabled: true\n", ""));
+    let feed = watch_feed(&d.addr);
+
+    // Every runtime-settable path, set away from what the file says.
+    for path in RUNTIME_SETTABLE {
+        let value = match *path {
+            "agent.approval" => json!("accept"),
+            "a2a.introspection.enabled" => json!(true),
+            other => panic!("no fixture for {other}: give it a value the file does not"),
+        };
+        SendMessage::command("admin.set", json!({"path": path, "value": value})).result(&d.addr);
+    }
+    // The file did not change; the reload puts every one of them back.
+    unsafe { libc::kill(d.child.id() as i32, libc::SIGHUP) };
+    feed_until(&feed, "the reload's config event", |f| {
+        f.iter()
+            .any(|v| v["event"]["kind"] == "config" && v["event"]["data"]["source"] == "reload")
+    });
+    let ev = feed_events(&feed, "config")
+        .into_iter()
+        .find(|e| e["source"] == "reload")
+        .unwrap();
+    for path in RUNTIME_SETTABLE {
+        assert!(
+            ev["paths"].as_array().unwrap().contains(&json!(path)),
+            "the reload put {path} back and did not say so: {ev}"
+        );
+    }
+    assert!(
+        !d.stderr().contains("\"changed\":[\"nothing\"]"),
+        "the reload recorded no change: {}",
+        d.stderr()
+    );
 }

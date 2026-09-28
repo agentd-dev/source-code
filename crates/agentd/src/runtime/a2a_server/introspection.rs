@@ -2,10 +2,8 @@
 //! The introspection reads behind `a2a.introspection.enabled`: transcripts,
 //! per-step run detail, subagent detail and the log ring.
 
-use super::commands::refusal;
-use super::{TASK_NOT_FOUND, UNSUPPORTED_OPERATION, err_obj, rpc_internal};
+use super::{TASK_NOT_FOUND, err_obj, rpc_internal};
 use crate::a2a::Principal;
-use crate::a2a::errors::reason;
 use crate::runtime::reactor::Runtime;
 use serde_json::{Value, json};
 
@@ -57,25 +55,20 @@ impl Runtime {
     ///
     /// Introspection alone gates these — not the feed, and not a display
     /// client — so an operator can open transcripts on an instance that
-    /// serves no feed, and any A2A client may read them once it is on.
+    /// serves no feed, and any A2A client may read them once it is on. The
+    /// dispatch checks that gate, from the op table's own column, before it
+    /// routes here.
     pub(super) fn introspection_op(
         &self,
         principal: &Principal,
         op: IntrospectionOp,
         data: &Value,
     ) -> Result<Value, Value> {
-        if !self.settings.a2a.introspection.enabled {
-            return Err(refusal(
-                UNSUPPORTED_OPERATION,
-                reason::INTROSPECTION_DISABLED,
-                "introspection is disabled (set a2a.introspection.enabled: true, or admin.set it)",
-                &[],
-            ));
-        }
+        debug_assert!(self.settings.a2a.introspection.enabled);
         match op {
             IntrospectionOp::Conversation => self.conversation_get(principal, data),
             IntrospectionOp::Run => self.run_get(principal, data),
-            IntrospectionOp::Subagent => self.subagent_get(data),
+            IntrospectionOp::Subagent => self.subagent_get(principal, data),
             IntrospectionOp::Events => self.debug_events(data),
         }
     }
@@ -94,12 +87,17 @@ impl Runtime {
     }
 
     /// `subagent.get {handle}`: one subagent's detail — instruction, status,
-    /// attempts, result/error (truncated) — the drill-down view.
-    fn subagent_get(&self, data: &Value) -> Result<Value, Value> {
+    /// attempts, result/error (truncated) — the drill-down view. Ownership:
+    /// the owner or an operator, and a non-owner is told the handle does not
+    /// exist, as `conversation.get` tells it.
+    fn subagent_get(&self, principal: &Principal, data: &Value) -> Result<Value, Value> {
         let handle = data["handle"].as_str().unwrap_or("");
         let Some(s) = self.subagents.get(handle) else {
             return Err(err_obj(TASK_NOT_FOUND, "no such subagent"));
         };
+        if !principal.is_operator() && self.subagent_owner(handle) != Some(principal.id.as_str()) {
+            return Err(err_obj(TASK_NOT_FOUND, "no such subagent"));
+        }
         Ok(json!({"subagent": {
             "handle": s.handle,
             "mode": s.mode,
@@ -114,6 +112,32 @@ impl Runtime {
             "updated": s.updated,
             "node": s.node.map(|n| n.0),
         }}))
+    }
+
+    /// Whose subagent `handle` is: the principal of the conversation or run
+    /// that spawned it, or — for a subagent's own subagent — its parent's.
+    /// The record names what spawned it, not who, so the owner is read off
+    /// the spawner; a subagent whose spawner is gone is the operator's alone.
+    fn subagent_owner(&self, handle: &str) -> Option<&str> {
+        let mut h = handle;
+        // Each hop is a distinct live record, so the chain ends within as
+        // many hops as there are records — the bound only guards a cycle.
+        for _ in 0..=self.subagents.len() {
+            let by = self.subagents.get(h)?.requested_by.as_ref()?;
+            let from_ctx = by["ctx"]
+                .as_str()
+                .and_then(|c| self.contexts.get(c))
+                .and_then(|c| c.principal.as_deref());
+            let from_run = by["run"]
+                .as_str()
+                .and_then(|r| self.runs.get(r))
+                .and_then(|r| r.principal.as_deref());
+            if let Some(p) = from_ctx.or(from_run) {
+                return Some(p);
+            }
+            h = by["subagent"].as_str()?;
+        }
+        None
     }
 
     /// `conversation.get {id, limit?}`: the conversation transcript — the one

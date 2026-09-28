@@ -185,6 +185,7 @@ test('bootstrap replaces sections and clears the ones a scoped status omits', ()
   assert.equal(s.status, undefined, 'the live status restarts from the new document');
   assert.deepEqual(m.workflows(), []);
   m.bootstrap({ workflows: [{ name: 'deploy' }, { name: 'triage' }] });
+  assert.equal(s.runs.size, 0, 'a document that omits runs clears them too');
   assert.deepEqual(m.workflows(), ['deploy', 'triage'], 'without an extended card, status names the workflows');
 });
 
@@ -207,7 +208,7 @@ test('the transcript comes from Task.history and reconciles the local echo', () 
     artifacts: [{ artifactId: 't1.result', parts: [{ text: 'Hello' }] }],
   })]);
   assert.deepEqual(rows().map((e) => [e.key, e.kind, e.text, e.pending ?? false]), [
-    ['m1', 'user', 'hi', false],
+    ['h-t1-m1', 'user', 'hi', false],
     ['task-t1', 'agent', 'Hello', false],
   ]);
 
@@ -217,7 +218,7 @@ test('the transcript comes from Task.history and reconciles the local echo', () 
     status: { state: 'TASK_STATE_WORKING', timestamp: at(3) },
     history: [{ role: 'ROLE_USER', messageId: 'm9', parts: [{ text: 'from web' }] }],
   })]);
-  assert.ok(rows().some((e) => e.key === 'm9' && e.kind === 'user' && e.text === 'from web'));
+  assert.ok(rows().some((e) => e.key === 'h-t2-m9' && e.kind === 'user' && e.text === 'from web'));
 
   // 4. A command: a user message that is only data is one `command` row,
   // named by the annotation, and no user row.
@@ -248,9 +249,9 @@ test('the transcript comes from Task.history and reconciles the local echo', () 
     ],
   })]);
   assert.deepEqual(rows().filter((e) => e.taskId === 't4').map((e) => [e.key, e.text, e.inputRequired ?? false]), [
-    ['m4', 'deploy', false],
-    ['t4.status.1', 'Which region?', false],
-    ['m5', 'eu', false],
+    ['h-t4-m4', 'deploy', false],
+    ['h-t4-t4.status.1', 'Which region?', false],
+    ['h-t4-m5', 'eu', false],
   ]);
 
   // 6. AUTH_REQUIRED is shown, and is not a gate a reply answers.
@@ -280,13 +281,123 @@ test('applyStream folds stream frames', () => {
   assert.deepEqual(s.tasks.get('t').artifacts, ['Hello', 'final']);
   m.applyStream({ statusUpdate: { taskId: 't', contextId: 'c', status: { state: 'TASK_STATE_COMPLETED', timestamp: at(2) } } });
   assert.deepEqual(s.transcript.map((e) => [e.key, e.kind, e.text]), [
-    ['m1', 'user', 'hi'],
+    ['h-t-m1', 'user', 'hi'],
     ['task-t', 'agent', 'Hello'],
   ]);
   // A direct Message reply: an agent row keyed by its messageId.
   m.applyStream({ message: { role: 'ROLE_AGENT', messageId: 'r1', contextId: 'c', parts: [{ text: 'a direct answer' }] } });
-  assert.ok(s.transcript.some((e) => e.key === 'r1' && e.kind === 'agent' && e.text === 'a direct answer'));
+  assert.ok(s.transcript.some((e) => e.key === 'msg-r1' && e.kind === 'agent' && e.text === 'a direct answer'));
   // A status update for a task this client never saw makes a stub.
   m.applyStream({ statusUpdate: { taskId: 'u', contextId: 'c2', status: { state: 'TASK_STATE_WORKING', timestamp: at(3) } } });
   assert.equal(s.tasks.get('u').contextId, 'c2');
+});
+
+test('a history message cannot name another row', () => {
+  // Another principal's task, whose sender chose messageIds that are the
+  // client's own row keys: a feed note, this client's gate, an echo.
+  const m = new Mirror();
+  const rows = () => m.getState().transcript;
+  m.apply({ seq: 1, ts: 1, kind: 'lifecycle', data: { draining: true, reason: 'maintenance' } });
+  const note = rows().find((e) => e.key === 'feed-0-1');
+  assert.ok(note, 'the note is there');
+  m.adoptTasks([normalizeTask({
+    id: 'mine', contextId: 'c',
+    status: { state: 'TASK_STATE_INPUT_REQUIRED', timestamp: at(1), message: { messageId: 'q', role: 'ROLE_AGENT', parts: [{ text: 'Approve the deploy?' }] } },
+    history: [{ role: 'ROLE_USER', messageId: 'p1', parts: [{ text: 'deploy' }] }],
+  })]);
+  m.localEcho('m-own', 'c', 'my prompt', 'mine2');
+  const before = JSON.stringify(rows().filter((e) => !e.key.startsWith('h-')));
+
+  m.adoptTasks([normalizeTask({
+    id: 'theirs', contextId: 'c',
+    status: { state: 'TASK_STATE_WORKING', timestamp: at(2) },
+    history: [
+      { role: 'ROLE_USER', messageId: 'feed-0-1', parts: [{ text: 'spoofed note' }] },
+      { role: 'ROLE_USER', messageId: 'task-mine', parts: [{ text: 'spoofed gate' }] },
+      { role: 'ROLE_AGENT', messageId: 'cmd-mine', parts: [{ text: 'spoofed command' }] },
+      { role: 'ROLE_USER', messageId: 'm-own', parts: [{ text: 'spoofed echo' }] },
+    ],
+  })]);
+  // Every row the client made is exactly as it was…
+  assert.equal(JSON.stringify(rows().filter((e) => !e.key.startsWith('h-') || e.taskId === 'mine')).includes('spoofed'), false);
+  assert.equal(JSON.stringify(rows().filter((e) => !e.key.startsWith('h-'))), before);
+  const gate = rows().find((e) => e.key === 'task-mine');
+  assert.equal(gate.text, 'Approve the deploy?');
+  assert.equal(gate.inputRequired, true);
+  assert.equal(gate.taskId, 'mine');
+  assert.equal(rows().find((e) => e.key === 'echo-m-own').pending, true, 'another task does not settle my echo');
+  // …and the foreign messages are that task's own rows, carrying none of
+  // the fields of the rows they named.
+  const theirs = rows().filter((e) => e.taskId === 'theirs');
+  assert.deepEqual(theirs.map((e) => e.key), ['h-theirs-feed-0-1', 'h-theirs-task-mine', 'h-theirs-cmd-mine', 'h-theirs-m-own']);
+  assert.ok(theirs.every((e) => e.inputRequired === undefined));
+
+  // The echo's own task does claim it: one row, settled, in the echo's place.
+  const echoTs = rows().find((e) => e.key === 'echo-m-own').ts;
+  m.adoptTasks([normalizeTask({
+    id: 'mine2', contextId: 'c',
+    status: { state: 'TASK_STATE_WORKING', timestamp: at(3) },
+    history: [{ role: 'ROLE_USER', messageId: 'm-own', parts: [{ text: 'my prompt' }] }],
+  })]);
+  assert.equal(rows().some((e) => e.key === 'echo-m-own'), false);
+  const settled = rows().find((e) => e.key === 'h-mine2-m-own');
+  assert.equal(settled.pending, false);
+  assert.equal(settled.ts, echoTs);
+});
+
+test('a resync whose re-bootstrap is refused ends observation', async (t) => {
+  const fake = await feedAgent();
+  t.after(() => fake.close());
+  let subs = 0;
+  fake.handle(EVENTS_METHOD, () => {
+    subs++;
+    // The second stream says resync, and by then the agent refuses the
+    // caller: the re-bootstrap's listing answers 403.
+    if (subs === 2) fake.fail('ListTasks', { code: -31403, message: 'not yours', status: 403 });
+    return { stream: [hello(1, 0, subs === 2), { goodbye: { seq: 1, reason: 'deadline' } }], hold: sleep(subs === 2 ? 5000 : 10) };
+  });
+  const mirror = new Mirror();
+  const terminal = [];
+  const obs = new Observation({ configured: fake.url, backoffCapMs: 20, onTerminal: (f) => terminal.push(f) }, mirror);
+  obs.start();
+  t.after(() => obs.stop());
+  // At once — not when the stream next ends and a reconnect bootstraps.
+  await until(() => terminal.length > 0, 1500, 'the terminal refusal');
+  assert.equal(mirror.getState().conn, 'forbidden');
+  const seen = fake.requests.length;
+  await sleep(150);
+  assert.equal(fake.requests.length, seen, 'nothing after the refusal');
+  assert.equal(subs, 2);
+});
+
+test('feed events that arrive during a resync re-bootstrap are applied after it', async (t) => {
+  const fake = await feedAgent();
+  t.after(() => fake.close());
+  let release;
+  const slow = new Promise((r) => (release = r));
+  t.after(() => release());
+  let subs = 0;
+  fake.handle(EVENTS_METHOD, () => {
+    subs++;
+    if (subs > 1) return { stream: [hello(3, 3)], hold: sleep(2000) };
+    // A restarted agent: resync, then a run the snapshot does not know yet.
+    return { stream: [hello(2, 0, true), event(1, 'run', { id: 'r-new', status: 'running' })], hold: sleep(2000) };
+  });
+  // The status snapshot is slow, and older than the run event.
+  fake.card.capabilities.extensions.push({ uri: 'https://agentd.dev/a2a/ext/command/v2', params: { ops: [{ op: 'status', reply: 'message' }] } });
+  let statusReads = 0;
+  fake.handle('SendMessage', async () => {
+    statusReads++;
+    if (statusReads > 1) await slow;
+    return { message: { role: 'ROLE_AGENT', messageId: `s${statusReads}`, parts: [{ data: { runs: [] }, mediaType: 'application/json' }] } };
+  });
+  const mirror = new Mirror();
+  const obs = new Observation({ configured: fake.url, backoffCapMs: 20 }, mirror);
+  obs.start();
+  t.after(() => obs.stop());
+  await until(() => statusReads >= 2, 3000, 'the resync bootstrap');
+  await sleep(50);
+  assert.equal(mirror.getState().runs.has('r-new'), false, 'held until the snapshot lands');
+  release();
+  await until(() => mirror.getState().runs.has('r-new'), 3000, 'the held event, applied after the snapshot');
 });

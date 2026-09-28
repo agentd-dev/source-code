@@ -224,7 +224,7 @@ export class Mirror {
   /** Echo a just-sent prompt (reconciled by messageId when the task's history carries it). */
   localEcho(messageId: string, ctx: string | undefined, text: string, taskId?: string): void {
     this.upsertEntry({
-      key: messageId,
+      key: `echo-${messageId}`,
       ctx: ctx ?? '',
       ts: Date.now(),
       kind: 'user',
@@ -272,7 +272,7 @@ export class Mirror {
     const text = h && h.text.length > 0 ? h.text : h && h.data.length > 0 ? JSON.stringify(h.data[0]) : '';
     if (text.length === 0) return;
     this.upsertEntry({
-      key: id,
+      key: `msg-${id}`,
       ctx: str(m.contextId) ?? '',
       ts: Date.now(),
       kind: 'agent',
@@ -632,10 +632,15 @@ export class Mirror {
   }
 
   /**
-   * One row per history message: a person's text keyed by its messageId (so
-   * the local echo, keyed by the id this client sent, becomes that row), an
-   * agent's superseded status keyed by its messageId, and a command — a user
+   * One row per history message: a person's text and an agent's superseded
+   * status, each keyed by its task AND its messageId, and a command — a user
    * message that is only data — as one `command` row for the task.
+   *
+   * The sender chooses a messageId, so it is never a key on its own: a
+   * message whose id was `task-<id>` or `feed-0-1` would otherwise overwrite
+   * that row — another principal's gate, or a note — and inherit whatever
+   * the history row does not set. The local echo becomes the history row
+   * only by the explicit reconciliation in {@link claimEcho}.
    */
   private historyRows(t: TaskView): void {
     const base = t.statusHistory?.[0]?.ts ?? t.created ?? t.updated;
@@ -650,8 +655,10 @@ export class Mirror {
       this.upsertEntry({ ...entry, ts }, true);
     };
     t.history.forEach((m, i) => {
+      const key = `h-${t.id}-${m.messageId}`;
       if (m.role === 'ROLE_USER' && m.text.length > 0) {
-        place({ key: m.messageId, ctx: t.contextId, kind: 'user', text: m.text, taskId: t.id, principal: t.principal, pending: false }, i);
+        this.claimEcho(m.messageId, t.id, key);
+        place({ key, ctx: t.contextId, kind: 'user', text: m.text, taskId: t.id, principal: t.principal, pending: false }, i);
       } else if (m.role === 'ROLE_USER' && m.data.length > 0) {
         const env = obj(obj(m.data[0])?.[COMMAND_DATA_KEY]);
         place(
@@ -666,9 +673,23 @@ export class Mirror {
           i,
         );
       } else if (m.role === 'ROLE_AGENT' && m.text.length > 0) {
-        place({ key: m.messageId, ctx: t.contextId, kind: 'agent', text: m.text, taskId: t.id }, i);
+        place({ key, ctx: t.contextId, kind: 'agent', text: m.text, taskId: t.id }, i);
       }
     });
+  }
+
+  /**
+   * This client's pending prompt, now in task `taskId`'s history as `key`:
+   * the echo row becomes that row, keeping its place. Only an echo sent for
+   * that task (or before its task was known) is claimed — never one another
+   * task's history happens to name.
+   */
+  private claimEcho(messageId: string, taskId: string, key: string): void {
+    const i = this.state.transcript.findIndex((e) => e.key === `echo-${messageId}`);
+    const echo = this.state.transcript[i];
+    if (!echo || (echo.taskId !== undefined && echo.taskId !== taskId)) return;
+    if (this.state.transcript.some((e) => e.key === key)) this.state.transcript.splice(i, 1);
+    else this.state.transcript[i] = { ...echo, key };
   }
 
   /**

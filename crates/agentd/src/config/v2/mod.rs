@@ -7756,7 +7756,10 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
         }
         // A grant naming a removed op would load, match nothing and leave the
         // operator believing the principal still holds the control it named —
-        // refused by name, with what replaced it.
+        // refused by name, with what replaced it. So would a grant naming an
+        // operator-only op on anyone but an operator: the floor answers to the
+        // role before any grant is read. A pattern (`admin*`) stays allowed —
+        // it names a family, and grants the members that are not operator-only.
         for g in &pr.grants {
             if let Some(hint) = crate::runtime::surface::removed_op(g) {
                 err(
@@ -7764,6 +7767,16 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                     format!(
                         "a2a.principals[{i}].grants: grant `{g}` was removed in agentd {}: {hint}",
                         crate::runtime::surface::OPS_REMOVED_IN
+                    ),
+                );
+            } else if pr.role != Role::Operator
+                && !g.contains('*')
+                && crate::runtime::surface::is_operator_floor(g)
+            {
+                err(
+                    &mut d,
+                    format!(
+                        "a2a.principals[{i}].grants: `{g}` is operator-only; a grant does not reach it — give the rule role: operator, or drop the grant"
                     ),
                 );
             }
@@ -11148,11 +11161,33 @@ mod tests {
         // A current op, or a pattern that merely covers a removed one, loads.
         assert_eq!(
             load_errors(
-                "a2a:\n  principals: [{id: p, match: {san: a.example}, role: user, grants: [\"admin.set\", \"config*\"]}]\n"
+                "a2a:\n  principals: [{id: p, match: {san: a.example}, role: user, grants: [\"workflow.signal\", \"config*\", \"admin*\"]}]\n"
             ),
             ""
         );
+        // An operator-only op named exactly, on a rule that is not the
+        // operator's, would load and grant nothing — refused, as a removed op
+        // is. The operator's own rule may name it (it is redundant there).
+        for op in ["admin.set", "config", "debug.events", "_instance.result"] {
+            let e = load_errors(&format!(
+                "a2a:\n  principals: [{{id: p, match: {{san: a.example}}, role: user, grants: [\"{op}\"]}}]\n"
+            ));
+            assert!(
+                e.contains(&format!(
+                    "a2a.principals[0].grants: `{op}` is operator-only; a grant does not reach it"
+                )),
+                "{op}: {e}"
+            );
+            assert_eq!(
+                load_errors(&format!(
+                    "a2a:\n  principals: [{{id: p, match: {{san: a.example}}, role: operator, grants: [\"{op}\"]}}]\n"
+                )),
+                "",
+                "{op} on an operator rule"
+            );
+        }
         for cmd in [
+            "_instance.",
             "_instance.result",
             "_instance.anything",
             "ask_human",

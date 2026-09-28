@@ -148,7 +148,13 @@ export interface Activity {
 
 /** One entry of the rendered conversation transcript (a client-side view). */
 export interface TranscriptEntry {
-  /** Stable key: the messageId (user) or taskId (agent/command). */
+  /**
+   * Stable key, namespaced by where the row came from so no sender can name
+   * another's row: `h-<task>-<messageId>` (a history message), `echo-<id>`
+   * (this client's pending prompt), `msg-<id>` (a direct Message reply),
+   * `task-<id>` / `cmd-<id>` (a task's state / its command), `feed-…` and
+   * `note-…` (client notes).
+   */
   key: string;
   ctx: string;
   ts: number;

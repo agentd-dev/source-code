@@ -104,7 +104,10 @@ impl OpSpec {
 
     fn matches(&self, op: &str) -> bool {
         if self.is_prefix() {
-            op.len() > self.name.len() && op.starts_with(self.name)
+            // The bare prefix too: `_instance.` names no op, but a workflow
+            // that claimed it would take the declared-command path, where the
+            // operator floor this row carries does not run.
+            op.starts_with(self.name)
         } else {
             op == self.name
         }
@@ -429,19 +432,16 @@ pub fn is_read_op(op: &str) -> bool {
     op_spec(op).is_some_and(|s| s.reply == Reply::Message)
 }
 
-/// Is the switch that serves `spec` on?
-fn gate_open(spec: &OpSpec, s: &Settings) -> bool {
+/// Is the switch that serves `spec` on? The dispatch asks this of every row
+/// before its handler runs, so a row behind a closed switch is refused in one
+/// place rather than by each handler remembering to check.
+pub fn gate_open(spec: &OpSpec, s: &Settings) -> bool {
     match spec.gate {
         Gate::Always => true,
         Gate::Introspection => s.a2a.introspection.enabled,
         Gate::DeviceGrant => s.a2a.device_grant.enabled,
         Gate::Listener => s.a2a.listen.is_some(),
     }
-}
-
-/// Does this instance answer `op` right now?
-pub fn served(op: &str, s: &Settings) -> bool {
-    op_spec(op).is_some_and(|spec| spec.handler != Handler::Reserved && gate_open(spec, s))
 }
 
 /// The rows that name an op a caller can ask for: not a prefix family, and

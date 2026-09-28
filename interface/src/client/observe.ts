@@ -120,10 +120,18 @@ export class Observation {
   private ended = false;
   /** Aborted to end the current session: stop, a terminal failure, or refresh. */
   private session?: AbortController;
-  private refreshWanted = false;
   private backoff = MIN_BACKOFF;
   /** SubscribeToTask streams, by task id. */
   private followers = new Map<string, AbortController>();
+  /**
+   * Tasks a follower gave up on, and until when: the poll has them now. The
+   * next poll would otherwise start a fresh follower on the same still-moving
+   * task at once, undoing the give-up and replaying its stream from the start.
+   * An entry lapses at its time, or when the task's state moves on.
+   */
+  private cooldown = new Map<string, { until: number; state: TaskState }>();
+  /** The last SSE id each task's stream carried, so a new follower resumes after it. */
+  private lastEventIds = new Map<string, string>();
   /** Tasks this client started: followed first, and polled when the agent cannot stream. */
   private own = new Set<string>();
   /** Tasks already asked for their history once. */
@@ -172,7 +180,6 @@ export class Observation {
    */
   refresh(): void {
     if (this.stopped) return;
-    this.refreshWanted = true;
     cardCache.delete(cardUrlOf(this.opts.configured));
     this.session?.abort();
   }
@@ -239,7 +246,6 @@ export class Observation {
     while (!this.stopped) {
       const session = new AbortController();
       this.session = session;
-      this.refreshWanted = false;
       try {
         this.mirror.setConn('connecting');
         const s = await openSession(this.opts.configured, {
@@ -317,6 +323,11 @@ export class Observation {
    */
   private async eventsLoop(client: AgentdClient, signal: AbortSignal): Promise<'core' | 'done'> {
     let bootstrapped = false;
+    // A resync re-bootstrap in flight, and the events that arrived meanwhile.
+    // The snapshot replaces whole sections, so an event applied before it
+    // lands would be rolled back by it; they are applied after it instead.
+    let resyncing = false;
+    let held: FeedEvent[] = [];
     // Where to resume: the last goodbye's cursor. Without one (a first
     // connect, a drop) the highest seq applied — the goodbye is the better
     // answer, because a caller who may see only some events has a cursor
@@ -339,12 +350,27 @@ export class Observation {
             if (hello.resync) {
               // The mirror reset its cursor already; the sections and tasks
               // need the same, now rather than at the next reconnect.
-              this.bootstrap(client).catch(() => {
-                bootstrapped = false;
-              });
+              resyncing = true;
+              this.bootstrap(client)
+                .catch((e: unknown) => {
+                  // A refusal is as terminal here as anywhere; anything else
+                  // leaves the sections to the next bootstrap.
+                  const f = classify(e);
+                  if (isTerminal(f)) this.terminate(f);
+                  bootstrapped = false;
+                })
+                .finally(() => {
+                  resyncing = false;
+                  const later = held;
+                  held = [];
+                  if (!signal.aborted) for (const ev of later) this.onEvent(client, ev, signal);
+                });
             }
           },
-          (ev) => this.onEvent(client, ev, signal),
+          (ev) => {
+            if (resyncing) held.push(ev);
+            else this.onEvent(client, ev, signal);
+          },
           signal,
         );
       } catch (e) {
@@ -443,8 +469,18 @@ export class Observation {
   /** Start SubscribeToTask streams on moving tasks, this client's own first, up to the cap. */
   private follow(client: AgentdClient, signal: AbortSignal): void {
     if (!client.caps.streaming) return;
-    const live = [...this.mirror.getState().tasks.values()]
-      .filter((t) => followable(t) && !this.followers.has(t.id))
+    const now = Date.now();
+    const tasks = this.mirror.getState().tasks;
+    for (const [id, c] of this.cooldown) {
+      const t = tasks.get(id);
+      if (!t || t.state !== c.state || now >= c.until) this.cooldown.delete(id);
+    }
+    for (const id of this.lastEventIds.keys()) {
+      const t = tasks.get(id);
+      if (!t || TERMINAL_STATES.has(t.state)) this.lastEventIds.delete(id);
+    }
+    const live = [...tasks.values()]
+      .filter((t) => followable(t) && !this.followers.has(t.id) && !this.cooldown.has(t.id))
       .sort((a, b) => Number(this.own.has(b.id)) - Number(this.own.has(a.id)) || b.updated - a.updated);
     for (const t of live) {
       if (this.followers.size >= this.opts.maxTaskStreams) return;
@@ -455,15 +491,21 @@ export class Observation {
   /**
    * Follow one task. The stream closes when the task ends or stops at a gate;
    * one that ends while the task is still moving is resumed after its last
-   * SSE id, a few times, before the poll takes over again.
+   * SSE id, a few times, before the poll takes over again — and keeps it:
+   * the task is not followed again until its state moves on, or a failure's
+   * wait (Retry-After, the backoff) has passed.
    */
   private startFollower(client: AgentdClient, id: string, parent: AbortSignal): void {
     const ac = new AbortController();
     const onAbort = (): void => ac.abort();
     parent.addEventListener('abort', onAbort, { once: true });
     this.followers.set(id, ac);
+    /** Hand the task to the poll until `until` (or its state changes). */
+    const giveUp = (until: number): void => {
+      const t = this.mirror.getState().tasks.get(id);
+      if (t) this.cooldown.set(id, { until, state: t.state });
+    };
     void (async () => {
-      let last: string | undefined;
       let ends = 0;
       try {
         while (!ac.signal.aborted) {
@@ -471,11 +513,11 @@ export class Observation {
             await client.subscribeTask(
               id,
               (frame, sseId) => {
-                if (sseId !== undefined) last = sseId;
+                if (sseId !== undefined) this.lastEventIds.set(id, sseId);
                 this.mirror.applyStream(frame);
               },
               ac.signal,
-              last,
+              this.lastEventIds.get(id),
             );
           } catch (e) {
             if (ac.signal.aborted) return;
@@ -490,11 +532,13 @@ export class Observation {
               return;
             }
             const f = classify(e);
-            if (isTerminal(f)) this.terminate(f);
-            if (f.kind !== 'transient') return;
+            if (isTerminal(f)) return this.terminate(f);
+            if (f.kind === 'rate-limited') return giveUp(Date.now() + (f.retryAfterMs ?? this.opts.backoffCapMs));
+            if (f.kind !== 'transient') return giveUp(Date.now() + this.opts.backoffCapMs);
           }
           const t = this.mirror.getState().tasks.get(id);
-          if (!t || !followable(t) || ++ends > STREAM_RESUMES) return;
+          if (!t || !followable(t)) return;
+          if (++ends > STREAM_RESUMES) return giveUp(Infinity);
           await sleep(MIN_BACKOFF * ends, ac.signal);
         }
       } finally {

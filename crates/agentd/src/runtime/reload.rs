@@ -198,6 +198,13 @@ impl Runtime {
         {
             changed.push("agent");
         }
+        // Runtime-settable: an `admin.set` changed it in memory, and the
+        // reload puts the file's value back. That is a change, and it is
+        // announced as one — otherwise the feed that said `admin.set` moved
+        // the path would never hear that a reload moved it back.
+        if old.agent.approval != new.agent.approval {
+            changed.push("agent.approval");
+        }
         // MCP servers: connect added, drop removed (re-handshake).
         if old.mcp != new.mcp {
             let keep: Vec<String> = new.mcp.servers.iter().map(|s| s.name.clone()).collect();

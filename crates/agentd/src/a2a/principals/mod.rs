@@ -349,4 +349,36 @@ mod tests {
         );
         assert_eq!(workflow_name_of(&serde_json::json!({"name": "b"})), None);
     }
+
+    /// `may_run` is both halves: the grants allow the workflow, AND its
+    /// default start's `roles:` admit the caller. A user holding every grant
+    /// still may not run a workflow whose only start is an operator's.
+    #[cfg(feature = "a2a")]
+    #[test]
+    fn may_run_asks_the_grants_and_the_default_starts_roles() {
+        use crate::runtime::reactor::Runtime;
+        let wf = |start: Value| {
+            crate::engine::model::parse_workflow(&serde_json::json!({
+                "name": "deploy-web", "steps": {
+                    "s": start,
+                    "f": {"kind": "finish", "depends_on": ["s"], "status": "completed"}}}))
+            .unwrap()
+        };
+        let gated = wf(serde_json::json!({"kind": "a2a", "command": "x", "roles": ["operator"]}));
+        let open = wf(serde_json::json!({"kind": "a2a", "command": "x"}));
+        assert!(!Runtime::may_run(&with(Role::User, &["*"]), &gated));
+        assert!(!Runtime::may_run(&with(Role::Agent, &["*"]), &gated));
+        assert!(Runtime::may_run(&with(Role::Operator, &[]), &gated));
+        assert!(Runtime::may_run(&with(Role::User, &[]), &open));
+        // …and the grants half: a scope that excludes the name refuses it
+        // whatever the start admits.
+        assert!(!Runtime::may_run(
+            &with(Role::User, &["workflow.run:wipe"]),
+            &open
+        ));
+        assert!(Runtime::may_run(
+            &with(Role::User, &["workflow.run:deploy-*"]),
+            &open
+        ));
+    }
 }

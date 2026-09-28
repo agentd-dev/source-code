@@ -229,8 +229,10 @@ pub fn install_event_ring(cap: usize) {
 
 /// The families a runtime event can belong to — the segment before the first
 /// dot in an event name. A closed vocabulary so `include: [pressur]` is a
-/// startup error rather than a filter that silently matches nothing.
-/// `families_cover_the_emitted_vocabulary` keeps this honest against the tree.
+/// startup error rather than a filter that silently matches nothing — which
+/// is also why a family nothing emits any more is removed rather than kept.
+/// `families_cover_the_emitted_vocabulary` keeps this honest against the tree
+/// in both directions.
 pub const EVENT_FAMILIES: &[&str] = &[
     "a2a",
     "admin",
@@ -242,21 +244,25 @@ pub const EVENT_FAMILIES: &[&str] = &[
     "child",
     "config",
     "context",
+    "correlate",
     "drain",
+    "exec",
     "freshness",
     "goal",
+    "http",
     "human",
     "inbox",
     "instance",
     "instruction",
     "intel",
-    "interface",
     "knowledge",
     "lifecycle",
     "limit",
     "loop",
     "mcp",
     "message",
+    "metrics",
+    "nested",
     "otel",
     "plan",
     "preflight",
@@ -265,7 +271,9 @@ pub const EVENT_FAMILIES: &[&str] = &[
     "prompt",
     "registry",
     "restore",
+    "root",
     "run",
+    "signal",
     "skill",
     "skills",
     "start",
@@ -279,6 +287,7 @@ pub const EVENT_FAMILIES: &[&str] = &[
     "turn",
     "wait",
     "webhook",
+    "webhooks",
     "workflow",
 ];
 
@@ -748,10 +757,11 @@ mod tests {
 
     /// The family list is a CLOSED vocabulary an operator's config is
     /// validated against, so a family the tree emits but the list omits would
-    /// make `include: [that]` a startup error for an event that really exists.
-    /// Scanning the source keeps the list honest without anyone remembering
-    /// to: log an event under a family nobody has listed yet and this fails
-    /// until the family is added.
+    /// make `include: [that]` a startup error for an event that really exists
+    /// — and a family the list keeps after its last emitter is gone would
+    /// validate `include: [that]` and match nothing, the very failure the
+    /// closed list exists to prevent. Scanning the source keeps the list
+    /// honest without anyone remembering to, in both directions.
     #[test]
     fn families_cover_the_emitted_vocabulary() {
         fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
@@ -770,13 +780,19 @@ mod tests {
             &mut files,
         );
         let mut missing: Vec<String> = Vec::new();
+        let mut emitted: Vec<String> = Vec::new();
         for f in files {
             let src = std::fs::read_to_string(&f).unwrap_or_default();
-            for m in ["\n.info(\"", ".warn(\"", ".error(\"", ".debug(\""] {
-                let needle = m.trim_start_matches('\n');
+            for needle in [".info(", ".warn(", ".error(", ".debug("] {
                 let mut rest = src.as_str();
                 while let Some(i) = rest.find(needle) {
                     rest = &rest[i + needle.len()..];
+                    // The name may sit on the next line, where rustfmt puts a
+                    // long call's arguments.
+                    let Some(after) = rest.trim_start().strip_prefix('"') else {
+                        continue;
+                    };
+                    rest = after;
                     let Some(end) = rest.find('"') else { break };
                     let name = &rest[..end];
                     // Event names are dotted lowercase identifiers; anything
@@ -792,12 +808,23 @@ mod tests {
                     if !EVENT_FAMILIES.contains(&family) && !missing.contains(&family.to_string()) {
                         missing.push(family.to_string());
                     }
+                    if !emitted.contains(&family.to_string()) {
+                        emitted.push(family.to_string());
+                    }
                 }
             }
         }
         assert!(
             missing.is_empty(),
             "these event families are emitted but missing from EVENT_FAMILIES: {missing:?}"
+        );
+        let silent: Vec<&&str> = EVENT_FAMILIES
+            .iter()
+            .filter(|f| !emitted.iter().any(|e| e == *f))
+            .collect();
+        assert!(
+            silent.is_empty(),
+            "these event families are listed but nothing emits them: {silent:?}"
         );
     }
 

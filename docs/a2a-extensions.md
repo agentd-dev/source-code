@@ -171,7 +171,10 @@ through from somewhere else.
 `admin.*` is operator-only, and an explicit `grants:` entry does **not** reach
 it — not even `grants: ["*"]`. A peer that could drain the instance it is
 delegating to would be an operator, and a peer is not one. This is checked
-before grants are consulted, and a test pins it.
+before grants are consulted, and a test pins it. The same floor holds `config`,
+`debug.events` and the `_instance.*` reports, and a rule whose role is not
+`operator` may not name any of them exactly in `grants:` — a grant that can
+never apply is a load error, not a control that silently grants nothing.
 
 ---
 

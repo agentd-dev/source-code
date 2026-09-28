@@ -776,32 +776,27 @@ impl Runtime {
     /// or a start node.
     #[cfg(feature = "a2a")]
     pub(crate) fn handle_instance_op(&mut self, ev: &crate::state::InboxEvent) -> bool {
-        let message = json!({"parts": ev.payload.get("parts").cloned().unwrap_or(Value::Null)});
-        let Some(op) = super::a2a_server::command_op(&message) else {
-            return false;
-        };
-        if !op.starts_with("_instance.") {
-            return false;
+        match inbox_report(ev) {
+            None => false,
+            Some(Ok((kind, args))) => {
+                if let Err(e) = self.consume_instance_op(kind, &args) {
+                    self.log
+                        .warn("instance.op.fail", json!({"op": kind.name(), "err": e}));
+                }
+                true
+            }
+            Some(Err(InboxRefusal::NotOperator(op))) => {
+                self.log.warn(
+                    "instance.op.refused",
+                    json!({"op": op, "role": ev.payload["role"], "note": "only the operator speaks for a child"}),
+                );
+                true
+            }
+            Some(Err(InboxRefusal::Unknown(op))) => {
+                self.log.warn("instance.op.unknown", json!({"op": op}));
+                true
+            }
         }
-        let role: Option<crate::config::v2::Role> =
-            serde_json::from_value(ev.payload["role"].clone()).ok();
-        if !role.is_some_and(speaks_for_child) {
-            self.log.warn(
-                "instance.op.refused",
-                json!({"op": op, "role": ev.payload["role"], "note": "only the operator speaks for a child"}),
-            );
-            return true;
-        }
-        let Some(kind) = InstanceOp::of(&op) else {
-            self.log.warn("instance.op.unknown", json!({"op": op}));
-            return true;
-        };
-        let args = super::a2a_server::command_data(&message).unwrap_or_else(|| json!({}));
-        if let Err(e) = self.consume_instance_op(kind, &args) {
-            self.log
-                .warn("instance.op.fail", json!({"op": op, "err": e}));
-        }
-        true
     }
 
     #[cfg(feature = "a2a")]
@@ -1086,11 +1081,50 @@ impl InstanceOp {
     }
 }
 
-/// Only the operator speaks for a child. A child dials home with the parent's
-/// own operator credential (its unix socket, or the `a2a.bearer` reference it
-/// was composed with), so nothing legitimate arrives as anything else — and an
-/// `agent` that could write a child's result could decide what the parent
-/// believes its own subagent answered.
+/// Why an `_instance.*` report in the inbox is consumed without effect.
+#[cfg(feature = "a2a")]
+#[derive(Debug, PartialEq)]
+enum InboxRefusal {
+    /// The caller it arrived from was not the operator.
+    NotOperator(String),
+    /// No such report.
+    Unknown(String),
+}
+
+/// Read an inbox event as a child's report: `None` when it is not one (it is
+/// ordinary traffic for the readers after this), else the report — or why it
+/// is refused. Separate from the consuming so the refusal is testable without
+/// a runtime.
+#[cfg(feature = "a2a")]
+fn inbox_report(
+    ev: &crate::state::InboxEvent,
+) -> Option<Result<(InstanceOp, Value), InboxRefusal>> {
+    let message = json!({"parts": ev.payload.get("parts").cloned().unwrap_or(Value::Null)});
+    let op = super::a2a_server::command_op(&message)?;
+    if !op.starts_with("_instance.") {
+        return None;
+    }
+    let role: Option<crate::config::v2::Role> =
+        serde_json::from_value(ev.payload["role"].clone()).ok();
+    if !role.is_some_and(speaks_for_child) {
+        return Some(Err(InboxRefusal::NotOperator(op)));
+    }
+    let Some(kind) = InstanceOp::of(&op) else {
+        return Some(Err(InboxRefusal::Unknown(op)));
+    };
+    let args = super::a2a_server::command_data(&message).unwrap_or_else(|| json!({}));
+    Some(Ok((kind, args)))
+}
+
+/// Only the operator speaks for a child: an `agent` that could write a
+/// child's result could decide what the parent believes its own subagent
+/// answered. A child dials home with the parent's own operator credential
+/// (its unix socket, or the `a2a.bearer` reference it was composed with) —
+/// but the resolver tries the configured principal rules first, so on a
+/// parent with a catch-all `any` rule that credential resolves to the rule's
+/// role, and the child's reports are refused here with `instance.op.refused`.
+/// Refusing such a spawn up front, by name, is the spawn's job, not this
+/// check's.
 #[cfg(feature = "a2a")]
 fn speaks_for_child(role: crate::config::v2::Role) -> bool {
     role == crate::config::v2::Role::Operator
@@ -1111,6 +1145,39 @@ mod tests {
                 "{role:?} must not speak for a child"
             );
         }
+        // …and the inbox path asks it: a report that reached the inbox from
+        // anyone but the operator is consumed as a refusal, never as the
+        // child's result.
+        let report = |role: &str, op: &str| {
+            crate::state::InboxEvent::new(
+                "message",
+                None,
+                json!({
+                    "role": role,
+                    "parts": [{"data": {"agentd": {"op": op, "handle": "c1", "status": "completed"}}}],
+                }),
+            )
+        };
+        for role in ["agent", "user", "anonymous", "nonsense"] {
+            assert_eq!(
+                inbox_report(&report(role, "_instance.result")).map(|r| r.map(|_| ())),
+                Some(Err(InboxRefusal::NotOperator("_instance.result".into()))),
+                "{role}"
+            );
+        }
+        let Some(Ok((op, args))) = inbox_report(&report("operator", "_instance.result")) else {
+            panic!("the operator's report is read");
+        };
+        assert_eq!(
+            (op, args["handle"].as_str()),
+            (InstanceOp::Result, Some("c1"))
+        );
+        assert_eq!(
+            inbox_report(&report("operator", "_instance.nope")).map(|r| r.map(|_| ())),
+            Some(Err(InboxRefusal::Unknown("_instance.nope".into())))
+        );
+        // Ordinary traffic is not a report at all.
+        assert!(inbox_report(&report("agent", "review.start")).is_none());
     }
 
     #[test]

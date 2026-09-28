@@ -17,7 +17,7 @@ import {
   userMessage,
 } from '../dist/client/index.js';
 import { cardCache } from '../dist/client/discovery.js';
-import { startFakeA2a } from './fake-a2a.mjs';
+import { RpcFailure, startFakeA2a } from './fake-a2a.mjs';
 
 const at = (s) => new Date(Date.UTC(2026, 8, 1, 0, 0, s)).toISOString();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -293,4 +293,133 @@ test('events/v1 when declared, core mode on -32601', async (t) => {
   assert.equal(b.mirror.getState().conn, 'polling');
   assert.equal(liar.rpcCalls(EVENTS_METHOD).length, 1);
   assert.ok(liar.rpcCalls('ListTasks').length > 5, 'polling');
+});
+
+test('a listing never moves a task backwards past what its stream said', async (t) => {
+  const fake = await startFakeA2a();
+  t.after(() => fake.close());
+  const w = fake.putTask({ id: 'w', contextId: 'c', status: { state: 'TASK_STATE_WORKING', timestamp: at(1) } });
+  // The stream says COMPLETED at T2; the store — and so every listing —
+  // still says WORKING at T1, as a listing that lags would. A later stream
+  // says nothing, so only a listing could move the task back.
+  let release;
+  const held = new Promise((r) => (release = r));
+  t.after(() => release());
+  let n = 0;
+  fake.handle('SubscribeToTask', () =>
+    ++n === 1
+      ? { stream: [{ statusUpdate: { taskId: 'w', contextId: 'c', status: { state: 'TASK_STATE_COMPLETED', timestamp: at(2) } } }] }
+      : { stream: [], hold: held },
+  );
+  const got = observe(t, fake);
+  await until(() => got.mirror.getState().tasks.get('w')?.state === 'TASK_STATE_COMPLETED', 3000, 'the stream');
+  const lists = fake.rpcCalls('ListTasks').length;
+  await until(() => fake.rpcCalls('ListTasks').length >= lists + 3, 3000, 'polls');
+  assert.equal(w.status.state, 'TASK_STATE_WORKING', 'the listing still says WORKING');
+  assert.equal(got.mirror.getState().tasks.get('w').state, 'TASK_STATE_COMPLETED');
+});
+
+test('a task stream that answers -32001 forgets the task; -32004 reads it once', async (t) => {
+  const fake = await startFakeA2a();
+  t.after(() => fake.close());
+  fake.putTask({ id: 'gone', contextId: 'c', status: { state: 'TASK_STATE_WORKING', timestamp: at(1) } });
+  fake.putTask({ id: 'done', contextId: 'c', status: { state: 'TASK_STATE_WORKING', timestamp: at(1) } });
+  fake.handle('SubscribeToTask', ({ id }) => {
+    if (id === 'gone') {
+      // The task went away between the listing and the stream.
+      fake.tasks.delete('gone');
+      throw new RpcFailure(-32001, 'task not found');
+    }
+    // Finished already: not streamable. GetTask tells the rest.
+    fake.tasks.get('done').status = { state: 'TASK_STATE_COMPLETED', timestamp: at(2) };
+    throw new RpcFailure(-32004, 'task is terminal');
+  });
+  const got = observe(t, fake);
+  await until(() => !got.mirror.getState().tasks.has('gone'), 3000, 'the vanished task to leave');
+  await until(() => got.mirror.getState().tasks.get('done')?.state === 'TASK_STATE_COMPLETED', 3000, 'the one read');
+  await sleep(200);
+  assert.equal(fake.rpcCalls('GetTask').filter((r) => r.params.id === 'done').length, 1, 'one GetTask');
+  assert.equal(fake.rpcCalls('SubscribeToTask').filter((r) => r.params.id === 'done').length, 1, 'no re-subscribe');
+  assert.equal(fake.rpcCalls('SubscribeToTask').filter((r) => r.params.id === 'gone').length, 1);
+});
+
+test('a refusal on a task stream stops every loop', async (t) => {
+  const fake = await startFakeA2a();
+  t.after(() => fake.close());
+  fake.putTask({ id: 'w', contextId: 'c', status: { state: 'TASK_STATE_WORKING', timestamp: at(1) } });
+  // The listing still answers; the stream is where the agent says no.
+  fake.fail('SubscribeToTask', {
+    code: -31401,
+    message: 'unauthenticated',
+    status: 401,
+    headers: { 'www-authenticate': 'Bearer error="invalid_token"' },
+  });
+  const got = observe(t, fake);
+  await until(() => got.mirror.getState().conn === 'unauthenticated', 3000, 'the refusal');
+  const ended = Date.now();
+  await sleep(300);
+  assert.deepEqual(fake.requests.filter((r) => r.at > ended + 50).map((r) => r.rpc ?? r.path), [], 'nothing after it');
+  assert.equal(got.terminal.length, 1);
+});
+
+test('a feed that drops without a goodbye is retried after a backoff, not at once', async (t) => {
+  const fake = await startFakeA2a();
+  t.after(() => fake.close());
+  fake.card.capabilities.extensions = [{ uri: EVENTS_EXTENSION, params: {} }];
+  fake.handle(EVENTS_METHOD, ({ fromSeq }) => ({
+    stream: [{ hello: { seq: fromSeq, resume: fromSeq, resync: false, introspection: false, version: 'x' } }],
+  }));
+  observe(t, fake, { backoffCapMs: 200 });
+  await sleep(700);
+  const at_ = fake.rpcCalls(EVENTS_METHOD).map((r) => r.at);
+  // 250 ms backoff doubling to the 200 ms cap — never a hot loop.
+  assert.ok(at_.length >= 2 && at_.length <= 6, `${at_.length} reconnects in 700 ms`);
+  for (let i = 1; i < at_.length; i++) assert.ok(at_[i] - at_[i - 1] >= 150, `reconnect ${i} after ${at_[i] - at_[i - 1]} ms`);
+});
+
+test('a gate is seen by the poll, never followed with a stream', async (t) => {
+  const fake = await startFakeA2a();
+  t.after(() => fake.close());
+  fake.putTask({ id: 'g', contextId: 'c', status: { state: 'TASK_STATE_INPUT_REQUIRED', timestamp: at(1) } });
+  fake.putTask({ id: 'a', contextId: 'c', status: { state: 'TASK_STATE_AUTH_REQUIRED', timestamp: at(1) } });
+  const got = observe(t, fake);
+  await until(() => got.mirror.getState().tasks.has('g') && got.mirror.getState().tasks.has('a'), 3000, 'the gates');
+  await sleep(200);
+  assert.equal(fake.rpcCalls('SubscribeToTask').length, 0);
+});
+
+test('a follower that gave up hands the task to the poll until it moves', async (t) => {
+  const fake = await startFakeA2a();
+  t.after(() => fake.close());
+  const w = fake.putTask({ id: 'w', contextId: 'c', status: { state: 'TASK_STATE_WORKING', timestamp: at(1) } });
+  // Every stream ends at once with the task still working.
+  fake.handle('SubscribeToTask', () => ({ stream: [{ task: fake.tasks.get('w') }] }));
+  const got = observe(t, fake, { pollMs: 20 });
+  // One follower: the first stream plus its resumes (after 250, 500 and
+  // 750 ms), then the poll — which polls every 20 ms and starts nothing.
+  await until(() => fake.rpcCalls('SubscribeToTask').length >= 4, 4000, 'the resumes');
+  await sleep(400);
+  const subs = fake.rpcCalls('SubscribeToTask');
+  assert.equal(subs.length, 4, 'the first stream and three resumes, then no fresh follower');
+  assert.deepEqual(subs.slice(1).map((r) => r.headers['last-event-id']), ['1', '1', '1'], 'each resume after the last SSE id');
+  // The task moves on: it is followed again, from where it was.
+  w.status = { state: 'TASK_STATE_SUBMITTED', timestamp: at(5) };
+  await until(() => fake.rpcCalls('SubscribeToTask').length > 4, 3000, 'a new follower');
+  assert.equal(fake.rpcCalls('SubscribeToTask')[4].headers['last-event-id'], '1');
+  assert.equal(got.terminal.length, 0);
+});
+
+test('a rate-limited task stream waits out Retry-After before it is followed again', async (t) => {
+  const fake = await startFakeA2a();
+  t.after(() => fake.close());
+  fake.putTask({ id: 'w', contextId: 'c', status: { state: 'TASK_STATE_WORKING', timestamp: at(1) } });
+  let release;
+  const held = new Promise((r) => (release = r));
+  t.after(() => release());
+  fake.fail('SubscribeToTask', { code: -32603, message: 'slow down', status: 429, headers: { 'retry-after': '1' }, times: 1 });
+  fake.handle('SubscribeToTask', () => ({ stream: [{ task: fake.tasks.get('w') }], hold: held }));
+  observe(t, fake, { pollMs: 20 });
+  await until(() => fake.rpcCalls('SubscribeToTask').length >= 2, 3000, 'the second stream');
+  const [a, b] = fake.rpcCalls('SubscribeToTask').map((r) => r.at);
+  assert.ok(b - a >= 950, `re-followed after ${b - a} ms`);
 });

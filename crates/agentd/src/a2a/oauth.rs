@@ -25,9 +25,19 @@
 //!   decided on, several sessions of one name share what that name owns, and
 //!   each session still has its own id to be revoked by.
 //!
-//! Only hashes are kept: the store holds the SHA-256 of every device code and
-//! token, never the value, and neither is ever logged. Everything is held in
-//! memory, so a restart revokes every session.
+//! The same origin also redeems the **launch grant** while `agentd tui` or
+//! `agentd ui` has installed a [`LaunchSlot`] in this process: a single-use
+//! code the launcher minted and handed its own client, or a request a browser
+//! tab makes that the person at the launcher's terminal approves by typing
+//! the code the tab shows. Nothing outside the launcher's process can mint a
+//! code or approve a request — there is no op, route or key that does — and
+//! both are redeemed only from a loopback peer. Either buys an operator
+//! session: it acts for the person who started this daemon, from their own
+//! configuration, on this host.
+//!
+//! Only hashes are kept: the store holds the SHA-256 of every device code,
+//! launch code, request code and token, never the value, and none is ever
+//! logged. Everything is held in memory, so a restart revokes every session.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::IpAddr;
@@ -137,12 +147,16 @@ fn ms(d: Duration) -> u64 {
 pub enum SessionKind {
     /// Through the device grant, approved by an operator.
     Device,
+    /// Through the launch grant: a code the launcher minted in this process,
+    /// or a request the person at the launcher's terminal approved.
+    Launch,
 }
 
 impl SessionKind {
     pub fn as_str(self) -> &'static str {
         match self {
             SessionKind::Device => "device",
+            SessionKind::Launch => "launch",
         }
     }
 }
@@ -150,10 +164,12 @@ impl SessionKind {
 /// One signed-in session.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Session {
-    /// The handle it is listed, audited and revoked by (`ds_<16 hex>`).
+    /// The handle it is listed, audited and revoked by (`ds_<16 hex>`, or
+    /// `ls_<16 hex>` for a launch session).
     pub sid: String,
     pub kind: SessionKind,
-    /// The name it was approved as.
+    /// The name it was approved as. A launch session has none: it is the
+    /// person who started the daemon, not somebody an operator named.
     pub name: Option<String>,
     pub role: Role,
     /// Who it acts as: `user:<name>`, or `operator`.
@@ -162,7 +178,8 @@ pub struct Session {
     pub created_ms: u64,
     /// `None`: it ends only when revoked.
     pub expires_ms: Option<u64>,
-    /// The principal id that approved it.
+    /// The principal id that approved it — for a launch session,
+    /// `launcher` (the code) or `launcher-terminal` (a typed request).
     pub approved_by: String,
     /// The rule that named the approver, when one with an id did.
     pub approved_rule: Option<String>,
@@ -913,6 +930,314 @@ impl DeviceGrant {
     }
 }
 
+// ---- the launch grant -------------------------------------------------------
+
+/// Where a browser tab the launcher opened asks the person at the launcher's
+/// terminal to sign it in. Served only while the slot carries a UI origin.
+pub const LAUNCH_AUTHORIZATION_PATH: &str = "/oauth2/launch_authorization";
+/// The prefix of a launch code.
+pub const LAUNCH_CODE_PREFIX: &str = "agentd_lc_";
+/// The prefix of a terminal-approved request's code.
+pub const LAUNCH_REQUEST_PREFIX: &str = "agentd_lr_";
+/// The prefix of a launch session's id.
+pub const LAUNCH_SID_PREFIX: &str = "ls_";
+/// How long a request waits for its code to be typed at the terminal.
+pub const LAUNCH_REQUEST_TTL: Duration = Duration::from_secs(120);
+/// How often a tab may poll its request…
+pub const LAUNCH_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// …and what `slow_down` adds to that.
+pub const LAUNCH_SLOW_DOWN_STEP: Duration = Duration::from_secs(2);
+/// Requests waiting on the terminal at once. A newer one displaces the
+/// oldest, whose tab is told `expired_token` and asks again: the terminal is
+/// the gate, so a flood can cost a tab a retry, never a sign-in.
+pub const LAUNCH_PENDING_MAX: usize = 16;
+/// Requests remembered at all, displaced and expired ones included, so a late
+/// poll is told `expired_token` rather than that it never existed.
+const LAUNCH_REQUESTS_KEPT: usize = 4 * LAUNCH_PENDING_MAX;
+/// Refused launch presentations a source is answered before it gets 429…
+pub const LAUNCH_FAILURE_BURST: u32 = 20;
+/// …forgiven one every this long.
+pub const LAUNCH_FAILURE_REFILL: Duration = Duration::from_secs(3);
+/// `approved_by` of a session a launch code bought.
+pub const LAUNCHER: &str = "launcher";
+/// `approved_by` of a session the person at the launcher's terminal approved.
+pub const LAUNCHER_TERMINAL: &str = "launcher-terminal";
+
+/// What a launch code is bound to: the web origin of the UI the launcher
+/// started, or no origin — a terminal client, which is no browser, so a
+/// request that carries any `Origin` (`null` included) is not its.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LaunchBind {
+    Origin(String),
+    NoOrigin,
+}
+
+impl LaunchBind {
+    /// Whether a presentation carrying `origin` — the `Origin` header, when
+    /// the request had one — is this bind's.
+    fn admits(&self, origin: Option<&str>) -> bool {
+        match (self, origin) {
+            (LaunchBind::NoOrigin, None) => true,
+            (LaunchBind::Origin(want), Some(got)) => same_origin(want, got),
+            _ => false,
+        }
+    }
+
+    /// How the exchange log names it: the origin, or `none`.
+    fn label(&self) -> &str {
+        match self {
+            LaunchBind::Origin(o) => o,
+            LaunchBind::NoOrigin => "none",
+        }
+    }
+}
+
+/// Two origins compared as origins (scheme, host, port with its default), so
+/// `http://127.0.0.1:4555` is `HTTP://127.0.0.1:4555`, and `null` or anything
+/// unparsable is nobody's.
+fn same_origin(a: &str, b: &str) -> bool {
+    matches!((v2::parse_origin(a), v2::parse_origin(b)), (Ok(a), Ok(b)) if a == b)
+}
+
+/// Whether a peer is on this host. The launch grant is redeemed only from
+/// one: a code or request that leaked off the host is useless even on a
+/// wildcard bind, while an SSH `-L` forward arrives from the remote end's own
+/// loopback and works.
+fn loopback(peer: Option<IpAddr>) -> bool {
+    peer.is_some_and(|ip| ip.to_canonical().is_loopback())
+}
+
+/// A code waiting to be redeemed.
+#[derive(Debug)]
+struct LaunchCode {
+    bind: LaunchBind,
+    client_id: String,
+    expires_ms: u64,
+}
+
+/// A browser tab's request, waiting for the terminal.
+#[derive(Debug)]
+struct LaunchRequest {
+    user_code: String,
+    client_id: String,
+    /// The origin that asked, and the only one that may poll.
+    origin: String,
+    requested_ms: u64,
+    expires_ms: u64,
+    interval_ms: u64,
+    last_poll_ms: Option<u64>,
+    approved: bool,
+}
+
+impl LaunchRequest {
+    fn expired(&self, now: u64) -> bool {
+        now >= self.expires_ms
+    }
+}
+
+/// The codes and requests in flight, keyed by the SHA-256 of their secrets.
+#[derive(Debug, Default)]
+struct LaunchTable {
+    codes: HashMap<String, LaunchCode>,
+    requests: HashMap<String, LaunchRequest>,
+}
+
+impl LaunchTable {
+    /// Forget expired codes, and requests expired a lifetime ago; then, past
+    /// what is kept at all, the oldest requests no tab can still redeem.
+    fn prune(&mut self, now: u64) {
+        self.codes.retain(|_, c| now < c.expires_ms);
+        let grace = ms(LAUNCH_REQUEST_TTL);
+        self.requests
+            .retain(|_, r| now < r.expires_ms.saturating_add(grace));
+        while self.requests.len() > LAUNCH_REQUESTS_KEPT {
+            let Some(oldest) = self
+                .requests
+                .iter()
+                .filter(|(_, r)| r.expired(now))
+                .min_by_key(|(_, r)| (r.requested_ms, r.user_code.clone()))
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            self.requests.remove(&oldest);
+        }
+    }
+}
+
+/// Something the launcher asked to hear about.
+pub type LaunchHook = Arc<dyn Fn() + Send + Sync>;
+
+/// **The launch slot**: what `agentd tui` / `agentd ui` install in the
+/// daemon's own process ([`crate::runtime::RunOpts`]) so the client they
+/// start can sign in without being handed a credential.
+///
+/// The launcher mints a code with [`LaunchSlot::issue`] and gives it to its
+/// client — over an inherited pipe, or in a URL fragment — and the client
+/// redeems it once at `/oauth2/token`. A browser that could not be given the
+/// code (a sandboxed one, an SSH forward, a second tab) asks at
+/// [`LAUNCH_AUTHORIZATION_PATH`] instead, shows a user code, and the person at
+/// the launcher's terminal types it: [`LaunchSlot::approve_user_code`]. Only
+/// the launcher holds the slot, so only it can do either.
+pub struct LaunchSlot {
+    /// The UI origin, for `agentd ui`: the one origin a code or request may
+    /// be bound to, and the one the listener's CORS list gains.
+    origin: Option<String>,
+    clock: Clock,
+    mint: Mint,
+    table: Mutex<LaunchTable>,
+    on_consume: Mutex<Option<LaunchHook>>,
+    on_request: Mutex<Option<LaunchHook>>,
+    /// The daemon's logger, attached when the listener starts.
+    log: OnceLock<crate::obs::log::Logger>,
+}
+
+impl std::fmt::Debug for LaunchSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LaunchSlot")
+            .field("origin", &self.origin)
+            .field("table", &*self.table())
+            .finish_non_exhaustive()
+    }
+}
+
+impl LaunchSlot {
+    /// A slot for a UI served at `origin` (`agentd ui`), or for a terminal
+    /// client (`None`, `agentd tui`).
+    pub fn new(origin: Option<&str>) -> Result<LaunchSlot, String> {
+        LaunchSlot::with(origin, system_clock(), os_mint())
+    }
+
+    /// [`LaunchSlot::new`] on an injected clock and entropy source.
+    pub fn with(origin: Option<&str>, clock: Clock, mint: Mint) -> Result<LaunchSlot, String> {
+        if let Some(o) = origin {
+            v2::parse_origin(o).map_err(|e| format!("the launched UI origin {o:?}: {e}"))?;
+        }
+        Ok(LaunchSlot {
+            origin: origin.map(str::to_string),
+            clock,
+            mint,
+            table: Mutex::new(LaunchTable::default()),
+            on_consume: Mutex::new(None),
+            on_request: Mutex::new(None),
+            log: OnceLock::new(),
+        })
+    }
+
+    fn table(&self) -> std::sync::MutexGuard<'_, LaunchTable> {
+        self.table.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The UI origin this slot was made for, if any.
+    pub fn origin(&self) -> Option<&str> {
+        self.origin.as_deref()
+    }
+
+    /// Mint a code for `bind` and `client_id`, redeemable once within
+    /// [`crate::runtime::surface::launch::LAUNCH_CODE_TTL`]. A bind has one
+    /// code at a time: issuing again makes the earlier one worthless, so a
+    /// copy of a code the launcher replaced cannot be redeemed later.
+    ///
+    /// Only the code's hash is kept. `Err` when OS randomness failed: nothing
+    /// was issued, and the earlier code, if any, still stands.
+    pub fn issue(&self, bind: LaunchBind, client_id: &str) -> std::io::Result<String> {
+        let code = format!("{LAUNCH_CODE_PREFIX}{}", (self.mint)(SECRET_BYTES)?);
+        let now = (self.clock)();
+        let ttl = ms(crate::runtime::surface::launch::LAUNCH_CODE_TTL);
+        let mut t = self.table();
+        t.prune(now);
+        t.codes.retain(|_, c| c.bind != bind);
+        t.codes.insert(
+            hash(&code),
+            LaunchCode {
+                bind,
+                client_id: client_id.to_string(),
+                expires_ms: now.saturating_add(ttl),
+            },
+        );
+        Ok(code)
+    }
+
+    /// Call `hook` whenever a code is consumed — by its redemption or by any
+    /// presentation that burned it — so the launcher removes the file that
+    /// carried it at once.
+    pub fn on_consume(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *self.on_consume.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(hook));
+    }
+
+    /// Call `hook` whenever a browser tab asks to be signed in, so the
+    /// launcher asks its terminal for the code the tab shows.
+    pub fn on_request(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *self.on_request.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(hook));
+    }
+
+    /// Run a hook with no lock held: it may take its time, or call back in.
+    fn fire(hook: &Mutex<Option<LaunchHook>>) {
+        let hook = hook.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(h) = hook {
+            h();
+        }
+    }
+
+    /// Approve the one waiting request whose user code `typed` is — as a
+    /// person types it: any case, dash optional. `false`, approving nothing,
+    /// when no request is waiting on it.
+    pub fn approve_user_code(&self, typed: &str) -> bool {
+        let Some(code) = normalize_user_code(typed) else {
+            return false;
+        };
+        let now = (self.clock)();
+        let mut t = self.table();
+        let Some(r) = t
+            .requests
+            .values_mut()
+            .find(|r| r.user_code == code && !r.expired(now) && !r.approved)
+        else {
+            return false;
+        };
+        r.approved = true;
+        let client_id = r.client_id.clone();
+        drop(t);
+        if let Some(log) = self.log.get() {
+            log.info(
+                "auth.launch.approved",
+                serde_json::json!({"client_id": client_id}),
+            );
+        }
+        true
+    }
+
+    /// Hand the slot the daemon's logger, once the listener is up.
+    pub(crate) fn attach_log(&self, log: crate::obs::log::Logger) {
+        let _ = self.log.set(log);
+    }
+}
+
+/// The browser origins a listener admits: `a2a.cors.origins`, and the UI a
+/// launcher started in this process. Every build of the live list goes
+/// through here — at spawn and on every reload — so a reload that edits the
+/// configured origins can never silently drop the launched UI. The launched
+/// origin is not configuration: no settings dump or manifest count sees it.
+pub fn admitted_origins(configured: &[String], launch: Option<&LaunchSlot>) -> Vec<String> {
+    let mut out = configured.to_vec();
+    if let Some(o) = launch.and_then(LaunchSlot::origin)
+        && !out.iter().any(|c| same_origin(c, o))
+    {
+        out.push(o.to_string());
+    }
+    out
+}
+
+impl Session {
+    /// The feed's `auth` event for a launch session: it acts as the
+    /// operator, and it is named by its sid (it has no name).
+    pub fn launched_event(&self) -> Value {
+        let mut v = auth_event("launch", &self.client_id, role_name(self.role));
+        v["sid"] = json!(self.sid);
+        v
+    }
+}
+
 // ---- the authority ----------------------------------------------------------
 
 /// What an endpoint answered, before it is HTTP: the listener adds the CORS
@@ -943,6 +1268,18 @@ pub enum Notice {
     Pending(Value),
     /// A session ended at `/oauth2/revoke`.
     Revoked(Session),
+    /// A launch session was issued: logged as `auth.launch.exchanged`, and
+    /// the feed's `auth` `launch` event.
+    Launched {
+        session: Session,
+        /// The code's bind ([`LaunchBind`]): the origin, or `none`.
+        bind: String,
+        /// `code` or `terminal`.
+        via: &'static str,
+    },
+    /// A browser tab asked the terminal to sign it in
+    /// (`auth.launch.requested`), from `client_id`.
+    LaunchRequested(String),
 }
 
 impl Reply {
@@ -959,6 +1296,17 @@ impl Reply {
         Reply::json(e.status, e.body())
     }
 
+    /// A route this authority does not serve. The listener mounts none of
+    /// them, so this is only a second lock.
+    fn not_found() -> Reply {
+        Reply {
+            status: 404,
+            body: ReplyBody::Empty,
+            retry_after: None,
+            notices: Vec::new(),
+        }
+    }
+
     fn limited(retry_after: u64, why: &str) -> Reply {
         let mut r = Reply::json(
             429,
@@ -969,15 +1317,22 @@ impl Reply {
     }
 }
 
-/// The authorization server: the device grant, its per-source limits, and
-/// the sessions it issues into — which it borrows, because they exist on the
-/// listener with or without it.
+/// The authorization server: the device grant and the launch grant — either
+/// or both — their per-source limits, and the sessions they issue into, which
+/// it borrows, because they exist on the listener with or without it.
 pub struct Authority {
-    pub device: DeviceGrant,
+    /// The device grant, when `a2a.device_grant.enabled`.
+    device: Option<DeviceGrant>,
+    /// The launch grant, while a launcher has installed its slot.
+    launch: Option<Arc<LaunchSlot>>,
     /// Device authorizations per source.
     limiter: SourceLimiter,
     /// Device-code polls per source.
     token_limiter: SourceLimiter,
+    /// Refused launch presentations per source. Its own, and counting only
+    /// refusals: a flood of junk from 127.0.0.1 must never delay a live code
+    /// past its lifetime, so what is limited is failing, never redeeming.
+    launch_failures: SourceLimiter,
     sessions: Arc<Sessions>,
     /// The listener origin, once the bind has settled it (a `:0` port is not
     /// known before).
@@ -1008,14 +1363,30 @@ fn take(limiter: &SourceLimiter, peer: Option<IpAddr>) -> Result<(), u64> {
 }
 
 impl Authority {
-    pub fn new(device: DeviceGrant, sessions: Arc<Sessions>) -> Authority {
+    pub fn new(
+        device: Option<DeviceGrant>,
+        launch: Option<Arc<LaunchSlot>>,
+        sessions: Arc<Sessions>,
+    ) -> Authority {
         Authority {
             device,
+            launch,
             limiter: bucket(AUTHORIZE_BURST, AUTHORIZE_REFILL),
             token_limiter: bucket(TOKEN_BURST, TOKEN_REFILL),
+            launch_failures: bucket(LAUNCH_FAILURE_BURST, LAUNCH_FAILURE_REFILL),
             sessions,
             issuer: OnceLock::new(),
         }
+    }
+
+    /// The device grant, when it is enabled.
+    pub fn device(&self) -> Option<&DeviceGrant> {
+        self.device.as_ref()
+    }
+
+    /// The launcher's slot, when one is installed.
+    pub fn launch(&self) -> Option<&Arc<LaunchSlot>> {
+        self.launch.as_ref()
     }
 
     /// Settle the issuer: the advertised origin, with no trailing slash.
@@ -1044,6 +1415,9 @@ impl Authority {
         body: &[u8],
         peer: Option<IpAddr>,
     ) -> Reply {
+        let Some(device) = &self.device else {
+            return Reply::not_found();
+        };
         // Every request is counted, before a byte of it means anything: a
         // flood of junk costs its source the same as a flood of real asks.
         if let Err(retry) = take(&self.limiter, peer) {
@@ -1068,13 +1442,13 @@ impl Authority {
                 Err(e) => return Reply::error(OAuthError::new("invalid_scope", e)),
             },
         };
-        if !self.device.scopes.contains(&requested) {
+        if !device.scopes.contains(&requested) {
             return Reply::error(OAuthError::new(
                 "invalid_scope",
                 format!("scope {} is not offered here", requested.as_str()),
             ));
         }
-        let verification_uri = match &self.device.verification_uri {
+        let verification_uri = match &device.verification_uri {
             Some(u) => u.clone(),
             None => match self.endpoint(VERIFICATION_PATH) {
                 Ok(u) => u,
@@ -1082,10 +1456,10 @@ impl Authority {
             },
         };
 
-        let now = (self.device.clock)();
+        let now = (device.clock)();
         let source = peer.map(SourceKey::of);
-        let mut t = self.device.table();
-        self.device.prune(&mut t, now);
+        let mut t = device.table();
+        device.prune(&mut t, now);
         let network = source.map(SourceKey::network);
         let live = t.values().filter(|a| a.occupies(now));
         let (mine, ours, all) = live.fold((0, 0, 0), |(m, n, a), x| {
@@ -1114,10 +1488,10 @@ impl Authority {
             );
         }
         let minted = (|| {
-            let device_code = (self.device.mint)(SECRET_BYTES)?;
+            let device_code = (device.mint)(SECRET_BYTES)?;
             // A user code is a name for the request, unique while it waits.
             for _ in 0..8 {
-                let user_code = mint_user_code(&self.device.mint)?;
+                let user_code = mint_user_code(&device.mint)?;
                 if !t.values().any(|a| a.user_code == user_code) {
                     return Ok((device_code, user_code));
                 }
@@ -1132,7 +1506,7 @@ impl Authority {
                 ));
             }
         };
-        let expires_ms = now.saturating_add(ms(self.device.code_ttl));
+        let expires_ms = now.saturating_add(ms(device.code_ttl));
         let authorization = Authorization {
             user_code: user_code.clone(),
             client_id: client_id.to_string(),
@@ -1154,7 +1528,7 @@ impl Authority {
                 "device_code": device_code,
                 "user_code": shown,
                 "verification_uri": verification_uri,
-                "expires_in": self.device.code_ttl.as_secs(),
+                "expires_in": device.code_ttl.as_secs(),
                 "interval": POLL_INTERVAL.as_secs(),
             }),
         );
@@ -1162,13 +1536,22 @@ impl Authority {
         r
     }
 
-    /// `POST /oauth2/token` with the device-code grant (RFC 8628 §3.4–3.5).
+    /// `POST /oauth2/token`: the device-code grant (RFC 8628 §3.4–3.5) while
+    /// the device grant is enabled, and the launch grant while a launcher's
+    /// slot is installed. `origin` is the request's `Origin` header, when it
+    /// had one — the launch grant is bound to it.
     ///
     /// The refusals come in a fixed order — `invalid_request`,
     /// `unsupported_grant_type`, `invalid_grant`, `expired_token`,
     /// `slow_down`, `authorization_pending`, `access_denied` — so a client
     /// polling too fast is told so whatever the approver has decided.
-    pub fn token(&self, content_type: Option<&str>, body: &[u8], peer: Option<IpAddr>) -> Reply {
+    pub fn token(
+        &self,
+        content_type: Option<&str>,
+        body: &[u8],
+        peer: Option<IpAddr>,
+        origin: Option<&str>,
+    ) -> Reply {
         let form = match parse_form(content_type, body) {
             Ok(f) => f,
             Err(e) => return Reply::error(e),
@@ -1176,12 +1559,35 @@ impl Authority {
         let Some(grant_type) = form.get("grant_type") else {
             return Reply::error(OAuthError::invalid_request("grant_type is required"));
         };
-        if grant_type != DEVICE_CODE_GRANT {
-            return Reply::error(OAuthError::new(
-                "unsupported_grant_type",
-                format!("this server issues tokens for {DEVICE_CODE_GRANT} only"),
-            ));
+        let launch_grant = crate::runtime::surface::launch::LAUNCH_GRANT_TYPE;
+        match (&self.device, &self.launch) {
+            (Some(device), _) if grant_type == DEVICE_CODE_GRANT => {
+                self.device_token(device, &form, peer)
+            }
+            (_, Some(slot)) if grant_type == launch_grant => {
+                self.launch_token(slot, &form, peer, origin)
+            }
+            _ => {
+                let offered: Vec<&str> = self
+                    .device
+                    .as_ref()
+                    .map(|_| DEVICE_CODE_GRANT)
+                    .into_iter()
+                    .chain(self.launch.as_ref().map(|_| launch_grant))
+                    .collect();
+                Reply::error(OAuthError::new(
+                    "unsupported_grant_type",
+                    format!(
+                        "this server issues tokens for {} only",
+                        offered.join(" and ")
+                    ),
+                ))
+            }
         }
+    }
+
+    /// The device-code grant's redemption.
+    fn device_token(&self, device: &DeviceGrant, form: &Form, peer: Option<IpAddr>) -> Reply {
         let (Some(device_code), Some(client_id)) = (form.get("device_code"), form.get("client_id"))
         else {
             return Reply::error(OAuthError::invalid_request(
@@ -1192,10 +1598,10 @@ impl Authority {
             return Reply::limited(retry, "too many token requests from this source");
         }
 
-        let now = (self.device.clock)();
+        let now = (device.clock)();
         let key = hash(device_code);
-        let mut t = self.device.table();
-        self.device.prune(&mut t, now);
+        let mut t = device.table();
+        device.prune(&mut t, now);
         let Some(a) = t.get_mut(&key).filter(|a| a.client_id == client_id) else {
             return Reply::error(OAuthError::new(
                 "invalid_grant",
@@ -1239,11 +1645,8 @@ impl Authority {
         // Mint before anything is recorded: on failure the approval stands
         // and the code is not burned, so the client's next poll can succeed.
         let minted = (|| {
-            let sid = format!("{DEVICE_SID_PREFIX}{}", (self.device.mint)(SID_BYTES)?);
-            let token = format!(
-                "{SESSION_TOKEN_PREFIX}{}",
-                (self.device.mint)(SECRET_BYTES)?
-            );
+            let sid = format!("{DEVICE_SID_PREFIX}{}", (device.mint)(SID_BYTES)?);
+            let token = format!("{SESSION_TOKEN_PREFIX}{}", (device.mint)(SECRET_BYTES)?);
             Ok::<_, std::io::Error>((sid, token))
         })();
         let Ok((sid, token)) = minted else {
@@ -1267,10 +1670,10 @@ impl Authority {
                 principal,
                 client_id: a.client_id,
                 created_ms: now,
-                expires_ms: Some(now.saturating_add(ms(self.device.token_ttl))),
+                expires_ms: Some(now.saturating_add(ms(device.token_ttl))),
                 approved_by: approval.approved_by,
                 approved_rule: approval.rule,
-                rate: self.device.rate.clone(),
+                rate: device.rate.clone(),
             },
         );
         Reply::json(
@@ -1278,10 +1681,316 @@ impl Authority {
             json!({
                 "access_token": token,
                 "token_type": "Bearer",
-                "expires_in": self.device.token_ttl.as_secs(),
+                "expires_in": device.token_ttl.as_secs(),
                 "scope": approval.scope.as_str(),
             }),
         )
+    }
+
+    /// The launch grant's redemption: exactly one of `code` (the launcher's
+    /// single-use code) or `request_code` (a terminal-approved request), and
+    /// the `client_id` it was issued to, from a loopback peer, bound as it
+    /// was issued.
+    ///
+    /// A code is consumed by ANY presentation of it: a wrong origin, a wrong
+    /// client, a remote peer all burn it along with the answer — the same
+    /// `invalid_grant` an unknown code gets — so a stolen code buys its thief
+    /// at most the denial of one sign-in. Only a failing mint leaves it be,
+    /// because then nothing was presented wrongly.
+    fn launch_token(
+        &self,
+        slot: &LaunchSlot,
+        form: &Form,
+        peer: Option<IpAddr>,
+        origin: Option<&str>,
+    ) -> Reply {
+        let client_id = form.get("client_id");
+        let (code, request_code, Some(client_id)) =
+            (form.get("code"), form.get("request_code"), client_id)
+        else {
+            return Reply::error(OAuthError::invalid_request(
+                "the launch grant takes client_id and exactly one of code or request_code",
+            ));
+        };
+        match (code, request_code) {
+            (Some(code), None) => self.launch_code(slot, code, client_id, peer, origin),
+            (None, Some(request)) => self.launch_request(slot, request, client_id, peer, origin),
+            _ => Reply::error(OAuthError::invalid_request(
+                "the launch grant takes client_id and exactly one of code or request_code",
+            )),
+        }
+    }
+
+    /// Redeem a launch code.
+    fn launch_code(
+        &self,
+        slot: &LaunchSlot,
+        code: &str,
+        client_id: &str,
+        peer: Option<IpAddr>,
+        origin: Option<&str>,
+    ) -> Reply {
+        let now = (slot.clock)();
+        let key = hash(code);
+        let mut t = slot.table();
+        t.prune(now);
+        let Some(held) = t.codes.get(&key) else {
+            drop(t);
+            return self.launch_refused(peer);
+        };
+        if !(loopback(peer)
+            && now < held.expires_ms
+            && held.bind.admits(origin)
+            && held.client_id == client_id)
+        {
+            t.codes.remove(&key);
+            drop(t);
+            LaunchSlot::fire(&slot.on_consume);
+            return self.launch_refused(peer);
+        }
+        // Mint before the code is spent: a failing entropy source answers
+        // 503 and the launcher's client may present the same code again.
+        let Ok((sid, token)) = launch_secrets(slot) else {
+            return Reply::error(OAuthError::unavailable(
+                "no session could be issued right now; present the code again",
+            ));
+        };
+        let held = t.codes.remove(&key).expect("held under the same lock");
+        drop(t);
+        LaunchSlot::fire(&slot.on_consume);
+        self.launched(now, sid, token, held.client_id, &held.bind, "code")
+    }
+
+    /// Poll a terminal-approved request.
+    fn launch_request(
+        &self,
+        slot: &LaunchSlot,
+        request_code: &str,
+        client_id: &str,
+        peer: Option<IpAddr>,
+        origin: Option<&str>,
+    ) -> Reply {
+        let now = (slot.clock)();
+        let key = hash(request_code);
+        let mut t = slot.table();
+        t.prune(now);
+        let Some(r) = t.requests.get_mut(&key).filter(|r| {
+            loopback(peer)
+                && r.client_id == client_id
+                && origin.is_some_and(|o| same_origin(&r.origin, o))
+        }) else {
+            drop(t);
+            return self.launch_refused(peer);
+        };
+        if r.expired(now) {
+            return Reply::error(OAuthError::new(
+                "expired_token",
+                "this sign-in request expired or gave way to a newer one; start again",
+            ));
+        }
+        if let Some(last) = r.last_poll_ms
+            && now.saturating_sub(last) < r.interval_ms
+        {
+            r.interval_ms = r.interval_ms.saturating_add(ms(LAUNCH_SLOW_DOWN_STEP));
+            r.last_poll_ms = Some(now);
+            return Reply::error(OAuthError::new(
+                "slow_down",
+                format!("poll at most every {}s", r.interval_ms / 1000),
+            ));
+        }
+        if !r.approved {
+            r.last_poll_ms = Some(now);
+            return Reply::error(OAuthError::new(
+                "authorization_pending",
+                "type the code this page shows at the terminal that ran agentd ui",
+            ));
+        }
+        let Ok((sid, token)) = launch_secrets(slot) else {
+            return Reply::error(OAuthError::unavailable(
+                "no session could be issued right now; poll again",
+            ));
+        };
+        let r = t.requests.remove(&key).expect("held under the same lock");
+        drop(t);
+        self.launched(
+            now,
+            sid,
+            token,
+            r.client_id,
+            &LaunchBind::Origin(r.origin),
+            "terminal",
+        )
+    }
+
+    /// A launch presentation refused: `invalid_grant`, one answer for every
+    /// reason, counted against its source — and past the limit, 429. Only a
+    /// failure is ever counted or refused so: a live code or an approved
+    /// request never reaches here, however much junk its source sent first.
+    fn launch_refused(&self, peer: Option<IpAddr>) -> Reply {
+        if let Some(ip) = peer {
+            if let Some(retry) = self.launch_failures.over(ip) {
+                return Reply::limited(retry, "too many refused launch sign-ins from this source");
+            }
+            self.launch_failures.failed(ip);
+        }
+        Reply::error(OAuthError::new(
+            "invalid_grant",
+            "the launch code or request is unknown, used, expired, or not this client's",
+        ))
+    }
+
+    /// Issue the launch session a redemption bought: the operator, named by
+    /// its sid, for eight hours when a browser holds it and until revoked or
+    /// the launcher exits when a terminal client does — whose token lives only
+    /// in that process's memory, so a long-running console is not cut off
+    /// daily.
+    fn launched(
+        &self,
+        now: u64,
+        sid: String,
+        token: String,
+        client_id: String,
+        bind: &LaunchBind,
+        via: &'static str,
+    ) -> Reply {
+        let ttl = match bind {
+            LaunchBind::Origin(_) => Some(crate::runtime::surface::launch::LAUNCH_SESSION_TTL),
+            LaunchBind::NoOrigin => None,
+        };
+        let session = Session {
+            sid,
+            kind: SessionKind::Launch,
+            name: None,
+            role: Role::Operator,
+            principal: "operator".into(),
+            client_id,
+            created_ms: now,
+            expires_ms: ttl.map(|d| now.saturating_add(ms(d))),
+            approved_by: match via {
+                "code" => LAUNCHER,
+                _ => LAUNCHER_TERMINAL,
+            }
+            .into(),
+            approved_rule: None,
+            // The operator is rate-exempt; a launch session is the operator.
+            rate: None,
+        };
+        self.sessions.insert(&token, session.clone());
+        let mut body = json!({
+            "access_token": token,
+            "token_type": "Bearer",
+            "scope": "operator",
+        });
+        if let Some(d) = ttl {
+            body["expires_in"] = json!(d.as_secs());
+        }
+        let mut r = Reply::json(200, body);
+        r.notices.push(Notice::Launched {
+            session,
+            bind: bind.label().to_string(),
+            via,
+        });
+        r
+    }
+
+    /// `POST /oauth2/launch_authorization`: a browser tab the launcher
+    /// started, which could not be handed the code, asks the person at the
+    /// launcher's terminal to sign it in. Only from the launched UI's origin
+    /// and a loopback peer; answered with a request code to poll with and a
+    /// user code to show. The terminal is the trust anchor: another web
+    /// origin cannot start a request, and another local process can start one
+    /// but cannot make the person at the terminal type its code.
+    pub fn launch_authorization(
+        &self,
+        content_type: Option<&str>,
+        body: &[u8],
+        peer: Option<IpAddr>,
+        origin: Option<&str>,
+    ) -> Reply {
+        let Some(slot) = self.launch.as_deref() else {
+            return Reply::not_found();
+        };
+        let Some(slot_origin) = slot.origin() else {
+            return Reply::not_found();
+        };
+        let form = match parse_form(content_type, body) {
+            Ok(f) => f,
+            Err(e) => return Reply::error(e),
+        };
+        let Some(client_id) = form.get("client_id").filter(|c| client_id_ok(c)) else {
+            return Reply::error(OAuthError::invalid_request(format!(
+                "client_id is required: 1-{CLIENT_ID_MAX} characters of A-Z a-z 0-9 . _ -"
+            )));
+        };
+        if !origin.is_some_and(|o| same_origin(slot_origin, o)) {
+            return Reply::error(OAuthError::invalid_request(
+                "only the web UI agentd ui started may ask its terminal to sign it in",
+            ));
+        }
+        if !loopback(peer) {
+            return Reply::error(OAuthError::invalid_request(
+                "a launch sign-in is asked for from this host only",
+            ));
+        }
+        let now = (slot.clock)();
+        let mut t = slot.table();
+        t.prune(now);
+        let minted = (|| {
+            let request_code = format!("{LAUNCH_REQUEST_PREFIX}{}", (slot.mint)(SECRET_BYTES)?);
+            for _ in 0..8 {
+                let user_code = mint_user_code(&slot.mint)?;
+                if !t.requests.values().any(|r| r.user_code == user_code) {
+                    return Ok((request_code, user_code));
+                }
+            }
+            Err(std::io::Error::other("no free user code"))
+        })();
+        let Ok((request_code, user_code)) = minted else {
+            return Reply::error(OAuthError::unavailable(
+                "no sign-in request could be issued right now; retry later",
+            ));
+        };
+        // At the bound, the oldest request still waiting gives way. It is
+        // expired, not forgotten, so its tab is told to start again.
+        let waiting: Vec<(u64, String, String)> = t
+            .requests
+            .iter()
+            .filter(|(_, r)| !r.expired(now) && !r.approved)
+            .map(|(k, r)| (r.requested_ms, r.user_code.clone(), k.clone()))
+            .collect();
+        if waiting.len() >= LAUNCH_PENDING_MAX
+            && let Some((_, _, oldest)) = waiting.into_iter().min()
+            && let Some(r) = t.requests.get_mut(&oldest)
+        {
+            r.expires_ms = now;
+        }
+        t.requests.insert(
+            hash(&request_code),
+            LaunchRequest {
+                user_code: user_code.clone(),
+                client_id: client_id.to_string(),
+                origin: slot_origin.to_string(),
+                requested_ms: now,
+                expires_ms: now.saturating_add(ms(LAUNCH_REQUEST_TTL)),
+                interval_ms: ms(LAUNCH_POLL_INTERVAL),
+                last_poll_ms: None,
+                approved: false,
+            },
+        );
+        drop(t);
+        LaunchSlot::fire(&slot.on_request);
+        let mut r = Reply::json(
+            200,
+            json!({
+                "request_code": request_code,
+                "user_code": display_user_code(&user_code),
+                "expires_in": LAUNCH_REQUEST_TTL.as_secs(),
+                "interval": LAUNCH_POLL_INTERVAL.as_secs(),
+            }),
+        );
+        r.notices
+            .push(Notice::LaunchRequested(client_id.to_string()));
+        r
     }
 
     /// `POST /oauth2/revoke` (RFC 7009): end the session a token belongs to.
@@ -1292,8 +2001,13 @@ impl Authority {
         revoke_with(&self.sessions, content_type, body)
     }
 
-    /// `GET /.well-known/oauth-authorization-server` (RFC 8414).
+    /// `GET /.well-known/oauth-authorization-server` (RFC 8414). Served with
+    /// the device grant only; it names the launch grant too while a slot is
+    /// installed, since the token endpoint then redeems it.
     pub fn metadata(&self) -> Reply {
+        let Some(device) = &self.device else {
+            return Reply::not_found();
+        };
         let Some(issuer) = self.issuer() else {
             return Reply::error(OAuthError::unavailable("the listener is still starting"));
         };
@@ -1305,11 +2019,13 @@ impl Authority {
                 "device_authorization_endpoint": at(DEVICE_AUTHORIZATION_PATH),
                 "token_endpoint": at(TOKEN_PATH),
                 "revocation_endpoint": at(REVOKE_PATH),
-                "grant_types_supported": [DEVICE_CODE_GRANT],
+                "grant_types_supported": std::iter::once(DEVICE_CODE_GRANT)
+                    .chain(self.launch.as_ref().map(|_| crate::runtime::surface::launch::LAUNCH_GRANT_TYPE))
+                    .collect::<Vec<_>>(),
                 "response_types_supported": [],
                 "token_endpoint_auth_methods_supported": ["none"],
                 "revocation_endpoint_auth_methods_supported": ["none"],
-                "scopes_supported": self.device.scopes.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                "scopes_supported": device.scopes.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
             }),
         )
     }
@@ -1317,6 +2033,9 @@ impl Authority {
     /// `GET /oauth2/device`: where a code's person is sent. Fixed text: the
     /// approval is an operator's op, not a page a stranger can submit.
     pub fn verification(&self) -> Reply {
+        if self.device.is_none() {
+            return Reply::not_found();
+        }
         Reply {
             status: 200,
             body: ReplyBody::Text(VERIFICATION_TEXT),
@@ -1324,6 +2043,13 @@ impl Authority {
             notices: Vec::new(),
         }
     }
+}
+
+/// A launch session's sid and token, from the slot's entropy source.
+fn launch_secrets(slot: &LaunchSlot) -> std::io::Result<(String, String)> {
+    let sid = format!("{LAUNCH_SID_PREFIX}{}", (slot.mint)(SID_BYTES)?);
+    let token = format!("{SESSION_TOKEN_PREFIX}{}", (slot.mint)(SECRET_BYTES)?);
+    Ok((sid, token))
 }
 
 /// The verification page's text.
@@ -1377,7 +2103,7 @@ mod tests {
             let clock: Clock = Arc::new(move || t.load(Ordering::SeqCst));
             let cfg: v2::DeviceGrant = serde_json::from_value(cfg).unwrap();
             let sessions = Arc::new(Sessions::new(Arc::clone(&clock)));
-            let auth = Authority::new(DeviceGrant::new(&cfg, clock, mint), sessions);
+            let auth = Authority::new(Some(DeviceGrant::new(&cfg, clock, mint)), None, sessions);
             auth.set_issuer("https://agent.example:8443");
             Fixture { now, auth }
         }
@@ -1407,15 +2133,25 @@ mod tests {
                 "grant_type={}&device_code={device_code}&client_id={client}",
                 DEVICE_CODE_GRANT.replace(':', "%3A")
             );
-            self.auth
-                .token(FORM, body.as_bytes(), Some("10.0.0.1".parse().unwrap()))
+            self.auth.token(
+                FORM,
+                body.as_bytes(),
+                Some("10.0.0.1".parse().unwrap()),
+                None,
+            )
         }
 
         fn approve(&self, user_code: &str, name: &str, scope: Option<&str>) {
-            let view = self.auth.device.find(user_code).unwrap();
-            let scope = self.auth.device.grant_scope(view.requested, scope).unwrap();
+            let view = self.auth.device().unwrap().find(user_code).unwrap();
+            let scope = self
+                .auth
+                .device()
+                .unwrap()
+                .grant_scope(view.requested, scope)
+                .unwrap();
             self.auth
-                .device
+                .device()
+                .unwrap()
                 .approve(
                     user_code,
                     Approval {
@@ -1506,12 +2242,12 @@ mod tests {
         meets_the_auth_contract(pending);
         assert_eq!(pending["scope"], "operator", "{pending}");
         assert_eq!(pending["peer"], "10.0.0.7", "{pending}");
-        let mut quiet = f.auth.device.pending()[0].clone();
+        let mut quiet = f.auth.device().unwrap().pending()[0].clone();
         quiet.peer = None;
         meets_the_auth_contract(&quiet.event("pending"));
 
         // approved: the granted scope and the name.
-        let view = f.auth.device.pending()[0].clone();
+        let view = f.auth.device().unwrap().pending()[0].clone();
         let approved = view.approved_event("alice", DeviceScope::User);
         meets_the_auth_contract(&approved);
         assert_eq!(
@@ -1521,7 +2257,7 @@ mod tests {
 
         // denied: every one refused, each with who asked and for what.
         f.code("10.0.0.8", "client_id=other");
-        let denied = f.auth.device.deny(None).unwrap();
+        let denied = f.auth.device().unwrap().deny(None).unwrap();
         assert_eq!(denied.len(), 2);
         for d in &denied {
             let e = d.event("denied");
@@ -1569,7 +2305,7 @@ mod tests {
             );
             seen.insert(bare);
             // Four per source are all that may wait; start each on a new one.
-            f.auth.device.deny(Some(&shown)).unwrap();
+            f.auth.device().unwrap().deny(Some(&shown)).unwrap();
         }
         assert!(seen.len() > 35, "codes repeat: {seen:?}");
         assert_eq!(USER_CODE_ALPHABET.len(), 20);
@@ -1588,7 +2324,7 @@ mod tests {
         let (_, shown) = f.code("10.9.9.9", "client_id=cli");
         let lower = shown.to_ascii_lowercase().replace('-', " ");
         assert_eq!(
-            f.auth.device.find(&lower).unwrap().user_code,
+            f.auth.device().unwrap().find(&lower).unwrap().user_code,
             shown.replace('-', "")
         );
     }
@@ -1602,7 +2338,7 @@ mod tests {
             dc.bytes()
                 .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
         );
-        let pending = format!("{:?}", f.auth.device.table());
+        let pending = format!("{:?}", f.auth.device().unwrap().table());
         assert!(
             !pending.contains(&dc),
             "the device code is kept in the clear"
@@ -1661,7 +2397,7 @@ mod tests {
             e("invalid_grant"),
             "not its client"
         );
-        f.auth.device.deny(Some(&uc)).unwrap();
+        f.auth.device().unwrap().deny(Some(&uc)).unwrap();
         assert_eq!(poll(&dc, "cli"), e("access_denied"));
         // Expired: told so, then forgotten.
         let (dc2, _) = f.code("10.0.0.2", "client_id=cli");
@@ -1670,9 +2406,12 @@ mod tests {
         assert_eq!(poll(&dc2, "cli"), e("invalid_grant"));
         // The form's own refusals come first.
         let token = |body: &str| {
-            let r = f
-                .auth
-                .token(FORM, body.as_bytes(), Some("10.0.0.3".parse().unwrap()));
+            let r = f.auth.token(
+                FORM,
+                body.as_bytes(),
+                Some("10.0.0.3".parse().unwrap()),
+                None,
+            );
             (r.status, error_of(&r))
         };
         assert_eq!(token("device_code=x&client_id=cli"), e("invalid_request"));
@@ -1714,28 +2453,42 @@ mod tests {
         // No scope asked: user.
         let v = both
             .auth
-            .device
+            .device()
+            .unwrap()
             .find(&both.code("10.0.0.1", "client_id=cli").1)
             .unwrap();
         assert_eq!(v.requested, DeviceScope::User);
         // The device asked for operator; the approver must say so too.
         let (dc, uc) = both.code("10.0.0.2", "client_id=cli&scope=operator");
-        let asked = both.auth.device.find(&uc).unwrap().requested;
+        let asked = both.auth.device().unwrap().find(&uc).unwrap().requested;
         assert_eq!(asked, DeviceScope::Operator);
-        assert!(both.auth.device.grant_scope(asked, None).is_err());
+        assert!(
+            both.auth
+                .device()
+                .unwrap()
+                .grant_scope(asked, None)
+                .is_err()
+        );
         // The approver may narrow it to user…
         assert_eq!(
-            both.auth.device.grant_scope(asked, Some("user")),
+            both.auth.device().unwrap().grant_scope(asked, Some("user")),
             Ok(DeviceScope::User)
         );
         // …never widen a user request.
         assert!(
             both.auth
-                .device
+                .device()
+                .unwrap()
                 .grant_scope(DeviceScope::User, Some("operator"))
                 .is_err()
         );
-        assert!(both.auth.device.grant_scope(asked, Some("agent")).is_err());
+        assert!(
+            both.auth
+                .device()
+                .unwrap()
+                .grant_scope(asked, Some("agent"))
+                .is_err()
+        );
         both.approve(&uc, "carol", Some("operator"));
         let r = both.poll(&dc, "cli");
         assert_eq!(json_of(&r)["scope"], "operator");
@@ -1757,7 +2510,8 @@ mod tests {
         assert!(
             user_only
                 .auth
-                .device
+                .device()
+                .unwrap()
                 .grant_scope(DeviceScope::Operator, Some("operator"))
                 .is_err()
         );
@@ -1814,10 +2568,10 @@ mod tests {
                 f.code(&format!("10.2.{s}.1"), "client_id=cli");
             }
         }
-        assert_eq!(f.auth.device.pending().len(), PENDING_GLOBAL);
+        assert_eq!(f.auth.device().unwrap().pending().len(), PENDING_GLOBAL);
         // Denying frees a slot.
-        let first = f.auth.device.pending()[0].user_code.clone();
-        f.auth.device.deny(Some(&first)).unwrap();
+        let first = f.auth.device().unwrap().pending()[0].user_code.clone();
+        f.auth.device().unwrap().deny(Some(&first)).unwrap();
         f.code("10.3.0.1", "client_id=cli");
         // At the cap a source holding fewer takes from one holding the most,
         // but never past an even share: at 3 against 4 it would only swap.
@@ -1825,10 +2579,10 @@ mod tests {
         f.code("10.3.0.1", "client_id=cli");
         let r = f.authorize_from("10.3.0.1", "client_id=cli");
         assert_eq!(r.status, 429, "even shares over the global cap: {r:?}");
-        assert_eq!(f.auth.device.pending().len(), PENDING_GLOBAL);
+        assert_eq!(f.auth.device().unwrap().pending().len(), PENDING_GLOBAL);
         // Expiry frees every slot.
         f.advance(Duration::from_secs(11 * 60));
-        assert!(f.auth.device.pending().is_empty());
+        assert!(f.auth.device().unwrap().pending().is_empty());
         f.code("10.3.0.2", "client_id=cli");
     }
 
@@ -1872,14 +2626,14 @@ mod tests {
                 }
             }
         }
-        assert_eq!(f.auth.device.pending().len(), PENDING_GLOBAL);
+        assert_eq!(f.auth.device().unwrap().pending().len(), PENDING_GLOBAL);
         // The very oldest is approved: the operator decided, so it stays, and
         // its network now holds fewer waiting codes than the others.
         let (approved_dc, approved_uc) = firsts[0].clone();
         f.approve(&approved_uc, "alice", None);
         f.code("198.51.100.7", "client_id=newcomer");
         assert_eq!(
-            f.auth.device.pending().len() + 1,
+            f.auth.device().unwrap().pending().len() + 1,
             PENDING_GLOBAL,
             "one waiting code gave way, and the approved one still holds its slot"
         );
@@ -2058,7 +2812,10 @@ mod tests {
             json_of(&r)
         );
         assert!(r.notices.is_empty());
-        assert!(f.auth.device.pending().is_empty(), "nothing recorded");
+        assert!(
+            f.auth.device().unwrap().pending().is_empty(),
+            "nothing recorded"
+        );
 
         fail.store(false, Ordering::SeqCst);
         let (dc, uc) = f.code("10.0.0.2", "client_id=cli");
@@ -2097,7 +2854,585 @@ mod tests {
         // An issuer not yet settled answers 503 rather than a wrong origin.
         let sessions = Arc::new(Sessions::new(system_clock()));
         let cfg: v2::DeviceGrant = serde_json::from_value(json!({"enabled": true})).unwrap();
-        let unsettled = Authority::new(DeviceGrant::new(&cfg, system_clock(), os_mint()), sessions);
+        let unsettled = Authority::new(
+            Some(DeviceGrant::new(&cfg, system_clock(), os_mint())),
+            None,
+            sessions,
+        );
         assert_eq!(unsettled.metadata().status, 503);
+    }
+
+    // ---- the launch grant ------------------------------------------------
+
+    use crate::runtime::surface::launch::{LAUNCH_CODE_TTL, LAUNCH_GRANT_TYPE, LAUNCH_SESSION_TTL};
+
+    const UI: &str = "http://127.0.0.1:4555";
+    const OTHER_UI: &str = "http://127.0.0.1:4556";
+    const LOCAL: &str = "127.0.0.1";
+
+    /// A listener's authority with a launcher's slot, on one injected clock
+    /// and entropy source, and — when `device` — the device grant beside it.
+    struct Launch {
+        now: Arc<AtomicU64>,
+        slot: Arc<LaunchSlot>,
+        auth: Authority,
+    }
+
+    impl Launch {
+        fn new(origin: Option<&str>, device: bool) -> Launch {
+            Launch::with_mint(origin, device, os_mint())
+        }
+
+        fn with_mint(origin: Option<&str>, device: bool, mint: Mint) -> Launch {
+            let now = Arc::new(AtomicU64::new(1_000_000));
+            let t = Arc::clone(&now);
+            let clock: Clock = Arc::new(move || t.load(Ordering::SeqCst));
+            let slot =
+                Arc::new(LaunchSlot::with(origin, Arc::clone(&clock), Arc::clone(&mint)).unwrap());
+            let cfg: v2::DeviceGrant = serde_json::from_value(json!({"enabled": true})).unwrap();
+            let auth = Authority::new(
+                device.then(|| DeviceGrant::new(&cfg, Arc::clone(&clock), mint)),
+                Some(Arc::clone(&slot)),
+                Arc::new(Sessions::new(clock)),
+            );
+            auth.set_issuer("http://127.0.0.1:8420");
+            Launch { now, slot, auth }
+        }
+
+        fn advance(&self, d: Duration) {
+            self.now.fetch_add(ms(d), Ordering::SeqCst);
+        }
+
+        /// Present a code as `client`, from `peer`, with `origin`.
+        fn exchange_from(
+            &self,
+            peer: &str,
+            code: &str,
+            client: &str,
+            origin: Option<&str>,
+        ) -> Reply {
+            let body = format!(
+                "grant_type={}&code={code}&client_id={client}",
+                enc(LAUNCH_GRANT_TYPE)
+            );
+            self.auth
+                .token(FORM, body.as_bytes(), Some(peer.parse().unwrap()), origin)
+        }
+
+        fn exchange(&self, code: &str, client: &str, origin: Option<&str>) -> Reply {
+            self.exchange_from(LOCAL, code, client, origin)
+        }
+
+        /// Ask the terminal to sign a tab in, from `origin`.
+        fn request(&self, origin: Option<&str>) -> Reply {
+            self.auth.launch_authorization(
+                FORM,
+                b"client_id=agentd-ui",
+                Some(LOCAL.parse().unwrap()),
+                origin,
+            )
+        }
+
+        /// A request from the launched UI: `(request_code, user_code)`.
+        fn requested(&self) -> (String, String) {
+            let r = self.request(Some(UI));
+            let v = json_of(&r);
+            assert_eq!(r.status, 200, "{v}");
+            (
+                v["request_code"].as_str().unwrap().to_string(),
+                v["user_code"].as_str().unwrap().to_string(),
+            )
+        }
+
+        fn poll_request(&self, request_code: &str) -> Reply {
+            let body = format!(
+                "grant_type={}&request_code={request_code}&client_id=agentd-ui",
+                enc(LAUNCH_GRANT_TYPE)
+            );
+            self.auth.token(
+                FORM,
+                body.as_bytes(),
+                Some(LOCAL.parse().unwrap()),
+                Some(UI),
+            )
+        }
+    }
+
+    fn enc(v: &str) -> String {
+        v.replace(':', "%3A").replace('/', "%2F")
+    }
+
+    fn token_of(r: &Reply) -> String {
+        let v = json_of(r);
+        assert_eq!(r.status, 200, "{v}");
+        v["access_token"].as_str().unwrap().to_string()
+    }
+
+    fn refused(r: &Reply) {
+        assert_eq!(
+            (r.status, error_of(r)),
+            (400, "invalid_grant".to_string()),
+            "{:?}",
+            r.body
+        );
+    }
+
+    #[test]
+    fn launch_codes_are_single_use_short_lived_and_bound() {
+        let f = Launch::new(Some(UI), false);
+        let bind = || LaunchBind::Origin(UI.into());
+        // Exchanged once with its origin and client…
+        let code = f.slot.issue(bind(), "agentd-ui").unwrap();
+        token_of(&f.exchange(&code, "agentd-ui", Some(UI)));
+        // …and never again.
+        refused(&f.exchange(&code, "agentd-ui", Some(UI)));
+        // Past its lifetime it is worthless.
+        let late = f.slot.issue(bind(), "agentd-ui").unwrap();
+        f.advance(LAUNCH_CODE_TTL + Duration::from_secs(1));
+        refused(&f.exchange(&late, "agentd-ui", Some(UI)));
+        // Another origin is refused — and the code is burned by asking, so
+        // the right presentation that follows is refused too.
+        let code = f.slot.issue(bind(), "agentd-ui").unwrap();
+        refused(&f.exchange(&code, "agentd-ui", Some(OTHER_UI)));
+        refused(&f.exchange(&code, "agentd-ui", Some(UI)));
+        // No origin at all, for an origin-bound code; another client.
+        let code = f.slot.issue(bind(), "agentd-ui").unwrap();
+        refused(&f.exchange(&code, "agentd-ui", None));
+        let code = f.slot.issue(bind(), "agentd-ui").unwrap();
+        refused(&f.exchange(&code, "someone-else", Some(UI)));
+        // The origin is compared as an origin, not as text.
+        let code = f.slot.issue(bind(), "agentd-ui").unwrap();
+        token_of(&f.exchange(&code, "agentd-ui", Some("HTTP://127.0.0.1:4555")));
+        // A code for a terminal client is no browser's: any Origin — `null`
+        // included — is refused.
+        for origin in [UI, "null"] {
+            let code = f.slot.issue(LaunchBind::NoOrigin, "agentd-tui").unwrap();
+            refused(&f.exchange(&code, "agentd-tui", Some(origin)));
+        }
+        let code = f.slot.issue(LaunchBind::NoOrigin, "agentd-tui").unwrap();
+        token_of(&f.exchange(&code, "agentd-tui", None));
+        // Issuing again for a bind invalidates its earlier code, and only its.
+        let tui = f.slot.issue(LaunchBind::NoOrigin, "agentd-tui").unwrap();
+        let first = f.slot.issue(bind(), "agentd-ui").unwrap();
+        let second = f.slot.issue(bind(), "agentd-ui").unwrap();
+        refused(&f.exchange(&first, "agentd-ui", Some(UI)));
+        token_of(&f.exchange(&second, "agentd-ui", Some(UI)));
+        token_of(&f.exchange(&tui, "agentd-tui", None));
+        // 256 bits, and only the hash is kept.
+        let code = f.slot.issue(bind(), "agentd-ui").unwrap();
+        let hex = code.strip_prefix(LAUNCH_CODE_PREFIX).expect("the prefix");
+        assert_eq!(hex.len(), 64);
+        assert!(
+            hex.bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        );
+        let table = format!("{:?}", f.slot);
+        assert!(!table.contains(hex), "the code is kept in the clear");
+        assert!(table.contains(&hash(&code)));
+    }
+
+    #[test]
+    fn launch_sessions_are_operator_and_revocable() {
+        let f = Launch::new(Some(UI), false);
+        // A web UI's session: the operator, for eight hours.
+        let code = f
+            .slot
+            .issue(LaunchBind::Origin(UI.into()), "agentd-ui")
+            .unwrap();
+        let r = f.exchange(&code, "agentd-ui", Some(UI));
+        let v = json_of(&r);
+        assert_eq!(v["expires_in"], LAUNCH_SESSION_TTL.as_secs(), "{v}");
+        assert_eq!(v["expires_in"], 28800);
+        assert_eq!(
+            (&v["scope"], &v["token_type"]),
+            (&json!("operator"), &json!("Bearer"))
+        );
+        assert!(v.get("refresh_token").is_none());
+        let ui = token_of(&r);
+        assert!(ui.starts_with(SESSION_TOKEN_PREFIX));
+        let p = principal_of(&f.auth, &ui);
+        assert_eq!((p.id.as_str(), p.role), ("operator", Role::Operator));
+        assert_eq!(p.grants, ["*"]);
+        assert_eq!(p.rate, None, "the operator is rate-exempt");
+        let sid = p.session.clone().unwrap();
+        assert!(
+            sid.starts_with(LAUNCH_SID_PREFIX) && sid.len() == 3 + 16,
+            "{sid}"
+        );
+        // What the exchange tells the operator: the sid, never the code.
+        let [Notice::Launched { session, bind, via }] = &r.notices[..] else {
+            panic!("one launch notice: {:?}", r.notices);
+        };
+        assert_eq!((bind.as_str(), *via), (UI, "code"));
+        let event = session.launched_event();
+        meets_the_auth_contract(&event);
+        assert_eq!(
+            event,
+            json!({"event": "launch", "sid": sid, "client_id": "agentd-ui", "scope": "operator"})
+        );
+        // A terminal client's session has no expiry of its own.
+        let code = f.slot.issue(LaunchBind::NoOrigin, "agentd-tui").unwrap();
+        let r = f.exchange(&code, "agentd-tui", None);
+        assert!(json_of(&r).get("expires_in").is_none(), "{:?}", r.body);
+        let tui = token_of(&r);
+        f.advance(Duration::from_secs(30 * 24 * 3600));
+        assert!(matches!(
+            f.auth.sessions().verify(&tui),
+            SessionCheck::Valid(_)
+        ));
+        assert_eq!(
+            f.auth.sessions().verify(&ui),
+            SessionCheck::Invalid,
+            "the web UI's session ended after eight hours"
+        );
+        // Listed as a launch, approved by the launcher, with no name.
+        let listed = f.auth.sessions().list();
+        let [s] = &listed[..] else {
+            panic!("the terminal session alone: {listed:?}")
+        };
+        let row = s.view();
+        assert_eq!(
+            (
+                &row["kind"],
+                &row["approved_by"],
+                &row["principal"],
+                &row["role"]
+            ),
+            (
+                &json!("launch"),
+                &json!("launcher"),
+                &json!("operator"),
+                &json!("operator")
+            )
+        );
+        assert!(row.get("name").is_none(), "{row}");
+        assert_eq!(row["expires_at"], Value::Null);
+        // auth.sessions.revoke {sid} ends it.
+        let tui_sid = s.sid.clone();
+        assert_eq!(f.auth.sessions().revoke(&Revoke::Sid(tui_sid)).len(), 1);
+        assert_eq!(f.auth.sessions().verify(&tui), SessionCheck::Invalid);
+        // …and so does /oauth2/revoke, the page's disconnect.
+        let code = f.slot.issue(LaunchBind::NoOrigin, "agentd-tui").unwrap();
+        let token = token_of(&f.exchange(&code, "agentd-tui", None));
+        let r = f.auth.revoke(FORM, format!("token={token}").as_bytes());
+        assert!(matches!(&r.notices[..], [Notice::Revoked(s)] if s.kind == SessionKind::Launch));
+        assert_eq!(f.auth.sessions().verify(&token), SessionCheck::Invalid);
+    }
+
+    #[test]
+    fn terminal_approved_requests() {
+        let f = Launch::new(Some(UI), false);
+        let (request, user_code) = f.requested();
+        assert!(request.starts_with(LAUNCH_REQUEST_PREFIX) && request.len() == 10 + 64);
+        assert_eq!(user_code.len(), USER_CODE_LEN + 1, "{user_code}");
+        assert!(normalize_user_code(&user_code).is_some(), "{user_code}");
+        let r = f.request(Some(UI));
+        let v = json_of(&r);
+        assert_eq!((&v["expires_in"], &v["interval"]), (&json!(120), &json!(2)));
+        assert_eq!(
+            r.notices,
+            [Notice::LaunchRequested("agentd-ui".into())],
+            "the request is logged by its client, never its codes"
+        );
+        // Waiting on the terminal; polled too fast, told to slow down.
+        assert_eq!(error_of(&f.poll_request(&request)), "authorization_pending");
+        f.advance(Duration::from_secs(1));
+        let r = f.poll_request(&request);
+        assert_eq!(error_of(&r), "slow_down");
+        assert!(
+            json_of(&r)["error_description"]
+                .as_str()
+                .unwrap()
+                .contains("4s")
+        );
+        // A code nobody's tab shows approves nothing.
+        let bare = normalize_user_code(&user_code).unwrap();
+        let other: String = std::iter::once(if bare.starts_with('B') { 'C' } else { 'B' })
+            .chain(bare.chars().skip(1))
+            .collect();
+        assert!(!f.slot.approve_user_code(&other));
+        assert!(!f.slot.approve_user_code("not a code"));
+        assert!(!f.slot.approve_user_code(""));
+        f.advance(Duration::from_secs(4));
+        assert_eq!(
+            error_of(&f.poll_request(&request)),
+            "authorization_pending",
+            "a wrong code approved the request"
+        );
+        // Typed lower-case, without the dash: exactly that request.
+        let typed = bare.to_ascii_lowercase();
+        assert!(f.slot.approve_user_code(&typed));
+        assert!(!f.slot.approve_user_code(&typed), "approved once");
+        f.advance(Duration::from_secs(4));
+        let r = f.poll_request(&request);
+        let token = token_of(&r);
+        assert!(
+            json_of(&r).get("expires_in").is_some(),
+            "a browser's session expires"
+        );
+        let p = principal_of(&f.auth, &token);
+        assert_eq!((p.id.as_str(), p.role), ("operator", Role::Operator));
+        let [Notice::Launched { session, via, .. }] = &r.notices[..] else {
+            panic!("one launch notice: {:?}", r.notices)
+        };
+        assert_eq!(
+            (session.approved_by.as_str(), *via),
+            ("launcher-terminal", "terminal")
+        );
+        // Redeemed once.
+        f.advance(Duration::from_secs(4));
+        refused(&f.poll_request(&request));
+        // Only the launched UI may ask, and only it may poll.
+        let r = f.request(Some(OTHER_UI));
+        assert_eq!(error_of(&r), "invalid_request", "{:?}", r.body);
+        let r = f.request(None);
+        assert_eq!(error_of(&r), "invalid_request");
+        let (req, _) = f.requested();
+        let body = format!(
+            "grant_type={}&request_code={req}&client_id=agentd-ui",
+            enc(LAUNCH_GRANT_TYPE)
+        );
+        let from = |origin| {
+            f.auth
+                .token(FORM, body.as_bytes(), Some(LOCAL.parse().unwrap()), origin)
+        };
+        refused(&from(Some(OTHER_UI)));
+        refused(&from(None));
+        // The seventeenth waiting request displaces the oldest, whose tab is
+        // told it expired.
+        let g = Launch::new(Some(UI), false);
+        let (oldest, _) = g.requested();
+        for _ in 1..LAUNCH_PENDING_MAX {
+            g.advance(Duration::from_millis(1));
+            g.requested();
+        }
+        assert_eq!(error_of(&g.poll_request(&oldest)), "authorization_pending");
+        g.advance(Duration::from_millis(1));
+        let (newest, _) = g.requested();
+        assert_eq!(error_of(&g.poll_request(&oldest)), "expired_token");
+        assert_eq!(error_of(&g.poll_request(&newest)), "authorization_pending");
+        // And a request left waiting expires on its own.
+        g.advance(LAUNCH_REQUEST_TTL);
+        assert_eq!(error_of(&g.poll_request(&newest)), "expired_token");
+        // A terminal client's slot takes no requests at all.
+        let tui = Launch::new(None, false);
+        assert_eq!(tui.request(Some(UI)).status, 404);
+    }
+
+    /// The limiter throttles failing, never redeeming: a flood of junk and
+    /// refused asks from 127.0.0.1 — enough to be answered 429 — leaves a
+    /// live code and an approved request redeemable at once, and the device
+    /// grant's own bucket untouched.
+    #[test]
+    fn launch_failures_never_block_a_valid_exchange() {
+        let f = Launch::new(Some(UI), true);
+        let code = f
+            .slot
+            .issue(LaunchBind::Origin(UI.into()), "agentd-ui")
+            .unwrap();
+        let (request, user_code) = f.requested();
+        let mut limited = 0;
+        for i in 0..200 {
+            let r = f.exchange(
+                &format!("{LAUNCH_CODE_PREFIX}{i:064x}"),
+                "agentd-ui",
+                Some(UI),
+            );
+            assert!(matches!(r.status, 400 | 429), "{:?}", r.body);
+            limited += usize::from(r.status == 429);
+            let r = f.request(Some(OTHER_UI));
+            assert_eq!(error_of(&r), "invalid_request");
+        }
+        assert!(limited > 100, "junk was never limited: {limited}");
+        assert!(f.slot.approve_user_code(&user_code));
+        token_of(&f.exchange(&code, "agentd-ui", Some(UI)));
+        token_of(&f.poll_request(&request));
+        // The device grant's bucket is the device grant's alone.
+        let body = format!(
+            "grant_type={}&device_code=x&client_id=cli",
+            enc(DEVICE_CODE_GRANT)
+        );
+        let r = f
+            .auth
+            .token(FORM, body.as_bytes(), Some(LOCAL.parse().unwrap()), None);
+        assert_eq!(error_of(&r), "invalid_grant", "{:?}", r.body);
+    }
+
+    #[test]
+    fn consuming_a_code_fires_on_consume() {
+        let f = Launch::new(Some(UI), false);
+        let fired = Arc::new(AtomicU64::new(0));
+        let n = Arc::clone(&fired);
+        f.slot.on_consume(move || {
+            n.fetch_add(1, Ordering::SeqCst);
+        });
+        let count = || fired.load(Ordering::SeqCst);
+        let bind = || LaunchBind::Origin(UI.into());
+        let code = f.slot.issue(bind(), "agentd-ui").unwrap();
+        token_of(&f.exchange(&code, "agentd-ui", Some(UI)));
+        assert_eq!(count(), 1, "a redemption");
+        let code = f.slot.issue(bind(), "agentd-ui").unwrap();
+        refused(&f.exchange(&code, "agentd-ui", Some(OTHER_UI)));
+        assert_eq!(count(), 2, "a burned presentation");
+        // Nothing left to consume: an unknown or spent code fires nothing.
+        refused(&f.exchange(&code, "agentd-ui", Some(UI)));
+        refused(&f.exchange("agentd_lc_unknown", "agentd-ui", Some(UI)));
+        assert_eq!(count(), 2);
+        // A request tells the launcher to ask its terminal.
+        let asked = Arc::new(AtomicU64::new(0));
+        let a = Arc::clone(&asked);
+        f.slot.on_request(move || {
+            a.fetch_add(1, Ordering::SeqCst);
+        });
+        f.requested();
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+    }
+
+    /// A code or a request presented from off the host is refused, and the
+    /// code is burned by it.
+    #[test]
+    fn launch_grants_are_redeemed_from_loopback_only() {
+        let f = Launch::new(Some(UI), false);
+        let code = f
+            .slot
+            .issue(LaunchBind::Origin(UI.into()), "agentd-ui")
+            .unwrap();
+        refused(&f.exchange_from("10.1.2.3", &code, "agentd-ui", Some(UI)));
+        refused(&f.exchange(&code, "agentd-ui", Some(UI)));
+        let code = f.slot.issue(LaunchBind::NoOrigin, "agentd-tui").unwrap();
+        token_of(&f.exchange_from("::1", &code, "agentd-tui", None));
+        let r = f.auth.launch_authorization(
+            FORM,
+            b"client_id=agentd-ui",
+            Some("10.1.2.3".parse().unwrap()),
+            Some(UI),
+        );
+        assert_eq!(error_of(&r), "invalid_request");
+    }
+
+    /// A failing entropy source answers 503 and costs nothing: no code, no
+    /// request, no session is issued, no code is burned, the launcher hears
+    /// of nothing, and the refusal is not counted against the source.
+    #[test]
+    fn a_failed_launch_mint_is_503_and_burns_nothing() {
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&fail);
+        let mint: Mint = Arc::new(move |n| {
+            if flag.load(Ordering::SeqCst) {
+                Err(std::io::Error::other("no entropy"))
+            } else {
+                crate::sec::random::hex_token(n)
+            }
+        });
+        let f = Launch::with_mint(Some(UI), false, mint);
+        let consumed = Arc::new(AtomicU64::new(0));
+        let c = Arc::clone(&consumed);
+        f.slot.on_consume(move || {
+            c.fetch_add(1, Ordering::SeqCst);
+        });
+        let asked = Arc::new(AtomicU64::new(0));
+        let a = Arc::clone(&asked);
+        f.slot.on_request(move || {
+            a.fetch_add(1, Ordering::SeqCst);
+        });
+        let code = f
+            .slot
+            .issue(LaunchBind::Origin(UI.into()), "agentd-ui")
+            .unwrap();
+        fail.store(true, Ordering::SeqCst);
+        assert!(f.slot.issue(LaunchBind::NoOrigin, "agentd-tui").is_err());
+        for _ in 0..(LAUNCH_FAILURE_BURST * 2) {
+            let r = f.exchange(&code, "agentd-ui", Some(UI));
+            assert_eq!(
+                (r.status, error_of(&r)),
+                (503, "temporarily_unavailable".to_string())
+            );
+            assert!(r.notices.is_empty());
+        }
+        let r = f.request(Some(UI));
+        assert_eq!(
+            (r.status, error_of(&r)),
+            (503, "temporarily_unavailable".to_string())
+        );
+        assert!(r.notices.is_empty());
+        assert!(f.auth.sessions().list().is_empty(), "no session issued");
+        assert_eq!(consumed.load(Ordering::SeqCst), 0, "no code burned");
+        assert_eq!(asked.load(Ordering::SeqCst), 0, "no request made");
+        assert!(
+            format!("{:?}", f.slot).contains("requests: {}"),
+            "{:?}",
+            f.slot
+        );
+        fail.store(false, Ordering::SeqCst);
+        token_of(&f.exchange(&code, "agentd-ui", Some(UI)));
+        assert_eq!(consumed.load(Ordering::SeqCst), 1);
+    }
+
+    /// Which grants the token endpoint redeems follows what is installed,
+    /// and the metadata says so.
+    #[test]
+    fn the_token_endpoint_redeems_the_installed_grants() {
+        let only_launch = Launch::new(None, false);
+        let body = format!(
+            "grant_type={}&device_code=x&client_id=cli",
+            enc(DEVICE_CODE_GRANT)
+        );
+        let r = only_launch
+            .auth
+            .token(FORM, body.as_bytes(), Some(LOCAL.parse().unwrap()), None);
+        assert_eq!(error_of(&r), "unsupported_grant_type");
+        assert_eq!(only_launch.auth.metadata().status, 404);
+        assert_eq!(only_launch.auth.verification().status, 404);
+        assert_eq!(
+            only_launch
+                .auth
+                .device_authorization(FORM, b"client_id=cli", Some(LOCAL.parse().unwrap()))
+                .status,
+            404
+        );
+        // Exactly one of code and request_code.
+        for body in [
+            format!("grant_type={}&client_id=agentd-tui", enc(LAUNCH_GRANT_TYPE)),
+            format!(
+                "grant_type={}&code=a&request_code=b&client_id=agentd-tui",
+                enc(LAUNCH_GRANT_TYPE)
+            ),
+            format!("grant_type={}&code=a", enc(LAUNCH_GRANT_TYPE)),
+        ] {
+            let r =
+                only_launch
+                    .auth
+                    .token(FORM, body.as_bytes(), Some(LOCAL.parse().unwrap()), None);
+            assert_eq!(error_of(&r), "invalid_request", "{body}");
+        }
+        let both = Launch::new(Some(UI), true);
+        let v = json_of(&both.auth.metadata());
+        assert_eq!(
+            v["grant_types_supported"],
+            json!([DEVICE_CODE_GRANT, LAUNCH_GRANT_TYPE])
+        );
+        // The device grant alone does not redeem a launch code.
+        let f = Fixture::new(json!({"enabled": true}));
+        let body = format!("grant_type={}&code=x&client_id=cli", enc(LAUNCH_GRANT_TYPE));
+        let r = f
+            .auth
+            .token(FORM, body.as_bytes(), Some(LOCAL.parse().unwrap()), None);
+        assert_eq!(error_of(&r), "unsupported_grant_type");
+    }
+
+    #[test]
+    fn the_launched_origin_is_admitted_once_and_only_with_a_slot() {
+        let configured = vec!["https://ui.example".to_string()];
+        assert_eq!(admitted_origins(&configured, None), configured);
+        let tui = LaunchSlot::new(None).unwrap();
+        assert_eq!(admitted_origins(&configured, Some(&tui)), configured);
+        let ui = LaunchSlot::new(Some(UI)).unwrap();
+        assert_eq!(
+            admitted_origins(&configured, Some(&ui)),
+            ["https://ui.example", UI]
+        );
+        let already = vec!["http://127.0.0.1:4555".to_string()];
+        assert_eq!(admitted_origins(&already, Some(&ui)), already);
+        assert!(LaunchSlot::new(Some("127.0.0.1:4555")).is_err());
     }
 }

@@ -189,11 +189,29 @@ fn reference_preflight(
     Some(crate::exit::USAGE)
 }
 
+/// What a caller embedding the daemon in its own process adds to it, beyond
+/// the configuration. Nothing here is configuration: it exists only in the
+/// process that built it, so no file, flag or variable can set it.
+#[derive(Default)]
+pub struct RunOpts {
+    /// The launcher's slot (`agentd tui` / `agentd ui`): the launch grant its
+    /// client signs in with, and for `agentd ui` the launched UI's origin.
+    #[cfg(feature = "a2a")]
+    pub launch: Option<std::sync::Arc<crate::a2a::oauth::LaunchSlot>>,
+}
+
 /// Start the runtime for a loaded configuration and block until it stops.
 /// Returns the process exit code: startup failures report before the loop is
 /// entered, so a non-zero return here is always a refusal to run rather than a
 /// partially started daemon.
 pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
+    run_with(loaded, args, env, RunOpts::default())
+}
+
+/// [`run`], with what the embedding process adds ([`RunOpts`]).
+pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts: RunOpts) -> i32 {
+    #[cfg(not(feature = "a2a"))]
+    let RunOpts {} = opts;
     let settings = loaded.settings.clone();
     let instance = settings.instance_name();
     let run_id = match settings.lifecycle.run_id.clone() {
@@ -1156,6 +1174,7 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
             &rt.durable,
             write_timeout,
             log.clone(),
+            opts.launch.clone(),
         ) {
             Ok(serving) => {
                 rt.a2a_feed = serving.feed.clone();

@@ -922,3 +922,178 @@ fn the_clients_approval_name_is_the_daemons() {
         "interface/src/client/composer.ts APPROVAL_NAME must be the daemon's approval-name pattern"
     );
 }
+
+// ---- the launch grant -------------------------------------------------------
+
+/// What the launch test hands the in-process daemon it starts.
+const LAUNCH_CFG_ENV: &str = "AGENTD_E2E_LAUNCH_CFG";
+const LAUNCH_CODE_ENV: &str = "AGENTD_E2E_LAUNCH_CODE";
+
+/// Not a test of its own: the daemon [`the_launch_event_matches_the_feed_schema`]
+/// starts, as this test binary re-run with `--ignored --exact`.
+///
+/// A launch slot is installed only in the process that runs the daemon —
+/// nothing on the command line or in a file can install one — so the daemon
+/// runs here, in-process, the way the launcher runs it, and in a process of
+/// its own so its child reaper and signal handlers are nobody else's. Built as
+/// a test, it is a debug build: the feed's schema assertion is compiled in.
+#[test]
+#[ignore = "the in-process daemon the_launch_event_matches_the_feed_schema starts"]
+fn launch_daemon() {
+    use agentd::a2a::oauth::{LaunchBind, LaunchSlot};
+    let (Ok(cfg), Ok(code_path)) = (
+        std::env::var(LAUNCH_CFG_ENV),
+        std::env::var(LAUNCH_CODE_ENV),
+    ) else {
+        return;
+    };
+    let args = vec!["--config".to_string(), cfg];
+    let env: Vec<(String, String)> = std::env::vars().collect();
+    let (loaded, _) =
+        agentd::config::v2::load(&args, &env).unwrap_or_else(|e| panic!("config: {e:?}"));
+    let slot = std::sync::Arc::new(LaunchSlot::new(None).unwrap());
+    let code = slot.issue(LaunchBind::NoOrigin, "agentd-tui").unwrap();
+    // Published whole: the test reads it once the file exists.
+    let staged = format!("{code_path}.tmp");
+    std::fs::write(&staged, &code).unwrap();
+    std::fs::rename(&staged, &code_path).unwrap();
+    let rc = agentd::runtime::run_with(
+        &loaded,
+        &args,
+        &env,
+        agentd::runtime::RunOpts { launch: Some(slot) },
+    );
+    let _ = std::fs::remove_file(&code_path);
+    std::process::exit(rc);
+}
+
+/// A launch exchange pushes the feed's `auth` `launch` event — the sid, the
+/// client and the operator scope the FeedKind contract requires — and an
+/// operator's subscriber receives it: the debug build's schema assertion in
+/// the feed's push did not fire. The session is an operator that lists as a
+/// launch, and neither the code nor the token reaches the log.
+#[test]
+fn the_launch_event_matches_the_feed_schema() {
+    let port = common::free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let cfg = common::unique_path("launch-daemon", "yaml");
+    std::fs::write(
+        &cfg,
+        config(&format!("http://127.0.0.1:{port}"), "", MEMORY),
+    )
+    .unwrap();
+    let code_path = common::unique_path("launch-code", "txt");
+    let stderr_path = common::unique_path("launch-daemon", "log");
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "launch_daemon",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(LAUNCH_CFG_ENV, &cfg)
+        .env(LAUNCH_CODE_ENV, &code_path)
+        .env("AGENTD_DG_OPS", OPS_TOKEN)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(std::fs::File::create(&stderr_path).unwrap()))
+        .spawn()
+        .expect("spawn the in-process daemon");
+    let mut daemon = Daemon {
+        child,
+        stderr_path,
+        cfg,
+    };
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while TcpStream::connect(&addr).is_err() || !std::path::Path::new(&code_path).exists() {
+        assert!(
+            daemon.alive() && Instant::now() < deadline,
+            "the launched daemon never came up:\n{}",
+            daemon.stderr()
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let code = std::fs::read_to_string(&code_path).unwrap();
+
+    // An operator watches the feed from before the exchange.
+    let ops = format!("Bearer {OPS_TOKEN}");
+    let mut feed = a2a_open(
+        &addr,
+        &rpc_body(77, common::feed_method(), json!({"fromSeq": 0})),
+        &[
+            ("Authorization", &ops),
+            ("A2A-Extensions", &common::feed_extensions()),
+        ],
+        Duration::from_secs(10),
+    );
+    let mut hello = String::new();
+    while !hello.contains("hello") {
+        hello.clear();
+        assert!(feed.read_line(&mut hello).unwrap() > 0, "no hello");
+    }
+
+    let grant = agentd::runtime::surface::launch::LAUNCH_GRANT_TYPE
+        .replace(':', "%3A")
+        .replace('/', "%2F");
+    let r = form_post(
+        &addr,
+        "/oauth2/token",
+        &format!("grant_type={grant}&code={code}&client_id=agentd-tui"),
+    );
+    assert_eq!(r.status, 200, "{r:?}\n{}", daemon.stderr());
+    let v = r.json();
+    assert_eq!(v["scope"], "operator", "{v}");
+    assert!(v.get("expires_in").is_none(), "a terminal session: {v}");
+    let token = v["access_token"].as_str().unwrap().to_string();
+
+    let mut launch = None;
+    common::read_frames(&mut feed, |f| {
+        let ev = &f["result"]["event"];
+        if ev["kind"] == "auth" && ev["data"]["event"] == "launch" {
+            launch = Some(ev["data"].clone());
+            return false;
+        }
+        true
+    });
+    let launch = launch.unwrap_or_else(|| {
+        panic!(
+            "no launch event reached the operator's feed:\n{}",
+            daemon.stderr()
+        )
+    });
+    let sid = launch["sid"].as_str().expect("the sid").to_string();
+    assert!(sid.starts_with("ls_"), "{launch}");
+    assert_eq!(
+        launch,
+        json!({"event": "launch", "sid": sid, "client_id": "agentd-tui", "scope": "operator"})
+    );
+
+    // The session is the operator's, and lists as a launch.
+    let listed = command_as(&addr, &token, "auth.sessions", json!({}));
+    let rows = answer(&listed)["sessions"].clone();
+    let row = rows
+        .as_array()
+        .and_then(|r| r.iter().find(|s| s["sid"] == sid.as_str()))
+        .unwrap_or_else(|| panic!("the launch session is listed: {listed}"));
+    assert_eq!(
+        (&row["kind"], &row["approved_by"], &row["principal"]),
+        (&json!("launch"), &json!("launcher"), &json!("operator"))
+    );
+    let line = daemon.wait_log(&["\"auth.launch.exchanged\"", &sid]);
+    assert!(line.contains("\"via\":\"code\""), "{line}");
+    let log = daemon.stderr();
+    assert!(
+        !log.contains(code.trim()),
+        "the launch code reached the log"
+    );
+    assert!(!log.contains(&token), "the token reached the log");
+    // Spent: a second exchange is refused.
+    let again = form_post(
+        &addr,
+        "/oauth2/token",
+        &format!("grant_type={grant}&code={code}&client_id=agentd-tui"),
+    );
+    assert_eq!(again.status, 400, "{again:?}");
+    assert!(daemon.alive(), "{}", daemon.stderr());
+}

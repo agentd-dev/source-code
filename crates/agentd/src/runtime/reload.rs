@@ -522,9 +522,13 @@ impl Runtime {
         // unlike the principals and the routes it is simply swapped.
         #[cfg(feature = "a2a")]
         if old.a2a.cors.origins != new.a2a.cors.origins
-            && let Some(origins) = self.a2a_serving.as_ref().map(|s| &s.origins)
+            && let Some(serving) = &self.a2a_serving
         {
-            *origins.write().unwrap_or_else(|e| e.into_inner()) = new.a2a.cors.origins.clone();
+            revise_origins(
+                &serving.origins,
+                &new.a2a.cors.origins,
+                serving.launch.as_deref(),
+            );
             changed.push("a2a.cors.origins");
         }
         if changed.is_empty() {
@@ -534,8 +538,53 @@ impl Runtime {
     }
 }
 
+/// Replace the live CORS allowlist with `configured` — and the UI a launcher
+/// started in this process, which is not configuration and so is in no
+/// reloaded file. Swapping in the file's list alone would be the "reported
+/// success, changed nothing" defect turned inside out: a reload that added
+/// one origin would silently lock out the tab the operator is looking at.
+#[cfg(feature = "a2a")]
+fn revise_origins(
+    live: &crate::a2a::serve::OriginList,
+    configured: &[String],
+    launch: Option<&crate::a2a::oauth::LaunchSlot>,
+) {
+    *live.write().unwrap_or_else(|e| e.into_inner()) =
+        crate::a2a::oauth::admitted_origins(configured, launch);
+}
+
 /// Why a reload did not apply.
 enum ReloadRefused {
     Invalid(Vec<String>),
     RestartRequired(Vec<String>),
+}
+
+#[cfg(all(test, feature = "a2a"))]
+mod tests {
+    use super::*;
+    use crate::a2a::oauth::{LaunchSlot, admitted_origins};
+
+    /// A reload that replaces `a2a.cors.origins` applies the new list and
+    /// keeps the UI a launcher started admitted — it is in no file, so a
+    /// reload that took the file's list alone would lock its tab out.
+    #[test]
+    fn the_launched_origin_survives_a_cors_reload() {
+        let launched = "http://127.0.0.1:4555";
+        let slot = LaunchSlot::new(Some(launched)).unwrap();
+        let live: crate::a2a::serve::OriginList = Arc::new(std::sync::RwLock::new(
+            admitted_origins(&["https://old.example".into()], Some(&slot)),
+        ));
+        revise_origins(&live, &["https://new.example".into()], Some(&slot));
+        assert_eq!(
+            *live.read().unwrap(),
+            ["https://new.example", launched],
+            "the new list applies and the launched UI stays"
+        );
+        // Emptied in the file, the launched UI is still the one admitted.
+        revise_origins(&live, &[], Some(&slot));
+        assert_eq!(*live.read().unwrap(), [launched]);
+        // Without a launcher, the list is exactly what the file says.
+        revise_origins(&live, &["https://new.example".into()], None);
+        assert_eq!(*live.read().unwrap(), ["https://new.example"]);
+    }
 }

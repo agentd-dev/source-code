@@ -37,8 +37,13 @@ pub(crate) struct A2aServing {
     /// every `agentd_at_` bearer to them — and held here, outside the
     /// authority, for that reason. `None` on a unix socket, which issues none.
     pub sessions: Option<Arc<crate::a2a::oauth::Sessions>>,
-    /// The authorization server, when `a2a.device_grant.enabled`.
+    /// The authorization server, when `a2a.device_grant.enabled` or a
+    /// launcher installed its slot.
     pub authority: Option<Arc<crate::a2a::oauth::Authority>>,
+    /// The launcher's slot, when `agentd tui` or `agentd ui` started this
+    /// daemon: kept so every rebuild of [`A2aServing::origins`] — a reload
+    /// that edits `a2a.cors.origins` — admits the UI it launched.
+    pub launch: Option<Arc<crate::a2a::oauth::LaunchSlot>>,
 }
 
 /// The URL a caller reaches this listener at, once it is bound.
@@ -86,6 +91,13 @@ pub(crate) fn advertised_url(a2a: &crate::config::v2::A2a, bound: &str) -> Strin
 /// in the first place, and the bridge that carries the resolver — the rules and
 /// the posture — every request is resolved under.
 ///
+/// `launch` is the slot a launcher installed in this process
+/// ([`crate::runtime::RunOpts`]). It adds the launch grant to the token
+/// endpoint and, for `agentd ui`, the launched UI's origin to the CORS list —
+/// and nothing else: the posture, the cards and the manifest are what they
+/// would be without it, because it is not a mechanism any caller but the
+/// launcher's own client can use.
+///
 /// Before anything binds, every rule id is recorded in the identity registry
 /// ([`crate::runtime::identities`]), and a `user`-role id that an approved
 /// device already owns refuses the start: the two would be one principal, and
@@ -97,6 +109,7 @@ pub(crate) fn spawn_a2a_listener(
     durable: &crate::state::Durable,
     _write_timeout: Duration,
     log: Logger,
+    launch: Option<Arc<crate::a2a::oauth::LaunchSlot>>,
 ) -> Result<A2aServing, String> {
     use std::path::Path;
     let listen = a2a.listen.as_deref().ok_or("a2a.listen is not set")?;
@@ -155,12 +168,18 @@ pub(crate) fn spawn_a2a_listener(
         .events
         .enabled
         .then(|| Arc::new(SharedFeed::new(a2a.introspection.enabled)));
-    // Shared with the listener so a reload can revise the CORS allowlist.
-    let origins: crate::a2a::serve::OriginList =
-        Arc::new(std::sync::RwLock::new(a2a.cors.origins.clone()));
+    // A unix socket has no browsers and issues no sessions: a slot there
+    // (which the launcher refuses to install) would have nothing to serve.
+    let launch = launch.filter(|_| !unix_listener);
+    // Shared with the listener so a reload can revise the CORS allowlist —
+    // which, like the reload, admits the UI a launcher started.
+    let origins: crate::a2a::serve::OriginList = Arc::new(std::sync::RwLock::new(
+        crate::a2a::oauth::admitted_origins(&a2a.cors.origins, launch.as_deref()),
+    ));
     let bridge = A2aBridge::with_feed(events_tx, resolver, feed.clone());
     // Sessions on every TCP listener; the authority that issues into them
-    // only with the grant. A unix socket's peers are the kernel's to name.
+    // only with a grant — the device grant, or a launcher's slot. A unix
+    // socket's peers are the kernel's to name.
     let sessions = (!unix_listener).then(|| {
         Arc::new(crate::a2a::oauth::Sessions::new(
             crate::a2a::oauth::system_clock(),
@@ -168,17 +187,23 @@ pub(crate) fn spawn_a2a_listener(
     });
     let authority = sessions
         .as_ref()
-        .filter(|_| a2a.device_grant.enabled)
+        .filter(|_| a2a.device_grant.enabled || launch.is_some())
         .map(|s| {
             Arc::new(crate::a2a::oauth::Authority::new(
-                crate::a2a::oauth::DeviceGrant::new(
-                    &a2a.device_grant,
-                    crate::a2a::oauth::system_clock(),
-                    crate::a2a::oauth::os_mint(),
-                ),
+                a2a.device_grant.enabled.then(|| {
+                    crate::a2a::oauth::DeviceGrant::new(
+                        &a2a.device_grant,
+                        crate::a2a::oauth::system_clock(),
+                        crate::a2a::oauth::os_mint(),
+                    )
+                }),
+                launch.clone(),
                 Arc::clone(s),
             ))
         });
+    if let Some(slot) = &launch {
+        slot.attach_log(log.clone());
+    }
 
     let listener = crate::a2a::serve::spawn(
         if unix_listener {
@@ -220,6 +245,7 @@ pub(crate) fn spawn_a2a_listener(
         origins,
         sessions,
         authority,
+        launch,
     };
     log.info(
         "a2a.listen",
@@ -231,6 +257,102 @@ pub(crate) fn spawn_a2a_listener(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn quiet() -> Logger {
+        Logger::new(
+            crate::obs::log::LogCtx {
+                run_id: "r".into(),
+                agent_id: "0".into(),
+                agent_path: "0".into(),
+                comp: crate::obs::log::Comp::Supervisor,
+                pid: std::process::id(),
+                trace_id: None,
+            },
+            crate::obs::log::Level::Error,
+        )
+    }
+
+    /// Spawn a listener for `a2a` on a free loopback port (a listen URL
+    /// names a fixed one), with `launch` installed or not.
+    fn serve(
+        a2a: &crate::config::v2::A2a,
+        launch: Option<Arc<crate::a2a::oauth::LaunchSlot>>,
+    ) -> A2aServing {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .unwrap()
+            .port();
+        let mut a2a = a2a.clone();
+        a2a.listen = Some(format!("http://127.0.0.1:{port}"));
+        let a2a = &a2a;
+        let durable = crate::state::Durable::new(
+            Arc::new(crate::store::memory::MemoryStore::new()),
+            "agentd",
+            "i",
+            crate::state::Policy::default(),
+            None,
+        );
+        let (tx, _rx) = std::sync::mpsc::channel();
+        spawn_a2a_listener(
+            a2a,
+            tx,
+            Resolver::build(a2a, &|_| None).unwrap(),
+            &durable,
+            Duration::from_secs(1),
+            quiet(),
+            launch,
+        )
+        .unwrap()
+    }
+
+    /// A launcher's slot is not a mechanism any caller but its own client can
+    /// use, so it changes no posture: what the resolver enforces, what the
+    /// card is built from — the posture and the advertised URL — and the
+    /// manifest's a2a section are the same with and without one, for every
+    /// shape of listener a launcher can start. Only the grant's own routes
+    /// and the launched UI's origin differ.
+    #[test]
+    fn a_launch_changes_no_posture() {
+        let settings = |a2a: serde_json::Value| crate::config::v2::Settings {
+            a2a: serde_json::from_value(a2a).unwrap(),
+            ..Default::default()
+        };
+        for doc in [
+            json!({"listen": "http://127.0.0.1:8420", "url": "http://127.0.0.1:8420"}),
+            json!({"listen": "http://127.0.0.1:8420", "url": "http://127.0.0.1:8420",
+                   "cors": {"origins": ["https://ui.example"]},
+                   "device_grant": {"enabled": true}, "events": {"enabled": true}}),
+        ] {
+            let s = settings(doc);
+            let plain = serve(&s.a2a, None);
+            let slot = Arc::new(
+                crate::a2a::oauth::LaunchSlot::new(Some("http://127.0.0.1:4555")).unwrap(),
+            );
+            let launched = serve(&s.a2a, Some(Arc::clone(&slot)));
+            let posture = plain.bridge.resolver().posture();
+            assert_eq!(launched.bridge.resolver().posture(), posture, "{s:?}");
+            assert_eq!(
+                posture,
+                crate::runtime::surface::auth::listener_auth_of(&s.a2a)
+            );
+            assert_eq!(launched.advertised_url, plain.advertised_url);
+            let manifest = crate::runtime::surface::manifest::a2a_section(&s);
+            assert_eq!(
+                manifest["cors_origins"],
+                s.a2a.cors.origins.len(),
+                "the launched origin is not configuration"
+            );
+            // The slot is what it adds: the launch grant, and the origin.
+            assert!(plain.launch.is_none() && launched.launch.is_some());
+            assert!(launched.authority.as_ref().unwrap().launch().is_some());
+            let admitted = launched.origins.read().unwrap().clone();
+            assert_eq!(
+                admitted.last().map(String::as_str),
+                Some("http://127.0.0.1:4555")
+            );
+            assert_eq!(*plain.origins.read().unwrap(), s.a2a.cors.origins);
+        }
+    }
 
     fn a2a(doc: serde_json::Value) -> crate::config::v2::A2a {
         serde_json::from_value(doc).unwrap()

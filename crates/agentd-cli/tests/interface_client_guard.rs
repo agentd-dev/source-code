@@ -8,21 +8,51 @@
 //! person opened the TUI. This reads the client's source and holds it to the
 //! daemon's constant.
 //!
-//! **Monorepo-only.** It reads `interface/src/client/wire.ts` beside this
-//! crate, so it guards the client only while the two live in one repository.
+//! The same holds for the launcher's contract with the clients it starts: the
+//! launch grant type the client redeems its code with, and every flag the
+//! launcher passes, must be what the client's source actually reads.
+//!
+//! **Monorepo-only.** It reads the interface sources beside this crate
+//! (`interface/src/client/*.ts`, the clients' argument parsers), so it guards
+//! the clients only while they live in one repository.
 //! A client built elsewhere is held to the same contract by the contract job
 //! that runs its own suite against a daemon, not by this file.
 
 use std::path::Path;
 
-/// The client transport, which every JSON-RPC request goes through.
-fn wire_ts() -> String {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../interface/src/client/wire.ts");
+/// A source file of the interface, by its path under `interface/`.
+fn interface_src(rel: &str) -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../interface")
+        .join(rel);
     std::fs::read_to_string(&path).unwrap_or_else(|e| {
         panic!(
             "{}: {e} — this guard is monorepo-only and expects the interface client beside the crates",
             path.display()
         )
+    })
+}
+
+/// The client transport, which every JSON-RPC request goes through.
+fn wire_ts() -> String {
+    interface_src("src/client/wire.ts")
+}
+
+/// The source that parses the argv of the client `agentd <sub>` starts.
+fn argv_parser(sub: &str) -> &'static str {
+    match sub {
+        "tui" => "src/tui/args.ts",
+        "ui" => "bin/serve.mjs",
+        other => panic!("no known argument parser for the {other} client: name it here"),
+    }
+}
+
+/// Whether `src` reads `flag`: as the literal flag (`'--endpoint'`), or by
+/// the name a `--${name}` helper builds it from (`opt('endpoint'`).
+fn reads_flag(src: &str, flag: &str) -> bool {
+    let name = flag.trim_start_matches('-');
+    ['\'', '"'].iter().any(|q| {
+        src.contains(&format!("{q}{flag}{q}")) || src.contains(&format!("opt({q}{name}{q}"))
     })
 }
 
@@ -68,4 +98,40 @@ fn the_const_reader_reads_what_it_is_given() {
         Some("2.1")
     );
     assert_eq!(ts_const("const A2A_VERSION = '1.0';", "A2A_VERSION"), None);
+}
+
+/// The launch grant the client redeems its launch code with is the one the
+/// daemon's token endpoint accepts, and every flag the launcher passes a
+/// client is one that client's parser reads — so neither side can rename its
+/// half of the contract alone.
+#[test]
+fn the_launch_contract_matches_the_clients() {
+    use agentd::runtime::surface::launch::{LAUNCH_CONTRACT, LAUNCH_GRANT_TYPE};
+    assert_eq!(
+        ts_const(&interface_src("src/client/auth.ts"), "LAUNCH_GRANT_TYPE").as_deref(),
+        Some(LAUNCH_GRANT_TYPE),
+        "interface/src/client/auth.ts LAUNCH_GRANT_TYPE must be the grant the daemon redeems"
+    );
+    for client in LAUNCH_CONTRACT {
+        let parser = argv_parser(client.sub);
+        let src = interface_src(parser);
+        for flag in client.argv {
+            assert!(
+                reads_flag(&src, flag),
+                "`agentd {}` passes {flag}, which interface/{parser} does not read",
+                client.sub
+            );
+        }
+    }
+}
+
+#[test]
+fn the_flag_reader_reads_what_it_is_given() {
+    assert!(reads_flag("valued(argv, i, '--launch-fd')", "--launch-fd"));
+    assert!(reads_flag("const e = opt('endpoint', x);", "--endpoint"));
+    assert!(!reads_flag(
+        "valued(argv, i, '--launch-fd-x')",
+        "--launch-fd"
+    ));
+    assert!(!reads_flag("// --endpoint in a comment", "--endpoint"));
 }

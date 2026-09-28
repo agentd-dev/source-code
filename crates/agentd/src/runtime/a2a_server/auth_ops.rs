@@ -53,8 +53,12 @@ pub(super) fn handle(
     };
     match op {
         "auth.device.pending" => {
-            let device = &authority(rt)?.device;
-            let pending: Vec<Value> = device.pending().iter().map(|p| p.view()).collect();
+            let authority = authority(rt)?;
+            let pending: Vec<Value> = device_of(&authority)?
+                .pending()
+                .iter()
+                .map(|p| p.view())
+                .collect();
             Ok(AuthAnswer::Doc(json!({"pending": pending})))
         }
         "auth.device.approve" => approve(rt, principal, args).map_err(|e| match e {
@@ -71,7 +75,8 @@ pub(super) fn handle(
                     ));
                 }
             };
-            let denied = authority(rt)?.device.deny(target).map_err(bad)?;
+            let authority = authority(rt)?;
+            let denied = device_of(&authority)?.deny(target).map_err(bad)?;
             for d in &denied {
                 push(rt, d.event("denied"));
             }
@@ -197,7 +202,7 @@ fn approve(rt: &mut Runtime, principal: &Principal, args: &Value) -> Result<Auth
         Some(_) => return Err(Refusal::Args("`scope` is a string".into())),
     };
     let authority = authority(rt)?;
-    let device = &authority.device;
+    let device = device_of(&authority)?;
     let view = device.find(code).map_err(Refusal::Args)?;
     let scope = device
         .grant_scope(view.requested, asked)
@@ -268,6 +273,20 @@ fn authority(rt: &Runtime) -> Result<std::sync::Arc<crate::a2a::oauth::Authority
                 "the device grant is not serving on this listener",
             )
         })
+}
+
+/// The device grant of `authority`, which a launcher's slot alone does not
+/// give it: the listener then serves `/oauth2/token` for the launch grant and
+/// has no device sign-in to approve.
+fn device_of(
+    authority: &crate::a2a::oauth::Authority,
+) -> Result<&crate::a2a::oauth::DeviceGrant, Value> {
+    authority.device().ok_or_else(|| {
+        err_obj(
+            super::UNSUPPORTED_OPERATION,
+            "the device grant is not serving on this listener",
+        )
+    })
 }
 
 /// The listener's sessions.

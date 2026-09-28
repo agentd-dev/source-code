@@ -68,7 +68,10 @@
 //! authorization server ([`crate::a2a::oauth`]): the device grant's endpoints
 //! under `/oauth2/`, and its RFC 8414 metadata at the root. They sit behind
 //! the same origin gate as `POST /`, and every answer is `no-store`. Without
-//! the grant they are not routes at all.
+//! the grant they are not routes at all — except that a launcher's slot
+//! (`agentd tui` / `agentd ui`) mounts the token and revocation endpoints for
+//! the launch grant, and, for a launched web UI, the endpoint its tab asks
+//! the launcher's terminal to sign it in at.
 //!
 //! The session a sign-in issues is checked on every request, and while a
 //! caller's requests are in flight: a revoked session loses the streams it
@@ -349,8 +352,12 @@ impl App {
 /// was the pre-1.0 name, and a client still asking there is told 404 rather
 /// than handed a document it would read with the wrong expectations.
 ///
-/// The authorization server's routes exist only while the device grant does:
-/// a listener that issues nothing does not answer as if it might.
+/// The authorization server's routes exist only while something issues
+/// through them — a listener that issues nothing does not answer as if it
+/// might: the token and revocation endpoints while the device grant or a
+/// launcher's slot does, the device grant's own endpoints and the RFC 8414
+/// metadata only with the device grant, and the launch request only while the
+/// slot names a web UI to accept it from.
 fn router(app: Arc<App>) -> Router {
     use crate::a2a::oauth;
     let mut r = Router::new()
@@ -359,19 +366,28 @@ fn router(app: Arc<App>) -> Router {
             "/.well-known/agent-card.json",
             get(card).options(card_preflight),
         );
-    if app.auth.authority.is_some() {
+    if let Some(authority) = &app.auth.authority {
         r = r
-            .route(
-                oauth::DEVICE_AUTHORIZATION_PATH,
-                post(oauth_device_authorization).options(preflight),
-            )
             .route(oauth::TOKEN_PATH, post(oauth_token).options(preflight))
-            .route(oauth::REVOKE_PATH, post(oauth_revoke).options(preflight))
-            .route(
-                oauth::VERIFICATION_PATH,
-                get(oauth_verification).options(preflight),
-            )
-            .route(oauth::METADATA_PATH, get(oauth_metadata).options(preflight));
+            .route(oauth::REVOKE_PATH, post(oauth_revoke).options(preflight));
+        if authority.device().is_some() {
+            r = r
+                .route(
+                    oauth::DEVICE_AUTHORIZATION_PATH,
+                    post(oauth_device_authorization).options(preflight),
+                )
+                .route(
+                    oauth::VERIFICATION_PATH,
+                    get(oauth_verification).options(preflight),
+                )
+                .route(oauth::METADATA_PATH, get(oauth_metadata).options(preflight));
+        }
+        if authority.launch().is_some_and(|l| l.origin().is_some()) {
+            r = r.route(
+                oauth::LAUNCH_AUTHORIZATION_PATH,
+                post(oauth_launch_authorization).options(preflight),
+            );
+        }
     }
     r.with_state(app)
 }
@@ -437,6 +453,18 @@ async fn oauth_call(
                         .info("auth.session.revoked", s.revoked_line("oauth2_revoke"));
                     push_auth_event(app, s.revoked_event());
                 }
+                // The sid and the bind, never the code or the token.
+                Notice::Launched { session, bind, via } => {
+                    app.log.info(
+                        "auth.launch.exchanged",
+                        json!({"sid": session.sid, "client_id": session.client_id, "bind": bind, "via": via}),
+                    );
+                    push_auth_event(app, session.launched_event());
+                }
+                Notice::LaunchRequested(client_id) => {
+                    app.log
+                        .info("auth.launch.requested", json!({"client_id": client_id}));
+                }
             }
         }
         let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -498,7 +526,27 @@ async fn oauth_token(
     body: axum::body::Body,
 ) -> axum::response::Response {
     let ip = peer_ip(&peer);
-    oauth_call(&app, &headers, Some(body), |a, ct, b| a.token(ct, b, ip)).await
+    // The launch grant is bound to the request's Origin — whether it has one
+    // at all, and which — so the endpoint is told it.
+    let origin = cors::origin_of(&headers).map(str::to_string);
+    oauth_call(&app, &headers, Some(body), |a, ct, b| {
+        a.token(ct, b, ip, origin.as_deref())
+    })
+    .await
+}
+
+async fn oauth_launch_authorization(
+    axum::extract::State(app): axum::extract::State<Arc<App>>,
+    axum::Extension(peer): axum::Extension<Peer>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Body,
+) -> axum::response::Response {
+    let ip = peer_ip(&peer);
+    let origin = cors::origin_of(&headers).map(str::to_string);
+    oauth_call(&app, &headers, Some(body), |a, ct, b| {
+        a.launch_authorization(ct, b, ip, origin.as_deref())
+    })
+    .await
 }
 
 async fn oauth_revoke(
@@ -1227,7 +1275,12 @@ mod tests {
         let cfg: crate::config::v2::DeviceGrant = serde_json::from_value(cfg).unwrap();
         let sessions = Arc::new(Sessions::new(oauth::system_clock()));
         let a = Arc::new(Authority::new(
-            DeviceGrant::new(&cfg, oauth::system_clock(), oauth::os_mint()),
+            Some(DeviceGrant::new(
+                &cfg,
+                oauth::system_clock(),
+                oauth::os_mint(),
+            )),
+            None,
             sessions,
         ));
         a.set_issuer(issuer);
@@ -1606,5 +1659,355 @@ mod tests {
             at.elapsed()
         );
         assert!(body.next().await.is_none(), "nothing after the goodbye");
+    }
+
+    // ---- the launch grant ------------------------------------------------
+
+    use crate::a2a::oauth::{LaunchBind, LaunchSlot};
+    use crate::runtime::surface::launch::LAUNCH_GRANT_TYPE;
+
+    const UI: &str = "http://127.0.0.1:4555";
+
+    /// The authority a listener builds with `slot` installed — and the
+    /// device grant too, when `device` — as `spawn_a2a_listener` builds it.
+    fn launch_auth(slot: &Arc<LaunchSlot>, device: bool) -> Auth {
+        let cfg: crate::config::v2::DeviceGrant =
+            serde_json::from_value(json!({"enabled": true})).unwrap();
+        let sessions = Arc::new(Sessions::new(oauth::system_clock()));
+        let a = Arc::new(Authority::new(
+            device.then(|| DeviceGrant::new(&cfg, oauth::system_clock(), oauth::os_mint())),
+            Some(Arc::clone(slot)),
+            Arc::clone(&sessions),
+        ));
+        a.set_issuer("http://127.0.0.1:8420");
+        Auth {
+            sessions: Some(sessions),
+            authority: Some(a),
+        }
+    }
+
+    fn launch_form(code: &str, client: &str) -> String {
+        format!(
+            "grant_type={}&code={code}&client_id={client}",
+            LAUNCH_GRANT_TYPE.replace(':', "%3A").replace('/', "%2F")
+        )
+    }
+
+    fn get(path: &str) -> Request<Body> {
+        Request::builder().uri(path).body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn launch_routes_follow_the_slot() {
+        // Neither the device grant nor a slot: no authorization server.
+        let (router, _) = listener(|_| task_not_found(), None);
+        for path in [oauth::TOKEN_PATH, oauth::LAUNCH_AUTHORIZATION_PATH] {
+            let r = send(&router, form_post(path, "client_id=agentd-ui", None)).await;
+            assert_eq!(r.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+
+        // A terminal client's slot alone: the token and revocation endpoints,
+        // the launch grant only, and nothing a browser tab could ask at.
+        let tui = Arc::new(LaunchSlot::new(None).unwrap());
+        let (router, _) = listener_with(
+            |_| task_not_found(),
+            launch_auth(&tui, false),
+            Vec::new(),
+            None,
+        );
+        let r = send(
+            &router,
+            form_post(
+                oauth::LAUNCH_AUTHORIZATION_PATH,
+                "client_id=agentd-ui",
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        let code = tui.issue(LaunchBind::NoOrigin, "agentd-tui").unwrap();
+        let r = send(
+            &router,
+            form_post(oauth::TOKEN_PATH, &launch_form(&code, "agentd-tui"), None),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let token = json_of(r).await["access_token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let device = format!(
+            "grant_type={}&device_code=x&client_id=cli",
+            oauth::DEVICE_CODE_GRANT.replace(':', "%3A")
+        );
+        let r = send(&router, form_post(oauth::TOKEN_PATH, &device, None)).await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_of(r).await["error"], "unsupported_grant_type");
+        let r = send(
+            &router,
+            form_post(oauth::REVOKE_PATH, &format!("token={token}"), None),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+        for req in [
+            form_post(oauth::DEVICE_AUTHORIZATION_PATH, "client_id=cli", None),
+            get(oauth::VERIFICATION_PATH),
+            get(oauth::METADATA_PATH),
+        ] {
+            let path = req.uri().to_string();
+            assert_eq!(
+                send(&router, req).await.status(),
+                StatusCode::NOT_FOUND,
+                "{path}"
+            );
+        }
+
+        // A web UI's slot: its tab may ask the terminal.
+        let ui = Arc::new(LaunchSlot::new(Some(UI)).unwrap());
+        let (router, _) = listener_with(
+            |_| task_not_found(),
+            launch_auth(&ui, false),
+            oauth::admitted_origins(&[], Some(&ui)),
+            None,
+        );
+        let r = send(
+            &router,
+            form_post(
+                oauth::LAUNCH_AUTHORIZATION_PATH,
+                "client_id=agentd-ui",
+                Some(UI),
+            ),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let v = json_of(r).await;
+        assert!(
+            v["request_code"]
+                .as_str()
+                .unwrap()
+                .starts_with(oauth::LAUNCH_REQUEST_PREFIX),
+            "{v}"
+        );
+
+        // Both: the metadata names both grants.
+        let (router, _) = listener_with(
+            |_| task_not_found(),
+            launch_auth(&ui, true),
+            Vec::new(),
+            None,
+        );
+        let r = send(&router, get(oauth::METADATA_PATH)).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(
+            json_of(r).await["grant_types_supported"],
+            json!([oauth::DEVICE_CODE_GRANT, LAUNCH_GRANT_TYPE])
+        );
+    }
+
+    /// The UI a launcher started is admitted by CORS with no configured
+    /// origin at all — and admitted is all it is: without a session it is
+    /// asked to sign in like any browser, and the origin next door is still
+    /// refused.
+    #[tokio::test]
+    async fn the_launched_origin_is_allowed_and_nothing_else() {
+        let slot = Arc::new(LaunchSlot::new(Some(UI)).unwrap());
+        let (router, reached) = listener_with(
+            |_| task_not_found(),
+            launch_auth(&slot, false),
+            oauth::admitted_origins(&[], Some(&slot)),
+            None,
+        );
+        let preflight = |origin: &str| {
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/")
+                .header("origin", origin)
+                .header("access-control-request-method", "POST")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let r = send(&router, preflight(UI)).await;
+        assert_eq!(r.status(), StatusCode::NO_CONTENT);
+        assert_eq!(r.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], UI);
+        let r = send(&router, preflight("http://127.0.0.1:4556")).await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"GetTask","params":{"id":"t"}}"#;
+        let r = post(&router, body, &[], &[("origin", UI)]).await;
+        assert_eq!(
+            r.status(),
+            StatusCode::UNAUTHORIZED,
+            "admitted is not trusted"
+        );
+        assert_eq!(r.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], UI);
+        let r = post(&router, body, &[], &[("origin", "http://127.0.0.1:4556")]).await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        assert_eq!(reached.load(Ordering::SeqCst), 0);
+
+        // Signed in with the launch code, the tab is the operator.
+        let code = slot
+            .issue(LaunchBind::Origin(UI.into()), "agentd-ui")
+            .unwrap();
+        let r = send(
+            &router,
+            form_post(
+                oauth::TOKEN_PATH,
+                &launch_form(&code, "agentd-ui"),
+                Some(UI),
+            ),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let token = json_of(r).await["access_token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let auth = format!("Bearer {token}");
+        let r = post(
+            &router,
+            body,
+            &[],
+            &[("origin", UI), ("authorization", &auth)],
+        )
+        .await;
+        assert_eq!(json_of(r).await["error"]["code"], -32001);
+        assert_eq!(reached.load(Ordering::SeqCst), 1);
+    }
+
+    /// An address of this host that is not loopback, if it has one: the
+    /// source address of a route out (no packet is sent).
+    fn interface_ip() -> Option<std::net::IpAddr> {
+        let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+        s.connect("192.0.2.1:9").ok()?;
+        let ip = s.local_addr().ok()?.ip();
+        (!ip.is_loopback() && !ip.is_unspecified()).then_some(ip)
+    }
+
+    /// A form POST over a real connection to `addr`, with `origin`: the
+    /// status and the body.
+    fn wire_post(addr: &str, path: &str, body: &str, origin: Option<&str>) -> (u16, Value) {
+        use std::io::{Read, Write};
+        let mut s = std::net::TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).ok();
+        let origin = origin
+            .map(|o| format!("Origin: {o}\r\n"))
+            .unwrap_or_default();
+        write!(
+            s,
+            "POST {path} HTTP/1.1\r\nHost: x\r\n{origin}Content-Type: application/x-www-form-urlencoded\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut raw = String::new();
+        s.read_to_string(&mut raw).ok();
+        let status = raw
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0);
+        let body = raw
+            .split_once("\r\n\r\n")
+            .and_then(|(_, b)| serde_json::from_str(b.trim()).ok())
+            .unwrap_or(Value::Null);
+        (status, body)
+    }
+
+    /// A live code presented from off the host — a wildcard-bound listener
+    /// dialled on this host's own interface address, so the peer is not
+    /// loopback — is refused and burned; a tab's request from there is
+    /// refused too.
+    #[test]
+    fn launch_grants_need_a_loopback_peer() {
+        let Some(ip) = interface_ip() else {
+            eprintln!("skipped: this host has no non-loopback address to dial");
+            return;
+        };
+        let slot = Arc::new(LaunchSlot::new(Some(UI)).unwrap());
+        let resolver = crate::a2a::Resolver::build(
+            &serde_json::from_value(
+                json!({"listen": "http://0.0.0.0:0", "url": "http://127.0.0.1:1"}),
+            )
+            .unwrap(),
+            &|_| None,
+        )
+        .unwrap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let log = Logger::new(
+            crate::obs::log::LogCtx {
+                run_id: "r".into(),
+                agent_id: "0".into(),
+                agent_path: "0".into(),
+                comp: crate::obs::log::Comp::Supervisor,
+                pid: std::process::id(),
+                trace_id: None,
+            },
+            crate::obs::log::Level::Error,
+        );
+        let listener = spawn(
+            Bind::Tcp("0.0.0.0:0".into()),
+            Opts {
+                auth: launch_auth(&slot, false),
+                cors_origins: Arc::new(std::sync::RwLock::new(oauth::admitted_origins(
+                    &[],
+                    Some(&slot),
+                ))),
+                tls: None,
+                request_timeout: Duration::from_secs(5),
+                stream_deadline: Duration::from_secs(5),
+            },
+            A2aBridge::new(tx, resolver),
+            None,
+            log,
+        )
+        .unwrap();
+        let port = listener.bound.rsplit_once(':').unwrap().1.to_string();
+        let remote = format!(
+            "{}:{port}",
+            crate::runtime::surface::auth::bracket(&ip.to_string())
+        );
+        let local = format!("127.0.0.1:{port}");
+
+        let code = slot
+            .issue(LaunchBind::Origin(UI.into()), "agentd-ui")
+            .unwrap();
+        let form = launch_form(&code, "agentd-ui");
+        let (status, v) = wire_post(&remote, oauth::TOKEN_PATH, &form, Some(UI));
+        assert_eq!((status, &v["error"]), (400, &json!("invalid_grant")), "{v}");
+        let (status, v) = wire_post(&local, oauth::TOKEN_PATH, &form, Some(UI));
+        assert_eq!(
+            (status, &v["error"]),
+            (400, &json!("invalid_grant")),
+            "burned: {v}"
+        );
+        let (status, v) = wire_post(
+            &remote,
+            oauth::LAUNCH_AUTHORIZATION_PATH,
+            "client_id=agentd-ui",
+            Some(UI),
+        );
+        assert_eq!(
+            (status, &v["error"]),
+            (400, &json!("invalid_request")),
+            "{v}"
+        );
+        // From loopback, both work.
+        let code = slot
+            .issue(LaunchBind::Origin(UI.into()), "agentd-ui")
+            .unwrap();
+        let (status, v) = wire_post(
+            &local,
+            oauth::TOKEN_PATH,
+            &launch_form(&code, "agentd-ui"),
+            Some(UI),
+        );
+        assert_eq!(status, 200, "{v}");
+        let (status, v) = wire_post(
+            &local,
+            oauth::LAUNCH_AUTHORIZATION_PATH,
+            "client_id=agentd-ui",
+            Some(UI),
+        );
+        assert_eq!(status, 200, "{v}");
     }
 }

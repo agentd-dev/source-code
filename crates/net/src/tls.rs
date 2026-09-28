@@ -11,6 +11,7 @@
 //! `Read + Write` — it drops straight into the transport-agnostic hand-rolled
 //! HTTP machinery ([`crate::http`]).
 
+use rustls::pki_types::pem::{self, PemObject};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{
@@ -46,9 +47,8 @@ pub fn install_extra_ca(ca_pem: &[u8]) -> io::Result<usize> {
     // Parse AND prove addability now (roots_from_pem add-validates each cert),
     // so a bad bundle fails fast at startup, never at a dial site.
     validate_ca_pem(ca_pem)?;
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut io::Cursor::new(ca_pem))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| io::Error::other(format!("tls: bad CA PEM: {e}")))?;
+    let certs: Vec<CertificateDer<'static>> =
+        pem_certs(ca_pem).map_err(|e| io::Error::other(format!("tls: bad CA PEM: {e}")))?;
     let n = certs.len();
     match EXTRA_CA.set(certs) {
         Ok(()) => Ok(n),
@@ -117,8 +117,7 @@ impl ClientIdentity {
     /// Load a client identity from PEM bytes (a cert chain + one private key —
     /// PKCS#8 / PKCS#1 / SEC1). Typically read from mounted secret files.
     pub fn from_pem(cert_pem: &[u8], key_pem: &[u8]) -> io::Result<ClientIdentity> {
-        let certs = rustls_pemfile::certs(&mut io::Cursor::new(cert_pem))
-            .collect::<Result<Vec<_>, _>>()
+        let certs = pem_certs(cert_pem)
             .map_err(|e| io::Error::other(format!("mtls: bad client cert PEM: {e}")))?;
         if certs.is_empty() {
             return Err(io::Error::new(
@@ -126,7 +125,7 @@ impl ClientIdentity {
                 "mtls: no CERTIFICATE in client cert PEM",
             ));
         }
-        let key = rustls_pemfile::private_key(&mut io::Cursor::new(key_pem))
+        let key = pem_key(key_pem)
             .map_err(|e| io::Error::other(format!("mtls: bad client key PEM: {e}")))?
             .ok_or_else(|| {
                 io::Error::new(
@@ -211,11 +210,33 @@ fn connect_with_config(
     Ok(StreamOwned::new(conn, tcp))
 }
 
+/// Every CERTIFICATE block in a PEM bundle, in order. Sections of any other
+/// kind, and text between them, are skipped — an empty result is the caller's
+/// "no CERTIFICATE" error, not this parser's.
+///
+/// The parser is the one in `rustls-pki-types`, which rustls already carries;
+/// `rustls-pemfile`, which wrapped the same code, is archived and unmaintained
+/// (RUSTSEC-2025-0134).
+fn pem_certs(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, pem::Error> {
+    CertificateDer::pem_slice_iter(pem).collect()
+}
+
+/// The first private key in a PEM document (PKCS#8, PKCS#1 or SEC1), or
+/// `None` when it holds none — so a keyless file keeps its own "no PRIVATE
+/// KEY" error rather than surfacing as a parse failure.
+fn pem_key(pem: &[u8]) -> Result<Option<PrivateKeyDer<'static>>, pem::Error> {
+    match PrivateKeyDer::from_pem_slice(pem) {
+        Ok(key) => Ok(Some(key)),
+        Err(pem::Error::NoItemsFound) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// Parse a PEM bundle of CA certificates into a root store.
 fn roots_from_pem(ca_pem: &[u8]) -> io::Result<RootCertStore> {
     let mut roots = RootCertStore::empty();
     let mut added = 0usize;
-    for cert in rustls_pemfile::certs(&mut io::Cursor::new(ca_pem)) {
+    for cert in CertificateDer::pem_slice_iter(ca_pem) {
         let cert = cert.map_err(|e| io::Error::other(format!("tls: bad CA PEM: {e}")))?;
         roots
             .add(cert)
@@ -255,8 +276,7 @@ impl ServerIdentity {
     /// Load a server identity from PEM bytes (a cert chain + one private key —
     /// PKCS#8 / PKCS#1 / SEC1). Typically read from mounted secret files.
     pub fn from_pem(cert_pem: &[u8], key_pem: &[u8]) -> io::Result<ServerIdentity> {
-        let certs = rustls_pemfile::certs(&mut io::Cursor::new(cert_pem))
-            .collect::<Result<Vec<_>, _>>()
+        let certs = pem_certs(cert_pem)
             .map_err(|e| io::Error::other(format!("tls: bad server cert PEM: {e}")))?;
         if certs.is_empty() {
             return Err(io::Error::new(
@@ -264,7 +284,7 @@ impl ServerIdentity {
                 "tls: no CERTIFICATE in server cert PEM",
             ));
         }
-        let key = rustls_pemfile::private_key(&mut io::Cursor::new(key_pem))
+        let key = pem_key(key_pem)
             .map_err(|e| io::Error::other(format!("tls: bad server key PEM: {e}")))?
             .ok_or_else(|| {
                 io::Error::new(

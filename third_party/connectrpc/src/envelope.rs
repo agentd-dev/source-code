@@ -23,10 +23,25 @@ pub mod flags {
     pub const COMPRESSED: u8 = 0x01;
     /// End of stream (trailers follow).
     pub const END_STREAM: u8 = 0x02;
+    /// gRPC-Web trailer frame. The payload is an HTTP/1-style trailer block
+    /// rather than a message, and the flag is defined only for gRPC-Web: on
+    /// plain gRPC a set high bit is a framing error.
+    pub const GRPC_WEB_TRAILER: u8 = 0x80;
 }
 
 /// Size of the envelope header in bytes.
 pub const HEADER_SIZE: usize = 5;
+
+/// Minimum payload size for chaining a payload as its own body frame
+/// instead of copying it into the contiguous framing buffer.
+///
+/// The trade-off is a payload-sized memcpy (tens of GiB/s) against the cost
+/// of an extra body frame: one more `poll_frame` cycle, a 9-byte HTTP/2
+/// frame header for the 5-byte envelope-header frame, and refcount
+/// bookkeeping. The crossover is low (single-digit KiB); 16 KiB is
+/// conservative and matches h2's default `max_frame_size`, above which the
+/// transport splits the payload into multiple DATA frames anyway.
+pub(crate) const MIN_CHAIN_SIZE: usize = 16 * 1024;
 
 /// An envelope-framed message.
 #[derive(Debug, Clone)]
@@ -86,6 +101,33 @@ impl Envelope {
         buf.freeze()
     }
 
+    /// Frame an already-encoded body, keeping any segments it arrived in.
+    ///
+    /// A body that the encoder split — because it could hand a large field
+    /// over by reference count rather than copy it — stays split all the way
+    /// to the socket, one body frame per segment, instead of being flattened
+    /// back into a single buffer here and undoing the saving.
+    ///
+    /// The envelope header still declares the total length across every
+    /// segment, so the framing on the wire is byte-for-byte what a contiguous
+    /// encode would have produced. Envelope framing has never depended on
+    /// HTTP frame boundaries.
+    ///
+    /// A body below `min_chain` is written into the head buffer as before: a
+    /// segment that small would be copied into the framing buffer downstream
+    /// regardless, so splitting it buys nothing and costs a frame.
+    pub(crate) fn encode_body_parts(
+        flags: u8,
+        body: crate::response::EncodedBody,
+        min_chain: usize,
+    ) -> (Bytes, Vec<Bytes>) {
+        let mut head = BytesMut::new();
+        let mut segments = Vec::new();
+        write_envelope_chained(flags, body, &mut head, &mut segments, min_chain)
+            .expect("envelope payload exceeds u32::MAX");
+        (head.freeze(), segments)
+    }
+
     /// Decode an envelope from bytes.
     ///
     /// Returns `Ok(Some(envelope))` if a complete envelope was decoded,
@@ -124,7 +166,12 @@ impl Envelope {
             )));
         }
 
-        if buf.len() < HEADER_SIZE + length {
+        // `saturating_add`: `length` is an untrusted u32 from the wire. On a
+        // 32-bit target `HEADER_SIZE + length` can overflow `usize` and panic
+        // in a debug build. Via `decode` (max_size = usize::MAX) the size check
+        // above does not bound `length`, so saturate here. A saturated sum is
+        // never <= buf.len(), so an over-large frame waits for more data.
+        if buf.len() < HEADER_SIZE.saturating_add(length) {
             return Ok(None);
         }
 
@@ -163,6 +210,17 @@ impl EnvelopeDecoder {
             compression,
             done: false,
         }
+    }
+
+    /// Returns `true` once an end-stream envelope has been decoded.
+    ///
+    /// After this point [`decode`](tokio_util::codec::Decoder::decode) always
+    /// returns `Ok(None)` — the decoder will never produce another message.
+    /// Callers must treat this as a terminal state and stop buffering body
+    /// bytes for the decoder; any further data is trailing garbage that
+    /// should be drained (bounded) or rejected, never accumulated.
+    pub(crate) fn is_done(&self) -> bool {
+        self.done
     }
 }
 
@@ -281,35 +339,115 @@ impl EnvelopeEncoder {
     ) -> Result<(), ConnectError> {
         write_envelope(flags::END_STREAM, &data, dst)
     }
+
+    /// Encode a data envelope, avoiding the payload copy for large messages.
+    ///
+    /// When the on-wire payload (post-compression, if negotiated) is at
+    /// least `min_chain` bytes in total, only the 5-byte envelope header is
+    /// written into `dst` and the payload's segments are appended to
+    /// `chained`, in wire order, for the caller to emit after `dst`: a
+    /// refcount move instead of a payload-sized memcpy. A body the encoder
+    /// already split keeps its segments, so a large field handed over by
+    /// reference count reaches the socket without being flattened here.
+    /// Smaller payloads are written contiguously into `dst` and nothing is
+    /// appended.
+    ///
+    /// Compression needs one contiguous input, so a segmented body is
+    /// flattened before compressing and the compressed output chains as a
+    /// single segment on its post-compression size.
+    ///
+    /// The [`Encoder`](tokio_util::codec::Encoder) impl delegates here with
+    /// `min_chain = usize::MAX` (never chain), so the compression decision and
+    /// the chaining decision cannot drift apart on the streaming path.
+    /// Unary responses take [`Envelope::encode_body_parts`], which applies the
+    /// same threshold to an already-encoded body.
+    ///
+    /// gRPC/Connect envelope framing is independent of HTTP-level frame
+    /// boundaries, so splitting the header and payload across body frames
+    /// does not change the wire protocol.
+    pub(crate) fn encode_chained(
+        &mut self,
+        body: crate::response::EncodedBody,
+        dst: &mut BytesMut,
+        chained: &mut impl Extend<Bytes>,
+        min_chain: usize,
+    ) -> Result<(), ConnectError> {
+        let (flag, body) = if let Some((ref comp, ref encoding)) = self.compression
+            && self.policy.should_compress(body.len())
+        {
+            let compressed = comp.compress(encoding, &body.into_contiguous())?;
+            (flags::COMPRESSED, compressed.into())
+        } else {
+            (flags::DATA, body)
+        };
+        write_envelope_chained(flag, body, dst, chained, min_chain)
+    }
 }
 
 impl tokio_util::codec::Encoder<Bytes> for EnvelopeEncoder {
     type Error = ConnectError;
 
     fn encode(&mut self, data: Bytes, dst: &mut BytesMut) -> Result<(), ConnectError> {
-        if let Some((ref comp, ref encoding)) = self.compression
-            && self.policy.should_compress(data.len())
-        {
-            let compressed = comp.compress(encoding, &data)?;
-            return write_envelope(flags::COMPRESSED, &compressed, dst);
-        }
-        write_envelope(flags::DATA, &data, dst)
+        // `usize::MAX` threshold: the contiguous entry point never chains.
+        let mut chained = Vec::new();
+        self.encode_chained(data.into(), dst, &mut chained, usize::MAX)?;
+        debug_assert!(chained.is_empty(), "usize::MAX threshold cannot chain");
+        Ok(())
     }
 }
 
 /// Write a single envelope (header + payload) into a `BytesMut` buffer.
+/// The length is validated (via [`envelope_length`]) before any buffer
+/// growth, so an oversized payload errors without allocating.
 fn write_envelope(flag: u8, data: &[u8], dst: &mut BytesMut) -> Result<(), ConnectError> {
-    if data.len() > u32::MAX as usize {
-        return Err(ConnectError::resource_exhausted(format!(
-            "envelope payload {} bytes exceeds u32::MAX",
-            data.len()
-        )));
-    }
-    dst.reserve(HEADER_SIZE + data.len());
-    dst.put_u8(flag);
-    dst.put_u32(data.len() as u32);
+    put_envelope_header(flag, envelope_length(data.len())?, dst);
     dst.put_slice(data);
     Ok(())
+}
+
+/// Write the envelope header for `body` into `dst`, then either copy the
+/// body in after it (below `min_chain` bytes in total) or append the body's
+/// segments to `chained` in wire order for the caller to emit after `dst`.
+/// The header always declares the total across every segment, and the
+/// length is validated before any buffer growth.
+fn write_envelope_chained(
+    flag: u8,
+    body: crate::response::EncodedBody,
+    dst: &mut BytesMut,
+    chained: &mut impl Extend<Bytes>,
+    min_chain: usize,
+) -> Result<(), ConnectError> {
+    let total = body.len();
+    let declared = envelope_length(total)?;
+    if total < min_chain {
+        dst.reserve(HEADER_SIZE + total);
+        put_envelope_header(flag, declared, dst);
+        for segment in body.segments() {
+            dst.put_slice(segment);
+        }
+        return Ok(());
+    }
+    put_envelope_header(flag, declared, dst);
+    match body {
+        crate::response::EncodedBody::Contiguous(bytes) => chained.extend([bytes]),
+        crate::response::EncodedBody::Segmented(segments) => chained.extend(segments),
+    }
+    Ok(())
+}
+
+/// The envelope length field for a payload of `len` bytes, or
+/// `ResourceExhausted` when it does not fit the 32-bit field.
+fn envelope_length(len: usize) -> Result<u32, ConnectError> {
+    u32::try_from(len).map_err(|_| {
+        ConnectError::resource_exhausted(format!("envelope payload {len} bytes exceeds u32::MAX"))
+    })
+}
+
+/// Write only the 5-byte envelope header (flag + big-endian length).
+fn put_envelope_header(flag: u8, len: u32, dst: &mut BytesMut) {
+    dst.reserve(HEADER_SIZE);
+    dst.put_u8(flag);
+    dst.put_u32(len);
 }
 
 #[cfg(test)]
@@ -328,6 +466,223 @@ mod tests {
     }
 
     // ── Envelope tests ──────────────────────────────────────────────
+
+    #[test]
+    fn encode_body_parts_chains_large_payload_by_refcount() {
+        let payload = Bytes::from(vec![7u8; 64]);
+        let ptr = payload.as_ptr();
+        let (head, chained) = Envelope::encode_body_parts(flags::DATA, payload.clone().into(), 64);
+        assert_eq!(head.len(), HEADER_SIZE);
+        let [chained] = &chained[..] else {
+            panic!("payload at threshold must chain as one segment");
+        };
+        assert!(std::ptr::eq(chained.as_ptr(), ptr), "must not copy");
+
+        // Reassembled bytes are identical to the contiguous encoding.
+        let mut reassembled = BytesMut::from(&head[..]);
+        reassembled.put_slice(chained);
+        assert_eq!(
+            reassembled.freeze(),
+            Envelope::data(payload).encode(),
+            "chained wire bytes must match contiguous encoding"
+        );
+    }
+
+    /// A payload that compresses is chained on the COMPRESSED payload's
+    /// size, with the COMPRESSED flag in the header segment.
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn encode_chained_chains_large_compressed_payload() {
+        let registry = Arc::new(CompressionRegistry::default());
+        let mut enc = EnvelopeEncoder::new(
+            Some((Arc::clone(&registry), "gzip")),
+            CompressionPolicy::default().with_min_size(0),
+        );
+        // Incompressible-ish random-ish payload so the compressed form stays
+        // above the chain threshold.
+        let data: Vec<u8> = (0..64 * 1024u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
+        let mut dst = BytesMut::new();
+        let mut chained = Vec::new();
+        enc.encode_chained(Bytes::from(data).into(), &mut dst, &mut chained, 1024)
+            .unwrap();
+        let [chained] = &chained[..] else {
+            panic!("large compressed payload must chain as one segment");
+        };
+
+        assert_eq!(dst.len(), HEADER_SIZE);
+        assert_eq!(dst[0], flags::COMPRESSED);
+        assert_eq!(
+            u32::from_be_bytes([dst[1], dst[2], dst[3], dst[4]]) as usize,
+            chained.len()
+        );
+
+        // Reassembled envelope decodes back to the original payload.
+        let mut wire = dst;
+        wire.put_slice(chained);
+        let mut dec = EnvelopeDecoder::new(1024 * 1024, Some("gzip".to_owned()), registry);
+        let decoded = Decoder::decode(&mut dec, &mut wire).unwrap().unwrap();
+        assert_eq!(decoded.len(), 64 * 1024);
+    }
+
+    /// A body the encoder already split keeps its segments through
+    /// `encode_chained`: only the header lands in `dst`, and every segment,
+    /// large or small, comes back as the same allocation in wire order. The
+    /// framing stream decides which of them to copy.
+    #[test]
+    fn encode_chained_keeps_segments_of_a_large_body() {
+        use crate::response::EncodedBody;
+
+        let lead = Bytes::from_static(b"tag");
+        let big = Bytes::from(vec![3u8; 64]);
+        let tail = Bytes::from_static(b"end");
+        let body = EncodedBody::Segmented(vec![lead.clone(), big.clone(), tail.clone()]);
+        let total = body.len();
+
+        let mut enc = EnvelopeEncoder::uncompressed();
+        let mut dst = BytesMut::new();
+        let mut segments = Vec::new();
+        enc.encode_chained(body, &mut dst, &mut segments, 32)
+            .unwrap();
+
+        assert_eq!(dst.len(), HEADER_SIZE, "only the header is copied");
+        assert_eq!(
+            u32::from_be_bytes([dst[1], dst[2], dst[3], dst[4]]) as usize,
+            total,
+            "header declares the total across segments"
+        );
+        let [s0, s1, s2] = &segments[..] else {
+            panic!("expected three segments, got {}", segments.len());
+        };
+        assert!(std::ptr::eq(s0.as_ptr(), lead.as_ptr()));
+        assert!(std::ptr::eq(s1.as_ptr(), big.as_ptr()));
+        assert!(std::ptr::eq(s2.as_ptr(), tail.as_ptr()));
+    }
+
+    /// Below the threshold a segmented body is copied in after the header,
+    /// exactly as a contiguous one would be.
+    #[test]
+    fn encode_chained_copies_a_small_segmented_body() {
+        use crate::response::EncodedBody;
+
+        let body =
+            EncodedBody::Segmented(vec![Bytes::from_static(b"ab"), Bytes::from_static(b"cd")]);
+        let mut enc = EnvelopeEncoder::uncompressed();
+        let mut dst = BytesMut::new();
+        let mut segments = Vec::new();
+        enc.encode_chained(body, &mut dst, &mut segments, 32)
+            .unwrap();
+
+        assert!(segments.is_empty());
+        assert_eq!(
+            dst.freeze(),
+            Envelope::data(Bytes::from_static(b"abcd")).encode()
+        );
+    }
+
+    /// Compression flattens a segmented body first, so the compressed
+    /// envelope decodes to the concatenation of the segments.
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn encode_chained_compresses_a_segmented_body_as_one() {
+        use crate::response::EncodedBody;
+
+        let registry = Arc::new(CompressionRegistry::default());
+        let mut enc = EnvelopeEncoder::new(
+            Some((Arc::clone(&registry), "gzip")),
+            CompressionPolicy::default().with_min_size(0),
+        );
+        let body = EncodedBody::Segmented(vec![
+            Bytes::from(vec![b'a'; 4096]),
+            Bytes::from(vec![b'b'; 4096]),
+        ]);
+        let expected = body.clone().into_contiguous();
+
+        let mut wire = BytesMut::new();
+        let mut segments = Vec::new();
+        enc.encode_chained(body, &mut wire, &mut segments, usize::MAX)
+            .unwrap();
+        assert!(segments.is_empty());
+        assert_eq!(wire[0], flags::COMPRESSED);
+
+        let mut dec = EnvelopeDecoder::new(1024 * 1024, Some("gzip".to_owned()), registry);
+        let decoded = Decoder::decode(&mut dec, &mut wire).unwrap().unwrap();
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn encode_body_parts_small_payload_stays_contiguous() {
+        let payload = Bytes::from_static(b"tiny");
+        let (head, chained) = Envelope::encode_body_parts(flags::DATA, payload.clone().into(), 64);
+        assert!(chained.is_empty());
+        assert_eq!(head, Envelope::data(payload).encode());
+    }
+
+    /// The property every branch has to hold: the header declares the total
+    /// length across all segments, and concatenating what is emitted equals
+    /// the contiguous envelope. A header that disagreed with the bytes after
+    /// it would desynchronize the peer's framing rather than fail locally, so
+    /// each branch is pinned rather than left to the conformance suite.
+    #[test]
+    fn encode_body_parts_declares_the_length_it_emits() {
+        use crate::response::EncodedBody;
+
+        let cases: Vec<(&str, EncodedBody)> = vec![
+            ("empty", EncodedBody::Contiguous(Bytes::new())),
+            (
+                "sub-threshold contiguous",
+                EncodedBody::Contiguous(Bytes::from_static(b"small")),
+            ),
+            (
+                "sub-threshold segmented",
+                EncodedBody::Segmented(vec![Bytes::from_static(b"ab"), Bytes::from_static(b"cd")]),
+            ),
+            (
+                "over-threshold contiguous",
+                EncodedBody::Contiguous(Bytes::from(vec![9u8; 128])),
+            ),
+            (
+                "over-threshold two segments",
+                EncodedBody::Segmented(vec![
+                    Bytes::from(vec![1u8; 64]),
+                    Bytes::from(vec![2u8; 64]),
+                ]),
+            ),
+            (
+                "over-threshold many segments",
+                EncodedBody::Segmented((0..5).map(|i| Bytes::from(vec![i as u8; 40])).collect()),
+            ),
+        ];
+
+        for (name, body) in cases {
+            let total = body.len();
+            let expected = Envelope::data(body.clone().into_contiguous()).encode();
+
+            let (head, segments) = Envelope::encode_body_parts(flags::DATA, body, 64);
+
+            let declared = u32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize;
+            assert_eq!(declared, total, "{name}: header must declare the total");
+
+            let emitted: usize =
+                head.len() - HEADER_SIZE + segments.iter().map(Bytes::len).sum::<usize>();
+            assert_eq!(
+                emitted, total,
+                "{name}: emitted payload bytes must match the declared length"
+            );
+
+            let mut reassembled = BytesMut::from(&head[..]);
+            for segment in &segments {
+                assert!(!segment.is_empty(), "{name}: no empty segments");
+                reassembled.put_slice(segment);
+            }
+            assert_eq!(
+                reassembled.freeze(),
+                expected,
+                "{name}: must reassemble to the contiguous envelope"
+            );
+        }
+    }
 
     #[test]
     fn test_envelope_roundtrip() {
@@ -372,6 +727,19 @@ mod tests {
         let result = Envelope::decode_with_limit(&mut buf, 1024 * 1024);
         assert!(result.is_ok());
         assert!(result.unwrap().is_some());
+    }
+
+    #[test]
+    fn test_envelope_unlimited_decode_huge_length_no_panic() {
+        // `decode` uses max_size = usize::MAX, so the size check does not bound
+        // `length`. A header claiming u32::MAX bytes must return `Ok(None)`
+        // (waiting for data that never comes), not panic on `HEADER_SIZE +
+        // length`. On a 32-bit target the unsaturated add would overflow.
+        let mut buf = BytesMut::new();
+        buf.put_u8(0); // flags
+        buf.put_u32(u32::MAX); // length prefix
+        let result = Envelope::decode(&mut buf);
+        assert!(matches!(result, Ok(None)));
     }
 
     // ── EnvelopeDecoder tests ───────────────────────────────────────
@@ -536,7 +904,7 @@ mod tests {
         let registry = Arc::new(CompressionRegistry::default());
         let mut enc = EnvelopeEncoder::new(
             Some((registry, "gzip")),
-            CompressionPolicy::default().min_size(0),
+            CompressionPolicy::default().with_min_size(0),
         );
         let mut buf = BytesMut::new();
         enc.encode(Bytes::from_static(b"compress me"), &mut buf)

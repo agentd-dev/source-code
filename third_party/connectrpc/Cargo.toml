@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.88"
 name = "connectrpc"
-version = "0.3.3"
+version = "0.9.1"
 build = false
 autolib = false
 autobins = false
@@ -35,7 +35,7 @@ categories = [
     "web-programming::http-client",
 ]
 license = "Apache-2.0"
-repository = "https://github.com/anthropics/connect-rust"
+repository = "https://github.com/connectrpc/connect-rust"
 resolver = "2"
 
 [package.metadata.docs.rs]
@@ -70,17 +70,17 @@ client-tls = [
 default = [
     "gzip",
     "zstd",
-    "streaming",
+    "json",
 ]
-gzip = [
-    "dep:flate2",
-    "async-compression?/gzip",
-]
+gzip = ["dep:flate2"]
+json = ["buffa/json"]
 server = [
     "hyper/server",
     "hyper/http1",
     "hyper/http2",
     "hyper-util/server",
+    "hyper-util/server-auto",
+    "hyper-util/server-graceful",
     "hyper-util/tokio",
     "hyper-util/http1",
     "hyper-util/http2",
@@ -89,51 +89,51 @@ server = [
     "dep:libc",
     "dep:tower-http",
     "tokio/net",
-    "tokio-util/rt",
 ]
 server-tls = [
     "dep:rustls",
     "dep:tokio-rustls",
     "server",
 ]
-streaming = ["dep:async-compression"]
 tls = [
     "server-tls",
     "client-tls",
 ]
-zstd = [
-    "dep:zstd",
-    "async-compression?/zstd",
-]
+zstd = ["dep:zstd"]
 
 [lib]
 name = "connectrpc"
 path = "src/lib.rs"
 
-[dependencies.async-compression]
-version = "0.4"
-features = ["tokio"]
-optional = true
+[dependencies.async-trait]
+version = "0.1"
 
 [dependencies.axum]
 version = "0.8"
 features = ["http2"]
 optional = true
+default-features = false
 
 [dependencies.base64]
 version = "0.22"
 
 [dependencies.buffa]
-version = "0.3"
-features = ["json"]
+version = "0.9.1"
+features = [
+    "std",
+    "fast-utf8",
+]
+default-features = false
 
 [dependencies.bytes]
-version = "1.5"
+version = "1.6"
 features = ["serde"]
 
 [dependencies.flate2]
 version = "1.0"
+features = ["zlib-rs"]
 optional = true
+default-features = false
 
 [dependencies.futures]
 version = "0.3"
@@ -201,6 +201,9 @@ features = [
 [dependencies.serde_json]
 version = "1"
 
+[dependencies.sync_wrapper]
+version = "1"
+
 [dependencies.thiserror]
 version = "2"
 
@@ -211,6 +214,7 @@ features = [
     "io-util",
     "sync",
     "time",
+    "macros",
 ]
 
 [dependencies.tokio-rustls]
@@ -224,10 +228,7 @@ features = [
 
 [dependencies.tokio-util]
 version = "0.7"
-features = [
-    "codec",
-    "io",
-]
+features = ["codec"]
 
 [dependencies.tower]
 version = "0.5"
@@ -252,8 +253,11 @@ version = "0.13"
 optional = true
 
 [dev-dependencies.buffa-types]
-version = "0.3"
+version = "0.9.1"
 features = ["json"]
+
+[dev-dependencies.h2]
+version = "0.4"
 
 [dev-dependencies.rcgen]
 version = "0.14"
@@ -269,9 +273,11 @@ features = [
     "test-util",
 ]
 
+[target.'cfg(target_arch = "wasm32")'.dependencies.wasm-bindgen-futures]
+version = "0.4"
+
 [lints.clippy]
 dbg_macro = "warn"
-result_large_err = "allow"
 uninlined_format_args = "warn"
 
 [lints.rust]
@@ -279,3 +285,7 @@ dead_code = "warn"
 explicit_outlives_requirements = "warn"
 unused_imports = "warn"
 unused_lifetimes = "warn"
+
+[lints.rust.refining_impl_trait]
+level = "allow"
+priority = -1

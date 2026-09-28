@@ -23,8 +23,10 @@ use crate::codec::CodecFormat;
 use crate::error::ConnectError;
 use crate::handler::BoxFuture;
 use crate::handler::BoxStream;
-use crate::handler::Context;
+use crate::payload::Payload;
+use crate::response::{EncodedResponse, EncodedStream, RequestContext};
 use crate::router::MethodKind;
+use crate::spec::Spec;
 
 /// Description of a method returned by [`Dispatcher::lookup`].
 ///
@@ -32,59 +34,117 @@ use crate::router::MethodKind;
 /// path in `handle_request`; the actual handler invocation happens in a
 /// separate `call_*` step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MethodDescriptor {
     /// The kind of RPC method.
     pub kind: MethodKind,
     /// Whether the method has no side effects and is eligible for Connect GET.
     ///
     /// Only meaningful for `MethodKind::Unary`. Always `false` for streaming.
+    ///
+    /// This is a *narrower* flag than [`Spec::idempotency_level`](crate::Spec):
+    /// it is `true` only for `IdempotencyLevel::NoSideEffects`. Methods
+    /// declared `Idempotent` (safe to retry but side-effecting) report
+    /// `idempotent == false` here while carrying the full level in `spec`.
     pub idempotent: bool,
+    /// Static method metadata, when known.
+    ///
+    /// Code-generated dispatchers always supply a [`Spec`]; the dynamic
+    /// [`Router`](crate::Router) supplies one when
+    /// [`Router::with_spec`](crate::Router::with_spec) was chained for the
+    /// route, which generated `register()` always does.
+    pub spec: Option<Spec>,
+    /// Per-route [`Limits`](crate::Limits), when the route declares its own.
+    ///
+    /// `Some` replaces the service-wide limits configured with
+    /// [`ConnectRpcService::with_limits`](crate::ConnectRpcService::with_limits)
+    /// for requests to this method — body size, message size and decode
+    /// budget alike — so a route can be tighter (a health check that never
+    /// legitimately exceeds a few KiB) or looser (an upload RPC) than the
+    /// rest of the service. `None` uses the service-wide limits. Set on a
+    /// [`Router`](crate::Router) route with
+    /// [`Router::with_route_limits`](crate::Router::with_route_limits);
+    /// generated `FooServiceServer<T>` dispatchers always report `None`.
+    pub limits: Option<crate::Limits>,
 }
 
 impl MethodDescriptor {
     /// Convenience constructor for unary methods.
     #[inline]
     pub const fn unary(idempotent: bool) -> Self {
-        Self {
-            kind: MethodKind::Unary,
-            idempotent,
-        }
+        Self::from_kind(MethodKind::Unary).with_idempotent(idempotent)
     }
 
     /// Convenience constructor for server-streaming methods.
     #[inline]
     pub const fn server_streaming() -> Self {
-        Self {
-            kind: MethodKind::ServerStreaming,
-            idempotent: false,
-        }
+        Self::from_kind(MethodKind::ServerStreaming)
     }
 
     /// Convenience constructor for client-streaming methods.
     #[inline]
     pub const fn client_streaming() -> Self {
-        Self {
-            kind: MethodKind::ClientStreaming,
-            idempotent: false,
-        }
+        Self::from_kind(MethodKind::ClientStreaming)
     }
 
     /// Convenience constructor for bidirectional streaming methods.
     #[inline]
     pub const fn bidi_streaming() -> Self {
+        Self::from_kind(MethodKind::BidiStreaming)
+    }
+
+    /// Construct a descriptor for the given [`MethodKind`] with default
+    /// `idempotent` (`false`), no [`Spec`] and no per-route limits.
+    #[inline]
+    pub const fn from_kind(kind: MethodKind) -> Self {
         Self {
-            kind: MethodKind::BidiStreaming,
+            kind,
             idempotent: false,
+            spec: None,
+            limits: None,
         }
+    }
+
+    /// Set the idempotency flag. Returns `self` for chaining.
+    #[inline]
+    #[must_use]
+    pub const fn with_idempotent(mut self, idempotent: bool) -> Self {
+        self.idempotent = idempotent;
+        self
+    }
+
+    /// Attach a [`Spec`]. Returns `self` for chaining.
+    ///
+    /// Generated dispatchers call this so [`RequestContext::spec`] is
+    /// populated for handlers and interceptors.
+    ///
+    /// [`RequestContext::spec`]: crate::RequestContext::spec
+    #[inline]
+    #[must_use]
+    pub const fn with_spec(mut self, spec: Spec) -> Self {
+        self.spec = Some(spec);
+        self
+    }
+
+    /// Attach per-route [`Limits`](crate::Limits) that replace the
+    /// service-wide limits for this method. Returns `self` for chaining.
+    #[inline]
+    #[must_use]
+    pub fn with_limits(mut self, limits: crate::Limits) -> Self {
+        self.limits = Some(limits);
+        self
     }
 }
 
 /// Result type for unary and client-streaming handler calls.
-pub type UnaryResult = BoxFuture<'static, Result<(Bytes, Context), ConnectError>>;
+pub type UnaryResult = BoxFuture<'static, Result<EncodedResponse, ConnectError>>;
 
 /// Result type for server-streaming and bidi-streaming handler calls.
+///
+/// The body is an [`EncodedStream`]: one already-encoded
+/// [`EncodedBody`](crate::EncodedBody) per response message.
 pub type StreamingResult =
-    BoxFuture<'static, Result<(BoxStream<Result<Bytes, ConnectError>>, Context), ConnectError>>;
+    BoxFuture<'static, Result<crate::response::Response<EncodedStream>, ConnectError>>;
 
 /// A stream of raw request message bytes (client-streaming / bidi input).
 pub type RequestStream = BoxStream<Result<Bytes, ConnectError>>;
@@ -115,14 +175,24 @@ pub trait Dispatcher: Send + Sync + 'static {
 
     /// Dispatch a unary call.
     ///
-    /// The caller decodes the request body to raw bytes (after envelope
-    /// stripping / decompression), and the dispatcher decodes it to the
-    /// concrete request type, invokes the handler, and encodes the response.
+    /// The caller wraps the body bytes (after envelope stripping /
+    /// decompression) in a [`Payload`], and the dispatcher decodes it to
+    /// the concrete request type, invokes the handler, and encodes the
+    /// response.
+    ///
+    /// The `request` is a [`Payload`] rather than raw `Bytes` so a
+    /// dispatcher backing an owned-message handler can call
+    /// [`Payload::take_message`] and reuse the decode an interceptor may
+    /// already have cached, instead of decoding the same bytes twice.
+    /// Dispatchers backing zero-copy view handlers call
+    /// [`Payload::encoded`] to recover the (post-replacement) wire bytes
+    /// — the cache stores owned messages, not views, so it cannot help
+    /// the view path.
     fn call_unary(
         &self,
         path: &str,
-        ctx: Context,
-        request: Bytes,
+        ctx: RequestContext,
+        request: Payload,
         format: CodecFormat,
     ) -> UnaryResult;
 
@@ -132,7 +202,7 @@ pub trait Dispatcher: Send + Sync + 'static {
     fn call_server_streaming(
         &self,
         path: &str,
-        ctx: Context,
+        ctx: RequestContext,
         request: Bytes,
         format: CodecFormat,
     ) -> StreamingResult;
@@ -143,7 +213,7 @@ pub trait Dispatcher: Send + Sync + 'static {
     fn call_client_streaming(
         &self,
         path: &str,
-        ctx: Context,
+        ctx: RequestContext,
         requests: RequestStream,
         format: CodecFormat,
     ) -> UnaryResult;
@@ -154,7 +224,7 @@ pub trait Dispatcher: Send + Sync + 'static {
     fn call_bidi_streaming(
         &self,
         path: &str,
-        ctx: Context,
+        ctx: RequestContext,
         requests: RequestStream,
         format: CodecFormat,
     ) -> StreamingResult;
@@ -217,8 +287,8 @@ impl<A: Dispatcher, B: Dispatcher> Dispatcher for Chain<A, B> {
     fn call_unary(
         &self,
         path: &str,
-        ctx: Context,
-        request: Bytes,
+        ctx: RequestContext,
+        request: Payload,
         format: CodecFormat,
     ) -> UnaryResult {
         if self.0.lookup(path).is_some() {
@@ -231,7 +301,7 @@ impl<A: Dispatcher, B: Dispatcher> Dispatcher for Chain<A, B> {
     fn call_server_streaming(
         &self,
         path: &str,
-        ctx: Context,
+        ctx: RequestContext,
         request: Bytes,
         format: CodecFormat,
     ) -> StreamingResult {
@@ -245,7 +315,7 @@ impl<A: Dispatcher, B: Dispatcher> Dispatcher for Chain<A, B> {
     fn call_client_streaming(
         &self,
         path: &str,
-        ctx: Context,
+        ctx: RequestContext,
         requests: RequestStream,
         format: CodecFormat,
     ) -> UnaryResult {
@@ -259,7 +329,7 @@ impl<A: Dispatcher, B: Dispatcher> Dispatcher for Chain<A, B> {
     fn call_bidi_streaming(
         &self,
         path: &str,
-        ctx: Context,
+        ctx: RequestContext,
         requests: RequestStream,
         format: CodecFormat,
     ) -> StreamingResult {
@@ -286,22 +356,21 @@ pub mod codegen {
     use std::pin::Pin;
 
     use buffa::Message;
-    use buffa::view::MessageView;
     use buffa::view::OwnedView;
     use bytes::Bytes;
     use futures::Stream;
     use futures::StreamExt;
-    use serde::Serialize;
-    use serde::de::DeserializeOwned;
 
     use crate::codec::CodecFormat;
+    use crate::codec::JsonDeserialize;
     use crate::error::ConnectError;
     use crate::handler::BoxStream;
 
     // Re-exports that generated code needs direct access to.
     pub use crate::handler::BoxFuture;
-    pub use crate::handler::decode_request_view;
-    pub use crate::handler::encode_response;
+    pub use crate::handler::decode_borrowed_request_view;
+    pub use crate::handler::request_proto_bytes;
+    pub use crate::response::EncodedResponse;
 
     pub use super::MethodDescriptor;
     pub use super::RequestStream;
@@ -310,29 +379,38 @@ pub mod codegen {
     pub use super::unimplemented_streaming;
     pub use super::unimplemented_unary;
 
-    /// Map a stream of typed responses through `encode_response`.
+    /// Map a stream of typed responses through
+    /// [`Encodable::encode_segments`].
     ///
     /// Used by generated `call_server_streaming` and `call_bidi_streaming`
-    /// arms to convert the handler's `Stream<Item = Result<Res, _>>` into
-    /// the `Stream<Item = Result<Bytes, _>>` that the dispatcher protocol
-    /// requires.
-    pub fn encode_response_stream<Res, S>(
-        stream: S,
-        format: CodecFormat,
-    ) -> BoxStream<Result<Bytes, ConnectError>>
+    /// arms to convert the handler's `Stream<Item = Result<B, _>>` into
+    /// the [`EncodedStream`](crate::EncodedStream) that the dispatcher
+    /// protocol requires. `B` is any [`Encodable<Res>`](crate::Encodable),
+    /// typically `Res` itself, but may be [`PreEncoded`](crate::PreEncoded)
+    /// or [`MaybeBorrowed`](crate::MaybeBorrowed) for handlers that encode
+    /// borrowing views per item. An item that can hand a large payload over
+    /// by reference count arrives segmented and, on an uncompressed
+    /// response, is framed without copying that payload. Every other item
+    /// takes the contiguous default. See [`EncodedStream`](crate::EncodedStream)
+    /// for when compression flattens it instead.
+    ///
+    /// [`Encodable`]: crate::Encodable
+    /// [`Encodable::encode_segments`]: crate::Encodable::encode_segments
+    pub fn encode_response_stream<Res, B, S>(stream: S, format: CodecFormat) -> crate::EncodedStream
     where
-        Res: Message + Serialize + Send + 'static,
-        S: Stream<Item = Result<Res, ConnectError>> + Send + 'static,
+        Res: Message + Send + 'static,
+        B: crate::Encodable<Res> + Send + 'static,
+        S: Stream<Item = Result<B, ConnectError>> + Send + 'static,
     {
+        use crate::response::Encodable;
         Box::pin(
             futures::stream::unfold(
                 (
-                    Box::pin(stream)
-                        as Pin<Box<dyn Stream<Item = Result<Res, ConnectError>> + Send>>,
+                    Box::pin(stream) as Pin<Box<dyn Stream<Item = Result<B, ConnectError>> + Send>>,
                     format,
                 ),
                 async |(mut s, fmt)| match s.next().await {
-                    Some(Ok(res)) => Some((encode_response(&res, fmt), (s, fmt))),
+                    Some(Ok(res)) => Some((Encodable::<Res>::encode_segments(&res, fmt), (s, fmt))),
                     Some(Err(e)) => Some((Err(e), (s, fmt))),
                     None => None,
                 },
@@ -341,22 +419,46 @@ pub mod codegen {
         )
     }
 
-    /// Map a stream of raw request bytes through `decode_request_view`.
+    /// Convert a stream of decoded `OwnedView` items into
+    /// [`StreamMessage`](crate::StreamMessage)s.
+    ///
+    /// Used by generated Router-registration glue, whose runtime handler
+    /// wrappers produce `ServiceStream<OwnedView<…>>`.
+    pub fn into_stream_messages<M>(
+        requests: crate::ServiceStream<OwnedView<M::View<'static>>>,
+    ) -> crate::ServiceStream<crate::StreamMessage<M>>
+    where
+        M: crate::HasMessageView + 'static,
+        M::View<'static>: 'static,
+    {
+        Box::pin(requests.map(|r| r.map(crate::StreamMessage::from_owned_view)))
+    }
+
+    /// Map a stream of raw request bytes into typed
+    /// [`StreamMessage`](crate::StreamMessage) items.
     ///
     /// Used by generated `call_client_streaming` and `call_bidi_streaming`
-    /// arms to convert the dispatcher's `Stream<Item = Result<Bytes, _>>`
-    /// into the typed view stream the handler expects.
-    pub fn decode_view_request_stream<ReqView>(
+    /// arms; the per-item decode is the same normalize-then-decode used on
+    /// the unary paths.
+    ///
+    /// Takes the limits by value because the returned stream outlives the
+    /// caller's frame; generated arms pass `ctx.decode_options().clone()`
+    /// before `ctx` is moved into the handler call.
+    pub fn decode_message_request_stream<M>(
         requests: BoxStream<Result<Bytes, ConnectError>>,
         format: CodecFormat,
-    ) -> BoxStream<Result<OwnedView<ReqView>, ConnectError>>
+        options: buffa::DecodeOptions,
+    ) -> crate::ServiceStream<crate::StreamMessage<M>>
     where
-        ReqView: MessageView<'static> + Send + Sync + 'static,
-        ReqView::Owned: Message + DeserializeOwned,
+        M: crate::HasMessageView + JsonDeserialize + 'static,
+        M::View<'static>: 'static,
     {
-        Box::pin(
-            requests.map(move |r| r.and_then(|raw| decode_request_view::<ReqView>(raw, format))),
-        )
+        Box::pin(requests.map(move |r| {
+            r.and_then(|raw| {
+                crate::handler::decode_request_view::<M::View<'static>>(raw, format, &options)
+            })
+            .map(crate::StreamMessage::from_owned_view)
+        }))
     }
 }
 
@@ -369,6 +471,7 @@ mod tests {
         let u = MethodDescriptor::unary(false);
         assert_eq!(u.kind, MethodKind::Unary);
         assert!(!u.idempotent);
+        assert_eq!(u.spec, None);
 
         let ui = MethodDescriptor::unary(true);
         assert!(ui.idempotent);
@@ -385,5 +488,50 @@ mod tests {
             MethodDescriptor::bidi_streaming().kind,
             MethodKind::BidiStreaming
         );
+    }
+
+    #[test]
+    fn method_descriptor_from_kind_builder_chain() {
+        use crate::spec::{Spec, StreamType};
+
+        // `from_kind` + `with_idempotent` is exactly the shape `unary(...)`
+        // produces, so the convenience constructors stay thin shims.
+        for kind in [
+            MethodKind::Unary,
+            MethodKind::ServerStreaming,
+            MethodKind::ClientStreaming,
+            MethodKind::BidiStreaming,
+        ] {
+            let d = MethodDescriptor::from_kind(kind);
+            assert_eq!(d.kind, kind);
+            assert!(!d.idempotent);
+            assert_eq!(d.spec, None);
+            assert_eq!(d.limits, None);
+        }
+
+        // `with_limits` attaches route limits and preserves the rest.
+        let route = crate::Limits::default().with_max_message_size(7);
+        let d = MethodDescriptor::unary(true).with_limits(route);
+        assert_eq!(d.limits, Some(route));
+        assert!(d.idempotent);
+        assert_eq!(
+            MethodDescriptor::from_kind(MethodKind::Unary).with_idempotent(true),
+            MethodDescriptor::unary(true)
+        );
+
+        // `with_spec` attaches the spec and preserves the rest.
+        const SPEC: Spec = Spec::server("/pkg.Svc/M", StreamType::ServerStream);
+        let desc = MethodDescriptor::from_kind(MethodKind::ServerStreaming)
+            .with_idempotent(false)
+            .with_spec(SPEC);
+        assert_eq!(desc.kind, MethodKind::ServerStreaming);
+        assert!(!desc.idempotent);
+        assert_eq!(desc.spec, Some(SPEC));
+
+        // The whole builder chain is `const`-evaluable so codegen output
+        // lands in `.rodata`.
+        const _: MethodDescriptor = MethodDescriptor::from_kind(MethodKind::ServerStreaming)
+            .with_idempotent(false)
+            .with_spec(SPEC);
     }
 }

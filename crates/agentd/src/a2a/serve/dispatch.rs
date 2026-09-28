@@ -218,7 +218,8 @@ async fn dispatch(
             "agentd".to_string(),
         ));
     let protocol = app.protocol.clone();
-    ports::with_caller(principal, async move {
+    let in_send = matches!(bare.as_str(), "SendMessage" | "SendStreamingMessage");
+    ports::with_caller(principal, in_send, async move {
         protocol
             .oneshot(request)
             .await

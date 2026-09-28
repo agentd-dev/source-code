@@ -158,13 +158,13 @@ decrypt = ["sign"]
 # a2a-rs's client is reqwest with a static bearer and would drop request
 # signing, mTLS and the SSRF guard. Leaving it off keeps reqwest and four other
 # crates out of the tree.
-a2a-rs = { version = "0.6", optional = true, default-features = false, features = ["jsonrpc-server"] }
+a2a-rs = { version = "0.10.0", optional = true, default-features = false, features = ["jsonrpc-server"] }
 # a2a-rs's protobuf runtime, pinned to the version it builds its domain types
 # with. agentd constructs those types directly rather than hand-writing their
 # JSON, so `MessageField`/`Struct`/`Timestamp` have to be the same types — a
 # mismatch is a compile error, which is the point.
-buffa = { version = "0.3.0", optional = true, features = ["json"] }
-buffa-types = { version = "0.3.0", optional = true, features = ["json"] }
+buffa = { version = "0.9.2", optional = true, features = ["json"] }
+buffa-types = { version = "0.9.2", optional = true, features = ["json"] }
 # The async runtime + HTTP server the A2A listener runs on (feature `a2a`).
 # a2a-rs's server adapter is an axum `Router`, so agentd serves it directly and
 # merges its own routes onto the same listener.

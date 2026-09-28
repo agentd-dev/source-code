@@ -115,8 +115,8 @@ crate here under `MIT OR Apache-2.0` rather than the AGPL, because a reference
 implementation the other implementations cannot link is a reference nobody uses.
 
 **Third-party surface sits in the leaves, and is optional above them.** `net`
-holds one heavy end of the default build — `rustls`, `webpki-roots` and
-`rustls-pemfile` behind its `tls` feature, `vsock` behind `vsock` — and `mcp`
+holds one heavy end of the default build — `rustls` and `webpki-roots`
+behind its `tls` feature, `vsock` behind `vsock` — and `mcp`
 carries the other: the official `rmcp` SDK and the async runtime it needs
 (`tokio`, `futures`, `sse-stream`, `tokio-stream`, `thiserror`, `http`). Beyond
 its own three (`serde`, `serde_json`, `libc`), the engine names fourteen further

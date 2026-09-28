@@ -117,19 +117,42 @@ tokio::task_local! {
 /// that opened it — the SSE body is polled long after the handler returned — and
 /// a send's verdict does not exist yet when its subscription is made.
 #[derive(Clone, Default)]
-struct StreamAuthz(Arc<Mutex<HashMap<String, bool>>>);
+struct StreamAuthz {
+    seen: Arc<Mutex<HashMap<String, bool>>>,
+    /// Whether the request is a send. A send's own task does not exist until
+    /// the message is processed, so a read that finds nothing *before* then is
+    /// not a verdict — see [`StreamAuthz::record_read`].
+    in_send: bool,
+}
 
 impl StreamAuthz {
     /// Record the reactor's verdict on one task.
     fn record(&self, task_id: &str, allowed: bool) {
-        if let Ok(mut seen) = self.0.lock() {
+        if let Ok(mut seen) = self.seen.lock() {
             seen.insert(task_id.to_string(), allowed);
+        }
+    }
+
+    /// Record what a task *read* found.
+    ///
+    /// A read that found the task is proof in any request. A read that found
+    /// nothing is proof only outside a send: a2a-rs (0.10) reads the task a
+    /// send names before it attaches — to learn its context — and that id is
+    /// the one the listener pre-minted for the task this very send is about to
+    /// create. Taking "not found" as a refusal there fails the attach, so a
+    /// blocking send stops waiting (it answers `WORKING`) and a streaming send
+    /// is refused outright. Left unrecorded, the attach falls back to the
+    /// verdict at first poll, which [`AsyncMessageHandler::process_message`]
+    /// has supplied by then — exactly the rule a send had before the read.
+    fn record_read(&self, task_id: &str, found: bool) {
+        if found || !self.in_send {
+            self.record(task_id, found);
         }
     }
 
     /// The verdict, or `None` for "this request has not asked yet".
     fn verdict(&self, task_id: &str) -> Option<bool> {
-        self.0
+        self.seen
             .lock()
             .ok()
             .and_then(|seen| seen.get(task_id).copied())
@@ -143,13 +166,17 @@ fn streamable() -> Option<StreamAuthz> {
 }
 
 /// Run `f` with `who` as the caller for the duration of one request.
-pub async fn with_caller<F, T>(who: Principal, f: F) -> T
+/// `in_send` says the request is a `SendMessage`/`SendStreamingMessage`, whose
+/// task comes into existence part-way through (see [`StreamAuthz::in_send`]).
+pub async fn with_caller<F, T>(who: Principal, in_send: bool, f: F) -> T
 where
     F: std::future::Future<Output = T>,
 {
-    CALLER
-        .scope(who, STREAMABLE.scope(StreamAuthz::default(), f))
-        .await
+    let ledger = StreamAuthz {
+        in_send,
+        ..StreamAuthz::default()
+    };
+    CALLER.scope(who, STREAMABLE.scope(ledger, f)).await
 }
 
 /// The caller of the request being served.
@@ -252,7 +279,7 @@ impl AsyncTaskLifecycle for RuntimePorts {
         // `SubscribeToTask` reads the task before it attaches, so recording it
         // here is what lets the attach refuse. See [`STREAMABLE`].
         if let Some(seen) = streamable() {
-            seen.record(id.as_str(), got.is_ok());
+            seen.record_read(id.as_str(), got.is_ok());
         }
         let mut t = task_from(got?)?;
         if let Some(n) = history_length {
@@ -455,10 +482,12 @@ impl AsyncStreamingHandler for SharedStreaming {
     ///   exists.
     /// * A **send** attaches *before* the message is processed, deliberately, so
     ///   that a task settling immediately cannot be missed. Nothing is known
-    ///   about the id at that moment — it came off the wire — so the
-    ///   subscription is made anyway and the verdict applied at the first
-    ///   poll, by which time the send has recorded the task it really created.
-    ///   Anything still unproved by then delivers nothing.
+    ///   about the id at that moment — it came off the wire, and the read
+    ///   a2a-rs makes of it first finds nothing for a task not yet created
+    ///   (see [`StreamAuthz::record_read`]) — so the subscription is made
+    ///   anyway and the verdict applied at the first poll, by which time the
+    ///   send has recorded the task it really created. Anything still unproved
+    ///   by then delivers nothing.
     async fn combined_update_stream(
         &self,
         task_id: &str,
@@ -579,4 +608,33 @@ impl StreamSink {
 /// before publishing (the reactor logs on terminal transitions).
 pub fn status_of(ev: &TaskStatusUpdateEvent) -> &TaskStatus {
     &ev.status
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Outside a send a read that finds nothing is a refusal, which is what
+    /// lets a stranger's `SubscribeToTask` be turned away before it attaches.
+    #[test]
+    fn a_failed_read_refuses_outside_a_send() {
+        let ledger = StreamAuthz::default();
+        ledger.record_read("task-x", false);
+        assert_eq!(ledger.verdict("task-x"), Some(false));
+    }
+
+    /// Inside a send it is not a verdict at all: the id is the one the send is
+    /// about to create, so the attach must wait for `process_message` to say.
+    #[test]
+    fn a_failed_read_inside_a_send_leaves_the_verdict_open() {
+        let ledger = StreamAuthz {
+            in_send: true,
+            ..StreamAuthz::default()
+        };
+        ledger.record_read("task-new", false);
+        assert_eq!(ledger.verdict("task-new"), None);
+        // A read that found the task is proof either way.
+        ledger.record_read("task-mine", true);
+        assert_eq!(ledger.verdict("task-mine"), Some(true));
+    }
 }

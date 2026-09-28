@@ -24,12 +24,12 @@ strip = true
 panic = "abort"
 codegen-units = 1
 
-# `connectrpc` (a hard dependency of `a2a-rs`) declares rustls, tokio-rustls and
-# hyper-rustls with their default features, which selects the `aws-lc-rs`
-# provider. Feature unification is additive and global, so that one crate drags
-# the C/assembly `aws-lc-sys` into a graph where every other crate — agentd,
-# agentd-net and a2a-rs itself — already asked for `ring`. The vendored copy
-# changes three dependency entries and no Rust source. Remove it when the fix
-# is upstream; see third_party/connectrpc/PATCH.md.
+# `connectrpc` (a hard dependency of `a2a-rs`) declares rustls and tokio-rustls
+# with their default features, which selects the `aws-lc-rs` provider. Feature
+# unification is additive and global, so that one crate drags the C/assembly
+# `aws-lc-sys` into a graph where every other crate — agentd, agentd-net and
+# a2a-rs itself — already asked for `ring`. The vendored copy (0.9.1, the
+# version a2a-rs 0.10 requires) changes three dependency entries and no Rust
+# source. Remove it when the fix is upstream; see third_party/connectrpc/PATCH.md.
 [patch.crates-io]
 connectrpc = { path = "third_party/connectrpc" }

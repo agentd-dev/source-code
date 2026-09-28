@@ -760,9 +760,13 @@ fn live_activity_reports_phase_tool_and_tokens_on_the_feed() {
         .iter()
         .find(|a| a["task"].as_str().is_some_and(|t| t.starts_with("task-")))
         .expect("the A2A turn's activity binds to its task");
+    // The conversation is the one the task names. A send that names none gets
+    // the id a2a-rs mints for it (a UUIDv4), so the check is against
+    // the task rather than a spelling of agentd's own.
     assert!(
-        bound["ctx"].as_str().is_some_and(|c| c.starts_with("a2a-")),
-        "…and to its conversation: {bound}"
+        bound["ctx"].as_str().is_some_and(|c| !c.is_empty())
+            && bound["ctx"] == sent["task"]["contextId"],
+        "…and to its conversation: {bound} / {sent}"
     );
     // Tokens accrue on the record (the mock reports usage per round).
     assert!(

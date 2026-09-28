@@ -1,6 +1,6 @@
-# Vendored `connectrpc` 0.3.3
+# Vendored `connectrpc` 0.9.1
 
-Upstream: <https://github.com/anthropics/connect-rust> · crates.io: `connectrpc` 0.3.3 · Apache-2.0
+Upstream: <https://github.com/connectrpc/connect-rust> · crates.io: `connectrpc` 0.9.1 · Apache-2.0
 
 This is an **unmodified copy of the published crate except for three `Cargo.toml`
 dependency entries**. No Rust source is changed. It is wired in from the
@@ -14,9 +14,11 @@ connectrpc = { path = "third_party/connectrpc" }
 ## Why
 
 `connectrpc` is a non-optional dependency of [`a2a-rs`], which agentd uses for
-A2A. It declares `rustls`, `tokio-rustls` and `hyper-rustls` **without**
+A2A, and a2a-rs 0.10 turns on its `tls` feature. Two of the entries that
+feature pulls in — `rustls` and `tokio-rustls` — are declared **without**
 `default-features = false`, so their defaults select the `aws-lc-rs` crypto
-provider.
+provider. (0.9.1 already declares `hyper-rustls` with its defaults off; 0.3.3,
+the copy this one replaces, did not.)
 
 Cargo feature unification is additive and global: one crate asking for
 `rustls/default` turns `aws-lc-rs` on for *every* crate in the graph, however
@@ -34,35 +36,46 @@ needs the C library.
 
 ## The change
 
-Three entries gain `default-features = false` and an explicit `ring`:
+Three entries gain an explicit `ring`, and the two that still take their
+defaults gain `default-features = false`:
 
 | entry | added |
 | --- | --- |
 | `rustls` | `default-features = false`, `features = ["ring", "std", "tls12", "logging"]` |
 | `tokio-rustls` | `default-features = false`, `features = ["ring", "tls12"]` |
-| `hyper-rustls` | `default-features = false`, `features += ["ring"]` |
+| `hyper-rustls` | `features += ["ring"]` (its defaults are already off upstream) |
 
 `hyper-rustls`'s root-store features (`native-tokio` / `webpki-tokio`) are
-deliberately **not** re-added: the library's only connector is built with
-`HttpsConnectorBuilder::with_tls_config(cfg)` (`src/client/mod.rs:418`), where
-the caller supplies the `ClientConfig` and its roots. Dropping them removes a
-`rustls-native-certs` dependency the code never reaches.
+deliberately **not** added: the library's only connector is built with
+`HttpsConnectorBuilder::with_tls_config(cfg)` (`src/client/mod.rs:762`), where
+the caller supplies the `ClientConfig` and its roots.
 
-The crate's own tests reference `rustls::crypto::aws_lc_rs` (`src/server.rs:911`),
-but that is inside `#[cfg(test)]` and never compiles for a consumer.
+The crate's own tests reference `rustls::crypto::aws_lc_rs` (`src/axum.rs:360`,
+`src/server.rs:4907`), but both are inside `#[cfg(test)]` modules and never
+compile for a consumer.
 
-## Result
+`zstd` (and with it the C `zstd-sys`) stays: it is a default feature of
+`connectrpc` that a2a-rs does not turn off, it was in the graph before this
+copy, and it is not what this patch is about.
 
-`aws-lc-rs`, `aws-lc-sys` and `rustls-native-certs` leave the graph entirely.
-The build needs no C toolchain, `FROM scratch` stays, and `Cross.toml`'s
-`cmake` pre-build step is gone.
+## Why 0.9.1 and not the 0.3.3 this replaces
+
+a2a-rs 0.10 requires `connectrpc` 0.9.1. That release also carries the fix
+for RUSTSEC-2026-0304 (a finished client-streaming or bidirectional call kept
+reading a stalled request body with no time limit). A vendored path copy is
+invisible to `cargo deny check advisories` — it matches advisories against
+registry sources only — so the older copy was affected without the gate ever
+saying so. **Re-vendoring is therefore also the security update; check the
+advisory database by hand on every re-vendor.**
 
 ## Removing this
 
 Delete the directory and the `[patch.crates-io]` stanza as soon as an upstream
-`connectrpc` release carries the fix — the patch is version-pinned to `0.3.3`
-and must be re-checked on any bump. `cargo tree -i aws-lc-sys` returning
-nothing is the test.
+`connectrpc` release carries the fix — the patch is version-pinned to `0.9.1`
+and must be redone on any bump (copy the published crate from
+`~/.cargo/registry/src/*/connectrpc-<version>/`, drop `.cargo-ok`, and re-apply
+the table above to `Cargo.toml`). `cargo tree -e normal --all-features -i
+aws-lc-sys` returning nothing is the test.
 
 **Note this patch does not reach people who `cargo install agentd-cli` or
 depend on `agentd-core` from crates.io.** `[patch.crates-io]` applies only to

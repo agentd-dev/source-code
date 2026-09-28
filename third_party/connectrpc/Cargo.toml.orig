@@ -1,6 +1,6 @@
 [package]
 name = "connectrpc"
-version = "0.3.3"
+version = "0.9.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -24,15 +24,36 @@ bytes = { workspace = true }
 # Tower service abstraction (the foundation)
 tower = { workspace = true }
 
-# Async runtime (minimal features for core)
-tokio = { workspace = true, features = ["rt", "io-util", "sync", "time"] }
+# Async runtime (minimal features for core). `macros` is load-bearing for
+# `tokio::select!` in the `server` accept loop; it stays on the base
+# dependency because CI's `--all-targets` would hide its removal via
+# dev-dep unification while breaking downstream `server`-only builds.
+tokio = { workspace = true, features = ["rt", "io-util", "sync", "time", "macros"] }
 futures = { workspace = true }
 pin-project = { workspace = true }
+sync_wrapper = { workspace = true }
+async-trait = { workspace = true }
 
-# Protobuf
-buffa = { workspace = true }
+# Protobuf.
+# Declared directly (not `workspace = true`) so the `json` feature can gate
+# `buffa/json`: the workspace `buffa` entry forces `features = ["json"]`, which
+# a member inheriting it cannot drop. The runtime only ever uses buffa's core
+# `Message`/view traits (never its JSON helpers), so a proto-only build needs
+# no buffa JSON. `std` is kept explicitly — `default-features = false` drops it
+# along with `json`, but `connectrpc` is unconditionally a std crate (tokio,
+# hyper), so building buffa as no_std would buy nothing and only risk a future
+# buffa change std-gating a core path we rely on. `fast-utf8` is kept
+# explicitly for the same reason: it is in buffa's default set (validated
+# string decoding on the hot path), and `default-features = false` would
+# silently drop it. Keep the version in sync with the
+# `[workspace.dependencies]` `buffa` entry, which documents why the floor is
+# where it is.
+buffa = { version = "0.9.1", default-features = false, features = ["std", "fast-utf8"] }
 
-# Serialization
+# Serialization. Non-optional even in proto-only builds: the Connect error and
+# streaming end-of-stream wire frames are always JSON regardless of the message
+# codec, so `serde`/`serde_json` are always required. The `json` feature gates
+# only *message-type* JSON (see `JsonSerialize`/`JsonDeserialize`).
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 
@@ -40,9 +61,8 @@ serde_json = { workspace = true }
 flate2 = { workspace = true, optional = true }
 zstd = { workspace = true, optional = true }
 
-# Streaming compression (optional)
-async-compression = { workspace = true, optional = true }
-tokio-util = { workspace = true, features = ["codec", "io"] }
+# Envelope framing (`Encoder`/`Decoder` for the 5-byte message header)
+tokio-util = { workspace = true, features = ["codec"] }
 
 # Error handling
 thiserror = { workspace = true }
@@ -76,14 +96,22 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"
 tempfile = { workspace = true }
 rcgen = { workspace = true }
 buffa-types = { workspace = true }
+h2 = { workspace = true }
 
 [features]
-default = ["gzip", "zstd", "streaming"]
+default = ["gzip", "zstd", "json"]
+
+# JSON codec for protobuf message types. On by default. Disabling it drops the
+# `serde::Serialize`/`DeserializeOwned` requirement on message types (see
+# `JsonSerialize`/`JsonDeserialize`), so proto-only code generated with the
+# codegen `no_json` option compiles against this crate. The Connect *error*
+# wire format is always JSON, so `serde`/`serde_json` remain unconditional
+# dependencies; only message-level JSON support is gated.
+json = ["buffa/json"]
 
 # Compression algorithms
-gzip = ["dep:flate2", "async-compression?/gzip"]
-zstd = ["dep:zstd", "async-compression?/zstd"]
-streaming = ["dep:async-compression"]
+gzip = ["dep:flate2"]
+zstd = ["dep:zstd"]
 
 # Standalone hyper-based server (convenience feature)
 server = [
@@ -91,6 +119,8 @@ server = [
     "hyper/http1",
     "hyper/http2",
     "hyper-util/server",
+    "hyper-util/server-auto",
+    "hyper-util/server-graceful",
     "hyper-util/tokio",
     "hyper-util/http1",
     "hyper-util/http2",
@@ -99,7 +129,6 @@ server = [
     "dep:libc",
     "dep:tower-http",
     "tokio/net",
-    "tokio-util/rt",
 ]
 
 # HTTP client with connection pooling
@@ -135,6 +164,12 @@ tls = ["server-tls", "client-tls"]
 
 # Framework integrations
 axum = ["dep:axum"]
+
+# On wasm32 there is no tokio runtime, so the request-body
+# reader for client-streaming / bidi is dispatched via
+# `wasm_bindgen_futures::spawn_local` instead of `tokio::spawn`.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen-futures = "0.4"
 
 [lints]
 workspace = true

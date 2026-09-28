@@ -215,7 +215,13 @@ export class Mirror {
     const data = (ev.data ?? {}) as { [k: string]: Json };
     switch (ev.kind) {
       case 'task': {
-        const t = normalizeTask((data.task as Json) ?? null);
+        // The feed activates the annotations only when the card declares
+        // them; without that, what sits under the key was not written under
+        // the extension's contract. A mirror with no session yet has no card
+        // to ask, and reads them.
+        const t = normalizeTask((data.task as Json) ?? null, {
+          annotations: this.state.session?.caps.annotations ?? true,
+        });
         if (t) this.putTask(t);
         break;
       }

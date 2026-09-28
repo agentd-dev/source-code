@@ -251,6 +251,16 @@ impl Instruction {
             None => uri.to_string(),
         })
     }
+
+    /// What the `instruction.subscribe` tool follows: the `uri` its caller
+    /// named, else [`Self::source_ref`] — the serving server, not a bare uri
+    /// any connected server would answer.
+    pub(crate) fn subscribe_target(&self, args: &serde_json::Value) -> Option<String> {
+        args.get("uri")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .or_else(|| self.source_ref())
+    }
 }
 
 /// Counters for status/reports.
@@ -1585,5 +1595,24 @@ mod tests {
             Some("oci://h/r:t".to_string())
         );
         assert_eq!(instruction(None, None).source_ref(), None);
+    }
+
+    /// `instruction.subscribe` with no uri follows the instruction where it
+    /// was served; a uri the caller names is followed as named.
+    #[test]
+    fn subscribe_without_a_uri_follows_the_serving_server() {
+        let served = instruction(Some("instruction://ins_x@stable"), Some("a"));
+        assert_eq!(
+            served.subscribe_target(&serde_json::json!({})),
+            Some("mcp://a/instruction://ins_x@stable".to_string())
+        );
+        assert_eq!(
+            served.subscribe_target(&serde_json::json!({"uri": "file://other"})),
+            Some("file://other".to_string())
+        );
+        assert_eq!(
+            instruction(None, None).subscribe_target(&serde_json::json!({})),
+            None
+        );
     }
 }

@@ -161,10 +161,12 @@ export class A2aClient {
     return rpcStream(this.ep, method, { message, configuration: configOf(config) }, onFrame, o);
   }
 
-  async getTask(id: string, historyLength?: number, o?: CallOptions): Promise<Json> {
+  /** GetTask, with the reply's `A2A-Extensions` echo (null when absent). */
+  async getTask(id: string, historyLength?: number, o?: CallOptions): Promise<{ result: Json; echo: string[] | null }> {
     const params: Obj = { id };
     if (historyLength !== undefined) params.historyLength = historyLength;
-    return (await this.call('GetTask', params, o)).result;
+    const { result, echo } = await this.call('GetTask', params, o);
+    return { result, echo };
   }
 
   /**
@@ -174,20 +176,25 @@ export class A2aClient {
    * {@link LIST_PAGE_SIZE} with artifacts, and
    * `nextPageToken` is followed until it runs out — or until `maxPages`, when
    * the listing is reported `truncated` instead of silently cut.
+   *
+   * Each task comes with the `A2A-Extensions` echo of the page it arrived on:
+   * pages are separate replies, and one that left an extension out says so
+   * only for its own tasks.
    */
   async listTasks(
     q: ListQuery = {},
     o?: CallOptions,
     maxPages = LIST_MAX_PAGES,
-  ): Promise<{ tasks: Json[]; truncated: boolean }> {
-    const tasks: Json[] = [];
+  ): Promise<{ tasks: { task: Json; echo: string[] | null }[]; truncated: boolean }> {
+    const tasks: { task: Json; echo: string[] | null }[] = [];
     let pageToken: string | undefined;
     for (let page = 0; page < maxPages; page++) {
       const params: Obj = { ...q, pageSize: LIST_PAGE_SIZE, includeArtifacts: true };
       if (pageToken !== undefined) params.pageToken = pageToken;
-      const r = obj((await this.call('ListTasks', params, o)).result);
+      const { result, echo } = await this.call('ListTasks', params, o);
+      const r = obj(result);
       if (!r) throw new ClientError('invalid-response', 'ListTasks answered something other than an object');
-      if (Array.isArray(r.tasks)) tasks.push(...r.tasks);
+      if (Array.isArray(r.tasks)) tasks.push(...r.tasks.map((task) => ({ task, echo })));
       const next = r.nextPageToken;
       if (typeof next !== 'string' || next === '') return { tasks, truncated: false };
       pageToken = next;
@@ -195,8 +202,10 @@ export class A2aClient {
     return { tasks, truncated: true };
   }
 
-  async cancelTask(id: string, o?: CallOptions): Promise<Json> {
-    return (await this.call('CancelTask', { id }, o)).result;
+  /** CancelTask, with the reply's `A2A-Extensions` echo (null when absent). */
+  async cancelTask(id: string, o?: CallOptions): Promise<{ result: Json; echo: string[] | null }> {
+    const { result, echo } = await this.call('CancelTask', { id }, o);
+    return { result, echo };
   }
 
   /** SubscribeToTask; `o.lastEventId` resumes after that SSE id. */

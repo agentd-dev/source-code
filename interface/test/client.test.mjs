@@ -176,7 +176,9 @@ test('activation headers and echo verification', async (t) => {
   const calls = stubFetch(t, (req) => {
     const headers = echo === undefined ? {} : { 'a2a-extensions': echo };
     if (req.body.method === EVENTS_METHOD) return { stream: [{ hello: { seq: 0 } }, { goodbye: { seq: 7, reason: 'deadline' } }], headers };
-    if (req.body.method === 'ListTasks') return { result: { tasks: [], nextPageToken: '' }, headers };
+    if (req.body.method === 'ListTasks') return { result: { tasks: result.task ? [result.task] : [], nextPageToken: '' }, headers };
+    // GetTask and CancelTask answer with the Task itself.
+    if (req.body.method === 'GetTask' || req.body.method === 'CancelTask') return { result: result.task ?? null, headers };
     return { result, headers };
   });
   const header = (i) => calls[i].headers['a2a-extensions'];
@@ -216,6 +218,16 @@ test('activation headers and echo verification', async (t) => {
   // extension's contract, so the task is read without it.
   echo = COMMAND_EXTENSION;
   assert.equal((await c.command(OPS.adminPause)).task.principal, undefined);
+  // The same rule on every core task call, not only on sends: the echo of
+  // GetTask, ListTasks and CancelTask governs the task that call returned.
+  echo = 'urn:x:other';
+  assert.equal((await c.getTask('t1')).principal, undefined, 'GetTask');
+  assert.equal((await c.listTasks()).tasks[0].principal, undefined, 'ListTasks');
+  assert.equal((await c.cancelTask('t1')).principal, undefined, 'CancelTask');
+  echo = ANN;
+  assert.equal((await c.getTask('t1')).principal, 'user:alice', 'GetTask');
+  assert.equal((await c.listTasks()).tasks[0].principal, 'user:alice', 'ListTasks');
+  assert.equal((await c.cancelTask('t1')).principal, 'user:alice', 'CancelTask');
   // An echo without the command extension: the agent did not run this as a
   // command (a model may have read it as prose), so the answer is refused.
   echo = ANN;
@@ -255,8 +267,10 @@ test('commandReply reads Message and Task DataParts', () => {
   assert.equal(work.kind, 'task');
   assert.equal(work.task.id, 't9');
   assert.deepEqual(work.data, { path: 'agent.approval', value: 'ask' });
-  // No `.result` artifact: the first artifact's DataPart.
-  assert.deepEqual(commandReply({ task: { id: 't', artifacts: [{ artifactId: 'x', parts: [{ data: 1 }] }] } }).data, 1);
+  // Only THIS task's result artifact is the answer: another artifact's data
+  // (a model's own, another task's result) is not, and is not guessed at.
+  assert.equal(commandReply({ task: { id: 't', artifacts: [{ artifactId: 'x', parts: [{ data: 1 }] }] } }).data, undefined);
+  assert.equal(commandReply({ task: { id: 't', artifacts: [{ artifactId: 'u.result', parts: [{ data: 1 }] }] } }).data, undefined);
   // A task still working has no result yet.
   assert.equal(commandReply({ task: { id: 't', status: { state: 'TASK_STATE_WORKING' } } }).data, undefined);
 
@@ -266,6 +280,20 @@ test('commandReply reads Message and Task DataParts', () => {
     assert.throws(() => commandReply(bad), (e) => e instanceof ClientError && e.kind === 'invalid-response');
   }
   assert.equal(commandReply({ task: { id: 't', artifacts: [{ artifactId: 't.result', parts: [{ text: '{"a":1}' }] }] } }).data, undefined);
+});
+
+test('the mirror reads feed annotations only when the card declares them', () => {
+  const task = { id: 't1', contextId: 'c', status: { state: 'TASK_STATE_WORKING' }, metadata: { [ANN]: { principal: 'user:alice' } } };
+  const session = (caps) => ({ cardUrl: 'x', card: {}, extended: null, ep: EP, caps, warnings: [] });
+  const principal = (caps) => {
+    const m = new Mirror();
+    if (caps) m.setSession(session(caps));
+    m.apply({ seq: 1, ts: 1, kind: 'task', data: { task } });
+    return m.getState().tasks.get('t1').principal;
+  };
+  assert.equal(principal(capsOf({ [EVENTS_EXTENSION]: {} })), undefined, 'not declared: not read');
+  assert.equal(principal(FULL()), 'user:alice', 'declared: read');
+  assert.equal(principal(null), 'user:alice', 'no session yet: read');
 });
 
 test('normalizeTask reads only URI-keyed annotations and core history', () => {

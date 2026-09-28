@@ -225,6 +225,16 @@ pub fn run(loaded: &Loaded, args: &[String], env: &[(String, String)]) -> i32 {
     }
     crate::signals::install();
     crate::supervisor::reap::set_child_subreaper();
+    // The entropy source every secret is minted from, opened before anything
+    // listens: a host without one refuses to start rather than failing the
+    // first request that needs a token, and no later mint needs a free fd.
+    if let Err(e) = crate::sec::random::open() {
+        log.error(
+            "proc.exit",
+            json!({"code": crate::exit::GENERIC, "err": format!("OS randomness (/dev/urandom): {e}")}),
+        );
+        return crate::exit::GENERIC;
+    }
     // Consumer presence (RFC-0028 §3.3): every MCP session this process opens
     // announces which workload it is, alongside name/version.
     crate::mcp::set_workload_label(&instance);

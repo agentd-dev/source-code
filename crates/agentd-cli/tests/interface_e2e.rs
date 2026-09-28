@@ -937,6 +937,7 @@ fn a_reload_revokes_a_web_origin_and_the_grant_stops() {
 /// that the ring is not installed until the next restart — a reload that
 /// reports success and changes nothing an operator can use.
 #[test]
+#[cfg(feature = "hot-reload")]
 fn a_reload_that_turns_introspection_on_arms_the_ring() {
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
     let (daemon, addr, cfg) = spawn_bound(|port| iface_config(&llm.uri, port, false, ""));

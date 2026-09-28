@@ -162,9 +162,10 @@ function firstData(parts: Json | undefined): Json | undefined {
 /**
  * Read a command's `SendMessageResponse`, which is exactly one of:
  * - `{message}` — a read op's answer: `data` is its first DataPart;
- * - `{task}` — work: `data` is the first DataPart of the result artifact
- *   (`<task>.result`), else of the first artifact; a task still working has
- *   none yet.
+ * - `{task}` — work: `data` is the first DataPart of THIS task's result
+ *   artifact (`<task id>.result`), and nothing else. A task still working has
+ *   none yet, and any other artifact (a model's own data, another task's
+ *   result) is not the command's answer, so `data` is then undefined.
  * Anything else is not a command reply, and is refused rather than guessed at.
  */
 export function commandReply(result: Json, o: NormalizeOptions = {}): CommandReply {
@@ -174,7 +175,7 @@ export function commandReply(result: Json, o: NormalizeOptions = {}): CommandRep
   const task = normalizeTask(r?.task ?? null, o);
   if (task) {
     const arts = Array.isArray(obj(r?.task)?.artifacts) ? (obj(r?.task)?.artifacts as Json[]) : [];
-    const result = arts.map(obj).find((a) => str(a?.artifactId)?.endsWith('.result')) ?? obj(arts[0]);
+    const result = arts.map(obj).find((a) => a?.artifactId === `${task.id}.result`);
     return { kind: 'task', task, data: firstData(result?.parts) };
   }
   throw new ClientError('invalid-response', 'command reply is neither a Task nor a Message');
@@ -289,18 +290,20 @@ export class AgentdClient {
   // ---- tasks -------------------------------------------------------------
 
   async getTask(id: string, historyLength?: number): Promise<TaskView | null> {
-    return normalizeTask(await this.a2a.getTask(id, historyLength, this.core()), this.annotationsIn(null));
+    const r = await this.a2a.getTask(id, historyLength, this.core());
+    return normalizeTask(r.result, this.annotationsIn(r.echo));
   }
 
   /** Every page of ListTasks (see {@link A2aClient.listTasks}). */
   async listTasks(q: ListQuery = {}): Promise<{ tasks: TaskView[]; truncated: boolean }> {
     const r = await this.a2a.listTasks(q, this.core());
-    const o = this.annotationsIn(null);
-    return { tasks: r.tasks.map((t) => normalizeTask(t, o)).filter((t): t is TaskView => t !== null), truncated: r.truncated };
+    const tasks = r.tasks.map(({ task, echo }) => normalizeTask(task, this.annotationsIn(echo)));
+    return { tasks: tasks.filter((t): t is TaskView => t !== null), truncated: r.truncated };
   }
 
   async cancelTask(id: string): Promise<TaskView | null> {
-    return normalizeTask(await this.a2a.cancelTask(id, this.core()), this.annotationsIn(null));
+    const r = await this.a2a.cancelTask(id, this.core());
+    return normalizeTask(r.result, this.annotationsIn(r.echo));
   }
 
   // ---- reads (Message replies; no task is created) -----------------------

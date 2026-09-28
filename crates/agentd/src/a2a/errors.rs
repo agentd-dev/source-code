@@ -150,18 +150,27 @@ pub fn rpc_error(id: Value, code: i64, message: &str, details: Vec<Value>) -> Va
     json!({"jsonrpc": "2.0", "id": id, "error": error})
 }
 
-/// A code the SDK raised on its own, made one a spec client can read.
+/// An error the SDK raised on its own, made one a spec client can read and
+/// one that says nothing about anyone else.
 ///
 /// a2a-rs answers some failures with codes of its own invention — `-32100`
 /// (its store), `-32101` (a version conflict) and `-32102` (a context another
 /// principal owns). They sit inside JSON-RPC's reserved range but in none of
-/// its defined blocks, so no client can interpret them, and the last one would
-/// reveal that a context exists. Each becomes [`INTERNAL_ERROR`]; the SDK's
-/// details and message stay as they were. Every other code passes unchanged.
-pub fn normalize_native(code: i64) -> i64 {
-    match code {
-        -32102..=-32100 => INTERNAL_ERROR,
-        other => other,
+/// its defined blocks, so no client can interpret them. `error` is the
+/// JSON-RPC `error` object; one carrying such a code becomes
+/// [`INTERNAL_ERROR`] with a generic message and no `data`. All three parts
+/// go together, which is why this takes the whole object and not the code:
+/// for `-32102` the SDK's message reads "Context belongs to another
+/// principal" and its `ErrorInfo` names the `context_id`, so folding the code
+/// alone would still confirm that someone else's context exists and which
+/// one it is. Every other error passes unchanged.
+pub fn normalize_native(error: &mut Value) {
+    let native = error
+        .get("code")
+        .and_then(Value::as_i64)
+        .is_some_and(|c| (-32102..=-32100).contains(&c));
+    if native {
+        *error = json!({"code": INTERNAL_ERROR, "message": "internal error"});
     }
 }
 
@@ -205,18 +214,36 @@ mod tests {
         }
     }
 
+    /// The code an error with `code` comes out of [`normalize_native`] with.
+    fn fold(code: i64) -> i64 {
+        let mut e = json!({"code": code, "message": "m"});
+        normalize_native(&mut e);
+        e["code"].as_i64().expect("a code")
+    }
+
     #[test]
     fn native_out_of_range_codes_normalise() {
         for code in [-32100, -32101, -32102] {
-            assert_eq!(normalize_native(code), INTERNAL_ERROR, "{code}");
+            assert_eq!(fold(code), INTERNAL_ERROR, "{code}");
         }
         for &code in ALL {
-            assert_eq!(normalize_native(code), code, "{code} must pass unchanged");
+            assert_eq!(fold(code), code, "{code} must pass unchanged");
         }
-        assert_eq!(normalize_native(TASK_NOT_FOUND), -32001);
+        assert_eq!(fold(TASK_NOT_FOUND), -32001);
         // The neighbours of the band are not swept up with it.
-        assert_eq!(normalize_native(-32099), -32099);
-        assert_eq!(normalize_native(-32103), -32103);
+        assert_eq!(fold(-32099), -32099);
+        assert_eq!(fold(-32103), -32103);
+        // An error that passes keeps its message and details.
+        let mut kept = rpc_error(
+            json!(1),
+            TASK_NOT_FOUND,
+            "no such task",
+            vec![bad_request(&[("id", "x")])],
+        )["error"]
+            .take();
+        let before = kept.clone();
+        normalize_native(&mut kept);
+        assert_eq!(kept, before);
     }
 
     #[test]
@@ -289,8 +316,32 @@ mod tests {
             sdk::VERSION_CONFLICT,
             sdk::CONTEXT_ACCESS_DENIED,
         ] {
-            assert_eq!(normalize_native(i64::from(native)), INTERNAL_ERROR);
+            assert_eq!(fold(i64::from(native)), INTERNAL_ERROR);
         }
+    }
+
+    /// The SDK's own refusal for someone else's context, as its server puts
+    /// it on the wire, comes out saying nothing about that context: not the
+    /// code, not the message, not the id in the details.
+    #[cfg(feature = "a2a")]
+    #[test]
+    fn a_foreign_context_refusal_names_no_context() {
+        let denied = a2a_rs::domain::A2AError::ContextAccessDenied {
+            context_id: "ctx-victim".into(),
+        };
+        let mut error = denied.to_jsonrpc_error();
+        error["data"] = serde_json::to_value(denied.error_details()).unwrap();
+        let wire = error.to_string();
+        assert!(
+            wire.contains("ctx-victim") && wire.contains("another principal"),
+            "{wire}"
+        );
+
+        normalize_native(&mut error);
+        assert_eq!(
+            error,
+            json!({"code": INTERNAL_ERROR, "message": "internal error"})
+        );
     }
 
     /// What the builders emit is what the SDK's typed details read back —

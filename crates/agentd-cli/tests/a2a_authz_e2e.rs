@@ -37,13 +37,14 @@
 
 mod common;
 
+use std::io::BufRead;
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use common::{SendMessage, a2a_post, a2a_post_within, rpc_as, rpc_body};
+use common::{SendMessage, a2a_open, a2a_post, a2a_post_within, rpc_as, rpc_body};
 
 /// The bearers the two principals present. Literal here, `{{secret:…}}` in the
 /// config — a bearer is a secret, and the config may only carry a reference.
@@ -290,6 +291,110 @@ fn one_principals_task_stream_is_not_readable_by_another() {
     assert!(
         a_body.contains("data:") && a_body.contains(&task_id),
         "the owner still receives its own task's events: {a_status} / {a_body}"
+    );
+
+    assert!(daemon.alive(), "daemon still serving: {}", daemon.stderr());
+    std::fs::remove_file(&cfg).ok();
+}
+
+/// A send that NAMES another principal's live task does not attach its caller
+/// to that task's stream.
+///
+/// a2a-rs 0.10 reads the task a send names, then attaches the send's
+/// subscription to that id, before the message is processed. Inside a send a
+/// read that finds nothing is deliberately not a verdict (the send's own task
+/// does not exist yet), so what keeps B off A's broadcast channel is that the
+/// reactor answers B's send with a fresh task of B's own and the ledger never
+/// records A's id as B's. Nothing else pins that: the subscribe test above
+/// never goes through a send. A's task is held live by a slow model, so a
+/// stream attached to it would carry A's transitions and its answer.
+#[test]
+fn a_send_naming_another_principals_live_task_streams_none_of_it() {
+    let llm = spawn_mock_llm(&json!({
+        "turns": [{"content": "B's own answer"}],
+        "match": [{"when_contains": "the victim's question", "content": "the private answer", "delay_ms": 3000}],
+    }));
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let cfg = write_config(&two_principal_config(&llm.uri, port));
+    let mut daemon = spawn_daemon(&cfg);
+    wait_ready(&addr);
+
+    // A starts a task and does not wait for it: the model is still thinking.
+    let started = SendMessage::text("the victim's question")
+        .bearer(TOKEN_A)
+        .return_immediately()
+        .post(&addr);
+    let a_task = &started["result"]["task"];
+    let a_id = a_task["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no task id in {started}"))
+        .to_string();
+    let a_ctx = a_task["contextId"].as_str().unwrap_or_default().to_string();
+    assert!(!a_ctx.is_empty(), "A's task has a context: {started}");
+    let live = rpc_as(&addr, TOKEN_A, 2, "GetTask", json!({"id": a_id}));
+    assert_ne!(
+        live["result"]["status"]["state"], "TASK_STATE_COMPLETED",
+        "A's task must still be live when B names it: {live}"
+    );
+
+    // B names A's task in a streaming send, and reads until the stream ends or
+    // well past the moment A's answer is produced.
+    let probe = SendMessage::text("probe from b")
+        .bearer(TOKEN_B)
+        .task(&a_id)
+        .streaming();
+    let headers = probe.headers();
+    let extra: Vec<(&str, &str)> = headers
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let mut reader = a2a_open(&addr, &probe.body(3), &extra, Duration::from_secs(6));
+    let mut body = String::new();
+    let deadline = Instant::now() + Duration::from_secs(12);
+    while Instant::now() < deadline {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => body.push_str(&line),
+        }
+    }
+
+    assert!(
+        !body.contains("the private answer"),
+        "B streamed A's answer: {body}"
+    );
+    assert!(!body.contains(&a_ctx), "B learned A's context: {body}");
+    // A's task id may come back only inside an error (B named it); no frame
+    // that is a result may carry it.
+    for data in body.lines().filter_map(|l| l.strip_prefix("data:")) {
+        let frame: Value = serde_json::from_str(data.trim())
+            .unwrap_or_else(|e| panic!("a non-JSON frame ({e}): {data}"));
+        assert!(
+            frame.get("error").is_some() || !frame.to_string().contains(&a_id),
+            "B received a frame of A's task: {frame}"
+        );
+    }
+
+    // The control: A's task did settle with the answer B must not have seen,
+    // inside the window B was reading, and B's message is not in it.
+    let end = Instant::now() + Duration::from_secs(15);
+    let settled = loop {
+        let got = rpc_as(&addr, TOKEN_A, 4, "GetTask", json!({"id": a_id}));
+        if got["result"]["status"]["state"] == "TASK_STATE_COMPLETED" {
+            break got;
+        }
+        assert!(Instant::now() < end, "A's task never settled: {got}");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let settled = settled.to_string();
+    assert!(
+        settled.contains("the private answer"),
+        "A's task carries its answer: {settled}"
+    );
+    assert!(
+        !settled.contains("probe from b"),
+        "B's message joined A's task: {settled}"
     );
 
     assert!(daemon.alive(), "daemon still serving: {}", daemon.stderr());

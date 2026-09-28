@@ -12,6 +12,7 @@
 
 import { normalizeTask } from './client.js';
 import { COMMAND_DATA_KEY } from './ext.js';
+import { workflowNames } from './composer.js';
 import {
   Activity,
   ConnState,
@@ -752,16 +753,9 @@ export class Mirror {
     return [...this.state.tasks.values()].sort((a, b) => b.updated - a.updated);
   }
 
-  /**
-   * The workflows this caller may run: from the extended card when one was
-   * read (it lists them per caller), else from the `status` document's
-   * `workflows` — the one other place an agent names them.
-   */
+  /** The workflows this caller may run (see {@link workflowNames}, the one reading of them). */
   workflows(): string[] {
-    const caps = this.state.session?.caps;
-    if (caps?.extendedCard) return caps.workflows;
-    const list = obj(this.state.bootstrap)?.workflows;
-    return (Array.isArray(list) ? list : []).map((w) => str(obj(w)?.name)).filter((n): n is string => n !== undefined);
+    return workflowNames(this.state);
   }
 }
 

@@ -20,18 +20,26 @@ export { Mirror, introspectionOn } from './mirror.js';
 export { Observation } from './observe.js';
 export type { ObserveOptions } from './observe.js';
 export {
+  APPROVAL_NAME,
   SYSTEM_COMMANDS,
   activityLine,
   applySuggestion,
+  availableCommands,
+  commandHelp,
+  currentGate,
   elapsed,
+  parseAuthCommand,
   prepare,
+  routeSend,
+  runAuthCommand,
   skillNames,
+  skillPrefix,
   suggest,
   tokens,
   triggerToken,
   workflowNames,
   duration,
 } from './composer.js';
-export type { Prepared, Suggestion } from './composer.js';
+export type { AuthClient, AuthCommand, AuthOutcome, Prepared, Suggestion, SystemCommand } from './composer.js';
 export { askForm, askAnswer } from './askform.js';
 export type { AskForm } from './askform.js';

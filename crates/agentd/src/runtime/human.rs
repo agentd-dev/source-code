@@ -141,18 +141,17 @@ impl Runtime {
     /// addressed the asking `human` step to one of its `::!human`s
     /// (`config::humans`). Looked up by the step rather than read from its
     /// `to`, because a channel is never part of a `to`: only the document's
-    /// own declaration can put one on a gate. Nor is it carried on the pending
-    /// ask or in the durable wait record: it is read from the settings the
-    /// runtime is running now whenever it is announced, so a reload that
-    /// changes it moves the next gate, and a restart re-derives it for a gate
-    /// it rebuilds.
+    /// own declaration can put one on a gate. It is read from the definition
+    /// the run executes — the one it started with, by hash — and only a
+    /// definition loaded from the configuration carries any, so a run of one
+    /// `workflow.update` rewrote under the same name announces nothing. Nor is
+    /// it carried on the pending ask or in the durable wait record: a restart
+    /// re-derives it for a gate it rebuilds, and a reload that changes it
+    /// reloads the definitions, which moves the next gate.
     pub(crate) fn document_gate_channel(&self, run: &str, step: &str) -> Option<String> {
-        let workflow = &self.runs.get(run)?.workflow;
-        self.settings
-            .agent
-            .document_gate_channels
-            .get(workflow)?
-            .get(step)
+        self.definition_for_run(run)?
+            .gate_channels
+            .get(&super::nested::definition_path(step))
             .cloned()
     }
 

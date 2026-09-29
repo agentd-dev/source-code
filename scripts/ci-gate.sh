@@ -8,7 +8,7 @@
 # closes it.
 #
 #   ./scripts/ci-gate.sh          # everything
-#   ./scripts/ci-gate.sh quick    # fmt + clippy matrix only (no test run)
+#   ./scripts/ci-gate.sh quick    # fmt + clippy matrix + cargo deny (no test run)
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -34,6 +34,10 @@ ROWS=(
 )
 
 fail=0
+# A check this machine could not run. It does not fail the gate — CI runs it —
+# but the verdict names it, so "GATE CLEAN" never claims a check that did not
+# happen.
+skipped=()
 step() { printf '\n=== %s\n' "$1"; }
 
 step "fmt"
@@ -55,15 +59,23 @@ done
 [ $fail -eq 0 ] && echo "  all rows clean"
 
 # ci.yml's `deny` job. It runs in quick mode too: it reads the lockfile and
-# builds nothing. Without cargo-deny the step is announced as NOT run rather
-# than passed over — a clean verdict here would otherwise claim a check that
-# never happened.
+# builds nothing. The version is ci.yml's own pin, read rather than copied, so
+# a local run that judges with another cargo-deny says so. Without cargo-deny
+# the step is recorded as skipped and the verdict names it.
 step "cargo deny (advisories, bans, licences, sources)"
+deny_version=$(sed -n 's/^ *CARGO_DENY_VERSION: *"\{0,1\}\([^"]*\)"\{0,1\} *$/\1/p' \
+                 .github/workflows/ci.yml | head -n1)
 if command -v cargo-deny >/dev/null 2>&1; then
+  have=$(cargo deny --version 2>/dev/null | awk '{print $2}')
+  if [ -n "$deny_version" ] && [ "$have" != "$deny_version" ]; then
+    echo "  NOTE  cargo-deny $have here, $deny_version in CI — results can differ"
+    echo "        (install CI's: cargo install cargo-deny --locked --version $deny_version)"
+  fi
   cargo deny check || fail=1
 else
   echo "  SKIPPED  cargo-deny is not installed — CI's deny job will run it"
-  echo "           (install: cargo install cargo-deny --locked)"
+  echo "           (install: cargo install cargo-deny --locked --version ${deny_version:-<see ci.yml>})"
+  skipped+=("cargo deny")
 fi
 
 if [ "${1:-}" != "quick" ]; then
@@ -121,5 +133,9 @@ if [ "${1:-}" != "quick" ]; then
   fi
 fi
 
-printf '\n%s\n' "$([ $fail -eq 0 ] && echo 'GATE CLEAN' || echo 'GATE FAILED')"
+verdict=$([ $fail -eq 0 ] && echo 'GATE CLEAN' || echo 'GATE FAILED')
+if [ ${#skipped[@]} -gt 0 ]; then
+  verdict="$verdict ($(IFS=,; echo "${skipped[*]}") NOT RUN)"
+fi
+printf '\n%s\n' "$verdict"
 exit $fail

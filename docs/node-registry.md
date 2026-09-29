@@ -269,8 +269,10 @@ model is principal syntax only, so it is refused too, saying so.
 
 **An instruction document's `@human/<name>`.** A document declares the people
 it involves with `::!human` — a name, and a `principal` and/or a `channel` —
-and its `:::!workflow` addresses a top-level `human` step to one with
-`to: "@human/<name>"`. The loader reads both attributes from the document:
+and its `:::!workflow` addresses a `human` step to one with
+`to: "@human/<name>"` — at the top level, or inside an `iterate` or
+`subgraph` body (a body that runs copies at once holds no gate at all). The
+loader reads both attributes from the document:
 
 - a human that names a **`principal`** addresses the gate to it, held to the
   rule above unchanged — `principal=operator` loads, `principal=user:alice` is
@@ -284,9 +286,16 @@ and its `:::!workflow` addresses a top-level `human` step to one with
   changes who may answer.
 
 The channel stays out of the definition — `workflow.get` shows `to:
-operator` — and is looked up for the step when the gate opens, so nothing but
-the document's own declaration can put one on a gate. A reference to a human
-the document does not declare is refused at load.
+operator` — and is bound to the definition the document loaded, looked up for
+the step when the gate opens. A definition `workflow.create` or
+`workflow.update` writes carries none, even under the document's workflow
+name, so nothing but the document's own declaration can put one on a gate. A
+reference to a human the document does not declare is refused at load.
+
+A subagent template's instruction is a document too, and its gates are
+addressed the same way, so its child loads them. Its channels are not
+announced: the child's configuration cannot carry one, and the parent's boot
+warns, naming each gate and its channel.
 
 Three more declarations are load errors rather than accepted-and-ignored,
 because each produces a gate that *looks* routed and is not: one that names

@@ -75,6 +75,24 @@ pub fn scoped_id(parent: &str, step: &str) -> String {
     format!("{parent}.{step}")
 }
 
+/// The definition a (possibly scoped) run-record id runs: the id with each
+/// `[<index>]` dropped (`each[3].ask` → `each.ask`), since every element and
+/// iteration of a body runs the one step. A branch is part of the definition
+/// and stays (`par{a}.ask`).
+pub fn definition_path(id: &str) -> String {
+    let mut out = String::with_capacity(id.len());
+    let mut in_index = false;
+    for c in id.chars() {
+        match c {
+            '[' => in_index = true,
+            ']' => in_index = false,
+            c if !in_index => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
 /// The parent scope of a scoped id (`each[3].classify` → `each[3]`).
 pub fn parent_of(id: &str) -> Option<&str> {
     id.rsplit_once('.').map(|(p, _)| p)
@@ -1182,6 +1200,7 @@ fn unreachable_wf() -> std::sync::Arc<Workflow> {
         steps: BTreeMap::new(),
         hash: String::new(),
         definition: Value::Null,
+        gate_channels: BTreeMap::new(),
     })
 }
 
@@ -1243,6 +1262,9 @@ mod tests {
         assert_eq!(strip_scope_suffix("each[3]"), "each");
         assert_eq!(strip_scope_suffix("par{a}"), "par");
         assert_eq!(strip_scope_suffix("x[1].y[2]"), "x[1].y");
+        assert_eq!(definition_path("ask"), "ask");
+        assert_eq!(definition_path("each[3].ask"), "each.ask");
+        assert_eq!(definition_path("par{a}.loop[2].ask"), "par{a}.loop.ask");
         // Cancellation scope: the element/branch forms are children of the
         // parent's own id too, and a longer name that merely shares the
         // prefix is not.

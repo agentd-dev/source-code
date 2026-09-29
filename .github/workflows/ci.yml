@@ -63,12 +63,14 @@ jobs:
             exit 1
           fi
 
-  # The supply-chain gate (deny.toml): advisories, bans, licences, sources.
-  # A pinned, checksum-verified cargo-deny release rather than
+  # The supply-chain gate (deny.toml): advisories, bans, licences, sources,
+  # over the workspace's DEFAULT feature graph (deny.toml says what that
+  # leaves out). A pinned, checksum-verified cargo-deny release rather than
   # cargo-deny-action: the action floats with its major tag and defaults to
   # `--all-features`, so CI would judge a different graph, with a different
-  # cargo-deny, than `scripts/ci-gate.sh` does locally. Here both run the same
-  # binary with the same command line.
+  # cargo-deny, than `scripts/ci-gate.sh` does locally. Both run the same
+  # command line, and ci-gate.sh reads CARGO_DENY_VERSION from here and says
+  # when the local cargo-deny is another version.
   deny:
     runs-on: ubuntu-latest
     env:

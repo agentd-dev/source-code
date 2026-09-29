@@ -309,6 +309,12 @@ test("a command's reply is read from where the extension puts it", () => {
   const [, set] = examplesOf(COMMAND_EXTENSION).find(([f]) => f === 'admin-set.json');
   const result = { path: set[COMMAND_DATA_KEY].path, value: set[COMMAND_DATA_KEY].value };
   check(validator(COMMAND_EXTENSION, `/$defs/ops/${OPS.adminSet}/result`), result, 'the admin.set result');
+  // Every optional member is carried by some example, so none of them is
+  // read (or dropped) untested.
+  assert.ok(
+    examplesOf(TASK_ANNOTATIONS_EXTENSION).some(([, ann]) => ann.askChannel !== undefined),
+    'an example carries askChannel',
+  );
   for (const [f, ann] of examplesOf(TASK_ANNOTATIONS_EXTENSION)) {
     check(annotations, ann, f);
     const wire = {
@@ -328,6 +334,7 @@ test("a command's reply is read from where the extension puts it", () => {
     assert.deepEqual(r.task.link, ann.link, f);
     assert.equal(r.task.command, ann.command, f);
     assert.deepEqual(r.task.askSchema, ann.askSchema, f);
+    assert.equal(r.task.askChannel, ann.askChannel, f);
     // An answer that did not activate the extension: what sits under the
     // key was not written under its contract, and is not read.
     const bare = commandReply({ task: wire }, { annotations: false });

@@ -822,10 +822,11 @@ export function App(props: AppProps): React.JSX.Element {
           text:
             active[0].state === 'TASK_STATE_INPUT_REQUIRED'
               ? // A form-shaped gate lists its options below, so the working
-                // line does not repeat the wait.
-                gateForm.kind === 'text'
-                ? 'waiting for your answer'
-                : 'waiting for your choice'
+                // line does not repeat the wait. Where else the question
+                // went rides on the same line: it tells whoever sees it that
+                // someone may already be answering there.
+                (gateForm.kind === 'text' ? 'waiting for your answer' : 'waiting for your choice') +
+                (active[0].askChannel ? ` · also asked on ${active[0].askChannel}` : '')
               : active[0].state === 'TASK_STATE_AUTH_REQUIRED'
                 ? 'waiting for authorization'
                 : activityLine(mirror.activityFor(active[0].id)) +

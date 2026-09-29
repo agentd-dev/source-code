@@ -235,6 +235,13 @@ impl Runtime {
             match parse_workflow(&resolved) {
                 Ok(mut w) => {
                     self.fill_durable_default(&mut w);
+                    // A configured definition is the only kind that carries
+                    // the instruction document's gate channels: bound to THIS
+                    // definition, not to its name, so whatever later replaces
+                    // it under the name carries none.
+                    if let Some(ch) = self.settings.agent.document_gate_channels.get(&w.name) {
+                        w.gate_channels = ch.clone();
+                    }
                     self.log.info("workflow.loaded", json!({"name": w.name, "hash": &w.hash[..12], "steps": w.steps.len(), "durable": w.durable, "starts": w.start_steps().iter().map(|s| s.kind.clone()).collect::<Vec<_>>()}));
                     self.workflows
                         .insert(w.name.clone(), std::sync::Arc::new(w));

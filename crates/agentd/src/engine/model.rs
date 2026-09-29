@@ -1101,6 +1101,14 @@ pub struct Workflow {
     pub hash: String,
     /// The definition as given (canonical JSON), for `workflow.list`/hash.
     pub definition: Value,
+    /// The channel each gate of THIS definition is announced on, by step path
+    /// (`config::humans`). Never parsed from a definition: the runtime sets it
+    /// only on a definition it loaded from the configuration, from the
+    /// instruction document's `::!human`s, so a definition `workflow.create`
+    /// or `workflow.update` wrote — or the store restored — carries none, and
+    /// a run of it announces nothing, whatever name it shares.
+    #[serde(skip)]
+    pub gate_channels: BTreeMap<String, String>,
 }
 
 fn default_true() -> bool {
@@ -1625,6 +1633,7 @@ pub fn parse_workflow(doc: &Value) -> Result<Workflow, Vec<String>> {
         steps,
         hash: String::new(),
         definition: doc.clone(),
+        gate_channels: BTreeMap::new(),
     };
     validate_graph(&wf, &mut errs);
     if !errs.is_empty() {

@@ -243,6 +243,70 @@ fn the_supply_chain_gate_runs_in_ci_and_locally() {
         !allowed.iter().any(|l| l.contains("AGPL")),
         "deny.toml allows AGPL for every dependency; except agentd's own crates by name instead: {allowed:?}"
     );
+
+    // The exceptions name exactly the workspace's AGPL crates — read from the
+    // workspace's own manifests, not from a list kept beside them. An
+    // exception for any other crate would let an AGPL dependency in by name.
+    let members: Vec<String> = read("Cargo.toml")
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("members = ["))
+        .expect("the workspace lists its members")
+        .trim_end_matches(']')
+        .split(',')
+        .map(|m| m.trim().trim_matches('"').to_string())
+        .filter(|m| !m.is_empty())
+        .collect();
+    assert!(members.len() > 3, "members parsed as {members:?}");
+    let package = |manifest: &str, key: &str| -> String {
+        manifest
+            .lines()
+            .find_map(|l| {
+                let (k, v) = l.split_once('=')?;
+                (k.trim() == key).then(|| v.trim().trim_matches('"').to_string())
+            })
+            .unwrap_or_else(|| panic!("no `{key}` in a member manifest"))
+    };
+    let mut agpl: Vec<String> = members
+        .iter()
+        .map(|m| read(&format!("{m}/Cargo.toml")))
+        .filter(|t| package(t, "license") == "AGPL-3.0-only")
+        .map(|t| package(&t, "name"))
+        .collect();
+    agpl.sort();
+    let exceptions = deny
+        .split("\nexceptions = [")
+        .nth(1)
+        .and_then(|s| s.split("\n]").next())
+        .expect("deny.toml has [licenses] exceptions");
+    let mut excepted: Vec<String> = exceptions
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with('{'))
+        .map(|l| {
+            assert!(
+                l.contains(r#"allow = ["AGPL-3.0-only"]"#),
+                "an exception grants something other than agentd's own licence: {l}"
+            );
+            l.split("crate = \"")
+                .nth(1)
+                .and_then(|r| r.split('"').next())
+                .unwrap_or_else(|| panic!("an exception names no crate: {l}"))
+                .to_string()
+        })
+        .collect();
+    excepted.sort();
+    assert_eq!(
+        excepted, agpl,
+        "deny.toml's AGPL exceptions must name exactly the workspace's AGPL-3.0-only crates"
+    );
+
+    // The local gate judges with CI's cargo-deny, or says it does not: it
+    // reads the version from ci.yml rather than keeping a copy.
+    let gate = read("scripts/ci-gate.sh");
+    assert!(
+        gate.contains("CARGO_DENY_VERSION") && gate.contains("--version $deny_version"),
+        "scripts/ci-gate.sh must read cargo-deny's version from ci.yml"
+    );
 }
 
 /// The `[features]` a manifest declares, by name.

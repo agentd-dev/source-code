@@ -319,14 +319,19 @@ There are no removal tables and no removed sections in `--help`.
   `agent.description`, `agent.ask_human_unowned` and
   `security.policies[].to`.
 - **An instruction document's `@human/<name>` gate loads, and its channel is
-  announced.** A top-level `human` step a document addresses to one of its
-  `::!human`s goes to that human's `principal`, held to the gate rule
+  announced.** A `human` step a document addresses to one of its
+  `::!human`s — top-level, or in an `iterate` or `subgraph` body — goes to
+  that human's `principal`, held to the gate rule
   (`principal=operator` loads, `principal=user:alice` is refused), or, when
   it names none, to the operators exactly as `to: operator`. The human's
   `channel` is carried on the gate — `human.asked`'s `payload.channel` and
   the task's `askChannel` annotation — for a workflow or a bridge to route
   the question; it never decides who may answer, and no `to:` written
-  anywhere else can set one. The spec's own conformance examples, which
+  anywhere else can set one. It is bound to the definition the document
+  loaded: one `workflow.update` writes under the same name announces
+  nothing. A subagent template's document addresses its gates the same way,
+  so its child loads them, but a template's channels are not announced (the
+  parent's boot warns). The spec's own conformance examples, which
   address their gates this way, now load; the instruction crate's fold and
   its corpus are unchanged.
 - `admin.set {path, value}`, an operator op over the runtime-settable paths.
@@ -443,7 +448,10 @@ holds up the next call on the same server.
 - **`cargo deny check` passes and CI runs it** (a `deny` job, and a step in
   `scripts/ci-gate.sh`): ISC is allowed (ring, rustls-webpki, untrusted), and
   AGPL-3.0-only is excepted for agentd's own five crates by name, not allowed
-  for dependencies.
+  for dependencies. It judges the workspace at its default features only. The
+  feature set the release ships is not yet checked, and under it the policy
+  still fails: Zlib (foldhash, zlib-rs) is not allowed, and `paste`
+  (RUSTSEC-2024-0436, unmaintained) comes in through cel-interpreter.
 
 ### Crates
 

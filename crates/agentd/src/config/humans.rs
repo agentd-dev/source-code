@@ -34,20 +34,87 @@ use serde_json::Value;
 use super::idoc::{Disposition, Document};
 
 /// The channel each document-addressed gate is announced on: workflow name →
-/// step id → the declaring human's `channel`.
+/// step path → the declaring human's `channel`. A top-level step's path is
+/// its id; a step inside a body is `<parent>.<id>`, and inside a branch
+/// `<parent>{<branch>}.<id>` — the run-record id with its `[<index>]`s
+/// dropped (`runtime::nested::definition_path`), since every element of a
+/// fan-out runs the one definition.
 pub type GateChannels = BTreeMap<String, BTreeMap<String, String>>;
 
-/// Address every top-level `human` step of the document's folded
-/// `workflows` that the document wrote as `to: "@human/<name>"` to the human
-/// it declares, and return the channels those gates are announced on.
+/// One `human` step a `:::!workflow` block's body wrote as
+/// `to: "@human/<name>"`.
+struct GateRef {
+    /// The object keys from the workflow's root down to the step.
+    keys: Vec<String>,
+    /// The step's path, as [`GateChannels`] keys it.
+    path: String,
+    /// The `<name>` it addresses.
+    human: String,
+}
+
+/// Every `human` step under `steps` addressed to a document human, at any
+/// depth. A body or branches are descended into only for the kinds that hold
+/// a nested definition there — the engine's own list (`engine::model`'s raw
+/// fields), so an `http` step's request `body` is never taken for one.
+fn gate_refs(steps: Option<&Value>, keys: &[String], prefix: &str, out: &mut Vec<GateRef>) {
+    let Some(steps) = steps.and_then(Value::as_object) else {
+        return;
+    };
+    for (id, s) in steps {
+        let mut here = keys.to_vec();
+        here.push(id.clone());
+        let path = if prefix.is_empty() {
+            id.clone()
+        } else {
+            format!("{prefix}.{id}")
+        };
+        let kind = s.get("kind").and_then(Value::as_str).unwrap_or_default();
+        if kind == "human"
+            && let Some(human) = s
+                .get("to")
+                .and_then(Value::as_str)
+                .and_then(|t| t.strip_prefix("@human/"))
+        {
+            out.push(GateRef {
+                keys: here.clone(),
+                path: path.clone(),
+                human: human.to_string(),
+            });
+        }
+        if crate::engine::model::is_raw_field(kind, "body") {
+            let mut k = here.clone();
+            k.extend(["body".to_string(), "steps".to_string()]);
+            gate_refs(s.get("body").and_then(|b| b.get("steps")), &k, &path, out);
+        }
+        if crate::engine::model::is_raw_field(kind, "branches") {
+            for (branch, b) in s
+                .get("branches")
+                .and_then(Value::as_object)
+                .into_iter()
+                .flatten()
+            {
+                let mut k = here.clone();
+                k.extend(["branches".to_string(), branch.clone(), "steps".to_string()]);
+                gate_refs(b.get("steps"), &k, &format!("{path}{{{branch}}}"), out);
+            }
+        }
+    }
+}
+
+/// Address every `human` step of the document's folded `workflows` that the
+/// document wrote as `to: "@human/<name>"` to the human it declares, and
+/// return the channels those gates are announced on.
 ///
 /// The reference is read from the workflow block's own body, since the fold
-/// has already replaced it. Only what the fold itself resolves is touched —
-/// top-level steps of a `:::!workflow` — and a reference to a human the
-/// document does not declare is left as the fold left it, `@human/<name>`, for
-/// the gate rule to refuse at load. A workflow name two blocks share is left
-/// alone too: which block's reference a step came from is then unknowable,
-/// and the duplicate is refused at load anyway.
+/// has already replaced it at the top level. A step nested in a body or a
+/// branch is addressed the same way: the fold resolves only top-level steps
+/// and leaves a nested reference as written, but it is the same document's
+/// reference to the same human, and a gate there waits exactly as one at the
+/// top does. A reference to a human the document does not declare is left
+/// as the fold left it, `@human/<name>`, for the gate rule to refuse at load.
+/// A workflow name two blocks share is left alone too: which block's
+/// reference a step came from is then unknowable, and the duplicate is
+/// refused at load anyway.
 pub fn address_document_gates(doc: &Document, workflows: &mut [Value]) -> GateChannels {
     let nonempty = |v: Option<&String>| v.filter(|s| !s.trim().is_empty()).cloned();
     // The same set the fold resolves against — top-level `human` blocks by
@@ -67,9 +134,8 @@ pub fn address_document_gates(doc: &Document, workflows: &mut [Value]) -> GateCh
     if humans.is_empty() {
         return GateChannels::new();
     }
-    // workflow name → [(step id, human name)], or `None` once the name is
-    // seen twice.
-    let mut refs: BTreeMap<String, Option<Vec<(String, String)>>> = BTreeMap::new();
+    // workflow name → its references, or `None` once the name is seen twice.
+    let mut refs: BTreeMap<String, Option<Vec<GateRef>>> = BTreeMap::new();
     for b in doc
         .blocks()
         .filter(|b| b.kind == "workflow" && b.disposition == Disposition::Machinery)
@@ -85,17 +151,8 @@ pub fn address_document_gates(doc: &Document, workflows: &mut [Value]) -> GateCh
         else {
             continue;
         };
-        let found: Vec<(String, String)> = body
-            .get("steps")
-            .and_then(Value::as_object)
-            .into_iter()
-            .flatten()
-            .filter(|(_, s)| s.get("kind").and_then(Value::as_str) == Some("human"))
-            .filter_map(|(id, s)| {
-                let human = s.get("to")?.as_str()?.strip_prefix("@human/")?;
-                Some((id.clone(), human.to_string()))
-            })
-            .collect();
+        let mut found = Vec::new();
+        gate_refs(body.get("steps"), &["steps".to_string()], "", &mut found);
         match refs.get_mut(&name) {
             Some(seen) => *seen = None,
             None => {
@@ -111,14 +168,16 @@ pub fn address_document_gates(doc: &Document, workflows: &mut [Value]) -> GateCh
         let Some(Some(found)) = refs.get(&name) else {
             continue;
         };
-        let Some(steps) = wf.get_mut("steps").and_then(Value::as_object_mut) else {
-            continue;
-        };
-        for (id, human) in found {
-            let (Some((principal, channel)), Some(step)) = (
-                humans.get(human),
-                steps.get_mut(id).and_then(Value::as_object_mut),
-            ) else {
+        for r in found {
+            let Some((principal, channel)) = humans.get(&r.human) else {
+                continue;
+            };
+            let Some(step) = r
+                .keys
+                .iter()
+                .try_fold(&mut *wf, |v, k| v.get_mut(k))
+                .and_then(Value::as_object_mut)
+            else {
                 continue;
             };
             let to = principal.as_deref().unwrap_or("operator");
@@ -127,7 +186,7 @@ pub fn address_document_gates(doc: &Document, workflows: &mut [Value]) -> GateCh
                 channels
                     .entry(name.clone())
                     .or_default()
-                    .insert(id.clone(), channel.clone());
+                    .insert(r.path.clone(), channel.clone());
             }
         }
     }
@@ -198,6 +257,58 @@ mod tests {
                 "{human}"
             );
         }
+    }
+
+    /// A gate inside a body or a branch is the same document's reference to
+    /// the same human: it is addressed like a top-level one, and its channel
+    /// is recorded under the step's path — the run-record id without its
+    /// element index. An `http` step's request `body` is not a definition and
+    /// is never descended into.
+    #[test]
+    fn a_nested_gate_is_addressed_and_keyed_by_its_path() {
+        let text = "---\nspec: \"1\"\n---\n:::!channel{name=ops}\n:::\n\n\
+                    :::!human{name=oncall channel=@channel/ops}\n:::\n\n\
+                    :::!workflow{name=w}\n\
+                    steps:\n\
+                    \x20 s: {kind: manual}\n\
+                    \x20 each:\n\
+                    \x20   kind: iterate\n\
+                    \x20   max_iterations: 2\n\
+                    \x20   depends_on: [s]\n\
+                    \x20   body: {steps: {ask: {kind: human, question: \"ok?\", to: \"@human/oncall\"}}}\n\
+                    \x20 par:\n\
+                    \x20   kind: parallel\n\
+                    \x20   depends_on: [each]\n\
+                    \x20   branches:\n\
+                    \x20     a: {steps: {ask: {kind: human, question: \"ok?\", to: \"@human/oncall\"}}}\n\
+                    \x20 post:\n\
+                    \x20   kind: http\n\
+                    \x20   depends_on: [par]\n\
+                    \x20   url: \"https://example.test\"\n\
+                    \x20   body: {steps: {x: {kind: human, to: \"@human/oncall\"}}}\n\
+                    \x20 f: {kind: finish, depends_on: [post]}\n\
+                    :::\n";
+        let (wfs, channels) = fold(text);
+        let steps = &wfs[0]["steps"];
+        assert_eq!(
+            steps["each"]["body"]["steps"]["ask"]["to"],
+            json!("operator")
+        );
+        assert_eq!(
+            steps["par"]["branches"]["a"]["steps"]["ask"]["to"],
+            json!("operator")
+        );
+        assert_eq!(
+            steps["post"]["body"]["steps"]["x"]["to"],
+            json!("@human/oncall"),
+            "a request body is data, not a nested definition"
+        );
+        let want: BTreeMap<String, String> = [
+            ("each.ask".to_string(), "@channel/ops".to_string()),
+            ("par{a}.ask".to_string(), "@channel/ops".to_string()),
+        ]
+        .into();
+        assert_eq!(channels.get("w"), Some(&want));
     }
 
     /// A reference to a human the document never declared is left as the

@@ -382,3 +382,204 @@ fn a_reload_that_addresses_a_gate_to_anyone_but_an_operator_is_refused() {
     let _ = child.wait();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// [`converse`] for an agent whose instruction is an instruction document
+/// declaring the `ops` channel, the `oncall` human and the `approve`
+/// workflow — served over a unix socket, and opening a gate task for an ask
+/// no caller owns, so a run the model starts has a gate to announce.
+#[cfg(feature = "a2a")]
+fn converse_document(workflow: &str, play: &str) -> String {
+    let doc = format!(
+        ":::!channel{{name=ops}}\n:::\n\n\
+         :::!human{{name=oncall channel=@channel/ops}}\n:::\n\n\
+         :::!workflow{{name=approve}}\n{workflow}:::\n"
+    );
+    let indented: String = doc.lines().map(|l| format!("    {l}\n")).collect();
+    let cfg = format!(
+        "\
+         agent:\n  name: gates\n  prompt: go\n  document_capabilities: [interface]\n  ask_human_unowned: gate\n\
+         \x20 instruction: |\n{indented}\
+         store: {{ kind: memory }}\n\
+         observability: {{ log_level: info, log_content: true }}\n\
+         intelligence: {{ endpoints: \"mock:file:__DIR__/play.json\", model: mock }}\n\
+         lifecycle: {{ run_until: idle, idle_grace: 2s }}\n\
+         a2a: {{ listen: \"unix://__DIR__/a2a.sock\" }}\n"
+    );
+    let dir = common::unique_path("gate-addressee-doc", "d");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(format!("{dir}/play.json"), play).unwrap();
+    std::fs::write(format!("{dir}/c.yaml"), cfg.replace("__DIR__", &dir)).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .args(["--config", &format!("{dir}/c.yaml")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .output()
+        .expect("run agentd");
+    let _ = std::fs::remove_dir_all(&dir);
+    String::from_utf8_lossy(&out.stderr).to_string()
+}
+
+/// The `channel` of every `human.ask` line in a log.
+#[cfg(feature = "a2a")]
+fn asked_channels(log: &str) -> Vec<serde_json::Value> {
+    log.lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["event"] == "human.ask")
+        .map(|v| v["channel"].clone())
+        .collect()
+}
+
+/// A document's gate in an `iterate` body, one iteration: the gate the
+/// iteration opens is announced on the channel its `::!human` declares.
+#[cfg(feature = "a2a")]
+const NESTED_GATE: &str = "\
+     steps:\n\
+     \x20 s: {kind: manual}\n\
+     \x20 loop: {kind: iterate, max_iterations: 1, depends_on: [s], body: {steps: {ask: {kind: human, question: \"ok?\", to: \"@human/oncall\", timeout: 1s}}}}\n\
+     \x20 f: {kind: finish, depends_on: [loop]}\n";
+
+/// A gate the document nests in a body opens like a top-level one, and it is
+/// announced on its human's channel — the iteration's run-record id
+/// (`loop[0].ask`) finds the definition's step (`loop.ask`).
+#[cfg(feature = "a2a")]
+#[test]
+fn a_documents_nested_gate_is_announced_on_its_channel() {
+    let log = converse_document(
+        NESTED_GATE,
+        r#"{"turns": [
+             {"tool_calls": [{"name": "workflow.run", "arguments": {"name": "approve"}}]},
+             {"echo_tool_result": true}]}"#,
+    );
+    assert_eq!(
+        asked_channels(&log),
+        [serde_json::json!("@channel/ops")],
+        "the nested gate opens once, announced on @channel/ops\n{log}"
+    );
+}
+
+/// The channel belongs to the document's definition, not to its name. A
+/// model that `workflow.update`s the workflow — same name, same step path,
+/// its own `to` — gets a gate announced nowhere: nothing but the document's
+/// own declaration puts a channel on a gate.
+#[cfg(feature = "a2a")]
+#[test]
+fn a_workflow_update_under_the_documents_name_carries_no_channel() {
+    let rewritten = serde_json::json!({
+        "name": "approve",
+        "steps": {
+            "s": {"kind": "manual"},
+            "loop": {"kind": "iterate", "max_iterations": 1, "depends_on": ["s"], "body": {"steps": {
+                "ask": {"kind": "human", "question": "ok?", "to": "operator", "timeout": "1s"}}}},
+            "f": {"kind": "finish", "depends_on": ["loop"]}
+        }
+    });
+    let log = converse_document(
+        NESTED_GATE,
+        &format!(
+            r#"{{"turns": [
+                 {{"tool_calls": [{{"name": "workflow.update", "arguments": {{"name": "approve", "definition": {rewritten}}}}}]}},
+                 {{"tool_calls": [{{"name": "workflow.run", "arguments": {{"name": "approve"}}}}]}},
+                 {{"echo_tool_result": true}}]}}"#
+        ),
+    );
+    assert!(
+        log.contains("\"op\":\"workflow.update\""),
+        "the update must be what ran\n{log}"
+    );
+    assert_eq!(
+        asked_channels(&log),
+        [serde_json::Value::Null],
+        "the rewritten gate opens once, announced nowhere\n{log}"
+    );
+}
+
+/// A reload that moves only a `::!human`'s channel moves the next gate. The
+/// channel rides on the document's definitions, whose hashes it does not
+/// change, so the reload re-derives them for it — and says it did.
+#[cfg(all(feature = "a2a", feature = "hot-reload"))]
+#[test]
+fn a_reload_that_moves_a_humans_channel_moves_the_next_gate() {
+    use std::io::{BufRead, BufReader};
+    use std::time::{Duration, Instant};
+
+    let dir = common::unique_path("gate-addressee-channel-reload", "d");
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg_for = |channel: &str| {
+        let doc = format!(
+            ":::!channel{{name=ops}}\n:::\n\n\
+             :::!channel{{name=pager}}\n:::\n\n\
+             :::!human{{name=oncall channel=@channel/{channel}}}\n:::\n\n\
+             :::!workflow{{name=approve}}\n\
+             steps:\n\
+             \x20 s: {{kind: schedule, every: 700ms}}\n\
+             \x20 ask: {{kind: human, question: \"ok?\", to: \"@human/oncall\", timeout: 300ms, depends_on: [s]}}\n\
+             \x20 f: {{kind: finish, depends_on: [ask]}}\n\
+             :::\n"
+        );
+        let indented: String = doc.lines().map(|l| format!("    {l}\n")).collect();
+        format!(
+            "\
+             agent:\n  name: gates\n  document_capabilities: [interface]\n  ask_human_unowned: gate\n\
+             \x20 instruction: |\n{indented}\
+             store: {{ kind: memory }}\n\
+             observability: {{ log_level: info }}\n\
+             intelligence: {{ endpoints: \"mock:final\", model: mock }}\n\
+             lifecycle: {{ run_until: drained, drain_timeout: 5s }}\n\
+             a2a: {{ listen: \"unix://{dir}/a2a.sock\" }}\n"
+        )
+    };
+    let cfg = format!("{dir}/c.yaml");
+    std::fs::write(&cfg, cfg_for("ops")).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .args(["--config", &cfg])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn agentd");
+    let pid = child.id() as i32;
+    let (tx, rx) = std::sync::mpsc::channel::<serde_json::Value>();
+    let stderr = child.stderr.take().unwrap();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if let Ok(v) = serde_json::from_str(&line) {
+                let _ = tx.send(v);
+            }
+        }
+    });
+    let wait = |pick: &dyn Fn(&serde_json::Value) -> bool, what: &str| {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(left) {
+                Ok(v) if pick(&v) => return v,
+                Ok(v) if v["event"] == "config.reload.invalid" => panic!("refused: {v}"),
+                Ok(_) => continue,
+                Err(_) => panic!("timed out waiting for {what}"),
+            }
+        }
+    };
+    let asked_on = |ch: &'static str| {
+        move |v: &serde_json::Value| v["event"] == "human.ask" && v["channel"] == ch
+    };
+    wait(
+        &asked_on("@channel/ops"),
+        "a gate announced on @channel/ops",
+    );
+
+    std::fs::write(&cfg, cfg_for("pager")).unwrap();
+    unsafe { libc::kill(pid, libc::SIGHUP) };
+    let reloaded = wait(&|v| v["event"] == "config.reloaded", "config.reloaded");
+    assert!(
+        reloaded["changed"].to_string().contains("workflows"),
+        "the reload re-derived the definitions the channel rides on: {reloaded}"
+    );
+    wait(
+        &asked_on("@channel/pager"),
+        "a gate announced on @channel/pager after the reload",
+    );
+
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+}

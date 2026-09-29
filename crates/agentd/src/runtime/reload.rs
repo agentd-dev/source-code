@@ -363,7 +363,13 @@ impl Runtime {
                 .iter()
                 .any(|k| w.get(*k).is_some())
         });
-        if old.workflows != new.workflows || external {
+        // The channels a document's gates are announced on ride on the
+        // definitions they belong to, so a document that moves only a
+        // `::!human`'s channel reloads the definitions too — their hashes
+        // stay, nothing retires, and the next gate is announced on the new
+        // channel.
+        let channels_moved = old.agent.document_gate_channels != new.agent.document_gate_channels;
+        if old.workflows != new.workflows || external || channels_moved {
             let previous = std::mem::take(&mut self.workflows);
             if let Err(errs) = self.load_workflows() {
                 self.workflows = previous; // the running set stays authoritative
@@ -393,7 +399,7 @@ impl Runtime {
                 && previous
                     .iter()
                     .all(|(n, w)| self.workflows.get(n).is_some_and(|nw| nw.hash == w.hash));
-            if !same {
+            if !same || channels_moved {
                 changed.push("workflows");
             }
         }

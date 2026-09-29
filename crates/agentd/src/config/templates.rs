@@ -49,6 +49,9 @@ pub struct CompiledTemplate {
     pub workflows: Vec<Value>,
     pub skills: Vec<InlineSkill>,
     pub spec: SubagentTemplate,
+    /// The channels the template's gates are addressed to by its
+    /// `::!human`s, which a child does not announce (see [`compile_one`]).
+    pub gate_channels: crate::config::humans::GateChannels,
 }
 
 /// Sections the PARENT composes for a child (`compose_instance_doc`), on top of
@@ -97,8 +100,21 @@ fn compile_one(
         return Err(vec![at("instruction must be non-empty".into())]);
     }
     // Directive extraction: once, at boot, on the operator-authored surface.
-    let ex = match idoc::extract(&t.instruction, &idoc::all_families()) {
-        Ok(ex) => ex,
+    // Parsed and folded as `idoc::extract` does, then held to the same gate
+    // addressing as the agent's own document: a template's instruction is an
+    // instruction document too, and its `human` steps addressed to its own
+    // `::!human`s would otherwise reach the child as the folded channel —
+    // accepted here, refused by the child at every spawn. The channels are
+    // kept: the child's configuration has no way to carry them (only the
+    // agent's own document can put a channel on a gate), so the parent's
+    // validation says they are not announced rather than dropping them
+    // without a word.
+    let (ex, gate_channels) = match idoc::parse(&t.instruction).and_then(|doc| {
+        let mut ex = idoc::fold(&doc, &idoc::all_families())?;
+        let channels = crate::config::humans::address_document_gates(&doc, &mut ex.workflows);
+        Ok((ex, channels))
+    }) {
+        Ok(folded) => folded,
         Err(es) => return Err(es.into_iter().map(at).collect()),
     };
     let has_config = !ex.config.is_empty();
@@ -288,6 +304,7 @@ fn compile_one(
             workflows: ex.workflows,
             skills: ex.skills,
             spec: t.clone(),
+            gate_channels,
         })
     } else {
         Err(errs)

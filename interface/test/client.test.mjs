@@ -322,6 +322,7 @@ test('normalizeTask reads only URI-keyed annotations and core history', () => {
         created: '2026-08-17T13:41:00Z',
         statusHistory: [{ state: 'TASK_STATE_SUBMITTED', ts: '2026-08-17T13:41:00Z' }],
         askSchema: { type: 'string', enum: ['eu', 'us'] },
+        askChannel: '@channel/ops',
       },
     },
   });
@@ -340,6 +341,7 @@ test('normalizeTask reads only URI-keyed annotations and core history', () => {
   assert.equal(full.created, Date.parse('2026-08-17T13:41:00Z'));
   assert.deepEqual(full.statusHistory, [{ state: 'TASK_STATE_SUBMITTED', ts: Date.parse('2026-08-17T13:41:00Z') }]);
   assert.deepEqual(full.askSchema, { type: 'string', enum: ['eu', 'us'] });
+  assert.equal(full.askChannel, '@channel/ops');
   // RFC 3339 on the wire, epoch ms in the view: the TUI sorts and subtracts it.
   assert.equal(full.updated, Date.parse('2026-08-17T13:41:27.824Z'));
 

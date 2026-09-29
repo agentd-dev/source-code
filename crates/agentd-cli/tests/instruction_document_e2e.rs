@@ -296,6 +296,18 @@ fn the_spec_corpus_documents_load_with_their_gates_answered_by_operators() {
         let env = json!({"webhooks": {"listen": "http://127.0.0.1:18081"}});
         // The binary's own validation, as a deployment runs it.
         let (valid, err, _) = load_with(&doc, &ALL, env.clone());
+        // Three of the documents' workflows carry `when:` CEL conditions,
+        // which a build without `cel` refuses at load. Such a row checks
+        // exactly that, so no row passes a case over in silence.
+        let needs_cel = ["deploy-runbook", "orchestrator", "coding-agent"].contains(&case);
+        if needs_cel && !cfg!(feature = "cel") {
+            assert!(
+                !valid && err.contains("the 'cel' build feature"),
+                "{case} without `cel` is refused naming the feature:\n{err}"
+            );
+            let _ = std::fs::remove_file(&secret);
+            continue;
+        }
         assert!(valid, "{case} must load through agentd:\n{err}");
         let s = settings(&doc, env);
         let steps = human_steps(&s);
@@ -384,6 +396,53 @@ fn a_documents_human_with_a_principal_is_held_to_the_gate_rule() {
         err.contains("`to` names @human/nobody, who could never see the task")
             && err.contains("resolves only inside the document that declares"),
         "the refusal says the reference names no declared human:\n{err}"
+    );
+}
+
+/// A gate nested in a body is the same document's reference to the same
+/// human, and loads like a top-level one: answered by the operators, its
+/// channel recorded under the step's path. Before, the loader resolved
+/// top-level steps only, and the nested reference was refused with a reason
+/// that said it resolves only inside the document that declares the human —
+/// the document it was in. (A body that runs copies at once — `foreach`,
+/// `batch`, `parallel`, `race` — holds no gate at all; the engine refuses
+/// that for its own reason.)
+#[test]
+fn a_documents_nested_gate_loads_like_a_top_level_one() {
+    let doc = "---\nspec: \"1\"\n---\n# Refunds\n\n\
+               :::!channel{name=ops}\n:::\n\n\
+               :::!human{name=oncall channel=@channel/ops}\n:::\n\n\
+               :::!workflow{name=w}\n\
+               steps:\n\
+               \x20 s: {kind: manual}\n\
+               \x20 loop:\n\
+               \x20   kind: iterate\n\
+               \x20   max_iterations: 2\n\
+               \x20   depends_on: [s]\n\
+               \x20   body: {steps: {ask: {kind: human, question: \"ok?\", to: \"@human/oncall\"}}}\n\
+               \x20 sub:\n\
+               \x20   kind: subgraph\n\
+               \x20   depends_on: [loop]\n\
+               \x20   body: {steps: {ask: {kind: human, question: \"ok?\", to: \"@human/oncall\"}}}\n\
+               \x20 f: {kind: finish, depends_on: [sub]}\n\
+               :::\n";
+    let (valid, err, _) = load(doc, &ALL);
+    assert!(valid, "a nested document gate must load:\n{err}");
+    let s = settings(doc, Value::Null);
+    let w = s
+        .workflows
+        .iter()
+        .find(|w| w["name"] == "w")
+        .expect("the document's workflow");
+    assert_eq!(w["steps"]["loop"]["body"]["steps"]["ask"]["to"], "operator");
+    assert_eq!(w["steps"]["sub"]["body"]["steps"]["ask"]["to"], "operator");
+    let got: Vec<(&str, &str)> = s.agent.document_gate_channels["w"]
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    assert_eq!(
+        got,
+        [("loop.ask", "@channel/ops"), ("sub.ask", "@channel/ops")]
     );
 }
 

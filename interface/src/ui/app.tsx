@@ -267,7 +267,10 @@ function Chat({ mirror, gate, onSend }: { mirror: Mirror; gate: TaskView | undef
           <div className="working">
             ⠿{' '}
             {active[0].state === 'TASK_STATE_INPUT_REQUIRED'
-              ? 'waiting for your answer'
+              ? // Where else the question went: someone may already be
+                // answering there.
+                'waiting for your answer' +
+                (active[0].askChannel ? ` · also asked on ${active[0].askChannel}` : '')
               : activityLine(mirror.activityFor(active[0].id), tick)}
             {active.length > 1 ? ` · ${active.length} tasks` : ''}
             <span className="cursor">▌</span>

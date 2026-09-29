@@ -7,6 +7,7 @@
     {"state": "TASK_STATE_INPUT_REQUIRED", "ts": "2026-09-29T11:02:41.250Z"}
   ],
   "principal": "operator",
+  "askChannel": "@channel/deploys",
   "askSchema": {
     "type": "object",
     "required": ["approve"],

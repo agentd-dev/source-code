@@ -2,6 +2,13 @@
 # `cargo deny check` enforces: no security advisories, no wildcard deps, and an
 # explicit license allow-list — so an "unearned" or unvetted dependency cannot
 # slip in unnoticed.
+#
+# What it judges is the workspace at its DEFAULT features (`tls` only). The
+# graph the release ships — release.yml's FEATURES — is NOT yet checked, and
+# under it this policy fails today: Zlib (foldhash, zlib-rs) is not on the
+# allow-list, and `paste` (RUSTSEC-2024-0436, unmaintained) arrives through
+# cel-interpreter. Widening the gate to the shipped graph waits on those two
+# decisions; until then a dependency only a feature brings in passes unseen.
 
 [advisories]
 version = 2

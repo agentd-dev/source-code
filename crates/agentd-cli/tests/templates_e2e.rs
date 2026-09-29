@@ -217,6 +217,67 @@ fn a_singleton_instance_refuses_a_second_live_spawn() {
     );
 }
 
+/// A template's instruction is an instruction document, so its `human` step
+/// addressed to its own `::!human` loads as the agent's own document's does:
+/// answered by the operators. Before, the parent accepted the template and
+/// every spawn failed — the child was handed the folded channel as its `to`
+/// and refused it. The child's configuration cannot carry the channel, and
+/// the parent's boot says so instead of dropping it without a word.
+#[cfg(feature = "a2a")]
+#[test]
+fn a_templates_document_gate_spawns_and_its_unannounced_channel_is_said() {
+    let (code, log) = run_cfg(
+        "agent: { name: parent }\nstore: { kind: memory }\n\
+         lifecycle: { run_until: idle, idle_grace: 2500ms }\n\
+         observability: { log_level: info, log_content: true }\n\
+         subagents:\n\
+        \x20 templates:\n\
+        \x20   approver:\n\
+        \x20     instruction: |\n\
+        \x20       Approve deploys.\n\
+        \x20       :::!channel{name=ops}\n\
+        \x20       :::\n\
+        \x20       :::!human{name=oncall channel=@channel/ops}\n\
+        \x20       :::\n\
+        \x20       :::!workflow{name=approve}\n\
+        \x20       steps:\n\
+        \x20         cmd: { kind: a2a, command: deploy.approve, roles: [agent, operator] }\n\
+        \x20         ask: { kind: human, question: \"ship it?\", to: \"@human/oncall\", depends_on: [cmd] }\n\
+        \x20         f:   { kind: finish, depends_on: [ask], status: completed }\n\
+        \x20       :::\n\
+        \x20     ttl: 2s\n\
+         workflows:\n  - name: w\n    steps:\n\
+        \x20     s:     { kind: once }\n\
+        \x20     spawn: { kind: subagent, template: approver, depends_on: [s], on_error: continue }\n\
+        \x20     f:     { kind: finish, depends_on: [spawn], status: completed, output: \"{{steps.spawn.error | ok}}\" }\n",
+    );
+    assert_eq!(code, Some(0), "{log}");
+    let done: Vec<Value> = events(&log, "run.done")
+        .into_iter()
+        .filter(|e| e["workflow"] == "w")
+        .collect();
+    assert_eq!(done.len(), 1, "{log}");
+    // `steps.spawn.error` is unset when the spawn succeeded; a refused child
+    // puts its reason there.
+    assert!(
+        done[0]["output"].is_null(),
+        "the child accepted the gate its template addressed to its own human:\n{log}"
+    );
+    assert!(
+        !events(&log, "instance.spawn").is_empty(),
+        "the instance child spawned:\n{log}"
+    );
+    assert!(
+        events(&log, "config.warning").iter().any(|w| {
+            let w = w["warning"].as_str().or(w["msg"].as_str()).unwrap_or("");
+            w.contains("subagents.templates.approver")
+                && w.contains("approve.ask → @channel/ops")
+                && w.contains("does not announce the channel")
+        }),
+        "the parent says the template's channel is announced nowhere:\n{log}"
+    );
+}
+
 #[test]
 fn template_machinery_may_not_define_listeners_and_fails_the_parents_boot() {
     let (code, log) = run_cfg(

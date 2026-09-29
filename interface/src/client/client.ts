@@ -89,6 +89,8 @@ function annotationsOf(a: Obj): Partial<TaskView> {
     out.statusHistory = hist;
   }
   if (a.askSchema !== undefined && a.askSchema !== null) out.askSchema = a.askSchema;
+  const askChannel = str(a.askChannel);
+  if (askChannel !== undefined) out.askChannel = askChannel;
   return out;
 }
 

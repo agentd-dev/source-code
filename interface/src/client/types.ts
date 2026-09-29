@@ -61,7 +61,7 @@ export interface HistoryMessage {
 
 /**
  * The client's view of one A2A `Task`, flattened once at the edge. The core
- * fields come from the Task itself; agentd's own facts (`link` … `askSchema`)
+ * fields come from the Task itself; agentd's own facts (`link` … `askChannel`)
  * come ONLY from `metadata[task-annotations]`, and only while that
  * extension is active — there is no other key and no flat fallback.
  */
@@ -87,6 +87,11 @@ export interface TaskView {
   statusHistory?: { state: TaskState; ts: number }[];
   /** The shape a gate's answer must take, if the gate declared one. */
   askSchema?: Json;
+  /**
+   * Where a gate is also announced: the channel of the instruction
+   * document's `::!human` it is addressed to. It never decides who answers.
+   */
+  askChannel?: string;
   /** Epoch ms of `status.timestamp`; 0 when the task carries none. */
   updated: number;
 }

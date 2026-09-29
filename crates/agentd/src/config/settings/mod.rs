@@ -304,9 +304,11 @@ pub struct Agent {
     /// `::!human`s is announced on, per workflow and step — DERIVED, never a
     /// config key (`config::humans`). Out of the definition on purpose: a `to`
     /// written anywhere else stays principal syntax only, so nothing but the
-    /// document's own declaration can put a channel on a gate. Read live by
-    /// the runtime when a gate opens, so a reload that changes it takes effect
-    /// on the next gate.
+    /// document's own declaration can put a channel on a gate. The runtime
+    /// hands each workflow's entries to the configured definition of that
+    /// name when it loads it (`engine::model::Workflow::gate_channels`), and
+    /// a reload that changes them reloads the definitions, so the next gate
+    /// is announced on the new channel.
     #[serde(skip)]
     pub document_gate_channels: crate::config::humans::GateChannels,
     /// Where a pulled instruction came from (an `oci://` reference resolved at
@@ -6762,9 +6764,37 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
     // instance-machinery checks all run here, so a bad template refuses the
     // PARENT's startup — naming the template — instead of failing at the first
     // spawn, long after the deploy.
-    if let Err(errs) = crate::config::templates::compile_templates(s) {
-        for e in errs {
-            err(&mut d, e);
+    match crate::config::templates::compile_templates(s) {
+        Err(errs) => {
+            for e in errs {
+                err(&mut d, e);
+            }
+        }
+        // A template's gate addressed to a `::!human` that declares a channel
+        // loads — answered by the operators, as in the agent's own document —
+        // but the child's configuration cannot carry the channel, so it is
+        // announced nowhere. Said here, where the author can still choose.
+        Ok(compiled) => {
+            for (name, c) in &compiled {
+                let at: Vec<String> = c
+                    .gate_channels
+                    .iter()
+                    .flat_map(|(wf, steps)| {
+                        steps
+                            .iter()
+                            .map(move |(st, ch)| format!("{wf}.{st} → {ch}"))
+                    })
+                    .collect();
+                if !at.is_empty() {
+                    d.warnings.push(format!(
+                        "subagents.templates.{name}: its gates addressed to a `::!human` with a \
+                         channel ({}) are answered by the operators, but a template's child does \
+                         not announce the channel — only the agent's own instruction document \
+                         carries a channel onto its gates",
+                        at.join(", ")
+                    ));
+                }
+            }
         }
     }
     if !s.subagents.templates.is_empty() && s.a2a.listen.is_none() {

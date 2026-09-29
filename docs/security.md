@@ -771,7 +771,8 @@ the task. The rule holds wherever a question is addressed with `to:`, a workflow
 included. An instruction document's `@human/<name>` is held to it too: the gate goes to that
 `::!human`'s `principal`, or to the operators when it names none, and the human's `channel` is only
 announced (`human.asked`, the task's `askChannel`), never consulted, so a channel cannot widen who
-answers. A `to:` anywhere else cannot name a channel at all. Work no caller owns — a schedule, a webhook, a subagent — gates on the listener only
+answers. A `to:` anywhere else cannot name a channel at all, and a definition `workflow.update`
+writes under the document's workflow name carries none. Work no caller owns — a schedule, a webhook, a subagent — gates on the listener only
 with `agent.ask_human_unowned: gate`.
 
 ### The remote posture

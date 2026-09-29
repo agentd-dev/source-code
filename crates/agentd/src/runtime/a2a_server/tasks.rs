@@ -211,6 +211,20 @@ fn list_tasks<'a>(
 /// a second late is nothing to either.
 const TASK_SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// How long a settled task nobody has read back yet is kept past the bound.
+///
+/// A blocking `SendMessage` is answered in two trips through the reactor: the
+/// terminal event ends a2a-rs's wait, and a2a-rs then fetches the task with a
+/// separate `GetTask` to build the reply. Between the two, any other task
+/// finishing — or the tick — applies the bound, and with `keep_last: 0`, or
+/// `keep_last: N` under N concurrent callers, it would drop the task before
+/// that `GetTask` lands and answer its caller "not found" for a task that
+/// COMPLETED. The read clears the mark (see [`Runtime::a2a_get_task`]), so in
+/// the ordinary case a finished task goes the moment the bound says; the
+/// grace only caps how long one nobody reads (a streamed or
+/// `returnImmediately` send) outlives it. Far past any reactor round trip.
+const SETTLE_GRACE_MS: u64 = 30_000;
+
 /// The terminal tasks `policy` drops at `now`, by id.
 ///
 /// Only a TERMINAL task is a candidate. A working task is someone's answer in
@@ -219,30 +233,33 @@ const TASK_SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
 /// ranked newest status first (the listing's order), so `keep_last` keeps a
 /// prefix, and `ttl` counts from the status that finished the task.
 ///
-/// `spare` is never returned: it is the task whose transition is being
-/// published, and the reply to the request that moved it is still to be built
-/// from it — dropping it now would answer that caller with nothing. It goes on
-/// the next sweep.
+/// A task still being handed back — settled within [`SETTLE_GRACE_MS`] and
+/// not read since — is never returned: the reply its caller is waiting for is
+/// still to be built from it. It goes on a later pass, once read or once the
+/// grace is over.
 fn tasks_to_evict<'a>(
     tasks: impl Iterator<Item = &'a Task>,
     policy: &crate::config::v2::TerminalRetention,
     now: u64,
-    spare: Option<&str>,
 ) -> Vec<String> {
     let ttl_ms = policy.ttl.as_ref().map(|d| d.0.as_millis() as u64);
-    if policy.keep_last.is_none() && ttl_ms.is_none() {
-        return Vec::new();
-    }
-    let mut terminal: Vec<&Task> = tasks.filter(|t| t.state.is_terminal()).collect();
+    let over_age = |t: &Task| ttl_ms.is_some_and(|ttl| now.saturating_sub(t.updated) > ttl);
+    let settling = |t: &Task| t.unread && now.saturating_sub(t.updated) < SETTLE_GRACE_MS;
+    let terminal = tasks.filter(|t| t.state.is_terminal());
+    let Some(keep) = policy.keep_last else {
+        // A ttl alone is a test of each task's own age: nothing to rank, so
+        // nothing is sorted on the single-writer loop.
+        return terminal
+            .filter(|t| over_age(t) && !settling(t))
+            .map(|t| t.id.clone())
+            .collect();
+    };
+    let mut terminal: Vec<&Task> = terminal.collect();
     terminal.sort_by(|a, b| list_key(b).cmp(&list_key(a)));
     terminal
         .iter()
         .enumerate()
-        .filter(|(i, t)| {
-            let over_count = policy.keep_last.is_some_and(|k| *i >= k as usize);
-            let over_age = ttl_ms.is_some_and(|ttl| now.saturating_sub(t.updated) > ttl);
-            (over_count || over_age) && spare != Some(t.id.as_str())
-        })
+        .filter(|(i, t)| (*i >= keep as usize || over_age(t)) && !settling(t))
         .map(|(_, t)| t.id.clone())
         .collect()
 }
@@ -325,10 +342,18 @@ impl Runtime {
         annotations_for(self.a2a_active)
     }
 
-    pub(super) fn a2a_get_task(&self, principal: &Principal, params: &Value) -> Value {
+    /// `GetTask`: the task, to a caller who may see it.
+    ///
+    /// A read hands a settled task back, which is what retention was waiting
+    /// for (see [`tasks_to_evict`]): from here the bound may take it.
+    pub(super) fn a2a_get_task(&mut self, principal: &Principal, params: &Value) -> Value {
         let id = params.get("id").and_then(Value::as_str).unwrap_or("");
-        match self.tasks.get(id) {
-            Some(t) if t.is_visible_to(principal) => t.to_a2a(self.annotations()),
+        let annotations = self.annotations();
+        match self.tasks.get_mut(id) {
+            Some(t) if t.is_visible_to(principal) => {
+                t.unread = false;
+                t.to_a2a(annotations)
+            }
             // Don't disclose existence to a non-owner.
             _ => err_obj(TASK_NOT_FOUND, "task not found"),
         }
@@ -639,12 +664,22 @@ impl Runtime {
 
     /// Publish a task transition, then apply `store.retention.tasks`.
     ///
-    /// A transition is the only moment the terminal set grows, so this is
-    /// where the bound is kept; the task being published is spared until the
-    /// next sweep (see [`tasks_to_evict`]), after its caller has its answer.
+    /// A task settling is the only moment the terminal set grows, so that is
+    /// where the bound is kept; any other transition leaves it to the sweep,
+    /// and costs no ranking. The settled task is marked unread, which spares
+    /// it until its caller has its answer (see [`tasks_to_evict`]).
     pub(crate) fn task_sync(&mut self, id: &str) {
+        let settled = match self.tasks.get_mut(id) {
+            Some(t) if t.state.is_terminal() => {
+                t.unread = true;
+                true
+            }
+            _ => false,
+        };
         self.task_publish(id);
-        self.evict_terminal_tasks(Some(id));
+        if settled {
+            self.evict_terminal_tasks();
+        }
     }
 
     /// The tick's share of `store.retention.tasks`: at most once per
@@ -656,29 +691,33 @@ impl Runtime {
             return;
         }
         self.tasks_swept = std::time::Instant::now();
-        self.evict_terminal_tasks(None);
+        self.evict_terminal_tasks();
     }
 
     /// Drop the terminal tasks `store.retention.tasks` no longer keeps (see
     /// [`tasks_to_evict`]).
     ///
     /// Each goes everywhere at once: from the task map, from the inbox-event
-    /// links that would otherwise name it, from the store — so a restart does
-    /// not bring it back — and from every display client, which is told with
-    /// `task.removed` by the same visibility its `task` events had, so the
-    /// owner's view drops it too.
-    pub(crate) fn evict_terminal_tasks(&mut self, spare: Option<&str>) {
+    /// links that would otherwise name it, from the stream fan-out — whose
+    /// replay ring holds its every status and its result, and would otherwise
+    /// outlive it for the daemon's whole life — from the store, so a restart
+    /// does not bring it back, and from every display client, which is told
+    /// with `task.removed` by the same visibility its `task` events had, so
+    /// the owner's view drops it too.
+    pub(crate) fn evict_terminal_tasks(&mut self) {
         let drop = tasks_to_evict(
             self.tasks.values(),
             &self.settings.store.retention.tasks,
             crate::state::now_ms(),
-            spare,
         );
         for id in drop {
             let Some(task) = self.tasks.remove(&id) else {
                 continue;
             };
             self.event_to_task.retain(|_, t| *t != id);
+            if let Some(sink) = &self.a2a_sink {
+                sink.forget(&id);
+            }
             match self.durable.delete(crate::state::Kind::Task, &id) {
                 Ok(()) => self.log.info("a2a.task.evicted", json!({"task": id})),
                 // Gone from memory regardless: the next life restores it and
@@ -709,30 +748,29 @@ impl Runtime {
             return;
         };
         let allow_private = self.settings.a2a.push.allow_private;
-        match self.tasks.get(id) {
-            Some(t) => {
-                // Send the artifact BEFORE the terminal status frame. A
-                // conformant streaming client stops reading as soon as it sees
-                // a terminal state, so a result frame sent after it is a result
-                // nobody reads.
-                if t.state.is_terminal()
-                    && let Some(a) = crate::a2a::wire::result_artifact(t)
-                {
-                    sink.artifact(&t.id, &t.context_id, a.clone());
-                }
-                sink.status(t);
-                // A caller that asked to be told rather than to watch. Fired
-                // from here because this is the one place every transition
-                // passes through, whatever caused it.
-                if !t.push.is_empty() {
-                    sink.push(t, allow_private);
-                }
-                self.feed_task(t);
-            }
-            None => {
-                self.feed_push("task.removed", FeedVis::Operator, json!({"id": id}));
-            }
+        // Retention is the only way a task leaves the map, and it has already
+        // told the owner's display clients. A turn or run that ends after
+        // that has nothing left to publish — and a second `task.removed`
+        // would reach a different audience than the first.
+        let Some(t) = self.tasks.get(id) else {
+            return;
+        };
+        // Send the artifact BEFORE the terminal status frame. A conformant
+        // streaming client stops reading as soon as it sees a terminal state,
+        // so a result frame sent after it is a result nobody reads.
+        if t.state.is_terminal()
+            && let Some(a) = crate::a2a::wire::result_artifact(t)
+        {
+            sink.artifact(&t.id, &t.context_id, a.clone());
         }
+        sink.status(t);
+        // A caller that asked to be told rather than to watch. Fired from
+        // here because this is the one place every transition passes
+        // through, whatever caused it.
+        if !t.push.is_empty() {
+            sink.push(t, allow_private);
+        }
+        self.feed_task(t);
     }
 
     /// Persist a task if dirty (durable across restarts — `GetTask` survives).
@@ -1004,8 +1042,8 @@ mod tests {
         }
     }
 
-    /// Retention takes terminal tasks only, newest kept first, and never the
-    /// task whose transition is being published.
+    /// Retention takes terminal tasks only, newest kept first, and never one
+    /// still being handed back to its caller.
     #[test]
     fn retention_drops_only_terminal_tasks_past_the_bound() {
         let tasks = [
@@ -1016,36 +1054,107 @@ mod tests {
             task("t-work", "c", "u", State::Working, 10),
             task("t-ask", "c", "u", State::InputRequired, 20),
         ];
-        let evict = |policy, now, spare| tasks_to_evict(tasks.iter(), &policy, now, spare);
+        // In id order: a ttl alone ranks nothing, so it answers in map order.
+        let evict = |tasks: &[Task], policy, now| {
+            let mut ids = tasks_to_evict(tasks.iter(), &policy, now);
+            ids.sort();
+            ids
+        };
 
         assert!(
-            evict(retention(None, None), 99_000, None).is_empty(),
+            evict(&tasks, retention(None, None), 99_000).is_empty(),
             "unset keeps"
         );
         assert_eq!(
-            evict(retention(Some(1), None), 3_000, None),
+            evict(&tasks, retention(Some(1), None), 3_000),
             ["t-mid", "t-old"]
         );
         assert_eq!(
-            evict(retention(Some(0), None), 3_000, None),
-            ["t-new", "t-mid", "t-old"]
+            evict(&tasks, retention(Some(0), None), 3_000),
+            ["t-mid", "t-new", "t-old"]
         );
         // The age is strictly past the ttl, counted from the finishing status.
-        assert_eq!(evict(retention(None, Some(1_500)), 3_500, None), ["t-old"]);
         assert_eq!(
-            evict(retention(None, Some(0)), 99_000, None),
-            ["t-new", "t-mid", "t-old"]
+            evict(&tasks, retention(None, Some(1_500)), 3_500),
+            ["t-old"]
+        );
+        assert_eq!(
+            evict(&tasks, retention(None, Some(0)), 99_000),
+            ["t-mid", "t-new", "t-old"]
         );
         // Either bound drops.
         assert_eq!(
-            evict(retention(Some(2), Some(1_500)), 3_500, None),
+            evict(&tasks, retention(Some(2), Some(1_500)), 3_500),
             ["t-old"]
         );
-        // The task being published waits for the next sweep.
-        assert_eq!(
-            evict(retention(Some(0), None), 3_000, Some("t-new")),
-            ["t-mid", "t-old"]
+    }
+
+    /// A settled task its caller has not read back is spared by every bound
+    /// — `keep_last: 0` and `ttl: 0s` included — until it is read or the
+    /// grace is over. A blocking send is answered by a `GetTask` a2a-rs makes
+    /// after the terminal event, and a task dropped in between answers the
+    /// caller whose task COMPLETED with "not found".
+    #[test]
+    fn retention_spares_a_task_until_its_caller_has_read_it() {
+        let mut tasks = [
+            task("t-read", "c", "u", State::Completed, 1_000),
+            task("t-unread", "c", "u", State::Completed, 2_000),
+        ];
+        tasks[1].unread = true;
+        let evict = |tasks: &[Task], policy, now| tasks_to_evict(tasks.iter(), &policy, now);
+        for policy in [
+            || retention(Some(0), None),
+            || retention(None, Some(0)),
+            || retention(Some(0), Some(0)),
+        ] {
+            assert_eq!(evict(&tasks, policy(), 2_001), ["t-read"]);
+            assert_eq!(
+                evict(&tasks, policy(), 2_000 + SETTLE_GRACE_MS - 1),
+                ["t-read"]
+            );
+            // Nobody came for it: the grace does not outlast itself.
+            let mut late = evict(&tasks, policy(), 2_000 + SETTLE_GRACE_MS);
+            late.sort();
+            assert_eq!(late, ["t-read", "t-unread"]);
+        }
+        // Read back, it goes the moment the bound says.
+        tasks[1].unread = false;
+        let mut read = evict(&tasks, retention(Some(0), None), 2_001);
+        read.sort();
+        assert_eq!(read, ["t-read", "t-unread"]);
+        // A spared task still holds its place in the ranking, so it pushes an
+        // older one out rather than letting it stay.
+        tasks[1].unread = true;
+        assert_eq!(evict(&tasks, retention(Some(1), None), 2_001), ["t-read"]);
+    }
+
+    /// An evicted task takes its stream state with it. What `forget` drops
+    /// is pinned in `ports`; that eviction asks for it cannot be shown from a
+    /// request — no read of an evicted task gets past "not found" to its
+    /// replay ring — and a runtime cannot be built in a unit test, so this
+    /// pins the call where every eviction passes.
+    #[test]
+    fn an_evicted_task_is_forgotten_by_the_stream_side() {
+        let src = include_str!("tasks.rs");
+        let body = src
+            .split("pub(crate) fn evict_terminal_tasks(&mut self)")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    }\n").next())
+            .expect("evict_terminal_tasks");
+        assert!(
+            body.contains("sink.forget(&id)"),
+            "eviction must drop the task's replay ring and channel"
         );
+        // …and eviction is the one place a removal is announced: a turn or
+        // run ending after it must not tell display clients a second time,
+        // to a different audience.
+        let code = src.split("#[cfg(test)]").next().unwrap();
+        assert_eq!(
+            code.matches("\"task.removed\"").count(),
+            1,
+            "task.removed is pushed by eviction alone"
+        );
+        assert!(body.contains("\"task.removed\""));
     }
 
     fn target(id: &str) -> PushTarget {

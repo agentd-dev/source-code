@@ -42,6 +42,7 @@ mod redact;
 mod send;
 mod tasks;
 
+pub(crate) use commands::a2a_start_node;
 pub use feed::{FeedVis, SharedFeed};
 pub(crate) use listener::{A2aServing, spawn_a2a_listener};
 pub(crate) use send::command_data;

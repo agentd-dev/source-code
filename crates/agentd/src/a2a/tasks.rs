@@ -194,6 +194,13 @@ pub struct Task {
     pub push: Vec<PushTarget>,
     #[serde(skip)]
     pub dirty: bool,
+    /// Settled, and not read back since. A blocking `SendMessage` answers
+    /// with a `GetTask` a2a-rs makes AFTER the terminal event — a second
+    /// round trip — so retention spares a task so marked for a short grace
+    /// rather than answer that caller "not found" for a task that completed.
+    /// In memory only: after a restart no send is waiting on anything.
+    #[serde(skip)]
+    pub unread: bool,
 }
 
 impl Task {
@@ -217,6 +224,7 @@ impl Task {
             status_seq: 0,
             push: Vec::new(),
             dirty: true,
+            unread: false,
         }
     }
 

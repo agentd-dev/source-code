@@ -925,12 +925,15 @@ fn the_clients_approval_name_is_the_daemons() {
 
 // ---- the launch grant -------------------------------------------------------
 
-/// What the launch test hands the in-process daemon it starts.
+/// What the launch tests hand the in-process daemon they start: its config,
+/// where to publish the launch code, and — for a web UI's launch — the
+/// origin the slot carries.
 const LAUNCH_CFG_ENV: &str = "AGENTD_E2E_LAUNCH_CFG";
 const LAUNCH_CODE_ENV: &str = "AGENTD_E2E_LAUNCH_CODE";
+const LAUNCH_ORIGIN_ENV: &str = "AGENTD_E2E_LAUNCH_ORIGIN";
 
-/// Not a test of its own: the daemon [`the_launch_event_matches_the_feed_schema`]
-/// starts, as this test binary re-run with `--ignored --exact`.
+/// Not a test of its own: the daemon the launch tests start, as this test
+/// binary re-run with `--ignored --exact`.
 ///
 /// A launch slot is installed only in the process that runs the daemon —
 /// nothing on the command line or in a file can install one — so the daemon
@@ -938,7 +941,7 @@ const LAUNCH_CODE_ENV: &str = "AGENTD_E2E_LAUNCH_CODE";
 /// its own so its child reaper and signal handlers are nobody else's. Built as
 /// a test, it is a debug build: the feed's schema assertion is compiled in.
 #[test]
-#[ignore = "the in-process daemon the_launch_event_matches_the_feed_schema starts"]
+#[ignore = "the in-process daemon the launch tests start"]
 fn launch_daemon() {
     use agentd::a2a::oauth::{LaunchBind, LaunchSlot};
     let (Ok(cfg), Ok(code_path)) = (
@@ -951,8 +954,13 @@ fn launch_daemon() {
     let env: Vec<(String, String)> = std::env::vars().collect();
     let (loaded, _) =
         agentd::config::v2::load(&args, &env).unwrap_or_else(|e| panic!("config: {e:?}"));
-    let slot = std::sync::Arc::new(LaunchSlot::new(None).unwrap());
-    let code = slot.issue(LaunchBind::NoOrigin, "agentd-tui").unwrap();
+    let origin = std::env::var(LAUNCH_ORIGIN_ENV).ok();
+    let slot = std::sync::Arc::new(LaunchSlot::new(origin.as_deref()).unwrap());
+    let code = match &origin {
+        Some(o) => slot.issue(LaunchBind::Origin(o.clone()), "agentd-ui"),
+        None => slot.issue(LaunchBind::NoOrigin, "agentd-tui"),
+    }
+    .unwrap();
     // Published whole: the test reads it once the file exists.
     let staged = format!("{code_path}.tmp");
     std::fs::write(&staged, &code).unwrap();
@@ -972,34 +980,39 @@ fn launch_daemon() {
 /// operator's subscriber receives it: the debug build's schema assertion in
 /// the feed's push did not fire. The session is an operator that lists as a
 /// launch, and neither the code nor the token reaches the log.
-#[test]
-fn the_launch_event_matches_the_feed_schema() {
+/// Start [`launch_daemon`] on a fresh loopback port with `a2a_extra` under
+/// `a2a:`, its slot carrying `origin` (a web UI's launch) or none (a terminal
+/// client's): the daemon, its authority, and the launch code it minted.
+fn launched(a2a_extra: &str, origin: Option<&str>) -> (Daemon, String, String) {
     let port = common::free_port();
     let addr = format!("127.0.0.1:{port}");
     let cfg = common::unique_path("launch-daemon", "yaml");
     std::fs::write(
         &cfg,
-        config(&format!("http://127.0.0.1:{port}"), "", MEMORY),
+        config(&format!("http://127.0.0.1:{port}"), a2a_extra, MEMORY),
     )
     .unwrap();
     let code_path = common::unique_path("launch-code", "txt");
     let stderr_path = common::unique_path("launch-daemon", "log");
-    let child = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "launch_daemon",
-            "--exact",
-            "--ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .env(LAUNCH_CFG_ENV, &cfg)
-        .env(LAUNCH_CODE_ENV, &code_path)
-        .env("AGENTD_DG_OPS", OPS_TOKEN)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(std::fs::File::create(&stderr_path).unwrap()))
-        .spawn()
-        .expect("spawn the in-process daemon");
+    let mut cmd = Command::new(std::env::current_exe().unwrap());
+    cmd.args([
+        "launch_daemon",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1",
+    ])
+    .env(LAUNCH_CFG_ENV, &cfg)
+    .env(LAUNCH_CODE_ENV, &code_path)
+    .env_remove(LAUNCH_ORIGIN_ENV)
+    .env("AGENTD_DG_OPS", OPS_TOKEN)
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::from(std::fs::File::create(&stderr_path).unwrap()));
+    if let Some(o) = origin {
+        cmd.env(LAUNCH_ORIGIN_ENV, o);
+    }
+    let child = cmd.spawn().expect("spawn the in-process daemon");
     let mut daemon = Daemon {
         child,
         stderr_path,
@@ -1015,6 +1028,12 @@ fn the_launch_event_matches_the_feed_schema() {
         std::thread::sleep(Duration::from_millis(25));
     }
     let code = std::fs::read_to_string(&code_path).unwrap();
+    (daemon, addr, code)
+}
+
+#[test]
+fn the_launch_event_matches_the_feed_schema() {
+    let (mut daemon, addr, code) = launched("", None);
 
     // An operator watches the feed from before the exchange.
     let ops = format!("Bearer {OPS_TOKEN}");
@@ -1095,5 +1114,54 @@ fn the_launch_event_matches_the_feed_schema() {
         &format!("grant_type={grant}&code={code}&client_id=agentd-tui"),
     );
     assert_eq!(again.status, 400, "{again:?}");
+    assert!(daemon.alive(), "{}", daemon.stderr());
+}
+
+/// A preflight of `POST /` from `origin`: the status.
+#[cfg(feature = "hot-reload")]
+fn preflight(addr: &str, origin: &str) -> u16 {
+    let mut s = TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).ok();
+    write!(
+        s,
+        "OPTIONS / HTTP/1.1\r\nHost: x\r\nOrigin: {origin}\r\n\
+         Access-Control-Request-Method: POST\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut raw = String::new();
+    s.read_to_string(&mut raw).ok();
+    raw.split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0)
+}
+
+/// A reload that edits `a2a.cors.origins` swaps the configured origins and
+/// keeps the UI the launcher started, which is in no file a reload re-reads.
+/// Swapping in the file's list alone would lock the operator's own tab out
+/// on the first CORS edit — and report the reload a success.
+#[cfg(feature = "hot-reload")]
+#[test]
+fn a_cors_reload_keeps_the_launched_origin() {
+    const UI: &str = "http://127.0.0.1:4555";
+    const ONE: &str = "https://one.example";
+    const TWO: &str = "https://two.example";
+    let origins = |o: &str| format!("\x20 cors:\n    origins: [\"{o}\"]\n");
+    let (mut daemon, addr, _code) = launched(&origins(ONE), Some(UI));
+    assert_eq!(preflight(&addr, UI), 204, "{}", daemon.stderr());
+    assert_eq!(preflight(&addr, ONE), 204);
+    assert_eq!(preflight(&addr, TWO), 403);
+
+    let listen = format!("http://{addr}");
+    std::fs::write(&daemon.cfg, config(&listen, &origins(TWO), MEMORY)).unwrap();
+    unsafe { libc::kill(daemon.child.id() as i32, libc::SIGHUP) };
+    daemon.wait_log(&["\"config.reloaded\"", "a2a.cors.origins"]);
+    assert_eq!(preflight(&addr, TWO), 204, "the edit is in force");
+    assert_eq!(preflight(&addr, ONE), 403, "and the removal");
+    assert_eq!(
+        preflight(&addr, UI),
+        204,
+        "the launched UI is still admitted"
+    );
     assert!(daemon.alive(), "{}", daemon.stderr());
 }

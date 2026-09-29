@@ -1692,11 +1692,19 @@ impl Authority {
     /// the `client_id` it was issued to, from a loopback peer, bound as it
     /// was issued.
     ///
-    /// A code is consumed by ANY presentation of it: a wrong origin, a wrong
-    /// client, a remote peer all burn it along with the answer — the same
-    /// `invalid_grant` an unknown code gets — so a stolen code buys its thief
-    /// at most the denial of one sign-in. Only a failing mint leaves it be,
-    /// because then nothing was presented wrongly.
+    /// A code is consumed by ANY presentation of it that reaches here: a
+    /// wrong origin, a wrong client, a remote peer all burn it along with the
+    /// answer — the same `invalid_grant` an unknown code gets — so a stolen
+    /// code buys its thief at most the denial of one sign-in. Only a failing
+    /// mint leaves it be, because then nothing was presented wrongly.
+    ///
+    /// "Reaches here" is the CORS gate's to decide: every `/oauth2/*` route
+    /// runs it first, so an `Origin` the listener does not admit — `null`
+    /// included — is answered 403 and burns nothing, the code staying its
+    /// own client's (a page on that origin could not read an answer anyway).
+    /// The wrong origin that burns a code is an admitted one that is not the
+    /// code's bind; `Origin: null` is no origin the gate can admit, so it
+    /// never gets this far.
     fn launch_token(
         &self,
         slot: &LaunchSlot,
@@ -2945,16 +2953,17 @@ mod tests {
         }
 
         fn poll_request(&self, request_code: &str) -> Reply {
+            self.poll_request_from(LOCAL, request_code)
+        }
+
+        /// Poll a request from `peer`, as the launched UI.
+        fn poll_request_from(&self, peer: &str, request_code: &str) -> Reply {
             let body = format!(
                 "grant_type={}&request_code={request_code}&client_id=agentd-ui",
                 enc(LAUNCH_GRANT_TYPE)
             );
-            self.auth.token(
-                FORM,
-                body.as_bytes(),
-                Some(LOCAL.parse().unwrap()),
-                Some(UI),
-            )
+            self.auth
+                .token(FORM, body.as_bytes(), Some(peer.parse().unwrap()), Some(UI))
         }
     }
 
@@ -3289,7 +3298,8 @@ mod tests {
     }
 
     /// A code or a request presented from off the host is refused, and the
-    /// code is burned by it.
+    /// code is burned by it. A terminal-approved request is not: it is the
+    /// tab's to poll, and a remote poll neither redeems nor spends it.
     #[test]
     fn launch_grants_are_redeemed_from_loopback_only() {
         let f = Launch::new(Some(UI), false);
@@ -3308,6 +3318,14 @@ mod tests {
             Some(UI),
         );
         assert_eq!(error_of(&r), "invalid_request");
+        // Approved at the terminal, then polled from off the host: refused,
+        // and no session is issued for it.
+        let (request, user_code) = f.requested();
+        assert!(f.slot.approve_user_code(&user_code));
+        let before = f.auth.sessions.list().len();
+        refused(&f.poll_request_from("10.1.2.3", &request));
+        assert_eq!(f.auth.sessions.list().len(), before, "no session");
+        token_of(&f.poll_request_from("::1", &request));
     }
 
     /// A failing entropy source answers 503 and costs nothing: no code, no

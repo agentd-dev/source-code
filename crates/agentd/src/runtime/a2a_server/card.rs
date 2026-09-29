@@ -39,47 +39,57 @@ pub(crate) enum CardView<'a> {
 }
 
 impl Runtime {
-    /// The posture the listener enforces now: the live resolver's, which a
-    /// reload of `a2a.principals` replaces. Read from the resolver rather than
-    /// recomputed from the settings, because a rebuild that fails keeps the
-    /// old rules — and then the card must describe the rules still enforced.
-    fn listener_posture(&self) -> ListenerAuth {
-        self.a2a_serving
-            .as_ref()
-            .map(|s| s.bridge.resolver().posture())
-            .unwrap_or_else(|| listener_auth_of(&self.settings.a2a))
-    }
-
-    /// The URL the listener is reached at, once bound.
-    fn advertised_url(&self) -> String {
-        self.a2a_serving
-            .as_ref()
-            .map(|s| s.advertised_url.clone())
-            .or_else(|| crate::runtime::surface::auth::configured_url(&self.settings))
-            .unwrap_or_default()
-    }
-
     /// The public card, unauthenticated at `/.well-known/agent-card.json`.
     pub(super) fn a2a_agent_card(&self) -> Value {
-        agent_card_of(
+        card_served(
             &self.settings,
-            &self.advertised_url(),
-            self.listener_posture(),
+            self.a2a_serving.as_ref(),
             &self.workflows,
             CardView::Public,
         )
     }
 
     /// `GetExtendedAgentCard`: the card for `principal`.
-    ///
-    /// The listener has already refused every caller that did not present a
-    /// declared scheme's credential (an `any` rule, the implicit operator and
-    /// a unix peer get 401 there), so what reaches here is a named caller —
-    /// or, on a listener that declares no scheme, whoever the bind admits.
-    /// That listener has no extended card to give: A2A 1.0 §3.3.4 makes an
-    /// agent that does not advertise one answer "unsupported operation".
     pub(super) fn a2a_extended_card(&self, principal: &Principal) -> Value {
-        let posture = self.listener_posture();
+        card_served(
+            &self.settings,
+            self.a2a_serving.as_ref(),
+            &self.workflows,
+            CardView::Extended(principal),
+        )
+    }
+}
+
+/// The card a runtime serves: from its settings, the listener it serves on
+/// (`serving`, once bound) and its loaded workflows — everything it reads,
+/// and nothing else of the runtime's, so what a card could be built from is
+/// all here to compare.
+///
+/// The posture is the live resolver's, which a reload of `a2a.principals`
+/// replaces. It is read from the resolver rather than recomputed from the
+/// settings, because a rebuild that fails keeps the old rules — and then the
+/// card must describe the rules still enforced.
+///
+/// The extended view: the listener has already refused every caller that did
+/// not present a declared scheme's credential (an `any` rule, the implicit
+/// operator and a unix peer get 401 there), so what reaches here is a named
+/// caller — or, on a listener that declares no scheme, whoever the bind
+/// admits. That listener has no extended card to give: A2A 1.0 §3.3.4 makes
+/// an agent that does not advertise one answer "unsupported operation".
+pub(super) fn card_served(
+    settings: &Settings,
+    serving: Option<&super::A2aServing>,
+    workflows: &BTreeMap<String, Arc<Workflow>>,
+    view: CardView<'_>,
+) -> Value {
+    let posture = serving
+        .map(|s| s.bridge.resolver().posture())
+        .unwrap_or_else(|| listener_auth_of(&settings.a2a));
+    let url = serving
+        .map(|s| s.advertised_url.clone())
+        .or_else(|| crate::runtime::surface::auth::configured_url(settings))
+        .unwrap_or_default();
+    if let CardView::Extended(principal) = view {
         if !posture.declares_any() {
             return refusal(
                 UNSUPPORTED_OPERATION,
@@ -98,14 +108,8 @@ impl Runtime {
                 &[],
             );
         }
-        agent_card_of(
-            &self.settings,
-            &self.advertised_url(),
-            posture,
-            &self.workflows,
-            CardView::Extended(principal),
-        )
     }
+    agent_card_of(settings, &url, posture, workflows, view)
 }
 
 /// The card, from settings, the advertised URL, the posture and the loaded

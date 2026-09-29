@@ -741,21 +741,44 @@ impl AsyncStreamingHandler for SharedStreaming {
 /// It is the only place the two directions meet.
 pub struct StreamSink {
     updates: Arc<a2a_rs::adapter::InMemoryStreamingHandler>,
+    /// The replay log under `updates` — the same one: a clone shares it. The
+    /// fan-out gives no handle to its log, and forgetting a task needs one.
+    events: a2a_rs::adapter::InMemoryEventLog,
     handle: tokio::runtime::Handle,
     log: crate::obs::log::Logger,
 }
 
 impl StreamSink {
+    /// A sink publishing into `updates`, which must fan out over `events`
+    /// (`StreamingFanout::over(events.clone())`).
     pub fn new(
         updates: Arc<a2a_rs::adapter::InMemoryStreamingHandler>,
+        events: a2a_rs::adapter::InMemoryEventLog,
         handle: tokio::runtime::Handle,
         log: crate::obs::log::Logger,
     ) -> StreamSink {
         StreamSink {
             updates,
+            events,
             handle,
             log,
         }
+    }
+
+    /// Drop everything the stream side holds for a task retention dropped:
+    /// its replay ring — up to 256 events, its result artifact among them —
+    /// and its channel. The in-memory log keeps a finished task's ring until
+    /// told otherwise, so without this `store.retention.tasks` would bound
+    /// the task map and leave the larger half of every task in memory.
+    pub fn forget(&self, task_id: &str) {
+        let updates = Arc::clone(&self.updates);
+        let events = self.events.clone();
+        let id = task_id.to_string();
+        self.handle.spawn(async move {
+            use a2a_rs::port::AsyncEventLog;
+            let _ = events.discard(&id).await;
+            let _ = updates.remove_task_subscribers(&id).await;
+        });
     }
 
     /// Publish a task's status as it now is.
@@ -1108,5 +1131,78 @@ mod tests {
         })
         .await;
         assert_eq!(verdict, Some(true));
+    }
+
+    /// A task retention forgets leaves nothing on the stream side: its replay
+    /// ring (every status and its result, which a `Last-Event-ID` would
+    /// otherwise still hand back) and its channel go, and every other task
+    /// keeps its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_forgotten_task_leaves_no_stream_state() {
+        use a2a_rs::port::AsyncEventLog;
+        let events = a2a_rs::adapter::InMemoryEventLog::new();
+        let updates = Arc::new(a2a_rs::adapter::StreamingFanout::over(events.clone()));
+        let log = crate::obs::log::Logger::new(
+            crate::obs::log::LogCtx {
+                run_id: "r".into(),
+                agent_id: "0".into(),
+                agent_path: "0".into(),
+                comp: crate::obs::log::Comp::Supervisor,
+                pid: std::process::id(),
+                trace_id: None,
+            },
+            crate::obs::log::Level::Error,
+        );
+        let sink = StreamSink::new(
+            Arc::clone(&updates),
+            events.clone(),
+            tokio::runtime::Handle::current(),
+            log,
+        );
+        let finished = |id: &str| {
+            let mut t = crate::a2a::tasks::Task::new(
+                id,
+                "c",
+                Some("u"),
+                crate::a2a::tasks::Link::Turn { ctx: "c".into() },
+            );
+            t.set_result(json!("done"));
+            t.transition(crate::a2a::tasks::State::Completed, None);
+            t
+        };
+        let held = |id: &'static str| {
+            let events = events.clone();
+            let updates = Arc::clone(&updates);
+            async move {
+                (
+                    events.replay(id, 0).await.unwrap().events.len(),
+                    updates.get_subscriber_count(id).await.unwrap(),
+                )
+            }
+        };
+        // Someone is still watching each, so each has a channel to drop.
+        let _watch_1 = updates.start_task_streaming("t-1", None).await.unwrap();
+        let _watch_2 = updates.start_task_streaming("t-2", None).await.unwrap();
+        for id in ["t-1", "t-2"] {
+            sink.status(&finished(id));
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while held("t-1").await.0 == 0 || held("t-2").await.0 == 0 {
+            assert!(std::time::Instant::now() < deadline, "never published");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(held("t-1").await.1, 1, "watched");
+
+        sink.forget("t-1");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while held("t-1").await != (0, 0) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "t-1 is still held: {:?}",
+                held("t-1").await
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(held("t-2").await, (1, 1), "t-2 keeps its own");
     }
 }

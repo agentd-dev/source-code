@@ -63,6 +63,48 @@ fn named_task(params: &Value) -> Option<&str> {
     named.filter(|t| !t.trim().is_empty())
 }
 
+/// A role as the inbox event records it and an `a2a` start's `roles:` names
+/// it — the one spelling both sides of that match read.
+fn role_name(role: crate::config::v2::Role) -> &'static str {
+    use crate::config::v2::Role;
+    match role {
+        Role::Operator => "operator",
+        Role::User => "user",
+        Role::Agent => "agent",
+        Role::Anonymous => "anonymous",
+    }
+}
+
+/// The command a send carries, held to what the listener already held it
+/// to: the command/v2 envelope — activated, marked, one of it
+/// ([`surface::check_command`]) — then the caller's reach
+/// ([`Principal::authorize_command`]). `Ok(None)` is a message that carries
+/// no command; `Err` is the reply that refuses it.
+///
+/// A pure function of the request, so the runtime's own lock can be shown
+/// to hold without a listener in front of it — which is the only case it
+/// exists for.
+fn admitted_command(
+    params: &Value,
+    principal: &Principal,
+    active: surface::Active,
+) -> Result<Option<Command>, Value> {
+    let activated = active.contains(Ext::Command);
+    let command = surface::check_command(params, named_task(params), activated)
+        .map_err(|e| json!({"_error": e}))?;
+    if let Some(c) = &command
+        && let Err(why) = principal.authorize_command(&c.op, &c.envelope)
+    {
+        return Err(refusal(
+            errors::PERMISSION_DENIED,
+            reason::PERMISSION_DENIED,
+            &why,
+            &[("op", &c.op)],
+        ));
+    }
+    Ok(command)
+}
+
 impl Runtime {
     /// The key of the conversation `principal`'s `contextId` (`wire`, see
     /// [`context_wire`]) names.
@@ -130,21 +172,10 @@ impl Runtime {
     pub(super) fn a2a_send(&mut self, principal: &Principal, params: &Value) -> Value {
         let message = &params["message"];
         let named = named_task(params);
-        let activated = self.a2a_active.contains(Ext::Command);
-        let command = match surface::check_command(params, named, activated) {
+        let command = match admitted_command(params, principal, self.a2a_active) {
             Ok(command) => command,
-            Err(e) => return json!({"_error": e}),
+            Err(refused) => return refused,
         };
-        if let Some(c) = &command
-            && let Err(why) = principal.authorize_command(&c.op, &c.envelope)
-        {
-            return refusal(
-                errors::PERMISSION_DENIED,
-                reason::PERMISSION_DENIED,
-                &why,
-                &[("op", &c.op)],
-            );
-        }
         if self.draining {
             return refusal(
                 errors::INTERNAL_ERROR,
@@ -248,10 +279,12 @@ impl Runtime {
         // sends home are consumed by their handler, never by a model, a wait
         // or a start node.
         let declared = match command {
-            Some(c) if c.spec.is_none() => match self.check_declared(c) {
-                Ok(declared) => declared,
-                Err(e) => return json!({"_error": e}),
-            },
+            Some(c) if c.spec.is_none() => {
+                match self.check_declared(c, role_name(principal.role)) {
+                    Ok(declared) => declared,
+                    Err(e) => return json!({"_error": e}),
+                }
+            }
             _ => false,
         };
         if let Some(c) = command
@@ -366,12 +399,7 @@ impl Runtime {
         let wire_id = self.conversation_wire(&principal.id, &ctx_id);
         let payload = json!({"context_id": ctx_id, "wire_id": wire_id, "text": text, "parts": message["parts"],
         "task": task_id, "message_id": message_id,
-        "role": match principal.role {
-            crate::config::v2::Role::Operator => "operator",
-            crate::config::v2::Role::User => "user",
-            crate::config::v2::Role::Agent => "agent",
-            crate::config::v2::Role::Anonymous => "anonymous",
-        }});
+        "role": role_name(principal.role)});
         match self.accept_event(kinds::A2A_MESSAGE, Some(principal.id.clone()), payload) {
             Ok(inbox_id) => {
                 self.event_to_task.insert(inbox_id, task_id.clone());
@@ -399,6 +427,83 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The runtime's own lock on a command, with no listener in front of it:
+    /// a command DataPart without command/v2 activated is not run as one, and
+    /// a child's `_instance.*` report from anyone but the operator is a 403
+    /// now — whatever a grant says — rather than an inbox event dropped later
+    /// where its sender cannot see. The listener refuses both first, so no
+    /// request through it can show this lock missing.
+    #[test]
+    fn the_runtime_holds_a_command_to_command_v2_itself() {
+        use crate::config::v2::Role;
+        let who = |role| Principal {
+            role,
+            grants: vec!["*".into()],
+            ..Principal::anonymous()
+        };
+        let send = |envelope: Value| {
+            json!({"newTask": true, "taskId": "t-1", "message": {
+                "role": "ROLE_USER", "messageId": "m-1",
+                "extensions": [surface::COMMAND_EXTENSION],
+                "parts": [{"data": {"agentd": envelope}, "mediaType": "application/json"}],
+            }})
+        };
+        // The code, and the ErrorInfo's reason wherever among the details
+        // it sits.
+        let reason_of = |e: &Value| {
+            let reason = e["_error"]["data"]
+                .as_array()
+                .and_then(|d| d.iter().find_map(|x| x["reason"].as_str()))
+                .unwrap_or_default()
+                .to_string();
+            (e["_error"]["code"].as_i64().unwrap_or_default(), reason)
+        };
+        let on = surface::Active::of(&[Ext::Command]);
+        let status = send(json!({"op": "status"}));
+
+        // Not activated: refused, for the operator too.
+        let e = admitted_command(&status, &who(Role::Operator), surface::Active::NONE).unwrap_err();
+        assert_eq!(
+            reason_of(&e),
+            (
+                errors::INVALID_PARAMS,
+                reason::EXTENSION_NOT_ACTIVATED.to_string()
+            ),
+            "{e}"
+        );
+        let c = admitted_command(&status, &who(Role::Operator), on).unwrap();
+        assert_eq!(c.map(|c| c.op).as_deref(), Some("status"));
+
+        // A child's report is the operator's alone, `*` grants or not.
+        let report = send(
+            json!({"op": "_instance.result", "handle": "c1", "status": "completed", "output": "ok"}),
+        );
+        for role in [Role::User, Role::Agent, Role::Anonymous] {
+            let e = admitted_command(&report, &who(role), on).unwrap_err();
+            assert_eq!(
+                reason_of(&e),
+                (
+                    errors::PERMISSION_DENIED,
+                    reason::PERMISSION_DENIED.to_string()
+                ),
+                "{role:?}: {e}"
+            );
+        }
+        let c = admitted_command(&report, &who(Role::Operator), on).unwrap();
+        assert_eq!(c.map(|c| c.op).as_deref(), Some("_instance.result"));
+
+        // Plain conversation carries no command, activated or not.
+        let text = json!({"newTask": true, "taskId": "t-1", "message": {
+            "role": "ROLE_USER", "messageId": "m-2", "parts": [{"text": "hello"}]}});
+        for active in [surface::Active::NONE, on] {
+            assert!(
+                admitted_command(&text, &who(Role::User), active)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
 
     /// The built-in command surface is RESERVED, in both directions.
     ///

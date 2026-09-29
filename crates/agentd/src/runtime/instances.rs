@@ -800,7 +800,7 @@ impl Runtime {
         op: InstanceOp,
         args: &Value,
     ) -> Result<String, String> {
-        let admitted = admit(principal.role, op).map_err(|refused| {
+        let admitted = admit_caller(principal, op).map_err(|refused| {
             self.log.warn(
                 refused.event,
                 json!({"op": op.name(), "principal": principal.id, "note": refused.note}),
@@ -1170,9 +1170,19 @@ mod admission {
             })
         }
     }
+
+    /// [`admit`], asked of the caller a request resolved to — its own role,
+    /// never one the asker picks. A request's path asks this; only the inbox,
+    /// which holds a role and no principal, asks `admit` directly.
+    pub(crate) fn admit_caller(
+        principal: &crate::a2a::Principal,
+        op: InstanceOp,
+    ) -> Result<Admitted, Refused> {
+        admit(principal.role, op)
+    }
 }
 #[cfg(feature = "a2a")]
-use admission::{Admitted, Refused, admit};
+use admission::{Admitted, Refused, admit, admit_caller};
 
 /// Why an `_instance.*` report in the inbox is consumed without effect.
 #[cfg(feature = "a2a")]
@@ -1283,12 +1293,30 @@ mod tests {
         // Ordinary traffic is not a report at all.
         assert!(inbox_report(&report("agent", "review.start")).is_none());
 
-        // And `instance_op` asks it of the caller's own role. End to end the
-        // listener and `a2a_send` refuse a non-operator first, so no request
-        // can show this line missing, and a runtime cannot be built in a unit
-        // test; `Admitted` stops a consumer that skips the question from
-        // compiling, and this pins the one it must ask — with the principal's
-        // role, not one of its choosing.
+        // A request asks it of the principal it resolved to, whatever its
+        // grants: only the operator is admitted.
+        let who = |role| crate::a2a::Principal {
+            role,
+            grants: vec!["*".into()],
+            ..crate::a2a::Principal::anonymous()
+        };
+        for op in [InstanceOp::Result, InstanceOp::Emit] {
+            assert_eq!(
+                admit_caller(&who(Role::Operator), op).map(|a| a.op()),
+                Ok(op)
+            );
+            for role in [Role::Agent, Role::User, Role::Anonymous] {
+                let refused = admit_caller(&who(role), op).expect_err("refused");
+                assert_eq!(refused.event, "instance.op.refused", "{role:?} {op:?}");
+            }
+        }
+
+        // And `instance_op` asks exactly that. End to end the listener and
+        // `a2a_send` refuse a non-operator first, so no request can show the
+        // question missing, and a runtime cannot be built in a unit test;
+        // `Admitted` stops a consumer that skips the question from compiling,
+        // and this pins the one it must ask: the caller's, once, with no
+        // other admission — of a role of its own choosing — beside it.
         let src = include_str!("instances.rs");
         let body = src
             .split("pub(crate) fn instance_op(")
@@ -1296,8 +1324,16 @@ mod tests {
             .and_then(|rest| rest.split("pub(crate) fn handle_instance_op(").next())
             .expect("instance_op");
         assert!(
-            body.contains("admit(principal.role, op)"),
-            "instance_op must admit the caller's own role"
+            body.contains("admit_caller(principal, op)"),
+            "instance_op must admit the caller it was given"
+        );
+        assert_eq!(
+            (
+                body.matches("admit_caller(").count(),
+                body.matches("admit(").count()
+            ),
+            (1, 0),
+            "instance_op must admit nothing but its caller: {body}"
         );
     }
 

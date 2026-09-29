@@ -306,11 +306,12 @@ mod tests {
     }
 
     /// A launcher's slot is not a mechanism any caller but its own client can
-    /// use, so it changes no posture: what the resolver enforces, what the
-    /// card is built from — the posture and the advertised URL — and the
-    /// manifest's a2a section are the same with and without one, for every
-    /// shape of listener a launcher can start. Only the grant's own routes
-    /// and the launched UI's origin differ.
+    /// use, so it changes no posture: what the resolver enforces, the public
+    /// and the extended card byte for byte — built as the runtime builds
+    /// them, from everything it reads — and the manifest's a2a section are
+    /// the same with and without one, for every shape of listener a launcher
+    /// can start. Only the grant's own routes and the launched UI's origin
+    /// differ.
     #[test]
     fn a_launch_changes_no_posture() {
         let settings = |a2a: serde_json::Value| crate::config::v2::Settings {
@@ -336,6 +337,24 @@ mod tests {
                 crate::runtime::surface::auth::listener_auth_of(&s.a2a)
             );
             assert_eq!(launched.advertised_url, plain.advertised_url);
+            let workflows = std::collections::BTreeMap::new();
+            let operator = crate::a2a::Principal {
+                role: crate::config::v2::Role::Operator,
+                id: "operator".into(),
+                ..crate::a2a::Principal::anonymous()
+            };
+            for view in [
+                super::super::card::CardView::Public,
+                super::super::card::CardView::Extended(&operator),
+            ] {
+                let card = |serving| {
+                    serde_json::to_string(&super::super::card::card_served(
+                        &s, serving, &workflows, view,
+                    ))
+                    .unwrap()
+                };
+                assert_eq!(card(Some(&launched)), card(Some(&plain)), "{s:?}");
+            }
             let manifest = crate::runtime::surface::manifest::a2a_section(&s);
             assert_eq!(
                 manifest["cors_origins"],

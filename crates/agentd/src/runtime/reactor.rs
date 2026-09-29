@@ -960,29 +960,10 @@ impl Runtime {
             )
         });
         let role = ev.payload["role"].as_str().unwrap_or("");
-        let specs: Vec<(String, String, serde_json::Map<String, Value>)> = self
-            .workflows
-            .values()
-            .flat_map(|w| {
-                w.start_steps()
-                    .into_iter()
-                    .filter(|s| s.kind == "a2a")
-                    .map(|s| (w.name.clone(), s.id.clone(), s.spec.clone()))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        for (workflow, node, spec) in specs {
-            if let Some(want) = spec.get("command").and_then(Value::as_str)
-                && Some(want) != op.as_deref()
-            {
-                continue;
-            }
-            if let Some(roles) = spec.get("roles").and_then(Value::as_array)
-                && !roles.is_empty()
-                && !roles.iter().any(|r| r.as_str() == Some(role))
-            {
-                continue;
-            }
+        let fired =
+            crate::runtime::a2a_server::a2a_start_node(&self.workflows, op.as_deref(), role)
+                .map(|(w, s)| (w.name.clone(), s.id.clone(), s.spec.clone()));
+        if let Some((workflow, node, spec)) = fired {
             let payload = json!({
                 "conversation": ctx,
                 "principal": ev.principal,

@@ -274,6 +274,12 @@ impl Active {
         Active(self.0 | ext.bit())
     }
 
+    /// Exactly `exts`, for a test that stands in for the negotiation.
+    #[cfg(all(test, feature = "a2a"))]
+    pub(crate) fn of(exts: &[Ext]) -> Active {
+        exts.iter().copied().fold(Active::NONE, Active::with)
+    }
+
     /// The activated extensions, in registry order.
     pub fn exts(self) -> impl Iterator<Item = Ext> {
         Ext::ALL.iter().copied().filter(move |e| self.contains(*e))

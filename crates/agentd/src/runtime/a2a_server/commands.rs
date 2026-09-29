@@ -12,11 +12,14 @@ use crate::a2a::Principal;
 use crate::a2a::errors::{self, reason};
 use crate::a2a::principals::workflow_name_of;
 use crate::a2a::tasks::{Link, State};
+use crate::engine::model::{Step, Workflow};
 use crate::runtime::events::kinds;
 use crate::runtime::reactor::{Runtime, may_act_on};
 use crate::runtime::surface::{self, Command, Gate, Handler, Reply};
 use crate::runtime::waits::SignalSender;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// A refusal carrying agentd's `ErrorInfo`, so a client branches on the
 /// reason rather than on the prose.
@@ -472,7 +475,7 @@ impl Runtime {
 
 impl Runtime {
     /// Whether `command` — an op no row of the table holds — is one a loaded
-    /// workflow declares, held to that declaration.
+    /// workflow declares, held to that declaration, for a caller of `role`.
     ///
     /// A declared command with a `schema:` is a CONTRACT: a payload that does
     /// not match is refused HERE, synchronously, with every miss named as the
@@ -481,8 +484,8 @@ impl Runtime {
     /// it. This is what makes cross-agent commands as typed as tool calls.
     /// `Ok(false)` is an op nobody declares, for [`Self::a2a_command`] to
     /// refuse as unknown.
-    pub(super) fn check_declared(&self, command: &Command) -> Result<bool, Value> {
-        let Some(schema) = self.declared_command(&command.op) else {
+    pub(super) fn check_declared(&self, command: &Command, role: &str) -> Result<bool, Value> {
+        let Some(schema) = declared_schema(&self.workflows, &command.op, role) else {
             return Ok(false);
         };
         if let Some(schema) = schema {
@@ -490,25 +493,70 @@ impl Runtime {
             if let Some(o) = payload.as_object_mut() {
                 o.remove("op");
             }
-            if let Err(errs) = crate::jsonschema::validate(&schema, &payload) {
+            if let Err(errs) = crate::jsonschema::validate(schema, &payload) {
                 return Err(surface::invalid_args(&command.op, command.index, &errs));
             }
         }
         Ok(true)
     }
+}
 
-    /// The `a2a` start node that declares `op` as its command, if a loaded
-    /// workflow has one: `Some(schema)`, the node's `schema:` when it
-    /// declares one. This is what turns a start node into a registered part
-    /// of the A2A command surface.
-    fn declared_command(&self, op: &str) -> Option<Option<Value>> {
-        self.workflows.values().find_map(|w| {
-            w.start_steps().into_iter().find_map(|s| {
-                (s.kind == "a2a" && s.spec.get("command").and_then(Value::as_str) == Some(op))
-                    .then(|| s.spec.get("schema").cloned())
+/// The `a2a` start node a message fires: the first, in workflow order, whose
+/// `command` is the message's `op` — or that names none, and so takes any
+/// message — and whose `roles` admit a caller of `role`. The reactor fires
+/// it and [`declared_schema`] holds the payload to its contract: one
+/// selection, so the schema checked is the schema of the node that runs.
+pub(crate) fn a2a_start_node<'a>(
+    workflows: &'a BTreeMap<String, Arc<Workflow>>,
+    op: Option<&str>,
+    role: &str,
+) -> Option<(&'a Workflow, &'a Step)> {
+    workflows.values().find_map(|w| {
+        w.start_steps()
+            .into_iter()
+            .find(|s| {
+                s.kind == "a2a"
+                    && s.spec
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .is_none_or(|want| Some(want) == op)
+                    && s.spec
+                        .get("roles")
+                        .and_then(Value::as_array)
+                        .is_none_or(|roles| {
+                            roles.is_empty() || roles.iter().any(|r| r.as_str() == Some(role))
+                        })
+            })
+            .map(|s| (w.as_ref(), s))
+    })
+}
+
+/// The contract a declared command `op` from a caller of `role` is held to:
+/// `None` when no `a2a` start node declares `op` (it is no command of any
+/// workflow's), else `Some` of the schema its payload must match, if any.
+///
+/// The schema is the one of the node that will run the payload. Two
+/// workflows may declare one command — say an operator-only path and an open
+/// one — and checking whichever declared it first let a caller that fires the
+/// second pass it a payload its own `schema:` refuses. A node that types
+/// nothing itself — a catch-all, or a declaration without a schema — is held
+/// to the first schema the command is declared with, as before: a command is
+/// typed once, wherever it is typed.
+fn declared_schema<'a>(
+    workflows: &'a BTreeMap<String, Arc<Workflow>>,
+    op: &str,
+    role: &str,
+) -> Option<Option<&'a Value>> {
+    let declaring = || {
+        workflows.values().flat_map(|w| {
+            w.start_steps().into_iter().filter(move |s| {
+                s.kind == "a2a" && s.spec.get("command").and_then(Value::as_str) == Some(op)
             })
         })
-    }
+    };
+    declaring().next()?;
+    let fired = a2a_start_node(workflows, Some(op), role).and_then(|(_, s)| s.spec.get("schema"));
+    Some(fired.or_else(|| declaring().find_map(|s| s.spec.get("schema"))))
 }
 
 /// The answer to a run the caller may not see — unknown or someone else's,
@@ -526,6 +574,86 @@ fn run_view(id: &str, r: &crate::engine::RunState) -> Value {
 mod tests {
     use super::*;
     use crate::runtime::surface::{INSTANCE_OPS, OPS, command_ops_of, is_builtin_op, op_spec};
+
+    /// A declared command's payload is held to the schema of the start node
+    /// that will run it — the one selection the reactor fires by — not to
+    /// whichever workflow declared the command first. Two workflows may
+    /// declare one command; checking the first let a caller who fires the
+    /// second hand it a payload its own `schema:` refuses.
+    #[test]
+    fn a_declared_command_is_held_to_the_node_that_runs_it() {
+        let wf = |name: &str, start: Value| {
+            Arc::new(
+                crate::engine::model::parse_workflow(&json!({"name": name, "steps": {
+                    "s": start,
+                    "f": {"kind": "finish", "depends_on": ["s"], "status": "completed"}}}))
+                .unwrap(),
+            )
+        };
+        let only = |field: &str| {
+            json!({"type": "object", "required": [field], "additionalProperties": false,
+                   "properties": {field: {"type": "integer"}}})
+        };
+        let (for_ops, for_all) = (only("n"), only("m"));
+        let fired = |w: &BTreeMap<String, Arc<Workflow>>, role| {
+            a2a_start_node(w, Some("x"), role).map(|(w, _)| w.name.clone())
+        };
+
+        // `a` sorts first and admits the operator only; `b` admits anyone.
+        let mut workflows = BTreeMap::new();
+        workflows.insert(
+            "a".to_string(),
+            wf(
+                "a",
+                json!({"kind": "a2a", "command": "x", "roles": ["operator"], "schema": for_ops}),
+            ),
+        );
+        workflows.insert(
+            "b".to_string(),
+            wf(
+                "b",
+                json!({"kind": "a2a", "command": "x", "schema": for_all}),
+            ),
+        );
+        assert_eq!(fired(&workflows, "user").as_deref(), Some("b"));
+        assert_eq!(
+            declared_schema(&workflows, "x", "user"),
+            Some(Some(&for_all))
+        );
+        assert_eq!(fired(&workflows, "operator").as_deref(), Some("a"));
+        assert_eq!(
+            declared_schema(&workflows, "x", "operator"),
+            Some(Some(&for_ops))
+        );
+
+        // The node that runs types nothing itself: the command is still
+        // typed, by the schema it is declared with.
+        workflows.insert(
+            "a".to_string(),
+            wf(
+                "a",
+                json!({"kind": "a2a", "command": "x", "roles": ["operator"]}),
+            ),
+        );
+        assert_eq!(fired(&workflows, "operator").as_deref(), Some("a"));
+        assert_eq!(
+            declared_schema(&workflows, "x", "operator"),
+            Some(Some(&for_all))
+        );
+        assert_eq!(
+            declared_schema(&workflows, "x", "user"),
+            Some(Some(&for_all))
+        );
+
+        // Nobody declares `y`; a declaration without a schema is untyped.
+        assert_eq!(declared_schema(&workflows, "y", "user"), None);
+        workflows.remove("b");
+        assert_eq!(declared_schema(&workflows, "x", "operator"), Some(None));
+        // A role the only declaring node refuses fires nothing — and the
+        // command is still one a workflow declares.
+        assert_eq!(fired(&workflows, "user"), None);
+        assert_eq!(declared_schema(&workflows, "x", "user"), Some(None));
+    }
 
     /// The op table is complete and the dispatch agrees with it: every row
     /// is described, every op an instance serves reaches a handler arm, and

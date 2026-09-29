@@ -276,6 +276,46 @@ fn terminal_tasks_are_evicted_and_announced() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A caller blocked on its own send is answered with its task, however many
+/// others finish around it. a2a-rs answers a blocking send with a `GetTask`
+/// it makes AFTER the terminal event, a second trip through the reactor; with
+/// `keep_last: 0` every finished task is over the bound the moment it
+/// finishes, and concurrent callers finish between one another's event and
+/// read. Evicting in that gap answered a caller whose task COMPLETED with
+/// "task not found". Once read, each is still dropped as the bound says.
+#[test]
+fn a_blocking_send_is_answered_with_its_task_under_any_bound() {
+    let dir = common::unique_path("retention-e2e-race", "d");
+    std::fs::create_dir_all(&dir).unwrap();
+    let daemon =
+        boot(|port| retention_config(&dir, "  retention:\n    tasks:\n      keep_last: 0\n", port));
+    let addr = daemon.addr.clone();
+    let answers: Vec<serde_json::Value> = std::thread::scope(|s| {
+        let sends: Vec<_> = (0..40)
+            .map(|i| {
+                let addr = &addr;
+                s.spawn(move || SendMessage::text(&format!("hello {i}")).post(addr))
+            })
+            .collect();
+        sends.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let lost: Vec<&serde_json::Value> = answers
+        .iter()
+        .filter(|v| v["result"]["task"]["status"]["state"] != "TASK_STATE_COMPLETED")
+        .collect();
+    assert!(
+        lost.is_empty(),
+        "{} of {} blocking sends were not handed their task: {lost:?}",
+        lost.len(),
+        answers.len()
+    );
+    for v in &answers {
+        wait_state(&addr, v["result"]["task"]["id"].as_str().unwrap(), None, 15);
+    }
+    drop(daemon);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Two users and the operator, over the in-process mock model.
 fn principals_config(port: u16) -> String {
     format!(

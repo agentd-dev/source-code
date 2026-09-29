@@ -220,9 +220,13 @@ pub fn spawn(
         .build()
         .map_err(|e| format!("a2a runtime: {e}"))?;
 
-    let updates = Arc::new(a2a_rs::adapter::InMemoryStreamingHandler::new());
+    // The fan-out over a log the sink keeps a handle to as well, so a task
+    // retention drops can take its replay ring with it.
+    let events = a2a_rs::adapter::InMemoryEventLog::new();
+    let updates = Arc::new(a2a_rs::adapter::StreamingFanout::over(events.clone()));
     let sink = Arc::new(ports::StreamSink::new(
         Arc::clone(&updates),
+        events,
         runtime.handle().clone(),
         log.clone(),
     ));
@@ -705,6 +709,19 @@ mod tests {
         origins: Vec<String>,
         liveness: Option<Liveness>,
     ) -> (Router, Arc<AtomicUsize>) {
+        listener_at("127.0.0.1:5000", answer, auth, origins, liveness)
+    }
+
+    /// [`listener_with`], every request arriving from `peer` — the address
+    /// the accept loop would have recorded, with no second interface needed
+    /// to be anywhere else.
+    fn listener_at(
+        peer: &str,
+        answer: impl Fn(&A2aRequest) -> Value + Send + Sync + 'static,
+        auth: Auth,
+        origins: Vec<String>,
+        liveness: Option<Liveness>,
+    ) -> (Router, Arc<AtomicUsize>) {
         let resolver = crate::a2a::Resolver::build(
             &serde_json::from_value(json!({"listen": "http://127.0.0.1:0"})).unwrap(),
             &|_| None,
@@ -748,9 +765,7 @@ mod tests {
         }
         let router = router(Arc::new(app))
             .layer(axum::Extension(PeerId::default()))
-            .layer(axum::Extension(Peer::Tcp(
-                "127.0.0.1:5000".parse().unwrap(),
-            )));
+            .layer(axum::Extension(Peer::Tcp(peer.parse().unwrap())));
         (router, reached)
     }
 
@@ -1872,6 +1887,157 @@ mod tests {
         .await;
         assert_eq!(json_of(r).await["error"]["code"], -32001);
         assert_eq!(reached.load(Ordering::SeqCst), 1);
+    }
+
+    /// The loopback rule as the router applies it, with the peer the accept
+    /// loop records standing in for a second interface — so it is proven on
+    /// a host that has none, where [`launch_grants_need_a_loopback_peer`]
+    /// can only skip. A code presented from off the host is refused and
+    /// burned; an approved request polled from there is refused and kept for
+    /// its tab.
+    #[tokio::test]
+    async fn the_router_redeems_launch_grants_from_loopback_only() {
+        let slot = Arc::new(LaunchSlot::new(Some(UI)).unwrap());
+        let listener_from = |peer| {
+            listener_at(
+                peer,
+                |_| task_not_found(),
+                launch_auth(&slot, false),
+                oauth::admitted_origins(&[], Some(&slot)),
+                None,
+            )
+            .0
+        };
+        let (remote, local) = (listener_from("10.0.0.1:5000"), listener_from("[::1]:5000"));
+        let token = |router: &Router, form: String| {
+            let router = router.clone();
+            async move {
+                let r = send(&router, form_post(oauth::TOKEN_PATH, &form, Some(UI))).await;
+                (r.status(), json_of(r).await)
+            }
+        };
+
+        let code = slot
+            .issue(LaunchBind::Origin(UI.into()), "agentd-ui")
+            .unwrap();
+        let (status, v) = token(&remote, launch_form(&code, "agentd-ui")).await;
+        assert_eq!(
+            (status, &v["error"]),
+            (StatusCode::BAD_REQUEST, &json!("invalid_grant"))
+        );
+        let (status, v) = token(&local, launch_form(&code, "agentd-ui")).await;
+        assert_eq!(
+            (status, &v["error"]),
+            (StatusCode::BAD_REQUEST, &json!("invalid_grant")),
+            "burned: {v}"
+        );
+
+        let r = send(
+            &remote,
+            form_post(
+                oauth::LAUNCH_AUTHORIZATION_PATH,
+                "client_id=agentd-ui",
+                Some(UI),
+            ),
+        )
+        .await;
+        assert_eq!(json_of(r).await["error"], "invalid_request");
+        let r = send(
+            &local,
+            form_post(
+                oauth::LAUNCH_AUTHORIZATION_PATH,
+                "client_id=agentd-ui",
+                Some(UI),
+            ),
+        )
+        .await;
+        let v = json_of(r).await;
+        let request = v["request_code"].as_str().unwrap().to_string();
+        assert!(slot.approve_user_code(v["user_code"].as_str().unwrap()));
+        let poll = format!(
+            "grant_type={}&request_code={request}&client_id=agentd-ui",
+            LAUNCH_GRANT_TYPE.replace(':', "%3A").replace('/', "%2F")
+        );
+        let (status, v) = token(&remote, poll.clone()).await;
+        assert_eq!(
+            (status, &v["error"]),
+            (StatusCode::BAD_REQUEST, &json!("invalid_grant"))
+        );
+        let (status, v) = token(&local, poll).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["scope"], "operator");
+    }
+
+    /// A launch code presented from an origin the listener does not admit —
+    /// `Origin: null` or a page next door — never reaches the grant: the
+    /// CORS gate every `/oauth2/*` route runs first answers 403, so the code
+    /// is neither burned nor reported consumed, and its own client still
+    /// redeems it. (A page could not read the answer anyway.) Only an
+    /// ADMITTED origin that is not the code's bind reaches the grant, and
+    /// burns it.
+    #[tokio::test]
+    async fn a_foreign_origin_is_refused_before_the_launch_grant() {
+        use std::sync::atomic::AtomicU64;
+        let slot = Arc::new(LaunchSlot::new(Some(UI)).unwrap());
+        let consumed = Arc::new(AtomicU64::new(0));
+        let c = Arc::clone(&consumed);
+        slot.on_consume(move || {
+            c.fetch_add(1, Ordering::SeqCst);
+        });
+        const LISTED: &str = "https://console.example";
+        let (router, _) = listener_with(
+            |_| task_not_found(),
+            launch_auth(&slot, false),
+            oauth::admitted_origins(&[LISTED.to_string()], Some(&slot)),
+            None,
+        );
+        let present = |code: &str, client: &str, origin: Option<&str>| {
+            let req = form_post(oauth::TOKEN_PATH, &launch_form(code, client), origin);
+            let router = router.clone();
+            async move {
+                let r = send(&router, req).await;
+                let status = r.status();
+                let bytes = axum::body::to_bytes(r.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                (
+                    status,
+                    serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
+                )
+            }
+        };
+
+        // A terminal client's code, then a browser's.
+        let tui = slot.issue(LaunchBind::NoOrigin, "agentd-tui").unwrap();
+        let ui = slot
+            .issue(LaunchBind::Origin(UI.into()), "agentd-ui")
+            .unwrap();
+        for origin in ["null", "http://127.0.0.1:4556"] {
+            for (code, client) in [(&tui, "agentd-tui"), (&ui, "agentd-ui")] {
+                let (status, _) = present(code, client, Some(origin)).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{origin} {client}");
+            }
+        }
+        assert_eq!(consumed.load(Ordering::SeqCst), 0, "nothing was consumed");
+        let (status, v) = present(&tui, "agentd-tui", None).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let (status, v) = present(&ui, "agentd-ui", Some(UI)).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(consumed.load(Ordering::SeqCst), 2);
+
+        // An admitted origin reaches the grant, which burns a code bound to
+        // another.
+        let ui = slot
+            .issue(LaunchBind::Origin(UI.into()), "agentd-ui")
+            .unwrap();
+        let (status, v) = present(&ui, "agentd-ui", Some(LISTED)).await;
+        assert_eq!(
+            (status, &v["error"]),
+            (StatusCode::BAD_REQUEST, &json!("invalid_grant"))
+        );
+        assert_eq!(consumed.load(Ordering::SeqCst), 3, "burned");
+        let (status, _) = present(&ui, "agentd-ui", Some(UI)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     /// An address of this host that is not loopback, if it has one: the

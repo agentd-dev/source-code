@@ -73,8 +73,9 @@ for exactly this:
 
 | Extension URI | What it declares |
 |---|---|
-| `https://agentd.dev/a2a/ext/command/v1` | the **command ops** — structured operations sent as a DataPart on `SendMessage`. Data-only: no new method, no changed core structure, never `required` |
-| `https://agentd.dev/a2a/ext/interface/v1` | `SubscribeToEvents`, the instance-wide observation feed. A method extension, because A2A has no instance-feed concept |
+| `https://agentd.dev/a2a/ext/command` | the **command ops** — structured operations sent as a DataPart on `SendMessage`. Data-only: no new method, no changed core structure, never `required` |
+| `https://agentd.dev/a2a/ext/events` | `agentd.events/SubscribeToEvents`, the instance-wide observation feed. A method extension, because A2A has no instance-feed concept; declared when `a2a.events.enabled` is on |
+| `https://agentd.dev/a2a/ext/task-annotations` | agentd's facts about a task, under `metadata[<URI>]`, on a method that returns tasks |
 
 A client activates one by listing its URI in the **`A2A-Extensions`** request
 header (comma-separated); the response echoes the header with the ones actually
@@ -83,8 +84,8 @@ it simply is not echoed, and none of agentd's extensions is `required`, so a
 client that sends no header at all still gets a complete service.
 
 ```console
-$ curl -H 'A2A-Extensions: https://agentd.dev/a2a/ext/command/v1' …
-< A2A-Extensions: https://agentd.dev/a2a/ext/command/v1
+$ curl -H 'A2A-Extensions: https://agentd.dev/a2a/ext/command' …
+< A2A-Extensions: https://agentd.dev/a2a/ext/command
 ```
 
 ### Calling an operation: the command DataPart
@@ -173,13 +174,6 @@ task, message and card agentd emits is serialized by types that crate generates
 from the A2A protobuf — so the wire shape is the schema's, not our reading of
 it. `agentd-conformance` then asserts the behaviour those shapes carry on every
 path that emits a task.
-
-There used to be a second reader here: an `a2a-oracle` crate that booted the
-daemon and re-parsed its responses with a2a-rs. It was worth having while the
-server was hand-written. Once the server became a2a-rs, the round trip had the
-same generated types on both ends and agreed by construction, so it was retired
-— keeping the two assertions that did not depend on a daemon (our method names
-and error codes are the SDK's constants) as unit tests.
 
 ## Roles, and what each may call
 

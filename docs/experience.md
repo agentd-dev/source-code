@@ -17,7 +17,7 @@ plumbed field by field, so a new path gets all three. For `limits.run.steps`:
 | Spelling | Form |
 |---|---|
 | file | `limits: {run: {steps: 40}}` |
-| env | `AGENTD_LIMITS_RUN_STEPS` > `AGENT_LIMITS_RUN_STEPS` > `LIMITS_RUN_STEPS` |
+| env | `AGENTD_LIMITS_RUN_STEPS` |
 | flag | `--limits.run.steps 40`; `.`, `_` and `-` are interchangeable, so `--limits-run-steps` binds the same |
 
 The precedence rule is one line, printed by `agentd --help`:
@@ -36,7 +36,7 @@ and `--workflow` — **add** one entry.
 flowchart TB
   subgraph SPELL["one path, three spellings: limits.run.steps"]
     S1["file<br/>limits.run.steps: 40"]
-    S2["env<br/>AGENTD_LIMITS_RUN_STEPS<br/>then AGENT_..., then bare"]
+    S2["env<br/>AGENTD_LIMITS_RUN_STEPS"]
     S3["flag<br/>--limits.run.steps 40<br/>= --limits-run-steps"]
   end
   D["built-in defaults"] --> F["FILE layer<br/>-c a.yaml -c b.yaml, merge-patch, later wins<br/>each file typed as it is read"]
@@ -55,9 +55,8 @@ flowchart TB
 
 The environment layer has a second precedence inside it: the derived path names
 are built *after* the short aliases and merged on top, so
-`AGENTD_INTELLIGENCE_MODEL` beats `AGENT_MODEL` for the same field. With the
-prefix ladder, a stale variable can look ignored, or a bare `MODEL` can quietly
-win over a config file. Look there first when a value surprises you.
+`AGENTD_INTELLIGENCE_MODEL` beats `AGENTD_MODEL` for the same field, and a stale
+variable can look ignored. Look there first when a value surprises you.
 
 A flag reaches wherever the schema says it can and nowhere else. It reaches into
 a free-form map with the key's exact spelling preserved
@@ -140,7 +139,6 @@ every non-start step needs `depends_on`, and the graph must be acyclic and
 reachable from a start. A document that validates clean:
 
 ```yaml
-config_version: "1"
 agent:
   name: releaser
   instruction: Keep the release queue moving.
@@ -165,7 +163,6 @@ interface:
   enabled: true
 workflows:
   - name: release
-    version: 3
     steps:
       start:
         kind: subscribe
@@ -202,9 +199,8 @@ all-or-nothing.
 
 ## The exit code is an API
 
-The process exit code is a frozen, versioned contract (`EXIT_CODES = "1.0"`,
-surfaced at `surfaces.exit_codes`) meant to be read by a scheduler without
-parsing a log. Each code carries an intent a control plane compiles into a
+The process exit code is a frozen contract meant to be read by a scheduler
+without parsing a log. Each code carries an intent a control plane compiles into a
 `podFailurePolicy`.
 
 | Code | Meaning | Intent |
@@ -293,7 +289,7 @@ sequenceDiagram
   participant C as client mirror
   participant D as agentd A2A listener
   C->>D: GetAgentCard, then interface.info
-  alt interface disabled, or an older daemon
+  alt the card declares no events extension
     D-->>C: error -32004 UNSUPPORTED_OPERATION
     loop every 1500 ms, status shows polling
       C->>D: status + ListTasks

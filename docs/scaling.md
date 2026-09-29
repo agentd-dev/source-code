@@ -219,7 +219,7 @@ Durable state is keyed `<store.prefix>/<instance>/<kind>/<id>`, where
 `store.prefix` defaults to `agentd` and `instance` is the first of
 
 1. `agent.name`,
-2. the downward-API pod name (`AGENT_POD_NAME` / `AGENTD_POD_NAME`),
+2. the downward-API pod name (`AGENTD_POD_NAME`),
 3. `HOSTNAME`,
 4. the literal `agentd`.
 
@@ -249,8 +249,7 @@ to someone else when the lease expires.
 
 ## 4. agentd has no cluster-coordination surface
 
-There is no shard flag, no claim route, no standby pool, and no `cluster` build
-feature.
+agentd carries no protocol for instances to coordinate with each other.
 
 That is a deliberate boundary, not a gap waiting to be filled. Coordination
 needs a shared source of truth, and agentd already talks to two: the MCP server
@@ -328,7 +327,7 @@ spec:
           env:
             # The pod name (agent-0, agent-1, …) becomes the durable identity
             # when agent.name is unset.
-            - name: AGENT_POD_NAME
+            - name: AGENTD_POD_NAME
               valueFrom: { fieldRef: { fieldPath: metadata.name } }
           # /healthz + /readyz ride the same surface as /metrics, so they need
           # observability.metrics_addr set (":9090" in the §2a config).

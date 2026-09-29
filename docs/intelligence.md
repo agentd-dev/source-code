@@ -4,8 +4,8 @@ agentd reaches the model over **one logical wire**. The agentic ReAct loop —
 which runs only inside a child process, a turn worker or a subagent — sends it
 messages plus a scoped tool catalogue and gets back text *and* structured tool
 calls. That wire is named in
-`AGENT_INTELLIGENCE` (or `--intelligence`) and authenticated with
-`AGENT_INTELLIGENCE_TOKEN` (or `--intelligence-token`). For resilience the wire
+`AGENTD_INTELLIGENCE` (or `--intelligence`) and authenticated with
+`AGENTD_INTELLIGENCE_TOKEN` (or `--intelligence-token`). For resilience the wire
 can list **several endpoints** (failover priority by order), each with its own
 credential, and the list + model are **hot-swappable without a restart** — but it
 stays one model-facing channel. That is the whole surface.
@@ -14,7 +14,7 @@ This is the **intelligence wire** — the model-facing channel. It is
 **categorically not MCP.** Tools come from MCP servers; this channel only carries
 the LLM request/response. Do not conflate the two.
 
-> **One wire, many endpoints.** `AGENT_INTELLIGENCE` takes an **ordered list**
+> **One wire, many endpoints.** `AGENTD_INTELLIGENCE` takes an **ordered list**
 > of endpoints for failover (see
 > [Resilience](#resilience-multi-endpoint-failover--the-circuit-breaker)), and
 > that list and the model are **hot-swappable** without a restart (see
@@ -51,7 +51,7 @@ the key in the agentd process; agentd reaches that gateway over `https://`, or o
 ### `https://` — direct provider or gateway (feature `tls`)
 
 ```bash
-export AGENT_INTELLIGENCE_TOKEN="$OPENAI_API_KEY"
+export AGENTD_INTELLIGENCE_TOKEN="$OPENAI_API_KEY"
 agentd \
   --instruction 'summarize the open incidents' \
   --intelligence https://api.openai.com/v1/chat/completions \
@@ -145,7 +145,7 @@ for a complete block.
 ### Anything else → push it to a gateway
 
 Gemini, Cohere, and other providers are **not** in the binary. Run a gateway
-that exposes an OpenAI-compatible `/chat/completions`, point `AGENT_INTELLIGENCE`
+that exposes an OpenAI-compatible `/chat/completions`, point `AGENTD_INTELLIGENCE`
 at it (`https://`, or a loopback `http://` for dev), and the canonical adapter
 handles the rest. This keeps the binary thin and the provider matrix out of
 agentd's release cadence.
@@ -179,10 +179,10 @@ SigV4, SPIFFE):
 # flag (sets endpoint 1's credential)
 agentd … --intelligence-token "$OPENAI_API_KEY"
 # or env (preferred for 12-factor / secret mounts)
-export AGENT_INTELLIGENCE_TOKEN="$OPENAI_API_KEY"
+export AGENTD_INTELLIGENCE_TOKEN="$OPENAI_API_KEY"
 agentd …
 # or read from a mounted file (rotation-friendly)
-export AGENT_INTELLIGENCE_TOKEN_FILE=/var/run/secrets/llm/token
+export AGENTD_INTELLIGENCE_TOKEN_FILE=/var/run/secrets/llm/token
 agentd …
 ```
 
@@ -193,9 +193,9 @@ position (1-indexed):
 
 | Endpoint | Inline env | File env |
 |---|---|---|
-| 1 (primary) | `AGENT_INTELLIGENCE_TOKEN` (or `--intelligence-token`) | `AGENT_INTELLIGENCE_TOKEN_FILE` (or `--intelligence-token-file`) |
-| 2 | `AGENT_INTELLIGENCE_TOKEN_2` | `AGENT_INTELLIGENCE_TOKEN_2_FILE` |
-| *N* | `AGENT_INTELLIGENCE_TOKEN_<N>` | `AGENT_INTELLIGENCE_TOKEN_<N>_FILE` |
+| 1 (primary) | `AGENTD_INTELLIGENCE_TOKEN` (or `--intelligence-token`) | `AGENTD_INTELLIGENCE_TOKEN_FILE` (or `--intelligence-token-file`) |
+| 2 | `AGENTD_INTELLIGENCE_TOKEN_2` | `AGENTD_INTELLIGENCE_TOKEN_2_FILE` |
+| *N* | `AGENTD_INTELLIGENCE_TOKEN_<N>` | `AGENTD_INTELLIGENCE_TOKEN_<N>_FILE` |
 
 Precedence per endpoint: an explicit inline env override wins, then the `…_FILE`
 variant, then (endpoint 1 only) the resolved `--intelligence-token`. An endpoint
@@ -226,7 +226,7 @@ Example of the redaction (the token is set but never echoed):
 // proc.start — note: no token field exists anywhere in the log stream
 {"ts":"2026-06-25T12:00:00Z","level":"info","event":"proc.start","run_id":"r-…",
  "agent_id":"sup","agent_path":"0","comp":"supervisor","pid":1,
- "version":"1.1.0","runtime":"1","instance":"agentd",
+ "version":"1.1.0","instance":"agentd",
  "config_files":["settings.yaml"]}
 ```
 
@@ -251,10 +251,9 @@ Example of the redaction (the token is set but never echoed):
 
 ## Model tiers
 
-The model used to be one instance-global string. Choosing a cheap model for a
-classify step and a frontier one for a judgement call meant forking a subagent
-process purely to change it — `model` appeared in no node's field list, so
-writing it on a step was exit 2. The breaker is per *endpoint* and is not
+A tier lets each step choose its model: a cheap one for a classify step and a
+frontier one for a judgement call, in the same instance, with no subagent
+process forked to change it. The breaker is per *endpoint* and is not
 operator-tunable — three consecutive failures open it, and the cooldown
 starts at 5s and doubles to a 60s cap — so a frontier and a cheap model
 behind one gateway still share one breaker; what a tier separates is the
@@ -299,22 +298,11 @@ endpoint or credential. Trifecta tags are not part of this either — `tags` is
 `kind: mcp` vocabulary, and writing it on a `kind: intelligence` entry is
 exit 2.
 
-Two keys that used to live here are gone as of 1.15, because neither did
-anything. `service:` named a `kind: intelligence` catalogue entry, was checked
-at startup, and was then ignored — every tier's call went to
-`intelligence.endpoints` regardless, so a config reading "this tier talks to my
-on-prem gateway" talked to the shared one. `pricing:` parsed and validated and
-was never multiplied by anything. Both are refused by name now rather than
-accepted and inert; see [Cost](#cost-recorded-not-spent) for what replaced the
-second one, which is nothing.
-
 Every tier's call goes to the endpoint list `intelligence.endpoints` names —
 the ordered failover list below — because that list, and nothing else, is what
 the client is built from at startup and rebuilt from on reload; a tier
-contributes the wire model name and, when it declares one, the window. That is
-the whole reason `service:` was removed: it looked like it selected an endpoint
-and did not, and there is no honest way to document a routing key that does not
-route. `security.egress: closed` works the same way from the other side: it walks the four outbound surfaces —
+contributes the wire model name and, when it declares one, the window. A tier
+selects no endpoint. `security.egress: closed` works the same way from the other side: it walks the four outbound surfaces —
 `mcp.servers`, `intelligence.endpoints`, `a2a.peers`, and the HTTP dials
 (`store.http`, a workflow `url:` reference, a literal `http` step URL) — and
 demands each URL match a catalogue entry of its own kind on scheme, authority
@@ -338,17 +326,11 @@ that cost, and on what" now has a per-turn answer.
 
 <a id="cost-recorded-not-spent"></a>
 The "on what" is the half agentd answers, and only that half. There is **no
-cost accounting**: `intelligence.pricing` and a tier's `pricing:` were removed
-in 1.15 because nothing ever read them. They parsed, validated, published a
-shape into the JSON schema so editors could autocomplete them — and then the
-trail ended. Nothing multiplied a rate by a token count, no event carried a
-money figure, and every limit under `intelligence.budget` is denominated in
-tokens and requests rather than currency.
-
-Both spellings are refused by name now. A config field that accepts a number
-and does nothing with it is worse than an absent one, because it reads like a
-feature: an operator writes their rate card into the config and reasonably
-expects a spend figure to come back out.
+cost accounting**: nothing multiplies a rate by a token count, no event carries
+a money figure, and every limit under `intelligence.budget` is denominated in
+tokens and requests rather than currency. The configuration has no price key,
+because a field that accepts a number and does nothing with it reads like a
+feature.
 
 If you want money, take it from the token counts: `turn.model` puts the
 resolved model on the log line and the usage events carry the token totals, so
@@ -360,7 +342,7 @@ denominated in currency does when a provider changes its prices mid-run.
 
 ## Resilience: multi-endpoint failover & the circuit breaker
 
-`AGENT_INTELLIGENCE` (or `--intelligence`) accepts an **ordered,
+`AGENTD_INTELLIGENCE` (or `--intelligence`) accepts an **ordered,
 comma-separated list** of endpoints. List order *is* failover priority — the
 first element is the primary. A single-element list is exactly the
 single-endpoint behaviour above; the failover/breaker machinery is inert with one
@@ -473,7 +455,7 @@ invisible — the run rebuilds its client with **fresh breaker state** (so no st
 breaker carries to a new endpoint) and continues. The endpoint URL and credential
 travel on the control frame like the spawn payload and are **never logged**.
 
-`--model-swap` (env `AGENT_MODEL_SWAP`) controls only what happens when a reload
+`--model-swap` (env `AGENTD_MODEL_SWAP`) controls only what happens when a reload
 changes the **model** under an in-flight turn:
 
 | Policy | Behaviour |
@@ -502,17 +484,17 @@ the flag wins over env, which wins over the default.)
 
 | Flag | Env | Meaning |
 |---|---|---|
-| `--intelligence <URI[,URI…]>` | `AGENT_INTELLIGENCE` | the endpoint **list**: comma-separated `https://` (or a loopback `http://`), order = failover priority (required) |
-| `--intelligence-token <T>` | `AGENT_INTELLIGENCE_TOKEN` | endpoint-1 bearer / `x-api-key` value (never logged) |
-| `--intelligence-token-file <PATH>` | `AGENT_INTELLIGENCE_TOKEN_FILE` | read endpoint-1's token from a mounted file (rotation) |
-| *(per-endpoint, env-only)* | `AGENT_INTELLIGENCE_TOKEN_<N>` / `…_<N>_FILE` | endpoint *N*'s token / token-file (1-indexed, N ≥ 2) |
-| `--model <NAME>` | `AGENT_MODEL` | model id sent in the request body (reloadable) |
-| `--model-swap <POLICY>` | `AGENT_MODEL_SWAP` | in-flight model-swap policy: `finish-on-old` (default) \| `restart-turn` |
+| `--intelligence <URI[,URI…]>` | `AGENTD_INTELLIGENCE` | the endpoint **list**: comma-separated `https://` (or a loopback `http://`), order = failover priority (required) |
+| `--intelligence-token <T>` | `AGENTD_INTELLIGENCE_TOKEN` | endpoint-1 bearer / `x-api-key` value (never logged) |
+| `--intelligence-token-file <PATH>` | `AGENTD_INTELLIGENCE_TOKEN_FILE` | read endpoint-1's token from a mounted file (rotation) |
+| *(per-endpoint, env-only)* | `AGENTD_INTELLIGENCE_TOKEN_<N>` / `…_<N>_FILE` | endpoint *N*'s token / token-file (1-indexed, N ≥ 2) |
+| `--model <NAME>` | `AGENTD_MODEL` | model id sent in the request body (reloadable) |
+| `--model-swap <POLICY>` | `AGENTD_MODEL_SWAP` | in-flight model-swap policy: `finish-on-old` (default) \| `restart-turn` |
 | `--intelligence-dialect <D>` | `AGENTD_INTELLIGENCE_DIALECT` | wire dialect: `openai` (default) \| `anthropic` \| `bedrock` |
-| `--max-tokens <N>` | `AGENT_MAX_TOKENS` | token budget for the run (default 2000000) |
-| `--deadline <dur>` | `AGENT_DEADLINE` | wall-clock deadline, e.g. `600s`, `5m` (default 3600s) |
+| `--max-tokens <N>` | `AGENTD_MAX_TOKENS` | token budget for the run (default 2000000) |
+| `--deadline <dur>` | `AGENTD_DEADLINE` | wall-clock deadline, e.g. `600s`, `5m` (default 3600s) |
 
-Every one of these is a `config_version: "1"` document path as well —
+Every one of these is a configuration document path as well —
 `intelligence.endpoints`, `intelligence.token`, `intelligence.model`,
 `intelligence.swap_policy`, `intelligence.dialect`, `limits.run.tokens`,
 `limits.run.deadline` — settable from a file, from `AGENTD_<PATH>`, or from

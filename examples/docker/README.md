@@ -4,9 +4,8 @@ A multi-stage build that produces a tiny, nonroot `agentd` image: a musl
 static binary on `gcr.io/distroless/static-debian12:nonroot` (no shell, no
 package manager, UID 65532).
 
-> **Status:** implemented and released (v2.0.0). The supervisor, agentic loop,
-> MCP client, and served self-MCP over HTTP(S) all ship; the commands below run
-> real agent runs given an intelligence endpoint + MCP servers.
+The commands below run real agent runs given an intelligence endpoint and MCP
+servers.
 
 ## Build
 
@@ -32,27 +31,26 @@ Feature flags map to the crate's `[features]` (see `crates/agentd-cli/Cargo.toml
 which forwards 1:1 to `crates/agentd/Cargo.toml`): `tls` (rustls+ring, bundled roots
 — **on by default**, it is the transport), `a2a`, `cron`, `metrics`, `otel`,
 `hot-reload`, `config-watch`, `cel`, `aauth`, `sign`, `oci`, `decrypt`, `oauth`,
-`exec`. There is also a declared `workflow` feature, deliberately left out of that
-list: the engine compiles unconditionally, so turning it on changes nothing you can
-observe — which is why the released binaries do not set it either.
+`exec`. The workflow engine is not among them: it compiles unconditionally.
 
 ## Run — one-shot (`once`)
 
-Mode defaults to `once`: run the instruction to a terminal status, then exit.
+With no workflow configured, the instruction runs once to a terminal status, then
+the process exits.
 Intelligence and the instruction are supplied per run.
 
 ```sh
 docker run --rm \
-  -e INSTRUCTION="Summarize /data/report.txt and write the summary via the fs MCP server." \
-  -e AGENT_INTELLIGENCE="https://api.example/v1" \
-  -e AGENT_INTELLIGENCE_TOKEN="$TOKEN" \
-  -e AGENT_MODEL="claude-sonnet-4-5" \
+  -e AGENTD_INSTRUCTION="Summarize /data/report.txt and write the summary via the fs MCP server." \
+  -e AGENTD_INTELLIGENCE="https://api.example/v1" \
+  -e AGENTD_INTELLIGENCE_TOKEN="$TOKEN" \
+  -e AGENTD_MODEL="claude-sonnet-4-5" \
   agentd:tls
 ```
 
-`AGENT_INTELLIGENCE_TOKEN` is a secret — it is **never** logged and is
+`AGENTD_INTELLIGENCE_TOKEN` is a secret — it is **never** logged and is
 redacted in any debug output (the `Secret` newtype's `Debug` writes `***` —
-`crates/agentd/src/config/v2/mod.rs`; resolution never touches a log line —
+`crates/agentd/src/config/settings/mod.rs`; resolution never touches a log line —
 `crates/agentd/src/sec/secret.rs`). Pass it via
 env or `--intelligence-token`, never via a config file.
 
@@ -61,8 +59,8 @@ The default image (no `FEATURES`) already keeps TLS out — point it at a
 
 ```sh
 docker run --rm \
-  -e INSTRUCTION="…" \
-  -e AGENT_INTELLIGENCE="http://127.0.0.1:4000/v1" \
+  -e AGENTD_INSTRUCTION="…" \
+  -e AGENTD_INTELLIGENCE="http://127.0.0.1:4000/v1" \
   agentd:no-tls
 ```
 
@@ -90,9 +88,9 @@ service and point `--mcp` at its URL; per-server auth headers go in the config f
 
 - **Reactivity rides the MCP servers' Streamable-HTTP subscriptions** — agentd
   subscribes and reacts to pushed `notifications/resources/updated` over HTTP/SSE.
-- **Serving agentd's own MCP** (`--serve-mcp https://host:port`, which sets
-  `a2a.listen` and needs the `a2a` feature) is over HTTP(S) with mTLS/bearer auth
-  (loopback `http://` for dev).
+- **The A2A listener** (`--listen https://host:port`, which sets `a2a.listen` and
+  needs the `a2a` feature) is HTTP(S) with mTLS/bearer auth (loopback `http://`
+  for dev). agentd serves no MCP.
 - **Agent-authored cyclic workflows** are in every build — the engine is
   unconditional; `cel` is what `when:` / `until:` / `filter:` need, and it is in the
   released binaries.

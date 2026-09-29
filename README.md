@@ -205,12 +205,11 @@ and what *triggers* runs is a workflow **start node**.
 $ agentd --instruction "…" --intelligence https://gw.example/v1
 ```
 
-Recurring / reactive shapes are **workflow start nodes** in a
-`config_version: "1"` document (see
+Recurring / reactive shapes are **workflow start nodes** in the configuration
+document (see
 [docs/modes-and-triggers.md](docs/modes-and-triggers.md)):
 
 ```yaml
-config_version: "1"
 intelligence: { endpoints: https://gw.example/v1, model: gpt-… }
 store: { kind: mcp, mcp: { server: state } }         # a daemon needs a durable store
 a2a:   { listen: https://0.0.0.0:8443,
@@ -232,7 +231,7 @@ upstream W3C trace.
 ## Workflows
 
 agentd runs **durable DAG workflows** (always compiled — no feature
-flag): a declarative graph of `steps` in the `config_version: "1"` document,
+flag): a declarative graph of `steps` in the configuration document,
 driven by the same reactor over durable state, so a run survives a restart and
 resumes exactly where it died. Deterministic steps (`assign` / `map` / `filter` /
 `switch` / …) cost **zero model tokens**; `agent` / `think` steps run turn
@@ -418,14 +417,13 @@ Prometheus `/metrics` + `/healthz` + `/readyz` via `--metrics-addr`
 liveness heartbeat file via `--health-file`, and the live log ring tailed with
 the `debug.events` command op (needs `interface.enabled` + `interface.debug`).
 
-**Discovery:** `agentd --capabilities` prints a machine-readable manifest
-(`runtime: "1"`, a `surfaces{}` block pinning the `exit_codes` and
-`config_schema` contract versions, and, alongside it, exactly what's compiled
-and configured in) and exits — feature-detect from this, not the version string.
+**Discovery:** `agentd --capabilities` prints a machine-readable manifest of
+exactly what is compiled and configured in, and exits — feature-detect from
+this, not the version string.
 
 **Control plane:** an operator-role principal drives the served endpoint with
-the `admin.drain` / `admin.lameduck` / `admin.pause` / `admin.resume` /
-`admin.cancel` command ops — each a DataPart on an ordinary A2A `SendMessage`,
+the `admin.drain` / `admin.pause` / `admin.resume` / `admin.cancel` command
+ops — each a DataPart on an ordinary A2A `SendMessage`,
 not a custom JSON-RPC method. `SIGTERM` starts a graceful drain
 (`--drain-timeout` < pod grace).
 

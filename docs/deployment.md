@@ -20,7 +20,7 @@ on a SIGTERM drain.
 
 ## The config surface you will actually use
 
-Configuration is a `config_version: "1"` document (`--config` / `AGENT_CONFIG`,
+Configuration is one document (`--config` / `AGENTD_CONFIG`,
 YAML or JSON, repeatable + merged). **Every path in the schema is also an env var
 and a flag** (`limits.run.steps` ⇒ `AGENTD_LIMITS_RUN_STEPS` /
 `--limits-run-steps`), so a container overrides at deploy time without editing
@@ -86,7 +86,7 @@ line. The canonical fields are
 `ts level event run_id agent_id agent_path comp pid …`:
 
 ```json
-{"ts":"2026-06-25T18:30:01.412Z","level":"info","event":"proc.start","run_id":"01M06TKN6W88955NQDJNKCS0SC","agent_id":"sup","agent_path":"0","comp":"supervisor","pid":4711,"version":"1.1.0","runtime":"1","instance":"agentd","config_files":["/etc/agentd/task.yaml"]}
+{"ts":"2026-06-25T18:30:01.412Z","level":"info","event":"proc.start","run_id":"01M06TKN6W88955NQDJNKCS0SC","agent_id":"sup","agent_path":"0","comp":"supervisor","pid":4711,"version":"1.1.0","instance":"agentd","config_files":["/etc/agentd/task.yaml"]}
 ```
 
 Because stdout is the result and stderr is telemetry, you compose with ordinary
@@ -100,7 +100,7 @@ agentd --instruction "$(cat task.md)" --intelligence https://gw.example/v1 \
 
 Read the instruction from a file (handy for ConfigMap/Secret projection) with
 `--instruction.file`, or set `INSTRUCTION` in the environment. The intelligence
-token is **never** logged — pass it via `AGENT_INTELLIGENCE_TOKEN` or
+token is **never** logged — pass it via `AGENTD_INTELLIGENCE_TOKEN` or
 `--intelligence-token`, not on a shared command line where it lands in `ps`.
 
 **Idempotent retries.** A bare run mints a random `run_id` per process. For a
@@ -136,7 +136,6 @@ a file store does and does not survive in a container.
 
 ```yaml
 # /etc/agentd/triage.yaml
-config_version: "1"
 agent: { instruction: "When a ticket is filed, triage it and assign an owner." }
 intelligence: { endpoints: https://gw.example/v1, model: my-model }
 mcp:
@@ -185,7 +184,7 @@ clean shutdown in dashboards, not a failure. A **second** `SIGTERM`/`SIGINT`
 forces immediate `SIGKILL` of all process groups.
 
 The whole drain is bounded by `lifecycle.drain_timeout` (`--drain-timeout`,
-`AGENT_DRAIN_TIMEOUT`; default 25s). **This MUST be smaller than the
+`AGENTD_DRAIN_TIMEOUT`; default 25s). **This MUST be smaller than the
 orchestrator's shutdown grace** — see the
 [footgun below](#the-top-footgun-drain-timeout--grace).
 
@@ -198,7 +197,7 @@ Description=agent ticket triage (daemon)
 After=network.target
 
 [Service]
-EnvironmentFile=/etc/agentd/triage.env       # e.g. AGENT_INTELLIGENCE_TOKEN=…
+EnvironmentFile=/etc/agentd/triage.env       # e.g. AGENTD_INTELLIGENCE_TOKEN=…
 ExecStart=/usr/local/bin/agentd --config /etc/agentd/triage.yaml
 # Give the drain room: must exceed lifecycle.drain_timeout.
 TimeoutStopSec=30
@@ -423,7 +422,7 @@ kills the process. A clean drain returns `0`.
 
 ### The top footgun: drain timeout < grace
 
-> **`AGENT_DRAIN_TIMEOUT` (default 25s) MUST be `<`
+> **`AGENTD_DRAIN_TIMEOUT` (default 25s) MUST be `<`
 > `terminationGracePeriodSeconds` (default 30s).**
 
 If your drain budget is `>=` the pod's grace period, the kubelet sends
@@ -477,12 +476,12 @@ spec:
             - --intelligence
             - https://gw.example/v1
           env:
-            - { name: AGENT_INTELLIGENCE_TOKEN, valueFrom: { secretKeyRef: { name: intel, key: token } } }
-            - { name: AGENT_LIFECYCLE_RUN_ID, value: "digest-2026-06-25" }   # stable → idempotent retries
+            - { name: AGENTD_INTELLIGENCE_TOKEN, valueFrom: { secretKeyRef: { name: intel, key: token } } }
+            - { name: AGENTD_LIFECYCLE_RUN_ID, value: "digest-2026-06-25" }   # stable → idempotent retries
 ```
 
-Pin `AGENT_LIFECYCLE_RUN_ID` (canonically `AGENTD_LIFECYCLE_RUN_ID`; `--run-id`
-on the command line) to a stable per-unit-of-work value — e.g. derived from the
+Pin `AGENTD_LIFECYCLE_RUN_ID` (`--run-id` on the command
+line) to a stable per-unit-of-work value — e.g. derived from the
 Job name — so retries dedupe through your MCP backing services.
 
 ### 4b. CronJob — on a schedule
@@ -578,7 +577,7 @@ and means "raise the limit".
 One `agentd` process is one durable agent **instance**, and its identity is
 baked into every durable key it writes: `<store.prefix>/<instance>/<kind>/<id>`.
 `instance` comes from `agent.name`, falling back to the downward-API pod name
-(`AGENT_POD_NAME`), then `HOSTNAME`. Two consequences shape a fleet:
+(`AGENTD_POD_NAME`), then `HOSTNAME`. Two consequences shape a fleet:
 
 - **Identity must be unique per replica.** If two processes claim the same
   `store.prefix` + instance name, the store's `seq`-CAS fences them: the loser
@@ -618,7 +617,7 @@ spec:
             # The ordinal-stable pod name namespaces this replica's durable
             # keys; it must differ from every sibling. Set `agent.name`
             # (AGENTD_AGENT_NAME) instead to name instances yourself.
-            - { name: AGENT_POD_NAME, valueFrom: { fieldRef: { fieldPath: metadata.name } } }
+            - { name: AGENTD_POD_NAME, valueFrom: { fieldRef: { fieldPath: metadata.name } } }
 ```
 
 **Splitting the work.** agentd does not fan one trigger out across a fleet; each
@@ -699,7 +698,7 @@ mounted Secret files at load/reload ([`configuration.md`](configuration.md)).
 
 The **A2A listener** (`a2a.listen`, `--features a2a`) is also the management
 transport. Over it an operator issues the admin family as command ops — `admin.drain`,
-`admin.lameduck`, `admin.pause`, `admin.resume`, `admin.cancel` — and the read
+`admin.pause`, `admin.resume`, `admin.cancel` — and the read
 commands `status` and `config` (the effective merged document, with secret
 references left unresolved). Workflow control rides the same channel:
 `workflow.run` / `workflow.status` / `workflow.cancel` / `workflow.signal`.

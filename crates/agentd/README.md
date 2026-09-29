@@ -11,7 +11,7 @@ an MCP server.
 
 ```toml
 [dependencies]
-agentd-core = "2.0"
+agentd-core = "1.16"
 ```
 
 ```rust,no_run

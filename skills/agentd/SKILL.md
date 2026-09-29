@@ -51,8 +51,6 @@ Docker: `ghcr.io/agentd-dev/agentd:<version>` (multi-arch, cosign-signed).
 ## A minimal working config
 
 ```yaml
-config_version: "1"          # required
-
 agent:
   name: helper
   instruction: |             # standing policy: HOW to work, not today's task

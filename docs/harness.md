@@ -294,8 +294,6 @@ from the *requester's stored* record, never read from the request — a child ca
 claim to be shallower than it is.
 
 ```yaml
-config_version: "1"
-
 limits:
   subagents:
     depth: 3            # delegation depth

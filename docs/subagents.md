@@ -167,7 +167,6 @@ long-lived daemon eventually refuses on `limits.subagents.total` with nothing
 running. Raise it for daemons.
 
 ```yaml
-config_version: "1"
 limits:
   run:                       # inherited by each subagent unless the call overrides
     steps: 500
@@ -327,7 +326,6 @@ subagents:
         You are the war room for {{params.id}}.
         :::workflow
         name: on-update
-        version: 3
         steps:
           cmd: {kind: a2a, command: incident.update, roles: [agent, operator]}
           f:   {kind: finish, depends_on: [cmd], status: completed, output: "..."}
@@ -404,7 +402,6 @@ liveness deadline. A workflow `subagent` step honours its `timeout`, because tha
 wait is a durable step record:
 
 ```yaml
-config_version: "1"
 workflows:
   - name: triage
     steps:

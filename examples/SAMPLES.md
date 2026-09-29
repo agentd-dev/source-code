@@ -12,15 +12,11 @@
 > | **`tail/`** | **Processing lines as they arrive** — react to appended CSV/text lines with a durable byte cursor that survives a restart, partial-line hold-back, and rotation detection. A directory-shaped project (`agentd.yml` + `workflows/`). |
 > | **`voice/`** | **A voice agent, end to end** — wake word, speech, and a room full of people who are not authenticated. Two instances split by the lethal-trifecta gate (the ears that hear vs. the hands that unlock), plus a stdlib-only reference MCP server for the microphone and the speaker. Runs with `--fake` and no hardware. |
 >
-> **Coming from agentd 1.x?** The `--mode`, `--subscribe` and `--interval`
-> spellings the 1.x samples used were **removed in 2.0**: naming one now fails
-> the load with a hint naming its replacement, so a stale command line is a loud
-> error rather than a flag that quietly does nothing. They survive in the flag
-> table below only as that migration map. What replaced them is one durable
-> runtime (`lifecycle.run_until` = job or daemon) triggered by workflow **start
-> nodes** (`once` / `loop` / `schedule` / `subscribe` / `signal` / `event` /
-> `a2a`) — which is what the runner scripts and the k8s manifests here run on
-> today. See [modes-and-triggers.md](../docs/modes-and-triggers.md) and
+> Every sample runs on one durable runtime (`lifecycle.run_until` = job or
+> daemon) triggered by workflow **start nodes** (`once` / `loop` / `schedule` /
+> `subscribe` / `signal` / `event` / `a2a`) — which is what the runner scripts
+> and the k8s manifests here run on. See
+> [modes-and-triggers.md](../docs/modes-and-triggers.md) and
 > [getting-started.md](../docs/getting-started.md).
 
 ---
@@ -29,8 +25,8 @@
 
 | File | What it is |
 |---|---|
-| `coding-agent.yaml` | **(2.0)** A pair-programming agent for a repository: the `exec` fence, approvals, budgets, and the display surface the TUI/web UI attach to. |
-| `voice/` | **(2.0)** A voice-controlled household agent: `subscribe` start on an MCP resource, `window` for conversational context, `on_overflow: replace` as barge-in, `event: human.asked` to speak every gate aloud, and an addressed gate a voice cannot answer. |
+| `coding-agent.yaml` | A pair-programming agent for a repository: the `exec` fence, approvals, budgets, and the display surface the TUI/web UI attach to. |
+| `voice/` | A voice-controlled household agent: `subscribe` start on an MCP resource, `window` for conversational context, `on_overflow: replace` as barge-in, `event: human.asked` to speak every gate aloud, and an addressed gate a voice cannot answer. |
 | `instructions/triage.md` | An instruction file with an output contract — classify an inbox item, take one action, emit JSON. Used by the reactive and loop samples. |
 | `instructions/research.md` | An instruction file with an output contract — research a topic to a single sourced answer. Used by the once sample. |
 | `mcp-servers.fragment.json` | A server-list **fragment**, not a runnable config: the shape of `mcp.servers` (name + remote `endpoint` + auth `headers` + `tags`), meant to be layered under a config with a second `-c`. |
@@ -50,7 +46,7 @@ agentd ships **no tools of its own** and runs **no local code** — every tool c
 from an MCP server it reaches over the network. It talks to **one** intelligence
 endpoint. So every sample needs two things wired:
 
-1. **An intelligence endpoint** — `--intelligence <URI>` or `AGENT_INTELLIGENCE`,
+1. **An intelligence endpoint** — `--intelligence <URI>` or `AGENTD_INTELLIGENCE`,
    one **HTTPS** URI:
    - `https://host/v1/...` — a direct HTTPS endpoint (`tls` feature, on by default).
    - `http://127.0.0.1:PORT/v1` — a **loopback-only** plaintext carve-out for a
@@ -62,8 +58,8 @@ endpoint. So every sample needs two things wired:
    config file, and is redacted everywhere agentd logs:
 
    ```bash
-   export AGENT_INTELLIGENCE=https://gw.example/v1
-   export AGENT_INTELLIGENCE_TOKEN=...        # or --intelligence-token
+   export AGENTD_INTELLIGENCE=https://gw.example/v1
+   export AGENTD_INTELLIGENCE_TOKEN=...        # or --intelligence-token
    ```
 
 2. **MCP servers for the tools/resources the instruction needs** — declared with
@@ -112,9 +108,8 @@ agentd -c ./my-agent.yaml -c examples/mcp-servers.fragment.json
 
 `--config` is repeatable and merges left to right (RFC 7396, later files win per
 leaf), which is what makes a shared server list a real deployment pattern:
-`examples/startup/` uses the same shape for its service catalogue. The file
-deliberately carries no `config_version` — it is not claiming to be a whole
-document.
+`examples/startup/` uses the same shape for its service catalogue. The file is
+a fragment, not a whole document.
 
 Each server has a `name`, a remote `endpoint` (an `https://host/mcp`
 Streamable-HTTP URL that agentd CONNECTS to — it spawns no process), optional auth
@@ -159,8 +154,8 @@ Run an instruction to a terminal status, then exit. This is the Job / CLI shape:
 result on stdout, telemetry on stderr, no daemon, no served surface.
 
 ```bash
-export AGENT_INTELLIGENCE=https://gw.example/v1
-export AGENT_INTELLIGENCE_TOKEN=...
+export AGENTD_INTELLIGENCE=https://gw.example/v1
+export AGENTD_INTELLIGENCE_TOKEN=...
 ./run-once.sh
 ```
 
@@ -198,8 +193,8 @@ drain signal (`SIGTERM`) or a fatal/limit class stops it. Deploy it as a
 long-lived Deployment.
 
 ```bash
-export AGENT_INTELLIGENCE=https://gw.example/v1
-export AGENT_INTELLIGENCE_TOKEN=...
+export AGENTD_INTELLIGENCE=https://gw.example/v1
+export AGENTD_INTELLIGENCE_TOKEN=...
 ./run-reactive.sh
 ```
 
@@ -261,8 +256,8 @@ after which the node re-arms on its backoff. The Job-with-deadline / Deployment
 shape.
 
 ```bash
-export AGENT_INTELLIGENCE=https://gw.example/v1
-export AGENT_INTELLIGENCE_TOKEN=...
+export AGENTD_INTELLIGENCE=https://gw.example/v1
+export AGENTD_INTELLIGENCE_TOKEN=...
 ./run-loop.sh
 ```
 
@@ -337,38 +332,30 @@ redacted (`***`) in all agentd output, including panic messages.
 ## Flag reference (used by these samples)
 
 Most flags below are aliases in the `ALIASES` table in
-`crates/agentd/src/config/v2/mod.rs`, which maps each spelling onto a config path;
-`--config`/`-c` is parsed by hand instead, because the file layer has already
-consumed it by the time the flag layer runs. `--mode`, `--subscribe` and
-`--interval` are the 1.x spellings this file keeps for reference — they live in
-`REMOVED_FLAGS`, so naming one now fails the load with a migration hint rather than
-being quietly ignored. Run `agentd --help` for the current list. Anything
-env-settable (12-factor) is shown with its env var. The neutral `AGENT_*` env
-prefix is accepted as an alias for the branded `AGENTD_*` one (branded wins on
-conflict).
+`crates/agentd/src/config/settings/mod.rs`, which maps each spelling onto a config
+path; `--config`/`-c` is parsed by hand instead, because the file layer has already
+consumed it by the time the flag layer runs. Run `agentd --help` for the current
+list. Anything env-settable (12-factor) is shown with its env var; every one is
+read under the `AGENTD_` prefix.
 
 | Flag | Env | Meaning |
 |---|---|---|
-| `--instruction <TEXT>` | `INSTRUCTION` | the task |
+| `--instruction <TEXT>` | `AGENTD_INSTRUCTION` | the task |
 | `--instruction.file <PATH>` | — | read the instruction from a file |
-| `--intelligence <URI>` | `AGENT_INTELLIGENCE` | `https://host/…` (or loopback `http://127.0.0.1:PORT` for a dev sidecar) |
-| `--intelligence-token <T>` | `AGENT_INTELLIGENCE_TOKEN` | bearer / api key (redacted) |
-| `--model <NAME>` | `AGENT_MODEL` | model id |
+| `--intelligence <URI>` | `AGENTD_INTELLIGENCE` | `https://host/…` (or loopback `http://127.0.0.1:PORT` for a dev sidecar) |
+| `--intelligence-token <T>` | `AGENTD_INTELLIGENCE_TOKEN` | bearer / api key (redacted) |
+| `--model <NAME>` | `AGENTD_MODEL` | model id |
 | `--mcp name=<endpoint>` | — | declare a remote MCP server URL (repeatable; Streamable HTTP) |
-| `--config <PATH>` | `AGENT_CONFIG` | load a declarative config file (`mcp.servers`, limits, …) |
-| `--mode …` | — | **removed in 2.0** — use a start node (`once` / `loop` / `schedule` / `subscribe` / …); `AGENT_MODE` is not read either |
-| `--subscribe <uri>` | — | **removed in 2.0** — use a `subscribe` start node: `{kind: subscribe, server: <name>, uri: <uri>}` |
-| `--interval <dur>` | — | **removed in 2.0** — `interval` on a `loop` start node, or `every` on a `schedule` start node |
-| `--max-steps <N>` | `AGENT_MAX_STEPS` | per-run step cap (`limits.run.steps`, default 500) |
-| `--max-tokens <N>` | `AGENT_MAX_TOKENS` | token budget for a **single run** (`limits.run.tokens`, default 2000000) |
-| `--budget-tokens-lifetime <N>` | `AGENT_BUDGET_TOKENS` | the instance's cumulative ceiling across **all** runs (`intelligence.budget.lifetime_tokens`, default `0` = unbounded) |
-| `--deadline <dur>` | `AGENT_DEADLINE` | wall-clock deadline (`limits.run.deadline`, default `3600s`) |
+| `--config <PATH>` | `AGENTD_CONFIG` | load a declarative config file (`mcp.servers`, limits, …) |
+| `--max-steps <N>` | `AGENTD_MAX_STEPS` | per-run step cap (`limits.run.steps`, default 500) |
+| `--max-tokens <N>` | `AGENTD_MAX_TOKENS` | token budget for a **single run** (`limits.run.tokens`, default 2000000) |
+| `--budget-tokens-lifetime <N>` | `AGENTD_BUDGET_TOKENS` | the instance's cumulative ceiling across **all** runs (`intelligence.budget.lifetime_tokens`, default `0` = unbounded) |
+| `--deadline <dur>` | `AGENTD_DEADLINE` | wall-clock deadline (`limits.run.deadline`, default `3600s`) |
 | `--max-depth <N>` | — | subagent tree depth cap (`limits.subagents.depth`, default 3) |
-| `--run-id <ID>` | `AGENT_RUN_ID` | idempotency key (auto-generated if unset) |
-| `--log-level <L>` | `AGENT_LOG_LEVEL` | `trace\|debug\|info\|warn\|error` (default `info`) |
-| `--drain-timeout <dur>` | `AGENT_DRAIN_TIMEOUT` | graceful drain budget (default `25s`) |
+| `--run-id <ID>` | `AGENTD_RUN_ID` | idempotency key (auto-generated if unset) |
+| `--log-level <L>` | `AGENTD_LOG_LEVEL` | `trace\|debug\|info\|warn\|error` (default `info`) |
+| `--drain-timeout <dur>` | `AGENTD_DRAIN_TIMEOUT` | graceful drain budget (default `25s`) |
 | `--health-file <PATH>` | — | liveness heartbeat file |
-| `--serve-mcp https://host:port` | `AGENT_SERVE_MCP` | serve agentd's own MCP over HTTP(S) with mTLS/bearer (sets `a2a.listen`; needs the `a2a` feature; loopback `http://` for dev) |
 
 Durations accept `ms` / `s` / `m` / `h`, or a bare integer (seconds): `250ms`,
 `30`, `5m`, `2h`.
@@ -377,8 +364,8 @@ Durations accept `ms` / `s` / `m` / `h`, or a bare integer (seconds): `250ms`,
 
 ## Boundaries
 
-- **Every network transport is HTTP(S).** Intelligence, the MCP client, the served
-  self-MCP, and A2A / operator control are HTTP(S) with mTLS/bearer auth; plaintext
+- **Every network transport is HTTP(S).** Intelligence, the MCP client, and A2A /
+  operator control are HTTP(S) with mTLS/bearer auth; plaintext
   `http://` is a **loopback-only** dev carve-out. Off the network it speaks two
   things. A **unix domain socket** (`unix:///run/agentd/a2a.sock`) carries that same
   HTTP/1.1 + JSON-RPC without TLS, because the kernel authenticates the peer by uid

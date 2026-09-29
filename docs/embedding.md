@@ -131,7 +131,7 @@ verified end-to-end against the built-in mock intelligence.)
 
 ### Recipe 2 — workflows as data in your app
 
-A workflow is a dialect-3 JSON/YAML document, and the engine that owns it is
+A workflow is a JSON/YAML document, and the engine that owns it is
 `agentd::engine`: `parse_workflow` validates a document into a `Workflow` (or
 returns every error at once), `workflow_schema()` hands you the same JSON Schema
 `agentd --workflow-schema` prints, and `engine::run` is the **pure scheduler** —
@@ -171,14 +171,14 @@ without owning a runtime.
 
 When you want the kill ladder, cgroup limits, liveness, the durable store, and
 the exit-code contract AROUND the model, do what `agentd-cli/src/main.rs` does:
-install the re-exec dispatch, load a `config_version: "1"` document with
-`agentd::config::v2::load`, and call `agentd::runtime::run(&loaded, args, env)`
+install the re-exec dispatch, load a configuration document with
+`agentd::config::settings::load`, and call `agentd::runtime::run(&loaded, args, env)`
 — the reasoning then runs in killable children of *your* binary, and everything
 in this documentation set (the lifecycle, workflow triggers, and A2A) applies
 unchanged. The CLI's `main.rs` is deliberately small enough to read as the
 reference: the re-exec dispatch, the early-exit asks (`--help`,
 `--config-schema`, `--validate-config`, `--capabilities`, `--login`/`--logout`),
-and the `run_v2` entrypoint.
+and the `run` entrypoint.
 
 ### Recipe 4 — just the pieces
 
@@ -193,7 +193,7 @@ and the `run_v2` entrypoint.
 ```toml
 [dependencies]
 # lib name is `agentd`, so code reads `use agentd::…`
-agentd = { package = "agentd-core", version = "1.14", features = ["a2a", "metrics"] }
+agentd = { package = "agentd-core", version = "1.16", features = ["a2a", "metrics"] }
 ```
 
 (The crates.io name `agentd` belongs to an unrelated project — hence the
@@ -208,7 +208,7 @@ same one the stock CLI forwards.
 - **Semver-honored embedding seams**: `agentd::tools::*`, the workflow engine
   (`engine::{parse_workflow, workflow_schema, Workflow, RunState}`), the re-exec
   dispatch pair (`SUBAGENT_ENV` + `subagent::control::run`),
-  `config::v2::load`, `runtime::run`, `exit::*`.
+  `config::settings::load`, `runtime::run`, `exit::*`.
 - **Everything else `pub`** is visible but unstable — it exists for the CLI
   and the test suites, and may change in any release. Pin a version, and treat
   the two lists above as the whole of what you may depend on.

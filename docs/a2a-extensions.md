@@ -6,15 +6,10 @@ than that, so the specification includes a mechanism for the rest:
 An extension is a URI, declared on the agent card, that a client may activate
 per request.
 
-agentd answers the eleven core methods and the extension methods it declares
-here, plus two bootstrap calls the spec's JSON-RPC binding does not define:
-`GetAgentCard` (the public card, also served unauthenticated as a GET on
-`/.well-known/agent-card.json` and `/.well-known/agent.json`) and `Pair`, the
-pairing handshake that trades a rotating code for a session token. Neither can
-ride an extension, because both run *before* the mechanism exists: a client has
-no card to read declarations from until `GetAgentCard` answers, and no
-credential to activate anything with until `Pair` succeeds. Everything else
-stays on the spec's own surface. That is not a stylistic preference — it is what
+agentd answers the eleven core methods and the methods of the extensions it
+declares here, and serves its public card unauthenticated as a GET on
+`/.well-known/agent-card.json`. Everything else stays on the spec's own
+surface. That is not a stylistic preference — it is what
 makes an agentd instance callable by a peer that has never heard of agentd.
 
 ---
@@ -32,9 +27,12 @@ The specification says four things worth memorising.
 header listing what was *actually* activated. Asking for something the agent
 does not implement is not an error; it simply is not echoed back.
 
-**URIs are identifiers, not addresses.** Nobody is expected to fetch them. They
-should carry a version, and a breaking change takes a *new* URI rather than
-redefining an old one.
+**URIs are identifiers, not addresses.** Nobody is expected to fetch them. The
+specification (A2A 1.0.1 §4.6.3) suggests a version in the URI, and requires
+(§4.6.3, §5.8) that a breaking change take a *new* URI rather than redefine an
+old one. agentd's URIs carry no version: a version in an identifier agentd owns
+would be a second name for the same thing. An incompatible change takes a new
+URI under a new name.
 
 **What an extension may not do.** It may not change the definition of core data
 structures — no new fields on `Task`, no removed fields on `Message`. Custom
@@ -52,9 +50,9 @@ uses the first three.
 
 | URI | Kind | Declares |
 |---|---|---|
-| `https://agentd.dev/a2a/ext/command/v1` | data-only | the **command ops** — structured operations sent as a DataPart on `SendMessage` |
-| `https://agentd.dev/a2a/ext/interface/v1` | method | `SubscribeToEvents`, the instance-wide observation feed |
-| `https://agentd.dev/a2a/ext/task-annotations/v1` | profile | agentd's facts about a task — its link (run, subagent or turn), principal, creation time, status history, a gate's `askSchema`, the command that started it — in `Task.metadata` under this URI. Declared on every card. |
+| `https://agentd.dev/a2a/ext/command` | data-only | the **command ops** — structured operations sent as a DataPart on `SendMessage` |
+| `https://agentd.dev/a2a/ext/events` | method | `agentd.events/SubscribeToEvents`, the instance-wide observation feed |
+| `https://agentd.dev/a2a/ext/task-annotations` | profile | agentd's facts about a task — its link (run, subagent or turn), principal, creation time, status history, a gate's `askSchema`, the command that started it — in `Task.metadata` under this URI. Declared on every card. |
 
 None is `required`. A client that sends no `A2A-Extensions` header at all gets a
 complete, working service: it can converse, run workflows, read tasks and
@@ -77,12 +75,12 @@ $ curl -s -X POST http://127.0.0.1:8080/ \
 ```console
 $ curl -i -X POST http://127.0.0.1:8080/ \
     -H 'content-type: application/json' \
-    -H 'A2A-Extensions: https://agentd.dev/a2a/ext/command/v1' \
+    -H 'A2A-Extensions: https://agentd.dev/a2a/ext/command' \
     -H 'authorization: Bearer …' \
     -d '{"jsonrpc":"2.0","id":1,"method":"GetAgentCard","params":{}}'
 
 HTTP/1.1 200 OK
-A2A-Extensions: https://agentd.dev/a2a/ext/command/v1
+A2A-Extensions: https://agentd.dev/a2a/ext/command
 ```
 
 Two behaviours to rely on:
@@ -139,7 +137,7 @@ follow it with `SubscribeToTask` or register a webhook.
 | `workflow.run` / `.status` / `.cancel` / `.signal` | workflow control | `user` (run/status/cancel), `agent` (run/status); `.signal` needs an explicit grant or `operator` |
 | `subagent.send` / `.kill` / `.status` | subagent control | `user` (send/status); `.kill` needs an explicit grant or `operator` |
 | `plan.get` | the working plan | `user` |
-| `admin.drain` / `.lameduck` / `.pause` / `.resume` / `.cancel` | lifecycle control — see [operations §2](operations.md) | **operator only** |
+| `admin.drain` / `.pause` / `.resume` / `.cancel` | lifecycle control — see [operations §2](operations.md) | **operator only** |
 | `interface.info` | display surface (needs `interface.enabled`) | any named caller |
 | `conversation.get`, `run.get`, `debug.events` | debug reads (need `interface.debug` as well) | `user`, scoped to its own objects; `debug.events` spans every principal's activity and cannot be scoped to the caller, so it needs `operator` or an explicit grant |
 
@@ -179,41 +177,7 @@ never apply is a load error, not a control that silently grants nothing.
 
 ---
 
-## 5. The interface extension
-
-`SubscribeToEvents` is an instance-wide observation feed: every attached display
-client sees the same frames, scoped to what its principal may see. A2A models
-per-task streams (`SubscribeToTask`), not per-instance ones, so there is nothing
-in the core protocol to map this onto — which is exactly the case a method
-extension is for.
-
-It is declared only when `interface.enabled` is set, because the card is a
-promise: an instance that will not serve the feed must not advertise it.
-
----
-
-## 6. There is no legacy path
-
-Earlier builds answered five custom JSON-RPC methods — `a2a.drain`,
-`a2a.lameduck`, `a2a.pause`, `a2a.resume`, `a2a.cancel`. They are **gone**, not
-deprecated: a call to one now gets `-32601`, the code that served them has been
-deleted, and nothing on the card mentions them. The same five operations are
-`admin.drain`, `admin.lameduck`, `admin.pause`, `admin.resume` and
-`admin.cancel`, sent as a command DataPart:
-
-```jsonc
-// then
-{ "method": "a2a.pause", "params": { "run": "reconcile-01J8…" } }
-
-// now
-{ "method": "SendMessage", "params": { "message": { "parts": [
-    { "data": { "agentd": { "op": "admin.pause", "run": "reconcile-01J8…" } } } ] } } }
-```
-
-The reply is a Task whose result carries the acknowledgement, rather than the
-acknowledgement directly.
-
-## 7. How this is kept honest
+## 5. How this is kept honest
 
 Three checks, because a compliance claim that nobody verifies decays:
 
@@ -225,11 +189,7 @@ Three checks, because a compliance claim that nobody verifies decays:
   `SubscribeToEvents`, is skipped by name.
 - **Every non-spec method must be declared.** `EXTENSION_METHODS` pairs each
   extra method with the extension that declares it, and a unit test refuses any
-  method that is in neither the spec list nor a declaration. Both that test and
-  the oracle walk the same `METHODS` constant, so the two bootstrap calls this
-  page opens with — `GetAgentCard` and `Pair` — sit outside the check by
-  construction rather than by accident: they are answered before a card or a
-  credential exists, so there is no declaration for them to be checked against.
+  method that is in neither the spec list nor a declaration.
 - **One list feeds three views.** The ops the card renders as skills, the ops
   the extension declares, and the ops `--capabilities` reports all come from
   `command_ops_of`. They cannot drift apart, because there is nothing to drift.

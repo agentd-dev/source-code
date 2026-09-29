@@ -187,7 +187,7 @@ automate it" pitches usually are not:
   one webhook-signature caveat — and every config's header documents the
   MCP tool contract that desk's workflows actually rely on.) The whole company
   dry-runs offline with the built-in mock intelligence
-  (`AGENT_INTELLIGENCE=mock:final`, which a debug build or `--features
+  (`AGENTD_INTELLIGENCE=mock:final`, which a debug build or `--features
   internal-mocks` carries — a release binary refuses it, so nothing can point
   production at fake intelligence) and `curl` as the webhook source, which is
   also how you rehearse changes to it.

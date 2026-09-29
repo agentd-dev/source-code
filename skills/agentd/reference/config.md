@@ -14,7 +14,6 @@ key rather than a setting that silently does nothing.
 
 | section | owns |
 |---|---|
-| `config_version` | `"1"`. |
 | `agent` | identity, standing instruction, preflight, wake-ups, ask-human fallback |
 | `intelligence` | the model endpoints, auth, budgets, failover/swap policy |
 | `limits` | per-run bounds: steps, tokens, deadline, subagent depth |
@@ -129,7 +128,7 @@ a2a:
     scopes: [user]                 # user | operator
     token_ttl: 8h                  # 5m..30d
     code_ttl: 10m                  # 1m..30m
-  events: { enabled: false }       # the events/v1 observation feed (restart-only)
+  events: { enabled: false }       # the events observation feed (restart-only)
   introspection: { enabled: false }  # operator introspection ops (reloadable)
 ```
 
@@ -161,26 +160,12 @@ A `bearer_ref` or `any` rule needs an `id` — a shared secret names no caller.
 A certificate rule without one acts as `<role>:cn=<CN>` (or
 `<role>:san=<first SAN>`), which can never equal a declared id.
 
-## Removed in 1.17.0
-
-These keys are refused by name — in a file, a flag, an `AGENTD_` variable or
-a `:::!config` fragment — with the replacement (`agentd --help` lists them):
-
-| removed | use instead |
-|---|---|
-| `interface.enabled` | `a2a.events.enabled` |
-| `interface.debug` | `a2a.introspection.enabled` (reloadable) |
-| `interface.origins` | `a2a.cors.origins` |
-| `interface.pairing` | `a2a.device_grant` |
-| `interface.display` | the client's own layout (`agentd-tui --top/--bottom`, `/layout`) |
-| `a2a.principals[].match.aauth_agent` | `san`, `sub` or `bearer_ref` |
-| `AGENTD_INTERFACE_LOG` | `agentd tui --daemon-log PATH` (or `agentd ui`) |
+## The launcher
 
 `agentd tui` / `agentd ui` are a thin launcher: the daemon loads exactly as
 `agentd <args>` would (the launcher sets nothing — put `a2a.events.enabled`
 in the config), and the client gets only its endpoint, never `a2a.bearer`.
-They need a loopback `http(s)` listener on a fixed port without `client_ca`;
-their `--debug` and `--inline` flags are refused.
+They need a loopback `http(s)` listener on a fixed port without `client_ca`.
 
 ## observability
 

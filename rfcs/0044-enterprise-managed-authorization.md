@@ -81,7 +81,7 @@ Checked against `main` at `c31637c5` (v1.16.0). Paths are relative to
 
 | Area | Today |
 |---|---|
-| Outbound credentials | Per endpoint: `static`, `oauth2` (grants `device`, `authorization_code`, `client_credentials`), `aws`, `spiffe`; AAuth as a separate section. `OAuthGrant` has exactly three variants (`config/v2/mod.rs:2128`). `client_credentials` requires a `client_secret` (`config/v2/mod.rs` ~5807). |
+| Outbound credentials | Per endpoint: `static`, `oauth2` (grants `device`, `authorization_code`, `client_credentials`), `aws`, `spiffe`; AAuth as a separate section. `OAuthGrant` has exactly three variants (`config/settings/mod.rs:2128`). `client_credentials` requires a `client_secret` (`config/settings/mod.rs` ~5807). |
 | Who holds them | One signer per MCP server spec, built in `mcp::from_spec` (`mcp/mod.rs:109-133`), with precedence `auth:` > `oauth:` > AAuth. `RequestSigner::sign(method, authority, path, body)` receives no principal (`crates/mcp/src/http.rs:182`). |
 | Credential cache | Keyed by login target only: `cred_id = sha256(target)`, e.g. `mcp:github` (`auth/cache.rs:59-61`). RFC 0031 §11 promised `(endpoint, provider, principal)`. The durable `Kind::Cred` helpers (`auth/cache.rs:64-83`) have no callers. |
 | Refresh | Never written back. A refresh response without a new `refresh_token` discards the old one (`auth/device.rs:53-56` with `auth/login.rs:157-168`). No RFC 7009 revocation; `--logout` deletes the local file only. |
@@ -887,7 +887,7 @@ check (§7).
    reason agentd owns the whole mint path here (§8).
 7. **Operator-only configuration.** Everything this RFC adds is on the
    operator's side of the RFC 0042 boundary. Today RFC 0042 lets a document
-   write the whole `mcp` section (`DOCUMENT_MAY_WRITE`, `config/v2/mod.rs:924`),
+   write the whole `mcp` section (`DOCUMENT_MAY_WRITE`, `config/settings/mod.rs:924`),
    including `mcp.servers[].auth`, so this invariant holds only with the
    amendment in §5.14.1, which is part of P1.
 8. **One identity per key.** Every cache, pool and single-flight key includes
@@ -1301,8 +1301,7 @@ transport says it is.
 
 1. **Template check.** A template must match the typed principal and the IdP;
    the default is deny (`delegation_not_permitted`). Templates cannot match role
-   `agent`, `bearer` principals or placeholder ids (v1.16 pairing principals,
-   also excluded, are removed by RFC 0043).
+   `agent`, `bearer` principals or placeholder ids.
 2. **Sign-in** as above. The gate text is written by agentd from structured
    data: "agentd `<instance>` will act as you on: `<servers from template>`,
    scopes `<scopes>`, until `<expiry>`, unattended: `<never|ciba|standing>`".
@@ -1412,7 +1411,7 @@ A **template** is operator configuration that decides who may enrol, for what:
 
 | Field | Meaning | Default |
 |---|---|---|
-| `principals` | Matcher over the typed principal: `source`, `role`, `labels`. Cannot match role `agent`, `bearer` or placeholder principals (nor v1.16 pairing principals, which RFC 0043 removes). | required |
+| `principals` | Matcher over the typed principal: `source`, `role`, `labels`. Cannot match role `agent`, `bearer` or placeholder principals. | required |
 | `clients` | For P3 inbound principals: the allowed front-end client IDs (`azp`/`cid`/`client_id`). A grant is usable only through a named front end. | `[]` (display-client sessions only) |
 | `idp` | The one IdP the template binds its principals to | required |
 | `servers.<name>.scopes` | Per-server scope ceiling | required |
@@ -2544,7 +2543,7 @@ nothing more. It never chooses **whose** authority is used, **how much**, or
      reads (`AWS_*` when an `aws` `source: env` credential is routed to it,
      intelligence keys), plus the `{{secret:NAME}}` references its own payload
      names, plus an operator `spawn.env_passthrough` list. Listed in §7.1 as a
-     behaviour change with a migration note.
+     behaviour change.
    - keys under `identity.*` and on delegated servers are resolved **only** in
      the supervisor. Two sources are accepted: `{{secret:NAME}}` resolved from
      the startup prompt (`--prompt-missing`) **only, never the environment**,
@@ -2919,7 +2918,7 @@ against 250 per user, per resource app, per month; and refuses
 ### 5.14.1 Amendment to RFC 0042 (normative, part of P1)
 
 RFC 0042's allow-list admits the whole `mcp` section to documents
-(`DOCUMENT_MAY_WRITE`, `config/v2/mod.rs:924`; RFC 0042 §4, "workflows, streams,
+(`DOCUMENT_MAY_WRITE`, `config/settings/mod.rs:924`; RFC 0042 §4, "workflows, streams,
 mcp, vars"), so `mcp.servers[].auth.*` is document-writable today. Without this
 amendment a served document or a `:::!mcp` block could declare or shadow a
 server with `grant: id_jag`, its own `idp`, `audience` and `resource` pins and
@@ -2958,7 +2957,7 @@ unless noted.
 
 | Feature | Change |
 |---|---|
-| **RFC 0031 `auth:` block** (`config/v2/mod.rs`) | `OAuthGrant` (:2128) gains `IdJag` (P1) and `TokenExchange` (P3). No new `AuthKind`, which keeps RFC 0031's one-`auth:`-block-per-endpoint rule. `Auth` gains `idp`, `client_auth{method, key, kid, alg, assertion_aud}`, `resource`, `subject`, `tool_scopes`, `scope_mode`, `tools_from`, `id_jag`, `id_jag_reuse`, `on_revoked`, `allow_unbound_at`, `attribution`. The existing `audience` (sent today at device start, `auth/oauth2.rs:142-144`) keeps that meaning for the other grants and means the RFC 8693 `audience` under the two new ones. `client_secret_*` methods read the existing `client_secret`; a config with both it and a key-based `client_auth` is rejected. The rule that `client_credentials` needs `client_secret` (~:5807) is relaxed when `client_auth` is key-based. Every endpoint gains `resource: auto | omit | <uri>` (§5.6). `Identity` (:2788) gains `providers` and `delegation`. |
+| **RFC 0031 `auth:` block** (`config/settings/mod.rs`) | `OAuthGrant` (:2128) gains `IdJag` (P1) and `TokenExchange` (P3). No new `AuthKind`, which keeps RFC 0031's one-`auth:`-block-per-endpoint rule. `Auth` gains `idp`, `client_auth{method, key, kid, alg, assertion_aud}`, `resource`, `subject`, `tool_scopes`, `scope_mode`, `tools_from`, `id_jag`, `id_jag_reuse`, `on_revoked`, `allow_unbound_at`, `attribution`. The existing `audience` (sent today at device start, `auth/oauth2.rs:142-144`) keeps that meaning for the other grants and means the RFC 8693 `audience` under the two new ones. `client_secret_*` methods read the existing `client_secret`; a config with both it and a key-based `client_auth` is rejected. The rule that `client_credentials` needs `client_secret` (~:5807) is relaxed when `client_auth` is key-based. Every endpoint gains `resource: auto | omit | <uri>` (§5.6). `Identity` (:2788) gains `providers` and `delegation`. |
 | **RFC 0031 credential cache** (`auth/cache.rs`) | The unused durable helpers become the sealed grant vault, finally delivering §11's `(endpoint, provider, principal)` key and §16's on-behalf-of extension. The existing per-endpoint cache is re-keyed by AS issuer (SEP-2352) and gets refresh write-back and RFC 7009. |
 | **OAuth helpers** (`auth/oauth2.rs`, `browser.rs`, `device.rs`, `login.rs`, `challenge.rs`, `mcp/oauth.rs`) | P0: `resource` on every grant to an MCP server's AS (per-endpoint override elsewhere, default `omit` for `intelligence` and A2A peers, §5.6); `id_token` kept in `Tokens`; MCP discovery order with issuer check; path-inserted PRM with `resource` equality, at connect time; PKCE gate; RFC 9207 `iss` and `nonce`; refresh write-back and retention; RFC 7009; one shared auth HTTP helper (§5.6). New: `auth/client_assertion.rs` (`private_key_jwt` on `ring`, already linked for `aauth/sig.rs` and `config/attest`), `auth/idjag.rs` (exchange, redeem, checks) and one wire-constants module, so an ID-JAG -05 rename is a one-file change. |
 | **`crates/mcp`** | `RequestSigner` (`http.rs:182`) is **unchanged**; the delegated signer's `sign()` is a pure read of an already-minted token, and minting runs as reactor work before dispatch (§5.7). `AuthResponse` (`http.rs:156`) gains `www_authenticate: Option<String>` (additive). `client.rs:266` / `modern.rs:53` add the EMA key for `id_jag` servers; 2025-11-25 adds it to `initialize`. `rmcp` stays at 3.1.2 without its `auth` feature (§8). |
@@ -2967,7 +2966,7 @@ unless noted.
 | **Child environments** (`supervisor/spawn.rs`, `runtime/instances.rs:463-469`) | P0 strips the reserved supervisor-only names; P2 moves to an allow-list with a baseline and `spawn.env_passthrough` (§5.13 item 1, §7.1). |
 | **Attribution** (P0) | `agent/acting_for` and labels added on `runtime/steps.rs:1670`, `runtime/turns.rs:399` and `:766`, `runtime/steps.rs:2211-2213`, `worker.rs:588`; subagent and think `ToolCaller`s inherit the principal (`runtime/tools.rs:93-104`). On delegated servers the value becomes the ID-JAG's `sub` (§5.7). |
 | **`agent/acting_for`** | Stays the attribution label for agent-mode calls. For delegated calls it is now backed by a real token whose `sub` is the same person. |
-| **Principals and roles** (RFC 0029, `a2a/principals.rs`) | Typed principal (§5.2); `sub` becomes a glob (fixes `principals.rs:417` against `docs/configuration.md:1884`); matcher fields combine with AND (today an else-if chain, `principals.rs:407-427`); new `token_iss` matcher (P3); `Principal` (`config/v2/mod.rs:3043`) gains `idp_subject` (pins); `id`, which RFC 0043 adds and requires on `bearer_ref` and `any` rules, also names per-person operators; `principal_of` populates the verified subject. The v1.16 `user:paired` and `user:unknown` collapses are already gone with RFC 0043 (pairing removed, rule ids required). RFC 0043's operator-named device principals (`user:<name>`, several devices per name by design) are delegation-eligible only with a `device_pins` pin or an IdP binding re-checked per session (§5.2). |
+| **Principals and roles** (RFC 0029, `a2a/principals.rs`) | Typed principal (§5.2); `sub` becomes a glob (fixes `principals.rs:417` against `docs/configuration.md:1884`); matcher fields combine with AND (today an else-if chain, `principals.rs:407-427`); new `token_iss` matcher (P3); `Principal` (`config/settings/mod.rs:3043`) gains `idp_subject` (pins); `id`, which RFC 0043 adds and requires on `bearer_ref` and `any` rules, also names per-person operators; `principal_of` populates the verified subject. The v1.16 `user:paired` and `user:unknown` collapses are already gone with RFC 0043 (pairing removed, rule ids required). RFC 0043's operator-named device principals (`user:<name>`, several devices per name by design) are delegation-eligible only with a `device_pins` pin or an IdP binding re-checked per session (§5.2). |
 | **`identity.autonomous_as`** | Unchanged as the M3 label. Trigger authority becomes a typed event field (§5.2). |
 | **Trifecta and policies** (`sec/scope.rs:170-182`, `sec/policy.rs`) | A delegated grant counts as `sensitive`; new facts and `any_tags` (§5.13); `to: principal`; `once_per`. |
 | **HITL** (RFC 0032, `runtime/human.rs`) | `PendingKind::Consent` next to `PendingKind::Human`; in P1 the enrolled operator answers with `--delegation-approve`/`--delegation-deny` (`via: operator_self`); consent and policy gates excluded from `spawn_human_judge` and from `operator_override`; polling moves to reactor timers, and the AAuth Person Server poll (`aauth/ps.rs:79-99`) is ported to them. |
@@ -3478,21 +3477,20 @@ command set (`--workspace --all-features`, the per-feature solo matrix, and the
 a2a-spec oracle), the shipped examples validate, and the RFC 0042 completeness
 test covers every new key.
 
-### 7.1 Compatibility
+### 7.1 Behaviour changes
 
 P0 has no delegation surface, but it changes behaviour that existing
-deployments can see. These are all the behaviour changes, each with its
-migration:
+deployments can see. These are all of them:
 
-| Change | Who notices | Migration |
-|---|---|---|
-| A2A context IDs become random values, namespaced per principal (**RFC 0043, v1.17.0**; listed because P0 relies on it) | Clients that parsed or predicted the sequential IDs; setups where several principals shared one conversation | None for spec-following clients; IDs were always opaque. A foreign `contextId` now opens the sender's own conversation; operators may still read; share by starting a context per principal. |
-| `match.sub` becomes a glob, and matcher fields combine with AND | Rules that named several matchers and relied on the first one winning | `--validate-config` warns on any rule naming more than one matcher. Documented `sub` globs start working. |
-| A webhook, stream or signal payload's `principal` key no longer sets the run's authority | Policies with `match.principal` on those triggers | The value is kept as the attribution label (`agent/acting_for`); policies that must match it use a `label_principal` fact. |
-| Child processes lose the reserved supervisor-only variables | Nothing that exists today (these names are new) | None. The P2 allow-list is the larger change and is listed there. |
-| RFC 8707 `resource` is sent to MCP servers' authorization servers | An AS that rejects unknown parameters | Per-endpoint `resource: omit`. `intelligence` and A2A peers default to `omit`, so Entra (AADSTS901002) is unaffected. |
-| A discovered `token_endpoint` must be same-origin with its issuer | MCP servers whose PRM names a cross-origin AS token endpoint | Pin the issuer; metadata from a pinned issuer is trusted for its declared endpoints (Google's documented shape keeps working). |
-| AS discovery tries RFC 8414 before OIDC, with path insertion and a byte-equal `issuer` | An AS whose metadata `issuer` differs from its URL | Fix the AS or pin the endpoints; mismatched metadata was never safe to use. |
+| Change | Effect |
+|---|---|
+| A2A context IDs are random values, namespaced per principal (**RFC 0043, v1.17.0**; listed because P0 relies on it) | IDs were always opaque, so spec-following clients see no difference. A foreign `contextId` opens the sender's own conversation; operators may still read; sharing means starting a context per principal. |
+| `match.sub` is a glob, and matcher fields combine with AND | A rule that names several matchers matches only a caller all of them admit. Documented `sub` globs match. |
+| A webhook, stream or signal payload's `principal` key does not set the run's authority | The value is kept as the attribution label (`agent/acting_for`); policies that must match it use a `label_principal` fact. |
+| Child processes do not receive the reserved supervisor-only variables | None today: these names are new. The P2 allow-list is the larger change and is listed there. |
+| RFC 8707 `resource` is sent to MCP servers' authorization servers | An AS that rejects unknown parameters needs per-endpoint `resource: omit`. `intelligence` and A2A peers default to `omit`, so Entra (AADSTS901002) is unaffected. |
+| A discovered `token_endpoint` must be same-origin with its issuer | An MCP server whose PRM names a cross-origin AS token endpoint needs its issuer pinned; metadata from a pinned issuer is trusted for its declared endpoints (Google's documented shape keeps working). |
+| AS discovery tries RFC 8414 before OIDC, with path insertion and a byte-equal `issuer` | An AS whose metadata `issuer` differs from its URL is refused until it is fixed or its endpoints are pinned; mismatched metadata was never safe to use. |
 
 P2 adds one more: **child environments become an allow-list** (baseline, the
 variables of credential sources routed to that child, the payload's secret
@@ -3544,8 +3542,7 @@ kept as regression checks): `securitySchemes` non-empty whenever
 `extendedAgentCard` is true; a message into another principal's context joins
 nothing of theirs and mints nothing under their grant. A webhook payload containing `principal`
 yields an agent-mode run. A worker's `/proc/self/environ` holds no reserved
-supervisor-only name. The only behaviour changes are those in §7.1, each with
-its migration note.
+supervisor-only name. The only behaviour changes are those in §7.1.
 
 ### P1 — ID-JAG client for one enrolling person (a per-person operator)
 

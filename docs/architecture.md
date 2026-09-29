@@ -116,7 +116,7 @@ implementation the other implementations cannot link is a reference nobody uses.
 
 **Third-party surface sits in the leaves, and is optional above them.** `net`
 holds one heavy end of the default build — `rustls` and `webpki-roots`
-behind its `tls` feature, `vsock` behind `vsock` — and `mcp`
+behind its `tls` feature — and `mcp`
 carries the other: the official `rmcp` SDK and the async runtime it needs
 (`tokio`, `futures`, `sse-stream`, `tokio-stream`, `thiserror`, `http`). Beyond
 its own three (`serde`, `serde_json`, `libc`), the engine names fourteen further
@@ -486,8 +486,6 @@ $ agentd \
 The same binary, woken by an MCP resource and keeping state across restarts:
 
 ```yaml
-config_version: "1"
-
 agent:
   name: triage
   instruction: You triage incoming issues and write a one-paragraph summary.

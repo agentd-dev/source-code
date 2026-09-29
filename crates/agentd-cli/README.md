@@ -39,7 +39,6 @@ quitting a client leaves the agent working.
 ## In 20 lines
 
 ```yaml
-config_version: "2"
 agent:
   name: triage
   instruction: You triage incoming issues. Be precise; ask if unsure.

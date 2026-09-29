@@ -382,8 +382,6 @@ says otherwise.
 | `lifecycle.drain_timeout`, `.exit_code_map`, `.run_id`, `.watch_config` | the orchestration contract: what an orchestrator sees, and whether the process watches its own config file |
 | `observability.log_content`, `.audit`, `.otel`, `.metrics_addr`, `.health_file`, `.report_file`, `.events_ring`, `.traceparent` | `log_content` puts conversation TEXT into the operator's log pipeline; `otel.endpoint` is the one egress `closed` deliberately does not cover; the rest name sockets and files |
 | `skills.dir`, `skills.sources` | where skills are READ FROM — a folder or source whose contents become prompt text |
-| `instruction_sources` | the pre-1.13 spelling of `trust` — refused as operator configuration rather than handed the rename hint |
-| `instruction` | the specification's own top-level spelling for the same surface — refused by name during the fold, before the fragment reaches the path check; agentd's config lost the section (the envelope keys live at `agent.instruction.decrypt`), and a document may not re-point the instruction it is |
 
 The check is by **path**, not by top-level key name — the fragment merges deep
 and arrays concatenate, so a nested `agent: {document_capabilities: […]}` is
@@ -458,7 +456,7 @@ token. Push with any client:
 
 ```console
 $ oras push ghcr.io/acme/support-agent:v3 \
-    --artifact-type application/vnd.instruction.document.v1 \
+    --artifact-type application/vnd.instruction-md.instruction.v1 \
     agent.md:'text/markdown; variant=instruction'
 ```
 
@@ -498,10 +496,7 @@ agent:
 ```
 
 The keys are operator surface and unreachable from a served `:::!config` — a
-document never names the key that decrypts it. (The top-level
-`instruction:` section is gone: a config that still carries it is refused by
-name at load — exit 2, naming `agent.instruction.decrypt` as the new home.) A
-binary built **without** the feature still detects an envelope and refuses it
+document never names the key that decrypts it. A binary built **without** the feature still detects an envelope and refuses it
 by name; ciphertext is never delivered to the model as prose. Sign-then-encrypt
 puts the §7 author signature *inside* the envelope (even authorship stays
 confidential); the delivery signature covers the ciphertext as sent.

@@ -220,7 +220,6 @@ run is durable, and the loop's iteration state survives a restart:
 
 ```yaml
 # poll.yaml
-config_version: "1"
 intelligence: { endpoints: https://gw.example/v1, model: my-model }
 store: { kind: mcp, mcp: { server: state } }
 mcp:

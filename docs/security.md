@@ -31,7 +31,7 @@ the network is bounded to a whitelist: an A2A caller's `config.set` reaches thre
 display/debug paths plus `agent.approval` — the human-approval mode, operator-only and
 deliberately settable mid-session, because how closely you want to be asked changes with
 what the agent is doing (`a2a_server/introspection.rs::interface_config_set`) — and nothing else, every
-other path refused by name in that same function's catch-all arm, which answers with the
+other path refused in that same function's catch-all arm, which answers with the
 list of what *is* settable. The model can never register an MCP server, edit an endpoint,
 or name a binary to run.
 
@@ -82,11 +82,10 @@ The trust budget is three operator-declared tags:
 | `egress` | the tool can move data out or change external state — HTTP POST, send mail, open a pull request |
 
 Tags are parsed as snake-case strings from config only; an unrecognized tag is a hard
-config error (`config/v2/mod.rs::McpServer::tag_set`). Nothing the model or a server says
+config error (`config/settings/mod.rs::McpServer::tag_set`). Nothing the model or a server says
 feeds the gate.
 
 ```yaml
-config_version: "1"
 mcp:
   servers:
     - { name: web,   endpoint: https://mcp-fetch.internal/mcp, tags: { "*": [untrusted_input] } }
@@ -103,12 +102,12 @@ grant reads untrusted input.
 
 Tags are **per server, not per tool.** The config shape is a map keyed by glob, but
 `McpServer::tag_set()` iterates `self.tags.values()` and discards the keys
-(`config/v2/mod.rs::McpServer::tag_set`); `Registry::build` stamps that union onto every
+(`config/settings/mod.rs::McpServer::tag_set`); `Registry::build` stamps that union onto every
 tool of the server (`registry/mod.rs::Registry::build`). So
 `tags: {"send_*": ["egress"], "read_*": ["untrusted_input"]}` does not split the server
 into two risk classes — both tools end up `untrusted_input | egress`. The only real split
 is one MCP server per tag profile. An **untagged server counts as `untrusted_input`**
-(`config/v2/mod.rs::validate`, in the fold headed `// trifecta over the root grant`), the
+(`config/settings/mod.rs::validate`, in the fold headed `// trifecta over the root grant`), the
 conservative default.
 
 ### Where the gate runs
@@ -132,7 +131,7 @@ flowchart TB
   K -- ok --> M["payload minted, binary re-exec'd"]
 ```
 
-Gate 1 lives inside config `validate()` (`config/v2/mod.rs::validate`, where the
+Gate 1 lives inside config `validate()` (`config/settings/mod.rs::validate`, where the
 root-grant fold ends in a `check_trifecta` call), the single validation authority that
 both startup and
 `--validate-config` run, so the two can never disagree. A refusal is a config error —
@@ -152,7 +151,7 @@ instance declaring an untrusted-input reader, a secrets server, and an egress se
 not start, even if you intend to hand each leg to a different subagent. To run that shape
 you either set `security.allow_trifecta: true` — which relaxes gate 2 as well — or run
 separate agentd instances per risk profile. `security` is a restart-only config path
-(`config/v2/mod.rs::RESTART_ONLY_PATHS`), so a hot reload can never widen the override; a
+(`config/settings/mod.rs::RESTART_ONLY_PATHS`), so a hot reload can never widen the override; a
 reload touching it is refused as `restart_required` and the running config is kept.
 
 Not every leg comes from `mcp.servers`: a binary built with the `exec` feature and
@@ -357,7 +356,7 @@ RPC method and `Principal::may_command` for a command DataPart:
 `status` and `interface.info` are always granted to any non-anonymous role
 (`principals/mod.rs::Principal::may_command`). Of the 53 internal contracts, exactly one —
 `status` — carries a default grant for `user`/`agent`. The admin family (`drain`,
-`lameduck`, `pause`, `resume`, `cancel`) is refused by name for every non-operator role,
+`pause`, `resume`, `cancel`) is refused for every non-operator role,
 independent of grants. Bearer
 tokens and pairing codes are compared in constant time: `principals/resolve.rs::ct_eq` for a
 principal's bearer (`::Compiled::matches`), and the shared `sha.rs::ct_eq` for the static
@@ -437,14 +436,14 @@ Secret verbatim while editors append one; interior whitespace stays part of the 
 An unknown `{{…}}` token is an **error**, not a pass-through, so a typo cannot smuggle
 braces onto the wire. Errors name the reference, never the value: a missing variable yields
 `{{secret:NAME}} is not set in the environment`. The `Secret` newtype's `Debug` prints
-`***` (`config/v2/mod.rs::Secret`), so a credential cannot reach a log line, a payload dump,
+`***` (`config/settings/mod.rs::Secret`), so a credential cannot reach a log line, a payload dump,
 or a panic message through formatting. The durable subagent record is written with the
 intelligence token nulled out, re-supplied from live settings on restore
 (`subagents.rs::secret_free_payload`).
 
 Two checks catch an inline credential in the config **file**. Four paths must be references
 outright — `/intelligence/token`, `/a2a/bearer`, `/security/aauth/enroll_token`, and each
-MCP server's `oauth.client_secret` (`config/v2/mod.rs::secret_violations`, whose first
+MCP server's `oauth.client_secret` (`config/settings/mod.rs::secret_violations`, whose first
 three come from `::FILE_SECRET_PATHS`). Separately, any header whose
 *key* looks credential-shaped — `authorization`, `api-key`, `x-api-key`, `token`,
 `password`, `secret`, or anything ending `-token` / `_token` / `-key` / `_key`
@@ -464,7 +463,7 @@ anything else exits `2` before any side effect (`config/mod.rs::mcp_endpoint_sch
 The same rule holds for the intelligence endpoint. A non-loopback `a2a.listen` **must**
 configure client auth — `a2a.tls.client_ca`, `a2a.bearer`, or `interface.pairing` — or
 startup fails validation, and plaintext `http://` on a non-loopback bind is likewise a
-startup error (`config/v2/mod.rs::validate`, the two refusals in its `a2a.listen` block).
+startup error (`config/settings/mod.rs::validate`, the two refusals in its `a2a.listen` block).
 
 One default deserves emphasis: **a loopback caller with no `a2a.principals` configured
 resolves to operator** with `grants: ["*"]` (`principals/resolve.rs::Resolver::build` sets the flag,
@@ -474,7 +473,7 @@ operator, which includes flipping `agent.approval` to `accept` over `config.set`
 agent's own `ask_human` gates then answer themselves from whatever they recommend, and the
 ones recommending nothing fall to a model judge (`runtime/human.rs::ask_human_tool`,
 `::spawn_human_judge`) — until the next reload puts the file's value back, since
-`agent.approval` is reloadable (`config/v2/mod.rs::RELOADABLE_PATHS`). Two kinds of gate
+`agent.approval` is reloadable (`config/settings/mod.rs::RELOADABLE_PATHS`). Two kinds of gate
 survive that flip: one that names its decider with `to:`, which is never auto-answered
 whatever the policy says — the `_ if addressee.is_some()` arm of `ask_human_tool`
 short-circuits ahead of every approval mode — and an operator-declared `security.policies`

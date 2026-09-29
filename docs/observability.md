@@ -76,7 +76,7 @@ Example — one supervisor line and one agent line:
 ```
 
 Set verbosity with `--log-level trace|debug|info|warn|error` (default `info`;
-env `AGENT_LOG_LEVEL`). The level filter is a cheap integer compare *before* any
+env `AGENTD_LOG_LEVEL`). The level filter is a cheap integer compare *before* any
 allocation — below-level calls cost essentially nothing.
 
 ---
@@ -94,7 +94,7 @@ exhaustive.
 
 | Event | Fields beyond canonical |
 |---|---|
-| `proc.start` | `version`, `runtime`, `instance`, `config_files` |
+| `proc.start` | `version`, `instance`, `config_files` |
 | `proc.ready` | readiness reached (see [Health](#health-shape-aware)) |
 | `proc.exit` | `code`, `uptime_ms` |
 | `config.invalid` / `config.warning` / `config.reloaded` | `error` / `warning` — one validation or reload finding, never a secret value; `config.reloaded` carries `trigger` and `changed` |
@@ -318,7 +318,7 @@ The default logs **hashes and lengths only** — never raw content:
 - `*_hash` is the first 8 hex chars of a fast non-cryptographic digest — a
   stable correlation aid, **not** a security primitive.
 
-`--log-content` (env `AGENT_LOG_CONTENT`) opts in to capturing
+`--log-content` (env `AGENTD_LOG_CONTENT`) opts in to capturing
 prompt / tool-arg / result bodies. It is loud, gated, and redaction-aware. It is
 a debug/non-prod switch.
 
@@ -342,7 +342,7 @@ backend.
 **Ingest (mint-or-adopt):**
 
 - If an inbound `traceparent` arrives — on an inbound A2A request to agentd's
-  listener, or via the **`AGENT_TRACEPARENT`** env var when an orchestrator starts
+  listener, or via the **`AGENTD_TRACEPARENT`** env var when an orchestrator starts
   the pod — adopt its `trace_id` and use its `span_id` as the root
   `parent_span_id`.
 - Otherwise **mint one `trace_id` per `run_id`** (16 random bytes) so the run is
@@ -446,9 +446,9 @@ the pod is not "ready", so an orchestrator won't route work to it.
 run — a pure CLI invocation carries zero health machinery. HTTP and socket
 surfaces are opt-in and never on for a one-shot.
 
-> `--health-file`, `--log-level` (plus `AGENT_LOG_LEVEL`), `--log-content`,
+> `--health-file`, `--log-level` (plus `AGENTD_LOG_LEVEL`), `--log-content`,
 > `--listen` (the A2A listener), and `--metrics-addr` (behind `metrics`) are the
-> observability flags; see [`config/v2/`](../crates/agentd/src/config/v2/) for the
+> observability flags; see [`config/settings/`](../crates/agentd/src/config/settings/) for the
 > authoritative flag/env list. `--aggregate-logs` and `--health-http` remain
 > roadmap items tracked in
 > [`docs/design/01-durable-agent-plan.md`](design/01-durable-agent-plan.md).
@@ -569,12 +569,8 @@ A tiny in-process table of atomic counters/gauges feeds a hand-written
 served on the already-opt-in surface (`/metrics`). **No `prometheus` or `metrics`
 crate** — it is plain text, no async, no SDK.
 
-The metric **names** and label **keys** are a **frozen, versioned contract**
-(`metrics_schema` = `1.2`, owned by `obs::metrics::METRICS_SCHEMA`). The set is
-additive within the major — 1.1 added the `agent_budget_tokens_remaining` gauge
-and the `tokens_lifetime` limit value; 1.2 the resource-pressure set below; a
-rename or removal bumps the major. A
-control plane authors scalers/alerts against it. Labels carry
+The metric **names** and label **keys** are a **stable contract** a control
+plane authors scalers and alerts against. Labels carry
 **bounded** values only — out-of-vocabulary values fold into an `other` slot so
 the cardinality is structurally bounded (the closed label set is a compile-time
 array). The same cardinality discipline as the default story applies: **never**
@@ -624,7 +620,7 @@ The A2A/hot-reload surfaces add these to the frozen set:
   NotReady); distinct from `agent_intel_up` (the active endpoint's
   reachability).
 - **`agent_restarts_total`**, **`agent_reactor_stalls_total`** *(counters;
-  **reserved** in `metrics_schema 1.0`)* — supervisor process restarts observed
+  **reserved**)* — supervisor process restarts observed
   (rebuild+reconcile), and wedged-reactor liveness trips. Both are rendered but
   **not emitted** in this build: there is no in-process rebuild+reconcile path for
   the former (a pod restart is a fresh zeroed process the orchestrator counts), and
@@ -649,7 +645,7 @@ the gauges that do move. The same reservation covers `agent_active_subagents`,
 - **`agent_subscriptions_active`** — reconciled declared subscriptions.
 - **`agent_reaction_lag_ms`** — age of the oldest un-routed pending event.
 
-#### Resource-pressure gauges (schema 1.2)
+#### Resource-pressure gauges
 
 - **`agent_pressure_level`** — 0 ok, 1 warn, 2 shedding (admission stopped,
   in-flight work draining; the levels and gates are in

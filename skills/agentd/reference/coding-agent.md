@@ -18,8 +18,6 @@ cargo build -p agentd-cli --release --features a2a,exec
 ## 2. Configure
 
 ```yaml
-config_version: "1"
-
 agent:
   name: coder
   instruction: |

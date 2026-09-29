@@ -7,7 +7,7 @@ a malformed endpoint, a mistyped workflow step, or an unresolvable secret
 reference exits `2` in milliseconds, not after an LLM round-trip or an MCP
 handshake.
 
-The configuration is one nested **`config_version: "1"`** document, with the
+The configuration is one nested document, with the
 sections `agent`, `goal`, `intelligence`, `mcp`, `tools`, `store`, `memory`,
 `context`, `knowledge`, `search`, `skills`, `subagents`, `services`,
 `workflows`, `streams`, `webhooks`, `limits`, `lifecycle`, `a2a`, `interface`,
@@ -29,14 +29,13 @@ values for every enum, and flag a typo as you type rather than at `exit 2`:
 
 | Document | URL |
 |---|---|
-| a config file | `https://agentd.dev/schema/config.json` (pinned: `config-1.json`) |
-| a standalone workflow file | `https://agentd.dev/schema/workflow.json` (pinned: `workflow-3.json`) |
+| a config file | `https://agentd.dev/schema/config.json` |
+| a standalone workflow file | `https://agentd.dev/schema/workflow.json` |
 
 The one-line form, which needs no editor settings and travels with the file:
 
 ```yaml
 # yaml-language-server: $schema=https://agentd.dev/schema/config.json
-config_version: "1"
 agent:
   name: my-agent
 ```
@@ -75,10 +74,6 @@ document; `agentd --validate-config` reports all of them at once, and that
 remains the authority. And it does not know your secrets exist: a
 `{{secret:NAME}}` reference is just a string until startup resolves it.
 
-Pin the versioned URL (`config-1.json`) when you want a config to keep
-validating against the version it was written for; the unversioned alias
-follows whatever the current major is.
-
 The files are generated from the binary — the same functions the loader uses —
 and CI regenerates and diffs them, so the published schema cannot drift from
 the code. Emit them yourself with `agentd --config-schema` and
@@ -98,7 +93,7 @@ built-in default  <  config file  <  env var  <  CLI flag
 - **built-in default** — the compiled-in defaults (see the table below).
 - **config file(s)** — local-only **YAML or JSON** files (`--config <path>`, or
   `-c`; the value may attach with `=`; repeatable;
-  `AGENT_CONFIG=a.yaml:b.yaml`) carrying verbose **structural**
+  `AGENTD_CONFIG=a.yaml:b.yaml`) carrying verbose **structural**
   config (the MCP-server inventory, workflow definitions, A2A peers and
   principals, the store, limits, model/log knobs, intelligence endpoint list +
   headers). **Live.** Several files compose into **one document,
@@ -123,7 +118,7 @@ plumbing (`agentd --help` prints the full table under `CONFIG PATHS`):
 | source | name for the path `limits.run.steps` |
 |---|---|
 | file (YAML or JSON) | `limits: { run: { steps: 5 } }` |
-| env | `AGENTD_LIMITS_RUN_STEPS` › `AGENT_LIMITS_RUN_STEPS` › bare `LIMITS_RUN_STEPS` (first present wins) |
+| env | `AGENTD_LIMITS_RUN_STEPS` |
 | flag | `--limits.run.steps 5` = `--limits.run-steps 5` = `--limits-run-steps 5` |
 
 Values are **typed by the schema**: integers/numbers/booleans parse, enums are
@@ -137,7 +132,7 @@ path *replaces* what the files declared (`AGENTD_TOOLS_DISABLED=a,b` ⇒ exactly
 `[a, b]`; `--mcp-servers '[{name: q, endpoint: https://…}]'` ⇒ exactly that
 list). The **named repeatable flags** (`--mcp`, `--a2a-peer`, `--workflow`)
 *add* one element. The named scalar aliases in §3 (`--max-steps`,
-`AGENT_MAX_STEPS`, …) set the same path with a shorter spelling.
+`AGENTD_MAX_STEPS`, …) set the same path with a shorter spelling.
 
 **Dotted flags reach into objects.** `--limits.run.steps 5` sets a nested
 schema path; `--intelligence.headers.x-team ops` sets ONE entry of a free-form
@@ -150,7 +145,7 @@ repeatable flag.
 Example — a flag beats the environment:
 
 ```console
-$ INSTRUCTION='from-env' AGENT_INTELLIGENCE=https://gw.example/v1 \
+$ AGENTD_INSTRUCTION='from-env' AGENTD_INTELLIGENCE=https://gw.example/v1 \
     agentd --instruction 'from-flag'
 # effective instruction: "from-flag"   (flag wins)
 # effective intelligence: https://gw.example/v1  (env, no flag given)
@@ -177,7 +172,6 @@ a bad document only reproduces it).
 
 | Check | Example diagnostic (exit 2) |
 |---|---|
-| `config_version` is `"1"` | `config_version must be "1" (got "3")` |
 | every `intelligence.endpoints` element is `https://` (loopback `http://` for dev) | `intelligence endpoint must be https://host[:port][/path] (got: ftp://nope)` / `plaintext http:// intelligence is allowed for loopback only (dev); use https://` |
 | `intelligence.swap_policy` / `dialect` / `auth` are coherent | `intelligence.dialect: bedrock requires intelligence.auth.kind = aws (SigV4)` |
 | every `mcp.servers[]` has a unique non-reserved name, a valid endpoint, and parseable tags | `mcp.servers[]: a server has an empty name` · `mcp.servers[]: duplicate server name 'fs'` · `mcp server 'a': mcp endpoint must be https://host[:port][/path] (got: ftp://x)` |
@@ -231,12 +225,10 @@ an operator reaches for most. They are derived verbatim from the binary's
 `--help`, which also prints the complete `CONFIG PATHS` table — **every** schema
 path as `--<path>` and `AGENTD_<PATH>`, whether or not it has an alias here.
 
-The **Env** column names the alias's short env var. Each is read as
-`AGENTD_<NAME>` › `AGENT_<NAME>` › bare `<NAME>` (first present wins) — so
-`INSTRUCTION` below means `AGENTD_INSTRUCTION`, `AGENT_INSTRUCTION`, or a bare
-`INSTRUCTION`. The one exception is `AGENT_CONFIG`, which is written out because
-it takes only the two prefixed spellings. A blank cell means the setting has no
-short env var — reach it by its path instead (`--health-file` ⇒
+The **Env** column names the alias's short env var, read under the one
+`AGENTD_` prefix — so `INSTRUCTION` below means `AGENTD_INSTRUCTION`. A name
+written out in full (`AGENTD_CONFIG`, `AGENTD_A2A_LISTEN`) is read exactly as
+written. A blank cell means the setting has no short env var — reach it by its path instead (`--health-file` ⇒
 `AGENTD_OBSERVABILITY_HEALTH_FILE`). Every alias's target path is given so the
 file spelling is never in doubt.
 
@@ -262,7 +254,7 @@ file spelling is never in doubt.
 | `--prompt.url <URL>` | `agent.prompt.url` | — | — | An `https://` document, fetched at load. |
 | `--prompt.oci <REF>` | `agent.prompt.oci` | — | — | An OCI artifact (needs `--features oci`). |
 | `--intelligence <LIST>` | `intelligence.endpoints` | `INTELLIGENCE` | *(none)* | Ordered, comma-separated LLM endpoint **list** for failover. Each element is `https://host[:port][/path]` (or a loopback `http://` for a same-host dev gateway) — see §4. |
-| `-c`, `--config <PATH>` | — | `AGENT_CONFIG` | *(none)* | Load a declarative config file — YAML or JSON (§12). Repeatable; the `=` form works too. |
+| `-c`, `--config <PATH>` | — | `AGENTD_CONFIG` | *(none)* | Load a declarative config file — YAML or JSON (§12). Repeatable; the `=` form works too. |
 
 ### 3.2 Intelligence
 
@@ -286,9 +278,9 @@ SPIFFE) and `intelligence.dialect` / `intelligence.headers` /
 |---|---|---|---|---|
 | `--mcp name=<endpoint>` | `mcp.servers` *(adds one)* | — | *(none)* | Declare a remote MCP server, reached over **Streamable HTTP** — `name=https://host[:port][/path]` (or a loopback `http://` for dev). agentd spawns no local process. Repeatable. See §5. **Reloadable** (§11). |
 | `--mcp-tags name=tag,tag` | `mcp.servers[].tags` | — | *(none)* | Capability tags for the Rule-of-Two check: `untrusted_input`\|`sensitive`\|`egress`. Attaches to a declared server (order-independent); an unknown name is exit `2`. Repeatable. |
-| `--listen <TARGET>` | `a2a.listen` | `SERVE_MCP` | *(off)* | Arm the A2A listener — the daemon's external channel and operator control: `https://host:port` (mTLS/bearer auth) or a loopback `http://host:port` (dev). `--serve-mcp` is the same alias. Needs `--features a2a`. |
-| `--serve-cert` / `--serve-key` / `--serve-client-ca` | `a2a.tls.cert` / `.key` / `.client_ca` | — | *(none)* | The listener's server certificate, private key, and client-CA bundle for mTLS. An `https://` listen without cert+key is exit `2`. |
-| `--serve-bearer <T>` | `a2a.bearer` | `SERVE_BEARER` | *(none)* | Static bearer token accepted by the listener. From a *file* it must be a `{{secret:…}}` reference. |
+| `--listen <TARGET>` | `a2a.listen` | `AGENTD_A2A_LISTEN` | *(off)* | Arm the A2A listener — the daemon's external channel and operator control: `https://host:port` (mTLS/bearer auth) or a loopback `http://host:port` (dev). Needs `--features a2a`. |
+| `--a2a.tls.cert` / `--a2a.tls.key` / `--a2a.tls.client_ca` | `a2a.tls.cert` / `.key` / `.client_ca` | — | *(none)* | The listener's server certificate, private key, and client-CA bundle for mTLS. An `https://` listen without cert+key is exit `2`. |
+| `--a2a.bearer <T>` | `a2a.bearer` | `AGENTD_A2A_BEARER` | *(none)* | Static bearer token accepted by the listener. From a *file* it must be a `{{secret:…}}` reference. |
 | `--a2a-peer name=<ENDPOINT>` | `a2a.peers` *(adds one)* | — | *(none)* | Declare a remote A2A delegation peer: `https://host[:port]` (or a loopback `http://`, or `unix:///path` for a co-located instance). Repeatable. Needs `--features a2a`. |
 | `--workflow <FILE>` | `workflows` *(adds one)* | — | *(none)* | Append a workflow definition to `workflows:` as `{name: <file stem>, file: <path>}` — its start node is the trigger. Repeatable; the same as an inline `workflows:` entry. See [`workflows.md`](workflows.md). |
 | `--allow-trifecta` | `security.allow_trifecta` | `ALLOW_TRIFECTA` | `false` | Permit all three lethal-trifecta legs in one agent: the startup refusal is downgraded to a loud, audited warning rather than dropped. |
@@ -334,7 +326,7 @@ AAuth direct dial) still stays bounded. `0` (the default) is unbounded.
   | Policy | The instance | Use when |
   |---|---|---|
   | `drain` *(default)* | finishes live work, then exits `0` | an orchestrator restarts it with a fresh window, which is what a lifetime budget is usually for |
-  | `refuse` | stays up, refusing every admission | you would rather inspect a stopped instance than lose it. The pre-1.15 behaviour |
+  | `refuse` | stays up, refusing every admission | you would rather inspect a stopped instance than lose it |
   | `exit` | stops now, exit `7` | overrunning the ceiling is a failure to notice, not a lifecycle |
 
   The transition is one log line — `budget.lifetime_exhausted` with the policy
@@ -388,12 +380,12 @@ and run time) is documented in [`security.md`](security.md) §11.
 
 | Flag | Path | Env | Default | Description |
 |---|---|---|---|---|
-| `-c`, `--config <PATH>` | — | `AGENT_CONFIG` | *(none)* | Load a declarative config file — YAML (`.yaml`/`.yml`) or JSON (`.json`/`.jsonc`; other extensions are sniffed) (§12). The lowest non-default precedence layer. |
+| `-c`, `--config <PATH>` | — | `AGENTD_CONFIG` | *(none)* | Load a declarative config file — YAML (`.yaml`/`.yml`) or JSON (`.json`/`.jsonc`; other extensions are sniffed) (§12). The lowest non-default precedence layer. |
 | `--validate-config` | — | — | — | Load + validate (files + env + flags), print the admission verdict (one `config.valid` line, or one `config.invalid` line per diagnostic — **all** collected in one pass), exit `0`/`2`. Side-effect-free. |
 | `--effective-config` | — | — | — | Print the **assembled** config and where each setting came from (§10a), to stdout as one JSON object, and exit `0`. Runs on an invalid config too — that is when it is most wanted — reporting the errors on stderr beside it. Credential-shaped values are redacted. Side-effect-free. |
 | `--config-schema` | — | — | — | Print the settings JSON Schema (Draft 2020-12) to stdout and exit `0`. Side-effect-free. |
 | `--workflow-schema` | — | — | — | Print the workflow JSON Schema + node registry to stdout and exit `0`. |
-| `--watch-config` | `lifecycle.watch_config` | `WATCH_CONFIG` | `false` | Watch each config file's parent directory via `inotify` and reload on change (the same reload SIGHUP triggers). Needs a `--config`/`AGENT_CONFIG` file (validated, exit `2`) and the `config-watch` build feature — without the feature the watch is simply not installed. See §11. |
+| `--watch-config` | `lifecycle.watch_config` | `WATCH_CONFIG` | `false` | Watch each config file's parent directory via `inotify` and reload on change (the same reload SIGHUP triggers). Needs a `--config`/`AGENTD_CONFIG` file (validated, exit `2`) and the `config-watch` build feature — without the feature the watch is simply not installed. See §11. |
 
 Hot reload itself (the `hot-reload` feature) is triggered by **SIGHUP** — there
 is no flag for it (§9, §11).
@@ -406,10 +398,10 @@ the web UI opened in a browser. Both set `interface.enabled: true` for you, and
 the client exits with the daemon. To attach detached instead, run `agentd -c …`
 and point `agentd-tui --endpoint <url>` at it. See [`interface.md`](interface.md).
 
-> **Not wired.** There is no `--log-format`/`AGENT_LOG_FORMAT` (the log surface
-> is JSON lines, always), no `--health-addr`/`AGENT_HEALTH_ADDR` (`/healthz` is
+> **Not wired.** There is no `--log-format`/`AGENTD_LOG_FORMAT` (the log surface
+> is JSON lines, always), no `--health-addr`/`AGENTD_HEALTH_ADDR` (`/healthz` is
 > served by the `metrics` feature on `--metrics-addr`), no `RUST_LOG`, and no
-> `--pod-grace`/`AGENT_POD_GRACE_SECONDS`. Only the tables above and the
+> `--pod-grace`/`AGENTD_POD_GRACE_SECONDS`. Only the tables above and the
 > `CONFIG PATHS` table in `agentd --help` are real.
 
 ---
@@ -437,8 +429,8 @@ list is *not* a config error: it fails at the first turn, with exit `4`
 (intelligence unavailable).
 
 **Per-endpoint credentials.** Endpoint 1 uses `--intelligence-token` /
-`AGENT_INTELLIGENCE_TOKEN` (or `…_FILE`). Later endpoints are 1-indexed by env
-only: endpoint 2 → `AGENT_INTELLIGENCE_TOKEN_2` (or `AGENT_INTELLIGENCE_TOKEN_2_FILE`),
+`AGENTD_INTELLIGENCE_TOKEN` (or `…_FILE`). Later endpoints are 1-indexed by env
+only: endpoint 2 → `AGENTD_INTELLIGENCE_TOKEN_2` (or `AGENTD_INTELLIGENCE_TOKEN_2_FILE`),
 endpoint 3 → `_3`, and so on. The inline value wins over the file; an absent
 token is legal (a public/unauthenticated gateway). A per-endpoint token *file* is
 read when that endpoint is resolved, so an unreadable path surfaces there, not at
@@ -451,8 +443,8 @@ $ agentd --instruction 'summarize the queue' \
     --intelligence-token "$LLM_KEY" --model my-model
 
 # Two endpoints with per-endpoint creds (primary + fallback)
-$ AGENT_INTELLIGENCE_TOKEN="$PRIMARY_KEY" \
-  AGENT_INTELLIGENCE_TOKEN_2_FILE=/var/run/secrets/fallback-token \
+$ AGENTD_INTELLIGENCE_TOKEN="$PRIMARY_KEY" \
+  AGENTD_INTELLIGENCE_TOKEN_2_FILE=/var/run/secrets/fallback-token \
   agentd --instruction 'summarize the queue' \
     --intelligence 'https://primary.internal/v1,https://fallback.internal/v1' \
     --model my-model
@@ -837,8 +829,8 @@ and nothing else:
 | `skills.dir`, and every skill file loaded from it | skills are documents, and the reload rebuilds the catalogue from the folder — the per-file watches catch a `<name>/SKILL.md` edit, which a watch on the parent folder never sees |
 
 A reload triggered this way re-reads those documents even when the config
-values around them are byte-identical — an edited workflow file whose entry
-never changed used to reload successfully and change nothing.
+values around them are byte-identical, so an edited workflow file whose entry
+did not change is applied rather than reported as reloaded and ignored.
 
 **Deliberately not watched:**
 
@@ -874,9 +866,7 @@ agent:
 ```
 
 It is **not** a source. `file`, `dir`, `url`, `oci` and `mcp` above say where
-the document comes from; `trust` says who may have signed what they serve. (It
-was `instruction_sources` at the top level through v1.12.0; the old spelling is
-refused by name.)
+the document comes from; `trust` says who may have signed what they serve.
 
 **Where it applies — everywhere.** The signature travels INSIDE the document,
 as a front-matter `signature:` line, so the same signed bytes verify however
@@ -1185,7 +1175,7 @@ number, or an unknown unit is a usage error (exit `2`), e.g.
 
 ## 8. Run ID & idempotency
 
-`lifecycle.run_id` (`--run-id` / `AGENT_RUN_ID`) is the idempotency key
+`lifecycle.run_id` (`--run-id` / `AGENTD_RUN_ID`) is the idempotency key
 propagated into every outbound MCP `tools/call` `_meta` — alongside
 `agent/instance` and a `traceparent` — so backing services can dedupe retries.
 
@@ -1317,7 +1307,7 @@ a process restart. Two triggers funnel into the **identical** reload routine:
 - **`lifecycle.watch_config`** / `--watch-config` (`--features config-watch`) —
   an `inotify` watch on each config file's *parent directory*, so a Kubernetes
   ConfigMap volume swap (an atomic directory-symlink rename) is seen and reloads
-  in place. Needs a `--config`/`AGENT_CONFIG` file (else exit `2` — watching
+  in place. Needs a `--config`/`AGENTD_CONFIG` file (else exit `2` — watching
   nothing is a usage error).
 
 Reload is **validate-first**: the files are re-read and re-merged through the
@@ -1362,7 +1352,7 @@ unit of work picks the new values up):
 **Restart-only paths** — a reload whose effective document differs under any of
 these is **refused** with `restart_required` (roll the pod instead):
 
-`config_version`, `agent.name`, `agent.document_capabilities`,
+`agent.name`, `agent.document_capabilities`,
 `agent.instruction.trust` (§5a.3b), `store.kind`, `store.prefix`, `store.mcp`,
 `store.http`, `store.file`, `store.max_value_bytes`, `lifecycle.run_until`,
 `lifecycle.drain_timeout`, `lifecycle.run_id`, `lifecycle.exit_code_map`,
@@ -1383,8 +1373,7 @@ worse than one that plainly refuses.
 (`every_config_path_is_classified`) walks the generated schema to prove it. That
 matters because the failure this prevents is silent: a field captured into a
 long-lived structure at startup, listed in neither partition, reports a
-successful reload and changes nothing. `a2a.principals`, the webhook routes and
-`interface.origins` were each exactly that before v1.4.0.
+successful reload and changes nothing.
 
 `store.file` is restart-only for the same reason as the rest of `store`: moving
 the state directory under a running instance would strand every key it has
@@ -1398,7 +1387,7 @@ Every applied reload logs `config.reloaded` with the changed groups, bumps
 
 ## 12. The config file (`--config`)
 
-`--config <PATH>` (repeatable) / `AGENT_CONFIG` loads one or more documents in
+`--config <PATH>` (repeatable) / `AGENTD_CONFIG` loads one or more documents in
 **YAML or JSON** (§12.2 for how several compose). The extension picks the syntax
 (`.yaml`/`.yml` ⇒ YAML, `.json`/`.jsonc` ⇒ JSON with `//`/`/* */` comments);
 any other extension is sniffed (a document starting with `{`/`[` is JSON, else
@@ -1417,7 +1406,7 @@ exit `0`); validate a candidate with `--validate-config`.
 
 ### 12.1 The discovery chain — the config you did not name
 
-When an invocation names **no** config — no `--config`, no `AGENT_CONFIG` —
+When an invocation names **no** config — no `--config`, no `AGENTD_CONFIG` —
 agentd walks a three-rung chain and loads every rung that has a file, the way a
 linter or a formatter picks up its dotfile:
 
@@ -1435,7 +1424,7 @@ editing a tracked file:
 ```console
 $ cd ~/work/triage     # contains agentd.yml and agentd.local.yml
 $ agentd --validate-config
-{"event":"config.valid","files":["/home/you/.config/agentd/config.yml","./agentd.yml","./agentd.local.yml"],"schema":"1"}
+{"event":"config.valid","files":["/home/you/.config/agentd/config.yml","./agentd.yml","./agentd.local.yml"]}
 ```
 
 Four rules keep it from being surprising:
@@ -1495,7 +1484,7 @@ Two rules make these **conventions** rather than declarations:
   it by name.)
 
 A `skills/` folder is the one that adds a capability rather than moving one:
-skills previously reached agentd only through an MCP server or an inline
+without it, skills reach agentd only through an MCP server or an inline
 `:::!skill` directive. A skill grants no tool — it is prose the model reads — so
 a local file needs no server. Frontmatter is optional: with none, the file stem
 names the skill and its first paragraph describes it. Like `:::!skill`, a local
@@ -1503,7 +1492,7 @@ file wins a name collision with a discovered one.
 
 ### 12.2 Several files — later overrides earlier
 
-The files in play are, in order: every entry of `AGENT_CONFIG` (a `:`-separated,
+The files in play are, in order: every entry of `AGENTD_CONFIG` (a `:`-separated,
 PATH-style list), then every `--config <path>` in argument order. They compose
 into **one document** with JSON-Merge-Patch semantics (RFC 7396): **objects
 merge key by key (recursively), scalars and lists are replaced by the later
@@ -1514,7 +1503,7 @@ the merged files (`config_files`); with `--watch-config`, every file is watched
 and a change to any of them re-merges the whole set on reload.
 
 ```console
-$ AGENT_CONFIG=/etc/agentd/base.yaml \
+$ AGENTD_CONFIG=/etc/agentd/base.yaml \
     agentd --config /etc/agentd/site.yaml --config ./local-overrides.yml …
 # base.yaml < site.yaml < local-overrides.yml < env < flags
 ```
@@ -1543,7 +1532,6 @@ each path is equally reachable from env and flags (§1.1), so
 
 | Section | Carries |
 |---|---|
-| `config_version` | `"1"`. Optional, but pin it — any other value is exit `2`. |
 | `vars` | Named values (any JSON type, nestable) referenced as `{{config.NAME}}` anywhere a string sits — see §12.4. |
 | `agent` | `name`, `instruction`, `prompt`, `preflight`, `wake_on`, `tools` (`internal`/`mcp`/`code` allow-lists), `max_parallel_turns`, `conversation_budget`, `ask_human_fallback`, `on_workflow_finished`. |
 | `intelligence` | `endpoints[]`, `model`, `dialect`, `swap_policy`, `timeout`, `headers{}`, `token`/`token_file`, `auth{}` (OAuth 2.1 / AWS SigV4 / SPIFFE), `budget{}`, `structured_output`. |
@@ -1704,7 +1692,6 @@ A YAML example (`/etc/agentd/config.yaml`):
 
 ```yaml
 # structural config; secrets stay in env / mounted files
-config_version: "1"
 
 agent:
   name: triage
@@ -1748,7 +1735,6 @@ And a JSON one:
 ```jsonc
 // /etc/agentd/config.json — structural config; secrets stay in env / mounted files
 {
-  "config_version": "1",
   "agent": { "instruction": "Triage the inbound queue." },
   "intelligence": {
     "endpoints": ["https://primary.internal/v1", "https://fallback.internal/v1"],
@@ -1780,8 +1766,7 @@ For the reloadable-vs-restart-only partition of these fields, see §11.
 
 ## 13. Running a fleet
 
-There is no `cluster` section, no `--shard` flag, and no per-start `claim` or
-`shard` option. agentd carries **no coordination protocol of its own**, because
+agentd carries **no coordination protocol of its own**, because
 coordination needs a shared source of truth and agentd already talks to two that
 are better placed to own it: the MCP server the work comes from, and the store.
 
@@ -1799,11 +1784,10 @@ interleaving writes into it.
 ## 14. A complete example
 
 A **daemon** that serves A2A, watches a queue, and runs a durable workflow — the
-whole configuration in one `config_version: "1"` file:
+whole configuration in one file:
 
 ```yaml
 # /etc/agentd/agentd.yaml
-config_version: "1"
 
 agent:
   name: triage
@@ -1870,9 +1854,9 @@ $ agentd --instruction "Summarise the incident." \
 ## 15. Identity — who work is done for
 
 A schedule, webhook, stream or `once` start carries no caller, so autonomous
-work used to pass no principal at all: "every effect names the human or the
-schedule that caused it" was false by construction, because the attribution
-chain was dropped at its very first hop.
+work runs as the principal `identity.autonomous_as` names. That is what keeps
+"every effect names the human or the schedule that caused it" true at the
+attribution chain's very first hop.
 
 ```yaml
 identity:

@@ -35,7 +35,7 @@ import {
 import { parseConfig, serializeConfig, emptyWorkflow, layout, newStepId } from "../../lib/workflowIo";
 import { validateWorkflow, canConnect } from "../../lib/validate";
 
-const DEFAULT_DOC = { config_version: "1" };
+const DEFAULT_DOC = {};
 
 // ── custom node ─────────────────────────────────────────────────────────────
 function WfNode({ id, data, selected }) {
@@ -747,7 +747,6 @@ function Editor() {
           ) : (
             <WorkflowPanel
               wf={wf}
-              doc={doc}
               onRename={renameWorkflow}
               onDelete={deleteWorkflow}
               canDelete={workflows.length > 1}
@@ -769,7 +768,7 @@ function Editor() {
             <textarea
               value={importText}
               onChange={(e) => setImportText(e.target.value)}
-              placeholder={'paste a config_version: "1" document…'}
+              placeholder={'paste an agentd config document…'}
               className="h-72 w-full rounded border border-[var(--line)] bg-[var(--bg-soft)] p-2 font-mono text-xs text-[var(--fg)]"
             />
             <div className="mt-2 flex justify-end gap-2">
@@ -944,7 +943,7 @@ function PropertyPanel({ node, onId, onKind, onField, onRemoveField, onDelete, i
   );
 }
 
-function WorkflowPanel({ wf, doc, onRename, onDelete, canDelete, onMeta }) {
+function WorkflowPanel({ wf, onRename, onDelete, canDelete, onMeta }) {
   return (
     <div>
       <div className="mb-3 flex items-center justify-between">
@@ -971,7 +970,6 @@ function WorkflowPanel({ wf, doc, onRename, onDelete, canDelete, onMeta }) {
       </p>
       <div className="mt-3 rounded border border-[var(--line)] bg-[var(--bg-soft)] p-2 text-[11px] text-[var(--dim)]">
         <div>{wf.nodes.length} steps · {wf.edges.length} edges</div>
-        {!doc.config_version && <div className="mt-1 text-amber-400">no config_version — export adds it on import only</div>}
       </div>
     </div>
   );

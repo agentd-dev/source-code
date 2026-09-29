@@ -124,7 +124,6 @@ A2A client can call them without knowing anything agentd-specific.
 | Op | What it does | Exits the process? |
 |---|---|---|
 | `admin.drain` | Begin a graceful drain (identical to SIGTERM) → exit `0` | yes, eventually |
-| `admin.lameduck` | Accepted as an alias of `admin.drain` | yes, eventually |
 | `admin.pause` | Hold the whole instance, or one run, at a safe boundary | no |
 | `admin.resume` | Clear a prior `admin.pause` | no |
 | `admin.cancel` | Cancel one run by id | no |
@@ -145,13 +144,6 @@ The reply is a completed **Task** whose result carries the acknowledgement
 that could drain the instance it is talking to would be an operator, and a
 delegating peer is not one. The ops appear as skills on
 `GetExtendedAgentCard` only for callers who may actually run them.
-
-> **Removed:** earlier builds answered `a2a.drain` / `a2a.pause` / … as custom
-> JSON-RPC methods. They are gone — a call gets `-32601` — because they were not
-> A2A methods and no conformant peer could discover them. The five operations
-> above are the replacement; see
-> [a2a-extensions.md](a2a-extensions.md#6-there-is-no-legacy-path) for the
-> one-line migration.
 
 ### 2.1 `admin.drain` — graceful shutdown for a rolling update
 
@@ -291,7 +283,7 @@ configuration — what this binary is set up to do — not live state.
 
 ```console
 $ agentd --capabilities -c /etc/agentd/ops.yaml
-{ "runtime":"1", "version":"1.1.0",
+{ "version":"1.1.0",
   "agent":{ "name":"agentd", "instruction":true, "preflight":"auto" },
   "intelligence":{ "model":null, "endpoints":1 },
   "mcp_servers":["state"], "internal_tools":[…], "tools":{ "overrides":[], "disabled":[] },
@@ -301,7 +293,7 @@ $ agentd --capabilities -c /etc/agentd/ops.yaml
                      "ListTasks","SubscribeToTask","GetAgentCard"],
           "command_ops":["status","config","workflow.run","…",
                          "admin.drain","admin.pause","admin.resume","admin.cancel"],
-          "extensions":["https://agentd.dev/a2a/ext/command/v1","…"],
+          "extensions":["https://agentd.dev/a2a/ext/command","…"],
           "principals":[…], "loopback_operator":false },
   "interface":{…}, "store":"mcp",
   "lifecycle":{ "run_until":"auto", "daemon":true } }
@@ -344,7 +336,7 @@ startup runs, so a bad file fails in CI instead of at rollout:
 
 ```console
 $ agentd --validate-config -c /etc/agentd/ops.yaml
-{"event":"config.valid","files":["/etc/agentd/ops.yaml"],"schema":"1"}
+{"event":"config.valid","files":["/etc/agentd/ops.yaml"]}
 
 $ agentd --validate-config -c /etc/agentd/broken.yaml
 {"event":"config.invalid","msg":"a2a.listen on a non-loopback address needs client auth: a2a.bearer, interface.pairing, or a2a.tls.client_ca (mTLS — then EVERY caller needs a client certificate, bearer-only and paired included)"}
@@ -380,11 +372,11 @@ Both funnel into one identical routine:
 
 Only the **files** are re-read; the env and flag layers are the process's fixed
 inputs, so a flag still overrides the new file. `RESTART_ONLY_PATHS` in
-`config/v2` is the authoritative partition:
+`config/settings` is the authoritative partition:
 
 | Reloadable (applied in place) | Restart-only (a diff is refused) |
 |---|---|
-| `intelligence` (endpoints, model, token) | `config_version`, `agent.name` |
+| `intelligence` (endpoints, model, token) | `agent.name` |
 | `intelligence.budget` (windows; counters carry over) | `store.kind`, `store.prefix`, `store.mcp`, `store.http`, `store.file` |
 | `agent.instruction` (static text or a resource URI) | `lifecycle.run_until`, `.drain_timeout`, `.run_id`, `.exit_code_map`, `.watch_config` |
 | `agent` (preflight, wake_on, tools, parallelism, budget) | `a2a.listen`, `a2a.tls`, `a2a.bearer` |
@@ -510,7 +502,7 @@ On the wire, per-route **arrival throttling** composes with this:
 once, `rate` bounds how fast they arrive, and pressure sheds regardless of
 either.
 
-With `--features metrics`, the levels are scrapeable (schema 1.2):
+With `--features metrics`, the levels are scrapeable:
 `agent_pressure_level` (0/1/2), `agent_disk_free_bytes` (absent without a file
 store), `agent_runs_active`, `agent_turns_queued` — the last two are the
 utilization pair to alert on *before* pressure does it for you.

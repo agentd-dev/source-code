@@ -1,4 +1,4 @@
-// Convert between an agentd `config_version: "1"` document (YAML) and the
+// Convert between an agentd configuration document (YAML) and the
 // editor's graph model. A workflow's `steps` map becomes React Flow nodes; every
 // `depends_on` entry becomes an edge (source → target means "target depends on
 // source"). The rest of the config document is preserved verbatim so an
@@ -16,7 +16,7 @@ const uid = (p) => `${p}_${(_seq++).toString(36)}${Date.now().toString(36).slice
 export function parseConfig(text) {
   const doc = yaml.load(text) || {};
   if (typeof doc !== "object" || Array.isArray(doc)) {
-    throw new Error("config must be a YAML mapping (config_version: \"1\")");
+    throw new Error("config must be a YAML mapping");
   }
   const wfs = Array.isArray(doc.workflows) ? doc.workflows : [];
   const workflows = wfs.map((wf, i) => workflowToModel(wf, i));
@@ -52,7 +52,7 @@ export function workflowToModel(wf, index = 0) {
   return {
     id: uid("wf"),
     name: name || `workflow_${index + 1}`,
-    meta, // version, description, concurrency, limits, inputs, outputs, armed …
+    meta, // description, concurrency, limits, inputs, outputs, armed …
     nodes,
     edges,
   };
@@ -62,9 +62,9 @@ export function workflowToModel(wf, index = 0) {
 export function serializeConfig(doc, workflows) {
   const out = { ...doc };
   out.workflows = workflows.map((wf) => modelToWorkflow(wf));
-  // Keep a stable, readable key order: config_version first if present.
+  // Keep a stable, readable key order: the sections an editor user reaches for
+  // first, then everything else in its original order.
   const ordered = orderKeys(out, [
-    "config_version",
     "agent",
     "intelligence",
     "mcp",
@@ -140,7 +140,7 @@ export function layout(nodes, edges, opts = {}) {
   const visiting = new Set();
   const rankOf = (id) => {
     if (rank.has(id)) return rank.get(id);
-    if (visiting.has(id)) return 0; // cycle guard (dialect-3 is a DAG, but be safe)
+    if (visiting.has(id)) return 0; // cycle guard (a workflow is a DAG, but be safe)
     visiting.add(id);
     const p = preds.get(id) || [];
     const r = p.length ? Math.max(...p.map((x) => rankOf(x) + 1)) : 0;

@@ -27,17 +27,18 @@ serves only:
 - the 11 A2A 1.0 JSON-RPC methods;
 - `GET /.well-known/agent-card.json`, public and readable cross-origin;
 - one **method** extension — `agentd.events/SubscribeToEvents` under
-  `https://agentd.dev/a2a/ext/events/v1`;
-- two **profile** extensions — `https://agentd.dev/a2a/ext/command/v2` and
-  `https://agentd.dev/a2a/ext/task-annotations/v1`;
+  `https://agentd.dev/a2a/ext/events`;
+- two **profile** extensions — `https://agentd.dev/a2a/ext/command` and
+  `https://agentd.dev/a2a/ext/task-annotations`;
 - one declared **custom binding** URI for the unix socket,
-  `https://agentd.dev/a2a/binding/jsonrpc-unix/v1`;
+  `https://agentd.dev/a2a/binding/jsonrpc-unix`;
 - an RFC 8628 / 6749 / 7009 / 8414 **authorization server** on the listener
   origin, declared on the card as an `oauth2` scheme with a `deviceCode` flow.
 
-Nothing else is answered. Every removed method, route, configuration key, op,
-launcher flag and client flag is refused **by name**, from one table per kind,
-with a pointer to its replacement.
+Nothing else is answered. Removed means gone: a removed method, route,
+configuration key, op, launcher flag or client flag is simply unknown, and
+meets its layer's generic refusal. There are no aliases, no removal tables and
+no hints.
 
 The display clients (`agentd-tui`, `agentd-ui`) become ordinary A2A clients.
 They discover the card and send `A2A-Version`. They activate only the
@@ -131,10 +132,11 @@ declaring so. Nothing the listener answers is outside the card.
 1. **The boundary is the spec's.** The listener answers the 11 core methods, the
    card route, the methods of declared extensions and the declared
    authorization server — nothing else (§4).
-2. **Removed means refused by name.** Every removed name is refused with its
-   replacement, from one table per kind (`REMOVED_KEYS`, `REMOVED_OPS`,
-   `REMOVED_LAUNCHER_FLAGS`, the removed-methods list). There are no aliases,
-   no prefix strips and no deprecation period.
+2. **Removed means gone.** A removed key, op, method or flag is unknown and
+   meets its layer's generic refusal: the unknown-key, unknown-op,
+   unknown-method or unknown-argument path. There are no aliases, no removal
+   tables, no hints, no prefix strips and no deprecation period. An `AGENTD_`
+   variable that binds no configuration path is not read.
 3. **The official libraries own the wire; the transport stays agentd's.**
    `a2a-rs` 0.10 serves the core methods and the extended card. agentd owns the
    listener in front of it — TLS, admission, CORS, the pipeline of §5 — and
@@ -175,23 +177,16 @@ extensions. A test under the `a2a` feature holds `SpecMethod::ALL` equal to
 
 The old `METHODS` and `LOCAL_METHODS` lists are deleted.
 
-### 4.2 Removed JSON-RPC methods and HTTP routes
+### 4.2 Everything else
 
-Each of these gets `-32601` for every caller that reaches pipeline step 8,
-before authorization and with no side effect:
+A method outside the 11 core methods and the methods of declared extensions
+gets `-32601` at pipeline step 8, for every caller that reaches that step,
+before authorization and with no side effect. A2A 0.3 names (`message/send`,
+`tasks/get`, …) are such methods. Any other HTTP route is 404.
 
-- `Pair` and `interface.pair` (their handlers are deleted);
-- `GetAgentCard`, `agent/card`, `agent/getAuthenticatedExtendedCard`;
-- any `a2a.`-prefixed name;
-- the bare `SubscribeToEvents` (now `agentd.events/SubscribeToEvents`);
-- 0.3 names (`message/send`, `tasks/get`, `SetTaskPushNotificationConfig`, …).
-
-Removed routes: `GET /.well-known/agent.json` → 404; `agentd-ui`'s
-`GET /config.js` → 404.
-
-Answering these `-32601` before authorization is deliberate: a removed method
-has no authorization rule to consult, and every caller that got that far gets
-the same answer whatever its role, so the answer says nothing about the
+Answering `-32601` before authorization is deliberate: a method agentd does not
+serve has no authorization rule to consult, and every caller that got that far
+gets the same answer whatever its role, so the answer says nothing about the
 caller's permissions. (An unauthenticated caller never gets that far: step 3
 answers it 401 first.)
 
@@ -199,9 +194,14 @@ answers it 401 first.)
 
 **surface::A2A_PROTOCOL_VERSION and extension constants** are always compiled:
 `A2A_PROTOCOL_VERSION = "1.0"`; `EVENTS_EXTENSION`, `EVENTS_METHOD`,
-`TASK_ANNOTATIONS_EXTENSION`, `UNIX_BINDING` and `COMMAND_EXTENSION` (now
-`…/command/v2`). The v1 interface extension URI is deleted and never declared
-or echoed.
+`TASK_ANNOTATIONS_EXTENSION`, `UNIX_BINDING` and `COMMAND_EXTENSION`.
+
+agentd's URIs carry no version. A2A 1.0.1 §4.6.3 only suggests one (a
+SHOULD), and a version in an identifier agentd owns is a second name for the
+same thing. An incompatible change takes a new URI under a new name, never a
+`/vN` suffix, because §4.6.3 and §5.8 say a URI's meaning MUST NOT change under
+a peer that already speaks it. `A2A_PROTOCOL_VERSION` is the one version on the
+wire, because the spec requires it.
 
 The **Internal bridge verbs** between the listener and the runtime are not wire
 methods: `PublicCard` replaces the old `GetAgentCard` verb; the `NewTaskId` verb
@@ -640,15 +640,9 @@ column of the op table (§9.2.1), so every op is classified where it is defined:
 `config`, `debug.events` and `admin.*` are Operator; `subagent.get` became an
 owner-scoped introspection read; `pairing.code` and `config.set` are gone.
 
-**REMOVED_OPS** refuses retired op names wherever they can appear:
-`interface.info` ("read the agent card and the `status` op"), `config.set`
-("use admin.set {path, value}"), `pairing.code` ("pairing was replaced by the
-OAuth device authorization grant … operators approve with
-auth.device.approve {user_code, as}"), `admin.lameduck` ("use admin.drain").
-As a grant value or a workflow `a2a` start `command` the refusal is at load,
-exit 2 ("grant `<n>` was removed in agentd 1.17.0: <hint>"); a start `command`
-may not use a built-in op name or the `_instance.` prefix either. At runtime a
-removed op gets `-32602 UNKNOWN_OP` naming the hint.
+A workflow `a2a` start `command` may not use a built-in op name or the
+`_instance.` prefix; that is refused at load, exit 2. An op the table does not
+hold is unknown like any other: at runtime it gets `-32602 UNKNOWN_OP`.
 
 ### 7.7 Ownership
 
@@ -754,13 +748,13 @@ origins.
   commands."). Command ops are never skills (F14, F32, F52).
 - `capabilities`: `streaming: true`; `pushNotifications` = `a2a.push.enabled`;
   `extendedAgentCard` = `ListenerAuth.declares_any()`; `extensions` = the static
-  declarations. The command/v2 params publish
+  declarations. The command extension's params publish
   `ops: static_vocabulary()` — every served-capable op, posture- and
   caller-independent — so a no-auth client can drive the instance without the
   public card revealing its configuration.
 - `securitySchemes` / `securityRequirements` per §8.4.
 
-The card varies only with push, whether events/v1 is declared, the security
+The card varies only with push, whether events is declared, the security
 fields, the advertised URL, `agent.name` and `agent.description`. It never
 varies with workflows, introspection or the caller.
 
@@ -799,9 +793,9 @@ agentd follows both literally:
   always exists.
 
 The extended card is the public card plus a `workflow:<name>` skill for each
-workflow `may_run` admits, command/v2 params narrowed to `served ∩
+workflow `may_run` admits, the command extension's params narrowed to `served ∩
 may_command` with the workflow-declared commands the caller may fire and the
-runtime-settable paths when it may run `admin.set`, and events/v1 params with
+runtime-settable paths when it may run `admin.set`, and the events params with
 the ring size and the kinds visible to this caller.
 
 This leaves a no-auth dev daemon without an extended card at all. That is the
@@ -833,7 +827,7 @@ extension gets `-32008` with `EXTENSION_SUPPORT_REQUIRED` (§3.3.4). agentd
 declares no required extension today; the path is unit-tested with a synthetic
 declaration.
 
-### 9.2 Extension https://agentd.dev/a2a/ext/command/v2
+### 9.2 Extension https://agentd.dev/a2a/ext/command
 
 A profile extension, `required: false`, always declared. The envelope is exactly
 one DataPart `{data: {agentd: {op, …args}}, mediaType: "application/json"}`
@@ -847,8 +841,7 @@ parent/child protocol of instance-tier subagents — are reserved and
 operator-only, published under `$defs.reserved` in the schema bundle with their
 args and results, and never listed in `params.ops` (F33).
 
-The version is in the URI and nowhere else; the v1 in-band protocol number is
-gone (F34).
+The extension carries no version, in its URI or in-band (F34).
 
 #### 9.2.1 surface::ops::OPS (the single command-op table)
 
@@ -886,7 +879,7 @@ description (F32), and the published schemas are the rows' `args_schema` /
 and an `ErrorInfo` reason: not activated (`EXTENSION_NOT_ACTIVATED`), not marked
 in `message.extensions` (`EXTENSION_NOT_MARKED`), more than one envelope
 (`COMMAND_ENVELOPE_AMBIGUOUS`), a `taskId` (`COMMAND_TASK_ID`), an unknown or
-removed op (`UNKNOWN_OP`, with the `REMOVED_OPS` hint), a schema failure
+op the table does not hold (`UNKNOWN_OP`), a schema failure
 (`INVALID_COMMAND_ARGS`). Output modes without `application/json` → `-32005`;
 an introspection op while introspection is off → `-32004 INTROSPECTION_DISABLED`.
 Nothing executes on any refusal, and the listener check and the runtime's belt
@@ -894,7 +887,7 @@ check call the same `check_command`.
 
 **Read-op reply (Message).** A Message-reply op answers with an A2A Message —
 `role: ROLE_AGENT`, a `msg-<ulid>` id, the request's `contextId` (else a minted
-one), one DataPart with the document, and `extensions: [command/v2]`. No task is
+one), one DataPart with the document, and `extensions: [COMMAND_EXTENSION]`. No task is
 created and no task event is pushed (F13, F42): a read is not work, and a client
 may poll it without growing every client's task list.
 
@@ -902,11 +895,11 @@ may poll it without growing every client's task list.
 through `a2a-rs`: unary blocks per the spec unless `returnImmediately`;
 streaming sends a Task frame then updates, closing at a terminal or interrupted
 state. An object result is the artifact `<task>.result` with one DataPart and
-`extensions: [command/v2]` when the task came from a command; a string result is
+`extensions: [COMMAND_EXTENSION]` when the task came from a command; a string result is
 a text part; a part-less artifact is never emitted. `Task.command` records the
 op.
 
-**admin.set** replaces `config.set` as a command/v2 Task op on the Operator
+**admin.set** is a Task op of the command extension on the Operator
 floor, over `RUNTIME_SETTABLE = [agent.approval, a2a.introspection.enabled]`,
 parsed with the configuration's own types. Success is a COMPLETED task with
 `{path, value}`, a `config` feed event and an `admin.set` log line. Turning
@@ -922,19 +915,19 @@ device grant is on; the session ops on every TCP listener (they also list and
 revoke launch sessions). Each call is audited and pushes an operator-only `auth`
 feed event.
 
-### 9.3 Extension https://agentd.dev/a2a/ext/events/v1
+### 9.3 Extension https://agentd.dev/a2a/ext/events
 
 A method extension, `required: false`, declared iff `a2a.events.enabled`
 (restart-only). Public params are `{method, schema}`; the extended card adds the
 ring size and the visible kinds. Its one method:
 
 **agentd.events/SubscribeToEvents** — SSE, params `{fromSeq?}` (strict:
-`after` → `-32602`), callable by any named principal and filtered by
+any unknown member → `-32602`), callable by any named principal and filtered by
 `FeedVis::admits`. Each frame's result is exactly one of
 `{hello: {seq, resume, resync, introspection, version}}` (`version` is the
 agentd build, not a protocol number), `{event: {seq, ts, kind, data}}` or
 `{goodbye: {seq, reason: "deadline"|"revoked"}}`. Frames carry no SSE id. A task
-event's annotations are stripped per subscriber unless task-annotations/v1 is
+event's annotations are stripped per subscriber unless task-annotations is
 active.
 
 **FeedKind vocabulary** — one enum with `ALL`, `as_str` and a data schema per
@@ -943,12 +936,12 @@ kind: `task`, `task.removed`, `run`, `run.removed`, `step`, `conversation`,
 `child.removed`, `activity`, `activity.removed`, `status`, `lifecycle`,
 `config`, `audit` (operator only, while introspection is on) and `auth`
 (operator only; `{event: pending|approved|denied|revoked|launch, client_id,
-scope, user_code?, peer?, sid?, name?}`). The kinds `message`, `command` and
-`pairing` are deleted: the transcript is `Task.history` (§14.1). The feed push
+scope, user_code?, peer?, sid?, name?}`). The transcript is `Task.history`
+(§14.1). The feed push
 asserts kind and schema in debug builds, a unit test pushes one sample of every
 kind, and a source scan requires every push literal to be in `FeedKind::ALL`.
 
-### 9.4 Extension https://agentd.dev/a2a/ext/task-annotations/v1
+### 9.4 Extension https://agentd.dev/a2a/ext/task-annotations
 
 A profile extension, `required: false`, always declared, params `{schema}`. When
 active on a method that returns tasks, every Task carries
@@ -957,7 +950,7 @@ statusHistory, askSchema?, command?}`. When inactive there is no metadata key.
 No `agentd/*` key appears anywhere (F35), and push bodies never carry
 annotations.
 
-### 9.5 Custom binding https://agentd.dev/a2a/binding/jsonrpc-unix/v1
+### 9.5 Custom binding https://agentd.dev/a2a/binding/jsonrpc-unix
 
 JSON-RPC 2.0 over HTTP/1.1 on a unix domain socket, with same-uid peers enforced
 by `SO_PEERCRED`. It is identical to the JSONRPC binding in method names,
@@ -972,9 +965,10 @@ endpoints, and the TypeScript client refuses it as an unsupported binding.
 
 ### 9.6 Published extension specifications and schemas
 
-Each URI resolves to a normative page (`docs/ext/<name>-<version>.md`, rendered
-under `agentd.dev/a2a/ext/…`) next to a draft 2020-12 schema bundle with `$id`
-`<uri>/schema.json`. `agentd --extension-schema <name>/<version>` prints a
+Each URI resolves to a normative page, `docs/ext/<name>.md`, served at the URI
+itself (`agentd.dev/a2a/ext/<name>`, `agentd.dev/a2a/binding/<name>`), next to a
+draft 2020-12 schema bundle with `$id` `<uri>/schema.json`.
+`agentd --extension-schema <name>` prints a
 bundle, `agentd --extensions` lists `{uri, path, kind, required, spec,
 schema}`, and `scripts/gen-schemas.sh` writes the site copies; CI diffs the
 regenerated output. The pages' tables are checked against `OPS`, `FeedKind` and
@@ -1157,9 +1151,8 @@ end and the listener right after spawn and the write end once the code is
 written, so the TUI's read reaches EOF.
 
 **Environment.** The launcher's own, minus every variable the config loader
-reads — derived from the loader's own tables, every `ENV_ALIASES` entry under
-every prefix included (so `SERVE_BEARER`, which sets `a2a.bearer`, is scrubbed
-in all three spellings) — minus every name a `{{secret:NAME}}` reference in the
+reads — derived from the loader's own tables (so `AGENTD_A2A_BEARER`, which sets
+`a2a.bearer`, is scrubbed) — minus every name a `{{secret:NAME}}` reference in the
 loaded settings names, minus `AGENTD_BEARER`; nothing is added. The promise is
 narrow on purpose: "never passes `a2a.bearer` or a resolved config secret".
 Credential variables that code other than the loader reads (the AWS chain) and
@@ -1173,11 +1166,9 @@ terminal-approved sign-in (§11.2). The daemon's output goes to `--daemon-log`
 0600, so a planted file or symlink is refused). The client exiting drains the
 daemon; the daemon exiting sends the client SIGTERM, then SIGKILL after 3 s.
 
-**REMOVED_LAUNCHER_FLAGS**: `--debug` ("the launcher no longer changes
-configuration: set a2a.introspection.enabled") and `--inline` ("a display-client
-option: the launcher passes the client only its endpoint"), refused before any
-config load. `AGENTD_INTERFACE_LOG` is refused through the `interface` catch-all
-(§13.2) and replaced by `--daemon-log`. No error text names an npm package.
+The launcher changes no configuration and passes the client only its endpoint,
+so it takes no configuration or display flags: any other argument meets the
+daemon's generic unknown-argument refusal. No error text names an npm package.
 
 **Why there is no client-side `--spawn`.** A client that started its own daemon
 would be a second way to do what the launcher does, and would need a second copy
@@ -1188,7 +1179,7 @@ daemon.
 
 ### 11.2 Launch grant (single-use launch code, launch sessions)
 
-`LAUNCH_GRANT_TYPE = https://agentd.dev/oauth/grant-type/launch/v1`, an RFC 6749
+`LAUNCH_GRANT_TYPE = https://agentd.dev/oauth/grant-type/launch`, an RFC 6749
 §4.5 extension grant. Minting and approval are **in-process only**: the launcher
 creates a `LaunchSlot` and hands it to the daemon it runs. There is no op, route
 or configuration key that mints a code or approves a request, so nothing outside
@@ -1302,8 +1293,8 @@ written to a query string (`?bearer=` is ignored and stripped), and disconnect
 revokes the token (`/oauth2/revoke`) before clearing it.
 
 **agentd-ui web surface.** `agentd-ui [--endpoint URL] [--port N | --listen-fd N]
-[--open]` holds no credential of any kind: `AGENTD_BEARER` is refused by name,
-`/config.js` is 404, and `GET /bootstrap.json` returns `{endpoint}` only, gated
+[--open]` holds no credential of any kind and reads none from its environment
+or a URL. `GET /bootstrap.json` returns `{endpoint}` only, gated
 on `Host`, `Sec-Fetch-Site` and a same-origin `Origin`. Every response carries a
 Host check, CORP same-origin, nosniff, `Referrer-Policy: no-referrer` and a CSP
 whose `connect-src` is `'self'` plus the endpoint's origin. With no credential
@@ -1313,9 +1304,9 @@ and no launcher slot, the page offers device sign-in when the card declares
 stripped before any request, and exchanged only with the bootstrap endpoint — a
 typed or `?endpoint=` endpoint that differs discards it unsent.
 
-## 13. Configuration moves and refusals
+## 13. Configuration
 
-### 13.1 New keys
+### 13.1 Keys
 
 - **a2a.url** — an optional absolute http(s) URL with no path other than `/`,
   no query and no fragment; https unless the host is loopback. It is the
@@ -1331,16 +1322,16 @@ typed or `?endpoint=` endpoint that differs discards it unsent.
   (5m..30d), code_ttl: 10m (1m..30m), verification_uri?, rate?}`. Restart-only,
   operator-only. Refused with `client_ca`, on a unix listener, with empty or
   duplicate scopes or `agent`, and without an operator credential (§10.2).
-- **a2a.events.enabled / a2a.introspection.enabled** — the two generic
-  switches that replace the UI flags (F19, F43). `a2a.events.enabled`
-  (restart-only) declares events/v1 and builds the feed.
+- **a2a.events.enabled / a2a.introspection.enabled** — two generic switches
+  (F19, F43). `a2a.events.enabled` (restart-only) declares the events extension
+  and builds the feed.
   `a2a.introspection.enabled` (reloadable, settable by `admin.set`) gates the
   introspection ops, the `audit` kind and the log ring, independently of the
   feed. Both require `a2a.listen` and are operator-only.
-- **a2a.principals[].id and match.aauth_agent removal** — `id` is required on
-  `bearer_ref` and `any` rules ("a bearer_ref/any rule names one caller, so it
-  needs `id:` — the principal id its tasks and conversations are owned by"),
-  optional on `san`/`sub` rules; `match.aauth_agent` is refused by name.
+- **a2a.principals[].id** — `id` is required on `bearer_ref` and `any` rules
+  ("a bearer_ref/any rule names one caller, so it needs `id:` — the principal
+  id its tasks and conversations are owned by"), optional on `san`/`sub`
+  rules.
 - **New agent/observability/security/store keys** — `agent.description`
   (reloadable, operator-only, so a served document cannot rewrite the public
   card); `agent.ask_human_unowned: gate|fallback` (default `fallback`, §14.3);
@@ -1349,43 +1340,12 @@ typed or `?endpoint=` endpoint that differs discards it unsent.
   `{role: operator}`); `store.retention.tasks: {keep_last?, ttl?}` for terminal
   tasks (unset keeps).
 
-### 13.2 REMOVED_KEYS (config keys refused by name)
-
-One table, checked on each file and the merged document, each `:::!config`
-fragment, the canonical flags and the `AGENTD_` environment names derived from
-the same bindings: `interface`, `interface.enabled`, `interface.debug`,
-`interface.display`, `interface.origins`, `interface.pairing`,
-`a2a.principals[].match.aauth_agent`. Each is refused (exit 2) as
-"<source>: `<path>` was removed in agentd 1.17.0: <hint>". The `interface`
-catch-all also refuses every `AGENTD_INTERFACE_*` variable. None exists in the
-generated schema, and `--help` lists them.
-
-### 13.3 The migration
-
-| Before (v1.16) | After (v1.17.0) |
-|---|---|
-| `interface.enabled` | `a2a.events.enabled` (the feed). HITL no longer depends on it; use `agent.ask_human_unowned: gate` for operator-answerable asks no caller owns. |
-| `interface.debug` | `a2a.introspection.enabled` (reloadable, `admin.set`-able) |
-| `interface.display` | Removed; layout is client-side (`--top/--bottom`, `AGENTD_TUI_TOP/BOTTOM`, `agentd.layout`, `/layout`). Memory values → `observability.status_values`. |
-| `interface.origins` | `a2a.cors.origins`, exact origins, no loopback trust |
-| `interface.pairing` | `a2a.device_grant` (needs an operator credential); approve with `auth.device.approve {user_code, as}` |
-| `Pair`, `pairing.code` | The device grant; `agentd ui` for a signed-in local tab |
-| `config.set` | `admin.set {path, value}` |
-| `interface.info` | The card and the `status` op |
-| `admin.lameduck` | `admin.drain` |
-| `GetAgentCard` | `GET /.well-known/agent-card.json` |
-| `SubscribeToEvents` | `agentd.events/SubscribeToEvents` under events/v1 |
-| `command/v1`, interface/v1 URIs | `command/v2`; events/v1; task-annotations/v1 |
-| `agentd tui` / `agentd ui` `--debug`, `--inline` | Config keys; client options |
-| `AGENTD_INTERFACE_LOG` | `agentd tui` / `agentd ui` `--daemon-log PATH` |
-| `agentd-tui --bearer`, `--code` | `--bearer-file`, `AGENTD_BEARER`, `--login [--scope]` |
-| `agentd-ui` `?bearer=`, `/config.js`, `AGENTD_BEARER` | Device sign-in or `agentd ui`; `sessionStorage` only |
-| `match.aauth_agent` | `san`, `sub` or `bearer_ref` |
+### 13.2 Client requirements
 
 Clients and scripts: every JSON-RPC POST needs `Content-Type:
 application/json`, `A2A-Version: 1.0` and an id; messages need `ROLE_USER`;
-command DataParts need `A2A-Extensions: …/command/v2` plus
-`message.extensions`. A loopback TCP listener with nothing configured still
+command DataParts need `A2A-Extensions: https://agentd.dev/a2a/ext/command`
+plus `message.extensions`. A loopback TCP listener with nothing configured still
 treats local non-browser callers as operator; once anything is configured, or the
 bind is not loopback, an uncredentialed caller gets 401.
 
@@ -1393,14 +1353,13 @@ bind is not loopback, an uncredentialed caller gets 401.
 
 ### 14.1 Task.history
 
-The transcript moves from a private feed kind to the core Task (F41). The
-durable task gains `messages` — inbound caller Messages (ids set to the task's)
+The transcript is the core Task's history (F41). The durable task keeps
+`messages` — inbound caller Messages (ids set to the task's)
 and superseded agent status messages (`<task>.status.<seq>`) — bounded at 64
 messages / 256 KiB, oldest dropped. The current status and the result artifact
 are not duplicated. `historyLength` unset returns all, 0 omits history, and n
-the newest n. The feed's `task` event carries at most 4 messages / 32 KiB, and
-the `message` and `command` feed kinds are deleted — every A2A client, not only
-agentd's, now sees what was said.
+the newest n. The feed's `task` event carries at most 4 messages / 32 KiB.
+Every A2A client, not only agentd's, sees what was said.
 
 ### 14.2 The core task methods
 
@@ -1495,7 +1454,7 @@ the client (F58).
 `agentd-tui [--endpoint URL] [--bearer-file PATH] [--login] [--scope
 user|operator] [--launch-fd N] [--no-extensions] [--top items] [--bottom items]
 [--debug] [--inline] [--insecure]`. `AGENTD_BEARER` is read and then deleted from
-the environment. `--bearer` and `--code` are refused by name. `--launch-fd N`
+the environment. `--launch-fd N`
 reads at most 256 bytes to EOF from the inherited fd, closes it, and exchanges
 the code once with `client_id` `agentd-tui`; the session is held in memory only.
 Combining it with another credential is exit 2, and a refused exchange says to
@@ -1526,8 +1485,9 @@ the ones that hold the design together are the derived lists:
 - the posture test iterates (posture, caller locality, Origin) against the
   resolver, so `required`, the card and the resolver cannot disagree;
 - the extension pages and schema bundles are regenerated and diffed in CI;
-- a repository-wide docs guard refuses removed names in the documentation and
-  checks the `#launcher` section against `LAUNCH_CONTRACT`;
+- a repository-wide docs guard checks that every method, extension method and
+  agentd URI the documentation names is one agentd serves, and checks the
+  `#launcher` section against `LAUNCH_CONTRACT`;
 - the conformance suite gains events, extensions, auth and card-honesty
   families (C6 — its push check had called a 0.3 method name and forbidden the
   spec's `-32003`, so it passed on any server);
@@ -1546,14 +1506,13 @@ server is being held to.
 
 ### 17.1 Breaking, by design
 
-Every removal is refused by name with its replacement (§13.3). Nothing keeps
-working silently under an old name: an alias that still answered would be a
+Nothing is kept for an older client: an alias that still answered would be a
 second vocabulary again. A client built on `a2a-rs` ≤ 0.10 (no `A2A-Version`
 header) gets `-32009`; that is the specification's rule, not agentd's.
 
 ### 17.2 RFC 0032
 
-RFC 0032's observation plane survives as events/v1; its discovery, reads,
+RFC 0032's observation plane survives as the events extension; its discovery, reads,
 chrome, pairing, `config.set`, composer shortcuts and HITL availability are
 replaced as described here. RFC 0032 carries a dated note at each superseded
 section.
@@ -1610,7 +1569,8 @@ in-process (§11.1).
   An operator who wants a fresh identity chooses another name.
 - **A per-process incarnation id in the events `hello` frame.** No contract
   carries one; the client's `ahead` check and re-discovery cover the restart
-  case, and adding an optional field later is additive under events/v1.
+  case, and adding an optional field later is additive under the events
+  extension.
 - **Versioning the npm package on its own semver** — release policy, not
   protocol; the client checks exact extension URIs.
 
@@ -1656,7 +1616,7 @@ Every contract of the v1.17.0 plan, and where this RFC records it.
 | A2A-Version request header | §5.2 |
 | surface::A2A_PROTOCOL_VERSION and extension constants | §4.3 |
 | Core method table (surface::SpecMethod, Route, route_of, methods_of) | §4.1 |
-| Removed JSON-RPC methods and HTTP routes | §4.2 |
+| Everything else | §4.2 |
 | Shared error table crate::a2a::errors | §5.3 |
 | HTTP 401 authentication challenge (-31401) | §5.3 |
 | HTTP 403 permission denied (-31403) | §5.3 |
@@ -1669,7 +1629,6 @@ Every contract of the v1.17.0 plan, and where this RFC records it.
 | Principal id | §7.4, §10.3 |
 | Listener posture (surface::auth::ListenerAuth) | §7.2, §7.3 |
 | surface::ops::OPS (the single command-op table) | §9.2.1 |
-| REMOVED_OPS | §7.6 |
 | Principal authorization API | §7.6 |
 | Ownership helpers, scoped signals and the model path | §7.7 |
 | contextId namespace | §7.7 |
@@ -1678,10 +1637,10 @@ Every contract of the v1.17.0 plan, and where this RFC records it.
 | Public Agent Card | §8.3 |
 | GetExtendedAgentCard (per-caller extended card) | §8.5 |
 | securitySchemes / securityRequirements | §8.4 |
-| Custom binding https://agentd.dev/a2a/binding/jsonrpc-unix/v1 | §9.5 |
-| Extension https://agentd.dev/a2a/ext/command/v2 | §9.2 |
-| Extension https://agentd.dev/a2a/ext/events/v1 | §9.3 |
-| Extension https://agentd.dev/a2a/ext/task-annotations/v1 | §9.4 |
+| Custom binding https://agentd.dev/a2a/binding/jsonrpc-unix | §9.5 |
+| Extension https://agentd.dev/a2a/ext/command | §9.2 |
+| Extension https://agentd.dev/a2a/ext/events | §9.3 |
+| Extension https://agentd.dev/a2a/ext/task-annotations | §9.4 |
 | A2A-Extensions request header (activation) and response echo | §9.1 |
 | Extension errors -32601 / -32008 | §9.1 |
 | Command envelope refusals | §9.2.1 |
@@ -1706,10 +1665,8 @@ Every contract of the v1.17.0 plan, and where this RFC records it.
 | a2a.cors.origins | §13.1 |
 | a2a.device_grant | §13.1, §10.2 |
 | a2a.events.enabled / a2a.introspection.enabled | §13.1 |
-| a2a.principals[].id and match.aauth_agent removal | §13.1 |
+| a2a.principals[].id | §13.1 |
 | New agent/observability/security/store keys | §13.1 |
-| REMOVED_KEYS (config keys refused by name) | §13.2 |
-| REMOVED_LAUNCHER_FLAGS | §11.1 |
 | wait {on: message}.from / a2a.wait.from | §14.3 |
 | --capabilities manifest a2a section | §4.4 |
 | Published extension specifications and schemas | §9.6 |
@@ -1780,7 +1737,7 @@ Every contract of the v1.17.0 plan, and where this RFC records it.
 | F37 | Error codes wrong across the two paths | §5.3, §6 |
 | F38 | SSE semantics broke §3.1.2 / §9.4.6 | §5.3, §5.4 |
 | F39 | Listener auth and CORS configured under the UI section | §13 |
-| F40 | The daemon owned the clients' chrome | §13.3 |
+| F40 | The daemon owned the clients' chrome | §13.1, §15.2 |
 | F41 | `Task.history` never populated | §14.1 |
 | F42 | Client polling created durable tasks | §9.2.1 |
 | F43 | Generic capabilities gated on UI flags | §13.1 |

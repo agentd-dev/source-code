@@ -61,8 +61,6 @@ cargo build --release --features a2a,exec
 **Configure** (`coding.yaml`):
 
 ```yaml
-config_version: "1"
-
 agent:
   name: coder
   # Your CLAUDE.md equivalent. Keep it about HOW to work, not what the task is.

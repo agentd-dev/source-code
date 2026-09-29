@@ -16,10 +16,10 @@
 #   --help
 #
 # Release binaries are Linux/musl (amd64 + arm64) and carry the cloud-native
-# feature set, `cel` included — it has been in the shipped set since 2.3.0,
-# because a published binary that refused `when`/`until`/`filter` at validation
-# made every non-trivial config a build-from-source job. One thing is
-# deliberately NOT in them, and needs a source build:
+# feature set, `cel` included, because a published binary that refused
+# `when`/`until`/`filter` at validation would make every non-trivial config a
+# build-from-source job. One thing is deliberately NOT in them, and needs a
+# source build:
 #   * `exec`, the local command runner (docs/coding-agent.md)
 # macOS and Windows have no prebuilt binary yet — this script tells you how to
 # build instead of pretending otherwise.
@@ -57,8 +57,8 @@ EOF
 }
 
 # --- options ----------------------------------------------------------------
-VERSION="${AGENTD_VERSION:-${AGENT_VERSION:-}}"        # AGENT_* kept for 1.x
-DIR="${AGENTD_INSTALL_DIR:-${AGENT_INSTALL_DIR:-}}"
+VERSION="${AGENTD_VERSION:-}"
+DIR="${AGENTD_INSTALL_DIR:-}"
 NO_VERIFY="${AGENTD_NO_VERIFY:-}"
 
 while [ $# -gt 0 ]; do

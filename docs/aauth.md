@@ -37,16 +37,16 @@ signed request. From then on **every** MCP request — and, when configured, the
 headers.
 
 Each flag is also a config path under `security.aauth` (so `--aauth-provider` is
-`security.aauth.provider`, and `AGENTD_SECURITY_AAUTH_PROVIDER` works alongside
-the shorter env name below).
+`security.aauth.provider`), and the env column names the variable that path
+derives.
 
 | Flag | Env | Meaning |
 |---|---|---|
-| `--aauth-provider <url>` | `AGENT_AAUTH_PROVIDER` | The Agent Provider — this turns AAuth on. |
-| `--aauth-key-file <path>` | `AGENT_AAUTH_KEY_FILE` | Durable Ed25519 key (created 0600 if absent; default `/var/lib/agentd/aauth-key`). Put it on shared storage so subagents resolve the same identity. |
-| `--aauth-enroll-token <T>` | `AGENT_AAUTH_ENROLL_TOKEN` | One-time enrollment token (a `{{secret:…}}` reference), if the provider is in `token` mode. |
-| `--aauth-enroll-assertion-file <path>` | `AGENT_AAUTH_ENROLL_ASSERTION_FILE` | **Federated** enrollment: a file holding an enrollment assertion — e.g. a Kubernetes projected ServiceAccount token whose audience is the provider. Re-read fresh on every enroll (so a rotated token is always current); the assertion never touches config or logs. |
-| `--aauth-person-server <url>` | `AGENT_AAUTH_PERSON_SERVER` | Person Server for user-scoped identity (Case C — the resource-token → user auth-token exchange). |
+| `--aauth-provider <url>` | `AGENTD_SECURITY_AAUTH_PROVIDER` | The Agent Provider — this turns AAuth on. |
+| `--aauth-key-file <path>` | `AGENTD_SECURITY_AAUTH_KEY_FILE` | Durable Ed25519 key (created 0600 if absent; default `/var/lib/agentd/aauth-key`). Put it on shared storage so subagents resolve the same identity. |
+| `--aauth-enroll-token <T>` | `AGENTD_SECURITY_AAUTH_ENROLL_TOKEN` | One-time enrollment token (a `{{secret:…}}` reference), if the provider is in `token` mode. |
+| `--aauth-enroll-assertion-file <path>` | `AGENTD_SECURITY_AAUTH_ENROLL_ASSERTION_FILE` | **Federated** enrollment: a file holding an enrollment assertion — e.g. a Kubernetes projected ServiceAccount token whose audience is the provider. Re-read fresh on every enroll (so a rotated token is always current); the assertion never touches config or logs. |
+| `--aauth-person-server <url>` | `AGENTD_SECURITY_AAUTH_PERSON_SERVER` | Person Server for user-scoped identity (Case C — the resource-token → user auth-token exchange). |
 
 A binary built without `--features aauth` accepts the settings and ignores them —
 nothing is signed. With the feature, a key file that cannot be read or created,

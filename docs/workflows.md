@@ -53,13 +53,11 @@ rules still belong to `agentd --validate-config`.
 
 ## The anatomy of a workflow document
 
-A workflow is an object under `workflows:` in a `config_version: "1"` settings
-file. The top-level keys are a closed set — anything else is a parse error.
+A workflow is an object under `workflows:` in a settings file. The top-level keys are a closed set — anything else is a parse error.
 
 | Key | Meaning |
 |---|---|
 | `name` | required; must match `[a-zA-Z_][a-zA-Z0-9_-]{0,63}` |
-| `version` | the document version; defaults to `3`, and `3` is the only value accepted if written |
 | `description` | free text |
 | `armed` | default `true`; `false` loads the definition without arming its triggers |
 | `inputs` | `{schema: <JSON Schema>}` — enforced when a run is created |
@@ -73,12 +71,11 @@ file. The top-level keys are a closed set — anything else is a parse error.
 | `durable` | default `true` (or the `store.durability.work` deployment default) — `false` makes runs memory-only: no run record, no checkpoints, forgotten by a restart. The fast path for recomputable work; see §durability. |
 | `state` | declares the run variables: a per-key `schema` that gates every write, and/or a `reducer` saying how concurrent writes combine (see §declared state) |
 | `steps` | the graph: an object of step id to step |
-| `file` / `uri` | load the document from a path or an MCP resource instead of inline (a config entry can also use `url:` with headers, or a `dir:` folder scan, `dir: {path, glob, order}` — `glob` and `order` live inside `dir`, and a sibling `glob` is refused by name at startup (exit `2`); see the configuration doc §6.1) |
+| `file` / `uri` | load the document from a path or an MCP resource instead of inline (a config entry can also use `url:` with headers, or a `dir:` folder scan, `dir: {path, glob, order}` — `glob` and `order` live inside `dir`; see the configuration doc §6.1) |
 
 A complete, runnable example:
 
 ```yaml
-config_version: "1"
 intelligence:
   endpoints: https://api.openai.com/v1
   model: gpt-5.1

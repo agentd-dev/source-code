@@ -46,6 +46,6 @@ double extension on the workflow entry.
 `$ref`), and validate against the metaschema. `yaml-language-server` handles
 2020-12; a reviewer may still ask, so it is worth saying so up front.
 
-**Stability.** The `versions` map pins `config-1.json` / `workflow-3.json`, so
-a document keeps validating against the version it was written for while the
-unversioned URL follows the current major.
+**Stability.** Each entry names one URL — `https://agentd.dev/schema/config.json`
+and `https://agentd.dev/schema/workflow.json` — and the schema at that URL is the
+one the current agentd validates against.

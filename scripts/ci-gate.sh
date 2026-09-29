@@ -57,7 +57,7 @@ done
 
 if [ "${1:-}" != "quick" ]; then
   step "test (workspace, all features)"
-  cargo test --workspace --all-features || fail=1
+  cargo test --workspace --all-features --no-fail-fast || fail=1
 
   # A release publishes agentd-net, agentd-mcp, agentd-core and agentd-cli to
   # crates.io. `cargo publish` refuses a crate whose path dependency is not

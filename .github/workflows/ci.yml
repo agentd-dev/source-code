@@ -39,12 +39,16 @@ jobs:
       # The whole workspace under all features: agent's feature-gated tests
       # (serve_mcp / otel_e2e / …) and the black-box agentd-conformance suite,
       # which builds + drives the real binary, both run here.
-      - run: cargo test --workspace --all-features
+      # --no-fail-fast, and the checks after it run even when it fails: one
+      # red test binary must not hide the verdict of every binary (and every
+      # check) that comes after it.
+      - run: cargo test --workspace --all-features --no-fail-fast
       # The published JSON Schemas are generated from the binary and committed,
       # because the site build has no Rust toolchain. Regenerate and diff: a
       # schema that has drifted from the loader is worse than none, since an
       # editor then reports valid documents as broken.
       - name: published schemas are current
+        if: ${{ !cancelled() }}
         run: |
           cargo build -p agentd-cli --all-features
           ./scripts/gen-schemas.sh
@@ -94,8 +98,9 @@ jobs:
       # between them fails loudly.
       - run: cargo clippy -p agentd-core --all-targets ${{ matrix.features }} -- -D warnings
       - run: cargo clippy -p agentd-cli --all-targets ${{ matrix.features }} -- -D warnings
-      - run: cargo test -p agentd-core ${{ matrix.features }}
-      - run: cargo test -p agentd-cli ${{ matrix.features }}
+      - run: cargo test -p agentd-core ${{ matrix.features }} --no-fail-fast
+      - if: ${{ !cancelled() }}
+        run: cargo test -p agentd-cli ${{ matrix.features }} --no-fail-fast
 
   # What ships is one static binary on an empty base. That is now the claim
   # worth guarding: MCP and A2A are the official/published implementations

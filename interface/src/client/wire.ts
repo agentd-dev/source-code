@@ -419,6 +419,12 @@ export async function rpcStream(
   }
   if (!res.body) throw new ClientError('invalid-response', 'the agent opened a stream with no body');
   const reader = res.body.getReader();
+  // The abort ends the stream here rather than trusting fetch to: Node's
+  // fetch errors a body only while a read is pending, so a heartbeat that
+  // lands between the abort and the next read leaves that read waiting
+  // forever — and the connection open, on a stream the caller has stopped.
+  const onAbort = () => void reader.cancel(o.signal?.reason).catch(() => {});
+  o.signal?.addEventListener('abort', onAbort, { once: true });
   try {
     // Checked before a single frame is read: nothing from an unactivated
     // extension reaches the caller.
@@ -426,7 +432,11 @@ export async function rpcStream(
     const decoder = new TextDecoder();
     const feed = sseParser((ev) => onFrame(frameOf(ev, res), ev.id));
     for (;;) {
+      o.signal?.throwIfAborted();
       const { done, value } = await reader.read();
+      // A stream the abort cancelled ends as fetch's own abort does: with
+      // the reason, never as a server's clean end.
+      o.signal?.throwIfAborted();
       if (done) break;
       feed(decoder.decode(value, { stream: true }));
     }
@@ -435,6 +445,8 @@ export async function rpcStream(
   } catch (e) {
     await reader.cancel().catch(() => {});
     throw e;
+  } finally {
+    o.signal?.removeEventListener('abort', onAbort);
   }
   return { echo };
 }

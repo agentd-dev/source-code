@@ -1,0 +1,6 @@
+# The official A2A Python SDK the interop tests hold agentd and its clients
+# to, pinned: a new SDK release is a new reading of the spec, and adopting it
+# is a change made on purpose. uvicorn serves the hello-world sample, as the
+# sample itself does.
+a2a-sdk[http-server]==1.1.5
+uvicorn==0.54.0

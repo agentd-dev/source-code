@@ -455,6 +455,51 @@ test('stream errors throw', async (t) => {
 
 // ---- the extension echo --------------------------------------------------------
 
+test('an abort ends a stream whose body does not heed the signal', async (t) => {
+  // Node's fetch errors a body only while a read is pending: a heartbeat
+  // that lands between the abort and the next read left that read waiting
+  // forever. This body never ends and never sees the signal, so only the
+  // client's own handling can stop it.
+  const enc = new TextEncoder();
+  const state = {};
+  let heartbeat;
+  stubFetch(
+    t,
+    (req) =>
+      new Response(
+        new ReadableStream({
+          start(c) {
+            c.enqueue(enc.encode(frame({ hello: { seq: 0 } }, req.body.id)));
+            heartbeat = setInterval(() => c.enqueue(enc.encode(':\n\n')), 5);
+          },
+          cancel() {
+            state.cancelled = true;
+            clearInterval(heartbeat);
+          },
+        }),
+        { status: 200, headers: { 'content-type': 'text/event-stream' } },
+      ),
+  );
+  t.after(() => clearInterval(heartbeat));
+  const ac = new AbortController();
+  const frames = [];
+  const done = rpcStream(EP, 'SubscribeToTask', { id: 't' }, (r) => frames.push(r), { signal: ac.signal });
+  await new Promise((r) => setTimeout(r, 30));
+  ac.abort();
+  let t2;
+  const settled = await Promise.race([
+    done.then(
+      () => 'resolved',
+      (e) => e,
+    ),
+    new Promise((r) => (t2 = setTimeout(() => r('still open'), 1000))),
+  ]);
+  clearTimeout(t2);
+  assert.equal(settled?.name, 'AbortError', `an aborted stream ends with the abort, not ${settled}`);
+  assert.equal(state.cancelled, true, 'and its body is cancelled');
+  assert.deepEqual(frames, [{ hello: { seq: 0 } }]);
+});
+
 test('echo verification', async (t) => {
   assert.equal(parseExtensionHeader(null), null);
   assert.deepEqual(parseExtensionHeader(''), []);

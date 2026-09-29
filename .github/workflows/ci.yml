@@ -63,6 +63,80 @@ jobs:
             exit 1
           fi
 
+  # The display clients (interface/): a separate Node package, gated on every
+  # push like the daemon — a change on either side of the wire can break the
+  # other, so neither side's gate is filtered to its own paths. Build first:
+  # the tests import the compiled dist/, which a fresh checkout lacks. The
+  # frames are the TUI rendered for the docs; generating them runs the real
+  # components, so a render that throws fails here.
+  interface:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [20, 22]
+    defaults:
+      run:
+        working-directory: interface
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: interface/package-lock.json
+      - run: npm ci
+      - run: npm run build
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run frames
+
+  # The contract between the daemon and its clients, held three ways: to the
+  # published extension files (the golden examples, validated with ajv), to
+  # the real daemon over the wire (live.e2e.mjs, every frame and reply against
+  # those files), and to someone else's reading of A2A 1.0 — the official
+  # Python SDK as a client of agentd, its hello-world server as a peer of
+  # agentd and of the TypeScript client. npm.yml runs the same scripts before
+  # it publishes. CI=true turns a missing prerequisite into a failure rather
+  # than a skip, so this job cannot pass by running nothing.
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: interface/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: interface/test/stock/requirements.txt
+      - run: pip install -r interface/test/stock/requirements.txt
+      - run: cargo build -p agentd-cli --features a2a,internal-mocks
+      - run: npm ci
+        working-directory: interface
+      - run: npm run build
+        working-directory: interface
+      - name: the published extension files
+        run: node --test test/contract.test.mjs
+        working-directory: interface
+      - name: interop with the official A2A SDK
+        if: ${{ !cancelled() }}
+        run: npm run test:stock
+        working-directory: interface
+        env:
+          AGENTD_E2E_BIN: ${{ github.workspace }}/target/debug/agentd
+          AGENTD_STOCK_PYTHON: python
+      - name: the TypeScript client against the real daemon
+        if: ${{ !cancelled() }}
+        run: npm run test:live
+        working-directory: interface
+        env:
+          AGENTD_E2E_BIN: ${{ github.workspace }}/target/debug/agentd
+
   # The capability-pruning story, proven in CI: every feature combination an
   # operator is likely to ship must build + test clean on its own (feature
   # unification under `--all-features` can hide a broken solo build).

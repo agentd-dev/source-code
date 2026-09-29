@@ -1388,33 +1388,56 @@ is kept**, nothing is half-applied. A coherence check then refuses the reload
 with `config.reload.restart_required` if any **restart-only** path changed,
 naming the paths that differ.
 
+A reload then **stages** everything it changes before any of it goes live: the
+new MCP servers are dialed into a connection set beside the running one, and
+the tool registry, the workflows (their documents, and each step's tool and
+server references), the skills catalogue, a resource instruction and the
+intelligence token are built and checked against the servers the reload would
+run on. Anything that fails refuses the reload with `config.reload.invalid`
+naming the reason: the running configuration, instruction, servers, registry,
+skills and workflows are untouched, and the connections the reload dialed are
+closed (`mcp.disconnect`, `reason: "reload refused"`). Only when every piece is
+staged is it **committed**, in one step with nothing left that can fail. A
+reload is applied whole or not at all, and `config.reloaded` or
+`config.reload.invalid` says which. (The listener's principal rules and webhook
+routes, below, are rebuilt at commit; one that fails to build keeps the rules
+already in force and logs why.)
+
 **Reloadable** (applied live at a quiesce boundary; the flat tree does most of
 the work — every turn worker is spawned fresh from the live settings, so the next
 unit of work picks the new values up):
 
 - `intelligence.endpoints` / `model` / `token` / `token_file` — repointed via the
-  runtime hot-swap primitive; in-flight turns follow the `swap_policy` — and
+  runtime hot-swap primitive; in-flight turns follow the `swap_policy`; a
+  token that cannot be resolved refuses the reload — and
   `intelligence.budget` (fresh windows, counters carried over)
-- `agent.instruction` (a resource instruction re-subscribes) and the rest of
+- `agent.instruction` (a resource instruction is read through the servers the
+  reload would run on, and one that cannot be read refuses the reload) and the
+  rest of
   `agent` — `description` (the public card follows it), `preflight`,
   `wake_on`, `tools`, `max_parallel_turns`, `on_workflow_finished`,
   `conversation_budget`, `approval`, `ask_human_fallback`,
   `ask_human_unowned`
-- `mcp` — re-handshaked live: removed servers disconnect, added or changed
-  servers connect + initialize; unchanged ones are left alone
-- `tools`, `knowledge`, `search` — the tool registry is rebuilt (a registry that
-  fails to build refuses the reload and keeps the old one)
+- `mcp` — re-handshaked live: added or changed servers connect + initialize
+  into the staged set, unchanged ones keep their live connection (never
+  re-dialed), removed ones disconnect when the reload applies. A server whose
+  dial fails is logged (`mcp.connect.fail`) and left out, as at startup. A call
+  already in flight on a removed server finishes on its connection; a step that
+  starts after the reload fails with `mcp server "<name>" is not connected`
+- `tools`, `knowledge`, `search` — the tool registry is rebuilt, and the
+  configuration's workflow tools are registered on it again (a registry that
+  fails to build refuses the reload)
 - `skills` — the catalogue is re-discovered
-- `workflows` — definitions reload and re-arm; **live runs stay pinned** to the
-  definition hash they started with. The definitions are read and parsed
-  before any other section applies, so one that does not load (a file that
-  does not parse, a failed fetch, two definitions of one name) refuses the
-  reload with nothing changed. Two checks can only run once the new servers
-  and tool registry are live, and refuse the reload after those sections
-  applied, keeping the running workflows: a `tool` or `mcp.tool` step naming
-  what the new registry or servers do not have, and a `uri:` document when the
-  same reload changes `mcp` (it is read through the servers that reload
-  connects)
+- `workflows` — definitions reload and re-arm (a `schedule`, `loop` or
+  `subscribe` start of an added or changed definition is armed); **live runs
+  stay pinned** to the definition hash they started with. The definitions are
+  read and parsed before any server is dialed, so one that does not load (a
+  file that does not parse, a failed fetch, two definitions of one name)
+  refuses the reload with nothing dialed. A `uri:` document is read through the
+  servers the reload would run on, and every definition is checked against
+  them and the rebuilt registry — also when only `mcp`, `tools`, `knowledge` or
+  `search` changed — so a `tool` or `mcp.tool` step naming what they do not
+  have refuses the reload
 - `limits`, `lifecycle.idle_grace`, `observability.log_level` /
   `log_content` / `status_values`, `memory`, `context`, and
   `store.retention` (the next sweep applies the new bound)

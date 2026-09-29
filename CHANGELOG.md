@@ -444,6 +444,35 @@ holds up the next call on the same server.
   configured one of the same name keeps from loading is logged as
   `workflow.stored.shadowed` instead of being skipped silently, and
   discarded.
+- **A reload applies completely or not at all.** Three checks could only
+  run once a reload's new MCP servers and tool registry were live — a
+  workflow step naming a tool or server they lack, a `uri:` workflow
+  document read through a server the same reload adds, and the registry
+  build itself — so a reload they refused left the settings, instruction,
+  MCP connections, registry and skills on the refused configuration and kept
+  only the running workflows. A reload is now staged beside the running
+  state: added and changed servers are dialed into a connection set of their
+  own (an unchanged server keeps its connection), and the registry, the
+  workflows and their references, the skills, a resource instruction and the
+  intelligence token are built and checked against it. Any failure refuses
+  the reload with nothing changed and closes what it dialed (`mcp.disconnect`,
+  `reason: "reload refused"`); otherwise everything is switched in at once,
+  with nothing left that can fail. On the way: the workflows are re-checked
+  whenever `mcp`, `tools`, `knowledge` or `search` change, so removing a
+  server a workflow calls is refused rather than applied; a resource
+  instruction served by a server the same reload adds is read through it
+  (it was read first, failed, and the old text stayed while the reload
+  reported `agent.instruction`), and one nothing serves refuses the reload,
+  as does an unreadable `intelligence.token_file` (the new endpoint went live
+  with the old credential); a rebuilt registry keeps the configuration's
+  workflow tools (it dropped every one); a workflow a reload adds or changes
+  has its `schedule`, `loop` and `subscribe` starts armed (an added schedule
+  never fired); a workflow document that resolves to something other than a
+  mapping is refused naming its source (it panicked the daemon); and a failed
+  `url:` workflow source is named by scheme, host and path in the log and the
+  refusal, with the fetch error scrubbed of the URL's userinfo and query. A
+  run in flight on a server the reload removes finishes the call it already
+  made; its next step on that server fails as not connected.
 - **A configured workflow cannot be edited or deleted at runtime.**
   `workflow.update` of a workflow the configuration defines (inline, `file:`,
   `dir:`, `url:`, `uri:`, an instruction document's `:::!workflow` or

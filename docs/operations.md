@@ -442,13 +442,17 @@ inputs, so a flag still overrides the new file. `RESTART_ONLY_PATHS` in
 | `workflows` (live runs stay pinned to their hash) | |
 | `limits`, `lifecycle.idle_grace`, `observability.log_level` / `.log_content`, `memory`, `context` | |
 
-`mcp` reloads via a live re-handshake: removed servers disconnect, added and
-edited servers connect and hand-shake, unchanged servers are left alone. A
-contained runtime failure (an added server that will not connect) is logged and
-that server is simply absent — it never rolls back the already-applied steps or
-kills the daemon. `intelligence` repoints the next unit of work: every turn
-worker is spawned fresh from the live settings, so a new endpoint, model, budget
-or tool override takes effect at the next turn.
+`mcp` reloads via a live re-handshake: added and edited servers are dialed
+and hand-shaken into a connection set beside the running one, unchanged servers
+keep their live connection (never re-dialed), and removed servers disconnect
+once the reload applies. An added or edited server that will not connect is
+logged (`mcp.connect.fail`) and absent from the new set, as at startup; a
+workflow step that needs it refuses the reload. A call already in flight on a
+removed server finishes on its connection; a step that starts after the reload
+fails with `mcp server "<name>" is not connected`. `intelligence` repoints the
+next unit of work: every turn worker is spawned fresh from the live settings,
+so a new endpoint, model, budget or tool override takes effect at the next
+turn.
 
 A reload whose diff touches **any** restart-only path is refused as a clean
 no-op, naming the paths, so a controller reads them and rolls a restart instead.
@@ -463,11 +467,18 @@ The routine is, in order:
    kept.
 2. **Restart-only diff** — any changed restart-only path refuses the reload
    before anything is applied.
-3. **Apply** the reloadable diff, lowest-risk first: value swaps, the MCP
-   re-handshake, the registry rebuild, skills re-discovery, then the workflow
-   reload (live runs keep the definition they started with, pinned by hash).
-4. A registry or workflow document that fails to build refuses the whole reload
-   and restores the previous tool settings.
+3. **Stage** everything that can fail, beside the running state: the workflow
+   documents (before anything is dialed), the intelligence token, the new MCP
+   servers' connections, then — against those servers — the `uri:` workflow
+   documents, the tool registry, every workflow's tool and server references,
+   the skills catalogue and a resource instruction. Any failure refuses the
+   whole reload with `config.reload.invalid`: nothing running changed, and the
+   connections it dialed are closed (`mcp.disconnect`, `reason: "reload
+   refused"`).
+4. **Commit** the staged pieces in one step on the loop thread, with nothing
+   left that can fail: settings, instruction, the MCP connection set, the
+   registry, skills and workflows switch together (live runs keep the
+   definition they started with, pinned by hash).
 
 `agentd --validate-config` runs the same validation as an admission gate before
 you ship the file, so a bad candidate fails fast (exit `2`) rather than at reload

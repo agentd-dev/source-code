@@ -880,8 +880,9 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         );
         return crate::exit::USAGE;
     }
-    // Workflow tools: registered ONCE, here, from the startup document. This
-    // is the only door — `workflow.create`/`update` refuse a `tool:` block —
+    // Workflow tools: registered here from the configuration, and again by a
+    // reload that rebuilds the registry. The configuration is the only door
+    // — `workflow.create`/`update` refuse a `tool:` block —
     // because the registry is otherwise built once and validated fail-closed,
     // and a root turn that could mint or shadow a tool name would make it a
     // mutable index with no operator in the loop.
@@ -899,20 +900,7 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
             );
             return crate::exit::USAGE;
         }
-        // One line per registered tool, carrying the tags that were DERIVED
-        // from what its steps reach. The derivation is the safety argument —
-        // a workflow author cannot declare its own trifecta floor — so an
-        // operator has to be able to see what it concluded.
-        for w in &defs {
-            let Some(t) = &w.tool else { continue };
-            log.info(
-                "registry.workflow_tools",
-                json!({"tool": t.name, "workflow": w.name,
-                       "mode": if t.mode == crate::engine::model::WorkflowToolMode::Sync { "sync" } else { "async" },
-                       "tags": rt.registry.get(&t.name).map(|s| s.tags.clone()).unwrap_or_default(),
-                       "arguments": rt.registry.get(&t.name).map(|s| s.input_schema.clone())}),
-            );
-        }
+        rt.log_workflow_tools();
     }
     // Workflows — a definition that fails to load is a config error, not a
     // warning: a daemon must not run with a workflow it silently dropped.
@@ -1545,7 +1533,53 @@ fn resolve_intel_token(
     Ok(None)
 }
 
+/// A resource instruction read, verified and folded through one server, not
+/// yet the running instruction ([`Runtime::adopt_instruction`] makes it so).
+pub(crate) struct FetchedInstruction {
+    server: String,
+    /// The connection it was read through, which the adoption subscribes on.
+    client: Arc<McpClient>,
+    res: String,
+    text: String,
+    version_id: Option<String>,
+    delivered_digest: Option<String>,
+    canonical: Option<String>,
+}
+
+/// An instruction resource reference split into the server it names (an
+/// `mcp://<server>/<uri>`) and the resource URI; a bare URI names no server,
+/// and whichever connected one serves it answers.
+pub(crate) fn instruction_resource(uri: &str) -> (Option<&str>, &str) {
+    match uri.strip_prefix("mcp://").and_then(|r| r.split_once('/')) {
+        Some((s, r)) => (Some(s), r),
+        None => (None, uri),
+    }
+}
+
 impl Runtime {
+    /// One line per registered workflow tool, carrying the tags that were
+    /// DERIVED from what its steps reach. The derivation is the safety
+    /// argument — a workflow author cannot declare its own trifecta floor — so
+    /// an operator has to be able to see what it concluded, at startup and
+    /// whenever a reload registers the tools again.
+    pub(crate) fn log_workflow_tools(&self) {
+        for w in self.workflows.values() {
+            // Read back from the registry, so a line is only ever about a
+            // tool that is actually there.
+            let Some(t) = &w.tool else { continue };
+            let Some(spec) = self.registry.get(&t.name) else {
+                continue;
+            };
+            self.log.info(
+                "registry.workflow_tools",
+                json!({"tool": t.name, "workflow": w.name,
+                       "mode": if t.mode == crate::engine::model::WorkflowToolMode::Sync { "sync" } else { "async" },
+                       "tags": spec.tags,
+                       "arguments": spec.input_schema}),
+            );
+        }
+    }
+
     /// Read the instruction resource and subscribe to it, so an update at the
     /// server reaches this agent without a reload.
     pub(crate) fn subscribe_instruction(&mut self, uri: &str) -> Result<(), String> {
@@ -1629,11 +1663,10 @@ impl Runtime {
             #[cfg(not(feature = "oci"))]
             return Err("an oci:// instruction requires building with --features oci".to_string());
         }
-        let (server, res) = match uri.strip_prefix("mcp://").and_then(|r| r.split_once('/')) {
-            Some((s, r)) => (Some(s.to_string()), r.to_string()),
-            None => (None, uri.to_string()),
-        };
-        self.subscribe_instruction_mcp(uri, server, res)
+        let (server, res) = instruction_resource(uri);
+        let fetched = self.fetch_instruction_mcp(&self.mcp, server, res)?;
+        self.adopt_instruction(fetched);
+        Ok(())
     }
 
     /// The §7 AUTHOR signature on a re-fetched document, checked against the
@@ -1951,28 +1984,27 @@ impl Runtime {
         }
     }
 
-    fn subscribe_instruction_mcp(
-        &mut self,
-        _uri: &str,
-        server: Option<String>,
-        res: String,
-    ) -> Result<(), String> {
+    /// Read a resource instruction through `mcp` and fold it — every step
+    /// that can refuse it — without adopting it. The connection set is a
+    /// parameter because a reload reads the instruction through the servers
+    /// it has staged, and adopts it only if the whole reload applies.
+    pub(crate) fn fetch_instruction_mcp(
+        &self,
+        mcp: &BTreeMap<String, Arc<McpClient>>,
+        server: Option<&str>,
+        res: &str,
+    ) -> Result<FetchedInstruction, String> {
         // Find the serving client.
-        let candidates: Vec<(String, Arc<McpClient>)> = match &server {
-            Some(s) => self
-                .mcp
+        let candidates: Vec<(String, Arc<McpClient>)> = match server {
+            Some(s) => mcp
                 .get(s)
-                .map(|c| vec![(s.clone(), c.clone())])
+                .map(|c| vec![(s.to_string(), c.clone())])
                 .unwrap_or_default(),
-            None => self
-                .mcp
-                .iter()
-                .map(|(n, c)| (n.clone(), c.clone()))
-                .collect(),
+            None => mcp.iter().map(|(n, c)| (n.clone(), c.clone())).collect(),
         };
         let mut last_err = String::from("no connected MCP server serves it");
         for (name, c) in candidates {
-            match c.read_resource(&res) {
+            match c.read_resource(res) {
                 Ok(r) => {
                     // An encrypted envelope served as a resource decrypts (or
                     // refuses) here — a decode failure is terminal, not a
@@ -1990,7 +2022,7 @@ impl Runtime {
                     // §7.6 wire verification, BEFORE anything interprets the
                     // bytes: a source that pins a publisher gets exactly what
                     // that publisher signed, or nothing.
-                    let attested = self.verify_registry_read(&c, &res, &raw, &meta)?;
+                    let attested = self.verify_registry_read(&c, res, &raw, &meta)?;
                     // Delivered text is the CLEANED document when it carries
                     // machinery (resolution "raw" = resolve locally); the
                     // machinery itself applies on reload/restart. A document
@@ -2022,53 +2054,74 @@ impl Runtime {
                     } else {
                         raw
                     };
-                    if c.capabilities().supports_resources()
-                        && let Err(e) = c.subscribe(&res)
-                    {
-                        self.log.warn(
-                            "instruction.subscribe.fail",
-                            json!({"server": name, "uri": res, "err": e.to_string()}),
-                        );
-                    }
-                    let changed = self.instruction.text != text;
-                    let old_version_id = self.instruction.version_id.clone();
-                    let version_id = get_meta("versionId");
-                    let delivered_digest = get_meta("deliveredDigest");
-                    let canonical = get_meta("canonical");
-                    self.instruction = reactor::Instruction {
+                    return Ok(FetchedInstruction {
+                        server: name,
+                        client: c,
+                        res: res.to_string(),
                         text,
-                        source: "resource",
-                        uri: Some(res.clone()),
-                        server: Some(name.clone()),
-                        version: self.instruction.version + u64::from(changed),
-                        version_id: version_id.clone(),
-                        delivered_digest: delivered_digest.clone(),
-                    };
-                    self.log.info("instruction.loaded", json!({"server": name, "uri": res, "bytes": self.instruction.text.len(), "version": self.instruction.version, "version_id": version_id}));
-                    // The APPLY boundary (RFC-0016 §6): a registry version
-                    // change is one log line, old → new, timestamped like
-                    // every line — the publish→applied latency measure.
-                    if version_id.is_some() && version_id != old_version_id {
-                        self.log.info(
-                            "instruction.applied",
-                            json!({"uri": res, "old_version_id": old_version_id,
-                                   "new_version_id": version_id,
-                                   "delivered_digest": delivered_digest}),
-                        );
-                        self.report_instruction_binding(
-                            &name,
-                            canonical.as_deref(),
-                            version_id.as_deref(),
-                            delivered_digest.as_deref(),
-                            &res,
-                        );
-                    }
-                    return Ok(());
+                        version_id: get_meta("versionId"),
+                        delivered_digest: get_meta("deliveredDigest"),
+                        canonical: get_meta("canonical"),
+                    });
                 }
                 Err(e) => last_err = e.to_string(),
             }
         }
         Err(last_err)
+    }
+
+    /// Adopt a fetched resource instruction: subscribe to it, make it the
+    /// running instruction, and report the apply boundary. Nothing here
+    /// refuses — the subscription and the binding report are best-effort and
+    /// logged — so a reload that fetched it can adopt it with everything else.
+    pub(crate) fn adopt_instruction(&mut self, fetched: FetchedInstruction) {
+        let FetchedInstruction {
+            server: name,
+            client: c,
+            res,
+            text,
+            version_id,
+            delivered_digest,
+            canonical,
+        } = fetched;
+        if c.capabilities().supports_resources()
+            && let Err(e) = c.subscribe(&res)
+        {
+            self.log.warn(
+                "instruction.subscribe.fail",
+                json!({"server": name, "uri": res, "err": e.to_string()}),
+            );
+        }
+        let changed = self.instruction.text != text;
+        let old_version_id = self.instruction.version_id.clone();
+        self.instruction = reactor::Instruction {
+            text,
+            source: "resource",
+            uri: Some(res.clone()),
+            server: Some(name.clone()),
+            version: self.instruction.version + u64::from(changed),
+            version_id: version_id.clone(),
+            delivered_digest: delivered_digest.clone(),
+        };
+        self.log.info("instruction.loaded", json!({"server": name, "uri": res, "bytes": self.instruction.text.len(), "version": self.instruction.version, "version_id": version_id}));
+        // The APPLY boundary (RFC-0016 §6): a registry version
+        // change is one log line, old → new, timestamped like
+        // every line — the publish→applied latency measure.
+        if version_id.is_some() && version_id != old_version_id {
+            self.log.info(
+                "instruction.applied",
+                json!({"uri": res, "old_version_id": old_version_id,
+                       "new_version_id": version_id,
+                       "delivered_digest": delivered_digest}),
+            );
+            self.report_instruction_binding(
+                &name,
+                canonical.as_deref(),
+                version_id.as_deref(),
+                delivered_digest.as_deref(),
+                &res,
+            );
+        }
     }
 
     /// Drain MCP notifications. An updated instruction resource is re-read and

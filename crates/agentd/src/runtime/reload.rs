@@ -5,6 +5,16 @@
 //! `restart_required` and the running configuration stays, so the daemon never
 //! ends up half on one configuration and half on another.
 //!
+//! The same holds inside the reloadable partition. A reload is staged first:
+//! the new MCP servers are dialed into a connection set beside the running
+//! one, and the tool registry, the workflows, the skills and the instruction
+//! are built and checked against it. Only when all of it succeeds is it
+//! committed, in one step with nothing left that can fail. A reload is
+//! applied whole or refused with nothing changed, and what a refused one
+//! dialed is closed. (The listener's principal rules and webhook routes are
+//! rebuilt at commit; one that fails to build keeps the rules in force and
+//! says so, rather than falling open.)
+//!
 //! The reloadable partition applies at the loop's quiesce boundary. The flat
 //! child tree makes most of it trivial: every turn worker is spawned fresh
 //! from the live settings, so a new intelligence endpoint, model, instruction,
@@ -110,20 +120,40 @@ impl Runtime {
         for w in &loaded.warnings {
             self.log.warn("config.warning", json!({"warning": w}));
         }
-        let new = loaded.settings;
-        let old = std::mem::replace(&mut self.settings, new.clone());
-        // Workflows are staged FIRST, before any section applies: a set that
-        // cannot load (two definitions of one name, a file that does not
-        // parse, a fetch that fails) refuses the reload with the running
-        // configuration untouched. Staged last, the refusal came after the
-        // new instruction, MCP servers, tools and skills were already live,
-        // and `config.reload.invalid` described a reload that had half
-        // happened.
+        // Stage, then commit. Everything that can refuse the reload runs in
+        // `stage_reload`, building the new pieces BESIDE the running ones:
+        // the new MCP servers are dialed into a set of their own, and the
+        // tool registry, the workflows, the skills and the instruction are
+        // built and checked against that set. The settings are the one
+        // running structure staging reads the new values through, and a
+        // refusal puts them back — so a refused reload changes nothing. The
+        // commit then switches everything in with no step left that can
+        // fail, so an applied reload changed everything it reports.
+        let old = std::mem::replace(&mut self.settings, loaded.settings);
+        let staged = match self.stage_reload(&old) {
+            Ok(staged) => staged,
+            Err(errs) => {
+                self.settings = old;
+                return Err(ReloadRefused::Invalid(errs));
+            }
+        };
+        self.settings_doc = loaded.doc;
+        Ok(self.commit_reload(&old, staged))
+    }
+
+    /// Build and check everything the reload changes, beside the running
+    /// state. `self.settings` already holds the new settings; nothing else
+    /// running is touched. What this dials, a refusal closes.
+    fn stage_reload(&self, old: &cfg::Settings) -> Result<StagedReload, Vec<String>> {
+        let new = &self.settings;
+        // Workflows first: a set that cannot load (two definitions of one
+        // name, a file that does not parse, a fetch that fails) refuses the
+        // reload before anything is dialed.
         //
         // Re-read whenever an entry names an external DOCUMENT, not only when
         // the entries themselves differ: `file:`/`dir:`/`uri:`/`url:` point at
         // content that changes without the config changing, and the entry
-        // comparison cannot see that. The retirement loop below keys off each
+        // comparison cannot see that. The retirement at commit keys off each
         // definition's HASH, so an unchanged document reloads to the same hash
         // and nothing churns.
         let external = new.workflows.iter().any(|w| {
@@ -137,47 +167,322 @@ impl Runtime {
         // stay, nothing retires, and the next gate is announced on the new
         // channel.
         let channels_moved = old.agent.document_gate_channels != new.agent.document_gate_channels;
-        let staged = if old.workflows != new.workflows || external || channels_moved {
+        let servers_change = old.mcp != new.mcp;
+        // …and whenever the servers or the registry the definitions are
+        // checked against change: a step naming a tool or a server the
+        // reload takes away refuses it, as it refuses a start, rather than
+        // going live to fail on the day it runs.
+        let registry_inputs_moved =
+            old.tools != new.tools || old.knowledge != new.knowledge || old.search != new.search;
+        let workflows = if old.workflows != new.workflows
+            || external
+            || channels_moved
+            || servers_change
+            || registry_inputs_moved
+        {
             let mut staged = super::steps::StagedWorkflows::default();
             let docs = self.workflow_documents(&mut staged.errs);
             // A `uri:` document is read through a connected MCP server. When
-            // this reload changes the servers, the ones it reads through are
-            // not connected yet, so those documents are staged after the MCP
-            // section below. They, and the checks of every definition against
-            // the rebuilt tool registry and the connected servers, can only
-            // run once those are live: the refusals that can still follow
-            // applied sections.
-            let servers_change = old.mcp != new.mcp;
+            // this reload changes the servers, it is read through the set the
+            // reload would run on, once that is staged below.
             let (now, after_mcp): (Vec<_>, Vec<_>) = docs
                 .into_iter()
                 .partition(|(d, _)| !(servers_change && reads_a_resource(d)));
-            self.stage_workflows(now, &mut staged);
+            self.stage_workflows(now, &self.mcp, &mut staged);
             if !staged.errs.is_empty() {
-                self.settings = old;
-                return Err(ReloadRefused::Invalid(staged.errs));
+                return Err(staged.errs);
             }
             Some((staged, after_mcp))
         } else {
             None
         };
-        self.settings_doc = loaded.doc;
+        // The intelligence token: a file that cannot be read refuses the
+        // reload, as it refuses a start. Kept as it was, the new endpoint
+        // went live with the old endpoint's credential.
+        let intel_token = if intelligence_moved(old, new) {
+            let env = self.env.clone();
+            let envmap = move |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+            Some(
+                super::resolve_intel_token(new, &envmap)
+                    .map_err(|e| vec![format!("intelligence token: {e}")])?,
+            )
+        } else {
+            None
+        };
+        let mcp = if servers_change {
+            Some(self.stage_mcp()?)
+        } else {
+            None
+        };
+        match self.stage_on_servers(old, mcp.as_ref(), workflows) {
+            Ok(rest) => Ok(StagedReload {
+                intel_token,
+                mcp,
+                ..rest
+            }),
+            Err(errs) => {
+                if let Some(m) = mcp {
+                    self.discard_mcp(m);
+                }
+                Err(errs)
+            }
+        }
+    }
+
+    /// The connection set the new `mcp` section describes, built beside the
+    /// running one: an unchanged server's live connection is carried over
+    /// (the same connection, never re-dialed); an added or changed server is
+    /// dialed and initialized into the new set. A server whose dial fails is
+    /// logged and left out, exactly as at startup — and a workflow that
+    /// needs it refuses the reload below.
+    fn stage_mcp(&self) -> Result<StagedMcp, Vec<String>> {
+        let new = &self.settings;
+        // Every spec first: one that cannot be built refuses the reload
+        // before any server is dialed, as it refuses a start.
+        let mut specs = std::collections::BTreeMap::new();
+        let mut errs = Vec::new();
+        for s in &new.mcp.servers {
+            match s.to_spec() {
+                Ok(spec) => {
+                    specs.insert(s.name.clone(), spec);
+                }
+                Err(e) => errs.push(format!("mcp server {:?}: {e}", s.name)),
+            }
+        }
+        if !errs.is_empty() {
+            return Err(errs);
+        }
+        let timeout = new
+            .mcp
+            .default_timeout
+            .map(|d| d.0)
+            .unwrap_or(Duration::from_secs(60));
+        let mut set = std::collections::BTreeMap::new();
+        let mut fresh = Vec::new();
+        for s in &new.mcp.servers {
+            let spec = &specs[&s.name];
+            let same = self.mcp_specs.get(&s.name).is_some_and(|old| {
+                old.endpoint == spec.endpoint
+                    && old.headers == spec.headers
+                    && old.aauth == spec.aauth
+            });
+            if same && let Some(live) = self.mcp.get(&s.name) {
+                set.insert(s.name.clone(), live.clone());
+                continue;
+            }
+            match crate::mcp::from_spec(spec, s.timeout.map(|d| d.0).unwrap_or(timeout))
+                .and_then(|mut c| c.initialize().map(|()| c))
+            {
+                Ok(mut c) => {
+                    c.set_tool_meta(crate::mcp::tool_meta(
+                        &self.run_id,
+                        &self.instance,
+                        self.trace_id.as_deref(),
+                    ));
+                    set.insert(s.name.clone(), Arc::new(c));
+                    fresh.push(s.name.clone());
+                }
+                Err(e) => {
+                    self.log.warn(
+                        "mcp.connect.fail",
+                        json!({"server": s.name, "err": e.to_string(), "reason": "reload"}),
+                    );
+                    crate::obs::metrics::record_mcp_connect_failure(&s.name);
+                }
+            }
+        }
+        Ok(StagedMcp { set, specs, fresh })
+    }
+
+    /// Close what a refused reload dialed. The connections are dropped with
+    /// the staged set — nothing running ever held them — and each is logged,
+    /// so the log shows a server that answered a handshake did not join.
+    fn discard_mcp(&self, staged: StagedMcp) {
+        for name in &staged.fresh {
+            self.log.info(
+                "mcp.disconnect",
+                json!({"server": name, "reason": "reload refused"}),
+            );
+        }
+    }
+
+    /// Everything built against the servers the reload would run on: the
+    /// `uri:` workflow documents they serve, the tool registry, the workflow
+    /// checks, the skills and a resource instruction. `mcp` is the staged
+    /// connection set when the servers change; otherwise the running one
+    /// serves.
+    fn stage_on_servers(
+        &self,
+        old: &cfg::Settings,
+        mcp: Option<&StagedMcp>,
+        workflows: Option<(
+            super::steps::StagedWorkflows,
+            Vec<(serde_json::Value, String)>,
+        )>,
+    ) -> Result<StagedReload, Vec<String>> {
+        let new = &self.settings;
+        let conns = mcp.map_or(&self.mcp, |m| &m.set);
+        let specs = mcp.map_or(&self.mcp_specs, |m| &m.specs);
+        let workflows = match workflows {
+            Some((mut staged, after_mcp)) => {
+                self.stage_workflows(after_mcp, conns, &mut staged);
+                if !staged.errs.is_empty() {
+                    return Err(staged.errs);
+                }
+                Some(staged)
+            }
+            None => None,
+        };
+        // The registry is rebuilt when what it is built from changed — or
+        // when the workflow tools did, since the configuration's workflows
+        // are the only door a workflow tool has.
+        let tools_moved = workflows.as_ref().is_some_and(|st| {
+            workflow_tools(st.defs().iter())
+                != workflow_tools(self.workflows.values().map(|w| &**w))
+        });
+        let rebuild = old.tools != new.tools
+            || old.mcp != new.mcp
+            || old.knowledge != new.knowledge
+            || old.search != new.search
+            || tools_moved;
+        let registry = if rebuild {
+            let server_tools: Vec<ServerTools> = new
+                .mcp
+                .servers
+                .iter()
+                .filter_map(|s| {
+                    let c = conns.get(&s.name)?;
+                    Some(ServerTools {
+                        name: s.name.clone(),
+                        ns: s.ns.clone(),
+                        tags: specs
+                            .get(&s.name)
+                            .map(|sp| sp.tags.clone())
+                            .unwrap_or_default(),
+                        tools: c.list_tools().unwrap_or_default(),
+                    })
+                })
+                .collect();
+            Some(Registry::build(new, &server_tools)?)
+        } else {
+            None
+        };
+        // The workflows are checked against the registry and the servers
+        // they will run with — the staged ones, not the running ones.
+        let workflows = match workflows {
+            Some(staged) => Some(self.prepare_workflows(
+                staged,
+                registry.as_ref().unwrap_or(&self.registry),
+                conns,
+            )?),
+            None => None,
+        };
+        // A rebuilt registry carries the workflow tools of the set that will
+        // be live: built from settings and servers alone, it would drop
+        // every one of them.
+        let registry = match registry {
+            Some(mut r) => {
+                let live = workflows.as_ref().map_or(&self.workflows, |p| &p.workflows);
+                let defs: Vec<&crate::engine::Workflow> = live.values().map(|w| &**w).collect();
+                let errs = r.register_workflow_tools(&defs);
+                if !errs.is_empty() {
+                    return Err(errs);
+                }
+                Some(r)
+            }
+            None => None,
+        };
+        // Skills sources — the config section, or the instruction's inline
+        // `:::!skill` definitions (they live on `agent`, but they land in this
+        // catalogue).
+        // …and rebuilt whenever a LOCAL folder is configured, even with the
+        // section unchanged: the skills live in files, and comparing the
+        // setting only would make "edit a skill, send SIGHUP" a reload that
+        // reports success and changes nothing.
+        let skills = if old.skills != new.skills
+            || old.agent.inline_skills != new.agent.inline_skills
+            || new.skills.dir.is_some()
+        {
+            let mut cat = crate::context::skills::Catalogue::new(
+                new.skills
+                    .reference_prefix
+                    .as_deref()
+                    .unwrap_or(crate::context::skills::DEFAULT_PREFIX),
+                new.skills.max_bytes.unwrap_or(32_768) as usize,
+            );
+            for src in &new.skills.sources {
+                if let Some(c) = conns.get(&src.server) {
+                    let mode = match src.discover {
+                        cfg::Discover::Prompts => crate::context::skills::Discover::Prompts,
+                        cfg::Discover::Resources => crate::context::skills::Discover::Resources,
+                        cfg::Discover::Auto => crate::context::skills::Discover::Auto,
+                    };
+                    cat.discover(&**c, mode, src.filter.as_deref());
+                }
+            }
+            if let Some(dir) = &new.skills.dir {
+                cat.add_dir(std::path::Path::new(dir));
+            }
+            cat.add_inline(&new.agent.inline_skills);
+            Some(cat)
+        } else {
+            None
+        };
+        // The instruction: static text, or a resource read (and verified,
+        // and folded) through the servers the reload would run on. One that
+        // cannot be read refuses the reload, as it refuses a start — the
+        // reload that reported `agent.instruction` while the old text stayed
+        // is the defect this closes.
+        let instruction = if old.agent.instruction != new.agent.instruction {
+            Some(match new.agent.instruction.clone() {
+                Some(t) if cfg::looks_like_resource_uri(&t) => {
+                    let (server, res) = super::instruction_resource(&t);
+                    StagedInstruction::Resource(
+                        self.fetch_instruction_mcp(conns, server, res)
+                            .map_err(|e| vec![format!("agent.instruction {t}: {e}")])?,
+                    )
+                }
+                Some(t) => StagedInstruction::Text(t),
+                None => StagedInstruction::Text(String::new()),
+            })
+        } else {
+            None
+        };
+        Ok(StagedReload {
+            intel_token: None,
+            mcp: None,
+            registry,
+            workflows,
+            skills,
+            instruction,
+            channels_moved: old.agent.document_gate_channels != new.agent.document_gate_channels,
+        })
+    }
+
+    /// Switch the staged reload in. Nothing here can refuse: every piece
+    /// that could fail was built in `stage_reload`, so this is swaps and
+    /// in-memory rebuilds, plus best-effort notices (a resource
+    /// subscription, a binding report, closing what the reload dropped)
+    /// that are logged when they fail.
+    fn commit_reload(&mut self, old: &cfg::Settings, staged: StagedReload) -> Vec<&'static str> {
+        let new = self.settings.clone();
+        let StagedReload {
+            intel_token,
+            mcp,
+            registry,
+            workflows,
+            skills,
+            instruction,
+            channels_moved,
+        } = staged;
         let mut changed = Vec::new();
 
         // Intelligence is hot-swappable: workers in flight keep dialing the
         // endpoint they were spawned with, the next spawned worker uses this.
-        if old.intelligence.endpoints != new.intelligence.endpoints
-            || old.intelligence.model != new.intelligence.model
-            || old.intelligence.token != new.intelligence.token
-            || old.intelligence.token_file != new.intelligence.token_file
-        {
+        if let Some(token) = intel_token {
             self.intel_uri = new.intelligence.endpoint_list().unwrap_or_default();
             self.model = new.intelligence.model.clone().unwrap_or_default();
-            let env = self.env.clone();
-            let envmap = move |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
-            match super::resolve_intel_token(&new, &envmap) {
-                Ok(t) => self.intel_token = t,
-                Err(e) => self.log.warn("config.reload.token", json!({"err": e})),
-            }
+            self.intel_token = token;
             changed.push("intelligence");
         }
         // Budgets: new windows, counters carried over.
@@ -198,28 +503,12 @@ impl Runtime {
             changed.push("agent.instruction.refresh");
         }
         // Instruction (static text; a resource instruction re-subscribes).
-        if old.agent.instruction != new.agent.instruction {
-            match new.agent.instruction.clone() {
-                Some(t) if cfg::looks_like_resource_uri(&t) => {
-                    if let Err(e) = self.subscribe_instruction(&t) {
-                        self.log
-                            .warn("instruction.subscribe.fail", json!({"uri": t, "err": e}));
-                    }
-                }
-                Some(t) => {
+        if let Some(instruction) = instruction {
+            match instruction {
+                StagedInstruction::Resource(fetched) => self.adopt_instruction(fetched),
+                StagedInstruction::Text(text) => {
                     self.instruction = super::reactor::Instruction {
-                        text: t,
-                        source: "static",
-                        uri: None,
-                        server: None,
-                        version: self.instruction.version + 1,
-                        version_id: None,
-                        delivered_digest: None,
-                    };
-                }
-                None => {
-                    self.instruction = super::reactor::Instruction {
-                        text: String::new(),
+                        text,
                         source: "static",
                         uri: None,
                         server: None,
@@ -254,138 +543,45 @@ impl Runtime {
         if old.agent.approval != new.agent.approval {
             changed.push("agent.approval");
         }
-        // MCP servers: connect added, drop removed (re-handshake).
-        if old.mcp != new.mcp {
-            let keep: Vec<String> = new.mcp.servers.iter().map(|s| s.name.clone()).collect();
-            let removed: Vec<String> = self
+        // MCP servers: the staged set replaces the running one whole. A
+        // connection the new set does not carry — a removed server's, or a
+        // changed one's — closes once the last holder lets go of it: a call
+        // already in flight on it finishes there, and a step that starts
+        // after this finds the server gone ("not connected").
+        if let Some(StagedMcp { set, specs, fresh }) = mcp {
+            let dropped: Vec<String> = self
                 .mcp
                 .keys()
-                .filter(|k| !keep.contains(k))
+                .filter(|k| !set.contains_key(*k))
                 .cloned()
                 .collect();
-            for r in &removed {
-                self.mcp.remove(r);
-                self.mcp_specs.remove(r);
-                self.skills.forget_server(r);
+            let previous = std::mem::replace(&mut self.mcp, set);
+            self.mcp_specs = specs;
+            for r in &dropped {
+                if skills.is_none() {
+                    self.skills.forget_server(r);
+                }
                 self.log
                     .info("mcp.disconnect", json!({"server": r, "reason": "reload"}));
             }
-            let timeout = new
-                .mcp
-                .default_timeout
-                .map(|d| d.0)
-                .unwrap_or(Duration::from_secs(60));
-            for s in &new.mcp.servers {
-                let spec = match s.to_spec() {
-                    Ok(sp) => sp,
-                    Err(e) => {
-                        self.log
-                            .warn("mcp.spec.invalid", json!({"server": s.name, "err": e}));
-                        continue;
-                    }
-                };
-                let same = self.mcp_specs.get(&s.name).is_some_and(|old| {
-                    old.endpoint == spec.endpoint
-                        && old.headers == spec.headers
-                        && old.aauth == spec.aauth
-                });
-                if same && self.mcp.contains_key(&s.name) {
-                    self.mcp_specs.insert(s.name.clone(), spec);
-                    continue;
-                }
-                match crate::mcp::from_spec(&spec, s.timeout.map(|d| d.0).unwrap_or(timeout))
-                    .and_then(|mut c| c.initialize().map(|()| c))
-                {
-                    Ok(mut c) => {
-                        c.set_tool_meta(crate::mcp::tool_meta(
-                            &self.run_id,
-                            &self.instance,
-                            self.trace_id.as_deref(),
-                        ));
-                        self.log
-                            .info("mcp.connect", json!({"server": s.name, "reason": "reload"}));
-                        self.mcp.insert(s.name.clone(), Arc::new(c));
-                    }
-                    Err(e) => self.log.warn(
-                        "mcp.connect.fail",
-                        json!({"server": s.name, "err": e.to_string()}),
-                    ),
-                }
-                self.mcp_specs.insert(s.name.clone(), spec);
+            for name in &fresh {
+                self.log
+                    .info("mcp.connect", json!({"server": name, "reason": "reload"}));
             }
+            drop(previous);
             changed.push("mcp");
         }
-        // Registry (overrides/disabled/tools) — always rebuilt when tools/mcp/knowledge/search changed.
-        if old.tools != new.tools
-            || old.mcp != new.mcp
-            || old.knowledge != new.knowledge
-            || old.search != new.search
-        {
-            let server_tools: Vec<ServerTools> = new
-                .mcp
-                .servers
-                .iter()
-                .filter_map(|s| {
-                    let c = self.mcp.get(&s.name)?;
-                    Some(ServerTools {
-                        name: s.name.clone(),
-                        ns: s.ns.clone(),
-                        tags: self
-                            .mcp_specs
-                            .get(&s.name)
-                            .map(|sp| sp.tags.clone())
-                            .unwrap_or_default(),
-                        tools: c.list_tools().unwrap_or_default(),
-                    })
-                })
-                .collect();
-            match Registry::build(&new, &server_tools) {
-                Ok(r) => {
-                    self.registry = r;
-                    changed.push("tools");
-                }
-                Err(errs) => {
-                    // The rebuild failed, so the daemon stays on the tool
-                    // configuration it is already running: put back the tools
-                    // settings to match the registry that is still installed,
-                    // or the two would disagree about what is callable.
-                    self.settings.tools = old.tools.clone();
-                    return Err(ReloadRefused::Invalid(errs));
-                }
+        // Registry (overrides/disabled/tools) — rebuilt when tools/mcp/knowledge/search
+        // or the workflow tools changed.
+        let registry_rebuilt = registry.is_some();
+        if let Some(r) = registry {
+            for w in &r.warnings {
+                self.log.warn("registry.warning", json!({"warning": w}));
             }
+            self.registry = r;
+            changed.push("tools");
         }
-        // Skills sources — the config section, or the instruction's inline
-        // `:::!skill` definitions (they live on `agent`, but they land in this
-        // catalogue).
-        // …and rebuilt whenever a LOCAL folder is configured, even with the
-        // section unchanged: the skills live in files, and comparing the
-        // setting only would make "edit a skill, send SIGHUP" a reload that
-        // reports success and changes nothing.
-        if old.skills != new.skills
-            || old.agent.inline_skills != new.agent.inline_skills
-            || new.skills.dir.is_some()
-        {
-            let mut cat = crate::context::skills::Catalogue::new(
-                new.skills
-                    .reference_prefix
-                    .as_deref()
-                    .unwrap_or(crate::context::skills::DEFAULT_PREFIX),
-                new.skills.max_bytes.unwrap_or(32_768) as usize,
-            );
-            for src in &new.skills.sources {
-                if let Some(c) = self.mcp.get(&src.server) {
-                    let mode = match src.discover {
-                        cfg::Discover::Prompts => crate::context::skills::Discover::Prompts,
-                        cfg::Discover::Resources => crate::context::skills::Discover::Resources,
-                        cfg::Discover::Auto => crate::context::skills::Discover::Auto,
-                    };
-                    cat.discover(&**c, mode, src.filter.as_deref());
-                }
-            }
-            if let Some(dir) = &new.skills.dir {
-                cat.add_dir(std::path::Path::new(dir));
-            }
-            cat.add_inline(&new.agent.inline_skills);
+        if let Some(cat) = skills {
             // Rebuilt on every reload when a local folder is configured, so
             // the report has to compare rather than assume: saying "skills"
             // changed on a reload that changed nothing is the same dishonesty
@@ -400,13 +596,9 @@ impl Runtime {
         // gives every old version the same exit — unsubscribe what nothing
         // else wants, pin for live runs, apply its own `unload:` policy —
         // whether it was removed outright or replaced by a new hash.
-        if let Some((mut staged, after_mcp)) = staged {
-            self.stage_workflows(after_mcp, &mut staged);
+        if let Some(prepared) = workflows {
             let previous = std::mem::take(&mut self.workflows);
-            if let Err(errs) = self.install_workflows(staged) {
-                self.workflows = previous; // the running set stays authoritative
-                return Err(ReloadRefused::Invalid(errs));
-            }
+            self.install_workflows(prepared);
             for (name, wf) in &previous {
                 let survives = self
                     .workflows
@@ -423,6 +615,13 @@ impl Runtime {
                 self.retire_workflow(wf, reason);
             }
             self.arm_workflows();
+            let anew: Vec<String> = self
+                .workflows
+                .iter()
+                .filter(|(n, w)| previous.get(*n).is_none_or(|p| p.hash != w.hash))
+                .map(|(n, _)| n.clone())
+                .collect();
+            self.arm_long_lived_starts_of(&anew);
             // Say "workflows" only when the loaded SET actually differs. A
             // re-read of unchanged documents must not report a change it did
             // not make — the reverse of the defect above, and just as
@@ -434,6 +633,9 @@ impl Runtime {
             if !same || channels_moved {
                 changed.push("workflows");
             }
+        }
+        if registry_rebuilt {
+            self.log_workflow_tools();
         }
         if old.limits != new.limits
             || old.lifecycle.idle_grace != new.lifecycle.idle_grace
@@ -574,8 +776,57 @@ impl Runtime {
         if changed.is_empty() {
             changed.push("nothing");
         }
-        Ok(changed)
+        changed
     }
+}
+
+/// A reload built and checked beside the running state: what
+/// `commit_reload` switches in. A `None` is a section the reload leaves as
+/// it is.
+struct StagedReload {
+    /// The resolved intelligence token, when intelligence changed.
+    intel_token: Option<Option<String>>,
+    mcp: Option<StagedMcp>,
+    registry: Option<Registry>,
+    workflows: Option<super::steps::PreparedWorkflows>,
+    skills: Option<crate::context::skills::Catalogue>,
+    instruction: Option<StagedInstruction>,
+    channels_moved: bool,
+}
+
+/// The connection set a reload that changes `mcp` would run on.
+struct StagedMcp {
+    /// Every configured server that is connected: carried-over live
+    /// connections and freshly dialed ones.
+    set: std::collections::BTreeMap<String, Arc<crate::mcp::client::McpClient>>,
+    specs: std::collections::BTreeMap<String, crate::config::McpServerSpec>,
+    /// The servers dialed for this reload: announced if it applies, closed
+    /// if it is refused.
+    fresh: Vec<String>,
+}
+
+enum StagedInstruction {
+    Text(String),
+    Resource(super::FetchedInstruction),
+}
+
+/// Whether the reload moves what a turn worker dials the model with.
+fn intelligence_moved(old: &cfg::Settings, new: &cfg::Settings) -> bool {
+    old.intelligence.endpoints != new.intelligence.endpoints
+        || old.intelligence.model != new.intelligence.model
+        || old.intelligence.token != new.intelligence.token
+        || old.intelligence.token_file != new.intelligence.token_file
+}
+
+/// The workflows that register a tool, by name, with the definition hash the
+/// tool is derived from (its arguments are the inputs, its tags what the
+/// steps reach).
+fn workflow_tools<'a>(
+    defs: impl Iterator<Item = &'a crate::engine::Workflow>,
+) -> std::collections::BTreeMap<&'a str, &'a str> {
+    defs.filter(|w| w.tool.is_some())
+        .map(|w| (w.name.as_str(), w.hash.as_str()))
+        .collect()
 }
 
 /// Replace the live CORS allowlist with `configured` — and the UI a launcher

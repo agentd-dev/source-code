@@ -419,15 +419,17 @@ impl Registry {
     }
 
     /// Register every workflow carrying a `tool:` block as a first-class
-    /// contract. Called ONCE, after the startup workflow load.
+    /// contract. Called on a freshly built registry only: after the startup
+    /// workflow load, and on the registry a reload builds.
     ///
-    /// Startup-only is the whole safety argument. The registry is otherwise
-    /// built once from settings plus connected servers and validated
+    /// Configuration-only is the whole safety argument. The registry is
+    /// otherwise built from settings plus connected servers and validated
     /// fail-closed; workflow tools would make it a mutable index if the model
     /// could add to it, and `workflow.create` is root-callable — a root turn
     /// could mint itself a new tool name, or shadow one, with no operator in
     /// the loop. So `workflow.create`/`update` refuse a `tool:` block, and
-    /// this is the only door.
+    /// the configuration (read at startup, or re-read by a reload an operator
+    /// sends) is the only door.
     ///
     /// Tags are DERIVED, never declared. A workflow author writing
     /// `tags: [sensitive, egress]` would make the one static instance-wide

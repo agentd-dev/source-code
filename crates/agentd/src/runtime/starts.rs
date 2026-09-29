@@ -63,10 +63,21 @@ impl Runtime {
         // repair (a run restored with a suspended step whose timer is gone)
         // rides here rather than re-running on every reload.
         self.repair_orphaned_timer_waits();
+        let all: Vec<String> = self.workflows.keys().cloned().collect();
+        self.arm_long_lived_starts_of(&all);
+    }
+
+    /// Arm the long-lived starts of the workflows named: every one at boot,
+    /// and on a reload the ones it added or replaced. A reload that armed
+    /// nothing left a workflow it added with a `schedule` that never fired,
+    /// and a replaced one's `subscribe` unsubscribed by its retirement; an
+    /// unchanged one is armed already, and arming it again would subscribe
+    /// its resources twice.
+    pub(crate) fn arm_long_lived_starts_of(&mut self, names: &[String]) {
         let specs: Vec<StartSpec> = self
             .workflows
             .values()
-            .filter(|w| w.armed)
+            .filter(|w| w.armed && names.contains(&w.name))
             .flat_map(|w| {
                 w.start_steps()
                     .into_iter()

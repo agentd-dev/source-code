@@ -46,6 +46,27 @@ pub(crate) struct StagedWorkflows {
     pub(crate) errs: Vec<String>,
 }
 
+impl StagedWorkflows {
+    /// The staged definitions, in source order.
+    pub(crate) fn defs(&self) -> &[Workflow] {
+        &self.defs
+    }
+}
+
+/// A staged set checked against the registry and servers it will run with and
+/// composed with the runtime-created definitions: what `install_workflows`
+/// makes live without a step left that can fail.
+pub(crate) struct PreparedWorkflows {
+    pub(crate) workflows: BTreeMap<String, std::sync::Arc<Workflow>>,
+    defined: HashMap<String, String>,
+    /// `workflow.loaded` lines, logged once the set is live.
+    loaded: Vec<Value>,
+    /// Stored definitions a configured name shadows: discarded once live.
+    shadowed: Vec<(String, Value)>,
+    /// Warnings about the set, logged once it is live.
+    warnings: Vec<(&'static str, Value)>,
+}
+
 impl Runtime {
     // ---- definitions -----------------------------------------------------------
 
@@ -91,8 +112,10 @@ impl Runtime {
     pub(crate) fn load_workflows(&mut self) -> Result<(), Vec<String>> {
         let mut staged = StagedWorkflows::default();
         let docs = self.workflow_documents(&mut staged.errs);
-        self.stage_workflows(docs, &mut staged);
-        self.install_workflows(staged)
+        self.stage_workflows(docs, &self.mcp, &mut staged);
+        let prepared = self.prepare_workflows(staged, &self.registry, &self.mcp)?;
+        self.install_workflows(prepared);
+        Ok(())
     }
 
     /// The configured workflow entries as a flat list of documents, each with
@@ -174,11 +197,21 @@ impl Runtime {
     }
 
     /// Resolve and parse workflow documents into `staged`: read each `file:`,
-    /// fetch each `url:`, read each `uri:` resource, fold `{{config.*}}` and
-    /// parse. Installs nothing and logs nothing, so a reload can stage the
-    /// whole set BEFORE it applies any section and refuse with nothing
-    /// changed; `install_workflows` makes a staged set live.
-    pub(crate) fn stage_workflows(&self, docs: Vec<(Value, String)>, staged: &mut StagedWorkflows) {
+    /// fetch each `url:`, read each `uri:` resource through `mcp`, fold
+    /// `{{config.*}}` and parse. Installs nothing and logs nothing, so a
+    /// reload can stage the whole set BEFORE it applies any section and
+    /// refuse with nothing changed; `prepare_workflows` checks a staged set
+    /// and `install_workflows` makes it live.
+    ///
+    /// The connection set is a parameter because a reload reads through the
+    /// servers it is about to run on — the ones it has only just dialed
+    /// beside the running set — not the ones running now.
+    pub(crate) fn stage_workflows(
+        &self,
+        docs: Vec<(Value, String)>,
+        mcp: &BTreeMap<String, std::sync::Arc<crate::mcp::client::McpClient>>,
+        staged: &mut StagedWorkflows,
+    ) {
         let errs = &mut staged.errs;
         for (doc, source) in docs {
             // `{{config.*}}` folds in at load, in two passes: the ENTRY first —
@@ -211,15 +244,10 @@ impl Runtime {
                                 &t,
                             ),
                         )
-                    }) {
-                    Ok(mut d) => {
-                        if d.get("name").is_none()
-                            && let Some(n) = doc.get("name")
-                        {
-                            d["name"] = n.clone();
-                        }
-                        d
-                    }
+                    })
+                    .and_then(|d| as_definition(d, &doc))
+                {
+                    Ok(d) => d,
                     Err(e) => {
                         errs.push(format!("workflow file {path}: {e}"));
                         continue;
@@ -232,34 +260,36 @@ impl Runtime {
                 // them makes the daemon dial.
                 (None, None) if doc.get("url").is_some() => {
                     let url = doc["url"].as_str().unwrap_or_default().to_string();
-                    match self.fetch_workflow_url(&doc, &url) {
-                        Ok(mut d) => {
-                            if d.get("name").is_none()
-                                && let Some(n) = doc.get("name")
-                            {
-                                d["name"] = n.clone();
-                            }
-                            d
-                        }
+                    match self
+                        .fetch_workflow_url(&doc, &url)
+                        .and_then(|d| as_definition(d, &doc))
+                    {
+                        Ok(d) => d,
+                        // Named by scheme, host and path, like every other
+                        // place a `url:` source is named: a definitions URL
+                        // can carry its credential in its userinfo or query,
+                        // and this line reaches the log and a reload's
+                        // refusal. The fetch error is scrubbed the same way —
+                        // a URL that does not parse is echoed whole, and a
+                        // host the resolver names carries the userinfo.
                         Err(e) => {
-                            errs.push(format!("workflow url {url}: {e}"));
+                            errs.push(format!(
+                                "workflow url {}: {}",
+                                crate::config::settings::url_locator(&url),
+                                scrub_url(&e, &url)
+                            ));
                             continue;
                         }
                     }
                 }
-                (None, Some(uri)) => match self.read_resource_any(uri) {
+                (None, Some(uri)) => match read_resource_any(mcp, uri) {
                     Ok(text) => match crate::config::file::parse_document(
                         &text,
                         crate::config::file::Format::detect(Some(std::path::Path::new(uri)), &text),
-                    ) {
-                        Ok(mut d) => {
-                            if d.get("name").is_none()
-                                && let Some(n) = doc.get("name")
-                            {
-                                d["name"] = n.clone();
-                            }
-                            d
-                        }
+                    )
+                    .and_then(|d| as_definition(d, &doc))
+                    {
+                        Ok(d) => d,
                         Err(e) => {
                             errs.push(format!("workflow uri {uri}: {e}"));
                             continue;
@@ -298,24 +328,31 @@ impl Runtime {
         }
     }
 
-    /// Make a staged set live: the configured definitions, then the
-    /// runtime-created ones from the store, then the checks against the
-    /// registry and the connected servers. `workflow.loaded` is logged only
-    /// once the whole set is accepted — a line for a definition that a later
-    /// refusal discards reads as if it went live.
-    pub(crate) fn install_workflows(&mut self, staged: StagedWorkflows) -> Result<(), Vec<String>> {
+    /// Check a staged set and compose it with the runtime-created definitions
+    /// from the store, against the tool registry and the connected servers it
+    /// will run with. Changes nothing: the set comes back ready for
+    /// `install_workflows`, which cannot fail, so a reload can check its
+    /// workflows against the registry and servers it has only STAGED and
+    /// refuse with the running ones untouched.
+    pub(crate) fn prepare_workflows(
+        &self,
+        staged: StagedWorkflows,
+        registry: &crate::registry::Registry,
+        mcp: &BTreeMap<String, std::sync::Arc<crate::mcp::client::McpClient>>,
+    ) -> Result<PreparedWorkflows, Vec<String>> {
         let StagedWorkflows {
             defs,
             defined,
             mut errs,
         } = staged;
+        let mut workflows: BTreeMap<String, std::sync::Arc<Workflow>> = BTreeMap::new();
         let mut loaded: Vec<Value> = Vec::new();
         // Stored definitions under a configured name: (store id, logged detail).
         let mut shadowed: Vec<(String, Value)> = Vec::new();
+        let mut warnings: Vec<(&'static str, Value)> = Vec::new();
         for w in defs {
             loaded.push(json!({"name": w.name, "hash": &w.hash[..12], "steps": w.steps.len(), "durable": w.durable, "starts": w.start_steps().iter().map(|s| s.kind.clone()).collect::<Vec<_>>()}));
-            self.workflows
-                .insert(w.name.clone(), std::sync::Arc::new(w));
+            workflows.insert(w.name.clone(), std::sync::Arc::new(w));
         }
         // Runtime-created definitions (durable under memory/_workflows/<name>).
         if let Ok(list) = self.durable.list(Kind::Memory) {
@@ -363,31 +400,30 @@ impl Runtime {
                         Ok(mut w) => {
                             self.fill_durable_default(&mut w);
                             loaded.push(json!({"name": w.name, "source": "store"}));
-                            self.workflows
-                                .insert(w.name.clone(), std::sync::Arc::new(w));
+                            workflows.insert(w.name.clone(), std::sync::Arc::new(w));
                         }
-                        Err(e) => self.log.warn(
+                        Err(e) => warnings.push((
                             "workflow.stored.invalid",
                             json!({"name": name, "errors": e}),
-                        ),
+                        )),
                     }
                 }
             }
         }
         // Validate tool/server references against the registry.
-        for w in self.workflows.values() {
+        for w in workflows.values() {
             for s in w.steps.values() {
                 match s.kind.as_str() {
                     "tool" => {
                         if let Some(n) = s.field_str("name")
-                            && !self.registry.allowed(&Caller::Workflow, n)
+                            && !registry.allowed(&Caller::Workflow, n)
                         {
                             errs.push(format!("workflow {:?} step {:?}: tool {n:?} is unknown, disabled or not granted to workflows", w.name, s.id));
                         }
                     }
                     "mcp.tool" => {
                         if let Some(srv) = s.field_str("server")
-                            && !self.mcp.contains_key(srv)
+                            && !mcp.contains_key(srv)
                         {
                             errs.push(format!(
                                 "workflow {:?} step {:?}: mcp server {srv:?} is not connected",
@@ -399,7 +435,7 @@ impl Runtime {
                         || k.starts_with("artifact.")
                         || k.starts_with("knowledge.")
                         || k.starts_with("search."))
-                        && !self.registry.allowed(&Caller::Workflow, k) =>
+                        && !registry.allowed(&Caller::Workflow, k) =>
                     {
                         errs.push(format!("workflow {:?} step {:?}: {k} is unavailable (map it with tools.overrides or configure its server)", w.name, s.id));
                     }
@@ -410,8 +446,8 @@ impl Runtime {
         // Mixed durability is legal but has one sharp edge worth a loud line:
         // a DURABLE parent step waiting on a NON-durable child run resumes
         // after a restart to find the run gone (the wait fails with "run does
-        // not exist"). Say so at load, where the shape is still a choice.
-        for w in self.workflows.values() {
+        // not exist"). Said at load, where the shape is still a choice.
+        for w in workflows.values() {
             if w.durable == Some(false) {
                 continue;
             }
@@ -419,22 +455,21 @@ impl Runtime {
                 if st.kind == "workflow"
                     && st.field_str("mode").unwrap_or("sync") != "detached"
                     && let Some(target) = st.field_str("name")
-                    && self
-                        .workflows
+                    && workflows
                         .get(target)
                         .is_some_and(|t| t.durable == Some(false))
                 {
-                    self.log.warn(
+                    warnings.push((
                         "workflow.durability_mix",
                         json!({"workflow": w.name, "step": st.id, "child": target,
                                "note": "a durable parent waits on a non-durable child; after a restart the wait fails (the child run does not survive)"}),
-                    );
+                    ));
                 }
             }
         }
         // Streams are fail-closed at load: an `emit` or `stream` node naming an
         // undeclared stream is a config error now, not a step failure later.
-        for w in self.workflows.values() {
+        for w in workflows.values() {
             for st in w.steps.values() {
                 if matches!(st.kind.as_str(), "emit" | "stream")
                     && let Some(name) = st.field_str("stream")
@@ -450,6 +485,32 @@ impl Runtime {
         if !errs.is_empty() {
             return Err(errs);
         }
+        Ok(PreparedWorkflows {
+            workflows,
+            defined,
+            loaded,
+            shadowed,
+            warnings,
+        })
+    }
+
+    /// Make a prepared set live: it replaces the installed set whole. Nothing
+    /// here can fail — every check ran in `prepare_workflows` — so a reload
+    /// that got this far applies its workflows with the rest of its sections.
+    /// `workflow.loaded` is logged only now: a line for a definition that a
+    /// later refusal discards reads as if it went live.
+    pub(crate) fn install_workflows(&mut self, prepared: PreparedWorkflows) {
+        let PreparedWorkflows {
+            workflows,
+            defined,
+            loaded,
+            shadowed,
+            warnings,
+        } = prepared;
+        self.workflows = workflows;
+        for (event, detail) in warnings {
+            self.log.warn(event, detail);
+        }
         for l in loaded {
             self.log.info("workflow.loaded", l);
         }
@@ -460,7 +521,6 @@ impl Runtime {
         // Only once the set is accepted: a refused reload keeps the running
         // set, and with it the names that set's configuration owns.
         self.configured_workflows = defined;
-        Ok(())
     }
 
     /// Fetch a workflow definition over HTTP(S).
@@ -501,31 +561,6 @@ impl Runtime {
             &text,
             crate::config::file::Format::detect(Some(std::path::Path::new(url)), &text),
         )
-    }
-
-    /// Read a resource URI (`mcp://<server>/<uri>` or a URI a connected server lists).
-    pub(crate) fn read_resource_any(&self, uri: &str) -> Result<String, String> {
-        if let Some(rest) = uri.strip_prefix("mcp://") {
-            let (server, res) = rest
-                .split_once('/')
-                .ok_or("mcp:// uri needs <server>/<resource-uri>")?;
-            let c = self
-                .mcp
-                .get(server)
-                .ok_or_else(|| format!("mcp server {server:?} is not connected"))?;
-            return c
-                .read_resource(res)
-                .map(|r| r.text())
-                .map_err(|e| e.to_string());
-        }
-        let mut last = String::from("no connected server serves it");
-        for c in self.mcp.values() {
-            match c.read_resource(uri) {
-                Ok(r) => return Ok(r.text()),
-                Err(e) => last = e.to_string(),
-            }
-        }
-        Err(last)
     }
 
     /// Arm start nodes. `once` fires immediately unless a live run of the
@@ -3697,5 +3732,120 @@ fn collect_memory_keys(v: &Value, out: &mut Vec<String>) {
         Value::Array(a) => a.iter().for_each(|x| collect_memory_keys(x, out)),
         Value::Object(o) => o.values().for_each(|x| collect_memory_keys(x, out)),
         _ => {}
+    }
+}
+
+/// A resolved document as a definition: a mapping, which takes its entry's
+/// `name` when it has none of its own. Anything else — a resource that
+/// serves plain text, say — is refused here, naming the source: filling the
+/// name in by index panicked on it, and on a reload that took the daemon
+/// down.
+fn as_definition(mut resolved: Value, entry: &Value) -> Result<Value, String> {
+    let Some(obj) = resolved.as_object_mut() else {
+        return Err("the document is not a workflow definition (a mapping)".into());
+    };
+    if !obj.contains_key("name")
+        && let Some(n) = entry.get("name")
+    {
+        obj.insert("name".into(), n.clone());
+    }
+    Ok(resolved)
+}
+
+/// Read a resource URI (`mcp://<server>/<uri>`, or a URI one of `mcp`'s
+/// servers serves) through the connection set given — the running one, or
+/// the one a reload has staged.
+pub(crate) fn read_resource_any(
+    mcp: &BTreeMap<String, std::sync::Arc<crate::mcp::client::McpClient>>,
+    uri: &str,
+) -> Result<String, String> {
+    if let Some(rest) = uri.strip_prefix("mcp://") {
+        let (server, res) = rest
+            .split_once('/')
+            .ok_or("mcp:// uri needs <server>/<resource-uri>")?;
+        let c = mcp
+            .get(server)
+            .ok_or_else(|| format!("mcp server {server:?} is not connected"))?;
+        return c
+            .read_resource(res)
+            .map(|r| r.text())
+            .map_err(|e| e.to_string());
+    }
+    let mut last = String::from("no connected server serves it");
+    for c in mcp.values() {
+        match c.read_resource(uri) {
+            Ok(r) => return Ok(r.text()),
+            Err(e) => last = e.to_string(),
+        }
+    }
+    Err(last)
+}
+
+/// `text` with every part of `url` that `url_locator` drops taken out — the
+/// userinfo, the query, the fragment — and the URL itself named by its
+/// locator. An error about a fetch can echo the URL whole (one that does not
+/// parse) or its host with the userinfo still on it (the resolver's), and the
+/// error goes where the URL may not: the log and a reload's refusal.
+fn scrub_url(text: &str, url: &str) -> String {
+    let mut out = text.replace(url, &crate::config::settings::url_locator(url));
+    let cut = url.find(['?', '#']).unwrap_or(url.len());
+    let (base, tail) = url.split_at(cut);
+    if !tail.is_empty() {
+        out = out.replace(tail, "");
+    }
+    if let Some((_, rest)) = base.split_once("://") {
+        let authority = &rest[..rest.find('/').unwrap_or(rest.len())];
+        if let Some((userinfo, _)) = authority.rsplit_once('@') {
+            out = out.replace(&format!("{userinfo}@"), "");
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every part of a URL that `url_locator` drops is taken out of an error
+    /// about it: echoed whole (a URL that does not parse), or as a host with
+    /// the userinfo still on it (the resolver's).
+    #[test]
+    fn a_fetch_error_loses_the_urls_userinfo_and_query() {
+        let url = "http://ops:pw@host.example:8080/defs.yaml?token=s3cr3t#frag";
+        let echoed = format!("bad port in {url}");
+        assert_eq!(
+            scrub_url(&echoed, url),
+            "bad port in http://host.example:8080/defs.yaml"
+        );
+        let resolver = "host `ops:pw@host.example` rejected: resolve failed";
+        assert_eq!(
+            scrub_url(resolver, url),
+            "host `host.example` rejected: resolve failed"
+        );
+        let query_alone = "GET /defs.yaml?token=s3cr3t#frag: HTTP 404";
+        assert_eq!(scrub_url(query_alone, url), "GET /defs.yaml: HTTP 404");
+        // A URL with nothing to hide leaves the text as it was.
+        assert_eq!(
+            scrub_url("HTTP 404", "https://defs.example/a.yaml"),
+            "HTTP 404"
+        );
+    }
+
+    /// A resolved document that is not a mapping is refused, not indexed
+    /// into — `d["name"] = …` on a string panicked, and on a reload that took
+    /// the daemon down. A mapping takes its entry's name when it has none.
+    #[test]
+    fn only_a_mapping_is_a_workflow_definition() {
+        let entry = json!({"name": "from-entry", "uri": "mcp://s/x"});
+        assert!(as_definition(json!("plain text"), &entry).is_err());
+        assert!(as_definition(json!([1, 2]), &entry).is_err());
+        assert_eq!(
+            as_definition(json!({"steps": {}}), &entry).unwrap()["name"],
+            "from-entry"
+        );
+        assert_eq!(
+            as_definition(json!({"name": "own", "steps": {}}), &entry).unwrap()["name"],
+            "own"
+        );
     }
 }

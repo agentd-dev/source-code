@@ -991,12 +991,14 @@ could only offer.
 
 Two constraints keep it safe:
 
-**Startup config only.** The registry is built once and validated fail-closed.
-`workflow.create`/`update` are root-callable, so a root turn could otherwise
-mint itself a new tool name — or shadow one — with no operator in the loop. A
-`tool:` block from either is refused; the startup document is the only door. A
-name that shadows an internal contract, or that two workflows both claim, is
-exit 2.
+**Configuration only.** The registry is built from the configuration and
+validated fail-closed. `workflow.create`/`update` are root-callable, so a root
+turn could otherwise mint itself a new tool name — or shadow one — with no
+operator in the loop. A `tool:` block from either is refused; the configuration
+is the only door — read at startup, and re-read by a reload, which registers
+the workflow tools again on the registry it rebuilds. A name that shadows an
+internal contract, or that two workflows both claim, is exit 2 (a refused
+reload).
 
 **Tags are derived, never declared.** A workflow author writing
 `tags: [sensitive, egress]` would make the one static instance-wide security

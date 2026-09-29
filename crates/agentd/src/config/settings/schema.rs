@@ -3,7 +3,7 @@
 //! (no `schemars`, the moat) and held faithful to [`super::Settings`] by the
 //! tests in `super::tests`, which walk both shapes object by object. It is the
 //! single source for the path bindings (env `AGENTD_<PATH>` names, `--<path>`
-//! flags, `--help`), for `--config-schema=2`, and for agentctl's admission
+//! flags, `--help`), for `--config-schema`, and for agentctl's admission
 //! validation, so a section added here reaches all of them at once.
 //!
 //! Conventions: every object is `additionalProperties: false` (mirrors
@@ -13,13 +13,6 @@
 //! document is always safe to commit.
 
 use serde_json::{Map, Value, json};
-
-/// The schema's `x-agentd-contract-version` — the config contract this
-/// document describes, matched against the capabilities manifest.
-pub const SCHEMA_CONTRACT_VERSION: &str = "1.0";
-
-/// The document version this schema describes (`config_version`).
-pub const CONFIG_VERSION: &str = "1";
 
 pub fn schema() -> Value {
     let duration = json!({ "type": ["string", "integer"], "description": "a duration: `10m`, `90s`, `500ms`, or bare seconds" });
@@ -49,10 +42,6 @@ pub fn schema() -> Value {
         }
     });
     let mut properties = Map::new();
-    properties.insert(
-        "config_version".to_string(),
-        json!({ "type": "string", "const": CONFIG_VERSION, "description": "the document version" }),
-    );
     top_level_properties(
         &mut properties,
         &duration,
@@ -66,12 +55,9 @@ pub fn schema() -> Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         // The URL this document is SERVED at, so an editor that fetches the
-        // `$id` gets this schema and not a 404. Versioned by the config
-        // document version, so pinning `config_version: "1"` and pinning the
-        // schema are the same decision.
-        "$id": format!("https://agentd.dev/schema/config-{CONFIG_VERSION}.json"),
-        "x-agentd-contract-version": SCHEMA_CONTRACT_VERSION,
-        "title": format!("agentd configuration (config_version {CONFIG_VERSION})"),
+        // `$id` gets this schema and not a 404.
+        "$id": "https://agentd.dev/schema/config.json",
+        "title": "agentd configuration",
         "description": "agentd configuration document (YAML or JSON; several files merge in order; every path is also AGENTD_<PATH> and --<path>)",
         "type": "object",
         "additionalProperties": false,
@@ -312,7 +298,7 @@ fn top_level_properties(
                     "origins": { "type": "array", "items": { "type": "string" }, "description": "browser origins (scheme://host[:port]) allowed to call the listener, matched exactly; `*` and paths are refused, and a loopback UI origin must be listed too" } } },
                 "device_grant": device_grant,
                 "events": { "type": "object", "additionalProperties": false, "properties": {
-                    "enabled": { "type": "boolean", "description": "declare the events/v1 extension and serve its observation feed; requires a2a.listen; restart-only" } } },
+                    "enabled": { "type": "boolean", "description": "declare the events extension and serve its observation feed; requires a2a.listen; restart-only" } } },
                 "introspection": { "type": "object", "additionalProperties": false, "properties": {
                     "enabled": { "type": "boolean", "description": "serve the operator introspection ops (transcripts, run step detail, the log ring, audit records on the feed); requires a2a.listen; reloadable" } } },
                 "tls": { "type": "object", "additionalProperties": false, "properties": {

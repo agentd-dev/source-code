@@ -6,7 +6,7 @@
 //! over that stream — and the process runs them and exits clean. Also: the
 //! precedence rule, end to end — an explicit flag beats the document's
 //! fragment.
-#![cfg(all(unix, feature = "workflow"))]
+#![cfg(unix)]
 
 mod common;
 

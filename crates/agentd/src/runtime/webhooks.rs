@@ -14,8 +14,8 @@
 //!   5. handed to the single-writer loop as an [`Event::Webhook`], which fires the
 //!      run and replies (`respond: ack` → `202`).
 //!
-//! The listener rides the same `mcp::http_server` raw-HTTP + `net::tls` surface as
-//! the A2A listener and never blocks the loop (one connection = one thread; the
+//! The listener rides the `mcp` crate's raw-HTTP server (`::mcp::http_server`)
+//! over `net::tls` and never blocks the loop (one connection = one thread; the
 //! reply arrives over a oneshot).
 #![cfg(feature = "a2a")]
 
@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use serde_json::{Map, Value, json};
 
-use crate::config::v2::{WebhookAuth, Webhooks};
+use crate::config::settings::{WebhookAuth, Webhooks};
 use crate::obs::log::Logger;
 use crate::runtime::events::Event;
 use crate::state::now_ms;

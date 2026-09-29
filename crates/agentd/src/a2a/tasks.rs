@@ -10,8 +10,8 @@ use crate::state::now_ms;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-/// The A2A task state (mirrors `mcp::a2a::TaskState`, kept here so the runtime
-/// does not depend on the `a2a` feature-gated module).
+/// The A2A task state, kept here so the runtime does not depend on the `a2a`
+/// feature-gated module.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum State {
@@ -72,7 +72,8 @@ pub enum Link {
 }
 
 /// A webhook a caller registered for this task's updates (A2A push
-/// notifications). `token` is echoed back in `X-A2A-Notification-Token` so the
+/// notifications). `token` is echoed back in `X-A2A-Notification-Token` (an
+/// interop header the a2a-python 1.x receiver reads) so the
 /// receiver can tell a real delivery from a stray POST; `auth` is a credential
 /// agentd presents *to* the receiver.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -141,10 +142,7 @@ pub struct Task {
     /// The conversation the runtime keeps this task's turns in: the internal
     /// key a non-operator's `contextId` was bound to at ingress
     /// (`runtime::conversations`), or the id itself for an operator, a run
-    /// and the root agent. Never on the wire. A record from before the two
-    /// were told apart leaves it empty, and restore fills it with
-    /// `context_id` — which is what the key was then.
-    #[serde(default)]
+    /// and the root agent. Never on the wire.
     pub conversation: String,
     #[serde(default)]
     pub state: State,
@@ -495,18 +493,12 @@ mod tests {
             !t.matches_context("ctx-k", false),
             "a key is no owner's name"
         );
-        // A record from before the two were told apart reads back without a
-        // key, which restore fills from the id.
-        let mut v = serde_json::to_value(&t).unwrap();
-        v.as_object_mut().unwrap().remove("conversation");
-        let back: Task = serde_json::from_value(v).unwrap();
-        assert!(back.conversation.is_empty());
     }
 
     #[test]
     fn a_task_is_visible_to_its_owner_and_the_operator_only() {
         use crate::a2a::Principal;
-        use crate::config::v2::Role;
+        use crate::config::settings::Role;
         let who = |id: &str, role| Principal {
             id: id.into(),
             role,

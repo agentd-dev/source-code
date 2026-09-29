@@ -20,6 +20,7 @@
 //! resolver is also where the listener's posture lives, so a reload that
 //! rebuilds the rules replaces the posture in the same swap.
 
+use crate::a2a::errors::UNSUPPORTED_OPERATION;
 use crate::a2a::principals::{Evidence, Resolution, SessionVerifier};
 use crate::a2a::{Principal, Resolver};
 use crate::runtime::events::Event;
@@ -51,11 +52,7 @@ pub use send::command_op;
 use super::surface::{Active, Declaration, declared_when};
 pub use super::surface::{COMMAND_EXTENSION, command_ops_of};
 
-/// A2A error: no such task.
-pub const TASK_NOT_FOUND: i64 = -32001;
-/// A2A error: the operation is not supported over this surface.
-pub const UNSUPPORTED_OPERATION: i64 = -32004;
-/// The interface feed ring capacity: the replay window a reconnecting client
+/// The observation feed ring capacity: the replay window a reconnecting client
 /// can resume across without a full re-bootstrap.
 pub const FEED_RING: usize = 1024;
 
@@ -68,7 +65,7 @@ pub struct A2aRequest {
     pub params: Value,
     pub principal: Principal,
     /// The extensions the request activated. The runtime projects a task's
-    /// annotations only while task-annotations/v1 is among them.
+    /// annotations only while task-annotations is among them.
     pub active: Active,
     pub reply: SyncSender<Value>,
 }
@@ -376,7 +373,7 @@ mod tests {
         else {
             panic!("the team SVID named nobody");
         };
-        assert_eq!(p.role, crate::config::v2::Role::User);
+        assert_eq!(p.role, crate::config::settings::Role::User);
         assert_eq!(p.id, "user:san=spiffe://corp/team/alice");
         // A cert under the ops path → operator (a different rule).
         let Resolution::Named(op, _) =

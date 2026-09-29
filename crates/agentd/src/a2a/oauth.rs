@@ -10,7 +10,7 @@
 //! Bearer like any other, and [`Sessions`] — the resolver's session verifier
 //! — names its caller.
 //!
-//! What replaced pairing, and why it is shaped this way:
+//! Why it is shaped this way:
 //!
 //! * **Nothing is armed until a client asks.** A code exists only while a
 //!   device waits on it, it is single-use, and it expires with `code_ttl`.
@@ -49,7 +49,7 @@ use serde_json::{Value, json};
 use crate::a2a::Principal;
 use crate::a2a::principals::{SESSION_TOKEN_PREFIX, SessionCheck, SessionVerifier};
 use crate::a2a::serve::limits::{NetworkKey, SourceKey, SourceLimiter};
-use crate::config::v2::{self, DeviceScope, Role};
+use crate::config::settings::{self, DeviceScope, Role};
 
 // ---- the constants ----------------------------------------------------------
 
@@ -729,7 +729,7 @@ pub struct DeviceGrant {
 }
 
 impl DeviceGrant {
-    pub fn new(cfg: &v2::DeviceGrant, clock: Clock, mint: Mint) -> DeviceGrant {
+    pub fn new(cfg: &settings::DeviceGrant, clock: Clock, mint: Mint) -> DeviceGrant {
         DeviceGrant {
             scopes: cfg.scopes.clone(),
             token_ttl: cfg.token_ttl(),
@@ -996,7 +996,7 @@ impl LaunchBind {
 /// `http://127.0.0.1:4555` is `HTTP://127.0.0.1:4555`, and `null` or anything
 /// unparsable is nobody's.
 fn same_origin(a: &str, b: &str) -> bool {
-    matches!((v2::parse_origin(a), v2::parse_origin(b)), (Ok(a), Ok(b)) if a == b)
+    matches!((settings::parse_origin(a), settings::parse_origin(b)), (Ok(a), Ok(b)) if a == b)
 }
 
 /// Whether a peer is on this host. The launch grant is redeemed only from
@@ -1111,7 +1111,7 @@ impl LaunchSlot {
     /// [`LaunchSlot::new`] on an injected clock and entropy source.
     pub fn with(origin: Option<&str>, clock: Clock, mint: Mint) -> Result<LaunchSlot, String> {
         if let Some(o) = origin {
-            v2::parse_origin(o).map_err(|e| format!("the launched UI origin {o:?}: {e}"))?;
+            settings::parse_origin(o).map_err(|e| format!("the launched UI origin {o:?}: {e}"))?;
         }
         Ok(LaunchSlot {
             origin: origin.map(str::to_string),
@@ -2109,7 +2109,7 @@ mod tests {
             let now = Arc::new(AtomicU64::new(1_000_000));
             let t = Arc::clone(&now);
             let clock: Clock = Arc::new(move || t.load(Ordering::SeqCst));
-            let cfg: v2::DeviceGrant = serde_json::from_value(cfg).unwrap();
+            let cfg: settings::DeviceGrant = serde_json::from_value(cfg).unwrap();
             let sessions = Arc::new(Sessions::new(Arc::clone(&clock)));
             let auth = Authority::new(Some(DeviceGrant::new(&cfg, clock, mint)), None, sessions);
             auth.set_issuer("https://agent.example:8443");
@@ -2861,7 +2861,7 @@ mod tests {
         );
         // An issuer not yet settled answers 503 rather than a wrong origin.
         let sessions = Arc::new(Sessions::new(system_clock()));
-        let cfg: v2::DeviceGrant = serde_json::from_value(json!({"enabled": true})).unwrap();
+        let cfg: settings::DeviceGrant = serde_json::from_value(json!({"enabled": true})).unwrap();
         let unsettled = Authority::new(
             Some(DeviceGrant::new(&cfg, system_clock(), os_mint())),
             None,
@@ -2897,7 +2897,8 @@ mod tests {
             let clock: Clock = Arc::new(move || t.load(Ordering::SeqCst));
             let slot =
                 Arc::new(LaunchSlot::with(origin, Arc::clone(&clock), Arc::clone(&mint)).unwrap());
-            let cfg: v2::DeviceGrant = serde_json::from_value(json!({"enabled": true})).unwrap();
+            let cfg: settings::DeviceGrant =
+                serde_json::from_value(json!({"enabled": true})).unwrap();
             let auth = Authority::new(
                 device.then(|| DeviceGrant::new(&cfg, Arc::clone(&clock), mint)),
                 Some(Arc::clone(&slot)),

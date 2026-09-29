@@ -3,7 +3,7 @@
 //! `${VAR}` expansion in the config, `{{secret:NAME}}` resolution — with the
 //! documented precedence (real environment beats any file, later file beats
 //! earlier), and a malformed file is a startup refusal naming file and line.
-#![cfg(all(unix, feature = "workflow"))]
+#![cfg(unix)]
 
 mod common;
 
@@ -97,7 +97,7 @@ fn env_files_feed_expansion_and_secrets_with_documented_precedence() {
         // ${EF_NAME}/${EF_PINNED} exercise config expansion; the http header
         // exercises {{secret:…}} resolution at the point of use, at runtime.
         format!(
-            "config_version: \"1\"\n\
+            "\
              agent:\n  name: ${{EF_NAME}}\n\
              workflows:\n  - name: w\n    steps:\n\
              \x20     start: {{kind: once}}\n\
@@ -147,7 +147,7 @@ fn a_malformed_env_file_refuses_startup_naming_the_line() {
     let cfg = format!("{dir}/config.yaml");
     std::fs::write(
         &cfg,
-        "config_version: \"1\"\nagent:\n  name: x\n  instruction: hi\n  preflight: never\n\
+        "agent:\n  name: x\n  instruction: hi\n  preflight: never\n\
          intelligence:\n  endpoints: [https://x/v1]\n  model: m\nstore:\n  kind: none\n",
     )
     .unwrap();

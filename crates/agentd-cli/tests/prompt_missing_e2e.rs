@@ -8,7 +8,7 @@
 //!      value must not appear on the terminal), the entered value resolves the
 //!      reference, and the workflow's HTTP request carries it — proof the
 //!      prompted value reached the point of use, not just the validator.
-#![cfg(all(unix, feature = "workflow"))]
+#![cfg(unix)]
 
 mod common;
 
@@ -74,7 +74,7 @@ fn spawn_key_recorder() -> (u16, Arc<Mutex<Option<String>>>) {
 
 fn config(port: u16) -> String {
     format!(
-        "config_version: \"1\"\n\
+        "\
          agent:\n  name: pm\n\
          workflows:\n  - name: w\n    steps:\n\
          \x20     start: {{kind: once}}\n\

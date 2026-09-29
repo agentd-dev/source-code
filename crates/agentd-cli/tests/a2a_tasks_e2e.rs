@@ -50,7 +50,7 @@ fn boot() -> (Daemon, String) {
         std::fs::write(
             &cfg_path,
             format!(
-                "config_version: \"1\"\n\
+                "\
                  agent:\n  name: tasks-e2e\n  instruction: You are a helpful test agent.\n  preflight: never\n\
                  intelligence:\n  endpoints: \"mock:final\"\n  model: mock\n\
                  store:\n  kind: memory\n\

@@ -69,7 +69,7 @@ fn free_port() -> u16 {
 
 fn a2a_config(llm: &str, port: u16, extra: &str) -> String {
     format!(
-        "config_version: \"1\"\n\
+        "\
          agent:\n  name: a2a-conf\n  instruction: You are a helpful test agent.\n  preflight: never\n\
          intelligence:\n  endpoints: {llm}\n  model: mock\n\
          store:\n  kind: memory\n\

@@ -15,7 +15,7 @@
 
 pub mod internal;
 
-use crate::config::v2::{Role, Settings, ToolOverride};
+use crate::config::settings::{Role, Settings, ToolOverride};
 use crate::jsonschema;
 use crate::sec::scope::TrifectaTag;
 use crate::store::mapping::{self, Vars};
@@ -690,7 +690,7 @@ impl Registry {
     pub fn defs_for(
         &self,
         caller: &Caller,
-        select: Option<&crate::config::v2::AgentTools>,
+        select: Option<&crate::config::settings::AgentTools>,
     ) -> Vec<ToolDef> {
         self.tools
             .values()
@@ -839,7 +839,7 @@ impl Registry {
         out
     }
 
-    /// A status view (`agent://tools`).
+    /// A status view of the tools.
     pub fn status(&self) -> Value {
         json!({
             "count": self.tools.len(),

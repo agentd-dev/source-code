@@ -52,18 +52,18 @@ impl crate::runtime::reactor::Runtime {
         // list is a ceiling in either mode — declaring an endpoint for reads
         // must not silently authorize writes to it.
         {
-            use crate::config::v2 as cfgv2;
-            if let Err(e) = cfgv2::egress_allows(
+            use crate::config::settings;
+            if let Err(e) = settings::egress_allows(
                 &self.settings.services,
                 self.settings.security.egress,
-                cfgv2::ServiceKind::Http,
+                settings::ServiceKind::Http,
                 &url,
             ) {
                 self.finish_step_pub(run_id, step_id, StepStatus::Failed, None, Some(e), 0);
                 return;
             }
             if let Some((name, entry)) =
-                cfgv2::service_match(&self.settings.services, cfgv2::ServiceKind::Http, &url)
+                settings::service_match(&self.settings.services, settings::ServiceKind::Http, &url)
                 && let Some(methods) = &entry.methods
                 && !methods.iter().any(|m| m == &method)
             {

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The black-box harness: locate + build the real `agentd` binary, then drive it
-//! as a peer would — a served-MCP JSON-RPC client, a once-mode runner, the mock
-//! LLM / mock MCP helpers — with no link against the agentd library.
+//! as a peer would — a one-shot runner, a daemon, the mock LLM / mock MCP
+//! helpers — with no link against the agentd library.
 
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -39,25 +39,15 @@ impl Drop for TempDir {
     }
 }
 
-/// The resolved binary paths the suite drives.
-struct Bins {
-    /// The default agentd (the a2a listener + the mock LLM/MCP re-exec) the
-    /// checks run.
-    agentd: PathBuf,
-    /// The recording reference MCP server — a spec-correct peer whose recorded
-    /// request log lets a check assert what agentd actually sent on the wire.
-    confmcp: PathBuf,
-}
-
-/// Build the binaries the suite needs once, then resolve their paths.
-fn binaries() -> &'static Bins {
-    static BINS: OnceLock<Bins> = OnceLock::new();
-    BINS.get_or_init(|| {
+/// Build the agentd binary the suite drives once, then resolve its path.
+fn binary() -> &'static PathBuf {
+    static BIN: OnceLock<PathBuf> = OnceLock::new();
+    BIN.get_or_init(|| {
         // Ensure the agentd binary (with the a2a listener + the mock LLM / mock
-        // MCP the suite drives) and the reference MCP server exist, whether we
-        // were invoked via `cargo test` (which builds them) or `cargo run` (which
-        // may not). `internal-mocks` is implicit in a debug build but we ask for
-        // it explicitly so a `--release` conformance run still ships the mocks.
+        // MCP the suite drives) exists, whether we were invoked via `cargo test`
+        // (which builds it) or `cargo run` (which may not). `internal-mocks` is
+        // implicit in a debug build but we ask for it explicitly so a
+        // `--release` conformance run still ships the mocks.
         build(&[
             "build",
             "-p",
@@ -65,14 +55,13 @@ fn binaries() -> &'static Bins {
             "--features",
             "a2a,cron,internal-mocks",
         ]);
-        build(&["build", "-p", "agentd-conformance", "--bin", "confmcp"]);
-        let dir = target_dir();
-        let agentd = dir.join("agentd");
-        let confmcp = dir.join("confmcp");
-        for (p, what) in [(&agentd, "agentd"), (&confmcp, "confmcp")] {
-            assert!(p.exists(), "{what} binary not found at {}", p.display());
-        }
-        Bins { agentd, confmcp }
+        let agentd = target_dir().join("agentd");
+        assert!(
+            agentd.exists(),
+            "agentd binary not found at {}",
+            agentd.display()
+        );
+        agentd
     })
 }
 
@@ -99,7 +88,6 @@ fn target_dir() -> PathBuf {
 /// every spawn gets its own temp dir + sockets so checks never collide.
 pub struct Harness {
     agentd: PathBuf,
-    confmcp: PathBuf,
 }
 
 impl Default for Harness {
@@ -110,21 +98,13 @@ impl Default for Harness {
 
 impl Harness {
     pub fn new() -> Harness {
-        let b = binaries();
         Harness {
-            agentd: b.agentd.clone(),
-            confmcp: b.confmcp.clone(),
+            agentd: binary().clone(),
         }
     }
 
     pub fn agentd(&self) -> &Path {
         &self.agentd
-    }
-
-    /// Path to the recording reference MCP server, for a check that needs to
-    /// inspect the requests agentd issued rather than only their effects.
-    pub fn confmcp(&self) -> &Path {
-        &self.confmcp
     }
 
     /// Launch the built-in agentd Streamable HTTP mock MCP server, serving one
@@ -141,14 +121,6 @@ impl Harness {
             args.push(Path::new("--no-emit"));
         }
         ConfServer::spawn_http(&self.agentd, &args, addr_file)
-    }
-
-    /// Launch `confmcp` as a Streamable HTTP MCP server (loopback TCP, announcing
-    /// through the `addr_file`), recording requests to `rec` and serving resource
-    /// `uri`. Blocks until announced; the guard kills it on drop. agentd dials
-    /// `.endpoint()` (an `http://<addr>`).
-    pub fn spawn_confmcp(&self, addr_file: &Path, rec: &Path, uri: &str) -> ConfServer {
-        ConfServer::spawn_http(&self.confmcp, &[addr_file, rec, Path::new(uri)], addr_file)
     }
 
     pub fn tempdir(&self) -> TempDir {
@@ -199,7 +171,7 @@ impl Harness {
     }
 
     /// Spawn agentd as a long-lived daemon with `args`; returns a guard that
-    /// SIGTERMs it on drop (or via [`Daemon::sigterm`] / [`Daemon::wait`]).
+    /// SIGTERMs it on drop.
     pub fn spawn(&self, args: &[&str]) -> Daemon {
         self.spawn_exe(&self.agentd, args)
     }
@@ -277,39 +249,9 @@ impl Drop for ConfServer {
     }
 }
 
-/// A spawned agentd daemon. SIGTERM on drop; [`Daemon::wait`] consumes it to
-/// observe the graceful exit code.
+/// A spawned agentd daemon, SIGTERMed (then killed) on drop.
 pub struct Daemon {
     child: Option<Child>,
-}
-
-impl Daemon {
-    /// Send SIGTERM (the graceful-drain signal).
-    pub fn sigterm(&self) {
-        if let Some(c) = &self.child {
-            unsafe {
-                libc::kill(c.id() as i32, libc::SIGTERM);
-            }
-        }
-    }
-
-    /// Wait (bounded) for exit, returning the code. SIGKILLs past `timeout`.
-    pub fn wait(mut self, timeout: Duration) -> Option<i32> {
-        let mut child = self.child.take().expect("alive");
-        let deadline = Instant::now() + timeout;
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => return status.code(),
-                Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(20))
-                }
-                _ => {
-                    let _ = child.kill();
-                    return child.wait().ok().and_then(|s| s.code());
-                }
-            }
-        }
-    }
 }
 
 impl Drop for Daemon {

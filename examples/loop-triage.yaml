@@ -1,12 +1,10 @@
 # The 5-minute triage loop, as a config file.
 #
-# `--mode loop --interval 5m` was the 1.x spelling; modes are gone, and the
-# shape they encoded is now a start node. A `loop` start fires again each time
-# the previous run FINISHES, so `interval` paces the gap between runs rather
+# The cadence is a `loop` start node. It fires again each time the previous
+# run FINISHES, so `interval` paces the gap between runs rather
 # than being a wall-clock schedule — two runs never overlap.
 #
 #   agentd -c examples/loop-triage.yaml
-config_version: "1"
 
 agent:
   # Inlined so `agentd -c <this file>` works from any directory. The same text

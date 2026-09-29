@@ -3,7 +3,7 @@
 //! runs out of the store entirely (the fast path), `store.durability.work:
 //! ephemeral` flips the deployment default with `durable: true` opting back
 //! in, and a `durable: false` subagent spawn leaves no record.
-#![cfg(all(unix, feature = "workflow"))]
+#![cfg(unix)]
 
 mod common;
 
@@ -44,7 +44,7 @@ fn run_and_dump_state(cfg_text: &str) -> (Option<i32>, String, String) {
 #[test]
 fn a_non_durable_workflow_leaves_no_run_record() {
     let (code, log, state) = run_and_dump_state(
-        "config_version: \"1\"\nagent: { name: d }\nstore: { kind: file, file: { path: __STATE__ } }\n\
+        "agent: { name: d }\nstore: { kind: file, file: { path: __STATE__ } }\n\
          lifecycle: { run_until: idle, idle_grace: 500ms }\n\
          observability: { log_level: info, log_content: true }\n\
          workflows:\n\
@@ -73,7 +73,7 @@ fn a_non_durable_workflow_leaves_no_run_record() {
 #[test]
 fn ephemeral_work_default_flips_and_explicit_durable_opts_back_in() {
     let (code, log, state) = run_and_dump_state(
-        "config_version: \"1\"\nagent: { name: d }\nstore: { kind: file, file: { path: __STATE__ }, durability: { work: ephemeral } }\n\
+        "agent: { name: d }\nstore: { kind: file, file: { path: __STATE__ }, durability: { work: ephemeral } }\n\
          lifecycle: { run_until: idle, idle_grace: 500ms }\n\
          observability: { log_level: info, log_content: true }\n\
          workflows:\n\
@@ -98,7 +98,7 @@ fn ephemeral_work_default_flips_and_explicit_durable_opts_back_in() {
 #[test]
 fn a_non_durable_subagent_leaves_no_record() {
     let (code, log, state) = run_and_dump_state(
-        "config_version: \"1\"\nagent: { name: d }\nstore: { kind: file, file: { path: __STATE__ } }\n\
+        "agent: { name: d }\nstore: { kind: file, file: { path: __STATE__ } }\n\
          intelligence: { endpoints: \"mock:final\", model: mock }\n\
          lifecycle: { run_until: idle, idle_grace: 900ms }\n\
          observability: { log_level: info, log_content: true }\n\

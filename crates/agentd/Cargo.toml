@@ -14,10 +14,9 @@ categories = ["development-tools", "network-programming"]
 name = "agentd"
 path = "src/lib.rs"
 
-# Capability surface is compile-time. The default build stays lean — no async
-# runtime, no C/C++ toolchain, single-digit first-party crates — but as of v2.0.0
-# HTTPS is the primary transport for both intelligence and MCP, so `tls` is ON by
-# default (pure-Rust rustls+ring, no cmake/C build dep). Everything else heavier is
+# Capability surface is compile-time. The default build stays lean — no C/C++
+# toolchain, single-digit first-party crates — and HTTPS is the primary
+# transport for both intelligence and MCP, so `tls` is ON by default (pure-Rust rustls+ring, no cmake/C build dep). Everything else heavier is
 # feature-gated and OFF by default. See rfcs/0002 §dependency-budget.
 [features]
 default = ["tls"]
@@ -66,16 +65,15 @@ exec = []
 # Hand-written Prometheus text on the opt-in HTTP/socket surface (no dep).
 metrics = []
 # Restart-free reconfiguration: a SIGHUP-triggered, validate-first,
-# quiesce-and-reapply hot reload of the reloadable config subset (model/limits/
-# log_level/subscribe/mcp_servers), gated at a reactive quiesce boundary.
-# Dependency-free — raw `libc::sigaction` + the existing self-pipe (no
-# signal-hook), reusing the one `Config::load` validation pipeline. SIGHUP keeps
-# its default disposition when this feature is OFF. `mcp_servers` is RELOADABLE:
-# a validated reload re-handshakes the MCP server set
-# live — removed servers stop+reap via the stdio shutdown ladder, added servers
-# spawn+handshake+subscribe (read-after-subscribe), changed servers remove-then-
-# add. The supervisor's name-keyed `servers`/`owner`/claim wiring makes the live
-# re-handshake safe (a remove/add never shifts another server's identity).
+# quiesce-and-reapply hot reload of the reloadable config subset (the paths
+# `config::settings::RELOADABLE_PATHS` lists), gated at a reactive quiesce
+# boundary. Dependency-free — raw `libc::sigaction` + the existing self-pipe (no
+# signal-hook), reusing the one `config::settings::load` validation pipeline.
+# SIGHUP keeps its default disposition when this feature is OFF. `mcp.servers`
+# is RELOADABLE: a validated reload applies the MCP server set live — a removed
+# server is disconnected, an added or changed one is (re)connected, and one
+# whose spec is unchanged is left alone. The name-keyed server wiring makes that
+# safe (a remove/add never shifts another server's identity).
 hot-reload = []
 # The inotify file-watch reload trigger: a `--watch-config`-armed
 # raw `inotify` watch on the config file's PARENT DIRECTORY that sets the SAME
@@ -89,19 +87,6 @@ config-watch = ["hot-reload"]
 # existing HTTP client + serde_json — no opentelemetry/protobuf deps, so
 # `--features otel` stays dependency-free (3 deps).
 otel = []
-# Agent-authored cyclic workflows (pivot Phase 7): a serde-only graph the model
-# self-authors (workflow.define/run/patch self-tools) or the operator pins
-# (--mode workflow --workflow <file>), driven by a thin walker reusing the ReAct
-# `Session`/`Budget`/`Router` — nodes Agent/Tool/Branch/Wait/Subgraph/Halt, a
-# blackboard, two-tier conditions (json-pointer preds + one semantic branch), and
-# four-layer cycle termination with distinct graph statuses. Dependency-free (serde
-# + serde_json::Value::pointer only — the minimalism moat). Default OFF: an absent
-# build is byte-for-byte today; the degenerate single-Agent-node workflow reproduces
-# today's behaviour. The ENGINE is transport-free — the self-tools and the driver
-# need no listener, and workflows are reached over A2A (`workflow.run` /
-# `workflow.status` / `workflow.cancel` / `workflow.signal`), not as a served
-# resource.
-workflow = []
 # Built-in mock intelligence + mock MCP server (the hidden `--internal-mock-llm`
 # / `--internal-mock-mcp` re-exec modes) that the test + conformance suites drive.
 # Test scaffolding, never a shippable capability — so it's OFF in release and the
@@ -113,10 +98,10 @@ internal-mocks = []
 # computed `assign.expr`, `infer.check` value constraints, and reactive `cel`
 # wake conditions — hermetic, non-Turing-complete, terminating expressions the
 # model can safely author. Off in the DEFAULT build, but IN the release feature
-# set since 2.3.0: `when`/`until`/`filter` are how a workflow branches, and a
-# published binary that refuses them at validation made every non-trivial config
-# a build-from-source job. A non-cel build still REJECTS graphs using CEL at
-# define time (fail-closed, clear message). Costs ~1.8 MiB. Rides `workflow`.
+# set: `when`/`until`/`filter` are how a workflow branches, and a published
+# binary that refused them at validation would make every non-trivial config a
+# build-from-source job. A non-cel build still REJECTS workflows using CEL at
+# define time (fail-closed, clear message). Costs ~1.8 MiB.
 cel = ["dep:cel-interpreter"]
 # AAuth [DRAFT] — agent-side auth for calling AAuth-protected MCP servers:
 # an Ed25519 agent identity, an Agent-Provider token client
@@ -184,11 +169,11 @@ cel-interpreter = { version = "0.10.0", optional = true, features = ["json"] }
 # to the SAME ring rustls already resolves (no new crate in the graph). The
 # `less-safe-getrandom-custom-or-rdrand` avoidance is default; std rng is used.
 ring = { version = "0.17", optional = true }
-# The reusable MCP base library (workspace crate): wire types + the version/era
-# model + the modern dialect helpers + the JSON-RPC codec. In-tree.
+# The reusable MCP base library (workspace crate): the client, wire types and the
+# JSON-RPC codec. In-tree.
 mcp = { package = "agentd-mcp", path = "../mcp", version = "1.0.1" }
 # Shared transport primitives (workspace crate): the HTTP/1.1+SSE client, unix +
-# feature-gated tls/vsock connects, SSRF guard. Owns the rustls/webpki deps
+# feature-gated tls connects, SSRF guard. Owns the rustls/webpki deps
 # (agentd's `tls` feature maps to `net/tls`).
 net = { package = "agentd-net", path = "../net", version = "1.0.1" }
 # The one non-negotiable dependency: JSON is the MCP + LLM wire format.
@@ -201,8 +186,6 @@ serde_json = "1"
 # `config::idoc` and `config::yaml` re-export it; behaviour is unchanged.
 instruction-core = { package = "agentd-instruction", path = "../instruction", version = "0.2.0" }
 
-# The reusable `net`/`mcp` crates keep their `vsock` features (agentd no longer
-# enables them — the pivot removed agentd's unix/vsock use). No direct `vsock` dep.
 # --- feature: cron --- hand-rolled in triggers/timer.rs; no dependency.
 
 # Unix-only: signals (sigaction), process control (setpgid/killpg/waitpid),

@@ -7,7 +7,7 @@
 //! sniffed (`{`/`[` ⇒ JSON, else YAML). Both parse to the same
 //! `serde_json::Value` document ([`read_document`]), which this module also
 //! merges across the config chain ([`read_documents_checked`], RFC 7396) before
-//! handing it to the typed [`super::v2::Settings`] — so validation, the schema,
+//! handing it to the typed [`super::settings::Settings`] — so validation, the schema,
 //! the env/flag path bindings ([`super::paths`]) and hot reload are all
 //! format-agnostic.
 //!
@@ -18,33 +18,19 @@
 //! the document can be committed and mounted as it stands.
 //!
 //! Precedence: `built-in default < FILE < env < flag`. The file is loaded
-//! first, then [`super::v2::load`] applies env and flags over it; a flag/env for
+//! first, then [`super::settings::load`] applies env and flags over it; a flag/env for
 //! the same key wins. List-valued keys (`mcp.servers`, `a2a.peers`) *seed* the
 //! list — repeatable `--mcp`/`--a2a-peer` flags **add to** the file's list
 //! rather than replacing it, matching the repeatable-flag semantics operators
 //! already expect.
 //!
-//! `deny_unknown_fields` makes a typo'd key (`max_token` vs `max_tokens`) a hard
-//! config error (exit 2) instead of a silently-ignored value — the single most
-//! common config footgun, closed at parse time.
-//!
-//! `ConfigFile` and `config_schema` are the RETIRED flat schema, not the live
-//! typing path: a document that speaks it is refused outright at load ("config
-//! file speaks the retired flat schema", [`super::v2::load`]). They survive as
-//! a test FIXTURE — a small, stable schema for exercising this module's merge
-//! semantics and `paths`' binding walk without pinning those tests to the real
-//! settings schema, which changes every release. All of it is `#[cfg(test)]`,
-//! so the compiler, not this paragraph, is what keeps it out of production.
-//!
-//! The schema is **hand-written** (no `schemars` — a forbidden dependency) and
-//! kept faithful to this struct by a unit test asserting the schema's top-level
-//! properties match the struct's fields, so the two cannot diverge unnoticed.
+//! Each file is typed on its own before the merge (the settings' own
+//! `deny_unknown_fields`), so a typo'd key (`max_token` vs `max_tokens`) is a
+//! hard config error (exit 2) naming the file that carries it, instead of a
+//! silently-ignored value — the single most common config footgun, closed at
+//! parse time.
 
-use serde::Deserialize;
 use serde_json::Value;
-#[cfg(test)]
-use serde_json::json;
-use std::collections::BTreeMap;
 use std::path::Path;
 
 /// The two config-file syntaxes.
@@ -145,24 +131,13 @@ pub fn read_document(path: &str) -> Result<(Value, Format), String> {
     Ok((doc, format))
 }
 
-/// TEST-ONLY: [`read_documents_checked`] bound to the retired flat typing.
-/// Production passes the v2 check.
-#[cfg(test)]
 /// Read several config files, in order, into ONE effective document: each later
 /// file is merged over the previous ones with **JSON Merge Patch** semantics
 /// (RFC 7396) — objects merge recursively, scalars and lists are REPLACED by the
-/// later file, and a `null` value UNSETS the key. Every file is type-checked on
-/// its own first (so an unknown key is reported against the file that carries
-/// it), then the merged document is returned with the `(path, format)` list.
-pub fn read_documents(paths: &[String]) -> Result<(Value, Vec<(String, Format)>), String> {
-    read_documents_checked(paths, &|doc, source| {
-        ConfigFile::from_document(doc.clone(), source).map(|_| ())
-    })
-}
-
-/// [`read_documents`] with a caller-supplied per-file check (the v2 settings
-/// typing, or none) — `check(doc, "config file <path>")` runs before the merge
-/// so an unknown key is attributed to its file.
+/// later file, and a `null` value UNSETS the key. `check(doc, "config file
+/// <path>")` — the settings typing — runs on every file before the merge, so an
+/// unknown key is attributed to the file that carries it; the merged document
+/// is returned with the `(path, format)` list.
 pub fn read_documents_checked(
     paths: &[String],
     check: &dyn Fn(&Value, &str) -> Result<(), String>,
@@ -218,173 +193,6 @@ fn kind_name(v: &Value) -> &'static str {
         Value::String(_) => "a string",
         Value::Array(_) => "a list",
         Value::Object(_) => "an object",
-    }
-}
-
-/// The `x-agentd-contract-version` the schema carries — the runtime contract a
-/// tool that validated a document against this schema is targeting. The
-/// capabilities manifest reports its own surface versions separately, under
-/// `surfaces` (`exit_codes`, and `config_schema`, which is the document major
-/// [`super::v2::schema::CONFIG_VERSION`]); nothing currently holds the two in
-/// lockstep.
-pub const SCHEMA_CONTRACT_VERSION: &str = "1.0";
-
-/// The deserialized config-file shape — one source of truth for the loader, the
-/// validator, and the `--config-schema` generator. `serde` only.
-///
-/// TEST-ONLY. The retired flat schema's typed shape, kept as the fixture the
-/// tests in this module and in [`super::paths`] exercise their mechanics
-/// against. Production types against [`super::v2::Settings`]; the `#[cfg(test)]`
-/// makes that a compiler guarantee rather than a comment.
-#[cfg(test)]
-/// `deny_unknown_fields` rejects a typo'd key at parse time (exit 2). A flattened
-/// catch-all is INTENTIONALLY ABSENT — `deny_unknown_fields` is the guard.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct ConfigFile {
-    /// Optional; pins the file to a schema major agentctl validated against.
-    pub config_version: Option<String>,
-    /// `--intelligence` / `AGENTD_INTELLIGENCE` — the ordered intelligence
-    /// endpoint *list* URI. File-settable and **reloadable** so a ConfigMap
-    /// update can repoint the endpoint list as a hot swap: the reload fans
-    /// `ctrl/swap_intel` to in-flight work and re-points new spawns. The
-    /// transport SCHEME is data, not a secret; the per-endpoint credential is
-    /// NEVER inline here — it comes from env or a `_FILE` path, so a config
-    /// document can be committed and mounted without carrying a credential.
-    pub intelligence: Option<String>,
-    /// `--model-swap` / `AGENTD_MODEL_SWAP` — the model hot-swap policy
-    /// (`finish-on-old` | `restart-turn`), deciding what an in-flight turn does
-    /// when the model changes under it. Reloadable. Validated against
-    /// [`crate::config::SwapPolicy`].
-    pub model_swap: Option<String>,
-    /// `--model` / `AGENTD_MODEL` (reloadable param, never the transport).
-    pub model: Option<String>,
-    /// `--max-tokens` / `AGENTD_MAX_TOKENS`.
-    pub max_tokens: Option<u64>,
-    /// Bounds on the model loop (`--max-steps` / `--max-depth` / `--deadline`).
-    pub limits: Option<LimitsFile>,
-    /// The MCP server inventory — one object per `--mcp name=cmd … --mcp-tags …`.
-    #[serde(default)]
-    pub mcp_servers: Vec<McpServerFile>,
-    /// Declared subscriptions (reactive mode) — each string == one `--subscribe URI`.
-    #[serde(default)]
-    pub subscribe: Vec<String>,
-    /// Declared remote-A2A delegation peers — each == one `--a2a-peer name=endpoint`.
-    #[serde(default)]
-    pub a2a_peers: Vec<A2aPeerFile>,
-    /// `--log-level` / `AGENTD_LOG_LEVEL` (a string; validated against `Level`).
-    pub log_level: Option<String>,
-    /// Declared intelligence HTTP headers. Values MAY interpolate
-    /// `{{secret:NAME}}` / `{{secret-file:PATH}}`; the resolved secret never
-    /// lands in this struct or in a log — only the reference does. A value that
-    /// looks like an inline secret is rejected outright, so a credential cannot
-    /// be committed to a config file by accident.
-    #[serde(default)]
-    pub intelligence_headers: BTreeMap<String, String>,
-}
-
-/// The `limits` sub-object — maps to the per-run limit flags.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct LimitsFile {
-    /// `--max-steps`.
-    pub max_steps: Option<u32>,
-    /// `--max-depth`.
-    pub max_depth: Option<u32>,
-    /// `--deadline` in whole seconds.
-    pub deadline_secs: Option<u64>,
-    /// `--budget-tokens-lifetime` — the per-instance cumulative token cap
-    /// across all runs and reactions, not per run (the CRD's
-    /// `limits.lifetimeTokens`). `0` or absent = unbounded.
-    pub lifetime_tokens: Option<u64>,
-}
-
-/// One MCP server, reached over the Streamable HTTP transport: a remote
-/// `endpoint` (`https://host[:port][/path]`, loopback `http://` for dev) with
-/// optional secret-free auth `headers`. There is no local process spawn — every
-/// server is a network peer, so config can never turn into command execution.
-/// `tags` is the glob→tags wire (the loader flattens a `{"*": ["sensitive"]}`
-/// map to the server's tag set).
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct McpServerFile {
-    pub name: String,
-    /// Remote MCP endpoint.
-    pub endpoint: Option<String>,
-    /// Auth/framing header templates — values MAY interpolate `{{secret:NAME}}` /
-    /// `{{secret-file:PATH}}`, never inline secrets.
-    #[serde(default)]
-    pub headers: BTreeMap<String, String>,
-    /// Glob→trifecta-tags. A server with no tags is treated as
-    /// `untrusted_input`, so forgetting to tag one narrows the trust budget
-    /// rather than widening it.
-    #[serde(default)]
-    pub tags: BTreeMap<String, Vec<String>>,
-    /// Sign requests to this server with the AAuth agent identity.
-    /// `None` inherits the global default (sign all when an identity is
-    /// configured); `false` opts out; `true` opts in. Needs `--features aauth`.
-    #[serde(default)]
-    pub aauth: Option<bool>,
-}
-
-/// One A2A peer — maps to `--a2a-peer name=endpoint`.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct A2aPeerFile {
-    pub name: String,
-    pub endpoint: String,
-    /// Secret-free auth header templates presented TO the peer (bearer leg),
-    /// e.g. `"authorization": "Bearer {{secret:PEER_TOKEN}}"`.
-    #[serde(default)]
-    pub headers: BTreeMap<String, String>,
-    /// Client-certificate PEM file paths for mutual TLS to the peer (both or
-    /// neither).
-    #[serde(default)]
-    pub client_cert: Option<String>,
-    #[serde(default)]
-    pub client_key: Option<String>,
-}
-
-/// The list of `ConfigFile` field names, in declaration order — the single
-/// source both the schema generator and its unit test read, so the schema's
-/// `properties` can never silently diverge from the struct.
-pub const CONFIG_FILE_FIELDS: &[&str] = &[
-    "config_version",
-    "intelligence",
-    "model_swap",
-    "model",
-    "max_tokens",
-    "limits",
-    "mcp_servers",
-    "subscribe",
-    "a2a_peers",
-    "log_level",
-    "intelligence_headers",
-];
-
-#[cfg(test)]
-impl ConfigFile {
-    /// Parse config text (YAML or JSON — sniffed, since there is no path). A
-    /// malformed document is an `Err` with a message the caller maps to exit 2
-    /// — before any side effect. JSON-with-comments is tolerated (`//` and
-    /// `/* */` are stripped first, matching the jsonc shown in the RFC set).
-    pub fn parse(text: &str) -> Result<ConfigFile, String> {
-        let doc = parse_document(text, Format::detect(None, text))?;
-        Self::from_document(doc, "config file")
-    }
-
-    /// Type a config DOCUMENT (from a file, or the env/flag path layers —
-    /// `source` names it in errors). Unknown keys are rejected
-    /// (`deny_unknown_fields`); the error names the offending key.
-    pub fn from_document(doc: Value, source: &str) -> Result<ConfigFile, String> {
-        serde_json::from_value(doc).map_err(|e| format!("{source} parse error: {e}"))
-    }
-
-    /// Load + parse a config file from a local path (no network) — YAML or JSON
-    /// by extension, sniffed otherwise.
-    pub fn load(path: &str) -> Result<ConfigFile, String> {
-        let (doc, _format) = read_document(path)?;
-        Self::from_document(doc, "config file")
     }
 }
 
@@ -461,198 +269,64 @@ fn strip_jsonc(src: &str) -> String {
     out
 }
 
-/// Emit the hand-written **JSON Schema (Draft 2020-12)** of the config file.
-/// No `schemars` — a schema *library* is binary weight the moat forbids. Kept
-/// faithful to [`ConfigFile`] by `tests::schema_properties_match_struct_fields`.
-///
-/// `additionalProperties:false` mirrors `deny_unknown_fields`; `$id` pins the
-/// major; `x-agentd-contract-version` ties it to the manifest. agentctl
-/// validates a CR against this before applying it to a pod.
-/// TEST-ONLY. The retired flat schema survives as a FIXTURE for the tests
-/// that exercise this module's own mechanics; production types against
-/// [`super::v2::Settings`] and derives its bindings from the v2 schema. The
-/// `#[cfg(test)]` is the enforcement: nothing outside a test can reach it, so
-/// it cannot quietly become live again.
-#[cfg(test)]
-pub fn config_schema() -> Value {
-    json!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        // A DIFFERENT document from the settings schema `--config-schema`
-        // prints, so it gets its own `$id`: two schemas sharing one identity
-        // is a real hazard for any tool that caches by `$id`. This one is
-        // internal — it derives the env/flag path bindings — and is not
-        // served.
-        "$id": format!("https://agentd.dev/schema/internal/config-file-{SCHEMA_CONTRACT_VERSION}.json"),
-        "x-agentd-contract-version": SCHEMA_CONTRACT_VERSION,
-        "title": "agentd config file",
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-            "config_version": { "type": "string" },
-            "intelligence": { "type": "string" },
-            "model_swap": { "enum": ["finish-on-old", "restart-turn"] },
-            "model": { "type": "string" },
-            "max_tokens": { "type": "integer", "minimum": 1 },
-            "limits": { "$ref": "#/$defs/Limits" },
-            "mcp_servers": { "type": "array", "items": { "$ref": "#/$defs/McpServer" } },
-            "subscribe": { "type": "array", "items": { "type": "string" } },
-            "a2a_peers": { "type": "array", "items": { "$ref": "#/$defs/A2aPeer" } },
-            "log_level": { "enum": ["trace", "debug", "info", "warn", "error"] },
-            "intelligence_headers": {
-                "type": "object",
-                "additionalProperties": { "type": "string" }
-            }
-        },
-        "$defs": {
-            "Limits": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "max_steps": { "type": "integer", "minimum": 1 },
-                    "max_depth": { "type": "integer", "minimum": 0 },
-                    "deadline_secs": { "type": "integer", "minimum": 0 },
-                    "lifetime_tokens": { "type": "integer", "minimum": 0 }
-                }
-            },
-            "McpServer": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["name", "endpoint"],
-                "properties": {
-                    "name": { "type": "string", "pattern": "^[a-zA-Z0-9_-]+$" },
-                    "endpoint": { "type": "string" },
-                    "headers": {
-                        "type": "object",
-                        "additionalProperties": { "type": "string" }
-                    },
-                    "tags": {
-                        "type": "object",
-                        "additionalProperties": {
-                            "type": "array",
-                            "items": { "enum": ["untrusted_input", "sensitive", "egress"] }
-                        }
-                    },
-                    "aauth": {
-                        "type": "boolean",
-                        "description": "sign requests to this server with the AAuth agent identity; omit to inherit the global default"
-                    }
-                }
-            },
-            "A2aPeer": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["name", "endpoint"],
-                "properties": {
-                    "name": { "type": "string", "pattern": "^[a-zA-Z0-9_-]+$" },
-                    "endpoint": { "type": "string" },
-                    "headers": {
-                        "type": "object",
-                        "additionalProperties": { "type": "string" },
-                        "description": "secret-free auth header templates presented to the peer ({{secret:NAME}} references)"
-                    },
-                    "client_cert": { "type": "string", "description": "client certificate PEM file path (mutual TLS to the peer; requires client_key)" },
-                    "client_key": { "type": "string", "description": "client private-key PEM file path" }
-                }
-            }
-        }
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
-    #[test]
-    fn parses_a_full_file() {
-        let src = r#"{
-            "config_version": "1.0",
-            "model": "claude-opus-4",
-            "max_tokens": 2000000,
-            "limits": { "max_steps": 200, "max_depth": 4, "deadline_secs": 600 },
-            "mcp_servers": [
-                { "name": "web", "endpoint": "https://web.example.com/mcp",
-                  "headers": { "Authorization": "Bearer {{secret:WEB_TOKEN}}" },
-                  "tags": { "*": ["untrusted_input"] } }
-            ],
-            "subscribe": ["fs:file:///watch/inbox"],
-            "a2a_peers": [{ "name": "mesh", "endpoint": "unix:/run/peer.sock" }],
-            "log_level": "info",
-            "intelligence_headers": { "anthropic-version": "2023-06-01" }
-        }"#;
-        let cf = ConfigFile::parse(src).unwrap();
-        assert_eq!(cf.model.as_deref(), Some("claude-opus-4"));
-        assert_eq!(cf.max_tokens, Some(2_000_000));
-        assert_eq!(cf.limits.unwrap().max_steps, Some(200));
-        assert_eq!(cf.mcp_servers.len(), 1);
-        assert_eq!(
-            cf.mcp_servers[0].endpoint.as_deref(),
-            Some("https://web.example.com/mcp")
-        );
-        assert_eq!(cf.subscribe, vec!["fs:file:///watch/inbox"]);
-        assert_eq!(cf.a2a_peers[0].name, "mesh");
-        assert_eq!(cf.log_level.as_deref(), Some("info"));
+    /// The settings typing the loader runs on every file.
+    fn settings(doc: Value) -> Result<(), String> {
+        super::super::settings::Settings::from_document(doc, "config file").map(|_| ())
     }
 
     #[test]
     fn unknown_key_is_rejected() {
         // deny_unknown_fields: a typo'd key is a hard error, not silently ignored.
-        let e = ConfigFile::parse(r#"{ "max_token": 5 }"#).unwrap_err();
-        assert!(e.contains("parse error"), "got: {e}");
+        let e =
+            settings(parse_document(r#"{ "max_token": 5 }"#, Format::Json).unwrap()).unwrap_err();
         assert!(e.contains("max_token"), "names the key: {e}");
         // Same for YAML — the typo is named, whatever the syntax.
-        let e = ConfigFile::parse("max_token: 5\n").unwrap_err();
-        assert!(
-            e.contains("parse error") && e.contains("max_token"),
-            "got: {e}"
-        );
+        let e = settings(parse_document("max_token: 5\n", Format::Yaml).unwrap()).unwrap_err();
+        assert!(e.contains("max_token"), "got: {e}");
     }
 
     #[test]
-    fn yaml_and_json_documents_type_identically() {
+    fn yaml_and_json_documents_parse_identically() {
         let yaml = r#"
-# the same document as parses_a_full_file, in YAML
-config_version: "1.0"
-model: claude-opus-4
-max_tokens: 2000000
+# one document, in YAML
+intelligence:
+  model: claude-opus-4
+  headers:
+    anthropic-version: "2023-06-01"
 limits:
-  max_steps: 200
-  max_depth: 4
-  deadline_secs: 600
-mcp_servers:
-  - name: web
-    endpoint: https://web.example.com/mcp
-    headers:
-      Authorization: "Bearer {{secret:WEB_TOKEN}}"
-    tags:
-      "*": [untrusted_input]
-subscribe: [fs:file:///watch/inbox]
-a2a_peers:
-  - name: mesh
-    endpoint: unix:/run/peer.sock
-log_level: info
-intelligence_headers:
-  anthropic-version: "2023-06-01"
+  run:
+    steps: 200
+mcp:
+  servers:
+    - name: web
+      endpoint: https://web.example.com/mcp
+      headers:
+        Authorization: "Bearer {{secret:WEB_TOKEN}}"
+      tags:
+        "*": [untrusted_input]
+observability:
+  log_level: info
 "#;
         let json = r#"{
-            "config_version": "1.0",
-            "model": "claude-opus-4",
-            "max_tokens": 2000000,
-            "limits": { "max_steps": 200, "max_depth": 4, "deadline_secs": 600 },
-            "mcp_servers": [
+            "intelligence": { "model": "claude-opus-4",
+                              "headers": { "anthropic-version": "2023-06-01" } },
+            "limits": { "run": { "steps": 200 } },
+            "mcp": { "servers": [
                 { "name": "web", "endpoint": "https://web.example.com/mcp",
                   "headers": { "Authorization": "Bearer {{secret:WEB_TOKEN}}" },
                   "tags": { "*": ["untrusted_input"] } }
-            ],
-            "subscribe": ["fs:file:///watch/inbox"],
-            "a2a_peers": [{ "name": "mesh", "endpoint": "unix:/run/peer.sock" }],
-            "log_level": "info",
-            "intelligence_headers": { "anthropic-version": "2023-06-01" }
+            ] },
+            "observability": { "log_level": "info" }
         }"#;
-        let from_yaml = ConfigFile::parse(yaml).expect("yaml parses");
-        let from_json = ConfigFile::parse(json).expect("json parses");
+        let from_yaml = parse_document(yaml, Format::Yaml).expect("yaml parses");
+        let from_json = parse_document(json, Format::Json).expect("json parses");
         assert_eq!(from_yaml, from_json, "one document model, two syntaxes");
-        assert_eq!(from_yaml.limits.as_ref().unwrap().max_steps, Some(200));
-        assert_eq!(from_yaml.mcp_servers[0].tags["*"], vec!["untrusted_input"]);
+        settings(from_yaml).expect("and it is a settings document");
     }
 
     #[test]
@@ -688,7 +362,7 @@ intelligence_headers:
             "model": "base",
             "limits": {"max_steps": 1, "max_depth": 2},
             "subscribe": ["a", "b"],
-            "intelligence_headers": {"h1": "v1"},
+            "headers": {"h1": "v1"},
             "log_level": "info"
         });
         merge_into(
@@ -697,7 +371,7 @@ intelligence_headers:
                 "model": "over",                    // scalar: replaced
                 "limits": {"max_steps": 9},         // object: merged (max_depth kept)
                 "subscribe": ["c"],                 // list: REPLACED, not appended
-                "intelligence_headers": {"h2": "v2"}, // map: merged
+                "headers": {"h2": "v2"},            // map: merged
                 "log_level": null                   // null: unset
             }),
         );
@@ -707,7 +381,7 @@ intelligence_headers:
                 "model": "over",
                 "limits": {"max_steps": 9, "max_depth": 2},
                 "subscribe": ["c"],
-                "intelligence_headers": {"h1": "v1", "h2": "v2"}
+                "headers": {"h1": "v1", "h2": "v2"}
             })
         );
         // A scalar in the way of an object overlay is replaced by the object.
@@ -724,31 +398,33 @@ intelligence_headers:
         let extra = dir.path().join("extra.json");
         std::fs::write(
             &base,
-            "model: base\nlimits:\n  max_steps: 1\n  max_depth: 2\nsubscribe: [a, b]\n",
+            "intelligence: {model: base}\nlimits:\n  run: {steps: 1, tokens: 2}\n",
         )
         .unwrap();
         std::fs::write(
             &prod,
-            "model: prod\nlimits:\n  max_steps: 9\nsubscribe: [c]\n",
+            "intelligence: {model: prod}\nlimits:\n  run: {steps: 9}\n",
         )
         .unwrap();
         std::fs::write(
             &extra,
-            r#"{ "log_level": "warn", "limits": { "max_depth": null } }"#,
+            r#"{ "observability": {"log_level": "warn"}, "limits": { "run": { "tokens": null } } }"#,
         )
         .unwrap();
         let paths: Vec<String> = [&base, &prod, &extra]
             .iter()
             .map(|p| p.to_str().unwrap().to_string())
             .collect();
-        let (doc, loaded) = read_documents(&paths).unwrap();
+        let check = |doc: &Value, source: &str| {
+            super::super::settings::Settings::from_document(doc.clone(), source).map(|_| ())
+        };
+        let (doc, loaded) = read_documents_checked(&paths, &check).unwrap();
         assert_eq!(
             doc,
             json!({
-                "model": "prod",
-                "limits": {"max_steps": 9},
-                "subscribe": ["c"],
-                "log_level": "warn"
+                "intelligence": {"model": "prod"},
+                "limits": {"run": {"steps": 9}},
+                "observability": {"log_level": "warn"}
             })
         );
         assert_eq!(loaded.len(), 3);
@@ -756,10 +432,10 @@ intelligence_headers:
         assert_eq!(loaded[2].1, Format::Json);
         // An unknown key is attributed to the file that carries it.
         std::fs::write(&prod, "modle: typo\n").unwrap();
-        let e = read_documents(&paths).unwrap_err();
+        let e = read_documents_checked(&paths, &check).unwrap_err();
         assert!(e.contains("prod.yaml") && e.contains("modle"), "{e}");
         // A missing file is an error naming it.
-        let e = read_documents(&["/no/such/agentd.yaml".to_string()]).unwrap_err();
+        let e = read_documents_checked(&["/no/such/agentd.yaml".to_string()], &check).unwrap_err();
         assert!(e.contains("/no/such/agentd.yaml"), "{e}");
     }
 
@@ -781,7 +457,8 @@ intelligence_headers:
 
     #[test]
     fn malformed_json_is_an_error() {
-        assert!(ConfigFile::parse("{ not json").is_err());
+        let e = parse_document("{ not json", Format::Json).unwrap_err();
+        assert!(e.contains("parse error (json)"), "{e}");
     }
 
     #[test]
@@ -791,11 +468,11 @@ intelligence_headers:
             "model": "m", /* block */ "max_tokens": 10,
             "subscribe": ["http://x//path"]  // a // inside a string is data
         }"#;
-        let cf = ConfigFile::parse(src).unwrap();
-        assert_eq!(cf.model.as_deref(), Some("m"));
-        assert_eq!(cf.max_tokens, Some(10));
+        let doc = parse_document(src, Format::Json).unwrap();
+        assert_eq!(doc["model"], json!("m"));
+        assert_eq!(doc["max_tokens"], json!(10));
         // The `//` inside the string literal survived (not treated as a comment).
-        assert_eq!(cf.subscribe, vec!["http://x//path"]);
+        assert_eq!(doc["subscribe"], json!(["http://x//path"]));
     }
 
     #[test]
@@ -809,71 +486,14 @@ intelligence_headers:
         let src = format!(
             "{{\n  /* 日本語 block */\"model\": \"{model}\",/*é*/\n  \"subscribe\": [\"fs:file:///wätch/收件箱\"] // — trailing 日本語\n}}"
         );
-        let cf = ConfigFile::parse(&src).unwrap();
-        assert_eq!(cf.model.as_deref(), Some(model), "mojibake in the value");
-        assert_eq!(cf.subscribe, vec!["fs:file:///wätch/收件箱"]);
+        let doc = parse_document(&src, Format::Json).unwrap();
+        assert_eq!(doc["model"], json!(model), "mojibake in the value");
+        assert_eq!(doc["subscribe"], json!(["fs:file:///wätch/收件箱"]));
         // The stripper itself must be the identity on a comment-free document.
         let plain = format!("{{ \"model\": \"{model}\" }}");
         assert_eq!(strip_jsonc(&plain), plain);
         // A \-escape adjacent to multibyte text must not eat the following byte.
-        let cf = ConfigFile::parse("{ \"model\": \"a\\\"—\\\\é\" }").unwrap();
-        assert_eq!(cf.model.as_deref(), Some("a\"—\\é"));
-    }
-
-    #[test]
-    fn schema_is_parseable_draft_2020_12() {
-        let s = config_schema();
-        assert_eq!(
-            s["$schema"],
-            json!("https://json-schema.org/draft/2020-12/schema")
-        );
-        assert_eq!(s["additionalProperties"], json!(false));
-        assert_eq!(
-            s["x-agentd-contract-version"],
-            json!(SCHEMA_CONTRACT_VERSION)
-        );
-        // It round-trips through serde_json as a valid document.
-        let text = serde_json::to_string(&s).unwrap();
-        let _: Value = serde_json::from_str(&text).unwrap();
-    }
-
-    #[test]
-    fn schema_properties_match_struct_fields() {
-        // The hand-written schema cannot silently diverge from the struct: its
-        // top-level `properties` keys must be EXACTLY the struct's fields.
-        let s = config_schema();
-        let props = s["properties"].as_object().unwrap();
-        let schema_keys: std::collections::BTreeSet<&str> =
-            props.keys().map(String::as_str).collect();
-        let struct_keys: std::collections::BTreeSet<&str> =
-            CONFIG_FILE_FIELDS.iter().copied().collect();
-        assert_eq!(
-            schema_keys, struct_keys,
-            "schema properties drifted from ConfigFile fields"
-        );
-    }
-
-    #[test]
-    fn config_file_fields_const_matches_a_full_deser() {
-        // Guard the CONFIG_FILE_FIELDS const itself: a fully-populated JSON object
-        // keyed by every const entry must deserialize (so a renamed/added struct
-        // field forces the const + schema to be updated together).
-        let mut obj = serde_json::Map::new();
-        for k in CONFIG_FILE_FIELDS {
-            let v = match *k {
-                "config_version" | "model" | "log_level" | "intelligence" => json!("x"),
-                "model_swap" => json!("finish-on-old"),
-                "max_tokens" => json!(1),
-                "limits" => json!({}),
-                "mcp_servers" => json!([{ "name": "a", "endpoint": "unix:/a.sock" }]),
-                "subscribe" => json!(["u"]),
-                "a2a_peers" => json!([{ "name": "p", "endpoint": "unix:/x" }]),
-                "intelligence_headers" => json!({ "h": "v" }),
-                other => panic!("CONFIG_FILE_FIELDS has an unmapped key {other}"),
-            };
-            obj.insert((*k).to_string(), v);
-        }
-        let text = serde_json::to_string(&Value::Object(obj)).unwrap();
-        ConfigFile::parse(&text).expect("every CONFIG_FILE_FIELDS key must deserialize");
+        let doc = parse_document("{ \"model\": \"a\\\"—\\\\é\" }", Format::Json).unwrap();
+        assert_eq!(doc["model"], json!("a\"—\\é"));
     }
 }

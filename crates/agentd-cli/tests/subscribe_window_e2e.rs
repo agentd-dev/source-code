@@ -9,7 +9,7 @@
 //! per update; each run's finish output carries the ring as of its firing. The
 //! ring must GROW to N and then SLIDE (oldest sample out), and survive across
 //! firings — it rides the durable start-state, not the run.
-#![cfg(all(unix, feature = "workflow"))]
+#![cfg(unix)]
 
 mod common;
 
@@ -200,7 +200,7 @@ fn a_subscribe_window_delivers_the_last_n_samples_growing_then_sliding() {
     std::fs::write(
         &cfg_path,
         format!(
-            "config_version: \"1\"\nagent:\n  name: sub-window\nstore:\n  kind: memory\nmcp:\n  servers:\n    - name: mock\n      endpoint: {endpoint}\nworkflows:\n  - name: watch\n    steps: {steps}\nlifecycle:\n  run_until: drained\nobservability:\n  log_level: info\n  log_content: true\n"
+            "agent:\n  name: sub-window\nstore:\n  kind: memory\nmcp:\n  servers:\n    - name: mock\n      endpoint: {endpoint}\nworkflows:\n  - name: watch\n    steps: {steps}\nlifecycle:\n  run_until: drained\nobservability:\n  log_level: info\n  log_content: true\n"
         ),
     )
     .expect("write config");

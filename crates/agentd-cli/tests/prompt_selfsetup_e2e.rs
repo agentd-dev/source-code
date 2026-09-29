@@ -78,7 +78,6 @@ fn a_prompt_that_sets_up_recurring_work_leaves_a_live_daemon() {
     let playbook = json!({"turns": [
         {"tool_calls": [{"name": "workflow.create", "arguments": {"definition": {
             "name": "watcher",
-            "version": 3,
             "steps": {
                 "tick": {"kind": "loop", "interval": "30s"},
                 "note": {"kind": "finish", "depends_on": ["tick"], "status": "completed", "output": "checked"}

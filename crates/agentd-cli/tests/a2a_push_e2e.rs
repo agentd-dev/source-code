@@ -85,7 +85,7 @@ fn spawn_hook() -> Hook {
 
 fn config(llm: &str, port: u16, push: &str) -> String {
     format!(
-        "config_version: \"1\"\n\
+        "\
          agent:\n  name: push-e2e\n  instruction: You are a helpful test agent.\n  preflight: never\n\
          intelligence:\n  endpoints: {llm}\n  model: mock\n\
          store:\n  kind: memory\n\
@@ -284,8 +284,9 @@ fn a_registered_webhook_receives_the_task_and_the_callers_credentials() {
             Some("application/a2a+json"),
             "{headers:?}"
         );
-        // The caller's token comes back too (the legacy courtesy header), so
-        // the receiver can tell a real delivery from a stray POST.
+        // The caller's token comes back too (an interop header the
+        // a2a-python 1.x receiver reads), so the receiver can tell a real
+        // delivery from a stray POST.
         assert_eq!(
             header(headers, "x-a2a-notification-token"),
             Some("caller-token"),

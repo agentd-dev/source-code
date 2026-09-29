@@ -3,7 +3,7 @@
 
 use serde_json::{Value, json};
 
-/// The redaction marker a [`crate::config::v2::Secret`]'s `Debug` writes — the
+/// The redaction marker a [`crate::config::settings::Secret`]'s `Debug` writes — the
 /// one spelling this codebase uses for "a credential was here".
 const REDACTED: &str = "***";
 
@@ -20,13 +20,13 @@ const REDACTED: &str = "***";
 /// Which values are credentials is not guessed from key names: the walk is
 /// driven by the config JSON Schema, where every `Secret`-typed field is
 /// declared with the one shared `secret` node and every header map with the one
-/// shared `string_map` node (`config::v2::schema`). The schema/struct drift test
+/// shared `string_map` node (`config::settings::schema`). The schema/struct drift test
 /// keeps a new field from being silently missing here, so the one act that
 /// redacts a `Secret` added tomorrow is declaring it as a secret in the schema —
 /// the same act that already makes it a credential everywhere else — rather than
 /// a separate list of key names someone has to remember to extend.
 pub(super) fn redact_settings(doc: &Value) -> Value {
-    let schema = crate::config::v2::schema::schema();
+    let schema = crate::config::settings::schema::schema();
     let defs = schema.get("$defs").cloned().unwrap_or(Value::Null);
     redact_by_schema(doc, &schema, &defs)
 }
@@ -96,7 +96,7 @@ fn redact_by_schema(v: &Value, node: &Value, defs: &Value) -> Value {
 }
 
 /// Is this schema node the shared `secret` node — the one every `Secret`-typed
-/// field is declared with (`config::v2::schema`)?
+/// field is declared with (`config::settings::schema`)?
 fn is_secret_node(node: &Value) -> bool {
     node["type"] == "string"
         && node["description"]

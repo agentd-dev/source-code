@@ -4,7 +4,7 @@
 //! a peer and delegating work to it — the co-located fast lane. Same A2A
 //! protocol, no TCP, no TLS; the kernel (SO_PEERCRED, same uid) and the socket
 //! file's 0600 mode are the authenticators.
-#![cfg(all(unix, feature = "a2a", feature = "workflow"))]
+#![cfg(all(unix, feature = "a2a"))]
 
 mod common;
 
@@ -96,7 +96,7 @@ fn two_instances_connect_and_delegate_over_a_unix_socket() {
     std::fs::write(
         &cfg_b,
         format!(
-            "config_version: \"1\"\n\
+            "\
              agent:\n  name: bee\n  instruction: You are B; answer briefly.\n  preflight: never\n\
              intelligence:\n  endpoints: {}\n  model: mock\n\
              store:\n  kind: memory\n\
@@ -149,7 +149,7 @@ fn two_instances_connect_and_delegate_over_a_unix_socket() {
     std::fs::write(
         &cfg_a,
         format!(
-            "config_version: \"1\"\n\
+            "\
              agent:\n  name: aye\n\
              a2a:\n  peers:\n    - name: bee\n      endpoint: \"unix://{sock}\"\n\
              workflows:\n  - name: ask\n    steps:\n\
@@ -235,7 +235,7 @@ fn a_same_uid_unix_caller_is_operator_even_with_principals() {
     std::fs::write(
         &cfg,
         format!(
-            "config_version: \"1\"\n\
+            "\
              agent:\n  name: uds-op\n  instruction: Test.\n  preflight: never\n\
              intelligence:\n  endpoints: https://127.0.0.1:9\n  model: mock\n\
              store:\n  kind: memory\n\

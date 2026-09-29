@@ -22,16 +22,10 @@ use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// The envelope major this build writes and accepts. A record carrying any
-/// other major is refused as [`StoreError::Corrupt`] rather than guessed at:
-/// misreading a record's shape would silently corrupt restored state.
-pub const ENVELOPE_VERSION: u32 = 2;
-
-/// A versioned store record: `state` is the kind-specific payload; a tombstone
-/// carries `state: null`.
+/// A store record: `state` is the kind-specific payload; a tombstone carries
+/// `state: null`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Envelope {
-    pub v: u32,
     pub kind: String,
     pub id: String,
     pub seq: u64,
@@ -53,7 +47,6 @@ impl Envelope {
         state: Value,
     ) -> Envelope {
         Envelope {
-            v: ENVELOPE_VERSION,
             kind: kind.to_string(),
             id: id.to_string(),
             seq,
@@ -72,17 +65,12 @@ impl Envelope {
         serde_json::to_value(self).unwrap_or(Value::Null)
     }
 
-    /// Parse a stored value; refuses an unknown envelope major.
+    /// Parse a stored value. A record that is not this shape is refused as
+    /// [`StoreError::Corrupt`] rather than guessed at: misreading a record
+    /// would silently corrupt restored state.
     pub fn from_value(v: Value) -> Result<Envelope, StoreError> {
-        let env: Envelope = serde_json::from_value(v)
-            .map_err(|e| StoreError::Corrupt(format!("envelope does not parse: {e}")))?;
-        if env.v != ENVELOPE_VERSION {
-            return Err(StoreError::Corrupt(format!(
-                "envelope version {} is not supported (this build writes {})",
-                env.v, ENVELOPE_VERSION
-            )));
-        }
-        Ok(env)
+        serde_json::from_value(v)
+            .map_err(|e| StoreError::Corrupt(format!("envelope does not parse: {e}")))
     }
 }
 
@@ -216,10 +204,10 @@ pub(crate) fn now_ms() -> u64 {
 /// resolves the `mcp` adapter's coordination server by name; `kind: none`
 /// yields no store (the caller decides whether that is allowed).
 pub fn open(
-    settings: &crate::config::v2::Store,
+    settings: &crate::config::settings::Store,
     servers: &dyn Fn(&str) -> Option<Arc<dyn mcp::McpCall>>,
 ) -> Result<Option<SharedStore>, StoreError> {
-    use crate::config::v2::StoreKind;
+    use crate::config::settings::StoreKind;
     let timeout = settings
         .timeout
         .map(|d| d.0)
@@ -248,7 +236,7 @@ pub fn open(
             // `--capabilities` and this open all name the same directory rather
             // than each deriving one. `store.file` may be absent entirely — the
             // resolution chain then runs on the environment alone.
-            let root = crate::config::v2::file_store_root(settings);
+            let root = crate::config::settings::file_store_root(settings);
             // `open` takes the exclusive instance lock, and a held lock arrives
             // as `Io` carrying the holder's pid. Name the
             // adapter in front of it: the operator reads this at exit, where
@@ -273,20 +261,25 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// A record carries no version: it round-trips as it was written, and
+    /// one that is not an envelope at all is `Corrupt`, never guessed at.
     #[test]
-    fn envelope_round_trips_and_refuses_unknown_major() {
+    fn envelope_round_trips_and_refuses_what_does_not_parse() {
         let e = Envelope::new("run", "01J", 3, "inst", Some("abc".into()), json!({"a": 1}));
         let v = e.to_value();
-        assert_eq!(v["v"], json!(2));
+        assert!(v.get("v").is_none(), "{v}");
         assert_eq!(v["seq"], json!(3));
         let back = Envelope::from_value(v).unwrap();
         assert_eq!(back, e);
-        let mut bad = e.to_value();
-        bad["v"] = json!(9);
-        assert!(matches!(
-            Envelope::from_value(bad),
-            Err(StoreError::Corrupt(_))
-        ));
+        for bad in [
+            json!("not a record"),
+            json!({"kind": "run", "seq": "three"}),
+        ] {
+            assert!(matches!(
+                Envelope::from_value(bad),
+                Err(StoreError::Corrupt(_))
+            ));
+        }
         assert!(!e.is_tombstone());
         assert!(Envelope::new("run", "x", 1, "i", None, Value::Null).is_tombstone());
     }

@@ -60,7 +60,6 @@
 #      essays. After hangup it POSTs {from, transcript} to
 #      /twilio/call-ended.
 # ─────────────────────────────────────────────────────────────────────────────
-config_version: "1"
 
 agent:
   name: support-l1

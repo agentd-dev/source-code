@@ -43,14 +43,14 @@ fn write_file(tag: &str, ext: &str, body: &str) -> String {
     path
 }
 
-/// A job-shaped v2 document with one inline workflow (JSON steps for brevity),
+/// A job-shaped settings document with one inline workflow (JSON steps for brevity),
 /// with no model and no MCP server — everything below is pure engine.
 fn job(steps: &str) -> String {
     write_file(
         "agentd-nested-cancel",
         "yaml",
         &format!(
-            "config_version: \"1\"\nagent:\n  name: nested-cancel\nworkflows:\n  - name: pipe\n    steps: {steps}\nlifecycle:\n  run_until: idle\n  idle_grace: 1s\nobservability:\n  log_level: info\n  log_content: true\n"
+            "agent:\n  name: nested-cancel\nworkflows:\n  - name: pipe\n    steps: {steps}\nlifecycle:\n  run_until: idle\n  idle_grace: 1s\nobservability:\n  log_level: info\n  log_content: true\n"
         ),
     )
 }

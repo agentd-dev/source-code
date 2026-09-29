@@ -35,7 +35,6 @@
 # (whatever returns here flows onward to customer channels); enforce a
 # server-side row cap.
 # ─────────────────────────────────────────────────────────────────────────────
-config_version: "1"
 
 agent:
   name: support-backoffice

@@ -9,12 +9,7 @@
 //! keeps them honest in CI, where no gateway exists: the apply boundary, the
 //! consumer binding + report, and §7.6 verification including its fail-closed
 //! refusals.
-#![cfg(all(
-    unix,
-    feature = "internal-mocks",
-    feature = "sign",
-    feature = "workflow"
-))]
+#![cfg(all(unix, feature = "internal-mocks", feature = "sign"))]
 
 mod common;
 
@@ -42,7 +37,6 @@ struct Run {
 fn boot(instruction: &str, sources: Value) -> Run {
     let mock = common::spawn_mock_mcp("mock://watched", false);
     let cfg = json!({
-        "config_version": "1",
         "agent": {"name": "reg-consumer", "preflight": "never",
                   // The pins live WITH the instruction they protect
                   // (`agent.instruction.trust`), so the long form carries both.

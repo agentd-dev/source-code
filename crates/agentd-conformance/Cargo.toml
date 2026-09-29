@@ -1,10 +1,10 @@
 # agent conformance suite.
 #
-# A BLACK-BOX validator of the agent runtime: it knows agent only as a binary
-# plus the MCP / JSON-RPC 2.0 spec, never linking the agent library — so it can
+# A BLACK-BOX validator of the agent runtime: it knows agentd only as a binary
+# plus the A2A / JSON-RPC 2.0 spec, never linking the agentd library — so it can
 # catch real protocol/behaviour regressions instead of agreeing with the
-# implementation's own types. It drives the real binary (served self-MCP, the
-# backing-MCP client, the supervisor, the ReAct loop) and asserts each contract.
+# implementation's own types. It drives the real binary (the A2A listener, the
+# supervisor, the durable store, the agent loop) and asserts each contract.
 #
 # Run it two ways:
 #   cargo test -p agentd-conformance      # every check as a #[test]
@@ -14,11 +14,9 @@ name = "agentd-conformance"
 version = "1.7.0"
 edition = "2024"
 rust-version = "1.96"
-description = "Black-box conformance suite for the agent runtime (MCP client/server + supervisor + agent loop)"
+description = "Black-box conformance suite for the agent runtime (A2A listener + supervisor + agent loop)"
 license = "AGPL-3.0-only"
 publish = false
-# `cargo run -p agentd-conformance` → the report runner (not the confmcp helper).
-default-run = "agentd-conformance"
 
 [lib]
 name = "agentd_conformance"
@@ -27,12 +25,6 @@ path = "src/lib.rs"
 [[bin]]
 name = "agentd-conformance"
 path = "src/main.rs"
-
-# A minimal recording MCP reference server (a reference MCP endpoint for the
-# suite and future v2 conformance families).
-[[bin]]
-name = "confmcp"
-path = "src/bin/confmcp.rs"
 
 [dependencies]
 serde_json = "1"

@@ -12,8 +12,8 @@
 //! effect** — a bad config exits `2` in milliseconds, not after an LLM
 //! round-trip.
 //!
-//! Module layout: [`file`] (the config document: format detection, the typed
-//! the retired flat shape, kept `#[cfg(test)]` as a fixture), [`v2`] (the typed [`v2::Settings`], its
+//! Module layout: [`file`] (the config document: format detection, parsing and
+//! the merge across files), [`settings`] (the typed [`settings::Settings`], its
 //! JSON Schema, and the loader that merges file < env < flag), [`yaml`] (the
 //! hand-rolled YAML-subset reader), [`paths`] (schema-derived path bindings:
 //! `AGENTD_<PATH>` env names and `--<path>` flags for every config-file path),
@@ -93,8 +93,8 @@ pub mod file;
 pub mod idoc;
 pub mod paths;
 pub mod prompt;
+pub mod settings;
 pub mod templates;
-pub mod v2;
 #[cfg(all(unix, feature = "config-watch"))]
 pub mod watch;
 pub mod yaml;
@@ -144,7 +144,7 @@ impl SwapPolicy {
 }
 
 /// Where a listener binds — the parsed form of a `listen` target. `a2a.listen`
-/// (spelled `--listen`, or the legacy `--serve-mcp` alias) is the main one;
+/// (spelled `--listen`) is the main one;
 /// `webhooks.listen` parses through the same type. Two transports:
 /// [`Http`](ServeTarget::Http), `https://HOST:PORT` (TLS, the control plane) or
 /// `http://LOOPBACK:PORT` (plaintext, loopback-only dev/tests), and
@@ -173,7 +173,7 @@ pub fn unix_socket_path(spec: &str) -> Option<&str> {
 }
 
 impl ServeTarget {
-    /// Parse a `--serve-mcp` value: `https://host:port` (or loopback
+    /// Parse an `a2a.listen` value: `https://host:port` (or loopback
     /// `http://host:port` for dev). Returns a [`ConfigError::Usage`] (exit 2,
     /// before any side effect) on a bad scheme / missing port / a path.
     pub fn parse(spec: &str) -> Result<ServeTarget, ConfigError> {
@@ -189,7 +189,7 @@ impl ServeTarget {
             let authority = spec.split("://").nth(1).unwrap_or("");
             if authority.is_empty() || authority.contains('/') {
                 return Err(usage(format!(
-                    "--serve-mcp: want http(s)://HOST:PORT with no path (got: {spec})"
+                    "a2a.listen: want http(s)://HOST:PORT with no path (got: {spec})"
                 )));
             }
             let host = serve_host_of(authority);
@@ -201,7 +201,7 @@ impl ServeTarget {
             }
             if !tls && !crate::net::http::is_loopback_host(host) {
                 return Err(usage(format!(
-                    "--serve-mcp: plaintext http:// is allowed for loopback only; use https:// (got: {spec})"
+                    "a2a.listen: plaintext http:// is allowed for loopback only; use https:// (got: {spec})"
                 )));
             }
             return Ok(ServeTarget::Http {
@@ -223,7 +223,7 @@ impl ServeTarget {
             });
         }
         Err(usage(format!(
-            "--serve-mcp: want https://host:port (or loopback http://host:port for dev): {spec}"
+            "a2a.listen: want https://host:port (or loopback http://host:port for dev): {spec}"
         )))
     }
 }
@@ -284,9 +284,7 @@ impl A2aPeerSpec {
 }
 
 /// The client transport an [`A2aPeerSpec`] endpoint resolves to. Parsed once
-/// (scheme-validated at startup), then the A2A client dials it. `vsock:CID:PORT`
-/// requires both forms of a cid+port (no wildcard — a client dials a concrete
-/// peer, unlike the `--serve-mcp` listen form which may wildcard).
+/// (scheme-validated at startup), then the A2A client dials it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum A2aEndpoint {
     /// Dial an A2A peer over HTTP(S):
@@ -490,23 +488,11 @@ pub struct AAuthSettings {
     pub person_server: Option<String>,
 }
 
-/// Does `s` name a remote MCP endpoint? True for the Streamable HTTP schemes
-/// agentd dials.
-pub fn is_mcp_endpoint(s: &str) -> bool {
-    let s = s.trim();
-    // This is a SHAPE test only, so plain `http://` passes here. Whether a
-    // given `http://` host is admissible (loopback only) and whether socket
-    // schemes are refused is decided by `mcp_endpoint_scheme_ok`, the single
-    // gate every server — CLI or config file — flows through at validation.
-    s.starts_with("https://") || s.starts_with("http://")
-}
-
 /// Whether an MCP-server endpoint scheme is admissible: `https://`, or a
 /// loopback `http://` for dev. Socket schemes (`unix:`, `vsock:`) and
 /// non-loopback plaintext are rejected. This gate runs BEFORE the reusable
-/// crate's `McpEndpoint::parse`, which is more permissive, so that a
-/// config-file server — which never goes through `is_mcp_endpoint` or CLI
-/// parsing — is held to the same HTTPS-only rule as a flag.
+/// crate's `McpEndpoint::parse`, which is more permissive, so every server is
+/// held to the same HTTPS-only rule wherever it was configured.
 pub fn mcp_endpoint_scheme_ok(endpoint: &str) -> Result<(), ConfigError> {
     let e = endpoint.trim();
     if e.starts_with("https://") {
@@ -531,22 +517,11 @@ pub fn mcp_endpoint_scheme_ok(endpoint: &str) -> Result<(), ConfigError> {
     )))
 }
 
-/// What `load()` can short-circuit with. `Help`/`Version`/`Capabilities` are
-/// *not* errors (exit 0); `Usage` is a validation or parse failure (exit 2).
-/// `Capabilities` carries the pretty-printed manifest JSON — the
-/// side-effect-free admission probe (`agentd --capabilities`), short-circuited
-/// before run-required validation so it succeeds even with no instruction,
-/// which is what lets agentctl probe an image that has no run config yet.
+/// Why a load did not produce settings. `Usage` is a validation or parse
+/// failure (exit 2).
 #[derive(Debug)]
 pub enum ConfigError {
-    Help(String),
-    Version(String),
-    Capabilities(String),
     Usage(String),
-    /// `--config-schema`: the JSON Schema of the config file,
-    /// printed to **stdout**, exit 0 — a side-effect-free schema export so
-    /// agentctl can validate a CR before applying it.
-    Schema(String),
     /// `--validate-config`: the admission verdict. `Ok(line)` is
     /// a valid config (one `config.valid` line, exit 0); `Err(lines)` is one or
     /// more `config.invalid` diagnostics (exit 2). The caller prints to stderr.
@@ -556,51 +531,11 @@ pub enum ConfigError {
 impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ConfigError::Help(s)
-            | ConfigError::Version(s)
-            | ConfigError::Capabilities(s)
-            | ConfigError::Schema(s) => {
-                write!(f, "{s}")
-            }
             ConfigError::Usage(s) => write!(f, "{s}"),
             ConfigError::Validate(Ok(s)) | ConfigError::Validate(Err(s)) => write!(f, "{s}"),
         }
     }
 }
-
-/// De-branding normalization: accept the neutral `AGENT_*` env prefix as an
-/// input alias for the branded `AGENTD_*` one. Returns the env list with a
-/// synthesized `AGENTD_<X>` entry for every `AGENT_<X>` whose branded form is
-/// ABSENT — the branded spelling WINS when both are present, since it is the
-/// more specific of the two. Branded keys are never dropped, and a
-/// non-prefixed key (e.g. `INSTRUCTION`) is untouched. Done once, here, so
-/// every downstream `AGENTD_*` read transparently honours `AGENT_*` too
-/// without a per-read change.
-pub(crate) fn debrand_env(env: &[(String, String)]) -> Vec<(String, String)> {
-    let have: std::collections::HashSet<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
-    let mut out: Vec<(String, String)> = env.to_vec();
-    for (k, v) in env {
-        // `AGENTD_*` itself does NOT match `AGENT_` (the 6th char is `D`, not `_`),
-        // so branded keys are never re-aliased; only true neutral keys are.
-        if let Some(suffix) = k.strip_prefix("AGENT_") {
-            let branded = format!("AGENTD_{suffix}");
-            if !have.contains(branded.as_str()) {
-                out.push((branded, v.clone()));
-            }
-        }
-    }
-    out
-}
-
-// ──────────────────────────────  hot reload  ────────────────────────────────
-//
-// The reloadable-vs-restart-only partition plus the coherence check that both
-// the reload path and `--validate-config` run. This block is pure data and
-// pure-CPU checks — no side effect, no subsystem touched; the apply step lives
-// in `triggers::mode`. It compiles in every feature combination: the SIGHUP
-// trigger and the reactive apply are `hot-reload`-gated, while the partition
-// itself is always available, so `--validate-config` reports restart-only
-// warnings on any build.
 
 /// Heuristic: is this header name credential-shaped? A header so named must
 /// carry a `{{secret:…}}` *reference*, never an inline literal, so a secret
@@ -723,7 +658,7 @@ pub(crate) fn config_flag(arg: &str) -> ConfigFlag<'_> {
 /// `AGENTD_CONFIG`) is a decision they made, while a DISCOVERED `.agentd.yml`
 /// is a file that happened to be in the working directory when they typed a
 /// flags-only command. The two get different trust (see the discovered-config
-/// containment in `config::v2::load`), so the loader must be able to tell them
+/// containment in `config::settings::load`), so the loader must be able to tell them
 /// apart rather than seeing one flat list of paths.
 pub(crate) struct ConfigPaths {
     /// The files to load, in merge order (earlier is overridden by later).
@@ -738,7 +673,7 @@ pub(crate) struct ConfigPaths {
     pub ambiguous: Option<String>,
 }
 
-/// The ordered config-file list over an already-debranded env map: the
+/// The ordered config-file list over an env map: the
 /// `AGENTD_CONFIG` entries (`:`-separated, empty entries skipped) then each
 /// `--config` value. Env first so a platform-injected base is overridden by an
 /// operator's explicit `--config` overlay (later wins).
@@ -878,12 +813,7 @@ fn is_informational(args: &[String]) -> bool {
     args.iter().any(|a| {
         matches!(
             a.as_str(),
-            "-h" | "--help"
-                | "-V"
-                | "--version"
-                | "--config-schema"
-                | "--config-schema=1"
-                | "--workflow-schema"
+            "-h" | "--help" | "-V" | "--version" | "--config-schema" | "--workflow-schema"
         )
     })
 }
@@ -973,16 +903,4 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
     }
-
-    // ──────────────────────────── config file ────────────────────────────────
-
-    // ─────────────────────────── --watch-config ──────────────────────────────
-
-    // ───────────────────────────  --validate-config  ─────────────────────────
-
-    // ────────────────────────────  --config-schema  ──────────────────────────
-
-    // ──────────────────────────────  secret refs  ────────────────────────────
-
-    // ───────────────────────  hot-reload coherence  ──────────────────────────
 }

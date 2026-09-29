@@ -4,7 +4,7 @@
 //! starts (`once {policy: always}`) and DEREGISTERS it during shutdown
 //! (`event {on: lifecycle.shutdown}`), with the drain WAITING for the
 //! deregistration to land before exit 0.
-#![cfg(all(unix, feature = "workflow"))]
+#![cfg(unix)]
 
 mod common;
 
@@ -76,8 +76,7 @@ fn a_daemon_registers_on_start_and_deregisters_during_drain() {
     std::fs::write(
         &cfg,
         format!(
-            r#"config_version: "1"
-agent:
+            r#"agent:
   name: hooked
 vars:
   service: "http://127.0.0.1:{port}"

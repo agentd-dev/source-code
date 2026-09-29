@@ -28,7 +28,7 @@
 //! Certificate-derived ids (`user:cn=…`, `user:san=…`) need no entry: the `=`
 //! puts them outside both the declared-id and the approval-name charset.
 
-use crate::config::v2::{A2a, Role};
+use crate::config::settings::{A2a, Role};
 use crate::state::{Durable, Kind, now_ms};
 use serde_json::{Value, json};
 

@@ -4,7 +4,7 @@
 //!
 //! Four claims, in the order a peer meets them:
 //!
-//! 1. the PUBLIC card declares each extension, with a versioned URI and the
+//! 1. the PUBLIC card declares each extension, under its URI, with the
 //!    vocabulary agentd can answer — and nothing that depends on what this
 //!    instance has loaded or switched on, or on who is asking; what a caller
 //!    may actually run is on the extended card, narrowed to that caller;
@@ -19,9 +19,8 @@
 //! 4. the operator admin family is reachable as an ordinary `SendMessage` with
 //!    a command DataPart — and a non-operator still cannot reach it, whatever
 //!    its grants;
-//! 5. a command is one only when command/v2 is activated and marked, its op
-//!    is one agentd serves (a removed one named with its replacement) and its
-//!    arguments match the published schema; nothing refused runs, and a
+//! 5. a command is one only when the command extension is activated and marked, its op
+//!    is one agentd serves and its arguments match the published schema; nothing refused runs, and a
 //!    child's `_instance.*` reports are the operator's alone, refused to
 //!    anyone else on the request itself.
 #![cfg(all(unix, feature = "a2a"))]
@@ -117,7 +116,7 @@ const WORKFLOWS: &str = "workflows:\n\
 
 fn config(port: u16, a2a_extra: &str, top_extra: &str) -> String {
     format!(
-        "config_version: \"1\"\n\
+        "\
          agent:\n  name: a2a-ext\n  instruction: You are a test agent.\n  preflight: never\n\
          intelligence:\n  endpoints: http://127.0.0.1:1/v1\n  model: mock\n\
          store:\n  kind: memory\n\
@@ -148,7 +147,7 @@ fn spawn(text: impl Fn(u16) -> String) -> (Daemon, String) {
         .env("AGENTD_EXT_OPERATOR", OPERATOR)
         .env("AGENTD_EXT_USER", USER)
         .env("AGENTD_EXT_CI", CI)
-        .env("AGENT_POD_NAME", POD)
+        .env("AGENTD_POD_NAME", POD)
         .env("HOSTNAME", HOST)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -210,13 +209,10 @@ fn extended_as(addr: &str, bearer: &str) -> Value {
 /// The public card is what anybody may know; the extended card is what THIS
 /// caller may use.
 ///
-/// The public card used to list every loaded workflow and every op this
-/// instance served, as skills and as the extension's params — so an
-/// anonymous reader learned the workflow inventory, whether introspection
-/// was on and what the operator could do, while an authenticated user's
-/// extended card told it LESS. Now the public card carries one conversation
-/// skill and the static vocabulary, and each caller's extended card adds
-/// what that caller may run.
+/// The public card carries one conversation skill and the static vocabulary,
+/// so an anonymous reader learns neither the workflow inventory, nor whether
+/// introspection is on, nor what the operator can do; each caller's extended
+/// card adds what that caller may run.
 #[test]
 fn the_public_card_reveals_no_posture_and_the_extended_card_adds_per_caller() {
     let (_d, addr) = boot();
@@ -438,12 +434,9 @@ fn greet_task(addr: &str) -> String {
 
 /// The echo is exactly what was activated — requested ∩ declared ∩ applies
 /// to the method, in registry order, once each — on every answer the handler
-/// produced, and on nothing else.
-///
-/// It used to be the header intersected with a build-wide list: a URI this
-/// instance did not declare came back, so did one the method never used, only
-/// the first header line was read, a duplicate came back twice, and a 401 or
-/// an origin refusal carried it as if something had been activated.
+/// produced, and on nothing else: not a URI this instance does not declare,
+/// not one the method never uses, every header line read, a duplicate once,
+/// and never on a 401 or an origin refusal, where nothing was activated.
 #[test]
 fn the_echo_is_exactly_what_was_activated() {
     // Events off: the feed's extension is not declared here.
@@ -472,8 +465,9 @@ fn the_echo_is_exactly_what_was_activated() {
         "{reply:?}"
     );
 
-    // A task read: command/v2 does not apply to it, and events/v1 is not
-    // declared on this instance, so only the annotations are echoed.
+    // A task read: the command extension does not apply to it, and the events
+    // extension is not declared on this instance, so only the annotations are
+    // echoed.
     let reply = post_with(
         &addr,
         OPERATOR,
@@ -567,25 +561,16 @@ fn the_echo_is_exactly_what_was_activated() {
     assert_eq!(unparsed.header("a2a-extensions"), None, "{unparsed:?}");
 }
 
-/// interface/v1 is gone, and its method with it: the feed is
-/// `agentd.events/SubscribeToEvents`, declared by events/v1, and answered
-/// only when that extension is declared AND activated. The old URI activates
-/// nothing, and the old method name is no method.
+/// The feed is `agentd.events/SubscribeToEvents`, declared by the events
+/// extension, and answered only when that extension is declared AND
+/// activated.
 #[test]
-fn interface_v1_is_gone() {
-    const INTERFACE_V1: &str = "https://agentd.dev/a2a/ext/interface/v1";
-    const COMMAND_V1: &str = "https://agentd.dev/a2a/ext/command/v1";
+fn the_feed_needs_its_extension_declared_and_activated() {
     let feed = rpc_body(7, EVENTS_METHOD, json!({"fromSeq": 0}));
     let reason = |v: &Value| v["error"]["data"][0]["reason"].as_str().map(str::to_string);
 
     let (_on, addr) = boot_with(&format!("{PRINCIPALS}  events:\n    enabled: true\n"), "");
     let card = get_card(&addr);
-    for gone in [INTERFACE_V1, COMMAND_V1] {
-        assert!(
-            !card.to_string().contains(gone),
-            "{gone} is declared: {card}"
-        );
-    }
     assert_eq!(
         extension(&card, EVENTS_EXTENSION)["params"]["method"],
         EVENTS_METHOD
@@ -613,31 +598,6 @@ fn interface_v1_is_gone() {
         format!("method not available: activate {EVENTS_EXTENSION} with the A2A-Extensions header")
     );
     assert_eq!(bare.header("a2a-extensions"), None, "{bare:?}");
-
-    // interface/v1 is not a way to activate it.
-    let old = post_with(&addr, OPERATOR, &feed, &[INTERFACE_V1]).json();
-    assert_eq!(
-        reason(&old).as_deref(),
-        Some("EXTENSION_NOT_ACTIVATED"),
-        "{old}"
-    );
-
-    // The pre-namespace name is no method, whatever is activated.
-    for lines in [&[][..], &[EVENTS_EXTENSION][..], &[INTERFACE_V1][..]] {
-        let v = post_with(
-            &addr,
-            OPERATOR,
-            &rpc_body(8, "SubscribeToEvents", json!({})),
-            lines,
-        )
-        .json();
-        assert_eq!(v["error"]["code"], -32601, "{lines:?}: {v}");
-        assert_eq!(
-            reason(&v),
-            None,
-            "an unknown method, not an extension's: {v}"
-        );
-    }
 
     // Activated, it streams — and says so on the stream's head.
     let auth = format!("Bearer {OPERATOR}");
@@ -675,18 +635,9 @@ fn interface_v1_is_gone() {
         v["error"]["message"],
         format!("{EVENTS_EXTENSION} is not offered by this instance")
     );
-    // And command/v1 activates nothing: a command sent under it is echoed
-    // nothing.
-    let reply = post_with(
-        &addr,
-        OPERATOR,
-        &SendMessage::command("status", json!({})).body(9),
-        &[COMMAND_V1],
-    );
-    assert_eq!(reply.header("a2a-extensions"), None, "{reply:?}");
 }
 
-/// A task carries its task-annotations/v1 facts exactly when the request
+/// A task carries its task-annotations facts exactly when the request
 /// activated the extension — on a send's answer, a task read, a listing and
 /// the feed's `task` events — and never otherwise. The ring holds one copy
 /// of each event, so the feed strips them per subscriber.
@@ -821,13 +772,11 @@ fn status_doc(addr: &str, bearer: &str) -> Value {
     v["message"]["parts"][0]["data"].clone()
 }
 
-/// A command is a command only when the request activates command/v2 and the
-/// message is marked with it; anything less is refused with a reason that
-/// says which, and nothing it asked for happens — no pause, no run, no task.
-///
-/// It used to be enough for a DataPart to carry `agentd.op`: a client that
-/// had never negotiated the extension drove the instance through it, and the
-/// echo told it nothing had been activated.
+/// A command is a command only when the request activates the command
+/// extension and the message is marked with it; anything less is refused with
+/// a reason that says which, and nothing it asked for happens — no pause, no
+/// run, no task. A DataPart carrying `agentd.op` is not enough: a client that
+/// never negotiated the extension does not drive the instance through it.
 #[test]
 fn a_command_without_activation_is_refused_and_not_run() {
     let (_d, addr) = boot();
@@ -924,43 +873,13 @@ fn a_command_without_activation_is_refused_and_not_run() {
     assert_eq!(status_doc(&addr, OPERATOR)["paused"], true);
 }
 
-/// An op agentd no longer serves is refused by name, with what replaced it,
-/// and an argument the op does not take is refused rather than ignored — so
-/// a client written against the old vocabulary is told what to change.
+/// An argument the op does not take is refused rather than ignored — so a
+/// client that misspells one is told what to change.
 #[test]
-fn a_removed_op_names_its_replacement() {
+fn an_argument_the_op_does_not_take_is_refused() {
     let (_d, addr) = boot();
-    for (op, args, hint) in [
-        (
-            "config.set",
-            json!({"path": "agent.approval", "value": "auto"}),
-            "use admin.set {path, value}",
-        ),
-        (
-            "interface.info",
-            json!({}),
-            "read the agent card and the `status` op",
-        ),
-        ("admin.lameduck", json!({}), "use admin.drain"),
-        (
-            "pairing.code",
-            json!({}),
-            "auth.device.approve {user_code, as}",
-        ),
-    ] {
-        let v = SendMessage::command(op, args).bearer(OPERATOR).post(&addr);
-        assert_eq!(v["error"]["code"], -32602, "{op}: {v}");
-        assert_eq!(v["error"]["data"][1]["reason"], "UNKNOWN_OP", "{op}: {v}");
-        assert_eq!(v["error"]["data"][1]["metadata"]["op"], op, "{v}");
-        let msg = v["error"]["message"].as_str().unwrap();
-        assert!(
-            msg.contains(&format!("command `{op}` was removed in agentd 1.17.0"))
-                && msg.contains(hint),
-            "{op}: {msg}"
-        );
-    }
-    // The canonical names only: `workflow.run` takes `workflow`, not the
-    // `name` an earlier version accepted beside it.
+    // The canonical names only: `workflow.run` takes `workflow`, and `name`
+    // is not one of its arguments.
     let v = SendMessage::command("workflow.run", json!({"name": "greet"}))
         .bearer(OPERATOR)
         .post(&addr);

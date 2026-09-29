@@ -12,9 +12,9 @@
 //!   actually went over the wire: the content type and `A2A-Version` on every
 //!   request, `ROLE_USER` and an explicit `returnImmediately` on every message,
 //!   and a command marked as its extension in the message AND the header;
-//! * the sources are scanned for the legacy spellings — `blocking`, the card as
-//!   a JSON-RPC method, a command DataPart typed out by hand — anywhere outside
-//!   the two harness files.
+//! * the sources are scanned for request shapes built anywhere outside the two
+//!   harness files — `blocking`, which is not an A2A 1.0 field, and a command
+//!   DataPart typed out by hand.
 //!
 //! This file lives apart from `common/mod.rs` because that module is compiled
 //! into every test binary, and these checks should run once, not once per binary.
@@ -358,27 +358,17 @@ fn sources(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// The suites that may name `GetAgentCard`: a test proving the server REFUSES
-/// the method has to send it. Listed by file name, so each exception is a
-/// deliberate line here rather than a pattern the scan happens to miss.
-const GET_AGENT_CARD_REFUSAL_TESTS: &[&str] = &["a2a_protocol_e2e.rs"];
-
-/// The legacy spellings, refused everywhere but the harness.
+/// Request shapes built outside the harness.
 ///
-/// * `"blocking"` — the pre-1.0 inverse of `returnImmediately`, which the spec
-///   does not have;
-/// * the card read as a JSON-RPC method — the spec publishes the public card at
-///   a well-known URL, and `common::get_card` reads it there. The method name
-///   is refused as a string literal in ANY position, because the suites called
-///   it positionally (`rpc(addr, 1, "GetAgentCard", …)`) far more often than
-///   they spelled a `"method"` key;
+/// * `"blocking"` — not an A2A 1.0 field; the spec's is `returnImmediately`,
+///   its inverse;
 /// * a command DataPart typed out by hand — it would carry neither the
 ///   extension mark nor the activation header, so it only works against a
 ///   server that checks neither. Only the two harness files may build one. The
 ///   `"agentd":` key is refused whatever follows it: `op` need not come first,
 ///   and the value may be a variable.
 #[test]
-fn no_legacy_shapes() {
+fn only_the_harness_builds_requests() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let tests = root.join("tests");
     let conformance = root.join("../agentd-conformance/src");
@@ -410,15 +400,6 @@ fn no_legacy_shapes() {
                 "{name}: \"blocking\" — say `returnImmediately` (SendMessage::return_immediately)"
             ));
         }
-        let refusal_test = file
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| GET_AGENT_CARD_REFUSAL_TESTS.contains(&n));
-        if !refusal_test && text.contains("\"GetAgentCard\"") {
-            found.push(format!(
-                "{name}: GetAgentCard as a method — read the card with get_card"
-            ));
-        }
         let is_harness = harnesses
             .iter()
             .any(|h| h.canonicalize().ok() == file.canonicalize().ok());
@@ -430,7 +411,7 @@ fn no_legacy_shapes() {
     }
     assert!(
         found.is_empty(),
-        "legacy request shapes outside the harness:\n{}",
+        "request shapes built outside the harness:\n{}",
         found.join("\n")
     );
 }

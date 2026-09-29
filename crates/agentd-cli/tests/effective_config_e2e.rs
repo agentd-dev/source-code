@@ -5,7 +5,7 @@
 //! about layering — the discovery chain, the environment, the flags, the
 //! conventional folders and an instruction's own `:::!config` — and a unit
 //! test over the loader would assert the parts and miss the arrangement.
-#![cfg(all(unix, feature = "workflow"))]
+#![cfg(unix)]
 
 mod common;
 
@@ -18,7 +18,6 @@ fn run_in(cwd: &Path, home: &Path, args: &[&str]) -> (Option<i32>, String, Strin
     let out = Command::new(env!("CARGO_BIN_EXE_agentd"))
         .args(args)
         .current_dir(cwd)
-        .env_remove("AGENT_CONFIG")
         .env_remove("AGENTD_CONFIG")
         .env_remove("XDG_CONFIG_HOME")
         .env("HOME", home)
@@ -51,7 +50,7 @@ fn the_report_names_the_layer_that_set_each_value() {
     let (root, home, work) = project("eff-layers");
     std::fs::write(
         home.join(".config/agentd/config.yml"),
-        "config_version: \"1\"\nagent: { name: from-user, instruction: user-policy, preflight: never }\n\
+        "agent: { name: from-user, instruction: user-policy, preflight: never }\n\
          intelligence: { endpoints: [\"https://intel.example/v1\"], model: from-user }\n\
          store: { kind: memory }\n",
     )
@@ -109,7 +108,7 @@ fn an_invalid_config_still_reports_and_names_its_errors() {
     let (root, home, work) = project("eff-invalid");
     std::fs::write(
         work.join("agentd.yml"),
-        "config_version: \"1\"\nagent: { name: broken, instruction: policy, preflight: never }\n\
+        "agent: { name: broken, instruction: policy, preflight: never }\n\
          intelligence: { endpoints: [\"https://intel.example/v1\"], model: m }\n\
          store: { kind: memory }\n\
          mcp:\n  servers:\n    - name: gw\n      endpoint: https://gw.example/mcp\n      \
@@ -151,7 +150,7 @@ fn the_report_shows_what_the_document_declared_and_what_was_generated() {
     .unwrap();
     std::fs::write(
         work.join("agentd.yml"),
-        "config_version: \"1\"\nagent: { name: doc, instruction: ./agent.md, preflight: never }\n\
+        "agent: { name: doc, instruction: ./agent.md, preflight: never }\n\
          intelligence: { endpoints: [\"https://intel.example/v1\"], model: m }\n\
          store: { kind: memory }\n",
     )

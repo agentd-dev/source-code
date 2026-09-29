@@ -92,6 +92,6 @@ $ bash bench/wfperf/run.sh target/release/agentd memory <label>
 $ bash bench/wfperf/run.sh target/release/agentd file <label>
 # profile (needs a symbolized build):
 $ CARGO_PROFILE_RELEASE_STRIP=false CARGO_PROFILE_RELEASE_DEBUG=true \
-    RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release --features workflow,cel
+    RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release --features cel
 $ perf record -F 999 --call-graph fp -- target/release/agentd --config <bench yaml>
 ```

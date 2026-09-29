@@ -129,7 +129,7 @@ impl Runtime {
         );
         d.insert(
             "egress_closed".into(),
-            json!(self.settings.security.egress == crate::config::v2::Egress::Closed),
+            json!(self.settings.security.egress == crate::config::settings::Egress::Closed),
         );
         d.insert(
             "streams".into(),

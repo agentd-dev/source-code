@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! **Every kind the feed pushes is one events/v1 declares.**
+//! **Every kind the feed pushes is one the events extension declares.**
 //!
 //! `FeedKind::ALL` is the published vocabulary: the extended card lists it,
 //! the schema bundle is built from it, a client switches on it. A push is a
@@ -65,7 +65,7 @@ fn every_pushed_kind_is_declared() {
     }
     assert!(
         bad.is_empty(),
-        "a feed push outside the events/v1 vocabulary (surface::events::FeedKind):\n  {}",
+        "a feed push outside the events vocabulary (surface::events::FeedKind):\n  {}",
         bad.join("\n  ")
     );
     let never: Vec<&&str> = declared.iter().filter(|k| !pushed.contains(**k)).collect();

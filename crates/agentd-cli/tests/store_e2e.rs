@@ -10,7 +10,7 @@
 
 mod common;
 
-use agentd::config::v2 as cfg;
+use agentd::config::settings as cfg;
 use agentd::mcp::client::McpClient;
 use agentd::state::{Durable, InboxEvent, Kind, Policy, TimerRecord};
 use agentd::store::{self, SharedStore, StoreError};

@@ -15,7 +15,7 @@ Real usage (you supply a model endpoint + the BFCL data):
         --answers possible_answer/BFCL_v3_simple.json \
         --intelligence https://gateway.example/v1 --model claude-opus-4-8 \
         --out bench/tasks/bfcl_simple.jsonl
-    AGENT_INTELLIGENCE_TOKEN=sk-... python3 bench/run.py \
+    AGENTD_INTELLIGENCE_TOKEN=sk-... python3 bench/run.py \
         --tasks bench/tasks/bfcl_simple.jsonl --repeats 5
 
 Both inputs are JSON or JSON-lines, joined on `id`. This covers BFCL's

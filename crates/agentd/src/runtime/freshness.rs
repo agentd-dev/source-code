@@ -50,7 +50,7 @@ impl super::reactor::Runtime {
     /// keep answering on the instruction it has; a deploy agent whose
     /// authorization may have been withdrawn should not.
     fn apply_unavailable_policy(&mut self, uri: &str, err: &str) {
-        use crate::config::v2::InstructionUnavailable as P;
+        use crate::config::settings::InstructionUnavailable as P;
         // `auto`: a trust-pinned source FREEZES (§7.7 — a stale authorization
         // is a security matter); an unpinned one KEEPS (a failed poll on an
         // unsigned artifact is usually a blip, and the agent holds a good copy).
@@ -205,7 +205,7 @@ impl super::reactor::Runtime {
 
 /// The shortest `freshness` interval across pinned sources, in ms — the cadence
 /// the watch re-checks at (§7.7). Sources without a `freshness` are ignored.
-fn min_freshness_ms(sources: &[crate::config::v2::InstructionSource]) -> Option<u64> {
+fn min_freshness_ms(sources: &[crate::config::settings::InstructionSource]) -> Option<u64> {
     sources
         .iter()
         .filter_map(|s| s.freshness.as_deref())
@@ -217,7 +217,7 @@ fn min_freshness_ms(sources: &[crate::config::v2::InstructionSource]) -> Option<
 #[cfg(test)]
 mod tests {
     use super::min_freshness_ms;
-    use crate::config::v2::{InstructionSource, InstructionUnavailable as P};
+    use crate::config::settings::{InstructionSource, InstructionUnavailable as P};
 
     /// The `auto` policy resolves by whether the source is TRUST-pinned, which
     /// is the distinction that matters: a stale authorization is a security

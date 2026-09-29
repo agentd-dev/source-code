@@ -32,7 +32,6 @@
 # design pipeline; the server should refuse an imageless instagram post
 # rather than posting a blank.
 # ─────────────────────────────────────────────────────────────────────────────
-config_version: "1"
 
 agent:
   name: outbox

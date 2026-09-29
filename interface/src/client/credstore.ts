@@ -139,12 +139,8 @@ export function persistEndpoint(storage: KeyValueStorage, v: { endpoint: string 
 }
 
 /**
- * The remembered endpoint, if any. Nothing else in that entry is read — and
- * nothing else is left in it: the v1.16 web UI stored `{endpoint, bearer}`
- * under this same key, often with the operator's bearer, so an entry carrying
- * anything besides the endpoint is rewritten to the endpoint alone (or
- * removed, when it has no endpoint to keep). Without that, an upgrade would
- * leave the old credential in persistent, cross-tab storage indefinitely.
+ * The remembered endpoint, if any. Nothing else in that entry is read, and an
+ * entry with no endpoint to keep is removed rather than left to be misread.
  */
 export function loadEndpoint(storage: KeyValueStorage): string | undefined {
   const raw = storage.getItem(ENDPOINT_KEY);
@@ -163,7 +159,6 @@ export function loadEndpoint(storage: KeyValueStorage): string | undefined {
     storage.removeItem(ENDPOINT_KEY);
     return undefined;
   }
-  if (Object.keys(v as object).some((k) => k !== 'endpoint')) persistEndpoint(storage, { endpoint });
   return endpoint;
 }
 

@@ -7,12 +7,11 @@
 //! back both the `#[test]` integration tests (so `cargo test` enforces
 //! conformance) and the `agentd-conformance` runner binary (which renders a
 //! PASS/FAIL report). Nothing here links the agentd library: conformance is
-//! judged against the MCP / JSON-RPC spec and the documented exit-code table,
+//! judged against the A2A / JSON-RPC spec and the documented exit-code table,
 //! not against agentd's own types.
 
 pub mod checks;
 pub mod harness;
-pub mod mcp_http_server;
 pub mod report;
 
 pub use harness::Harness;

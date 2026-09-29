@@ -9,7 +9,6 @@
 # This is also a `agentd.yml` + `workflows/` project, so the workflows are
 # adopted from the folder rather than listed here.
 # ─────────────────────────────────────────────────────────────────────────────
-config_version: "1"
 
 agent:
   name: tailer

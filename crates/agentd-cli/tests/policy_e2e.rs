@@ -7,7 +7,7 @@
 //! SUBAGENT is covered. A policy table that held for root turns but not for
 //! subagent turns would be worse than none, because the operator would believe
 //! they were covered.
-#![cfg(all(unix, feature = "workflow", feature = "cel"))]
+#![cfg(all(unix, feature = "cel"))]
 
 mod common;
 
@@ -29,7 +29,7 @@ fn run(cfg_text: &str) -> (Option<i32>, String) {
     (out.status.code(), log)
 }
 
-const BASE: &str = "config_version: \"1\"\nagent: { name: p }\n\
+const BASE: &str = "agent: { name: p }\n\
      store: { kind: file, file: { path: __STATE__ } }\n\
      observability: { log_level: info, log_content: true }\n\
      lifecycle: { run_until: idle, idle_grace: 2s }\n";
@@ -283,7 +283,7 @@ impl GatedDaemon {
             std::fs::write(
                 &cfg,
                 format!(
-                    "config_version: \"1\"\n\
+                    "\
                      agent: {{ name: p, instruction: You save things., preflight: never }}\n\
                      intelligence: {{ endpoints: {llm}, model: mock }}\n\
                      store: {{ kind: memory }}\n\
@@ -593,7 +593,7 @@ fn an_unanswered_policy_gate_is_never_approved_by_the_auto_judge() {
             std::fs::write(
                 &cfg,
                 format!(
-                    "config_version: \"1\"\n\
+                    "\
                      agent: {{ name: p, instruction: You save things., preflight: never, ask_human_fallback: auto }}\n\
                      intelligence: {{ endpoints: {llm}, model: mock }}\n\
                      store: {{ kind: memory }}\n\

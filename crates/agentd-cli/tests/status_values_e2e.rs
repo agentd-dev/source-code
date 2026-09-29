@@ -90,7 +90,7 @@ fn status_values_and_skill_prefix_are_published() {
     std::fs::write(
         &cfg,
         format!(
-            "config_version: \"1\"\n\
+            "\
              agent:\n  name: status-values\n  instruction: You are a test agent.\n  preflight: never\n\
              intelligence:\n  endpoints: https://127.0.0.1:9\n  model: mock\n\
              store:\n  kind: memory\n\

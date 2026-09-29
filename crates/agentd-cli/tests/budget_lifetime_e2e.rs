@@ -7,7 +7,7 @@
 //! what happens to the process — and the answer used to be nothing: every
 //! admission failed and the daemon sat there refusing work until an operator
 //! noticed a gauge. A budget that cannot end anything is not a budget.
-#![cfg(all(unix, feature = "workflow"))]
+#![cfg(unix)]
 
 mod common;
 
@@ -28,7 +28,7 @@ fn events(stderr: &str, name: &str) -> Vec<Value> {
 /// second admission trips the ceiling. `extra` goes inside `budget:`.
 fn cfg(extra: &str) -> String {
     format!(
-        "config_version: \"1\"\nagent: {{ name: broke }}\nstore: {{ kind: memory }}\n\
+        "agent: {{ name: broke }}\nstore: {{ kind: memory }}\n\
          intelligence:\n  endpoints: \"mock:final\"\n  model: mock\n\
          \x20 budget: {{ lifetime_tokens: 1{extra} }}\n\
          lifecycle: {{ run_until: idle, idle_grace: 30s }}\n\
@@ -102,8 +102,8 @@ fn exit_stops_now_with_the_budget_code() {
     assert_eq!(code, Some(7), "exit::BUDGET:\n{log}");
 }
 
-/// `refuse` is the pre-1.15 behaviour, kept for an operator who would rather
-/// inspect a stopped instance than lose it.
+/// `refuse` is for an operator who would rather inspect a stopped instance
+/// than lose it.
 #[test]
 fn refuse_keeps_the_instance_up() {
     let (code, log) = run(&cfg(", lifetime_exhausted: refuse"), 8);

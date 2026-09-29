@@ -6,7 +6,7 @@
 //! land in the same directory — and the rest of the manifest never has to be
 //! touched for it.
 
-use crate::config::v2::Settings;
+use crate::config::settings::Settings;
 use serde_json::{Value, json};
 
 use super::auth::{configured_url, listener_auth_of};
@@ -16,9 +16,8 @@ use super::{EXTENSION_METHODS, SpecMethod, declared_for, extensions_of};
 /// then the methods of the extensions it declares.
 ///
 /// Derived from the route table and the declaration list, which are the same
-/// two lists the listener routes by and the card declares from. The manifest
-/// used to keep its own copy, and it had drifted: it listed `GetAgentCard`,
-/// which was never a method of the specification, and missed five that were.
+/// two lists the listener routes by and the card declares from, so the
+/// manifest cannot report a method the listener does not answer.
 pub fn methods_of(s: &Settings) -> Vec<&'static str> {
     let declared = declared_for(s);
     SpecMethod::ALL
@@ -85,8 +84,8 @@ mod tests {
 
     /// The manifest's methods are the route table: every name routes, every
     /// core method is there, and an extension's method is there exactly when
-    /// the instance declares the extension. Nothing the table refuses — the
-    /// card read as a method, pairing — can be reported as served.
+    /// the instance declares the extension, so nothing the table refuses can
+    /// be reported as served.
     #[test]
     fn manifest_methods_are_the_route_table() {
         let with_feed =
@@ -106,9 +105,6 @@ mod tests {
             }
             for m in SpecMethod::ALL {
                 assert!(reported.contains(&m.name()), "{m:?} is not reported");
-            }
-            for gone in ["GetAgentCard", "Pair", "interface.pair"] {
-                assert!(!reported.contains(&gone), "{gone} is reported");
             }
             let declared = extensions_of(s);
             for (name, ext, _) in EXTENSION_METHODS {
@@ -147,7 +143,7 @@ mod tests {
         }));
         assert_eq!(
             a2a_section(&s).to_string(),
-            r#"{"auth":{"bearer":true,"device":false,"implicit_operator":false,"mtls":true,"required":true},"command_ops":["status","config","workflow.run","workflow.status","workflow.cancel","workflow.signal","subagent.send","subagent.kill","subagent.status","plan.get","conversation.get","run.get","subagent.get","debug.events","admin.drain","admin.pause","admin.resume","admin.cancel","admin.set","auth.sessions","auth.sessions.revoke"],"cors_origins":2,"events":true,"extensions":["https://agentd.dev/a2a/ext/command/v2","https://agentd.dev/a2a/ext/events/v1","https://agentd.dev/a2a/ext/task-annotations/v1"],"introspection":true,"methods":["SendMessage","SendStreamingMessage","GetTask","ListTasks","CancelTask","SubscribeToTask","CreateTaskPushNotificationConfig","GetTaskPushNotificationConfig","ListTaskPushNotificationConfigs","DeleteTaskPushNotificationConfig","GetExtendedAgentCard","agentd.events/SubscribeToEvents"],"url":"https://agent.example.com"}"#
+            r#"{"auth":{"bearer":true,"device":false,"implicit_operator":false,"mtls":true,"required":true},"command_ops":["status","config","workflow.run","workflow.status","workflow.cancel","workflow.signal","subagent.send","subagent.kill","subagent.status","plan.get","conversation.get","run.get","subagent.get","debug.events","admin.drain","admin.pause","admin.resume","admin.cancel","admin.set","auth.sessions","auth.sessions.revoke"],"cors_origins":2,"events":true,"extensions":["https://agentd.dev/a2a/ext/command","https://agentd.dev/a2a/ext/events","https://agentd.dev/a2a/ext/task-annotations"],"introspection":true,"methods":["SendMessage","SendStreamingMessage","GetTask","ListTasks","CancelTask","SubscribeToTask","CreateTaskPushNotificationConfig","GetTaskPushNotificationConfig","ListTaskPushNotificationConfigs","DeleteTaskPushNotificationConfig","GetExtendedAgentCard","agentd.events/SubscribeToEvents"],"url":"https://agent.example.com"}"#
         );
 
         // A unix socket: the kernel authenticates, the caller is the operator,
@@ -155,7 +151,7 @@ mod tests {
         let t = settings(json!({"listen": "unix:/run/agentd.sock"}));
         assert_eq!(
             a2a_section(&t).to_string(),
-            r#"{"auth":{"bearer":false,"device":false,"implicit_operator":true,"mtls":false,"required":false},"command_ops":["status","config","workflow.run","workflow.status","workflow.cancel","workflow.signal","subagent.send","subagent.kill","subagent.status","plan.get","admin.drain","admin.pause","admin.resume","admin.cancel","admin.set"],"cors_origins":0,"events":false,"extensions":["https://agentd.dev/a2a/ext/command/v2","https://agentd.dev/a2a/ext/task-annotations/v1"],"introspection":false,"methods":["SendMessage","SendStreamingMessage","GetTask","ListTasks","CancelTask","SubscribeToTask","CreateTaskPushNotificationConfig","GetTaskPushNotificationConfig","ListTaskPushNotificationConfigs","DeleteTaskPushNotificationConfig","GetExtendedAgentCard"],"url":null}"#
+            r#"{"auth":{"bearer":false,"device":false,"implicit_operator":true,"mtls":false,"required":false},"command_ops":["status","config","workflow.run","workflow.status","workflow.cancel","workflow.signal","subagent.send","subagent.kill","subagent.status","plan.get","admin.drain","admin.pause","admin.resume","admin.cancel","admin.set"],"cors_origins":0,"events":false,"extensions":["https://agentd.dev/a2a/ext/command","https://agentd.dev/a2a/ext/task-annotations"],"introspection":false,"methods":["SendMessage","SendStreamingMessage","GetTask","ListTasks","CancelTask","SubscribeToTask","CreateTaskPushNotificationConfig","GetTaskPushNotificationConfig","ListTaskPushNotificationConfigs","DeleteTaskPushNotificationConfig","GetExtendedAgentCard"],"url":null}"#
         );
 
         assert_eq!(
@@ -164,7 +160,7 @@ mod tests {
             "no listener, no section"
         );
 
-        let loaded = crate::config::v2::Loaded {
+        let loaded = crate::config::settings::Loaded {
             settings: s.clone(),
             doc: json!({}),
             file_doc: json!({}),

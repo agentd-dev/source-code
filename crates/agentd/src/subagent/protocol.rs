@@ -2,7 +2,7 @@
 //! The supervisor↔subagent control protocol.
 //!
 //! A minimal JSON-RPC *sibling* — not literal MCP (no `initialize`
-//! handshake) — carried length-framed (4-byte prefix, [`crate::json::frame`])
+//! handshake) — carried length-framed (4-byte prefix, [`::mcp::rpc::frame`])
 //! over the child's stdio pipes, so payloads that contain newlines
 //! (instructions, context seeds, distilled results) survive. Two directions:
 //! [`ControlMsg`] flows down (supervisor→child), [`AgentMsg`] flows up.
@@ -22,7 +22,7 @@ use serde_json::Value;
 
 /// The environment variable the supervisor sets on the child so its `main`
 /// takes the subagent path instead of re-parsing CLI config.
-pub const SUBAGENT_ENV: &str = "AGENT_SUBAGENT";
+pub const SUBAGENT_ENV: &str = "AGENTD_SUBAGENT";
 
 // ---- downward: supervisor -> subagent ----
 
@@ -159,11 +159,10 @@ pub enum AgentMsg {
     /// channel. The supervisor has no LLM of its own and no live view of a
     /// child's breaker state, so the child is the only party that can report
     /// this; the supervisor latches it into the `intel_all_down` process-global
-    /// that the readiness probe, the `agentd_intel_all_down` gauge, and the
-    /// `agentd://intelligence` / `capacity` bodies all read — one latched truth,
-    /// eventually consistent (see [`crate::signals::set_intel_all_down`]).
-    /// `active` is best-effort transport and index ONLY — never a URL or a
-    /// credential, matching what the `agentd://intelligence` resource redacts.
+    /// that the readiness probe and the `agentd_intel_all_down` gauge read — one
+    /// latched truth, eventually consistent (see
+    /// [`crate::signals::set_intel_all_down`]). `active` is best-effort transport
+    /// and index ONLY — never a URL or a credential.
     IntelHealth {
         all_down: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -186,9 +185,8 @@ pub enum AgentMsg {
 
 /// Which endpoint is serving the child's intelligence, for
 /// [`AgentMsg::IntelHealth`]. The bounded structural identity ONLY — the list
-/// index and the transport scheme (`unix`/`vsock`/`https`) — never the URL, cid,
-/// host, or any credential, matching what the `agentd://intelligence` resource
-/// redacts. An index plus a scheme is enough to tell operators which configured
+/// index and the transport scheme (`https`, or `http` on loopback) — never the
+/// URL, host, or any credential. An index plus a scheme is enough to tell operators which configured
 /// endpoint is live without putting an address into logs or events.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IntelActive {
@@ -336,20 +334,6 @@ impl SpawnPayload {
             .find(|m| m.role == ALLOWED_TOOLS_ROLE)
             .map(|m| parse_allowed_tools(&m.content))
     }
-}
-
-/// A checkpoint-resume reference: which checkpoint store (`server`) holds the
-/// run under `key`, optionally pinned to a sequence number, and whether to
-/// resume `force`fully past a mismatch. Parsed from `--workflow-resume`.
-#[cfg(feature = "workflow")]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct WorkflowResumeRef {
-    pub server: String,
-    pub key: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub seq: Option<u64>,
-    #[serde(default)]
-    pub force: bool,
 }
 
 /// The child's role: which driver the child process runs after spawn.
@@ -535,7 +519,7 @@ pub struct Telemetry {
 mod tests {
     use super::*;
     use crate::agentloop::stop::TerminalStatus;
-    use crate::json::frame;
+    use ::mcp::rpc::frame;
     use serde_json::json;
     use std::io::Cursor;
 

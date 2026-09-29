@@ -56,24 +56,24 @@ function run(argv, { env = {}, write, ms = 10_000 } = {}) {
   });
 }
 
-test('removed flags are refused by name and the env token is scrubbed', async () => {
-  for (const argv of [['--bearer', 'tok'], ['--bearer=tok'], ['--code', '1234'], ['--code=1234']]) {
+test('a flag the client does not define is an unknown option, and the env token is scrubbed', async () => {
+  for (const argv of [['--bearer', 'tok'], ['--bearer=s3cret'], ['--code', '1234'], ['--spawn']]) {
     const flag = argv[0].split('=')[0];
     assert.throws(
       () => parseArgs(['--endpoint', 'http://127.0.0.1:1', ...argv]),
-      (e) => e instanceof UsageError && e.message.startsWith(`${flag} was removed in agentd 1.17.0: `),
+      (e) => e instanceof UsageError && e.message === `unknown option "${flag}" — see --help`,
       argv.join(' '),
     );
   }
-  // The token's value is never echoed back in the refusal.
+  // A value after `=` is never echoed back in the refusal.
   assert.throws(() => parseArgs(['--bearer=s3cret']), (e) => !e.message.includes('s3cret'));
   // The program itself refuses, with exit 2, before any request.
-  const r = await run([CLI, '--endpoint', 'http://127.0.0.1:1', '--bearer', 's3cret']);
-  assert.equal(r.code, 2);
-  assert.match(r.stderr, /--bearer was removed in agentd 1\.17\.0: .*--bearer-file/);
-  assert.doesNotMatch(r.stderr, /s3cret/);
-  // An unknown flag is refused too, rather than mistaken for a setting.
-  assert.throws(() => parseArgs(['--spawn']), /unknown option "--spawn"/);
+  for (const argv of [['--bearer', 's3cret'], ['--code', '1234'], ['--bearer=s3cret']]) {
+    const r = await run([CLI, '--endpoint', 'http://127.0.0.1:1', ...argv]);
+    assert.equal(r.code, 2, argv.join(' '));
+    assert.match(r.stderr, /unknown option "--(bearer|code)"/, argv.join(' '));
+    assert.doesNotMatch(r.stderr, /s3cret/, argv.join(' '));
+  }
 
   // AGENTD_BEARER is taken out of the environment as it is read.
   const env = { AGENTD_BEARER: ' tok-1 \n', OTHER: 'x' };
@@ -166,7 +166,7 @@ test('--launch-fd reads the code from the inherited fd until EOF, closes it, and
     const exchange = fake.requests.filter((q) => q.path === '/oauth2/token');
     assert.equal(exchange.length, 1, 'exchanged exactly once, never retried');
     const form = new URLSearchParams(exchange[0].body);
-    assert.equal(form.get('grant_type'), 'https://agentd.dev/oauth/grant-type/launch/v1');
+    assert.equal(form.get('grant_type'), 'https://agentd.dev/oauth/grant-type/launch');
     assert.equal(form.get('client_id'), 'agentd-tui');
     assert.equal(form.get('code'), 'agentd_lc_bad');
   } finally {

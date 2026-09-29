@@ -194,18 +194,17 @@ pub mod elicit;
 #[cfg(feature = "oauth")]
 pub mod oauth;
 // Built-in Streamable HTTP mock MCP server (the hidden `--internal-mock-mcp-http`
-// mode) for the test + conformance suites: serves a one-resource reactive MCP over
-// a unix socket, so the harness drives agentd's real HTTP transport end to end.
+// mode) for the test + conformance suites: serves a one-resource reactive MCP on
+// a loopback port, so the harness drives agentd's real HTTP transport end to end.
 // In debug it is always present (so `cargo test` needs no flag); in release it
 // ships only under `internal-mocks`, so the production binary carries no test
 // scaffolding.
 #[cfg(any(feature = "internal-mocks", debug_assertions))]
 pub mod mock_http;
 
-// agentd-as-A2A-client: the remote-A2A-agent delegation backend. Connects to a
-// declared peer over HTTP(S) with the JSON-RPC codec, runs `a2a.SendMessage` and
-// then polls `a2a.GetTask` until the task reaches a terminal state, and returns
-// the distillate. Reuses the wire types from `a2a`; adds no dependencies. The
+// agentd-as-A2A-client: the remote-A2A-agent delegation backend. Reads a
+// declared peer's card, sends the objective, follows the task to a terminal
+// state and returns the distillate (the module doc has the whole sequence). The
 // serving side of A2A is `runtime::a2a_server`.
 #[cfg(feature = "a2a")]
 pub mod a2a_client;

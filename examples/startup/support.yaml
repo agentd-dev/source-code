@@ -43,7 +43,6 @@
 # MCP contract — `docs` server: read-only product documentation (search +
 # fetch). It is deliberately untagged: public content, no trust legs spent.
 # ─────────────────────────────────────────────────────────────────────────────
-config_version: "1"
 
 agent:
   name: support

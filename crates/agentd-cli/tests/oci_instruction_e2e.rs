@@ -6,7 +6,7 @@
 //! and reaches `proc.ready` with the document's workflow armed. With the
 //! `decrypt` feature too, the registry serves an age-ENCRYPTED blob and the
 //! oci→decrypt→idoc chain is proven in one pass.
-#![cfg(all(unix, feature = "oci", feature = "workflow"))]
+#![cfg(all(unix, feature = "oci"))]
 
 mod common;
 
@@ -48,7 +48,7 @@ fn mock_registry(blob: Vec<u8>) -> u16 {
             let manifest = json!({
                 "schemaVersion": 2,
                 "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                "artifactType": "application/vnd.instruction.document.v1",
+                "artifactType": "application/vnd.instruction-md.instruction.v1",
                 "layers": [{
                     "mediaType": "text/markdown; variant=instruction",
                     "digest": format!("sha256:{}", sha(&blob)),
@@ -90,7 +90,6 @@ const DOC: &str = "---\nspec: \"1\"\n---\n# Pulled agent\n\nServe pulls.\n\n:::!
 /// otherwise identical to [`boot_and_capture`].
 fn boot_and_capture_cfg(overlay: Value) -> String {
     let mut cfg = json!({
-        "config_version": "1",
         "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
         "store": {"kind": "memory"},
     });
@@ -106,7 +105,6 @@ fn boot_and_capture_cfg(overlay: Value) -> String {
 /// `proc.ready`, return the captured stderr log.
 fn boot_and_capture(uri: &str, extra: Value) -> String {
     let mut cfg = json!({
-        "config_version": "1",
         "agent": {"name": "oci-e2e", "preflight": "never", "instruction": uri},
         "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
         "store": {"kind": "memory"},
@@ -299,7 +297,7 @@ fn mock_registry_cosign(doc: Vec<u8>, sig: Sig<'_>) -> u16 {
     let manifest = json!({
         "schemaVersion": 2,
         "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        "artifactType": "application/vnd.instruction.document.v1",
+        "artifactType": "application/vnd.instruction-md.instruction.v1",
         "layers": [{
             "mediaType": "text/markdown; variant=instruction",
             "digest": doc_digest, "size": doc.len(),
@@ -543,7 +541,6 @@ fn a_re_pulled_document_is_verified_against_the_same_pin() {
     );
 
     let cfg = json!({
-        "config_version": "1",
         "agent": {"name": "oci-pin", "preflight": "never", "instruction": {
             "oci": format!("127.0.0.1:{port}/acme/agent:v1"),
             "trust": [{"uri": "instruction://ins_1",
@@ -604,7 +601,7 @@ fn two_document_registry(
         json!({
             "schemaVersion": 2,
             "mediaType": "application/vnd.oci.image.manifest.v1+json",
-            "artifactType": "application/vnd.instruction.document.v1",
+            "artifactType": "application/vnd.instruction-md.instruction.v1",
             "layers": [{
                 "mediaType": "text/markdown; variant=instruction",
                 "digest": format!("sha256:{}", sha_hex(doc)),

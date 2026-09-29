@@ -803,8 +803,8 @@ impl Runtime {
     }
 
     /// Which policy caller this invocation counts as.
-    pub(crate) fn policy_caller(caller: &ToolCaller) -> crate::config::v2::PolicyCaller {
-        use crate::config::v2::PolicyCaller;
+    pub(crate) fn policy_caller(caller: &ToolCaller) -> crate::config::settings::PolicyCaller {
+        use crate::config::settings::PolicyCaller;
         match (&caller.subagent, &caller.run) {
             (Some(_), _) => PolicyCaller::Subagent,
             (None, Some(_)) => PolicyCaller::Workflow,
@@ -819,7 +819,7 @@ impl Runtime {
         name: &str,
         args: &Value,
     ) -> Option<ToolOutcome> {
-        use crate::config::v2::PolicyAction;
+        use crate::config::settings::PolicyAction;
         let tags = self
             .registry
             .tags_of(std::slice::from_ref(&name.to_string()));
@@ -906,7 +906,7 @@ impl Runtime {
         args: &Value,
         verdict: &crate::sec::policy::Verdict,
     ) -> Option<ToolOutcome> {
-        use crate::config::v2::PolicyAction;
+        use crate::config::settings::PolicyAction;
         let question = verdict
             .question
             .clone()
@@ -932,7 +932,7 @@ impl Runtime {
                 super::human::HumanChannel::Owned(t) => Some(Some(t.clone())),
                 super::human::HumanChannel::Unowned
                     if self.settings.agent.ask_human_unowned
-                        == crate::config::v2::AskHumanUnowned::Gate =>
+                        == crate::config::settings::AskHumanUnowned::Gate =>
                 {
                     Some(None)
                 }
@@ -955,7 +955,7 @@ impl Runtime {
                     .to
                     .clone()
                     .unwrap_or_else(|| crate::a2a::principals::Addressee {
-                        role: Some(crate::config::v2::Role::Operator),
+                        role: Some(crate::config::settings::Role::Operator),
                         ..Default::default()
                     });
                 let held = super::reactor::PolicyCall {

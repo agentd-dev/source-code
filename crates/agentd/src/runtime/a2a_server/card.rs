@@ -8,10 +8,10 @@
 //! the next read.
 
 use super::commands::refusal;
-use super::{COMMAND_EXTENSION, FEED_RING, UNSUPPORTED_OPERATION, command_ops_of};
+use super::{COMMAND_EXTENSION, FEED_RING, command_ops_of};
 use crate::a2a::Principal;
 use crate::a2a::errors::{self, reason};
-use crate::config::v2::Settings;
+use crate::config::settings::Settings;
 use crate::engine::model::Workflow;
 use crate::runtime::reactor::Runtime;
 use crate::runtime::surface::auth::{ListenerAuth, listener_auth_of, origin_of, security_of};
@@ -92,7 +92,7 @@ pub(super) fn card_served(
     if let CardView::Extended(principal) = view {
         if !posture.declares_any() {
             return refusal(
-                UNSUPPORTED_OPERATION,
+                errors::UNSUPPORTED_OPERATION,
                 reason::UNSUPPORTED_OPERATION,
                 "this agent declares no authentication scheme, so it has no extended card",
                 &[],
@@ -317,7 +317,7 @@ fn workflow_skill(w: &Workflow) -> Value {
 mod tests {
     use super::super::listener::advertised_url as advertised;
     use super::*;
-    use crate::config::v2::{A2a, Role};
+    use crate::config::settings::{A2a, Role};
     use crate::runtime::surface::{op_spec, static_vocabulary};
 
     fn settings(a2a: serde_json::Value) -> Settings {
@@ -423,13 +423,10 @@ mod tests {
 
     /// Both cards survive the SDK's typed `AgentCard` without losing a field,
     /// declare the A2A version the listener serves, and carry every field
-    /// the message REQUIRES — every skill's included.
-    ///
-    /// The version was `"0.3.0"` for an interface that speaks the 1.0 wire, so
-    /// a 1.0 client either passed our interface over or spoke 0.3 at it; and
-    /// a skill with no description (an op without an arm, a workflow without
-    /// one) lost the REQUIRED field in the round trip on one card and carried
-    /// `""` on the other, because the extended card was patched after it.
+    /// the message REQUIRES — every skill's included: a 1.0 client passes over
+    /// an interface whose version is not 1.0, and a skill with no description
+    /// (an op without an arm, a workflow without one) would lose the REQUIRED
+    /// field in the round trip.
     #[test]
     fn the_card_round_trips_through_the_sdks_typed_agent_card() {
         let s = settings(json!({
@@ -538,8 +535,7 @@ mod tests {
     /// a2a-rs's `TransportNegotiator::select` offers a transport factory an
     /// interface only when its `protocolBinding` is the factory's protocol and
     /// its `protocolVersion` passes `version_compatible` — empty, or major
-    /// `1`. With `"0.3.0"` on the card nothing passed, and a stock client
-    /// answered "no compatible transport". The negotiator itself cannot be
+    /// `1`; nothing else is a compatible transport. The negotiator itself cannot be
     /// linked here: a2a-rs 0.10's `client` feature does not compile without
     /// the reqwest transports this crate keeps out of its tree. So its rule is
     /// applied, as written there, to the card the SDK's own type parsed.

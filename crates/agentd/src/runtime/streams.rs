@@ -500,11 +500,11 @@ impl crate::runtime::reactor::Runtime {
             run_id,
             step_id,
         } = *ev;
-        use crate::config::v2 as cfgv2;
-        if let Err(e) = cfgv2::egress_allows(
+        use crate::config::settings;
+        if let Err(e) = settings::egress_allows(
             &self.settings.services,
             self.settings.security.egress,
-            cfgv2::ServiceKind::Http,
+            settings::ServiceKind::Http,
             url,
         ) {
             self.log.warn(

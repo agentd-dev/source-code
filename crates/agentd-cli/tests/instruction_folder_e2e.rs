@@ -6,7 +6,7 @@
 //! file folds into the configuration exactly as it would had someone pasted
 //! the folder into a single markdown file, and the front matter of a later
 //! document does not end up read as prose in the middle of the text.
-#![cfg(all(unix, feature = "workflow"))]
+#![cfg(unix)]
 
 mod common;
 

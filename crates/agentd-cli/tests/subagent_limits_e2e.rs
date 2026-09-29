@@ -4,7 +4,7 @@
 //! exec, and `priority: low` becomes a niceness of +10 — read back from
 //! `/proc/<pid>/limits` and `/proc/<pid>/stat` while the child is alive, not
 //! inferred from our own bookkeeping.
-#![cfg(all(target_os = "linux", feature = "workflow"))]
+#![cfg(target_os = "linux")]
 
 mod common;
 
@@ -70,7 +70,7 @@ fn subagent_limits_and_priority_reach_the_child_process() {
     std::fs::write(
         &cfg,
         format!(
-            "config_version: \"1\"\n\
+            "\
              agent:\n  instruction: delegate with caps\n\
              intelligence:\n  endpoints: {}\n  model: mock\n\
              lifecycle:\n  run_until: idle\n  idle_grace: 6s\n\

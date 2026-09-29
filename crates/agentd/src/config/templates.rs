@@ -11,7 +11,7 @@
 //! that ordering enforceable rather than merely intended.
 
 use super::idoc::{self, InlineSkill};
-use super::v2::{self, ParamSpec, Settings, SubagentTemplate};
+use super::settings::{self, ParamSpec, Settings, SubagentTemplate};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
@@ -260,7 +260,7 @@ fn compile_one(
                 )));
             }
             if let Some(b) = &t.budget
-                && let Err(e) = serde_json::from_value::<v2::Budget>(b.clone())
+                && let Err(e) = serde_json::from_value::<settings::Budget>(b.clone())
             {
                 errs.push(at(format!("budget: {e}")));
             }
@@ -314,7 +314,7 @@ fn validate_instance_machinery(name: &str, ex: &idoc::Extraction, s: &Settings) 
     // It subsumes the listener/store/lifecycle/security keys a template was
     // refused before: every one of them is now `OPERATOR_ONLY`, which is also
     // why the parent composes them (`compose_instance_doc`).
-    let forbidden = crate::config::v2::document_wrote_operator_config(&ex.config);
+    let forbidden = crate::config::settings::document_wrote_operator_config(&ex.config);
     if !forbidden.is_empty() {
         errs.push(at(format!(
             "machinery writes {} — operator configuration is not a document's to set (§6 rule 4)",
@@ -349,22 +349,22 @@ fn validate_instance_machinery(name: &str, ex: &idoc::Extraction, s: &Settings) 
     // The composed MCP set: catalog resolution (the child inherits the
     // parent's catalog and cannot extend it), tag floor, trifecta, egress.
     if let Some(servers_v) = config.pointer("/mcp/servers") {
-        match serde_json::from_value::<Vec<v2::McpServer>>(servers_v.clone()) {
+        match serde_json::from_value::<Vec<settings::McpServer>>(servers_v.clone()) {
             Ok(servers) => {
                 let mut probe = Settings {
                     services: s.services.clone(),
                     ..Default::default()
                 };
                 probe.mcp.servers = servers;
-                for e in v2::resolve_services(&mut probe) {
+                for e in settings::resolve_services(&mut probe) {
                     errs.push(at(e));
                 }
                 let mut tags = Vec::new();
                 for srv in &probe.mcp.servers {
-                    if let Err(e) = v2::egress_allows(
+                    if let Err(e) = settings::egress_allows(
                         &s.services,
                         s.security.egress,
-                        v2::ServiceKind::Mcp,
+                        settings::ServiceKind::Mcp,
                         &srv.endpoint,
                     ) {
                         errs.push(at(format!("mcp server '{}': {e}", srv.name)));
@@ -386,7 +386,8 @@ fn validate_instance_machinery(name: &str, ex: &idoc::Extraction, s: &Settings) 
         }
     }
     if let Some(streams_v) = config.get("streams")
-        && let Err(e) = serde_json::from_value::<BTreeMap<String, v2::StreamCfg>>(streams_v.clone())
+        && let Err(e) =
+            serde_json::from_value::<BTreeMap<String, settings::StreamCfg>>(streams_v.clone())
     {
         errs.push(at(format!("streams: {e}")));
     }
@@ -559,7 +560,7 @@ mod tests {
     #[test]
     fn tier_resolution_is_by_machinery() {
         let s = settings_with(
-            "    worker:\n      instruction: do the thing\n    room:\n      instruction: |\n        Be the room.\n        :::!workflow{name=w}\n        version: 3\n        steps: {s: {kind: once}, f: {kind: finish, depends_on: [s], status: completed}}\n        :::\n",
+            "    worker:\n      instruction: do the thing\n    room:\n      instruction: |\n        Be the room.\n        :::!workflow{name=w}\n        steps: {s: {kind: once}, f: {kind: finish, depends_on: [s], status: completed}}\n        :::\n",
         );
         let c = compile_templates(&s).unwrap();
         assert_eq!(c["worker"].tier, Tier::Flat);
@@ -573,7 +574,7 @@ mod tests {
         // The child is wired as an A2A peer; a build that cannot speak A2A
         // refuses the tier at the parent's boot, naming the feature.
         let s = settings_with(
-            "    room:\n      instruction: |\n        Be the room.\n        :::!workflow{name=w}\n        version: 3\n        steps: {s: {kind: once}, f: {kind: finish, depends_on: [s], status: completed}}\n        :::\n",
+            "    room:\n      instruction: |\n        Be the room.\n        :::!workflow{name=w}\n        steps: {s: {kind: once}, f: {kind: finish, depends_on: [s], status: completed}}\n        :::\n",
         );
         let e = compile_templates(&s).unwrap_err();
         assert!(e.iter().any(|m| m.contains("'a2a' build feature")), "{e:?}");
@@ -747,7 +748,7 @@ mod tests {
     #[test]
     fn instance_templates_may_not_take_webhook_starts() {
         let s = settings_with(
-            "    room:\n      instruction: |\n        Room.\n        :::!workflow{name=w}\n        version: 3\n        steps: {s: {kind: webhook, path: /x}, f: {kind: finish, depends_on: [s], status: completed}}\n        :::\n",
+            "    room:\n      instruction: |\n        Room.\n        :::!workflow{name=w}\n        steps: {s: {kind: webhook, path: /x}, f: {kind: finish, depends_on: [s], status: completed}}\n        :::\n",
         );
         let e = compile_templates(&s).unwrap_err();
         assert!(e.iter().any(|m| m.contains("no webhook listener")), "{e:?}");
@@ -756,7 +757,7 @@ mod tests {
     #[test]
     fn fixed_until_on_non_singleton_is_refused() {
         let s = settings_with(
-            "    room:\n      instruction: |\n        Room.\n        :::!workflow{name=w}\n        version: 3\n        steps: {s: {kind: once}, f: {kind: finish, depends_on: [s], status: completed}}\n        :::\n      until: closed\n",
+            "    room:\n      instruction: |\n        Room.\n        :::!workflow{name=w}\n        steps: {s: {kind: once}, f: {kind: finish, depends_on: [s], status: completed}}\n        :::\n      until: closed\n",
         );
         let e = compile_templates(&s).unwrap_err();
         assert!(e.iter().any(|m| m.contains("fixed signal")), "{e:?}");

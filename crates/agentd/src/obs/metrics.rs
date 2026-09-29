@@ -15,14 +15,14 @@
 //! logs; cross-process metric rollup is a deliberate non-goal (the same process
 //! boundary the tree token ceiling draws).
 //!
-//! ## The frozen `metrics_schema` contract
+//! ## The metric contract
 //!
-//! The metric **names** and label **keys** below are a versioned public API
-//! ([`METRICS_SCHEMA`]) that a control plane (agentctl) authors dashboards,
-//! alerts and scalers against. Exposition is hand-written Prometheus 0.0.4 text
-//! — no `prometheus`/`metrics` crate. The enumerated set *is* the contract: it is
-//! additive within a major, and removing or renaming a metric or a label key
-//! bumps the major.
+//! The metric **names** and label **keys** below are a public API that a
+//! control plane (agentctl) authors dashboards, alerts and scalers against.
+//! Exposition is hand-written Prometheus 0.0.4 text — no `prometheus`/`metrics`
+//! crate. The enumerated set *is* the contract: series and label values are
+//! added, never removed or renamed — a metric whose meaning changes takes a
+//! new name.
 //!
 //! **Cardinality is binding:** `/metrics` is unauthenticated and may be bound on
 //! all interfaces. Labels carry **bounded** values only (`status`, `model`,
@@ -36,20 +36,6 @@
 //!
 //! Telemetry never crashes the agent: every fn here is a plain atomic add/store
 //! that cannot fail; `render` only ever reads.
-
-/// Frozen metrics-schema version. Surfaced in the manifest at
-/// `surfaces.metrics_schema`; the integrator wires that surface — this const is
-/// the single source of truth for the value. Additive series and label values
-/// bump the minor; a removed or renamed metric or label key bumps the major.
-///
-/// Minors are additive, so a consumer written against an earlier minor still
-/// parses a later render. Over 1.0, minor 1.1 carries the
-/// `agent_budget_tokens_remaining` gauge and the `tokens_lifetime` value of the
-/// `agent_limit_exceeded_total{limit}` domain; 1.2 carries the resource-pressure
-/// set on top of that — `agent_pressure_level` (0 ok / 1 warn / 2 shed),
-/// `agent_disk_free_bytes` (file-store filesystem headroom; absent without a
-/// file store), `agent_runs_active` and `agent_turns_queued`.
-pub const METRICS_SCHEMA: &str = "1.2";
 
 /// Terminal disposition of one supervised run.
 #[derive(Debug, Clone, Copy)]
@@ -249,7 +235,7 @@ pub fn record_drain(phase: &str) {
 /// `agent_restarts_total` — distinct from the breaker-trip counter
 /// [`record_restart_tripped`].
 ///
-/// **Reserved / unwired in metrics_schema 1.0:** there is no in-process
+/// **Reserved / unwired:** there is no in-process
 /// rebuild+reconcile restart path to call it from, because a pod restart is a
 /// fresh process with a zeroed registry — an orchestrator counts those, not the
 /// binary. The series renders (always 0) so the frozen contract stays
@@ -263,7 +249,7 @@ pub fn record_supervisor_restart() {
 
 /// A wedged-reactor liveness trip. Drives `agent_reactor_stalls_total`.
 ///
-/// **Reserved / unwired in metrics_schema 1.0:** a wedged reactor is surfaced as a
+/// **Reserved / unwired:** a wedged reactor is surfaced as a
 /// `/healthz` 503 (a per-scrape read of the heartbeat age in `obs::serve`), not as
 /// a one-shot in-process event, so there is no clean site to bump this exactly
 /// once. The series renders (always 0) for discoverability; the live alerting
@@ -862,8 +848,8 @@ mod imp {
             );
 
             // --- token / cost accounting -------------------------------------
-            // `agent_tokens_total{type}`: the frozen `model` label is DEFERRED in
-            // metrics_schema 1.0 — the only call site (`record_tokens`, fed by
+            // `agent_tokens_total{type}`: the frozen `model` label is DEFERRED —
+            // the only call site (`record_tokens`, fed by
             // `AgentMsg::Usage` up the control channel) does not carry the model
             // identifier, and adding it needs an emit site at the intelligence
             // boundary. The label key stays reserved and absent rather than
@@ -872,7 +858,7 @@ mod imp {
             labelled_counter(
                 &mut s,
                 "agent_tokens_total",
-                "Model tokens by direction (the frozen `model` label is deferred in metrics_schema 1.0 — the AgentMsg::Usage hook carries no model id; never faked).",
+                "Model tokens by direction (the frozen `model` label is deferred — the AgentMsg::Usage hook carries no model id; never faked).",
                 "type",
                 TOKEN_TYPES,
                 &self.tokens_typed,
@@ -885,7 +871,7 @@ mod imp {
             counter(
                 &mut s,
                 "agent_intel_calls_total",
-                "Intelligence calls made (process-local — the LLM client runs in the child; the frozen `model` label is deferred in metrics_schema 1.0, never faked).",
+                "Intelligence calls made (process-local — the LLM client runs in the child; the frozen `model` label is deferred, never faked).",
                 g(&self.intel_calls),
             );
 
@@ -1024,7 +1010,7 @@ mod imp {
                 &mut s,
                 "agent_tool_calls_total",
                 "counter",
-                "Tool calls by server/tool/ok — reserved in metrics_schema 1.0; the tool-call boundary runs in the child loop, so a supervisor scrape can't reflect it (derive from tool.result log lines).",
+                "Tool calls by server/tool/ok — reserved; the tool-call boundary runs in the child loop, so a supervisor scrape can't reflect it (derive from tool.result log lines).",
             );
             // `agent_tool_call_duration_ms` / `agent_intel_call_duration_ms` /
             // `agent_run_duration_ms` are frozen HISTOGRAMS. This crate has no
@@ -1037,19 +1023,19 @@ mod imp {
                 &mut s,
                 "agent_tool_call_duration_ms",
                 "histogram",
-                "Tool-call latency — reserved in metrics_schema 1.0; histogram exposition not implemented (use the tool.result dur_ms field).",
+                "Tool-call latency — reserved; histogram exposition not implemented (use the tool.result dur_ms field).",
             );
             reserved(
                 &mut s,
                 "agent_intel_call_duration_ms",
                 "histogram",
-                "Intelligence-call latency — reserved in metrics_schema 1.0; histogram exposition not implemented (use the intel.result dur_ms field).",
+                "Intelligence-call latency — reserved; histogram exposition not implemented (use the intel.result dur_ms field).",
             );
             reserved(
                 &mut s,
                 "agent_run_duration_ms",
                 "histogram",
-                "Run latency by terminal status — reserved in metrics_schema 1.0; histogram exposition not implemented (derive from run start→terminal log lines).",
+                "Run latency by terminal status — reserved; histogram exposition not implemented (derive from run start→terminal log lines).",
             );
 
             // --- lifecycle events ---------------------------------------------
@@ -1065,9 +1051,9 @@ mod imp {
                 DRAIN_PHASES,
                 &self.drains,
             );
-            // `agent_restarts_total` is RESERVED in metrics_schema 1.0: it counts
-            // a supervisor process *restart* (rebuild + reconcile), and there is no
-            // such in-process restart path to emit it from — a pod restart is a
+            // `agent_restarts_total` is RESERVED: it counts a supervisor process
+            // *restart* (rebuild + reconcile), and there is no such in-process
+            // restart path to emit it from — a pod restart is a
             // fresh process with a zeroed registry, so an orchestrator counts
             // those, not the binary. Rendered (always 0) so the frozen series
             // stays discoverable; `record_supervisor_restart` is the hook a
@@ -1075,21 +1061,21 @@ mod imp {
             counter(
                 &mut s,
                 "agent_restarts_total",
-                "Supervisor process restarts observed — reserved in metrics_schema 1.0; no in-process restart/reconcile emit site.",
+                "Supervisor process restarts observed — reserved; no in-process restart/reconcile emit site.",
                 g(&self.supervisor_restarts),
             );
-            // `agent_reactor_stalls_total` is RESERVED in metrics_schema 1.0: a
-            // wedged reactor is surfaced as a `/healthz` 503 (a derived read of the
-            // heartbeat age in `obs::serve`, evaluated per scrape), not as a
-            // one-shot in-process event, so there is no clean emit site to bump a
-            // counter exactly once. Rendered (always 0) for discoverability;
+            // `agent_reactor_stalls_total` is RESERVED: a wedged reactor is
+            // surfaced as a `/healthz` 503 (a derived read of the heartbeat age in
+            // `obs::serve`, evaluated per scrape), not as a one-shot in-process
+            // event, so there is no clean emit site to bump a counter exactly
+            // once. Rendered (always 0) for discoverability;
             // `record_reactor_stall` stays unwired until a dedicated
-            // stall-detection edge exists. The liveness signal an operator alerts
-            // on is the 503 itself, not this counter.
+            // stall-detection edge exists. The liveness signal an operator
+            // alerts on is the 503 itself, not this counter.
             counter(
                 &mut s,
                 "agent_reactor_stalls_total",
-                "Wedged-reactor liveness trips — reserved in metrics_schema 1.0; the live signal is the /healthz 503, there is no one-shot in-process emit site.",
+                "Wedged-reactor liveness trips — reserved; the live signal is the /healthz 503, there is no one-shot in-process emit site.",
                 g(&self.reactor_stalls),
             );
 
@@ -1749,7 +1735,7 @@ mod imp {
                 }
             }
             // The reserved markers say so (honest HELP text).
-            assert!(out.contains("reserved in metrics_schema 1.0"));
+            assert!(out.contains("reserved"));
         }
 
         #[test]
@@ -1804,7 +1790,7 @@ mod imp {
             assert!(out.contains("agent_reactor_stalls_total 0"));
             // Their HELP marks them reserved (not silently permanent-0). Both
             // reserved-counter HELP lines carry the marker phrase.
-            assert!(out.matches("reserved in metrics_schema 1.0").count() >= 2);
+            assert!(out.matches("reserved").count() >= 2);
         }
     }
 }

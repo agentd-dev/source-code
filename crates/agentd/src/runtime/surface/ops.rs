@@ -5,15 +5,14 @@
 //! may call it, what switch serves it and which handler runs it — is a column
 //! of [`OPS`], and everything else is derived from the table: the reserved
 //! names a workflow may not claim, the ops the card and `params.ops` list, the
-//! authorization floor, the audit mirror and the dispatch. The properties used
-//! to live in five hand lists (the reserved set, the served set, the display
-//! subset, the admin family and the role defaults), and they disagreed: an op
-//! classified in one and missing from another is how `config.set` ended up
-//! reachable by a `grants: ["*"]` user. A new op is one row plus its handler.
+//! authorization floor, the audit mirror and the dispatch. One table because
+//! an op classified in one list and missing from another is an op the
+//! authorization floor and the dispatch disagree about. A new op is one row
+//! plus its handler.
 
 use super::events::FeedKind;
 use crate::a2a::errors::{self, reason};
-use crate::config::v2::{DeviceScope, Role, Settings};
+use crate::config::settings::{DeviceScope, Role, Settings};
 use serde_json::{Value, json};
 
 /// How an op answers.
@@ -472,29 +471,6 @@ pub const OPS: &[OpSpec] = &[
     ),
 ];
 
-/// Command ops that no longer exist, each with what replaces it. Refused BY
-/// NAME wherever one can still be written — a principal's grant, a workflow's
-/// `a2a` start command, a command sent at runtime — so an operator upgrading
-/// reads the replacement rather than "unknown".
-pub const REMOVED_OPS: &[(&str, &str)] = &[
-    ("interface.info", "read the agent card and the `status` op"),
-    ("config.set", "use admin.set {path, value}"),
-    (
-        "pairing.code",
-        "pairing was replaced by the OAuth device authorization grant (a2a.device_grant); operators approve with auth.device.approve {user_code, as}",
-    ),
-    ("admin.lameduck", "use admin.drain"),
-];
-
-/// The release that removed the [`REMOVED_OPS`], as every refusal names it —
-/// the same release as the removed configuration keys.
-pub const OPS_REMOVED_IN: &str = crate::config::v2::KEYS_REMOVED_IN;
-
-/// The replacement hint for a removed op.
-pub fn removed_op(op: &str) -> Option<&'static str> {
-    REMOVED_OPS.iter().find(|(n, _)| *n == op).map(|(_, h)| *h)
-}
-
 /// The names `auth.device.approve` refuses as `as`: each is already how the
 /// audit trail and the labels spell someone else — the operator, a caller
 /// nobody named, the launcher, the runtime acting on its own — so a device
@@ -554,11 +530,6 @@ pub fn op_spec(op: &str) -> Option<&'static OpSpec> {
 /// the day it flipped.
 pub fn is_builtin_op(op: &str) -> bool {
     op_spec(op).is_some()
-}
-
-/// Is `op` in the operator admin family (the `Admin` handler)?
-pub fn is_admin_op(op: &str) -> bool {
-    op_spec(op).is_some_and(|s| s.handler == Handler::Admin)
 }
 
 /// Does `op` answer to the operator role alone, whatever the grants say?
@@ -1325,12 +1296,9 @@ pub fn command_refusal(
     })
 }
 
-/// An op nothing serves — named with its replacement when it was removed.
+/// An op nothing serves.
 pub fn unknown_op_error(op: &str, field: &str) -> Value {
-    let message = match removed_op(op) {
-        Some(hint) => format!("command `{op}` was removed in agentd {OPS_REMOVED_IN}: {hint}"),
-        None => format!("unknown command {op:?}"),
-    };
+    let message = format!("unknown command {op:?}");
     command_refusal(
         errors::INVALID_PARAMS,
         field,
@@ -1381,7 +1349,7 @@ fn is_json(media_type: &str) -> bool {
         .is_some_and(|t| t.trim().eq_ignore_ascii_case("application/json"))
 }
 
-/// The command a `SendMessage`'s `params` carries, held to command/v2 — or
+/// The command a `SendMessage`'s `params` carries, held to the command extension — or
 /// the JSON-RPC error object refusing it. `Ok(None)` is a message that
 /// carries no command at all.
 ///
@@ -1393,7 +1361,7 @@ fn is_json(media_type: &str) -> bool {
 /// again for whatever reaches a send another way, so the two refuse the same
 /// requests the same way. In order:
 ///
-/// 1. a command needs command/v2 activated by the `A2A-Extensions` header
+/// 1. a command needs the command extension activated by the `A2A-Extensions` header
 ///    (`EXTENSION_NOT_ACTIVATED`) — a DataPart under `agentd` sent without it
 ///    is not a command a client can have meant, and it is not run as one;
 /// 2. and the message marked with it in `extensions` (`EXTENSION_NOT_MARKED`),
@@ -1502,7 +1470,7 @@ pub fn check_command(
             &[],
         ));
     }
-    let spec = if is_builtin_op(op) || removed_op(op).is_some() {
+    let spec = if is_builtin_op(op) {
         let Some(schema) = command_envelope(op) else {
             return Err(unknown_op_error(op, &op_field));
         };
@@ -1525,7 +1493,7 @@ pub fn check_command(
     }))
 }
 
-/// The command/v2 schema bundle, published next to the extension's URI.
+/// The command extension's schema bundle, published next to the extension's URI.
 ///
 /// The root is the object a command DataPart carries (`{"agentd": {…}}`);
 /// `$defs.envelopes.<op>` is each op's whole envelope, the schema
@@ -1572,7 +1540,7 @@ pub fn schema_bundle() -> Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "$id": super::schema_of(super::COMMAND_EXTENSION),
-        "title": "agentd command/v2",
+        "title": "agentd command",
         "description": "The data of a command DataPart. $defs/envelopes/$defs/<op> is each op's \
                         envelope; $defs/ops/<op> and $defs/reserved/<op> give its reply kind \
                         (message or task), arguments and result — for a message op the document \
@@ -1681,7 +1649,7 @@ mod tests {
     }
 
     /// A command send's params, as the listener reads them: `parts`, marked
-    /// with command/v2 unless `marked` is false.
+    /// with the command extension unless `marked` is false.
     fn send(parts: Value, marked: bool) -> Value {
         let mut message = json!({"role": "ROLE_USER", "messageId": "m-1", "parts": parts});
         if marked {
@@ -1746,7 +1714,7 @@ mod tests {
         envelope
     }
 
-    /// Every refusal command/v2 names, each in its shape — code, reason and
+    /// Every refusal the command extension names, each in its shape — code, reason and
     /// the field it concerns — and nothing refused that should run.
     #[test]
     fn command_check_refusals() {
@@ -1837,17 +1805,9 @@ mod tests {
         picky["configuration"]["acceptedOutputModes"] = json!([]);
         assert!(check(&picky).is_ok(), "an empty list names no preference");
 
-        // Ops nothing serves: removed (naming the replacement), held in
-        // reserve, a name under a prefix that is no member, none at all.
-        for (op, removed) in [
-            ("config.set", true),
-            ("pairing.code", true),
-            ("interface.info", true),
-            ("admin.lameduck", true),
-            ("ask_human", false),
-            ("_instance.nope", false),
-            ("_instance.", false),
-        ] {
+        // Ops nothing serves: held in reserve, a name under a prefix that is
+        // no member.
+        for op in ["ask_human", "_instance.nope", "_instance."] {
             let e = check(&command(json!({"op": op}))).unwrap_err();
             assert_eq!(
                 refused(&e),
@@ -1858,13 +1818,7 @@ mod tests {
                 ),
                 "{op}"
             );
-            let msg = e["message"].as_str().unwrap();
-            if removed {
-                let hint = removed_op(op).unwrap();
-                assert!(msg.contains(hint) && msg.contains(OPS_REMOVED_IN), "{msg}");
-            } else {
-                assert_eq!(msg, format!("unknown command {op:?}"));
-            }
+            assert_eq!(e["message"], format!("unknown command {op:?}"));
         }
         for missing in [json!({}), json!({"op": ""}), json!({"op": 7})] {
             let e = check(&command(missing.clone())).unwrap_err();

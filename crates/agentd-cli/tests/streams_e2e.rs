@@ -5,7 +5,7 @@
 //! processes them: life 1 emits with no consumer configured; life 2 adds the
 //! consumer with `from: earliest` and the backlog replays, in order, exactly
 //! once. Life 3 proves the durable offset: nothing re-fires.
-#![cfg(all(unix, feature = "workflow"))]
+#![cfg(unix)]
 
 mod common;
 
@@ -31,7 +31,7 @@ fn config(dir: &str, with_consumer: bool) -> String {
         ""
     };
     format!(
-        "config_version: \"1\"\nagent:\n  name: eventful\n\
+        "agent:\n  name: eventful\n\
          store:\n  kind: file\n  file:\n    path: {dir}/state\n  checkpoint:\n    debounce_ms: 0\n\
          streams:\n  orders:\n    retention: {{ max_events: 100 }}\n\
          workflows:\n  - name: producer\n    steps:\n\
@@ -118,7 +118,7 @@ fn an_undeclared_stream_is_refused_at_startup() {
     let cfg = format!("{dir}/c.yaml");
     std::fs::write(
         &cfg,
-        "config_version: \"1\"\nagent:\n  name: x\nstore:\n  kind: memory\n\
+        "agent:\n  name: x\nstore:\n  kind: memory\n\
          workflows:\n  - name: w\n    steps:\n\
          \x20     s: {kind: once}\n\
          \x20     e: {kind: emit, depends_on: [s], stream: nope, subject: a.b}\n\
@@ -155,7 +155,7 @@ fn a_correlate_start_fires_once_per_completed_pair() {
     std::fs::write(
         &cfg_path,
         format!(
-            "config_version: \"1\"\nagent:\n  name: joiner\n\
+            "agent:\n  name: joiner\n\
              store:\n  kind: file\n  file:\n    path: {dir}/state\n  checkpoint:\n    debounce_ms: 0\n\
              streams:\n  orders:\n    retention: {{ max_events: 100 }}\n\
              workflows:\n  - name: producer\n    steps:\n\
@@ -227,7 +227,7 @@ fn an_incomplete_join_fires_partial_when_its_window_expires() {
     std::fs::write(
         &cfg_path,
         format!(
-            "config_version: \"1\"\nagent:\n  name: escalator\n\
+            "agent:\n  name: escalator\n\
              store:\n  kind: file\n  file:\n    path: {dir}/state\n  checkpoint:\n    debounce_ms: 0\n\
              streams:\n  orders:\n    retention: {{ max_events: 100 }}\n\
              workflows:\n  - name: producer\n    steps:\n\
@@ -292,7 +292,7 @@ fn a_batching_stream_consumer_fires_once_per_group() {
     std::fs::write(
         &cfg_path,
         format!(
-            "config_version: \"1\"\nagent:\n  name: batcher\n\
+            "agent:\n  name: batcher\n\
              store:\n  kind: file\n  file:\n    path: {dir}/state\n  checkpoint:\n    debounce_ms: 0\n\
              streams:\n  ticks:\n    retention: {{ max_events: 100 }}\n\
              workflows:\n  - name: producer\n    steps:\n\
@@ -381,7 +381,7 @@ fn a_forwarded_emit_notifies_a_webhook_and_still_appends() {
     std::fs::write(
         &cfg_path,
         format!(
-            "config_version: \"1\"\nagent:\n  name: forwarder\n\
+            "agent:\n  name: forwarder\n\
              store:\n  kind: file\n  file:\n    path: {dir}/state\n  checkpoint:\n    debounce_ms: 0\n\
              streams:\n  outbox:\n    retention: {{ max_events: 100 }}\n\
              workflows:\n  - name: producer\n    steps:\n\

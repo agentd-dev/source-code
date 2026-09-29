@@ -10,8 +10,8 @@
 
 use super::mapping::{self, Vars};
 use super::{KeySeq, PutOutcome, Store, StoreError};
-use crate::config::v2::{StoreMcp, StoreOp};
-use crate::wire::mcp::CallToolResult;
+use crate::config::settings::{StoreMcp, StoreOp};
+use ::mcp::wire::CallToolResult;
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
@@ -400,7 +400,7 @@ mod tests {
     fn default_profile_round_trips_with_cas_and_meta() {
         let srv = Arc::new(FakeServer::default());
         let s = store(srv.clone());
-        let env = json!({"v": 2, "kind": "run", "id": "1", "seq": 1, "state": {"x": 1}});
+        let env = json!({"kind": "run", "id": "1", "seq": 1, "state": {"x": 1}});
         assert_eq!(s.put("agentd/i/run/1", 1, &env).unwrap(), PutOutcome::Ok);
         assert_eq!(
             s.put("agentd/i/run/1", 1, &env).unwrap(),

@@ -32,7 +32,7 @@ impl BreakerState {
             _ => BreakerState::Closed,
         }
     }
-    /// The wire spelling published in the `agentd://intelligence` resource body.
+    /// The wire spelling a status body publishes.
     pub fn as_str(self) -> &'static str {
         match self {
             BreakerState::Closed => "closed",

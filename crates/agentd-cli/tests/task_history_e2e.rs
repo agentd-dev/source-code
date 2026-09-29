@@ -83,7 +83,7 @@ fn boot(llm: &str) -> (Daemon, String) {
         std::fs::write(
             &cfg_path,
             format!(
-                "config_version: \"1\"\n\
+                "\
                  agent:\n  name: history-e2e\n  instruction: You are a helpful test agent.\n  preflight: never\n\
                  intelligence:\n  endpoints: {llm}\n  model: mock\n\
                  store:\n  kind: memory\n\
@@ -273,7 +273,7 @@ fn history_carries_the_turn() {
         "workflow.run"
     );
     // Which op it runs is a task annotation, carried only for a read that
-    // activates task-annotations/v1.
+    // activates task-annotations.
     let annotated = common::rpc_activating(
         &addr,
         901,

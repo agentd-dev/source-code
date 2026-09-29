@@ -5,7 +5,7 @@
 //! The two properties worth testing are the ones no other wait has:
 //! `match` sees THIS run's inputs beside the event (so correlation is
 //! expressible at all), and a timeout makes ABSENCE a declared branch.
-#![cfg(all(unix, feature = "workflow", feature = "cel"))]
+#![cfg(all(unix, feature = "cel"))]
 
 mod common;
 
@@ -27,7 +27,7 @@ fn run(cfg_text: &str) -> (Option<i32>, String) {
     (out.status.code(), log)
 }
 
-const BASE: &str = "config_version: \"1\"\nagent: { name: e }\n\
+const BASE: &str = "agent: { name: e }\n\
      store: { kind: file, file: { path: __STATE__ } }\n\
      observability: { log_level: info, log_content: true }\n\
      lifecycle: { run_until: idle, idle_grace: 3s }\n\

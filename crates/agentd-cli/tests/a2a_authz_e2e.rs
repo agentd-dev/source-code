@@ -207,7 +207,7 @@ fn respawn(cfg: &str, cfg_for: impl Fn(u16) -> String) -> Daemon {
 /// subscribe, which is exactly the surface under test.
 fn two_principal_config(llm: &str, port: u16) -> String {
     format!(
-        "config_version: \"1\"\n\
+        "\
          agent:\n  name: a2a-authz\n  instruction: You are a helpful test agent.\n  preflight: never\n\
          intelligence:\n  endpoints: {llm}\n  model: mock\n\
          store:\n  kind: memory\n\
@@ -467,7 +467,7 @@ fn rss_kb(pid: u32) -> u64 {
 /// measurement from being about the size of the log file.
 fn loopback_config(port: u16) -> String {
     format!(
-        "config_version: \"1\"\n\
+        "\
          agent:\n  name: a2a-leak\n  instruction: You are a test agent.\n  preflight: never\n\
          intelligence:\n  endpoints: https://127.0.0.1:9\n  model: mock\n\
          store:\n  kind: memory\n\
@@ -701,7 +701,7 @@ fn extended_card_needs_a_declared_scheme_credential() {
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "hello pub"}]}));
     let (mut daemon, cfg) = spawn_daemon(|port| {
         format!(
-            "config_version: \"1\"\n\
+            "\
          agent:\n  name: a2a-authz\n  instruction: You are a helpful test agent.\n  preflight: never\n\
          intelligence:\n  endpoints: {llm}\n  model: mock\n\
          store:\n  kind: memory\n\
@@ -795,12 +795,11 @@ fn a_browser_origin_is_never_the_implicit_operator() {
 
 /// A reload REBUILDS the principal rules — proven by revocation taking effect.
 ///
-/// Principals compile into a `Resolver` at startup. Until v1.4.0 the listener
-/// held the one built at boot forever: an operator could demote a principal,
-/// reload, watch `config.reloaded` report success, and still be serving the
-/// old rules. v1.3.3 made that honest by refusing the reload; this makes it
-/// work. The demotion is the case worth testing, because a revocation that
-/// silently does not apply is the direction that costs you something.
+/// Principals compile into a `Resolver` at startup, and a reload rebuilds it:
+/// an operator who demotes a principal and reloads must be serving the new
+/// rules, not watching `config.reloaded` report success over the old ones.
+/// The demotion is the case worth testing, because a revocation that silently
+/// does not apply is the direction that costs you something.
 #[test]
 #[cfg(feature = "hot-reload")]
 fn a_reload_demotes_a_principal_and_the_revocation_takes_effect() {
@@ -809,7 +808,7 @@ fn a_reload_demotes_a_principal_and_the_revocation_takes_effect() {
     // privilege a demotion is meant to remove.
     let cfg_for = |role: &str, port: u16| {
         format!(
-            "config_version: \"1\"\n\
+            "\
              agent:\n  name: a2a-authz\n  instruction: You are a helpful test agent.\n  preflight: never\n\
              intelligence:\n  endpoints: {llm}\n  model: mock\n\
              store:\n  kind: memory\n\
@@ -891,7 +890,7 @@ fn owners_config(llm: &str, port: u16, b_grants: &str) -> String {
 
 fn owners_config_on(llm: &str, port: u16, b_grants: &str, store: &str) -> String {
     format!(
-        "config_version: \"1\"\n\
+        "\
          agent:\n  name: a2a-owners\n  instruction: You are a helpful test agent.\n  preflight: never\n\
          intelligence:\n  endpoints: {llm}\n  model: mock\n\
          {store}\
@@ -1814,7 +1813,7 @@ fn a_subagent_reads_status_as_its_owner() {
 fn listed_workflows_are_exactly_the_runnable_ones() {
     let (mut daemon, cfg) = spawn_daemon(|port| {
         format!(
-            "config_version: \"1\"\n\
+            "\
          agent:\n  name: a2a-runnable\n  instruction: You are a test agent.\n  preflight: never\n\
          intelligence:\n  endpoints: https://127.0.0.1:9\n  model: mock\n\
          store:\n  kind: memory\n\

@@ -1,16 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! **The shipped examples still load.**
 //!
-//! `examples/` is documentation people copy. When a config setting is renamed
-//! — and this project renames rather than deprecating — an example written
-//! against the old spelling stops working, silently, until somebody runs it.
-//! Two shipped examples had rotted that way (`instruction_sources:` after it
-//! moved under `agent.instruction.trust`, and `--instruction-file` in the
-//! runner scripts and the systemd unit), and nothing in the tree noticed.
+//! `examples/` is documentation people copy. When a config setting or a flag
+//! changes — and this project removes rather than deprecating — an example
+//! written against the old spelling stops working, silently, until somebody
+//! runs it.
 //!
 //! So: every example that IS an agentd config goes through `--validate-config`,
-//! the same authority startup runs, and every shipped script and unit file is
-//! checked for a flag the CLI now refuses.
+//! the same authority startup runs, and every flag a shipped script or unit
+//! file passes is held to the table the loader reads.
 #![cfg(unix)]
 
 #[cfg(all(feature = "cel", feature = "sign"))]
@@ -72,9 +70,14 @@ fn every_shipped_example_config_validates() {
     let mut failures = Vec::new();
     for f in &files {
         let text = std::fs::read_to_string(f).unwrap_or_default();
-        // An agentd config declares its version. Kubernetes manifests and
-        // standalone workflow documents live here too and are not ours to load.
-        if !text.lines().any(|l| l.starts_with("config_version:")) {
+        // Picked by SHAPE: Kubernetes manifests (a top-level `apiVersion:`)
+        // and standalone workflow documents (a top-level `steps:`) live here
+        // too and are not configs. Every other YAML file is one, so an example
+        // cannot opt out of the check by what it leaves out.
+        if text
+            .lines()
+            .any(|l| l.starts_with("apiVersion:") || l.starts_with("steps:"))
+        {
             continue;
         }
         // A `services.yaml` beside it is a shared catalog, not a config: the
@@ -115,8 +118,8 @@ fn every_shipped_example_config_validates() {
         }
     }
     assert!(
-        checked >= 5,
-        "only {checked} example configs found — wrong path?"
+        checked >= 20,
+        "only {checked} example configs found — wrong path, or a shape the sweep skips?"
     );
     assert!(
         failures.is_empty(),
@@ -137,19 +140,14 @@ fn every_shipped_example_config_validates() {
 #[test]
 fn the_server_fragment_layers_under_a_config_and_its_trifecta_is_refused() {
     let frag = examples_root().join("mcp-servers.fragment.json");
-    let text = std::fs::read_to_string(&frag).expect("the fragment is shipped");
-    assert!(
-        !text.contains("config_version"),
-        "a fragment must not claim to be a whole document — that is what makes \
-         `-c base -c fragment` the documented shape"
-    );
+    assert!(frag.exists(), "the fragment is shipped");
 
     // A base config the fragment layers under. Two of the four servers is a
     // legal agent; all four is not.
     let base = common::unique_path("frag-base", "yaml");
     std::fs::write(
         &base,
-        "config_version: \"1\"\nagent: { name: frag, instruction: \"be terse\", preflight: never }\n\
+        "agent: { name: frag, instruction: \"be terse\", preflight: never }\n\
          intelligence: { endpoints: [\"mock:final\"], model: mock }\nstore: { kind: memory }\n",
     )
     .unwrap();
@@ -179,32 +177,97 @@ fn the_server_fragment_layers_under_a_config_and_its_trifecta_is_refused() {
             && merged.contains("egress"),
         "the refusal is the lesson, and must name the legs:\n{merged}"
     );
-
-    // …and the fragment is a v2 document even alone: a config whose only
-    // section is `mcp:` must not be mistaken for the retired flat schema.
-    let alone = run(&["-c".as_ref(), frag.as_os_str()]);
-    assert!(
-        !alone.contains("flat schema"),
-        "a document made of one v2 section is a v2 document:\n{alone}"
-    );
     let _ = std::fs::remove_file(&base);
 }
 
-/// The scripts and unit files people copy invoke the CLI directly, so a removed
-/// flag breaks them exactly as a removed config key breaks a YAML example —
-/// and `--validate-config` cannot see them.
-#[test]
-fn no_shipped_script_or_unit_uses_a_removed_flag() {
-    // The WHOLE table, not a subset. This once covered two of the sixteen
-    // spellings, with a comment explaining that shipped scripts still invoked
-    // several of the rest — which is a note that the check does not check,
-    // and three runner scripts stayed broken behind it. Reading the authority
-    // means a flag retired tomorrow is covered tomorrow.
-    let removed: Vec<&str> = agentd::config::v2::REMOVED_FLAGS
-        .iter()
-        .map(|(f, _)| *f)
-        .collect();
+/// The CLI's hidden re-exec and per-process flags: consumed by `main` before
+/// the settings loader sees the argv, so no loader table lists them.
+const MAIN_FLAGS: &[&str] = &[
+    "--fresh",
+    "--prompt-missing",
+    "--env",
+    "--internal-mock-mcp-http",
+    "--internal-mock-llm",
+    "--no-emit",
+];
 
+/// Every flag an agentd invocation in `text` passes, with the line it starts
+/// on. An invocation is what follows the binary — `agentd`, `$AGENTD` or a
+/// path ending in `/agentd` — on one logical line: shell continuations are
+/// joined, and in Python the bracketed argv the binary opens. A Kubernetes
+/// manifest's `args:` items are the container's, and every container shipped
+/// here runs agentd.
+fn invoked_flags(path: &Path, text: &str) -> Vec<(usize, String)> {
+    let yaml = path.extension().is_some_and(|e| e == "yaml" || e == "yml");
+    let python = path.extension().is_some_and(|e| e == "py");
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let start = i;
+        let first = lines[i].trim_start();
+        if first.starts_with('#') || first.starts_with("//") {
+            i += 1;
+            continue;
+        }
+        if yaml {
+            if let Some(item) = first.strip_prefix("- ")
+                && item.trim().starts_with("--")
+            {
+                out.push((start + 1, item.trim().to_string()));
+            }
+            i += 1;
+            continue;
+        }
+        // One logical line: a trailing `\` continues it, and in Python an
+        // open bracket does.
+        let mut logical = lines[i].trim_end().to_string();
+        let open = |l: &str| l.matches('[').count() as i64 - l.matches(']').count() as i64;
+        let mut depth = open(&logical);
+        while i + 1 < lines.len() && (logical.ends_with('\\') || (python && depth > 0)) {
+            logical = logical.trim_end_matches('\\').to_string();
+            i += 1;
+            logical.push(' ');
+            logical.push_str(lines[i].trim());
+            depth += open(lines[i]);
+        }
+        i += 1;
+        let tokens: Vec<&str> = logical
+            .split(|c: char| c.is_whitespace() || c == '=' || c == ',' || c == '[' || c == ']')
+            .map(|t| t.trim_matches(|c| c == '"' || c == '\'' || c == '\\'))
+            .filter(|t| !t.is_empty())
+            .collect();
+        let Some(bin) = tokens.iter().position(|t| {
+            *t == "agentd"
+                || *t == "$AGENTD"
+                || *t == "${AGENTD}"
+                || (t.ends_with("/agentd") && !t.starts_with('/') || *t == "/usr/local/bin/agentd")
+        }) else {
+            continue;
+        };
+        // In Python only the argv the binary opens is its own.
+        if python && !logical.contains("[agentd") {
+            continue;
+        }
+        for t in &tokens[bin + 1..] {
+            if t.starts_with("--") && t.len() > 2 {
+                out.push((start + 1, (*t).to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// The scripts and unit files people copy invoke the CLI directly, so a flag
+/// the loader does not know breaks them exactly as an unknown config key
+/// breaks a YAML example — and `--validate-config` cannot see them.
+///
+/// Every `--flag` an agentd invocation passes, in every shipped non-Markdown
+/// file under `examples/`, `packaging/` and `bench/`, must be one the loader
+/// accepts ([`agentd::config::settings::is_known_flag`], the same tables
+/// `load` reads) or one `main` consumes first.
+#[test]
+fn every_flag_a_shipped_script_passes_is_accepted() {
     let root = examples_root();
     let mut files = Vec::new();
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -223,42 +286,58 @@ fn no_shipped_script_or_unit_uses_a_removed_flag() {
     }
     walk(&root, &mut files);
     walk(&root.join("../packaging"), &mut files);
-    // The benchmark harness drives the same CLI, and rotted the same way: it
-    // still spelled `--mode once` long after modes were removed, so every
-    // offline run in bench/README.md's quick start exited 2.
     walk(&root.join("../bench"), &mut files);
 
+    let mut seen = 0;
     let mut hits = Vec::new();
     for f in &files {
-        // Prose may NAME a removed flag — a migration note saying it is gone is
-        // correct and useful. Only things that get executed are scanned.
+        // Prose is the docs' to keep true; only what gets executed is here.
         if f.extension().is_some_and(|e| e == "md") {
             continue;
         }
         let Ok(text) = std::fs::read_to_string(f) else {
             continue;
         };
-        for (n, line) in text.lines().enumerate() {
-            // A comment explaining the migration is fine; an invocation is not.
-            if line.trim_start().starts_with('#') {
-                continue;
-            }
-            for flag in &removed {
-                // A token boundary, not a substring: `--model` contains
-                // `--mode`, and `--claim` prefixes `--claim-ttl`. Matching
-                // loosely reported three false positives on the first run.
-                if line
-                    .split(|c: char| c.is_whitespace() || c == '=')
-                    .any(|t| t.trim_matches(|c| c == '"' || c == '\'' || c == '\\') == *flag)
-                {
-                    hits.push(format!("{}:{}: {}", f.display(), n + 1, line.trim()));
-                }
+        for (line, flag) in invoked_flags(f, &text) {
+            seen += 1;
+            if !agentd::config::settings::is_known_flag(&flag) && !MAIN_FLAGS.contains(&&*flag) {
+                hits.push(format!("{}:{line}: {flag}", f.display()));
             }
         }
     }
     assert!(
+        seen >= 20,
+        "only {seen} flags found in shipped agentd invocations — wrong path, or a shape the scan misses?"
+    );
+    assert!(
         hits.is_empty(),
-        "shipped files invoke flags the CLI refuses:\n{}",
+        "shipped files pass flags the CLI does not accept:\n{}",
         hits.join("\n")
+    );
+}
+
+/// The scan itself: a continued shell line, a Python argv, a manifest's args
+/// and a flag BEFORE the binary (a `COPY --from=`) that is not agentd's.
+#[test]
+fn the_flag_scan_reads_each_invocation_shape() {
+    let sh = "exec \"$AGENTD\" \\\n  --config x.yaml \\\n  --max-tokens 5\nCOPY --from=build /agentd /usr/local/bin/agentd\n# agentd --commented\n";
+    assert_eq!(
+        invoked_flags(Path::new("run.sh"), sh),
+        vec![(1, "--config".into()), (1, "--max-tokens".into())]
+    );
+    let py = "argv = [agentd, \"--instruction\", x,\n        \"--log-level\", \"info\"]\nstub = [sys.executable, \"--addr-file\", f]\n";
+    assert_eq!(
+        invoked_flags(Path::new("run.py"), py),
+        vec![(1, "--instruction".into()), (1, "--log-level".into())]
+    );
+    let yaml = "args:\n  - --mcp\n  - fs=https://x\n";
+    assert_eq!(
+        invoked_flags(Path::new("job.yaml"), yaml),
+        vec![(2, "--mcp".into())]
+    );
+    let unit = "ExecStart=/usr/local/bin/agentd \\\n  --drain-timeout 25s\n";
+    assert_eq!(
+        invoked_flags(Path::new("a.service"), unit),
+        vec![(1, "--drain-timeout".into())]
     );
 }

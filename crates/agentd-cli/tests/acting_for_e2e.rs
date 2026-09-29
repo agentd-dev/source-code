@@ -1,17 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! `acting_for`: the attribution chain that travels with the work.
 //!
-//! Four config surfaces parsed, validated and were read by nothing —
-//! `principals[].quotas.rate`, `.budget`, `Principal::scope_key` and
-//! `BudgetScope`. And a trigger firing carried no principal at all, so "every
-//! effect names the human or the schedule that caused it" was false by
-//! construction: the chain was dropped at its very first hop.
+//! Every effect names the human or the schedule that caused it — a trigger
+//! firing carries its principal from the first hop — and the per-principal
+//! quotas (`principals[].quotas.rate`, `.budget`) are what that principal's
+//! work is held to.
 //!
 //! The claim here is narrow and worth keeping narrow. This is an audit field
 //! plus quota enforcement — NOT multi-tenancy, which this project has
 //! declined: the answer to "a different caller needs a different surface" is a
 //! different process.
-#![cfg(all(unix, feature = "workflow"))]
+#![cfg(unix)]
 
 mod common;
 
@@ -33,7 +32,7 @@ fn run(cfg_text: &str) -> (Option<i32>, String) {
     (out.status.code(), log)
 }
 
-const BASE: &str = "config_version: \"1\"\n\
+const BASE: &str = "\
      store: { kind: file, file: { path: __STATE__ } }\n\
      observability: { log_level: info, log_content: true }\n\
      lifecycle: { run_until: idle, idle_grace: 2s }\n";

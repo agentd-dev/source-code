@@ -1333,9 +1333,6 @@
         "url": {
           "description": "fetched over HTTP(S) at startup; fail-closed if unreachable",
           "type": "string"
-        },
-        "version": {
-          "const": 3
         }
       },
       "required": [
@@ -2453,7 +2450,7 @@
       "type": "object"
     }
   },
-  "$id": "https://agentd.dev/schema/config-1.json",
+  "$id": "https://agentd.dev/schema/config.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "description": "agentd configuration document (YAML or JSON; several files merge in order; every path is also AGENTD_<PATH> and --<path>)",
@@ -2531,7 +2528,7 @@
           "additionalProperties": false,
           "properties": {
             "enabled": {
-              "description": "declare the events/v1 extension and serve its observation feed; requires a2a.listen; restart-only",
+              "description": "declare the events extension and serve its observation feed; requires a2a.listen; restart-only",
               "type": "boolean"
             }
           },
@@ -3116,11 +3113,6 @@
         }
       },
       "type": "object"
-    },
-    "config_version": {
-      "const": "1",
-      "description": "the document version",
-      "type": "string"
     },
     "context": {
       "additionalProperties": false,
@@ -4253,7 +4245,6 @@
       "type": "array"
     }
   },
-  "title": "agentd configuration (config_version 1)",
-  "type": "object",
-  "x-agentd-contract-version": "1.0"
+  "title": "agentd configuration",
+  "type": "object"
 }

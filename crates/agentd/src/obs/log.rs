@@ -109,11 +109,6 @@ static STDERR_LOCK: Mutex<()> = Mutex::new(());
 // `dropped`, never blocking — a slow or dead subscriber can never back-pressure
 // the supervisor.
 
-/// Envelope version for the `debug.events` read body. Bumped only on a
-/// breaking change to the `{oldest_seq,newest_seq,dropped,events}` envelope —
-/// never for the per-line schema, which is versioned independently of this.
-pub const EVENTS_SCHEMA: &str = "1.0";
-
 /// Default ring capacity, overridable with `observability.events_ring`
 /// (`--events-ring`): the last N emitted lines held in memory. Bounds memory on
 /// a slow subscriber.

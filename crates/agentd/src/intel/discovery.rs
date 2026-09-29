@@ -13,13 +13,10 @@
 //! dialed regardless, which is why discovery can be absent without breaking a
 //! run.
 //!
-//! The surfaces that consume the result — `agentd://intelligence` and the
-//! capabilities manifest's `intelligence.models` — are served supervisor-side,
-//! which is where a caller is expected to fire the probe: lazily, on a read of
-//! the served surface, and behind its own cache. Those reads are infrequent and
-//! operator-driven, so a cached probe at that seam costs a run nothing and keeps
-//! the discovery field off the control protocol entirely. This module is the
-//! pure probe: it holds no cache, no TTL and no state of its own, so every
+//! A caller fires the probe lazily, on an operator's read, and behind its own
+//! cache — such reads are infrequent, so a cached probe costs a run nothing and
+//! keeps the discovery field off the control protocol entirely. This module is
+//! the pure probe: it holds no cache, no TTL and no state of its own, so every
 //! caller is responsible for not re-probing on every read.
 
 use std::time::Duration;
@@ -49,9 +46,8 @@ pub struct DiscoveryResult {
 /// `discovery` false. It is never fatal and never counts as a failover-class
 /// error, so a probe must not be able to trip an endpoint's circuit breaker.
 ///
-/// Must not be called on the hot path or at startup — only when the served
-/// `agentd://intelligence` or live `agentd://capabilities` surface is actually
-/// read. It probes every endpoint on every call, so the caller must cache the
+/// Must not be called on the hot path or at startup — only when an operator
+/// reads the result. It probes every endpoint on every call, so the caller must cache the
 /// result rather than re-running it per read.
 pub fn discover(list: &EndpointList, model: Option<&str>, timeout: Duration) -> DiscoveryResult {
     let mut models: Vec<String> = Vec::new();

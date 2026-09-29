@@ -36,7 +36,6 @@
 # that comes BACK into prompts later — the tag is how that round trip stays
 # honest. Upserts must be idempotent by external id (the lead_id).
 # ─────────────────────────────────────────────────────────────────────────────
-config_version: "1"
 
 agent:
   name: sales

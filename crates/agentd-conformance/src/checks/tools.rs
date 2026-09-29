@@ -34,7 +34,7 @@ pub fn checks() -> Vec<Check> {
 
 fn job_config(llm: &str) -> String {
     format!(
-        "config_version: \"1\"\n\
+        "\
          agent:\n  instruction: do a thing\n\
          intelligence:\n  endpoints: {llm}\n  model: mock\n\
          observability:\n  log_level: info\n"
@@ -131,11 +131,9 @@ fn registry_introspection(h: &Harness) -> Outcome {
             return Outcome::fail(format!("capabilities not JSON: {e}; stdout:\n{}", r.stdout));
         }
     };
-    Outcome::require(v["runtime"] == "1", format!("runtime should be 1: {v}")).and(|| {
-        let tools = v["internal_tools"].as_array().cloned().unwrap_or_default();
-        Outcome::require(
-            tools.iter().any(|t| t == "workflow.run"),
-            format!("internal tool registry should list workflow.run: {tools:?}"),
-        )
-    })
+    let tools = v["internal_tools"].as_array().cloned().unwrap_or_default();
+    Outcome::require(
+        tools.iter().any(|t| t == "workflow.run"),
+        format!("internal tool registry should list workflow.run: {tools:?}"),
+    )
 }

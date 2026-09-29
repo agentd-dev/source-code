@@ -59,9 +59,9 @@ pub fn check_url(url: &str, allow_private: bool) -> Result<(), String> {
 /// `event` is the body as built — a `StreamResponse` for a task delivery (see
 /// [`crate::a2a::wire::push_body`]). The headers are the spec's: the A2A media
 /// type, and `Authorization: <scheme> <credentials>` when the caller registered
-/// authentication (§4.3.3). `X-A2A-Notification-Token` is a legacy courtesy:
-/// 1.0 does not define it, but the official a2a-python 1.x receiver still reads
-/// the caller's token from it, so a registered token keeps travelling there.
+/// authentication (§4.3.3). `X-A2A-Notification-Token` is an interop header the
+/// a2a-python 1.x receiver reads: 1.0 does not define it, but that receiver
+/// takes the caller's token from it, so a registered token travels there.
 pub fn deliver(target: &PushTarget, event: &Value, allow_private: bool) -> Result<(), String> {
     // Guarded again here, not only at registration: the name resolved once when
     // the caller registered, and nothing stops it resolving elsewhere now. This
@@ -148,7 +148,8 @@ pub fn to_wire(task_id: &str, t: &PushTarget) -> Value {
 /// * `credentials` must be non-empty and free of control characters, so a CR
 ///   or LF cannot end the header and start another.
 ///
-/// The legacy `token` rides in a header line too (`x-a2a-notification-token`),
+/// The `token` rides in a header line too (`x-a2a-notification-token`, an
+/// interop header the a2a-python 1.x receiver reads),
 /// so it is held to the same rule: the transport refuses a CR or LF in a
 /// header, and a token carrying one would fail every delivery silently —
 /// delivery is best-effort — where refusing it here tells the caller.
@@ -311,7 +312,7 @@ mod tests {
         refused(json!({"scheme": "Bearer", "credentials": ""}));
         refused(json!({"scheme": "Bearer", "credentials": "k\r\nX-Evil: 1"}));
         refused(json!({"scheme": "Bearer", "credentials": "k\u{7f}"}));
-        // The legacy token is a header value too.
+        // The token is a header value too.
         for token in ["t\r\nX-Evil: 1", "t\n", "t\u{0}"] {
             let cfg = typed(json!({"url": "https://hooks.example/x", "token": token}));
             let e = from_wire(&cfg, "p".into()).expect_err(&format!("{cfg} must be refused"));
@@ -329,7 +330,8 @@ mod tests {
     }
 
     /// What a receiver actually sees: the A2A media type, the registered
-    /// authentication as one `Authorization` line, and the legacy token header.
+    /// authentication as one `Authorization` line, and the token under the
+    /// interop header the a2a-python 1.x receiver reads.
     #[test]
     fn a_delivery_carries_the_registered_authentication() {
         use std::io::{BufRead, BufReader, Read, Write};

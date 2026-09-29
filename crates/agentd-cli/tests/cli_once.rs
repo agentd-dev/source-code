@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Black-box CLI test of the agentd supervisor: the binary loads a v2
+//! Black-box CLI test of the agentd supervisor: the binary loads a
 //! configuration, validates it, and — for a bare `once` job — spawns a root
 //! turn worker and maps the outcome to an exit code. With an unreachable
 //! intelligence endpoint the run fails fast with exit 4 (intel unavailable) and
 //! must not hang or leak. The validation gate (exit 2) fires before any side
-//! effect. A retired `--mode` invocation is rejected with a migration hint.
+//! effect.
 
 use std::process::Command;
 
 #[test]
-fn validate_config_rejects_retired_intelligence_transports() {
-    // HTTPS-only intelligence: the retired unix:/vsock: schemes and non-loopback
-    // plaintext http:// are exit 2 at the validation gate; https:// (and loopback
-    // http://) pass. `--instruction`/`--intelligence` alias onto the v2 schema.
+fn validate_config_rejects_non_https_intelligence() {
+    // HTTPS-only intelligence: socket schemes and non-loopback plaintext
+    // http:// are exit 2 at the validation gate; https:// (and loopback
+    // http://) pass. `--instruction`/`--intelligence` alias onto the settings.
     let exe = env!("CARGO_BIN_EXE_agentd");
     let run = |intel: &str| {
         Command::new(exe)
@@ -52,16 +52,12 @@ fn validate_config_rejects_retired_intelligence_transports() {
 
 #[test]
 fn yaml_config_path_env_and_generic_flags_pass_the_validation_gate() {
-    // Black-box: a v2 YAML config file, a path-derived env var, and a generic
+    // Black-box: a YAML config file, a path-derived env var, and a generic
     // `--<path>` flag all reach `--validate-config` through the real binary.
     let exe = env!("CARGO_BIN_EXE_agentd");
     let dir = tempfile::tempdir().unwrap();
     let cfg = dir.path().join("agentd.yaml");
-    std::fs::write(
-        &cfg,
-        "# yaml config\nconfig_version: \"1\"\nlimits:\n  max_runs: 4\n",
-    )
-    .unwrap();
+    std::fs::write(&cfg, "# yaml config\nlimits:\n  max_runs: 4\n").unwrap();
     let base = |extra: &[&str], env: &[(&str, &str)]| {
         let mut cmd = Command::new(exe);
         cmd.args([
@@ -95,7 +91,7 @@ fn yaml_config_path_env_and_generic_flags_pass_the_validation_gate() {
     assert_eq!(bad.status.code(), Some(2), "stderr:\n{stderr}");
     assert!(stderr.contains("AGENTD_LIMITS_MAX_RUNS"), "{stderr}");
     // So is a YAML typo (unknown key), before any side effect.
-    std::fs::write(&cfg, "config_version: \"1\"\nmax_token: 5\n").unwrap();
+    std::fs::write(&cfg, "max_token: 5\n").unwrap();
     let typo = base(&[], &[]);
     let stderr = String::from_utf8_lossy(&typo.stderr);
     assert_eq!(typo.status.code(), Some(2), "stderr:\n{stderr}");
@@ -136,32 +132,4 @@ fn bad_flag_exits_2() {
         .output()
         .expect("run agentd");
     assert_eq!(out.status.code(), Some(2));
-}
-
-#[test]
-fn a_v1_mode_invocation_is_rejected_with_a_migration_hint() {
-    // There is no mode driver to select: `--mode` is a retired flag, refused at
-    // the gate (exit 2) with an error that names it so the call can be migrated.
-    let exe = env!("CARGO_BIN_EXE_agentd");
-    let out = Command::new(exe)
-        .args([
-            "--mode",
-            "reactive",
-            "--instruction",
-            "hi",
-            "--intelligence",
-            "http://127.0.0.1:9",
-        ])
-        .output()
-        .expect("run agentd");
-    assert_eq!(
-        out.status.code(),
-        Some(2),
-        "stderr:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("--mode"),
-        "names the retired flag"
-    );
 }

@@ -2,12 +2,12 @@
 //! **A spec error code means what the spec says, and nothing else.**
 //!
 //! A2A gives `-32003` one meaning — push notifications are not supported — and
-//! `-32007` one meaning — this agent has no extended card. agentd once answered
-//! "not authorized" with the first and "who are you?" with the second, so a
-//! client that branched on the spec's code told its user to turn on push
-//! notifications when the real answer was "sign in". Identity refusals now have
-//! codes of their own (`a2a::errors::{UNAUTHENTICATED, PERMISSION_DENIED}`), and
-//! this file keeps the two spec codes where they belong:
+//! `-32007` one meaning — this agent has no extended card. A client branches on
+//! the spec's code, so answering "not authorized" with either would tell its
+//! user to turn on push notifications when the real answer is "sign in".
+//! Identity refusals have codes of their own
+//! (`a2a::errors::{UNAUTHENTICATED, PERMISSION_DENIED}`), and this file keeps
+//! the two spec codes where they belong:
 //!
 //! * `-32003` is raised only by `Runtime::push_enabled`, the one check that
 //!   knows whether push is on;

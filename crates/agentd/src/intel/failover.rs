@@ -89,9 +89,8 @@ pub fn is_transient_status(code: u16) -> bool {
 
 /// The result of one failover sweep, plus the side-channel of breaker and
 /// active-endpoint transitions. The sweep observes these but emits nothing
-/// itself; the caller turns them into metrics, events and the
-/// `agentd://intelligence` body, which keeps this module free of observability
-/// dependencies.
+/// itself; the caller turns them into metrics and events, which keeps this
+/// module free of observability dependencies.
 pub struct SweepResult {
     pub outcome: Result<Response, IntelError>,
     /// `(from, to)` if a failover advanced the endpoint within the sweep.

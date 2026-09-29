@@ -24,12 +24,6 @@ pub fn resolve_headers(templates: &[(String, String)]) -> Result<Vec<(String, St
         .collect()
 }
 
-/// Pre-flight (for `--validate-config` / startup): every header template must
-/// resolve, without retaining the bytes. Same diagnostics as [`resolve_headers`].
-pub fn headers_resolvable(templates: &[(String, String)]) -> Result<(), String> {
-    resolve_headers(templates).map(|_| ())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

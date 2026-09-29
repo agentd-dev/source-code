@@ -25,11 +25,10 @@
 //! terminal or the UI's socket. The one fd a client is meant to have reaches
 //! descriptor 3 only in that client, between fork and exec.
 
-use agentd::config::v2::{self, Ask};
+use agentd::config::settings::{self, Ask};
 use agentd::exit;
 use agentd::runtime::surface::launch::{
-    DEFAULT_UI_PORT, LAUNCH_FD, LAUNCHER_DOCS, LaunchClient, REMOVED_LAUNCHER_FLAGS, launch_client,
-    launch_endpoint,
+    DEFAULT_UI_PORT, LAUNCH_FD, LAUNCHER_DOCS, LaunchClient, launch_client, launch_endpoint,
 };
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
@@ -54,9 +53,10 @@ struct Options {
     open: bool,
 }
 
-/// Split the launcher's flags from the daemon's, refusing a removed one by
-/// name. Everything that is not the launcher's is passed on untouched, in
-/// order — the daemon loads exactly the arguments it would have been given.
+/// Split the launcher's flags from the daemon's. Everything that is not the
+/// launcher's is passed on untouched, in order — the daemon loads exactly the
+/// arguments it would have been given, and refuses one it does not know the
+/// way it would without the launcher.
 fn split_args(sub: &str, args: &[String]) -> Result<(Options, Vec<String>), String> {
     let mut opts = Options {
         daemon_log: None,
@@ -66,12 +66,6 @@ fn split_args(sub: &str, args: &[String]) -> Result<(Options, Vec<String>), Stri
     let mut daemon = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
-        if let Some((flag, hint)) = REMOVED_LAUNCHER_FLAGS.iter().find(|(f, _)| f == a) {
-            return Err(format!(
-                "agentd {sub} {flag} was removed in agentd {}: {hint}",
-                v2::KEYS_REMOVED_IN
-            ));
-        }
         match a.as_str() {
             "--daemon-log" => {
                 let path = it
@@ -98,8 +92,9 @@ pub fn run(sub: &str, args: &[String], env: &[(String, String)]) -> i32 {
         eprintln!("agentd {sub}: not a launcher subcommand");
         return exit::USAGE;
     };
-    // Before any configuration is read: a stale flag is the operator's to fix,
-    // and loading a config first would bury that under whatever it says.
+    // Before any configuration is read: a launcher flag missing its value is
+    // the operator's to fix, and loading a config first would bury that under
+    // whatever it says.
     let (opts, daemon_args) = match split_args(sub, args) {
         Ok(x) => x,
         Err(e) => {
@@ -216,12 +211,13 @@ pub fn run(sub: &str, args: &[String], env: &[(String, String)]) -> i32 {
 /// config secret — because that is what the scrub can keep: credentials read
 /// by code other than the loader (the AWS chain) pass through, and a same-uid
 /// process can read `/proc/<ppid>/environ` anyway.
-fn client_env(loaded: &v2::Loaded, env: &[(String, String)]) -> Vec<(String, String)> {
+fn client_env(loaded: &settings::Loaded, env: &[(String, String)]) -> Vec<(String, String)> {
     let mut scrub: std::collections::HashSet<String> =
-        v2::consumed_env_names(env).into_iter().collect();
+        settings::consumed_env_names(env).into_iter().collect();
     scrub.extend(agentd::sec::secret::secret_env_names(&loaded.doc));
-    // The name the pre-1.17 launcher handed the bearer over in: a client that
-    // still reads it must find nothing there.
+    // The TUI reads AGENTD_BEARER as a credential and refuses one beside
+    // --launch-fd, so a value inherited from the operator's shell would stop
+    // `agentd tui` before it signed in with its launch code.
     scrub.insert("AGENTD_BEARER".to_string());
     env.iter()
         .filter(|(k, _)| !scrub.contains(k))
@@ -503,8 +499,8 @@ mod tests {
     }
 
     /// The daemon loads exactly what it was given: the launcher takes its own
-    /// flags out and adds nothing — the `--interface.enabled` it used to push
-    /// is the kind of line this pins.
+    /// flags out and adds nothing, so a flag it slipped in would be a setting
+    /// the operator never wrote.
     #[test]
     fn the_daemon_args_are_the_ones_given_minus_the_launchers() {
         let given = args(&[
@@ -529,20 +525,6 @@ mod tests {
         // daemon's to accept or refuse.
         let (_, daemon) = split_args("tui", &args(&["--no-open", "--config", "a.yaml"])).unwrap();
         assert_eq!(daemon, args(&["--no-open", "--config", "a.yaml"]));
-    }
-
-    #[test]
-    fn a_removed_launcher_flag_is_refused_by_name() {
-        for (flag, hint) in REMOVED_LAUNCHER_FLAGS {
-            for sub in ["tui", "ui"] {
-                let e = split_args(sub, &args(&["--config", "a.yaml", flag])).unwrap_err();
-                assert!(
-                    e.contains(&format!("agentd {sub} {flag} was removed in agentd 1.17.0"))
-                        && e.contains(hint),
-                    "{e}"
-                );
-            }
-        }
     }
 
     #[test]

@@ -6,7 +6,7 @@
 //! things the unit tests cannot: that the document validates through the actual
 //! config loader, that every element is visible in `--capabilities`, and that
 //! the trust ladder refuses an ungranted family naming the exact grant to add.
-#![cfg(all(unix, feature = "workflow"))]
+#![cfg(unix)]
 
 use std::process::Command;
 
@@ -14,7 +14,6 @@ use serde_json::{Value, json};
 
 fn load(instruction: &str, capabilities: &[&str]) -> (bool, String, Value) {
     let cfg = json!({
-        "config_version": "1",
         "agent": {
             "name": "idoc-e2e", "preflight": "never",
             "instruction": instruction,

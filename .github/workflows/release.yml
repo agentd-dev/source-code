@@ -15,21 +15,18 @@ permissions:
 
 # Release artifacts ship the full cloud-native surface on the HTTPS-everywhere
 # transport (`tls` is a default feature — rustls/ring with bundled roots, so the
-# static binary trusts public CAs with no system bundle): the A2A v2 HTTPS
-# listener with mTLS/bearer principals (RFC 0029), /healthz+/readyz+/metrics,
-# UTC-cron scheduling, OTLP traces+logs, SIGHUP/inotify config hot-reload, and the
-# AAuth [DRAFT] agent-identity client (`--features aauth`). AAuth ships in the
+# static binary trusts public CAs with no system bundle): the A2A HTTPS listener
+# with mTLS/bearer principals (RFC 0029), /healthz+/readyz+/metrics, UTC-cron
+# scheduling, OTLP traces+logs, SIGHUP/inotify config hot-reload, and the AAuth
+# [DRAFT] agent-identity client (`--features aauth`). AAuth ships in the
 # artifact because its crypto (`ring`) is ALREADY linked by rustls (the `tls`
 # default) — zero marginal dependency, so the minimalism moat is untouched.
 # CEL (`--features cel`) is the one shipped feature that buys a crate for
-# config expressiveness alone (`cel-interpreter`, ~1.8 MiB) — carried since
-# 2.3.0, because a published binary without it refuses every `when:` guard at
-# config validation (an `iterate.until` then fails its step at run time, and a
-# start-node `filter` silently drops the event), which made every non-trivial
-# config a build-from-source job. The 1.x serve-mcp/serve-https/events/cluster
-# features were removed in 2.0; `workflow` survives as a feature — CI lints it
-# solo — but is not shipped, because the workflow engine itself compiles
-# unconditionally.
+# config expressiveness alone (`cel-interpreter`, ~1.8 MiB), because a binary
+# without it refuses every `when:` guard at config validation (an
+# `iterate.until` then fails its step at run time, and a start-node `filter`
+# silently drops the event), which would make every non-trivial config a
+# build-from-source job.
 env:
   FEATURES: "a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt"
 

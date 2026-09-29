@@ -3,8 +3,7 @@
 //! that records what it was handed: exactly the contract's argv, an
 //! environment with nothing the config loader reads and no config secret, a
 //! listening loopback socket on fd 3 for the web UI — and nothing else. Also:
-//! the removed launcher flags refused by name before any config is read, the
-//! postures the clients cannot use refused before anything is spawned, the
+//! the postures the clients cannot use refused before anything is spawned, the
 //! daemon log that will not write through a planted path, and the tied
 //! lifetimes.
 #![cfg(all(unix, feature = "a2a"))]
@@ -29,7 +28,7 @@ fn free_port() -> u16 {
 /// turn is ever run.
 fn config(port: u16, extra_a2a: &str, extra: &str) -> String {
     format!(
-        "config_version: \"1\"\n\
+        "\
          agent:\n  name: launcher-e2e\n  instruction: Test.\n  preflight: never\n\
          intelligence:\n  endpoints: https://127.0.0.1:9\n  model: mock\n{extra}\
          store:\n  kind: memory\n\
@@ -119,46 +118,14 @@ fn launch(s: &Scratch, args: &[&str], env: &[(&str, &str)]) -> (ExitStatus, Stri
     (status, s.read("launcher.err"))
 }
 
-/// A removed launcher flag is refused by name before any configuration is
-/// read — the `--config` here does not exist, so reading it would fail
-/// differently.
-#[test]
-fn removed_launcher_flags_are_refused_by_name() {
-    let s = Scratch::new();
-    for (sub, flag, hint) in [
-        ("tui", "--debug", "set a2a.introspection.enabled"),
-        ("ui", "--inline", "a display-client option"),
-        ("ui", "--debug", "set a2a.introspection.enabled"),
-        ("tui", "--inline", "a display-client option"),
-    ] {
-        let (status, err) = launch(
-            &s,
-            &[sub, flag, "--config", "/nonexistent/agentd.yaml"],
-            &[],
-        );
-        assert_eq!(status.code(), Some(2), "{sub} {flag}: {err}");
-        assert!(
-            err.contains(&format!("agentd {sub} {flag} was removed in agentd 1.17.0"))
-                && err.contains(hint),
-            "{sub} {flag}: {err}"
-        );
-        assert!(
-            !err.contains("npm") && !err.contains("@agentd-dev"),
-            "{sub} {flag}: {err}"
-        );
-        assert!(!err.contains("/nonexistent"), "no config was read: {err}");
-    }
-}
-
 /// The variables the daemon's configuration reads, each holding a value the
-/// client must never see.
+/// client must never see — and `AGENTD_BEARER`, which the TUI would read as a
+/// credential and refuse beside its launch code.
 const SEKRIT_ENV: &[(&str, &str)] = &[
     ("LLM_KEY", "sekrit-llm-key"),
-    ("AGENTD_BEARER", "sekrit-old-handoff"),
+    ("AGENTD_BEARER", "sekrit-tui-credential"),
     ("AGENTD_AGENT_DESCRIPTION", "sekrit-description"),
-    ("SERVE_BEARER", "sekrit-serve-bare"),
-    ("AGENTD_SERVE_BEARER", "sekrit-serve-branded"),
-    ("AGENT_SERVE_BEARER", "sekrit-serve-neutral"),
+    ("AGENTD_A2A_BEARER", "sekrit-a2a-bearer"),
 ];
 
 fn assert_nothing_leaked(s: &Scratch) {
@@ -297,7 +264,6 @@ fn the_launcher_forces_no_configuration() {
         listen.contains("\"events\":false") && listen.contains("\"introspection\":false"),
         "the launcher switched something on: {listen}"
     );
-    assert!(!dlog.contains("\"interface\":true"), "{dlog}");
 }
 
 /// `a2a.bearer` stays in the daemon: not in the client's argv, environment or
@@ -417,7 +383,7 @@ fn the_launcher_refuses_what_its_clients_cannot_use() {
         let cfg = s.write(
             "agentd.yaml",
             &format!(
-                "config_version: \"1\"\n\
+                "\
                  agent:\n  name: launcher-refuse\n  instruction: Test.\n  preflight: never\n\
                  intelligence:\n  endpoints: https://127.0.0.1:9\n  model: mock\n\
                  store:\n  kind: memory\n{listen_and_more}"

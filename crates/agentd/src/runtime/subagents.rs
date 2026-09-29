@@ -352,7 +352,7 @@ impl Runtime {
                         &self.settings.security.policies,
                         n,
                         &self.registry.tags_of(std::slice::from_ref(n)),
-                        crate::config::v2::PolicyCaller::Subagent,
+                        crate::config::settings::PolicyCaller::Subagent,
                     )
                 })
                 .collect()
@@ -703,7 +703,7 @@ impl Runtime {
             .settings
             .agent
             .wake_on()
-            .contains(&crate::config::v2::WakeEvent::SubagentResult)
+            .contains(&crate::config::settings::WakeEvent::SubagentResult)
         {
             self.note_root(format!("subagent {handle} {status}: {note}"));
         }
@@ -827,7 +827,7 @@ pub fn parse_rate(s: &str) -> (u32, f64) {
 /// explicit choice.
 fn apply_spawn_defaults(
     o: &mut serde_json::Map<String, Value>,
-    d: &crate::config::v2::SubagentDefaults,
+    d: &crate::config::settings::SubagentDefaults,
 ) {
     for (key, val) in [
         ("mode", d.mode.clone()),

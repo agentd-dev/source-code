@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The **agentd settings document** — one nested document (YAML or JSON;
-//! several files merge in order) whose every path is also `AGENTD_<PATH>` /
-//! `AGENT_<PATH>` / `<PATH>` and `--<path>`. This module holds the typed
-//! [`Settings`], its JSON Schema ([`schema::schema`]), the load pipeline
-//! (files → env → flags → typed → validated), the flat **alias** table
-//! (`--instruction`, `--intelligence`, `--model`, `--mcp`, …), the
-//! `agentd --instruction X` **sugar**, schema **detection**, and the reload
-//! partition (which paths only a restart can change).
+//! several files merge in order) whose every path is also `AGENTD_<PATH>` and
+//! `--<path>`. This module holds the typed [`Settings`], its JSON Schema
+//! ([`schema::schema`]), the load pipeline (files → env → flags → typed →
+//! validated), the flat **alias** table (`--instruction`, `--intelligence`,
+//! `--model`, `--mcp`, …), the `agentd --instruction X` **sugar**, and the
+//! reload partition (which paths only a restart can change).
 //!
 //! Layering: `built-in < files < env < flags`. Files compose with
 //! JSON-Merge-Patch semantics; env sets a path (lists and maps are replaced,
@@ -123,13 +122,12 @@ fn string_or_list<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>,
 // The document
 // ---------------------------------------------------------------------------
 
-/// The typed v2 settings document. Every object is `deny_unknown_fields`;
+/// The typed settings document. Every object is `deny_unknown_fields`;
 /// every section defaults so a minimal document (`agent.instruction` alone)
 /// is complete.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct Settings {
-    pub config_version: Option<String>,
     /// Named durable event streams: `{name: {retention: {max_events,
     /// max_age}}}`. A stream must be declared before an `emit` or `stream` node
     /// may reference it — an undeclared name is refused at startup rather than
@@ -358,7 +356,6 @@ pub enum Approval {
     /// Ask a person and wait. The default: a gate exists because someone
     /// wanted a decision, so the decision is theirs unless told otherwise.
     #[default]
-    #[serde(alias = "await", alias = "human")]
     Ask,
     /// An LLM judge decides whether it is safe to proceed, conservatively, and
     /// the answer is marked `via: auto` so nobody mistakes it for a person's.
@@ -369,7 +366,6 @@ pub enum Approval {
     /// schema `default`. With neither there is nothing to accept, and inventing
     /// an answer would be worse than the interruption, so it degrades to
     /// `auto` rather than guessing.
-    #[serde(alias = "accept_all", alias = "yes")]
     Accept,
 }
 
@@ -820,12 +816,7 @@ pub fn resolve_document_source(
             let key = instruction_key(scalar);
             serde_json::from_value(json!({ key: scalar })).map_err(|e| format!("{at}: {e}"))?
         }
-        Value::Object(_) => {
-            if let Some(m) = moved_under_dir(v) {
-                return Err(format!("{at}.{m}"));
-            }
-            serde_json::from_value(v.clone()).map_err(|e| format!("{at}: {e}"))?
-        }
+        Value::Object(_) => serde_json::from_value(v.clone()).map_err(|e| format!("{at}: {e}"))?,
         _ => return Err(format!("{at} must be a string or an object")),
     };
     // The same "exactly one source" arithmetic the agent's instruction gets,
@@ -885,22 +876,6 @@ pub fn resolve_document_source(
     Ok((value, Vec::new()))
 }
 
-/// `glob:`/`order:` beside `dir:` rather than inside it. They qualify the
-/// folder and nothing else, so the nested spelling is the only one — and a
-/// config written against the flat one is told exactly where it moved rather
-/// than being met with "unknown field".
-fn moved_under_dir(v: &Value) -> Option<String> {
-    for k in ["glob", "order"] {
-        if v.get(k).is_some() {
-            return Some(format!(
-                "{k} belongs inside `dir` — write `dir: {{path: …, {k}: …}}`; it \
-                 qualifies the folder and nothing else"
-            ));
-        }
-    }
-    None
-}
-
 /// Unix seconds, for signature `exp` checks.
 #[cfg(feature = "sign")]
 fn now_secs() -> u64 {
@@ -931,12 +906,11 @@ fn expand_home(path: &str) -> String {
 /// workflows, the servers it needs, its context and its limits are the first.
 /// Everything else is the operator's.
 ///
-/// The polarity is the fix. Until v1.16.0 this was a deny-list of six
-/// prefixes, which meant every section nobody had thought about was writable
-/// by default — including the service catalogue `security.egress: closed`
-/// reads, the principal table, the tool grant and the intelligence endpoints.
-/// An allow-list fails closed: a section added tomorrow is refused to a
-/// document until somebody classifies it.
+/// The polarity is the point. A deny-list leaves every section nobody thought
+/// about writable by default — the service catalogue `security.egress: closed`
+/// reads, the principal table, the tool grant, the intelligence endpoints. An
+/// allow-list fails closed: a section added tomorrow is refused to a document
+/// until somebody classifies it.
 ///
 /// Checked by PATH rather than by key name, because the fragment merges DEEP
 /// (arrays concatenate) and the specification states the rule in its own
@@ -1121,18 +1095,7 @@ pub const OPERATOR_ONLY: &[&str] = &[
     // become prompt text. The caps on the loader are the document's.
     "skills.dir",
     "skills.sources",
-    // Which settings schema the operator wrote against.
-    "config_version",
-    // The pre-1.13 spelling of `agent.instruction.trust`. Kept so a fragment
-    // written against the old surface is refused as OPERATOR configuration,
-    // which is what it is, rather than being handed the rename hint.
-    "instruction_sources",
 ];
-
-/// Entries of [`OPERATOR_ONLY`] that are deliberately NOT in the schema: a
-/// retired spelling a fragment may still be written against, which must be
-/// refused by name rather than silently ignored.
-pub const RETIRED_OPERATOR_SPELLINGS: &[&str] = &["instruction_sources"];
 
 /// Whether `path` is at or under one of `list`'s entries.
 fn path_covered(path: &str, list: &[&str]) -> bool {
@@ -1370,10 +1333,9 @@ pub struct Intelligence {
     /// has nowhere to write one.
     ///
     /// It never inherited tags either: `tags` is `kind: mcp` vocabulary and is
-    /// refused on a `kind: intelligence` entry. A `service:` key used to sit
-    /// here and was removed in 1.15 — it named a catalog entry, was validated,
-    /// and was then ignored, since the client is built from
-    /// `intelligence.endpoints` and nothing else.
+    /// refused on a `kind: intelligence` entry. A tier names no catalog entry
+    /// either: the client is built from `intelligence.endpoints` and nothing
+    /// else.
     pub models: BTreeMap<String, ModelTier>,
     /// Which tier is used when nothing names one. Falls back to `model`.
     pub default: Option<String>,
@@ -1549,8 +1511,8 @@ pub enum LifetimeExhausted {
     /// instance with a fresh window, which is what a lifetime budget is for.
     #[default]
     Drain,
-    /// Refuse every admission and stay up. The pre-1.15 behaviour — for an
-    /// operator who would rather inspect a stopped instance than lose it.
+    /// Refuse every admission and stay up — for an operator who would rather
+    /// inspect a stopped instance than lose it.
     Refuse,
     /// Stop now, exit 7 (`BUDGET`), abandoning live work.
     Exit,
@@ -3001,7 +2963,7 @@ impl<'de> Deserialize<'de> for DeviceScope {
     }
 }
 
-/// The observation feed (`https://agentd.dev/a2a/ext/events/v1`).
+/// The observation feed (`https://agentd.dev/a2a/ext/events`).
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct A2aEvents {
@@ -3727,7 +3689,6 @@ impl Settings {
     /// arriving from files, URLs and directories can be treated identically to
     /// inline ones.
     pub fn from_document(mut doc: Value, source: &str) -> Result<Settings, String> {
-        refuse_removed_keys(&doc, source)?;
         let vars: BTreeMap<String, Value> = doc
             .get("vars")
             .and_then(Value::as_object)
@@ -3768,15 +3729,6 @@ impl Settings {
         if let Some(v) = doc.get("agent").and_then(|a| a.get("instruction"))
             && v.is_object()
         {
-            if v.get("http").is_some() {
-                return Err(format!(
-                    "{source}: agent.instruction.http was renamed to `url` — the spelling a \
-                     workflow entry's HTTP source already uses"
-                ));
-            }
-            if let Some(m) = moved_under_dir(v) {
-                return Err(format!("{source}: agent.instruction.{m}"));
-            }
             let spec: InstructionSpec = serde_json::from_value(v.clone())
                 .map_err(|e| format!("{source}: agent.instruction: {e}"))?;
             let value = spec.source_value().map_err(|e| format!("{source}: {e}"))?;
@@ -4130,12 +4082,6 @@ impl Settings {
                     if let Some(a) = doc.get_mut("agent").and_then(Value::as_object_mut) {
                         a.insert("instruction".into(), Value::String(ex.cleaned.clone()));
                     }
-                    // Before the boundary check, which would call a removed
-                    // key "operator configuration" and name no replacement.
-                    refuse_removed_keys(
-                        &Value::Object(ex.config.clone()),
-                        &format!("{source}: the instruction's :::!config"),
-                    )?;
                     let forbidden = document_wrote_operator_config(&ex.config);
                     if !forbidden.is_empty() {
                         return Err(format!(
@@ -4177,23 +4123,6 @@ impl Settings {
             if let Some(a) = doc.get_mut("agent").and_then(Value::as_object_mut) {
                 a.insert("prompt".into(), Value::String(text));
             }
-        }
-        // `instruction_sources` moved under the instruction it protects, and
-        // was renamed on the way: `file`, `dir`, `url`, `oci` and `mcp` are
-        // the SOURCES, while these say who may sign what they serve.
-        if doc.get("instruction").is_some() {
-            return Err(format!(
-                "{source}: the top-level `instruction` section is gone — the envelope \
-                 recipient keys live at `agent.instruction.decrypt`, with everything else \
-                 about the instruction"
-            ));
-        }
-        if doc.get("instruction_sources").is_some() {
-            return Err(format!(
-                "{source}: instruction_sources moved to `agent.instruction.trust` — it is not \
-                 another source (file/dir/url/oci/mcp are), it is who may sign the document \
-                 those name"
-            ));
         }
         // A subagent template's instruction is a document too, and it takes
         // every source the agent's own instruction takes that can be resolved
@@ -4273,99 +4202,6 @@ impl Settings {
             || self.webhooks.listen.is_some()
             || self.goal.is_some()
             || self.workflows.iter().any(workflow_is_long_lived)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Detection
-// ---------------------------------------------------------------------------
-
-/// Top-level keys only the settings document has. `limits` is deliberately
-/// absent: it exists in both schemas, so it decides nothing. `intelligence`
-/// is absent for a different reason — it is a STRING (the endpoint list) in
-/// the flat schema but an OBJECT here, so [`detect`] judges it by shape.
-/// Every top-level section of the settings schema, minus the three that decide
-/// nothing.
-///
-/// DERIVED, not hand-listed. The list used to be a hand-maintained subset and
-/// had fallen seven sections behind — `mcp`, `services`, `identity`,
-/// `interface`, `goal`, `subagents` and `webhooks` were all missing, so a
-/// document whose only section was one of them (a `-c` overlay carrying just
-/// `mcp:`, say) fell through to `Detected::V1` and was refused as "the flat
-/// schema, which agentd does not accept". Reading the schema means a section
-/// added tomorrow is detected tomorrow.
-pub fn v2_keys() -> Vec<String> {
-    schema::schema()["properties"]
-        .as_object()
-        .map(|o| {
-            o.keys()
-                .filter(|k| !DETECTION_IGNORES.contains(&k.as_str()))
-                .cloned()
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Sections that cannot decide which schema a document speaks.
-/// `config_version` is judged explicitly; `limits` exists in BOTH schemas; and
-/// `intelligence` is a string in the flat one and an object here, so [`detect`]
-/// judges it by shape instead.
-pub const DETECTION_IGNORES: &[&str] = &["config_version", "limits", "intelligence"];
-
-/// v1 (flat) top-level keys.
-pub const V1_KEYS: &[&str] = &[
-    "intelligence_headers",
-    "model_swap",
-    "model",
-    "max_tokens",
-    "mcp_servers",
-    "subscribe",
-    "a2a_peers",
-    "log_level",
-];
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Detected {
-    /// No document at all (no config files).
-    Empty,
-    /// The v1 flat schema.
-    V1,
-    /// The v2 nested schema.
-    V2,
-    /// Both key families present — refused.
-    Mixed,
-}
-
-/// Decide which schema a merged document speaks.
-pub fn detect(doc: &Value) -> Detected {
-    let Some(obj) = doc.as_object() else {
-        return Detected::Empty;
-    };
-    if obj.is_empty() {
-        return Detected::Empty;
-    }
-    let version = obj.get("config_version").and_then(Value::as_str);
-    let intel_is_object = obj.get("intelligence").is_some_and(Value::is_object);
-    let intel_is_string = obj.get("intelligence").is_some_and(Value::is_string);
-    // A removed top-level section is still this schema's vocabulary: judged
-    // v1 instead, a file holding only `interface:` would get the flat-schema
-    // migration message rather than the refusal that names its replacement.
-    let has_v2 = version == Some(schema::CONFIG_VERSION) || intel_is_object || {
-        let v2 = v2_keys();
-        obj.keys()
-            .any(|k| v2.iter().any(|v| v == k) || REMOVED_KEYS.iter().any(|(path, _)| path == k))
-    };
-    let has_v1 = intel_is_string
-        || obj.keys().any(|k| V1_KEYS.contains(&k.as_str()))
-        || matches!(version, Some(v) if v != schema::CONFIG_VERSION);
-    match (has_v1, has_v2) {
-        (true, true) => Detected::Mixed,
-        (false, true) => Detected::V2,
-        (true, false) => Detected::V1,
-        // Only `config_version` absent + neither family (e.g. `{}` with a
-        // comment) or `intelligence`… every key was matched above; anything
-        // else is a v1 document for the v1 loader to judge.
-        (false, false) => Detected::V1,
     }
 }
 
@@ -4593,31 +4429,6 @@ pub const ALIASES: &[Alias] = &[
         kind: AliasKind::Set,
     },
     Alias {
-        flag: "--serve-mcp",
-        path: "a2a.listen",
-        kind: AliasKind::Set,
-    },
-    Alias {
-        flag: "--serve-cert",
-        path: "a2a.tls.cert",
-        kind: AliasKind::Set,
-    },
-    Alias {
-        flag: "--serve-key",
-        path: "a2a.tls.key",
-        kind: AliasKind::Set,
-    },
-    Alias {
-        flag: "--serve-client-ca",
-        path: "a2a.tls.client_ca",
-        kind: AliasKind::Set,
-    },
-    Alias {
-        flag: "--serve-bearer",
-        path: "a2a.bearer",
-        kind: AliasKind::Set,
-    },
-    Alias {
         flag: "--log-level",
         path: "observability.log_level",
         kind: AliasKind::Set,
@@ -4706,8 +4517,7 @@ pub const ALIASES: &[Alias] = &[
 
 /// Short env names → document paths. The derived `AGENTD_<PATH>` names are the
 /// primary surface; these are the shorter spellings a quickstart or a k8s
-/// manifest can use instead. Branded (`AGENTD_`) and neutral (`AGENT_`)
-/// prefixes both apply, as does the bare name.
+/// manifest can use instead, under the same one prefix (`AGENTD_MODEL`).
 pub const ENV_ALIASES: &[(&str, &str)] = &[
     ("INSTRUCTION", "agent.instruction"),
     ("PROMPT", "agent.prompt"),
@@ -4726,236 +4536,32 @@ pub const ENV_ALIASES: &[(&str, &str)] = &[
     ("LOG_CONTENT", "observability.log_content"),
     ("METRICS_ADDR", "observability.metrics_addr"),
     ("TRACEPARENT", "observability.traceparent"),
-    ("SERVE_MCP", "a2a.listen"),
-    ("SERVE_BEARER", "a2a.bearer"),
     ("TLS_CA", "security.tls_ca"),
     ("ALLOW_TRIFECTA", "security.allow_trifecta"),
     ("WATCH_CONFIG", "lifecycle.watch_config"),
 ];
 
-/// Flags agentd does not accept, each paired with the hint that replaces it.
-/// Naming one fails the load with its hint, so a stale command line is a loud
-/// error rather than a flag that is silently ignored.
-pub const REMOVED_FLAGS: &[(&str, &str)] = &[
-    // Renamed one release after it shipped: a workflow entry's HTTP source has
-    // been `url:` since long before `agent.instruction` had one, and two
-    // spellings for one concept is the kind of thing that never gets fixed
-    // later.
-    (
-        "--instruction.http",
-        "renamed to --instruction.url (`url:` in the config), the spelling a workflow entry already uses",
-    ),
-    // One spelling per concept. `--instruction.file` is the key of the long
-    // form, which is where every other instruction setting already lives.
-    (
-        "--instruction-file",
-        "use --instruction.file <PATH> (or --instruction <PATH>, which classifies a path-shaped value as a file)",
-    ),
-    (
-        "--prompt-file",
-        "use --prompt.file <PATH> (or --prompt <PATH>, classified the same way)",
-    ),
-    (
-        "--mode",
-        "modes are gone: give the workflow a start node (`once` | `loop` | `schedule` | `subscribe` | `signal` | `event` | `a2a` | `manual`) and set `lifecycle.run_until` if needed",
-    ),
-    (
-        "--subscribe",
-        "use a `subscribe` start node: `{kind: subscribe, server: <name>, uri: <uri>}`",
-    ),
-    (
-        "--continue",
-        "use a `subscribe` start node with `deliver: wait` (or a warm subagent)",
-    ),
-    (
-        "--interval",
-        "use a `loop` start node with `interval`, or a `schedule` start node with `every`",
-    ),
-    ("--cron", "use a `schedule` start node with `cron`"),
-    // Clustering has no replacement flag, deliberately: agentd owns no
-    // coordination protocol. A fleet partitions upstream instead — one
-    // subscription per replica, or the queue's own lease semantics called from
-    // a workflow step (docs/scaling.md).
-    (
-        "--shard",
-        "agentd does not partition work; give each replica its own subscription (docs/scaling.md)",
-    ),
-    (
-        "--claim",
-        "call the queue's own claim/lease tools from a workflow step (docs/scaling.md)",
-    ),
-    ("--claim-ttl", "it went with --claim"),
-    ("--claim-renew-fraction", "it went with --claim"),
-    (
-        "--standby",
-        "there is no standby pool; a worker replica is an ordinary instance with its own subscription",
-    ),
-    ("--assign-from", "it went with --standby"),
-    (
-        "--workflow-resume",
-        "automatic: runs resume from the store on restart (`resume_policy` per workflow)",
-    ),
-    (
-        "--workflow-resume-force",
-        "set `resume_policy: force` on the workflow",
-    ),
-];
-
-/// The release that removed the [`REMOVED_KEYS`], as every refusal names it.
-pub const KEYS_REMOVED_IN: &str = "1.17.0";
-
-/// Configuration keys agentd no longer accepts, each paired with the hint that
-/// replaces it. `[]` stands for any element of a list.
-///
-/// Refused BY NAME on every layer that can carry one — each file, the merged
-/// document, a `:::!config` fragment, a `--<path>` flag and an `AGENTD_<PATH>`
-/// variable — because each of them would otherwise fail differently or not at
-/// all: a file with `deny_unknown_fields` says "unknown field", a flag says
-/// "unknown argument", a fragment says "operator configuration", and an
-/// environment variable that binds no path is silently ignored. An operator
-/// upgrading needs the replacement, not four different shrugs.
-///
-/// Ordered most specific first: a lookup takes the first entry that matches,
-/// so `interface.enabled` gets its own replacement while the catch-all
-/// `interface` answers for everything else under it — `AGENTD_INTERFACE_LOG`,
-/// which the launcher used to read, included.
-pub const REMOVED_KEYS: &[(&str, &str)] = &[
-    (
-        "interface.enabled",
-        "use a2a.events.enabled — it declares the events extension and serves the observation feed (docs/configuration.md#removed-in-1-17-0)",
-    ),
-    (
-        "interface.debug",
-        "use a2a.introspection.enabled — reloadable, and independent of the feed (docs/configuration.md#removed-in-1-17-0)",
-    ),
-    (
-        "interface.display",
-        "the layout is the client's: agentd-tui --top/--bottom, AGENTD_TUI_TOP/AGENTD_TUI_BOTTOM, or /layout in the web UI; the memory values a status line shows are observability.status_values",
-    ),
-    (
-        "interface.origins",
-        "use a2a.cors.origins — exact origins, and a loopback UI origin has to be listed too",
-    ),
-    (
-        "interface.pairing",
-        "use a2a.device_grant — a client shows a code and an operator approves it with auth.device.approve",
-    ),
-    (
-        "interface",
-        "the display-client section is gone: the feed is a2a.events.enabled, introspection a2a.introspection.enabled, browser origins a2a.cors.origins, sign-in a2a.device_grant, and the launcher's log path is `agentd tui|ui --daemon-log PATH` (docs/configuration.md#removed-in-1-17-0)",
-    ),
-    (
-        "a2a.principals[].match.aauth_agent",
-        "match on san, sub or bearer_ref instead — nothing verified an inbound AAuth agent, so the rule matched nobody",
-    ),
-];
-
-/// A binding for `path`, so a removed key's flag and variable names are spelled
-/// by the same [`Binding`] methods that spell a live key's — a second
-/// derivation here would be a second spelling to fall out of step.
-fn removed_binding(path: &str) -> Binding {
-    Binding {
-        path: path.to_string(),
-        kind: paths::Kind::Any,
-        description: None,
-        entry_kind: None,
-    }
-}
-
-/// The first [`REMOVED_KEYS`] entry `doc` sets.
-pub fn removed_key_in(doc: &Value) -> Option<(&'static str, &'static str)> {
-    fn sets(v: &Value, segs: &[&str]) -> bool {
-        let Some((head, rest)) = segs.split_first() else {
-            return true;
-        };
-        match head.strip_suffix("[]") {
-            Some(key) => v
-                .get(key)
-                .and_then(Value::as_array)
-                .is_some_and(|items| items.iter().any(|e| sets(e, rest))),
-            None => v.get(*head).is_some_and(|child| sets(child, rest)),
-        }
-    }
-    REMOVED_KEYS
-        .iter()
-        .copied()
-        .find(|(path, _)| sets(doc, &path.split('.').collect::<Vec<_>>()))
-}
-
-/// The refusal for a removed key, in the one shape every layer uses.
-fn removed_key_error(source: &str, path: &str, hint: &str) -> String {
-    format!("{source}: `{path}` was removed in agentd {KEYS_REMOVED_IN}: {hint}")
-}
-
-/// Refuse a document — a file, the merged document, a fragment — that sets a
-/// removed key.
-pub fn refuse_removed_keys(doc: &Value, source: &str) -> Result<(), String> {
-    match removed_key_in(doc) {
-        Some((path, hint)) => Err(removed_key_error(source, path, hint)),
-        None => Ok(()),
-    }
-}
-
-/// The removed key a `--<path>` flag names, in any of its spellings. An entry
-/// reaching into a list (`[]`) has no flag — list elements are not addressable
-/// by path — and is caught on the document the whole-list flag sets instead.
-fn removed_key_of_flag(arg: &str) -> Option<(&'static str, &'static str)> {
-    let flag = removed_binding(arg.strip_prefix("--")?).flag();
-    REMOVED_KEYS
-        .iter()
-        .copied()
-        .filter(|(path, _)| !path.contains("[]"))
-        .find(|(path, _)| {
-            let want = removed_binding(path).flag();
-            flag == want || flag.starts_with(&format!("{want}-"))
-        })
-}
-
-/// The removed key an environment variable names: the branded spelling of the
-/// entry, or anything under it. Checked after debranding, so the neutral
-/// `AGENT_` spelling is refused too; the bare spelling is not, because
-/// `INTERFACE_*` is too generic a name to claim for agentd.
-fn removed_key_of_env(name: &str) -> Option<(&'static str, &'static str)> {
-    REMOVED_KEYS
-        .iter()
-        .copied()
-        .filter(|(path, _)| !path.contains("[]"))
-        .find(|(path, _)| {
-            let names = removed_binding(path).env_names();
-            let branded = &names[0];
-            name == branded || name.starts_with(&format!("{branded}_"))
-        })
-}
-
-/// The environment names one [`ENV_ALIASES`] entry is read under, most
-/// specific first — the same prefixes a derived path name takes.
-fn alias_env_names(alias: &str) -> Vec<String> {
-    paths::ENV_PREFIXES
-        .iter()
-        .map(|p| format!("{p}{alias}"))
-        .collect()
+/// The environment name one [`ENV_ALIASES`] entry is read under — the prefix
+/// a derived path name takes.
+fn alias_env_name(alias: &str) -> String {
+    format!("{}{alias}", paths::ENV_PREFIX)
 }
 
 /// Every variable in `env` the config loader would read.
 ///
 /// The launcher's scrub: `agentd tui|ui` hands its display client its own
 /// environment minus these, so a variable that set `a2a.bearer`
-/// (`SERVE_BEARER` under any prefix) or any other setting never reaches a
-/// process that has no business with the daemon's configuration. Derived from
-/// the tables the ENV layer itself iterates — every path's
-/// [`Binding::env_names`] and every [`ENV_ALIASES`] entry under every
-/// [`paths::ENV_PREFIXES`] spelling — so an alias added there is scrubbed here
+/// (`AGENTD_A2A_BEARER`) or any other setting never reaches a process that
+/// has no business with the daemon's configuration. Derived from the tables
+/// the ENV layer itself iterates — every path's [`Binding::env_name`] and
+/// every [`ENV_ALIASES`] entry — so an alias added there is scrubbed here
 /// without a second list.
 pub fn consumed_env_names(env: &[(String, String)]) -> Vec<String> {
     let bindings = paths::bindings_of(&schema::schema());
     let read: std::collections::HashSet<String> = bindings
         .iter()
-        .flat_map(Binding::env_names)
-        .chain(
-            ENV_ALIASES
-                .iter()
-                .flat_map(|(name, _)| alias_env_names(name)),
-        )
+        .map(Binding::env_name)
+        .chain(ENV_ALIASES.iter().map(|(name, _)| alias_env_name(name)))
         .collect();
     env.iter()
         .filter(|(k, _)| read.contains(k))
@@ -4967,7 +4573,7 @@ pub fn consumed_env_names(env: &[(String, String)]) -> Vec<String> {
 // Load pipeline
 // ---------------------------------------------------------------------------
 
-/// The result of a v2 load: the typed settings plus the documents they came
+/// The result of a load: the typed settings plus the documents they came
 /// from (the merged FILE document is kept for secret-provenance validation and
 /// for the reload diff).
 #[derive(Debug, Clone)]
@@ -5010,41 +4616,44 @@ pub enum Ask {
     Logout(String),
 }
 
-/// Probe the invocation without side effects: which schema the config files
-/// speak (`Detected`), so `main` can route to the v2 runtime.
-pub fn probe(args: &[String], env: &[(String, String)]) -> Result<Detected, ConfigError> {
-    let env = super::debrand_env(env);
-    let envmap: HashMap<&str, &str> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    // A flag/env `config_version: "1"` selects the full runtime for a flag-only
-    // invocation (`agentd --config-version 1 --instruction …`).
-    let flag_v2 = args
-        .windows(2)
-        .any(|w| matches!(w[0].as_str(), "--config-version" | "--config_version") && w[1] == "1")
-        || args
-            .iter()
-            .any(|a| a == "--config-version=1" || a == "--config_version=1")
-        || envmap
-            .get("AGENTD_CONFIG_VERSION")
-            .or_else(|| envmap.get("CONFIG_VERSION"))
-            .is_some_and(|v| *v == "1");
-    let paths = super::config_paths_from_map(args, &envmap).paths;
-    if paths.is_empty() {
-        return Ok(if flag_v2 {
-            Detected::V2
-        } else {
-            Detected::Empty
-        });
-    }
-    let (doc, _) = file::read_documents_checked(&paths, &|_, _| Ok(())).map_err(usage)?;
-    let d = detect(&doc);
-    Ok(match (d, flag_v2) {
-        (Detected::Empty, true) => Detected::V2,
-        (Detected::V1, true) => Detected::Mixed,
-        (d, _) => d,
+/// The ask a flag makes, when it makes one: the flags that want something
+/// other than a run. `Login` and `Logout` come back with an empty target — the
+/// loader reads it from the next argument.
+fn ask_flag(flag: &str) -> Option<Ask> {
+    Some(match flag {
+        "-h" | "--help" => Ask::Help,
+        "-V" | "--version" => Ask::Version,
+        "--config-schema" => Ask::Schema,
+        "--workflow-schema" => Ask::WorkflowSchema,
+        "--context-template" => Ask::ContextTemplate,
+        "--validate-config" => Ask::Validate,
+        "--capabilities" => Ask::Capabilities,
+        "--effective-config" => Ask::EffectiveConfig,
+        "--login" => Ask::Login(String::new()),
+        "--logout" => Ask::Logout(String::new()),
+        _ => return None,
     })
 }
 
-/// Load, layer and validate a v2 document from `args` (excluding the program
+/// Whether the loader accepts `flag` (the part before any `=`): an ask, the
+/// config-file flag, a named alias, or a `--<path>` the schema derives. What a
+/// shipped script may pass — the same tables [`load`] reads, so a flag the
+/// loader would call an unknown argument is unknown here too.
+pub fn is_known_flag(flag: &str) -> bool {
+    if ask_flag(flag).is_some()
+        || !matches!(
+            crate::config::config_flag(flag),
+            crate::config::ConfigFlag::No
+        )
+        || ALIASES.iter().any(|al| al.flag == flag)
+    {
+        return true;
+    }
+    let bindings = paths::bindings_of(&schema::schema());
+    matches!(paths::resolve_flag(&bindings, flag), Ok(Some(_)))
+}
+
+/// Load, layer and validate the settings document from `args` (excluding the program
 /// name) and `env`. Returns `(Loaded, Ask)`; `Ask` tells the caller what the
 /// invocation wants (`--help`, `--config-schema`, `--validate-config`, …).
 /// Errors are `ConfigError::Usage` (exit 2), before any side effect.
@@ -5053,7 +4662,6 @@ pub fn probe(args: &[String], env: &[(String, String)]) -> Result<Detected, Conf
 pub const MERGED_DOCUMENT: &str = "config";
 
 pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), ConfigError> {
-    let env = super::debrand_env(env);
     let envmap: HashMap<&str, &str> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     let schema = schema::schema();
     let bindings = paths::bindings_of(&schema);
@@ -5087,36 +4695,13 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
     let (file_doc, files) = if config_paths.is_empty() {
         (Value::Object(Map::new()), Vec::new())
     } else {
+        // Each file is typed on its own before the merge, so a key nobody
+        // defines is refused naming ITS file rather than "the config".
         file::read_documents_checked(&config_paths, &|doc, source| {
-            // A removed key names ITS file whatever else the file is, so an
-            // upgrade finds the line to change rather than a migration hint.
-            refuse_removed_keys(doc, source)?;
-            // A v1/mixed file is judged after the merge (a clear migration
-            // message); a v2 file is typed here so an unknown key names ITS file.
-            match detect(doc) {
-                Detected::V2 | Detected::Empty => {
-                    Settings::from_document(doc.clone(), source).map(|_| ())
-                }
-                _ => Ok(()),
-            }
+            Settings::from_document(doc.clone(), source).map(|_| ())
         })
         .map_err(usage)?
     };
-    match detect(&file_doc) {
-        Detected::Mixed => {
-            return Err(usage(
-                "config file mixes legacy flat keys (model/subscribe/mcp_servers/…) with settings sections (agent/intelligence/…); \
-                 migrate the legacy keys (docs/configuration.md §migration)"
-                    .into(),
-            ));
-        }
-        Detected::V1 => {
-            return Err(usage(
-                "config file speaks the retired flat schema; the loader needs `config_version: \"1\"` or settings sections (agent/intelligence/…)".into(),
-            ));
-        }
-        _ => {}
-    }
     // A DISCOVERED config governs an invocation that never named it: `cd` into a
     // repo you cloned, type `agentd --prompt …`, and that repo's `agentd.yml`
     // decides where your credentials go. Convenience is worth that only while the
@@ -5175,28 +4760,19 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
     // --- ENV layer: derived path names, then the short aliases. A path name
     // wins over an alias for the same field, since it names the field exactly
     // and cannot be a coincidence. ---
-    // A variable naming a removed key would bind no path and be silently
-    // ignored, so it is refused before anything reads the environment.
-    let mut env_names: Vec<&str> = envmap.keys().copied().collect();
-    env_names.sort_unstable();
-    for name in env_names {
-        if let Some((path, hint)) = removed_key_of_env(name) {
-            return Err(usage(removed_key_error(name, path, hint)));
-        }
-    }
     let mut env_doc = Value::Object(Map::new());
     for (name, path) in ENV_ALIASES {
-        let candidates = alias_env_names(name);
-        if let Some(raw) = candidates.iter().find_map(|k| envmap.get(k.as_str())) {
+        let var = alias_env_name(name);
+        if let Some(raw) = envmap.get(var.as_str()) {
             let binding = binding_for(&bindings, path)
                 .ok_or_else(|| usage(format!("internal: alias path {path} not in schema")))?;
             let v = binding
                 .coerce(raw)
-                .map_err(|e| usage(format!("invalid {}: {e}", candidates[0])))?;
+                .map_err(|e| usage(format!("invalid {var}: {e}")))?;
             paths::set_path(&mut env_doc, path, v);
         }
     }
-    let (derived, _applied) = paths::env_document_in(&bindings, &envmap).map_err(usage)?;
+    let (derived, _applied) = paths::env_document(&bindings, &envmap).map_err(usage)?;
     file::merge_into(&mut env_doc, derived);
     file::merge_into(&mut doc, env_doc);
     if let Some(t) = trace.as_mut() {
@@ -5209,29 +4785,21 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
     let mut it = args.iter().peekable();
     while let Some(arg) = it.next() {
         let a = arg.as_str();
+        if let Some(asked) = ask_flag(a) {
+            ask =
+                match asked {
+                    // The two asks that name a target take it as the next argument.
+                    Ask::Login(_) => Ask::Login(it.next().cloned().ok_or_else(|| {
+                        usage("--login requires a target (e.g. mcp:<name>)".into())
+                    })?),
+                    Ask::Logout(_) => Ask::Logout(it.next().cloned().ok_or_else(|| {
+                        usage("--logout requires a target (e.g. mcp:<name>)".into())
+                    })?),
+                    other => other,
+                };
+            continue;
+        }
         match a {
-            "-h" | "--help" => ask = Ask::Help,
-            "-V" | "--version" => ask = Ask::Version,
-            "--config-schema" | "--config-schema=1" => ask = Ask::Schema,
-            "--workflow-schema" => ask = Ask::WorkflowSchema,
-            "--context-template" => ask = Ask::ContextTemplate,
-            "--validate-config" => ask = Ask::Validate,
-            "--capabilities" => ask = Ask::Capabilities,
-            "--effective-config" => ask = Ask::EffectiveConfig,
-            "--login" => {
-                let t = it
-                    .next()
-                    .cloned()
-                    .ok_or_else(|| usage("--login requires a target (e.g. mcp:<name>)".into()))?;
-                ask = Ask::Login(t);
-            }
-            "--logout" => {
-                let t = it
-                    .next()
-                    .cloned()
-                    .ok_or_else(|| usage("--logout requires a target (e.g. mcp:<name>)".into()))?;
-                ask = Ask::Logout(t);
-            }
             "--config" | "-c" => {
                 it.next(); // consumed by the FILE layer
             }
@@ -5241,17 +4809,11 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
                 crate::config::ConfigFlag::Inline(_)
             ) => {}
             _ => {
-                if let Some((path, hint)) = removed_key_of_flag(a) {
-                    return Err(usage(removed_key_error(a, path, hint)));
-                }
-                if let Some((flag, hint)) = REMOVED_FLAGS.iter().find(|(f, _)| *f == a) {
-                    return Err(usage(format!("{flag} was removed in agentd: {hint}")));
-                }
                 if let Some(alias) = ALIASES.iter().find(|al| al.flag == a) {
                     apply_alias(&mut doc, &bindings, alias, &mut it, &mut mcp_tags)?;
                     continue;
                 }
-                match paths::resolve_flag_in(&bindings, a).map_err(usage)? {
+                match paths::resolve_flag(&bindings, a).map_err(usage)? {
                     Some(target) => {
                         let raw = if matches!(target.value_kind(), paths::Kind::Boolean)
                             && !it.peek().is_some_and(|n| !n.starts_with("--"))
@@ -5941,7 +5503,6 @@ fn apply_instruction_sugar(doc: &mut Value, settings: &mut Settings) {
     }
     let sugar = json!({
         "name": "main",
-        "version": 3,
         "steps": {
             "start": { "kind": "once" },
             "work":  {
@@ -6509,19 +6070,6 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                 ),
             );
         }
-    }
-
-    // config_version
-    if let Some(v) = &s.config_version
-        && v != schema::CONFIG_VERSION
-    {
-        err(
-            &mut d,
-            format!(
-                "config_version must be \"{}\" (got {v:?})",
-                schema::CONFIG_VERSION
-            ),
-        );
     }
 
     // observability.runtime_events / audit.stream — both name a stream, and a
@@ -7761,22 +7309,13 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                 format!("a2a.principals[{i}]: `any` cannot grant the operator role"),
             );
         }
-        // A grant naming a removed op would load, match nothing and leave the
-        // operator believing the principal still holds the control it named —
-        // refused by name, with what replaced it. So would a grant naming an
-        // operator-only op on anyone but an operator: the floor answers to the
-        // role before any grant is read. A pattern (`admin*`) stays allowed —
-        // it names a family, and grants the members that are not operator-only.
+        // A grant naming an operator-only op on anyone but an operator would
+        // load and leave the operator believing the principal holds a control
+        // the floor never lets it reach: the floor answers to the role before
+        // any grant is read. A pattern (`admin*`) stays allowed — it names a
+        // family, and grants the members that are not operator-only.
         for g in &pr.grants {
-            if let Some(hint) = crate::runtime::surface::removed_op(g) {
-                err(
-                    &mut d,
-                    format!(
-                        "a2a.principals[{i}].grants: grant `{g}` was removed in agentd {}: {hint}",
-                        crate::runtime::surface::OPS_REMOVED_IN
-                    ),
-                );
-            } else if pr.role != Role::Operator
+            if pr.role != Role::Operator
                 && !g.contains('*')
                 && crate::runtime::surface::is_operator_floor(g)
             {
@@ -8005,7 +7544,7 @@ pub fn workflow_uses_webhook(w: &Value) -> bool {
             steps.values().any(|st| {
                 let kind = st.get("kind").and_then(Value::as_str);
                 kind == Some("webhook")
-                    || (matches!(kind, Some("wait") | Some("await"))
+                    || (kind == Some("wait")
                         && st.get("on").and_then(Value::as_str) == Some("webhook"))
             })
         })
@@ -8026,7 +7565,7 @@ fn webhook_nodes(w: &Value) -> Vec<(&str, Option<&Value>)> {
             let kind = st.get("kind").and_then(Value::as_str);
             if kind == Some("webhook") {
                 Some((id.as_str(), st.get("auth")))
-            } else if matches!(kind, Some("wait") | Some("await"))
+            } else if kind == Some("wait")
                 && st.get("on").and_then(Value::as_str) == Some("webhook")
             {
                 Some((id.as_str(), st.get("webhook").and_then(|c| c.get("auth"))))
@@ -8150,7 +7689,6 @@ fn secret_violations(file_doc: &Value) -> Vec<String> {
 /// Restart-only path prefixes: a live reload whose effective document differs
 /// under any of these is refused (`restart_required`).
 pub const RESTART_ONLY_PATHS: &[&str] = &[
-    "config_version",
     "agent.name",
     "store.kind",
     "store.prefix",
@@ -8343,7 +7881,6 @@ pub const RELOADABLE_PATHS: &[&str] = &[
     "workflows.unload",
     "workflows.uri",
     "workflows.url",
-    "workflows.version",
 ];
 
 /// The restart-only paths that live INSIDE a reloadable one.
@@ -8369,16 +7906,16 @@ pub fn restart_only_diff(running: &Value, candidate: &Value) -> Vec<String> {
         .collect()
 }
 
-/// The `--help` section for the v2 paths.
+/// The `--help` section for the settings paths.
 pub fn help_section() -> String {
-    paths::help_section_in(&paths::bindings_of(&schema::schema()))
+    paths::help_section(&paths::bindings_of(&schema::schema()))
 }
 
-/// The v2 `--help` text: usage, the alias flags, the removed flags, and every
-/// config path (flag · env).
+/// The `--help` text: usage, the alias flags, and every config path
+/// (flag · env).
 pub fn help_text() -> String {
     let mut out = format!(
-        "agentd {ver} — a durable, workflow-driven agent (config schema v2)\n\
+        "agentd {ver} — a durable, workflow-driven agent\n\
          \n\
          USAGE:\n\
          \x20 agentd --config <settings.yaml> [--config <overlay.yaml> …] [--<path> <value> …]\n\
@@ -8416,7 +7953,7 @@ pub fn help_text() -> String {
          \x20                            to --daemon-log (default $XDG_RUNTIME_DIR/agentd-<sub>-<pid>.log).\n\
          \x20                            Anything else: run `agentd -c …`, then `agentd-<sub> --endpoint <url>`.\n\
          \nCONTROL:\n\
-         \x20 -c, --config <PATH>        a settings file (repeatable; `=` form too; or AGENT_CONFIG=a.yaml:b.yaml)\n\
+         \x20 -c, --config <PATH>        a settings file (repeatable; `=` form too; or AGENTD_CONFIG=a.yaml:b.yaml)\n\
          \x20 --validate-config          load+validate everything, print the verdict, exit 0/2\n\
          \x20 --effective-config         print the assembled config + where each setting came from\n\
          \x20                            (runs on an invalid config too; credentials redacted)\n\
@@ -8429,22 +7966,8 @@ pub fn help_text() -> String {
          \x20 --prompt-missing           ask interactively (echo off, on /dev/tty) for each {{secret:NAME}} the startup preflight finds missing; refused without a controlling terminal\n\
          \x20 --env <FILE>               load a dotenv file into this process's environment (repeatable; real env wins, later files win)\n\
          \x20 -h, --help / -V, --version\n\
-         \nREMOVED FLAGS:\n",
+         \n",
     );
-    for (flag, hint) in REMOVED_FLAGS {
-        out.push_str(&format!("  {flag:<32} {hint}\n"));
-    }
-    out.push_str("\nREMOVED LAUNCHER FLAGS (agentd tui|ui):\n");
-    for (flag, hint) in crate::runtime::surface::launch::REMOVED_LAUNCHER_FLAGS {
-        out.push_str(&format!("  {flag:<32} {hint}\n"));
-    }
-    out.push_str(&format!(
-        "\nREMOVED KEYS (refused in a file, a flag, an AGENTD_ variable or a :::!config fragment; removed in {KEYS_REMOVED_IN}):\n"
-    ));
-    for (path, hint) in REMOVED_KEYS {
-        out.push_str(&format!("  {path:<32} {hint}\n"));
-    }
-    out.push('\n');
     out.push_str(&help_section());
     out
 }
@@ -8687,8 +8210,6 @@ mod tests {
                         json!(".")
                     }
                     p if is_document_path(p, "dir.glob") => json!("README.md"),
-
-                    "config_version" => json!("2"),
                     _ => json!("x"),
                 },
                 paths::Kind::Integer => json!(1),
@@ -8886,51 +8407,18 @@ mod tests {
     }
 
     #[test]
-    fn env_and_flag_names_derive_from_the_v2_paths() {
+    fn env_and_flag_names_derive_from_the_settings_paths() {
         let bs = paths::bindings_of(&schema::schema());
         let model = bs.iter().find(|b| b.path == "intelligence.model").unwrap();
-        assert_eq!(model.env_names()[0], "AGENTD_INTELLIGENCE_MODEL");
-        assert_eq!(model.env_names()[2], "INTELLIGENCE_MODEL");
+        assert_eq!(model.env_name(), "AGENTD_INTELLIGENCE_MODEL");
         assert_eq!(model.flag(), "--intelligence-model");
         let steps = bs.iter().find(|b| b.path == "limits.run.steps").unwrap();
-        assert_eq!(steps.env_names()[0], "AGENTD_LIMITS_RUN_STEPS");
-        // Uniqueness of the derived names across the whole v2 schema.
+        assert_eq!(steps.env_name(), "AGENTD_LIMITS_RUN_STEPS");
+        // Uniqueness of the derived names across the whole schema.
         let mut seen = std::collections::HashSet::new();
         for b in &bs {
             assert!(seen.insert(b.flag()), "duplicate flag {}", b.flag());
         }
-    }
-
-    // ---- detection ------------------------------------------------------------
-
-    #[test]
-    fn detects_v1_v2_mixed_and_empty() {
-        assert_eq!(detect(&json!({})), Detected::Empty);
-        assert_eq!(detect(&json!({"model": "m"})), Detected::V1);
-        assert_eq!(detect(&json!({"config_version": "1"})), Detected::V2);
-        assert_eq!(
-            detect(&json!({"agent": {"instruction": "x"}})),
-            Detected::V2
-        );
-        assert_eq!(detect(&json!({"agent": {}, "model": "m"})), Detected::Mixed);
-        assert_eq!(
-            detect(&json!({"config_version": "1.0", "model": "m"})),
-            Detected::V1
-        );
-        // `limits` is neutral; `intelligence` decides by shape.
-        assert_eq!(
-            detect(&json!({"model": "m", "limits": {"max_steps": 1}})),
-            Detected::V1
-        );
-        assert_eq!(
-            detect(&json!({"intelligence": "https://x", "limits": {}})),
-            Detected::V1
-        );
-        assert_eq!(
-            detect(&json!({"intelligence": {"model": "m"}, "limits": {}})),
-            Detected::V2
-        );
-        assert_eq!(detect(&json!({"limits": {"max_steps": 1}})), Detected::V1);
     }
 
     // ---- load: layering, aliases, sugar --------------------------------------
@@ -8943,7 +8431,7 @@ mod tests {
         // never reached the check and this config started happily. It is the
         // whole lethal trifecta: untrusted input, sensitive powers, an egress
         // path.
-        let cfg = "config_version: \"1\"\nstore: {kind: memory}\n\
+        let cfg = "store: {kind: memory}\n\
                    mcp:\n  servers:\n    - name: web\n      endpoint: https://mcp-web.internal/mcp\n      tags: {\"*\": [untrusted_input]}\n\
                    security:\n  exec: {enabled: true, workdir: /tmp, allow: [git]}\n";
         let f = write_tmp(cfg, "yaml");
@@ -8968,7 +8456,7 @@ mod tests {
 
         // exec WITHOUT an untrusted-input source is only two legs: still fine.
         let alone = write_tmp(
-            "config_version: \"1\"\nstore: {kind: memory}\n\
+            "store: {kind: memory}\n\
              security:\n  exec: {enabled: true, workdir: /tmp, allow: [git]}\n",
             "yaml",
         );
@@ -8989,7 +8477,7 @@ mod tests {
         // the first real start: a validator that accepts what startup refuses
         // is worse than no validator, because it certifies the broken config.
         let f = write_tmp(
-            "config_version: \"1\"\nstore: {kind: memory}\nworkflows:\n  - name: w\n    version: 3\n    steps:\n      s: {kind: once}\n      a: {kind: agent, depends_on: [s], prompt: \"typo — agent steps take `instruction`\"}\n      f: {kind: finish, depends_on: [a], status: completed}\n",
+            "store: {kind: memory}\nworkflows:\n  - name: w\n    steps:\n      s: {kind: once}\n      a: {kind: agent, depends_on: [s], prompt: \"typo — agent steps take `instruction`\"}\n      f: {kind: finish, depends_on: [a], status: completed}\n",
             "yaml",
         );
         let e = load(
@@ -9007,7 +8495,7 @@ mod tests {
 
         // The same workflow, spelled correctly, still validates.
         let ok = write_tmp(
-            "config_version: \"1\"\nstore: {kind: memory}\nworkflows:\n  - name: w\n    version: 3\n    steps:\n      s: {kind: once}\n      a: {kind: agent, depends_on: [s], instruction: \"do it\"}\n      f: {kind: finish, depends_on: [a], status: completed}\n",
+            "store: {kind: memory}\nworkflows:\n  - name: w\n    steps:\n      s: {kind: once}\n      a: {kind: agent, depends_on: [s], instruction: \"do it\"}\n      f: {kind: finish, depends_on: [a], status: completed}\n",
             "yaml",
         );
         load(
@@ -9092,7 +8580,7 @@ mod tests {
         assert_eq!(l.settings.store.kind, StoreKind::File);
         // A long-lived start node ⇒ the same default.
         let f = write_tmp(
-            "config_version: \"1\"\nworkflows:\n  - name: w\n    steps:\n      s: {kind: schedule, cron: \"* * * * *\"}\n      f: {kind: finish, depends_on: [s], status: completed}\n",
+            "workflows:\n  - name: w\n    steps:\n      s: {kind: schedule, cron: \"* * * * *\"}\n      f: {kind: finish, depends_on: [s], status: completed}\n",
             "yaml",
         );
         let (l, _) = load(
@@ -9172,14 +8660,12 @@ mod tests {
 
     /// **Every configuration path is classified: restart-only, or reloadable.**
     ///
-    /// This is the forcing function for the defect class that produced
-    /// v1.3.3, v1.3.4 and v1.4.0: a config field whose value is captured into
-    /// a long-lived structure at startup, which the reload never rebuilds and
-    /// which nobody listed as restart-only either. The reload reports success;
-    /// the daemon keeps its boot snapshot. `a2a.principals`, the webhook
-    /// routes and `interface.origins` were all of exactly this shape, and the
-    /// existing reload test could not see any of them, because it asserts what
-    /// the reload REPORTED rather than what it did.
+    /// This is the forcing function for one defect class: a config field whose
+    /// value is captured into a long-lived structure at startup, which the
+    /// reload never rebuilds and which nobody listed as restart-only either.
+    /// The reload reports success; the daemon keeps its boot snapshot. A
+    /// reload test cannot see that shape, because it asserts what the reload
+    /// REPORTED rather than what it did.
     ///
     /// What this proves is narrow and worth stating plainly: that a decision
     /// was RECORDED for every path, not that the decision is correct. Proving
@@ -9230,13 +8716,9 @@ mod tests {
     /// [`every_config_path_is_classified`] applies to the reload partition,
     /// for the same reason and after the same kind of defect.
     ///
-    /// The boundary used to be a deny-list of six prefixes with no check at
-    /// all behind it, so every section nobody had thought about was writable
-    /// by a served document: `services` (the catalogue `security.egress:
-    /// closed` reads), `a2a.principals`, `agent.tools`,
-    /// `intelligence.endpoints`, `interface` and `webhooks` were all reachable
-    /// from an unsigned, ungranted instruction. None of them was a decision
-    /// anyone made; each was a path nobody had classified.
+    /// Without it, a section nobody had thought about would be a path nobody
+    /// had classified — and, to a served document, either silently writable
+    /// or silently refused, with no decision anyone made behind it.
     ///
     /// So: a path in neither list is not "probably fine", it is **unexamined**.
     /// Add it to one, and prefer [`OPERATOR_ONLY`] when unsure — a document
@@ -9269,16 +8751,13 @@ mod tests {
         assert!(both.is_empty(), "classified as both: {both:?}");
 
         // A stale entry in either list — a field renamed or removed — silently
-        // weakens the check above, so every entry must name a real path. The
-        // exception is declared: a RETIRED spelling is kept deliberately, so a
-        // fragment written against the old surface is still refused by name.
+        // weakens the check above, so every entry must name a real path.
         for (list, which) in [
             (DOCUMENT_MAY_WRITE, "DOCUMENT_MAY_WRITE"),
             (OPERATOR_ONLY, "OPERATOR_ONLY"),
         ] {
             let stale: Vec<&&str> = list
                 .iter()
-                .filter(|e| !RETIRED_OPERATOR_SPELLINGS.contains(e))
                 .filter(|e| !paths.iter().any(|p| super::path_covered(p, &[*e])))
                 .collect();
             assert!(
@@ -9346,23 +8825,38 @@ mod tests {
                  nested that way any more — drop it from the list"
             );
         }
-        let stale: Vec<&&str> = RELOADABLE_PATHS
-            .iter()
-            .filter(|e| {
-                !paths
-                    .iter()
-                    .any(|p| p == *e || p.starts_with(&format!("{e}.")))
-            })
+        // Both lists: a restart-only entry the schema no longer has is as
+        // stale as a reloadable one, and would let a removed key's entry
+        // outlive the key. A restart-only entry may sit deeper than the
+        // section.field walk above (`agent.instruction.trust`), so the full
+        // binding walk counts too.
+        let deep: Vec<String> = paths::bindings_of(&schema::schema())
+            .into_iter()
+            .map(|b| b.path)
             .collect();
-        assert!(
-            stale.is_empty(),
-            "RELOADABLE_PATHS names paths the schema does not have — renamed or \
-             removed fields leave the coverage check weaker than it looks: {stale:?}"
-        );
+        for (list, which) in [
+            (RELOADABLE_PATHS, "RELOADABLE_PATHS"),
+            (RESTART_ONLY_PATHS, "RESTART_ONLY_PATHS"),
+        ] {
+            let stale: Vec<&&str> = list
+                .iter()
+                .filter(|e| {
+                    !paths
+                        .iter()
+                        .chain(deep.iter())
+                        .any(|p| p == *e || p.starts_with(&format!("{e}.")))
+                })
+                .collect();
+            assert!(
+                stale.is_empty(),
+                "{which} names paths the schema does not have — renamed or \
+                 removed fields leave the coverage check weaker than it looks: {stale:?}"
+            );
+        }
     }
 
-    /// The two paths that once reported a SUCCESSFUL reload and did nothing,
-    /// were then made restart-only (v1.3.3), and now genuinely reload.
+    /// Two paths whose rules are captured by a live listener, and genuinely
+    /// reload.
     ///
     /// What stays restart-only is the SOCKET, not the rules: rebinding an
     /// address or swapping a TLS identity still needs a restart. The rules —
@@ -9416,7 +8910,7 @@ mod tests {
     #[test]
     fn config_vars_fold_typed_values_and_collect_every_miss() {
         let file = write_tmp(
-            "config_version: \"1\"\n\
+            "\
              vars:\n  region: eu-1\n  port: 8443\n  team:\n    name: platform\n\
              agent:\n  name: \"svc-{{config.region}}\"\n  instruction: serve\n  preflight: never\n\
              intelligence:\n  endpoints: [https://x/v1]\n  model: m\n\
@@ -9455,7 +8949,7 @@ mod tests {
 
         // Every unresolved reference is reported, in ONE refusal.
         let bad = write_tmp(
-            "config_version: \"1\"\n\
+            "\
              vars:\n  set: yes\n\
              agent:\n  name: \"{{config.gone}}\"\n  instruction: serve\n  preflight: never\n\
              intelligence:\n  endpoints: [\"https://{{config.also_gone}}/v1\"]\n  model: m\n\
@@ -9510,7 +9004,7 @@ mod tests {
     #[test]
     fn env_substitution_reaches_config_values_and_workflows() {
         let file = write_tmp(
-            "config_version: \"1\"\n\
+            "\
              agent:\n  name: ${SVC_NAME}\n  instruction: serve\n  preflight: never\n\
              intelligence:\n  endpoints: [https://x/v1]\n  model: m\n\
              store:\n  kind: memory\n\
@@ -9579,15 +9073,15 @@ mod tests {
     #[test]
     fn files_env_flags_layer_in_order_with_aliases() {
         let base = write_tmp(
-            "config_version: \"1\"\nagent:\n  instruction: from-file\nintelligence:\n  endpoints: [https://file.example/v1]\n  model: file-model\nlimits:\n  run:\n    steps: 10\nstore: { kind: memory }\n",
+            "agent:\n  instruction: from-file\nintelligence:\n  endpoints: [https://file.example/v1]\n  model: file-model\nlimits:\n  run:\n    steps: 10\nstore: { kind: memory }\n",
             "yaml",
         );
         let over = write_tmp("intelligence:\n  model: over-model\n", "yml");
         let mut env = base_env();
         env.clear();
         env.push(("AGENTD_LIMITS_RUN_STEPS".into(), "20".into())); // derived path name
-        env.push(("AGENT_MODEL".into(), "env-model".into())); // short alias
-        env.push(("INSTRUCTION".into(), "env-instruction".into())); // bare alias
+        env.push(("AGENTD_MODEL".into(), "env-model".into())); // short alias
+        env.push(("AGENTD_INSTRUCTION".into(), "env-instruction".into())); // short alias
         let (l, _) = load(
             &args(&[
                 "--config",
@@ -9628,7 +9122,7 @@ mod tests {
         assert_eq!(l.files.len(), 2);
         // A derived path name beats the short alias for the same field.
         let env2: Vec<(String, String)> = vec![
-            ("AGENT_MODEL".into(), "legacy".into()),
+            ("AGENTD_MODEL".into(), "alias".into()),
             ("AGENTD_INTELLIGENCE_MODEL".into(), "path".into()),
             ("AGENTD_INTELLIGENCE_ENDPOINTS".into(), "https://i".into()),
         ];
@@ -9674,57 +9168,6 @@ mod tests {
         }
     }
 
-    /// The config KEY renames are refused by name too, not only the flags —
-    /// `deny_unknown_fields` would say "unknown field", which tells an
-    /// operator nothing about where the setting went.
-    #[test]
-    fn renamed_instruction_keys_name_their_replacement() {
-        let load = |instruction: Value| {
-            Settings::from_document(
-                serde_json::json!({"config_version": "1",
-                    "agent": {"name": "a", "instruction": instruction},
-                    "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
-                    "store": {"kind": "memory"}}),
-                "t",
-            )
-            .unwrap_err()
-        };
-        let e = load(json!({"http": "https://docs.example/agent.md"}));
-        assert!(e.contains("renamed to `url`"), "{e}");
-        let e = load(json!({"dir": ".", "glob": "*.md"}));
-        assert!(e.contains("belongs inside `dir`"), "{e}");
-        let e = load(json!({"dir": ".", "order": "date"}));
-        assert!(e.contains("belongs inside `dir`"), "{e}");
-    }
-
-    #[test]
-    fn removed_flags_name_their_replacement() {
-        for (flag, _) in REMOVED_FLAGS {
-            let e = load(&args(&[flag, "x"]), &base_env()).unwrap_err();
-            assert!(format!("{e}").contains("removed in agentd"), "{flag}: {e}");
-        }
-        let e = load(&args(&["--mode", "reactive"]), &base_env()).unwrap_err();
-        assert!(format!("{e}").contains("start node"), "{e}");
-    }
-
-    #[test]
-    fn mixed_and_v1_files_are_refused_by_the_v2_loader() {
-        let mixed = write_tmp("agent: {instruction: x}\nmodel: m\n", "yaml");
-        let e = load(
-            &args(&["--config", mixed.path().to_str().unwrap()]),
-            &base_env(),
-        )
-        .unwrap_err();
-        assert!(format!("{e}").contains("mixes legacy flat keys"), "{e}");
-        let v1 = write_tmp("model: m\n", "yaml");
-        let e = load(
-            &args(&["--config", v1.path().to_str().unwrap()]),
-            &base_env(),
-        )
-        .unwrap_err();
-        assert!(format!("{e}").contains("retired flat schema"), "{e}");
-    }
-
     #[test]
     fn an_instruction_that_names_no_source_is_refused_not_silently_absent() {
         use super::InstructionSpec;
@@ -9750,8 +9193,7 @@ mod tests {
 
         // …and the merged document is where it is refused, by name.
         let e = Settings::from_document(
-            serde_json::json!({"config_version": "1",
-                "agent": {"name": "a", "preflight": "never",
+            serde_json::json!({"agent": {"name": "a", "preflight": "never",
                           "instruction": {"refresh": "60s"}},
                 "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
                 "store": {"kind": "memory"}}),
@@ -9766,7 +9208,6 @@ mod tests {
         // Omitting `instruction` ALTOGETHER stays supported — a workflow-only
         // or `--prompt` agent is a different shape, not a broken one.
         let doc = serde_json::json!({
-            "config_version": "1",
             "agent": {"name": "a", "preflight": "never"},
             "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
             "store": {"kind": "memory"},
@@ -9830,8 +9271,7 @@ mod tests {
         let cfg = dir.path().join("c.json");
         std::fs::write(
             &cfg,
-            serde_json::json!({"config_version": "1",
-                "agent": {"name": "a", "preflight": "never"},
+            serde_json::json!({"agent": {"name": "a", "preflight": "never"},
                 "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
                 "store": {"kind": "memory"}})
             .to_string(),
@@ -9891,8 +9331,7 @@ mod tests {
             let cfg = dir.path().join(format!("c{}.json", rand_tag()));
             std::fs::write(
                 &cfg,
-                serde_json::json!({"config_version": "1",
-                    "agent": {"name": "a", "instruction": instruction, "preflight": "never"},
+                serde_json::json!({"agent": {"name": "a", "instruction": instruction, "preflight": "never"},
                     "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
                     "store": {"kind": "memory"}})
                 .to_string(),
@@ -9963,8 +9402,7 @@ mod tests {
         };
         let load = |path: String| {
             Settings::from_document(
-                serde_json::json!({"config_version": "1",
-                    "agent": {"name": "a", "preflight": "never",
+                serde_json::json!({"agent": {"name": "a", "preflight": "never",
                               "instruction": {"file": path}},
                     "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
                     "store": {"kind": "memory"}}),
@@ -10061,7 +9499,7 @@ mod tests {
                 "tools.overrides",
             ),
             // It declared a whole child agent. Refused HERE as well as in
-            // `compile_one`, because a template is the one hop that used to
+            // `compile_one`, because a template is the one hop that would
             // reach everything above.
             (
                 "child.md",
@@ -10118,8 +9556,7 @@ mod tests {
         // A file carrying SETTINGS only — no source anywhere in it.
         std::fs::write(
             &cfg,
-            serde_json::json!({"config_version": "1",
-                "agent": {"name": "a", "preflight": "never",
+            serde_json::json!({"agent": {"name": "a", "preflight": "never",
                           "instruction": {"refresh": "30s"}},
                 "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
                 "store": {"kind": "memory"}})
@@ -10164,8 +9601,7 @@ mod tests {
                 spec["unenforceable"] = json!(p);
             }
             Settings::from_document(
-                serde_json::json!({"config_version": "1",
-                    "agent": {"name": "a", "instruction": spec, "preflight": "never"},
+                serde_json::json!({"agent": {"name": "a", "instruction": spec, "preflight": "never"},
                     "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
                     "store": {"kind": "memory"}}),
                 MERGED_DOCUMENT,
@@ -10208,8 +9644,7 @@ mod tests {
     fn a_closed_egress_covers_the_document_the_agent_takes_its_policy_from() {
         let load = |instruction: Value, services: Value| {
             Settings::from_document(
-                json!({"config_version": "1",
-                    "agent": {"name": "a", "instruction": instruction, "preflight": "never"},
+                json!({"agent": {"name": "a", "instruction": instruction, "preflight": "never"},
                     "security": {"egress": "closed"},
                     "services": services,
                     "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
@@ -10244,8 +9679,7 @@ mod tests {
         // The same gate covers a one-shot prompt and a subagent template, which
         // resolve through the shared document resolver.
         let e = Settings::from_document(
-            json!({"config_version": "1",
-                "agent": {"name": "a", "instruction": "be terse", "preflight": "never",
+            json!({"agent": {"name": "a", "instruction": "be terse", "preflight": "never",
                           "prompt": {"url": "https://evil.example/task.md"}},
                 "security": {"egress": "closed"},
                 "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
@@ -10288,63 +9722,6 @@ mod tests {
         );
     }
 
-    /// A document made of nothing but a v2 section is a v2 document.
-    ///
-    /// The detection list was a hand-maintained subset of the schema and had
-    /// fallen seven sections behind, so `-c overlay.json` carrying only `mcp:`
-    /// — a perfectly ordinary layer in the config chain — was refused as "the
-    /// flat schema, which agentd does not accept". The message was doubly
-    /// wrong: the document is not flat, and the retired schema had nothing to
-    /// do with it.
-    #[test]
-    fn every_v2_section_identifies_a_document_as_v2_on_its_own() {
-        // Read the SCHEMA, not `v2_keys()`. Deriving the input from the
-        // function under test makes the test drop a key exactly when the code
-        // does — which is how the first draft of this passed while `mcp` was
-        // filtered back out of the derivation.
-        let sections: Vec<String> = schema::schema()["properties"]
-            .as_object()
-            .expect("the schema has top-level properties")
-            .keys()
-            .filter(|k| !DETECTION_IGNORES.contains(&k.as_str()))
-            .cloned()
-            .collect();
-        assert!(sections.len() > 20, "{} sections?", sections.len());
-        for key in sections {
-            let doc = json!({ &key: {} });
-            assert_eq!(
-                detect(&doc),
-                Detected::V2,
-                "a document whose only section is `{key}` must read as v2"
-            );
-        }
-        // The three that deliberately decide nothing still do not.
-        assert_eq!(detect(&json!({"limits": {}})), Detected::V1);
-        // `intelligence` is judged by SHAPE, not by name: an object is v2, the
-        // flat schema's endpoint string is v1.
-        assert_eq!(detect(&json!({"intelligence": {}})), Detected::V2);
-        assert_eq!(
-            detect(&json!({"intelligence": "https://x/v1"})),
-            Detected::V1
-        );
-    }
-
-    /// The old top-level spelling names where it went    /// The old top-level spelling names where it went, rather than dying as an
-    /// unknown field.
-    #[test]
-    fn instruction_sources_names_its_replacement() {
-        let e = Settings::from_document(
-            serde_json::json!({"config_version": "1",
-                "agent": {"name": "a", "instruction": "be terse"},
-                "instruction_sources": [{"uri": "instruction://x"}],
-                "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
-                "store": {"kind": "memory"}}),
-            "t",
-        )
-        .unwrap_err();
-        assert!(e.contains("agent.instruction.trust"), "{e}");
-    }
-
     /// `agent.prompt` and a subagent template's `instruction` are documents
     /// too, and take the same sources through the same code — that is the
     /// whole point of the shared resolver.
@@ -10357,8 +9734,7 @@ mod tests {
         let task = dir.path().join("task.md").to_string_lossy().to_string();
         let folder = dir.path().to_string_lossy().to_string();
         let s = Settings::from_document(
-            serde_json::json!({"config_version": "2",
-                "agent": {"name": "a", "instruction": "be terse", "prompt": task},
+            serde_json::json!({"agent": {"name": "a", "instruction": "be terse", "prompt": task},
                 "subagents": {"templates": {
                     "r": {"instruction": {"dir": {"path": folder, "glob": "tpl-*.md"}}}}},
                 "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
@@ -10378,8 +9754,7 @@ mod tests {
 
         // …and the long form still means "this text, never a path".
         let s = Settings::from_document(
-            serde_json::json!({"config_version": "2",
-                "agent": {"name": "a", "instruction": "be terse",
+            serde_json::json!({"agent": {"name": "a", "instruction": "be terse",
                           "prompt": {"text": "./not-a-file.md"}},
                 "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
                 "store": {"kind": "memory"}}),
@@ -10410,8 +9785,7 @@ mod tests {
             }
             let instruction = serde_json::json!({ "dir": folder });
             Settings::from_document(
-                serde_json::json!({"config_version": "2",
-                    "agent": {"name": "a", "instruction": instruction},
+                serde_json::json!({"agent": {"name": "a", "instruction": instruction},
                     "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
                     "store": {"kind": "memory"}}),
                 "t",
@@ -10449,8 +9823,7 @@ mod tests {
         filetime_set(&dir.path().join("aaa.md"), 2_000_000);
         let doc = |order: &str| {
             Settings::from_document(
-                serde_json::json!({"config_version": "2",
-                    "agent": {"name": "a", "instruction":
+                serde_json::json!({"agent": {"name": "a", "instruction":
                         {"dir": {"path": dir.path().to_string_lossy(), "order": order}}},
                     "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
                     "store": {"kind": "memory"}}),
@@ -10490,8 +9863,7 @@ mod tests {
         std::fs::write(dir.path().join("a.md"), "---\nid: ins_1\n---\nfirst\n").unwrap();
         std::fs::write(dir.path().join("b.md"), "---\nid: ins_2\n---\nsecond\n").unwrap();
         let s = Settings::from_document(
-            serde_json::json!({"config_version": "2",
-                "agent": {"name": "a", "instruction": {"dir": dir.path().to_string_lossy()}},
+            serde_json::json!({"agent": {"name": "a", "instruction": {"dir": dir.path().to_string_lossy()}},
                 "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
                 "store": {"kind": "memory"}}),
             "t",
@@ -10544,8 +9916,7 @@ mod tests {
             "a document extension is still a file"
         );
         let s = Settings::from_document(
-            serde_json::json!({"config_version": "2",
-                "agent": {"name": "a", "instruction": path},
+            serde_json::json!({"agent": {"name": "a", "instruction": path},
                 "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
                 "store": {"kind": "memory"}}),
             "t",
@@ -10565,8 +9936,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let base = |instruction: serde_json::Value| {
             Settings::from_document(
-                serde_json::json!({"config_version": "2",
-                    "agent": {"name": "a", "instruction": instruction},
+                serde_json::json!({"agent": {"name": "a", "instruction": instruction},
                     "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
                     "store": {"kind": "memory"}}),
                 "t",
@@ -10575,12 +9945,12 @@ mod tests {
         };
         let e = base(json!({"dir": dir.path().to_string_lossy()}));
         assert!(e.contains("no file matched"), "{e}");
-        // `glob`/`order` beside `dir` rather than inside it: the refusal says
-        // where they moved, because "unknown field" would not.
+        // `glob`/`order` qualify the folder, so they live inside `dir`; beside
+        // it they are keys the instruction does not have.
         let e = base(json!({"text": "be terse", "glob": "*.md"}));
-        assert!(e.contains("belongs inside `dir`"), "{e}");
+        assert!(e.contains("unknown field `glob`"), "{e}");
         let e = base(json!({"dir": {"path": "."}, "order": "date"}));
-        assert!(e.contains("belongs inside `dir`"), "{e}");
+        assert!(e.contains("unknown field `order`"), "{e}");
         let e = base(json!({"dir": dir.path().to_string_lossy(), "text": "be terse"}));
         assert!(e.contains("names 2 sources"), "{e}");
     }
@@ -10593,8 +9963,7 @@ mod tests {
         let base = dir.path().join("c.json");
         std::fs::write(
             &base,
-            serde_json::json!({"config_version": "1",
-                "agent": {"name": "a", "preflight": "never"},
+            serde_json::json!({"agent": {"name": "a", "preflight": "never"},
                 "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
                 "store": {"kind": "memory"}})
             .to_string(),
@@ -10691,17 +10060,6 @@ mod tests {
         );
         assert_eq!(l.settings.lifecycle.exit_code_map.get("3"), Some(&9));
         assert_eq!(l.settings.lifecycle.exit_code_map.get("7"), Some(&9));
-
-        // The retired spellings say where they went, rather than "unknown
-        // argument" — the whole point of removing them by name.
-        for (gone, want) in [
-            ("--instruction-file", "--instruction.file"),
-            ("--prompt-file", "--prompt.file"),
-        ] {
-            let e = load(&args(&[gone, f.path().to_str().unwrap()]), &base_env()).unwrap_err();
-            let msg = format!("{e}");
-            assert!(msg.contains(gone) && msg.contains(want), "{msg}");
-        }
     }
 
     // ---- validation -----------------------------------------------------------
@@ -10714,10 +10072,8 @@ mod tests {
     #[test]
     fn validation_collects_the_document_rules() {
         // A file with an inline credential is refused; the same value from env is fine.
-        let e = load_doc(
-            "config_version: \"1\"\nintelligence:\n  endpoints: [https://i]\n  token: sk-inline\n",
-        )
-        .unwrap_err();
+        let e =
+            load_doc("intelligence:\n  endpoints: [https://i]\n  token: sk-inline\n").unwrap_err();
         assert!(format!("{e}").contains("inline credential"), "{e}");
         let (l, _) = load(
             &args(&[
@@ -10741,14 +10097,14 @@ mod tests {
         // Undeclared servers referenced by tools/store/knowledge/skills: the
         // startup path fast-fails on the first problem (exit 2)…
         let e = load_doc(
-            "config_version: \"1\"\nstore: {kind: mcp, mcp: {server: nope}}\nknowledge: {server: kb}\nskills: {sources: [{server: sk}]}\ntools: {overrides: {memory.get: {server: mem, tool: t}}, disabled: [memory.get]}\n",
+            "store: {kind: mcp, mcp: {server: nope}}\nknowledge: {server: kb}\nskills: {sources: [{server: sk}]}\ntools: {overrides: {memory.get: {server: mem, tool: t}}, disabled: [memory.get]}\n",
         )
         .unwrap_err();
         assert!(matches!(e, ConfigError::Usage(_)), "{e}");
 
         // --validate-config collects EVERYTHING.
         let f = write_tmp(
-            "config_version: \"1\"\nstore: {kind: mcp, mcp: {server: nope}}\nknowledge: {server: kb}\nskills: {sources: [{server: sk}]}\ntools: {overrides: {memory.get: {server: mem, tool: t}}, disabled: [memory.get]}\nlifecycle: {exit_code_map: {\"4\": 300}}\n",
+            "store: {kind: mcp, mcp: {server: nope}}\nknowledge: {server: kb}\nskills: {sources: [{server: sk}]}\ntools: {overrides: {memory.get: {server: mem, tool: t}}, disabled: [memory.get]}\nlifecycle: {exit_code_map: {\"4\": 300}}\n",
             "yaml",
         );
         let e = load(
@@ -10772,36 +10128,36 @@ mod tests {
         }
 
         // A2A listener rules.
-        let e = load_doc("config_version: \"1\"\nstore: {kind: memory}\na2a: {listen: \"https://0.0.0.0:8443\"}\n").unwrap_err();
+        let e = load_doc("store: {kind: memory}\na2a: {listen: \"https://0.0.0.0:8443\"}\n")
+            .unwrap_err();
         assert!(format!("{e}").contains("a2a.tls.cert"), "{e}");
-        let e = load_doc("config_version: \"1\"\nstore: {kind: memory}\na2a: {listen: \"http://0.0.0.0:8080\"}\n").unwrap_err();
+        let e = load_doc("store: {kind: memory}\na2a: {listen: \"http://0.0.0.0:8080\"}\n")
+            .unwrap_err();
         assert!(format!("{e}").contains("loopback"), "{e}");
         // Principals: `any` cannot be operator.
-        let e = load_doc(
-            "config_version: \"1\"\na2a: {principals: [{match: {any: true}, role: operator}]}\n",
-        )
-        .unwrap_err();
+        let e =
+            load_doc("a2a: {principals: [{match: {any: true}, role: operator}]}\n").unwrap_err();
         assert!(format!("{e}").contains("operator role"), "{e}");
         // Budget rules.
-        let e = load_doc("config_version: \"1\"\nintelligence: {budget: {windows: [{per: hour}], on_exhausted: degrade}}\n").unwrap_err();
+        let e =
+            load_doc("intelligence: {budget: {windows: [{per: hour}], on_exhausted: degrade}}\n")
+                .unwrap_err();
         assert!(format!("{e}").contains("tokens and/or requests"), "{e}");
         // Trifecta over the root grant.
         let e = load_doc(
-            "config_version: \"1\"\nmcp:\n  servers:\n    - {name: fs, endpoint: https://fs/mcp, tags: {\"*\": [untrusted_input, sensitive, egress]}}\n",
+            "mcp:\n  servers:\n    - {name: fs, endpoint: https://fs/mcp, tags: {\"*\": [untrusted_input, sensitive, egress]}}\n",
         )
         .unwrap_err();
         assert!(format!("{e}").contains("lethal-trifecta"), "{e}");
     }
 
-    // ---- the v1.17 A2A keys ------------------------------------------------
+    // ---- the A2A keys --------------------------------------------------------
 
     /// The whole diagnostic a document earns: empty when it loads, else the
     /// error text. Seeds the one secret the fixtures reference.
     fn load_errors(yaml: &str) -> String {
         crate::sec::secret::set_prompted("A2A_TEST_BEARER", "test-bearer".into());
-        match load_doc(&format!(
-            "config_version: \"1\"\nstore: {{kind: memory}}\n{yaml}"
-        )) {
+        match load_doc(&format!("store: {{kind: memory}}\n{yaml}")) {
             Ok(_) => String::new(),
             Err(e) => e.to_string(),
         }
@@ -11131,41 +10487,13 @@ mod tests {
         assert_eq!(g.code_ttl(), DEFAULT_DEVICE_CODE_TTL);
     }
 
-    /// A removed op is refused BY NAME wherever it can still be written: as
-    /// a principal's grant, which would otherwise load and match nothing, and
-    /// as a workflow's `a2a` start command, which would otherwise answer an
-    /// old client in the operator control's place. The `_instance.` family
-    /// and the reserved names are a workflow's to claim neither.
+    /// A grant naming an operator-only op on a rule that is not the
+    /// operator's would load and grant nothing, so it is refused; the
+    /// operator's own rule may name one. A pattern that merely covers such an
+    /// op loads. The `_instance.` family and the reserved names are a
+    /// workflow's to claim neither.
     #[test]
-    fn removed_op_names_are_refused_as_grants_and_workflow_commands() {
-        use crate::runtime::surface::REMOVED_OPS;
-        for (op, hint) in REMOVED_OPS {
-            let e = load_errors(&format!(
-                "a2a:\n  principals: [{{id: p, match: {{san: a.example}}, role: user, grants: [\"status\", \"{op}\"]}}]\n"
-            ));
-            assert!(
-                e.contains(&format!(
-                    "a2a.principals[0].grants: grant `{op}` was removed in agentd 1.17.0: {hint}"
-                )),
-                "{op}: {e}"
-            );
-            let errs = crate::engine::model::parse_workflow(&serde_json::json!({
-                "name": "old", "version": 3,
-                "steps": {
-                    "s": {"kind": "a2a", "command": op},
-                    "f": {"kind": "finish", "depends_on": ["s"], "status": "completed"}
-                }
-            }))
-            .err()
-            .unwrap_or_default();
-            assert!(
-                errs.iter().any(|e| e.contains(&format!(
-                    "command `{op}` was removed in agentd 1.17.0: {hint}"
-                ))),
-                "{op}: {errs:?}"
-            );
-        }
-        // A current op, or a pattern that merely covers a removed one, loads.
+    fn operator_only_ops_are_refused_as_non_operator_grants() {
         assert_eq!(
             load_errors(
                 "a2a:\n  principals: [{id: p, match: {san: a.example}, role: user, grants: [\"workflow.signal\", \"config*\", \"admin*\"]}]\n"
@@ -11173,8 +10501,8 @@ mod tests {
             ""
         );
         // An operator-only op named exactly, on a rule that is not the
-        // operator's, would load and grant nothing — refused, as a removed op
-        // is. The operator's own rule may name it (it is redundant there).
+        // operator's. The operator's own rule may name it (it is redundant
+        // there).
         for op in ["admin.set", "config", "debug.events", "_instance.result"] {
             let e = load_errors(&format!(
                 "a2a:\n  principals: [{{id: p, match: {{san: a.example}}, role: user, grants: [\"{op}\"]}}]\n"
@@ -11201,8 +10529,7 @@ mod tests {
             "admin.set",
         ] {
             let errs = crate::engine::model::parse_workflow(&serde_json::json!({
-                "name": "shadow", "version": 3,
-                "steps": {
+                "name": "shadow", "steps": {
                     "s": {"kind": "a2a", "command": cmd},
                     "f": {"kind": "finish", "depends_on": ["s"], "status": "completed"}
                 }
@@ -11309,291 +10636,189 @@ mod tests {
         assert_eq!(a2a("https://10.0.0.5:8443", ""), "");
     }
 
-    /// A document setting `path` (`[]` = one element of the list) to `true`.
-    fn document_setting(path: &str) -> Value {
-        fn build(segs: &[&str]) -> Value {
-            let Some((head, rest)) = segs.split_first() else {
-                return json!(true);
-            };
-            match head.strip_suffix("[]") {
-                Some(key) => json!({ key: [build(rest)] }),
-                None => json!({ *head: build(rest) }),
-            }
-        }
-        build(&path.split('.').collect::<Vec<_>>())
-    }
-
-    /// The same document in block YAML, for a `:::!config` fragment.
-    fn yaml_setting(path: &str) -> String {
-        let mut out = String::new();
-        let mut indent = 0;
-        let mut item = false;
-        for seg in path.split('.') {
-            let (key, list) = match seg.strip_suffix("[]") {
-                Some(k) => (k, true),
-                None => (seg, false),
-            };
-            let lead = if item { "- " } else { "" };
-            out.push_str(&format!("{}{lead}{key}:\n", " ".repeat(indent)));
-            // A list item's keys sit past its `- `.
-            indent += if item { 4 } else { 2 };
-            item = list;
-        }
-        out.pop();
-        out.push_str(" true");
-        out
-    }
-
-    /// A removed key is refused BY NAME on every layer — a file, a flag, an
-    /// `AGENTD_` variable, a `:::!config` fragment — with the release and the
-    /// replacement, instead of "unknown field", "unknown argument",
-    /// "operator configuration" or, for a variable, silence.
+    /// A key nobody defines is refused by the layer that carries it, in that
+    /// layer's own words. A variable is the one layer that cannot refuse: an
+    /// `AGENTD_` name that binds no path is simply not read.
     #[test]
-    fn removed_keys_are_refused_by_name_everywhere() {
-        // The promised entries, spelled out so deleting a row fails here even
-        // though every loop below would shrink with the table.
-        for promised in [
-            "interface",
-            "interface.enabled",
-            "interface.debug",
-            "interface.display",
-            "interface.origins",
-            "interface.pairing",
-            "a2a.principals[].match.aauth_agent",
-        ] {
-            assert!(
-                REMOVED_KEYS.iter().any(|(k, _)| *k == promised),
-                "{promised} left REMOVED_KEYS"
-            );
-        }
-        let refused = |e: String, path: &str, hint: &str, layer: &str| {
-            assert!(
-                e.contains(&format!("`{path}` was removed in agentd 1.17.0: {hint}")),
-                "{layer} did not refuse {path} by name: {e}"
-            );
-        };
+    fn an_unknown_key_is_refused_on_every_layer_that_can_name_one() {
         let dir = tempfile::tempdir().unwrap();
         let base = ["--store.kind", "memory"];
-        for (i, (path, hint)) in REMOVED_KEYS.iter().enumerate() {
-            let doc = document_setting(path);
-            // A FILE — alone, where it used to read as the flat schema, and
-            // beside a legacy flat key, where it used to read as a mixed one.
-            for (n, body) in [doc.clone(), {
-                let mut mixed = doc.clone();
-                mixed["model"] = json!("m");
-                mixed
-            }]
-            .into_iter()
-            .enumerate()
-            {
-                let f = dir.path().join(format!("removed-{i}-{n}.yaml"));
-                std::fs::write(&f, body.to_string()).unwrap();
-                let f = f.to_str().unwrap();
-                let e = load(&args(&["--config", f]), &[]).unwrap_err().to_string();
-                refused(e.clone(), path, hint, "a file");
-                assert!(e.contains(f), "the refusal names its file: {e}");
-                if n == 0 {
-                    assert_eq!(
-                        probe(&args(&["--config", f]), &[]).unwrap(),
-                        Detected::V2,
-                        "{path}: a file of just a removed section is this schema's"
-                    );
-                }
-            }
-            // A FRAGMENT, before the operator-configuration boundary names it
-            // something else.
-            let instr = dir.path().join(format!("removed-{i}.md"));
+        // A FILE: typed on its own, so the refusal names it.
+        let f = dir.path().join("section.yaml");
+        std::fs::write(&f, "interface: {enabled: true}\n").unwrap();
+        let f = f.to_str().unwrap();
+        let e = load(&args(&["--config", f]), &[]).unwrap_err().to_string();
+        assert!(e.contains("unknown field `interface`"), "{e}");
+        assert!(e.contains(f), "the refusal names its file: {e}");
+        // A FLAG.
+        let mut a = args(&base);
+        a.extend(args(&["--interface.enabled", "true"]));
+        let e = load(&a, &[]).unwrap_err().to_string();
+        assert!(e.contains("unknown argument: --interface.enabled"), "{e}");
+        // A FRAGMENT: outside what a document may write, so it is operator
+        // configuration — the fail-closed walk refuses a leaf nobody
+        // classified.
+        let instr = dir.path().join("desk.md");
+        std::fs::write(
+            &instr,
+            "You are the desk.\n\n:::!config\ninterface:\n  enabled: true\n:::\n",
+        )
+        .unwrap();
+        let e = Settings::from_document(
+            json!({"agent": {"name": "a", "preflight": "never",
+                          "instruction": {"file": instr.to_str().unwrap()}},
+                "store": {"kind": "memory"}}),
+            "t",
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("writes interface.enabled")
+                && e.contains("operator configuration is not a document's to set"),
+            "{e}"
+        );
+        // A LIST ELEMENT: the matcher is typed, so a key it does not have is
+        // refused wherever the list came from.
+        let e = load_doc(
+            "store: {kind: memory}\na2a: {principals: [{id: p, match: {aauth_agent: x}, role: user}]}\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("unknown field `aauth_agent`"), "{e}");
+        // A VARIABLE that binds no path is not read, and the load succeeds.
+        assert!(
+            load(
+                &args(&base),
+                &[("AGENTD_INTERFACE_LOG".into(), "/tmp/x.log".into())]
+            )
+            .is_ok()
+        );
+    }
+
+    /// A top-level key the schema does not define is refused by the file that
+    /// carries it, named — `model:` being what an older flat document looked
+    /// like is nobody's business here.
+    #[test]
+    fn a_top_level_key_nobody_defines_is_refused_naming_its_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("flat.yaml");
+        std::fs::write(&f, "model: m\n").unwrap();
+        let f = f.to_str().unwrap();
+        let e = load(&args(&["--config", f]), &[]).unwrap_err().to_string();
+        assert!(e.contains("unknown field `model`") && e.contains(f), "{e}");
+    }
+
+    /// instruction.md §7.5: `instruction_sources` and a top-level
+    /// `document_capabilities` MUST be unreachable from `!config`. Neither is
+    /// a setting agentd has, so no list names them — and the fail-closed walk
+    /// refuses a path nobody classified, which is what keeps them out.
+    #[test]
+    fn a_fragment_cannot_reach_instruction_sources_or_document_capabilities() {
+        let dir = tempfile::tempdir().unwrap();
+        for (i, body) in [
+            "instruction_sources:\n  - uri: instruction://x\n",
+            "instruction_sources: true\n",
+            "document_capabilities: [config]\n",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let instr = dir.path().join(format!("reach-{i}.md"));
             std::fs::write(
                 &instr,
-                format!(
-                    "You are the desk.\n\n:::!config\n{}\n:::\n",
-                    yaml_setting(path)
-                ),
+                format!("You are the desk.\n\n:::!config\n{body}:::\n"),
             )
             .unwrap();
             let e = Settings::from_document(
-                json!({"config_version": "1",
-                    "agent": {"name": "a", "preflight": "never",
+                json!({"agent": {"name": "a", "preflight": "never",
                               "instruction": {"file": instr.to_str().unwrap()}},
                     "store": {"kind": "memory"}}),
                 "t",
             )
             .unwrap_err();
-            refused(e.clone(), path, hint, "a fragment");
-            assert!(e.contains(":::!config"), "{e}");
-            if path.contains("[]") {
-                // No flag or variable addresses a list element; the whole
-                // list does, and the merged document is refused.
-                let list = path.split("[]").next().unwrap();
-                let value = document_setting(path)
-                    .pointer(&format!("/{}", list.replace('.', "/")))
-                    .unwrap()
-                    .to_string();
-                let flag = format!("--{list}");
-                let mut a = args(&base);
-                a.extend(args(&[&flag, &value]));
-                refused(
-                    load(&a, &[]).unwrap_err().to_string(),
-                    path,
-                    hint,
-                    "a list flag",
-                );
-                let var = format!("AGENTD_{}", list.to_ascii_uppercase().replace('.', "_"));
-                refused(
-                    load(&args(&base), &[(var, value)]).unwrap_err().to_string(),
-                    path,
-                    hint,
-                    "a list variable",
-                );
-                continue;
-            }
-            // Every FLAG spelling the loader canonicalizes.
-            for flag in [
-                format!("--{path}"),
-                format!("--{}", path.replace('.', "-")),
-                format!("--{}", path.replace('.', "_")),
-            ] {
-                let mut a = args(&base);
-                a.extend(args(&[&flag, "true"]));
-                let e = load(&a, &[]).unwrap_err().to_string();
-                refused(e.clone(), path, hint, "a flag");
-                assert!(
-                    e.starts_with(&format!("agentd: {flag}:")),
-                    "the refusal names the flag: {e}"
+            // Refused as operator configuration — by the instruction parser's
+            // own §7.5 check or by the boundary walk, whichever reaches it
+            // first; never merged.
+            let key = body.split(':').next().unwrap();
+            assert!(
+                e.contains("operator configuration") && e.contains(key),
+                "{body}: {e}"
+            );
+        }
+        // …and the boundary walk refuses each on its own: neither is a path
+        // any list classifies, so it is operator configuration by default.
+        for key in ["instruction_sources", "document_capabilities"] {
+            for value in [json!([{"uri": "instruction://x"}]), json!(true)] {
+                let fragment = json!({ key: value });
+                assert_eq!(
+                    document_wrote_operator_config(fragment.as_object().unwrap()),
+                    vec![key.to_string()],
+                    "{fragment}"
                 );
             }
-            // The VARIABLE, branded and neutral.
-            let upper = path.to_ascii_uppercase().replace('.', "_");
-            for var in [format!("AGENTD_{upper}"), format!("AGENT_{upper}")] {
-                let e = load(&args(&base), &[(var.clone(), "true".into())])
-                    .unwrap_err()
-                    .to_string();
-                refused(e, path, hint, &var);
-            }
         }
-        // The catch-all answers for what nothing more specific names —
-        // including the launcher's old log-path variable and flag.
-        let (_, catch_all) = REMOVED_KEYS
-            .iter()
-            .find(|(k, _)| *k == "interface")
-            .unwrap();
-        let e = load(
-            &args(&base),
-            &[("AGENTD_INTERFACE_LOG".into(), "/tmp/x.log".into())],
-        )
-        .unwrap_err()
-        .to_string();
-        refused(e, "interface", catch_all, "AGENTD_INTERFACE_LOG");
-        let mut a = args(&base);
-        a.extend(args(&["--interface.anything", "1"]));
-        refused(
-            load(&a, &[]).unwrap_err().to_string(),
-            "interface",
-            catch_all,
-            "a flag under the catch-all",
-        );
-        // The bare spelling is too generic to claim, and is left alone.
-        assert!(load(&args(&base), &[("INTERFACE_LOG".into(), "x".into())]).is_ok());
-        // `--help` lists every removed key.
-        let help = help_text();
-        for (path, _) in REMOVED_KEYS {
-            assert!(help.contains(path), "--help omits {path}");
-        }
-    }
-
-    /// Whether `path` (`[]` = the list's items) resolves in the schema.
-    fn schema_has(schema: &Value, path: &str) -> bool {
-        let defs = &schema["$defs"];
-        let deref = |v: &Value| -> Value {
-            match v.get("$ref").and_then(Value::as_str) {
-                Some(r) => defs[r.trim_start_matches("#/$defs/")].clone(),
-                None => v.clone(),
-            }
-        };
-        let mut node = schema.clone();
-        for seg in path.split('.') {
-            let (key, list) = match seg.strip_suffix("[]") {
-                Some(k) => (k, true),
-                None => (seg, false),
-            };
-            let Some(child) = node.get("properties").and_then(|p| p.get(key)) else {
-                return false;
-            };
-            node = deref(child);
-            if list {
-                node = deref(&node["items"]);
-            }
-        }
-        true
-    }
-
-    /// A removed key is gone from the schema that generates every flag and
-    /// variable — and every key a hint sends the operator to is live.
-    #[test]
-    fn removed_keys_are_not_live_schema_paths() {
-        let schema = schema::schema();
-        // The walker itself: it finds a live list-element key and a nested one.
-        assert!(schema_has(&schema, "a2a.principals[].match.san"));
-        assert!(schema_has(&schema, "a2a.events.enabled"));
-        for (path, hint) in REMOVED_KEYS {
-            assert!(!schema_has(&schema, path), "{path} is still in the schema");
-            for word in hint.split(|c: char| c.is_whitespace() || c == ',' || c == ';') {
-                let word = word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_');
-                if word.starts_with("a2a.") || word.starts_with("observability.") {
-                    assert!(
-                        schema_has(&schema, word),
-                        "the hint for {path} names {word}, which is not a setting"
-                    );
-                }
-            }
-        }
-        let bindings = paths::bindings_of(&schema);
-        assert!(
-            !bindings.iter().any(|b| b.path.starts_with("interface")),
-            "an interface path still binds a flag or a variable"
-        );
     }
 
     /// The launcher's environment scrub reads the loader's own tables: every
-    /// alias under every prefix, and every path's names.
+    /// alias and every path's name, under the one prefix.
     #[test]
     fn consumed_env_names_cover_every_alias() {
         let one = |name: &str| consumed_env_names(&[(name.to_string(), "x".to_string())]);
         for (alias, _) in ENV_ALIASES {
-            for prefix in paths::ENV_PREFIXES {
-                let name = format!("{prefix}{alias}");
-                assert_eq!(
-                    one(&name),
-                    vec![name.clone()],
-                    "{name} is read by the loader"
-                );
-            }
-        }
-        // `a2a.bearer` travels under this alias, so all three spellings must go.
-        for name in ["SERVE_BEARER", "AGENTD_SERVE_BEARER", "AGENT_SERVE_BEARER"] {
-            assert_eq!(one(name), vec![name.to_string()]);
+            let name = format!("{}{alias}", paths::ENV_PREFIX);
+            assert_eq!(
+                one(&name),
+                vec![name.clone()],
+                "{name} is read by the loader"
+            );
         }
         let bindings = paths::bindings_of(&schema::schema());
         for b in bindings.iter().step_by(11) {
-            for name in b.env_names() {
-                assert_eq!(one(&name), vec![name.clone()], "{} via {name}", b.path);
-            }
+            let name = b.env_name();
+            assert_eq!(one(&name), vec![name.clone()], "{} via {name}", b.path);
         }
-        for ignored in ["HOME", "PATH", "AGENTD_NOT_A_SETTING", "LLM_KEY"] {
+        assert_eq!(
+            one("AGENTD_A2A_BEARER"),
+            vec!["AGENTD_A2A_BEARER".to_string()]
+        );
+        for ignored in [
+            "HOME",
+            "PATH",
+            "AGENTD_NOT_A_SETTING",
+            "LLM_KEY",
+            "AGENT_MODEL",
+            "MODEL",
+        ] {
             assert!(one(ignored).is_empty(), "{ignored} is not the loader's");
         }
-        // …and the ENV layer really reads an alias under each prefix, so the
+        // …and the ENV layer really reads an alias under the prefix, so the
         // two cannot disagree about what "consumed" means.
-        for prefix in paths::ENV_PREFIXES {
+        let (l, _) = load(
+            &args(&["--store.kind", "memory"]),
+            &[("AGENTD_LOG_LEVEL".into(), "debug".into())],
+        )
+        .unwrap();
+        assert_eq!(l.settings.observability.log_level.as_deref(), Some("debug"));
+    }
+
+    /// `AGENTD_` is the only prefix the loader reads: the same name under
+    /// `AGENT_`, or bare, is another program's variable and sets nothing.
+    #[test]
+    fn an_agent_prefixed_or_bare_variable_is_not_read() {
+        for var in [
+            "AGENT_LOG_LEVEL",
+            "LOG_LEVEL",
+            "AGENT_OBSERVABILITY_LOG_LEVEL",
+            "OBSERVABILITY_LOG_LEVEL",
+        ] {
             let (l, _) = load(
                 &args(&["--store.kind", "memory"]),
-                &[(format!("{prefix}LOG_LEVEL"), "debug".into())],
+                &[(var.into(), "debug".into())],
             )
             .unwrap();
-            assert_eq!(
+            assert_ne!(
                 l.settings.observability.log_level.as_deref(),
                 Some("debug"),
-                "{prefix}LOG_LEVEL"
+                "{var} was read"
             );
         }
     }
@@ -11611,7 +10836,7 @@ mod tests {
 
         // `to` on an ask parses with the addressee parser, in both spellings.
         let l = load_doc(
-            "config_version: \"1\"\nstore: {kind: memory}\nsecurity:\n  policies:\n    - {match: {tool: \"fs.*\"}, action: ask, to: {role: user, labels: {team: fin}}}\n    - {match: {tool: \"db.*\"}, action: ask, to: \"*@fin.example\"}\n",
+            "store: {kind: memory}\nsecurity:\n  policies:\n    - {match: {tool: \"fs.*\"}, action: ask, to: {role: user, labels: {team: fin}}}\n    - {match: {tool: \"db.*\"}, action: ask, to: \"*@fin.example\"}\n",
         )
         .unwrap();
         let p = &l.settings.security.policies;
@@ -11623,7 +10848,7 @@ mod tests {
         // …and a rule without one stays unaddressed here (the runtime default
         // is the operator role).
         let l = load_doc(
-            "config_version: \"1\"\nstore: {kind: memory}\nsecurity: {policies: [{match: {tool: x}, action: ask}]}\n",
+            "store: {kind: memory}\nsecurity: {policies: [{match: {tool: x}, action: ask}]}\n",
         )
         .unwrap();
         assert!(l.settings.security.policies[0].to.is_none());
@@ -11700,8 +10925,7 @@ mod tests {
         )
         .unwrap();
         let e = Settings::from_document(
-            json!({"config_version": "1",
-                "agent": {"name": "a", "preflight": "never",
+            json!({"agent": {"name": "a", "preflight": "never",
                           "instruction": {"file": doc.to_string_lossy()}},
                 "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
                 "store": {"kind": "memory"}}),
@@ -11885,12 +11109,12 @@ mod tests {
     #[test]
     fn file_store_validation_diagnostics() {
         // `kind: file` needs no block at all.
-        let l = load_doc("config_version: \"1\"\nstore: {kind: file}\n").unwrap();
+        let l = load_doc("store: {kind: file}\n").unwrap();
         assert_eq!(l.settings.store.kind, StoreKind::File);
         assert!(validate(&l).errors.is_empty(), "{:?}", validate(&l).errors);
         // …and a long-lived instance is satisfied by it (no `store.kind is none`).
         let l = load_doc(
-            "config_version: \"1\"\nstore: {kind: file, file: {path: /var/lib/agentd}}\na2a: {listen: \"http://127.0.0.1:8080\"}\n",
+            "store: {kind: file, file: {path: /var/lib/agentd}}\na2a: {listen: \"http://127.0.0.1:8080\"}\n",
         )
         .unwrap();
         assert!(validate(&l).errors.is_empty(), "{:?}", validate(&l).errors);
@@ -11900,16 +11124,12 @@ mod tests {
         );
 
         // An explicitly empty path would resolve to the working directory.
-        let e = load_doc("config_version: \"1\"\nstore: {kind: file, file: {path: \"\"}}\n")
-            .unwrap_err();
+        let e = load_doc("store: {kind: file, file: {path: \"\"}}\n").unwrap_err();
         assert!(format!("{e}").contains("store.file.path is empty"), "{e}");
 
         // A block belonging to an adapter that is not selected is dead config:
         // a warning (it is ignored), not a refusal (it does no harm).
-        let l = load_doc(
-            "config_version: \"1\"\nstore: {kind: memory, file: {path: /var/lib/agentd}}\n",
-        )
-        .unwrap();
+        let l = load_doc("store: {kind: memory, file: {path: /var/lib/agentd}}\n").unwrap();
         let d = validate(&l);
         assert!(d.errors.is_empty(), "{:?}", d.errors);
         assert!(
@@ -11920,9 +11140,7 @@ mod tests {
             d.warnings
         );
         // No warning when the file adapter IS the selected one.
-        let l =
-            load_doc("config_version: \"1\"\nstore: {kind: file, file: {path: /var/lib/agentd}}\n")
-                .unwrap();
+        let l = load_doc("store: {kind: file, file: {path: /var/lib/agentd}}\n").unwrap();
         assert!(
             !validate(&l)
                 .warnings
@@ -11956,7 +11174,7 @@ mod tests {
     fn help_and_schema_asks_short_circuit_validation() {
         let (_, ask) = load(&args(&["--help"]), &[]).unwrap();
         assert_eq!(ask, Ask::Help);
-        let (_, ask) = load(&args(&["--config-schema=1"]), &[]).unwrap();
+        let (_, ask) = load(&args(&["--config-schema"]), &[]).unwrap();
         assert_eq!(ask, Ask::Schema);
         // `--workflow-schema` is a static, side-effect-free dump: it must resolve
         // even with no config file present (no intelligence endpoint, etc.).
@@ -11967,7 +11185,7 @@ mod tests {
 
     // ---- service catalog & egress policy -----------------------------------
 
-    const CATALOG: &str = "config_version: \"1\"\nstore: {kind: memory}\nservices:\n  billing:\n    endpoint: https://billing.example/mcp\n    auth: {kind: static, token: \"{{secret:BILLING}}\"}\n    headers: {X-Env: prod}\n    tags: {\"*\": [sensitive]}\n    allow: [charge_lookup, invoice_*]\n    exclude: [invoice_purge]\n  brain:\n    kind: intelligence\n    endpoint: https://intel.example/v1\n";
+    const CATALOG: &str = "store: {kind: memory}\nservices:\n  billing:\n    endpoint: https://billing.example/mcp\n    auth: {kind: static, token: \"{{secret:BILLING}}\"}\n    headers: {X-Env: prod}\n    tags: {\"*\": [sensitive]}\n    allow: [charge_lookup, invoice_*]\n    exclude: [invoice_purge]\n  brain:\n    kind: intelligence\n    endpoint: https://intel.example/v1\n";
 
     #[test]
     fn service_reference_inherits_and_narrows() {
@@ -12052,7 +11270,7 @@ mod tests {
     #[test]
     fn unknown_service_reference_is_refused() {
         let f = write_tmp(
-            "config_version: \"1\"\nstore: {kind: memory}\nmcp:\n  servers:\n    - {name: x, service: nope}\n",
+            "store: {kind: memory}\nmcp:\n  servers:\n    - {name: x, service: nope}\n",
             "yaml",
         );
         let e = load(
@@ -12121,7 +11339,7 @@ mod tests {
     #[test]
     fn ambiguous_catalog_endpoints_are_refused() {
         let f = write_tmp(
-            "config_version: \"1\"\nstore: {kind: memory}\nservices:\n  a: {endpoint: \"https://s.example/mcp\"}\n  b: {endpoint: \"https://s.example/mcp/deeper\"}\n",
+            "store: {kind: memory}\nservices:\n  a: {endpoint: \"https://s.example/mcp\"}\n  b: {endpoint: \"https://s.example/mcp/deeper\"}\n",
             "yaml",
         );
         let e = load(
@@ -12174,7 +11392,7 @@ mod tests {
         // A `kind: peer` entry feeds a2a.peers[].service, and closed mode
         // covers intelligence endpoints, peers and http-step literals too.
         let f = write_tmp(
-            "config_version: \"1\"\nstore: {kind: memory}\nsecurity: {egress: closed}\nservices:\n  brain: {kind: intelligence, endpoint: \"https://intel.example/v1\"}\n  buddy: {kind: peer, endpoint: \"https://peer.example\", auth: {kind: static, token: \"{{secret:PEER}}\"}}\n  hooks: {kind: http, endpoint: \"https://hooks.example\", methods: [POST]}\na2a:\n  peers:\n    - {name: pal, service: buddy}\nworkflows:\n  - name: w\n    steps:\n      s: {kind: once}\n      h: {kind: http, depends_on: [s], method: POST, url: \"https://hooks.example/x\"}\n      f: {kind: finish, depends_on: [h], status: completed}\n",
+            "store: {kind: memory}\nsecurity: {egress: closed}\nservices:\n  brain: {kind: intelligence, endpoint: \"https://intel.example/v1\"}\n  buddy: {kind: peer, endpoint: \"https://peer.example\", auth: {kind: static, token: \"{{secret:PEER}}\"}}\n  hooks: {kind: http, endpoint: \"https://hooks.example\", methods: [POST]}\na2a:\n  peers:\n    - {name: pal, service: buddy}\nworkflows:\n  - name: w\n    steps:\n      s: {kind: once}\n      h: {kind: http, depends_on: [s], method: POST, url: \"https://hooks.example/x\"}\n      f: {kind: finish, depends_on: [h], status: completed}\n",
             "yaml",
         );
         let (loaded, _) = load(
@@ -12187,7 +11405,7 @@ mod tests {
         assert!(p.auth.is_some(), "peer inherited auth");
 
         let bad = write_tmp(
-            "config_version: \"1\"\nstore: {kind: memory}\nsecurity: {egress: closed}\na2a:\n  peers:\n    - {name: rogue, endpoint: \"https://rogue.example\"}\n",
+            "store: {kind: memory}\nsecurity: {egress: closed}\na2a:\n  peers:\n    - {name: rogue, endpoint: \"https://rogue.example\"}\n",
             "yaml",
         );
         let e = load(
@@ -12201,7 +11419,7 @@ mod tests {
         );
 
         let badi = write_tmp(
-            "config_version: \"1\"\nstore: {kind: memory}\nsecurity: {egress: closed}\nintelligence: {endpoints: \"https://rogue-intel.example/v1\"}\n",
+            "store: {kind: memory}\nsecurity: {egress: closed}\nintelligence: {endpoints: \"https://rogue-intel.example/v1\"}\n",
             "yaml",
         );
         let e = load(&args(&["--config", badi.path().to_str().unwrap()]), &[]).unwrap_err();
@@ -12214,7 +11432,7 @@ mod tests {
     #[test]
     fn kind_specific_entry_fields_are_validated() {
         let f = write_tmp(
-            "config_version: \"1\"\nstore: {kind: memory}\nservices:\n  x: {kind: http, endpoint: \"https://x.example\", tags: {\"*\": [egress]}}\n  y: {kind: mcp, endpoint: \"https://y.example\", methods: [GET]}\n",
+            "store: {kind: memory}\nservices:\n  x: {kind: http, endpoint: \"https://x.example\", tags: {\"*\": [egress]}}\n  y: {kind: mcp, endpoint: \"https://y.example\", methods: [GET]}\n",
             "yaml",
         );
         let e = load(

@@ -31,7 +31,6 @@
 # need a thin re-signing relay — see the finance.yaml and support-l1.yaml
 # headers.
 # ─────────────────────────────────────────────────────────────────────────────
-config_version: "1"
 
 services:
   # ── Customer-facing surfaces ───────────────────────────────────────────────

@@ -5,7 +5,7 @@
 //! commands answered by the child's own workflow over its unix socket, ttl
 //! retirement, singleton refusal) — plus the boot-time refusal of template
 //! machinery that tries to define listeners.
-#![cfg(all(unix, feature = "workflow"))]
+#![cfg(unix)]
 
 mod common;
 
@@ -44,7 +44,7 @@ fn a_flat_template_spawns_with_folded_params_and_the_template_grant() {
     // it and fills the declared hole; `instruction` at the call site would be
     // refused (mutual exclusion is validated at workflow load).
     let (code, log) = run_cfg(
-        "config_version: \"1\"\nagent: { name: t }\nstore: { kind: memory }\n\
+        "agent: { name: t }\nstore: { kind: memory }\n\
          intelligence: { endpoints: \"mock:final\", model: mock }\n\
          lifecycle: { run_until: idle, idle_grace: 900ms }\n\
          observability: { log_level: info, log_content: true }\n\
@@ -76,7 +76,7 @@ fn a_flat_template_spawns_with_folded_params_and_the_template_grant() {
 #[test]
 fn freeform_spawns_are_refused_when_the_operator_disables_them() {
     let (code, log) = run_cfg(
-        "config_version: \"1\"\nagent: { name: t }\nstore: { kind: memory }\n\
+        "agent: { name: t }\nstore: { kind: memory }\n\
          intelligence: { endpoints: \"mock:final\", model: mock }\n\
          lifecycle: { run_until: idle, idle_grace: 700ms }\n\
          observability: { log_level: info, log_content: true }\n\
@@ -101,7 +101,7 @@ fn freeform_spawns_are_refused_when_the_operator_disables_them() {
 #[test]
 fn template_params_are_schema_checked_at_the_chokepoint() {
     let (code, log) = run_cfg(
-        "config_version: \"1\"\nagent: { name: t }\nstore: { kind: memory }\n\
+        "agent: { name: t }\nstore: { kind: memory }\n\
          intelligence: { endpoints: \"mock:final\", model: mock }\n\
          lifecycle: { run_until: idle, idle_grace: 700ms }\n\
          observability: { log_level: info, log_content: true }\n\
@@ -133,7 +133,7 @@ fn an_instance_template_boots_answers_typed_commands_and_retires_on_ttl() {
     // by handle over the auto-wired unix socket; the ttl retires it through
     // the child's own graceful drain.
     let (code, log) = run_cfg(
-        "config_version: \"1\"\nagent: { name: parent }\nstore: { kind: memory }\n\
+        "agent: { name: parent }\nstore: { kind: memory }\n\
          lifecycle: { run_until: idle, idle_grace: 1500ms }\n\
          observability: { log_level: info, log_content: true }\n\
          subagents:\n\
@@ -142,7 +142,6 @@ fn an_instance_template_boots_answers_typed_commands_and_retires_on_ttl() {
         \x20     instruction: |\n\
         \x20       You are the room for {{params.id}}.\n\
         \x20       :::!workflow{name=on-ping}\n\
-        \x20       version: 3\n\
         \x20       steps:\n\
         \x20         cmd: { kind: a2a, command: room.ping, roles: [agent, operator] }\n\
         \x20         f:   { kind: finish, depends_on: [cmd], status: completed, output: \"pong {{params.id}}/{{steps.cmd.output.args.x}}\" }\n\
@@ -185,7 +184,7 @@ fn an_instance_template_boots_answers_typed_commands_and_retires_on_ttl() {
 #[test]
 fn a_singleton_instance_refuses_a_second_live_spawn() {
     let (code, log) = run_cfg(
-        "config_version: \"1\"\nagent: { name: parent }\nstore: { kind: memory }\n\
+        "agent: { name: parent }\nstore: { kind: memory }\n\
          lifecycle: { run_until: idle, idle_grace: 1200ms }\n\
          observability: { log_level: info, log_content: true }\n\
          subagents:\n\
@@ -194,7 +193,6 @@ fn a_singleton_instance_refuses_a_second_live_spawn() {
         \x20     instruction: |\n\
         \x20       The one board.\n\
         \x20       :::!workflow{name=on-ask}\n\
-        \x20       version: 3\n\
         \x20       steps:\n\
         \x20         cmd: { kind: a2a, command: board.ask, roles: [agent, operator] }\n\
         \x20         f:   { kind: finish, depends_on: [cmd], status: completed, output: ok }\n\
@@ -222,7 +220,7 @@ fn a_singleton_instance_refuses_a_second_live_spawn() {
 #[test]
 fn template_machinery_may_not_define_listeners_and_fails_the_parents_boot() {
     let (code, log) = run_cfg(
-        "config_version: \"1\"\nagent: { name: parent }\nstore: { kind: memory }\n\
+        "agent: { name: parent }\nstore: { kind: memory }\n\
          lifecycle: { run_until: idle, idle_grace: 500ms }\n\
          subagents:\n\
         \x20 templates:\n\
@@ -233,7 +231,6 @@ fn template_machinery_may_not_define_listeners_and_fails_the_parents_boot() {
         \x20       webhooks: { listen: \"http://127.0.0.1:1\" }\n\
         \x20       :::\n\
         \x20       :::!workflow{name=w}\n\
-        \x20       version: 3\n\
         \x20       steps: { s: { kind: once }, f: { kind: finish, depends_on: [s], status: completed } }\n\
         \x20       :::\n",
     );

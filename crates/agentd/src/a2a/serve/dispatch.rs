@@ -238,9 +238,8 @@ async fn dispatch(
         );
     }
 
-    // The route table, matched exactly, for every caller: an unknown name —
-    // the card read as a method, an `a2a.` prefix, a 0.3 spelling — is the
-    // same answer for an operator and a stranger, and it comes before the
+    // The route table, matched exactly, for every caller: an unknown name is
+    // the same answer for an operator and a stranger, and it comes before the
     // method gate so authorization can never be what tells them apart.
     let Some(route) = route_of(&method) else {
         return err(
@@ -339,7 +338,7 @@ async fn dispatch(
     } else {
         None
     };
-    // The command the send carries, held to command/v2 before anything is
+    // The command the send carries, held to the command extension before anything is
     // done with it: activated by the header and marked on the message, one
     // envelope, no task of its own choosing, an answer the caller accepts,
     // an op something serves and arguments that match its published schema.
@@ -447,7 +446,7 @@ struct Admitted {
     via: Via,
     /// The task the send's message named (see `ports::RequestScope`).
     named_task: Option<String>,
-    /// The command a send carries, held to command/v2.
+    /// The command a send carries, held to the command extension.
     command: Option<Command>,
     bearer_used: bool,
     active: Active,

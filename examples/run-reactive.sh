@@ -8,16 +8,15 @@
 # `notifications/resources/updated` over HTTP/SSE. The subscribed servers are
 # remote HTTP endpoints.
 #
-# The subscription is a `subscribe` start node. `--mode reactive --subscribe
-# <uri>` was the 1.x spelling; modes were removed in 2.0 and the shape they
-# encoded became a start node. See docs/modes-and-triggers.md.
+# The subscription is a `subscribe` start node in the config. See
+# docs/modes-and-triggers.md.
 
 set -euo pipefail
 
 AGENTD="${AGENTD:-agentd}"
 
-export AGENT_INTELLIGENCE="${AGENT_INTELLIGENCE:-https://gw.example/v1}"
-# export AGENT_INTELLIGENCE_TOKEN=...   # set in your environment, not here
+export AGENTD_INTELLIGENCE="${AGENTD_INTELLIGENCE:-https://gw.example/v1}"
+# export AGENTD_INTELLIGENCE_TOKEN=...   # set in your environment, not here
 
 # --max-tokens bounds ONE RUN (`limits.run.tokens`), not the daemon's lifetime
 # spend — every wake gets the same allowance again. For a cumulative ceiling set

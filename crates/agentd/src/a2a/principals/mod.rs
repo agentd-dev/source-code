@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! **Principals, roles and authorization**: every A2A caller is resolved to a
-//! principal (identity from mTLS SAN / bearer subject / AAuth agent id) with a
+//! principal (identity from an mTLS SAN, a bearer's subject, a named bearer or a
+//! session) with a
 //! role (`operator | user | agent | anonymous`), a set of granted tool
 //! patterns, and optional per-principal quotas. The authorization matrix —
 //! which methods and commands a role may call — is decided here; the served
@@ -8,7 +9,7 @@
 //! does not match a rule lands on the anonymous principal, which may call
 //! nothing, so a caller agentd cannot identify gets no surface at all.
 
-use crate::config::v2::{self, Role};
+use crate::config::settings::{self, Role};
 use crate::runtime::surface::{self, Floor};
 use serde_json::Value;
 
@@ -31,7 +32,7 @@ pub struct Principal {
     pub grants: Vec<String>,
     /// The rate quota (`"<burst>/<per>s"`) and budget scope key, if any.
     pub rate: Option<String>,
-    pub budget: Option<v2::Budget>,
+    pub budget: Option<settings::Budget>,
     /// Operator-declared attributes that travel with everything this
     /// principal causes (the run, the MCP `_meta`, the audit line).
     pub labels: std::collections::BTreeMap<String, String>,
@@ -116,8 +117,7 @@ impl Principal {
     /// answers to the role alone, because `grants: ["*"]` — or any prefix
     /// pattern that happens to cover it — on a `user` must not hand out the
     /// power to drain the instance, relax its approval policy or read every
-    /// principal's log lines; grants used to be checked first, and that is how
-    /// an ordinary wildcard grant reached the operator controls. An op that is
+    /// principal's log lines. An op that is
     /// no row of the table is a workflow-declared command, which the grants
     /// decide and the start node's `roles:` then filter.
     pub fn may_command(&self, op: &str) -> bool {
@@ -206,11 +206,6 @@ impl Principal {
             .map(String::as_str)
             .filter(|g| g.starts_with("workflow.run:"))
     }
-
-    /// The governor scope this principal's spend is charged to.
-    pub fn scope_key(&self) -> String {
-        scope_key_for(&self.id)
-    }
 }
 
 /// The governor scope key for a principal id. One source for the format,
@@ -266,9 +261,9 @@ mod tests {
 
     /// An operator-floor op answers to the ROLE, never to a grant — every
     /// row of the table, and the `_instance.*` reports a child sends home.
-    /// Grants used to be consulted first, so `grants: ["*"]` on a user
-    /// reached `config.set` (and through it `agent.approval`), `config` and
-    /// the cross-principal log ring.
+    /// Grants are not consulted, so `grants: ["*"]` on a user reaches none of
+    /// them — not `admin.set` (and through it `agent.approval`), not `config`,
+    /// not the cross-principal log ring.
     #[test]
     fn operator_floor_ops_answer_to_the_role_whatever_the_grants_say() {
         let floor: Vec<&str> = OPS
@@ -327,10 +322,6 @@ mod tests {
         // `status` needs no grant at all; anonymous still gets nothing.
         assert!(with(Role::Agent, &[]).may_command("status"));
         assert!(!with(Role::Anonymous, &["*"]).may_command("status"));
-        // Nothing grants a removed op back.
-        for (op, _) in crate::runtime::surface::REMOVED_OPS {
-            assert!(!with(Role::User, &[]).may_command(op), "{op}");
-        }
     }
 
     /// A scoped `workflow.run:<pattern>` grant REPLACES the role default:

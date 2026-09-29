@@ -40,7 +40,6 @@
 # public page. Idempotent per incident id — the correlation id below is the
 # alert id for exactly that reason.
 # ─────────────────────────────────────────────────────────────────────────────
-config_version: "1"
 
 agent:
   name: sre

@@ -280,10 +280,7 @@ mod tests {
         let mut v = Vars::new();
         v.insert("key".into(), json!("agentd/x/run/1"));
         v.insert("seq".into(), json!(7));
-        v.insert(
-            "envelope".into(),
-            json!({"v": 2, "state": {"a": "q\"uote"}}),
-        );
+        v.insert("envelope".into(), json!({"state": {"a": "q\"uote"}}));
         v.insert("prefix".into(), json!("agentd"));
         v.insert(
             "nested".into(),
@@ -301,7 +298,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             v,
-            json!({"key": "agentd/x/run/1", "seq": 7, "state": {"v": 2, "state": {"a": "q\"uote"}}})
+            json!({"key": "agentd/x/run/1", "seq": 7, "state": {"state": {"a": "q\"uote"}}})
         );
         // A lone placeholder yields the value itself.
         assert_eq!(

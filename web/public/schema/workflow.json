@@ -1110,7 +1110,7 @@
       "type": "object"
     }
   },
-  "$id": "https://agentd.dev/schema/workflow-3.json",
+  "$id": "https://agentd.dev/schema/workflow.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "properties": {
     "armed": {
@@ -1294,9 +1294,6 @@
     "uri": {
       "description": "load the document from an MCP resource instead of inline",
       "type": "string"
-    },
-    "version": {
-      "const": 3
     }
   },
   "required": [

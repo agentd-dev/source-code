@@ -77,8 +77,6 @@ pub mod kinds {
     pub const A2A_MESSAGE: &str = "a2a_message";
     /// A named signal: `{name, payload, from}`.
     pub const SIGNAL: &str = "signal";
-    /// A2A control: `{op, args}`.
-    pub const A2A_CONTROL: &str = "a2a_control";
     /// A tool-driven request to run a workflow (`workflow.run`): `{workflow, inputs, start, requested_by}`.
     pub const WORKFLOW_RUN: &str = "workflow_run";
 }

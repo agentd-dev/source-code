@@ -20,7 +20,7 @@ import { createHash } from 'node:crypto';
 
 const CARD_PATH = '/.well-known/agent-card.json';
 /** The daemon's `surface::launch::LAUNCH_GRANT_TYPE`. */
-const LAUNCH_GRANT_TYPE = 'https://agentd.dev/oauth/grant-type/launch/v1';
+const LAUNCH_GRANT_TYPE = 'https://agentd.dev/oauth/grant-type/launch';
 
 /** A public card for an agent at `origin`, JSON-RPC 1.0 at `origin/`. */
 export function defaultCard(origin) {

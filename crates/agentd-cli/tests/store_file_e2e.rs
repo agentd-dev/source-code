@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// An envelope the way the runtime writes one: v2, kind/id/instance filled in,
+/// An envelope the way the runtime writes one: kind/id/instance filled in,
 /// `seq` matching the CAS argument (the adapter reads its CAS floor back out of
 /// the stored envelope, so the two must agree).
 fn env(kind: &str, id: &str, seq: u64, state: Value) -> Value {
@@ -124,7 +124,7 @@ fn round_trip_put_get_list_delete_cas_and_tombstone() {
         PutOutcome::Ok
     );
     let got = s.get(&k, None).unwrap().expect("stored");
-    let e = Envelope::from_value(got).expect("parses as a v2 envelope");
+    let e = Envelope::from_value(got).expect("parses as an envelope");
     assert_eq!(
         (e.seq, e.kind.as_str(), e.instance.as_str()),
         (1, "run", "inst")

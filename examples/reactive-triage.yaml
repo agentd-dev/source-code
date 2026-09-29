@@ -1,14 +1,12 @@
 # The event-reactive daemon, as a config file.
 #
-# `--mode reactive --subscribe inbox:///items/new` was the 1.x spelling. The
-# subscription is now a `subscribe` start node: agentd subscribes over the MCP
+# The subscription is a `subscribe` start node: agentd subscribes over the MCP
 # server's Streamable-HTTP transport, and each pushed
 # `notifications/resources/updated` fires one run. Idle between events is the
 # normal state, and the process stays alive because a subscribe start is
 # long-lived — only a drain signal or a fatal class stops it.
 #
 #   agentd -c examples/reactive-triage.yaml
-config_version: "1"
 
 agent:
   # Inlined so `agentd -c <this file>` works from any directory. The same text

@@ -7,12 +7,11 @@
 //! could not read the table grew a hand-typed copy of it, and that copy drifted
 //! by five methods.
 //!
-//! [`route_of`] is the whole vocabulary. It matches names exactly — no `a2a.`
-//! prefix strip, no 0.3 alias, no convenience method — so a name that is not in
-//! the table is `-32601` for every caller, before any authorization runs and
-//! before anything reaches the runtime. Each of the old spellings once worked
-//! for some methods and not others, and none of them went through the version
-//! gate a spec client would have been held to.
+//! [`route_of`] is the whole vocabulary. It matches names exactly — no prefix
+//! strip, no 0.3 alias, no convenience method — so a name that is not in the
+//! table is `-32601` for every caller, before any authorization runs and
+//! before anything reaches the runtime, and every method that is answered went
+//! through the version gate a spec client is held to.
 
 use super::EXTENSION_METHODS;
 
@@ -161,11 +160,11 @@ mod tests {
     }
 
     /// Every name the table routes, and nothing else: the specification's,
-    /// then the declared extension methods, each to its own route. Every
-    /// spelling agentd once answered besides those is refused, which is what
-    /// makes it `-32601` on the wire.
+    /// then the declared extension methods, each to its own route. Anything
+    /// else — an earlier specification's names included — is refused, which
+    /// is what makes it `-32601` on the wire.
     #[test]
-    fn route_table_is_exact_and_refuses_every_legacy_spelling() {
+    fn route_table_is_exact() {
         for m in SpecMethod::ALL {
             assert_eq!(route_of(m.name()), Some(Route::Spec(*m)), "{m:?}");
             assert_eq!(Route::Spec(*m).name(), m.name());
@@ -187,22 +186,9 @@ mod tests {
                 "an extension method is never a core one: {name}"
             );
         }
-        for legacy in [
-            // The card read as a method, and its aliases.
-            "GetAgentCard",
-            "agent/card",
+        for other in [
+            // A2A 0.3's names (spec §3.6.2): a 1.0 server does not answer them.
             "agent/getAuthenticatedExtendedCard",
-            // The `a2a.` prefix, on a core method and on an extension one.
-            "a2a.SendMessage",
-            "a2a.GetTask",
-            "a2a.GetAgentCard",
-            "a2a.SubscribeToEvents",
-            // The feed's name before events/v1 namespaced it.
-            "SubscribeToEvents",
-            // Pairing, deleted with its handler.
-            "Pair",
-            "interface.pair",
-            // The 0.3 names.
             "message/send",
             "message/stream",
             "tasks/get",
@@ -220,7 +206,7 @@ mod tests {
             "SendMessage ",
             "",
         ] {
-            assert_eq!(route_of(legacy), None, "{legacy:?} must not route");
+            assert_eq!(route_of(other), None, "{other:?} must not route");
         }
     }
 

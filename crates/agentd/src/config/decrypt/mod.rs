@@ -20,7 +20,7 @@ mod scrypt;
 pub mod x25519;
 
 use crate::config::envelope::{self, b64url_decode};
-use crate::config::v2::InstructionDecrypt;
+use crate::config::settings::InstructionDecrypt;
 
 /// The loaded recipient-key material, resolved from operator config once.
 #[derive(Default)]
@@ -124,7 +124,7 @@ fn parse_key_line(line: &str) -> Option<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::v2::InstructionDecrypt;
+    use crate::config::settings::InstructionDecrypt;
 
     fn cfg_with_key(dir: &std::path::Path, content: &str) -> InstructionDecrypt {
         let p = dir.join("key.txt");

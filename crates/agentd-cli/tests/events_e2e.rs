@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! **events/v1** end to end, and the display surface around it: a daemon with
-//! `a2a.events.enabled` (+ `a2a.introspection.enabled`) serves the display-client
+//! **The events extension** end to end, and the display surface around it: a
+//! daemon with `a2a.events.enabled` (+ `a2a.introspection.enabled`) serves the display-client
 //! contract over its real A2A listener — the card's extension declarations, the
 //! `agentd.events/SubscribeToEvents` feed (its method gate, strict params,
 //! `hello`, replay of a task's history, per-principal kinds, cross-client
 //! transcript sync and cursor resume), the taskless introspection reads (`conversation.get` with message bodies,
 //! `run.get` with per-step detail, `debug.events` log-ring tail), the
-//! browser-origin CORS path, the disabled-by-default gate, and the removed
-//! pairing exchange. The `agentd tui|ui` launcher lives in `launcher_e2e`.
+//! browser-origin CORS path and the disabled-by-default gate. The `agentd
+//! tui|ui` launcher lives in `launcher_e2e`.
 #![cfg(all(unix, feature = "a2a"))]
 
 mod common;
@@ -138,7 +138,7 @@ fn spawn_bound_with(
 /// `extra` shape each test.
 fn iface_config(llm: &str, port: u16, debug: bool, extra: &str) -> String {
     format!(
-        "config_version: \"1\"\n\
+        "\
          agent:\n  name: iface-e2e\n  instruction: You are a helpful test agent.\n  preflight: never\n\
          intelligence:\n  endpoints: {llm}\n  model: mock\n\
          store:\n  kind: memory\n\
@@ -310,13 +310,6 @@ fn subscribe_to_events_streams_cross_client_activity_and_resumes() {
                 && first["parts"][0]["text"] == "Ping across clients"
         })
     });
-    {
-        let f = frames.lock().unwrap();
-        assert!(
-            !f.iter().any(|v| v["event"]["kind"] == "message"),
-            "the `message` feed kind is gone: {f:#?}"
-        );
-    }
     wait_for(&frames, 10, |f| {
         f.iter().any(|v| {
             v["event"]["kind"] == "task"
@@ -409,7 +402,7 @@ fn subscribe_as(addr: &str, bearer: &str, sink: Arc<Mutex<Vec<Value>>>) {
     });
 }
 
-/// The events/v1 contract on the wire.
+/// The events extension's contract on the wire.
 ///
 /// * The method is the extension's: without `A2A-Extensions` it is `-32601`,
 ///   as plain JSON.
@@ -443,8 +436,8 @@ fn feed_contract() {
         "{v}"
     );
 
-    // `after`: refused by name, not streamed.
-    let body = common::rpc_body(2, common::feed_method(), json!({"after": 0}));
+    // A member the method does not define: refused, not streamed.
+    let body = common::rpc_body(2, common::feed_method(), json!({"cursor": 0}));
     let ext = common::feed_extensions();
     let after = common::a2a_post(
         &addr,
@@ -455,7 +448,7 @@ fn feed_contract() {
     let v = after.json();
     assert_eq!(v["error"]["code"], -32602, "{v}");
     assert_eq!(
-        v["error"]["data"][0]["fieldViolations"][0]["field"], "params.after",
+        v["error"]["data"][0]["fieldViolations"][0]["field"], "params.cursor",
         "{v}"
     );
 
@@ -524,12 +517,12 @@ fn feed_contract() {
 }
 
 #[test]
-fn the_interface_is_gated_off_by_default() {
+fn the_feed_is_gated_off_by_default() {
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
     // Neither switch: the surface must refuse, the core must be untouched.
     let (_daemon, addr, cfg) = spawn_bound(|port| {
         format!(
-            "config_version: \"1\"\n\
+            "\
          agent:\n  name: iface-off\n  instruction: Test.\n  preflight: never\n\
          intelligence:\n  endpoints: {}\n  model: mock\n\
          store:\n  kind: memory\n\
@@ -539,11 +532,7 @@ fn the_interface_is_gated_off_by_default() {
         )
     });
 
-    // The removed discovery op is refused by name, with its replacement…
-    let (code, msg) = error_of(&SendMessage::command("interface.info", json!({})).post(&addr));
-    assert_eq!(code, -32602);
-    assert!(msg.contains("removed") && msg.contains("status"), "{msg}");
-    // …introspection reads refuse, naming their own switch…
+    // Introspection reads refuse, naming their own switch…
     let (code, msg) = error_of(&SendMessage::command("debug.events", json!({})).post(&addr));
     assert_eq!(code, -32004);
     assert!(msg.contains("a2a.introspection.enabled"), "{msg}");
@@ -565,7 +554,7 @@ fn the_interface_is_gated_off_by_default() {
     // …and the core surface still answers (status command untouched).
     let st = read(&addr, "status", json!({}));
     assert!(st["runs"].is_array(), "{st}");
-    // The card promises nothing about the interface. Other extensions (the
+    // The card promises nothing about the feed. Other extensions (the
     // command vocabulary) are still declared — the claim under test is that a
     // surface this instance will NOT serve is never advertised, which is what
     // makes the card a promise.
@@ -850,7 +839,6 @@ fn cors_and_content_type() {
 /// ETag is a 304. The tag follows the card, not the daemon: a reload that
 /// changes what the card says changes it, a reload that only changes the
 /// loaded workflows (which the public card does not list) leaves it alone.
-/// And the pre-1.0 path is simply not there.
 #[test]
 #[cfg(feature = "hot-reload")]
 fn well_known_card() {
@@ -972,81 +960,8 @@ fn well_known_card() {
     assert_eq!(card["description"], "After.", "{card}");
     assert_ne!(header(&headers, "etag"), Some(etag.as_str()));
 
-    // The 0.2.x path is gone.
-    let (code, _, _) = exchange(&addr, "GET", "/.well-known/agent.json", &[], "");
-    assert_eq!(code, 404);
-
     std::fs::remove_file(&cfg).ok();
     std::fs::remove_dir_all(&wf_dir).ok();
-}
-
-/// The pairing exchange is gone, under every name it answered to.
-///
-/// `Pair` was an anonymous, undeclared JSON-RPC method that minted operator
-/// session tokens; `a2a.device_grant` replaced it. What is pinned here is that
-/// no spelling issues a credential — on a no-auth loopback daemon, where the
-/// caller is the operator and reaches the dispatcher, and on a bearer-protected
-/// one, where the anonymous admission that let a code holder in is gone too.
-/// (Which error code a removed method gets is the listener's vocabulary, and
-/// is pinned where that is.)
-#[test]
-fn pair_is_gone() {
-    let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
-    let names = ["Pair", "interface.pair", "a2a.Pair", "a2a.interface.pair"];
-
-    let (_daemon, addr, cfg) = spawn_bound(|port| iface_config(&llm.uri, port, false, ""));
-    for (i, name) in names.iter().enumerate() {
-        let reply = common::rpc(&addr, i as i64 + 1, name, json!({"code": "000000"}));
-        assert!(
-            reply.get("error").is_some() && reply.get("result").is_none(),
-            "{name} answered: {reply}"
-        );
-        assert!(
-            !reply.to_string().contains("pat-") && !reply.to_string().contains("token"),
-            "{name} issued a credential: {reply}"
-        );
-    }
-    std::fs::remove_file(&cfg).ok();
-
-    let (_daemon, addr, cfg) = spawn_bound_with(
-        |port| {
-            format!(
-                "config_version: \"1\"\n\
-         agent:\n  name: pair-gone\n  instruction: Test.\n  preflight: never\n\
-         intelligence:\n  endpoints: {}\n  model: mock\n\
-         store:\n  kind: memory\n\
-         a2a:\n  listen: http://127.0.0.1:{port}\n  bearer: \"{{{{secret:PAIRB}}}}\"\n\
-         lifecycle:\n  run_until: drained\n",
-                llm.uri
-            )
-        },
-        |cfg| {
-            let stderr_path = common::unique_path("pair-daemon", "log");
-            let errf = std::fs::File::create(&stderr_path).unwrap();
-            let child = Command::new(env!("CARGO_BIN_EXE_agentd"))
-                .args(["--config", cfg])
-                .env("PAIRB", "server-secret-bearer")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::from(errf))
-                .spawn()
-                .expect("spawn daemon");
-            Daemon { child, stderr_path }
-        },
-    );
-    for (i, name) in names.iter().enumerate() {
-        let reply = common::a2a_post(
-            &addr,
-            &common::rpc_body(i as i64 + 1, name, json!({"code": "000000"})),
-            &[],
-        );
-        assert_eq!(
-            reply.status, 401,
-            "an uncredentialed {name} is refused before any dispatch: {}",
-            reply.body
-        );
-    }
-    std::fs::remove_file(&cfg).ok();
 }
 
 #[test]
@@ -1073,35 +988,23 @@ fn admin_set_toggles_introspection_live() {
     let ev = read(&addr, "debug.events", json!({"limit": 10}));
     assert!(ev["events"].is_array(), "{ev}");
 
-    // The removed paths are not runtime-settable: the op's published schema
-    // refuses them, and the error names what is.
-    for path in [
-        "interface.debug",
-        "interface.display.bottom",
-        "intelligence.model",
-    ] {
-        let v = SendMessage::command("admin.set", json!({"path": path, "value": "x"})).post(&addr);
-        let (code, msg) = error_of(&v);
-        assert_eq!(code, -32602, "{path}");
-        assert_eq!(
-            v["error"]["data"][1]["reason"], "INVALID_COMMAND_ARGS",
-            "{v}"
-        );
-        assert!(
-            msg.contains("agent.approval") && msg.contains("a2a.introspection.enabled"),
-            "{path}: {msg}"
-        );
-    }
-    // …and the op it replaced is refused by name.
-    let (code, msg) = error_of(
-        &SendMessage::command(
-            "config.set",
-            json!({"path": "a2a.introspection.enabled", "value": true}),
-        )
-        .post(&addr),
+    // A path that is not runtime-settable: the op's published schema refuses
+    // it, and the error names what is.
+    let v = SendMessage::command(
+        "admin.set",
+        json!({"path": "intelligence.model", "value": "x"}),
+    )
+    .post(&addr);
+    let (code, msg) = error_of(&v);
+    assert_eq!(code, -32602, "{v}");
+    assert_eq!(
+        v["error"]["data"][1]["reason"], "INVALID_COMMAND_ARGS",
+        "{v}"
     );
-    assert_eq!(code, -32602);
-    assert!(msg.contains("admin.set"), "{msg}");
+    assert!(
+        msg.contains("agent.approval") && msg.contains("a2a.introspection.enabled"),
+        "{msg}"
+    );
 
     std::fs::remove_file(&cfg).ok();
 }
@@ -1319,14 +1222,11 @@ fn an_immutable_daemon_refuses_the_model_rewriting_its_workflows() {
     );
 }
 
-/// A reload REVISES the CORS allowlist — the third instance of the same defect.
-///
-/// The origin list (then `interface.origins`, now `a2a.cors.origins`) was captured into the listener's app state at spawn and
-/// never re-read, and it was not restart-only either: an operator who removed
-/// an origin to revoke a web client's access got `config.reloaded` success and
-/// a listener that kept granting the old origin. Found while classifying the
-/// config surface after fixing the same shape in `a2a.principals` and the
-/// webhook routes.
+/// A reload REVISES the CORS allowlist: `a2a.cors.origins` is held by the
+/// listener's app state, and an operator who removes an origin to revoke a
+/// web client's access must get a listener that stops granting it, not a
+/// `config.reloaded` success over the boot snapshot — the same shape as
+/// `a2a.principals` and the webhook routes.
 ///
 /// Revocation is the direction under test, for the same reason as the other
 /// two: a grant that fails to apply is an inconvenience, a revocation that

@@ -2,8 +2,8 @@
 #
 # This is the PREFERRED way to schedule agentd (rfcs/0011 §9): an external
 # The CronJob fires one run per tick. It is more robust, observable, and
-# 12-factor than agentd's own internal --interval/--schedule clock (which
-# exists as a standalone convenience, not the recommended cluster pattern).
+# 12-factor than agentd's own `schedule` start node (which exists as a
+# standalone convenience, not the recommended cluster pattern).
 # Each tick is an independent, idempotent unit of work.
 #
 # NOTE: the CronJob controller is part of Kubernetes, not agentd. agentd is
@@ -60,25 +60,25 @@ spec:
                 - --mcp
                 - fs=https://mcp-fs.internal/mcp
               env:
-                - name: INSTRUCTION
+                - name: AGENTD_INSTRUCTION
                   value: >-
                     Build the hourly digest from /data and publish it via the
                     fs MCP server. If this hour's digest already exists, exit 0
                     without redoing the work.
-                - name: AGENT_INTELLIGENCE
+                - name: AGENTD_INTELLIGENCE
                   value: https://gw.example/v1
-                - name: AGENT_INTELLIGENCE_TOKEN
+                - name: AGENTD_INTELLIGENCE_TOKEN
                   valueFrom:
                     secretKeyRef:
                       name: agentd-intelligence
                       key: token
-                - name: AGENT_MODEL
+                - name: AGENTD_MODEL
                   value: claude-sonnet-5
                 # Deadline shorter than the Job's activeDeadlineSeconds so a
                 # hung run trips agentd's own --deadline (exit 124) first.
-                - name: AGENT_DEADLINE
+                - name: AGENTD_DEADLINE
                   value: 600s
-                - name: AGENT_LOG_LEVEL
+                - name: AGENTD_LOG_LEVEL
                   value: info
               securityContext:
                 allowPrivilegeEscalation: false

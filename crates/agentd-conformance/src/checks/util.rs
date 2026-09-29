@@ -124,16 +124,16 @@ pub fn get_card(addr: &str) -> Value {
 }
 
 /// The URI of the extension that carries agentd's commands, as the card
-/// declares it. Found by its path rather than matched whole, so a new VERSION
-/// of the extension — which the extension spec says takes a new URI — is still
-/// the one a command is sent under.
+/// declares it — matched whole, because a URI is an exact identifier: a card
+/// that declares something else under a similar name does not carry agentd's
+/// commands, and a check sending one there would be testing nothing.
 pub fn command_uri(card: &Value) -> String {
     card["capabilities"]["extensions"]
         .as_array()
         .and_then(|exts| {
             exts.iter()
                 .filter_map(|e| e["uri"].as_str())
-                .find(|u| u.starts_with("https://agentd.dev/a2a/ext/command/"))
+                .find(|u| *u == "https://agentd.dev/a2a/ext/command")
         })
         .unwrap_or_else(|| panic!("the card declares no command extension: {card}"))
         .to_string()
@@ -149,7 +149,7 @@ pub fn feed_method() -> &'static str {
 /// events extension, which the method belongs to and is refused without, and
 /// task-annotations, which a `task` event carries only when activated.
 pub fn feed_activation() -> &'static str {
-    "https://agentd.dev/a2a/ext/events/v1, https://agentd.dev/a2a/ext/task-annotations/v1"
+    "https://agentd.dev/a2a/ext/events, https://agentd.dev/a2a/ext/task-annotations"
 }
 
 /// A fresh `messageId`: no two messages the suite sends share one.
@@ -246,13 +246,9 @@ mod tests {
     /// command carries the extension it was sent under.
     #[test]
     fn messages_are_spec_shaped_and_commands_are_marked() {
-        let c = command_params("https://agentd.dev/a2a/ext/command/v9", "status");
+        let c = command_params("urn:x", "status");
         assert_eq!(c["message"]["role"], "ROLE_USER", "{c}");
-        assert_eq!(
-            c["message"]["extensions"],
-            json!(["https://agentd.dev/a2a/ext/command/v9"]),
-            "{c}"
-        );
+        assert_eq!(c["message"]["extensions"], json!(["urn:x"]), "{c}");
         assert_eq!(c["configuration"]["returnImmediately"], false, "{c}");
 
         let t = text_params("hi", Some("t-1"), true);
@@ -266,13 +262,19 @@ mod tests {
         );
     }
 
-    /// The command URI is discovered from the card, whatever its version.
+    /// The command URI is the one the card declares, exactly: a card
+    /// without it — or with only a look-alike — has no command extension.
     #[test]
-    fn the_command_uri_is_read_off_the_card() {
+    fn the_command_uri_is_the_declared_one() {
         let card = json!({"capabilities": {"extensions": [
-            {"uri": "https://agentd.dev/a2a/ext/events/v1"},
-            {"uri": "https://agentd.dev/a2a/ext/command/v2"},
+            {"uri": "https://agentd.dev/a2a/ext/events"},
+            {"uri": "https://agentd.dev/a2a/ext/command"},
         ]}});
-        assert_eq!(command_uri(&card), "https://agentd.dev/a2a/ext/command/v2");
+        assert_eq!(command_uri(&card), "https://agentd.dev/a2a/ext/command");
+        let look_alike = json!({"capabilities": {"extensions": [
+            {"uri": "https://agentd.dev/a2a/ext/command/"},
+            {"uri": "https://agentd.dev/a2a/ext/commands"},
+        ]}});
+        assert!(std::panic::catch_unwind(|| command_uri(&look_alike)).is_err());
     }
 }

@@ -23,7 +23,7 @@
 //! was never asked for.
 
 use super::{Principal, glob};
-use crate::config::v2::{self, Role};
+use crate::config::settings::{self, Role};
 use crate::runtime::surface::auth::{ListenerAuth, listener_auth_of};
 use crate::sec::secret;
 use serde_json::{Value, json};
@@ -121,11 +121,11 @@ pub struct Resolver {
 struct Compiled {
     /// The rule's declared `id`, which names its callers when set.
     id: Option<String>,
-    matcher: v2::PrincipalMatch,
+    matcher: settings::PrincipalMatch,
     role: Role,
     grants: Vec<String>,
     rate: Option<String>,
-    budget: Option<v2::Budget>,
+    budget: Option<settings::Budget>,
     labels: std::collections::BTreeMap<String, String>,
     bearer_secret: Option<String>,
 }
@@ -138,7 +138,10 @@ impl Resolver {
     /// rule's (one secret would mean two principals, and only the first could
     /// ever be reached), and any secret starting with the session-token
     /// prefix (it would be routed to the sessions and never match).
-    pub fn build(a2a: &v2::A2a, env: &dyn Fn(&str) -> Option<String>) -> Result<Resolver, String> {
+    pub fn build(
+        a2a: &settings::A2a,
+        env: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<Resolver, String> {
         let server_bearer = match &a2a.bearer {
             Some(b) => {
                 let s = secret::resolve(&b.0, env).map_err(|e| format!("a2a.bearer: {e}"))?;
@@ -372,7 +375,7 @@ impl Compiled {
 ///
 /// Needs no secret: an id is derived from the rule, never from its bearer.
 /// When two rules name the same id, the first wins, as it does in `resolve`.
-pub fn declared_principals(a2a: &v2::A2a) -> std::collections::BTreeMap<String, Principal> {
+pub fn declared_principals(a2a: &settings::A2a) -> std::collections::BTreeMap<String, Principal> {
     let mut out = std::collections::BTreeMap::new();
     let op = operator();
     out.insert(op.id.clone(), op);
@@ -440,7 +443,7 @@ fn principal_id(role: Role, declared: Option<&str>, cert: Option<&CertId>) -> Op
     Some(format!("{role_name}:{name}"))
 }
 
-fn matcher_desc(m: &v2::PrincipalMatch) -> Value {
+fn matcher_desc(m: &settings::PrincipalMatch) -> Value {
     if m.any {
         json!({"any": true})
     } else if let Some(s) = &m.san {
@@ -459,7 +462,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn a2a(doc: Value) -> v2::A2a {
+    fn a2a(doc: Value) -> settings::A2a {
         serde_json::from_value(doc).unwrap()
     }
 

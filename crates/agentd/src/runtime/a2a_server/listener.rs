@@ -54,7 +54,7 @@ pub(crate) struct A2aServing {
 /// `unix://<path>` for a socket. A wildcard bind names no host a caller could
 /// dial, which is why validation requires `a2a.url` for one; should one reach
 /// here without it, the bound socket address is the least wrong answer.
-pub(crate) fn advertised_url(a2a: &crate::config::v2::A2a, bound: &str) -> String {
+pub(crate) fn advertised_url(a2a: &crate::config::settings::A2a, bound: &str) -> String {
     if let Some(url) = &a2a.url {
         return url.clone();
     }
@@ -103,7 +103,7 @@ pub(crate) fn advertised_url(a2a: &crate::config::v2::A2a, bound: &str) -> Strin
 /// device already owns refuses the start: the two would be one principal, and
 /// the rule would inherit the device's history.
 pub(crate) fn spawn_a2a_listener(
-    a2a: &crate::config::v2::A2a,
+    a2a: &crate::config::settings::A2a,
     events_tx: Sender<Event>,
     resolver: Resolver,
     durable: &crate::state::Durable,
@@ -275,7 +275,7 @@ mod tests {
     /// Spawn a listener for `a2a` on a free loopback port (a listen URL
     /// names a fixed one), with `launch` installed or not.
     fn serve(
-        a2a: &crate::config::v2::A2a,
+        a2a: &crate::config::settings::A2a,
         launch: Option<Arc<crate::a2a::oauth::LaunchSlot>>,
     ) -> A2aServing {
         let port = std::net::TcpListener::bind("127.0.0.1:0")
@@ -314,7 +314,7 @@ mod tests {
     /// differ.
     #[test]
     fn a_launch_changes_no_posture() {
-        let settings = |a2a: serde_json::Value| crate::config::v2::Settings {
+        let settings = |a2a: serde_json::Value| crate::config::settings::Settings {
             a2a: serde_json::from_value(a2a).unwrap(),
             ..Default::default()
         };
@@ -339,7 +339,7 @@ mod tests {
             assert_eq!(launched.advertised_url, plain.advertised_url);
             let workflows = std::collections::BTreeMap::new();
             let operator = crate::a2a::Principal {
-                role: crate::config::v2::Role::Operator,
+                role: crate::config::settings::Role::Operator,
                 id: "operator".into(),
                 ..crate::a2a::Principal::anonymous()
             };
@@ -373,7 +373,7 @@ mod tests {
         }
     }
 
-    fn a2a(doc: serde_json::Value) -> crate::config::v2::A2a {
+    fn a2a(doc: serde_json::Value) -> crate::config::settings::A2a {
         serde_json::from_value(doc).unwrap()
     }
 

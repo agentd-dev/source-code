@@ -18,7 +18,7 @@
 //! second answer named. The real callers are then driven for their own sake: a
 //! refusal must not dial, and — the other half of the bar — an allowed target
 //! must still be reached, with SNI/`Host` untouched.
-#![cfg(all(unix, feature = "a2a", feature = "workflow"))]
+#![cfg(all(unix, feature = "a2a"))]
 
 mod common;
 
@@ -367,7 +367,7 @@ fn an_http_node_refuses_a_private_url_while_a_declared_one_still_reaches_its_ser
     let (port, seen) = spawn_receiver();
     let cfg_path = common::unique_path("agentd-ssrf-http", "yaml");
     let cfg = format!(
-        "config_version: \"1\"\n\
+        "\
          agent:\n  name: caller\n  instruction: make a call\n  preflight: never\n\
          intelligence:\n  endpoints: http://127.0.0.1:1\n  model: mock\n\
          store:\n  kind: memory\n\

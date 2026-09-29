@@ -51,7 +51,7 @@ pub mod worker;
 
 pub use reactor::Runtime;
 
-use crate::config::v2::{Loaded, StoreKind};
+use crate::config::settings::{Loaded, StoreKind};
 use crate::context::memory::Memory;
 use crate::context::{Contexts, skills, tokens};
 use crate::engine::run::StepStatus;
@@ -147,17 +147,17 @@ fn resolve_verify_key(
 /// fix belongs in the file, not in a terminal that will forget it.
 fn reference_preflight(
     doc: &Value,
-    settings: &crate::config::v2::Settings,
+    settings: &crate::config::settings::Settings,
     at: &str,
     log: &Logger,
 ) -> Option<i32> {
-    let mut missing = crate::config::v2::missing_references(doc, at, &settings.vars);
+    let mut missing = crate::config::settings::missing_references(doc, at, &settings.vars);
     if missing.is_empty() {
         return None;
     }
     if crate::config::prompt::prompt_missing_requested() {
         let mut found = Vec::new();
-        crate::config::v2::scan_references(doc, at, &mut found);
+        crate::config::settings::scan_references(doc, at, &mut found);
         let mut names: Vec<String> = found
             .into_iter()
             .filter(|r| r.kind == "secret" && !crate::sec::secret::secret_available(&r.name))
@@ -174,7 +174,7 @@ fn reference_preflight(
                 }
             }
         }
-        missing = crate::config::v2::missing_references(doc, at, &settings.vars);
+        missing = crate::config::settings::missing_references(doc, at, &settings.vars);
         if missing.is_empty() {
             return None;
         }
@@ -237,7 +237,7 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         level,
     )
     .with_content(settings.observability.log_content);
-    log.info("proc.start", json!({"version": crate::VERSION, "runtime": "1", "instance": instance, "config_files": loaded.files.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>()}));
+    log.info("proc.start", json!({"version": crate::VERSION, "instance": instance, "config_files": loaded.files.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>()}));
     for w in &loaded.warnings {
         log.warn("config.warning", json!({"warning": w}));
     }
@@ -281,7 +281,7 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
     // any server is dialed, so no request can leave unsigned.
     #[cfg(feature = "aauth")]
     if let Some(a) = &settings.security.aauth {
-        let v1 = crate::config::AAuthSettings {
+        let aauth = crate::config::AAuthSettings {
             provider: a.provider.clone(),
             key_file: a
                 .key_file
@@ -291,7 +291,7 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
             enroll_assertion_file: a.enroll_assertion_file.clone(),
             person_server: a.person_server.clone(),
         };
-        if let Err(e) = crate::aauth::setup(&v1, Duration::from_secs(30)) {
+        if let Err(e) = crate::aauth::setup(&aauth, Duration::from_secs(30)) {
             log.error(
                 "proc.exit",
                 json!({"code": crate::exit::USAGE, "err": format!("aauth: {e}")}),
@@ -364,10 +364,10 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         // The dial-time backstop behind boot validation: under `closed`
         // egress an endpoint with no service-catalog entry must never reach
         // the socket, whichever path assembled it.
-        if let Err(e) = crate::config::v2::egress_allows(
+        if let Err(e) = crate::config::settings::egress_allows(
             &settings.services,
             settings.security.egress,
-            crate::config::v2::ServiceKind::Mcp,
+            crate::config::settings::ServiceKind::Mcp,
             &s.endpoint,
         ) {
             log.error("proc.exit", json!({"code": crate::exit::USAGE, "err": e}));
@@ -470,7 +470,7 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
     // that is where the manifest's `generation` becomes known — a fresh
     // instance has no manifest and is generation 1.
     if settings.store.kind == StoreKind::File {
-        let root = crate::config::v2::file_store_root(&settings.store);
+        let root = crate::config::settings::file_store_root(&settings.store);
         log.info(
             "store.file",
             json!({
@@ -517,9 +517,9 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         match mcp.get(&src.server) {
             Some(c) => {
                 let mode = match src.discover {
-                    crate::config::v2::Discover::Prompts => skills::Discover::Prompts,
-                    crate::config::v2::Discover::Resources => skills::Discover::Resources,
-                    crate::config::v2::Discover::Auto => skills::Discover::Auto,
+                    crate::config::settings::Discover::Prompts => skills::Discover::Prompts,
+                    crate::config::settings::Discover::Resources => skills::Discover::Resources,
+                    crate::config::settings::Discover::Auto => skills::Discover::Auto,
                 };
                 let found = catalogue.discover(&**c, mode, src.filter.as_deref());
                 log.info(
@@ -596,9 +596,9 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
     // a checkpoint failure at ENOSPC halts the daemon, so at that point
     // shedding new work while draining is strictly better than dying mid-write.
     let pressure = {
-        use crate::config::v2::StoreKind;
+        use crate::config::settings::StoreKind;
         let (path, shed) = if settings.store.kind == StoreKind::File {
-            let root = crate::config::v2::file_store_root(&settings.store);
+            let root = crate::config::settings::file_store_root(&settings.store);
             let min = settings
                 .store
                 .file
@@ -791,19 +791,9 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
             ),
         }
     }
-    // A record from before subagents kept their owner inherits one from what
-    // spawned it — now, while the runs and conversations it names are here.
-    rt.backfill_subagent_principals();
     #[cfg(feature = "a2a")]
     {
         rt.restore_a2a_tasks(restored.of(Kind::Task));
-        // A task recorded before a conversation's key and its name were told
-        // apart was kept under its name, so that is its key.
-        for t in rt.tasks.values_mut() {
-            if t.conversation.is_empty() {
-                t.conversation = t.context_id.clone();
-            }
-        }
         // Every caller's `contextId`s still name the conversations they
         // named: a message after the restart continues one, rather than
         // being bound to a fresh one beside it.
@@ -847,7 +837,7 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
                    "bytes": rt.instruction.text.len(), "version": rt.instruction.version}),
         );
     } else if let Some(text) = rt.settings.agent.instruction.clone() {
-        if crate::config::v2::looks_like_resource_uri(&text) {
+        if crate::config::settings::looks_like_resource_uri(&text) {
             match rt.subscribe_instruction(&text) {
                 Ok(()) => {}
                 Err(e) => {
@@ -1009,7 +999,7 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
             .as_ref()
             .is_some_and(|s| {
                 s.iter()
-                    .any(|x| matches!(x, crate::config::v2::AuditSink::Stream))
+                    .any(|x| matches!(x, crate::config::settings::AuditSink::Stream))
             });
         if re.is_some() || (audit_wants_stream && audit_stream.is_some()) {
             let (stream, include, sampled, cap) = match &re {
@@ -1023,7 +1013,7 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
                     String::new(),
                     Vec::new(),
                     Vec::new(),
-                    crate::config::v2::DEFAULT_TAP_QUEUE as usize,
+                    crate::config::settings::DEFAULT_TAP_QUEUE as usize,
                 ),
             };
             crate::obs::log::install_runtime_tap(&stream, include.clone(), sampled.clone(), cap);
@@ -1039,9 +1029,9 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
     // shape when nothing can bring in outside work — no A2A listener and no
     // long-lived start node.
     rt.job_shape = match rt.settings.lifecycle.run_until {
-        crate::config::v2::RunUntil::Drained => false,
-        crate::config::v2::RunUntil::Idle => true,
-        crate::config::v2::RunUntil::Auto => {
+        crate::config::settings::RunUntil::Drained => false,
+        crate::config::settings::RunUntil::Idle => true,
+        crate::config::settings::RunUntil::Auto => {
             rt.settings.a2a.listen.is_none() && !rt.workflows.values().any(|w| w.is_long_lived())
         }
     };
@@ -1347,7 +1337,6 @@ pub fn capabilities(loaded: &Loaded) -> Value {
         })
         .collect();
     json!({
-        "runtime": "1",
         "version": crate::VERSION,
         "agent": {"name": s.instance_name(), "instruction": s.agent.instruction.is_some(), "preflight": format!("{:?}", s.agent.preflight).to_lowercase()},
         "intelligence": {"model": s.intelligence.model, "endpoints": s.intelligence.endpoints.len()},
@@ -1366,7 +1355,7 @@ pub fn capabilities(loaded: &Loaded) -> Value {
         // for every other adapter, so the `store` string above stays the
         // stable answer to "which adapter".
         "store_file": (s.store.kind == StoreKind::File).then(|| json!({
-            "path": crate::config::v2::file_store_root(&s.store).display().to_string(),
+            "path": crate::config::settings::file_store_root(&s.store).display().to_string(),
             "defaulted": loaded.doc.pointer("/store/kind").is_none(),
         })),
         // A FOURTH copy of "which starts keep us alive" used to live here as an
@@ -1402,14 +1391,6 @@ pub fn capabilities(loaded: &Loaded) -> Value {
                     })).collect::<Vec<_>>()
             }).collect::<Vec<_>>(),
         })),
-        // The contract versions a control plane negotiates against.
-        // `exit_codes` is referenced by name in exit.rs's own documentation as
-        // living here, and was never emitted — a surface promised to readers
-        // and absent from the thing they read.
-        "surfaces": {
-            "exit_codes": crate::exit::EXIT_CODES,
-            "config_schema": crate::config::v2::schema::CONFIG_VERSION,
-        },
         // The instruction document as an agent: what the trust ladder granted,
         // and every extended-family block that loaded (kind → count). Present
         // only when the instruction is an Instruction Document (`instruction/1`)
@@ -1433,7 +1414,7 @@ pub fn capabilities(loaded: &Loaded) -> Value {
 /// always without `--features oauth`), which leaves the static
 /// `intelligence.token` path untouched.
 fn intel_bearer_provider(
-    settings: &crate::config::v2::Settings,
+    settings: &crate::config::settings::Settings,
 ) -> Option<std::sync::Arc<dyn Fn() -> Option<String> + Send + Sync>> {
     #[cfg(feature = "oauth")]
     {
@@ -1498,7 +1479,7 @@ impl Runtime {
     /// dials intelligence carries the same credential.
     pub(crate) fn intel_aws_auth(&self) -> Option<crate::config::AuthSpec> {
         let a = self.settings.intelligence.auth.as_ref()?;
-        (a.kind == crate::config::v2::AuthKind::Aws).then(|| a.to_spec())
+        (a.kind == crate::config::settings::AuthKind::Aws).then(|| a.to_spec())
     }
 
     /// The configured `intelligence.dialect`, threaded into a child's spawn
@@ -1540,7 +1521,7 @@ pub(crate) fn bearer_now(
 
 /// Resolve `intelligence.token` / `token_file` (secret refs, files).
 fn resolve_intel_token(
-    settings: &crate::config::v2::Settings,
+    settings: &crate::config::settings::Settings,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<Option<String>, String> {
     if let Some(t) = &settings.intelligence.token {
@@ -1558,7 +1539,7 @@ fn resolve_intel_token(
         return Ok(None);
     }
     // No token in the configuration: the intel client falls back to its own
-    // environment conventions (`AGENT_INTELLIGENCE_TOKEN`…).
+    // environment conventions (`AGENTD_INTELLIGENCE_TOKEN`…).
     Ok(None)
 }
 
@@ -1581,7 +1562,7 @@ impl Runtime {
                         .instruction_spec
                         .oci
                         .as_ref()
-                        .and_then(crate::config::v2::OciSource::cosign_key),
+                        .and_then(crate::config::settings::OciSource::cosign_key),
                 )?;
                 let raw = self.decode_instruction_bytes(pulled.bytes)?;
                 // The pin that guarded the FIRST pull guards every re-pull. A
@@ -2132,7 +2113,7 @@ impl Runtime {
                     .settings
                     .agent
                     .wake_on()
-                    .contains(&crate::config::v2::WakeEvent::InstructionUpdated)
+                    .contains(&crate::config::settings::WakeEvent::InstructionUpdated)
                 {
                     self.note_root("instruction.updated: the instruction resource changed; re-read it with instruction.read".into());
                 }

@@ -10,7 +10,7 @@
 //! parser uses IS the vendored `instruction.schema.json`; behaviour
 //! pinned here is CONTRACT: a change that fails a fixture is a spec change, not
 //! a refactor.
-#![cfg(all(unix, feature = "workflow"))]
+#![cfg(unix)]
 
 use std::path::Path;
 use std::process::Command;
@@ -20,7 +20,6 @@ use serde_json::Value;
 fn run_case(doc_path: &Path, grants: &[Value]) -> (bool, String, Value) {
     let doc = std::fs::read_to_string(doc_path).unwrap();
     let cfg = serde_json::json!({
-        "config_version": "1",
         "agent": {
             "name": "conf", "preflight": "never", "instruction": doc,
             // Grants are declared PER FIXTURE (the corpus's `grants:` key,

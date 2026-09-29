@@ -7,7 +7,7 @@
 //! message → turn → run → message from re-arming forever, and the two
 //! refusals that make the cap unavoidable (a turn messaging itself, and a
 //! chain routed through a workflow).
-#![cfg(all(unix, feature = "workflow"))]
+#![cfg(unix)]
 
 mod common;
 
@@ -56,7 +56,7 @@ fn run_daemon(cfg_text: &str, settle: std::time::Duration) -> String {
     log
 }
 
-const BASE: &str = "config_version: \"1\"\n\
+const BASE: &str = "\
      store: { kind: file, file: { path: __STATE__ } }\n\
      observability: { log_level: info, log_content: true }\n";
 
@@ -179,10 +179,10 @@ fn each_hop_inherits_the_last_ones_depth() {
 /// be unbounded through a path the cap never sees.
 ///
 /// Gated on `a2a`: the chain routes through the `a2a` START reader, so the case
-/// only exists in a build that has that listener. Ungated it fails the solo
-/// `--features workflow` matrix row, where the reader is absent, no
-/// `start.a2a.fired` is ever logged, and the assertion reads as a broken hop
-/// cap rather than an absent feature.
+/// only exists in a build that has that listener. Ungated it fails every
+/// matrix row without `a2a`, where the reader is absent, no `start.a2a.fired`
+/// is ever logged, and the assertion reads as a broken hop cap rather than an
+/// absent feature.
 #[cfg(feature = "a2a")]
 #[test]
 fn the_depth_survives_a_delivery_that_fires_a_workflow() {

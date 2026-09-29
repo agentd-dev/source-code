@@ -11,7 +11,7 @@
 //! operator on the next request, because there is no second posture left
 //! believing otherwise.
 
-use crate::config::v2::{A2a, Role, Settings};
+use crate::config::settings::{A2a, Role, Settings};
 
 /// What the listener requires of a caller, and what it grants without asking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -208,7 +208,7 @@ pub struct CardSecurity {
 pub fn security_of(
     posture: &ListenerAuth,
     origin: Option<&str>,
-    scopes: &[crate::config::v2::DeviceScope],
+    scopes: &[crate::config::settings::DeviceScope],
 ) -> Option<CardSecurity> {
     use a2a_rs::domain::{
         DeviceCodeOAuthFlow, OAuthFlows, SecurityRequirement, SecurityScheme, StringList,
@@ -311,8 +311,8 @@ pub fn security_of(
 
 /// What granting a device scope lets the signed-in client do, for the card.
 #[cfg(feature = "a2a")]
-fn scope_description(scope: crate::config::v2::DeviceScope) -> &'static str {
-    use crate::config::v2::DeviceScope;
+fn scope_description(scope: crate::config::settings::DeviceScope) -> &'static str {
+    use crate::config::settings::DeviceScope;
     match scope {
         DeviceScope::User => "Act as a user of this agent: converse, and run what you are granted",
         DeviceScope::Operator => {

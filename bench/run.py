@@ -248,9 +248,8 @@ def _agentd_turn(agentd: str, instruction: str, intel: str, mcp_url: str | None,
                  timeout_s: float, model: str | None = None) -> tuple[str, int, int, int, int]:
     """One agentd `once` run (an agent OR user turn). Returns
     (reply, tokens, steps, tool_calls, exit)."""
-    # No mode flag: an --instruction with no start node gets the sugar `main`
-    # workflow, which is exactly what `--mode once` used to spell. Modes were
-    # removed in 2.0 and are refused by name.
+    # An --instruction with no start node gets the sugar `main` workflow: one
+    # `once` run to a terminal status.
     argv = [agentd, "--instruction", instruction,
             "--intelligence", intel, "--log-level", "info", "--log-content"]
     if model:
@@ -342,9 +341,9 @@ def run_task_once(agentd: str, task: dict, timeout_s: float) -> RunResult:
     with tempfile.TemporaryDirectory(prefix="agentd-bench-") as td:
         workdir = Path(td)
         argv = [agentd, "--log-level", "info"]
-        # A `workflow` task runs an agent-authored graph (the ablation's decomposed
-        # variant, RFC 0024 §5); the graph carries the instruction, so --workflow
-        # replaces --instruction. Needs a `--features workflow` build of agentd.
+        # A `workflow` task runs a workflow document (the ablation's decomposed
+        # variant, RFC 0024 §5); the document carries the instruction, so
+        # --workflow replaces --instruction.
         if "workflow" in task:
             wf = workdir / "workflow.json"
             wf.write_text(json.dumps(task["workflow"]))

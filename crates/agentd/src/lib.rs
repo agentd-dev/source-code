@@ -4,8 +4,8 @@
 //! One binary that is CLI, daemon, and subagent re-exec. A **supervisor**
 //! owns lifecycle, triggers, and the process tree but never reasons; the
 //! **agentic loop** lives only inside subagent processes. Tools come only
-//! from MCP servers; reactivity comes from MCP resource subscriptions;
-//! agentd is itself an MCP server so agents compose with one protocol.
+//! from MCP servers; reactivity comes from MCP resource subscriptions; agents
+//! reach each other over A2A.
 //!
 //! The split is deliberate: because only subagent processes reason, a wedged
 //! or runaway model can never take the supervisor down with it, and the
@@ -27,10 +27,7 @@ pub mod governor; // token governor: windowed durable budgets + shedding tactics
 pub mod identity; // instance identity from the Kubernetes downward API (env-only)
 pub mod intel; // intelligence client + provider adapters
 pub mod jsonschema; // dependency-free JSON Schema subset validator (tool contracts, workflow schemas)
-// JSON-RPC 2.0 codec + framing lives in the reusable `mcp` crate; re-exported
-// so `crate::json::*` resolves (MCP + the supervisor<->subagent channel).
-pub use ::mcp::rpc as json;
-pub mod mcp; // MCP client (to servers) + self-MCP server + registry/config
+pub mod mcp; // MCP client (to servers) + the A2A peer client + test mocks
 // Transport primitives live in the reusable `net` crate; re-exported so
 // `crate::net::*` resolves across the runtime (MCP transport + intelligence).
 pub use ::net;

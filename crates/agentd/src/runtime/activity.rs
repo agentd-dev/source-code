@@ -207,7 +207,7 @@ impl Runtime {
         }
     }
 
-    /// Publish to the interface feed — a no-op without the `a2a` feature (no
+    /// Publish to the observation feed — a no-op without the `a2a` feature (no
     /// feed exists to publish to; `status.activity` still carries the record).
     #[allow(unused_mut, unused_variables)]
     fn publish_activity(&self, node: NodeId, mut v: Value) {

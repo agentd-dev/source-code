@@ -320,7 +320,7 @@ impl PrincipalRates {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::v2::Role;
+    use crate::config::settings::Role;
 
     #[test]
     fn a_source_is_over_only_after_more_than_the_burst_and_drains() {

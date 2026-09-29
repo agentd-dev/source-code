@@ -12,10 +12,7 @@
         "*.agentd.yml",
         "*.agentd.yaml"
       ],
-      "url": "https://agentd.dev/schema/config.json",
-      "versions": {
-        "1": "https://agentd.dev/schema/config-1.json"
-      }
+      "url": "https://agentd.dev/schema/config.json"
     },
     {
       "name": "agentd workflow",
@@ -24,10 +21,7 @@
         "*.agentd-workflow.yml",
         "*.agentd-workflow.yaml"
       ],
-      "url": "https://agentd.dev/schema/workflow.json",
-      "versions": {
-        "3": "https://agentd.dev/schema/workflow-3.json"
-      }
+      "url": "https://agentd.dev/schema/workflow.json"
     }
   ]
 }

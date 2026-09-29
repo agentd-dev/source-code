@@ -12,24 +12,6 @@
 //! Always compiled, and every item is `pub`, so a feature-matrix row that
 //! builds no launcher still compiles the contract without a dead-code warning.
 
-/// Launcher flags agentd no longer accepts, each with the hint that replaces
-/// it. Refused before any configuration is read, so a stale command line is a
-/// loud error rather than a flag the daemon rejects as an unknown argument.
-///
-/// No hint names a package or a client binary: which client is installed, and
-/// how, is the operator's business, and naming one here is how the daemon came
-/// to embed a Node project's install instructions.
-pub const REMOVED_LAUNCHER_FLAGS: &[(&str, &str)] = &[
-    (
-        "--debug",
-        "the launcher no longer changes configuration: set a2a.introspection.enabled (e.g. --a2a.introspection.enabled true)",
-    ),
-    (
-        "--inline",
-        "a display-client option: the launcher passes the client only its endpoint — see https://agentd.dev/docs/interface#launcher",
-    ),
-];
-
 /// Where a missing or unstartable client sends the operator.
 pub const LAUNCHER_DOCS: &str = "https://agentd.dev/docs/interface#launcher";
 
@@ -85,7 +67,7 @@ pub const DEFAULT_UI_PORT: u16 = 4173;
 
 /// The OAuth extension grant (RFC 6749 §4.5) a launched client redeems its
 /// single-use launch code with.
-pub const LAUNCH_GRANT_TYPE: &str = "https://agentd.dev/oauth/grant-type/launch/v1";
+pub const LAUNCH_GRANT_TYPE: &str = "https://agentd.dev/oauth/grant-type/launch";
 
 /// How long a launch code stays redeemable: long enough for a client to start
 /// and exchange it, short enough that a copy found later is worthless.
@@ -105,7 +87,7 @@ pub const LAUNCH_SESSION_TTL: std::time::Duration = std::time::Duration::from_se
 /// endpoint is `a2a.url` when set — what the card advertises, so an https
 /// certificate matches the name the client dials — else the concrete bind (a
 /// wildcard bind requires `a2a.url` anyway).
-pub fn launch_endpoint(s: &crate::config::v2::Settings) -> Result<String, String> {
+pub fn launch_endpoint(s: &crate::config::settings::Settings) -> Result<String, String> {
     let listen = s
         .a2a
         .listen
@@ -165,8 +147,8 @@ fn is_loopback_name(host: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn settings(a2a: serde_json::Value) -> crate::config::v2::Settings {
-        crate::config::v2::Settings {
+    fn settings(a2a: serde_json::Value) -> crate::config::settings::Settings {
+        crate::config::settings::Settings {
             a2a: serde_json::from_value(a2a).unwrap(),
             ..Default::default()
         }
@@ -204,7 +186,7 @@ mod tests {
     }
 
     #[test]
-    fn every_client_is_named_once_and_no_hint_names_a_package() {
+    fn every_client_is_named_once_with_the_endpoint_first() {
         for (i, c) in LAUNCH_CONTRACT.iter().enumerate() {
             assert_eq!(launch_client(c.sub), Some(c));
             assert!(LAUNCH_CONTRACT[..i].iter().all(|o| o.sub != c.sub));
@@ -212,12 +194,6 @@ mod tests {
                 c.argv[0], ENDPOINT_FLAG,
                 "{}: the endpoint comes first",
                 c.sub
-            );
-        }
-        for (flag, hint) in REMOVED_LAUNCHER_FLAGS {
-            assert!(
-                !hint.contains("npm") && !hint.contains("@agentd-dev"),
-                "{flag}: {hint}"
             );
         }
     }

@@ -366,7 +366,7 @@ fn an_mcp_elicitation_reaches_the_operator_and_the_server_sees_accept_with_the_c
     let (daemon, addr, cfg) = spawn_bound(
         |port| {
             format!(
-                "config_version: \"1\"\n\
+                "\
                  agent:\n  name: elicit-e2e\n  instruction: You deploy things.\n  preflight: never\n\
                  intelligence:\n  endpoints: {llm}\n  model: mock\n\
                  mcp:\n  servers:\n    - name: ops\n      endpoint: {mcp}\n\
@@ -481,7 +481,7 @@ fn a_gate_whose_asking_child_died_ends_explicitly_instead_of_hanging() {
     let (daemon, addr, cfg) = spawn_bound(
         |port| {
             format!(
-                "config_version: \"1\"\n\
+                "\
                  agent:\n  name: orphan-e2e\n  instruction: You ask questions.\n  preflight: never\n  ask_human_unowned: gate\n\
                  intelligence:\n  endpoints: {llm}\n  model: mock\n\
                  store:\n  kind: memory\n\

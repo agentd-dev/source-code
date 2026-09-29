@@ -32,7 +32,7 @@ use crate::runtime::surface::{Active, EVENTS_METHOD, Ext, TASK_ANNOTATIONS_EXTEN
 /// `active` is what the subscriber activated. The ring holds one copy of each
 /// event for every subscriber, so a `task` event is stored annotated and the
 /// annotations are taken off here, per subscriber, unless this one activated
-/// task-annotations/v1.
+/// task-annotations.
 ///
 /// The params are held to the published schema before anything is streamed:
 /// a refusal is a plain JSON `-32602`, never an SSE response.
@@ -117,9 +117,8 @@ pub(super) fn feed_stream(
 
 /// The cursor `params` resume from, held to [`params_schema`]: absent params
 /// and an absent `fromSeq` are the start, and anything else the schema does
-/// not name — `after`, the cursor's earlier name, included — is refused
-/// rather than ignored, because ignoring it would replay from the start a
-/// client that meant to resume.
+/// not name is refused rather than ignored, because ignoring it would replay
+/// from the start a client that meant to resume.
 ///
 /// `Err` holds each violation as `(field, why)`.
 fn from_seq(params: &Value) -> Result<u64, Vec<(String, String)>> {
@@ -210,9 +209,9 @@ mod tests {
     use super::*;
 
     /// The params are `{fromSeq?}` and nothing else: absent params, absent
-    /// cursor and a cursor are accepted; the cursor's earlier name, a
-    /// stranger, a negative or fractional cursor and a non-object are each
-    /// refused naming the field.
+    /// cursor and a cursor are accepted; a member the method does not define,
+    /// a negative or fractional cursor and a non-object are each refused
+    /// naming the field.
     #[test]
     fn the_params_are_strict() {
         assert_eq!(from_seq(&Value::Null), Ok(0));
@@ -226,7 +225,7 @@ mod tests {
                 .map(|(f, _)| f)
                 .collect()
         };
-        assert_eq!(field(json!({"after": 3})), ["params.after"]);
+        assert_eq!(field(json!({"cursor": 3})), ["params.cursor"]);
         assert_eq!(field(json!({"fromSeq": 1, "limit": 2})), ["params.limit"]);
         assert_eq!(field(json!({"fromSeq": -1})), ["params.fromSeq"]);
         assert_eq!(field(json!({"fromSeq": 1.5})), ["params.fromSeq"]);

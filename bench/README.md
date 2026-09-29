@@ -284,14 +284,14 @@ can run the *same* task suite under progressively richer structures and ask what
 decomposition actually buys. `bench/ablate.py` runs each task as:
 
 - `once` — a single ReAct loop (baseline);
-- `workflow` — the task wrapped in a one-agent graph (orchestration overhead);
-- `fanout-N` — a `foreach` graph fanning the task across N parallel subagents.
+- `workflow` — the task wrapped in a one-agent workflow (orchestration overhead);
+- `fanout-N` — a `foreach` workflow fanning the task across N parallel subagents.
 
 and reports **accuracy × cost** per config. Cost is summed across the whole
 subagent tree (every `loop.final`), so a fan-out's N× token cost is visible.
 
 ```console
-$ cargo build -p agentd-cli --features workflow      # workflow mode needs this
+$ cargo build -p agentd-cli
 $ python3 bench/ablate.py --repeats 2
 config        pass@1  pass^k  tok/task  Δcost   verdict
 ----------------------------------------------------------

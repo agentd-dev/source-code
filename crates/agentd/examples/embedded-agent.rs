@@ -6,12 +6,12 @@
 //! live OpenAI-compatible endpoint:
 //!
 //! ```console
-//! AGENT_INTELLIGENCE=https://gw.example/v1 \
-//! AGENT_INTELLIGENCE_TOKEN=… AGENT_MODEL=my-model \
+//! AGENTD_INTELLIGENCE=https://gw.example/v1 \
+//! AGENTD_INTELLIGENCE_TOKEN=… AGENTD_MODEL=my-model \
 //! cargo run -p agentd-core --example embedded-agent
 //! ```
 //!
-//! Optionally add remote MCP tools too: `AGENT_MCP=fs=https://mcp-fs.internal/mcp`.
+//! Optionally add remote MCP tools too: `AGENTD_MCP=fs=https://mcp-fs.internal/mcp`.
 //!
 //! Trade-off to understand: this runs the reasoning IN YOUR
 //! PROCESS — simplest integration, no process isolation. When you want the
@@ -57,17 +57,19 @@ fn main() {
     ))
     .expect("unique tool name");
 
-    // ── 2. Wiring from the environment (the same names the stock CLI honors).
-    let Ok(intel_uri) = std::env::var("AGENT_INTELLIGENCE") else {
-        eprintln!("set AGENT_INTELLIGENCE (and optionally AGENT_INTELLIGENCE_TOKEN,");
-        eprintln!("AGENT_MODEL, AGENT_MCP=name=https://…) to run this example");
+    // ── 2. Wiring from the environment (the intelligence names are the stock
+    //       CLI's; `AGENTD_MCP` is this example's own shorthand).
+    let Ok(intel_uri) = std::env::var("AGENTD_INTELLIGENCE") else {
+        eprintln!("set AGENTD_INTELLIGENCE (and optionally AGENTD_INTELLIGENCE_TOKEN,");
+        eprintln!("AGENTD_MODEL, AGENTD_MCP=name=https://…) to run this example");
         return;
     };
-    let intel = IntelClient::from_parts(&intel_uri, std::env::var("AGENT_INTELLIGENCE_TOKEN").ok())
-        .expect("intelligence endpoint");
+    let intel =
+        IntelClient::from_parts(&intel_uri, std::env::var("AGENTD_INTELLIGENCE_TOKEN").ok())
+            .expect("intelligence endpoint");
     let mut servers: Vec<McpClient> = Vec::new();
-    if let Ok(spec) = std::env::var("AGENT_MCP") {
-        let (name, endpoint) = spec.split_once('=').expect("AGENT_MCP=name=endpoint");
+    if let Ok(spec) = std::env::var("AGENTD_MCP") {
+        let (name, endpoint) = spec.split_once('=').expect("AGENTD_MCP=name=endpoint");
         let server_spec = agentd::config::McpServerSpec {
             name: name.into(),
             endpoint: endpoint.into(),
@@ -100,7 +102,7 @@ fn main() {
             .into(),
         output_contract: Some("Answer with a single integer.".into()),
         seed: Vec::new(),
-        model: std::env::var("AGENT_MODEL").unwrap_or_default(),
+        model: std::env::var("AGENTD_MODEL").unwrap_or_default(),
         max_steps: 10,
         max_tokens: 20_000,
         deadline: Instant::now() + Duration::from_secs(120),

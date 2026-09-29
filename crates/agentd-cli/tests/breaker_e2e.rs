@@ -6,7 +6,7 @@
 //! without the mock seeing a request (and a restart did not amnesty the
 //! remote); after the cooldown one probe goes through, finds the remote
 //! recovered, and closes the circuit for the runs that follow.
-#![cfg(all(unix, feature = "workflow"))]
+#![cfg(unix)]
 
 mod common;
 
@@ -86,7 +86,7 @@ fn the_breaker_opens_survives_restarts_probes_and_closes() {
     std::fs::write(
         &cfg,
         format!(
-            "config_version: \"1\"\n\
+            "\
              agent:\n  name: breakerbox\n\
              store:\n  kind: file\n  file:\n    path: {dir}/state\n\
              workflows:\n  - name: pay\n    steps:\n\
@@ -175,7 +175,7 @@ fn a_rated_step_paces_a_fanout_instead_of_bursting() {
     std::fs::write(
         &cfg,
         format!(
-            "config_version: \"1\"\n\
+            "\
              agent:\n  name: pacer\n\
              store:\n  kind: memory\n\
              workflows:\n  - name: sweep\n    steps:\n\

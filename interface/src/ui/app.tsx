@@ -684,22 +684,16 @@ export interface Bootstrap {
  * Take the launch code out of the URL — the one thing main.tsx does before
  * any request. The code (`#launch=<code>`) is returned for the page to hold in
  * memory, and the fragment is replaced away, so no later request, history
- * entry or error that quotes the location carries it. `?bearer=` (a v1.16
- * link) is stripped in the same step and never read: a credential in a query
- * string reaches server logs and history, so this page takes none from one.
+ * entry or error that quotes the location carries it. Only the fragment is
+ * read: a credential in a query string reaches server logs and history, so
+ * this page takes none from one.
  */
 export function takeLaunchCode(
   loc: Pick<Location, 'hash' | 'search' | 'pathname'>,
   hist: Pick<History, 'replaceState'>,
 ): string | undefined {
   const code = new URLSearchParams(loc.hash.replace(/^#/, '')).get('launch') ?? '';
-  const query = new URLSearchParams(loc.search);
-  const bearer = query.has('bearer');
-  query.delete('bearer');
-  if (loc.hash !== '' || bearer) {
-    const rest = query.toString();
-    hist.replaceState(null, '', `${loc.pathname}${rest ? `?${rest}` : ''}`);
-  }
+  if (loc.hash !== '') hist.replaceState(null, '', `${loc.pathname}${loc.search}`);
   return code !== '' ? code : undefined;
 }
 
@@ -816,7 +810,7 @@ export interface AppProps {
 export function App({ bootstrap, launchCode }: AppProps): React.JSX.Element {
   // The session store is this tab's; the persistent store gets the endpoint
   // and the layout only (credstore.ts has no path that writes a credential
-  // there, and loadEndpoint rewrites a v1.16 `{endpoint, bearer}` entry).
+  // there).
   const tab = useMemo(() => storageOf(() => sessionStorage), []);
   const local = useMemo(() => storageOf(() => localStorage), []);
   const creds = useMemo(() => new CredentialStore(tab), [tab]);

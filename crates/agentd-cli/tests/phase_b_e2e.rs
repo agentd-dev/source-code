@@ -3,7 +3,7 @@
 //! child resolving the spawn with its declared workflow's first result; child
 //! streams mirrored into the parent's; the catalog's per-entry breaker default
 //! opening on an unreachable service; and the `http` step's method ceiling.
-#![cfg(all(unix, feature = "workflow", feature = "a2a"))]
+#![cfg(all(unix, feature = "a2a"))]
 
 mod common;
 
@@ -44,7 +44,7 @@ fn a_sync_instance_resolves_the_spawn_with_its_workflows_first_result() {
     // run's output while the child keeps running under its ttl.
     let port = common::free_port();
     let (code, log) = run_cfg(&format!(
-        "config_version: \"1\"\nagent: {{ name: parent }}\nstore: {{ kind: memory }}\n\
+        "agent: {{ name: parent }}\nstore: {{ kind: memory }}\n\
          lifecycle: {{ run_until: idle, idle_grace: 1500ms }}\n\
          observability: {{ log_level: info, log_content: true }}\n\
          a2a: {{ listen: \"http://127.0.0.1:{port}\" }}\n\
@@ -54,7 +54,6 @@ fn a_sync_instance_resolves_the_spawn_with_its_workflows_first_result() {
         \x20     instruction: |\n\
         \x20       The room.\n\
         \x20       :::!workflow{{name=on-ping}}\n\
-        \x20       version: 3\n\
         \x20       steps:\n\
         \x20         cmd: {{ kind: a2a, command: room.ping, roles: [agent, operator] }}\n\
         \x20         f:   {{ kind: finish, depends_on: [cmd], status: completed, output: \"pong {{{{steps.cmd.output.args.x}}}}\" }}\n\
@@ -93,7 +92,7 @@ fn a_sync_instance_resolves_the_spawn_with_its_workflows_first_result() {
 fn a_mirrored_child_stream_lands_in_the_parents_stream() {
     let port = common::free_port();
     let (code, log) = run_cfg(&format!(
-        "config_version: \"1\"\nagent: {{ name: parent }}\nstore: {{ kind: memory }}\n\
+        "agent: {{ name: parent }}\nstore: {{ kind: memory }}\n\
          lifecycle: {{ run_until: idle, idle_grace: 2000ms }}\n\
          observability: {{ log_level: info, log_content: true }}\n\
          a2a: {{ listen: \"http://127.0.0.1:{port}\" }}\n\
@@ -107,7 +106,6 @@ fn a_mirrored_child_stream_lands_in_the_parents_stream() {
         \x20       retention: {{ max_events: 100 }}\n\
         \x20       :::\n\
         \x20       :::!workflow{{name=on-add}}\n\
-        \x20       version: 3\n\
         \x20       steps:\n\
         \x20         cmd: {{ kind: a2a, command: desk.add, roles: [agent, operator] }}\n\
         \x20         put: {{ kind: emit, depends_on: [cmd], stream: orders, subject: \"order.new\", data: {{ sku: \"{{{{steps.cmd.output.args.sku}}}}\" }} }}\n\
@@ -149,7 +147,7 @@ fn a_catalog_breaker_default_opens_for_a_failing_service() {
     // The mock MCP connects fine; calling a tool it does not serve fails.
     let mock = common::spawn_mock_mcp("mock://r", false);
     let (code, log) = run_cfg(&format!(
-        "config_version: \"1\"\nagent: {{ name: b }}\nstore: {{ kind: memory }}\n\
+        "agent: {{ name: b }}\nstore: {{ kind: memory }}\n\
          lifecycle: {{ run_until: idle, idle_grace: 700ms }}\n\
          observability: {{ log_level: info, log_content: true }}\n\
          services:\n\
@@ -182,7 +180,7 @@ fn a_catalog_breaker_default_opens_for_a_failing_service() {
 #[test]
 fn the_http_steps_method_ceiling_holds() {
     let (code, log) = run_cfg(
-        "config_version: \"1\"\nagent: { name: h }\nstore: { kind: memory }\n\
+        "agent: { name: h }\nstore: { kind: memory }\n\
          lifecycle: { run_until: idle, idle_grace: 500ms }\n\
          observability: { log_level: info, log_content: true }\n\
          services:\n\

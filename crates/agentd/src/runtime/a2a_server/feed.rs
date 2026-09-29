@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The events/v1 observation feed: the ring the loop pushes state changes
+//! The events extension's observation feed: the ring the loop pushes state changes
 //! onto, and the section diff that finds the changes nobody pushed.
 
 use super::FEED_RING;
@@ -86,7 +86,7 @@ impl SharedFeed {
 
     /// Append one event; returns its `seq`.
     ///
-    /// A debug build refuses, loudly, an event events/v1 does not define: a
+    /// A debug build refuses, loudly, an event the events extension does not define: a
     /// kind outside [`FeedKind::ALL`], data off its kind's schema, or a
     /// visibility the kind may not carry. Every e2e runs a debug daemon, so a
     /// push that drifted from the published contract stops the suite at the
@@ -97,7 +97,7 @@ impl SharedFeed {
     pub fn push(&self, kind: &str, vis: FeedVis, data: Value) -> u64 {
         #[cfg(debug_assertions)]
         if let Err(why) = conforms(kind, &vis, &data) {
-            panic!("feed push outside events/v1: {why}");
+            panic!("feed push outside the events vocabulary: {why}");
         }
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.seq += 1;
@@ -152,7 +152,7 @@ impl SharedFeed {
     }
 }
 
-/// Whether an event is one events/v1 defines: its kind, its data against the
+/// Whether an event is one the events extension defines: its kind, its data against the
 /// kind's schema, and its visibility against who the kind may reach.
 #[cfg(debug_assertions)]
 fn conforms(kind: &str, vis: &FeedVis, data: &Value) -> Result<(), String> {
@@ -331,7 +331,7 @@ mod tests {
     use super::super::introspection::truncate_strings;
     use super::*;
 
-    /// A `task` event's data: the smallest Task events/v1 accepts.
+    /// A `task` event's data: the smallest Task the events extension accepts.
     fn task_data(id: &str) -> Value {
         json!({"task": {"id": id, "contextId": "c", "status": {"state": "TASK_STATE_WORKING"}}})
     }
@@ -467,8 +467,8 @@ mod tests {
         assert_eq!(kinds("operator", true).len(), 4, "the operator sees all");
     }
 
-    /// A debug build refuses every push events/v1 does not define — an
-    /// unknown or removed kind, data off its schema, a kind pushed to an
+    /// A debug build refuses every push the events extension does not define
+    /// — an unknown kind, data off its schema, a kind pushed to an
     /// audience it may not reach — and stores none of them; a conforming
     /// push goes through.
     #[test]
@@ -480,10 +480,12 @@ mod tests {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f.push(kind, vis, data)))
                     .expect_err("the push should have panicked");
             let why = why.downcast_ref::<String>().cloned().unwrap_or_default();
-            assert!(why.contains("outside events/v1"), "{kind}: {why}");
+            assert!(
+                why.contains("outside the events vocabulary"),
+                "{kind}: {why}"
+            );
         };
-        refused("message", FeedVis::All, json!({"text": "hi"}));
-        refused("pairing", FeedVis::Operator, json!({}));
+        refused("no.such.kind", FeedVis::All, json!({"text": "hi"}));
         refused("run.removed", FeedVis::Operator, json!({"id": 7}));
         refused(
             "auth",

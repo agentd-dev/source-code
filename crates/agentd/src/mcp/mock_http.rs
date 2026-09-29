@@ -16,8 +16,8 @@
 //! `emit` is off), so a reactive agent reached over HTTP has something to react
 //! to.
 
-use crate::json::{self, Incoming, Request, Response};
-use crate::wire::mcp::{PROTOCOL_VERSION, method};
+use ::mcp::rpc::{self as json, Incoming, Request, Response};
+use ::mcp::wire::{PROTOCOL_VERSION, method};
 use serde_json::json;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};

@@ -55,8 +55,8 @@
 
 use crate::a2a::peer::{self as a2a, PeerCard};
 use crate::config::A2aEndpoint;
-use crate::json::{Id, Request};
 use crate::runtime::surface::{A2A_PROTOCOL_VERSION, COMMAND_EXTENSION};
+use ::mcp::rpc::{Id, Request};
 use a2a_rs::domain::TaskState;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -756,7 +756,7 @@ impl HttpConn {
             use std::io::Read as _;
             let mut text = String::new();
             let _ = resp.into_reader().take(1 << 20).read_to_string(&mut text);
-            let frame: crate::json::Response = serde_json::from_str(text.trim())
+            let frame: ::mcp::rpc::Response = serde_json::from_str(text.trim())
                 .map_err(|e| format!("a2a: bad unary streaming reply: {e}"))?;
             if let Some(err) = frame.error {
                 if err.code == crate::a2a::errors::UNSUPPORTED_OPERATION {
@@ -826,7 +826,7 @@ impl HttpConn {
             if ev.data.trim().is_empty() {
                 continue;
             }
-            let Ok(frame) = serde_json::from_str::<crate::json::Response>(ev.data.trim()) else {
+            let Ok(frame) = serde_json::from_str::<::mcp::rpc::Response>(ev.data.trim()) else {
                 continue; // an unparseable frame is skipped, not fatal
             };
             if let Some(err) = frame.error {
@@ -940,7 +940,7 @@ impl Caller for HttpConn {
         if !resp.is_success() {
             return Err(format!("a2a: {method} HTTP {}", resp.status));
         }
-        let response: crate::json::Response = serde_json::from_slice(&resp.body)
+        let response: ::mcp::rpc::Response = serde_json::from_slice(&resp.body)
             .map_err(|e| format!("a2a: {method} bad reply: {e}"))?;
         if let Some(err) = response.error {
             return Err(format!(

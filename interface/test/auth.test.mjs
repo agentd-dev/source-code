@@ -427,7 +427,7 @@ test('launch exchange', async () => {
   } finally {
     await refused.close();
   }
-  assert.equal(LAUNCH_GRANT_TYPE, 'https://agentd.dev/oauth/grant-type/launch/v1');
+  assert.equal(LAUNCH_GRANT_TYPE, 'https://agentd.dev/oauth/grant-type/launch');
   await assert.rejects(launchExchange('http://agent.example/oauth2/token', 'c', 'agentd-ui'), InsecureEndpoint);
   // A launch code is redeemable only over loopback, so even https elsewhere
   // would only burn it — or hand it to whoever answers. Nothing is sent.
@@ -497,13 +497,7 @@ test('no credential reaches persistent storage', () => {
   persistEndpoint(local, { endpoint: 'http://127.0.0.1:8420', bearer: 'sekrit', token: 'agentd_at_x' });
   assert.deepEqual(local.writes, [[ENDPOINT_KEY, JSON.stringify({ endpoint: 'http://127.0.0.1:8420' })]]);
 
-  // A v1.16 web UI left `{endpoint, bearer}` under the same key. Reading the
-  // endpoint scrubs the bearer out of persistent storage.
-  const legacy = recordingStorage();
-  legacy.setItem(ENDPOINT_KEY, JSON.stringify({ endpoint: 'http://127.0.0.1:8420', bearer: 'operator-secret' }));
-  assert.equal(loadEndpoint(legacy), 'http://127.0.0.1:8420');
-  assert.deepEqual(JSON.parse(legacy.getItem(ENDPOINT_KEY)), { endpoint: 'http://127.0.0.1:8420' });
-  // …and an entry with a credential but no endpoint to keep is removed.
+  // An entry with no endpoint to keep is removed.
   for (const junk of [JSON.stringify({ bearer: 'operator-secret' }), '{not json', JSON.stringify(['x'])]) {
     const s = recordingStorage();
     s.setItem(ENDPOINT_KEY, junk);

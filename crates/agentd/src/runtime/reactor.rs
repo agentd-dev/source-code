@@ -17,7 +17,7 @@ use super::artifacts::Artifacts;
 use super::children::{ChildKind, Children};
 use super::events::{Event, kinds};
 use super::timers::Timers;
-use crate::config::v2::{RunUntil, Settings};
+use crate::config::settings::{RunUntil, Settings};
 use crate::context::memory::Memory;
 use crate::context::{Contexts, skills, tokens};
 use crate::engine::{RunState, RunStatus, Workflow};
@@ -115,7 +115,7 @@ pub struct PolicyCall {
     /// The index of the rule that asked, for every message about it.
     pub rule: usize,
     /// What the rule said an unanswered gate becomes.
-    pub on_timeout: crate::config::v2::PolicyAction,
+    pub on_timeout: crate::config::settings::PolicyAction,
 }
 
 /// A queued root/conversation turn, waiting for a worker slot and for its
@@ -209,8 +209,7 @@ pub struct SubagentRecord {
     /// The principal this subagent works for: who may steer, read or kill it.
     /// `requested_by` names WHAT spawned it — a conversation, a run, another
     /// subagent — and any of those can be gone by the time someone asks, so
-    /// the owner is recorded at spawn. A record written before it was kept
-    /// inherits one at restore ([`inherited_principal`]); `None` is
+    /// the owner is recorded at spawn ([`inherited_principal`]); `None` is
     /// operator-only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub principal: Option<String>,
@@ -372,7 +371,7 @@ pub struct Runtime {
     /// `a2a.principals[].quotas` parsed and validated for a long time without
     /// anything reading it; this is the budget's reader. (The rate is
     /// admission, and the listener applies it.)
-    pub(crate) principal_budgets: BTreeMap<String, crate::config::v2::Budget>,
+    pub(crate) principal_budgets: BTreeMap<String, crate::config::settings::Budget>,
     /// Labels an id acts under, for `_meta` and audit.
     pub(crate) principal_labels: BTreeMap<String, BTreeMap<String, String>>,
     /// Every resolved caller as last seen, by principal id. A turn or a run
@@ -456,9 +455,7 @@ pub struct Runtime {
     /// restore.
     #[cfg(feature = "a2a")]
     pub(crate) conv_index: super::conversations::ConversationIndex,
-    /// The task snapshot the A2A listener threads read (None ⇒ not serving).
-    #[cfg(feature = "a2a")]
-    /// The interface event feed. `None` means the interface is disabled.
+    /// The observation feed. `None` means the feed is off.
     #[cfg(feature = "a2a")]
     pub(crate) a2a_feed: Option<std::sync::Arc<super::a2a_server::SharedFeed>>,
     /// The id the listener reserved for the task the request being served will
@@ -468,7 +465,7 @@ pub struct Runtime {
     pub(crate) reserved_task_id: Option<String>,
     /// The extensions the request being served activated; `NONE` between
     /// requests. A task's annotations are projected only while it holds
-    /// task-annotations/v1.
+    /// task-annotations.
     #[cfg(feature = "a2a")]
     pub(crate) a2a_active: super::surface::Active,
     /// Where a task transition is published so A2A subscribers see it.
@@ -519,7 +516,7 @@ impl Runtime {
     pub(crate) fn work_durable_default(&self) -> bool {
         !matches!(
             self.settings.store.durability.work,
-            Some(crate::config::v2::WorkDurability::Ephemeral)
+            Some(crate::config::settings::WorkDurability::Ephemeral)
         )
     }
 
@@ -665,7 +662,7 @@ impl Runtime {
                     self.turn_queue.len() as u64,
                 );
             }
-            // 10.5. The interface feed's section diff: publish
+            // 10.5. The observation feed's section diff: publish
             // run/conversation/subagent/child/status deltas to attached display
             // clients. A no-op unless `a2a.events.enabled`; rate-limited inside.
             #[cfg(feature = "a2a")]
@@ -861,8 +858,7 @@ impl Runtime {
             .unwrap_or("default")
             .to_string();
         // The name the sender used for the conversation — the key itself for
-        // an operator, a `message` step, and a record written before the two
-        // were told apart.
+        // an operator and a `message` step.
         let wire = ev.payload["wire_id"].as_str().unwrap_or(&ctx).to_string();
         // Only the listener writes a message ahead with the task it answers;
         // a caller's own `message.send` says it is one (`owner_checked`).
@@ -910,7 +906,6 @@ impl Runtime {
             return;
         }
         // 3. Otherwise it is what it looks like: something to answer.
-        #[allow(unused)]
         let skills = self.skills.references(&text);
         let depth = ev.payload["msg_depth"].as_u64().unwrap_or(0) as u32;
         self.turn_queue.push_back(
@@ -1226,7 +1221,7 @@ impl Runtime {
     /// The unit that tripped it still fails; this only answers the larger
     /// question of whether the process should carry on refusing.
     pub(crate) fn apply_lifetime_exhausted(&mut self, reason: &str) {
-        use crate::config::v2::LifetimeExhausted as P;
+        use crate::config::settings::LifetimeExhausted as P;
         let policy = self.settings.intelligence.budget.lifetime_exhausted;
         if self.lifetime_spent {
             return;
@@ -1511,7 +1506,7 @@ impl Runtime {
 
     // ---- status ------------------------------------------------------------
 
-    /// `status` tool / `agent://status`: the whole document, as an operator
+    /// The `status` tool and op: the whole document, as an operator
     /// sees it. A caller who is not the operator is answered from
     /// [`Runtime::status_value_for`].
     pub(crate) fn status_value(&self) -> Value {
@@ -1848,8 +1843,7 @@ pub(crate) fn status_summary(status: &Value) -> String {
 /// the ID and nothing else, never the credential or session that presented it,
 /// so a principal keeps its runs and subagents across a re-login and a token's
 /// expiry, and two sessions of one principal are one owner. An object nobody
-/// owns (a record from before owners were kept, whose spawner is gone) is the
-/// operator's alone.
+/// owns is the operator's alone.
 pub(crate) fn may_act_on(principal: &crate::a2a::Principal, owner: Option<&str>) -> bool {
     principal.is_operator() || owner == Some(principal.id.as_str())
 }
@@ -1882,30 +1876,6 @@ pub(crate) fn inherited_principal(
         cur = subagents.get(by["subagent"].as_str()?)?;
     }
     None
-}
-
-/// Give every record restored without a principal the one it inherits. Run
-/// once the runs and contexts it inherits from are restored; a record that
-/// gains one is re-persisted, so the owner no longer depends on its spawner
-/// surviving the next restart.
-pub(crate) fn backfill_principals(
-    subagents: &mut BTreeMap<String, SubagentRecord>,
-    run_owner: impl Fn(&str) -> Option<String>,
-    ctx_owner: impl Fn(&str) -> Option<String>,
-) {
-    let found: Vec<(String, String)> = subagents
-        .values()
-        .filter(|s| s.principal.is_none())
-        .filter_map(|s| {
-            inherited_principal(subagents, s, &run_owner, &ctx_owner).map(|p| (s.handle.clone(), p))
-        })
-        .collect();
-    for (handle, p) in found {
-        if let Some(s) = subagents.get_mut(&handle) {
-            s.principal = Some(p);
-            s.dirty = s.durable;
-        }
-    }
 }
 
 impl Runtime {
@@ -1981,16 +1951,6 @@ impl Runtime {
             |c| self.contexts.get(c).and_then(|c| c.principal.clone()),
         )
     }
-
-    /// [`backfill_principals`] over the restored state.
-    pub(crate) fn backfill_subagent_principals(&mut self) {
-        let (runs, contexts) = (&self.runs, &self.contexts);
-        backfill_principals(
-            &mut self.subagents,
-            |r| runs.get(r).and_then(|r| r.principal.clone()),
-            |c| contexts.get(c).and_then(|c| c.principal.clone()),
-        );
-    }
 }
 
 pub(crate) fn is_terminal_status(s: &str) -> bool {
@@ -2028,11 +1988,10 @@ pub fn run_exit_code(r: &RunState) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Instruction, SubagentRecord, backfill_principals, may_act_on, status_summary};
+    use super::{Instruction, may_act_on, status_summary};
     use crate::a2a::Principal;
-    use crate::config::v2::Role;
+    use crate::config::settings::Role;
     use serde_json::json;
-    use std::collections::BTreeMap;
 
     fn principal(id: &str, role: Role, grants: &[&str], rate: Option<&str>) -> Principal {
         Principal {
@@ -2076,66 +2035,6 @@ mod tests {
         // An object nobody owns is the operator's alone.
         assert!(may_act_on(&operator, None));
         assert!(!may_act_on(&first, None));
-    }
-
-    fn restored(doc: serde_json::Value) -> SubagentRecord {
-        serde_json::from_value(doc).expect("a record from before `principal` was kept")
-    }
-
-    /// A subagent record persisted before it carried its owner is given one
-    /// at restore: its run's owner first, then its conversation's, then its
-    /// parent subagent's. Without the backfill every such record would be
-    /// operator-only, and its owner would lose it across the upgrade.
-    #[test]
-    fn subagent_principal_is_inherited_at_restore() {
-        let mut subagents = BTreeMap::new();
-        for (handle, by, principal) in [
-            ("s-run", json!({"run": "r1", "ctx": "c1"}), None),
-            ("s-ctx", json!({"ctx": "c1"}), None),
-            ("s-child", json!({"subagent": "s-run"}), None),
-            ("s-own", json!({"run": "r1"}), Some("user:dave")),
-            ("s-orphan", json!({"run": "gone", "ctx": "gone"}), None),
-        ] {
-            let mut doc = json!({"handle": handle, "instruction": "x", "mode": "async",
-                                 "status": "running", "requested_by": by});
-            if let Some(p) = principal {
-                doc["principal"] = json!(p);
-            }
-            subagents.insert(handle.to_string(), restored(doc));
-        }
-        let runs = BTreeMap::from([("r1", "user:alice")]);
-        let ctxs = BTreeMap::from([("c1", "user:carol")]);
-        backfill_principals(
-            &mut subagents,
-            |r| runs.get(r).map(|p| p.to_string()),
-            |c| ctxs.get(c).map(|p| p.to_string()),
-        );
-        let owner = |h: &str| subagents[h].principal.clone();
-        assert_eq!(
-            owner("s-run").as_deref(),
-            Some("user:alice"),
-            "the run first"
-        );
-        assert_eq!(
-            owner("s-ctx").as_deref(),
-            Some("user:carol"),
-            "then the conversation"
-        );
-        assert_eq!(
-            owner("s-child").as_deref(),
-            Some("user:alice"),
-            "then the parent"
-        );
-        assert_eq!(
-            owner("s-own").as_deref(),
-            Some("user:dave"),
-            "a recorded owner stays"
-        );
-        assert_eq!(owner("s-orphan"), None, "nobody left: the operator's");
-        assert!(
-            subagents["s-run"].dirty && !subagents["s-orphan"].dirty,
-            "a record that gained an owner is re-persisted"
-        );
     }
 
     fn instruction(uri: Option<&str>, server: Option<&str>) -> Instruction {

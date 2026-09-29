@@ -46,9 +46,8 @@
 //! The method names are the route table's ([`crate::runtime::surface::route_of`]):
 //! the specification's eleven and the extension methods agentd declares,
 //! matched exactly. The public card is not a method — the spec publishes it at
-//! `/.well-known/agent-card.json` — and the old spellings (an `a2a.` prefix,
-//! the 0.3 names, the card read as a call) are `-32601` like any other unknown
-//! name.
+//! `/.well-known/agent-card.json` — and any other name, an earlier
+//! specification's included, is `-32601`.
 //!
 //! Most of the table is a2a-rs's to answer. A few calls are answered here:
 //! the command ops that reply with a Message (a read has no task for the
@@ -164,12 +163,10 @@ struct App {
     denials: limits::DenialLog,
     /// Per-principal admission, from each rule's declared rate.
     rates: limits::PrincipalRates,
-    /// The browser CORS allowlist, shared so a reload can revise it.
-    ///
-    /// Frozen at spawn until v1.4.0: an operator who REMOVED an origin to
-    /// revoke a web client's access got a successful reload and a listener
-    /// that kept honouring the old list — the same shape as the webhook
-    /// secret that would not rotate.
+    /// The browser CORS allowlist, shared so a reload can revise it: an
+    /// operator who removes an origin to revoke a web client's access gets a
+    /// listener that stops honouring it, not a reload that reported success
+    /// and changed nothing.
     cors_origins: OriginList,
     /// How long a call handed to a2a-rs may take to produce its first byte:
     /// the fidelity filter waits this long for a stream's first event.
@@ -352,9 +349,8 @@ impl App {
     }
 }
 
-/// The listener's routes. The card has one path: `/.well-known/agent.json`
-/// was the pre-1.0 name, and a client still asking there is told 404 rather
-/// than handed a document it would read with the wrong expectations.
+/// The listener's routes. The card has one path, the one A2A 1.0 names; any
+/// other is 404 like every path the listener does not serve.
 ///
 /// The authorization server's routes exist only while something issues
 /// through them — a listener that issues nothing does not answer as if it
@@ -1287,7 +1283,7 @@ mod tests {
 
     /// An authority over fresh sessions, issuing at `issuer`.
     fn authority(cfg: Value, issuer: &str) -> Arc<Authority> {
-        let cfg: crate::config::v2::DeviceGrant = serde_json::from_value(cfg).unwrap();
+        let cfg: crate::config::settings::DeviceGrant = serde_json::from_value(cfg).unwrap();
         let sessions = Arc::new(Sessions::new(oauth::system_clock()));
         let a = Arc::new(Authority::new(
             Some(DeviceGrant::new(
@@ -1307,7 +1303,7 @@ mod tests {
             sid: sid.into(),
             kind: SessionKind::Device,
             name: Some(name.into()),
-            role: crate::config::v2::Role::User,
+            role: crate::config::settings::Role::User,
             principal: format!("user:{name}"),
             client_id: "cli".into(),
             created_ms: crate::state::now_ms(),
@@ -1540,7 +1536,7 @@ mod tests {
     /// the issuer joined with its path, the same URLs the card's flow names.
     #[tokio::test]
     async fn metadata_round_trips_rfc8414() {
-        let a2a: crate::config::v2::A2a = serde_json::from_value(json!({
+        let a2a: crate::config::settings::A2a = serde_json::from_value(json!({
             "listen": "https://0.0.0.0:8443", "url": "https://agent.example:8443",
             "tls": {"cert": "c", "key": "k"}, "bearer": "{{secret:B}}",
             "device_grant": {"enabled": true, "scopes": ["user", "operator"]}}))
@@ -1686,7 +1682,7 @@ mod tests {
     /// The authority a listener builds with `slot` installed — and the
     /// device grant too, when `device` — as `spawn_a2a_listener` builds it.
     fn launch_auth(slot: &Arc<LaunchSlot>, device: bool) -> Auth {
-        let cfg: crate::config::v2::DeviceGrant =
+        let cfg: crate::config::settings::DeviceGrant =
             serde_json::from_value(json!({"enabled": true})).unwrap();
         let sessions = Arc::new(Sessions::new(oauth::system_clock()));
         let a = Arc::new(Authority::new(

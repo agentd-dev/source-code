@@ -580,7 +580,7 @@ impl Contexts {
         Ok(written)
     }
 
-    /// A status view (`agent://conversations`).
+    /// A status view of the conversations.
     pub fn status(&self) -> Value {
         json!(
             self.map

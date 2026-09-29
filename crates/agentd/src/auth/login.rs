@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use crate::auth::cache::{self, CachedCred};
 use crate::auth::oauth2::{self, DeviceAuth, OAuth2Params, PollOutcome};
-use crate::config::v2::{Auth, AuthKind, OAuthGrant, Settings};
+use crate::config::settings::{Auth, AuthKind, OAuthGrant, Settings};
 
 /// The user-facing device prompt (RFC 8628 §3.2) handed to the printer.
 pub struct DevicePrompt<'a> {
@@ -277,7 +277,7 @@ fn print_prompt(target: &str, p: &DevicePrompt) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::v2::Secret;
+    use crate::config::settings::Secret;
 
     fn oauth_block() -> Auth {
         Auth {

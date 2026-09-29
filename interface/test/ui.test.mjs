@@ -503,7 +503,7 @@ test('tokens never touch localStorage or a URL', async (t) => {
   // A device sign-in, then a layout change.
   const dev = await deviceAgent(t);
   const devToken = `agentd_at_${'e'.repeat(64)}`;
-  let tab = browser(`${UI}?bearer=agentd_at_${'9'.repeat(64)}`, {
+  let tab = browser(UI, {
     local: { [ENDPOINT_KEY]: JSON.stringify({ endpoint: dev.url }) },
     routes: (c) => {
       if (c.path === '/oauth2/device_authorization') {
@@ -515,8 +515,6 @@ test('tokens never touch localStorage or a URL', async (t) => {
     },
   });
   let page = render(await runMain(), t);
-  // `?bearer=` is stripped with the fragment, and never sent anywhere.
-  assert.equal(location.search, '');
   await until(() => page.find((n) => n.type === 'button' && textOf(n) === 'sign in'), 'the sign-in offer');
   page.click('sign in');
   await until(() => page.connected(), 'signed in');
@@ -525,7 +523,6 @@ test('tokens never touch localStorage or a URL', async (t) => {
   assert.deepEqual(JSON.parse(tab.local.getItem('agentd.layout')).top, ['name', 'version']);
   assert.ok(tab.session.getItem(CREDENTIAL_KEY).includes(devToken), 'the session is in sessionStorage');
   assertClean(tab);
-  assert.ok(!tab.calls.some((c) => carries(c, 'agentd_at_9999')), 'the query-string bearer went nowhere');
   page.unmount();
 
   // A launch exchange.
@@ -545,16 +542,6 @@ test('tokens never touch localStorage or a URL', async (t) => {
   assertClean(tab);
   // No request URL carries a credential either.
   for (const c of tab.calls) assert.ok(!/agentd_(at|lc)_/.test(c.url), `no credential in ${c.url}`);
-});
-
-test('a v1.16 remembered entry loses its bearer on the first load', async (t) => {
-  const fake = await plainAgent(t);
-  const tab = browser(UI, { local: { [ENDPOINT_KEY]: JSON.stringify({ endpoint: fake.url, bearer: `agentd_at_${'0'.repeat(64)}` }) } });
-  const page = render(React.createElement(ui.App, { bootstrap: {} }), t);
-  await until(() => /a2a\.device_grant/.test(page.text()), 'the Connect screen');
-  assert.equal(tab.local.getItem(ENDPOINT_KEY), JSON.stringify({ endpoint: fake.url }), 'rewritten to exactly {endpoint}');
-  assert.ok(!tab.calls.some((c) => carries(c, 'agentd_at_0000')), 'and the old bearer was never sent');
-  assert.equal(fake.rpcCalls().length, 0);
 });
 
 test('no credential means sign-in, never an implicit connection', async (t) => {

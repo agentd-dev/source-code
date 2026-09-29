@@ -8,12 +8,11 @@ After=network.target
 
 [Service]
 Type=simple
-Environment=AGENT_INTELLIGENCE=https://gw.example/v1
+Environment=AGENTD_INTELLIGENCE=https://gw.example/v1
 # Secrets via EnvironmentFile (mode 0600), never on the command line or a config
-# file (RFC 0011 §3.2). The file sets AGENT_INTELLIGENCE_TOKEN=...
+# file (RFC 0011 §3.2). The file sets AGENTD_INTELLIGENCE_TOKEN=...
 EnvironmentFile=/etc/agentd/triage.env
-# The trigger is a workflow START NODE, not a flag: the 1.x `--mode` /
-# `--subscribe` pair was removed in 2.0 and is now refused by name. So
+# The trigger is a workflow START NODE, not a flag. So
 # /etc/agentd/triage.yaml carries `lifecycle: {run_until: drained}` — what keeps
 # the process alive between wakes — and a workflow whose first step is
 #   {kind: subscribe, server: tickets, uri: "tickets://queue/inbound"}

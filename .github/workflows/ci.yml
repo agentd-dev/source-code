@@ -2,7 +2,7 @@ name: ci
 
 on:
   push:
-    branches: [main, rewrite/mcp-native-agent]
+    branches: [main]
   pull_request:
 
 env:
@@ -12,11 +12,11 @@ permissions:
   contents: read
 
 jobs:
-  # Format, lint, and the full test suite. agent is a Linux-native daemon
+  # Format, lint, and the full test suite. agentd is a Linux-native daemon
   # (PR_SET_PDEATHSIG, the subreaper, waitpid, cgroups, unix sockets), so CI is
   # Linux-only — there is no macOS/Windows runtime target. `--all-features` so the
-  # feature-gated modules (tls/vsock/serve-mcp/cron/metrics/otel) are linted and
-  # tested too; without it a gated module can rot unseen.
+  # feature-gated modules (tls/a2a/cron/metrics/otel/…) are linted and tested
+  # too; without it a gated module can rot unseen.
   gate:
     runs-on: ubuntu-latest
     steps:
@@ -36,8 +36,8 @@ jobs:
       - run: echo "INSTRUCTION_SPEC_REPO=$GITHUB_WORKSPACE/.spec-upstream" >> "$GITHUB_ENV"
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      # The whole workspace under all features: agent's feature-gated tests
-      # (serve_mcp / otel_e2e / …) and the black-box agentd-conformance suite,
+      # The whole workspace under all features: agentd's feature-gated tests
+      # (a2a_*_e2e / otel_e2e / …) and the black-box agentd-conformance suite,
       # which builds + drives the real binary, both run here.
       # --no-fail-fast, and the checks after it run even when it fails: one
       # red test binary must not hide the verdict of every binary (and every
@@ -52,7 +52,7 @@ jobs:
         run: |
           cargo build -p agentd-cli --all-features
           ./scripts/gen-schemas.sh
-          git diff --exit-code -- web/public/schema || {
+          git diff --exit-code -- web/public/schema web/lib/workflow-nodes.json || {
             echo "::error::web/public/schema is stale — run ./scripts/gen-schemas.sh and commit"
             exit 1
           }
@@ -67,14 +67,13 @@ jobs:
       matrix:
         features:
           - "" # default: tls + the official MCP SDK
-          - "--features a2a" # the A2A v2 HTTPS listener — agentd 2.0's only external channel (RFC 0029)
+          - "--features a2a" # the A2A listener — agentd's only external channel (RFC 0029)
           - "--features cron"
           - "--features metrics"
           - "--features otel"
           - "--features oauth"
           - "--features hot-reload"
           - "--features config-watch"
-          - "--features workflow"
           - "--features cel"
           - "--features aauth" # AAuth [DRAFT] — Ed25519 identity + RFC 9421 signing (in the shipped feature set)
           - "--features a2a,hot-reload" # the combo that latently broke once

@@ -15,7 +15,7 @@
 // not load at all. Ungated, this file compiles into every feature combination
 // the CI matrix builds and fails each one at `wait_ready` — a daemon that never
 // becomes ready because the surface under test was never built.
-#![cfg(all(unix, feature = "a2a", feature = "workflow"))]
+#![cfg(all(unix, feature = "a2a"))]
 
 mod common;
 
@@ -102,7 +102,7 @@ fn an_a2a_start_node_turns_an_inbound_command_into_a_run() {
     std::fs::write(
         &cfg,
         format!(
-            "config_version: \"1\"\n\
+            "\
              agent:\n  name: a2a-nodes\n  instruction: test\n  preflight: never\n\
              intelligence:\n  endpoints: http://127.0.0.1:1/v1\n  model: mock\n\
              store:\n  kind: memory\n\
@@ -153,7 +153,7 @@ fn a_non_matching_message_is_still_a_conversation() {
     std::fs::write(
         &cfg,
         format!(
-            "config_version: \"1\"\n\
+            "\
              agent:\n  name: a2a-nodes\n  instruction: test\n  preflight: never\n\
              intelligence:\n  endpoints: http://127.0.0.1:1/v1\n  model: mock\n\
              store:\n  kind: memory\n\
@@ -200,7 +200,7 @@ fn an_a2a_wait_is_woken_by_the_message_it_waits_for() {
     std::fs::write(
         &cfg,
         format!(
-            "config_version: \"1\"\n\
+            "\
              agent:\n  name: a2a-nodes\n  instruction: test\n  preflight: never\n\
              intelligence:\n  endpoints: http://127.0.0.1:1/v1\n  model: mock\n\
              store:\n  kind: memory\n\
@@ -266,7 +266,7 @@ fn an_a2a_start_can_append_its_command_to_a_stream_instead_of_running() {
     std::fs::write(
         &cfg,
         format!(
-            "config_version: \"1\"\n\
+            "\
              agent:\n  name: a2a-into\n  instruction: test\n  preflight: never\n\
              intelligence:\n  endpoints: http://127.0.0.1:1/v1\n  model: mock\n\
              store:\n  kind: file\n  file:\n    path: {dir}/state\n  checkpoint:\n    debounce_ms: 0\n\
@@ -342,7 +342,7 @@ fn an_emit_forwarded_to_a_peer_lands_on_that_peers_stream() {
     std::fs::write(
         &cfg_b,
         format!(
-            "config_version: \"1\"\n\
+            "\
              agent:\n  name: receiver\n  instruction: test\n  preflight: never\n\
              intelligence:\n  endpoints: http://127.0.0.1:1/v1\n  model: mock\n\
              store:\n  kind: file\n  file:\n    path: {dir_b}/state\n  checkpoint:\n    debounce_ms: 0\n\
@@ -371,7 +371,7 @@ fn an_emit_forwarded_to_a_peer_lands_on_that_peers_stream() {
     std::fs::write(
         &cfg_a,
         format!(
-            "config_version: \"1\"\n\
+            "\
              agent:\n  name: sender\n  instruction: test\n  preflight: never\n\
              intelligence:\n  endpoints: http://127.0.0.1:1/v1\n  model: mock\n\
              store:\n  kind: file\n  file:\n    path: {dir_a}/state\n  checkpoint:\n    debounce_ms: 0\n\
@@ -424,12 +424,9 @@ fn events(d: &Daemon, event: &str) -> Vec<serde_json::Value> {
 
 /// **A plain-text `a2a.send` reaches an agentd peer.**
 ///
-/// The send used to spell its message by hand with the 0.3 role `"user"`,
-/// which every A2A 1.0 server refuses as an unknown enum name — agentd's own
-/// included. Nothing caught it: the only send the suite exercised peer to peer
-/// was a stream forward, whose command part the listener routed around the
-/// typed parse. This one is a conversational message, so it goes through the
-/// same parse any peer's would, and B's waiting step is woken by it.
+/// A conversational message goes through the same typed parse any peer's
+/// would — an A2A 1.0 server refuses a role spelled any other way than
+/// `ROLE_USER` — and B's waiting step is woken by it.
 #[test]
 fn plain_text_send_to_agentd_peer() {
     let b_port = free_port();
@@ -438,7 +435,7 @@ fn plain_text_send_to_agentd_peer() {
     std::fs::write(
         &cfg_b,
         format!(
-            "config_version: \"1\"\n\
+            "\
              agent:\n  name: listener\n  instruction: test\n  preflight: never\n\
              intelligence:\n  endpoints: http://127.0.0.1:1/v1\n  model: mock\n\
              store:\n  kind: memory\n\
@@ -469,7 +466,7 @@ fn plain_text_send_to_agentd_peer() {
     std::fs::write(
         &cfg_a,
         format!(
-            "config_version: \"1\"\n\
+            "\
              agent:\n  name: sender\n  instruction: test\n  preflight: never\n\
              intelligence:\n  endpoints: http://127.0.0.1:1/v1\n  model: mock\n\
              store:\n  kind: memory\n\
@@ -614,7 +611,7 @@ fn delegation_to_non_streaming_peer() {
     std::fs::write(
         &cfg,
         format!(
-            "config_version: \"1\"\n\
+            "\
              agent:\n  name: delegator\n  instruction: test\n  preflight: never\n\
              intelligence:\n  endpoints: http://127.0.0.1:1/v1\n  model: mock\n\
              store:\n  kind: memory\n\

@@ -14,7 +14,7 @@
 //! change shape halfway through.
 
 use super::reactor::Runtime;
-use crate::config::v2 as cfg;
+use crate::config::settings as cfg;
 use crate::governor::Governor;
 use crate::registry::{Registry, ServerTools};
 use crate::state::now_ms;

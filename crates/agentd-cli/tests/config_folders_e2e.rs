@@ -21,7 +21,6 @@ fn run_in(cwd: &Path, home: &Path, args: &[&str]) -> (Option<i32>, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_agentd"))
         .args(args)
         .current_dir(cwd)
-        .env_remove("AGENT_CONFIG")
         .env_remove("AGENTD_CONFIG")
         .env_remove("XDG_CONFIG_HOME")
         .env("HOME", home)
@@ -45,7 +44,7 @@ fn project(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
     (root, home, work)
 }
 
-const BASE: &str = "config_version: \"1\"\n\
+const BASE: &str = "\
      agent: { name: conv, instruction: conventions }\n\
      intelligence: { endpoints: \"mock:final\", model: mock }\n\
      store: { kind: memory }\n\
@@ -580,7 +579,7 @@ fn validate_refuses_every_credential_reference_startup_refuses() {
         let cfg = work.join("c.yml");
         std::fs::write(
             &cfg,
-            format!("config_version: \"1\"\nagent: {{ name: c, instruction: x }}\nstore: {{ kind: memory }}\n{body}"),
+            format!("agent: {{ name: c, instruction: x }}\nstore: {{ kind: memory }}\n{body}"),
         )
         .unwrap();
         let (code, log) = run_in(&work, &home, &["-c", "c.yml", "--validate-config"]);
@@ -604,13 +603,12 @@ fn a_resolvable_credential_reference_validates() {
     let (root, home, work) = project("credok");
     std::fs::write(
         work.join("c.yml"),
-        "config_version: \"1\"\nagent: { name: c, instruction: x }\nstore: { kind: memory }\nintelligence: { endpoints: \"https://x/v1\", model: m, token: \"{{secret:PRESENT_ONE}}\" }\n",
+        "agent: { name: c, instruction: x }\nstore: { kind: memory }\nintelligence: { endpoints: \"https://x/v1\", model: m, token: \"{{secret:PRESENT_ONE}}\" }\n",
     )
     .unwrap();
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_agentd"))
         .args(["-c", "c.yml", "--validate-config"])
         .current_dir(&work)
-        .env_remove("AGENT_CONFIG")
         .env_remove("AGENTD_CONFIG")
         .env("HOME", &home)
         .env("PRESENT_ONE", "a-value")
@@ -635,8 +633,7 @@ fn a_resolvable_credential_reference_validates() {
 #[test]
 fn an_unimplemented_hmac_algo_is_refused_at_validate_time() {
     let (root, home, work) = project("hmacalgo");
-    let cfg = r#"config_version: "1"
-agent: { name: c, instruction: x }
+    let cfg = r#"agent: { name: c, instruction: x }
 store: { kind: memory }
 intelligence: { endpoints: "https://x/v1", model: m }
 webhooks:
@@ -652,7 +649,6 @@ workflows:
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_agentd"))
         .args(["-c", "c.yml", "--validate-config"])
         .current_dir(&work)
-        .env_remove("AGENT_CONFIG")
         .env_remove("AGENTD_CONFIG")
         .env("HOME", &home)
         .env("HOOKSEC", "s")
@@ -672,7 +668,6 @@ workflows:
         let out = std::process::Command::new(env!("CARGO_BIN_EXE_agentd"))
             .args(["-c", "c.yml", "--validate-config"])
             .current_dir(&work)
-            .env_remove("AGENT_CONFIG")
             .env_remove("AGENTD_CONFIG")
             .env("HOME", &home)
             .env("HOOKSEC", "s")

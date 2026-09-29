@@ -84,7 +84,7 @@ spec:
           env:
             # The instruction (the unit of work). Often projected from a
             # ConfigMap; inline here for clarity.
-            - name: INSTRUCTION
+            - name: AGENTD_INSTRUCTION
               value: >-
                 Read /data/report.txt, produce a one-paragraph digest, and
                 write it back via the fs MCP server. If the digest already
@@ -92,22 +92,22 @@ spec:
             # Intelligence endpoint over HTTPS (the tls-feature image). For a
             # no-TLS image, point at a loopback sidecar (http://127.0.0.1:PORT)
             # that owns the upstream TLS connection.
-            - name: AGENT_INTELLIGENCE
+            - name: AGENTD_INTELLIGENCE
               value: https://gw.example/v1
-            - name: AGENT_INTELLIGENCE_TOKEN
+            - name: AGENTD_INTELLIGENCE_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: agentd-intelligence
                   key: token
-            - name: AGENT_MODEL
+            - name: AGENTD_MODEL
               value: claude-sonnet-5
             # Stable idempotency key per logical unit of work, so a Job retry
             # dedupes side effects in the backing MCP service (rfcs/0011 §6).
-            - name: AGENT_RUN_ID
+            - name: AGENTD_RUN_ID
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
-            - name: AGENT_LOG_LEVEL
+            - name: AGENTD_LOG_LEVEL
               value: info
           securityContext:
             allowPrivilegeEscalation: false

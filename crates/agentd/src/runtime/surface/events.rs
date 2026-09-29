@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The observation feed's vocabulary: every kind an event may carry, who may
 //! see it, the shape of its `data`, and the frames and params of
-//! `agentd.events/SubscribeToEvents` — the events/v1 schema bundle.
+//! `agentd.events/SubscribeToEvents` — the events extension's schema bundle.
 //!
 //! One source for all of it. The feed's push asserts each event against this
 //! in debug builds, the extended card lists the kinds from it, the published
@@ -18,7 +18,7 @@
 use serde_json::{Value, json};
 
 use super::ext::{EVENTS_EXTENSION, EVENTS_METHOD, schema_of};
-use crate::config::v2::DeviceScope;
+use crate::config::settings::DeviceScope;
 
 /// Who an event of a kind may reach — the feed's visibility tag says which
 /// principal exactly; this says which tags a kind may carry at all.
@@ -34,7 +34,8 @@ pub enum Audience {
     Operator,
 }
 
-/// One kind of feed event. The closed vocabulary events/v1 publishes.
+/// One kind of feed event. The closed vocabulary the events extension
+/// publishes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FeedKind {
     Task,
@@ -56,12 +57,6 @@ pub enum FeedKind {
     Audit,
     Auth,
 }
-
-/// Kinds earlier versions pushed and events/v1 does not have: the transcript
-/// is the task's history (a `task` event carries it), a command is a task,
-/// and pairing gave way to the device grant. Listed so a test can hold that
-/// none of them comes back under its old name.
-pub const REMOVED_FEED_KINDS: &[&str] = &["message", "command", "pairing"];
 
 impl FeedKind {
     /// Every kind, in the order the published tables list them.
@@ -407,9 +402,9 @@ impl FeedKind {
 /// The `event` values an `auth` event may carry.
 pub const AUTH_EVENTS: &[&str] = &["pending", "approved", "denied", "revoked", "launch"];
 
-/// Whether an event of kind `kind` carrying `data` is one events/v1 allows:
-/// `Err` names the kind, or each way the data misses its schema. What the
-/// feed's push asserts in debug builds.
+/// Whether an event of kind `kind` carrying `data` is one the events extension
+/// allows: `Err` names the kind, or each way the data misses its schema. What
+/// the feed's push asserts in debug builds.
 pub fn check_event(kind: &str, data: &Value) -> Result<FeedKind, String> {
     let k = FeedKind::of(kind).ok_or_else(|| format!("{kind:?} is not a FeedKind"))?;
     crate::jsonschema::validate(&k.data_schema(), data)
@@ -430,8 +425,9 @@ pub fn kinds_for(is_operator: bool, introspection: bool) -> Vec<&'static str> {
 }
 
 /// `SubscribeToEvents`'s params: at most a cursor, and nothing else. Strict,
-/// so a client still sending an earlier name (`after`) is told rather than
-/// silently replayed from the start.
+/// so a member the method does not define is refused rather than ignored —
+/// a client that misspells the cursor is told, not silently replayed from
+/// the start.
 pub fn params_schema() -> Value {
     json!({
         "type": "object",
@@ -440,7 +436,7 @@ pub fn params_schema() -> Value {
     })
 }
 
-/// The events/v1 schema bundle, published next to the extension's URI: a
+/// The events extension's schema bundle, published next to the extension's URI: a
 /// frame's `result` at the root, the method's params and each kind's data
 /// under `$defs`.
 pub fn schema_bundle() -> Value {
@@ -463,7 +459,7 @@ pub fn schema_bundle() -> Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "$id": schema_of(EVENTS_EXTENSION),
-        "title": "agentd events/v1",
+        "title": "agentd events",
         "description": format!(
             "The result of each {EVENTS_METHOD} frame: exactly one of hello, event or goodbye. \
              $defs/params is the method's params; $defs/kinds/$defs/<kind> is each kind's data."
@@ -570,8 +566,7 @@ mod tests {
     use super::*;
 
     /// The vocabulary is closed and every schema is complete: `ALL` holds
-    /// every variant once, `as_str` and `of` round-trip, no removed kind is
-    /// back, each data schema is a well-formed closed object schema, and the
+    /// every variant once, `as_str` and `of` round-trip, each data schema is a well-formed closed object schema, and the
     /// bundle names every kind in its enum and its `$defs`.
     #[test]
     fn feed_kinds_are_closed_and_schemas_complete() {
@@ -598,9 +593,6 @@ mod tests {
                 assert_eq!(alt["type"], "object", "{k:?}: {alt}");
                 assert_eq!(alt["additionalProperties"], false, "{k:?}: {alt}");
             }
-        }
-        for gone in REMOVED_FEED_KINDS {
-            assert_eq!(FeedKind::of(gone), None, "{gone} is back");
         }
         // Exhaustiveness in the other direction: a variant missing from ALL
         // would still have a name, and nothing else would notice.
@@ -685,14 +677,13 @@ mod tests {
         }
     }
 
-    /// What the schemas refuse: an unknown kind, a removed one, a field the
+    /// What the schemas refuse: an unknown kind, a field the
     /// schema does not name, an `auth` event missing what the contract
     /// requires — scope included, which the launch push must carry — and a
     /// launch that is not an operator's.
     #[test]
     fn a_payload_off_the_schema_is_refused() {
-        assert!(check_event("message", &json!({})).is_err());
-        assert!(check_event("pairing", &json!({})).is_err());
+        assert!(check_event("no.such.kind", &json!({})).is_err());
         assert!(check_event("run.removed", &json!({"id": "r", "owner": "x"})).is_err());
         assert!(check_event("config", &json!({"paths": [], "source": "file"})).is_err());
         let launch = json!({"event": "launch", "sid": "ls_0123456789abcdef",
@@ -717,15 +708,16 @@ mod tests {
         assert!(
             check_event(
                 "auth",
-                &json!({"event": "paired", "client_id": "c", "scope": "user"})
+                &json!({"event": "no-such-event", "client_id": "c", "scope": "user"})
             )
-            .is_err()
+            .is_err(),
+            "an auth event the vocabulary does not name"
         );
         // The params: a cursor, and nothing else.
         let p = params_schema();
         assert!(crate::jsonschema::validate(&p, &json!({"fromSeq": 3})).is_ok());
         assert!(crate::jsonschema::validate(&p, &json!({})).is_ok());
-        assert!(crate::jsonschema::validate(&p, &json!({"after": 3})).is_err());
+        assert!(crate::jsonschema::validate(&p, &json!({"cursor": 3})).is_err());
         assert!(crate::jsonschema::validate(&p, &json!({"fromSeq": -1})).is_err());
     }
 
@@ -798,7 +790,7 @@ mod tests {
                                  "parts": [{"text": "count for me"}], "role": "ROLE_USER",
                                  "taskId": "292d3149-7786-4d13-a994-8e7949b48cb0"}],
                     "artifacts": [{"artifactId": "292d3149.result", "parts": [{"text": "delegated and done"}]}],
-                    "metadata": {"https://agentd.dev/a2a/ext/task-annotations/v1": {
+                    "metadata": {super::super::ext::TASK_ANNOTATIONS_EXTENSION: {
                         "created": "2026-09-28T21:40:25.851Z",
                         "link": {"id": "3a9d525f-c5b8-4f5d-bd41-9a10e1a641d7", "kind": "turn"},
                         "principal": "operator"}},

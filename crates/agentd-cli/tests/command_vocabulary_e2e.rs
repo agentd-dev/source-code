@@ -118,7 +118,7 @@ fn config(llm: &str, a2a: &str, extra: &str) -> impl Fn(u16) -> String {
     let (llm, a2a, extra) = (llm.to_string(), a2a.to_string(), extra.to_string());
     move |port| {
         format!(
-            "config_version: \"1\"\n\
+            "\
              agent:\n  name: vocab-e2e\n  instruction: You are a helpful test agent.\n  preflight: never\n\
              intelligence:\n  endpoints: {llm}\n  model: mock\n\
              store:\n  kind: memory\n\
@@ -169,7 +169,7 @@ fn doc_of(result: &Value) -> Value {
     result["task"]["artifacts"][0]["parts"][0]["data"].clone()
 }
 
-/// Who owns the task a `task` feed event carries: its task-annotations/v1
+/// Who owns the task a `task` feed event carries: its task-annotations
 /// `principal`.
 fn owner_of(event_data: &Value) -> &Value {
     &event_data["task"]["metadata"][agentd::runtime::surface::TASK_ANNOTATIONS_EXTENSION]["principal"]
@@ -360,7 +360,7 @@ fn admin_set_parses_like_the_config_file() {
         std::fs::write(
             &file,
             format!(
-                "config_version: \"1\"\n{nested}intelligence:\n  endpoints: {}\n  model: mock\n",
+                "{nested}intelligence:\n  endpoints: {}\n  model: mock\n",
                 llm.uri
             ),
         )
@@ -378,11 +378,7 @@ fn admin_set_parses_like_the_config_file() {
 
     let cases: &[(&str, Value)] = &[
         ("agent.approval", json!("ask")),
-        ("agent.approval", json!("await")),
-        ("agent.approval", json!("human")),
         ("agent.approval", json!("auto")),
-        ("agent.approval", json!("accept_all")),
-        ("agent.approval", json!("yes")),
         ("agent.approval", json!("Accept")),
         ("agent.approval", json!("sometimes")),
         ("agent.approval", json!(1)),
@@ -417,19 +413,11 @@ fn admin_set_parses_like_the_config_file() {
             );
         }
     }
-    assert!(accepted >= 6, "the accepted spellings were exercised");
-
-    // An alias is stored as what it means.
-    let v = SendMessage::command(
-        "admin.set",
-        json!({"path": "agent.approval", "value": "await"}),
-    )
-    .result(&d.addr);
-    assert_eq!(doc_of(&v)["value"], "ask", "{v}");
+    assert!(accepted >= 4, "the accepted spellings were exercised");
 
     // Every accepted set is announced — on the feed and in the log.
     let deadline = Instant::now() + Duration::from_secs(5);
-    while feed_events(&feed, "config").len() < accepted + 1 {
+    while feed_events(&feed, "config").len() < accepted {
         assert!(
             Instant::now() < deadline,
             "config events: {:?}",
@@ -440,7 +428,7 @@ fn admin_set_parses_like_the_config_file() {
     let ev = feed_events(&feed, "config").pop().unwrap();
     assert_eq!(
         ev,
-        json!({"paths": ["agent.approval"], "source": "admin.set"})
+        json!({"paths": ["a2a.introspection.enabled"], "source": "admin.set"})
     );
     assert!(
         d.stderr().contains("\"event\":\"admin.set\""),
@@ -455,7 +443,7 @@ fn introspection_works_without_the_feed_and_follows_admin_set() {
     // No feed, no introspection.
     let d = spawn(config(&llm.uri, "", ""));
 
-    // With the feed off, events/v1 is not declared: the method is refused as
+    // With the feed off, the events extension is not declared: the method is refused as
     // one this instance does not offer, whatever the request activates.
     let v = common::rpc_activating(
         &d.addr,

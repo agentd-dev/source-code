@@ -122,8 +122,8 @@ fn spawn_aauth_mcp() -> String {
             let method = req["method"].as_str().unwrap_or("");
             let id = req["id"].clone();
             if method == "server/discover" {
-                // A legacy server: reject the modern probe so the client falls
-                // back to the `initialize` handshake (era detection).
+                // A server that does not define `server/discover` answers it
+                // -32601; the handshake is `initialize`.
                 let r = serde_json::json!({"jsonrpc":"2.0","id":id,
                     "error":{"code":-32601,"message":"method not found"}});
                 write_http(&mut s, "200 OK", &[], &r.to_string());

@@ -40,7 +40,6 @@
 # are integer cents end-to-end — never floats, and the instruction's
 # "never round" leans on the server not rounding either.
 # ─────────────────────────────────────────────────────────────────────────────
-config_version: "1"
 
 agent:
   name: finance

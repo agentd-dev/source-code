@@ -93,7 +93,7 @@ fn boot(llm: &MockLlm) -> (Daemon, String) {
     std::fs::write(
         &cfg,
         format!(
-            "config_version: \"1\"\n\
+            "\
              agent:\n  name: a2a-sdk-bump\n  instruction: You are a test agent.\n  preflight: never\n\
              intelligence:\n  endpoints: {}\n  model: mock\n\
              store:\n  kind: memory\n\

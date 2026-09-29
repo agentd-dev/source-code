@@ -17,7 +17,7 @@
 //! First match wins and no match is allow, so an empty list is exactly today's
 //! behaviour and the common path pays one `is_empty` check.
 
-use crate::config::v2::{Policy, PolicyAction, PolicyCaller};
+use crate::config::settings::{Policy, PolicyAction, PolicyCaller};
 use crate::sec::scope::TrifectaTag;
 use serde_json::Value;
 
@@ -188,7 +188,7 @@ pub fn could_apply(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::v2::PolicyMatch;
+    use crate::config::settings::PolicyMatch;
 
     fn pol(m: PolicyMatch, a: PolicyAction) -> Policy {
         Policy {

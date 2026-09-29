@@ -14,7 +14,6 @@
 # That refusal is the design. A single instance that can hear a room AND unlock
 # a door is one convincing sentence away from unlocking the door.
 # ─────────────────────────────────────────────────────────────────────────────
-config_version: "1"
 
 agent:
   name: hands
@@ -36,10 +35,7 @@ agent:
 #
 # A tier carries the wire model name and its context window — it does NOT
 # select an endpoint. Every tier's call goes to `intelligence.endpoints`, which
-# is what the client is built from, so the credential belongs there too. (This
-# example used to point its tiers at a `services:` entry, which read like
-# routing and was not: the key was checked at startup and then ignored, so the
-# token below never reached a dial. It was removed in 1.15 for exactly that.)
+# is what the client is built from, so the credential belongs there too.
 services:
   gateway:
     kind: intelligence

@@ -2,8 +2,9 @@
 //! The introspection reads behind `a2a.introspection.enabled`: transcripts,
 //! per-step run detail, subagent detail and the log ring.
 
-use super::{TASK_NOT_FOUND, err_obj, rpc_internal};
+use super::{err_obj, rpc_internal};
 use crate::a2a::Principal;
+use crate::a2a::errors::TASK_NOT_FOUND;
 use crate::runtime::reactor::Runtime;
 use serde_json::{Value, json};
 
@@ -30,7 +31,7 @@ impl IntrospectionOp {
 
 /// Truncate every string in a JSON tree to `max` bytes (marking the cut) — the
 /// debug reads bound their payloads with this so a huge tool result cannot
-/// balloon an interface reply.
+/// balloon a debug read's reply.
 pub(super) fn truncate_strings(v: Value, max: usize) -> Value {
     match v {
         Value::String(s) if s.len() > max => {

@@ -2,7 +2,7 @@
 //! Gate addressees: who must answer an `ask_human`/`human` gate.
 
 use super::{Principal, glob};
-use crate::config::v2::Role;
+use crate::config::settings::Role;
 use serde_json::Value;
 
 /// **Who must answer a gate.** An `ask_human`/`human` `to:` declaration.

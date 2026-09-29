@@ -237,7 +237,7 @@ pub struct TimerRecord {
 #[derive(Debug, Clone)]
 pub struct Policy {
     pub debounce: Duration,
-    pub on_error: crate::config::v2::StoreOnError,
+    pub on_error: crate::config::settings::StoreOnError,
     pub retries: u32,
     /// Refuse a durable write whose serialized envelope exceeds this many
     /// bytes (`store.max_value_bytes`; `None` = unbounded, the default).
@@ -256,7 +256,7 @@ impl Default for Policy {
     fn default() -> Self {
         Policy {
             debounce: Duration::from_millis(250),
-            on_error: crate::config::v2::StoreOnError::Halt,
+            on_error: crate::config::settings::StoreOnError::Halt,
             retries: 3,
             max_value_bytes: None,
         }
@@ -264,7 +264,7 @@ impl Default for Policy {
 }
 
 impl Policy {
-    pub fn from_settings(s: &crate::config::v2::Store) -> Policy {
+    pub fn from_settings(s: &crate::config::settings::Store) -> Policy {
         Policy {
             debounce: Duration::from_millis(s.checkpoint.debounce_ms.unwrap_or(250)),
             on_error: s.on_error,
@@ -305,7 +305,7 @@ pub fn fresh_requested() -> bool {
 /// Record the digest of the configuration this process runs under, for
 /// [`Durable::restore`] to compare against the manifest's.
 /// First call wins — the configuration is loaded once, before any side effect.
-pub fn record_config_digest(settings: &crate::config::v2::Settings) {
+pub fn record_config_digest(settings: &crate::config::settings::Settings) {
     let _ = CONFIG_DIGEST.set(config_digest(settings));
 }
 
@@ -328,7 +328,7 @@ fn recorded_config_digest() -> BTreeMap<String, String> {
 /// of a low-entropy secret is a secret. The hash uses the crate's dependency-free
 /// SHA-256 ([`crate::sha::sha256_hex`], already the workflow/artifact content
 /// hash), so this adds no dependency and no feature gate.
-pub fn config_digest(settings: &crate::config::v2::Settings) -> BTreeMap<String, String> {
+pub fn config_digest(settings: &crate::config::settings::Settings) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     // serde_json's Map is a BTreeMap here (no `preserve_order`), so `to_string`
     // is already canonical: key order cannot make an unchanged config look moved.
@@ -349,7 +349,7 @@ pub fn config_digest(settings: &crate::config::v2::Settings) -> BTreeMap<String,
 /// go and how they are checkpointed. `Store` is deserialize-only, so this is
 /// spelled out field by field — which is the point: a new secret-bearing field
 /// cannot silently join the digest.
-fn store_shape(s: &crate::config::v2::Store) -> Value {
+fn store_shape(s: &crate::config::settings::Store) -> Value {
     json!({
         "kind": format!("{:?}", s.kind),
         "prefix": s.prefix(),
@@ -369,7 +369,7 @@ fn store_shape(s: &crate::config::v2::Store) -> Value {
 /// The projection of `limits` — all numbers and durations, nothing secret. The
 /// resolved values (not the `Option`s) so that writing a default explicitly does
 /// not read as a change.
-fn limits_shape(s: &crate::config::v2::Limits) -> Value {
+fn limits_shape(s: &crate::config::settings::Limits) -> Value {
     json!({
         "max_runs": s.max_runs,
         "run_steps": s.run.steps(),
@@ -654,7 +654,7 @@ impl Durable {
                         "error",
                         started.elapsed().as_millis() as u64,
                     );
-                    if self.policy.on_error == crate::config::v2::StoreOnError::Degrade {
+                    if self.policy.on_error == crate::config::settings::StoreOnError::Degrade {
                         self.degraded.store(true, Ordering::Relaxed);
                         // Degraded: remember the seq we intended so a later put
                         // does not reuse it, and go on.
@@ -1268,7 +1268,7 @@ mod tests {
             "inst",
             Policy {
                 debounce: Duration::from_millis(0),
-                on_error: crate::config::v2::StoreOnError::Degrade,
+                on_error: crate::config::settings::StoreOnError::Degrade,
                 retries: 1,
                 max_value_bytes: Some(512),
             },
@@ -1310,7 +1310,7 @@ mod tests {
             "inst",
             Policy {
                 debounce: Duration::from_millis(0),
-                on_error: crate::config::v2::StoreOnError::Degrade,
+                on_error: crate::config::settings::StoreOnError::Degrade,
                 retries: 1,
                 max_value_bytes: None,
             },
@@ -1433,15 +1433,14 @@ mod tests {
     #[test]
     fn the_digest_covers_workflows_store_and_limits_only() {
         let doc = json!({
-            "config_version": "1",
             "agent": {"name": "a", "instruction": "one"},
-            "workflows": [{"name": "w", "version": 3, "steps": {"s": {"kind": "once"}}}],
+            "workflows": [{"name": "w", "steps": {"s": {"kind": "once"}}}],
             "limits": {"run": {"steps": 10}},
         });
         let settings = |patch: &dyn Fn(&mut Value)| {
             let mut d = doc.clone();
             patch(&mut d);
-            serde_json::from_value::<crate::config::v2::Settings>(d).expect("settings")
+            serde_json::from_value::<crate::config::settings::Settings>(d).expect("settings")
         };
         let base = config_digest(&settings(&|_| {}));
         assert_eq!(

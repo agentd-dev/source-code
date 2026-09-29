@@ -2,15 +2,14 @@
 //! `intelligence.models`: the model as a named tier rather than one
 //! instance-global string.
 //!
-//! Choosing a cheap model for a classify step and a frontier one for a
-//! judgement call meant forking a subagent process just to change a string —
-//! `model` appeared in no node's field list, so writing it on a step was
-//! exit 2. And the breaker was per ENDPOINT, so a frontier and a cheap model
-//! behind one gateway shared one breaker and one spend pool.
+//! A cheap model for a classify step and a frontier one for a judgement call
+//! is a `model:` on the step, not a subagent forked just to change a string,
+//! and the breaker is per tier, so a frontier and a cheap model behind one
+//! gateway do not share one breaker and one spend pool.
 //!
-//! A tier is NOT a second service catalogue: it points at a `services:` entry
-//! and may only narrow, inheriting that service's trifecta tags so "make it
-//! cheaper" cannot quietly become a different security decision.
+//! A tier is NOT a second service catalogue: it carries a wire model name and
+//! may only narrow, so "make it cheaper" cannot quietly become a different
+//! security decision — every tier's call goes to `intelligence.endpoints`.
 //!
 //! `model:` is accepted on every kind that makes a model call — `think` and
 //! `agent`, and the five shaping presets (`classify`, `extract`, `summarize`,
@@ -18,7 +17,7 @@
 //! presets reach the model by synthesizing a `think` spec, so the field has to
 //! be carried across that rewrite as well as allowed by the parser; a test per
 //! kind is the only thing that tells those two failures apart.
-#![cfg(all(unix, feature = "workflow"))]
+#![cfg(unix)]
 
 mod common;
 
@@ -40,7 +39,7 @@ fn run(cfg_text: &str) -> (Option<i32>, String) {
     (out.status.code(), log)
 }
 
-const BASE: &str = "config_version: \"1\"\nagent: { name: t }\n\
+const BASE: &str = "agent: { name: t }\n\
      store: { kind: file, file: { path: __STATE__ } }\n\
      observability: { log_level: info, log_content: true }\n\
      lifecycle: { run_until: idle, idle_grace: 2s }\n";
@@ -190,28 +189,6 @@ fn a_fallback_cycle_is_refused_at_startup() {
     ));
     assert_eq!(code, Some(2), "{log}");
     assert!(log.contains("fallback cycle"), "{log}");
-}
-
-/// A tier's `service:` is refused by name.
-///
-/// It named a `kind: intelligence` catalogue entry, was checked at startup, and
-/// was then ignored — every tier's call goes to `intelligence.endpoints`, which
-/// is what the client is built from. A key that reads like routing and does not
-/// route is worse than an absent one: `examples/voice/hands.yaml` used it to
-/// "point" two tiers at a gateway whose credential consequently never reached a
-/// dial. Refused since 1.15.
-#[test]
-fn a_tier_service_is_refused_because_it_never_selected_an_endpoint() {
-    let (code, log) = run(&format!(
-        "{BASE}services:\n  gw: {{ kind: intelligence, endpoint: \"https://g.example/v1\" }}\n\
-         intelligence:\n  endpoints: \"mock:json\"\n\
-        \x20 models:\n    x: {{ model: m, service: gw }}\n  default: x\n"
-    ));
-    assert_eq!(code, Some(2), "{log}");
-    assert!(
-        log.contains("unknown field `service`") && log.contains("`model`"),
-        "the refusal should name the field and what a tier does take\n{log}"
-    );
 }
 
 /// A tier's declared window replaces the guess from the model NAME — a

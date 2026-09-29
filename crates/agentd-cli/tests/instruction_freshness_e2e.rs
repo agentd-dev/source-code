@@ -4,17 +4,17 @@
 //! in-tree mock registry, the registry dies mid-run, and the operator's
 //! `unavailable:` policy must fire.
 //!
-//! It did not, for every 1.x release: the MCP SDK's response cache answered
-//! each re-read from memory — inside the server's `ttlMs`, and past it whenever
-//! the server was down — so the poll logged `instruction.loaded` against a
-//! server that no longer existed, the deadline never tripped, and `exit`,
-//! `freeze` and `drain` never happened. The mock now offers a `ttlMs` like the
-//! registry does, which is what makes that cache reachable here.
+//! The hazard is a response cache between the watch and the server: one that
+//! answers a re-read from memory — inside the server's `ttlMs`, or past it
+//! while the server is down — makes the poll log `instruction.loaded` against
+//! a server that no longer exists, so the deadline never trips and `exit`,
+//! `freeze` and `drain` never happen. The mock offers a `ttlMs` like the
+//! registry does, which is what makes such a cache reachable here.
 //!
 //! The arbiter is the SERVER's log, not agentd's: the mock writes one
 //! `MOCK_READ <uri>` line per `resources/read` that reached it, and each test
 //! compares that with what agentd claims it read.
-#![cfg(all(unix, feature = "internal-mocks", feature = "workflow"))]
+#![cfg(all(unix, feature = "internal-mocks"))]
 
 mod common;
 
@@ -108,7 +108,6 @@ fn boot(cfg: Value) -> Daemon {
 /// instance long-lived and gives a freeze something to refuse.
 fn config(instruction: &str, unavailable: &str, servers: Value, every: &str) -> Value {
     json!({
-        "config_version": "1",
         "agent": {"name": "freshness", "preflight": "never",
                   "instruction": {"mcp": instruction, "refresh": "1s", "unavailable": unavailable},
                   "document_capabilities": ["compute"]},

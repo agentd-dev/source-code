@@ -26,13 +26,13 @@ pub fn checks() -> Vec<Check> {
         Check {
             id: "interface/default-off-gate",
             category: Category::Interface,
-            desc: "without a2a.events.enabled the feed's method is not offered (-32601 EXTENSION_NOT_DECLARED), interface.info is an unknown op, and the core answers",
+            desc: "without a2a.events.enabled the feed's method is not offered (-32601 EXTENSION_NOT_DECLARED), and the core answers",
             run: default_off,
         },
         Check {
             id: "interface/feed-hello-and-replay",
             category: Category::Interface,
-            desc: "the feed is refused until events/v1 is activated (-32601 EXTENSION_NOT_ACTIVATED) and takes only {fromSeq} (`after` is -32602), then opens with a hello {seq, resume, resync, introspection, version} and replays from seq 0 a task event whose history holds the prompt",
+            desc: "the feed is refused until the events extension is activated (-32601 EXTENSION_NOT_ACTIVATED) and takes only {fromSeq} (any other member is -32602), then opens with a hello {seq, resume, resync, introspection, version} and replays from seq 0 a task event whose history holds the prompt",
             run: feed_replay,
         },
         Check {
@@ -110,7 +110,7 @@ fn config(llm: &str, port: u16, feed: bool) -> String {
         ""
     };
     format!(
-        "config_version: \"1\"\n\
+        "\
          agent:\n  name: iface-conf\n  instruction: You are a helpful test agent.\n  preflight: never\n\
          intelligence:\n  endpoints: {llm}\n  model: mock\n\
          store:\n  kind: memory\n\
@@ -139,14 +139,6 @@ fn default_off(h: &Harness) -> Outcome {
         feed.contains("-32601") && feed.contains("EXTENSION_NOT_DECLARED"),
         format!("the feed should be -32601 EXTENSION_NOT_DECLARED while disabled: {feed}"),
     )
-    .and(|| {
-        // …the removed discovery op is an unknown op, whatever the switch…
-        let gone = send_command(&addr, 2, "interface.info");
-        Outcome::require(
-            gone["error"]["code"] == -32602,
-            format!("interface.info was removed and should be an unknown op (-32602): {gone}"),
-        )
-    })
     .and(|| {
         // …and the core surface is untouched: status still answers, as a
         // Message carrying the document.
@@ -180,23 +172,25 @@ fn feed_replay(h: &Harness) -> Outcome {
     );
 
     let body = rpc_body(9, feed_method(), json!({"fromSeq": 0}));
-    // The method belongs to events/v1: without activating it, it is refused.
+    // The method belongs to the events extension: without activating it, it
+    // is refused.
     let bare = post(&addr, &body, &[]);
     if !(bare.contains("-32601") && bare.contains("EXTENSION_NOT_ACTIVATED")) {
         return Outcome::fail(format!(
-            "the feed without events/v1 activated should be -32601 EXTENSION_NOT_ACTIVATED: {bare}"
+            "the feed without the events extension activated should be -32601 EXTENSION_NOT_ACTIVATED: {bare}"
         ));
     }
-    // Its params are `{fromSeq?}` and nothing else: the cursor's earlier
-    // name is refused, as plain JSON, rather than replayed from the start.
-    let after = post(
+    // Its params are `{fromSeq?}` and nothing else: a member the method does
+    // not define is refused, as plain JSON, rather than replayed from the
+    // start.
+    let stray = post(
         &addr,
-        &rpc_body(10, feed_method(), json!({"after": 0})),
+        &rpc_body(10, feed_method(), json!({"cursor": 0})),
         &[("A2A-Extensions", feed_activation())],
     );
-    if !(after.contains("-32602") && after.contains("params.after")) || after.contains("data:") {
+    if !(stray.contains("-32602") && stray.contains("params.cursor")) || stray.contains("data:") {
         return Outcome::fail(format!(
-            "the feed given `after` should be a plain -32602 naming params.after: {after}"
+            "the feed given `cursor` should be a plain -32602 naming params.cursor: {stray}"
         ));
     }
     let s = open(&addr, &body, &[("A2A-Extensions", feed_activation())]);
@@ -235,7 +229,7 @@ fn feed_replay(h: &Harness) -> Outcome {
     )
     .and(|| {
         // Exactly the five fields, the switch as it stands (off here) and the
-        // build's version — nothing under an earlier name.
+        // build's version, and nothing else.
         let mut fields: Vec<&str> = hello
             .as_object()
             .map(|o| o.keys().map(String::as_str).collect())

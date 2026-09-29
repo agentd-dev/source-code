@@ -366,7 +366,7 @@ pub fn parse_manifest(yaml: &str) -> Result<Manifest, String> {
 /// Re-exported rather than redeclared: two structs with the same fields and
 /// the same meaning are two places to change when the surface moves, and one
 /// of them will be missed.
-pub use crate::config::v2::InstructionSource;
+pub use crate::config::settings::InstructionSource;
 
 /// The outcome of verifying a signed, delivered document (§7.6): the effective
 /// capability ceiling, and the verified claims + manifest for audit.
@@ -563,7 +563,7 @@ pub fn families_retracted(before: &[String], after: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod authored_tests {
     use super::*;
-    use crate::config::v2::InstructionSource;
+    use crate::config::settings::InstructionSource;
 
     fn key_and_doc(dir: &std::path::Path, body: &str, caps: &[&str]) -> (String, String) {
         // A real Ed25519 key pair, a real author JWS, a real document that

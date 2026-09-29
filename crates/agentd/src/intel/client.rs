@@ -365,10 +365,9 @@ impl IntelClient {
         }
     }
 
-    /// Borrow the endpoint list for the read-only `agentd://intelligence`
-    /// resource body. The caller serializes transport, index and health only —
-    /// never the URL or any credential, since that body is exposed to whoever
-    /// can read the resource.
+    /// Borrow the endpoint list for a read-only view of it. A caller serializes
+    /// transport, index and health only — never the URL or any credential,
+    /// since such a view is exposed to whoever can read it.
     pub fn with_list<R>(&self, f: impl FnOnce(&EndpointList) -> R) -> R {
         f(&self.list.borrow())
     }

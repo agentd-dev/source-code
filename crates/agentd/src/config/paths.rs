@@ -9,40 +9,35 @@
 //! | source | name                                                    |
 //! |--------|---------------------------------------------------------|
 //! | file   | `limits: { run: { steps: 5 } }` (YAML or JSON)          |
-//! | env    | `AGENTD_LIMITS_RUN_STEPS` > `AGENT_LIMITS_RUN_STEPS` > `LIMITS_RUN_STEPS` |
+//! | env    | `AGENTD_LIMITS_RUN_STEPS`                               |
 //! | flag   | `--limits.run.steps 5` / `--limits.run-steps 5` / `--limits-run-steps 5` |
 //!
-//! The env candidates are the branded, the neutral, and the bare spelling of
-//! the upper-cased path with `.` → `_`; the first present wins.
+//! The env name is `AGENTD_` and the upper-cased path with `.` → `_` — one
+//! spelling, so a variable either configures agentd or is not agentd's.
 //! A flag is the path with `.`/`_` → `-` (any of the three spellings above
 //! canonicalizes to the same flag). Values are typed by the schema's declared
 //! type ([`Kind`]): integers/numbers/booleans parse, enums are checked against
 //! their allowed set, arrays take a `[a, b]` literal or a comma-separated list,
 //! objects take a `{k: v}` / JSON literal — everything else is the verbatim
-//! string. The typed [`super::v2::Settings`] then re-validates the merged
+//! string. The typed [`super::settings::Settings`] then re-validates the merged
 //! document exactly as it does the file (unknown keys, ranges).
 //!
 //! A dotted flag may also reach INTO a free-form map (a schema object with
-//! `additionalProperties`): `--intelligence_headers.x-team ops` sets ONE key of
+//! `additionalProperties`): `--intelligence.headers.x-team ops` sets ONE key of
 //! that map (the key keeps its exact spelling — no canonicalization past the
 //! schema path), typed by the map's value type. Array elements are not
 //! addressable by path (set the whole list, or use the named repeatable flag).
 //!
-//! The single source of truth is [`super::v2::schema::schema`] — the same JSON
+//! The single source of truth is [`super::settings::schema::schema`] — the same JSON
 //! Schema `--config-schema` prints — walked once at startup by [`bindings_of`].
-//! (The no-arg [`bindings`] still walks the legacy v1 schema in
-//! [`super::file`], and is reached only by this module's own tests.)
 
-#[cfg(test)]
-use super::file::config_schema;
 use super::yaml;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 
-/// The env-name prefixes tried for every path, most-specific first: branded
-/// (`AGENTD_`), neutral (`AGENT_`), then the bare path. Most-specific-first is
-/// what makes a branded name beat a neutral one that happens to collide.
-pub const ENV_PREFIXES: [&str; 3] = ["AGENTD_", "AGENT_", ""];
+/// The prefix of every environment variable the config loader reads. The only
+/// one: a second spelling is a variable some other program may already set.
+pub const ENV_PREFIX: &str = "AGENTD_";
 
 /// The value type a config path takes, per its JSON Schema.
 #[derive(Debug, Clone, PartialEq)]
@@ -92,10 +87,10 @@ pub struct Binding {
 }
 
 impl Binding {
-    /// The env-var names that set this path, most-specific first.
-    pub fn env_names(&self) -> Vec<String> {
+    /// The env-var name that sets this path.
+    pub fn env_name(&self) -> String {
         let base = self.path.to_ascii_uppercase().replace('.', "_");
-        ENV_PREFIXES.iter().map(|p| format!("{p}{base}")).collect()
+        format!("{ENV_PREFIX}{base}")
     }
 
     /// The canonical generic flag: `--<path>` with `.`/`_` → `-`.
@@ -114,20 +109,8 @@ fn canonical_flag_body(s: &str) -> String {
     s.replace(['.', '_'], "-")
 }
 
-/// Every path in the (v1) config-file schema, in schema order (nested objects
-/// are walked; arrays and free-form maps are leaves).
-/// TEST-ONLY. The retired flat schema survives as a FIXTURE for the tests
-/// that exercise this module's own mechanics; production types against
-/// [`super::v2::Settings`] and derives its bindings from the v2 schema. The
-/// `#[cfg(test)]` is the enforcement: nothing outside a test can reach it, so
-/// it cannot quietly become live again.
-#[cfg(test)]
-pub fn bindings() -> Vec<Binding> {
-    bindings_of(&config_schema())
-}
-
-/// Every path of an arbitrary JSON Schema document (the same walk, for the v2
-/// settings schema or any future one).
+/// Every path of a JSON Schema document, in schema order (nested objects are
+/// walked; arrays and free-form maps are leaves).
 pub fn bindings_of(schema: &Value) -> Vec<Binding> {
     let defs = schema.get("$defs").cloned().unwrap_or(Value::Null);
     let mut out = Vec::new();
@@ -332,33 +315,22 @@ pub fn set_path(root: &mut Value, path: &str, value: Value) {
     }
 }
 
-/// TEST-ONLY: a thin wrapper over the `*_in` variant, bound to the retired
-/// flat schema. Production calls the `*_in` form with the v2 bindings.
-#[cfg(test)]
-/// The env layer as a config DOCUMENT: for every schema path, the first present
-/// env candidate (`AGENTD_…` > `AGENT_…` > bare) is coerced and set at its
-/// path. Returns the document (an empty object when nothing is set) plus the
-/// `(env name, path)` pairs that were applied. An untypeable value is an
-/// error naming the variable.
-pub fn env_document(env: &HashMap<&str, &str>) -> Result<(Value, Vec<(String, String)>), String> {
-    env_document_in(&bindings(), env)
-}
-
-/// [`env_document`] over a given binding set (a schema other than v1's).
-pub fn env_document_in(
+/// The env layer as a config DOCUMENT: for every schema path whose variable is
+/// set, the value is coerced and set at its path. Returns the document (an
+/// empty object when nothing is set) plus the `(env name, path)` pairs that
+/// were applied. An untypeable value is an error naming the variable.
+pub fn env_document(
     bindings: &[Binding],
     env: &HashMap<&str, &str>,
 ) -> Result<(Value, Vec<(String, String)>), String> {
     let mut doc = Value::Object(Map::new());
     let mut applied = Vec::new();
     for b in bindings {
-        for name in b.env_names() {
-            if let Some(raw) = env.get(name.as_str()) {
-                let v = b.coerce(raw).map_err(|e| format!("invalid {name}: {e}"))?;
-                set_path(&mut doc, &b.path, v);
-                applied.push((name, b.path.clone()));
-                break;
-            }
+        let name = b.env_name();
+        if let Some(raw) = env.get(name.as_str()) {
+            let v = b.coerce(raw).map_err(|e| format!("invalid {name}: {e}"))?;
+            set_path(&mut doc, &b.path, v);
+            applied.push((name, b.path.clone()));
         }
     }
     Ok((doc, applied))
@@ -369,7 +341,7 @@ pub fn env_document_in(
 #[derive(Debug, Clone, PartialEq)]
 pub struct FlagTarget {
     pub binding: Binding,
-    /// `Some(key)` for `--intelligence_headers.x-team` (key = `x-team`); `None`
+    /// `Some(key)` for `--intelligence.headers.x-team` (key = `x-team`); `None`
     /// when the flag names the schema path itself.
     pub entry: Option<String>,
 }
@@ -401,23 +373,15 @@ impl FlagTarget {
     }
 }
 
-/// TEST-ONLY: a thin wrapper over the `*_in` variant, bound to the retired
-/// flat schema. Production calls the `*_in` form with the v2 bindings.
-#[cfg(test)]
 /// Resolve a `--flag` (with or without the leading dashes) to the schema path it
 /// addresses — canonicalizing `.`/`_`/`-` — or, for a dotted flag whose longest
 /// schema-path prefix is a free-form map, to that map plus the remaining
-/// segments as ONE entry key with its exact spelling (`--intelligence_headers.x-team`
-/// ⇒ path `intelligence_headers`, key `x-team`). `Ok(None)` when it is not a
+/// segments as ONE entry key with its exact spelling (`--intelligence.headers.x-team`
+/// ⇒ path `intelligence.headers`, key `x-team`). `Ok(None)` when it is not a
 /// config path at all (the caller reports an unknown argument); `Err` when it
 /// names a config path but reaches into something that is not a map (an array
 /// element, a scalar).
-pub fn resolve_flag(arg: &str) -> Result<Option<FlagTarget>, String> {
-    resolve_flag_in(&bindings(), arg)
-}
-
-/// [`resolve_flag`] over a given binding set.
-pub fn resolve_flag_in(all: &[Binding], arg: &str) -> Result<Option<FlagTarget>, String> {
+pub fn resolve_flag(all: &[Binding], arg: &str) -> Result<Option<FlagTarget>, String> {
     let body = arg.strip_prefix("--").unwrap_or(arg);
     if body.is_empty() {
         return Ok(None);
@@ -456,29 +420,16 @@ pub fn resolve_flag_in(all: &[Binding], arg: &str) -> Result<Option<FlagTarget>,
     Ok(None)
 }
 
-/// TEST-ONLY: a thin wrapper over the `*_in` variant, bound to the retired
-/// flat schema. Production calls the `*_in` form with the v2 bindings.
-#[cfg(test)]
 /// The `--help` section listing every config path with its flag and env name.
-pub fn help_section() -> String {
-    help_section_in(&bindings())
-}
-
-/// [`help_section`] over a given binding set.
-pub fn help_section_in(bindings: &[Binding]) -> String {
+pub fn help_section(bindings: &[Binding]) -> String {
     let mut out = String::from(
         "CONFIG PATHS (every config-file path is also a flag and an env var; \
-         env: AGENTD_<PATH> > AGENT_<PATH> > <PATH>; a named flag above with the \
+         env: AGENTD_<PATH>; a named flag above with the \
          same spelling keeps its own semantics):\n",
     );
     for b in bindings {
         let flag = format!("{} {}", b.flag(), b.kind.hint());
-        out.push_str(&format!(
-            "  {:<26} {:<44} {}\n",
-            b.path,
-            flag,
-            b.env_names()[0]
-        ));
+        out.push_str(&format!("  {:<26} {:<44} {}\n", b.path, flag, b.env_name()));
     }
     out
 }
@@ -487,6 +438,37 @@ pub fn help_section_in(bindings: &[Binding]) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A small schema with one of every shape the walk distinguishes, so these
+    /// tests pin the mechanics rather than whatever the settings schema holds
+    /// today (the settings tests walk that one).
+    fn fixture() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "model": {"type": "string"},
+                "max_tokens": {"type": "integer"},
+                "log_level": {"enum": ["error", "warn", "info", "debug"]},
+                "swap": {"enum": ["next-turn", "restart-turn"]},
+                "limits": {"type": "object", "properties": {
+                    "max_steps": {"type": "integer"},
+                    "max_depth": {"type": "integer"}
+                }},
+                "subscribe": {"type": "array", "items": {"type": "string"}},
+                "servers": {"type": "array", "items": {"$ref": "#/$defs/Server"}},
+                "headers": {"type": "object", "additionalProperties": {"type": "string"}}
+            },
+            "$defs": {"Server": {"type": "object", "properties": {"name": {"type": "string"}}}}
+        })
+    }
+
+    fn bindings() -> Vec<Binding> {
+        bindings_of(&fixture())
+    }
+
+    fn flag(arg: &str) -> Result<Option<FlagTarget>, String> {
+        resolve_flag(&bindings(), arg)
+    }
 
     fn paths() -> Vec<String> {
         bindings().into_iter().map(|b| b.path).collect()
@@ -497,20 +479,15 @@ mod tests {
         let p = paths();
         // Top-level scalars, a nested object (walked), lists + maps (leaves).
         for want in [
-            "config_version",
-            "intelligence",
-            "model_swap",
             "model",
             "max_tokens",
+            "log_level",
+            "swap",
             "limits.max_steps",
             "limits.max_depth",
-            "limits.deadline_secs",
-            "limits.lifetime_tokens",
-            "mcp_servers",
             "subscribe",
-            "a2a_peers",
-            "log_level",
-            "intelligence_headers",
+            "servers",
+            "headers",
         ] {
             assert!(p.contains(&want.to_string()), "missing path {want}: {p:?}");
         }
@@ -518,16 +495,16 @@ mod tests {
             !p.contains(&"limits".to_string()),
             "walked objects are not leaves"
         );
-        // Kinds follow the schema.
+        // Kinds follow the schema, through a `$ref`.
         let by: HashMap<String, Kind> = bindings().into_iter().map(|b| (b.path, b.kind)).collect();
         assert_eq!(by["model"], Kind::String);
         assert_eq!(by["max_tokens"], Kind::Integer);
         assert_eq!(by["limits.max_steps"], Kind::Integer);
         assert_eq!(by["subscribe"], Kind::Array(Box::new(Kind::String)));
-        assert_eq!(by["mcp_servers"], Kind::Array(Box::new(Kind::Object)));
-        assert_eq!(by["intelligence_headers"], Kind::Object);
+        assert_eq!(by["servers"], Kind::Array(Box::new(Kind::Object)));
+        assert_eq!(by["headers"], Kind::Object);
         assert!(matches!(&by["log_level"], Kind::Enum(v) if v.contains(&"info".to_string())));
-        assert!(matches!(&by["model_swap"], Kind::Enum(v) if v.len() == 2));
+        assert!(matches!(&by["swap"], Kind::Enum(v) if v.len() == 2));
     }
 
     #[test]
@@ -536,14 +513,7 @@ mod tests {
             .into_iter()
             .find(|b| b.path == "limits.max_steps")
             .unwrap();
-        assert_eq!(
-            b.env_names(),
-            vec![
-                "AGENTD_LIMITS_MAX_STEPS".to_string(),
-                "AGENT_LIMITS_MAX_STEPS".to_string(),
-                "LIMITS_MAX_STEPS".to_string()
-            ]
-        );
+        assert_eq!(b.env_name(), "AGENTD_LIMITS_MAX_STEPS");
         assert_eq!(b.flag(), "--limits-max-steps");
         // Every spelling resolves to the same binding.
         for spelling in [
@@ -553,24 +523,22 @@ mod tests {
             "--limits_max_steps",
             "limits.max_steps",
         ] {
-            let t = resolve_flag(spelling).unwrap().expect(spelling);
+            let t = flag(spelling).unwrap().expect(spelling);
             assert_eq!(t.binding.path, "limits.max_steps", "{spelling}");
             assert!(t.entry.is_none());
         }
-        assert!(resolve_flag("--no-such-path").unwrap().is_none());
-        assert!(resolve_flag("--").unwrap().is_none());
+        assert!(flag("--no-such-path").unwrap().is_none());
+        assert!(flag("--").unwrap().is_none());
         // A nested object is not itself addressable (only its leaves are).
-        assert!(resolve_flag("--limits").unwrap().is_none());
+        assert!(flag("--limits").unwrap().is_none());
     }
 
     #[test]
     fn dotted_flags_reach_into_free_form_maps_with_exact_keys() {
-        // `intelligence_headers` is a map: a dotted flag past it names ONE entry,
-        // spelling preserved (dashes/underscores/dots inside the key are data).
-        let t = resolve_flag("--intelligence_headers.x-team")
-            .unwrap()
-            .unwrap();
-        assert_eq!(t.binding.path, "intelligence_headers");
+        // `headers` is a map: a dotted flag past it names ONE entry, spelling
+        // preserved (dashes/underscores/dots inside the key are data).
+        let t = flag("--headers.x-team").unwrap().unwrap();
+        assert_eq!(t.binding.path, "headers");
         assert_eq!(t.entry.as_deref(), Some("x-team"));
         assert_eq!(
             *t.value_kind(),
@@ -579,21 +547,19 @@ mod tests {
         );
         assert_eq!(
             t.document(json!("ops")),
-            json!({"intelligence_headers": {"x-team": "ops"}})
+            json!({"headers": {"x-team": "ops"}})
         );
-        // The schema-path part still canonicalizes; the key never does.
-        let t = resolve_flag("--intelligence-headers.Anthropic_Version.v2")
-            .unwrap()
-            .unwrap();
-        assert_eq!(t.entry.as_deref(), Some("Anthropic_Version.v2"));
+        // The key never canonicalizes.
+        let t = flag("--headers.Anthropic_Version.next").unwrap().unwrap();
+        assert_eq!(t.entry.as_deref(), Some("Anthropic_Version.next"));
         // The whole-map form has no entry.
-        let t = resolve_flag("--intelligence-headers").unwrap().unwrap();
+        let t = flag("--headers").unwrap().unwrap();
         assert!(t.entry.is_none());
         assert_eq!(*t.value_kind(), Kind::Object);
         // Reaching into a list or a scalar is a clear error, not a guess.
-        let e = resolve_flag("--mcp-servers.0.aauth").unwrap_err();
+        let e = flag("--servers.0.name").unwrap_err();
         assert!(e.contains("array elements"), "{e}");
-        let e = resolve_flag("--model.sub").unwrap_err();
+        let e = flag("--model.sub").unwrap_err();
         assert!(e.contains("not an object"), "{e}");
     }
 
@@ -601,16 +567,11 @@ mod tests {
     fn derived_names_are_unique_across_the_schema() {
         // Two paths canonicalizing to the same flag/env would be ambiguous —
         // guard the schema against it.
-        let bs = bindings();
         let mut flags = std::collections::HashSet::new();
         let mut envs = std::collections::HashSet::new();
-        for b in &bs {
+        for b in bindings() {
             assert!(flags.insert(b.flag()), "duplicate flag {}", b.flag());
-            assert!(
-                envs.insert(b.env_names()[0].clone()),
-                "duplicate env {}",
-                b.env_names()[0]
-            );
+            assert!(envs.insert(b.env_name()), "duplicate env {}", b.env_name());
         }
     }
 
@@ -666,74 +627,46 @@ mod tests {
         assert_eq!(doc["model"], json!({"sub": 1}));
     }
 
+    /// Only the `AGENTD_` spelling is read: the same path under `AGENT_` or
+    /// bare is some other program's variable, and binds nothing.
     #[test]
-    fn env_document_prefers_branded_then_neutral_then_bare() {
+    fn env_document_reads_only_the_agentd_prefix() {
         let mut env: HashMap<&str, &str> = HashMap::new();
         env.insert("LIMITS_MAX_STEPS", "1");
         env.insert("AGENT_LIMITS_MAX_STEPS", "2");
         env.insert("AGENTD_LIMITS_MAX_STEPS", "3");
         env.insert("MODEL", "bare-model");
+        env.insert("AGENT_MAX_TOKENS", "5");
         env.insert("AGENTD_SUBSCRIBE", "a,b");
         env.insert("UNRELATED", "x");
-        let (doc, applied) = env_document(&env).unwrap();
+        let (doc, applied) = env_document(&bindings(), &env).unwrap();
         assert_eq!(doc["limits"]["max_steps"], json!(3));
-        assert_eq!(doc["model"], json!("bare-model"));
         assert_eq!(doc["subscribe"], json!(["a", "b"]));
-        assert!(
-            applied
-                .iter()
-                .any(|(n, p)| n == "AGENTD_LIMITS_MAX_STEPS" && p == "limits.max_steps")
+        assert!(doc.get("model").is_none(), "a bare name binds nothing");
+        assert!(doc.get("max_tokens").is_none(), "AGENT_ binds nothing");
+        assert_eq!(
+            applied,
+            vec![
+                (
+                    "AGENTD_LIMITS_MAX_STEPS".to_string(),
+                    "limits.max_steps".to_string()
+                ),
+                ("AGENTD_SUBSCRIBE".to_string(), "subscribe".to_string()),
+            ]
         );
-        assert!(applied.iter().any(|(n, _)| n == "MODEL"));
-        assert!(!applied.iter().any(|(n, _)| n == "UNRELATED"));
         // A bad value names the variable.
         env.insert("AGENTD_MAX_TOKENS", "lots");
-        let e = env_document(&env).unwrap_err();
+        let e = env_document(&bindings(), &env).unwrap_err();
         assert!(e.contains("AGENTD_MAX_TOKENS"), "{e}");
     }
 
     #[test]
-    fn every_binding_deserializes_into_the_typed_config_file() {
-        // The schema (bindings) and the typed struct must agree at every path:
-        // a sample value per kind, set at the path, must deserialize.
-        for b in bindings() {
-            let sample = match &b.kind {
-                Kind::String => json!("x"),
-                Kind::Integer => json!(1),
-                Kind::Number => json!(1.5),
-                Kind::Boolean => json!(true),
-                Kind::Enum(vs) => json!(vs[0]),
-                Kind::Array(item) => match **item {
-                    Kind::Object if b.path == "mcp_servers" => {
-                        json!([{"name": "a", "endpoint": "https://a.example/mcp"}])
-                    }
-                    Kind::Object if b.path == "a2a_peers" => {
-                        json!([{"name": "p", "endpoint": "https://p.example"}])
-                    }
-                    Kind::Object => json!([{}]),
-                    _ => json!(["s"]),
-                },
-                Kind::Object => json!({"k": "v"}),
-                Kind::Any => json!(null),
-            };
-            let mut doc = Value::Object(Map::new());
-            set_path(&mut doc, &b.path, sample);
-            super::super::file::ConfigFile::from_document(doc, "test")
-                .unwrap_or_else(|e| panic!("path {} does not deserialize: {e}", b.path));
-        }
-    }
-
-    #[test]
     fn help_section_lists_every_path() {
-        let h = help_section();
+        let h = help_section(&bindings());
         for b in bindings() {
             assert!(h.contains(&b.path), "help lacks {}", b.path);
             assert!(h.contains(&b.flag()), "help lacks {}", b.flag());
-            assert!(
-                h.contains(&b.env_names()[0]),
-                "help lacks {}",
-                b.env_names()[0]
-            );
+            assert!(h.contains(&b.env_name()), "help lacks {}", b.env_name());
         }
     }
 }

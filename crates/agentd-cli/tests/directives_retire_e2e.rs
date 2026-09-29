@@ -5,7 +5,7 @@
 //! definition that leaves the config lets its live runs finish (or cancels
 //! them, when its `unload:` policy says so) instead of stranding them —
 //! a run whose definition vanishes underneath it can never reach a verdict.
-#![cfg(all(unix, feature = "workflow"))]
+#![cfg(unix)]
 
 mod common;
 
@@ -93,8 +93,7 @@ fn an_instruction_carries_its_workflow_and_its_skill() {
     // block scalar (`|`): the fences reach agentd verbatim.
     std::fs::write(
         &cfg,
-        r#"config_version: "1"
-agent:
+        r#"agent:
   name: carried
   instruction: |
     You watch the queue and keep things tidy.
@@ -161,7 +160,7 @@ fn an_unknown_machinery_directive_is_refused_naming_the_known_set() {
     let cfg = common::unique_path("dir-bad", "yaml");
     std::fs::write(
         &cfg,
-        "config_version: \"1\"\nagent:\n  name: x\n  instruction: |\n    :::!workfow{name=typo}\n    :::\nstore:\n  kind: none\n",
+        "agent:\n  name: x\n  instruction: |\n    :::!workfow{name=typo}\n    :::\nstore:\n  kind: none\n",
     )
     .unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_agentd"))
@@ -181,8 +180,7 @@ fn an_unknown_machinery_directive_is_refused_naming_the_known_set() {
 #[cfg(feature = "hot-reload")]
 fn scheduled_cfg(version: &str) -> String {
     format!(
-        r#"config_version: "1"
-agent:
+        r#"agent:
   name: swapper
   instruction: |
     Keep ticking.
@@ -248,7 +246,7 @@ fn slow_cfg(unload: &str, with_wf: bool) -> String {
         String::new()
     };
     format!(
-        "config_version: \"1\"\nagent:\n  name: griefer\n\
+        "agent:\n  name: griefer\n\
          store:\n  kind: memory\n\
          workflows:\n  - name: idle\n    steps:\n\
          \x20     s: {{kind: manual}}\n\

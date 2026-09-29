@@ -39,7 +39,7 @@
 //! human decision.
 
 use super::reactor::{PendingKind, Runtime, Target};
-use crate::config::v2::AskHumanFallback;
+use crate::config::settings::AskHumanFallback;
 use crate::intel::client::IntelClient;
 use crate::state::now_ms;
 use crate::wire::intel::{Message, Request};
@@ -188,7 +188,7 @@ impl Runtime {
         // operator made and should hold whether or not a channel happens to
         // exist.
         match self.settings.agent.approval {
-            crate::config::v2::Approval::Ask => {}
+            crate::config::settings::Approval::Ask => {}
             // An ADDRESSED gate is never auto-answered, whatever the approval
             // policy says. The point of naming a decider is that the record is
             // true; a model judge standing in for the finance lead makes it a
@@ -196,7 +196,7 @@ impl Runtime {
             // statement about the agent's own asks, not about a gate that
             // names someone.
             _ if addressee.is_some() => {}
-            crate::config::v2::Approval::Accept => {
+            crate::config::settings::Approval::Accept => {
                 // Accept what the ask RECOMMENDS. With nothing recommended
                 // there is nothing to accept, and inventing an answer to a
                 // question a person wanted asked is worse than asking it — so
@@ -242,7 +242,7 @@ impl Runtime {
                     policy: None,
                 });
             }
-            crate::config::v2::Approval::Auto => {
+            crate::config::settings::Approval::Auto => {
                 let ask = self.next_id("ask");
                 self.spawn_human_judge(&ask, &question);
                 return ToolOutcome::Deferred(PendingKind::Human {
@@ -274,7 +274,7 @@ impl Runtime {
             }
             HumanChannel::Unowned
                 if self.settings.agent.ask_human_unowned
-                    == crate::config::v2::AskHumanUnowned::Gate =>
+                    == crate::config::settings::AskHumanUnowned::Gate =>
             {
                 return self.human_gate(
                     caller,
@@ -388,7 +388,7 @@ impl Runtime {
                     .unwrap_or_else(|| "operator".to_string());
                 let principal = crate::a2a::Principal {
                     id: principal_id,
-                    role: crate::config::v2::Role::Operator,
+                    role: crate::config::settings::Role::Operator,
                     grants: Vec::new(),
                     rate: None,
                     budget: None,
@@ -842,7 +842,7 @@ impl Runtime {
                     let allow = matches!(
                         &self.pending[i].kind,
                         PendingKind::Human { policy: Some(call), .. }
-                            if call.on_timeout == crate::config::v2::PolicyAction::Allow
+                            if call.on_timeout == crate::config::settings::PolicyAction::Allow
                     );
                     if allow {
                         self.policy_timeout_allows(i);
@@ -1023,13 +1023,13 @@ fn policy_call_of(v: &Value) -> Option<super::reactor::PolicyCall> {
             .get("on_timeout")
             .cloned()
             .and_then(|a| serde_json::from_value(a).ok())
-            .unwrap_or(crate::config::v2::PolicyAction::Deny),
+            .unwrap_or(crate::config::settings::PolicyAction::Deny),
     })
 }
 
 /// A policy call as the durable wait record of the step it suspends.
 pub(crate) fn policy_call_json(call: &super::reactor::PolicyCall) -> Value {
-    use crate::config::v2::PolicyAction;
+    use crate::config::settings::PolicyAction;
     json!({
         "tool": call.tool,
         "args": call.args,
@@ -1096,7 +1096,7 @@ UNDECIDED.";
 #[cfg(all(test, feature = "a2a"))]
 mod tests {
     use super::*;
-    use crate::config::v2::PolicyAction;
+    use crate::config::settings::PolicyAction;
 
     /// A step's policy gate is rebuilt from its wait record after a restart,
     /// and the call it holds must come back whole — an approval then runs the

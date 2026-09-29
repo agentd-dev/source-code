@@ -11,7 +11,7 @@
 //!
 //! The safety argument is startup-only registration plus DERIVED tags, and
 //! both are tested here.
-#![cfg(all(unix, feature = "workflow"))]
+#![cfg(unix)]
 
 mod common;
 
@@ -33,7 +33,7 @@ fn run(cfg_text: &str) -> (Option<i32>, String) {
     (out.status.code(), log)
 }
 
-const BASE: &str = "config_version: \"1\"\n\
+const BASE: &str = "\
      store: { kind: file, file: { path: __STATE__ } }\n\
      observability: { log_level: info, log_content: true }\n\
      intelligence: { endpoints: \"mock:final\", model: mock }\n\
@@ -72,7 +72,7 @@ fn a_registered_workflow_tool_is_callable_from_a_turn() {
     std::fs::write(
         &cfg,
         format!(
-            "config_version: \"1\"\n\
+            "\
              agent: {{ name: wt, prompt: \"refund order A1\" }}\n\
              store: {{ kind: file, file: {{ path: {dir}/state }} }}\n\
              observability: {{ log_level: info, log_content: true }}\n\
@@ -266,7 +266,7 @@ fn workflow_create_refuses_a_tool_block() {
         std::fs::write(
             &cfg,
             format!(
-                "config_version: \"1\"\n\
+                "\
                  agent: {{ name: wt, prompt: \"define a workflow\" }}\n\
                  store: {{ kind: file, file: {{ path: {dir}/state }} }}\n\
                  observability: {{ log_level: info, log_content: true }}\n\

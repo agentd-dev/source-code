@@ -2,8 +2,9 @@
 //! The operator admin family: drain, pause, resume, cancel and set.
 
 use super::commands::refusal;
-use super::{FeedVis, TASK_NOT_FOUND, err_obj};
+use super::{FeedVis, err_obj};
 use crate::a2a::Principal;
+use crate::a2a::errors::TASK_NOT_FOUND;
 use crate::a2a::errors::{self, reason};
 use crate::runtime::reactor::Runtime;
 use crate::runtime::surface::RUNTIME_SETTABLE;
@@ -174,7 +175,7 @@ impl Runtime {
 /// One parsed `admin.set`.
 #[derive(Debug, PartialEq)]
 enum Setting {
-    Approval(crate::config::v2::Approval),
+    Approval(crate::config::settings::Approval),
     Introspection(bool),
 }
 
@@ -197,11 +198,11 @@ fn parse_set(path: &str, value: Value) -> Result<Setting, String> {
 }
 
 /// The canonical spelling of an approval mode.
-fn approval_name(a: crate::config::v2::Approval) -> &'static str {
+fn approval_name(a: crate::config::settings::Approval) -> &'static str {
     match a {
-        crate::config::v2::Approval::Ask => "ask",
-        crate::config::v2::Approval::Auto => "auto",
-        crate::config::v2::Approval::Accept => "accept",
+        crate::config::settings::Approval::Ask => "ask",
+        crate::config::settings::Approval::Auto => "auto",
+        crate::config::settings::Approval::Accept => "accept",
     }
 }
 
@@ -226,7 +227,7 @@ mod tests {
         }
         assert_eq!(
             parse_set("agent.approval", json!("auto")),
-            Ok(Setting::Approval(crate::config::v2::Approval::Auto))
+            Ok(Setting::Approval(crate::config::settings::Approval::Auto))
         );
         // A value the config file refuses is refused here too.
         assert!(parse_set("agent.approval", json!("sometimes")).is_err());

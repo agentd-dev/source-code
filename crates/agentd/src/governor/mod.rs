@@ -23,9 +23,9 @@
 //!   (`intelligence.budget.lifetime_exhausted`).
 //!
 //! Pure and clock-injected (`now_ms`) — the runtime feeds it, the manifest
-//! stores it, `agent://budget` reads it.
+//! stores it, `status` reads it.
 
-use crate::config::v2::{Budget, BudgetTactic, BudgetWindow, WindowUnit};
+use crate::config::settings::{Budget, BudgetTactic, BudgetWindow, WindowUnit};
 use crate::wire::intel::Usage;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -502,7 +502,7 @@ impl Governor {
         self.instance.roll(now_ms);
     }
 
-    /// `agent://budget`.
+    /// The budget as `status` reports it.
     pub fn status(&self, now_ms: u64) -> Value {
         json!({
             "active": self.is_active(),

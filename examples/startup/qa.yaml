@@ -25,7 +25,6 @@
 # step, not hold the run; screenshots/DOM dumps beyond a few KB should come
 # back as summaries, not raw trees (context is a budget).
 # ─────────────────────────────────────────────────────────────────────────────
-config_version: "1"
 
 agent:
   name: qa

@@ -155,7 +155,7 @@ pub struct RequestScope {
     pub pending_push: Arc<Mutex<Vec<TaskPushNotificationConfig>>>,
     /// The extensions the request activated (pipeline step 9). The ports
     /// pass it on every runtime call, which projects a task's annotations
-    /// only while task-annotations/v1 is in it.
+    /// only while task-annotations is in it.
     pub active: Active,
 }
 
@@ -978,7 +978,8 @@ mod tests {
         answer: impl Fn(&crate::runtime::a2a_server::A2aRequest) -> Value + Send + 'static,
     ) -> RuntimePorts {
         let resolver =
-            crate::a2a::Resolver::build(&crate::config::v2::A2a::default(), &|_| None).unwrap();
+            crate::a2a::Resolver::build(&crate::config::settings::A2a::default(), &|_| None)
+                .unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             while let Ok(crate::runtime::events::Event::A2a(req)) = rx.recv() {

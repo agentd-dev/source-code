@@ -132,7 +132,7 @@ fn a_met_goal_condition_self_finishes_the_daemon() {
     // A daemon whose `once` workflow finishes one run; the goal watchdog then sees
     // `runs_finished >= 1` and finishes (drains → exit 0) with no SIGTERM.
     let cfg = write_config(&format!(
-        "config_version: \"1\"\n\
+        "\
          agent:\n  name: g1\n  instruction: You do the work.\n  preflight: never\n\
          intelligence:\n  endpoints: {}\n  model: mock\n\
          store:\n  kind: memory\n\
@@ -173,7 +173,7 @@ fn a_stuck_goal_self_corrects_by_firing_the_recovery_workflow() {
     // The goal is never achievable and nothing makes progress, so after
     // `stuck_after` checks the watchdog fires the `recover` workflow.
     let cfg = write_config(&format!(
-        "config_version: \"1\"\n\
+        "\
          agent:\n  name: g2\n  instruction: You recover.\n  preflight: never\n\
          intelligence:\n  endpoints: {}\n  model: mock\n\
          store:\n  kind: memory\n\
@@ -224,7 +224,7 @@ fn an_llm_judge_decides_the_goal_is_achieved_and_finishes() {
         "match": [{"when_contains": "GOAL:", "content": "{\"achieved\": true, \"stuck\": false, \"reason\": \"the task is complete\"}"}]
     }));
     let cfg = write_config(&format!(
-        "config_version: \"1\"\n\
+        "\
          agent:\n  name: gj\n  instruction: You do the work.\n  preflight: never\n\
          intelligence:\n  endpoints: {}\n  model: mock\n\
          store:\n  kind: memory\n\

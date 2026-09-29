@@ -280,7 +280,6 @@ impl Runtime {
             doc = json!({});
         }
         fold_params_value(&mut doc, params);
-        doc["config_version"] = json!(crate::config::v2::schema::CONFIG_VERSION);
         let agent = doc
             .as_object_mut()
             .expect("object")
@@ -315,7 +314,7 @@ impl Runtime {
                 .and_then(Value::as_str)
             {
                 a.push(json!({
-                    "name": "_agentd_report", "version": 3, "steps": {
+                    "name": "_agentd_report", "steps": {
                         "ev":   {"kind": "event", "on": "workflow.finished"},
                         "pick": {"kind": "switch", "depends_on": ["ev"],
                                  "on": "{{steps.ev.output.payload.workflow}}",
@@ -338,7 +337,7 @@ impl Runtime {
             // tell a mirrored event from one of its own.
             for m in t.spec.mirror_streams.iter().flatten() {
                 a.push(json!({
-                    "name": format!("_agentd_mirror_{m}"), "version": 3, "steps": {
+                    "name": format!("_agentd_mirror_{m}"), "steps": {
                         "ev":   {"kind": "stream", "stream": m, "from": "new"},
                         "send": {"kind": "a2a.send", "depends_on": ["ev"], "to": "parent",
                                  "command": "_instance.emit",
@@ -385,7 +384,7 @@ impl Runtime {
         if self.settings.security.allow_trifecta {
             security["allow_trifecta"] = json!(true);
         }
-        if self.settings.security.egress == crate::config::v2::Egress::Closed {
+        if self.settings.security.egress == crate::config::settings::Egress::Closed {
             security["egress"] = json!("closed");
         }
         if let Some(ca) = &self.settings.security.tls_ca {
@@ -990,7 +989,7 @@ impl Runtime {
     }
 
     fn instance_dir(&self, handle: &str) -> PathBuf {
-        crate::config::v2::file_store_root(&self.settings.store)
+        crate::config::settings::file_store_root(&self.settings.store)
             .join("subagents")
             .join(handle)
     }
@@ -1074,10 +1073,10 @@ fn instance_socket_path(dir: &std::path::Path, handle: &str) -> String {
 /// Boot the composed document through the same typing + resolution +
 /// validation a config file gets. Errors are the aggregate report.
 fn validate_composed(doc: &Value) -> Result<(), String> {
-    let mut settings = crate::config::v2::Settings::from_document(doc.clone(), "template")
+    let mut settings = crate::config::settings::Settings::from_document(doc.clone(), "template")
         .map_err(|e| e.to_string())?;
-    let res = crate::config::v2::resolve_services(&mut settings);
-    let loaded = crate::config::v2::Loaded {
+    let res = crate::config::settings::resolve_services(&mut settings);
+    let loaded = crate::config::settings::Loaded {
         settings,
         doc: doc.clone(),
         file_doc: doc.clone(),
@@ -1085,7 +1084,7 @@ fn validate_composed(doc: &Value) -> Result<(), String> {
         warnings: Vec::new(),
         trace: Default::default(),
     };
-    let diags = crate::config::v2::validate(&loaded);
+    let diags = crate::config::settings::validate(&loaded);
     let mut errs = res;
     errs.extend(diags.errors);
     if errs.is_empty() {
@@ -1129,7 +1128,7 @@ impl InstanceOp {
 #[cfg(feature = "a2a")]
 mod admission {
     use super::InstanceOp;
-    use crate::config::v2::Role;
+    use crate::config::settings::Role;
 
     /// A report [`admit`] let through. Its field is private to this module,
     /// so nothing outside it can make one: a consumer that takes an
@@ -1200,7 +1199,7 @@ enum InboxRefusal {
 /// a runtime.
 #[cfg(feature = "a2a")]
 fn inbox_report(ev: &crate::state::InboxEvent) -> Option<Result<(Admitted, Value), InboxRefusal>> {
-    use crate::config::v2::Role;
+    use crate::config::settings::Role;
     let message = json!({"parts": ev.payload.get("parts").cloned().unwrap_or(Value::Null)});
     let op = super::a2a_server::command_op(&message)?;
     if !op.starts_with("_instance.") {
@@ -1237,7 +1236,7 @@ mod tests {
     #[cfg(feature = "a2a")]
     #[test]
     fn only_the_operator_speaks_for_a_child() {
-        use crate::config::v2::Role;
+        use crate::config::settings::Role;
         for op in [InstanceOp::Result, InstanceOp::Emit] {
             assert_eq!(admit(Role::Operator, op).map(|a| a.op()), Ok(op));
             for role in [Role::Agent, Role::User, Role::Anonymous] {
@@ -1363,7 +1362,7 @@ mod tests {
         std::fs::write(
             m.join("agent.json"),
             serde_json::to_string(&json!({
-                "v": 2, "kind": "manifest", "id": "agent", "seq": 9,
+                "kind": "manifest", "id": "agent", "seq": 9,
                 "state": {"generation": 1, "budget": {
                     "instance": {"windows": [], "lifetime_used": 4242},
                     "scopes": {}}}

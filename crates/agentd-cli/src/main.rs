@@ -15,10 +15,12 @@ use serde_json::json;
 mod launcher;
 
 fn main() {
-    std::process::exit(run());
+    std::process::exit(dispatch());
 }
 
-fn run() -> i32 {
+/// Picks the role this process plays — launcher, hidden mock, subagent
+/// re-exec or the supervisor — from argv and the environment alone.
+fn dispatch() -> i32 {
     let argv: Vec<String> = std::env::args().collect();
 
     // `agentd tui …` / `agentd ui …`: the thin launcher — the daemon exactly as
@@ -83,25 +85,24 @@ fn run() -> i32 {
     }
 
     let env: Vec<(String, String)> = std::env::vars().collect();
-    run_v2(&argv[1..], &env)
+    run(&argv[1..], &env)
 }
 
 /// A loaded daemon invocation: the configuration, what was asked of it, and
 /// the arguments and environment it was loaded from — the per-process intents
 /// (`--fresh`, `--prompt-missing`, `--env`) already consumed.
 pub(crate) struct Invocation {
-    pub loaded: agentd::config::v2::Loaded,
-    pub ask: agentd::config::v2::Ask,
+    pub loaded: agentd::config::settings::Loaded,
+    pub ask: agentd::config::settings::Ask,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
 }
 
 /// The agentd supervisor: load + validate the configuration and run it (or
-/// answer an early-exit ask). A flat-schema (or `--mode`) configuration is
-/// rejected with a migration hint; `v2::load` emits the precise per-key
+/// answer an early-exit ask). `settings::load` emits the precise per-key
 /// diagnostics that say which entries are unrecognized.
-fn run_v2(args: &[String], env: &[(String, String)]) -> i32 {
-    use agentd::config::v2::{self, Ask};
+fn run(args: &[String], env: &[(String, String)]) -> i32 {
+    use agentd::config::settings::{self, Ask};
     let Invocation {
         loaded,
         ask,
@@ -119,7 +120,7 @@ fn run_v2(args: &[String], env: &[(String, String)]) -> i32 {
             // it would be a flag that works and is undocumented.
             print!(
                 "{}",
-                v2::help_text().replace(
+                settings::help_text().replace(
                     "  -h, --help",
                     "  --fresh                    start a NEW generation: do not resume prior durable state\n                             (the previous generation is kept on the store, not deleted)\n  -h, --help",
                 )
@@ -133,7 +134,7 @@ fn run_v2(args: &[String], env: &[(String, String)]) -> i32 {
         Ask::Schema => {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&v2::schema::schema())
+                serde_json::to_string_pretty(&settings::schema::schema())
                     .unwrap_or_else(|_| "{}".to_string())
             );
             exit::SUCCESS
@@ -172,12 +173,7 @@ fn run_v2(args: &[String], env: &[(String, String)]) -> i32 {
             }
             eprintln!(
                 "{}",
-                // The document version this config was validated against, from
-                // the one constant that defines it — it was hardcoded "2" and
-                // kept saying so after the reset to `config_version: "1"`,
-                // which is exactly the kind of drift a literal invites.
                 json!({"event": "config.valid",
-                       "schema": agentd::config::v2::schema::CONFIG_VERSION,
                        "files": loaded.files.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>()})
             );
             exit::SUCCESS
@@ -192,7 +188,7 @@ fn run_v2(args: &[String], env: &[(String, String)]) -> i32 {
             // The report runs on an INVALID config on purpose, so it has to
             // say so — a document printed without its errors would read as a
             // clean bill of health.
-            let diags = agentd::config::v2::validate(&loaded);
+            let diags = agentd::config::settings::validate(&loaded);
             for e in &diags.errors {
                 eprintln!("{}", json!({"event": "config.invalid", "error": e}));
             }
@@ -274,13 +270,13 @@ fn run_v2(args: &[String], env: &[(String, String)]) -> i32 {
 
 /// Load a daemon invocation the one way both the supervisor and the `agentd
 /// tui|ui` launcher do: consume the per-process intents, apply `--env` files,
-/// refuse the flat schema, then load and validate. `Err` carries the exit code,
+/// then load and validate. `Err` carries the exit code,
 /// its diagnostic already printed.
 pub(crate) fn load_invocation(
     args: &[String],
     env: &[(String, String)],
 ) -> Result<Invocation, i32> {
-    use agentd::config::v2::{self, Detected};
+    use agentd::config::settings;
     // `--fresh` is an intent for *this* process's life, not a
     // setting: it has no document path, and a file or env var that pinned an
     // instance to never resuming would be a footgun. So it is consumed here,
@@ -360,22 +356,7 @@ pub(crate) fn load_invocation(
     if prompt_missing {
         agentd::config::prompt::request_prompt_missing();
     }
-    let detected = match v2::probe(args, env) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("{e}");
-            return Err(exit::USAGE);
-        }
-    };
-    if detected == Detected::V1 {
-        eprintln!(
-            "agentd: this configuration uses the flat schema, which agentd does not accept. \
-Migrate to `config_version: \"1\"` with sections (agent / intelligence / a2a / workflows); \
-see docs/configuration.md."
-        );
-        return Err(exit::USAGE);
-    }
-    let (loaded, ask) = match v2::load(args, env) {
+    let (loaded, ask) = match settings::load(args, env) {
         Ok(x) => x,
         Err(ConfigError::Validate(Ok(line))) => {
             eprintln!("{line}");
@@ -387,10 +368,6 @@ see docs/configuration.md."
         }
         Err(ConfigError::Usage(s)) => {
             eprintln!("{s}");
-            return Err(exit::USAGE);
-        }
-        Err(other) => {
-            eprintln!("{other:?}");
             return Err(exit::USAGE);
         }
     };

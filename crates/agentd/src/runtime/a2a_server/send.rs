@@ -5,9 +5,10 @@
 //! carry, and whether the agent is still taking work.
 
 use super::commands::refusal;
-use super::{TASK_NOT_FOUND, UNSUPPORTED_OPERATION, err_obj, rpc_internal};
+use super::{err_obj, rpc_internal};
 use crate::a2a::Principal;
 use crate::a2a::errors::{self, reason};
+use crate::a2a::errors::{TASK_NOT_FOUND, UNSUPPORTED_OPERATION};
 use crate::a2a::tasks::{Link, State};
 use crate::runtime::events::kinds;
 use crate::runtime::reactor::{PendingKind, Runtime};
@@ -65,8 +66,8 @@ fn named_task(params: &Value) -> Option<&str> {
 
 /// A role as the inbox event records it and an `a2a` start's `roles:` names
 /// it — the one spelling both sides of that match read.
-fn role_name(role: crate::config::v2::Role) -> &'static str {
-    use crate::config::v2::Role;
+fn role_name(role: crate::config::settings::Role) -> &'static str {
+    use crate::config::settings::Role;
     match role {
         Role::Operator => "operator",
         Role::User => "user",
@@ -76,7 +77,7 @@ fn role_name(role: crate::config::v2::Role) -> &'static str {
 }
 
 /// The command a send carries, held to what the listener already held it
-/// to: the command/v2 envelope — activated, marked, one of it
+/// to: the command extension's envelope — activated, marked, one of it
 /// ([`surface::check_command`]) — then the caller's reach
 /// ([`Principal::authorize_command`]). `Ok(None)` is a message that carries
 /// no command; `Err` is the reply that refuses it.
@@ -114,9 +115,7 @@ impl Runtime {
     /// key — root included. Anyone else's is bound in its own namespace, so it
     /// reaches only a conversation it started, and never errors on, reads or
     /// charges one it did not: another principal's id, the root's and one
-    /// nobody has used all get the same fresh conversation. A conversation of
-    /// its own kept from before the namespace is adopted under its old id
-    /// ([`crate::runtime::conversations::ConversationIndex::claim_or_adopt`]).
+    /// nobody has used all get the same fresh conversation.
     pub(super) fn resolve_context(
         &mut self,
         principal: &Principal,
@@ -125,10 +124,7 @@ impl Runtime {
         if principal.is_operator() {
             return Ok(wire.to_string());
         }
-        match self
-            .conv_index
-            .claim_or_adopt(&self.contexts, &principal.id, wire)
-        {
+        match self.conv_index.claim(&principal.id, wire) {
             Ok(key) => Ok(key),
             // No randomness, no key: refused, with nothing bound or written.
             Err(e) => {
@@ -429,14 +425,14 @@ mod tests {
     use super::*;
 
     /// The runtime's own lock on a command, with no listener in front of it:
-    /// a command DataPart without command/v2 activated is not run as one, and
+    /// a command DataPart without the command extension activated is not run as one, and
     /// a child's `_instance.*` report from anyone but the operator is a 403
     /// now — whatever a grant says — rather than an inbox event dropped later
     /// where its sender cannot see. The listener refuses both first, so no
     /// request through it can show this lock missing.
     #[test]
-    fn the_runtime_holds_a_command_to_command_v2_itself() {
-        use crate::config::v2::Role;
+    fn the_runtime_holds_a_command_itself() {
+        use crate::config::settings::Role;
         let who = |role| Principal {
             role,
             grants: vec!["*".into()],
@@ -542,8 +538,7 @@ mod tests {
 
         // The validator refuses the collision, naming it.
         let wf = serde_json::json!({
-            "name": "shadow", "version": 3,
-            "steps": {
+            "name": "shadow", "steps": {
                 "s": {"kind": "a2a", "command": "admin.drain"},
                 "f": {"kind": "finish", "depends_on": ["s"], "status": "completed"}
             }
@@ -559,8 +554,7 @@ mod tests {
 
         // …and a name of the workflow's own still loads.
         let ok = serde_json::json!({
-            "name": "fine", "version": 3,
-            "steps": {
+            "name": "fine", "steps": {
                 "s": {"kind": "a2a", "command": "review.start"},
                 "f": {"kind": "finish", "depends_on": ["s"], "status": "completed"}
             }

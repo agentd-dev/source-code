@@ -33,10 +33,6 @@ impl MockMcp {
     pub fn uri(&self) -> String {
         format!("http://{}", self.addr)
     }
-    /// The `--mcp` argument value: `name=http://<addr>`.
-    pub fn mcp_arg(&self, name: &str) -> String {
-        format!("{name}=http://{}", self.addr)
-    }
     /// Everything the mock wrote to stderr so far.
     pub fn log(&self) -> String {
         std::fs::read_to_string(&self.log_path).unwrap_or_default()
@@ -98,7 +94,6 @@ pub fn spawn_mock_mcp(uri: &str, emit: bool) -> MockMcp {
 }
 
 /// A free loopback TCP port (bind :0, read it back, release).
-#[allow(dead_code)]
 pub fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .expect("bind :0")
@@ -188,11 +183,10 @@ pub fn try_a2a_bound(stderr_path: &str, timeout: Duration) -> Option<String> {
 // Every e2e test that talks to the listener goes through here, so the request
 // shape the specification asks for is written ONCE: the `A2A-Version` header,
 // `ROLE_USER`, an explicit `returnImmediately`, a command marked as the
-// extension it belongs to. The tests used to carry a dozen copies of a
-// hand-rolled POST, and every one of them spelled the request its own way —
-// which is how a suite ends up green against a server that accepts shapes no
-// real client sends. `harness_guard.rs` holds the line: it proves the helpers
-// send the spec's shape, and refuses the legacy spellings anywhere else.
+// extension it belongs to — because a suite whose tests each spell the request
+// their own way ends up green against a server that accepts shapes no real
+// client sends. `harness_guard.rs` holds the line: it proves the helpers send
+// the spec's shape, and that no test builds a request any other way.
 
 /// The `A2A-Version` every request carries: the protocol version the listener
 /// answers, from the one constant the listener's gate and the card read.
@@ -491,7 +485,7 @@ pub fn subscribe_feed(addr: &str, from_seq: u64, read_timeout: Duration) -> BufR
 }
 
 /// [`rpc`] activating `extensions` with the `A2A-Extensions` header — a task
-/// read that should carry the task-annotations/v1 facts, say.
+/// read that should carry the task-annotations facts, say.
 pub fn rpc_activating(
     addr: &str,
     id: i64,

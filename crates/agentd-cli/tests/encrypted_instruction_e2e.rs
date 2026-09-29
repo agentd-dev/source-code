@@ -6,7 +6,7 @@
 //! applies, and the machinery registers in `--capabilities`. The fail-closed
 //! half is pinned too: an envelope with no configured key is a refusal that
 //! names `agent.instruction.decrypt.keys`, never ciphertext delivered as prose.
-#![cfg(all(unix, feature = "decrypt", feature = "workflow"))]
+#![cfg(all(unix, feature = "decrypt"))]
 
 mod common;
 
@@ -45,7 +45,6 @@ fn run_cfg(cfg: &Value) -> (bool, String, Value) {
 
 fn base_cfg(instruction: &str, key_file: Option<&str>) -> Value {
     let mut cfg = json!({
-        "config_version": "1",
         "agent": {"name": "sealed", "preflight": "never", "instruction": instruction},
         "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
         "store": {"kind": "memory"},
@@ -116,7 +115,6 @@ fn a_binary_age_file_via_instruction_file_is_armored_and_decrypted() {
     std::fs::write(
         &cfg_path,
         serde_json::to_vec(&json!({
-            "config_version": "1",
             "agent": {"name": "sealed", "preflight": "never",
                       "instruction": {"decrypt": {"keys": [key_path]}}},
             "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},

@@ -35,7 +35,6 @@
 # + fetch (url → readable text). Nuances: fetch must cap size and strip
 # markup; snippets are the default diet, full fetch is the exception.
 # ─────────────────────────────────────────────────────────────────────────────
-config_version: "1"
 
 agent:
   name: marketing

@@ -7,7 +7,7 @@ Wants=network-online.target
 [Service]
 Type=exec
 EnvironmentFile=-/etc/default/agentd
-ExecStart=/usr/bin/agentd $AGENT_ARGS
+ExecStart=/usr/bin/agentd $AGENTD_ARGS
 Restart=on-failure
 RestartSec=5s
 
@@ -59,9 +59,9 @@ SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 SystemCallArchitectures=native
 
-# Networking: AF_UNIX for the intel/served-MCP sockets; INET/INET6 for an
-# https:// intelligence endpoint (tls build) and the /metrics+/healthz surface.
-# No raw sockets, no netlink. Add AF_VSOCK only for the vsock build.
+# Networking: AF_UNIX for a unix-socket A2A listener or peer; INET/INET6 for
+# an https:// intelligence endpoint (tls build), the A2A listener and the
+# /metrics+/healthz surface. No raw sockets, no netlink.
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
 # Drop all capabilities. The runtime never needs any.

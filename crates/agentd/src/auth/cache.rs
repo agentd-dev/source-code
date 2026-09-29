@@ -11,7 +11,7 @@
 //! an embedder that keeps credentials alongside the rest of its state.
 //!
 //! **Redaction:** a cred record holds live tokens, so it is excluded from all
-//! logs, audit records, and the `agent://` read surface. [`Kind::Cred`] is also
+//! logs, audit records, and every status read. [`Kind::Cred`] is also
 //! deliberately non-indexed — it never appears in the manifest, so nothing that
 //! walks the manifest to enumerate or replicate state can reach a credential.
 

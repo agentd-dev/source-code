@@ -6,9 +6,9 @@ Run the SAME task suite under several configurations and compare accuracy AND
 cost, to map *where decomposition pays off*:
 
   * once      — a single ReAct loop (the baseline);
-  * workflow  — the task wrapped in a one-agent graph (orchestration overhead);
-  * fanout-N  — a `foreach` graph that fans the task across N parallel subagents
-                and joins (agentd's real decomposition primitive).
+  * workflow  — the task wrapped in a one-agent workflow (orchestration overhead);
+  * fanout-N  — a `foreach` workflow that fans the task across N parallel
+                subagents and joins (agentd's real decomposition primitive).
 
 The evidence on multi-agent systems is mixed — a single agent often matches or
 beats a fan-out at a fraction of the cost, while genuinely-wide tasks win big —
@@ -17,8 +17,8 @@ table. Cost is summed across the whole subagent tree (every `loop.final`), so a
 fan-out's N× token cost is visible even though the workflow driver reports its
 own usage as 0.
 
-Requires a `--features workflow` build of agentd:
-    cargo build -p agentd-cli --features workflow
+Requires a build of agentd:
+    cargo build -p agentd-cli
     python3 bench/ablate.py --tasks bench/tasks/ablation_smoke.jsonl --repeats 3
 
 Dependency-free (Python 3 stdlib); reuses bench/run.py.
@@ -35,23 +35,30 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import run  # noqa: E402
 
 
-def _agent_body(instruction: str) -> dict:
-    return {"start": "a", "nodes": {
-        "a": {"kind": "agent", "instruction": instruction, "writes": "out", "edges": {"ok": "h"}},
-        "h": {"kind": "halt", "status": "completed", "result_from": "out"}}}
+# The workflow document `--workflow <file>` loads is named after the file's
+# stem, which bench/run.py writes as `workflow.json`.
+WORKFLOW_NAME = "workflow"
 
 
 def _linear_graph(instruction: str) -> dict:
-    return _agent_body(instruction)
+    """once → agent → finish: the task as a one-agent workflow."""
+    return {"name": WORKFLOW_NAME, "steps": {
+        "start": {"kind": "once"},
+        "work": {"kind": "agent", "depends_on": ["start"], "instruction": instruction},
+        "done": {"kind": "finish", "depends_on": ["work"], "status": "completed",
+                 "output": "{{steps.work.output}}"}}}
 
 
 def _fanout_graph(instruction: str, n: int) -> dict:
-    return {"start": "fan", "nodes": {
-        "fan": {"kind": "foreach", "items": [{"i": i} for i in range(n)],
-                "body": _agent_body(instruction),
-                "parallel": n, "writes": "results", "edges": {"ok": "done", "error": "fail"}},
-        "done": {"kind": "halt", "status": "completed", "result_from": "results"},
-        "fail": {"kind": "halt", "status": "crashed"}}}
+    """once → foreach (n agents, all in parallel) → finish."""
+    return {"name": WORKFLOW_NAME, "steps": {
+        "start": {"kind": "once"},
+        "fan": {"kind": "foreach", "depends_on": ["start"],
+                "over": [{"i": i} for i in range(n)],
+                "batch": {"size": 1, "parallel": n},
+                "body": {"steps": {"work": {"kind": "agent", "instruction": instruction}}}},
+        "done": {"kind": "finish", "depends_on": ["fan"], "status": "completed",
+                 "output": "{{steps.fan.output}}"}}}
 
 
 def apply_config(task: dict, config: dict) -> dict:
@@ -79,7 +86,7 @@ DEFAULT_CONFIGS = [
 def main() -> int:
     default_bin = str(Path(__file__).resolve().parents[1] / "target" / "debug" / "agentd")
     ap = argparse.ArgumentParser(description="workflow-lift ablation (RFC 0024 §5)")
-    ap.add_argument("--agentd", default=default_bin, help="a --features workflow build of agentd")
+    ap.add_argument("--agentd", default=default_bin, help="the agentd binary to drive")
     ap.add_argument("--tasks", default=str(Path(__file__).resolve().parent / "tasks" / "ablation_smoke.jsonl"))
     ap.add_argument("--repeats", type=int, default=1, help="runs per task (k for pass^k)")
     ap.add_argument("--timeout", type=float, default=120.0)
@@ -87,7 +94,7 @@ def main() -> int:
     args = ap.parse_args()
 
     if not Path(args.agentd).exists():
-        print(f"agentd not found: {args.agentd} (build with --features workflow)", file=sys.stderr)
+        print(f"agentd not found: {args.agentd} (cargo build -p agentd-cli)", file=sys.stderr)
         return 2
     tasks = [json.loads(l) for l in Path(args.tasks).read_text().splitlines()
              if l.strip() and not l.lstrip().startswith("//")]

@@ -12,7 +12,7 @@
 //! `instance.spawn.refused`. The refusal is the point: without it the child
 //! ran its work and then had every report refused, and the spawn sat parked
 //! until its timeout with nothing in the log saying why.
-#![cfg(all(unix, feature = "workflow", feature = "a2a"))]
+#![cfg(all(unix, feature = "a2a"))]
 
 mod common;
 
@@ -56,7 +56,7 @@ const POKER: &str = "\x20 - name: poker\n    steps:\n\
 /// keeps one in the file.
 fn parent_config(port: u16, bearer: &str, poke: bool) -> String {
     format!(
-        "config_version: \"1\"\nagent: {{ name: parent }}\nstore: {{ kind: memory }}\n\
+        "agent: {{ name: parent }}\nstore: {{ kind: memory }}\n\
          lifecycle: {{ run_until: idle, idle_grace: 1500ms }}\n\
          observability: {{ log_level: info, log_content: true }}\n\
          security: {{ tls_ca: \"{ca}\" }}\n\
@@ -67,7 +67,6 @@ fn parent_config(port: u16, bearer: &str, poke: bool) -> String {
         \x20     instruction: |\n\
         \x20       The room.\n\
         \x20       :::!workflow{{name=on-ping}}\n\
-        \x20       version: 3\n\
         \x20       steps:\n\
         \x20         cmd: {{ kind: a2a, command: room.ping, roles: [agent, operator] }}\n\
         \x20         f:   {{ kind: finish, depends_on: [cmd], status: completed, output: \"pong {{{{steps.cmd.output.args.x}}}}\" }}\n\
@@ -139,7 +138,7 @@ fn a_tcp_parent_with_an_inline_bearer_refuses_the_spawn() {
     let (_code, log) = run_parent(
         // Nothing pokes the child: there is none to poke.
         &parent_config(common::free_port(), "", false),
-        &["--serve-bearer", TOKEN],
+        &["--a2a.bearer", TOKEN],
     );
     let refused = events(&log, "instance.spawn.refused");
     assert_eq!(refused.len(), 1, "the spawn is refused once:\n{log}");

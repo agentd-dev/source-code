@@ -7,7 +7,6 @@
 //! first reply cancels the other's entry, and a stale index would answer the
 //! wrong request or index past the end and panic the reactor thread — which is
 //! the whole daemon.
-#![cfg(feature = "workflow")]
 
 mod common;
 
@@ -54,7 +53,7 @@ fn a_race_whose_branches_share_a_deadline_does_not_kill_the_reactor() {
         "done": {"kind": "finish", "depends_on": ["race"], "status": "completed", "output": {"winner": "{{steps.race.output.winner}}"}}
     }"#;
     let cfg = write_config(&format!(
-        "config_version: \"1\"\nagent:\n  name: reentrancy\nworkflows:\n  - name: pipe\n    steps: {steps}\nlifecycle:\n  run_until: idle\n  idle_grace: 1s\nobservability:\n  log_level: info\n  log_content: true\n"
+        "agent:\n  name: reentrancy\nworkflows:\n  - name: pipe\n    steps: {steps}\nlifecycle:\n  run_until: idle\n  idle_grace: 1s\nobservability:\n  log_level: info\n  log_content: true\n"
     ));
     let out = run_agentd(&cfg);
     let stderr = String::from_utf8_lossy(&out.stderr);

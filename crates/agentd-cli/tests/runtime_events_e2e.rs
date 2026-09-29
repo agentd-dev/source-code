@@ -5,7 +5,7 @@
 //! What matters here is that the loop actually closes — a runtime event starts
 //! a run — and that the guards hold: undeclared streams and unknown families
 //! are startup errors, and the tap cannot feed itself.
-#![cfg(all(unix, feature = "workflow"))]
+#![cfg(unix)]
 
 mod common;
 
@@ -27,7 +27,7 @@ fn run(cfg_text: &str) -> (Option<i32>, String) {
     (out.status.code(), log)
 }
 
-const BASE: &str = "config_version: \"1\"\nagent: { name: r }\n\
+const BASE: &str = "agent: { name: r }\n\
      store: { kind: file, file: { path: __STATE__ } }\n";
 
 /// The loop closes: a run finishing emits `run.done`, the tap appends it to

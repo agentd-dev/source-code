@@ -39,7 +39,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       # agentd talks MCP; the bench runner drives the real binary per task.
       - name: Build agentd
-        run: cargo build -p agentd-cli --features workflow
+        run: cargo build -p agentd-cli
       - name: Fetch + convert a BFCL slice
         run: |
           set -euo pipefail
@@ -58,7 +58,7 @@ jobs:
           echo "converted $(wc -l < bench/tasks/bfcl_run.jsonl) tasks"
       - name: Run the benchmark
         env:
-          AGENT_INTELLIGENCE_TOKEN: ${{ secrets.OPENAI_API_KEY }}
+          AGENTD_INTELLIGENCE_TOKEN: ${{ secrets.OPENAI_API_KEY }}
         run: |
           python3 bench/run.py --tasks bench/tasks/bfcl_run.jsonl \
             --repeats "${{ inputs.repeats }}" --config "${{ inputs.model }}_${{ inputs.category }}" \

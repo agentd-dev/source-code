@@ -8,33 +8,34 @@ use serde_json::{Value, json};
 use super::methods::{Route, SpecMethod};
 use super::ops::{Floor, Reply, op_spec, static_vocabulary};
 use crate::a2a::errors::{self, reason};
-use crate::config::v2::Settings;
+use crate::config::settings::Settings;
 
 // ── A2A extensions (spec: docs/a2a-extensions.md) ───────────────────────────
 //
 // Anything agentd speaks beyond the core protocol is declared as an
-// `AgentExtension` on the card, identified by a URI. The spec's guidance on
-// those URIs is followed here: they carry a VERSION (a breaking change takes a
-// new URI rather than redefining this one), and they are identifiers — a peer
-// is not expected to fetch them.
+// `AgentExtension` on the card, identified by a URI. The URIs carry no
+// version: A2A 1.0.1 §4.6.3 only suggests one, and a version in an
+// identifier agentd owns is a second name for the same thing. An
+// incompatible change takes a NEW URI under a new name — never a `/vN`
+// suffix — because §4.6.3/§5.8 say a URI's meaning MUST NOT change under a
+// peer that already speaks it. Each URI is an exact identifier: a peer is
+// not expected to fetch it, and neither case nor a trailing slash is forgiven.
 
 /// Structured operations invoked as a DataPart on `SendMessage`. A profile
 /// extension: it adds no method and changes no core structure, so it is never
-/// `required` and a client that ignores it can still converse. v2 because the
-/// envelope and the op arguments changed incompatibly from v1, which a peer
-/// must be able to tell from the URI alone.
-pub const COMMAND_EXTENSION: &str = "https://agentd.dev/a2a/ext/command/v2";
+/// `required` and a client that ignores it can still converse.
+pub const COMMAND_EXTENSION: &str = "https://agentd.dev/a2a/ext/command";
 /// The observation feed, as an A2A method extension.
-pub const EVENTS_EXTENSION: &str = "https://agentd.dev/a2a/ext/events/v1";
+pub const EVENTS_EXTENSION: &str = "https://agentd.dev/a2a/ext/events";
 /// The method [`EVENTS_EXTENSION`] declares, namespaced so it can never collide
 /// with a method the specification defines later.
 pub const EVENTS_METHOD: &str = "agentd.events/SubscribeToEvents";
 /// The extension that declares agentd's own annotations on a task, so a peer
 /// finds them under a URI it can look up rather than in ad-hoc metadata keys.
-pub const TASK_ANNOTATIONS_EXTENSION: &str = "https://agentd.dev/a2a/ext/task-annotations/v1";
+pub const TASK_ANNOTATIONS_EXTENSION: &str = "https://agentd.dev/a2a/ext/task-annotations";
 /// The protocol binding a unix-socket interface declares on the card: JSON-RPC,
 /// but over a path no `https://` URL can name.
-pub const UNIX_BINDING: &str = "https://agentd.dev/a2a/binding/jsonrpc-unix/v1";
+pub const UNIX_BINDING: &str = "https://agentd.dev/a2a/binding/jsonrpc-unix";
 
 /// The most `A2A-Extensions` tokens one request has considered. agentd
 /// declares three; a header naming more than this is not a client asking for
@@ -67,12 +68,6 @@ impl Ext {
             Ext::Events => EVENTS_EXTENSION,
             Ext::TaskAnnotations => TASK_ANNOTATIONS_EXTENSION,
         }
-    }
-
-    /// The extension `uri` names, matched exactly — a URI is an identifier,
-    /// so neither case nor a trailing slash is forgiven.
-    pub fn of_uri(uri: &str) -> Option<Ext> {
-        Ext::ALL.iter().copied().find(|e| e.uri() == uri)
     }
 
     /// Whether the extension means anything on `route`. An extension a
@@ -189,7 +184,8 @@ pub struct Declaration {
 }
 
 /// What an instance declares, from the one switch that varies it:
-/// command/v2 and task-annotations/v1 always, events/v1 while the feed is on.
+/// the command and task-annotations extensions always, events while the feed
+/// is on.
 ///
 /// Takes the switch rather than the settings because the listener asks with
 /// what it SERVES: the feed is armed at spawn and `a2a.events` is
@@ -243,7 +239,8 @@ pub fn schema_of(uri: &str) -> String {
     format!("{uri}/schema.json")
 }
 
-/// `[{op, reply}]` for `ops`, as command/v2's `params.ops` spells them.
+/// `[{op, reply}]` for `ops`, as the command extension's `params.ops` spells
+/// them.
 pub fn op_entries(ops: &[&str]) -> Vec<Value> {
     ops.iter()
         .map(|op| {
@@ -258,7 +255,7 @@ pub fn op_entries(ops: &[&str]) -> Vec<Value> {
 
 /// The extensions activated for one request: requested ∩ declared ∩ applies
 /// to the method. Travels with the request to the runtime, which projects a
-/// task's annotations only while task-annotations/v1 is in it.
+/// task's annotations only while task-annotations is in it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Active(u8);
 
@@ -611,16 +608,15 @@ mod tests {
             assert!(active.contains(*owner), "{method}");
             assert!(owner.applies_to(r), "{method} is its extension's");
         }
-        // The bare name of the feed is no method at all.
-        assert_eq!(route_of("SubscribeToEvents"), None);
     }
 
-    /// Every URI in the registry carries its version as its last path
-    /// segment (`/v<N>`), is `https://agentd.dev/a2a/…`, and is its own:
-    /// a breaking change takes a new URI, and an unversioned one could never
-    /// be superseded without being redefined.
+    /// Every URI in the registry is agentd's (`https://agentd.dev/a2a/…`),
+    /// carries no version segment, and is its own: an incompatible change
+    /// takes a new name, so a `/v<N>` here would be the old habit coming
+    /// back. Each extension method is namespaced under its extension's
+    /// name, read off the URI's last segment.
     #[test]
-    fn every_extension_uri_is_versioned() {
+    fn every_extension_uri_is_agentds_unversioned_and_unique() {
         let mut seen = Vec::new();
         for uri in Ext::ALL
             .iter()
@@ -628,30 +624,19 @@ mod tests {
             .chain(std::iter::once(UNIX_BINDING))
         {
             assert!(uri.starts_with("https://agentd.dev/a2a/"), "{uri}");
-            let last = uri.rsplit('/').next().unwrap();
-            assert!(
-                last.strip_prefix('v')
-                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())),
-                "{uri} is not versioned"
-            );
+            for seg in uri.split('/') {
+                assert!(
+                    !seg.strip_prefix('v')
+                        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())),
+                    "{uri} carries a version segment {seg:?}"
+                );
+            }
             assert!(!seen.contains(&uri), "{uri} twice");
             seen.push(uri);
         }
-        for e in Ext::ALL {
-            assert_eq!(Ext::of_uri(e.uri()), Some(*e));
-        }
-        assert_eq!(COMMAND_EXTENSION, "https://agentd.dev/a2a/ext/command/v2");
-        // interface/v1 and command/v1 are gone, not aliased.
-        for gone in [
-            "https://agentd.dev/a2a/ext/interface/v1",
-            "https://agentd.dev/a2a/ext/command/v1",
-        ] {
-            assert_eq!(Ext::of_uri(gone), None, "{gone}");
-        }
-        // Each extension method is namespaced under its extension's name.
         for (method, owner, _) in EXTENSION_METHODS {
             let (ns, _) = method.split_once('/').expect("a namespaced method");
-            let name = owner.uri().rsplit('/').nth(1).unwrap();
+            let name = owner.uri().rsplit('/').next().unwrap();
             assert_eq!(ns, format!("agentd.{name}"), "{method}");
         }
     }

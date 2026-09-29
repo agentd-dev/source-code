@@ -7,9 +7,10 @@
 //! for a read, a Task for work. A new op is a row plus its handler's arm.
 
 use super::redact::redact_settings;
-use super::{TASK_NOT_FOUND, UNSUPPORTED_OPERATION, err_obj, rpc_internal};
+use super::{err_obj, rpc_internal};
 use crate::a2a::Principal;
 use crate::a2a::errors::{self, reason};
+use crate::a2a::errors::{TASK_NOT_FOUND, UNSUPPORTED_OPERATION};
 use crate::a2a::principals::workflow_name_of;
 use crate::a2a::tasks::{Link, State};
 use crate::engine::model::{Step, Workflow};
@@ -677,7 +678,7 @@ mod tests {
 
         for events in [false, true] {
             for introspection in [false, true] {
-                let mut s = crate::config::v2::Settings::default();
+                let mut s = crate::config::settings::Settings::default();
                 s.a2a.events.enabled = events;
                 s.a2a.introspection.enabled = introspection;
                 for op in command_ops_of(&s) {
@@ -704,17 +705,8 @@ mod tests {
             }
         }
 
-        // Outside the table, nothing is routed — the removed names included.
-        for op in [
-            "interface.info",
-            "config.set",
-            "pairing.code",
-            "admin.lameduck",
-            "review.start",
-            "admin",
-            "_instance.nope",
-            "",
-        ] {
+        // Outside the table, nothing is routed.
+        for op in ["review.start", "admin", "_instance.nope", ""] {
             assert!(route(op).is_none(), "{op:?} must be an unknown op");
         }
     }

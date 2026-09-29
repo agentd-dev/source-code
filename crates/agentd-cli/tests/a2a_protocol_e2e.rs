@@ -9,8 +9,8 @@
 //!   anything being done for it;
 //! * the body is `application/json`, or the request is a bare 415;
 //! * the method table is the specification's plus the declared extension
-//!   methods, matched exactly — every spelling agentd once also answered is
-//!   `-32601` for an operator and a user alike, and changes nothing;
+//!   methods, matched exactly — any other name is `-32601` for an operator
+//!   and a user alike, and changes nothing;
 //! * a stream is either exactly one frame (a read's Message) or a2a-rs's
 //!   task stream, and a refusal is never a frame;
 //! * a subscription to a task the caller cannot see is refused as JSON
@@ -113,7 +113,7 @@ fn boot_with(extra: &str) -> Daemon {
     std::fs::write(
         &cfg,
         format!(
-            "config_version: \"1\"\n\
+            "\
              agent:\n  name: a2a-protocol\n  instruction: You are a test agent.\n  preflight: never\n\
              intelligence:\n  endpoints: {}\n  model: mock\n\
              store:\n  kind: memory\n\
@@ -238,32 +238,25 @@ fn version_gate() {
     );
 }
 
-/// Every name agentd answered before 1.0 besides the table — the card read as
-/// a method, the `a2a.` prefix, pairing, the 0.3 names — is -32601 for the
-/// operator and a user alike, and changes nothing. The pre-1.0 card path is
-/// gone too.
+/// A name the table does not hold — a made-up one, and A2A 0.3's — is -32601
+/// for the operator and a user alike, the request's id echoed, and nothing is
+/// done for it.
 #[test]
-fn vocabulary_deny_list() {
+fn an_unknown_method_is_32601_for_everyone() {
     let d = boot();
     let before = task_count(&d, OPERATOR);
     let send = SendMessage::text("hello").return_immediately().params();
-    let legacy = [
-        ("GetAgentCard", json!({})),
-        ("agent/card", json!({})),
+    let unknown = [
+        ("NoSuchMethod", json!({})),
+        // A2A 0.3's names (spec §3.6.2): a 1.0 server does not answer them.
         ("agent/getAuthenticatedExtendedCard", json!({})),
-        ("a2a.GetAgentCard", json!({})),
-        ("a2a.SendMessage", send.clone()),
-        ("a2a.ListTasks", json!({})),
-        ("a2a.GetExtendedAgentCard", json!({})),
-        ("Pair", json!({"code": "123456"})),
-        ("interface.pair", json!({"code": "123456"})),
         ("message/send", send.clone()),
         ("message/stream", send.clone()),
         ("tasks/get", json!({"id": "task-x"})),
         ("SetTaskPushNotificationConfig", json!({"taskId": "task-x"})),
     ];
     for bearer in [OPERATOR, USER_A] {
-        for (i, (method, params)) in legacy.iter().enumerate() {
+        for (i, (method, params)) in unknown.iter().enumerate() {
             let reply = call(&d, bearer, 500 + i as i64, method, params.clone());
             assert_eq!(reply.status, 200, "{method}: {reply:?}");
             assert!(is_json(&reply), "{method}: {reply:?}");
@@ -277,12 +270,6 @@ fn vocabulary_deny_list() {
         before,
         "a refused name did something"
     );
-
-    assert_eq!(
-        common::http_get(&d.addr, "/.well-known/agent.json").status,
-        404
-    );
-    assert!(common::get_card(&d.addr)["name"].is_string());
 }
 
 /// The binding is JSON over `application/json`. Anything else is a bare 415.
@@ -768,21 +755,4 @@ fn draining_is_identical_on_both_paths() {
         .post_raw(&d.addr);
     assert!(is_json(&streamed), "a refusal is JSON: {streamed:?}");
     assert_eq!(expected(&streamed.json(), "a stream"), one);
-}
-
-/// The listener once rewrote sends for the protocol layer: a task id minted
-/// ahead of the message, and the 0.3 `configuration.blocking` translated to
-/// 1.0's field. Both are gone — a task id is a2a-rs's to generate, and a
-/// field 1.0 does not have means nothing — and they stay gone.
-#[test]
-fn the_listener_rewrites_no_send() {
-    let src = include_str!("../../agentd/src/a2a/serve/dispatch.rs");
-    assert!(
-        !src.contains("\"blocking\""),
-        "serve/dispatch.rs reads configuration.blocking again"
-    );
-    assert!(
-        !src.contains("NewTaskId"),
-        "serve/dispatch.rs mints task ids again"
-    );
 }

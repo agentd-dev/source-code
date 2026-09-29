@@ -99,7 +99,7 @@ fn boot(cfg_for: impl Fn(u16) -> String) -> Daemon {
 /// INPUT_REQUIRED.
 fn retention_config(store: &str, retention: &str, port: u16) -> String {
     format!(
-        "config_version: \"1\"\n\
+        "\
          agent:\n  name: retention-e2e\n  instruction: You are a helpful test agent.\n  preflight: never\n\
          intelligence:\n  endpoints: \"mock:final\"\n  model: mock\n\
          store:\n{store}{retention}\
@@ -381,7 +381,7 @@ fn a_blocking_send_is_answered_with_its_task_under_any_bound() {
 /// Two users and the operator, over the in-process mock model.
 fn principals_config(port: u16) -> String {
     format!(
-        "config_version: \"1\"\n\
+        "\
          agent:\n  name: retention-ctx\n  instruction: You are a helpful test agent.\n  preflight: never\n\
          intelligence:\n  endpoints: \"mock:final\"\n  model: mock\n\
          store:\n  kind: memory\n\

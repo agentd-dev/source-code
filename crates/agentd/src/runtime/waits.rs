@@ -75,8 +75,8 @@ pub(crate) const ANY_CONVERSATION: &str = "*";
 /// owned by `owner`.
 ///
 /// Both halves must hold. The CONVERSATION: the one the wait names, by key or
-/// by name, or any for `*`; a record naming none (armed before a missing one
-/// meant the run's own) listens to nothing, never to everything. The SENDER:
+/// by name, or any for `*`; a record naming none listens to nothing, never to
+/// everything. The SENDER:
 /// whoever the wait's `from` names; without one, the run's own principal, an
 /// operator, or the runtime itself — never another caller who merely named
 /// the conversation.
@@ -1470,7 +1470,7 @@ impl Runtime {
         let peer = match configured {
             Some(p) => p,
             None => match self.instance_peer_endpoint(peer_name) {
-                Some(endpoint) => crate::config::v2::A2aPeer {
+                Some(endpoint) => crate::config::settings::A2aPeer {
                     name: peer_name.to_string(),
                     endpoint,
                     service: None,
@@ -1486,7 +1486,7 @@ impl Runtime {
                 }
             },
         };
-        let spec_v1 = crate::config::A2aPeerSpec {
+        let spec = crate::config::A2aPeerSpec {
             name: peer.name.clone(),
             endpoint: peer.endpoint.clone(),
             headers: peer
@@ -1497,11 +1497,11 @@ impl Runtime {
             client_cert: peer.client_cert.clone(),
             client_key: peer.client_key.clone(),
         };
-        let endpoint = spec_v1
+        let endpoint = spec
             .endpoint_of()
             .map_err(|e| format!("{what}: peer endpoint: {e}"))?;
         #[allow(unused_mut)]
-        let mut headers = crate::mcp::auth::resolve_headers(&spec_v1.headers)
+        let mut headers = crate::mcp::auth::resolve_headers(&spec.headers)
             .map_err(|e| format!("{what}: peer headers: {e}"))?;
         // A peer `auth:` block resolves at dial time. A body-INDEPENDENT
         // bearer (static / oauth2 device-login / spiffe jwt) is baked into the
@@ -1542,7 +1542,7 @@ impl Runtime {
             auth.signer = peer_signer;
         }
         #[cfg(feature = "tls")]
-        if let (Some(cert), Some(key)) = (&spec_v1.client_cert, &spec_v1.client_key) {
+        if let (Some(cert), Some(key)) = (&spec.client_cert, &spec.client_key) {
             let id = std::fs::read(cert)
                 .and_then(|c| std::fs::read(key).map(|k| (c, k)))
                 .map_err(|e| e.to_string())
@@ -1951,7 +1951,7 @@ mod signal_sender_tests {
 mod message_wait_tests {
     use super::{message_wait_matches, wait_record};
     use crate::a2a::Principal;
-    use crate::config::v2::Role;
+    use crate::config::settings::Role;
     use serde_json::json;
 
     fn who(id: &str, role: Role) -> Principal {

@@ -103,9 +103,6 @@ pub enum PollOutcome {
 #[derive(Debug, Deserialize)]
 struct OAuthError {
     error: String,
-    #[serde(default)]
-    #[allow(dead_code)]
-    error_description: Option<String>,
 }
 
 /// Discover the authorization server's endpoints from an issuer URL, trying the

@@ -15,22 +15,19 @@ BIN="${AGENTD_BIN:-./target/debug/agentd}"
 OUT=web/public/schema
 mkdir -p "$OUT"
 
-# Versioned by the DOCUMENT version each schema describes, so pinning
-# `config_version: "1"` and pinning a schema URL are the same decision.
-"$BIN" --config-schema   > "$OUT/config-1.json"
-"$BIN" --workflow-schema > "$OUT/workflow-3.json"
-
-# Unversioned aliases for "whatever this agentd speaks", which is what a
-# modeline in a project's own config usually wants.
-cp "$OUT/config-1.json"   "$OUT/config.json"
-cp "$OUT/workflow-3.json" "$OUT/workflow.json"
+# One schema per document, each at the URL its `$id` names. Whatever else is in
+# the directory is gone first, so a schema the binary no longer emits cannot
+# linger at a URL an editor still fetches.
+rm -f "$OUT"/config*.json "$OUT"/workflow*.json
+"$BIN" --config-schema   > "$OUT/config.json"
+"$BIN" --workflow-schema > "$OUT/workflow.json"
 
 # The site's workflow editor offers node kinds and fields from its own copy of
 # `$defs.kinds`, enriched with a `category` and a `kind` the schema does not
 # carry. Regenerate the schema-derived half and keep the enrichment, so the
 # editor can never offer a kind the binary refuses — it had drifted to a
 # different set of kinds entirely.
-python3 - "$OUT/workflow-3.json" web/lib/workflow-nodes.json <<'PYGEN'
+python3 - "$OUT/workflow.json" web/lib/workflow-nodes.json <<'PYGEN'
 import json, sys
 kinds = json.load(open(sys.argv[1]))["$defs"]["kinds"]
 try:
@@ -52,4 +49,4 @@ if missing:
     print(f"  NOTE: new node kind(s) need a category in web/lib/workflow-nodes.json: {missing}", file=sys.stderr)
 PYGEN
 
-echo "wrote $OUT/{config-1,config,workflow-3,workflow}.json + web/lib/workflow-nodes.json"
+echo "wrote $OUT/{config,workflow}.json + web/lib/workflow-nodes.json"

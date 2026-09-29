@@ -6,7 +6,7 @@
 //! The daemon runs against the in-process mock intelligence, which echoes the
 //! system prompt it was given, so these assert on what a model ACTUALLY
 //! receives rather than on an internal function's return value.
-#![cfg(all(unix, feature = "workflow"))]
+#![cfg(unix)]
 
 mod common;
 
@@ -46,7 +46,7 @@ fn validate(cfg_text: &str) -> (Option<i32>, String) {
     (out.status.code(), log)
 }
 
-const BASE: &str = "config_version: \"1\"\nagent: { name: tpl }\nstore: { kind: memory }\n\
+const BASE: &str = "agent: { name: tpl }\nstore: { kind: memory }\n\
      intelligence: { endpoints: \"mock:echo-system\", model: mock }\n\
      lifecycle: { run_until: idle, idle_grace: 900ms }\n\
      observability: { log_level: info, log_content: true }\n";

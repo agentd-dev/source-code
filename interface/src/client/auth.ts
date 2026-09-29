@@ -15,8 +15,6 @@
  * the endpoints receive a device code, a launch code or a token, and a
  * redirect or a cleartext hop would hand it to someone the operator never
  * named.
- *
- * The shared auth types live here until the client types are rebuilt.
  */
 
 import { parseRetryAfter } from './errors.js';
@@ -31,7 +29,7 @@ export const DEVICE_CODE_GRANT = 'urn:ietf:params:oauth:grant-type:device_code';
  * launcher's terminal approves. Must equal the daemon's
  * `surface::launch::LAUNCH_GRANT_TYPE`; `interface_client_guard` checks it.
  */
-export const LAUNCH_GRANT_TYPE = 'https://agentd.dev/oauth/grant-type/launch/v1';
+export const LAUNCH_GRANT_TYPE = 'https://agentd.dev/oauth/grant-type/launch';
 
 /** The RFC 8414 metadata path, relative to the issuer (the listener origin). */
 export const AUTHORIZATION_SERVER_METADATA = '/.well-known/oauth-authorization-server';

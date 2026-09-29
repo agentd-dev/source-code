@@ -21,23 +21,13 @@
 //! success, not a kill. 137/143 only ever appear because the OS sets them when
 //! the kernel kills the process; agentd never calls `exit(137)` itself.
 //!
-//! Around the table this module freezes two things a control plane depends on:
-//! a contract version ([`EXIT_CODES`], surfaced at `surfaces.exit_codes`) and a
-//! per-code `podFailurePolicy` *intent* ([`pod_failure_intent`]) that agentctl
-//! compiles into `onExitCodes` rules. agentd emits codes and intents only; the
-//! policy decision itself belongs to agentctl.
+//! Beside the table this module states the per-code `podFailurePolicy`
+//! *intent* ([`pod_failure_intent`]) a control plane compiles into
+//! `onExitCodes` rules. agentd emits codes and intents only; the policy
+//! decision itself belongs to the control plane. A code's meaning never
+//! changes: a new outcome takes a new code.
 
 use crate::agentloop::stop::TerminalStatus;
-
-/// The exit-code *contract* version (major.minor), surfaced in the manifest at
-/// `surfaces.exit_codes`. It freezes the code->meaning table plus the
-/// [`pod_failure_intent`] mapping as a versioned public API that a control plane
-/// authors `podFailurePolicy` rules against. New codes may be added within a
-/// major; **any** change to an existing code's meaning or intent is breaking and
-/// bumps the major, because a reader compiled against the old major would
-/// otherwise silently author the wrong policy. agentctl refuses to compile rules
-/// for an `exit_codes` major it does not understand.
-pub const EXIT_CODES: &str = "1.0";
 
 pub const SUCCESS: i32 = 0;
 pub const GENERIC: i32 = 1;
@@ -96,9 +86,8 @@ pub const SIGTERM_EXIT: i32 = 143; // 128 + 15 — ungraceful SIGTERM (drain for
 ///
 /// An unrecognised code defaults to `retriable` — the conservative posture: an
 /// unknown failure is treated like a generic one and left to the backoff limit,
-/// never silently `FailJob`'d. (A code outside the contract should not occur at
-/// the frozen `EXIT_CODES` major; this is belt-and-suspenders for a future
-/// additive code an older agentctl has not learned.)
+/// never silently `FailJob`'d. (A code outside the table should not occur; this
+/// is belt-and-suspenders for a code added after a control plane was built.)
 pub fn pod_failure_intent(code: i32) -> &'static str {
     match code {
         SUCCESS => "complete",
@@ -253,12 +242,6 @@ mod tests {
                 "code {code} must not be authored as a retry rule"
             );
         }
-    }
-
-    #[test]
-    fn exit_codes_contract_version_is_frozen_at_one_zero() {
-        // The manifest's surfaces.exit_codes value.
-        assert_eq!(EXIT_CODES, "1.0");
     }
 
     #[test]

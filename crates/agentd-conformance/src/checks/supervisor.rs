@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The supervisor contract: the documented exit-code table (a `once` job maps
-//! its outcome to an exit code) and the migration gate that refuses a
-//! configuration written against the flat schema.
+//! its outcome to an exit code).
 //!
 //! Every check here drives the real binary and judges it by its exit code, so
 //! the contract is proven the way an operator's supervisor observes it — not
@@ -22,12 +21,6 @@ pub fn checks() -> Vec<Check> {
             category: Category::Supervisor,
             desc: "an unknown flag is a usage error → exit 2",
             run: exit_bad_flag,
-        },
-        Check {
-            id: "supervisor/exit-2-on-retired-v1-flag",
-            category: Category::Supervisor,
-            desc: "an unsupported --mode flag is rejected with a migration hint → exit 2",
-            run: exit_retired_flag,
         },
         Check {
             id: "supervisor/exit-4-on-intel-down",
@@ -59,30 +52,6 @@ fn exit_success(h: &Harness) -> Outcome {
 fn exit_bad_flag(h: &Harness) -> Outcome {
     let r = h.run(&["--no-such-flag"]);
     Outcome::require(r.code == Some(2), format!("want exit 2, got {:?}", r.code))
-}
-
-fn exit_retired_flag(h: &Harness) -> Outcome {
-    // `--mode` is not a flag agentd accepts. It must fail as a usage error AND
-    // name itself in the diagnostic: a bare "unknown flag" leaves an operator
-    // migrating an old configuration with nothing to act on.
-    let r = h.run(&[
-        "--mode",
-        "reactive",
-        "--instruction",
-        "hi",
-        "--intelligence",
-        "http://127.0.0.1:9",
-    ]);
-    Outcome::require(
-        r.code == Some(2),
-        format!("want exit 2, got {:?}; stderr:\n{}", r.code, r.stderr),
-    )
-    .and(|| {
-        Outcome::require(
-            r.stderr.contains("--mode"),
-            format!("stderr should name the rejected flag:\n{}", r.stderr),
-        )
-    })
 }
 
 fn exit_intel_down(h: &Harness) -> Outcome {

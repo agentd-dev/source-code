@@ -9,7 +9,7 @@
 //! CAS'd, never listed, so it cannot be rewritten). Audit is security telemetry:
 //! it answers "why did the agent do that, and on whose authority?".
 
-use crate::config::v2::AuditSink;
+use crate::config::settings::AuditSink;
 use crate::runtime::reactor::Runtime;
 use crate::state::{Kind, now_ms, ulid};
 use serde_json::{Value, json};
@@ -164,7 +164,7 @@ fn mirror_to_feed(method: &str, op: Option<&str>, outcome: &str) -> bool {
 #[cfg(test)]
 mod tests {
     // The emitter is exercised end-to-end by
-    // `runtime_v2_a2a_e2e::a2a_calls_are_audited_when_the_audit_log_sink_is_on`
+    // `runtime_a2a_e2e::a2a_calls_are_audited_when_the_audit_log_sink_is_on`
     // (a real daemon with `observability.audit.sink: [log]`); these pin the
     // one decision that is made here rather than there.
     #[cfg(feature = "a2a")]

@@ -75,11 +75,6 @@ pub fn scoped_id(parent: &str, step: &str) -> String {
     format!("{parent}.{step}")
 }
 
-/// Whether an id is nested (has a scope).
-pub fn is_scoped(id: &str) -> bool {
-    id.contains('.')
-}
-
 /// The parent scope of a scoped id (`each[3].classify` → `each[3]`).
 pub fn parent_of(id: &str) -> Option<&str> {
     id.rsplit_once('.').map(|(p, _)| p)
@@ -1175,7 +1170,6 @@ fn unreachable_wf() -> std::sync::Arc<Workflow> {
         tool: None,
         state: Default::default(),
         name: String::new(),
-        version: 3,
         priority: Default::default(),
         unload: Default::default(),
         durable: None,
@@ -1249,7 +1243,6 @@ mod tests {
         assert_eq!(strip_scope_suffix("each[3]"), "each");
         assert_eq!(strip_scope_suffix("par{a}"), "par");
         assert_eq!(strip_scope_suffix("x[1].y[2]"), "x[1].y");
-        assert!(is_scoped("a.b") && !is_scoped("a"));
         // Cancellation scope: the element/branch forms are children of the
         // parent's own id too, and a longer name that merely shares the
         // prefix is not.

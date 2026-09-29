@@ -13,7 +13,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, Stdio};
 
 fn write_config(yaml: &str) -> String {
-    let path = common::unique_path("chaos-v2", "yaml");
+    let path = common::unique_path("chaos", "yaml");
     std::fs::File::create(&path)
         .unwrap()
         .write_all(yaml.as_bytes())
@@ -42,7 +42,7 @@ fn chaos_config(mock_uri: &str) -> String {
         "f": {"kind": "finish", "depends_on": ["c"], "status": "completed", "output": "done"}
     }"#;
     write_config(&format!(
-        "config_version: \"1\"\nagent:\n  name: chaos\nmcp:\n  servers:\n    - name: mock\n      endpoint: {mock_uri}\nstore:\n  kind: mcp\n  mcp:\n    server: mock\nworkflows:\n  - name: chain\n    steps: {steps}\nlifecycle:\n  run_until: idle\n  idle_grace: 1s\nobservability:\n  log_level: warn\n"
+        "agent:\n  name: chaos\nmcp:\n  servers:\n    - name: mock\n      endpoint: {mock_uri}\nstore:\n  kind: mcp\n  mcp:\n    server: mock\nworkflows:\n  - name: chain\n    steps: {steps}\nlifecycle:\n  run_until: idle\n  idle_grace: 1s\nobservability:\n  log_level: warn\n"
     ))
 }
 

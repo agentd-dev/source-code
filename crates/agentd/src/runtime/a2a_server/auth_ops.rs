@@ -20,7 +20,7 @@ use super::{FeedVis, err_obj};
 use crate::a2a::Principal;
 use crate::a2a::errors::{self, reason};
 use crate::a2a::oauth::{Approval, Revoke, Session};
-use crate::config::v2::DeviceScope;
+use crate::config::settings::DeviceScope;
 use crate::runtime::audit::AuditEvent;
 use crate::runtime::identities::{self, Registered};
 use crate::runtime::reactor::Runtime;
@@ -269,7 +269,7 @@ fn authority(rt: &Runtime) -> Result<std::sync::Arc<crate::a2a::oauth::Authority
         .and_then(|s| s.authority.clone())
         .ok_or_else(|| {
             err_obj(
-                super::UNSUPPORTED_OPERATION,
+                crate::a2a::errors::UNSUPPORTED_OPERATION,
                 "the device grant is not serving on this listener",
             )
         })
@@ -283,7 +283,7 @@ fn device_of(
 ) -> Result<&crate::a2a::oauth::DeviceGrant, Value> {
     authority.device().ok_or_else(|| {
         err_obj(
-            super::UNSUPPORTED_OPERATION,
+            crate::a2a::errors::UNSUPPORTED_OPERATION,
             "the device grant is not serving on this listener",
         )
     })
@@ -296,7 +296,7 @@ fn sessions(rt: &Runtime) -> Result<std::sync::Arc<crate::a2a::oauth::Sessions>,
         .and_then(|s| s.sessions.clone())
         .ok_or_else(|| {
             err_obj(
-                super::UNSUPPORTED_OPERATION,
+                crate::a2a::errors::UNSUPPORTED_OPERATION,
                 "this listener issues no sessions",
             )
         })

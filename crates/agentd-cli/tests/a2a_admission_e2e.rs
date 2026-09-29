@@ -130,7 +130,7 @@ fn spawn(llm: &str, a2a_extra: &str) -> (Daemon, String) {
 
 fn config(llm: &str, port: u16, a2a_extra: &str) -> String {
     format!(
-        "config_version: \"1\"\n\
+        "\
          agent:\n  name: admission\n  instruction: You are a helpful test agent.\n  preflight: never\n\
          intelligence:\n  endpoints: {llm}\n  model: mock\n\
          store:\n  kind: memory\n\

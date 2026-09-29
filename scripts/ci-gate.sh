@@ -22,7 +22,6 @@ ROWS=(
   "--features oauth"
   "--features hot-reload"
   "--features config-watch"
-  "--features workflow"
   "--features cel"
   "--features aauth"
   "--features a2a,hot-reload"

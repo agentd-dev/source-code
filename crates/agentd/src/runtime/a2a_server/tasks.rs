@@ -2,8 +2,9 @@
 //! Durable tasks: the task methods, the push-notification family, and the
 //! lifecycle every other path creates and advances tasks through.
 
-use super::{FeedVis, TASK_NOT_FOUND, err_obj};
+use super::{FeedVis, err_obj};
 use crate::a2a::Principal;
+use crate::a2a::errors::TASK_NOT_FOUND;
 use crate::a2a::errors::{INVALID_PARAMS, TASK_NOT_CANCELABLE};
 use crate::a2a::tasks::{Link, PushTarget, State, Task};
 use crate::a2a::wire::{Annotations, DEFAULT_PAGE_SIZE, ListView, MAX_PAGE_SIZE};
@@ -239,7 +240,7 @@ const SETTLE_GRACE_MS: u64 = 30_000;
 /// grace is over.
 fn tasks_to_evict<'a>(
     tasks: impl Iterator<Item = &'a Task>,
-    policy: &crate::config::v2::TerminalRetention,
+    policy: &crate::config::settings::TerminalRetention,
     now: u64,
 ) -> Vec<String> {
     let ttl_ms = policy.ttl.as_ref().map(|d| d.0.as_millis() as u64);
@@ -325,7 +326,7 @@ fn push_page(targets: &[PushTarget], task_id: &str, params: &Value) -> Result<Va
 }
 
 /// Whether a task projected for a request that activated `active` carries
-/// its annotations: only when the request activated task-annotations/v1. An
+/// its annotations: only when the request activated task-annotations. An
 /// extension a client did not ask for is not the client's to parse.
 fn annotations_for(active: Active) -> Annotations {
     if active.contains(Ext::TaskAnnotations) {
@@ -438,10 +439,10 @@ impl Runtime {
         // different questions — "is this address reachable from here?" and "is
         // this endpoint one we declared?" — and a push URL comes from the
         // caller, so both have to hold.
-        if let Err(e) = crate::config::v2::egress_allows(
+        if let Err(e) = crate::config::settings::egress_allows(
             &self.settings.services,
             self.settings.security.egress,
-            crate::config::v2::ServiceKind::Http,
+            crate::config::settings::ServiceKind::Http,
             &target.url,
         ) {
             return Err(err_obj(
@@ -736,7 +737,7 @@ impl Runtime {
         }
     }
 
-    /// Publish a task transition: to A2A subscribers, and onto the interface
+    /// Publish a task transition: to A2A subscribers, and onto the observation
     /// feed so every attached display client converges without polling.
     ///
     /// The A2A half is also what *settles a blocking send* — the protocol layer
@@ -894,7 +895,7 @@ mod tests {
         assert!(v4(&a) && v4(&b), "{a} / {b}");
     }
 
-    fn who(id: &str, role: crate::config::v2::Role) -> Principal {
+    fn who(id: &str, role: crate::config::settings::Role) -> Principal {
         Principal {
             id: id.into(),
             role,
@@ -924,7 +925,7 @@ mod tests {
     /// the projection — and one that cannot be is refused, never ignored.
     #[test]
     fn list_tasks_semantics() {
-        use crate::config::v2::Role;
+        use crate::config::settings::Role;
         let tasks = [
             task("t-a", "c1", "user:a", State::Completed, 1_000),
             task("t-b", "c2", "user:a", State::Working, 3_000),
@@ -1009,7 +1010,7 @@ mod tests {
     /// by its name and nothing by a key the runtime chose.
     #[test]
     fn the_context_filter_reads_keys_for_operators_and_names_for_owners() {
-        use crate::config::v2::Role;
+        use crate::config::settings::Role;
         let mut a = task("t-a", "chat1", "user:a", State::Completed, 1_000);
         a.set_conversation("ctx-aaaa", "chat1");
         let mut b = task("t-b", "chat1", "user:b", State::Completed, 2_000);
@@ -1035,10 +1036,11 @@ mod tests {
     fn retention(
         keep_last: Option<u32>,
         ttl_ms: Option<u64>,
-    ) -> crate::config::v2::TerminalRetention {
-        crate::config::v2::TerminalRetention {
+    ) -> crate::config::settings::TerminalRetention {
+        crate::config::settings::TerminalRetention {
             keep_last,
-            ttl: ttl_ms.map(|ms| crate::config::v2::Dur(std::time::Duration::from_millis(ms))),
+            ttl: ttl_ms
+                .map(|ms| crate::config::settings::Dur(std::time::Duration::from_millis(ms))),
         }
     }
 

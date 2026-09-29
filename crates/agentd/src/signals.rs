@@ -65,10 +65,10 @@ mod imp {
     // state; the supervisor has NO LLM and no live view of that breaker
     // state. The child therefore reports its reachability UPWARD (an edge-triggered
     // `AgentMsg::IntelHealth` at the breaker/failover seam — on entering all-down
-    // and on recovering); the supervisor latches it HERE so the readiness probe,
-    // the `agentd_intel_all_down` gauge, and the `agentd://intelligence`/`capacity`
-    // bodies all read ONE truth without a feature dependency (it rides here, not in
-    // a feature-gated module, exactly like LAME_DUCK/PAUSED).
+    // and on recovering); the supervisor latches it HERE so the readiness probe
+    // and the `agentd_intel_all_down` gauge read ONE truth without a feature
+    // dependency (it rides here, not in a feature-gated module, exactly like
+    // LAME_DUCK/PAUSED).
     //
     // SEMANTICS (be honest): this is EVENTUALLY-CONSISTENT, last-child-experience.
     // A fresh subagent spawn starts with FRESH breakers (all CLOSED), so the latched
@@ -217,8 +217,8 @@ mod imp {
 
     /// Latch the intelligence all-endpoints-down state from a child's upward
     /// `AgentMsg::IntelHealth` report. Returns `true` iff the value
-    /// TRANSITIONED (so the supervisor fires the `agentd://intelligence`
-    /// notify-then-read exactly on a breaker enter/exit, not on every report).
+    /// TRANSITIONED (so the supervisor reacts exactly on a breaker enter/exit,
+    /// not on every report).
     /// Eventually-consistent / last-child-experience — see the static's doc above.
     pub fn set_intel_all_down(on: bool) -> bool {
         INTEL_ALL_DOWN.swap(on, Ordering::SeqCst) != on
@@ -415,9 +415,8 @@ pub fn set_paused(on: bool) {
 
 /// Is the intelligence channel all-endpoints-down? The latched,
 /// EVENTUALLY-CONSISTENT last-child-experience truth a child reports up via
-/// `AgentMsg::IntelHealth` — read by `/readyz` (flips NotReady), the
-/// `agentd_intel_all_down` gauge, and the `agentd://intelligence`/`capacity`
-/// bodies. NOT a live supervisor-side probe (there is no model loop in the
+/// `AgentMsg::IntelHealth` — read by `/readyz` (flips NotReady) and the
+/// `agentd_intel_all_down` gauge. NOT a live supervisor-side probe (there is no model loop in the
 /// supervisor): it reflects whichever child last exercised the endpoints.
 pub fn intel_all_down() -> bool {
     imp::intel_all_down()
@@ -425,8 +424,7 @@ pub fn intel_all_down() -> bool {
 
 /// Latch the intelligence all-endpoints-down state from a child's `AgentMsg::
 /// IntelHealth` report. Returns `true` iff the value TRANSITIONED,
-/// so the supervisor can fire the `agentd://intelligence` notify exactly on a
-/// breaker enter/exit. Eventually-consistent / last-child-experience: a fresh
+/// so the supervisor can react exactly on a breaker enter/exit. Eventually-consistent / last-child-experience: a fresh
 /// spawn has fresh breakers, so this reflects the most recent child's reachability
 /// and persists between reactions — the right "route work here?" signal, not a
 /// continuous probe.

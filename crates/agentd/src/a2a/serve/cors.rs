@@ -17,7 +17,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
 use super::App;
-use crate::config::v2::parse_origin;
+use crate::config::settings::parse_origin;
 
 /// The request headers a browser client may send, answered on the preflight.
 ///

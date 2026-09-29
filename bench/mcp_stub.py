@@ -10,8 +10,7 @@ scripted (or echo) results — so a benchmark that provides its own functions
 (BFCL) or a stubbed environment (MCP-Universe offline) is a data file, not code.
 
 Speaks the minimal wire agentd expects (mirrors crates/agentd/src/mcp/mock_http.rs):
-  * era probe: any unknown method (incl. `server/discover`) -> JSON-RPC -32601,
-    so the client falls back to the legacy `initialize` handshake;
+  * any method it does not implement -> JSON-RPC -32601;
   * `initialize` -> capabilities {tools:{}} + serverInfo, stamping Mcp-Session-Id;
   * `notifications/initialized` (a POST notification) -> 202, no body;
   * `tools/list` -> the configured tools;
@@ -242,7 +241,7 @@ class Stub:
                 "content": [{"type": "text", "text": json.dumps(payload)}],
                 "isError": False,
             }), False
-        # Unknown (incl. `server/discover`) -> era-probe fallback signal.
+        # A method this stub does not implement.
         return _err(rid, METHOD_NOT_FOUND, f"unsupported: {method}"), False
 
     def handle(self, conn: socket.socket) -> None:

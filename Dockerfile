@@ -3,7 +3,7 @@
 # agentd cloud-native appliance image — a fully static musl binary on `scratch`.
 #
 # The image ships the **cloud-native feature set**
-# (`a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt`): the A2A v2 HTTPS listener
+# (`a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt`): the A2A HTTPS listener
 # (RFC 0029, the external channel + delegation peers), the `/healthz`+`/readyz`+
 # `/metrics` HTTP probe surface (so k8s liveness/readiness probes work), UTC-cron
 # scheduling, OTLP trace+log export, SIGHUP + inotify config hot-reload (a
@@ -30,8 +30,8 @@
 #   docker build --build-arg FEATURES=a2a,metrics,cron,otel .
 #   docker build --build-arg FEATURES= .          # the flag-free build (still TLS via default)
 # `tls` (default) needs no system CA bundle — the webpki roots are bundled. To drop
-# TLS entirely (reach https only via a `unix:` TLS-terminating sidecar), build with
-# cargo `--no-default-features`.
+# TLS entirely (reach https only via a TLS-terminating sidecar on a loopback
+# `http://` port), build with cargo `--no-default-features`.
 
 # ---- builder -------------------------------------------------------------
 FROM rust:1.96-alpine AS builder

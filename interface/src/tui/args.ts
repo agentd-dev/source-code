@@ -27,15 +27,6 @@ export const TUI_CLIENT_ID = 'agentd-tui';
 /** A launch code is `agentd_lc_` + 64 hex; anything longer than this is not one. */
 export const MAX_LAUNCH_CODE = 256;
 
-/** Flags that no longer exist, refused by name with where to go instead. */
-export const REMOVED_FLAGS: ReadonlyArray<readonly [string, string]> = Object.freeze([
-  [
-    '--bearer',
-    'a token on the command line is readable by every local user (ps, /proc): use --bearer-file PATH or AGENTD_BEARER',
-  ],
-  ['--code', 'pairing was replaced by the OAuth device grant: use --login'],
-] as const);
-
 /** A refusal of the command line or environment: printed, then exit 2. */
 export class UsageError extends Error {
   constructor(message: string) {
@@ -70,17 +61,15 @@ function valued(argv: readonly string[], i: number, name: string): { value: stri
 }
 
 /**
- * Read the command line. A removed flag is refused by name — silently
- * ignoring `--bearer TOKEN` would start an unauthenticated client while the
- * token sat in the process list — and so is anything unknown, so a typo is
+ * Read the command line. Anything unknown is refused — silently ignoring
+ * `--bearer TOKEN` would start an unauthenticated client while the token sat
+ * in the process list — so a typo is
  * never mistaken for a setting.
  */
 export function parseArgs(argv: readonly string[]): TuiArgs {
   const out: TuiArgs = { login: false, noExtensions: false, debug: false, inline: false, insecure: false, help: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    const removed = REMOVED_FLAGS.find(([flag]) => a === flag || a.startsWith(`${flag}=`));
-    if (removed) throw new UsageError(`${removed[0]} was removed in agentd 1.17.0: ${removed[1]}`);
     let v: { value: string; next: number } | undefined;
     if (a === '-e') v = valued(argv, i, '-e');
     else v = valued(argv, i, '--endpoint');
@@ -114,7 +103,9 @@ export function parseArgs(argv: readonly string[]): TuiArgs {
     else if (a === '--inline') out.inline = true;
     else if (a === '--insecure') out.insecure = true;
     else if (a === '-h' || a === '--help') out.help = true;
-    else throw new UsageError(`unknown option ${JSON.stringify(a)} — see --help`);
+    // Only the name before any `=` is echoed: an unknown `--flag=value` may
+    // carry a token, and a refusal must not print it back to the terminal.
+    else throw new UsageError(`unknown option ${JSON.stringify(a.split('=')[0])} — see --help`);
   }
   if (out.scope !== undefined && !out.login) throw new UsageError('--scope chooses what --login asks for; add --login');
   return out;
@@ -325,7 +316,5 @@ export const HELP = [
   '',
   '  env: AGENTD_ENDPOINT, AGENTD_BEARER (read, then removed from the environment),',
   '       AGENTD_TUI_TOP, AGENTD_TUI_BOTTOM, AGENTD_TUI_INLINE=1, AGENTD_INSECURE=1',
-  '',
-  `  removed: ${REMOVED_FLAGS.map(([f]) => f).join(', ')}`,
   '',
 ].join('\n');

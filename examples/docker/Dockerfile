@@ -6,7 +6,7 @@
 #
 # TRANSPORT = HTTPS. The default build links `tls` (rustls + ring + bundled
 # webpki roots), so agentd dials `https://` directly — intelligence, the MCP
-# client, the served self-MCP, and A2A are all HTTPS:
+# client and A2A are all HTTPS:
 #   - https://host/...   — the default; agentd holds the trust roots
 #   - http://127.0.0.1/… — loopback only, for a same-host TLS-terminating sidecar
 # To keep TLS out of the image, build --no-default-features and use a loopback
@@ -30,7 +30,7 @@ FROM rust:1.96-bookworm AS build
 
 # Capability surface is compile-time. The default build links `tls` (the
 # transport). Override to add opt-in surfaces, e.g.
-# --build-arg FEATURES=a2a,cron,metrics,otel,workflow — or --no-default-features
+# --build-arg FEATURES=a2a,cron,metrics,otel — or --no-default-features
 # (empty FEATURES + the build below) for the TLS-free loopback-sidecar posture.
 ARG FEATURES=""
 
@@ -74,7 +74,7 @@ COPY --from=build /agentd /usr/local/bin/agentd
 USER 65532:65532
 
 # No CMD instruction/intelligence baked in — those are the unit of work and
-# are supplied per-run via env (INSTRUCTION, AGENT_INTELLIGENCE) or flags.
+# are supplied per-run via env (AGENTD_INSTRUCTION, AGENTD_INTELLIGENCE) or flags.
 # `agentd` with no args validates config and exits 2 (missing instruction),
 # which is the correct, fail-fast default for a misconfigured pod.
 ENTRYPOINT ["/usr/local/bin/agentd"]

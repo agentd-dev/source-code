@@ -34,7 +34,6 @@
 # the PR is not mergeable rather than force; keep tool outputs bounded
 # (a whole-repo read blows the context — expose search + ranged reads).
 # ─────────────────────────────────────────────────────────────────────────────
-config_version: "1"
 
 agent:
   name: engineering

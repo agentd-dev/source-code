@@ -19,7 +19,7 @@
 
 use serde_json::{Value, json};
 
-use crate::config::v2::{Goal, GoalAction};
+use crate::config::settings::{Goal, GoalAction};
 use crate::intel::client::IntelClient;
 use crate::runtime::events::Event;
 use crate::state::{Kind, now_ms};

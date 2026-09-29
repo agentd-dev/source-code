@@ -11,7 +11,7 @@ use super::events::kinds;
 use super::reactor::{PendingKind, Runtime, Target};
 use super::tools::{ToolCaller, ToolOutcome};
 use crate::config::fileset::{Dir, expand_dir_ordered};
-use crate::config::v2::substitute_config_vars;
+use crate::config::settings::substitute_config_vars;
 use crate::context::Msg;
 use crate::engine::model::{OnError, Step, Workflow, parse_workflow};
 use crate::engine::run::{
@@ -2347,11 +2347,10 @@ impl Runtime {
         let Some(wf) = self.definition_for_run(run_id) else {
             return scopes;
         };
-        if let Some(b) = wf
-            .limits
-            .budget
-            .as_ref()
-            .and_then(|b| serde_json::from_value::<crate::config::v2::Budget>(b.clone()).ok())
+        if let Some(b) =
+            wf.limits.budget.as_ref().and_then(|b| {
+                serde_json::from_value::<crate::config::settings::Budget>(b.clone()).ok()
+            })
         {
             let key = format!("run:{run_id}");
             self.governor.ensure_scope(&key, &b);
@@ -3016,10 +3015,10 @@ impl Runtime {
         );
         let wake = self.settings.agent.wake_on();
         let notify = match self.settings.agent.on_workflow_finished {
-            crate::config::v2::OnWorkflowFinished::Ignore => false,
+            crate::config::settings::OnWorkflowFinished::Ignore => false,
             _ => {
-                ok && wake.contains(&crate::config::v2::WakeEvent::WorkflowFinished)
-                    || !ok && wake.contains(&crate::config::v2::WakeEvent::WorkflowFailed)
+                ok && wake.contains(&crate::config::settings::WakeEvent::WorkflowFinished)
+                    || !ok && wake.contains(&crate::config::settings::WakeEvent::WorkflowFailed)
             }
         };
         if notify && !self.job_shape {
@@ -3038,7 +3037,7 @@ impl Runtime {
                 // turn: the difference between leaving a message and making
                 // the call. The hop depth continues this run's chain, so a
                 // workflow the agent started cannot wake it without bound.
-                crate::config::v2::OnWorkflowFinished::Think => {
+                crate::config::settings::OnWorkflowFinished::Think => {
                     let depth = self.runs.get(run_id).map(|r| r.msg_depth).unwrap_or(0) + 1;
                     let cap = self.settings.limits.message_depth();
                     if depth > cap {

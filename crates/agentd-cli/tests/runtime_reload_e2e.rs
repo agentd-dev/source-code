@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 fn config(instruction: &str, name: &str, llm: &str) -> String {
     format!(
-        "config_version: \"1\"\nagent:\n  name: {name}\n  instruction: {instruction}\nintelligence:\n  endpoints: {llm}\n  model: mock\nworkflows:\n  - name: idle\n    steps:\n      s: {{kind: manual}}\n      f: {{kind: finish, depends_on: [s]}}\nlifecycle:\n  run_until: drained\n  drain_timeout: 5s\nobservability:\n  log_level: info\n"
+        "agent:\n  name: {name}\n  instruction: {instruction}\nintelligence:\n  endpoints: {llm}\n  model: mock\nworkflows:\n  - name: idle\n    steps:\n      s: {{kind: manual}}\n      f: {{kind: finish, depends_on: [s]}}\nlifecycle:\n  run_until: drained\n  drain_timeout: 5s\nobservability:\n  log_level: info\n"
     )
 }
 
@@ -45,7 +45,7 @@ fn a_daemon_reloads_on_sighup_refuses_restart_only_changes_and_drains_on_sigterm
         .spawn()
         .unwrap();
     let llm_uri = format!("http://{}", common::read_addr_file(&mock_llm_addr));
-    let cfg_path = common::unique_path("agentd-v2-reload", "yaml");
+    let cfg_path = common::unique_path("agentd-reload", "yaml");
     std::fs::write(&cfg_path, config("first instruction", "daemon", &llm_uri)).unwrap();
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_agentd"))
@@ -153,7 +153,7 @@ fn a_reload_rereads_a_workflow_file_and_reports_only_a_real_change() {
     std::fs::write(&wf_path, wf("completed")).unwrap();
     let cfg_path = common::unique_path("agentd-reload-wfcfg", "yaml");
     let cfg = format!(
-        "config_version: \"1\"\nagent:\n  name: d\n  instruction: standing\nintelligence:\n  endpoints: {llm_uri}\n  model: mock\nworkflows:\n  - name: worker\n    file: {wf_path}\nlifecycle:\n  run_until: drained\n  drain_timeout: 5s\nobservability:\n  log_level: info\n"
+        "agent:\n  name: d\n  instruction: standing\nintelligence:\n  endpoints: {llm_uri}\n  model: mock\nworkflows:\n  - name: worker\n    file: {wf_path}\nlifecycle:\n  run_until: drained\n  drain_timeout: 5s\nobservability:\n  log_level: info\n"
     );
     std::fs::write(&cfg_path, &cfg).unwrap();
 

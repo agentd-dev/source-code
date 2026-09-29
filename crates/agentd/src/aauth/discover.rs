@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! AAuth discovery: fetch a party's well-known
 //! metadata document (AAuth protocol §12.10). Resource discovery
-//! (`/.well-known/aauth-resource.json`) learns a server's `access_mode` /
-//! `content-digest` requirement; Agent-Provider discovery
+//! (`/.well-known/aauth-resource.json`) learns a server's `content-digest`
+//! requirement — the access mode is the runtime `AAuth-Requirement`'s to say,
+//! which is always authoritative; Agent-Provider discovery
 //! (`/.well-known/aauth-agent.json`) confirms the provider's `issuer`. Both are
 //! best-effort — a party without a document is used as configured — EXCEPT the
 //! §12.10 anti-host-poisoning rule: a document that IS served MUST declare an
@@ -26,12 +27,6 @@ pub(super) fn issuer_matches(doc_issuer: &str, base_url: &str) -> bool {
 /// The subset of `aauth-resource.json` agentd acts on.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ResourceMeta {
-    /// `agent-token` | `aauth-access-token` | `auth-token` — the case the
-    /// server declares up front. Parsed for completeness; agentd reacts to the
-    /// runtime `AAuth-Requirement` (always authoritative) rather than pre-picking.
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub access_mode: Option<String>,
     /// Whether requests must cover a body `content-digest`.
     #[serde(default)]
     pub content_digest: bool,
@@ -72,9 +67,6 @@ pub fn fetch(endpoint: &str, timeout: Duration) -> Option<ResourceMeta> {
 pub struct ProviderMeta {
     #[serde(default)]
     pub issuer: Option<String>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub name: Option<String>,
 }
 
 /// Fetch + validate the Agent-Provider metadata document for `base_url`

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Spawning a subagent process.
 //!
-//! A subagent is the **same binary re-exec'd** with `AGENT_SUBAGENT` set, so
+//! A subagent is the **same binary re-exec'd** with `AGENTD_SUBAGENT` set, so
 //! the one artifact is CLI, supervisor, and subagent. Each child is put in its
 //! own **process group** (`setpgid` in `pre_exec`) so the kill ladder can
 //! `killpg` a whole subtree in one call, including grandchildren the subagent
@@ -15,10 +15,10 @@
 //! `waitpid(-1)` it calls [`Subagent::mark_reaped`], so `Drop` will not signal
 //! a possibly-reused pid.
 
-use crate::json::frame;
 use crate::subagent::protocol::{AgentMsg, ControlMsg, SUBAGENT_ENV, SpawnPayload};
 use crate::supervisor::kill::kill_group;
 use crate::supervisor::tree::NodeId;
+use ::mcp::rpc::frame;
 use std::io;
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};

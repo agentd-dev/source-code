@@ -19,8 +19,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// The dialect this model speaks.
-pub const DIALECT: u32 = 3;
 /// Structural caps, enforced at validation so a pathological document is
 /// refused when it is submitted rather than after it has been scheduled.
 pub const MAX_STEPS: usize = 512;
@@ -1037,7 +1035,6 @@ pub struct StateDecl {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Workflow {
     pub name: String,
-    pub version: u32,
     /// Scheduling weight under contention. `low` admissions shed one pressure
     /// level EARLIER (at `warn`, not just `shed`),
     /// and ready steps of higher-priority runs are scheduled first each tick.
@@ -1278,7 +1275,6 @@ fn json_kind(v: &Value) -> &'static str {
 /// loader accepts (or complete one it refuses) — they drifted apart once.
 pub const TOP: &[&str] = &[
     "name",
-    "version",
     "description",
     "armed",
     "inputs",
@@ -1319,7 +1315,7 @@ pub fn start_kinds() -> Vec<&'static str> {
 /// Whether a start kind keeps the instance alive.
 ///
 /// THE authority. Three hand-maintained copies of this judgement used to exist
-/// — the workflow method, `config::v2::LONG_LIVED_STARTS`, and the
+/// — the workflow method, `config::settings::LONG_LIVED_STARTS`, and the
 /// capabilities manifest's own list — and all three disagreed: one had `stream`
 /// and not `webhook`, one the reverse, one neither. A webhook-only instance
 /// under the default `run_until: auto` therefore reported ready and immediately
@@ -1328,7 +1324,7 @@ pub fn is_long_lived_start(kind: &str) -> bool {
     KINDS.iter().any(|k| k.start && k.name == kind) && !ONE_SHOT_STARTS.contains(&kind)
 }
 
-/// Parse + validate a dialect-3 document. Errors name every problem.
+/// Parse + validate a workflow document. Errors name every problem.
 pub fn parse_workflow(doc: &Value) -> Result<Workflow, Vec<String>> {
     let mut errs = Vec::new();
     let Some(obj) = doc.as_object() else {
@@ -1349,18 +1345,6 @@ pub fn parse_workflow(doc: &Value) -> Result<Workflow, Vec<String>> {
         errs.push(format!(
             "workflow name {name:?} must match [a-zA-Z_][a-zA-Z0-9_-]{{0,63}}"
         ));
-    }
-    let version = obj
-        .get("version")
-        .and_then(Value::as_u64)
-        .unwrap_or(DIALECT as u64) as u32;
-    if version != DIALECT {
-        errs.push(format!(
-            "workflow {name:?}: version {version} is not dialect 3 (dialect 1/2 documents are refused — see docs/workflows.md §migration)"
-        ));
-    }
-    if obj.contains_key("start") || obj.contains_key("nodes") {
-        errs.push(format!("workflow {name:?}: `start`/`nodes` are dialect 1/2 — use `steps` with start nodes (docs/workflows.md §migration)"));
     }
     let armed = obj.get("armed").and_then(Value::as_bool).unwrap_or(true);
     let priority = match Priority::from_spec(obj.get("priority")) {
@@ -1624,7 +1608,6 @@ pub fn parse_workflow(doc: &Value) -> Result<Workflow, Vec<String>> {
     let mut wf = Workflow {
         state,
         name,
-        version,
         priority,
         unload,
         durable,
@@ -1945,16 +1928,10 @@ fn parse_step(
             // claiming `admin.drain` would shadow an operator's control with a
             // run that anyone its `roles:` admits could trigger. Refused here,
             // at load AND at `workflow.create`, because both reach this
-            // validation. A removed op is refused by name too: a workflow
-            // answering `config.set` would look, to a client written for the
-            // old vocabulary, like the operator control it replaced.
+            // validation.
             if let Some(cmd) = spec.get("command").and_then(Value::as_str) {
-                use crate::runtime::surface::{OPS_REMOVED_IN, is_builtin_op, removed_op};
-                if let Some(hint) = removed_op(cmd) {
-                    errs.push(format!(
-                        "{at}: command `{cmd}` was removed in agentd {OPS_REMOVED_IN}: {hint}"
-                    ));
-                } else if is_builtin_op(cmd) {
+                use crate::runtime::surface::is_builtin_op;
+                if is_builtin_op(cmd) {
                     errs.push(format!(
                         "{at}: command {cmd:?} is a built-in operation and cannot be \
                          declared by a workflow — pick a name of your own"
@@ -2753,15 +2730,13 @@ pub fn workflow_schema() -> Value {
     let kinds: Vec<&str> = KINDS.iter().map(|k| k.name).collect();
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        // Served at this URL; `schema/` (singular) matches the config schema's
-        // path, which the previous `schemas/` did not.
-        "$id": "https://agentd.dev/schema/workflow-3.json",
+        // Served at this URL, beside the config schema.
+        "$id": "https://agentd.dev/schema/workflow.json",
         "title": "agentd workflow",
         "type": "object",
         "required": ["name", "steps"],
         "properties": {
             "name": {"type": "string", "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$"},
-            "version": {"const": 3},
             "description": {"type": "string"},
             "armed": {"type": "boolean", "default": true},
             "durable": {"type": "boolean", "description": "false = runs are memory-only (no checkpoints, gone after a restart) — the fast path for recomputable work; absent = the store.durability.work default (durable)"},
@@ -3106,7 +3081,7 @@ mod tests {
     #[test]
     fn the_sugar_workflow_parses_hashes_and_orders() {
         let w = wf(json!({
-            "name": "main", "version": 3,
+            "name": "main",
             "steps": {
                 "start": {"kind": "once"},
                 "work": {"kind": "agent", "depends_on": ["start"], "instruction": "{{env.instruction}}"},
@@ -3180,7 +3155,7 @@ mod tests {
         let joined = e.join("\n");
         for needle in [
             "workflow name \"bad name\"",
-            "`start`/`nodes` are dialect 1/2",
+            "unknown workflow field \"start\"",
             "unknown field \"bogus\"",
             "unknown kind \"nope\"",
             "sleep.duration",
@@ -3221,9 +3196,18 @@ mod tests {
         assert!(joined.contains("unreachable root"), "{joined}");
         assert!(joined.contains("cycle among steps"), "{joined}");
         assert!(joined.contains("`finish` step is required"), "{joined}");
-        // Version.
-        let e = wf(json!({"name": "w", "version": 2, "steps": {"s": {"kind": "once"}, "f": {"kind": "finish", "depends_on": ["s"]}}})).unwrap_err();
-        assert!(e[0].contains("not dialect 3"));
+        // A workflow document carries no version: `version`, like the
+        // `start`/`nodes` of no current shape, is a field nobody defines.
+        for field in ["version", "start", "nodes"] {
+            let mut doc = json!({"name": "w", "steps": {"s": {"kind": "once"}, "f": {"kind": "finish", "depends_on": ["s"]}}});
+            doc[field] = json!(3);
+            let e = wf(doc).unwrap_err();
+            assert!(
+                e.iter()
+                    .any(|m| m == &format!("unknown workflow field {field:?}")),
+                "{field}: {e:?}"
+            );
+        }
         // Happy path with every implemented kind referenced.
         let ok = wf(json!({"name": "w", "inputs": {"schema": {"type": "object"}}, "concurrency": {"max_runs": 2, "on_overflow": "drop"}, "limits": {"deadline": "10m", "steps": 50}, "steps": {
             "s": {"kind": "manual"},

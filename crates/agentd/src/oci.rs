@@ -2,7 +2,7 @@
 //! **Instruction documents from an OCI artifact registry** (RFC 0040).
 //!
 //! An instruction document is pushed to any OCI-compliant registry as a
-//! first-class artifact (`artifactType: application/vnd.instruction.document.v1`,
+//! first-class artifact (`artifactType: application/vnd.instruction-md.instruction.v1`,
 //! one `text/markdown; variant=instruction` layer) and pulled here by
 //! `oci://registry/repo:tag` or `…@sha256:…`. The Distribution Spec v2 is plain
 //! HTTPS + JSON, so this rides the existing hand-rolled HTTP client, `serde_json`
@@ -21,7 +21,6 @@
 //! binaries are NOT executed (agentd runs no local processes); cloud-IAM token
 //! exchange (ECR SigV4) is deferred to a later phase and documented as such.
 
-use std::io::{Read, Write};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -699,14 +698,6 @@ fn is_hex(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-// Keep `Read`/`Write` in scope for the boxed stream trait object.
-#[allow(unused)]
-fn _assert_stream_traits(s: &mut dyn http::Stream) -> &mut (dyn http::Stream) {
-    let _ = s as &mut dyn Read;
-    let _ = s as &mut dyn Write;
-    s
-}
-
 #[cfg(test)]
 mod cosign_tests {
     use super::*;
@@ -819,6 +810,7 @@ mod cosign_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
 
     #[test]
     fn references_parse_with_tags_digests_and_ports() {
@@ -955,7 +947,7 @@ mod tests {
                 let manifest = serde_json::json!({
                     "schemaVersion": 2,
                     "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                    "artifactType": "application/vnd.instruction.document.v1",
+                    "artifactType": "application/vnd.instruction-md.instruction.v1",
                     "layers": [{
                         "mediaType": "text/markdown; variant=instruction",
                         "digest": layer_digest,

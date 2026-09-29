@@ -186,11 +186,11 @@ impl Runtime {
         // Which policy caller this plan is being built for. A plan is per
         // turn, so this is fixed for every call the child will make.
         let who = match caller {
-            Caller::Subagent { .. } => crate::config::v2::PolicyCaller::Subagent,
-            Caller::Workflow => crate::config::v2::PolicyCaller::Workflow,
+            Caller::Subagent { .. } => crate::config::settings::PolicyCaller::Subagent,
+            Caller::Workflow => crate::config::settings::PolicyCaller::Workflow,
             // A principal's calls arrive over A2A and reach `execute_tool`
             // directly; for plan purposes they are served like a root turn.
-            Caller::Root | Caller::Principal { .. } => crate::config::v2::PolicyCaller::Root,
+            Caller::Root | Caller::Principal { .. } => crate::config::settings::PolicyCaller::Root,
         };
         let policies = &self.settings.security.policies;
         let mut internal = Vec::new();
@@ -284,8 +284,8 @@ impl Runtime {
         // already bound its `contextId` to one (`runtime::conversations`);
         // this is the second lock, for a job that reached the queue some
         // other way — a `message.send` its own turn's model aimed at the
-        // root or at another's key, a record written before the namespace
-        // existed — so it still cannot read, extend or charge somebody else's.
+        // root or at another's key — so it still cannot read, extend or charge
+        // somebody else's.
         if job.owner_checked
             && let Err(why) = self.listener_may_turn(&job)
         {
@@ -471,9 +471,9 @@ impl Runtime {
     /// an open plan; `never`.
     fn preflight_wanted(&self, ctx_id: &str, text: &str) -> bool {
         match self.settings.agent.preflight {
-            crate::config::v2::Preflight::Never => false,
-            crate::config::v2::Preflight::Always => true,
-            crate::config::v2::Preflight::Auto => {
+            crate::config::settings::Preflight::Never => false,
+            crate::config::settings::Preflight::Always => true,
+            crate::config::settings::Preflight::Auto => {
                 let long = text.chars().count() > 280;
                 let lower = text.to_ascii_lowercase();
                 let verbs = [
@@ -731,7 +731,7 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
     // ---- knowledge auto-context: retrieve before the turn ----------------------
 
     fn knowledge_wanted(&self) -> bool {
-        self.settings.knowledge.auto_context.on == crate::config::v2::AutoContextOn::Turn
+        self.settings.knowledge.auto_context.on == crate::config::settings::AutoContextOn::Turn
             && self.registry.route("knowledge.search").is_some()
     }
 

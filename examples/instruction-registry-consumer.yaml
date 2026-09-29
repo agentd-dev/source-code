@@ -22,7 +22,6 @@
 # it). The §7.7 freshness watch is the floor underneath that, not the primary
 # path — both converge on the same apply boundary. Pick the cadence from the
 # registry's cache hint (`md.instruction/cache.maxAge`, 30s on the dev gateway).
-config_version: "1"
 
 agent:
   name: loop-demo

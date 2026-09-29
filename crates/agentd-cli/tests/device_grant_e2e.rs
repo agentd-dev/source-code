@@ -148,7 +148,7 @@ fn playbook() -> String {
 /// `waiter` workflow a user may start that parks on a signal.
 fn config(listen: &str, a2a_extra: &str, store: &str) -> String {
     format!(
-        "config_version: \"1\"\n\
+        "\
          agent:\n  name: device-grant\n  instruction: You are a helpful test agent.\n  preflight: never\n\
          intelligence:\n  endpoints: \"mock:file:{play}\"\n  model: mock\n\
          {store}\
@@ -953,7 +953,7 @@ fn launch_daemon() {
     let args = vec!["--config".to_string(), cfg];
     let env: Vec<(String, String)> = std::env::vars().collect();
     let (loaded, _) =
-        agentd::config::v2::load(&args, &env).unwrap_or_else(|e| panic!("config: {e:?}"));
+        agentd::config::settings::load(&args, &env).unwrap_or_else(|e| panic!("config: {e:?}"));
     let origin = std::env::var(LAUNCH_ORIGIN_ENV).ok();
     let slot = std::sync::Arc::new(LaunchSlot::new(origin.as_deref()).unwrap());
     let code = match &origin {

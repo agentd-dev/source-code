@@ -125,9 +125,8 @@ impl<'a> Session<'a> {
         }
         tools.extend(self_handler.tools());
         let resources = collect_resources(servers);
-        // Offer `resource.read` when there are MCP resources OR the handler
-        // serves agentd:// self-resources (e.g. async-child completions).
-        if !resources.owner.is_empty() || self_handler.serves_self_resources() {
+        // Offer `resource.read` when there are MCP resources to read.
+        if !resources.owner.is_empty() {
             tools.push(resource_read_tool_def());
         }
         // The parent's narrowed grant lands LAST, over the whole assembled
@@ -177,7 +176,7 @@ impl<'a> Session<'a> {
             tools.extend(code);
         }
         tools.extend(self_handler.tools());
-        if !self.resources.owner.is_empty() || self_handler.serves_self_resources() {
+        if !self.resources.owner.is_empty() {
             tools.push(resource_read_tool_def());
         }
         // Re-narrow: a server that ADDS a tool mid-session must not widen a
@@ -419,22 +418,7 @@ impl<'a> Session<'a> {
                             true,
                         )
                     } else if tc.name == "resource.read" {
-                        // An `agentd://` URI reads agentd's own state (e.g. an
-                        // async child's completion) via the self-handler; any
-                        // other URI is an MCP-server resource.
-                        let uri = tc
-                            .arguments
-                            .get("uri")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .trim();
-                        if uri.starts_with("agentd://") || uri.starts_with("agent://") {
-                            self_handler.read_resource(uri).unwrap_or_else(|| {
-                                (format!("unknown agentd resource: {uri}"), true)
-                            })
-                        } else {
-                            read_resource_tool(self.servers, &self.resources.owner, &tc.arguments)
-                        }
+                        read_resource_tool(self.servers, &self.resources.owner, &tc.arguments)
                     } else {
                         match self_handler.handle(&tc.name, &tc.arguments) {
                             Some(r) => r, // a self-tool (e.g. subagent.spawn)

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The subagent side of the control channel.
 //!
-//! Entered when `main` sees `AGENT_SUBAGENT` set. The child, in order:
+//! Entered when `main` sees `AGENTD_SUBAGENT` set. The child, in order:
 //! 1. installs `PR_SET_PDEATHSIG` so a supervisor death collapses it. This must
 //!    happen here rather than in `pre_exec`, because `execve` clears the setting;
 //! 2. reads its [`SpawnPayload`] (first control frame) from stdin;
@@ -20,11 +20,11 @@ use crate::agentloop::runner::{LoopAbort, LoopInput, Session, run_loop};
 use crate::agentloop::stop::{Outcome, TerminalStatus};
 use crate::config::SwapPolicy;
 use crate::intel::client::{IntelClient, IntelHealthReport};
-use crate::json::frame;
 use crate::mcp::client::McpClient;
 use crate::obs::log::{Comp, Level, LogCtx, Logger};
 use crate::subagent::protocol::{AgentMsg, ControlMsg, IntelActive, SpawnPayload, SwapIntel};
 use crate::supervisor::budget::Budget;
+use ::mcp::rpc::frame;
 use std::io::{self, BufReader, Stdin, Stdout};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
@@ -599,8 +599,7 @@ fn rebuild_intel(swap: &SwapIntel, old: &IntelClient, log: &Logger) -> Option<In
 /// Emit the `intel.swap` event for an applied swap. NO secret and NO URL ever
 /// appear — only the swap KIND (`endpoint` or `model`), the model names, which
 /// are non-secret identifiers, the policy, and whether the endpoint list
-/// changed. Endpoint identity stays transport-and-index only and is surfaced by
-/// the `agentd://intelligence` resource, never by this event, so an operator
+/// changed. Endpoint identity never appears in this event, so an operator
 /// reading logs can see that a swap happened without learning where it points.
 fn log_swap(
     log: &Logger,
@@ -726,7 +725,7 @@ fn refresh_tools_if_changed(
     servers: &[McpClient],
     log: &Logger,
 ) {
-    use crate::wire::mcp::method;
+    use ::mcp::wire::method;
     let changed = servers.iter().any(|s| {
         s.drain_notifications()
             .iter()

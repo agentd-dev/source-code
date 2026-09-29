@@ -204,7 +204,7 @@ fn write_config(yaml: &str) -> String {
 
 fn config(llm: &str, port: u16) -> String {
     format!(
-        "config_version: \"1\"\n\
+        "\
          agent:\n  name: hook\n  instruction: You handle webhooks.\n  preflight: never\n\
          intelligence:\n  endpoints: {llm}\n  model: mock\n\
          store:\n  kind: memory\n\
@@ -306,7 +306,7 @@ fn a_signed_webhook_fires_the_workflow_bad_signature_is_rejected_and_replays_ded
 
 fn await_config(llm: &str, port: u16) -> String {
     format!(
-        "config_version: \"1\"\n\
+        "\
          agent:\n  name: hookawait\n  instruction: You process callbacks.\n  preflight: never\n\
          intelligence:\n  endpoints: {llm}\n  model: mock\n\
          store:\n  kind: memory\n\
@@ -376,7 +376,7 @@ fn a_respond_sync_webhook_returns_the_run_result_inline() {
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
     let cfg = write_config(&format!(
-        "config_version: \"1\"\n\
+        "\
          agent:\n  name: sync\n  instruction: You process.\n  preflight: never\n\
          intelligence:\n  endpoints: {}\n  model: mock\n\
          store:\n  kind: memory\n\
@@ -414,7 +414,7 @@ fn a_respond_sync_webhook_returns_the_run_result_inline() {
 
 fn rate_config(llm: &str, port: u16) -> String {
     format!(
-        "config_version: \"1\"\n\
+        "\
          agent:\n  name: ratehook\n  instruction: You handle webhooks.\n  preflight: never\n\
          intelligence:\n  endpoints: {llm}\n  model: mock\n\
          store:\n  kind: memory\n\
@@ -477,7 +477,7 @@ fn a_rated_route_admits_its_burst_then_answers_429_with_retry_after() {
 
 fn shed_config(llm: &str, port: u16, store_dir: &str) -> String {
     format!(
-        "config_version: \"1\"\n\
+        "\
          agent:\n  name: shedhook\n  instruction: You handle webhooks.\n  preflight: never\n\
          intelligence:\n  endpoints: {llm}\n  model: mock\n\
          store:\n  kind: file\n  file:\n    path: {store_dir}\n    min_free: 999999GB\n\
@@ -564,7 +564,7 @@ fn at_warn_a_low_priority_route_sheds_while_normal_still_admits() {
     let store_dir = common::unique_path("wh-warn-store", "d");
     std::fs::create_dir_all(&store_dir).unwrap();
     let cfg = write_config(&format!(
-        "config_version: \"1\"\n\
+        "\
          agent:\n  name: warnhook\n  instruction: You handle webhooks.\n  preflight: never\n\
          intelligence:\n  endpoints: {llm}\n  model: mock\n\
          store:\n  kind: file\n  file:\n    path: {store_dir}\n    min_free: \"{min_free}\"\n\
@@ -612,10 +612,9 @@ fn at_warn_a_low_priority_route_sheds_while_normal_still_admits() {
 
 /// A reload REBUILDS the webhook routes — proven by the effect, not the report.
 ///
-/// This is the regression test for the defect that shipped as a refusal in
-/// v1.3.3: route auth was compiled into the listener at startup and never
-/// rebuilt, so rotating a secret and reloading reported `config.reloaded`
-/// success while the listener kept verifying against the OLD secret. A test
+/// Route auth is compiled into the listener at startup, so a reload has to
+/// rebuild it: rotating a secret must stop the OLD secret verifying, not
+/// report `config.reloaded` success over it. A test
 /// asserting the reload *reported* the change (which is what the existing
 /// reload e2e does) passes in both worlds; only checking whether the old
 /// signature still opens the door tells them apart.
@@ -635,7 +634,7 @@ fn a_reload_rotates_webhook_auth_and_the_old_secret_stops_working() {
     std::fs::write(&secret_path, "secret-one\n").unwrap();
 
     let cfg = write_config(&format!(
-        "config_version: \"1\"\n\
+        "\
          agent:\n  name: rot\n  instruction: You handle webhooks.\n  preflight: never\n\
          intelligence:\n  endpoints: {llm}\n  model: mock\n\
          store:\n  kind: memory\n\
@@ -724,7 +723,7 @@ fn a_webhook_into_a_stream_appends_and_replays_into_a_later_consumer() {
 
     let cfg_for = |consumer: &str| {
         format!(
-            "config_version: \"1\"\n\
+            "\
              agent:\n  name: ingest\n  instruction: You handle webhooks.\n  preflight: never\n\
              intelligence:\n  endpoints: [\"http://127.0.0.1:1/v1\"]\n  model: mock\n\
              store:\n  kind: file\n  file:\n    path: {dir}/state\n  checkpoint:\n    debounce_ms: 0\n\

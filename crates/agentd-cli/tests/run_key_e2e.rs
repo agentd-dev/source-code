@@ -9,7 +9,7 @@
 //! The distinction under test is the one that matters: `scope: workflow` with
 //! `max_runs: 1` is a QUEUE (every entity behind one run); `scope: key` is a
 //! per-entity LOCK (each entity serialised against itself, entities parallel).
-#![cfg(all(unix, feature = "workflow"))]
+#![cfg(unix)]
 
 mod common;
 
@@ -31,7 +31,7 @@ fn run(cfg_text: &str) -> (Option<i32>, String) {
     (out.status.code(), log)
 }
 
-const BASE: &str = "config_version: \"1\"\nagent: { name: k }\n\
+const BASE: &str = "agent: { name: k }\n\
      store: { kind: file, file: { path: __STATE__ } }\n\
      observability: { log_level: info, log_content: true }\n\
      lifecycle: { run_until: idle, idle_grace: 3s }\n\

@@ -39,7 +39,7 @@ pub mod browser;
 /// credential, so a login must land where all of them look and a logout must
 /// revoke it for all of them at once. Deliberately outside the `oauth` feature
 /// gate, so logout still resolves in a build without interactive login.
-pub fn canonical_target(settings: &crate::config::v2::Settings, target: &str) -> String {
+pub fn canonical_target(settings: &crate::config::settings::Settings, target: &str) -> String {
     if let Some(name) = target.strip_prefix("mcp:")
         && let Some(svc) = settings
             .mcp

@@ -17,8 +17,8 @@
 //! error rather than silently misinterpreted.
 
 use a2a_rs::domain::{
-    Artifact, Message, Part, Role, Task as WireTask, TaskArtifactUpdateEvent, TaskState,
-    TaskStatus, TaskStatusUpdateEvent,
+    Artifact, Message, Part, Task as WireTask, TaskArtifactUpdateEvent, TaskState, TaskStatus,
+    TaskStatusUpdateEvent,
 };
 use buffa::MessageField;
 use buffa_types::google::protobuf::{Struct, Timestamp};
@@ -73,7 +73,7 @@ fn metadata(v: Value) -> MessageField<Struct> {
 
 /// Whether a projection carries agentd's own facts about the task.
 ///
-/// They ride only under the task-annotations/v1 URI, and only for a caller
+/// They ride only under the task-annotations URI, and only for a caller
 /// that activated it: an extension a client did not ask for is not the
 /// client's to parse, and a strict peer then sees nothing but the spec's
 /// fields.
@@ -231,7 +231,7 @@ pub fn history_of(t: &Task) -> Vec<Message> {
         .collect()
 }
 
-/// The task-annotations/v1 object: what agentd knows about a task that the
+/// The task-annotations object: what agentd knows about a task that the
 /// spec has no field for, in the shape that extension's schema publishes.
 ///
 /// Every key is a documented name, never a serde rendering of a Rust type — a
@@ -444,49 +444,6 @@ pub fn artifact_event(
     }
 }
 
-/// The text a caller sent, concatenated across the message's text parts. A
-/// non-text part (a file, a data command) contributes nothing here — commands
-/// are read separately, by [`command`].
-pub fn message_text(m: &Message) -> String {
-    let mut out = String::new();
-    for p in &m.parts {
-        if let Some(a2a_rs::domain::part::Content::Text(t)) = &p.content {
-            if !out.is_empty() {
-                out.push('\n');
-            }
-            out.push_str(t);
-        }
-    }
-    out
-}
-
-/// agentd's command envelope, if this message carries one: a DataPart shaped
-/// `{"agentd": {"op": "...", ...}}`. This is an agentd extension riding the
-/// spec's data part, not an A2A concept.
-pub fn command(m: &Message) -> Option<(String, Value)> {
-    for p in &m.parts {
-        let Some(a2a_rs::domain::part::Content::Data(d)) = &p.content else {
-            continue;
-        };
-        let Ok(v) = serde_json::to_value(d) else {
-            continue;
-        };
-        let inner = v.get("data").unwrap_or(&v);
-        let Some(env) = inner.get("agentd") else {
-            continue;
-        };
-        if let Some(op) = env.get("op").and_then(Value::as_str) {
-            return Some((op.to_string(), env.clone()));
-        }
-    }
-    None
-}
-
-/// Whether a message came from the human/peer side rather than the agent.
-pub fn is_from_caller(m: &Message) -> bool {
-    m.role.as_known() != Some(Role::ROLE_AGENT)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -666,7 +623,7 @@ mod tests {
         assert_eq!(ids, ["s6", "s7", "s8", "s9"]);
     }
 
-    /// agentd's facts about a task are the task-annotations/v1 object under
+    /// agentd's facts about a task are the task-annotations object under
     /// that extension's URI, in its documented shape — present only when the
     /// caller activated it, never on a webhook, and never under an ad-hoc
     /// `agentd/` key anywhere.
@@ -844,23 +801,6 @@ mod tests {
             back.status.as_option().unwrap().state.as_known(),
             Some(TaskState::TASK_STATE_SUBMITTED)
         );
-    }
-
-    #[test]
-    fn text_and_commands_are_read_from_their_parts() {
-        let mut m = Message::user_text("please".into(), "m1".into());
-        assert_eq!(message_text(&m), "please");
-        assert!(command(&m).is_none());
-        assert!(is_from_caller(&m));
-
-        m.parts.push(Part::data(
-            serde_json::from_value(json!({"agentd": {"op": "status"}})).unwrap(),
-        ));
-        let (op, env) = command(&m).expect("a command DataPart");
-        assert_eq!(op, "status");
-        assert_eq!(env["op"], "status");
-        // The text half is unchanged by the command riding alongside it.
-        assert_eq!(message_text(&m), "please");
     }
 
     /// Every id the agent mints is in the reserved namespace, whatever the

@@ -92,16 +92,17 @@ fn boot(cfg_for: impl Fn(u16) -> String) -> Daemon {
     panic!("the daemon never bound an A2A listener (5 attempts); last stderr:\n{last}")
 }
 
-/// A loopback daemon on a file store under `dir`, with `retention` as its
-/// `store.retention.tasks` block (empty keeps everything). No principals, so
-/// the test is the operator. `waiter` parks on a signal, so its task stays
-/// WORKING; `approve` asks a human, so its task waits INPUT_REQUIRED.
-fn retention_config(dir: &str, retention: &str, port: u16) -> String {
+/// A loopback daemon on `store` (a [`file_store`] or [`MEMORY_STORE`]), with
+/// `retention` as its `store.retention.tasks` block (empty keeps everything).
+/// No principals, so the test is the operator. `waiter` parks on a signal, so
+/// its task stays WORKING; `approve` asks a human, so its task waits
+/// INPUT_REQUIRED.
+fn retention_config(store: &str, retention: &str, port: u16) -> String {
     format!(
         "config_version: \"1\"\n\
          agent:\n  name: retention-e2e\n  instruction: You are a helpful test agent.\n  preflight: never\n\
          intelligence:\n  endpoints: \"mock:final\"\n  model: mock\n\
-         store:\n  kind: file\n  file:\n    path: {dir}/state\n{retention}\
+         store:\n{store}{retention}\
          a2a:\n  listen: http://127.0.0.1:{port}\n  events:\n    enabled: true\n\
          workflows:\n\
          \x20 - name: waiter\n    steps:\n      s: {{kind: manual}}\n      w: {{kind: wait, on: signal, signal: go, depends_on: [s]}}\n      f: {{kind: finish, depends_on: [w]}}\n\
@@ -110,6 +111,15 @@ fn retention_config(dir: &str, retention: &str, port: u16) -> String {
          observability:\n  log_level: info\n"
     )
 }
+
+/// The `store` block body of a file store under `dir`: what a restart reads
+/// back, so what an eviction must reach.
+fn file_store(dir: &str) -> String {
+    format!("  kind: file\n  file:\n    path: {dir}/state\n")
+}
+
+/// The `store` block body of a store that writes nothing to disk.
+const MEMORY_STORE: &str = "  kind: memory\n";
 
 /// The task `id` as `GetTask` answers it: `Some(state)`, or `None` for the
 /// spec's "task not found".
@@ -192,7 +202,7 @@ fn terminal_tasks_are_evicted_and_announced() {
     let keep_one = "  retention:\n    tasks:\n      keep_last: 1\n";
 
     // ── keep_last: the bound holds at every finish ──────────────────────────
-    let daemon = boot(|port| retention_config(&dir, keep_one, port));
+    let daemon = boot(|port| retention_config(&file_store(&dir), keep_one, port));
     let addr = daemon.addr.clone();
     let working = start(&addr, "waiter");
     wait_state(&addr, &working, Some("TASK_STATE_WORKING"), 10);
@@ -232,7 +242,7 @@ fn terminal_tasks_are_evicted_and_announced() {
     drop(daemon);
 
     // ── a restart that keeps everything still has none of them ─────────────
-    let daemon = boot(|port| retention_config(&dir, "", port));
+    let daemon = boot(|port| retention_config(&file_store(&dir), "", port));
     let addr = daemon.addr.clone();
     assert_eq!(state_of(&addr, &t1), None, "the store forgot t1 too");
     assert_eq!(state_of(&addr, &t2), None, "the store forgot t2 too");
@@ -248,8 +258,13 @@ fn terminal_tasks_are_evicted_and_announced() {
     drop(daemon);
 
     // ── ttl: a finished task ages out with nothing else happening ──────────
-    let daemon =
-        boot(|port| retention_config(&dir, "  retention:\n    tasks:\n      ttl: 1s\n", port));
+    let daemon = boot(|port| {
+        retention_config(
+            &file_store(&dir),
+            "  retention:\n    tasks:\n      ttl: 1s\n",
+            port,
+        )
+    });
     let addr = daemon.addr.clone();
     wait_state(&addr, &t3, None, 15);
     // A task finished in this life, then nothing: no transition follows it,
@@ -283,25 +298,45 @@ fn terminal_tasks_are_evicted_and_announced() {
 /// finishes, and concurrent callers finish between one another's event and
 /// read. Evicting in that gap answered a caller whose task COMPLETED with
 /// "task not found". Once read, each is still dropped as the bound says.
+///
+/// The race is between the reactor's eviction and a2a-rs's read, and no
+/// store takes part in it, so the daemon keeps its tasks in memory. On a file
+/// store every checkpoint is two fsyncs on the single-writer loop, and on a
+/// disk other builds were writing to, the 40 turns ran past a2a-rs's 25 s
+/// send-wait. A send whose wait runs out is answered with its task still
+/// unsettled. That is a slow host, not this defect, so an unsettled answer is
+/// held only to being the caller's own task. The race needs settled answers
+/// to happen at all, though, so a run where none settled proves nothing and
+/// fails as such.
 #[test]
 fn a_blocking_send_is_answered_with_its_task_under_any_bound() {
-    let dir = common::unique_path("retention-e2e-race", "d");
-    std::fs::create_dir_all(&dir).unwrap();
-    let daemon =
-        boot(|port| retention_config(&dir, "  retention:\n    tasks:\n      keep_last: 0\n", port));
+    let daemon = boot(|port| {
+        retention_config(
+            MEMORY_STORE,
+            "  retention:\n    tasks:\n      keep_last: 0\n",
+            port,
+        )
+    });
     let addr = daemon.addr.clone();
-    let answers: Vec<serde_json::Value> = std::thread::scope(|s| {
+    let answers: Vec<(String, serde_json::Value)> = std::thread::scope(|s| {
         let sends: Vec<_> = (0..40)
             .map(|i| {
                 let addr = &addr;
-                s.spawn(move || SendMessage::text(&format!("hello {i}")).post(addr))
+                s.spawn(move || {
+                    let text = format!("hello {i}");
+                    let v = SendMessage::text(&text).post(addr);
+                    (text, v)
+                })
             })
             .collect();
         sends.into_iter().map(|h| h.join().unwrap()).collect()
     });
+    // The defect: an answer that is not the caller's own task. An evicted
+    // task comes back as -32001, which has no task at all.
     let lost: Vec<&serde_json::Value> = answers
         .iter()
-        .filter(|v| v["result"]["task"]["status"]["state"] != "TASK_STATE_COMPLETED")
+        .filter(|(text, v)| v["result"]["task"]["history"][0]["parts"][0]["text"] != *text)
+        .map(|(_, v)| v)
         .collect();
     assert!(
         lost.is_empty(),
@@ -309,11 +344,38 @@ fn a_blocking_send_is_answered_with_its_task_under_any_bound() {
         lost.len(),
         answers.len()
     );
-    for v in &answers {
+    let state = |v: &serde_json::Value| v["result"]["task"]["status"]["state"].clone();
+    let settled = answers
+        .iter()
+        .filter(|(_, v)| state(v) == "TASK_STATE_COMPLETED")
+        .count();
+    let odd: Vec<&serde_json::Value> = answers
+        .iter()
+        .map(|(_, v)| v)
+        .filter(|v| {
+            ![
+                "TASK_STATE_COMPLETED",
+                "TASK_STATE_SUBMITTED",
+                "TASK_STATE_WORKING",
+            ]
+            .iter()
+            .any(|s| state(v) == *s)
+        })
+        .collect();
+    assert!(
+        odd.is_empty(),
+        "a send that neither finished nor is still running: {odd:?}"
+    );
+    assert!(
+        settled > 0,
+        "none of the {} sends settled within a2a-rs's send-wait, so no answer \
+         was read after its task finished and the race never ran",
+        answers.len()
+    );
+    for (_, v) in &answers {
         wait_state(&addr, v["result"]["task"]["id"].as_str().unwrap(), None, 15);
     }
     drop(daemon);
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// Two users and the operator, over the in-process mock model.

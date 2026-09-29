@@ -139,7 +139,9 @@ process running as the same user can read the launcher's environment through
 **File descriptors.** Everything the launcher opens is close-on-exec, so
 nothing the daemon spawns — the exec tool, instances, subagents — inherits the
 terminal, the pipe or the UI's socket; the one descriptor a client is meant to
-have reaches fd 3 in that client only.
+have reaches fd 3 in that client only. A descriptor the launcher itself
+inherited beyond its stdio is marked close-on-exec before it opens anything,
+so it reaches neither the client nor the daemon's children.
 
 ### How the launched client signs in
 

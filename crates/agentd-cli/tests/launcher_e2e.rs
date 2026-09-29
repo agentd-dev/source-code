@@ -221,8 +221,51 @@ impl Drop for Running {
     }
 }
 
+/// Where GitHub's runners leave two pipes open without close-on-exec in every
+/// process they start. Every launch here inherits a pipe on these numbers, so
+/// each host sees what a CI runner hands agentd: the descriptor tests fail
+/// wherever a stray descriptor could leak, not only where one happens to.
+const STRAY_FDS: [i32; 2] = [142, 145];
+
+/// Arrange for `cmd`'s process — and only it — to inherit both ends of a
+/// fresh pipe on [`STRAY_FDS`], without close-on-exec, as a careless parent
+/// would leave them. The test's own ends are close-on-exec, so no other
+/// process the test binary spawns sees them; they close when `cmd` has been
+/// spawned, leaving the spawned process the only holder.
+fn inherit_stray_pipe(cmd: &mut Command) {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::process::CommandExt;
+    let mut fds = [0 as libc::c_int; 2];
+    #[cfg(target_os = "linux")]
+    let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    #[cfg(not(target_os = "linux"))]
+    let rc = unsafe {
+        let rc = libc::pipe(fds.as_mut_ptr());
+        for fd in fds {
+            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+        rc
+    };
+    assert_eq!(rc, 0, "pipe: {}", std::io::Error::last_os_error());
+    let ends = unsafe { [OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])] };
+    let srcs = [ends[0].as_raw_fd(), ends[1].as_raw_fd()];
+    unsafe {
+        cmd.pre_exec(move || {
+            // `ends` is moved in, so the pipe outlives this closure's use.
+            let _ = &ends;
+            for (src, dst) in srcs.into_iter().zip(STRAY_FDS) {
+                // dup2 leaves the copy without close-on-exec: inherited.
+                if libc::dup2(src, dst) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+}
+
 /// Start the launcher and return at once; `stdin` is a pipe the test holds
-/// when `typed`, else /dev/null.
+/// when `typed`, else /dev/null. It inherits a stray pipe on [`STRAY_FDS`].
 fn start(s: &Scratch, args: &[&str], env: &[(&str, &str)], typed: bool) -> Running {
     let err = std::fs::File::create(s.path("launcher.err")).unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_agentd"));
@@ -233,6 +276,7 @@ fn start(s: &Scratch, args: &[&str], env: &[(&str, &str)], typed: bool) -> Runni
     for (k, v) in env {
         cmd.env(k, v);
     }
+    inherit_stray_pipe(&mut cmd);
     let mut child = cmd.spawn().expect("spawn the launcher");
     let stdin = child.stdin.take();
     Running { child, stdin }
@@ -328,7 +372,8 @@ fn tui_code(s: &Scratch) -> String {
 #[test]
 fn the_launcher_passes_only_the_contract() {
     // tui: `--endpoint <url> --launch-fd 3`, the scrubbed environment, the
-    // terminal on 0/1/2 and the code's pipe on 3 — and no other descriptor.
+    // terminal on 0/1/2 and the code's pipe on 3 — and no other descriptor,
+    // not even the stray pipe the launcher itself inherited.
     let s = Scratch::new();
     let port = free_port();
     let cfg = s.write(
@@ -1345,9 +1390,10 @@ fn proc_fds(pid: i32) -> BTreeMap<u32, String> {
 
 /// Nothing the launcher holds for its client reaches a process the daemon
 /// spawns: a model-driven `exec` child has its stdio and no other descriptor
-/// — not the operator's terminal, not the code's pipe, not the UI's socket —
-/// and every descriptor the launcher itself holds beyond its stdio is
-/// close-on-exec, so no later child can inherit one either.
+/// — not the operator's terminal, not the code's pipe, not the UI's socket,
+/// not the stray pipe the launcher inherited — and every descriptor the
+/// launcher itself holds beyond its stdio is close-on-exec, so no later child
+/// can inherit one either.
 ///
 /// The code's pipe is closed before this child is spawned, so its own
 /// close-on-exec is not what this run sees: the launcher's unit test
@@ -1467,4 +1513,93 @@ fn launcher_fds_never_reach_daemon_children() {
         let (status, err) = run.finish(&s);
         assert!(status.success(), "{sub}: {status:?}: {err}");
     }
+}
+
+/// A daemon started without the launcher holds to the same rule: a
+/// descriptor it inherited without close-on-exec — here the stray pipe on
+/// [`STRAY_FDS`] — is marked at start, so its `exec` child holds its stdio
+/// and nothing else.
+#[cfg(all(
+    target_os = "linux",
+    feature = "exec",
+    any(feature = "internal-mocks", debug_assertions)
+))]
+#[test]
+fn a_daemon_hands_no_inherited_fd_to_its_children() {
+    let s = Scratch::new();
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let playbook = s.write(
+        "playbook.json",
+        &json!({"turns": [
+            {"tool_calls": [{"name": "exec", "arguments": {"cmd": "sleep", "args": ["30"]}}]},
+            {"content": "slept"}
+        ]})
+        .to_string(),
+    );
+    let workdir = s.path("work");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let cfg = s.write(
+        "agentd.yaml",
+        &format!(
+            "\
+             agent:\n  name: daemon-fds\n  instruction: Test.\n  preflight: never\n\
+             intelligence:\n  endpoints: \"mock:file:{playbook}\"\n  model: mock\n\
+             store:\n  kind: memory\n\
+             security:\n  exec:\n    enabled: true\n    allow: [sleep]\n    workdir: {}\n    timeout: 60s\n\
+             a2a:\n  listen: http://127.0.0.1:{port}\n\
+             lifecycle:\n  run_until: drained\n  drain_timeout: 2s\n",
+            workdir.display()
+        ),
+    );
+    let err = std::fs::File::create(s.path("daemon.err")).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_agentd"));
+    cmd.args(["--config", &cfg])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(err));
+    inherit_stray_pipe(&mut cmd);
+    // Held in a `Running` so a failed assertion still kills it.
+    let daemon = Running {
+        child: cmd.spawn().expect("spawn the daemon"),
+        stdin: None,
+    };
+    let pid = daemon.child.id() as i32;
+    let stray = proc_fds(pid).get(&(STRAY_FDS[0] as u32)).cloned();
+    assert!(
+        stray.as_deref().is_some_and(|t| t.starts_with("pipe:[")),
+        "the daemon inherited the stray pipe: {stray:?}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while std::net::TcpStream::connect(&addr).is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "the daemon never listened; stderr:\n{}",
+            s.read("daemon.err")
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    SendMessage::text("sleep, please")
+        .return_immediately()
+        .result(&addr);
+    let sleeper = loop {
+        if let Some(pid) = children_named(pid, "sleep").first() {
+            break *pid;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the exec tool never ran sleep; stderr:\n{}",
+            s.read("daemon.err")
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let fds = proc_fds(sleeper);
+    unsafe { libc::kill(sleeper, libc::SIGKILL) };
+    drop(daemon);
+    assert_eq!(
+        fds.keys().copied().collect::<Vec<_>>(),
+        vec![0, 1, 2],
+        "the exec child holds its stdio only, not the daemon's inherited pipe {stray:?}: {fds:?}"
+    );
 }

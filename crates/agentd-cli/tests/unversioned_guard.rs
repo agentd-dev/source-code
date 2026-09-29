@@ -18,12 +18,11 @@
 
 use std::path::{Path, PathBuf};
 
-/// Where agentd's own identifiers live, relative to the workspace root.
+/// Where agentd's own identifiers live, relative to the workspace root: the
+/// code, and every page and client that names them to a reader.
 ///
-/// The display clients (`interface/`) and the prose (`docs/`, the RFCs) join
-/// this list once they are clean (unit U39 of the v1.17.0 plan). History —
-/// `CHANGELOG.md`, the older RFCs, `docs/design/` — is never scanned: it
-/// records what was, versions included.
+/// History — `CHANGELOG.md`, the RFCs before 0043 and their index,
+/// `docs/design/` — is never scanned: it records what was, versions included.
 const ROOTS: &[&str] = &[
     "crates",
     "examples",
@@ -33,19 +32,31 @@ const ROOTS: &[&str] = &[
     "packaging",
     "web/public/schema",
     "web/public/a2a",
-    "web/lib/workflow-nodes.json",
-    "web/lib/extensions.json",
+    "web/public/llms.txt",
+    "web/lib",
+    "web/app",
     "contrib/schemastore-catalog-entry.json",
     "Dockerfile",
+    "install.sh",
+    "interface",
+    "docs",
+    "skills",
+    "README.md",
+    "SECURITY.md",
+    "CONFORMANCE.md",
+    "rfcs/0043-a2a-boundary-and-device-authorization.md",
+    "rfcs/0044-enterprise-managed-authorization.md",
 ];
 
 /// Trees under the roots that are not agentd's to spell: build output,
-/// dependencies, and the vendored upstream Instruction Specification corpus,
-/// which is checked against the published one byte for byte.
+/// dependencies, the design notes (history, like the older RFCs), and the
+/// vendored upstream Instruction Specification corpus, which is checked
+/// against the published one byte for byte.
 const SKIP_DIRS: &[&str] = &[
     "target",
     "node_modules",
     "dist",
+    "docs/design",
     "crates/agentd-cli/tests/instruction-spec-corpus",
     "crates/instruction/tests",
 ];
@@ -176,6 +187,41 @@ fn retired_tokens(line: &str) -> Vec<&'static str> {
     out
 }
 
+/// Each `AGENT_<X>` variable the line names. `AGENTD_*` is the only prefix
+/// agentd reads; the older `AGENT_*` spelling was a second name for every
+/// variable, and a page that still offers it tells a reader to set something
+/// nothing reads. Checked in prose only: the code and its tests name those
+/// variables on purpose, to prove they are ignored.
+fn legacy_env_prefix(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(i) = line[from..].find("AGENT_") {
+        let at = from + i;
+        let end = at + "AGENT_".len();
+        let before = line[..at].chars().next_back();
+        if !before.is_some_and(is_word)
+            && line[end..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_uppercase())
+        {
+            let name: String = line[at..].chars().take_while(|c| is_word(*c)).collect();
+            out.push(format!("{name} (agentd reads AGENTD_* only)"));
+        }
+        from = end;
+    }
+    out
+}
+
+/// A page a person reads, rather than code: where [`legacy_env_prefix`]
+/// applies.
+fn is_prose(rel: &Path) -> bool {
+    rel == Path::new("install.sh")
+        || rel
+            .extension()
+            .is_some_and(|e| matches!(e.to_str(), Some("md" | "mdx" | "txt" | "jsx")))
+}
+
 /// Every hit on one line, described.
 fn hits(line: &str) -> Vec<String> {
     let mut out = versioned_agentd_paths(line);
@@ -186,13 +232,13 @@ fn hits(line: &str) -> Vec<String> {
 
 fn skipped(rel: &Path) -> bool {
     let rel_str = rel.to_string_lossy();
-    rel.components()
-        .any(|c| matches!(c.as_os_str().to_str(), Some("target" | "node_modules" | "dist")))
-        || SKIP_DIRS.iter().any(|d| rel_str.starts_with(d))
+    rel.components().any(|c| {
+        matches!(
+            c.as_os_str().to_str(),
+            Some("target" | "node_modules" | "dist")
+        )
+    }) || SKIP_DIRS.iter().any(|d| rel_str.starts_with(d))
         || rel == Path::new("crates/agentd-cli/tests/unversioned_guard.rs")
-        // The crates' READMEs are prose, and prose joins the scan with docs/.
-        || (rel.starts_with("crates") && rel.extension().is_some_and(|e| e == "md"))
-        || (rel.starts_with("examples") && rel.extension().is_some_and(|e| e == "md"))
 }
 
 fn walk(root: &Path, rel: &Path, out: &mut Vec<PathBuf>) {
@@ -236,8 +282,13 @@ fn no_agentd_identifier_carries_a_version() {
         let Ok(text) = std::fs::read_to_string(root.join(rel)) else {
             continue;
         };
+        let prose = is_prose(rel);
         for (n, line) in text.lines().enumerate() {
-            for h in hits(line) {
+            let mut line_hits = hits(line);
+            if prose {
+                line_hits.extend(legacy_env_prefix(line));
+            }
+            for h in line_hits {
                 found.push(format!("{}:{}: {h}", rel.display(), n + 1));
             }
         }
@@ -267,6 +318,21 @@ fn the_scan_finds_each_shape_and_nothing_else() {
         "--config-schema=1",
     ] {
         assert!(!hits(caught).is_empty(), "missed: {caught}");
+    }
+    for caught in ["set `AGENT_MODEL` instead", "AGENT_INTELLIGENCE_TOKEN=…"] {
+        assert!(!legacy_env_prefix(caught).is_empty(), "missed: {caught}");
+    }
+    for clean in [
+        "AGENTD_MODEL",
+        "SUBAGENT_ENV",
+        "AGENT_",
+        "the AGENT_md file",
+    ] {
+        assert!(
+            legacy_env_prefix(clean).is_empty(),
+            "false hit on {clean}: {:?}",
+            legacy_env_prefix(clean)
+        );
     }
     for clean in [
         "\"https://agentd.dev/a2a/ext/command\"",

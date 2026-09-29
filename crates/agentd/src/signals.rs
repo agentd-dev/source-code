@@ -304,6 +304,48 @@ mod imp {
         }
     }
 
+    pub fn cloexec_inherited_fds() {
+        // One syscall on Linux 5.11+: it sets the flag on every descriptor
+        // from 3 up and closes none of them.
+        #[cfg(target_os = "linux")]
+        {
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_close_range,
+                    3 as libc::c_uint,
+                    libc::c_uint::MAX,
+                    libc::CLOSE_RANGE_CLOEXEC,
+                )
+            };
+            if rc == 0 {
+                return;
+            }
+        }
+        // An older kernel, or another unix: walk the descriptor table. The
+        // listing's own descriptor is in it, already close-on-exec and closed
+        // by the time the flag is set, which `fcntl` refuses harmlessly.
+        let dir = if cfg!(target_os = "linux") {
+            "/proc/self/fd"
+        } else {
+            "/dev/fd"
+        };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let fds: Vec<libc::c_int> = entries
+            .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+            .filter(|fd| *fd >= 3)
+            .collect();
+        for fd in fds {
+            unsafe {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags >= 0 {
+                    libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+                }
+            }
+        }
+    }
+
     /// Test-only: clear the one-way `DRAINING`/`FORCE` latches (production has no
     /// clear — drain is monotonic for a process's life). The signals test guard
     /// uses this so a draining test cannot poison readiness for later tests that
@@ -361,6 +403,24 @@ mod imp {
         -1
     }
     pub fn drain_wakeup() {}
+    pub fn cloexec_inherited_fds() {}
+}
+
+/// Mark every descriptor this process inherited beyond its stdio
+/// close-on-exec. Call first thing at process start, before anything is opened
+/// that is meant to be handed on.
+///
+/// Whatever started agentd may have left descriptors open without the flag —
+/// a CI runner's pipes, a shell's redirections, a supervisor's sockets — and
+/// every process agentd spawns (the exec tool, subagents, instances, a
+/// launched display client) would otherwise inherit them: a pipe held open by
+/// a stranger never reaches end-of-file, and a descriptor is a capability the
+/// child was never granted. agentd itself keeps using them; only a later
+/// `exec` drops them. Nothing agentd hands a child arrives by inheritance
+/// from its own parent: the launcher's fd 3 is one it creates and places
+/// between fork and exec, so marking everything is the whole rule.
+pub fn cloexec_inherited_fds() {
+    imp::cloexec_inherited_fds();
 }
 
 /// Install SIGTERM/SIGINT/SIGCHLD/SIGPIPE handlers + the self-pipe. Call once

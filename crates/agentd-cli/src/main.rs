@@ -21,6 +21,10 @@ fn main() {
 /// Picks the role this process plays — launcher, hidden mock, subagent
 /// re-exec or the supervisor — from argv and the environment alone.
 fn dispatch() -> i32 {
+    // Before any role opens anything: a descriptor this process inherited
+    // without close-on-exec would reach every child the launcher, the daemon
+    // or a subagent spawns.
+    agentd::signals::cloexec_inherited_fds();
     let argv: Vec<String> = std::env::args().collect();
 
     // `agentd tui …` / `agentd ui …`: the thin launcher — the daemon exactly as

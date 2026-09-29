@@ -34,7 +34,9 @@
 //! instances, subagents — and none of them may inherit the operator's
 //! terminal, the pipe holding a launch code or the UI's socket. The one fd a
 //! client is meant to have reaches descriptor 3 only in that client, between
-//! fork and exec.
+//! fork and exec. What the launcher inherited itself is marked close-on-exec
+//! by `main` before any role runs ([`agentd::signals::cloexec_inherited_fds`]),
+//! so a stray descriptor from whatever started it reaches no child either.
 //!
 //! Child processes: the daemon's reaper collects every exited child of this
 //! process (`waitpid(-1)`), the launcher's own included, so the client and the

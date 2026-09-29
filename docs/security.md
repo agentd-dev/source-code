@@ -690,6 +690,9 @@ match (an admitted origin other than the code's, or any `Origin` on a TUI's code
 saved terminal, the daemon log — is close-on-exec, and the one a client is meant to have reaches
 fd 3 only in that client, between fork and exec. So no process the daemon spawns — the `exec`
 tool, an instance, a subagent — inherits the operator's terminal, the pipe or the UI socket.
+And at start, before it opens anything, every agentd process — the launcher, a daemon however it
+was started, a subagent — marks close-on-exec each descriptor it inherited beyond its stdio, so a
+pipe or socket its own parent left open reaches none of its children either.
 
 **The session is the operator's.** It acts for the person who ran the launcher, who started
 this daemon in-process from their own configuration and credentials — and, on a no-auth

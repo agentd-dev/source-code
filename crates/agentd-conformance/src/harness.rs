@@ -173,13 +173,19 @@ impl Harness {
     /// Spawn agentd as a long-lived daemon with `args`; returns a guard that
     /// SIGTERMs it on drop.
     pub fn spawn(&self, args: &[&str]) -> Daemon {
-        self.spawn_exe(&self.agentd, args)
+        self.spawn_env(args, &[])
     }
 
-    /// Spawn an arbitrary agentd binary as a daemon, capturing nothing.
-    fn spawn_exe(&self, exe: &Path, args: &[&str]) -> Daemon {
-        let child = Command::new(exe)
-            .args(args)
+    /// Like [`Harness::spawn`], with extra environment variables — how a check
+    /// hands the daemon a credential its config names as `{{secret:NAME}}`,
+    /// since agentd refuses one written inline.
+    pub fn spawn_env(&self, args: &[&str], env: &[(&str, &str)]) -> Daemon {
+        let mut cmd = Command::new(&self.agentd);
+        cmd.args(args);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let child = cmd
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()

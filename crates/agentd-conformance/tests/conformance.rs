@@ -3,12 +3,13 @@
 //! checks against a freshly-built agentd and asserting every check passes. The
 //! same checks back the `agentd-conformance` runner binary.
 
-use agentd_conformance::{Check, Harness, checks, run_check};
+use agentd_conformance::{Category, Harness, family, run_check};
 
-fn run_family(name: &str, family: Vec<Check>) {
+fn run_family(category: Category) {
+    let checks = family(category);
     let h = Harness::new();
     let mut failures = Vec::new();
-    for c in &family {
+    for c in &checks {
         let o = run_check(&h, c);
         if !o.passed {
             failures.push(format!("  {}: {}", c.id, o.detail));
@@ -17,44 +18,70 @@ fn run_family(name: &str, family: Vec<Check>) {
     assert!(
         failures.is_empty(),
         "{} conformance failures ({}/{}):\n{}",
-        name,
+        category.as_str(),
         failures.len(),
-        family.len(),
+        checks.len(),
         failures.join("\n")
     );
 }
 
 #[test]
 fn supervisor_conformance() {
-    run_family("supervisor", checks::supervisor::checks());
+    run_family(Category::Supervisor);
 }
 
 #[test]
 fn security_conformance() {
-    run_family("security", checks::security::checks());
+    run_family(Category::Security);
 }
 
 #[test]
 fn store_conformance() {
-    run_family("store", checks::store::checks());
+    run_family(Category::Store);
 }
 
 #[test]
 fn durability_conformance() {
-    run_family("durability", checks::durability::checks());
+    run_family(Category::Durability);
 }
 
 #[test]
 fn tools_conformance() {
-    run_family("tools", checks::tools::checks());
+    run_family(Category::Tools);
 }
 
 #[test]
 fn a2a_conversation_conformance() {
-    run_family("a2a-conversation", checks::a2a_conversation::checks());
+    run_family(Category::A2aConversation);
 }
 
 #[test]
-fn interface_conformance() {
-    run_family("interface", checks::interface::checks());
+fn events_conformance() {
+    run_family(Category::Events);
+}
+
+#[test]
+fn extensions_conformance() {
+    run_family(Category::Extensions);
+}
+
+#[test]
+fn auth_conformance() {
+    run_family(Category::Auth);
+}
+
+/// Every family runs as a test above: one missing here would never run under
+/// `cargo test`, and CI would stay green over it.
+#[test]
+fn every_family_is_a_test() {
+    let this = include_str!("conformance.rs");
+    for c in Category::ALL {
+        let call = format!("run_family(Category::{c:?});");
+        assert_eq!(
+            this.matches(&call).count(),
+            1,
+            "{} has no #[test] of its own here",
+            c.as_str()
+        );
+    }
 }

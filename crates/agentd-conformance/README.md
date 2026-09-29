@@ -31,12 +31,22 @@ the environment — so there are no capability-gated checks to skip.
 | `store`            | a job backed by an MCP store runs, and a restarted instance restores the completed run without re-firing its `once` start. |
 | `durability`       | a SIGKILL before and during a step is recovered by the next life.   |
 | `tools`            | internal tools round-trip to the supervisor, an invented tool is answered as an error, and `--capabilities` lists the registry. |
-| `a2a-conversation` | the A2A 1.0 JSON-RPC surface: the agent card, command DataParts, conversational turns as task artifacts, `GetTask`/`ListTasks`, and the error codes. |
-| `interface`        | the observation feed (`agentd.events/SubscribeToEvents`): off by default, gated on the events extension, `hello` + ring replay; the human-in-the-loop gate; the browser-origin CORS path. |
+| `a2a-conversation` | the core A2A 1.0 surface: the version gate and the method vocabulary, reads answered as Messages with no task, turns as task artifacts with their history, `input-required` on the core wire, push delivery, the card's promises, and the error codes. |
+| `events`           | the observation feed the events extension declares: off by default, strict params, `hello` + ring replay. |
+| `extensions`       | activation by `A2A-Extensions` is the only way in (commands and methods), results are a Task or a Message, and metadata keys are declared extension URIs. |
+| `auth`             | the card's security fields match what the listener enforces, the extended card needs a declared credential, and browsers are admitted only from listed origins. |
+
+Every check, and what it proves, is listed in the repository's
+[`CONFORMANCE.md`](../../CONFORMANCE.md).
 
 ## Adding a check
 
 Append a `Check { id, category, desc, run }` to the relevant family's
 `checks()`. The `run` function takes `&Harness` and returns an `Outcome`
 (`pass` / `note` / `fail` / `require(cond, why)`). It is picked up automatically
-by both the tests and the runner.
+by both the tests and the runner; add its row to the family's table in
+`CONFORMANCE.md`, which a unit test holds to the registration. A new family is
+a `Category` variant listed in `Category::ALL`, an arm of `family()`, a
+`#[test]` in `tests/conformance.rs` and a row above: the compiler requires the
+arm, and the suite's tests require the `#[test]` and both tables' rows for
+every family in `Category::ALL`.

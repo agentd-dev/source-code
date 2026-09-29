@@ -42,9 +42,19 @@ pub const A2A_VERSION: &str = "1.0";
 /// The request line and headers of a POST to `/`. Every request the suite
 /// sends is written here, so none of them can omit the version.
 fn post_head(body_len: usize, extra: &[(&str, &str)]) -> String {
+    head_stating(Some(A2A_VERSION), body_len, extra)
+}
+
+/// The head of a POST to `/` that states `version` in `A2A-Version`, or sends
+/// no such header for `None`. Only the version gate's own check chooses the
+/// version; every other request goes through [`post_head`].
+fn head_stating(version: Option<&str>, body_len: usize, extra: &[(&str, &str)]) -> String {
     let mut head = format!(
-        "POST / HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nA2A-Version: {A2A_VERSION}\r\nContent-Length: {body_len}\r\nConnection: close\r\n"
+        "POST / HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {body_len}\r\nConnection: close\r\n"
     );
+    if let Some(v) = version {
+        head.push_str(&format!("A2A-Version: {v}\r\n"));
+    }
     for (k, v) in extra {
         head.push_str(&format!("{k}: {v}\r\n"));
     }
@@ -52,33 +62,121 @@ fn post_head(body_len: usize, extra: &[(&str, &str)]) -> String {
     head
 }
 
-/// Read one HTTP response to the end; returns `(status, body)`.
-fn read_reply(s: TcpStream) -> (u16, String) {
-    let mut reader = BufReader::new(s);
+/// A response's header fields, names lowercased.
+pub type Headers = Vec<(String, String)>;
+
+/// The value of the header `name` (lowercase), if the response carried it.
+pub fn header<'h>(headers: &'h Headers, name: &str) -> Option<&'h str> {
+    headers
+        .iter()
+        .find(|(k, _)| k == name)
+        .map(|(_, v)| v.as_str())
+}
+
+/// Read a response's status line and header fields.
+fn read_head(reader: &mut BufReader<TcpStream>) -> (u16, Headers) {
     let mut status = String::new();
     reader.read_line(&mut status).unwrap();
+    let mut headers = Vec::new();
     loop {
         let mut l = String::new();
         reader.read_line(&mut l).unwrap();
         if l.trim().is_empty() {
             break;
         }
+        if let Some((k, v)) = l.split_once(':') {
+            headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
+        }
     }
-    let mut b = String::new();
-    reader.read_to_string(&mut b).unwrap();
     let code = status
         .split_whitespace()
         .nth(1)
         .and_then(|c| c.parse().ok())
         .unwrap_or(0);
-    (code, b)
+    (code, headers)
+}
+
+/// Read one HTTP response to the end; returns `(status, headers, body)`. A
+/// chunked body (an SSE stream) is returned with its chunk framing, which no
+/// check parses past: the frames are found by their `data:` lines.
+fn read_reply(s: TcpStream) -> (u16, Headers, String) {
+    let mut reader = BufReader::new(s);
+    let (code, headers) = read_head(&mut reader);
+    let mut raw = Vec::new();
+    reader.read_to_end(&mut raw).ok();
+    if header(&headers, "transfer-encoding").is_some_and(|v| v.eq_ignore_ascii_case("chunked")) {
+        raw = dechunk(&raw);
+    }
+    (code, headers, String::from_utf8_lossy(&raw).into_owned())
+}
+
+/// The payload of a chunked body. Decoded rather than read with the framing
+/// left in, because a chunk boundary may fall inside an SSE frame, and a check
+/// that parses frames must see each one whole.
+fn dechunk(mut raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    while let Some(eol) = raw.windows(2).position(|w| w == b"\r\n") {
+        let size = std::str::from_utf8(&raw[..eol])
+            .ok()
+            .and_then(|l| usize::from_str_radix(l.split(';').next()?.trim(), 16).ok());
+        let Some(size) = size.filter(|n| *n > 0) else {
+            break;
+        };
+        let start = eol + 2;
+        let end = (start + size).min(raw.len());
+        out.extend_from_slice(&raw[start..end]);
+        raw = raw.get(end + 2..).unwrap_or_default();
+    }
+    out
+}
+
+/// POST a JSON-RPC body with `extra` headers; returns the status, the
+/// headers and the body — for a check that judges the HTTP layer too.
+pub fn post_full(addr: &str, body: &str, extra: &[(&str, &str)]) -> (u16, Headers, String) {
+    let s = open(addr, body, extra);
+    s.set_read_timeout(Some(Duration::from_secs(30))).ok();
+    read_reply(s)
+}
+
+/// POST a JSON-RPC body stating `version` in `A2A-Version` (or none); returns
+/// the envelope. The version gate's check is the only caller.
+pub fn post_stating(addr: &str, version: Option<&str>, body: &str) -> Value {
+    let mut s = TcpStream::connect(addr).expect("connect a2a http");
+    s.set_read_timeout(Some(Duration::from_secs(30))).ok();
+    s.write_all(head_stating(version, body.len(), &[]).as_bytes())
+        .unwrap();
+    s.write_all(body.as_bytes()).unwrap();
+    let (_, _, reply) = read_reply(s);
+    serde_json::from_str(&reply).unwrap_or_else(|_| panic!("non-JSON A2A response: {reply:?}"))
+}
+
+/// One raw HTTP exchange; `(status, headers, body)`. By hand, because what a
+/// browser sends — its `Origin`, its preflight — or a GET of the card is the
+/// thing under test, not a JSON-RPC call.
+pub fn exchange(
+    addr: &str,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> (u16, Headers, String) {
+    let mut req = format!("{method} {path} HTTP/1.1\r\nHost: x\r\n");
+    for (k, v) in headers {
+        req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    req.push_str(&format!(
+        "Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    ));
+    let mut s = TcpStream::connect(addr).expect("connect a2a http");
+    s.set_read_timeout(Some(Duration::from_secs(30))).ok();
+    s.write_all(req.as_bytes()).expect("write request");
+    read_reply(s)
 }
 
 /// POST a JSON-RPC body with `extra` headers; returns the response body.
 pub fn post(addr: &str, body: &str, extra: &[(&str, &str)]) -> String {
-    let s = open(addr, body, extra);
-    s.set_read_timeout(Some(Duration::from_secs(30))).ok();
-    read_reply(s).1
+    post_full(addr, body, extra).2
 }
 
 /// POST and hand back the connection, for a caller reading an SSE stream.
@@ -118,7 +216,7 @@ pub fn get_card(addr: &str) -> Value {
         b"GET /.well-known/agent-card.json HTTP/1.1\r\nHost: x\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
     )
     .unwrap();
-    let (status, body) = read_reply(s);
+    let (status, _, body) = read_reply(s);
     assert_eq!(status, 200, "GET agent-card.json: {status} {body:?}");
     serde_json::from_str(&body).unwrap_or_else(|_| panic!("non-JSON agent card: {body:?}"))
 }
@@ -206,6 +304,168 @@ fn command_params(uri: &str, op: &str) -> Value {
         },
         "configuration": {"returnImmediately": false},
     })
+}
+
+/// Send the command `op` dressed the way a careless client would: `activate`
+/// says whether the `A2A-Extensions` header names the extension, `mark` whether
+/// the message lists it. A client that read the card does both; the checks
+/// that prove each one is REQUIRED leave it out. Returns the envelope.
+pub fn send_command_dressed(addr: &str, id: i64, op: &str, activate: bool, mark: bool) -> Value {
+    let uri = command_uri(&get_card(addr));
+    let mut params = command_params(&uri, op);
+    if !mark {
+        params["message"]
+            .as_object_mut()
+            .expect("a message")
+            .remove("extensions");
+    }
+    let headers: &[(&str, &str)] = if activate {
+        &[("A2A-Extensions", &uri)]
+    } else {
+        &[]
+    };
+    let resp = post(addr, &rpc_body(id, "SendMessage", params), headers);
+    serde_json::from_str(&resp).unwrap_or_else(|_| panic!("non-JSON A2A response: {resp:?}"))
+}
+
+/// Send the command `op`, marked, with `activation` as the whole
+/// `A2A-Extensions` value — for a check that activates another extension
+/// beside the command one. Returns the envelope.
+pub fn send_command_activating(addr: &str, id: i64, op: &str, activation: &str) -> Value {
+    let uri = command_uri(&get_card(addr));
+    let resp = post(
+        addr,
+        &rpc_body(id, "SendMessage", command_params(&uri, op)),
+        &[("A2A-Extensions", activation)],
+    );
+    serde_json::from_str(&resp).unwrap_or_else(|_| panic!("non-JSON A2A response: {resp:?}"))
+}
+
+/// Stream the command `op` (`SendStreamingMessage`), dressed as a client that
+/// read the card; the status, the headers and the frames.
+pub fn stream_command(addr: &str, id: i64, op: &str) -> (u16, Headers, Vec<Frame>) {
+    let uri = command_uri(&get_card(addr));
+    stream(
+        addr,
+        &rpc_body(id, "SendStreamingMessage", command_params(&uri, op)),
+        &[("A2A-Extensions", &uri)],
+    )
+}
+
+/// One server-sent event: its `id:` line, if it had one, and its data.
+#[derive(Debug, Clone)]
+pub struct Frame {
+    pub id: Option<String>,
+    pub data: Value,
+}
+
+/// The events of an SSE body, in order. A `data:` line that is not JSON is
+/// kept as a string, so a malformed frame fails the check that reads it
+/// rather than vanishing.
+pub fn sse_frames(body: &str) -> Vec<Frame> {
+    let mut frames = Vec::new();
+    for event in body.split("\n\n") {
+        let mut id = None;
+        let mut data = String::new();
+        for line in event.lines() {
+            if let Some(v) = line.strip_prefix("id:") {
+                id = Some(v.trim().to_string());
+            } else if let Some(v) = line.strip_prefix("data:") {
+                data.push_str(v.trim());
+            }
+        }
+        if !data.is_empty() {
+            let data = serde_json::from_str(&data).unwrap_or(Value::String(data));
+            frames.push(Frame { id, data });
+        }
+    }
+    frames
+}
+
+/// POST a streaming request and read the stream to its close; the status,
+/// the headers and the frames (none when the answer was plain JSON).
+pub fn stream(addr: &str, body: &str, extra: &[(&str, &str)]) -> (u16, Headers, Vec<Frame>) {
+    let (status, headers, reply) = post_full(addr, body, extra);
+    (status, headers, sse_frames(&reply))
+}
+
+/// POST a request whose answer may be a stream that never closes (the feed),
+/// and return as soon as the first frame arrives: the status, the headers,
+/// and the first frame's data — or, for a plain JSON answer, the envelope.
+pub fn first_frame(addr: &str, body: &str, extra: &[(&str, &str)]) -> (u16, Headers, Value) {
+    let s = open(addr, body, extra);
+    s.set_read_timeout(Some(Duration::from_secs(10))).ok();
+    let mut reader = BufReader::new(s);
+    let (status, headers) = read_head(&mut reader);
+    let sse = header(&headers, "content-type").is_some_and(|c| c.starts_with("text/event-stream"));
+    if !sse {
+        let mut b = Vec::new();
+        reader.read_to_end(&mut b).ok();
+        if header(&headers, "transfer-encoding").is_some_and(|v| v.eq_ignore_ascii_case("chunked"))
+        {
+            b = dechunk(&b);
+        }
+        let v = serde_json::from_slice(&b).unwrap_or(Value::Null);
+        return (status, headers, v);
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        if let Some(data) = line.strip_prefix("data:")
+            && let Ok(v) = serde_json::from_str::<Value>(data.trim())
+        {
+            return (status, headers, v);
+        }
+    }
+    (status, headers, Value::Null)
+}
+
+/// A JSON-RPC call presenting `bearer`; the status, the headers and the
+/// envelope (`Null` when the body is not JSON).
+pub fn rpc_as(
+    addr: &str,
+    bearer: &str,
+    id: i64,
+    method: &str,
+    params: Value,
+) -> (u16, Headers, Value) {
+    let auth = format!("Bearer {bearer}");
+    let extra: &[(&str, &str)] = if bearer.is_empty() {
+        &[]
+    } else {
+        &[("Authorization", &auth)]
+    };
+    let (status, headers, body) = post_full(addr, &rpc_body(id, method, params), extra);
+    (
+        status,
+        headers,
+        serde_json::from_str(&body).unwrap_or(Value::Null),
+    )
+}
+
+/// A free loopback port (bind :0, read it, drop). agentd rebinds within ms.
+pub fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind ephemeral")
+        .local_addr()
+        .expect("local_addr")
+        .port()
+}
+
+/// The URIs of every extension the card declares, in its order.
+pub fn declared_extensions(card: &Value) -> Vec<String> {
+    card["capabilities"]["extensions"]
+        .as_array()
+        .map(|exts| {
+            exts.iter()
+                .filter_map(|e| e["uri"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Block until the listener accepts a connection, or fail past the deadline.

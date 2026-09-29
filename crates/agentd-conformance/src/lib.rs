@@ -35,16 +35,38 @@ pub enum Category {
     /// The tool registry: internal tools round-trip to the supervisor,
     /// an unknown tool is answered as an error, and the introspected surface.
     Tools,
-    /// A2A conversations: the JSON-RPC surface — command DataParts,
-    /// natural-language turns landing as task artifacts, GetTask/ListTasks, card.
+    /// A2A conversations: the core JSON-RPC surface — the version gate and
+    /// method vocabulary, reads that answer without a task, natural-language
+    /// turns landing as task artifacts with their history, the
+    /// `input-required` gate, push delivery, and the card's promises.
     A2aConversation,
-    /// The display-client interface: the default-OFF gate, the
-    /// SubscribeToEvents feed (hello + ring replay), and the human-in-the-loop
-    /// gate round-trip.
-    Interface,
+    /// The observation feed the events extension declares: off unless the
+    /// operator enables it, strict about its params, hello + ring replay.
+    Events,
+    /// The extension contract: activation by the `A2A-Extensions` header is
+    /// the only way in, a result is a Task or a Message, and agentd's facts
+    /// travel only under a declared extension URI.
+    Extensions,
+    /// Authentication honesty: the card declares exactly what the listener
+    /// enforces, the extended card needs a declared credential, and a browser
+    /// reaches the agent only from a listed origin.
+    Auth,
 }
 
 impl Category {
+    /// Every family, in report order: the one list the docs are held to.
+    pub const ALL: [Category; 9] = [
+        Category::Supervisor,
+        Category::Security,
+        Category::Store,
+        Category::Durability,
+        Category::Tools,
+        Category::A2aConversation,
+        Category::Events,
+        Category::Extensions,
+        Category::Auth,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Category::Supervisor => "supervisor",
@@ -53,7 +75,9 @@ impl Category {
             Category::Durability => "durability",
             Category::Tools => "tools",
             Category::A2aConversation => "a2a-conversation",
-            Category::Interface => "interface",
+            Category::Events => "events",
+            Category::Extensions => "extensions",
+            Category::Auth => "auth",
         }
     }
 }
@@ -130,15 +154,114 @@ pub fn run_check(h: &Harness, check: &Check) -> Outcome {
     }
 }
 
+/// The checks of one family. The match is exhaustive, so a new family cannot
+/// be declared without saying where its checks live.
+pub fn family(category: Category) -> Vec<Check> {
+    match category {
+        Category::Supervisor => checks::supervisor::checks(),
+        Category::Security => checks::security::checks(),
+        Category::Store => checks::store::checks(),
+        Category::Durability => checks::durability::checks(),
+        Category::Tools => checks::tools::checks(),
+        Category::A2aConversation => checks::a2a_conversation::checks(),
+        Category::Events => checks::events::checks(),
+        Category::Extensions => checks::extensions::checks(),
+        Category::Auth => checks::auth::checks(),
+    }
+}
+
 /// Every conformance check across all families, in a stable order.
 pub fn all_checks() -> Vec<Check> {
-    let mut v = Vec::new();
-    v.extend(checks::supervisor::checks());
-    v.extend(checks::security::checks());
-    v.extend(checks::store::checks());
-    v.extend(checks::durability::checks());
-    v.extend(checks::tools::checks());
-    v.extend(checks::a2a_conversation::checks());
-    v.extend(checks::interface::checks());
-    v
+    Category::ALL.into_iter().flat_map(family).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The section of `CONFORMANCE.md` that lists the checks: per family, in
+    /// report order, a row per check naming it and what it proves — written
+    /// from the checks themselves, so the page cannot claim a check that does
+    /// not exist or describe one differently from the report.
+    fn checks_section() -> String {
+        let mut out = String::new();
+        for c in Category::ALL {
+            out.push_str(&format!(
+                "### `{}`\n\n| Check | What it proves |\n|---|---|\n",
+                c.as_str()
+            ));
+            for check in family(c) {
+                out.push_str(&format!("| `{}` | {} |\n", check.id, check.desc));
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn conformance_md_lists_exactly_the_checks() {
+        let doc = include_str!("../../../CONFORMANCE.md");
+        let section = checks_section();
+        assert!(
+            doc.contains(&section),
+            "CONFORMANCE.md must list the checks exactly as they are registered:\n\n{section}"
+        );
+        // …and nothing else: every table row in the page is one of those.
+        let rows = |s: &str| s.lines().filter(|l| l.starts_with("| `")).count();
+        assert_eq!(
+            rows(doc),
+            rows(&section),
+            "CONFORMANCE.md lists a check that does not exist"
+        );
+    }
+
+    /// The crate README's family table names the families there are, in
+    /// report order.
+    #[test]
+    fn the_readme_names_every_family() {
+        let readme = include_str!("../README.md");
+        let named: Vec<&str> = readme
+            .lines()
+            .filter_map(|l| l.strip_prefix("| `"))
+            .filter_map(|l| l.split_once('`').map(|(name, _)| name))
+            .collect();
+        let families: Vec<&str> = Category::ALL.iter().map(|c| c.as_str()).collect();
+        assert_eq!(named, families);
+    }
+
+    /// A check's id names its family, ids are unique, and a description can
+    /// sit in a table cell.
+    #[test]
+    fn check_ids_are_unique_and_name_their_family() {
+        let checks = all_checks();
+        let mut ids: Vec<&str> = checks.iter().map(|c| c.id).collect();
+        for c in &checks {
+            assert!(
+                c.id.starts_with(&format!("{}/", c.category.as_str())),
+                "{} is not in the {} family's namespace",
+                c.id,
+                c.category.as_str()
+            );
+            assert!(
+                !c.desc.contains('|'),
+                "{}: `|` would split its table row",
+                c.id
+            );
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), checks.len(), "two checks share an id");
+        for c in Category::ALL {
+            assert!(
+                family(c).iter().all(|check| check.category == c),
+                "{}: a check registered under another family",
+                c.as_str()
+            );
+            assert!(
+                !family(c).is_empty(),
+                "{}: a family with no checks",
+                c.as_str()
+            );
+        }
+    }
 }

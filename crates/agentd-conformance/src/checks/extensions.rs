@@ -14,15 +14,12 @@ use serde_json::{Value, json};
 
 use crate::checks::events;
 use crate::checks::util::{
-    Frame, command_uri, declared_extensions, first_frame, free_port, get_card, header, mock_llm,
-    post, rpc_body, send_command, send_command_activating, send_command_dressed, stream,
+    ANNOTATIONS, Frame, command_uri, declared_extensions, first_frame, free_port, get_card, header,
+    mock_llm, post, rpc_body, send_command, send_command_activating, send_command_dressed, stream,
     stream_command, text_params, wait_ready, write_file,
 };
 use crate::harness::{Daemon, MockLlm, TempDir};
 use crate::{Category, Check, Harness, Outcome};
-
-/// The task-annotations extension's URI, as the card declares it.
-const ANNOTATIONS: &str = "https://agentd.dev/a2a/ext/task-annotations";
 
 pub fn checks() -> Vec<Check> {
     vec![
@@ -324,6 +321,22 @@ fn metadata_keys(v: &Value, out: &mut Vec<String>) {
     }
 }
 
+/// Every A2A `Task` in a reply: an object with an `id`, a `contextId` and a
+/// `status`. A status-update event names its task by `taskId`, so it is not
+/// one.
+fn tasks_in<'a>(v: &'a Value, out: &mut Vec<&'a Value>) {
+    match v {
+        Value::Object(o) => {
+            if o.contains_key("id") && o.contains_key("contextId") && o.contains_key("status") {
+                out.push(v);
+            }
+            o.values().for_each(|child| tasks_in(child, out));
+        }
+        Value::Array(a) => a.iter().for_each(|x| tasks_in(x, out)),
+        _ => {}
+    }
+}
+
 fn no_bare_metadata(h: &Harness) -> Outcome {
     let booted = boot(h, false);
     let addr = booted.addr.as_str();
@@ -384,8 +397,12 @@ fn no_bare_metadata(h: &Harness) -> Outcome {
         out
     };
 
+    // Activated, EVERY task each reply carries has its annotations — one
+    // reply that has them cannot cover another that dropped them — and each
+    // reply but the later stream frames carries a task to hold to that. Not
+    // activated, none has them.
     for activate in [true, false] {
-        let mut annotated = 0;
+        let mut first_frame = true;
         for (what, reply) in replies(activate) {
             if reply.get("error").is_some() || reply.is_null() {
                 return Outcome::fail(format!("{what} should be answered: {reply}"));
@@ -397,18 +414,29 @@ fn no_bare_metadata(h: &Harness) -> Outcome {
                     "{what}: metadata key {stray:?} is not the URI of a declared extension: {reply}"
                 ));
             }
-            annotated += found.iter().filter(|k| *k == ANNOTATIONS).count();
-        }
-        if activate && annotated == 0 {
-            return Outcome::fail(
-                "with task-annotations activated, the tasks should carry annotations under its URI"
-                    .to_string(),
-            );
-        }
-        if !activate && annotated > 0 {
-            return Outcome::fail(
-                "without task-annotations activated, no task may carry its annotations".to_string(),
-            );
+            if !activate {
+                if found.iter().any(|k| k == ANNOTATIONS) {
+                    return Outcome::fail(format!(
+                        "{what}: without task-annotations activated, no task may carry its annotations: {reply}"
+                    ));
+                }
+                continue;
+            }
+            let mut tasks = Vec::new();
+            tasks_in(&reply, &mut tasks);
+            let is_frame = what == "a SendStreamingMessage frame";
+            if tasks.is_empty() && (!is_frame || first_frame) {
+                return Outcome::fail(format!("{what} should carry a task: {reply}"));
+            }
+            first_frame &= !is_frame;
+            if let Some(bare) = tasks
+                .iter()
+                .find(|t| t["metadata"].get(ANNOTATIONS).is_none())
+            {
+                return Outcome::fail(format!(
+                    "{what}: with task-annotations activated, a task carries no annotations under its URI: {bare}"
+                ));
+            }
         }
     }
     Outcome::pass()

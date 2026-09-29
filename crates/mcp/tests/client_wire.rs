@@ -8,10 +8,12 @@
 //!   nothing else: MCP reserves `params._meta`, and a strict tool schema
 //!   (`additionalProperties: false`) refuses a stray `_meta` argument.
 //! * A caller's per-call bound governs: a tool that never answers is a timeout
-//!   error inside the bound, not a wait for the connection's long default.
+//!   error inside the bound, not a wait for the connection's long default —
+//!   and the call it abandoned holds up no call after it.
+//! * A call whose exchange fails says why (`HTTP 503`), not only that it ended.
 //! * The `GET` notification stream carries the operator's credential, the
 //!   negotiated `MCP-Protocol-Version`, and on a reconnect the `Last-Event-ID`
-//!   it resumes from.
+//!   it resumes from; a first dial that fails is dialled again.
 //! * Each operator header goes out exactly once per request: `Authorization`
 //!   is not a list-valued field (RFC 9110 §5.3), so a doubled one is ambiguous.
 
@@ -59,6 +61,9 @@ enum GetMode {
     ResumableOnce,
     /// `405 Method Not Allowed`: the server offers no push channel.
     NotAllowed,
+    /// The first dial gets `503` — a server mid-restart — and later dials
+    /// open a stream carrying one notification, then stay open quietly.
+    UnavailableOnce,
 }
 
 fn read_req(r: &mut BufReader<TcpStream>) -> Option<Req> {
@@ -138,6 +143,20 @@ fn spawn_server(seen: Seen, get: GetMode) -> String {
                                 b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                             );
                         }
+                        GetMode::UnavailableOnce if n == 1 => {
+                            let _ = w.write_all(
+                                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            );
+                        }
+                        GetMode::UnavailableOnce => {
+                            let _ = w.write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                            );
+                            let note = json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"});
+                            let _ = w.write_all(format!("data: {note}\n\n").as_bytes());
+                            let _ = w.flush();
+                            std::thread::sleep(Duration::from_secs(10));
+                        }
                         GetMode::ResumableOnce => {
                             let _ = w.write_all(
                                 b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
@@ -186,6 +205,11 @@ fn spawn_server(seen: Seen, get: GetMode) -> String {
                         ]}}),
                     ),
                     "tools/call" => match msg["params"]["name"].as_str() {
+                        Some("unavailable") => {
+                            let _ = w.write_all(
+                                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            );
+                        }
                         Some("silent") => {
                             // Hold the exchange open and say nothing, until
                             // the client gives up and closes it.
@@ -347,6 +371,48 @@ fn a_call_bound_ends_a_silent_tool_and_the_client_drops_promptly() {
 }
 
 #[test]
+fn a_call_abandoned_at_its_bound_does_not_hold_the_next_one() {
+    // The SDK sends every message on a connection from one worker, which waits
+    // for each send before the next. A send that waited for the server's
+    // first word would leave every later call behind a silent one until the
+    // socket timed out — the connection's minute here, far past any bound.
+    let seen: Seen = Arc::default();
+    let ep = spawn_server(Arc::clone(&seen), GetMode::NotAllowed);
+    let c = connect(&ep, vec![], Duration::from_secs(60));
+
+    let r = c.call_tool_with_meta_within(
+        "silent",
+        Some(json!({})),
+        json!({}),
+        Duration::from_millis(300),
+    );
+    assert!(r.is_err(), "a silent tool answered");
+
+    let bound = Duration::from_secs(3);
+    let started = Instant::now();
+    let r = c
+        .call_tool_with_meta_within("echo", Some(json!({"s": "next"})), json!({}), bound)
+        .expect("the next call answers inside its own bound");
+    assert!(!r.is_error(), "{}", r.text());
+    assert!(started.elapsed() < bound, "took {:?}", started.elapsed());
+    drop(c);
+}
+
+#[test]
+fn a_call_whose_exchange_fails_reports_the_transports_reason() {
+    // A call's answer reaches the SDK on a stream, so an exchange that fails
+    // before the server says anything has to be turned into an answer there —
+    // the SDK's own for a stream that closed early says only that it closed.
+    let seen: Seen = Arc::default();
+    let ep = spawn_server(Arc::clone(&seen), GetMode::NotAllowed);
+    let c = connect(&ep, vec![], Duration::from_secs(10));
+    match c.call_tool("unavailable", Some(json!({}))) {
+        Err(e) => assert!(e.to_string().contains("HTTP 503"), "{e}"),
+        Ok(r) => panic!("a 503 answered: {}", r.text()),
+    }
+}
+
+#[test]
 fn every_post_carries_each_operator_header_exactly_once() {
     let seen: Seen = Arc::default();
     let ep = spawn_server(Arc::clone(&seen), GetMode::NotAllowed);
@@ -433,5 +499,31 @@ fn a_server_without_a_notification_stream_is_not_redialled() {
     std::thread::sleep(Duration::from_secs(3));
     let gets = seen.lock().unwrap().iter().filter(|r| r.is_get()).count();
     assert_eq!(gets, 1, "the GET was redialled {gets} times");
+    drop(c);
+}
+
+#[test]
+fn a_notification_stream_whose_first_dial_fails_is_dialled_again() {
+    // The SDK takes an error from the first dial as final and never dials
+    // again, so a server that was briefly down when the connection came up
+    // would lose its push channel for the life of the connection — its
+    // `resources/updated` wakes with it — while every call kept working.
+    let seen: Seen = Arc::default();
+    let ep = spawn_server(Arc::clone(&seen), GetMode::UnavailableOnce);
+    let c = connect(&ep, vec![], Duration::from_secs(10));
+
+    let until = Instant::now() + Duration::from_secs(10);
+    let mut notes = Vec::new();
+    while notes.is_empty() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(100));
+        notes = c.drain_notifications();
+    }
+    let gets = seen.lock().unwrap().iter().filter(|r| r.is_get()).count();
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.method == "notifications/tools/list_changed"),
+        "no notification arrived after a failed first dial ({gets} GETs): {notes:?}"
+    );
     drop(c);
 }

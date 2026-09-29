@@ -347,20 +347,18 @@ impl Runtime {
         if !labels.is_empty() {
             meta["agent/labels"] = json!(labels);
         }
-        let timeout = self
-            .settings
-            .mcp
-            .default_timeout
-            .map(|d| d.0)
-            .unwrap_or(Duration::from_secs(60));
         let tx = self.events_tx.clone();
         let target = ExecTarget::from(caller);
         let call_ctx = ctx.clone();
         std::thread::Builder::new()
             .name(format!("tool:{tool_name}"))
             .spawn(move || {
-                let res =
-                    client.call_tool_with_meta_within(&mapping.tool, Some(mcp_args), meta, timeout);
+                // No bound of our own: the server's own `timeout` caps each
+                // silence on its socket, and a live call — a long tool, an
+                // operator answering an elicitation — is left to finish. A
+                // fixed default here would cut off a server configured
+                // with a longer `timeout` than the default.
+                let res = client.call_tool_with_meta(&mapping.tool, Some(mcp_args), meta);
                 let (result, is_error) = match res {
                     Ok(r) => {
                         // The result mapping sees `result`, the original `args` and `ctx`.
@@ -423,22 +421,16 @@ impl Runtime {
         if !labels.is_empty() {
             meta["agent/labels"] = json!(labels);
         }
-        let timeout = self
-            .settings
-            .mcp
-            .default_timeout
-            .map(|d| d.0)
-            .unwrap_or(Duration::from_secs(60));
         let tx = self.events_tx.clone();
         let target = ExecTarget::from(caller);
         std::thread::Builder::new()
             .name(format!("mcp:{server}.{tool}"))
             .spawn(move || {
-                let (result, is_error) =
-                    match client.call_tool_with_meta_within(&tool, Some(args), meta, timeout) {
-                        Ok(r) => (super::worker::tool_result_value(&r), r.is_error()),
-                        Err(e) => (Value::String(format!("transport error: {e}")), true),
-                    };
+                // Unbounded as a whole, for the reason `run_mapped` gives.
+                let (result, is_error) = match client.call_tool_with_meta(&tool, Some(args), meta) {
+                    Ok(r) => (super::worker::tool_result_value(&r), r.is_error()),
+                    Err(e) => (Value::String(format!("transport error: {e}")), true),
+                };
                 target.send(&tx, result, is_error);
             })
             .ok();

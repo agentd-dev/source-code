@@ -27,10 +27,17 @@ The specification says four things worth memorising.
 header listing what was *actually* activated. Asking for something the agent
 does not implement is not an error; it simply is not echoed back.
 
-**URIs are identifiers, not addresses.** Nobody is expected to fetch them. The
-specification (A2A 1.0.1 §4.6.3) suggests a version in the URI, and requires
-(§4.6.3, §5.8) that a breaking change take a *new* URI rather than redefine an
-old one. agentd's URIs carry no version: a version in an identifier agentd owns
+**Each URI is an identifier and an address.** A peer matches the URI exactly —
+neither case nor a trailing slash is forgiven — and can also fetch it:
+agentd.dev serves each extension's normative specification at its URI and the
+schema bundle at `<uri>/schema.json`, as A2A's extension guidance recommends
+for a third-party extension. The specifications are
+[command](https://agentd.dev/a2a/ext/command),
+[events](https://agentd.dev/a2a/ext/events) and
+[task-annotations](https://agentd.dev/a2a/ext/task-annotations).
+
+A2A 1.0.1 §4.6.3 suggests a version in the URI, and requires (§4.6.3, §5.8)
+that a breaking change take a *new* URI rather than redefine an old one. agentd's URIs carry no version: a version in an identifier agentd owns
 would be a second name for the same thing. An incompatible change takes a new
 URI under a new name.
 

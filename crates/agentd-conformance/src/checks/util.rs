@@ -20,6 +20,14 @@ use std::time::{Duration, Instant};
 use crate::harness::{Harness, MockLlm, TempDir};
 use serde_json::{Value, json};
 
+/// The URIs of the extensions agentd declares, each spelled once for the
+/// whole suite. They are wire strings a spec-only peer reads off the card, not
+/// a link into agentd, so naming them keeps the suite a black box; a check
+/// still confirms a card declares one before it relies on it.
+pub const COMMAND: &str = "https://agentd.dev/a2a/ext/command";
+pub const EVENTS: &str = "https://agentd.dev/a2a/ext/events";
+pub const ANNOTATIONS: &str = "https://agentd.dev/a2a/ext/task-annotations";
+
 /// Write `contents` to `name` inside `tmp`; return the absolute path.
 pub fn write_file(tmp: &TempDir, name: &str, contents: &str) -> String {
     let p = tmp.path().join(name);
@@ -231,7 +239,7 @@ pub fn command_uri(card: &Value) -> String {
         .and_then(|exts| {
             exts.iter()
                 .filter_map(|e| e["uri"].as_str())
-                .find(|u| *u == "https://agentd.dev/a2a/ext/command")
+                .find(|u| *u == COMMAND)
         })
         .unwrap_or_else(|| panic!("the card declares no command extension: {card}"))
         .to_string()
@@ -247,7 +255,8 @@ pub fn feed_method() -> &'static str {
 /// events extension, which the method belongs to and is refused without, and
 /// task-annotations, which a `task` event carries only when activated.
 pub fn feed_activation() -> &'static str {
-    "https://agentd.dev/a2a/ext/events, https://agentd.dev/a2a/ext/task-annotations"
+    static VALUE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VALUE.get_or_init(|| format!("{EVENTS}, {ANNOTATIONS}"))
 }
 
 /// A fresh `messageId`: no two messages the suite sends share one.
@@ -527,13 +536,13 @@ mod tests {
     #[test]
     fn the_command_uri_is_the_declared_one() {
         let card = json!({"capabilities": {"extensions": [
-            {"uri": "https://agentd.dev/a2a/ext/events"},
-            {"uri": "https://agentd.dev/a2a/ext/command"},
+            {"uri": EVENTS},
+            {"uri": COMMAND},
         ]}});
-        assert_eq!(command_uri(&card), "https://agentd.dev/a2a/ext/command");
+        assert_eq!(command_uri(&card), COMMAND);
         let look_alike = json!({"capabilities": {"extensions": [
-            {"uri": "https://agentd.dev/a2a/ext/command/"},
-            {"uri": "https://agentd.dev/a2a/ext/commands"},
+            {"uri": format!("{COMMAND}/")},
+            {"uri": format!("{COMMAND}s")},
         ]}});
         assert!(std::panic::catch_unwind(|| command_uri(&look_alike)).is_err());
     }

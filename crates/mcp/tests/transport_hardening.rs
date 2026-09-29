@@ -275,17 +275,21 @@ fn spawn_elicit_server(state: Arc<Answered>) -> String {
                 let _ = w.write_all(format!("data: {ask}\n\n").as_bytes());
                 let _ = w.flush();
 
-                // Block on the answer, exactly as a real elicitation does. The
-                // bound is what keeps a failing run finite instead of hung.
+                // Block on the answer, exactly as a real elicitation does,
+                // keeping the stream alive with SSE comments the way a server
+                // waiting on a human does. The bound is what keeps a failing
+                // run finite instead of hung.
                 let mut got = state.got.lock().unwrap();
-                let deadline = Duration::from_secs(3);
+                let deadline = Duration::from_secs(5);
                 let start = Instant::now();
                 while got.is_none() && start.elapsed() < deadline {
                     let (g, _) = state
                         .wake
-                        .wait_timeout(got, deadline - start.elapsed())
+                        .wait_timeout(got, Duration::from_millis(100))
                         .unwrap();
                     got = g;
+                    let _ = w.write_all(b": keepalive\n\n");
+                    let _ = w.flush();
                 }
                 let answered = got.is_some();
                 drop(got);
@@ -314,7 +318,7 @@ fn a_request_interleaved_on_a_post_stream_is_answered_not_buffered() {
         .expect("connect");
 
     let out = client
-        .call_tool("ask", Some(json!({})), None, Duration::from_secs(10))
+        .call_tool("ask", Some(json!({})), None, Some(Duration::from_secs(10)))
         .expect("tools/call must complete — the server is waiting on our answer");
     assert_eq!(
         out["content"][0]["text"], "answered",
@@ -324,7 +328,7 @@ fn a_request_interleaved_on_a_post_stream_is_answered_not_buffered() {
     // The answer is a JSON-RPC RESPONSE, which the server acks `202` with no
     // body — a transport that waited for a reply to it would fail that send.
     let again = client
-        .call_tool("ask", Some(json!({})), None, Duration::from_secs(10))
+        .call_tool("ask", Some(json!({})), None, Some(Duration::from_secs(10)))
         .expect("the session survives having answered");
     assert_eq!(again["content"][0]["text"], "answered", "{again}");
 
@@ -341,6 +345,61 @@ fn a_request_interleaved_on_a_post_stream_is_answered_not_buffered() {
     assert_eq!(
         got["result"]["content"]["env"], "staging",
         "the host's answer reached the server: {got}"
+    );
+}
+
+/// Answers like a person: after a while.
+struct SaysYesSlowly(Duration);
+impl InboundHandler for SaysYesSlowly {
+    fn handle(&self, _req: Inbound) -> Option<Answer> {
+        std::thread::sleep(self.0);
+        Some(Answer::Accept(json!({"env": "staging"})))
+    }
+}
+
+#[test]
+fn an_operator_slower_than_the_connection_timeout_still_completes_the_call() {
+    // The connection's timeout is a transport's — how long a socket may stay
+    // silent — and a server that waits on a human keeps its stream alive. The
+    // human's time is not the transport's: a call carrying an elicitation the
+    // operator answers after that timeout must still complete.
+    let state: Arc<Answered> = Arc::default();
+    let ep = spawn_elicit_server(Arc::clone(&state));
+    let timeout = Duration::from_millis(400);
+    let h: Arc<dyn InboundHandler> = Arc::new(SaysYesSlowly(timeout * 3));
+    let mut c = mcp::client::McpClient::connect("elicit", &ep, vec![], timeout)
+        .expect("connect")
+        .with_elicitation(h);
+    c.initialize().expect("initialize");
+
+    let r = c
+        .call_tool("ask", Some(json!({})))
+        .expect("the call waits for the operator, not for the connection timeout");
+    assert_eq!(r.text(), "answered", "{}", r.text());
+}
+
+#[test]
+fn a_bound_fires_while_the_operator_is_still_answering() {
+    // A caller's deadline counts the operator's time too, and it has to fire
+    // ON time: the host answers synchronously, and an answer awaited where the
+    // SDK's worker runs would stall the timer until the human had answered —
+    // the caller told "timed out" only after the answer went to the server.
+    let state: Arc<Answered> = Arc::default();
+    let ep = spawn_elicit_server(Arc::clone(&state));
+    let h: Arc<dyn InboundHandler> = Arc::new(SaysYesSlowly(Duration::from_secs(3)));
+    let mut c = mcp::client::McpClient::connect("elicit", &ep, vec![], Duration::from_secs(10))
+        .expect("connect")
+        .with_elicitation(h);
+    c.initialize().expect("initialize");
+
+    let bound = Duration::from_millis(400);
+    let started = Instant::now();
+    let r = c.call_tool_with_meta_within("ask", Some(json!({})), json!({}), bound);
+    let took = started.elapsed();
+    assert!(r.is_err(), "the call outlived its bound");
+    assert!(
+        took < Duration::from_millis(1500),
+        "the bound fired only after the operator answered ({took:?})"
     );
 }
 

@@ -682,7 +682,7 @@ fn input_required(h: &Harness) -> Outcome {
     let card = get_card(&a.addr);
     if declared_extensions(&card)
         .iter()
-        .any(|u| u == "https://agentd.dev/a2a/ext/events")
+        .any(|u| u == crate::checks::util::EVENTS)
     {
         return Outcome::fail(format!(
             "this daemon enables no feed, so the gate below would not prove the core carries it: {card}"

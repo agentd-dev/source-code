@@ -272,19 +272,26 @@ on each update (notify-then-read).
 
 ### 1.7 Liveness and lifecycle
 
-Every request is bounded, though not all by the same clock. The supervisor's
-own connections — the boot handshake, `tools/list` — honour that server's
-timeout (`mcp.servers[].timeout`, else `mcp.default_timeout`, default **60s**),
-and the registry-routed calls the runtime dispatches — a workflow's `tool:`
-step, its `memory.*`/`artifact.*`/`knowledge.*`/`search.*` steps — take
-`mcp.default_timeout` directly. A workflow's own `mcp.tool` step is bounded by
-that step's `timeout` instead (else `limits.step_timeout`, default **600s**),
-because it names its server itself rather than routing through the registry.
-The in-loop `tools/call`s a turn worker or a subagent makes are bounded by a
-fixed **60s**: the spawn payload carries no per-server timeout, so neither dial
-reaches the child. Either way a wedged server cannot hang the loop: the call
-fails, the failure becomes an observation, and the run carries on. Its `ping`
-method is available as an explicit liveness round-trip.
+Every request is bounded, though not all by the same clock. A connection's
+timeout — that server's `mcp.servers[].timeout`, else `mcp.default_timeout`,
+default **60s** — caps each silence on it: the boot handshake, a `tools/list`,
+or a call whose server has gone quiet fails once the server has said nothing
+for that long. A call that is alive is not cut off by it — a tool streaming
+progress, or a server waiting on an operator to answer its elicitation — and
+that is the whole bound on the registry-routed calls the runtime dispatches (a
+workflow's `tool:` step, its `memory.*`/`artifact.*`/`knowledge.*`/`search.*`
+steps) and on a subagent's in-loop calls. A call made against a deadline is
+also bounded by that deadline as a whole, an operator's answer included: a
+workflow's own `mcp.tool` step by that step's `timeout` (else
+`limits.step_timeout`, default **600s**), because it names its server itself
+rather than routing through the registry, and a turn worker's in-loop call by
+what is left of the turn's deadline, at most **600s**. The connections a turn
+worker or a subagent dials take a fixed **60s**: the spawn payload carries no
+per-server timeout, so neither reaches the child. Either way a wedged server
+cannot hang the loop: the call fails, the failure becomes an observation, and
+the run carries on. A call abandoned at its bound holds up no other call on
+the same connection. Its `ping` method is available as an explicit liveness
+round-trip.
 
 Because agentd spawns no process for an MCP server, there is no child to signal
 or reap — closing the HTTP connection *is* the shutdown. The notification thread

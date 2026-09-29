@@ -110,10 +110,23 @@ impl ClientHandler for Handler {
         let Some(handler) = &self.elicitation else {
             return Ok(declined());
         };
-        let answer = handler.handle(inbound::Inbound::Elicit {
-            message,
-            requested_schema,
+        // The host answers synchronously and may wait minutes for a human.
+        // Run on the runtime, that wait would hold its one worker — and with
+        // it the timer of a bounded call, which could then fire only after the
+        // human had answered and the answer was on its way to the server. On a
+        // plain thread it holds nothing: a bound fires on time, and an answer
+        // for a call abandoned meanwhile lands on a closed channel. Not the
+        // blocking pool either — the runtime waits for that pool when it is
+        // dropped, so an unanswered question would hold the client's drop.
+        let handler = Arc::clone(handler);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(handler.handle(inbound::Inbound::Elicit {
+                message,
+                requested_schema,
+            }));
         });
+        let answer = rx.await.ok().flatten();
         Ok(match answer {
             Some(inbound::Answer::Accept(content)) => {
                 ElicitResult::new(ElicitationAction::Accept).with_content(content)
@@ -392,24 +405,27 @@ impl RmcpClient {
         self.convert(&res, "tools/list")
     }
 
-    /// `tools/call`, bounded by `timeout` as a whole. `meta` (run id,
-    /// idempotency key, traceparent) is the request's `params._meta` — the
-    /// field MCP reserves for it — and the tool's `arguments` carry the tool's
-    /// arguments alone: a server validating them against a strict schema
-    /// would refuse a stray `_meta` there.
+    /// `tools/call`, bounded as a whole by `bound` when there is one. `meta`
+    /// (run id, idempotency key, traceparent) is the request's `params._meta`
+    /// — the field MCP reserves for it — and the tool's `arguments` carry the
+    /// tool's arguments alone: a server validating them against a strict
+    /// schema would refuse a stray `_meta` there.
     ///
-    /// The bound covers every round of the call, not one HTTP exchange; on
-    /// expiry the call is abandoned and the caller gets a timeout error. The
-    /// abandoned exchange itself runs on until the socket's own timeout, and
-    /// the SDK starts the next request on this connection only once the one
-    /// before it has begun answering — so a call behind a silent one waits,
-    /// but only within its own bound.
+    /// A bound covers every round of the call, not one HTTP exchange — the
+    /// operator's answer to an elicitation included; on expiry the call is
+    /// abandoned and the caller gets a timeout error. The abandoned exchange
+    /// runs on until the socket's own timeout without holding up the calls
+    /// behind it (see [`crate::rmcp_transport`]). No `notifications/cancelled`
+    /// is sent for it: the SDK's call helper, which drives the MRTR rounds,
+    /// does not expose the request id, so the server learns of the abandonment
+    /// only when the exchange closes. Without a bound, only the socket's
+    /// timeout on each silence can end the call.
     pub fn call_tool(
         &self,
         name: &str,
         args: Option<Value>,
         meta: Option<serde_json::Map<String, Value>>,
-        timeout: Duration,
+        bound: Option<Duration>,
     ) -> Result<Value, McpError> {
         let arguments = match args {
             Some(Value::Object(m)) => m,
@@ -418,18 +434,22 @@ impl RmcpClient {
         let mut param = CallToolRequestParams::new(name.to_string()).with_arguments(arguments);
         param.meta = meta.map(RequestMetaObject::from);
         let op = format!("tools/call {name}");
-        let res = self
-            .rt
-            // The timer is built inside the runtime: it needs its clock.
-            .block_on(async { tokio::time::timeout(timeout, self.service.call_tool(param)).await })
-            .map_err(|_| {
-                rpc_err(
-                    &self.name,
-                    &op,
-                    format!("timed out after {} ms", timeout.as_millis()),
-                )
-            })?
-            .map_err(|e| rpc_err(&self.name, &op, e))?;
+        let call = self.service.call_tool(param);
+        let res = match bound {
+            Some(bound) => self
+                .rt
+                // The timer is built inside the runtime: it needs its clock.
+                .block_on(async { tokio::time::timeout(bound, call).await })
+                .map_err(|_| {
+                    rpc_err(
+                        &self.name,
+                        &op,
+                        format!("timed out after {} ms", bound.as_millis()),
+                    )
+                })?,
+            None => self.rt.block_on(call),
+        }
+        .map_err(|e| rpc_err(&self.name, &op, e))?;
         serde_json::to_value(&res).map_err(|e| rpc_err(&self.name, "tools/call", e))
     }
 

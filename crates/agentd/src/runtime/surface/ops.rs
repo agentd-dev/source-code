@@ -1370,9 +1370,8 @@ fn is_json(media_type: &str) -> bool {
 /// 4. no task (`COMMAND_TASK_ID`): a command starts its own;
 /// 5. JSON among the output modes the caller accepts, if it names any
 ///    (`-32005`): every command answers with data;
-/// 6. an op something serves (`UNKNOWN_OP`, naming a removed op's
-///    replacement) — an op no row holds is passed on, since only the runtime
-///    knows the commands its workflows declare;
+/// 6. an op something serves (`UNKNOWN_OP`) — an op no row holds is passed
+///    on, since only the runtime knows the commands its workflows declare;
 /// 7. arguments that match the op's published schema (`INVALID_COMMAND_ARGS`).
 pub fn check_command(
     params: &Value,

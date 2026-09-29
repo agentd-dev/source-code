@@ -1348,6 +1348,12 @@ fn proc_fds(pid: i32) -> BTreeMap<u32, String> {
 /// — not the operator's terminal, not the code's pipe, not the UI's socket —
 /// and every descriptor the launcher itself holds beyond its stdio is
 /// close-on-exec, so no later child can inherit one either.
+///
+/// The code's pipe is closed before this child is spawned, so its own
+/// close-on-exec is not what this run sees: the launcher's unit test
+/// `both_ends_of_the_launch_pipe_are_close_on_exec` reads it off the
+/// descriptors, and the TUI tests' exact descriptor set and end-of-file read
+/// fail if either end leaks into the client.
 #[cfg(all(
     target_os = "linux",
     feature = "exec",

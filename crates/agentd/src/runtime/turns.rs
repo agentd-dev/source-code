@@ -774,29 +774,23 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
             self.seq
         };
         let tx = self.events_tx.clone();
-        let timeout = self
-            .settings
-            .mcp
-            .default_timeout
-            .map(|d| d.0)
-            .unwrap_or(Duration::from_secs(60));
         let meta = json!({"agent/instance": self.instance, "agent/ctx": job.ctx});
         self.staged_turns.insert(stage_id, job);
         std::thread::Builder::new()
             .name("knowledge.auto_context".into())
             .spawn(move || {
-                let block =
-                    match client.call_tool_with_meta_within(&m.tool, Some(mcp_args), meta, timeout)
-                    {
-                        Ok(r) if !r.is_error() => {
-                            let mut ctx = crate::store::mcp::result_ctx(&r);
-                            ctx["args"] = args;
-                            crate::registry::Registry::map_result(&m, &ctx)
-                                .ok()
-                                .and_then(|v| render_knowledge_block(&v, max_bytes))
-                        }
-                        _ => None,
-                    };
+                // Unbounded as a whole, like every data-path tool call (see
+                // `run_mapped`): the server's own `timeout` caps each silence.
+                let block = match client.call_tool_with_meta(&m.tool, Some(mcp_args), meta) {
+                    Ok(r) if !r.is_error() => {
+                        let mut ctx = crate::store::mcp::result_ctx(&r);
+                        ctx["args"] = args;
+                        crate::registry::Registry::map_result(&m, &ctx)
+                            .ok()
+                            .and_then(|v| render_knowledge_block(&v, max_bytes))
+                    }
+                    _ => None,
+                };
                 let _ = tx.send(super::events::Event::KnowledgeDone {
                     job: stage_id,
                     block,

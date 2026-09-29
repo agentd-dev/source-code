@@ -2,7 +2,8 @@
 //! agentd runtime end to end: a configuration drives the event loop — the
 //! `--instruction` sugar workflow (`once → agent → finish`) runs a turn worker
 //! against the built-in mock LLM, internal tools round-trip to the supervisor,
-//! tool overrides map onto the mock MCP server, and a SIGKILLed instance
+//! tool overrides map onto the mock MCP server (held to the server's own
+//! `timeout`, not the default), and a SIGKILLed instance
 //! restores its durable state from the mock MCP store and finishes the job on
 //! restart.
 
@@ -169,6 +170,33 @@ fn tool_overrides_map_an_internal_contract_onto_the_mock_mcp_server() {
         .unwrap()
         .text();
     assert!(ops.contains("state.get"), "{ops}");
+}
+
+#[test]
+fn a_mapped_tool_on_a_server_with_a_longer_timeout_outlives_the_default() {
+    // `mcp.servers[].timeout` is the operator saying this server's tools are
+    // slow. The runtime's own tool paths must honour it: a call held to
+    // `mcp.default_timeout` instead would cut this one off at one second,
+    // though the server answers inside its own five.
+    let mock = common::spawn_mock_mcp("mock://noop", false);
+    let llm = spawn_mock_llm(&serde_json::json!({"turns": [
+        {"tool_calls": [{"name": "memory.get", "arguments": {"key": "slow"}}]},
+        {"content": "the value is {{tool}}"}
+    ]}));
+    let cfg = write_config(&format!(
+        "agent:\n  instruction: read memory\nintelligence:\n  endpoints: {}\n  model: mock\nmcp:\n  default_timeout: 1s\n  servers:\n    - name: mock\n      endpoint: {}\n      timeout: 5s\ntools:\n  overrides:\n    memory.get:\n      server: mock\n      tool: mock.slow\n      args: '{{\"ms\": 2000}}'\n      result: '{{\"found\": true, \"key\": \"{{{{args.key}}}}\", \"value\": {{{{result.structuredContent.state}}}}}}'\nobservability:\n  log_level: info\n  log_content: true\n",
+        llm.uri,
+        mock.uri()
+    ));
+    let out = run_agentd(&cfg, &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{stderr}");
+    let results = events(&stderr, "tool.result");
+    let mg = results
+        .iter()
+        .find(|e| e["tool"] == "memory.get")
+        .unwrap_or_else(|| panic!("no memory.get result in the worker log:\n{stderr}"));
+    assert_eq!(mg["is_error"], false, "{mg}\n{stderr}");
 }
 
 #[test]

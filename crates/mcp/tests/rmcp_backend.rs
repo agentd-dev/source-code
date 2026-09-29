@@ -306,12 +306,7 @@ fn a_tool_call_round_trips() {
         .expect("connect");
     let meta = json!({"agent/run_id": "r1"}).as_object().cloned();
     let out = client
-        .call_tool(
-            "echo",
-            Some(json!({"s": "hi"})),
-            meta,
-            Duration::from_secs(5),
-        )
+        .call_tool("echo", Some(json!({"s": "hi"})), meta, None)
         .expect("tools/call");
     assert_eq!(out["content"][0]["text"], "echoed");
 }

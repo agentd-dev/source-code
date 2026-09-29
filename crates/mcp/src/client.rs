@@ -219,14 +219,21 @@ impl McpClient {
     /// `tools/call`. The returned [`CallToolResult`] carries `isError` (a
     /// tool-domain failure the model sees as an observation) — distinct from an
     /// `Err` here, which is a transport/protocol failure and fails the call.
-    /// Carries the persistent [`Self::set_tool_meta`] and is bounded by the
-    /// connection's default timeout.
+    /// Carries the persistent [`Self::set_tool_meta`].
+    ///
+    /// No bound on the call as a whole: the connection's timeout caps each
+    /// silence on the socket, so a dead server still fails, but a call that is
+    /// alive is left to finish. A tool may run long while it streams progress,
+    /// and a server may stop mid-call to ask the operator a question
+    /// (elicitation), whose answer takes a human's time, not a transport's.
+    /// A caller with a deadline of its own says so through
+    /// [`Self::call_tool_with_meta_within`].
     pub fn call_tool(
         &self,
         name: &str,
         arguments: Option<Value>,
     ) -> Result<CallToolResult, McpError> {
-        self.call(name, arguments, None, self.timeout)
+        self.call(name, arguments, None, None)
     }
 
     /// `tools/call` with **per-call** `_meta` merged on top of the persistent
@@ -236,14 +243,15 @@ impl McpClient {
     /// persistently would attach one item's key to every later call.
     /// The keys of `extra_meta` (an object) win key-by-key over the persistent
     /// meta; `_meta` is an object on the wire, so a non-object `extra_meta`
-    /// adds nothing. The persistent meta is left untouched.
+    /// adds nothing. The persistent meta is left untouched. Unbounded as a
+    /// whole, exactly like [`Self::call_tool`].
     pub fn call_tool_with_meta(
         &self,
         name: &str,
         arguments: Option<Value>,
         extra_meta: Value,
     ) -> Result<CallToolResult, McpError> {
-        self.call_tool_with_meta_within(name, arguments, extra_meta, self.timeout)
+        self.call(name, arguments, Some(extra_meta), None)
     }
 
     /// `tools/call` with per-call `_meta` AND a caller-supplied bound on the
@@ -252,7 +260,13 @@ impl McpClient {
     /// `timeout` is a transport error then, not when the connection's own
     /// default runs out, so a silent server cannot hold the caller past the
     /// deadline it derived the bound from. The connection's timeout still caps
-    /// each HTTP exchange, so a bound longer than it does not extend it.
+    /// each silence on the socket, so a bound longer than it does not extend
+    /// that.
+    ///
+    /// Only a bound derived from a deadline belongs here. Everything under it
+    /// counts against it — an operator answering an elicitation included —
+    /// so a fixed default passed as a bound cuts off live calls: a slow tool,
+    /// and a server whose own `timeout` was set longer than the default.
     pub fn call_tool_with_meta_within(
         &self,
         name: &str,
@@ -260,7 +274,7 @@ impl McpClient {
         extra_meta: Value,
         timeout: Duration,
     ) -> Result<CallToolResult, McpError> {
-        self.call(name, arguments, Some(extra_meta), timeout)
+        self.call(name, arguments, Some(extra_meta), Some(timeout))
     }
 
     /// Every `tools/call` path lands here, so the persistent meta rides each
@@ -270,10 +284,10 @@ impl McpClient {
         name: &str,
         arguments: Option<Value>,
         extra_meta: Option<Value>,
-        timeout: Duration,
+        bound: Option<Duration>,
     ) -> Result<CallToolResult, McpError> {
         let meta = merge_meta(self.tool_meta.as_ref(), extra_meta.as_ref());
-        let raw = self.sdk()?.call_tool(name, arguments, meta, timeout)?;
+        let raw = self.sdk()?.call_tool(name, arguments, meta, bound)?;
         serde_json::from_value(raw).map_err(|e| {
             McpError::Transport(format!("bad tools/call result on '{}': {e}", self.name))
         })

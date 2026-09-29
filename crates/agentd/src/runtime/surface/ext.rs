@@ -1099,6 +1099,128 @@ mod tests {
         }
     }
 
+    /// The `i64` error codes `a2a/errors.rs` names, by identifier, the
+    /// JSON-RPC ones it re-exports from the MCP crate resolved there.
+    fn error_codes() -> std::collections::BTreeMap<String, i64> {
+        fn consts(src: &str) -> Vec<(String, String)> {
+            src.lines()
+                .filter_map(|l| l.trim().strip_prefix("pub const "))
+                .filter_map(|l| l.split_once(": i64 = "))
+                .map(|(n, v)| (n.to_string(), v.trim_end_matches(';').to_string()))
+                .collect()
+        }
+        let rpc: std::collections::BTreeMap<String, String> =
+            consts(&read_repo("crates/mcp/src/rpc/mod.rs"))
+                .into_iter()
+                .collect();
+        consts(&read_repo("crates/agentd/src/a2a/errors.rs"))
+            .into_iter()
+            .map(|(name, v)| {
+                let v = match v.strip_prefix("::mcp::rpc::") {
+                    Some(r) => rpc[r].clone(),
+                    None => v,
+                };
+                let code = v.parse().unwrap_or_else(|_| panic!("{name} = {v}"));
+                (name, code)
+            })
+            .collect()
+    }
+
+    /// Every `reason::R` a source emits outside its tests, with the code of
+    /// the refusal it sits in: the last error-code identifier named on the
+    /// lines before it (a code and a reason share some names, so a name
+    /// under `reason::` is never taken for a code).
+    fn emitted_reasons(
+        rel: &str,
+        codes: &std::collections::BTreeMap<String, i64>,
+    ) -> Vec<(String, i64)> {
+        let src = read_repo(rel);
+        let src = src.split("\n#[cfg(test)]").next().unwrap_or_default();
+        let lines: Vec<&str> = src.lines().collect();
+        let code_on = |line: &str| -> Option<i64> {
+            line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':'))
+                .filter(|t| !t.starts_with("reason::"))
+                .filter_map(|t| codes.get(t.trim_start_matches("errors::")))
+                .next_back()
+                .copied()
+        };
+        let mut out = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let mut rest = *line;
+            while let Some(at) = rest.find("reason::") {
+                rest = &rest[at + "reason::".len()..];
+                let name: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_uppercase() || *c == '_')
+                    .collect();
+                let code = (i.saturating_sub(8)..=i)
+                    .rev()
+                    .find_map(|j| code_on(lines[j]))
+                    .unwrap_or_else(|| panic!("{rel}:{}: reason::{name} has no code", i + 1));
+                out.push((name, code));
+            }
+        }
+        out
+    }
+
+    /// The command spec's error table is what the command path refuses with:
+    /// each row names a reason `errors::reason` defines, with the code every
+    /// site that emits it answers, and every agentd reason the command path
+    /// emits has its row. A renamed reason or a changed code would otherwise
+    /// publish a normative contract the listener does not keep.
+    #[test]
+    fn the_command_spec_error_table_is_what_the_command_path_refuses_with() {
+        let codes = error_codes();
+        let errors_src = read_repo("crates/agentd/src/a2a/errors.rs");
+        let reasons: Vec<&str> = errors_src
+            .split_once("pub mod reason {")
+            .map(|(_, rest)| rest.split('}').next().unwrap_or_default())
+            .expect("errors.rs has mod reason")
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("pub const "))
+            .filter_map(|l| l.split(':').next())
+            .collect();
+
+        let mut emitted: Vec<(String, i64)> = Vec::new();
+        for rel in [
+            "crates/agentd/src/runtime/surface/ops.rs",
+            "crates/agentd/src/runtime/a2a_server/commands.rs",
+            "crates/agentd/src/runtime/a2a_server/admin.rs",
+            "crates/agentd/src/runtime/a2a_server/auth_ops.rs",
+        ] {
+            emitted.extend(emitted_reasons(rel, &codes));
+        }
+        assert!(!emitted.is_empty(), "the scan found no refusal");
+
+        let command = read_repo(&spec_doc(COMMAND_EXTENSION));
+        let rows = table_under(&command, "## Errors");
+        let mut documented = Vec::new();
+        for r in &rows {
+            assert_eq!(r.len(), 3, "an error row has three cells: {r:?}");
+            let code: i64 = ident(&r[0])
+                .parse()
+                .unwrap_or_else(|_| panic!("the code cell {:?} is not a number", r[0]));
+            let reason = ident(&r[1]);
+            assert!(
+                reasons.contains(&reason),
+                "docs/ext/command.md names {reason}, which errors::reason does not define"
+            );
+            for (_, got) in emitted.iter().filter(|(e, _)| e == reason) {
+                assert_eq!(
+                    *got, code,
+                    "docs/ext/command.md gives {reason} the code {code}; the command path answers {got}"
+                );
+            }
+            documented.push(reason);
+        }
+        for (reason, code) in &emitted {
+            assert!(
+                documented.contains(&reason.as_str()),
+                "the command path refuses with {reason} ({code}), which docs/ext/command.md does not list"
+            );
+        }
+    }
+
     /// The task-annotations bundle accepts what the wire writes on a task
     /// that has every optional fact, and one that has none — and is closed,
     /// so a fact the wire adds without the schema is caught here.

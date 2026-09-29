@@ -948,6 +948,20 @@ mod tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
+    /// Both ends of the code's pipe are close-on-exec from the moment they
+    /// exist. Read straight off the descriptors: the risk is a child the
+    /// daemon spawns while the pipe is open, and no end-to-end run can time a
+    /// spawn into that window.
+    #[test]
+    fn both_ends_of_the_launch_pipe_are_close_on_exec() {
+        let (r, w) = launch_pipe().expect("pipe");
+        for fd in [r.as_raw_fd(), w.as_raw_fd()] {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert!(flags >= 0, "fd {fd}: {}", std::io::Error::last_os_error());
+            assert_ne!(flags & libc::FD_CLOEXEC, 0, "fd {fd} is inheritable");
+        }
+    }
+
     /// The daemon loads exactly what it was given: the launcher takes its own
     /// flags out and adds nothing, so a flag it slipped in would be a setting
     /// the operator never wrote.

@@ -16,13 +16,10 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use crate::checks::util::{
-    declared_extensions, feed_activation, feed_method, free_port, get_card, mock_llm, open, post,
-    rpc_body, rpc_value, send_command, text_params, wait_ready, write_file,
+    EVENTS, declared_extensions, feed_activation, feed_method, free_port, get_card, mock_llm, open,
+    post, rpc_body, rpc_value, send_command, text_params, wait_ready, write_file,
 };
 use crate::{Category, Check, Harness, Outcome};
-
-/// The events extension's URI, as the card declares it when the feed is on.
-const EVENTS: &str = "https://agentd.dev/a2a/ext/events";
 
 pub fn checks() -> Vec<Check> {
     vec![

@@ -135,6 +135,7 @@ fn handle_request(req: Request, state: &State) -> (Response, bool) {
                     {"name": "flaky", "description": "fails once, then succeeds", "inputSchema": {"type": "object"}},
                     {"name": "mock.fault", "description": "fail the next N state.* calls", "inputSchema": {"type": "object"}},
                     {"name": "mock.ops", "description": "the state.* calls performed so far", "inputSchema": {"type": "object"}},
+                    {"name": "mock.slow", "description": "answer after `ms` milliseconds", "inputSchema": {"type": "object"}},
                     {"name": "knowledge.search", "description": "RAG search over the mock corpus", "inputSchema": {"type": "object"}},
                     {"name": "knowledge.get", "description": "fetch a mock document", "inputSchema": {"type": "object"}},
                     {"name": "knowledge.list", "description": "list mock documents", "inputSchema": {"type": "object"}},
@@ -337,6 +338,16 @@ fn handle_tool_call(req: Request, state: &State) -> Response {
                 .unwrap_or(1);
             state.fail_next.store(n, Ordering::SeqCst);
             tool_ok(req.id, json!({"ok": true, "count": n}))
+        }
+        // A live tool that takes its time: nothing on the wire until it
+        // answers, the way a JSON-answering server computes before it replies.
+        Some("mock.slow") => {
+            let ms = args
+                .get("ms")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            std::thread::sleep(Duration::from_millis(ms));
+            tool_ok(req.id, json!({"state": {"slept_ms": ms}}))
         }
         Some("mock.ops") => {
             let ops = state.ops.lock().unwrap_or_else(|e| e.into_inner()).clone();

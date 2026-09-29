@@ -95,7 +95,17 @@ impl StreamableHttpClient for AgentdHttp {
     /// exchange: the server waits for an answer the SDK has not been shown yet,
     /// the POST runs to its timeout, and the frames are dropped with the error.
     /// So the blocking read runs on its own thread and forwards each frame as it
-    /// arrives; this returns as soon as the FIRST one does.
+    /// arrives.
+    ///
+    /// **A request does not hold the connection.** The SDK sends every message
+    /// from one worker that awaits this call before it sends the next, so
+    /// whatever this waits for, every later message on the connection waits for
+    /// too. For a request that is nothing: its stream is handed back at once,
+    /// and a slow tool — or one abandoned at its caller's bound and left running
+    /// to the socket's timeout — delays no call but its own. Only `initialize`
+    /// waits for its first frame, because the session it opens rides that
+    /// answer's head; and a notification, or our answer to a server's request,
+    /// waits for its `202`, which a server gives at once.
     async fn post_message(
         &self,
         _uri: Arc<str>,
@@ -107,6 +117,11 @@ impl StreamableHttpClient for AgentdHttp {
         let body = serde_json::to_vec(&message)
             .map_err(|e| StreamableHttpError::Client(TransportError(e.to_string())))?;
         let request_id = request_id_of(&message);
+        let opens_session = matches!(
+            &message,
+            rmcp::model::JsonRpcMessage::Request(r)
+                if matches!(r.request, rmcp::model::ClientRequest::InitializeRequest(_))
+        );
         let http = Arc::clone(&self.http);
         let timeout = self.timeout;
         let extra = header_pairs(auth_header, custom_headers);
@@ -134,9 +149,33 @@ impl StreamableHttpClient for AgentdHttp {
             let _ = tx.send(Pumped::Done(resp.map_err(|e| e.to_string())));
         });
 
-        // Wait for the first frame only. `Mcp-Session-Id` rides the response
-        // HEAD, which the transport has already recorded by the time any frame
-        // can reach us, so reading it here is not early.
+        // A request other than `initialize`: its answer, or the error that
+        // ended its exchange, reaches the SDK on the stream. An exchange that
+        // fails before the server said anything becomes an error RESPONSE to
+        // this request carrying the transport's reason — the SDK itself answers
+        // a stream that closed early with a synthesised error, but a generic
+        // one, and "HTTP 401" is what an operator needs to see.
+        if let (Some(id), false) = (request_id, opens_session) {
+            let session = self.http.session_id();
+            let frames = futures::stream::unfold(Some(rx), move |rx| async move {
+                let mut rx = rx?;
+                match rx.recv().await {
+                    Some(Pumped::Message(v)) | Some(Pumped::Done(Ok(Some(v)))) => {
+                        Some((Ok(as_event(&v)), Some(rx)))
+                    }
+                    Some(Pumped::Done(Err(e))) => Some((Ok(as_event(&failed(id, &e))), None)),
+                    // Accepted with no body, or the pump vanished: the stream
+                    // is over, and the SDK fails the request for want of an
+                    // answer.
+                    Some(Pumped::Done(Ok(None))) | None => None,
+                }
+            });
+            return Ok(StreamableHttpPostResponse::Sse(Box::pin(frames), session));
+        }
+
+        // Wait for the first frame. `Mcp-Session-Id` rides the response HEAD,
+        // which the transport has already recorded by the time any frame can
+        // reach us, so reading it here is not early.
         let first = match rx.recv().await {
             Some(Pumped::Message(v)) | Some(Pumped::Done(Ok(Some(v)))) => v,
             // A notification: nothing came back, and nothing should have.
@@ -202,6 +241,14 @@ impl StreamableHttpClient for AgentdHttp {
     /// A stream handed back unopened would instead look like one that opened
     /// and ended — which the SDK redials, every second, for the life of the
     /// connection.
+    ///
+    /// Every other failure is handed back as a stream that ends at once. The
+    /// SDK takes an error from the connection's FIRST dial as final — it never
+    /// dials again — so a refused connect while the server restarts, a `503`,
+    /// or a `401` just before a credential refresh would otherwise cost the
+    /// connection its push channel for good, `resources/updated` wakes and
+    /// server requests with it, while every call kept working. An ended
+    /// stream is redialled after the SDK's retry interval instead.
     async fn get_stream(
         &self,
         _uri: Arc<str>,
@@ -259,12 +306,9 @@ impl StreamableHttpClient for AgentdHttp {
             Ok(Err(HttpError::Status(405) | HttpError::NoEventStream)) => {
                 Err(StreamableHttpError::ServerDoesNotSupportSse)
             }
-            Ok(Err(e)) => Err(StreamableHttpError::Client(TransportError(e.to_string()))),
-            // The dialling thread died before reporting — a dead socket either
-            // way.
-            Err(_) => Err(StreamableHttpError::Client(TransportError(
-                "mcp: the notification stream dial ended with no outcome".into(),
-            ))),
+            // Possibly transient, so not a verdict on the server: an ended
+            // stream, which the SDK redials.
+            Ok(Err(_)) | Err(_) => Ok(Box::pin(futures::stream::empty())),
         }
     }
 }
@@ -277,9 +321,23 @@ impl StreamableHttpClient for AgentdHttp {
 /// owed a reply for: the server acks it `202` with no body. Only a message with
 /// a `method` is a request of ours, so that is what the id is read from.
 fn request_id_of(message: &rmcp::model::ClientJsonRpcMessage) -> Option<i64> {
+    if !matches!(message, rmcp::model::JsonRpcMessage::Request(_)) {
+        return None;
+    }
     serde_json::to_value(message)
         .ok()
         .and_then(|v| v.get("id").and_then(Value::as_i64))
+}
+
+/// The error response a request gets when its exchange ended before the
+/// server answered it: JSON-RPC's internal error, with the transport's reason
+/// as the message.
+fn failed(id: i64, reason: &str) -> Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {"code": crate::rpc::INTERNAL_ERROR, "message": format!("mcp: transport: {reason}")}
+    })
 }
 
 /// The SDK's headers, flattened to the pairs our transport takes. A header whose

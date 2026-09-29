@@ -120,7 +120,7 @@ a2a:
 - A **natural-language** message becomes a durable conversation turn; the answer
   comes back as the A2A task's artifact.
 - A **command** DataPart (`{"data":{"agentd":{"op":"workflow.run","workflow":"…"}}}`),
-  sent with the [command extension](ext/command.md) activated, runs a registry
+  sent with the [command extension](https://agentd.dev/a2a/ext/command) activated, runs a registry
   action directly, with no model in the path — deterministic dispatch rather
   than prose the receiving agent has to interpret.
 - Every call is resolved to a **principal** (mTLS / bearer → `operator | user |

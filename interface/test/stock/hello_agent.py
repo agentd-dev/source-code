@@ -1,4 +1,11 @@
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
+#
+# Adapted from the helloworld sample of a2aproject/a2a-samples
+# (samples/python/agents/helloworld), licensed under the Apache License,
+# Version 2.0 <https://www.apache.org/licenses/LICENSE-2.0>. This file is a
+# modified version of that sample: the agentd authors added the port
+# argument, the `listening` line and the request log described below. It stays
+# under Apache-2.0, not agentd's AGPL.
 """The official A2A "Hello World" sample agent, as a peer for the interop tests.
 
 Someone else's reading of the spec: this is the helloworld sample of

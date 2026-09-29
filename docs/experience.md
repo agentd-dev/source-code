@@ -355,8 +355,8 @@ daemon so it drains to 0; the daemon exiting SIGTERMs the client, waits 3 s,
 then kills it. [interface.md](interface.md#launcher) has the whole contract.
 
 You can also attach to a running daemon — `agentd-tui --endpoint …`,
-`agentd-ui --endpoint … --open` — and several at once. On a plaintext loopback
-listener with nothing configured, a local TUI *is* the operator with no setup
+`agentd-ui --endpoint … --open` — and several at once. On a loopback listener
+(http or https) with no credential configured, a local TUI *is* the operator with no setup
 at all; a browser is never the implicit operator and always signs in.
 Otherwise the listener's OAuth device grant avoids pasting a token: the client
 shows a code, an operator approves it under a name with `/approve <code>

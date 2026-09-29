@@ -42,9 +42,9 @@ a2a:
   internals (see [Debug](#debug)). It is reloadable, and an operator can set
   it at runtime with `/set a2a.introspection.enabled true`.
 
-Who may connect is the listener's business, not the clients': on a plaintext
-loopback listener with nothing configured, a local non-browser process is the
-operator; everything else signs in (see [Signing in](#signing-in)). The
+Who may connect is the listener's business, not the clients': on a loopback
+listener (http or https) with no credential configured, a local non-browser
+process is the operator; everything else signs in (see [Signing in](#signing-in)). The
 listener answers a web page only from an origin listed in `a2a.cors.origins`
 ([hosting-the-ui.md](hosting-the-ui.md)).
 
@@ -354,8 +354,8 @@ prompts, labelled by principal.
 
 The card's security declarations say how, and the client follows them:
 
-- **Nothing declared** (a plaintext loopback listener with nothing
-  configured): `agentd-tui` connects with no credential and is the implicit
+- **Nothing declared** (a loopback listener, http or https, with no
+  credential configured): `agentd-tui` connects with no credential and is the implicit
   operator — it never sends an `Origin` header. A browser is **never** the
   implicit operator: a request carrying `Origin` always authenticates, so the
   web UI signs in on every daemon.

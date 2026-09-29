@@ -2028,8 +2028,8 @@ status is older than `ttl`. Unset keeps every task. Three things to know:
   callers share, one caller's finished tasks can push out another's, the
   operator's included. Use `ttl` — each task's own age — on a multi-tenant
   listener, alone or beside a generous `keep_last`.
-- **A settled task nobody has read back yet is spared for up to 30 seconds**
-  past `keep_last` and `ttl`. A blocking `SendMessage` is answered with a
+- **A settled task nobody has read back yet is kept for at least 30 seconds
+  after it settles**, whatever `keep_last` and `ttl` say. A blocking `SendMessage` is answered with a
   second read after the task finishes, and dropping the task in between would
   answer that caller "not found" for work that completed. Once read, or once
   the 30 seconds pass, it goes on the next sweep.

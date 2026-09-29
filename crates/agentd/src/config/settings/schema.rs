@@ -190,7 +190,7 @@ fn top_level_properties(
                             "keep_last": { "type": "integer", "minimum": 0, "description": "keep at most this many terminal runs" },
                             "ttl": duration } },
                         "tasks": { "type": "object", "additionalProperties": false, "properties": {
-                            "keep_last": { "type": "integer", "minimum": 0, "description": "keep at most this many terminal A2A tasks — one bound across every principal, so on a shared listener one caller's finished tasks can push out another's; prefer ttl there. A settled task nobody has read back yet is spared up to 30s past keep_last and ttl, so a blocking SendMessage still gets its own answer" },
+                            "keep_last": { "type": "integer", "minimum": 0, "description": "keep at most this many terminal A2A tasks — one bound across every principal, so on a shared listener one caller's finished tasks can push out another's; prefer ttl there. A settled task nobody has read back yet is kept for at least 30s after it settles, whatever keep_last and ttl say, so a blocking SendMessage still gets its own answer" },
                             "ttl": duration } } } },
                     "durability": { "type": "object", "additionalProperties": false, "properties": {
                         "a2a": { "enum": ["strict", "eventual"] }, "steps": { "enum": ["strict", "eventual"] },

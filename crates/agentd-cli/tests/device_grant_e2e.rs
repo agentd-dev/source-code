@@ -593,6 +593,51 @@ fn ownership_survives_re_login() {
     assert!(daemon.alive(), "{}", daemon.stderr());
 }
 
+/// A signed-in session is served through a flood of junk bearers from its own
+/// source.
+///
+/// The launched console and every device on the host present their session
+/// from 127.0.0.1, which any local process can push over the failure limit.
+/// Past it, a configured bearer is still refused 429 unchecked — it may be a
+/// weak secret, and checking it would be an oracle — and so is a session
+/// token that names nobody; a live session is checked and served, because a
+/// 256-bit token agentd minted gives a guesser nothing to learn from
+/// "valid, or 429".
+#[test]
+fn a_live_session_is_served_past_the_failure_limit() {
+    let (mut daemon, addr) = loopback("", MEMORY);
+    let (token, _) = session(&addr, "alice");
+    let body = rpc_body(1, "ListTasks", json!({}));
+    let bearer = |t: &str| format!("Bearer {t}");
+
+    for n in 1..=21 {
+        let r = common::a2a_post(&addr, &body, &[("Authorization", "Bearer guess")]);
+        assert_eq!(r.status, 401, "junk bearer #{n}: {r:?}");
+    }
+    let limited = common::a2a_post(&addr, &body, &[("Authorization", "Bearer guess")]);
+    assert_eq!(limited.status, 429, "the 22nd failure: {limited:?}");
+
+    let served = common::a2a_post(&addr, &body, &[("Authorization", &bearer(&token))]);
+    assert_eq!(
+        served.status, 200,
+        "the signed-in console was locked out: {served:?}"
+    );
+    assert!(served.json().get("error").is_none(), "{served:?}");
+
+    let forged = format!("agentd_at_{}", "0".repeat(64));
+    let r = common::a2a_post(&addr, &body, &[("Authorization", &bearer(&forged))]);
+    assert_eq!(
+        r.status, 429,
+        "a session token naming nobody is refused unchecked: {r:?}"
+    );
+    let r = common::a2a_post(&addr, &body, &[("Authorization", &bearer(OPS_TOKEN))]);
+    assert_eq!(
+        r.status, 429,
+        "a configured bearer is refused unchecked: {r:?}"
+    );
+    assert!(daemon.alive(), "{}", daemon.stderr());
+}
+
 /// `as` is required and well formed, never a reserved name and never a name
 /// a configured rule holds — of any role, in any case; a second approval of
 /// one name says so.

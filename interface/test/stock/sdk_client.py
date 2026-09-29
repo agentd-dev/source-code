@@ -10,8 +10,11 @@ an enum spelled any other way, or a wrong shape. So "the SDK parsed it" is
 the claim this file tests, for the whole method list:
 
 - the card, through A2ACardResolver, declaring the bearer scheme the listener
-  enforces (or the AuthInterceptor would send nothing);
-- SendMessage, blocking and with returnImmediately; GetTask; ListTasks;
+  enforces (or the AuthInterceptor would send nothing) — and read again raw
+  and parsed strictly, because the resolver itself ignores unknown fields;
+- SendMessage, blocking and with returnImmediately; GetTask; ListTasks, and a
+  listing that matches nothing, whose raw answer must still carry every field
+  the proto marks REQUIRED (ParseDict does not check that);
 - SubscribeToTask on a task that is still WORKING, to its end;
 - CancelTask on a finished task, refused as TaskNotCancelableError (-32002);
 - GetExtendedAgentCard;
@@ -44,6 +47,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import httpx
 
+from google.api import field_behavior_pb2
 from google.protobuf import json_format
 
 from a2a.client import (
@@ -63,6 +67,7 @@ from a2a.types import (
     GetExtendedAgentCardRequest,
     GetTaskRequest,
     ListTasksRequest,
+    ListTasksResponse,
     Message,
     Role,
     SendMessageConfiguration,
@@ -213,6 +218,11 @@ async def run(url: str) -> list[httpx.Request]:
         # The card, the way any SDK client finds an agent.
         card = await A2ACardResolver(http, url).get_agent_card()
         expect(card.name == 'sdk-interop', f'the card: {card.name}')
+        # A2ACardResolver parses with ignore_unknown_fields=True, so a
+        # misspelled field on the public card would pass it. Parsed strictly
+        # here, the way every JSON-RPC answer below is.
+        raw_card = await http.get(f'{url}/.well-known/agent-card.json')
+        json_format.ParseDict(raw_card.json(), AgentCard())
         bearer_schemes = [
             name
             for name, s in card.security_schemes.items()
@@ -255,6 +265,29 @@ async def run(url: str) -> list[httpx.Request]:
         listed = await unary.list_tasks(ListTasksRequest())
         ids = {t.id for t in listed.tasks}
         expect({done.id, slow.id} <= ids, f'ListTasks lists both: {ids}')
+
+        # A listing that matches nothing, read raw: ProtoJSON drops an empty
+        # list, an empty string and a zero, and ParseDict would fill all three
+        # back in without a word — so only the raw answer shows whether the
+        # fields A2A marks REQUIRED are on the wire.
+        empty = await http.post(
+            url,
+            headers={'A2A-Version': '1.0', 'Authorization': f'Bearer {BEARER}'},
+            json={'jsonrpc': '2.0', 'id': 'empty', 'method': 'ListTasks', 'params': {'contextId': 'no-such-context'}},
+        )
+        result = empty.json().get('result')
+        required = [
+            f.json_name
+            for f in ListTasksResponse.DESCRIPTOR.fields
+            if field_behavior_pb2.REQUIRED in f.GetOptions().Extensions[field_behavior_pb2.field_behavior]
+        ]
+        expect(required, 'the proto marks some ListTasksResponse field REQUIRED')
+        expect(
+            isinstance(result, dict) and all(k in result for k in required),
+            f'an empty listing carries every REQUIRED field ({required}): {empty.text}',
+        )
+        expect(result['tasks'] == [] and result['totalSize'] == 0, f'an empty listing: {result}')
+        json_format.ParseDict(result, ListTasksResponse())
 
         # A webhook for the working task, with a credential to present.
         pushed = await unary.create_task_push_notification_config(

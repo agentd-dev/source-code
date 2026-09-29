@@ -20,19 +20,31 @@ import { spawn } from 'node:child_process';
 import { mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import net from 'node:net';
 import { AgentdClient, COMMAND_EXTENSION, TERMINAL_STATES, openSession } from '../../dist/client/index.js';
 import { freePort, skipUnless, startHelloAgent, stockUnavailable, until } from './harness.mjs';
 
 const BIN = process.env.AGENTD_E2E_BIN;
 const skip = skipUnless(BIN ? stockUnavailable() : 'set AGENTD_E2E_BIN to an agentd built with a2a,internal-mocks');
 
-const connects = (port) =>
-  new Promise((resolve) => {
-    const s = net.connect(port, '127.0.0.1');
-    s.once('connect', () => (s.destroy(), resolve(true)));
-    s.once('error', () => resolve(false));
-  });
+/**
+ * The authority the daemon logged on its `a2a.listen` line, `null` once it
+ * has exited without one, or `undefined` while it is still starting. The line
+ * is the only race-free sign the daemon holds the port: `a2a.listen` refuses
+ * port 0, so the test probes a free one and closes it, and another process
+ * can take it in the gap — a bare connect would then reach a stranger.
+ */
+function bound(log, exited) {
+  for (const line of log.split('\n')) {
+    if (!line.startsWith('{')) continue;
+    try {
+      const e = JSON.parse(line);
+      if (e.event === 'a2a.listen' && typeof e.bound === 'string') return e.bound;
+    } catch {
+      // A partly written line; the next read sees it whole.
+    }
+  }
+  return exited ? null : undefined;
+}
 
 test('peer: a2a.send and a2a.delegate complete against the official Python server', { skip }, async (t) => {
   const hello = await startHelloAgent();
@@ -42,10 +54,7 @@ test('peer: a2a.send and a2a.delegate complete against the official Python serve
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const playbook = join(dir, 'playbook.json');
   writeFileSync(playbook, JSON.stringify({ turns: [{ content: 'ok' }] }));
-  const port = await freePort();
-  const cfg = join(dir, 'agentd.yaml');
-  writeFileSync(
-    cfg,
+  const config = (port) =>
     [
       'agent:',
       '  name: peer-e2e',
@@ -74,23 +83,40 @@ test('peer: a2a.send and a2a.delegate complete against the official Python serve
       '      ask: {kind: a2a.delegate, depends_on: [tell], peer: hello, objective: "greet the peer", timeout: 30s}',
       '      f: {kind: finish, depends_on: [ask], status: completed, output: "peer said {{steps.ask.output}}"}',
       '',
-    ].join('\n'),
-  );
+    ].join('\n');
+  const cfg = join(dir, 'agentd.yaml');
   const log = join(dir, 'daemon.log');
-  const daemon = spawn(BIN, ['--config', cfg], { stdio: ['ignore', 'ignore', openSync(log, 'w')] });
-  const exited = new Promise((resolve) => daemon.once('exit', resolve));
+  const daemonLog = () => readFileSync(log, 'utf8');
+  // Started until a daemon reports the port it was given: one whose bind lost
+  // the race exits, and the next try takes a fresh port.
+  let daemon;
+  let exited;
+  let url;
+  for (let attempt = 1; !url; attempt++) {
+    const port = await freePort();
+    writeFileSync(cfg, config(port));
+    const child = spawn(BIN, ['--config', cfg], { stdio: ['ignore', 'ignore', openSync(log, 'w')] });
+    let gone = false;
+    const ended = new Promise((resolve) => child.once('exit', () => resolve((gone = true))));
+    let got;
+    await until(() => (got = bound(daemonLog(), gone)) !== undefined, 20000, `the a2a.listen line (${daemonLog()})`);
+    if (got === `127.0.0.1:${port}`) {
+      [daemon, exited, url] = [child, ended, `http://127.0.0.1:${port}`];
+    } else {
+      child.kill('SIGKILL');
+      await ended;
+      assert.ok(attempt < 3, `the daemon never bound its port (${got}):\n${daemonLog()}`);
+    }
+  }
   t.after(async () => {
     daemon.kill('SIGTERM');
     const k = setTimeout(() => daemon.kill('SIGKILL'), 5000);
     await exited;
     clearTimeout(k);
   });
-  const daemonLog = () => readFileSync(log, 'utf8');
-  await until(() => connects(port), 20000, `the listener (${daemonLog()})`);
 
   // The TypeScript client starts the run as a command: the command
   // extension activated, the op one DataPart.
-  const url = `http://127.0.0.1:${port}`;
   const session = await openSession(url);
   assert.notEqual(session.caps.command, null, `the card declares ${COMMAND_EXTENSION}`);
   const client = new AgentdClient(session.ep, session.caps);

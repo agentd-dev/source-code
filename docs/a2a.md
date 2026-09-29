@@ -551,9 +551,10 @@ share what that name owns — tasks, runs, subagents, conversations — its stat
 scope and its rate bucket, so a person's history survives signing in again and
 token expiry. The flip side is stated in the answer: approving a name that was
 approved before sets `existing: true`, because reusing a name for a different
-person hands that person the name's history. A name that is a configured
-principal id — now, or ever, while the store remembers it — is refused, as are
-reserved names such as `operator`.
+person hands that person the name's history. A name any configured
+principal rule declares now is refused, and so is one a `user`-role rule ever
+declared, while the store remembers it — as are reserved names such as
+`operator`.
 
 **Scopes.** A session is a `user` unless the operator explicitly approves
 `scope: operator`, which `a2a.device_grant.scopes` must list; then the principal
@@ -608,8 +609,9 @@ its source, but a live code or an approved request is always honoured.
 The grant is **not declared on the card**, and adds no scheme and changes no
 posture: nothing outside the launcher's process can mint a code or approve a
 request — there is no op, route or config key that does — so a card that
-advertised it would advertise something no reader of the card could use. The
-RFC 8414 metadata lists the grant type while a launch is installed.
+advertised it would advertise something no reader of the card could use. When
+the device grant also serves RFC 8414 metadata, it lists the launch grant type
+while a launch is installed.
 
 ### Failed credentials and the source limiter
 
@@ -624,10 +626,14 @@ sailed through.
 What is never counted: an origin refusal (a web page could otherwise lock the
 local console out), a request that presents nothing, and the refusal of a caller
 who did authenticate. What is never refused by it: a request that presents
-nothing (the implicit operator, an `any` rule) and a client certificate, which is
-proven in the handshake and cannot be guessed. The residual is a bearer client
-sharing a source with a guesser — behind one NAT, or on 127.0.0.1 — which waits
-until the source drains.
+nothing (the implicit operator, an `any` rule), a client certificate, which is
+proven in the handshake and cannot be guessed, and a **live session token** —
+the launched console and every signed-in device keep working through a flood,
+because a session token is 256 bits agentd minted, so answering it "valid, or
+`429`" tells a guesser nothing. The residual is a client presenting a
+*configured* bearer (`a2a.bearer`, a `bearer_ref` rule) that shares a source
+with a guesser — behind one NAT, or on 127.0.0.1 — which waits until the source
+drains.
 
 Refusals any stranger can provoke for free are logged once per source and reason
 per minute, with a count of what the window left out.
@@ -669,10 +675,10 @@ not define are ignored. The message is a user's: `role` must be `ROLE_USER`.
   is opaque, and one this server did not issue is `-32602`;
 - `historyLength` unset omits the history, `n` keeps the newest `n`;
   artifacts ride along only with `includeArtifacts: true`;
-- the result always carries `tasks` and `nextPageToken`, and
-  **`nextPageToken` is `""` on the last page** — never absent, so "no token" is
-  never readable as "there is more". `pageSize` and `totalSize` ride beside
-  them, except that proto3 JSON leaves out a `totalSize` of zero.
+- the result always carries `tasks`, `nextPageToken`, `pageSize` and
+  `totalSize` — the four fields A2A marks required, present even on an empty
+  page (`[]`, `0`) — and **`nextPageToken` is `""` on the last page**, never
+  absent, so "no token" is never readable as "there is more".
 
 A filter the server cannot honour is refused with `-32602` rather than ignored.
 `ListTaskPushNotificationConfigs` pages the same way on the wire (`pageSize`

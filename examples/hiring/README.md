@@ -114,6 +114,18 @@ hiring manager the TUI, authenticate the listener with `a2a.bearer` and
 `agentd-tui --endpoint https://hiring-intake.internal:8444 --login` and
 talent-ops approves the code under their name (`/approve <code> <name>`).
 
+Two consequences come with that switch. Talent-ops is an operator here only
+through its `san` rule, which matches nothing once `client_ca` is gone, so the
+first approval is made with the `a2a.bearer` itself: talent-ops signs in with
+`agentd-tui --login --scope operator` (`device_grant.scopes` must list
+`operator`), and the bearer's holder approves that code with `scope: operator`
+through the `curl` in
+[the device authorization grant](../../docs/a2a.md#the-device-authorization-grant).
+That operator session is what talent-ops approves the manager from. And
+the manager's sessions are a new principal, `user:<name>`, not
+`user:san=hm@example.com`: what the certificate identity owned does not carry
+over.
+
 They can ask about any candidate, and because intake holds the analysis and the
 JD it can answer with evidence. Steering a run is an operator's: talent-ops can
 pause and resume one, and a principal rule whose `grants` name `workflow.signal`

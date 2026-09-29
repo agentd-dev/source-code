@@ -364,5 +364,6 @@ rolling the fleet.
   `subscribe` node turns a notification into a run.
 - [Configuration reference](configuration.md) — every setting, including the
   run-id the idempotency story rides on.
-- [Operations](operations.md) — the A2A management surface, `drain` /
-  `lame-duck`, and hot reload.
+- [Operations](operations.md) — the A2A management surface, the admin ops
+  (`admin.drain`, `admin.pause`, `admin.resume`, `admin.cancel`,
+  `admin.set`), and hot reload.

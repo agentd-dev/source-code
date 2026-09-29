@@ -500,6 +500,47 @@ test('an abort ends a stream whose body does not heed the signal', async (t) => 
   assert.deepEqual(frames, [{ hello: { seq: 0 } }]);
 });
 
+test('an abort ends a stream whose body has gone quiet', async (t) => {
+  // The case the abort listener exists for: one frame, then silence, so the
+  // client's next read is pending when the abort lands and nothing the body
+  // sends will ever wake it. Only cancelling the reader settles that read —
+  // a check between reads never runs.
+  const enc = new TextEncoder();
+  const state = {};
+  stubFetch(
+    t,
+    (req) =>
+      new Response(
+        new ReadableStream({
+          start(c) {
+            c.enqueue(enc.encode(frame({ hello: { seq: 0 } }, req.body.id)));
+          },
+          cancel() {
+            state.cancelled = true;
+          },
+        }),
+        { status: 200, headers: { 'content-type': 'text/event-stream' } },
+      ),
+  );
+  const ac = new AbortController();
+  const frames = [];
+  const done = rpcStream(EP, 'SubscribeToTask', { id: 't' }, (r) => frames.push(r), { signal: ac.signal });
+  await new Promise((r) => setTimeout(r, 30));
+  ac.abort();
+  let t2;
+  const settled = await Promise.race([
+    done.then(
+      () => 'resolved',
+      (e) => e,
+    ),
+    new Promise((r) => (t2 = setTimeout(() => r('still open'), 1000))),
+  ]);
+  clearTimeout(t2);
+  assert.equal(settled?.name, 'AbortError', `an aborted quiet stream ends with the abort, not ${settled}`);
+  assert.equal(state.cancelled, true, 'and its body is cancelled');
+  assert.deepEqual(frames, [{ hello: { seq: 0 } }]);
+});
+
 test('echo verification', async (t) => {
   assert.equal(parseExtensionHeader(null), null);
   assert.deepEqual(parseExtensionHeader(''), []);

@@ -307,8 +307,8 @@ with backoff and reports `durability: degraded`.
 There is no database protocol, no message-bus client, no local socket. The
 operator edge is the *same* listener as the peer edge: the TUI and web UI are
 thin display clients holding no truth of their own, subscribing to a feed and
-forwarding your intent back. Auth is the listener's — on a plaintext loopback
-listener with no principals a local client is the operator with zero setup; a
+forwarding your intent back. Auth is the listener's — on a loopback listener
+(http or https) with no credential configured a local non-browser client is the operator with zero setup; a
 remote client presents a bearer token or an mTLS identity and sees only what its
 role allows. The probe surface (`/metrics`, `/healthz`, `/readyz`, on a separate
 port when you set `--metrics-addr`) is read-only and off by default. A workflow

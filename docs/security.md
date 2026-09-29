@@ -548,10 +548,17 @@ dropped. **The limiter throttles guesses, not callers:**
 - **What presents nothing is never refused by it** — the implicit operator, an `any` rule —
   and neither is a client certificate, proven in the handshake and not guessable. A unix peer
   has no source.
+- **A live session token is checked, and served.** The launched console and every signed-in
+  device present one, from `127.0.0.1` for a local console, so refusing it unchecked would let
+  any local process — or a page on an admitted origin — keep the operator's console at `429`
+  with a trickle of junk bearers. A session token is 256 bits agentd minted, not a secret
+  someone chose, so answering it "valid, or `429`" gives a guesser nothing to use; a session
+  token that names nobody is still refused `429` unchecked.
 
-The residual is stated plainly. A bearer client that shares a source with a failing one —
-behind one NAT, on the same host, or behind the same reverse proxy, where every caller is the
-proxy's address — is refused until the source drains, at one failure per 3 seconds. And a
+The residual is stated plainly. A client presenting a *configured* bearer (`a2a.bearer`, a
+`bearer_ref` rule) that shares a source with a failing one — behind one NAT, on the same host,
+or behind the same reverse proxy, where every caller is the proxy's address — is refused until
+the source drains, at one failure per 3 seconds. And a
 browser sends a bearer only from a page on an origin the listener admits, so only an
 allow-listed origin's page can make a browser spend the local console's budget.
 
@@ -632,7 +639,7 @@ spells another party in the audit trail.
 and ownership is persisted by principal id, so the durable store keeps an identity registry
 (`runtime/identities.rs`): every declared `user`- or `agent`-role rule id is recorded at listener
 spawn and at every principals reload, and every approved name at approval. An approval of a name
-that is declared now, or was ever recorded as a rule, is refused; a start (exit `2`) or a reload
+any rule declares now, or one a `user`-role rule ever declared, is refused; a start (exit `2`) or a reload
 (the old rules stay) that declares a `user`-role id already approved as a device name is refused
 and logged `identity.collision`. So a device name and a rule id never share a principal across
 restarts, token expiry and rule removal — for as long as the store persists; a memory store
@@ -696,7 +703,8 @@ page's `/disconnect`, which revokes its own token.
 device grant's buckets. Only `invalid_grant` answers count, per source (20, forgiven one every 3
 seconds); past the limit only a *failing* presentation is refused `429`, and a live code or an
 approved request is always honoured — so a flood of junk from `127.0.0.1` cannot keep the real
-client out.
+client out, and the session it buys is served through the listener's own limiter
+([above](#failed-credentials-the-source-limiter)) however far over it the source is.
 
 **Availability against same-host processes.** Any process on the host can ask
 `/oauth2/launch_authorization` from the launched UI's origin; at 16 waiting requests the oldest
@@ -751,7 +759,8 @@ with `agent.ask_human_unowned: gate`.
 
 On a host you do not fully own, or anywhere a listener is reachable off the machine, the posture
 is **TLS plus `a2a.device_grant`, approved by an operator credential**: an `https://` bind with a
-certificate, `a2a.bearer` (or an operator `bearer_ref` rule) held by whoever approves, and every
+certificate, `a2a.bearer` held by whoever approves — off loopback the listener needs it (or
+`client_ca`), so an operator `bearer_ref` rule alone does not load — and every
 person signed in under a name they are accountable for. The load enforces the edges: a
 non-loopback bind needs `a2a.bearer` or `a2a.tls.client_ca`, plaintext is loopback-only, a
 wildcard bind needs `a2a.url`, and the device grant needs the operator credential. `client_ca`

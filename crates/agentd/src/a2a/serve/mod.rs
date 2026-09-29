@@ -1141,6 +1141,11 @@ mod tests {
         let v = json_of(resp).await;
         assert_eq!(v["result"]["nextPageToken"], "", "{v}");
         assert_eq!(v["result"]["tasks"], json!([]), "{v}");
+        assert_eq!(
+            v["result"]["totalSize"], 0,
+            "an empty listing counts nothing: {v}"
+        );
+        assert_eq!(v["result"]["pageSize"], 50, "a field present is kept: {v}");
         let v = json_of(filtered(unary_response(&page), fidelity(None, false)).await).await;
         assert_eq!(v, page, "only a listing is completed");
     }

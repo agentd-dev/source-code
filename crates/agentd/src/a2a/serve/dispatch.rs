@@ -115,6 +115,11 @@ async fn dispatch(
     let posture = resolver.posture();
     let ev = evidence_of(&headers, &peer_id, &peer);
     let source = peer.source();
+    let sessions = app
+        .auth
+        .sessions
+        .as_deref()
+        .map(|s| s as &dyn crate::a2a::principals::SessionVerifier);
     // A source past its failure limit presents no more bearers: they are
     // refused before they are checked. Checking them — throttling only the
     // ones that turned out wrong — would leave a guesser's rate untouched
@@ -123,9 +128,17 @@ async fn dispatch(
     // guessed; a certificate is proven in the handshake, and a request that
     // presents nothing guesses nothing, so neither is refused here — the
     // implicit operator and an `any` rule are never locked out by a flood.
+    //
+    // A live session token is the exception. The launched console and every
+    // signed-in device send one from this host, so refusing it unchecked
+    // would let any local process, or a page on an admitted origin, keep
+    // the operator's console at 429 with a trickle of junk bearers. It is
+    // 256 bits agentd minted, not a guessable secret, so answering "valid,
+    // or 429" tells a guesser nothing it could use.
     if let Some(ip) = source
-        && ev.bearer.is_some()
+        && let Some(token) = ev.bearer.as_deref()
         && let Some(retry) = app.failures.over(ip)
+        && !live_session(token, sessions)
     {
         denied(
             &app,
@@ -152,11 +165,6 @@ async fn dispatch(
         return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
     }
 
-    let sessions = app
-        .auth
-        .sessions
-        .as_deref()
-        .map(|s| s as &dyn crate::a2a::principals::SessionVerifier);
     let (principal, via) = match resolver.resolve(&ev, peer.is_unix(), sessions) {
         Resolution::Named(p, via) => (p, via),
         // Nothing presented: a challenge, never counted. An uncredentialed
@@ -599,6 +607,21 @@ fn is_json(headers: &HeaderMap) -> bool {
         .is_some_and(|t| t.trim().eq_ignore_ascii_case("application/json"))
 }
 
+/// Whether `token` is a session the listener issued and still holds. Anything
+/// else — a configured bearer, junk, an expired or revoked session — is not.
+fn live_session(
+    token: &str,
+    sessions: Option<&dyn crate::a2a::principals::SessionVerifier>,
+) -> bool {
+    token.starts_with(crate::a2a::principals::SESSION_TOKEN_PREFIX)
+        && sessions.is_some_and(|s| {
+            matches!(
+                s.verify(token),
+                crate::a2a::principals::SessionCheck::Valid(_)
+            )
+        })
+}
+
 /// A request that passed the envelope checks.
 struct Envelope {
     /// A string or an integer — never null, never absent.
@@ -894,11 +917,12 @@ impl Fidelity {
     }
 
     /// A `ListTasks` page with the fields the spec's response always carries.
-    /// a2a-rs writes ProtoJSON, which leaves out an empty string and an empty
-    /// list — so the last page came back with no `nextPageToken` and an empty
-    /// one with no `tasks`, and a client reading "no token" as "more to
-    /// come" (or `tasks` as required) broke on exactly the page that ends the
-    /// listing. Returns whether anything was added.
+    /// a2a-rs writes ProtoJSON, which leaves out an empty string, an empty
+    /// list and a zero — so the last page came back with no `nextPageToken`
+    /// and an empty one with no `tasks` and no `totalSize`, and a client
+    /// reading "no token" as "more to come" (or any of the four as the
+    /// REQUIRED fields A2A marks them) broke on exactly the page that ends
+    /// the listing. Returns whether anything was added.
     fn complete_page(&self, envelope: &mut Value) -> bool {
         let Some(result) = envelope
             .get_mut("result")
@@ -908,7 +932,12 @@ impl Fidelity {
             return false;
         };
         let mut changed = false;
-        for (field, empty) in [("nextPageToken", json!("")), ("tasks", json!([]))] {
+        for (field, empty) in [
+            ("nextPageToken", json!("")),
+            ("tasks", json!([])),
+            ("totalSize", json!(0)),
+            ("pageSize", json!(0)),
+        ] {
             if !result.contains_key(field) {
                 result.insert(field.to_string(), empty);
                 changed = true;

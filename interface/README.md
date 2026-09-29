@@ -71,8 +71,8 @@ session in the tab's `sessionStorage` only. The daemon admits the page only
 from an origin listed in `a2a.cors.origins` — except the page `agentd ui`
 launches.
 
-A TUI on a plaintext loopback daemon with nothing configured needs no
-credential. A browser always signs in: through the device grant, or as the tab
+A TUI on a loopback daemon (http or https) with no credential configured
+needs no credential. A browser always signs in: through the device grant, or as the tab
 `agentd ui` opened (and, from that launcher's terminal, any tab after it).
 
 ## As a library

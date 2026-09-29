@@ -92,7 +92,7 @@ export const DOCS = [
     file: "docs/a2a-extensions.md",
     title: "A2A extensions",
     group: "concepts",
-    blurb: "Everything agentd speaks beyond core A2A — the command, events and task-annotations extensions and the unix binding — each specified at its own URI under agentd.dev/a2a/ext/.",
+    blurb: "Everything agentd speaks beyond core A2A — the command, events and task-annotations extensions and the unix binding — each specified at its own URI under agentd.dev/a2a/.",
   },
   {
     slug: "subagents",

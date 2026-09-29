@@ -45,7 +45,7 @@ store:
   kind: memory                # see §5 — the session dies with the daemon
 
 a2a:
-  listen: http://127.0.0.1:8420   # plaintext loopback, no credential ⇒ your terminal is the operator
+  listen: http://127.0.0.1:8420   # loopback, no credential ⇒ your terminal is the operator
   events:
     enabled: true             # the live feed the TUI and web UI watch
   introspection:
@@ -150,6 +150,6 @@ Workflow `human` steps gate the same way and survive a daemon restart.
 - No built-in editing tools — §4 is the whole story.
 - `exec` is not in release binaries, on purpose.
 - MCP servers must speak HTTP(S); no stdio transport.
-- A plaintext loopback listener with nothing configured makes every local
-  non-browser client the operator: correct for a laptop, wrong for a shared
-  host.
+- A loopback listener (http or https) with no credential configured makes
+  every local non-browser client the operator: correct for a laptop, wrong
+  for a shared host. A certificate alone changes nothing.

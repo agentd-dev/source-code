@@ -119,3 +119,40 @@ fn an_allow_listed_command_runs_and_a_denied_one_is_refused() {
 
     std::fs::remove_dir_all(&workdir).ok();
 }
+
+/// The daemon's reactor reaps every exited child in the process while a
+/// workflow's `exec` step waits on its own: run the step many times, several
+/// at once, and every one still reports its command's exit.
+#[test]
+fn every_exec_step_reports_its_exit_while_the_reactor_reaps() {
+    const RUNS: usize = 30;
+    let workdir = common::unique_path("exec-wd", "d");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let over = (0..RUNS)
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let fan = format!(
+        "\x20     run:  {{kind: foreach, depends_on: [s], over: [{over}], batch: {{size: 1, parallel: 4}},\n\
+         \x20            body: {{steps: {{x: {{kind: tool, name: exec, args: {{cmd: echo, args: [\"n-{{{{item}}}}\"]}}}}}}}}}}"
+    );
+    let d = run(&config(&workdir, &fan));
+    assert!(
+        d.wait_done(60),
+        "the exec workflow finished:\n{}",
+        d.stderr()
+    );
+    let done = d.events("run.done");
+    let outs = done[0]["output"]
+        .as_array()
+        .unwrap_or_else(|| panic!("one output per run: {}", done[0]))
+        .clone();
+    assert_eq!(outs.len(), RUNS, "{}", done[0]);
+    for (i, out) in outs.iter().enumerate() {
+        assert_eq!(out["exit_code"], 0, "run {i} exits 0: {out}");
+        assert_eq!(out["stdout"], format!("n-{i}\n"), "run {i}: {out}");
+        assert_eq!(out["timed_out"], false, "run {i}: {out}");
+    }
+    drop(d);
+    std::fs::remove_dir_all(&workdir).ok();
+}

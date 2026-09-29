@@ -178,8 +178,9 @@ mod tests {
 
     // NOTE: `reap_pending()` is intentionally NOT unit-tested here. It calls
     // `waitpid(-1, WNOHANG)`, which in a multi-threaded test process would reap
-    // *other* tests' child processes (e.g. the `exec` tests' /bin/echo) before
-    // their own `Child::wait`, causing spurious ECHILD failures. In production
+    // *other* tests' child processes (e.g. the signals tests' `ls` listings)
+    // before their own `Child::wait`, causing spurious ECHILD failures (the
+    // `exec` runner's race test re-execs itself for the same reason). In production
     // it only runs inside the supervisor process, whose reaping domain is its
     // own; it's covered end-to-end by the spawn/reactive integration tests,
     // which run agentd in separate processes.

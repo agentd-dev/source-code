@@ -442,6 +442,13 @@ holds up the next call on the same server.
   tools and skills were already live. A runtime-stored definition that a
   configured one of the same name keeps from loading is logged as
   `workflow.stored.shadowed` instead of being skipped silently.
+- **An `exec` workflow step keeps its command's exit status.** The daemon's
+  reactor reaps every exited child in the process, and the `exec` runner
+  polled its own child with `try_wait`: when a tick landed between the
+  command's exit and the poll, the step failed with `wait <cmd>: No child
+  processes` and no `exit_code`. The command is now spawned through the
+  reaper's pid registry, so its status reaches the runner whichever side
+  collects it, and a timed-out command is still killed and reaped.
 
 ### Known limitations
 

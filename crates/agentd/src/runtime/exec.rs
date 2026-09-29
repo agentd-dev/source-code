@@ -29,6 +29,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+use crate::supervisor::reap::WaitOutcome;
+
 /// Resolve + confine the working directory. `workdir` must exist; a requested
 /// `cwd` (relative to it, or absolute) must canonicalize to a path inside it.
 pub(crate) fn resolve_cwd(workdir: &Path, req: Option<&str>) -> Result<PathBuf, String> {
@@ -86,10 +88,14 @@ pub(crate) fn run_command(
     // Nor any descriptor the host left inheritable: a model-chosen command
     // gets its three pipes and nothing else, however agentd was started.
     crate::signals::pass_only_stdio(&mut c);
-    let mut child = c.spawn().map_err(|e| format!("spawn {cmd}: {e}"))?;
+    // Routed from the fork on: a workflow step runs this on a `tool:exec`
+    // thread while the reactor's tick reaps every exited child in the process,
+    // so a plain `try_wait` here would lose the status to it.
+    let mut child = crate::supervisor::reaper::spawn_owned(|| c.spawn())
+        .map_err(|e| format!("spawn {cmd}: {e}"))?;
 
     // Feed stdin on a thread (so a child that writes before reading can't deadlock).
-    if let Some(mut si) = child.stdin.take() {
+    if let Some(mut si) = child.take_stdin() {
         let input = stdin.unwrap_or("").as_bytes().to_vec();
         std::thread::spawn(move || {
             let _ = si.write_all(&input);
@@ -97,32 +103,34 @@ pub(crate) fn run_command(
         });
     }
     // Read stdout/stderr on threads, capped (avoids a full-pipe deadlock).
-    let out = child.stdout.take();
-    let err = child.stderr.take();
+    let out = child.take_stdout();
+    let err = child.take_stderr();
     let oh = out.map(|r| std::thread::spawn(move || read_capped(r, max_output)));
     let eh = err.map(|r| std::thread::spawn(move || read_capped(r, max_output)));
 
-    // Wait with a deadline; kill on timeout.
+    // Wait with a deadline; past it, kill and still collect the exit, so a
+    // timed-out command leaves no zombie behind.
     let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(s)) => break Some(s),
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break None;
-                }
-                std::thread::sleep(Duration::from_millis(15));
-            }
-            Err(e) => return Err(format!("wait {cmd}: {e}")),
+    let status = match child.wait_until(Some(deadline)) {
+        Ok(Some(s)) => Some(s),
+        Ok(None) => {
+            child.kill();
+            child
+                .wait_until(None)
+                .map_err(|e| format!("wait {cmd}: {e}"))?;
+            None
         }
+        Err(e) => return Err(format!("wait {cmd}: {e}")),
     };
 
     let stdout = oh.and_then(|h| h.join().ok()).unwrap_or_default();
     let stderr = eh.and_then(|h| h.join().ok()).unwrap_or_default();
     let timed_out = status.is_none();
-    let exit_code = status.and_then(|s| s.code()).unwrap_or(-1);
+    // A signal death has no exit code, as with `ExitStatus::code`.
+    let exit_code = match status {
+        Some(WaitOutcome::Exited(code)) => code,
+        _ => -1,
+    };
     Ok(json!({
         "stdout": stdout,
         "stderr": stderr,
@@ -214,6 +222,104 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out["timed_out"], true, "killed at the deadline");
+        std::fs::remove_dir_all(&wd).ok();
+    }
+
+    /// A timed-out command is reported `timed_out`, and by the time the run
+    /// returns its child is killed and reaped: no process, not even a zombie,
+    /// is left under the pid.
+    #[test]
+    fn a_timed_out_command_is_killed_and_reaped() {
+        let wd = tmp_workdir("reaped");
+        let cwd = resolve_cwd(&wd, None).unwrap();
+        let started = Instant::now();
+        let out = run_command(
+            "sh",
+            &["-c".into(), "echo $$; exec sleep 30".into()],
+            &cwd,
+            None,
+            Duration::from_millis(300),
+            4096,
+            &["PATH".into()],
+        )
+        .unwrap();
+        std::fs::remove_dir_all(&wd).ok();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "killed at the deadline, not left to run: {out}"
+        );
+        assert_eq!(out["timed_out"], true, "{out}");
+        assert_eq!(out["exit_code"], -1, "{out}");
+        let pid: i32 = out["stdout"].as_str().unwrap().trim().parse().unwrap();
+        // A zombie still answers signal 0; only a reaped pid is ESRCH.
+        let alive = unsafe { libc::kill(pid, 0) };
+        assert!(
+            alive == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH),
+            "pid {pid} is still there (running or a zombie)"
+        );
+    }
+
+    const REAPER_CHILD: &str = "AGENTD_EXEC_REAPER_CHILD";
+
+    /// A workflow's `exec` step runs on its own thread while the daemon's
+    /// reactor reaps every exited child in the process: every run still
+    /// reports its own command's exit. Run in a child test process, because a
+    /// tight `reap_and_dispatch` loop would reap the children of every other
+    /// test in this binary.
+    #[test]
+    fn exec_keeps_its_exit_status_under_a_ticking_reaper() {
+        if std::env::var_os(REAPER_CHILD).is_some() {
+            return runs_under_a_ticking_reaper();
+        }
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "runtime::exec::tests::exec_keeps_its_exit_status_under_a_ticking_reaper",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(REAPER_CHILD, "1")
+            .output()
+            .expect("spawn the test binary");
+        let log = String::from_utf8_lossy(&out.stdout).into_owned()
+            + &String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "the child failed:\n{log}");
+        // The filter matched the test, so the child really ran it.
+        assert!(log.contains("1 passed"), "the child ran nothing:\n{log}");
+    }
+
+    fn runs_under_a_ticking_reaper() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stop = Arc::new(AtomicBool::new(false));
+        let reaper = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    crate::supervisor::reaper::reap_and_dispatch();
+                    std::thread::yield_now();
+                }
+            })
+        };
+        let wd = tmp_workdir("ticking");
+        let cwd = resolve_cwd(&wd, None).unwrap();
+        for i in 0..200 {
+            let out = run_command(
+                "echo",
+                &[format!("run-{i}")],
+                &cwd,
+                None,
+                Duration::from_secs(10),
+                4096,
+                &[],
+            )
+            .unwrap_or_else(|e| panic!("run {i}: {e}"));
+            assert_eq!(out["exit_code"], 0, "run {i}: {out}");
+            assert_eq!(out["stdout"], format!("run-{i}\n"), "run {i}: {out}");
+            assert_eq!(out["timed_out"], false, "run {i}: {out}");
+        }
+        stop.store(true, Ordering::Relaxed);
+        reaper.join().unwrap();
         std::fs::remove_dir_all(&wd).ok();
     }
 

@@ -828,6 +828,7 @@ security:
 | output cap | default 1 MiB; the reader drains past the cap and discards the excess (`exec.rs::read_capped`) | bounded capture, and no deadlock on a full pipe |
 | minimal env | `env_clear()` then rebuild from the named list (`exec.rs::run_command`) | the agent's environment, and its secrets, are never inherited |
 | off the reactor | a named `tool:exec` thread; stdin fed from a further thread | a child that writes before reading cannot stall the daemon |
+| its own exit status | the child's pid is routed to the runner's channel from the fork (`supervisor/reaper.rs::spawn_owned`); the runner takes the status from the daemon's reaper or reaps the pid itself, never both | the reactor reaps every exited child in the process, and a workflow step used to lose its command's exit to it |
 | audit | `exec.run{cmd, argc, cwd, timeout_ms, caller}` (`runtime/tools.rs::exec_tool`) | the confinement is logged, never the output |
 
 Every guard is re-checked at call time even though `Registry::build` already gated the

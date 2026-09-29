@@ -485,7 +485,7 @@ test('a task whose start this client never saw stays OFF the transcript', () => 
   assert.equal(m.getState().transcript.filter((e) => e.kind === 'agent').length, 1);
 });
 
-test('feed cases: lifecycle, config and auth notes; the deleted kinds are not read', () => {
+test('feed cases: lifecycle, config and auth notes', () => {
   const m = new Mirror();
   const s = m.getState();
   let refreshed = 0;

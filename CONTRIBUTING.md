@@ -1,7 +1,6 @@
 # Contributing to agentd
 
-Thanks for contributing! agentd is the **reference agent** for the Agent Control
-Contract (ACC) that the agentctl control plane consumes.
+Thanks for contributing!
 
 ## Licensing & DCO sign-off
 
@@ -24,19 +23,20 @@ New source files carry an SPDX header on line 1:
 // SPDX-License-Identifier: AGPL-3.0-only
 ```
 
-## ACC conformance — keep the contract honest
+## Conformance — keep the served surfaces honest
 
-agentd is conformant to the ACC **by behaviour**, not by sharing code with the
-control plane ([`CONFORMANCE.md`](CONFORMANCE.md)). If you change a served
-surface (manifest, management profile, metrics, exit codes, events, config, A2A,
-env, report):
+agentd's conformance is judged by **behaviour**, against the specifications and
+the contracts it documents ([`CONFORMANCE.md`](CONFORMANCE.md)). If you change a
+served surface (exit codes, the A2A listener, events, config admission, env, the
+store contract):
 
-- keep the change conformant to the contract schemas (the agentctl repo's
-  `contract/schemas/*` + `contract/SPEC.md`);
-- preserve the hard invariants — the manifest stays `json!`→`Value` (no
-  `Serialize`, secret-safe); no credential reaches the manifest/config/identity
-  path; branded **and** neutral (`AGENT_*` / `agent://`) spellings stay accepted;
-- update `CONFORMANCE.md` and add/extend a conformance check.
+- extend the black-box suite in `crates/agentd-conformance` with a check that
+  fails when the change is reverted;
+- keep credentials out of every surface a caller can read;
+- keep one spelling per name: `AGENTD_` is the only environment prefix, and an
+  agentd-owned name carries no version. A renamed or removed key, flag, method
+  or variable is deleted outright — no alias, no by-name refusal; the generic
+  unknown-name path refuses it.
 
 ## Dev workflow
 

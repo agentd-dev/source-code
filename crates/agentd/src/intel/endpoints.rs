@@ -36,13 +36,10 @@ pub struct Endpoint {
     /// The resolved bearer credential for THIS endpoint (never logged/serialized).
     pub(super) token: Option<String>,
     pub(super) provider: Provider,
-    /// Structural transport scheme reported in the observable resource body:
+    /// Structural transport scheme reported in the child's health report:
     /// `https`, or `http` for the loopback dev carve-out. Never the URL, which
     /// can carry a credential in its userinfo or path.
     pub(super) scheme: &'static str,
-    /// Structural address reported in the observable resource body — `host[:port]`
-    /// only, with no scheme, no path and therefore no secret.
-    pub(super) addr: String,
     /// Extra request headers: the resolved `intelligence.headers`, pushed on
     /// every dial. Empty unless configured.
     pub(super) extra_headers: Vec<(String, String)>,
@@ -102,7 +99,7 @@ impl EndpointList {
         for (i, part) in parts.iter().enumerate() {
             let (transport, http_path, host_header) = resolve(part, provider)?;
             let token = resolve_token(i, default_token.as_deref(), env)?;
-            let (scheme, addr) = scheme_and_addr(part);
+            let scheme = scheme_of(part);
             eps.push(Endpoint {
                 transport,
                 http_path,
@@ -110,7 +107,6 @@ impl EndpointList {
                 token,
                 provider,
                 scheme,
-                addr,
                 extra_headers: Vec::new(),
                 signer: None,
                 health: HealthRecord::new(),
@@ -235,62 +231,10 @@ impl EndpointList {
     /// The active endpoint's bounded structural identity `(index,
     /// transport-scheme)` for the child→supervisor
     /// [`crate::subagent::protocol::AgentMsg::IntelHealth`] report. Transport and
-    /// index ONLY — never the URL, host, cid or credential — matching the
-    /// redaction the served resource body applies, so neither route can leak
-    /// what the other withholds.
+    /// index ONLY — never the URL, host, cid or credential — because the report
+    /// crosses a process boundary into telemetry any reader can see.
     pub fn active_identity(&self) -> (usize, &'static str) {
         (self.active, self.eps[self.active].scheme)
-    }
-
-    /// A redacted status body: the endpoint list by transport
-    /// and index, which one is active, and each one's health — state, latency
-    /// and error rate. It must contain no secret and no URL: only the bounded
-    /// structural `transport` and `addr` (a bare `host[:port]`, which cannot
-    /// carry a scheme-borne credential) plus the live health atomics. Anything
-    /// added here becomes readable by every reader of the body.
-    pub fn body(&self, model: Option<&str>) -> serde_json::Value {
-        use serde_json::json;
-        let cfg = &self.breaker;
-        let endpoints: Vec<serde_json::Value> = self
-            .eps
-            .iter()
-            .enumerate()
-            .map(|(i, ep)| {
-                let h = &ep.health;
-                let mut e = json!({
-                    "index": i,
-                    "transport": ep.scheme,
-                    "addr": ep.addr,
-                    "state": h.state().as_str(),
-                    "active": i == self.active,
-                    "ewma_latency_ms": h.ewma_latency_ms(),
-                    "error_rate": h.error_rate(),
-                    "consec_fail": h.consec_fail(),
-                });
-                if let serde_json::Value::Object(m) = &mut e {
-                    if let Some(ms) = h.last_ok_ms_ago() {
-                        m.insert("last_ok_ms_ago".into(), json!(ms));
-                    }
-                    if h.state() == super::health::BreakerState::Open {
-                        if let Some(ms) = h.opened_ms_ago() {
-                            m.insert("opened_ms_ago".into(), json!(ms));
-                        }
-                        m.insert(
-                            "cooldown_ms".into(),
-                            json!(h.cooldown(cfg).as_millis() as u64),
-                        );
-                        m.insert("last_err".into(), json!(h.last_err_kind().as_str()));
-                    }
-                }
-                e
-            })
-            .collect();
-        json!({
-            "active": self.active,
-            "all_down": self.all_down(),
-            "model": model,
-            "endpoints": endpoints,
-        })
     }
 }
 
@@ -329,25 +273,18 @@ fn resolve_token(
     Ok(None)
 }
 
-/// The structural `(scheme, addr)` published in the observable resource body:
-/// the bounded transport identity only, never the URL path or any secret.
-/// `http` appears only for the loopback dev carve-out, because
-/// [`resolve`](super::client) has already rejected every other non-HTTPS form
-/// before an endpoint reaches here.
-fn scheme_and_addr(uri: &str) -> (&'static str, String) {
-    if let Some(rest) = uri.strip_prefix("https://") {
-        ("https", host_only(rest))
-    } else if let Some(rest) = uri.strip_prefix("http://") {
-        ("http", host_only(rest))
+/// The structural scheme published in the child's health report: the bounded
+/// transport identity only, never the URL or any secret. `http` appears only
+/// for the loopback dev carve-out, because [`resolve`](super::client) has
+/// already rejected every other non-HTTPS form before an endpoint reaches here.
+fn scheme_of(uri: &str) -> &'static str {
+    if uri.starts_with("https://") {
+        "https"
+    } else if uri.starts_with("http://") {
+        "http"
     } else {
-        ("unknown", String::new())
+        "unknown"
     }
-}
-
-/// The host[:port] of an `http(s)://host[:port]/path`, dropping the path (it may
-/// be sensitive and is not addressing).
-fn host_only(rest: &str) -> String {
-    rest.split('/').next().unwrap_or(rest).to_string()
 }
 
 /// A tool name in provider-safe wire form: OpenAI/Anthropic require tool names to
@@ -542,68 +479,6 @@ impl Endpoint {
         }
         Ok((parsed, latency))
     }
-
-    /// Model-discovery probe: one hand-rolled HTTP **GET** to the `/v1/models`
-    /// sibling of this endpoint's chat path, over the SAME transport and the
-    /// SAME bearer auth the chat call uses — no second client, no streaming.
-    /// Returns the discovered model `id`s.
-    ///
-    /// **Best-effort with silent degrade.** The `anthropic` dialect has no list
-    /// endpoint and returns `vec![]`. For an OpenAI-compatible endpoint, a
-    /// connection or transport failure, a non-2xx status (a 404 simply means
-    /// discovery is unsupported), or a body that is not the expected JSON all
-    /// yield `vec![]` too. None of these is a failover-class error and none is
-    /// fatal: the endpoint stays fully usable without discovery, since the
-    /// configured model is dialed regardless. Recording a probe failure against
-    /// the endpoint's health would let an optional feature open a breaker on a
-    /// perfectly healthy provider, which is why nothing here touches health. The
-    /// caller bounds this with a short timeout.
-    pub(super) fn discover_models(&self, timeout: Duration) -> Vec<String> {
-        use super::openai;
-        use crate::net::http;
-
-        // The dialect is already settled by the configured provider, so there is
-        // nothing to sniff here. Anthropic has no list endpoint.
-        if self.provider != Provider::OpenAiCompatible {
-            return Vec::new();
-        }
-
-        let path = openai::models_path(&self.http_path);
-        // Same auth header the chat call sends (`Authorization: Bearer …`), no body.
-        let mut headers: Vec<(String, String)> = Vec::new();
-        if let Some(tok) = self.token.as_deref() {
-            headers.push(("authorization".into(), format!("Bearer {tok}")));
-        }
-        // Sign the discovery GET too (over its own `/v1/models` path), so a
-        // signature-attesting gateway accepts it exactly like the chat dial.
-        for (k, v) in self.aauth_headers("GET", &path, &[]) {
-            headers.push((k, v));
-        }
-        let header_refs: Vec<(&str, &str)> = headers
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
-
-        // Connect → GET → parse. Any error degrades to [] (silent, never fatal).
-        let Ok(mut stream) = self.transport.connect(timeout) else {
-            return Vec::new();
-        };
-        let Ok(resp) = http::send(
-            stream.as_mut(),
-            &self.host_header,
-            "GET",
-            &path,
-            &header_refs,
-            &[],
-        ) else {
-            return Vec::new();
-        };
-        if !resp.is_success() {
-            // 404 / 4xx / 5xx → discovery unsupported for this endpoint.
-            return Vec::new();
-        }
-        openai::parse_models(&resp.body)
-    }
 }
 
 #[cfg(test)]
@@ -668,8 +543,8 @@ mod tests {
         .unwrap();
         assert_eq!(list.len(), 3);
         assert_eq!(list.ep(0).scheme, "https");
-        assert_eq!(list.ep(0).addr, "gw-a.example:8443");
-        assert_eq!(list.ep(1).addr, "gw-b.example:8444");
+        assert_eq!(list.ep(0).host_header, "gw-a.example:8443");
+        assert_eq!(list.ep(1).host_header, "gw-b.example:8444");
         assert_eq!(list.ep(2).scheme, "https");
         assert_eq!(list.active(), 0);
     }
@@ -681,8 +556,8 @@ mod tests {
             EndpointList::parse_with_env(" https://a.example , https://b.example ", None, &env)
                 .unwrap();
         assert_eq!(list.len(), 2);
-        assert_eq!(list.ep(0).addr, "a.example");
-        assert_eq!(list.ep(1).addr, "b.example");
+        assert_eq!(list.ep(0).host_header, "a.example");
+        assert_eq!(list.ep(1).host_header, "b.example");
     }
 
     #[test]
@@ -802,41 +677,6 @@ mod tests {
         list.ep(0).health.record_success(Duration::from_millis(5));
         assert_eq!(list.prefer_lowest_healthy(), Some(0));
         assert_eq!(list.active(), 0);
-    }
-
-    #[test]
-    fn resource_body_has_health_and_no_url_or_token() {
-        use super::super::health::ErrKind;
-        let env = env_of(&[("AGENTD_INTELLIGENCE_TOKEN", "super-secret-tok")]);
-        let list = EndpointList::parse_with_env(
-            "https://gw-a.example:8443,https://gw-b.example/v1/secret-path",
-            None,
-            &env,
-        )
-        .unwrap();
-        // make endpoint 1 broken, endpoint 0 healthy + active
-        list.ep(0).health.record_success(Duration::from_millis(41));
-        let cfg = *list.breaker_config();
-        for _ in 0..3 {
-            list.ep(1).health.record_failure(ErrKind::Refused, &cfg);
-        }
-        let body = list.body(Some("claude-opus-4"));
-        let text = body.to_string();
-        // schema: active/all_down/model/endpoints[]
-        assert_eq!(body["active"], 0);
-        assert_eq!(body["model"], "claude-opus-4");
-        assert_eq!(body["endpoints"][0]["transport"], "https");
-        assert_eq!(body["endpoints"][0]["addr"], "gw-a.example:8443");
-        assert_eq!(body["endpoints"][0]["state"], "closed");
-        assert_eq!(body["endpoints"][0]["active"], true);
-        assert_eq!(body["endpoints"][0]["ewma_latency_ms"], 41);
-        assert_eq!(body["endpoints"][1]["state"], "open");
-        assert_eq!(body["endpoints"][1]["last_err"], "refused");
-        // The body must carry neither the token nor a full URL (no scheme
-        // prefix, no path).
-        assert!(!text.contains("super-secret-tok"), "token leaked: {text}");
-        assert!(!text.contains("https://"), "full URI leaked: {text}");
-        assert!(!text.contains("secret-path"), "URL path leaked: {text}");
     }
 
     #[test]

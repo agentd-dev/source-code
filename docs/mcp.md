@@ -27,9 +27,8 @@ model or the operator, never on the world). Four more are contracts without a
 built-in implementation — `knowledge.*`, `search.*`, `code.run` and `exec` —
 which resolve only when an operator maps them to an MCP server (and `exec`
 additionally needs `--features exec` plus `security.exec.enabled`). One more,
-`resource.read`, joins the catalogue only when there is something to read: an
-MCP server's resource, or an `agentd://` self-resource such as an async child's
-completion.
+`resource.read`, joins the catalogue only when there is something to read: a
+connected MCP server that exposes resources.
 
 This is deliberate: the action space is configuration, not code. Swapping what
 an agent can do never means rebuilding agentd.
@@ -318,10 +317,11 @@ how to do:
 - OAuth token refresh through the signer seam
 - AWS SigV4, computed per request
 - SPIFFE X.509-SVID mutual TLS
-- the SSRF guard on every dial
 
 There is no split fleet and no fallback path: every server goes through the SDK,
-and every server keeps its credentials.
+and every server keeps its credentials. An MCP endpoint is operator-configured,
+so it is dialled directly; the SSRF guard is for addresses a peer or the model
+supplies — push callbacks, the `http` node, an AAuth person server.
 
 ### Which revision agentd speaks
 

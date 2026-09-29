@@ -466,9 +466,7 @@ Required fields in **bold**.
   `npm i -g @agentd-dev/cli` then `agentd-tui --endpoint <url>`. They are thin
   clients: all state lives in the daemon.
 - **No served MCP** — agentd is an MCP *client* only; nothing addresses it over
-  MCP. A `resource.read` for an `agentd://` URI routes to the agent's own loop
-  instead of to a server — an extension point an embedder can fill, not a
-  surface another process can reach. A2A is the only agent-facing protocol
+  MCP. A2A is the only agent-facing protocol
   served inbound — the second inbound listener is `webhooks.listen` (§5.7), which turns an HTTP
   request into a run.
 

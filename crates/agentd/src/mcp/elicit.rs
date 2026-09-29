@@ -66,8 +66,8 @@ impl Handler for ElicitationBridge {
             requested_schema,
         } = req
         else {
-            // `roots/list` is not wired: we do not advertise the capability, so
-            // this arm is unreachable in practice.
+            // A server-to-client request this host does not know: decline it.
+            // `Inbound` is non_exhaustive because MCP adds such requests.
             return None;
         };
         if self.cancel.load(Ordering::Relaxed) {

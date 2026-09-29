@@ -192,8 +192,9 @@ const MAIN_FLAGS: &[&str] = &[
 ];
 
 /// Every flag an agentd invocation in `text` passes, with the line it starts
-/// on. An invocation is what follows the binary — `agentd`, `$AGENTD` or a
-/// path ending in `/agentd` — on one logical line: shell continuations are
+/// on. An invocation is what follows the binary — `agentd`, `$AGENTD`, any
+/// path ending in `/agentd`, or an `AGENTD_ARGS=` assignment — on one logical
+/// line: shell continuations are
 /// joined, and in Python the bracketed argv the binary opens. A Kubernetes
 /// manifest's `args:` items are the container's, and every container shipped
 /// here runs agentd.
@@ -237,11 +238,14 @@ fn invoked_flags(path: &Path, text: &str) -> Vec<(usize, String)> {
             .map(|t| t.trim_matches(|c| c == '"' || c == '\'' || c == '\\'))
             .filter(|t| !t.is_empty())
             .collect();
+        // `AGENTD_ARGS=` is an invocation too: the packaged unit expands it
+        // into its `ExecStart`, so its value is argv the daemon parses.
         let Some(bin) = tokens.iter().position(|t| {
             *t == "agentd"
                 || *t == "$AGENTD"
                 || *t == "${AGENTD}"
-                || (t.ends_with("/agentd") && !t.starts_with('/') || *t == "/usr/local/bin/agentd")
+                || *t == "AGENTD_ARGS"
+                || t.ends_with("/agentd")
         }) else {
             continue;
         };
@@ -339,5 +343,17 @@ fn the_flag_scan_reads_each_invocation_shape() {
     assert_eq!(
         invoked_flags(Path::new("a.service"), unit),
         vec![(1, "--drain-timeout".into())]
+    );
+    // The packaged unit: any absolute path to the binary, and the flags it
+    // takes from its environment file.
+    let unit = "EnvironmentFile=-/etc/default/agentd\nExecStart=/usr/bin/agentd --no-such-flag $AGENTD_ARGS\n";
+    assert_eq!(
+        invoked_flags(Path::new("agentd.service"), unit),
+        vec![(2, "--no-such-flag".into())]
+    );
+    let env = "# flags in AGENTD_ARGS\nAGENTD_ARGS=--drain-timeout 25s\n";
+    assert_eq!(
+        invoked_flags(Path::new("agentd.env"), env),
+        vec![(2, "--drain-timeout".into())]
     );
 }

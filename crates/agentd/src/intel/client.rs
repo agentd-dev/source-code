@@ -364,13 +364,6 @@ impl IntelClient {
             }
         }
     }
-
-    /// Borrow the endpoint list for a read-only view of it. A caller serializes
-    /// transport, index and health only — never the URL or any credential,
-    /// since such a view is exposed to whoever can read it.
-    pub fn with_list<R>(&self, f: impl FnOnce(&EndpointList) -> R) -> R {
-        f(&self.list.borrow())
-    }
 }
 
 /// The jittered backoff delay for all-down retry `attempt`: the exponential

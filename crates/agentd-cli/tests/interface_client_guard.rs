@@ -87,6 +87,60 @@ fn interface_client_speaks_the_served_protocol_version() {
     );
 }
 
+/// The client uses an extension only when the card declares that exact URI,
+/// so a client constant that drifted from the daemon's drops the TUI and the
+/// web UI to core mode without a word — and every interface test would still
+/// pass, because they read the client's own constants. Each is held to the
+/// daemon's here, and every op the client sends to one the daemon has.
+#[test]
+fn the_clients_extension_vocabulary_is_the_daemons() {
+    use agentd::runtime::surface as daemon;
+    let ext = interface_src("src/client/ext.ts");
+    for (name, want) in [
+        ("COMMAND_EXTENSION", daemon::COMMAND_EXTENSION),
+        ("EVENTS_EXTENSION", daemon::EVENTS_EXTENSION),
+        (
+            "TASK_ANNOTATIONS_EXTENSION",
+            daemon::TASK_ANNOTATIONS_EXTENSION,
+        ),
+        ("UNIX_BINDING", daemon::UNIX_BINDING),
+        ("EVENTS_METHOD", daemon::EVENTS_METHOD),
+    ] {
+        assert_eq!(
+            ts_const(&ext, name).as_deref(),
+            Some(want),
+            "interface/src/client/ext.ts {name} must equal runtime/surface/ext.rs {name}"
+        );
+    }
+    let ops = ts_ops(&ext);
+    assert!(ops.len() > 10, "OPS parsed as {ops:?}");
+    for op in &ops {
+        assert!(
+            daemon::op_spec(op).is_some(),
+            "interface/src/client/ext.ts OPS sends `{op}`, which is no op the daemon serves"
+        );
+    }
+}
+
+/// The values of ext.ts's `OPS` table (`key: 'op',` lines).
+fn ts_ops(src: &str) -> Vec<String> {
+    let start = src
+        .find("export const OPS = Object.freeze({")
+        .expect("ext.ts declares OPS");
+    let body = &src[start..];
+    // The table closes on the first line that starts with `}`.
+    let body = &body[..body.find("\n}").expect("OPS closes")];
+    body.lines()
+        .skip(1)
+        .filter_map(|l| l.split_once(':').map(|(_, v)| v.trim()))
+        .map(|v| {
+            v.trim_end_matches(',')
+                .trim_matches(['\'', '"'])
+                .to_string()
+        })
+        .collect()
+}
+
 #[test]
 fn the_const_reader_reads_what_it_is_given() {
     assert_eq!(

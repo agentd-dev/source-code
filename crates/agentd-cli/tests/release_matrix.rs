@@ -201,3 +201,148 @@ fn the_local_gate_runs_the_same_rows_as_ci() {
         "scripts/ci-gate.sh is missing rows CI runs: {missing:#?}"
     );
 }
+
+/// The `[features]` a manifest declares, by name.
+fn declared_features(manifest: &str) -> Vec<String> {
+    let text = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(manifest))
+        .unwrap_or_else(|e| panic!("{manifest}: {e}"));
+    let mut out = Vec::new();
+    let mut inside = false;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with('[') && !t.starts_with("[\"") {
+            inside = t == "[features]";
+            continue;
+        }
+        if inside
+            && let Some((name, _)) = t.split_once('=')
+            && !t.starts_with('#')
+            && !t.starts_with('"')
+        {
+            out.push(name.trim().to_string());
+        }
+    }
+    out
+}
+
+/// The feature names each `--features <list>` in `text` passes.
+fn features_named(text: &str) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        let mut rest = line;
+        while let Some(i) = rest.find("--features") {
+            rest = &rest[i + "--features".len()..];
+            let Some(list) = rest.strip_prefix(' ').or_else(|| rest.strip_prefix('=')) else {
+                continue;
+            };
+            let list = list.trim_start_matches(['"', '\'']);
+            let run: String = list
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == ',' || *c == '-' || *c == '/')
+                .collect();
+            for name in run.split(',').filter(|s| !s.is_empty()) {
+                // `agentd/tls` forwards to the library's feature of the same name.
+                let name = name.rsplit('/').next().unwrap_or(name);
+                // A placeholder (`--features X`) names nothing.
+                if !name.chars().any(|c| c.is_ascii_uppercase()) {
+                    out.push((n + 1, name.to_string()));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Every `--features` a reader is told to pass names a feature that exists.
+///
+/// A deleted cargo feature makes cargo refuse the whole command before it
+/// builds anything, and the prose that still names it is what people copy.
+/// History (the changelog, RFCs and design notes) records what was, and is
+/// left alone.
+#[test]
+fn every_feature_a_reader_is_told_to_pass_exists() {
+    let mut known = declared_features("Cargo.toml");
+    known.extend(declared_features("../agentd/Cargo.toml"));
+    assert!(
+        known.iter().any(|f| f == "a2a"),
+        "features parsed as {known:?}"
+    );
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    fn walk(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for p in rd.filter_map(Result::ok).map(|e| e.path()) {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if p.is_dir() {
+                if !matches!(name, "target" | "node_modules" | "dist" | ".git" | "design") {
+                    walk(&p, out);
+                }
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    for dir in [
+        "docs",
+        "examples",
+        "bench",
+        "packaging",
+        "scripts",
+        "crates",
+        ".github",
+        "skills",
+        "interface",
+        "web/public",
+    ] {
+        walk(&root.join(dir), &mut files);
+    }
+    for f in [
+        "README.md",
+        "CONTRIBUTING.md",
+        "CONFORMANCE.md",
+        "Dockerfile",
+        "install.sh",
+    ] {
+        files.push(root.join(f));
+    }
+    let mut seen = 0;
+    let mut stale = Vec::new();
+    for f in &files {
+        // This file spells a deleted feature on purpose, to test the scan.
+        if f.ends_with(file!().rsplit('/').next().unwrap()) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(f) else {
+            continue;
+        };
+        for (line, name) in features_named(&text) {
+            seen += 1;
+            if !known.contains(&name) {
+                stale.push(format!("{}:{line}: {name}", f.display()));
+            }
+        }
+    }
+    assert!(seen >= 20, "only {seen} feature names found — wrong root?");
+    assert!(
+        stale.is_empty(),
+        "these tell a reader to pass a cargo feature that does not exist:\n{}",
+        stale.join("\n")
+    );
+}
+
+#[test]
+fn the_feature_scan_reads_each_spelling() {
+    let text = "$ cargo build --features a2a,workflow\nFEATURES=x cargo b --features=\"tls,agentd/oci\"\nbuild with --features X\n";
+    assert_eq!(
+        features_named(text),
+        vec![
+            (1, "a2a".into()),
+            (1, "workflow".into()),
+            (2, "tls".into()),
+            (2, "oci".into())
+        ]
+    );
+}

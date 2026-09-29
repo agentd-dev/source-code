@@ -495,7 +495,7 @@ impl Runtime {
             ))
             .stderr(std::process::Stdio::from(log_file));
         for (k, _) in std::env::vars() {
-            let alias = k.starts_with("AGENTD_") || k.starts_with("AGENT_");
+            let alias = k.starts_with(crate::config::paths::ENV_PREFIX);
             let keep = k.contains("INTELLIGENCE");
             if alias && !keep {
                 cmd.env_remove(&k);

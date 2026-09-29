@@ -16,11 +16,6 @@ pub mod endpoints;
 pub mod failover;
 pub mod health;
 pub mod openai;
-// Optional, capability-negotiated model discovery: a best-effort
-// `GET /v1/models` over the existing intel transport. Off the hot path, silent
-// on failure, never fatal — a provider that does not expose the endpoint simply
-// reports no models.
-pub mod discovery;
 // Built-in mock LLM (the hidden `--internal-mock-llm` mode) that backs the
 // observe-to-validate and conformance suites. Debug builds always carry it so
 // `cargo test` works with no flag; release ships it only under `internal-mocks`,

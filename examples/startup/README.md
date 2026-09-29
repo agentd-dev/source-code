@@ -169,7 +169,7 @@ $ agentd-tui --endpoint http://127.0.0.1:8448     # the chief of staff
 **Dry-run the whole company offline** — debug builds carry a mock LLM:
 
 ```console
-$ cargo build --features a2a,workflow
+$ cargo build --features a2a
 $ AGENTD_INTELLIGENCE=mock:final ./target/debug/agentd \
     -c examples/startup/services.yaml -c examples/startup/sre.yaml
 $ curl -X POST 127.0.0.1:9444/alerts/firing -d '{"alert_id":"a1","service":"probes","severity":"critical"}'

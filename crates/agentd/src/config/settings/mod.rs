@@ -4828,7 +4828,12 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
                             .map_err(|e| usage(format!("invalid {a}: {e}")))?;
                         file::merge_into(&mut doc, target.document(value));
                     }
-                    None => return Err(usage(format!("unknown argument: {a}"))),
+                    // Echo only the name: `--a2a.bearer=…` is a flag this
+                    // loader does not take in that form, and the refusal goes
+                    // to stderr, the journal and pod logs.
+                    None => {
+                        return Err(usage(format!("unknown argument: {}", paths::flag_name(a))));
+                    }
                 }
             }
         }
@@ -7068,6 +7073,17 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                 }
             }
             Err(e) => err(&mut d, format!("a2a.listen: {e}")),
+        }
+        // A TCP listener with no credential at all runs everybody on this host
+        // who presents nothing as the operator. That is a posture the operator
+        // should see stated, not infer from the absence of a key: a credential
+        // supplied through a variable this loader does not read looks, from
+        // the outside, exactly like one that was set.
+        let posture = crate::runtime::surface::auth::listener_auth_of(&s.a2a);
+        if posture.implicit_operator && !posture.unix {
+            d.warnings.push(
+                "a2a.listen: no credential is configured, so every local process that presents none is the operator — set a2a.bearer, an a2a.principals rule, a2a.tls.client_ca or a2a.device_grant to require one".into(),
+            );
         }
     }
 
@@ -10163,6 +10179,27 @@ mod tests {
         }
     }
 
+    /// A loopback TCP listener with no credential makes every local caller
+    /// that presents nothing the operator; the load says so, and stops saying
+    /// so once any credential is configured.
+    #[test]
+    fn a_listener_without_a_credential_warns_that_every_local_process_is_the_operator() {
+        crate::sec::secret::set_prompted("A2A_TEST_BEARER", "test-bearer".into());
+        let warned = |yaml: &str| {
+            let l = load_doc(&format!("store: {{kind: memory}}\n{yaml}")).unwrap();
+            l.warnings
+                .iter()
+                .any(|w| w.contains("every local process that presents none is the operator"))
+        };
+        assert!(warned("a2a:\n  listen: \"http://127.0.0.1:18999\"\n"));
+        assert!(!warned(
+            "a2a:\n  listen: \"http://127.0.0.1:18999\"\n  bearer: \"{{secret:A2A_TEST_BEARER}}\"\n"
+        ));
+        assert!(!warned(
+            "a2a:\n  listen: \"unix:///tmp/agentd-warn-test.sock\"\n"
+        ));
+    }
+
     #[test]
     fn new_a2a_keys_require_a_listener() {
         let bearer = "  bearer: \"{{secret:A2A_TEST_BEARER}}\"\n";
@@ -10655,6 +10692,19 @@ mod tests {
         a.extend(args(&["--interface.enabled", "true"]));
         let e = load(&a, &[]).unwrap_err().to_string();
         assert!(e.contains("unknown argument: --interface.enabled"), "{e}");
+        // A flag typed with its value attached is refused by name alone: the
+        // value may be a credential and the refusal lands in logs.
+        for bad in [
+            "--x.y=s3cret",
+            "--mcp.servers.x=s3cret",
+            "--store.kind.x=s3cret",
+        ] {
+            let mut a = args(&base);
+            a.push(bad.to_string());
+            let e = load(&a, &[]).unwrap_err().to_string();
+            assert!(e.contains(bad.split('=').next().unwrap()), "{e}");
+            assert!(!e.contains("s3cret"), "the refusal echoed the value: {e}");
+        }
         // A FRAGMENT: outside what a document may write, so it is operator
         // configuration — the fail-closed walk refuses a leaf nobody
         // classified.

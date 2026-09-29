@@ -373,6 +373,14 @@ impl FlagTarget {
     }
 }
 
+/// The part of a command-line argument that names it: everything before the
+/// first `=`. A refusal echoes this and never the whole argument, because an
+/// argument typed as `--name=value` carries its value — often a credential —
+/// and refusals land in stderr, the journal and pod logs.
+pub fn flag_name(arg: &str) -> &str {
+    arg.split_once('=').map_or(arg, |(name, _)| name)
+}
+
 /// Resolve a `--flag` (with or without the leading dashes) to the schema path it
 /// addresses — canonicalizing `.`/`_`/`-` — or, for a dotted flag whose longest
 /// schema-path prefix is a free-form map, to that map plus the remaining
@@ -407,13 +415,16 @@ pub fn resolve_flag(all: &[Binding], arg: &str) -> Result<Option<FlagTarget>, St
                 entry: Some(rest),
             })),
             Kind::Array(_) => Err(format!(
-                "{arg}: array elements cannot be addressed by path (set the whole list `--{} '[…]'`, or use the named repeatable flag)",
+                "{}: array elements cannot be addressed by path (set the whole list `--{} '[…]'`, or use the named repeatable flag)",
+                flag_name(arg),
                 canonical_flag_body(&binding.path)
             )),
             _ => Err(format!(
-                "{arg}: `{}` is a {} value, not an object — nothing to set at `.{rest}`",
+                "{}: `{}` is a {} value, not an object — nothing to set at `.{}`",
+                flag_name(arg),
                 binding.path,
-                binding.kind.hint().trim_matches(['<', '>'])
+                binding.kind.hint().trim_matches(['<', '>']),
+                flag_name(&rest)
             )),
         };
     }

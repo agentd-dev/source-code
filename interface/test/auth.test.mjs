@@ -504,6 +504,12 @@ test('no credential reaches persistent storage', () => {
     assert.equal(loadEndpoint(s), undefined, junk);
     assert.equal(s.getItem(ENDPOINT_KEY), null, junk);
   }
+  // An entry carrying anything beside the endpoint is rewritten to exactly
+  // the endpoint on the first read, whatever the extra field is called.
+  const extra = recordingStorage();
+  extra.setItem(ENDPOINT_KEY, JSON.stringify({ endpoint: 'http://127.0.0.1:8420', token: 'operator-secret' }));
+  assert.equal(loadEndpoint(extra), 'http://127.0.0.1:8420');
+  assert.deepEqual(JSON.parse(extra.getItem(ENDPOINT_KEY)), { endpoint: 'http://127.0.0.1:8420' });
   // A clean entry is read without a write.
   const clean = recordingStorage();
   persistEndpoint(clean, { endpoint: 'http://127.0.0.1:8420' });

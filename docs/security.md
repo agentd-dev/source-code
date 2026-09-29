@@ -481,7 +481,7 @@ short-circuits ahead of every approval mode — and an operator-declared `securi
 (`runtime/tools.rs::policy_gate`). Configure principals on any host you do not fully own.
 
 The only process agentd launches is a re-exec of its own binary via `current_exe()`
-(`runtime/mod.rs::run`), marked with the `AGENT_SUBAGENT` environment variable. The child's
+(`runtime/mod.rs::run`), marked with the `AGENTD_SUBAGENT` environment variable. The child's
 work arrives as a serialized control frame on its stdin — data to a model loop, never argv
 to a shell. Each child gets its own process group so the kill ladder can target the
 subtree, an optional cgroup leaf whose `Drop` writes `cgroup.kill`, and `PR_SET_PDEATHSIG`

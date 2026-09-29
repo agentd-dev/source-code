@@ -307,7 +307,13 @@ fn origin_is_loopback(origin: &str) -> bool {
     } else {
         authority.split(':').next().unwrap_or(authority)
     };
-    host == "localhost" || host == "::1" || host.starts_with("127.")
+    // Classify the host exactly: a name that merely begins with `127.` is a
+    // DNS name anyone can register (`127.evil.example`), so a prefix test would
+    // let a cross-site page through the one browser defence this listener has.
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Why a request could not be read.
@@ -448,6 +454,10 @@ mod tests {
         let addr = spawn_server();
         // A browser cross-site Origin → 403 (DNS-rebinding defense).
         assert_eq!(http_post_origin(&addr, Some("https://evil.example")), 403);
+        assert_eq!(
+            http_post_origin(&addr, Some("http://127.evil.example")),
+            403
+        );
         // No Origin (the normal non-browser caller) → served (200).
         assert_eq!(http_post_origin(&addr, None), 200);
         // A loopback Origin (a local dev tool) → served.
@@ -464,5 +474,10 @@ mod tests {
         assert!(!origin_is_loopback("https://evil.example"));
         assert!(!origin_is_loopback("http://169.254.1.1")); // link-local, not loopback
         assert!(!origin_is_loopback("null")); // opaque origin → untrusted
+        // A DNS name that only looks loopback is somebody's domain.
+        assert!(!origin_is_loopback("http://127.evil.example"));
+        assert!(!origin_is_loopback("http://127.0.0.1.evil.example"));
+        assert!(!origin_is_loopback("http://localhost.evil.example"));
+        assert!(origin_is_loopback("http://127.1.2.3:80"));
     }
 }

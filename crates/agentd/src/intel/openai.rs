@@ -14,42 +14,6 @@ use serde_json::{Map, Value, json};
 /// path (`https://host[:port]` with path `/`).
 pub const DEFAULT_PATH: &str = "/v1/chat/completions";
 
-/// The OpenAI-compatible model-list path used by the discovery probe. The `/v1`
-/// API root has a sibling `/models` next to `/chat/completions`.
-pub const MODELS_PATH: &str = "/v1/models";
-
-/// Derive the model-discovery `GET` path as the **sibling** of the configured
-/// chat path: swap the trailing `…/chat/completions` segment for `…/models` so
-/// a non-default API root (e.g. a gateway mounted at `/proxy/v1`) keeps its
-/// prefix. Anything that isn't the canonical chat suffix falls back to the
-/// absolute `MODELS_PATH` — discovery is best-effort, never a hard failure, so
-/// guessing a plausible path beats refusing to probe.
-pub fn models_path(chat_path: &str) -> String {
-    match chat_path.strip_suffix("/chat/completions") {
-        Some(prefix) => format!("{prefix}/models"),
-        None => MODELS_PATH.to_string(),
-    }
-}
-
-/// Parse an OpenAI-compatible `/v1/models` response body into the list of model
-/// `id`s. The expected shape is `{ "data": [ { "id": "…" }, … ] }`. A missing,
-/// empty or non-array `data`, or a body that is not JSON at all, yields an empty
-/// list: discovery degrades silently and never counts as a failover-class
-/// failure, so a provider without the endpoint must not mark itself unhealthy.
-pub fn parse_models(body: &[u8]) -> Vec<String> {
-    let Ok(v) = serde_json::from_slice::<Value>(body) else {
-        return Vec::new();
-    };
-    let Some(arr) = v.get("data").and_then(Value::as_array) else {
-        return Vec::new();
-    };
-    arr.iter()
-        .filter_map(|m| m.get("id").and_then(Value::as_str))
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
 /// The output-token-limit parameter name for `model`. OpenAI's reasoning models
 /// (`gpt-5*`, the `o1/o3/o4` series) require `max_completion_tokens` and REJECT
 /// the older `max_tokens`; everything else (gpt-4o/4.1, and self-hosted
@@ -300,41 +264,5 @@ mod tests {
                 .unwrap_err()
                 .contains("invalid api key")
         );
-    }
-
-    // --- model discovery ---------------------------------------------------
-
-    #[test]
-    fn models_path_is_sibling_of_chat_path() {
-        // Canonical: /v1/chat/completions → /v1/models.
-        assert_eq!(models_path("/v1/chat/completions"), "/v1/models");
-        // A gateway mounted at a non-default root keeps its prefix.
-        assert_eq!(
-            models_path("/proxy/v1/chat/completions"),
-            "/proxy/v1/models"
-        );
-        // Anything non-canonical falls back to the absolute path.
-        assert_eq!(models_path("/weird/endpoint"), "/v1/models");
-    }
-
-    #[test]
-    fn parse_models_reads_data_ids() {
-        let body = br#"{"object":"list","data":[{"id":"claude-opus-4","object":"model"},{"id":"claude-haiku-4"}]}"#;
-        assert_eq!(
-            parse_models(body),
-            vec!["claude-opus-4".to_string(), "claude-haiku-4".to_string()]
-        );
-    }
-
-    #[test]
-    fn parse_models_degrades_to_empty_on_bad_or_missing_data() {
-        // Non-JSON → [].
-        assert!(parse_models(b"<html>404</html>").is_empty());
-        // JSON without a `data` array → [].
-        assert!(parse_models(br#"{"error":{"message":"nope"}}"#).is_empty());
-        // `data` present but entries without an `id` → [].
-        assert!(parse_models(br#"{"data":[{"object":"model"}]}"#).is_empty());
-        // Empty list → [].
-        assert!(parse_models(br#"{"data":[]}"#).is_empty());
     }
 }

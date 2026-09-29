@@ -10,7 +10,7 @@
 
 use crate::http::{HttpTransport, McpEndpoint};
 use crate::inbound;
-use crate::rpc::{self, RpcError};
+use crate::rpc;
 use crate::wire::{
     CallToolResult, CompleteResult, GetPromptResult, Implementation, Prompt, ReadResourceResult,
     Resource, ResourceTemplate, ServerCapabilities, Tool,
@@ -23,11 +23,6 @@ use std::time::Duration;
 #[derive(Debug)]
 pub enum McpError {
     Transport(String),
-    /// A JSON-RPC error object from the server (protocol failure, distinct
-    /// from a `tools/call` result with `isError: true`).
-    Rpc(RpcError),
-    /// No response within the per-request timeout.
-    Timeout(String),
     /// The server doesn't advertise the capability the call needs.
     Capability(String),
 }
@@ -36,8 +31,6 @@ impl fmt::Display for McpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             McpError::Transport(m) => write!(f, "mcp: transport: {m}"),
-            McpError::Rpc(e) => write!(f, "mcp: rpc error {}: {}", e.code, e.message),
-            McpError::Timeout(m) => write!(f, "mcp: timeout: {m}"),
             McpError::Capability(m) => write!(f, "mcp: capability: {m}"),
         }
     }
@@ -262,9 +255,10 @@ impl McpClient {
     /// default. Used by the reactor-thread lease management path (claim
     /// renew/ack/release) — a slow coordination server must not block the reactor
     /// past the liveness staleness window. Behaviour is otherwise identical to
-    /// [`Self::call_tool_with_meta`]; a timeout surfaces as [`McpError::Timeout`],
-    /// which the lease callers already treat as a best-effort failure. The data
-    /// path (subagent tool calls) never uses this — it keeps the default timeout.
+    /// [`Self::call_tool_with_meta`]. The SDK owns the per-request deadline, so
+    /// `timeout` is currently unused and the short bound is not enforced here —
+    /// an open defect, not a guarantee. The data path (subagent tool calls)
+    /// never uses this — it keeps the default timeout.
     pub fn call_tool_with_meta_within(
         &self,
         name: &str,
@@ -363,8 +357,8 @@ mod tests {
 
     #[test]
     fn error_display() {
-        let e = McpError::Timeout("tools/call on 'fs'".into());
-        assert!(e.to_string().contains("timeout"));
+        let e = McpError::Capability("resources on 'fs'".into());
+        assert!(e.to_string().contains("capability"));
     }
 
     #[test]

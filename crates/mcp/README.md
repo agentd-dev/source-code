@@ -11,7 +11,9 @@ the version table — and tracking the specification upstream is exactly what yo
 want from a protocol implementation. What its own transport cannot do is carry
 a credential your deployment requires: an AAuth request signature with its
 challenge/re-sign loop, an AWS SigV4 signature computed per request, an mTLS
-client identity, an OAuth token you refresh, an SSRF guard on every dial.
+client identity, an OAuth token you refresh. The transport dials the endpoint
+it is given as-is: vetting a URL that did not come from your operator is the
+embedder's job.
 
 So `rmcp_transport` implements the SDK's `StreamableHttpClient` over
 [`agentd-net`](https://crates.io/crates/agentd-net)'s HTTP stack. The SDK speaks

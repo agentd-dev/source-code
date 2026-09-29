@@ -139,8 +139,11 @@ export function persistEndpoint(storage: KeyValueStorage, v: { endpoint: string 
 }
 
 /**
- * The remembered endpoint, if any. Nothing else in that entry is read, and an
- * entry with no endpoint to keep is removed rather than left to be misread.
+ * The remembered endpoint, if any. The entry holds exactly `{endpoint}`:
+ * anything else found in it is dropped on this read — rewritten away, not just
+ * ignored, because an unread field is still a value sitting in persistent,
+ * cross-tab storage — and an entry with no endpoint to keep is removed rather
+ * than left to be misread.
  */
 export function loadEndpoint(storage: KeyValueStorage): string | undefined {
   const raw = storage.getItem(ENDPOINT_KEY);
@@ -159,6 +162,7 @@ export function loadEndpoint(storage: KeyValueStorage): string | undefined {
     storage.removeItem(ENDPOINT_KEY);
     return undefined;
   }
+  if (Object.keys(v as object).some((k) => k !== 'endpoint')) persistEndpoint(storage, { endpoint });
   return endpoint;
 }
 

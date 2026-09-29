@@ -39,7 +39,7 @@ idle daemon 5.5 MiB RSS · protocols from their own SDKs · HTTPS everywhere · 
    [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk), the official Rust
    SDK; A2A is [`a2a-rs`](https://github.com/emillindfors/a2a-rs), generated from
    the specification's protocol buffers. Both run over agentd's own socket, so
-   request signing, mTLS and the SSRF guard survive the adoption. Everything
+   request signing and mTLS survive the adoption. Everything
    small and frozen — the HTTP client, the cron parser, Prometheus text, OTLP
    export, the inotify watch — is still hand-rolled on `std` + `libc`. What
    ships is one 8.5 MiB static binary that starts in under a millisecond, idles

@@ -86,7 +86,7 @@ flowchart TB
 
 ### Why re-exec, not threads
 
-A child is the *same binary* re-executed with `AGENT_SUBAGENT=1`. `main` checks that
+A child is the *same binary* re-executed with `AGENTD_SUBAGENT=1`. `main` checks that
 variable and jumps to the subagent entry point before parsing any CLI configuration;
 the child receives its whole configuration from the first frame on its stdin. One
 artifact ships, with no second code path to keep in sync.
@@ -109,7 +109,7 @@ Threads would have been cheaper. Three reasons, in priority order:
 Spawning is one atomic block, held under a process-global routes mutex so the reaper
 can never `waitpid` a child that is not yet registered:
 
-1. `Command::new(current_exe())` with `AGENT_SUBAGENT=1`, stdin and stdout piped,
+1. `Command::new(current_exe())` with `AGENTD_SUBAGENT=1`, stdin and stdout piped,
    stderr **inherited** — the child's JSON telemetry flows into the parent's stream,
    leaving stdout for binary frames.
 2. `pre_exec` → `setpgid(0, 0)`, making the child its own process-group leader. The

@@ -27,7 +27,7 @@ the daemon.
 ## The shape: one flat generation of children
 
 There is one artifact. `agentd` re-execs itself to make a child, setting
-`AGENT_SUBAGENT=1`; the re-exec'd process sees that marker and runs the subagent
+`AGENTD_SUBAGENT=1`; the re-exec'd process sees that marker and runs the subagent
 entry point instead of the daemon.
 
 The runtime tree is **flat**. Every child — a turn worker, a `think` worker, a

@@ -94,7 +94,7 @@ Flags: `--agentd <path>` (or `AGENTD_BIN`), `--tasks <file.jsonl>`,
  "grade": {"regex": "\\b1600 Amphitheatre\\b"}}
 ```
 
-Set the model credential via `AGENT_INTELLIGENCE_TOKEN` in the environment. No
+Set the model credential via `AGENTD_INTELLIGENCE_TOKEN` in the environment. No
 runner code changes — swapping the mock fields for `intelligence`/`mcp` is all it
 takes. That is the on-ramp to the Phase-1 benchmarks.
 
@@ -169,7 +169,7 @@ The reusable pieces that turn "run agentd" into "run a benchmark":
       --answers possible_answer/BFCL_v3_simple.json \
       --intelligence https://gateway.example/v1 --model claude-opus-4-8 \
       --out bench/tasks/bfcl_simple.jsonl
-  $ AGENT_INTELLIGENCE_TOKEN=sk-... python3 bench/run.py \
+  $ AGENTD_INTELLIGENCE_TOKEN=sk-... python3 bench/run.py \
       --tasks bench/tasks/bfcl_simple.jsonl --repeats 5 --config opus
   ```
 

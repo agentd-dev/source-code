@@ -268,14 +268,13 @@ pub fn run() -> i32 {
         match connected {
             Ok(mut c) => {
                 log.info("mcp.connect", serde_json::json!({"server": spec.name}));
-                // Stamp the run id, so a server can deduplicate a retried call,
-                // and a W3C traceparent, so the call joins the run's trace, on
-                // every tool call.
-                let mut meta = serde_json::json!({"agent/run_id": payload.telemetry.run_id});
-                if let Some(tid) = &payload.telemetry.trace_id {
-                    meta["traceparent"] = crate::obs::trace::outbound_traceparent(tid).into();
-                }
-                c.set_tool_meta(meta);
+                // The same meta the reactor stamps on its own connections, so a
+                // server sees one run whichever process made the call.
+                c.set_tool_meta(crate::mcp::tool_meta(
+                    &payload.telemetry.run_id,
+                    &payload.telemetry.instance,
+                    payload.telemetry.trace_id.as_deref(),
+                ));
                 servers.push(c);
             }
             Err(e) => {

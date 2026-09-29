@@ -384,10 +384,11 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         match crate::mcp::from_spec(&spec, per_timeout).and_then(|mut c| c.initialize().map(|()| c))
         {
             Ok(mut c) => {
-                let mut meta = json!({"agent/run_id": run_id, "agent/instance": instance});
-                meta["traceparent"] =
-                    crate::obs::trace::outbound_traceparent(&trace.trace_id).into();
-                c.set_tool_meta(meta);
+                c.set_tool_meta(crate::mcp::tool_meta(
+                    &run_id,
+                    &instance,
+                    Some(&trace.trace_id),
+                ));
                 let tools = c.list_tools().unwrap_or_default();
                 log.info(
                     "mcp.connect",

@@ -1029,6 +1029,7 @@ skills from the catalogue that apply. Reply with ONLY one JSON object matching t
             },
             telemetry: Telemetry {
                 run_id: self.run_id.clone(),
+                instance: self.instance.clone(),
                 agent_id: launch.agent_path.clone(),
                 agent_path: launch.agent_path.clone(),
                 trace_id: self.trace_id.clone(),

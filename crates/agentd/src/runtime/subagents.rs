@@ -398,6 +398,7 @@ impl Runtime {
             },
             telemetry: Telemetry {
                 run_id: self.run_id.clone(),
+                instance: self.instance.clone(),
                 agent_id: handle.clone(),
                 agent_path: format!("sub/{handle}"),
                 trace_id: self.trace_id.clone(),

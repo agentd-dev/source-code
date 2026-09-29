@@ -53,9 +53,10 @@ pub struct McpClient {
     rmcp: Option<crate::rmcp_client::RmcpClient>,
     /// What the SDK needs to build its side of the connection. The socket
     /// itself is `http` above — that is how a request signer and an mTLS
-    /// identity survive the SDK owning the protocol.
+    /// identity survive the SDK owning the protocol, and it is also the ONE
+    /// place the caller's headers live: handing them to the SDK as well put
+    /// each of them, `Authorization` included, on every request twice.
     endpoint: String,
-    extra_headers: Vec<(String, String)>,
     /// The host callback that answers a server's `elicitation/create`. Present
     /// iff the `elicitation` client capability is declared, so a server only
     /// asks what the host can actually deliver to a human.
@@ -63,7 +64,8 @@ pub struct McpClient {
     /// Stamped into every `tools/call` request's `params._meta` (e.g.
     /// `{"agent/run_id": …}`) so a backing service can recognize a retried call
     /// as the same logical operation and dedupe it rather than repeating a side
-    /// effect.
+    /// effect. The one copy of it: every call path merges from here, so no path
+    /// can send a call without it.
     tool_meta: Option<Value>,
     /// The client identity sent in `initialize`. Defaults to this crate's
     /// identity; the host overrides it via [`Self::with_client_info`] (agentd
@@ -100,13 +102,12 @@ impl McpClient {
             .map_err(|e| McpError::Transport(format!("mcp server '{name}': {e}")))?;
         Ok(McpClient {
             name: name.to_string(),
-            http: Arc::new(HttpTransport::new(ep, headers.clone()).with_signer(signer)),
+            http: Arc::new(HttpTransport::new(ep, headers).with_signer(signer)),
             caps: ServerCapabilities::default(),
             protocol_version: None,
             timeout,
             rmcp: None,
             endpoint: endpoint.to_string(),
-            extra_headers: headers,
             elicitation: None,
             tool_meta: None,
             client_info: Implementation {
@@ -181,14 +182,12 @@ impl McpClient {
         // connection's transport, so a request signer (AAuth's challenge loop,
         // AWS SigV4) and an mTLS client identity still apply. Adopting the SDK
         // cost neither of them.
-        let mut b = crate::rmcp_client::RmcpBuilder::new(
-            &self.name,
-            &self.endpoint,
-            self.extra_headers.clone(),
-            timeout,
-        )
-        .with_http(Arc::clone(&self.http))
-        .with_client_info(self.client_info.clone());
+        // No headers for the SDK: the socket already carries the caller's, and
+        // the SDK's own come on top of them per request.
+        let mut b =
+            crate::rmcp_client::RmcpBuilder::new(&self.name, &self.endpoint, Vec::new(), timeout)
+                .with_http(Arc::clone(&self.http))
+                .with_client_info(self.client_info.clone());
         if let Some(h) = &self.elicitation {
             b = b.with_elicitation(Arc::clone(h));
         }
@@ -220,17 +219,14 @@ impl McpClient {
     /// `tools/call`. The returned [`CallToolResult`] carries `isError` (a
     /// tool-domain failure the model sees as an observation) — distinct from an
     /// `Err` here, which is a transport/protocol failure and fails the call.
+    /// Carries the persistent [`Self::set_tool_meta`] and is bounded by the
+    /// connection's default timeout.
     pub fn call_tool(
         &self,
         name: &str,
         arguments: Option<Value>,
     ) -> Result<CallToolResult, McpError> {
-        // The tool call is the hot path; the SDK owns the whole round trip
-        // (including its own `_meta` handling).
-        let raw = self.sdk()?.call_tool_with_meta(name, arguments, None)?;
-        serde_json::from_value(raw).map_err(|e| {
-            McpError::Transport(format!("bad tools/call result on '{}': {e}", self.name))
-        })
+        self.call(name, arguments, None, self.timeout)
     }
 
     /// `tools/call` with **per-call** `_meta` merged on top of the persistent
@@ -238,9 +234,9 @@ impl McpClient {
     /// stored meta. Used by the work-claim client, where `agent/claim_key`
     /// identifies one work item and must ride only that call — stamping it
     /// persistently would attach one item's key to every later call.
-    /// `extra_meta` (an object) wins key-by-key over
-    /// the persistent meta; a non-object `extra_meta` replaces it. The persistent
-    /// meta is left untouched.
+    /// The keys of `extra_meta` (an object) win key-by-key over the persistent
+    /// meta; `_meta` is an object on the wire, so a non-object `extra_meta`
+    /// adds nothing. The persistent meta is left untouched.
     pub fn call_tool_with_meta(
         &self,
         name: &str,
@@ -250,15 +246,13 @@ impl McpClient {
         self.call_tool_with_meta_within(name, arguments, extra_meta, self.timeout)
     }
 
-    /// `tools/call` with per-call `_meta` AND a caller-supplied per-request
-    /// timeout — the SHORT management bound rather than the long data-path
-    /// default. Used by the reactor-thread lease management path (claim
-    /// renew/ack/release) — a slow coordination server must not block the reactor
-    /// past the liveness staleness window. Behaviour is otherwise identical to
-    /// [`Self::call_tool_with_meta`]. The SDK owns the per-request deadline, so
-    /// `timeout` is currently unused and the short bound is not enforced here —
-    /// an open defect, not a guarantee. The data path (subagent tool calls)
-    /// never uses this — it keeps the default timeout.
+    /// `tools/call` with per-call `_meta` AND a caller-supplied bound on the
+    /// whole call — the step timeout of a workflow step, the SHORT management
+    /// bound of the reactor's lease path. A tool that has not answered inside
+    /// `timeout` is a transport error then, not when the connection's own
+    /// default runs out, so a silent server cannot hold the caller past the
+    /// deadline it derived the bound from. The connection's timeout still caps
+    /// each HTTP exchange, so a bound longer than it does not extend it.
     pub fn call_tool_with_meta_within(
         &self,
         name: &str,
@@ -266,9 +260,20 @@ impl McpClient {
         extra_meta: Value,
         timeout: Duration,
     ) -> Result<CallToolResult, McpError> {
-        let c = self.sdk()?;
-        let _ = timeout; // the SDK owns its own per-request deadline
-        let raw = c.call_tool_with_meta(name, arguments.clone(), Some(extra_meta.clone()))?;
+        self.call(name, arguments, Some(extra_meta), timeout)
+    }
+
+    /// Every `tools/call` path lands here, so the persistent meta rides each
+    /// one — the subagent loop's plain `call_tool` included.
+    fn call(
+        &self,
+        name: &str,
+        arguments: Option<Value>,
+        extra_meta: Option<Value>,
+        timeout: Duration,
+    ) -> Result<CallToolResult, McpError> {
+        let meta = merge_meta(self.tool_meta.as_ref(), extra_meta.as_ref());
+        let raw = self.sdk()?.call_tool(name, arguments, meta, timeout)?;
         serde_json::from_value(raw).map_err(|e| {
             McpError::Transport(format!("bad tools/call result on '{}': {e}", self.name))
         })
@@ -349,11 +354,40 @@ impl McpClient {
     }
 }
 
+/// The `params._meta` of one call: the connection's persistent meta with the
+/// call's own keys on top. `None` when neither holds a key, so a call with no
+/// meta sends no `_meta` at all.
+fn merge_meta(
+    base: Option<&Value>,
+    extra: Option<&Value>,
+) -> Option<serde_json::Map<String, Value>> {
+    let mut m = base.and_then(Value::as_object).cloned().unwrap_or_default();
+    if let Some(eo) = extra.and_then(Value::as_object) {
+        for (k, v) in eo {
+            m.insert(k.clone(), v.clone());
+        }
+    }
+    (!m.is_empty()).then_some(m)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::io::Read;
     use std::net::TcpListener;
+
+    #[test]
+    fn meta_overlay_wins_without_mutating_the_base() {
+        let base = json!({"agent/run_id": "r1", "traceparent": "tp"});
+        let merged = merge_meta(Some(&base), Some(&json!({"traceparent": "tp2", "k": 1}))).unwrap();
+        assert_eq!(merged["agent/run_id"], "r1");
+        assert_eq!(merged["traceparent"], "tp2");
+        assert_eq!(merged["k"], 1);
+        assert_eq!(base["traceparent"], "tp");
+        assert!(merge_meta(None, None).is_none());
+        assert!(merge_meta(None, Some(&json!({}))).is_none());
+    }
 
     #[test]
     fn error_display() {

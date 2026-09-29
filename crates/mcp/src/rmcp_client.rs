@@ -47,7 +47,7 @@ use std::time::Duration;
 use rmcp::model::{
     CallToolRequestParams, ClientCapabilities, ClientInfo, ElicitRequestParams, ElicitResult,
     ElicitationAction, ElicitationCapability, Implementation as RmcpImpl, ProtocolVersion,
-    ReadResourceRequestParams, SubscriptionFilter,
+    ReadResourceRequestParams, RequestMetaObject, SubscriptionFilter,
 };
 use rmcp::service::{RoleClient, RunningService};
 use rmcp::transport::StreamableHttpClientTransport;
@@ -185,7 +185,6 @@ pub struct RmcpClient {
     /// The revision the handshake settled on, kept as rmcp's own type so the
     /// version-dependent branches compare it the way rmcp does.
     protocol_version: Option<ProtocolVersion>,
-    tool_meta: Option<Value>,
     notifications: Arc<Mutex<Vec<rpc::Notification>>>,
     /// Every URI the host asked for; one `listen` subscription covers them all.
     uris: Mutex<std::collections::BTreeSet<String>>,
@@ -198,6 +197,8 @@ pub struct RmcpClient {
 pub struct RmcpBuilder {
     name: String,
     endpoint: String,
+    /// Request headers for the socket this builder dials when none is handed to
+    /// it ([`Self::with_http`]); a supplied socket carries its own.
     headers: Vec<(String, String)>,
     timeout: Duration,
     client_info: Implementation,
@@ -266,18 +267,13 @@ impl RmcpBuilder {
                 McpError::Transport(format!("mcp server '{}': runtime: {e}", self.name))
             })?;
 
-        let mut config =
+        // The caller's headers are the socket's, never the SDK's too: the SDK
+        // hands its custom headers to the socket on every request, so a copy
+        // here put each one — `Authorization` included — on the wire twice.
+        let config =
             rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(
                 self.endpoint.clone(),
             );
-        for (k, v) in &self.headers {
-            if let (Ok(name), Ok(value)) = (
-                http::HeaderName::from_bytes(k.as_bytes()),
-                http::HeaderValue::from_str(v),
-            ) {
-                config.custom_headers.insert(name, value);
-            }
-        }
 
         let mut caps = ClientCapabilities::default();
         if self.elicitation.is_some() {
@@ -345,7 +341,6 @@ impl RmcpBuilder {
             service,
             caps,
             protocol_version,
-            tool_meta: None,
             notifications,
             uris: Mutex::new(std::collections::BTreeSet::new()),
             pump: Mutex::new(None),
@@ -377,10 +372,6 @@ impl RmcpClient {
         self.protocol_version.as_ref().map(ProtocolVersion::as_str)
     }
 
-    pub fn set_tool_meta(&mut self, meta: Value) {
-        self.tool_meta = Some(meta);
-    }
-
     /// Convert an rmcp value into our wire type. Both sides are the same JSON
     /// shape, so this is exact — and it does not need updating when rmcp adds a
     /// field we do not model.
@@ -401,26 +392,44 @@ impl RmcpClient {
         self.convert(&res, "tools/list")
     }
 
-    /// `_meta` (run id, idempotency key) rides on the arguments object, which is
-    /// where the wire carries it.
-    pub fn call_tool_with_meta(
+    /// `tools/call`, bounded by `timeout` as a whole. `meta` (run id,
+    /// idempotency key, traceparent) is the request's `params._meta` — the
+    /// field MCP reserves for it — and the tool's `arguments` carry the tool's
+    /// arguments alone: a server validating them against a strict schema
+    /// would refuse a stray `_meta` there.
+    ///
+    /// The bound covers every round of the call, not one HTTP exchange; on
+    /// expiry the call is abandoned and the caller gets a timeout error. The
+    /// abandoned exchange itself runs on until the socket's own timeout, and
+    /// the SDK starts the next request on this connection only once the one
+    /// before it has begun answering — so a call behind a silent one waits,
+    /// but only within its own bound.
+    pub fn call_tool(
         &self,
         name: &str,
         args: Option<Value>,
-        extra_meta: Option<Value>,
+        meta: Option<serde_json::Map<String, Value>>,
+        timeout: Duration,
     ) -> Result<Value, McpError> {
-        let mut arguments = match args {
+        let arguments = match args {
             Some(Value::Object(m)) => m,
             _ => serde_json::Map::new(),
         };
-        if let Some(m) = merge_meta(self.tool_meta.as_ref(), extra_meta) {
-            arguments.insert("_meta".into(), m);
-        }
-        let param = CallToolRequestParams::new(name.to_string()).with_arguments(arguments);
+        let mut param = CallToolRequestParams::new(name.to_string()).with_arguments(arguments);
+        param.meta = meta.map(RequestMetaObject::from);
+        let op = format!("tools/call {name}");
         let res = self
             .rt
-            .block_on(self.service.call_tool(param))
-            .map_err(|e| rpc_err(&self.name, &format!("tools/call {name}"), e))?;
+            // The timer is built inside the runtime: it needs its clock.
+            .block_on(async { tokio::time::timeout(timeout, self.service.call_tool(param)).await })
+            .map_err(|_| {
+                rpc_err(
+                    &self.name,
+                    &op,
+                    format!("timed out after {} ms", timeout.as_millis()),
+                )
+            })?
+            .map_err(|e| rpc_err(&self.name, &op, e))?;
         serde_json::to_value(&res).map_err(|e| rpc_err(&self.name, "tools/call", e))
     }
 
@@ -631,38 +640,9 @@ impl RmcpClient {
     }
 }
 
-/// Merge the persistent tool `_meta` with a per-call overlay; the overlay wins.
-fn merge_meta(base: Option<&Value>, extra: Option<Value>) -> Option<Value> {
-    match (base, extra) {
-        (None, None) => None,
-        (Some(b), None) => Some(b.clone()),
-        (None, Some(e)) => Some(e),
-        (Some(b), Some(e)) => {
-            let mut m = b.as_object().cloned().unwrap_or_default();
-            if let Some(eo) = e.as_object() {
-                for (k, v) in eo {
-                    m.insert(k.clone(), v.clone());
-                }
-            }
-            Some(Value::Object(m))
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn meta_overlay_wins_without_mutating_the_base() {
-        let base = json!({"agent/run_id": "r1", "traceparent": "tp"});
-        let merged = merge_meta(Some(&base), Some(json!({"traceparent": "tp2", "k": 1}))).unwrap();
-        assert_eq!(merged["agent/run_id"], "r1");
-        assert_eq!(merged["traceparent"], "tp2");
-        assert_eq!(merged["k"], 1);
-        assert_eq!(base["traceparent"], "tp");
-        assert!(merge_meta(None, None).is_none());
-    }
 
     #[test]
     fn the_sdk_still_pins_a_revision_before_the_listen_one() {

@@ -58,6 +58,20 @@ pub mod pace {
     }
 }
 
+/// The `_meta` every `tools/call` on a connection carries, whichever process
+/// dialled it — the reactor at startup or on reload, or a subagent: the run id
+/// and instance, so a backing service can recognize a retried call and
+/// deduplicate its side effect, and a W3C `traceparent`, so the call joins the
+/// run's trace. One builder, because each dial site keeping its own copy is how
+/// a reload dropped the traceparent and a subagent the instance.
+pub fn tool_meta(run_id: &str, instance: &str, trace_id: Option<&str>) -> serde_json::Value {
+    let mut meta = serde_json::json!({"agent/run_id": run_id, "agent/instance": instance});
+    if let Some(tid) = trace_id {
+        meta["traceparent"] = crate::obs::trace::outbound_traceparent(tid).into();
+    }
+    meta
+}
+
 /// Build an MCP client from a declared [`crate::config::McpServerSpec`]: resolve
 /// its secret-free `{{secret:…}}` auth header templates (via [`auth`]) and connect
 /// to the spec's remote `endpoint`, stamping agentd's client identity. The

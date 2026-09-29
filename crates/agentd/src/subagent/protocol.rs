@@ -503,6 +503,9 @@ pub struct Limits {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Telemetry {
     pub run_id: String,
+    /// The instance the run belongs to; the child stamps it on its MCP calls
+    /// as the reactor does on its own.
+    pub instance: String,
     pub agent_id: String,
     pub agent_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -560,6 +563,7 @@ mod tests {
             },
             telemetry: Telemetry {
                 run_id: "r1".into(),
+                instance: "i1".into(),
                 agent_id: "0.1".into(),
                 agent_path: "0.1".into(),
                 trace_id: None,

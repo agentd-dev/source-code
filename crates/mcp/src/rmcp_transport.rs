@@ -34,7 +34,7 @@ use rmcp::transport::streamable_http_client::{
 use serde_json::Value;
 use sse_stream::{Error as SseError, Sse};
 
-use crate::http::HttpTransport;
+use crate::http::{HttpError, HttpTransport};
 
 /// The SDK's transport, backed by agentd's authenticated HTTP.
 #[derive(Clone)]
@@ -112,12 +112,18 @@ impl StreamableHttpClient for AgentdHttp {
         let extra = header_pairs(auth_header, custom_headers);
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Pumped>();
-        // Not awaited: the send owns a blocking thread for as long as the server
-        // keeps the exchange open, and this call must return before it finishes.
-        // The thread ends when the send does; a receiver dropped early makes the
+        // Not awaited: the send owns a thread for as long as the server keeps
+        // the exchange open, and this call must return before it finishes. The
+        // thread ends when the send does; a receiver dropped early makes the
         // sends fail, which costs nothing since the send is already unwinding.
+        //
+        // A plain thread, not the runtime's blocking pool: a call its caller
+        // abandoned at its bound leaves its exchange running until the socket's
+        // own timeout, and the runtime waits for its pool when the client is
+        // dropped — so an abandoned call would hold whoever drops the client
+        // for up to that long.
         let notes_tx = tx.clone();
-        tokio::task::spawn_blocking(move || {
+        std::thread::spawn(move || {
             let refs: Vec<(&str, &str)> = extra
                 .iter()
                 .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -185,6 +191,17 @@ impl StreamableHttpClient for AgentdHttp {
     /// Open the server→client event stream: the channel a server uses to send
     /// requests of its own (elicitation, sampling, roots) and unsolicited
     /// notifications.
+    ///
+    /// The dial carries what the SDK hands it — the negotiated
+    /// `MCP-Protocol-Version`, and on a reconnect the `Last-Event-ID` to resume
+    /// from — on top of the socket's own credentials and signature.
+    ///
+    /// The dial is made before this returns, so its outcome is the SDK's to
+    /// act on: a server with no push channel (`405`, or an answer that is not
+    /// an event stream) is reported as exactly that, and the SDK stops asking.
+    /// A stream handed back unopened would instead look like one that opened
+    /// and ended — which the SDK redials, every second, for the life of the
+    /// connection.
     async fn get_stream(
         &self,
         _uri: Arc<str>,
@@ -195,23 +212,32 @@ impl StreamableHttpClient for AgentdHttp {
     ) -> Result<BoxStream<'static, Result<Sse, SseError>>, StreamableHttpError<Self::Error>> {
         let http = Arc::clone(&self.http);
         let timeout = self.timeout;
-        let extra = header_pairs(auth_header, custom_headers);
+        let mut extra = header_pairs(auth_header, custom_headers);
+        if let Some(id) = last_event_id {
+            extra.push(("Last-Event-ID".to_string(), id));
+        }
+        let (opened_tx, opened_rx) = tokio::sync::oneshot::channel::<Result<(), HttpError>>();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Sse, SseError>>();
 
         // A blocking reader pumping into a channel: the stream the SDK polls is
         // the receiving end. When the SDK drops the stream the sends fail and
-        // the reader stops, so a closed stream closes the connection.
+        // the reader stops, so a closed stream closes the connection. The
+        // reader is not `Send`, so the thread that dials it is the one that
+        // reads it, and it reports the dial's outcome first.
         std::thread::spawn(move || {
-            let mut refs: Vec<(&str, &str)> = extra
+            let refs: Vec<(&str, &str)> = extra
                 .iter()
                 .map(|(k, v)| (k.as_str(), v.as_str()))
                 .collect();
-            if let Some(id) = &last_event_id {
-                refs.push(("Last-Event-ID", id.as_str()));
-            }
-            let _ = &refs;
-            let Ok(mut events) = http.open_events(timeout) else {
-                return;
+            let mut events = match http.open_events(timeout, &refs) {
+                Ok(events) => {
+                    let _ = opened_tx.send(Ok(()));
+                    events
+                }
+                Err(e) => {
+                    let _ = opened_tx.send(Err(e));
+                    return;
+                }
             };
             while let Ok(Some(ev)) = events.next_event() {
                 let sse = Sse {
@@ -226,9 +252,20 @@ impl StreamableHttpClient for AgentdHttp {
             }
         });
 
-        Ok(Box::pin(
-            tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
-        ))
+        match opened_rx.await {
+            Ok(Ok(())) => Ok(Box::pin(
+                tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
+            )),
+            Ok(Err(HttpError::Status(405) | HttpError::NoEventStream)) => {
+                Err(StreamableHttpError::ServerDoesNotSupportSse)
+            }
+            Ok(Err(e)) => Err(StreamableHttpError::Client(TransportError(e.to_string()))),
+            // The dialling thread died before reporting — a dead socket either
+            // way.
+            Err(_) => Err(StreamableHttpError::Client(TransportError(
+                "mcp: the notification stream dial ended with no outcome".into(),
+            ))),
+        }
     }
 }
 

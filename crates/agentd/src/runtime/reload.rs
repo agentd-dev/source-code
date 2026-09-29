@@ -249,9 +249,11 @@ impl Runtime {
                     .and_then(|mut c| c.initialize().map(|()| c))
                 {
                     Ok(mut c) => {
-                        c.set_tool_meta(
-                            json!({"agent/run_id": self.run_id, "agent/instance": self.instance}),
-                        );
+                        c.set_tool_meta(crate::mcp::tool_meta(
+                            &self.run_id,
+                            &self.instance,
+                            self.trace_id.as_deref(),
+                        ));
                         self.log
                             .info("mcp.connect", json!({"server": s.name, "reason": "reload"}));
                         self.mcp.insert(s.name.clone(), Arc::new(c));

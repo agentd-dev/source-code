@@ -301,12 +301,17 @@ fn tools_and_resources_come_back_as_agentds_own_wire_types() {
 fn a_tool_call_round_trips() {
     let seen: Shared = Arc::default();
     let ep = spawn_server(Arc::clone(&seen));
-    let mut client = RmcpBuilder::new("mock", &ep, vec![], Duration::from_secs(5))
+    let client = RmcpBuilder::new("mock", &ep, vec![], Duration::from_secs(5))
         .connect()
         .expect("connect");
-    client.set_tool_meta(json!({"agent/run_id": "r1"}));
+    let meta = json!({"agent/run_id": "r1"}).as_object().cloned();
     let out = client
-        .call_tool_with_meta("echo", Some(json!({"s": "hi"})), None)
+        .call_tool(
+            "echo",
+            Some(json!({"s": "hi"})),
+            meta,
+            Duration::from_secs(5),
+        )
         .expect("tools/call");
     assert_eq!(out["content"][0]["text"], "echoed");
 }

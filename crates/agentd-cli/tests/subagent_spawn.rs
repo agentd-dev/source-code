@@ -46,6 +46,7 @@ fn bogus_payload() -> SpawnPayload {
         },
         telemetry: Telemetry {
             run_id: "itest".into(),
+            instance: "itest".into(),
             agent_id: "0".into(),
             agent_path: "0".into(),
             trace_id: None,

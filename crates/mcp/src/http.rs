@@ -82,6 +82,9 @@ pub enum HttpError {
     Unsupported(String),
     /// No JSON-RPC response matched the request id before the stream ended.
     NoResponse,
+    /// The server answered the notification `GET` with something other than an
+    /// event stream: it offers no push channel.
+    NoEventStream,
 }
 
 impl std::fmt::Display for HttpError {
@@ -92,6 +95,9 @@ impl std::fmt::Display for HttpError {
             HttpError::Status(s) => write!(f, "mcp-http: server returned HTTP {s}"),
             HttpError::Unsupported(m) => write!(f, "mcp-http: {m}"),
             HttpError::NoResponse => write!(f, "mcp-http: no JSON-RPC response before stream end"),
+            HttpError::NoEventStream => {
+                write!(f, "mcp-http: server has no GET SSE notification stream")
+            }
         }
     }
 }
@@ -437,9 +443,19 @@ impl HttpTransport {
     /// server answers with `text/event-stream`, carrying JSON-RPC notifications
     /// (e.g. `resources/updated`). Returns an owning SSE reader. `read_timeout`
     /// bounds each read so the caller's loop can poll a stop flag between events
-    /// (clean shutdown). Errors if the server has no push channel (non-2xx or a
-    /// non-SSE response) — the caller then runs without server-initiated pushes.
-    pub fn open_events(&self, read_timeout: Duration) -> Result<EventStream, HttpError> {
+    /// (clean shutdown). Errors if the server has no push channel (non-2xx, or
+    /// [`HttpError::NoEventStream`] for a non-SSE response) — the caller then runs
+    /// without server-initiated pushes.
+    ///
+    /// `extra_headers` are what the SDK says this dial needs, exactly as on the
+    /// POST path: the negotiated `MCP-Protocol-Version`, which Streamable HTTP
+    /// requires on every request after `initialize`, and on a reconnect the
+    /// `Last-Event-ID` the server resumes the stream from.
+    pub fn open_events(
+        &self,
+        read_timeout: Duration,
+        extra_headers: &[(&str, &str)],
+    ) -> Result<EventStream, HttpError> {
         let stream = self.connect(read_timeout)?;
         let mut headers: Vec<(&str, &str)> = vec![("Accept", "text/event-stream")];
         let session = self
@@ -450,6 +466,7 @@ impl HttpTransport {
         if let Some(sid) = &session {
             headers.push(("Mcp-Session-Id", sid));
         }
+        headers.extend_from_slice(extra_headers);
         for (k, v) in &self.headers {
             headers.push((k.as_str(), v.as_str()));
         }
@@ -476,9 +493,7 @@ impl HttpTransport {
             return Err(HttpError::Status(resp.status));
         }
         if !resp.is_event_stream() {
-            return Err(HttpError::Unsupported(
-                "server has no GET SSE notification stream".into(),
-            ));
+            return Err(HttpError::NoEventStream);
         }
         Ok(resp.sse())
     }

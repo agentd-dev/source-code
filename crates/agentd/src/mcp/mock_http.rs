@@ -280,6 +280,20 @@ fn handle_tool_call(req: Request, state: &State) -> Response {
     let params = req.params.clone().unwrap_or(json!({}));
     let name = params.get("name").and_then(serde_json::Value::as_str);
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
+    // Every call's params as they reached the server — `_meta` and arguments
+    // both — so an e2e can assert what the wire carried, not what the client
+    // meant to send.
+    eprintln!("MOCK_CALL {params}");
+    // A strict server: `_meta` belongs in `params._meta` (MCP reserves it
+    // there), and no tool here declares an argument by that name, so one
+    // arriving inside `arguments` is refused the way `additionalProperties:
+    // false` refuses any undeclared property.
+    if args.get("_meta").is_some() {
+        return tool_err(
+            req.id,
+            "arguments: additional property '_meta' is not allowed",
+        );
+    }
     // The registry's consumer-alignment tools (RFC-0028 §3.3). The call is
     // echoed on stderr so an e2e can assert WHAT the consumer reported
     // without needing a live registry.

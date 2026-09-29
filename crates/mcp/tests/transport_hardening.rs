@@ -141,7 +141,7 @@ fn the_notification_stream_dial_carries_the_request_signature() {
     let t = HttpTransport::new(McpEndpoint::parse(&ep).unwrap(), vec![])
         .with_signer(Some(Arc::clone(&signer)));
 
-    t.open_events(Duration::from_secs(5))
+    t.open_events(Duration::from_secs(5), &[])
         .expect("the stub answers with an event stream");
 
     let dials = seen.lock().unwrap().clone();
@@ -314,7 +314,7 @@ fn a_request_interleaved_on_a_post_stream_is_answered_not_buffered() {
         .expect("connect");
 
     let out = client
-        .call_tool_with_meta("ask", Some(json!({})), None)
+        .call_tool("ask", Some(json!({})), None, Duration::from_secs(10))
         .expect("tools/call must complete — the server is waiting on our answer");
     assert_eq!(
         out["content"][0]["text"], "answered",
@@ -324,7 +324,7 @@ fn a_request_interleaved_on_a_post_stream_is_answered_not_buffered() {
     // The answer is a JSON-RPC RESPONSE, which the server acks `202` with no
     // body — a transport that waited for a reply to it would fail that send.
     let again = client
-        .call_tool_with_meta("ask", Some(json!({})), None)
+        .call_tool("ask", Some(json!({})), None, Duration::from_secs(10))
         .expect("the session survives having answered");
     assert_eq!(again["content"][0]["text"], "answered", "{again}");
 

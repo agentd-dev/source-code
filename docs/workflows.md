@@ -801,6 +801,14 @@ every step reachable from a start node; and any non-start step with an empty
 registry — a `tool` step naming a tool not granted to workflows, or an `mcp.tool`
 naming a disconnected server, exits the process with the usage code.
 
+A name is one definition. Two configured workflows that resolve to the same
+`name` — an inline entry, a `file:`, a file a `dir:` matched, a `url:` or
+`uri:` fetch, the instruction's `:::!workflow` — are refused with
+`workflow "x" is defined twice — by <first> and by <second>`, at startup and
+on reload alike, instead of the later one replacing the earlier (the
+configuration doc §6.1). At runtime, `workflow.create` likewise refuses a
+name already loaded (`workflow "x" exists (use workflow.update)`).
+
 | Cap | Value |
 |---|---|
 | top-level steps per workflow | 512 (body steps are not counted) |

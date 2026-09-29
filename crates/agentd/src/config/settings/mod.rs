@@ -311,6 +311,13 @@ pub struct Agent {
     /// is announced on the new channel.
     #[serde(skip)]
     pub document_gate_channels: crate::config::humans::GateChannels,
+    /// Which entries of `workflows` the instruction document's `:::!workflow`
+    /// blocks contributed, by index — DERIVED, never a config key. Once
+    /// spliced, a document's workflow is indistinguishable from an inline
+    /// entry, and a refusal of two definitions sharing a name has to say
+    /// which document each came from ([`Settings::workflow_entry_source`]).
+    #[serde(skip)]
+    pub document_workflows: std::ops::Range<usize>,
     /// Where a pulled instruction came from (an `oci://` reference resolved at
     /// config load, RFC 0040) — DERIVED: the runtime uses it to log
     /// `instruction.loaded` with its version pin and to arm the freshness
@@ -4053,6 +4060,7 @@ impl Settings {
 
         let mut idoc_extraction: Option<crate::config::idoc::Extraction> = None;
         let mut gate_channels = crate::config::humans::GateChannels::new();
+        let mut document_workflows = 0..0;
         if let Some(instr) = doc
             .get("agent")
             .and_then(|a| a.get("instruction"))
@@ -4129,6 +4137,7 @@ impl Settings {
                                 .or_insert_with(|| Value::Array(Vec::new()))
                                 .as_array_mut()
                         {
+                            document_workflows = w.len()..w.len() + ex.workflows.len();
                             w.extend(ex.workflows.clone());
                         }
                     }
@@ -4195,12 +4204,43 @@ impl Settings {
             settings.agent.document_config = ex.config;
         }
         settings.agent.document_gate_channels = gate_channels;
+        settings.agent.document_workflows = document_workflows;
         settings.agent.instruction_origin = instruction_origin;
         settings.agent.instruction_path = instruction_path;
         settings.agent.instruction_spec = instruction_spec;
         settings.agent.instruction_dir_files = instruction_dir_files;
         settings.agent.instruction_warnings = instruction_warnings;
         Ok(settings)
+    }
+
+    /// Where `workflows[i]` came from, in the words a refusal names it by: the
+    /// instruction document that carried it, or the entry's own source (the
+    /// file, folder, URL or resource it points at, or the inline definition).
+    pub fn workflow_entry_source(&self, i: usize) -> String {
+        if self.agent.document_workflows.contains(&i) {
+            return match &self.agent.instruction_path {
+                Some(p) => format!("the instruction document {p}"),
+                None => "the instruction document".to_string(),
+            };
+        }
+        let Some(w) = self.workflows.get(i) else {
+            return format!("workflows[{i}]");
+        };
+        let s = |k: &str| w.get(k).and_then(Value::as_str);
+        if let Some(f) = s("file") {
+            format!("file {f} (workflows[{i}])")
+        } else if let Some(u) = s("url") {
+            format!("url {u} (workflows[{i}])")
+        } else if let Some(u) = s("uri") {
+            format!("uri {u} (workflows[{i}])")
+        } else if let Some(d) = w.get("dir") {
+            let path = serde_json::from_value::<crate::config::fileset::Dir>(d.clone())
+                .map(|d| d.path().to_string())
+                .unwrap_or_else(|_| d.to_string());
+            format!("dir {path} (workflows[{i}])")
+        } else {
+            format!("the inline definition workflows[{i}]")
+        }
     }
 
     /// The `agent.name` fallback chain: config › downward-API instance ›
@@ -7001,7 +7041,10 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
     }
 
     // workflows (the structural minimum only; full validation is the engine's)
-    let mut wf_names = std::collections::HashSet::new();
+    // name → the index of the entry that defined it first, so a second one
+    // is refused naming both (an instruction document's `:::!workflow` is an
+    // entry here too, spliced in before typing).
+    let mut wf_names: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for (i, w) in s.workflows.iter().enumerate() {
         let Some(obj) = w.as_object() else {
             err(&mut d, format!("workflows[{i}] must be an object"));
@@ -7016,11 +7059,17 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
         let name = obj.get("name").and_then(Value::as_str).unwrap_or("");
         if name.trim().is_empty() {
             err(&mut d, format!("workflows[{i}] has no name"));
-        } else if !wf_names.insert(name.to_string()) {
+        } else if let Some(&first) = wf_names.get(name) {
             err(
                 &mut d,
-                format!("workflows[]: duplicate workflow name '{name}'"),
+                duplicate_workflow(
+                    name,
+                    &s.workflow_entry_source(first),
+                    &s.workflow_entry_source(i),
+                ),
             );
+        } else {
+            wf_names.insert(name.to_string(), i);
         }
         // A `model:` on a node names a TIER once a catalogue exists. Catching
         // the typo here keeps it a startup error instead of a run that
@@ -7623,6 +7672,19 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
 /// Re-exported so existing callers keep a name to use; the judgement itself
 /// lives in `engine::model` with the kind table, so it cannot drift from it.
 pub use crate::engine::model::is_long_lived_start;
+
+/// The refusal for two configured definitions sharing one name — one wording,
+/// whether the config check sees it on the entries or the loader sees it after
+/// the files, folders and fetches resolved. Both sources are named because
+/// either could be the mistake, and with only one named the operator goes
+/// looking for the other. Neither is kept: the later one silently replacing
+/// the earlier changed what ran without a word.
+pub fn duplicate_workflow(name: &str, first: &str, second: &str) -> String {
+    format!(
+        "workflow {name:?} is defined twice — by {first} and by {second}; a workflow name \
+         is one definition, so rename or remove one of them"
+    )
+}
 
 /// Whether a raw workflow document has a long-lived start node.
 pub fn workflow_is_long_lived(w: &Value) -> bool {
@@ -9470,6 +9532,57 @@ mod tests {
         // bolting a model loop onto it would run work nobody declared.
         assert_eq!(names(json!(carries.clone())), vec!["own"], "short form");
         assert_eq!(names(json!({"file": carries})), vec!["own"], "long form");
+    }
+
+    /// An inline entry and the instruction document's block sharing a name
+    /// are refused naming BOTH — once the block is spliced into `workflows`
+    /// the two look alike, and "duplicate name" alone sent the operator
+    /// looking for a second inline entry that does not exist.
+    #[test]
+    fn an_inline_and_a_document_workflow_sharing_a_name_are_refused_naming_both() {
+        let dir = tempfile::tempdir().unwrap();
+        let doc = dir.path().join("agent.md");
+        std::fs::write(
+            &doc,
+            concat!(
+                "be terse\n\n",
+                ":::!workflow{name=dup}\n",
+                "steps:\n",
+                "  s: { kind: once }\n",
+                "  f: { kind: finish, depends_on: [s], status: completed }\n",
+                ":::\n"
+            ),
+        )
+        .unwrap();
+        let cfg = dir.path().join("c.json");
+        std::fs::write(
+            &cfg,
+            json!({"agent": {"name": "a", "instruction": doc.to_string_lossy(), "preflight": "never"},
+                "store": {"kind": "memory"},
+                "workflows": [{"name": "dup", "steps": {
+                    "s": {"kind": "once"},
+                    "f": {"kind": "finish", "depends_on": ["s"], "status": "completed"}}}]})
+            .to_string(),
+        )
+        .unwrap();
+        let env: Vec<(String, String)> = Vec::new();
+        let Err(e) = super::load(&["-c".to_string(), cfg.to_string_lossy().to_string()], &env)
+        else {
+            panic!("two definitions of one name must not load");
+        };
+        let e = e.to_string();
+        assert!(e.contains("workflow \"dup\" is defined twice"), "{e}");
+        assert!(
+            e.contains("the inline definition workflows[0]"),
+            "names the inline entry: {e}"
+        );
+        assert!(
+            e.contains(&format!(
+                "the instruction document {}",
+                doc.to_string_lossy()
+            )),
+            "names the document it came from: {e}"
+        );
     }
 
     /// A distinct suffix per generated config file within one test.

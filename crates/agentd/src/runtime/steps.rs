@@ -23,7 +23,7 @@ use crate::registry::Caller;
 use crate::state::{InboxEvent, Kind, now_ms, ulid};
 use crate::subagent::protocol::{TurnKind, TurnResult, TurnSpec};
 use serde_json::{Map, Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// The memory key prefix runtime-created workflow definitions are stored under.
 const WORKFLOW_DEF_PREFIX: &str = "_workflows/";
@@ -75,8 +75,10 @@ impl Runtime {
         // A `{dir}` entry expands into one entry per matching file BEFORE
         // resolution, so everything downstream — parsing, naming, the duplicate
         // check — sees a plain list of documents and needs no directory case.
-        let mut docs: Vec<Value> = Vec::new();
-        for doc in self.settings.workflows.clone() {
+        // Each document travels with where it came from, so two that resolve
+        // to one name can be refused naming both.
+        let mut docs: Vec<(Value, String)> = Vec::new();
+        for (i, doc) in self.settings.workflows.clone().into_iter().enumerate() {
             // The ENTRY fold runs here, BEFORE the dir expansion, because a
             // `dir:` is consumed by that expansion and would never reach the
             // per-document fold below — `{{config.wf_dir}}` went to the
@@ -112,7 +114,7 @@ impl Runtime {
                 },
             };
             match entry_dir {
-                None => docs.push(doc),
+                None => docs.push((doc, self.settings.workflow_entry_source(i))),
                 Some(dir) => {
                     let pattern = dir.glob().unwrap_or("*.yaml,*.yml,*.json");
                     match expand_dir_ordered(dir.path(), pattern, dir.order()) {
@@ -130,7 +132,11 @@ impl Runtime {
                                 if let Some(a) = doc.get("armed") {
                                     d["armed"] = a.clone();
                                 }
-                                docs.push(d);
+                                let source = format!(
+                                    "file {path} (from {})",
+                                    self.settings.workflow_entry_source(i)
+                                );
+                                docs.push((d, source));
                             }
                         }
                         Err(e) => errs.push(format!("workflow dir {}: {e}", dir.path())),
@@ -138,7 +144,13 @@ impl Runtime {
                 }
             }
         }
-        for doc in docs {
+        // name → the source that defined it first. A configured name is ONE
+        // definition: the map insert below would otherwise let whichever
+        // source loaded later replace the other without a word — a folder's
+        // file and a document's block sharing a name, say, which no check on
+        // the entries can see before the files are read.
+        let mut defined: HashMap<String, String> = HashMap::new();
+        for (doc, source) in docs {
             // `{{config.*}}` folds in at load, in two passes: the ENTRY first —
             // so a var can sit in a `file:`, `url:` or `dir:` reference and in
             // the headers that fetch it — and the RESOLVED document after, so a
@@ -242,6 +254,13 @@ impl Runtime {
                     if let Some(ch) = self.settings.agent.document_gate_channels.get(&w.name) {
                         w.gate_channels = ch.clone();
                     }
+                    if let Some(first) = defined.get(&w.name) {
+                        errs.push(crate::config::settings::duplicate_workflow(
+                            &w.name, first, &source,
+                        ));
+                        continue;
+                    }
+                    defined.insert(w.name.clone(), source);
                     self.log.info("workflow.loaded", json!({"name": w.name, "hash": &w.hash[..12], "steps": w.steps.len(), "durable": w.durable, "starts": w.start_steps().iter().map(|s| s.kind.clone()).collect::<Vec<_>>()}));
                     self.workflows
                         .insert(w.name.clone(), std::sync::Arc::new(w));

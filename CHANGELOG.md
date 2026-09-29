@@ -433,6 +433,11 @@ bound is honoured; the MCP notification stream carries its headers; operator
 headers go out once per POST; a slow or abandoned `tools/call` no longer
 holds up the next call on the same server.
 
+- **Two workflows with one name are refused, naming both sources.** A `dir:`
+  or `file:` workflow sharing its name with another, or with an instruction
+  document's `:::!workflow`, silently replaced it at load. Startup now exits
+  `2` and a reload is refused with the running set kept.
+
 ### Known limitations
 
 - A `tools/call` that agentd abandons at its bound (a step timeout, a lease

@@ -1101,7 +1101,7 @@ workflows:
     headers: { authorization: "Bearer {{secret:WF_TOKEN}}" }
     timeout: 10s                    # default 30s
     allow_private: true             # the fetch rides the same SSRF guard as http nodes
-  - dir: ./workflows                # every match becomes a workflow, named by file stem
+  - dir: ./workflows                # every match becomes a workflow, named by its own `name:`
   - dir:                            # …or the folder carries its own settings
       path: ./workflows
       glob: "**/*.yaml"             # `*` within a segment, `**` crosses segments
@@ -1115,6 +1115,17 @@ header map (§3). A `dir` with zero matches is also exit `2`: an empty glob is
 almost always a typo, and fail-open here means a reactive daemon with no
 reactions. However a definition arrived, it is hashed and pinned identically —
 a run started under one hash finishes under it.
+
+**A workflow name is one definition.** The name a workflow loads under is the
+one its definition carries — a file's own `name:` wins over the entry's, and a
+file a `dir:` matched has only its own. Two definitions that resolve to one
+name, from any two sources (inline entries, files, folders, URLs, resources,
+the instruction document's `:::!workflow`), are refused: exit `2` at startup,
+a refused reload with the running set kept. The message names the workflow
+and both sources, and neither definition loads; nothing decides which one
+wins, because the later one silently replacing the other is how an operator's
+workflow changed without a word. Two files in one folder are named in folder
+order, so the message reads the same on every machine.
 
 `dir:` is the same folder source an
 [instruction folder](#5a1a-a-folder-of-documents--dir) takes —

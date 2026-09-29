@@ -29,17 +29,48 @@ Anything that breaks one of these boundaries is in scope:
   out of `workdir`, or running anything not on the allow-list — is a
   vulnerability.
 - **Secrets.** `{{secret:…}}` / `{{secret-file:…}}` values must never reach
-  logs, telemetry, error text, the `/config` view, or a child process
+  logs, telemetry, error text, the `config` op's view, or a child process
   environment. A leak is a vulnerability.
 - **The Rule-of-Two / trifecta check.** A config combining untrusted input,
   sensitive powers and an egress path must refuse to start without
   `--allow-trifecta`. A way to assemble that combination while the check passes
   is a vulnerability.
-- **The A2A listener.** Plaintext `http://` binds are loopback-only;
-  non-loopback binds require client auth. Reaching a privileged operation
-  without the credential the config demands — including via the pairing-code
-  exchange or the interface feed — is a vulnerability. So is a display client
-  seeing state outside its principal's visibility scope.
+- **The A2A listener.** Plaintext `http://` binds are loopback-only, and
+  non-loopback binds require client auth. Every request is resolved to a
+  principal before its body is read, and the rules are these:
+  - the implicit operator exists only on a loopback bind with no credential
+    mechanism, and never for a request carrying `Origin` — a browser always
+    authenticates, even on a no-auth loopback daemon, and an `any` rule can
+    never carry the operator role;
+  - an operator-only op answers to the operator role alone, whatever a
+    principal's grants say;
+  - what a non-operator starts — tasks, runs, subagents, conversations — is
+    reachable only by that principal (by its id) and operators, on the A2A
+    path and through the model alike, and its `contextId` is its own name;
+  - a failed credential counts against its source, and a throttled source's
+    bearers are refused unchecked; nothing a web page can make a browser send
+    without a credential is counted;
+  - a device sign-in needs an operator's approval under a name, and a revoked
+    session loses the streams it already opened.
+
+  Reaching a privileged operation or another principal's work without the
+  credential the config demands — through a browser, a relayed request, the
+  device grant, a session, or the observation feed — is a vulnerability. So is
+  a display client seeing state outside its principal's visibility scope.
+- **The launcher.** `agentd tui` and `agentd ui` never pass the client
+  `a2a.bearer` or a resolved config secret, by argv, environment, file or HTTP.
+  The client signs in with a launch code minted in the daemon's own process —
+  single-use, valid 60 seconds, bound to the client and the launched origin,
+  redeemed only from a loopback peer, and delivered over an inherited pipe or,
+  for the web UI, only in a URL fragment from a 0600 file or the owner's
+  terminal. Every later browser sign-in is approved at the launcher's
+  terminal, and no descriptor the launcher holds reaches a process the daemon
+  spawns. `agentd-ui` holds no credential, and reads none from its environment
+  or a URL — the page takes only the single-use launch code from its URL
+  fragment, and strips it before its first request; a tab keeps its session in
+  `sessionStorage`, bound to its endpoint. A code or session obtained any other way — by another user on the
+  host, another web origin, or a remote peer — is a vulnerability. A process
+  running as the same user is the user, and is out of scope.
 - **Transport.** TLS verification bypass, SSRF through the HTTP client's
   redirect/host handling, or request smuggling.
 - **Untrusted MCP content.** Tool descriptions, prompts and resources from an
@@ -55,7 +86,12 @@ Anything that breaks one of these boundaries is in scope:
   fence is the allow-list and `workdir`, not the model's judgment.
 - **`--allow-trifecta` behaving as documented** once an operator sets it.
 - Findings that require an attacker who already has the config file, the
-  process's memory, or root on the host.
+  process's memory, the operator's user account, or root on the host.
+- **The implicit operator behaving as documented**: on a loopback listener
+  with no credential, every local account that presents nothing — and any
+  same-host proxy that relays to it without `Origin` — is the operator. That is
+  the posture the load warns about; configure a credential or a unix listener
+  instead.
 - Denial of service from limits you configured (`limits.run`, budgets) doing
   their job.
 
@@ -69,4 +105,6 @@ issue is severe and the fix is small.
 [docs/security.md](docs/security.md) is the full treatment. The short version:
 grant the smallest capability set that works, keep `exec` compiled out unless
 you need it, keep secrets as references, bind non-loopback only with client
-auth, and treat the trifecta refusal as information rather than an obstacle.
+auth — off the machine, TLS plus `a2a.device_grant`, approved by an operator
+credential — and treat the trifecta refusal as information rather than an
+obstacle.

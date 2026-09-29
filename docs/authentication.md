@@ -1,5 +1,9 @@
 # Authenticating to endpoints
 
+> Signing callers **in** to agentd's own A2A listener — principals, the device
+> grant, `agentd tui` / `agentd ui` launch codes — is in [a2a.md](a2a.md#signing-in),
+> and its threat model in [security.md](security.md#the-a2a-boundary).
+
 agentd talks to three kinds of outbound endpoint that may require credentials:
 **intelligence** (the LLM), **MCP** servers, and **A2A** peers. Each takes an
 optional `auth:` block — one credential provider shared by all three — so you can

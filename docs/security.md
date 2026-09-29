@@ -27,13 +27,14 @@ in security terms. The defenses here are structural — they bound what a compro
 *can reach*, not what it *intends*.
 
 agentd trusts its own binary, the OS, and the operator's configuration. What arrives from
-the network is bounded to a whitelist: an A2A caller's `config.set` reaches three
-display/debug paths plus `agent.approval` — the human-approval mode, operator-only and
-deliberately settable mid-session, because how closely you want to be asked changes with
-what the agent is doing (`a2a_server/introspection.rs::interface_config_set`) — and nothing else, every
-other path refused in that same function's catch-all arm, which answers with the
-list of what *is* settable. The model can never register an MCP server, edit an endpoint,
-or name a binary to run.
+the network is bounded to a whitelist: the one command op that changes the running
+configuration, `admin.set`, is the operator's alone and reaches two paths
+(`runtime/surface/ops.rs::RUNTIME_SETTABLE`) — `agent.approval`, the human-approval mode,
+deliberately settable mid-session because how closely you want to be asked changes with
+what the agent is doing, and `a2a.introspection.enabled`. Every other path is refused with
+the list of what *is* settable (`runtime/a2a_server/admin.rs`), nothing is written to disk,
+and the next reload puts the file's value back. The model can never register an MCP
+server, edit an endpoint, or name a binary to run.
 
 ## Capability scoping
 
@@ -62,11 +63,11 @@ which enforce it at different points, and the difference matters:
 An unknown name in `servers:` is filtered out silently, not rejected — that read filters
 on `self.mcp_specs.contains_key`, so a typo yields a less capable child and no diagnostic.
 
-`sec/scope.rs` also defines a `Scope` / `ToolScope` intersection type — `parent ∩
-requested` over a server whitelist and a tool-name whitelist, both dimensions checked
-independently. It has **no call site outside its own tests**; the live exports of that
-module are `TrifectaTag` and `check_trifecta`. The two bullets above are the whole of the
-narrowing.
+`sec/scope.rs` also defines an intersection type (`scope.rs::Scope`, over
+`scope.rs::ToolScope`) — `parent ∩ requested` over a server whitelist and a tool-name
+whitelist, both dimensions checked independently. It has **no call site outside its own
+tests**; the live exports of that module are `scope.rs::TrifectaTag` and `check_trifecta`.
+The two bullets above are the whole of the narrowing.
 
 Separately, `agent.tools.internal | mcp | code` controls what the model *sees*. That is a
 catalogue filter, not the authorization check; the check is `Registry::allowed`.
@@ -163,7 +164,7 @@ untrusted-input server refuses startup like any other trifecta.
 `scope.trifecta_grant` event name is reserved but never written, so an allowed trifecta
 proceeds silently and the only trace is the config value. And code-registered (embedder)
 tools sit outside the accounting: they are inserted with `Grant::all()` and an empty tag
-vector — the `ToolSpec` literal that `registry/mod.rs::Registry::build` writes for a code
+vector — the tool literal that `registry/mod.rs::Registry::build` writes for a code
 tool — so an embedder whose native tool does egress or reads secrets defeats the budget
 silently.
 
@@ -225,14 +226,26 @@ same deferred-human path `ask_human` and the `human` node already use. This is
 also where the trifecta tags finally do work at runtime rather than only
 folding at startup.
 
-A policy gate has **no addressee**: it asks whoever is watching. Naming a
-decider for an operator-declared tool gate is the same feature the `human`
-node's `to` provides (see
-[Addressed gates](node-registry.md#addressed-gates)), but it belongs on the
-policy rule rather than being invented per call — so it is not there yet.
+**A policy gate holds the call.** `action: ask` does not run the call and
+then ask; it parks the call and puts the question on the asking task, which
+turns `input-required`. The answer is a decision: `approve` runs the held call
+— its grant and its arguments checked again, the policy not re-applied — and
+the asker gets the call's real result (`runtime/tools.rs::policy_settle`);
+`deny` is an error result naming the rule; anything else is refused as an
+answer and the question stays open. A timeout runs the
+call only when the rule's `on_timeout` is `allow`, and refuses it otherwise
+(the default). A workflow step's gate is recorded durably with its question,
+its addressee and the held call, so a restart rebuilds it unweakened.
 
-An empty list is exactly the previous behaviour, for the cost of one
-`is_empty` check.
+**A policy gate is addressed**, to the rule's `to:`, and to `{role: operator}`
+when the rule names nobody (`runtime/tools.rs::policy_gate`). The gate usually
+lands on the task of the very caller whose call is being judged, and whoever
+holds a task may answer an unaddressed question on it — so an unaddressed
+policy gate would be approved by the party it exists to check. A policy is the
+operator wanting a say. Who else a `to:` may name is the
+[gate addressee rule](#human-gates-who-may-answer).
+
+An empty list costs one `is_empty` check.
 
 ### Every caller, or it is worse than nothing
 
@@ -257,11 +270,18 @@ and no result exists. A schema-conformant fake would be reasoned over as real,
 and every later decision built on an observation that never happened — a
 strange thing for a fail-closed runtime to ship, and worse than refusing.
 
-**An `ask` with no interface attached denies.** A gate nobody could answer has
-not been approved, and running the call because no client happens to be
-connected would make the policy a suggestion. A policy `ask` also does *not*
-route through `agent.approval`, whose `auto` mode answers with a model judge —
-letting the agent approve the operator's own security gate.
+**An `ask` nobody can be asked takes its `on_timeout`, and that defaults to
+deny.** A gate nobody could answer has not been approved, and running the call
+because no client happens to be connected would make the policy a suggestion.
+Nobody can be asked when no A2A listener serves, or when the call belongs to
+work no caller owns — a schedule, a webhook, a subagent (a subagent's gate is
+unowned even under a caller's turn) — and `agent.ask_human_unowned` is not
+`gate`. The question is logged (`tool.policy.unanswerable`) so the operator
+learns what they were not asked. A rule that says `on_timeout: allow` runs the
+call and returns its real result; it never returns a success for a call that
+did not run. A policy `ask` also does *not* route through `agent.approval`,
+whose `auto` mode answers with a model judge — letting the agent approve the
+operator's own security gate: an addressed gate is never judged.
 
 **An argument guard that will not compile is exit 2.** Silently treating it as
 no-match turns a `deny` into an allow at exactly the moment it was meant to
@@ -292,7 +312,8 @@ tools (`subagent/control.rs::NoSelfTools`), so it cannot spawn children in-proce
 
 ## Caller scopes
 
-Internally there are four caller kinds: `Root`, `Workflow`, `Subagent`, `Principal`.
+Internally there are four caller kinds (`registry::Caller`): root, workflow, subagent and
+principal.
 Grants only ever gate **internal** contracts — for MCP and code tools the check
 short-circuits to allowed for root and workflow callers, and for a subagent spawned without
 a `tools:` grant; a subagent that carries one is held to it for every tool class, MCP and
@@ -328,49 +349,414 @@ already in flight at once. A caller named only by its evidence (a certificate's 
 device session) is known once it has made a request; until then, work it owns acts with
 no role and reaches only what it owns.
 
-External callers arrive over A2A. The transport supplies a `CallerIdentity` — verified
-mTLS SANs and subject, a bearer reference, an AAuth agent id, a loopback flag — and
-`Resolver::resolve` walks the `a2a.principals` rules first-match, then falls back to
-operator on verified management, then operator on loopback with no principals configured,
-then anonymous (`a2a/principals/resolve.rs::Resolver::resolve`).
+Callers from outside arrive over A2A, and what they are and may do is the
+[next section](#the-a2a-boundary). Two honest limits sit at the seam between the two.
+**A2A command-op limits bound command DataParts, not conversation:** a natural-language
+message from a `user` principal drives a root turn, and a root turn's tool plan is the
+root plan (`runtime/turns.rs::tool_plan`) — every MCP tool and every internal tool that is
+not instance-wide. What holds that turn to its caller is the instance-wide refusal and
+the ownership checks above, not the principal's `grants`: a caller whose grants reach no
+command op may still, in prose, have the model call any MCP tool the root plan holds.
+`security.policies` is the tool for that — a rule can match `principal: {role: user}` and
+deny or ask. And **the
+registry's per-contract role table is not the live one** — `registry/mod.rs::Grant`'s
+`roles` are read only by the `Caller::Principal` arm of `Registry::allowed`, which no
+production path constructs — so editing a contract's `user`/`agent` grant changes nothing
+for A2A.
 
-```yaml
-a2a:
-  listen: https://0.0.0.0:8443
-  tls: { cert: /tls/cert.pem, key: /tls/key.pem, client_ca: /tls/clients.pem }
-  principals:
-    - { match: { san: "spiffe://ops/*" },  role: operator }
-    - { match: { san: "spiffe://team/*" }, role: user, grants: [workflow.*] }
-```
+## The A2A boundary
 
-Authorization for the served surface is a hand-written matrix, `Principal::may` for the
-RPC method and `Principal::may_command` for a command DataPart:
+The A2A listener is the one door into a running agentd, and [a2a.md](a2a.md) is the full
+account of what it serves. This section is the model it enforces, and the threat each piece
+answers.
 
-| Role | May call |
-|------|----------|
-| `operator` | everything, unconditionally |
-| `user` | `workflow.run` / `status` / `cancel`, `subagent.send` / `status`, `plan.get`, `ask_human`, `conversation.get`, `run.get` |
-| `agent` | `workflow.run`, `workflow.status` |
-| `anonymous` | nothing — denied at every layer, and an explicit `grants: ["*"]` does not rescue it |
+### Who is calling: the evidence, in order
 
-`status` and `interface.info` are always granted to any non-anonymous role
-(`principals/mod.rs::Principal::may_command`). Of the 53 internal contracts, exactly one —
-`status` — carries a default grant for `user`/`agent`. The admin family (`drain`,
-`pause`, `resume`, `cancel`) is refused for every non-operator role,
-independent of grants. Bearer
-tokens and pairing codes are compared in constant time: `principals/resolve.rs::ct_eq` for a
-principal's bearer (`::Compiled::matches`), and the shared `sha.rs::ct_eq` for the static
-server bearer (`a2a/serve/identity.rs::is_server_bearer`) and the rotating pairing code
-(`a2a_server/pairing.rs::PairingState::pair`). Those are two copies of the same
-length-check-then-XOR-fold compare rather than one shared helper — a duplication to know
-about, not a hole.
+Every request resolves to a **principal** — an id, a role and grants — from its headers
+and its connection, before a byte of its body is read
+(`a2a/principals/resolve.rs::Resolver::resolve`). Each kind of evidence decides only for
+itself, in this order:
 
-Two honest limits. **A2A role limits bound command DataParts, not conversation:** a
-natural-language message from a `user` principal drives a turn handed the *root* tool plan
-(`runtime/turns.rs::start_root_turn`), so a caller who cannot invoke `workflow.delete` as a
-command may still be able to ask for it in prose. And **the registry's `Grant.roles` table
-is not the live one** — `Principal::as_caller()` has no production call site, so editing a
-contract's `user`/`agent` grant changes nothing for A2A.
+0. **A unix-socket peer** is the operator: the kernel admits only the daemon's own uid,
+   checked at accept.
+1. **A presented bearer** decides. A session token (`agentd_at_…`) is checked against the
+   listener's sessions and nothing else. Any other bearer, on a listener with a bearer
+   mechanism (`a2a.bearer`, a `bearer_ref` rule, or the device grant), names the operator
+   when it is `a2a.bearer`, and a rule's principal when it is that rule's `bearer_ref`. A
+   bearer that matches nothing is a `401`, never a fallback to what else the request
+   carried: otherwise "present any junk" would be as good as presenting nothing. A bearer
+   sent to a listener with no bearer mechanism at all is ignored.
+2. **A verified client certificate** takes the first `san`/`sub`/`any` rule it matches,
+   in the order written; it is the operator only while no rule exists at all, and nobody
+   (`403`) once one does.
+3. **An `any` rule** names whoever is left.
+4. **The implicit operator** ([below](#the-implicit-operator)).
+5. Anybody else is `401`.
+
+A rule with `role: anonymous` names nobody. Bearer secrets are compared in constant time
+(`sha.rs::ct_eq`). Session tokens, device codes and launch codes are 256 random bits, held
+only as their SHA-256 digest, in memory.
+
+**Principal ids are what work is owned by.** Every operator is `operator`. A `user` or
+`agent` is `<role>:<id>` when its rule declares `id` — required on `bearer_ref` and `any`
+rules, unique across rules — and otherwise, from its certificate, `<role>:cn=<CN>` or
+`<role>:san=<first SAN>`. The `=` is in neither the declared-id charset nor the approval-name
+charset, so a certificate whose CN equals a declared id or a device name can never inherit
+that principal's work. A device session is `user:<name>` ([below](#named-identities)).
+
+### The implicit operator
+
+On a TCP listener **bound to loopback** (`127.0.0.0/8`, `::1`, `localhost`) with no
+`a2a.bearer`, no principals, no `client_ca` and no device grant, a request from a local peer
+that presents nothing **and carries no `Origin`** is the operator
+(`runtime/surface/auth.rs::listener_auth_of` decides the posture; step 4 of the resolver
+applies it). Being on the machine *is* the authorization there, and the load says so with a
+warning. What that means, and where it stops:
+
+- **Every local account is the operator**, not only yours: plain `curl` from any uid on the
+  host. On a multi-user host use a unix listener, where the kernel checks the uid, or set
+  `a2a.bearer`.
+- **It needs the bind, not merely the peer.** On a wildcard or any other bind, a connection
+  from `127.0.0.1` grants nothing: a same-host reverse proxy relays every remote caller from
+  there.
+- **A browser is never the implicit operator.** A request carrying `Origin` — any value,
+  `Origin: null` included, which is what a `file://` page, a sandboxed iframe or a `data:`
+  URL sends — is refused `401`, with a body saying browser requests must authenticate. Any
+  page on any site can make the operator's browser POST to `127.0.0.1`, so a browser always
+  authenticates: with a session, a bearer or a certificate, even on a no-auth loopback
+  daemon.
+- **An `any` rule applies to browsers too, and can never carry the operator role** — the
+  load refuses `any` with `role: operator` (`config/settings/mod.rs::validate`). A page
+  that reaches an `any`-rule listener is that rule's principal and no more.
+
+One caveat follows from the design. **A same-host reverse proxy or sidecar that relays to a
+loopback-bound listener, and strips `Origin`, makes every request it relays the operator**:
+the relayed request is local and presents nothing. Do not front a no-credential loopback
+listener with a proxy. Bind a routable address with credentials instead — the load demands
+them there — or configure a credential on the loopback listener.
+
+### The posture follows a reload
+
+The rules and the posture they imply are **one value**: `Resolver::build` computes the posture
+from the same `a2a` section and keeps it, and a reload that changes `a2a.principals`
+rebuilds the resolver and swaps it whole (`runtime/reload.rs`). Every request takes one
+snapshot that answers both *who is this* and *what does this listener require*, so a reload
+can never pair new rules with an old posture; the card is built from the current settings on
+every read. A SIGHUP that adds the first rule to a no-auth loopback daemon ends the implicit
+operator, and puts the scheme on the card, at once. A reload whose rebuild fails keeps the old
+rules *and* the old posture. The runtime's view of who the model acts for moves in the same
+step, so narrowing or removing a rule narrows work already in flight. `a2a.bearer`,
+`a2a.listen`, `a2a.tls.*` and `a2a.device_grant` are restart-only.
+
+### What a principal may do: the operator floor
+
+Every named role may call every core A2A method, on its own tasks; `anonymous` may call
+nothing. What a role reaches beyond that is a command op, and the op table — who may call
+each op, and which switch serves it — is the command extension's specification, published
+at [`https://agentd.dev/a2a/ext/command`](https://agentd.dev/a2a/ext/command) from
+`docs/ext/command.md`, which a test holds to the very table the listener enforces. Its
+**floor** is the part that matters here: an `operator` op — `admin.*`, `auth.*`, `config`, `debug.events`
+and the reserved ops — answers to the operator role alone, before any grant is read. A `user`
+holding `grants: ["*"]` reaches none of them, and a rule whose `grants` name an operator-only
+op on a non-operator role is refused at load rather than left looking like a control it
+cannot reach. A name no row serves, and no loaded workflow declares, is `UNKNOWN_OP`.
+
+### Ownership, by principal id
+
+What a non-operator starts is its own, and ownership is recorded and compared **by principal
+id** — never by the credential or the session that presented it, so a person who signs in
+again under the same name finds what that name started:
+
+- **Tasks.** A task is visible to its owner and to operators
+  (`a2a/tasks.rs::Task::is_visible_to`). Anyone else's is `-32001` "task not found", the same answer as a task that does not exist,
+  so ids cannot be probed.
+- **Runs, subagents and conversations on the A2A path.** `workflow.status {run}`,
+  `workflow.cancel`, `workflow.signal {run}`, `subagent.send`, `subagent.kill`,
+  `subagent.status {handle}`, `subagent.get` and `plan.get` act only on the caller's own
+  (`-32001` otherwise). An object nobody owns is the operator's.
+- **The same on the model path.** When a turn runs for a non-operator, the model's own
+  `workflow.cancel`, `workflow.signal` and `subagent.*` tools meet the same checks, and a
+  principal the runtime cannot place fails closed. A caller cannot reach through the model
+  what it cannot reach through the listener.
+- **`contextId` is the caller's own name.** A non-operator's `contextId` is never a key into
+  the runtime: it is bound, per principal, to a fresh key of the runtime's (`ctx-<32 hex>`),
+  so two callers who pick the same id — `root` included — hold two conversations, and neither
+  can join, read or charge the other's. A task always shows its owner the `contextId` the
+  owner used. An operator addresses conversations by the runtime's keys.
+- **Signals are scoped to their sender.** A signal a non-operator sends, over A2A or through
+  the model, wakes only runs that principal owns, starts only workflows it may run (and those
+  runs are its own), and never ends an instance's `lifecycle.until_signal` wait — that
+  attempt is logged `lifecycle.until_signal.refused` instead.
+
+**A finished task is kept by one bound across every caller.**
+`store.retention.tasks.keep_last` counts all principals' terminal tasks together, so on a listener several callers share, one
+caller's finished tasks can push out another's, the operator's included. A task that settled
+less than 30 seconds ago and that nobody has read back yet is spared past `keep_last` and
+`ttl`, so a blocking `SendMessage` always gets its own answer; after that, or once it has been
+read, it goes. On a multi-tenant listener bound retention with `ttl` — each task's own age —
+rather than `keep_last` alone.
+
+### A child instance must be able to sign in to its parent
+
+An instance-tier subagent reports home over a `parent` peer. When the parent's listener is TCP,
+is not in the implicit-operator posture (read from the current settings at spawn, so a
+principals reload counts), and the `parent` peer entry would carry no authorization header, the
+spawn is refused before anything is created — "the child cannot authenticate to its parent:
+make a2a.bearer a {{secret:…}} reference or use a unix listener" — and logged
+`instance.spawn.refused` (`runtime/instances.rs`). The alternative is a child that runs its
+work and then has every report refused.
+
+### Browsers
+
+**CORS admits exact origins.** A request carrying `Origin` — to `POST /` or any `/oauth2/*`
+endpoint — is served only when that origin is listed in `a2a.cors.origins`, compared as a
+parsed origin (scheme, host, port with its default). `Origin: null` and an unparsable value
+never match; `*` is refused at load; a UI served from loopback must be listed like any other.
+A refused origin is `403` with no CORS headers, before the body is read, and never counts
+against the [source limiter](#failed-credentials-the-source-limiter). The one origin admitted
+unlisted is the UI `agentd ui` launched — `http://127.0.0.1:<port>` of the socket the
+launcher bound — for that process only: it is not configuration, and no settings dump shows
+it. **Admission is not trust**: an admitted page still authenticates.
+
+**The Agent Card is public.** `GET /.well-known/agent-card.json` answers every origin with
+`Access-Control-Allow-Origin: *` and never with credentials; it holds nothing a stranger may
+not read. The private-network preflight grant goes only to listed origins.
+
+**Web credentials live in the tab.** The web UI keeps its session token in `sessionStorage`
+only — this tab, this visit — bound to the endpoint it was issued for, so a page opened
+against another endpoint finds nothing to send; `localStorage` remembers the endpoint and the
+layout and nothing else. The TUI keeps its token in memory. The `agentd-ui` server holds no
+credential and reads none from its environment or a URL; the page takes one thing from its own
+URL, a single-use [launch code](#the-launch-grant-threat-model) in the fragment, and removes it
+before its first request.
+
+### Failed credentials: the source limiter
+
+A presented credential that fails — a bearer or session token that names nobody, a
+certificate no rule gives a role — counts against its **source**: an IPv4 address, or an IPv6
+/64, because one host is routinely handed a whole /64 (`a2a/serve/limits.rs`). A source may
+fail 20 times, forgiven one every 3 seconds; 4096 sources are tracked, the least recently seen
+dropped. **The limiter throttles guesses, not callers:**
+
+- **Only failures count.** An origin refusal is never counted — it costs nothing and guesses
+  nothing, and counting it would let any web page lock the local console out — and neither is
+  a request that presents nothing, or the refusal of a caller who did authenticate.
+- **Past the limit, a source's bearers are refused `429` before they are checked.** A limiter
+  that still checked each guess would slow nobody down; it would only turn a wrong guess's
+  `401` into a `429` while a right one sailed through at full speed. That refusal is not
+  itself counted.
+- **What presents nothing is never refused by it** — the implicit operator, an `any` rule —
+  and neither is a client certificate, proven in the handshake and not guessable. A unix peer
+  has no source.
+
+The residual is stated plainly. A bearer client that shares a source with a failing one —
+behind one NAT, on the same host, or behind the same reverse proxy, where every caller is the
+proxy's address — is refused until the source drains, at one failure per 3 seconds. And a
+browser sends a bearer only from a page on an origin the listener admits, so only an
+allow-listed origin's page can make a browser spend the local console's budget.
+
+Refusals a caller can provoke for free — no credential, a bad one, a throttled source, a
+rate refusal, and any refusal of a principal only an `any` rule named — are bounded in the
+log too (`limits.rs::DenialLog`): one `a2a.denied` line per source and reason per minute,
+carrying a `suppressed` count of what the previous window left out, under a global budget of
+20 lines plus one a second. Any other refusal of a principal a credential named — a method or
+an op its role does not reach — is logged every time.
+
+### The device grant: threat model
+
+With `a2a.device_grant.enabled`, the listener origin is an OAuth 2.0 authorization server for
+the RFC 8628 device flow, and a person signs a terminal or a browser in without any credential
+of the daemon's being copied into it ([a2a.md](a2a.md#the-device-authorization-grant) has the
+endpoints and the flow). The grant needs an operator credential to approve with — `a2a.bearer`,
+or an operator rule matched by `bearer_ref` — and the load refuses it otherwise; it is refused
+beside `client_ca` and on a unix listener.
+
+**Brute force.** Nothing a client presents is small enough to guess. The device code a client
+polls with and the session token it gets are each 256 random bits. The user code (eight letters
+from a twenty-consonant alphabet) names a request to the approver and is never presented by the
+client, so guessing one buys nothing. Token polls are bounded per source (30, then one a second),
+a client polling faster than its interval is told `slow_down`, and a guessed session token is a
+bearer, which the source limiter throttles.
+
+**Remote phishing** — an attacker starts a sign-in on its own machine and talks an operator into
+approving its code — is the device flow's known weakness, and approval is built to make it hard:
+
+- approving is an operator act over the command extension (`auth.device.approve`), never a page
+  a link can take someone to — `GET /oauth2/device` is fixed text that approves nothing;
+- `auth.device.pending` shows each waiting request's peer address, `client_id`, scope and when
+  it was asked, so an operator approves only a code they watched a client they recognise
+  display;
+- a session is a `user` unless the operator explicitly approves `scope: operator` *and*
+  `a2a.device_grant.scopes` lists it; an approver may narrow a request, never widen it, and
+  `agent` is never grantable;
+- a mistaken approval is ended by its sid, and revoking never deletes what the principal owns.
+
+**Per-source limits.** Per source, a client may ask for 5 codes and then one every 12 seconds,
+and may hold 4 waiting; one network (an IPv6 /48; for IPv4, the address itself) may hold 16, and
+the whole table 64. At the global bound a newcomer is still admitted by retiring the oldest code
+of the network holding the most, as long as that network holds at least two more than the
+newcomer's. So 16 IPv4 addresses fill the table without keeping anybody out; a party holding one
+waiting code in each of 64 separate networks does keep newcomers out (`429`) until its codes
+expire at `code_ttl`. Users behind one NAT are one source and share its buckets and caps, and
+**behind a reverse proxy everything is one source**: every caller shares 5 codes, 4 waiting and
+one failure budget.
+
+**Stream revocation.** A session is checked on every request and while its requests are in
+flight: revoked — by `auth.sessions.revoke`, `POST /oauth2/revoke` or expiry — its open streams
+end, and its blocking waits answer `401` `invalid_token`, within a tenth of a second, and the
+observation feed says goodbye with reason `revoked`. The check is by **sid**, so a sibling
+session of the same name keeps working.
+
+**Session rate, and the reserved prefix.** `a2a.device_grant.rate` admits one token per request
+from a session principal, one bucket per principal id, so every session of one name shares it;
+operators, including operator sessions, are exempt. Session tokens start with `agentd_at_`, and
+a bearer carrying that prefix is checked against the sessions and nothing else, so no configured
+secret may use it: an `a2a.bearer` or `bearer_ref` secret that starts with it — or that equals
+`a2a.bearer` or another rule's secret — is refused when the listener builds its rules, at start
+and at a principals reload. There are no refresh tokens, and a restart revokes every session.
+
+#### Named identities
+
+**The operator vouches for the name.** `auth.device.approve` requires `as`, a lowercase name
+(`^[a-z0-9][a-z0-9._-]{0,63}$`), and the session's principal is `user:<name>`; nothing checks the
+name against the person but the operator approving it. **Sessions sharing a name are one
+principal**, by design: they share its tasks, runs, subagents and conversations, one rate bucket
+and one status scope, so a person's history survives signing in again and token expiry. The
+flip side: approving a new person under an old name hands them its history, and the approval
+says so — its answer carries `existing: true` when the name was approved before. Revoking one
+sid ends only that session; `{name}` ends every session of the name. The names `operator`,
+`anonymous`, `unknown`, `launcher`, `runtime` and `system` are refused, because each already
+spells another party in the audit trail.
+
+**One namespace across time.** A `user`-role rule id and a device name both spell `user:<x>`,
+and ownership is persisted by principal id, so the durable store keeps an identity registry
+(`runtime/identities.rs`): every declared `user`- or `agent`-role rule id is recorded at listener
+spawn and at every principals reload, and every approved name at approval. An approval of a name
+that is declared now, or was ever recorded as a rule, is refused; a start (exit `2`) or a reload
+(the old rules stay) that declares a `user`-role id already approved as a device name is refused
+and logged `identity.collision`. So a device name and a rule id never share a principal across
+restarts, token expiry and rule removal — for as long as the store persists; a memory store
+persists no ownership either. There is no command that releases a recorded name.
+
+### The launch grant: threat model
+
+`agentd tui` and `agentd ui` run the daemon and one display client as one command, and sign the
+client in without handing it any credential the daemon was configured with
+([interface.md](interface.md#launcher) is the user's view; [a2a.md](a2a.md#the-launch-grant) the
+wire).
+
+**What the launcher never passes.** Not `a2a.bearer`, and not a resolved config secret — by argv,
+environment, file or HTTP. The client's environment is the launcher's own minus every variable
+the config loader reads (every spelling of every path it binds), every `{{secret:NAME}}` the
+loaded settings reference, and `AGENTD_BEARER` (`agentd-cli/src/launcher.rs::client_env`).
+
+**The code.** The only credential the launcher hands out is a launch code, minted in the daemon's
+own process — there is no op, route or configuration key that mints one or approves a request.
+It is 256 random bits (`agentd_lc_…`), single-use, valid 60 seconds, bound to its client and to
+the launched UI's origin (`agentd ui`) or to the absence of any `Origin` (`agentd tui`), and
+redeemed at `/oauth2/token` with the grant type
+`https://agentd.dev/oauth/grant-type/launch`, only from a loopback peer. The order at the wire
+matters: the origin gate runs first, so a presentation whose `Origin` is not admitted —
+`Origin: null` included — is `403` and spends nothing. A presentation that reaches the grant
+spends the code whatever its answer: an unknown, spent or expired code, a bind that does not
+match (an admitted origin other than the code's, or any `Origin` on a TUI's code) and a wrong
+`client_id` all get the same `400` `invalid_grant`, so a stolen code can at most be burned.
+
+**Delivery.**
+
+- **`agentd tui`**, always, whatever the listener's posture: over a pipe the TUI inherits as fd 3.
+- **`agentd ui`**: in a 0600 launch file in a fresh 0700 directory under `$HOME`
+  (`agentd-launch-XXXXXX`; `$XDG_RUNTIME_DIR` when `$HOME` is unset), opened with the desktop's
+  opener, which is given the file's path and never the URL — a process's argv is readable by
+  every user. The file is deleted the moment the code is spent, after 60 seconds, and at exit.
+  With `--no-open`, or when the opener fails, the URL is printed on the launcher's terminal
+  instead, never in the daemon log. Either way the code travels **only in the URL fragment**
+  (`#launch=…`), which a browser never sends over HTTP, and the page strips it before it makes
+  any request.
+- **Every later browser sign-in is approved at the launcher's terminal.** A tab asks
+  `POST /oauth2/launch_authorization` — only from the launched origin and a loopback peer — and
+  shows a short code; the person types it at the launcher's terminal, which approves exactly
+  that request. Another web origin cannot start one, and another local process can start one
+  but cannot make the person type its code.
+
+**Descriptor hygiene.** Every descriptor the launcher creates — the pipe, the UI's socket, the
+saved terminal, the daemon log — is close-on-exec, and the one a client is meant to have reaches
+fd 3 only in that client, between fork and exec. So no process the daemon spawns — the `exec`
+tool, an instance, a subagent — inherits the operator's terminal, the pipe or the UI socket.
+
+**The session is the operator's.** It acts for the person who ran the launcher, who started
+this daemon in-process from their own configuration and credentials — and, on a no-auth
+loopback daemon, is already the implicit operator from any non-browser process. A lower role
+would protect nothing from that person and would break the console's operator functions. A
+`ui` session lives 8 hours at most; a `tui` session as long as the launcher. Both end with the
+launcher's process and are revocable like any session: `auth.sessions.revoke {sid}`, or the
+page's `/disconnect`, which revokes its own token.
+
+**Failure limiting throttles failures, not callers.** A launch exchange never draws from the
+device grant's buckets. Only `invalid_grant` answers count, per source (20, forgiven one every 3
+seconds); past the limit only a *failing* presentation is refused `429`, and a live code or an
+approved request is always honoured — so a flood of junk from `127.0.0.1` cannot keep the real
+client out.
+
+**Availability against same-host processes.** Any process on the host can ask
+`/oauth2/launch_authorization` from the launched UI's origin; at 16 waiting requests the oldest
+is retired, so a local flood can make the real tab start its request again. It cannot get any
+request approved: approval is the person at the launcher's terminal typing the code the tab
+shows. There is no rate bucket on it, deliberately — every presenter, the real tab included, is
+`127.0.0.1`, so a bucket would lock the tab out exactly as the flood does.
+
+**Why it opens none of the obvious holes.** No credential is served over HTTP: `agentd-ui`
+holds none, and the code reaches the browser only through a 0600 file or the owner's terminal.
+No credential is ever in a query string: the page takes the code from the fragment, exchanges it
+only with the endpoint its own server names, and the session token never appears in a URL. And
+the browser is not an implicit operator: the tab authenticates with a session no other origin
+can obtain — origin binding and CORS, and for a later tab the terminal's approval — while CORS
+admission of the launched origin grants nothing by itself.
+
+**Residual risk, stated plainly.**
+
+- **Other local users** cannot read the launch file, the pipe, the terminal or the pre-bound UI
+  port. But on a no-auth loopback TCP daemon every local uid is already the implicit operator
+  through plain `curl`, so these protections matter on a protected daemon; on a multi-user host
+  use a unix listener or `a2a.bearer`.
+- **Same-uid processes are equivalent to the user** — agentd's own model-driven `exec` and
+  instance children included. Within the 60-second window one could read the launch file, or
+  `/proc/<tui>/fd/3`. Descriptor hygiene, deletion on consumption and loopback-only redemption
+  shrink that window; they do not close it.
+- **Browser history**, and history sync, may record the `#launch=` URL before the page strips it.
+  That is harmless: the code is single-use and spent within seconds.
+- **The environment scrub** covers `a2a.bearer` and resolved config secrets, not credentials
+  that code other than the loader reads (the implicit `AWS_*` chain), and a same-uid child can
+  read `/proc/<ppid>/environ` anyway.
+- **A same-host proxy** that relays to the listener makes remote requests loopback peers, as it
+  does for the [implicit operator](#the-implicit-operator); the launcher refuses a non-loopback
+  endpoint, but it cannot see a proxy in front of a loopback one.
+
+### Human gates: who may answer
+
+When the agent needs a person — `ask_human`, a workflow `human` step, a `security.policies`
+gate — the task turns `input-required`, and whoever may see the task may answer it. An addressee
+narrows that: a gate's `to:` names who must answer, and a gate that names one is never answered
+by the model judge whatever `agent.approval` says.
+
+**An addressee must be able to see the task**, and a task is visible only to its owner and to
+operators. So `to:` may be absent — the question goes to the task's owner, or, for a policy gate,
+to `{role: operator}` — or name an operator. A `to:` that names any other principal is refused
+at load (exit `2`, and a reload is refused), naming the principal and saying it could never see
+the task. The rule holds wherever a question is addressed with `to:`, a workflow's `human` step
+included. Work no caller owns — a schedule, a webhook, a subagent — gates on the listener only
+with `agent.ask_human_unowned: gate`.
+
+### The remote posture
+
+On a host you do not fully own, or anywhere a listener is reachable off the machine, the posture
+is **TLS plus `a2a.device_grant`, approved by an operator credential**: an `https://` bind with a
+certificate, `a2a.bearer` (or an operator `bearer_ref` rule) held by whoever approves, and every
+person signed in under a name they are accountable for. The load enforces the edges: a
+non-loopback bind needs `a2a.bearer` or `a2a.tls.client_ca`, plaintext is loopback-only, a
+wildcard bind needs `a2a.url`, and the device grant needs the operator credential. `client_ca`
+instead makes a client certificate mandatory for every caller, bearer-only and browser clients
+included, which is why the device grant refuses to load beside it.
 
 ## The exec runner
 
@@ -461,27 +847,30 @@ Outbound credential providers — OAuth2, AWS SigV4, SPIFFE, `agentd login` — 
 MCP endpoints are HTTPS-only, with plaintext `http://` permitted for loopback hosts alone;
 anything else exits `2` before any side effect (`config/mod.rs::mcp_endpoint_scheme_ok`).
 The same rule holds for the intelligence endpoint. A non-loopback `a2a.listen` **must**
-configure client auth — `a2a.tls.client_ca`, `a2a.bearer`, or `interface.pairing` — or
-startup fails validation, and plaintext `http://` on a non-loopback bind is likewise a
-startup error (`config/settings/mod.rs::validate`, the two refusals in its `a2a.listen` block).
+configure client auth — `a2a.bearer` or `a2a.tls.client_ca` — or startup fails validation,
+plaintext `http://` on a non-loopback bind is likewise a startup error, and a wildcard bind
+needs `a2a.url` (`config/settings/mod.rs::validate`, the refusals in its `a2a.listen` block).
 
-One default deserves emphasis: **a loopback caller with no `a2a.principals` configured
-resolves to operator** with `grants: ["*"]` (`principals/resolve.rs::Resolver::build` sets the flag,
-`::Resolver::resolve` acts on it). Anything that can reach the loopback port — a sidecar, a
-co-tenant process, an SSRF from another service in the same network namespace — is a full
-operator, which includes flipping `agent.approval` to `accept` over `config.set`: the
-agent's own `ask_human` gates then answer themselves from whatever they recommend, and the
-ones recommending nothing fall to a model judge (`runtime/human.rs::ask_human_tool`,
-`::spawn_human_judge`) — until the next reload puts the file's value back, since
-`agent.approval` is reloadable (`config/settings/mod.rs::RELOADABLE_PATHS`). Two kinds of gate
-survive that flip: one that names its decider with `to:`, which is never auto-answered
-whatever the policy says — the `_ if addressee.is_some()` arm of `ask_human_tool`
-short-circuits ahead of every approval mode — and an operator-declared `security.policies`
-`ask`, which is deliberately not routed through `agent.approval` at all
-(`runtime/tools.rs::policy_gate`). Configure principals on any host you do not fully own.
+One default deserves emphasis: **the implicit operator.** On a loopback-bound listener with
+no credential mechanism, a local caller that presents nothing and is not a browser resolves
+to the operator with `grants: ["*"]` ([the implicit operator](#the-implicit-operator)).
+Anything that can reach the loopback port without a browser — a co-tenant process, another
+local user, an SSRF from another service in the same network namespace, a same-host proxy
+that strips `Origin` — is a full operator, which includes flipping `agent.approval` to
+`accept` over `admin.set`: the agent's own `ask_human` gates then answer themselves from
+whatever they recommend, and the ones recommending nothing fall to a model judge
+(`runtime/human.rs::ask_human_tool`, `::spawn_human_judge`) — until the next reload puts the
+file's value back. Two kinds of gate survive that flip: one that names its decider with
+`to:`, which is never auto-answered whatever the policy says — the `_ if addressee.is_some()`
+arm of `ask_human_tool` short-circuits ahead of every approval mode — and an
+operator-declared `security.policies` `ask`, which is addressed and deliberately not routed
+through `agent.approval` at all (`runtime/tools.rs::policy_gate`). Configure a credential on
+any host you do not fully own.
 
-The only process agentd launches is a re-exec of its own binary via `current_exe()`
-(`runtime/mod.rs::run`), marked with the `AGENTD_SUBAGENT` environment variable. The child's
+Apart from the `exec` runner above, and the display client and desktop opener that
+`agentd tui` / `agentd ui` start, the processes agentd launches are re-execs of its own
+binary via `current_exe()` (`runtime/mod.rs::run`); a subagent is marked with the
+`AGENTD_SUBAGENT` environment variable. The child's
 work arrives as a serialized control frame on its stdin — data to a model loop, never argv
 to a shell. Each child gets its own process group so the kill ladder can target the
 subtree, an optional cgroup leaf whose `Drop` writes `cgroup.kill`, and `PR_SET_PDEATHSIG`
@@ -591,6 +980,12 @@ Stated plainly so you size the surrounding environment correctly.
 - **No audit event for a trifecta override** — it proceeds silently.
 - **No artifact redaction.** Artifacts carry a `sensitive` flag, but `artifact.get` returns
   the content regardless (`runtime/artifacts.rs::get_value`).
+- **No defence against the host's own users on a no-credential loopback listener.** Every
+  local uid is the [implicit operator](#the-implicit-operator) there, and a same-uid process
+  is the user in every sense — it can read a launch file or a pipe as easily as the person
+  can.
+- **No per-caller bound on task retention.** `store.retention.tasks.keep_last` is one bound
+  across every principal; use `ttl` on a shared listener.
 - **No policy engine, request signing, or RBAC beyond the principal roles above.**
 
 ## Operator checklist
@@ -599,7 +994,10 @@ Stated plainly so you size the surrounding environment correctly.
    security boundary; agentd is not.
 2. Treat every declared MCP server as code you execute at agentd's privilege. Vet it.
 3. Tag every server, one server per tag profile — glob keys do not split a server.
-4. Configure `a2a.principals` on any host where loopback is not exclusively yours.
+4. Configure a credential — `a2a.bearer`, a unix listener, or principals — on any host where
+   loopback is not exclusively yours, and never put a proxy in front of a no-credential
+   loopback listener. Off the machine, the posture is TLS plus `a2a.device_grant`, approved
+   by an operator credential, with every person approved under their own name.
 5. Reference every secret; validation covers four config paths plus credential-shaped
    header keys — a credential under any other key name sails through.
 6. Leave `exec` off. If you enable it, keep `allow` minimal, never allow-list a shell, and

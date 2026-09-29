@@ -10,9 +10,10 @@ handshake.
 The configuration is one nested document, with the
 sections `agent`, `goal`, `intelligence`, `mcp`, `tools`, `store`, `memory`,
 `context`, `knowledge`, `search`, `skills`, `subagents`, `services`,
-`workflows`, `streams`, `webhooks`, `limits`, `lifecycle`, `a2a`, `interface`,
-`identity`, `observability`, `security`, `vars`. Every **path** in that schema
-is also an env var (`limits.max_runs` ⇒ `AGENTD_LIMITS_MAX_RUNS`) and a flag
+`workflows`, `streams`, `webhooks`, `limits`, `lifecycle`, `a2a`,
+`identity`, `observability`, `security`, `vars`. The document carries no
+version field: its shape is the one this binary's schema describes. Every
+**path** in that schema is also an env var (`limits.max_runs` ⇒ `AGENTD_LIMITS_MAX_RUNS`) and a flag
 (`--limits.max-runs`); a set of short spellings is wired up as **aliases**
 (`--instruction`, `--intelligence`, `--model`, `--mcp`, `--config`,
 `--log-level`, …). The authoritative machine-readable schema is
@@ -31,6 +32,10 @@ values for every enum, and flag a typo as you type rather than at `exit 2`:
 |---|---|
 | a config file | `https://agentd.dev/schema/config.json` |
 | a standalone workflow file | `https://agentd.dev/schema/workflow.json` |
+
+Each URL is the one schema for that document, and neither document declares a
+version of itself: a config has no version field and a workflow has no
+`version:` key.
 
 The one-line form, which needs no editor settings and travels with the file:
 
@@ -127,6 +132,11 @@ checked against their set, a list takes a `[a, b]` literal or a comma-separated
 verbatim string. A value that does not type is exit `2` naming the source
 (`invalid AGENTD_LIMITS_RUN_STEPS: expected an integer, got "many"`).
 
+The names are derived from the schema and only from it. A file key or list
+field the schema does not have is `unknown field` and a flag it does not have is
+`unknown argument` — both exit `2` — while an `AGENTD_` variable that names no
+path is simply not read.
+
 **Setting a path SETS its value.** From env or a `--<path>` flag, a list or map
 path *replaces* what the files declared (`AGENTD_TOOLS_DISABLED=a,b` ⇒ exactly
 `[a, b]`; `--mcp-servers '[{name: q, endpoint: https://…}]'` ⇒ exactly that
@@ -180,11 +190,14 @@ a bad document only reproduces it).
 | a **long-lived** instance (an `a2a.listen`/`webhooks.listen`, a `goal`, or a `loop`/`schedule`/`subscribe`/`signal`/`event`/`stream`/`correlate`/`a2a`/`webhook` start node) has a durable `store` — naming no store at all **defaults** to `kind: file` (§12.3), so this fires only when a config asks for `kind: none` outright | `store.kind is none but the instance is long-lived … — configure a durable store (store.kind: file \| mcp \| http), or drop store.kind to get the local file store by default` |
 | every workflow is named, unique, and has exactly one of `file` \| `uri` \| `url` \| `steps` | `workflows['w'] must have exactly one of file \| uri \| url \| steps (dir is a separate entry shape)` |
 | every inline workflow parses under the workflow node registry — the *same* parse the runtime runs at startup | `workflow "w" step "s": unknown field "every" for kind "loop" (allowed: interval, delay, until, max_iterations, backoff, inputs)` |
-| an `a2a.listen: https://…` sets `a2a.tls.cert` + `a2a.tls.key`, and a non-loopback bind authenticates its clients | `a2a.listen is https:// but a2a.tls.cert / a2a.tls.key are not set` · `a2a.listen on a non-loopback address needs client auth: a2a.bearer, interface.pairing, or a2a.tls.client_ca (mTLS — then EVERY caller needs a client certificate, bearer-only and paired included)` |
-| `interface.enabled` has a listener to ride, and pairing has an interface | `interface.enabled requires a2a.listen (the interface is served on the A2A listener)` |
+| an `a2a.listen: https://…` sets `a2a.tls.cert` + `a2a.tls.key`, a non-loopback bind authenticates its clients, and a wildcard bind says where callers reach it | `a2a.listen is https:// but a2a.tls.cert / a2a.tls.key are not set` · `a2a.listen on a non-loopback address needs client auth: a2a.bearer or a2a.tls.client_ca (mTLS — then EVERY caller needs a client certificate, bearer-only included)` · `a2a.listen binds a wildcard host (https://0.0.0.0:8443), which is no address a caller can reach: set a2a.url to the origin callers use …` |
+| `a2a.url` is an origin (§12.5) | `a2a.url must be an origin (scheme://host[:port]); A2A card discovery and OAuth metadata are served at the origin root` · `a2a.url: "https://Agent.example:443" is not in canonical form; write "https://agent.example" …` |
+| everything served ON the listener has one — `a2a.url`, `a2a.cors.origins`, `a2a.events.enabled`, `a2a.introspection.enabled`, `a2a.device_grant.enabled`, `agent.ask_human_unowned: gate` | `a2a.events.enabled requires a2a.listen (it is served on the A2A listener)` |
+| every `a2a.cors.origins` entry is an exact origin | `` a2a.cors.origins: `*` is not allowed; list each exact origin (a loopback UI origin must be listed too) `` |
+| an enabled device grant has somebody to approve its codes, and a listener it can sign anyone in on (§12.5) | `a2a.device_grant.enabled needs an operator credential to approve device codes: set a2a.bearer or add an a2a.principals rule with role: operator and match.bearer_ref` · `a2a.device_grant.enabled cannot be combined with a2a.tls.client_ca: …` |
 | a `webhook` node has a listener | `a 'webhook' node (start or wait) is used but webhooks.listen is not set — configure webhooks.listen (https://host:port)` |
 | a non-loopback `webhooks.listen` authenticates every route it serves — symmetric with `a2a.listen`, since both are inbound listeners that trigger work | `webhooks.listen on a non-loopback address needs auth: set webhooks.default_auth (hmac, bearer or header), or give every 'webhook' node its own auth (HMAC recommended) — unauthenticated: w/h` |
-| every `a2a.peers[]` is uniquely named with an `http(s)://` endpoint; every `a2a.principals[]` match names exactly one subject | `a2a peer 'p': endpoint must be http(s):// (or unix:///path for a co-located peer)` · `a2a.principals[0]: match needs one of san \| sub \| bearer_ref \| aauth_agent \| any` · `a2a.principals[0]: match sets more than one of san \| sub \| bearer_ref \| aauth_agent \| any; a rule matches one way — write one rule per matcher` |
+| every `a2a.peers[]` is uniquely named with an `http(s)://` endpoint; every `a2a.principals[]` match names exactly one subject, and a rule that cannot name its caller declares the `id` its work is owned by (§12.5) | `a2a peer 'p': endpoint must be http(s):// (or unix:///path for a co-located peer)` · `a2a.principals[0]: match needs one of san \| sub \| bearer_ref \| any` · `a2a.principals[0]: match sets more than one of san \| sub \| bearer_ref \| any; a rule matches one way — write one rule per matcher` · `` a2a.principals[1]: a bearer_ref/any rule names one caller, so it needs `id:` … `` · `a2a.principals[2].id "ci-bot" is already declared by a2a.principals[0]; ids are unique across rules` |
 | `lifecycle.exit_code_map` remaps only the policy codes | `lifecycle.exit_code_map: only the policy codes 3 and 7 are remappable (got key "5")` |
 | `lifecycle.watch_config` has a file to watch | `lifecycle.watch_config requires a config file (--config / AGENTD_CONFIG)` |
 | `observability.log_level` is a known level; an `audit.sink: store` has a store | `observability.audit.sink includes 'store' but store.kind is none` |
@@ -199,8 +212,9 @@ Non-fatal findings come back on the same channel as
 sitting beside a `kind` that is not `file` (dead config, ignored), a non-loopback
 `webhooks.listen` with no `webhooks.default_auth` *and no webhook routes yet*
 (nothing is reachable, but the next node added would be — an unauthenticated
-route is an error, see below), an `interface.debug` with the
-interface off, and an unknown `interface.display` item.
+route is an error, see below), and a TCP `a2a.listen` with no credential of any
+kind (`a2a.listen: no credential is configured, so every local process that
+presents none is the operator — …`, §12.5).
 
 `-h`/`--help`, `-V`/`--version`, `--capabilities`, `--config-schema`,
 `--workflow-schema`, and `--validate-config` short-circuit and exit `0`
@@ -361,7 +375,7 @@ is why they are two settings and not one.
 | `--health-file <PATH>` | `observability.health_file` | — | *(none)* | Liveness heartbeat file, rewritten every 10s — the exec-probe target for images with no HTTP surface. |
 | `--metrics-addr <ADDR>` | `observability.metrics_addr` | `METRICS_ADDR` | *(off)* | Serve `/metrics`+`/healthz`+`/readyz` on a TCP addr — `host:port`, or `:port` for all IPv4 interfaces (read-only; restrict via firewall/NetworkPolicy if exposed). Needs `--features metrics`. |
 | `--traceparent <W3C>` | `observability.traceparent` | `TRACEPARENT` | *(none)* | Continue an upstream W3C trace; else a trace id is minted from the run id. |
-| `--events-ring <N>` | `observability.events_ring` | — | `1024` | Capacity of the in-memory log ring the interface's debug feed tails. Installed only when `interface.enabled` **and** `interface.debug` are on, so an instance with no debug UI pays nothing for it. |
+| `--events-ring <N>` | `observability.events_ring` | — | `1024` | Capacity of the in-memory log ring the operator introspection ops tail. Armed only once `a2a.introspection.enabled` is on — at startup, on a reload, or by `admin.set` — so an instance nobody introspects pays nothing for it. Restart-only. |
 | `--report-file <PATH>` | `observability.report_file` | — | *(off)* | Path for a run-outcome report file. Accepted by the schema; the runtime does not write it — the terminal outcome is the `proc.exit` event and the A2A task artifact. |
 | `--cgroup <auto\|PATH>` | `security.cgroup.spec` | — | *(off)* | cgroup-v2 parent for spawned children (turn workers + subagents), each placed in its own leaf for atomic `cgroup.kill` teardown: `auto` (derive `<own-cgroup>/agent`) or an absolute path under `/sys/fs/cgroup`. Best-effort — disabled if not writable. Linux only. |
 | `--cgroup-memory-max <SIZE>` | `security.cgroup.memory_max` | — | *(none)* | Per-child `memory.max`: `max` or a size (`512M`/`2G`/bytes). Needs a parent that can delegate the `memory` controller. |
@@ -392,11 +406,26 @@ is no flag for it (§9, §11).
 
 ### 3.7 Subcommands
 
-`agentd tui` and `agentd ui` run the daemon with a display client attached:
-the terminal UI (`--inline` for in-place instead of fullscreen) or
-the web UI opened in a browser. Both set `interface.enabled: true` for you, and
-the client exits with the daemon. To attach detached instead, run `agentd -c …`
-and point `agentd-tui --endpoint <url>` at it. See [`interface.md`](interface.md).
+`agentd tui` and `agentd ui` run the daemon exactly as `agentd <args>` would,
+plus one display client — the terminal UI, or the web UI opened in a browser —
+signed in with a single-use launch code, and the two exit together. They add no
+configuration: the observation feed needs `a2a.events.enabled` and the debug
+panes `a2a.introspection.enabled` in your own config (§12.5). Their own flags
+are few:
+
+| Flag | Subcommand | Meaning |
+|---|---|---|
+| `--daemon-log <PATH>` | both | where the daemon's JSON-lines output goes while the client holds the terminal; default `$XDG_RUNTIME_DIR/agentd-<sub>-<pid>.log`, else the same name in the temp directory |
+| `--port <N>` | `ui` | the loopback port the web UI is served on (default `4173`) |
+| `--no-open` | `ui` | print the sign-in URL instead of opening a browser |
+
+`AGENTD_TUI_BIN` / `AGENTD_UI_BIN` name the client binary when it is not
+`agentd-tui` / `agentd-ui` on `PATH`. Every other argument goes to the daemon.
+The launcher refuses, before spawning anything, a listener its client could not
+sign in on — a unix socket, port `0`, `a2a.tls.client_ca`, or an endpoint whose
+host is not loopback. To attach to a daemon started some other way, run
+`agentd-tui --endpoint <url> --login` against it. The whole contract is in
+[`interface.md`](interface.md#launcher).
 
 > **Not wired.** There is no `--log-format`/`AGENTD_LOG_FORMAT` (the log surface
 > is JSON lines, always), no `--health-addr`/`AGENTD_HEALTH_ADDR` (`/healthz` is
@@ -416,7 +445,7 @@ Each element is selected by URI scheme:
 
 | Scheme | Form | Use |
 |---|---|---|
-| `https:` | `https://api.example.com/v1` | Remote HTTPS endpoint (the default; `tls` feature). Pair with a token. |
+| `https:` | `https://api.example.com/v1` | Remote HTTPS endpoint (the default; `tls` feature), usually with a token. |
 | `http:` | `http://127.0.0.1:8080` | **Loopback only** — a same-host dev gateway. Any other `http://` host is rejected. |
 | `mock:` | `mock:final`, `mock:file:play.json` | **Offline dev**: the built-in mock LLM, spawned in-process, dialled over loopback — a whole agent runs with no key, no network, no second terminal. Debug builds always carry it; a release binary needs `--features internal-mocks`. Scripts: `final` (answer immediately), `read`, `schedule`, `file:<playbook.json>` (scripted turns). |
 
@@ -811,9 +840,20 @@ whose signature does not verify is a failed re-read, and takes the same policy
 path. That is the point of `auto` — a registry that starts serving unsigned
 documents is a security event, not a blip.
 
-Every outcome is one log line — `instruction.unavailable` with the policy that
-applied and whether the source was trust-pinned — so a frozen or draining
-agent is never a mystery.
+**A re-read asks the source, every time.** Each re-read of an `mcp://` or
+`instruction://` source is one request to the server that served the
+instruction. agentd keeps no response cache and switches off the one its MCP
+client would otherwise keep for a server's `ttlMs` (SEP-2549), so a registry
+that is down, or that answers "not found" for a withdrawn document, is a failed
+re-read — never the last answer it gave, replayed from memory — and another
+connected server that happens to have the same document cannot answer for it.
+That is what lets the deadline trip and `freeze` fire when a source stops
+confirming its document. The cost is load on the registry: every poll reaches
+it, so `refresh` and `trust[].freshness` are how you set the rate.
+
+Every outcome is one log line — `instruction.unavailable` with the `uri`, the
+`server` that stopped answering, the policy that applied and whether the source
+was trust-pinned — so a frozen or draining agent is never a mystery.
 
 ### 5a.3a What `lifecycle.watch_config` actually watches
 
@@ -1011,6 +1051,19 @@ kind: declaring `command:` on it REGISTERS an A2A command the listener
 accepts, and a matching inbound message fires a run instead of a
 conversation turn — `examples/hiring/actions.yaml` and `examples/startup/`
 are built on it.)
+
+**A run that waits for a reply says whose.** A conversation id is the sender's
+to choose, so naming the conversation alone would let anyone who names it answer
+the wait. `a2a.wait` therefore requires `from:` — the principal the reply must
+come from, in the addressee syntax a `human` gate uses (`from: agent:peer`,
+`from: {role: agent, labels: {team: ops}}`) — because the reply it waits for is
+a peer's and no default could name that peer. On `wait {on: message}`, `from:`
+is optional; without it only the run's own principal, an operator or the
+runtime wakes the wait. Either step's `conversation:` is a runtime key, the
+`contextId` the sender used, or `"*"` for any conversation; left out, the run's
+own conversation is used, and a run that has none fails the step. A malformed
+`from:` is a load error (exit `2`), not a wait that hears nobody. The fields
+are in [`node-registry.md`](node-registry.md).
 
 ```yaml
 workflows:
@@ -1325,8 +1378,10 @@ unit of work picks the new values up):
   runtime hot-swap primitive; in-flight turns follow the `swap_policy` — and
   `intelligence.budget` (fresh windows, counters carried over)
 - `agent.instruction` (a resource instruction re-subscribes) and the rest of
-  `agent` — `preflight`, `wake_on`, `tools`, `max_parallel_turns`,
-  `on_workflow_finished`, `conversation_budget`
+  `agent` — `description` (the public card follows it), `preflight`,
+  `wake_on`, `tools`, `max_parallel_turns`, `on_workflow_finished`,
+  `conversation_budget`, `approval`, `ask_human_fallback`,
+  `ask_human_unowned`
 - `mcp` — re-handshaked live: removed servers disconnect, added or changed
   servers connect + initialize; unchanged ones are left alone
 - `tools`, `knowledge`, `search` — the tool registry is rebuilt (a registry that
@@ -1335,19 +1390,25 @@ unit of work picks the new values up):
 - `workflows` — definitions reload and re-arm; **live runs stay pinned** to the
   definition hash they started with
 - `limits`, `lifecycle.idle_grace`, `observability.log_level` /
-  `log_content`, `memory`, `context`
+  `log_content` / `status_values`, `memory`, `context`, and
+  `store.retention` (the next sweep applies the new bound)
 - `a2a.principals` — the rules are recompiled and swapped into the live
   listener, so a demotion or a rotated `bearer_ref` takes effect on the next
-  request. A rebuild that fails (an unresolvable `{{secret:…}}`, a malformed
-  matcher) keeps the rules already in force rather than falling open
+  request, and so does the posture: the first rule added to a no-auth loopback
+  daemon ends the implicit operator at once. A rebuild that fails (an
+  unresolvable `{{secret:…}}`, a malformed matcher, a `user`-role `id` an
+  approved device already owns — §12.5) keeps the rules already in force rather
+  than falling open, and logs `config.reload.principals`
 - `webhooks.default_auth` and the `webhook` routes themselves (which live in
   `workflows[]`) — the route table is rebuilt on every reload, so a
   `{{secret-file:…}}` rotated by a remounted Kubernetes Secret is picked up
   even though the config *document* did not change. Live per-route state (the
   in-flight count, the rate-limit bucket) is carried across the rebuild, so
   reloading does not hand a caller a fresh burst allowance
-- `interface.origins` — the browser CORS allowlist is replaced in the live
+- `a2a.cors.origins` — the browser CORS allowlist is replaced in the live
   listener, so removing an origin actually revokes it
+- `a2a.introspection.enabled` — turning it on arms the log ring then and there
+  (it is also the one `a2a` path `admin.set` changes at runtime)
 
 **Restart-only paths** — a reload whose effective document differs under any of
 these is **refused** with `restart_required` (roll the pod instead):
@@ -1356,18 +1417,19 @@ these is **refused** with `restart_required` (roll the pod instead):
 `agent.instruction.trust` (§5a.3b), `store.kind`, `store.prefix`, `store.mcp`,
 `store.http`, `store.file`, `store.max_value_bytes`, `lifecycle.run_until`,
 `lifecycle.drain_timeout`, `lifecycle.run_id`, `lifecycle.exit_code_map`,
-`lifecycle.watch_config`, `a2a.listen`, `a2a.tls`, `a2a.bearer`,
-`interface.enabled`, `interface.pairing`, `webhooks.listen`, `webhooks.tls`,
+`lifecycle.watch_config`, `a2a.listen`, `a2a.tls`, `a2a.bearer`, `a2a.url`,
+`a2a.device_grant`, `a2a.events`, `webhooks.listen`, `webhooks.tls`,
 `observability.otel`, `observability.metrics_addr`,
 `observability.health_file`, `observability.events_ring`,
 `observability.traceparent`, `security`.
 
-The webhook and interface entries name the **socket**, not the rules: rebinding
-an address, swapping a TLS identity, arming the observation feed or the pairing
-flow are all startup decisions, while the auth and routing on top of them
-reload. `interface.enabled` is restart-only even though turning it *off* would
-work (those gates are read live) — a knob that reloads in one direction only is
-worse than one that plainly refuses.
+The webhook and listener entries name the **socket** and what is built with it,
+not the rules: rebinding an address, swapping a TLS identity, moving the origin
+the OAuth issuer is bound to, the device grant's pending codes and sessions, and
+arming the observation feed are all startup decisions, while the principals,
+origins and routing on top of them reload. `a2a.events` is restart-only even
+though turning it *off* would work (those gates are read live) — a knob that
+reloads in one direction only is worse than one that plainly refuses.
 
 **Every configuration path is classified** as one or the other, and a test
 (`every_config_path_is_classified`) walks the generated schema to prove it. That
@@ -1533,23 +1595,22 @@ each path is equally reachable from env and flags (§1.1), so
 | Section | Carries |
 |---|---|
 | `vars` | Named values (any JSON type, nestable) referenced as `{{config.NAME}}` anywhere a string sits — see §12.4. |
-| `agent` | `name`, `instruction`, `prompt`, `preflight`, `wake_on`, `tools` (`internal`/`mcp`/`code` allow-lists), `max_parallel_turns`, `conversation_budget`, `ask_human_fallback`, `on_workflow_finished`. |
+| `agent` | `name`, `description` (the public card's, §12.7), `instruction`, `prompt`, `preflight`, `wake_on`, `tools` (`internal`/`mcp`/`code` allow-lists), `max_parallel_turns`, `conversation_budget`, `approval`, `ask_human_fallback`, `ask_human_unowned` (§12.6), `on_workflow_finished`. |
 | `intelligence` | `endpoints[]`, `model`, `dialect`, `swap_policy`, `timeout`, `headers{}`, `token`/`token_file`, `auth{}` (OAuth 2.1 / AWS SigV4 / SPIFFE), `budget{}`, `structured_output`. |
 | `mcp` | `servers[]` — `{name, endpoint, headers{}, tags{glob:[…]}, ns, allow[], exclude[], timeout, auth{}, oauth{}, aauth}` — and `default_timeout`. `allow`/`exclude` gate the server's advertised tool names by glob (exclude beats allow; a gated-out tool never registers). |
 | `tools` | `disabled[]`, `overrides{}` (retarget a tool at a declared server, optionally rewriting `args`/`result`). |
 | `context` | `template` (the system-prompt template; unset = the built-in, printed by `agentd --context-template`), `templates{}` (named alternates a node picks with `context: {template: <name>}`), `summarize{prompt, model}` (the compaction guidance and a cheaper model to run it on), `compact_at`, `keep_last`, `model_window`, `plan{}`. |
-| `store` | `kind` (`file`\|`mcp`\|`http`\|`memory`\|`none`), the matching `file{path, min_free}` / `mcp{}` / `http{}` block, `prefix`, `timeout`, `on_error`, `durability{a2a, steps, work}`, `checkpoint{}`, `audit`, `retention{runs{keep_last, ttl}}`, `max_value_bytes`. Defaults per instance shape — see below. **`retention.runs`** bounds durable run records: a terminal run is dropped once it falls outside `keep_last` (newest first) or past `ttl`. Nothing in flight is ever dropped. The default is unbounded, so a long-lived instance keeps one record per run for its whole uptime — set one of these and steady-state size tracks concurrent runs rather than uptime. **`max_value_bytes`** refuses a durable write larger than N bytes. Set it when the store's READ limit is lower than its write limit — an MCP store reached through a broker often caps a tool RESULT well below its request body, so agentd can write a checkpoint it cannot read back and the failure lands on the next boot restore rather than on the write that caused it. Over the cap, the write is refused (`store.on_error` decides what happens next) with a message naming the key, the size and the cap; nothing is stored. Unbounded by default, and **restart-only** (§11): the cap rides the policy built once at startup, so a reload that changes it is refused rather than leaving writes refused at the old value an operator believes they raised. `durability.work: ephemeral` flips the deployment's durability CLASS: runs and subagent records are memory-only unless a workflow says `durable: true` (docs/workflows.md §durability) — the fast path when all work is recomputable. |
+| `store` | `kind` (`file`\|`mcp`\|`http`\|`memory`\|`none`), the matching `file{path, min_free}` / `mcp{}` / `http{}` block, `prefix`, `timeout`, `on_error`, `durability{a2a, steps, work}`, `checkpoint{}`, `audit`, `retention{runs{keep_last, ttl}, tasks{keep_last, ttl}}`, `max_value_bytes`. Defaults per instance shape — see below. **`retention.runs`** bounds durable run records: a terminal run is dropped once it falls outside `keep_last` (newest first) or past `ttl`. Nothing in flight is ever dropped. **`retention.tasks`** does the same for finished A2A tasks (§12.7). The default is unbounded, so a long-lived instance keeps one record per run for its whole uptime — set one of these and steady-state size tracks concurrent runs rather than uptime. **`max_value_bytes`** refuses a durable write larger than N bytes. Set it when the store's READ limit is lower than its write limit — an MCP store reached through a broker often caps a tool RESULT well below its request body, so agentd can write a checkpoint it cannot read back and the failure lands on the next boot restore rather than on the write that caused it. Over the cap, the write is refused (`store.on_error` decides what happens next) with a message naming the key, the size and the cap; nothing is stored. Unbounded by default, and **restart-only** (§11): the cap rides the policy built once at startup, so a reload that changes it is refused rather than leaving writes refused at the old value an operator believes they raised. `durability.work: ephemeral` flips the deployment's durability CLASS: runs and subagent records are memory-only unless a workflow says `durable: true` (docs/workflows.md §durability) — the fast path when all work is recomputable. |
 | `workflows` | Inline definitions, or `{name, file}` / `{name, uri}` / `{name, url, headers, timeout, allow_private}` references, or a folder scan — `{dir: <path>}` or `{dir: {path, glob, order}}` (§6.1); `glob` and `order` live INSIDE `dir`, and a sibling `glob` is exit `2`. `security.workflows.immutable: true` locks the loaded set. |
 | `streams` | Declared event streams: `streams: {orders: {retention: {max_events: 10000, max_age: 7d}}}`. An `emit` step or `stream` start naming an undeclared stream is exit `2`. Events are durable in the store; retention trims from the head (`max_events` defaults to 10000). |
 | `goal` | The goal watchdog: `statement`, `check{via,condition,every}`, `stuck_after`, `on_achieved`, `on_stuck`. |
 | `limits` | `max_message_depth` (chained `message` deliveries; default 8), `max_runs`, `run{steps,tokens,deadline}`, `step_timeout`, `inline_max_bytes`, `subagents{depth,breadth,total,rate}`. |
 | `lifecycle` | `run_until`, `idle_grace`, `drain_timeout`, `run_id`, `exit_code_map`, `watch_config` (§6, §9). |
-| `a2a` | `listen` (`https://host:port`, loopback `http://`, or `unix:///path` for co-located peers — kernel-authenticated, no TLS), `tls{cert,key,client_ca}`, `bearer`, `principals[]`, `peers[]` (endpoints may also be `unix:///path`), `conversation_ttl`. |
+| `a2a` | `listen` (`https://host:port`, loopback `http://`, or `unix:///path` for co-located peers — kernel-authenticated, no TLS), `url`, `tls{cert,key,client_ca}`, `bearer`, `principals[]`, `cors{origins}`, `device_grant{}`, `events{enabled}`, `introspection{enabled}`, `push{}`, `peers[]` (endpoints may also be `unix:///path`), `conversation_ttl`. The listener's keys are §12.5. |
 | `webhooks` | `listen`, `tls{}`, `default_auth{}` for `webhook` nodes. |
-| `interface` | The TUI/web-UI surface served on the A2A listener: `enabled`, `origins[]`, `display{}`, `pairing{}`, `debug`. |
 | `memory`, `context`, `knowledge`, `search`, `skills` | Working-memory caps, context window/compaction, and the MCP servers backing knowledge, search, and the skill catalogue. |
-| `observability` | `log_level`, `log_content`, `metrics_addr`, `health_file`, `events_ring`, `traceparent`, `report_file`, `otel{}`, `audit{sink}`. |
-| `security` | `allow_trifecta`, `tls_ca`, `cgroup{}`, `aauth{}`, `exec{}`, `egress`, `workflows{immutable}`, `policies[]` (ordered verdicts on a tool call — see [security.md](security.md#policies-a-verdict-on-the-call)). |
+| `observability` | `log_level`, `log_content`, `metrics_addr`, `health_file`, `events_ring`, `traceparent`, `report_file`, `otel{}`, `audit{sink, stream}`, `runtime_events{}`, `status_values[]` (§12.7). |
+| `security` | `allow_trifecta`, `tls_ca`, `cgroup{}`, `aauth{}`, `exec{}`, `egress`, `workflows{immutable}`, `policies[]` (ordered verdicts on a tool call — see [security.md](security.md#policies-a-verdict-on-the-call); who answers an `ask` is `to:`, §12.6). |
 | `identity` | `autonomous_as` (who a schedule/webhook/stream firing is attributed to; default `system`) and `labels{}` carried with that work — see §15. |
 
 **The `store` section, and the default each instance shape gets.** `store.kind`
@@ -1762,6 +1823,219 @@ $ agentd --config /etc/agentd/config.json \
 
 For the reloadable-vs-restart-only partition of these fields, see §11.
 
+### 12.5 The A2A listener — `a2a.*`
+
+The keys below configure the A2A listener and what is served on it, so
+`a2a.url`, `a2a.cors.origins`, `a2a.device_grant.enabled`,
+`a2a.events.enabled` and `a2a.introspection.enabled` each require `a2a.listen`
+(exit `2` without one). Every one is also **operator-only**:
+a `:::!config` fragment in the instruction that writes one is refused
+(`… operator configuration is not a document's to set`), because who may talk
+to this agent, and as whom, is the deployment's decision and not the served
+document's. Of the whole `a2a` section, a document may write only `a2a.peers`
+— an outbound dial. The protocol side of each key is in [`a2a.md`](a2a.md).
+
+| Key | What it is | Reload |
+|---|---|---|
+| `a2a.url` | The origin callers reach the listener at | restart-only |
+| `a2a.cors.origins[]` | The browser origins admitted to the listener | reloadable |
+| `a2a.principals[].id` | The principal a rule's callers are, and own their work as | reloadable (with `a2a.principals`) |
+| `a2a.device_grant.*` | Sign-in by a code an operator approves (RFC 8628) | restart-only |
+| `a2a.events.enabled` | Declare the events extension and serve its observation feed | restart-only |
+| `a2a.introspection.enabled` | Serve the operator introspection ops | reloadable, and settable with `admin.set` |
+
+**`a2a.url` is an origin** — `scheme://host[:port]`, nothing more: no path,
+query or fragment, lowercase, no default port, and `https` unless the host is
+loopback. It is published as the Agent Card's interface URL and as the OAuth
+issuer, and both discovery documents live at the root of an origin, so a path
+would put the listener where neither is looked for. The issuer is compared as
+text, so only the canonical spelling loads; the error names it. It is
+**required** when `a2a.listen` binds a wildcard host (`0.0.0.0`, `::`), which
+is no address a caller can dial. Without it, a concrete bind advertises
+itself.
+
+**`a2a.cors.origins`** lists every browser origin allowed to call the listener,
+compared exactly as an origin; `*` and paths are refused at load. A request
+carrying `Origin` from an origin not listed is `403` before its body is read.
+There is no implicit trust for loopback: a web UI served from
+`http://127.0.0.1:4173` must be listed like any other. The one exception is the
+origin `agentd ui` itself launches (§3.7), which the launcher adds for its own
+process only. An admitted browser still signs in — a request carrying `Origin`
+is never [the implicit operator](a2a.md#the-implicit-operator). The public Agent
+Card is readable from any origin regardless.
+
+**`a2a.principals[].id`** is the principal a rule names, and what that
+principal's tasks, runs, subagents and conversations are owned by (`<role>:<id>`;
+the operator role is always `operator`).
+
+- It is **required** on `bearer_ref` and `any` rules: a shared secret and
+  "anyone" carry no name of their own, so the id is stated where the evidence
+  cannot supply it.
+- It is optional on `san` and `sub` rules, where it gathers every matching
+  certificate into one principal; without it each certificate is its own
+  (`<role>:cn=<CN>` or `<role>:san=<first SAN>`).
+- It is `1..=128` of `A-Z a-z 0-9 . _ @ : / + -`, and **unique** across rules.
+- A `bearer_ref` secret may not equal `a2a.bearer`, another rule's secret, or
+  start with `agentd_at_` (the prefix of the session tokens this listener
+  issues).
+
+Device names and `user`-role ids **share one namespace across time**. Both
+spell `user:<name>`, and ownership is recorded by that id, so a device approved
+as `alice` and a rule later declared with `id: alice` would be one principal —
+the second inheriting the first's history. An identity registry in the durable
+store records every claim the first time it is made, and keeps the two apart
+for as long as the store persists: an approval may not use a name any rule
+declares now, or one a `user`-role rule ever declared, and a `user`-role id
+that was ever approved as a device name is refused at startup (exit `2`) and by a reload (the rules in
+force are kept). Names are compared with ASCII case folded. There is no command
+that releases a name.
+
+**`a2a.device_grant`** — the OAuth 2.0 device authorization grant on the
+listener's origin: a client shows a code, an operator approves it, and the
+client's session token follows. See
+[the device authorization grant](a2a.md#the-device-authorization-grant).
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | Serve the grant and declare it on the card |
+| `scopes` | `[user]` | What a client may request: `user`, `operator`. Non-empty, no duplicates; `agent` is refused — an agent authenticates with its own credential |
+| `token_ttl` | `8h` | Session lifetime, `5m`..`30d` |
+| `code_ttl` | `10m` | How long a code waits for approval, `1m`..`30m` |
+| `verification_uri` | the listener's own page | Where the approving person is sent: `https://`, or `http://` on a loopback host; no userinfo or fragment |
+| `rate` | *(unlimited)* | `"<burst>/<per>s"` for every session principal; every session under one name shares one bucket, and a refusal is `429` with `Retry-After` |
+
+- **It needs an operator credential**: `a2a.bearer`, or an `a2a.principals`
+  rule with `role: operator` and `match.bearer_ref`. Approving a code is an
+  operator op, and without such a credential nobody could; the load refuses
+  it rather than issue codes nobody can approve.
+- It is refused beside `a2a.tls.client_ca` (mTLS demands a certificate of every
+  caller, and a device session has none) and on a `unix://` listener (the
+  kernel already vouches for every peer).
+- **An approval names the person.** The operator approves with
+  `auth.device.approve {user_code, as: <name>}`, where the name is lowercase
+  (`^[a-z0-9][a-z0-9._-]{0,63}$`) and not one of `operator`, `anonymous`,
+  `unknown`, `launcher`, `runtime` or `system`. The session acts as
+  `user:<name>` (or as `operator` when the operator scope was requested and
+  granted); every session approved under one name is one principal, so a
+  person who signs in again keeps what that name started. `auth.sessions.revoke
+  {sid}` ends one session.
+- Enabling it is a credential mechanism: it ends the implicit operator on a
+  loopback listener.
+
+**`a2a.events.enabled`** declares the events extension on the card and serves
+its observation feed, which the display clients render. It is restart-only:
+the feed is built at startup, so turning it on later would have nothing to
+publish on. Human-in-the-loop does not depend on it — a gate is core A2A
+(`input-required`, §12.6).
+
+**`a2a.introspection.enabled`** serves the operator introspection ops —
+conversation transcripts, run step detail, a subagent's detail, the log ring —
+and audit records on the feed. It is independent of the feed, arms the log ring
+(`observability.events_ring`, §3.5) when it turns on, and is the one listener
+setting `admin.set` may change at runtime.
+
+**With none of these, and no `a2a.bearer`, principals or `client_ca`**, a
+listener bound to loopback treats a local caller that presents nothing as the
+operator (and says so with a startup warning). Any credential mechanism — the
+device grant included — ends that, as does a non-loopback bind, and a request
+carrying `Origin` never gets it. The full rules are in
+[`a2a.md`](a2a.md#the-implicit-operator) and [`security.md`](security.md).
+
+### 12.6 Asking a person — `agent.ask_human_unowned`, `security.policies[].to`
+
+A task somebody sent always has somebody to ask: the caller who owns it. When
+the agent needs a person there — the `ask_human` tool, a workflow `human` step,
+a `security.policies` gate — the task becomes `input-required` and the owner
+answers it over core A2A. The settings below cover the asks nobody owns, and
+who may answer a policy gate.
+
+| Key | Default | Reload | Written by |
+|---|---|---|---|
+| `agent.ask_human_unowned` | `fallback` | reloadable | operator or document |
+| `agent.ask_human_fallback` | `fail` | reloadable | operator or document |
+| `security.policies[].to` | *(the operator)* | restart-only (all of `security`) | operator only |
+
+**`agent.ask_human_unowned`** decides what an ask **no caller owns** does — an
+`ask_human` or a `security.policies` gate raised by a schedule, a webhook, a
+stream, or a subagent. A subagent is unowned even when a caller's turn spawned
+it: it is its own unit of work.
+
+- `gate` — open a gate task on the A2A listener, owned by the principal the
+  asking unit works for or, when it works for nobody, the operator, and
+  answered by that owner or the addressee the gate names. Requires
+  `a2a.listen`; without a listener nobody could ever answer it.
+- `fallback` *(default)* — apply `agent.ask_human_fallback`, exactly as when
+  there is no channel at all; a policy gate takes its `on_timeout` (default
+  `deny`).
+
+Whether the operator is willing to be interrupted by work nobody sent is a
+deployment decision, so it is stated here rather than inferred from which
+clients happen to be attached.
+
+**`agent.ask_human_fallback`** is what an `ask_human` does when it does not
+gate: `fail` (the ask errors at once), `wait` (park until the ask's timeout),
+or `auto` (an LLM judge answers on the operator's behalf, conservatively, and
+the answer is marked as automatic). `auto` also answers a gate that names no
+addressee once it times out. An **addressed** gate is never judged — every
+`security.policies` gate is addressed — it times out and takes its
+`on_timeout`.
+
+**`security.policies[].to`** says who may answer an `action: ask` gate: a
+principal-id glob, or `{id, role, labels}`. It is refused on a rule that never
+asks. Unset, a policy gate is addressed to `{role: operator}`: the gate usually
+lands on the task of the very caller whose call is being judged, and a policy
+exists because the operator wanted a say, so that caller does not approve its
+own call unless the operator names it.
+
+**An addressee must be able to see the task.** A task is visible only to its
+owner and to operators, so a gate addressed to anyone else could never be
+answered. `to:` may therefore be absent — the question goes to the task's
+owner, or for a policy gate to the operator — or name an operator. A `to:` that
+names any other principal is refused at load (exit `2`, and a reload is
+refused); the refusal names the principal and says it could never see the task.
+The same rule holds wherever a question is addressed with `to:`, a workflow's
+`human` step included.
+
+### 12.7 What callers are shown, and for how long
+
+| Key | Default | Reload | Written by |
+|---|---|---|---|
+| `agent.description` | a generic sentence about agentd | reloadable | operator only |
+| `observability.status_values[]` | `[]` | reloadable | operator only |
+| `store.retention.tasks` | unset — keep every task | reloadable | operator only |
+
+**`agent.description`** is what this agent does, in a sentence: the public
+Agent Card's `description`, which anyone may read without signing in. A reload
+changes the card served next. It is operator-only because a served document
+rewriting it would be the document describing itself to strangers in the
+operator's name.
+
+**`observability.status_values`** lists memory keys whose current values the
+`status` op publishes as `status.values` — for a display client's
+`memory:<key>` chrome item, say. **Every caller of `status` sees them**, so
+list only what every caller may read. A key never written, or whose TTL has
+run out, is left out rather than shown empty or stale; a key memory could never
+hold is exit `2`. Operator-only, because it decides which of the agent's
+memory every caller is shown.
+
+**`store.retention.tasks`** — `{keep_last, ttl}` — bounds the finished A2A
+tasks the store keeps, as `retention.runs` does for runs. A task that is still
+working, or waiting for someone's input, is never dropped; a terminal one is
+dropped once it falls outside `keep_last` (newest status first) or its final
+status is older than `ttl`. Unset keeps every task. Three things to know:
+
+- **`keep_last` is one bound across every principal.** On a listener several
+  callers share, one caller's finished tasks can push out another's, the
+  operator's included. Use `ttl` — each task's own age — on a multi-tenant
+  listener, alone or beside a generous `keep_last`.
+- **A settled task nobody has read back yet is spared for up to 30 seconds**
+  past `keep_last` and `ttl`. A blocking `SendMessage` is answered with a
+  second read after the task finishes, and dropping the task in between would
+  answer that caller "not found" for work that completed. Once read, or once
+  the 30 seconds pass, it goes on the next sweep.
+- The bound applies when a task finishes and on a sweep every second, so a
+  `ttl` passing or a reload lowering the bound takes effect within a second.
+
 ---
 
 ## 13. Running a fleet
@@ -1813,6 +2087,7 @@ store:                                  # a daemon must be durable
 
 a2a:                                    # the external channel
   listen: https://0.0.0.0:8443
+  url: https://triage.internal:8443     # a wildcard bind says where callers reach it
   tls: { cert: /tls/cert.pem, key: /tls/key.pem, client_ca: /tls/clients.pem }
   principals:
     - { match: { san: "spiffe://ops/*" },  role: operator }
@@ -1881,9 +2156,12 @@ the audit line.
 **The quotas now bite.** `quotas.budget` becomes a governor scope beside
 `conversation:` and `run:`, and a run is charged to the principal it is *for*,
 not only to itself, so a per-person ceiling covers work someone started rather
-than only the turns they typed. `quotas.rate` is a real arrival limit, with
-operators exempt — locking out the person who administers the daemon during an
-incident is worse than the load they could generate. Both are also checked for
+than only the turns they typed. `quotas.rate` (`"<burst>/<per>s"`) is a real
+arrival limit — one token per inbound request at the listener, refused with
+`429` and `Retry-After` before anything reaches the runtime — with operators
+exempt: locking out the person who administers the daemon during an incident is
+worse than the load they could generate. A device session's rate is
+`a2a.device_grant.rate` (§12.5). Both are also checked for
 *shape* at startup, so a typo is exit 2 rather than a ceiling that silently
 does nothing.
 

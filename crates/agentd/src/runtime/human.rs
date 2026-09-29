@@ -173,9 +173,14 @@ impl Runtime {
         // Who must answer. A malformed `to` is refused rather than dropped: a
         // gate that looks routed and is not is worse than one that never
         // claimed to be.
+        // Nor may it name someone who could never see the gate's task: the
+        // load holds a declared `to` to this, and this holds the one a model
+        // or a rendered template supplies.
         let addressee = match args.get("to").filter(|v| !v.is_null()) {
             None => None,
-            Some(v) => match crate::a2a::principals::Addressee::parse(v) {
+            Some(v) => match crate::a2a::principals::Addressee::parse(v)
+                .and_then(|a| a.check_gate().map(|()| a))
+            {
                 Ok(a) => Some(a),
                 Err(e) => {
                     return ToolOutcome::Ready(Value::String(format!("ask_human: {e}")), true);

@@ -2215,10 +2215,20 @@ fn parse_step(
             }
             // A malformed addressee is a load error rather than a gate that
             // looks routed and is not.
-            if let Some(v) = spec.get("to")
-                && let Err(e) = crate::a2a::principals::Addressee::parse(v)
-            {
-                errs.push(format!("{at}: human.to: {e}"));
+            // One that names someone who could never see the gate's task is
+            // refused here too — at load AND at `workflow.create`/`update`,
+            // which both reach this validation. A templated `to` is only known
+            // when the step runs, and `ask_human` holds it to the same rule.
+            if let Some(v) = spec.get("to") {
+                match crate::a2a::principals::Addressee::parse(v) {
+                    Err(e) => errs.push(format!("{at}: human.to: {e}")),
+                    Ok(_) if v.as_str().is_some_and(|s| s.contains("{{")) => {}
+                    Ok(a) => {
+                        if let Err(e) = a.check_gate() {
+                            errs.push(format!("{at}: human.to: {e}"));
+                        }
+                    }
+                }
             }
         }
         "finish" => {
@@ -2955,8 +2965,27 @@ mod tests {
                 "g": {"kind": "human", "question": "ok?", "to": to, "depends_on": ["s"]},
                 "f": {"kind": "finish", "depends_on": ["g"]}}}))
         };
-        assert!(gate(json!("*@finance.example")).is_ok());
-        assert!(gate(json!({"role": "user", "labels": {"team": "finance"}})).is_ok());
+        assert!(gate(json!({"role": "operator"})).is_ok());
+        assert!(gate(json!({"role": "operator", "labels": {"team": "finance"}})).is_ok());
+        assert!(gate(json!("operator")).is_ok());
+        // Known only when the step runs; `ask_human` holds it then.
+        assert!(gate(json!("{{ inputs.who }}")).is_ok());
+        // Anyone but an operator could never see the gate's task.
+        for (bad, named) in [
+            (json!("*@finance.example"), "*@finance.example"),
+            (
+                json!({"role": "user", "labels": {"team": "finance"}}),
+                "role user",
+            ),
+        ] {
+            let e = gate(bad.clone()).unwrap_err();
+            assert!(
+                e.iter().any(|m| m.contains("human.to")
+                    && m.contains(named)
+                    && m.contains("could never see the task")),
+                "{bad} should be refused at load, got {e:?}"
+            );
+        }
         // Names nobody / names everybody / a typo that would widen it.
         for bad in [
             json!(""),

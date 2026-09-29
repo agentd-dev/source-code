@@ -11,7 +11,7 @@
 
 mod common;
 
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -33,29 +33,6 @@ fn free_port() -> u16 {
         .local_addr()
         .unwrap()
         .port()
-}
-
-/// Wait until the daemon can actually answer, which is NOT the same as its
-/// socket accepting. The A2A listener binds before the workflow registry is
-/// populated, so a `workflow.run` that arrives in between is answered
-/// `-32602 no such workflow` — a real failure of the test's setup, not of the
-/// product. On an unloaded machine the two happen within the same millisecond,
-/// so the window only opens on a loaded runner. `proc.ready` is logged after
-/// the workflows load, so that is the signal worth waiting for.
-fn wait_ready(addr: &str, daemon: &Daemon) {
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        if TcpStream::connect(addr).is_ok() && daemon.stderr().contains("\"event\":\"proc.ready\"")
-        {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "a2a listener never became ready; daemon stderr:\n{}",
-            daemon.stderr()
-        );
-        std::thread::sleep(Duration::from_millis(25));
-    }
 }
 
 struct MockLlm {
@@ -134,6 +111,22 @@ fn spawn_daemon(config: &str) -> Daemon {
     Daemon { child, stderr_path }
 }
 
+/// Spawn the daemon on `cfg_for(port)` and return it with the A2A authority it
+/// confirmed binding and the config path to clean up. Ready means answering:
+/// `proc.ready` is logged after the workflows load, and the listener binds
+/// before that, so a `workflow.run` arriving in between would be answered
+/// `no such workflow` — see [`common::spawn_bound`].
+fn spawn_bound(cfg_for: impl Fn(u16) -> String) -> (Daemon, String, String) {
+    let cfg = common::unique_path("a2a-e2e", "yaml");
+    let (daemon, addr) = common::spawn_bound(|port| {
+        std::fs::write(&cfg, cfg_for(port)).unwrap();
+        let daemon = spawn_daemon(&cfg);
+        let log = daemon.stderr_path.clone();
+        (daemon, log)
+    });
+    (daemon, addr, cfg)
+}
+
 /// A daemon that serves A2A over plaintext loopback (⇒ operator), no preflight,
 /// backed by the mock LLM and an in-memory store.
 fn a2a_config(llm: &str, port: u16, extra: &str) -> String {
@@ -166,11 +159,7 @@ fn text_part_answer(task: &Value) -> String {
 #[test]
 fn a_status_command_over_a2a_is_a_message_without_a_task_or_a_model_turn() {
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-    let cfg = write_config(&a2a_config(&llm.uri, port, ""));
-    let daemon = spawn_daemon(&cfg);
-    wait_ready(&addr, &daemon);
+    let (_daemon, addr, cfg) = spawn_bound(|port| a2a_config(&llm.uri, port, ""));
 
     // A `status` command DataPart is answered deterministically, as the
     // spec's immediate reply: an agent Message carrying the document, and no
@@ -203,11 +192,7 @@ fn a_status_command_over_a2a_is_a_message_without_a_task_or_a_model_turn() {
 #[test]
 fn a_natural_language_message_runs_a_turn_and_the_answer_is_the_task_artifact() {
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "Hello over A2A!"}]}));
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-    let cfg = write_config(&a2a_config(&llm.uri, port, ""));
-    let daemon = spawn_daemon(&cfg);
-    wait_ready(&addr, &daemon);
+    let (_daemon, addr, cfg) = spawn_bound(|port| a2a_config(&llm.uri, port, ""));
 
     // A natural-language message → a conversation turn → a completed task whose
     // artifact carries the model's answer (blocking send waits for it).
@@ -245,13 +230,9 @@ fn a_natural_language_message_runs_a_turn_and_the_answer_is_the_task_artifact() 
 #[test]
 fn a_workflow_run_command_starts_a_run_and_the_task_tracks_it_to_completion() {
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     // A one-shot workflow: a manual start into a finish. `workflow.run` kicks it.
     let extra = "workflows:\n  - name: greet\n    steps:\n      s: {kind: manual}\n      f: {kind: finish, depends_on: [s], output: \"done\"}\n";
-    let cfg = write_config(&a2a_config(&llm.uri, port, extra));
-    let daemon = spawn_daemon(&cfg);
-    wait_ready(&addr, &daemon);
+    let (_daemon, addr, cfg) = spawn_bound(|port| a2a_config(&llm.uri, port, extra));
 
     // A `workflow.run` command DataPart starts the run; its task begins working.
     let result = SendMessage::command("workflow.run", json!({"workflow": "greet"})).result(&addr);
@@ -323,11 +304,8 @@ fn a2a_calls_are_audited_when_the_audit_log_sink_is_on() {
     // The audit stream: every A2A call is recorded as an `audit` event
     // carrying the principal, action (method:op), and outcome.
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-    let cfg = write_config(&a2a_config(&llm.uri, port, "  audit:\n    sink: [log]\n"));
-    let daemon = spawn_daemon(&cfg);
-    wait_ready(&addr, &daemon);
+    let (daemon, addr, cfg) =
+        spawn_bound(|port| a2a_config(&llm.uri, port, "  audit:\n    sink: [log]\n"));
 
     // A deterministic `status` command drives one A2A call → one audit event.
     let _ = SendMessage::command("status", json!({})).result(&addr);

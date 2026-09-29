@@ -27,7 +27,6 @@
 
 mod common;
 
-use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -51,34 +50,6 @@ const HEADER_NAME: &str = "Proxy-Authorization";
 fn sigterm(pid: u32) {
     unsafe {
         libc::kill(pid as i32, libc::SIGTERM);
-    }
-}
-
-/// A free loopback port (bind :0, read the port, drop). A tiny TOCTOU window —
-/// agentd rebinds within milliseconds.
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
-/// Block until the listener accepts. The daemon comes along so that a failure
-/// reports WHY: a config the loader refuses exits 2 long before it binds, and
-/// "never became connectable" on its own says nothing about that.
-fn wait_ready(d: &Daemon, addr: &str) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if TcpStream::connect(addr).is_ok() {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "a2a listener never became connectable\nstderr:\n{}",
-            d.stderr()
-        );
-        std::thread::sleep(Duration::from_millis(25));
     }
 }
 
@@ -121,8 +92,8 @@ impl Daemon {
     fn stderr(&self) -> String {
         std::fs::read_to_string(&self.stderr_path).unwrap_or_default()
     }
-    /// Drain and wait for the process to be GONE — the next life binds the same
-    /// port and reads the same store, so overlapping them would test nothing.
+    /// Drain and wait for the process to be GONE — the next life reads the
+    /// same store, so overlapping them would test nothing.
     fn shutdown(mut self) {
         sigterm(self.child.id());
         let deadline = Instant::now() + Duration::from_secs(15);
@@ -170,10 +141,23 @@ fn spawn_daemon(config: &str, env: &[(&str, &str)]) -> Daemon {
     Daemon { child, stderr_path }
 }
 
-fn write_config(tag: &str, yaml: &str) -> String {
-    let path = common::unique_path(tag, "yaml");
-    std::fs::write(&path, yaml).unwrap();
-    path
+/// Spawn a daemon on `cfg_for(port)` and return it with the A2A authority it
+/// confirmed binding and the config path to clean up — see
+/// [`common::spawn_bound`]. Each life gets its own: the store is what carries
+/// a task across a restart, not the port.
+fn spawn_bound(
+    tag: &str,
+    cfg_for: impl Fn(u16) -> String,
+    env: &[(&str, &str)],
+) -> (Daemon, String, String) {
+    let cfg = common::unique_path(tag, "yaml");
+    let (daemon, addr) = common::spawn_bound(|port| {
+        std::fs::write(&cfg, cfg_for(port)).unwrap();
+        let daemon = spawn_daemon(&cfg, env);
+        let log = daemon.stderr_path.clone();
+        (daemon, log)
+    });
+    (daemon, addr, cfg)
 }
 
 /// The text of the task's `.result` artifact (the model's answer).
@@ -202,11 +186,8 @@ fn a_new_message_after_a_restart_gets_its_own_task_not_a_restored_one() {
     ]}));
     // The store outlives both lives; that is what makes a restored task exist.
     let store = common::spawn_mock_mcp("mock://noop", false);
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-    let cfg = write_config(
-        "a2a-restart-ids",
-        &format!(
+    let cfg_for = |port: u16| {
+        format!(
             "\
              agent:\n  name: a2a-restart\n  instruction: You are a test agent.\n  preflight: never\n\
              intelligence:\n  endpoints: {}\n  model: mock\n\
@@ -214,15 +195,14 @@ fn a_new_message_after_a_restart_gets_its_own_task_not_a_restored_one() {
              store:\n  kind: mcp\n  mcp:\n    server: store\n\
              a2a:\n  listen: http://127.0.0.1:{port}\n\
              lifecycle:\n  run_until: drained\n\
-             observability:\n  log_level: warn\n",
+             observability:\n  log_level: info\n",
             llm.uri,
             store.uri()
-        ),
-    );
+        )
+    };
 
     // Life 1: one natural-language message, one durable task.
-    let life1 = spawn_daemon(&cfg, &[]);
-    wait_ready(&life1, &addr);
+    let (life1, addr, cfg) = spawn_bound("a2a-restart-ids", cfg_for, &[]);
     let first = SendMessage::text("first-life-question").result(&addr)["task"].clone();
     let first_id = first["id"].as_str().unwrap_or_default().to_string();
     assert!(!first_id.is_empty(), "life 1 task: {first}");
@@ -231,10 +211,10 @@ fn a_new_message_after_a_restart_gets_its_own_task_not_a_restored_one() {
         "life 1 answer: {first}"
     );
     life1.shutdown();
+    std::fs::remove_file(&cfg).ok();
 
     // Life 2: the same store, so the task above comes back.
-    let life2 = spawn_daemon(&cfg, &[]);
-    wait_ready(&life2, &addr);
+    let (_life2, addr, cfg) = spawn_bound("a2a-restart-ids", cfg_for, &[]);
     let restored = rpc(&addr, 2, "GetTask", json!({"id": first_id.clone()}));
     assert_eq!(
         restored["id"], first_id,
@@ -266,28 +246,27 @@ fn a_new_message_after_a_restart_gets_its_own_task_not_a_restored_one() {
 
 #[test]
 fn the_config_command_never_echoes_a_credential() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     // The intelligence endpoint is deliberately dead: `config` is answered from
     // durable state, and `preflight: never` means nothing dials the model — the
-    // header below only has to be CONFIGURED, never sent.
-    let cfg = write_config(
+    // header below only has to be CONFIGURED, never sent. The token comes from
+    // the ENVIRONMENT, which is exactly the layer a file may not use, and the
+    // one that lands inline in the merged doc.
+    let (daemon, addr, cfg) = spawn_bound(
         "a2a-restart-config",
-        &format!(
-            "\
-             agent:\n  name: a2a-redact\n  instruction: You are a test agent.\n  preflight: never\n\
-             intelligence:\n  endpoints: https://127.0.0.1:9\n  model: mock\n  \
-             headers:\n    {HEADER_NAME}: \"Bearer {HEADER_TOKEN}\"\n\
-             store:\n  kind: memory\n\
-             a2a:\n  listen: http://127.0.0.1:{port}\n\
-             lifecycle:\n  run_until: drained\n\
-             observability:\n  log_level: warn\n"
-        ),
+        |port| {
+            format!(
+                "\
+                 agent:\n  name: a2a-redact\n  instruction: You are a test agent.\n  preflight: never\n\
+                 intelligence:\n  endpoints: https://127.0.0.1:9\n  model: mock\n  \
+                 headers:\n    {HEADER_NAME}: \"Bearer {HEADER_TOKEN}\"\n\
+                 store:\n  kind: memory\n\
+                 a2a:\n  listen: http://127.0.0.1:{port}\n\
+                 lifecycle:\n  run_until: drained\n\
+                 observability:\n  log_level: info\n"
+            )
+        },
+        &[("AGENTD_INTELLIGENCE_TOKEN", ENV_TOKEN)],
     );
-    // The token comes from the ENVIRONMENT, which is exactly the layer a file
-    // may not use, and the one that lands inline in the merged doc.
-    let daemon = spawn_daemon(&cfg, &[("AGENTD_INTELLIGENCE_TOKEN", ENV_TOKEN)]);
-    wait_ready(&daemon, &addr);
 
     // The redaction assertion is about the bytes on the wire, not a parsed field.
     let raw = SendMessage::command("config", json!({}))

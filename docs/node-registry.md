@@ -223,17 +223,16 @@ remote-effect step already carries a retry-stable idempotency key for that.
 
 ## Addressed gates
 
-A `human` gate — and `ask_human` — normally reaches whoever is watching this
-agent's tasks. `to` narrows that to a named decider:
+A `human` gate — and `ask_human` — is answered by whoever may see its task:
+the task's owner, or an operator. `to` narrows that to an operator:
 
 ```yaml
 approve:
   kind: human
   question: "Refund {{ inputs.order_id }} for {{ inputs.amount }}?"
   schema: {type: object, required: [approved], properties: {approved: {type: boolean}}}
-  to: "*@finance.example"                      # a principal-id glob
-  # or, when identity is better described than enumerated:
-  # to: {role: user, labels: {team: finance}}
+  to: {role: operator, labels: {team: finance}}   # an operator from finance
+  # or any operator: to: {role: operator}
   timeout: 24h
   on_error: continue                           # a lapsed gate is a "no", not a crash
 ```
@@ -252,23 +251,32 @@ ANDed, so adding one always narrows — an operator tightening a gate never
 widens it by accident. Labels are the durable form (people change, teams do
 not) and come from `a2a.principals[].labels`.
 
-Three declarations are load errors rather than accepted-and-ignored, because
-each produces a gate that *looks* routed and is not: one that names nobody
-(`to: {}`), one that names `role: anonymous` — precisely the identity nothing
-vouches for — and any typo in a field or role name.
+**An addressee must be able to see the task**, and a task is visible only to
+its owner and to operators. So `to` is either absent — the task's owner may
+answer — or names an operator: `{role: operator}` with any labels, or the id
+`operator`. A `to` that could name anyone else (another principal's id, a glob
+starting with `*`, `role: user`, labels with no role) is refused at load and at
+`workflow.create`/`workflow.update`, naming the principal and saying it could
+never see the task; `ask_human` refuses such a `to` when it is called, which
+covers a model's call and a `to` rendered from a template.
+
+Three more declarations are load errors rather than accepted-and-ignored,
+because each produces a gate that *looks* routed and is not: one that names
+nobody (`to: {}`), one that names `role: anonymous` — precisely the identity
+nothing vouches for — and any typo in a field or role name.
 
 An addressed gate is **never auto-answered**, whatever `agent.approval` says. A
 model judge standing in for the finance lead makes the record a lie, and an
 operator who set `approval: auto` was making a statement about the agent's own
 asks, not about a gate that names someone.
 
-**An operator can still answer**, and this is deliberate. Refusing them would
-be theatre — an operator can already rewrite the config, the store or the
-definition — so what matters instead is that it is *visible*: the answer is
-recorded as `operator_override`, logged, and audited under the id of whoever
-actually replied. The audit line names the person rather than "human", which
-is what makes "the finance lead approved this refund" a record instead of a
-claim.
+**Any operator can still answer**, and this is deliberate. Refusing one whose
+labels do not match would be theatre — an operator can already rewrite the
+config, the store or the definition — so what matters instead is that it is
+*visible*: the answer is recorded as `operator_override`, logged, and audited
+under the id of whoever actually replied. The audit line names the person
+rather than "human", which is what makes "the finance lead approved this
+refund" a record instead of a claim.
 
 Both the addressee and the answer schema live in the run's **durable wait
 record**, so a restart rebuilds the gate exactly as declared. That matters more

@@ -8,19 +8,11 @@
 mod common;
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 /// POST `body` to `path` with extra headers; returns `(status_code, body)`.
 fn post(addr: &str, path: &str, headers: &[(&str, &str)], body: &str) -> (u16, String) {
@@ -104,17 +96,6 @@ fn sign(secret: &str, body: &str) -> String {
     format!("sha256={}", agentd::sha::to_hex(&mac))
 }
 
-fn wait_ready(addr: &str) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if TcpStream::connect(addr).is_ok() {
-            return;
-        }
-        assert!(Instant::now() < deadline, "webhook listener never came up");
-        std::thread::sleep(Duration::from_millis(25));
-    }
-}
-
 struct MockLlm {
     child: Child,
     addr_file: String,
@@ -196,10 +177,20 @@ fn spawn_daemon(config: &str, env: &[(&str, &str)]) -> Daemon {
     Daemon { child, stderr_path }
 }
 
-fn write_config(yaml: &str) -> String {
-    let path = common::unique_path("agentd-webhook", "yaml");
-    std::fs::write(&path, yaml).unwrap();
-    path
+/// Spawn the daemon on `cfg_for(port)` and return it with the webhook
+/// authority it confirmed binding and the config path to clean up — see
+/// [`common::spawn_bound`]: the authority comes from the daemon's own
+/// `webhooks.listen` line, never from the probe, so a lost bind is retried
+/// rather than handing the test a stranger's listener.
+fn spawn_bound(cfg_for: impl Fn(u16) -> String, env: &[(&str, &str)]) -> (Daemon, String, String) {
+    let cfg = common::unique_path("agentd-webhook", "yaml");
+    let (daemon, addr) = common::spawn_listener_bound("webhooks.listen", |port| {
+        std::fs::write(&cfg, cfg_for(port)).unwrap();
+        let daemon = spawn_daemon(&cfg, env);
+        let log = daemon.stderr_path.clone();
+        (daemon, log)
+    });
+    (daemon, addr, cfg)
 }
 
 fn config(llm: &str, port: u16) -> String {
@@ -233,11 +224,8 @@ fn wait_for<F: Fn() -> bool>(f: F, secs: u64) -> bool {
 fn a_signed_webhook_fires_the_workflow_bad_signature_is_rejected_and_replays_dedupe() {
     let secret = "topsecret";
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "handled the webhook"}]}));
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-    let cfg = write_config(&config(&llm.uri, port));
-    let daemon = spawn_daemon(&cfg, &[("HOOK_SECRET", secret)]);
-    wait_ready(&addr);
+    let (daemon, addr, cfg) =
+        spawn_bound(|port| config(&llm.uri, port), &[("HOOK_SECRET", secret)]);
 
     let body = r#"{"ref":"refs/heads/main","action":"deploy"}"#;
 
@@ -324,11 +312,7 @@ fn await_config(llm: &str, port: u16) -> String {
 #[test]
 fn a_webhook_await_pauses_a_workflow_until_the_callback_arrives() {
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "processed the callback"}]}));
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-    let cfg = write_config(&await_config(&llm.uri, port));
-    let daemon = spawn_daemon(&cfg, &[]);
-    wait_ready(&addr);
+    let (daemon, addr, cfg) = spawn_bound(|port| await_config(&llm.uri, port), &[]);
 
     // The `once` run reaches the `wait: {on: webhook}` and suspends.
     assert!(
@@ -373,24 +357,25 @@ fn a_webhook_await_pauses_a_workflow_until_the_callback_arrives() {
 fn a_respond_sync_webhook_returns_the_run_result_inline() {
     let secret = "s3cr3t";
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "processed synchronously"}]}));
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-    let cfg = write_config(&format!(
-        "\
-         agent:\n  name: sync\n  instruction: You process.\n  preflight: never\n\
-         intelligence:\n  endpoints: {}\n  model: mock\n\
-         store:\n  kind: memory\n\
-         webhooks:\n  listen: http://127.0.0.1:{port}\n\
-         workflows:\n  - name: sync-hook\n    steps:\n\
-         \x20     h: {{kind: webhook, path: /hooks/sync, methods: [POST], respond: sync, auth: {{hmac: {{secret: \"{{{{secret:HOOK_SECRET}}}}\"}}}}}}\n\
-         \x20     a: {{kind: agent, depends_on: [h], instruction: \"process it\"}}\n\
-         \x20     f: {{kind: finish, depends_on: [a], output: \"done-sync\"}}\n\
-         lifecycle:\n  run_until: drained\n\
-         observability:\n  log_level: info\n",
-        llm.uri
-    ));
-    let _daemon = spawn_daemon(&cfg, &[("HOOK_SECRET", secret)]);
-    wait_ready(&addr);
+    let (_daemon, addr, cfg) = spawn_bound(
+        |port| {
+            format!(
+                "\
+             agent:\n  name: sync\n  instruction: You process.\n  preflight: never\n\
+             intelligence:\n  endpoints: {}\n  model: mock\n\
+             store:\n  kind: memory\n\
+             webhooks:\n  listen: http://127.0.0.1:{port}\n\
+             workflows:\n  - name: sync-hook\n    steps:\n\
+             \x20     h: {{kind: webhook, path: /hooks/sync, methods: [POST], respond: sync, auth: {{hmac: {{secret: \"{{{{secret:HOOK_SECRET}}}}\"}}}}}}\n\
+             \x20     a: {{kind: agent, depends_on: [h], instruction: \"process it\"}}\n\
+             \x20     f: {{kind: finish, depends_on: [a], output: \"done-sync\"}}\n\
+             lifecycle:\n  run_until: drained\n\
+             observability:\n  log_level: info\n",
+                llm.uri
+            )
+        },
+        &[("HOOK_SECRET", secret)],
+    );
     let body = r#"{"x":1}"#;
     let sig = sign(secret, body);
     // A respond:sync webhook holds the HTTP response until the run finishes.
@@ -432,11 +417,10 @@ fn rate_config(llm: &str, port: u16) -> String {
 fn a_rated_route_admits_its_burst_then_answers_429_with_retry_after() {
     let secret = "topsecret";
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "handled"}]}));
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-    let cfg = write_config(&rate_config(&llm.uri, port));
-    let daemon = spawn_daemon(&cfg, &[("HOOK_SECRET", secret)]);
-    wait_ready(&addr);
+    let (daemon, addr, cfg) = spawn_bound(
+        |port| rate_config(&llm.uri, port),
+        &[("HOOK_SECRET", secret)],
+    );
 
     let body = r#"{"n":1}"#;
     let sig = sign(secret, body);
@@ -495,15 +479,14 @@ fn shed_config(llm: &str, port: u16, store_dir: &str) -> String {
 fn a_daemon_under_disk_pressure_sheds_webhooks_with_429() {
     let secret = "topsecret";
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "never reached"}]}));
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     // min_free of ~1PB puts any real filesystem below the shed threshold: the
     // daemon comes up already shedding, so the gate itself is what we observe.
     let store_dir = common::unique_path("wh-shed-store", "d");
     std::fs::create_dir_all(&store_dir).unwrap();
-    let cfg = write_config(&shed_config(&llm.uri, port, &store_dir));
-    let daemon = spawn_daemon(&cfg, &[("HOOK_SECRET", secret)]);
-    wait_ready(&addr);
+    let (daemon, addr, cfg) = spawn_bound(
+        |port| shed_config(&llm.uri, port, &store_dir),
+        &[("HOOK_SECRET", secret)],
+    );
 
     let body = r#"{"n":1}"#;
     let sig = sign(secret, body);
@@ -555,34 +538,35 @@ fn free_bytes_root() -> u64 {
 fn at_warn_a_low_priority_route_sheds_while_normal_still_admits() {
     let secret = "topsecret";
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "handled"}]}));
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     // min_free at 2/3 of the actual free space puts the daemon in the WARN
     // band (shed < free < 2×shed): low-priority admissions shed, normal ones
     // do not — priority's teeth, observed on the wire.
     let min_free = free_bytes_root() * 2 / 3;
     let store_dir = common::unique_path("wh-warn-store", "d");
     std::fs::create_dir_all(&store_dir).unwrap();
-    let cfg = write_config(&format!(
-        "\
-         agent:\n  name: warnhook\n  instruction: You handle webhooks.\n  preflight: never\n\
-         intelligence:\n  endpoints: {llm}\n  model: mock\n\
-         store:\n  kind: file\n  file:\n    path: {store_dir}\n    min_free: \"{min_free}\"\n\
-         webhooks:\n  listen: http://127.0.0.1:{port}\n\
-         workflows:\n  - name: bulk\n    priority: low\n    steps:\n\
-         \x20     h: {{kind: webhook, path: /hooks/bulk, methods: [POST], auth: {{hmac: {{secret: \"{{{{secret:HOOK_SECRET}}}}\"}}}}}}\n\
-         \x20     a: {{kind: agent, depends_on: [h], instruction: \"handle it\"}}\n\
-         \x20     f: {{kind: finish, depends_on: [a]}}\n\
-         \x20 - name: urgent\n    steps:\n\
-         \x20     h: {{kind: webhook, path: /hooks/urgent, methods: [POST], auth: {{hmac: {{secret: \"{{{{secret:HOOK_SECRET}}}}\"}}}}}}\n\
-         \x20     a: {{kind: agent, depends_on: [h], instruction: \"handle it\"}}\n\
-         \x20     f: {{kind: finish, depends_on: [a]}}\n\
-         lifecycle:\n  run_until: drained\n\
-         observability:\n  log_level: info\n",
-        llm = llm.uri
-    ));
-    let daemon = spawn_daemon(&cfg, &[("HOOK_SECRET", secret)]);
-    wait_ready(&addr);
+    let (daemon, addr, cfg) = spawn_bound(
+        |port| {
+            format!(
+                "\
+             agent:\n  name: warnhook\n  instruction: You handle webhooks.\n  preflight: never\n\
+             intelligence:\n  endpoints: {llm}\n  model: mock\n\
+             store:\n  kind: file\n  file:\n    path: {store_dir}\n    min_free: \"{min_free}\"\n\
+             webhooks:\n  listen: http://127.0.0.1:{port}\n\
+             workflows:\n  - name: bulk\n    priority: low\n    steps:\n\
+             \x20     h: {{kind: webhook, path: /hooks/bulk, methods: [POST], auth: {{hmac: {{secret: \"{{{{secret:HOOK_SECRET}}}}\"}}}}}}\n\
+             \x20     a: {{kind: agent, depends_on: [h], instruction: \"handle it\"}}\n\
+             \x20     f: {{kind: finish, depends_on: [a]}}\n\
+             \x20 - name: urgent\n    steps:\n\
+             \x20     h: {{kind: webhook, path: /hooks/urgent, methods: [POST], auth: {{hmac: {{secret: \"{{{{secret:HOOK_SECRET}}}}\"}}}}}}\n\
+             \x20     a: {{kind: agent, depends_on: [h], instruction: \"handle it\"}}\n\
+             \x20     f: {{kind: finish, depends_on: [a]}}\n\
+             lifecycle:\n  run_until: drained\n\
+             observability:\n  log_level: info\n",
+                llm = llm.uri
+            )
+        },
+        &[("HOOK_SECRET", secret)],
+    );
 
     let body = r#"{"n":1}"#;
     let sig = sign(secret, body);
@@ -628,26 +612,27 @@ fn at_warn_a_low_priority_route_sheds_while_normal_still_admits() {
 #[cfg(feature = "hot-reload")]
 fn a_reload_rotates_webhook_auth_and_the_old_secret_stops_working() {
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "handled"}]}));
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     let secret_path = common::unique_path("hook-secret", "txt");
     std::fs::write(&secret_path, "secret-one\n").unwrap();
 
-    let cfg = write_config(&format!(
-        "\
-         agent:\n  name: rot\n  instruction: You handle webhooks.\n  preflight: never\n\
-         intelligence:\n  endpoints: {llm}\n  model: mock\n\
-         store:\n  kind: memory\n\
-         webhooks:\n  listen: http://127.0.0.1:{port}\n\
-         workflows:\n  - name: on-hook\n    steps:\n\
-         \x20     h: {{kind: webhook, path: /hooks/rot, methods: [POST], auth: {{hmac: {{secret: \"{{{{secret-file:{secret_path}}}}}\"}}}}}}\n\
-         \x20     f: {{kind: finish, depends_on: [h]}}\n\
-         lifecycle:\n  run_until: drained\n\
-         observability:\n  log_level: info\n",
-        llm = llm.uri
-    ));
-    let daemon = spawn_daemon(&cfg, &[]);
-    wait_ready(&addr);
+    let (daemon, addr, cfg) = spawn_bound(
+        |port| {
+            format!(
+                "\
+             agent:\n  name: rot\n  instruction: You handle webhooks.\n  preflight: never\n\
+             intelligence:\n  endpoints: {llm}\n  model: mock\n\
+             store:\n  kind: memory\n\
+             webhooks:\n  listen: http://127.0.0.1:{port}\n\
+             workflows:\n  - name: on-hook\n    steps:\n\
+             \x20     h: {{kind: webhook, path: /hooks/rot, methods: [POST], auth: {{hmac: {{secret: \"{{{{secret-file:{secret_path}}}}}\"}}}}}}\n\
+             \x20     f: {{kind: finish, depends_on: [h]}}\n\
+             lifecycle:\n  run_until: drained\n\
+             observability:\n  log_level: info\n",
+                llm = llm.uri
+            )
+        },
+        &[],
+    );
 
     let body = r#"{"n":1}"#;
 
@@ -716,12 +701,10 @@ fn a_reload_rotates_webhook_auth_and_the_old_secret_stops_working() {
 #[test]
 fn a_webhook_into_a_stream_appends_and_replays_into_a_later_consumer() {
     let secret = "into-secret";
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
     let dir = common::unique_path("wh-into", "d");
     std::fs::create_dir_all(&dir).unwrap();
 
-    let cfg_for = |consumer: &str| {
+    let cfg_for = |port: u16, consumer: &str| {
         format!(
             "\
              agent:\n  name: ingest\n  instruction: You handle webhooks.\n  preflight: never\n\
@@ -739,9 +722,7 @@ fn a_webhook_into_a_stream_appends_and_replays_into_a_later_consumer() {
     };
 
     // Life 1: no consumer at all — the requests are appended anyway.
-    let cfg = write_config(&cfg_for(""));
-    let daemon = spawn_daemon(&cfg, &[("INTO_SECRET", secret)]);
-    wait_ready(&addr);
+    let (daemon, addr, cfg) = spawn_bound(|port| cfg_for(port, ""), &[("INTO_SECRET", secret)]);
 
     let body = r#"{"order":"o-1"}"#;
     let (code, resp) = post(
@@ -794,8 +775,8 @@ fn a_webhook_into_a_stream_appends_and_replays_into_a_later_consumer() {
          \x20     take: {kind: stream, stream: inbox, subject: \"webhook.*\", from: earliest}\n\
          \x20     note: {kind: assign, depends_on: [take], value: \"got {{steps.take.output.data.body.order}}\"}\n\
          \x20     f:    {kind: finish, depends_on: [note], status: completed, output: \"{{steps.note.output}}\"}\n";
-    let cfg2 = write_config(&cfg_for(consumer));
-    let daemon2 = spawn_daemon(&cfg2, &[("INTO_SECRET", secret)]);
+    let (daemon2, _, cfg2) =
+        spawn_bound(|port| cfg_for(port, consumer), &[("INTO_SECRET", secret)]);
     assert!(
         wait_for(|| daemon2.events("run.done").len() >= 2, 15),
         "the backlog replays into the late consumer:\n{}",

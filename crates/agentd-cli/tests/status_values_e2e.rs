@@ -18,7 +18,6 @@
 
 mod common;
 
-use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -49,14 +48,6 @@ impl Drop for Daemon {
     }
 }
 
-fn wait_ready(addr: &str) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while TcpStream::connect(addr).is_err() {
-        assert!(Instant::now() < deadline, "the listener never came up");
-        std::thread::sleep(Duration::from_millis(25));
-    }
-}
-
 /// The `status` document as `bearer` reads it.
 fn status_as(addr: &str, bearer: &str) -> Value {
     let v = SendMessage::command("status", json!({}))
@@ -82,51 +73,58 @@ fn wait_status(addr: &str, bearer: &str, what: &str, pred: impl Fn(&Value) -> bo
 
 #[test]
 fn status_values_and_skill_prefix_are_published() {
-    let port = common::free_port();
-    let addr = format!("127.0.0.1:{port}");
     // `publish` writes a listed key, a listed key with a short TTL, and a key
-    // nobody listed; `never.set` is listed and never written.
+    // nobody listed; `never.set` is listed and never written. The daemon is
+    // spawned on a probed port and talked to at the authority it confirmed
+    // binding (`common::spawn_bound`), never at the probe.
     let cfg = common::unique_path("status-values", "yaml");
-    std::fs::write(
-        &cfg,
-        format!(
-            "\
-             agent:\n  name: status-values\n  instruction: You are a test agent.\n  preflight: never\n\
-             intelligence:\n  endpoints: https://127.0.0.1:9\n  model: mock\n\
-             store:\n  kind: memory\n\
-             skills:\n  reference_prefix: \"#skill:\"\n\
-             a2a:\n  listen: http://127.0.0.1:{port}\n  events:\n    enabled: true\n\
-             \x20 principals:\n\
-             \x20   - id: op\n\
-             \x20     match: {{ bearer_ref: \"{{{{secret:STATUS_VALUES_OP}}}}\" }}\n\
-             \x20     role: operator\n\
-             \x20   - id: viewer\n\
-             \x20     match: {{ bearer_ref: \"{{{{secret:STATUS_VALUES_USER}}}}\" }}\n\
-             \x20     role: user\n\
-             observability:\n  log_level: info\n  status_values: [deploy.state, fleeting, never.set]\n\
-             workflows:\n\
-             \x20 - name: publish\n    steps:\n\
-             \x20     s: {{kind: once}}\n\
-             \x20     a: {{kind: memory.set, depends_on: [s], key: deploy.state, value: green}}\n\
-             \x20     b: {{kind: memory.set, depends_on: [a], key: fleeting, value: soon gone, ttl: 2s}}\n\
-             \x20     c: {{kind: memory.set, depends_on: [b], key: unlisted, value: not for the chrome}}\n\
-             \x20     f: {{kind: finish, depends_on: [c]}}\n\
-             lifecycle:\n  run_until: drained\n"
-        ),
-    )
-    .unwrap();
-    let stderr_path = common::unique_path("status-values-daemon", "log");
-    let child = Command::new(env!("CARGO_BIN_EXE_agentd"))
-        .args(["--config", &cfg])
-        .env("STATUS_VALUES_OP", TOKEN_OP)
-        .env("STATUS_VALUES_USER", TOKEN_USER)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(std::fs::File::create(&stderr_path).unwrap()))
-        .spawn()
-        .expect("spawn agentd");
-    let mut daemon = Daemon { child, stderr_path };
-    wait_ready(&addr);
+    let (mut daemon, addr) = common::spawn_bound(|port| {
+        std::fs::write(
+            &cfg,
+            format!(
+                "\
+                 agent:\n  name: status-values\n  instruction: You are a test agent.\n  preflight: never\n\
+                 intelligence:\n  endpoints: https://127.0.0.1:9\n  model: mock\n\
+                 store:\n  kind: memory\n\
+                 skills:\n  reference_prefix: \"#skill:\"\n\
+                 a2a:\n  listen: http://127.0.0.1:{port}\n  events:\n    enabled: true\n\
+                 \x20 principals:\n\
+                 \x20   - id: op\n\
+                 \x20     match: {{ bearer_ref: \"{{{{secret:STATUS_VALUES_OP}}}}\" }}\n\
+                 \x20     role: operator\n\
+                 \x20   - id: viewer\n\
+                 \x20     match: {{ bearer_ref: \"{{{{secret:STATUS_VALUES_USER}}}}\" }}\n\
+                 \x20     role: user\n\
+                 observability:\n  log_level: info\n  status_values: [deploy.state, fleeting, never.set]\n\
+                 workflows:\n\
+                 \x20 - name: publish\n    steps:\n\
+                 \x20     s: {{kind: once}}\n\
+                 \x20     a: {{kind: memory.set, depends_on: [s], key: deploy.state, value: green}}\n\
+                 \x20     b: {{kind: memory.set, depends_on: [a], key: fleeting, value: soon gone, ttl: 2s}}\n\
+                 \x20     c: {{kind: memory.set, depends_on: [b], key: unlisted, value: not for the chrome}}\n\
+                 \x20     f: {{kind: finish, depends_on: [c]}}\n\
+                 lifecycle:\n  run_until: drained\n"
+            ),
+        )
+        .unwrap();
+        let stderr_path = common::unique_path("status-values-daemon", "log");
+        let child = Command::new(env!("CARGO_BIN_EXE_agentd"))
+            .args(["--config", &cfg])
+            .env("STATUS_VALUES_OP", TOKEN_OP)
+            .env("STATUS_VALUES_USER", TOKEN_USER)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(std::fs::File::create(&stderr_path).unwrap()))
+            .spawn()
+            .expect("spawn agentd");
+        (
+            Daemon {
+                child,
+                stderr_path: stderr_path.clone(),
+            },
+            stderr_path,
+        )
+    });
 
     // The operator's feed, opened before the values land, so it sees the
     // status event that carries them.

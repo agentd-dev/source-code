@@ -644,11 +644,11 @@ pub fn contracts() -> Vec<Contract> {
     c(
         "ask_human",
         "human",
-        "Ask a person a question and wait for the answer. The answer is CHECKED against `schema`, so a reply that does not match is rejected and the person is asked again with the reason. By default the question reaches whoever is watching this agent's tasks; `to` names who must answer, and a reply from anyone else is refused.",
+        "Ask a person a question and wait for the answer. The answer is CHECKED against `schema`, so a reply that does not match is rejected and the person is asked again with the reason. By default the question reaches whoever is watching this agent's tasks; `to` names the operator who must answer, and a reply from anyone else is refused.",
         obj(
             json!({
                 "question": s("The question"),
-                "to": {"description": "Who must answer: a principal-id glob (\"*@finance.example\"), or {id, role, labels} — all conditions must hold. Anyone else is refused and the gate stays open. Use it when the DECISION belongs to a particular person; omit it when any watcher will do."},
+                "to": {"description": "Which operator must answer: {role: operator}, narrowed by labels if you like ({role: operator, labels: {team: finance}}), or the id \"operator\" — all conditions must hold. Only a task's owner and operators can see it, so naming anyone else is refused. A reply from anyone else is refused and the gate stays open. Omit it when the task's owner may answer."},
                 "schema": {"type": "object", "description": "The answer's shape, as a JSON Schema. Enforced on the reply, not merely advertised: build it for the decision you actually need. A single-property schema also lets a person answer in plain language (\"yes\" for {approved: boolean})."},
                 "recommend": {"description": "The answer you would choose if nobody replies. Used only when the operator set `agent.approval: accept`; otherwise a person still decides."},
                 "timeout": s("Duration"),
@@ -931,8 +931,8 @@ mod tests {
         assert_eq!(c.input["additionalProperties"], serde_json::json!(false));
         for args in [
             json!({"question": "ship it?", "recommend": {"approved": true}}),
-            json!({"question": "ship it?", "to": "*@finance.example"}),
-            json!({"question": "ship it?", "to": {"role": "user", "labels": {"team": "finance"}}}),
+            json!({"question": "ship it?", "to": "operator"}),
+            json!({"question": "ship it?", "to": {"role": "operator", "labels": {"team": "finance"}}}),
         ] {
             assert!(
                 crate::jsonschema::validate(&c.input, &args).is_ok(),

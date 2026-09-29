@@ -28,6 +28,10 @@ use serde_json::Value;
 ///
 /// Labels are the durable form — people change, teams do not — and they come
 /// from `a2a.principals[].labels`, which is operator-declared and closed.
+///
+/// The same syntax says whose reply a message wait hears (`from`). A GATE's
+/// `to` is further held to [`Addressee::check_gate`]: only an operator can
+/// see a task it does not own, so only an operator can be a gate's decider.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Addressee {
     /// Principal-id glob (`*` suffix, or exact).
@@ -126,6 +130,38 @@ impl Addressee {
 
     fn is_empty(&self) -> bool {
         self.id.is_none() && self.role.is_none() && self.labels.is_empty()
+    }
+
+    /// Whether a GATE may be addressed to this: `Err` names who it would
+    /// wait for and says why they never could answer.
+    ///
+    /// A gate is a task, and a task is visible only to its owner and to
+    /// operators (`a2a::tasks::Task::is_visible_to`), so anyone else a `to:`
+    /// named would get task-not-found before the addressee check ever ran —
+    /// a gate that waits for someone who can never see it. What remains is an
+    /// operator: `{role: operator}` (narrowed by labels if the operator
+    /// likes), or an id glob that can only match `operator`, the one id every
+    /// operator principal carries. A glob that starts with `*`, or labels
+    /// with no role, could match a `user:`/`agent:` principal too, and the
+    /// load cannot prove it does not. `from` on a message wait uses the same
+    /// syntax for a peer and is not held to this.
+    pub fn check_gate(&self) -> Result<(), String> {
+        let operator_only = match (self.role, &self.id) {
+            (Some(Role::Operator), None) => true,
+            (Some(Role::Operator), Some(pat)) => glob(pat, "operator"),
+            (Some(_), _) => false,
+            (None, Some(pat)) => !pat.starts_with('*') && glob(pat, "operator"),
+            (None, None) => false,
+        };
+        if operator_only {
+            return Ok(());
+        }
+        Err(format!(
+            "`to` names {}, who could never see the task: a task is visible only to its \
+             owner and to operators — leave `to` unset to ask the task's owner, or name an \
+             operator ({{role: operator}})",
+            self.describe()
+        ))
     }
 
     /// Whether this principal is who the gate is waiting for.
@@ -242,6 +278,41 @@ mod tests {
         assert!(Addressee::parse(&json!({"rolle": "user"})).is_err());
         assert!(Addressee::parse(&json!({"role": "auditor"})).is_err());
         assert!(Addressee::parse(&json!({"labels": {"team": 1}})).is_err());
+    }
+
+    /// A gate may wait only for someone who can see its task: an operator.
+    /// Every other form is refused, naming who it would have waited for.
+    #[test]
+    fn a_gate_may_address_only_an_operator() {
+        for ok in [
+            json!({"role": "operator"}),
+            json!({"role": "operator", "labels": {"team": "sec"}}),
+            json!({"id": "operator", "role": "operator"}),
+            json!("operator"),
+            json!("oper*"),
+        ] {
+            let a = Addressee::parse(&ok).unwrap();
+            assert!(a.check_gate().is_ok(), "{ok} names an operator");
+        }
+        for (bad, named) in [
+            (json!("user:alice"), "user:alice"),
+            (json!("*@finance.example"), "*@finance.example"),
+            (json!("*"), "*"),
+            (json!("*tor"), "*tor"),
+            (json!({"role": "user"}), "role user"),
+            (
+                json!({"role": "agent", "labels": {"team": "x"}}),
+                "role agent",
+            ),
+            (json!({"labels": {"team": "finance"}}), "team=finance"),
+            (json!({"id": "user:*", "role": "operator"}), "user:*"),
+        ] {
+            let e = Addressee::parse(&bad).unwrap().check_gate().unwrap_err();
+            assert!(
+                e.contains(named) && e.contains("could never see the task"),
+                "{bad}: {e}"
+            );
+        }
     }
 
     /// A gate that will not take your answer has to say whose it wants.

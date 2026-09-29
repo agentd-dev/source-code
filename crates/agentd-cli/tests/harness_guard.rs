@@ -415,3 +415,92 @@ fn only_the_harness_builds_requests() {
         found.join("\n")
     );
 }
+
+/// A daemon killed when the test lets go of it.
+#[cfg(all(unix, feature = "a2a"))]
+struct Spawned(std::process::Child, String);
+#[cfg(all(unix, feature = "a2a"))]
+impl Drop for Spawned {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+        let _ = std::fs::remove_file(&self.1);
+    }
+}
+
+/// `common::spawn_bound` hands a test the authority its daemon's own
+/// `a2a.listen` line names, and retries a daemon whose bind lost the race —
+/// never the probed port. Forced here: the first attempt is aimed at a port
+/// this test is holding, so that daemon exits on its bind, and a helper that
+/// trusted the probe would hand the test this test's own socket as the agent.
+#[test]
+#[cfg(all(unix, feature = "a2a"))]
+fn spawn_bound_retries_a_lost_bind_and_reports_the_daemons_own_authority() {
+    let squatter = TcpListener::bind("127.0.0.1:0").unwrap();
+    let taken = squatter.local_addr().unwrap().port();
+    let mut attempts = 0;
+    let (_daemon, addr) = common::spawn_bound(|port| {
+        attempts += 1;
+        let port = if attempts == 1 { taken } else { port };
+        let cfg = common::unique_path("spawn-bound", "yaml");
+        std::fs::write(
+            &cfg,
+            format!(
+                "agent: {{name: spawn-bound, preflight: never}}\n\
+                 intelligence: {{endpoints: \"https://127.0.0.1:9\", model: mock}}\n\
+                 store: {{kind: memory}}\n\
+                 a2a: {{listen: \"http://127.0.0.1:{port}\"}}\n\
+                 lifecycle: {{run_until: drained}}\n\
+                 observability: {{log_level: info}}\n"
+            ),
+        )
+        .unwrap();
+        let log = common::unique_path("spawn-bound", "log");
+        let child = std::process::Command::new(env!("CARGO_BIN_EXE_agentd"))
+            .args(["--config", &cfg])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::fs::File::create(&log).unwrap())
+            .spawn()
+            .expect("spawn agentd");
+        (Spawned(child, log.clone()), log)
+    });
+    assert_eq!(attempts, 2, "the lost bind was retried once");
+    assert_ne!(
+        addr,
+        format!("127.0.0.1:{taken}"),
+        "the test was handed the squatter's port"
+    );
+    assert_eq!(common::get_card(&addr)["name"], "spawn-bound");
+    drop(squatter);
+}
+
+/// A no-credential loopback daemon logs a `config.warning` that starts with
+/// `a2a.listen:` BEFORE it binds. Reading that text as a failed bind made a
+/// healthy daemon look dead whenever the poll landed between the two lines,
+/// so the bound authority is waited for until the daemon actually exits.
+#[test]
+fn a_listen_warning_before_the_bind_is_not_a_failed_bind() {
+    let log = common::unique_path("try-bound", "log");
+    std::fs::write(
+        &log,
+        "{\"event\":\"config.warning\",\"warning\":\"a2a.listen: no credential is configured\"}\n",
+    )
+    .unwrap();
+    let writer = {
+        let log = log.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+            writeln!(
+                f,
+                "{{\"event\":\"a2a.listen\",\"bound\":\"127.0.0.1:4242\"}}"
+            )
+            .unwrap();
+        })
+    };
+    let bound = common::try_a2a_bound(&log, Duration::from_secs(10));
+    writer.join().unwrap();
+    std::fs::remove_file(&log).ok();
+    assert_eq!(bound.as_deref(), Some("127.0.0.1:4242"));
+}

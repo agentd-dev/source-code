@@ -550,7 +550,7 @@ fn a_workflow_human_node_gates_the_run_task_and_the_reply_is_the_step_output() {
 #[test]
 fn an_operator_answering_someone_elses_gate_is_recorded_as_an_override() {
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
-    let extra = "workflows:\n  - name: approve\n    steps:\n      s: {kind: manual}\n      gate: {kind: human, question: \"Approve the refund?\", to: \"*@finance.example\", depends_on: [s]}\n      f: {kind: finish, depends_on: [gate], output: \"refunded\"}\n";
+    let extra = "workflows:\n  - name: approve\n    steps:\n      s: {kind: manual}\n      gate: {kind: human, question: \"Approve the refund?\", to: {role: operator, labels: {team: finance}}, depends_on: [s]}\n      f: {kind: finish, depends_on: [gate], output: \"refunded\"}\n";
     let (daemon, addr, cfg) = spawn_bound(|port| base_config(&llm.uri, port, true, extra));
 
     let started = command(&addr, "workflow.run", json!({"workflow": "approve"}));
@@ -559,7 +559,8 @@ fn an_operator_answering_someone_elses_gate_is_recorded_as_an_override() {
         t["status"]["state"] == "TASK_STATE_INPUT_REQUIRED"
     });
 
-    // The loopback caller is an operator, and is NOT the addressee.
+    // The loopback caller is an operator without the finance label, so it
+    // is NOT the addressee.
     SendMessage::text("approved")
         .task(&task_id)
         .return_immediately()
@@ -587,7 +588,7 @@ fn an_operator_answering_someone_elses_gate_is_recorded_as_an_override() {
 #[test]
 fn a_gates_addressee_and_schema_are_durable() {
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
-    let extra = "workflows:\n  - name: approve\n    steps:\n      s: {kind: manual}\n      gate: {kind: human, question: \"Approve?\", to: \"*@finance.example\", schema: {type: object, properties: {ok: {type: boolean}}}, depends_on: [s]}\n      f: {kind: finish, depends_on: [gate], output: \"done\"}\n";
+    let extra = "workflows:\n  - name: approve\n    steps:\n      s: {kind: manual}\n      gate: {kind: human, question: \"Approve?\", to: {role: operator, labels: {team: finance}}, schema: {type: object, properties: {ok: {type: boolean}}}, depends_on: [s]}\n      f: {kind: finish, depends_on: [gate], output: \"done\"}\n";
     let (_daemon, addr, cfg) = spawn_bound(|port| base_config(&llm.uri, port, true, extra));
 
     let started = command(&addr, "workflow.run", json!({"workflow": "approve"}));
@@ -607,7 +608,8 @@ fn a_gates_addressee_and_schema_are_durable() {
     let wait = &run["run"]["steps"]["gate"]["wait"];
     assert_eq!(wait["kind"], "human", "{run}");
     assert_eq!(
-        wait["to"], "*@finance.example",
+        wait["to"],
+        json!({"role": "operator", "labels": {"team": "finance"}}),
         "the addressee must survive a restart\n{run}"
     );
     assert!(

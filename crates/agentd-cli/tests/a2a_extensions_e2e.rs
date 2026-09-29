@@ -27,9 +27,8 @@
 
 mod common;
 
-use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
@@ -44,14 +43,6 @@ const USER: &str = "ext-e2e-user-token";
 const CI: &str = "ext-e2e-ci-token";
 const POD: &str = "ext-e2e-pod-7f9c";
 const HOST: &str = "ext-e2e-host.internal";
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 struct Daemon {
     child: Child,
@@ -73,18 +64,6 @@ impl Drop for Daemon {
         let _ = std::fs::remove_file(&self.cfg);
         let _ = std::fs::remove_file(&self.stderr_path);
     }
-}
-
-fn wait_ready(addr: &str) {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while Instant::now() < deadline {
-        if TcpStream::connect(addr).is_ok() {
-            std::thread::sleep(Duration::from_millis(200));
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    panic!("listener never came up on {addr}");
 }
 
 /// The two named callers every card test reads as: an operator, and a user
@@ -132,37 +111,38 @@ fn boot_with(a2a_extra: &str, top_extra: &str) -> (Daemon, String) {
     spawn(|port| config(port, a2a_extra, top_extra))
 }
 
-/// A daemon on a free loopback port, configured by `text(port)`. It runs with
+/// A daemon on a free loopback port, configured by `text(port)`, and the
+/// authority it confirmed binding — see [`common::spawn_bound`]. It runs with
 /// a pod name and a host name in its environment — what the instance name
 /// falls back to, and what an unauthenticated card must never carry.
 fn spawn(text: impl Fn(u16) -> String) -> (Daemon, String) {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-    let cfg = common::unique_path("a2a-ext", "yaml");
-    std::fs::write(&cfg, text(port)).unwrap();
-    let stderr_path = common::unique_path("a2a-ext-daemon", "log");
-    let errf = std::fs::File::create(&stderr_path).unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_agentd"))
-        .args(["--config", &cfg])
-        .env("AGENTD_EXT_OPERATOR", OPERATOR)
-        .env("AGENTD_EXT_USER", USER)
-        .env("AGENTD_EXT_CI", CI)
-        .env("AGENTD_POD_NAME", POD)
-        .env("HOSTNAME", HOST)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(errf))
-        .spawn()
-        .expect("spawn");
-    wait_ready(&addr);
-    (
-        Daemon {
-            child,
-            cfg,
-            stderr_path,
-        },
-        addr,
-    )
+    common::spawn_bound(|port| {
+        let cfg = common::unique_path("a2a-ext", "yaml");
+        std::fs::write(&cfg, text(port)).unwrap();
+        let stderr_path = common::unique_path("a2a-ext-daemon", "log");
+        let errf = std::fs::File::create(&stderr_path).unwrap();
+        let child = Command::new(env!("CARGO_BIN_EXE_agentd"))
+            .args(["--config", &cfg])
+            .env("AGENTD_EXT_OPERATOR", OPERATOR)
+            .env("AGENTD_EXT_USER", USER)
+            .env("AGENTD_EXT_CI", CI)
+            .env("AGENTD_POD_NAME", POD)
+            .env("HOSTNAME", HOST)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(errf))
+            .spawn()
+            .expect("spawn");
+        let log = stderr_path.clone();
+        (
+            Daemon {
+                child,
+                cfg,
+                stderr_path,
+            },
+            log,
+        )
+    })
 }
 
 fn boot() -> (Daemon, String) {
@@ -379,7 +359,7 @@ fn the_card_follows_a_principals_reload() {
                 \x20     role: user\n";
     std::fs::write(&d.cfg, config(port, rule, "")).unwrap();
     unsafe { libc::kill(d.child.id() as i32, libc::SIGHUP) };
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         let log = d.stderr();
         if log
@@ -389,7 +369,7 @@ fn the_card_follows_a_principals_reload() {
             break;
         }
         assert!(
-            Instant::now() < deadline,
+            std::time::Instant::now() < deadline,
             "the daemon never reloaded:\n{log}"
         );
         std::thread::sleep(Duration::from_millis(50));

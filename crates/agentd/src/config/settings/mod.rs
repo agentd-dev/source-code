@@ -6301,6 +6301,13 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                 format!("{at}: `to` names who answers an `action: ask` gate; this rule never asks"),
             );
         }
+        // …and whether the one it names could ever answer. A policy gate
+        // lands on a task, which only its owner and operators can see.
+        if let Some(to) = &p.to
+            && let Err(e) = to.check_gate()
+        {
+            err(&mut d, format!("{at}: {e}"));
+        }
     }
 
     // intelligence
@@ -10916,15 +10923,29 @@ mod tests {
 
         // `to` on an ask parses with the addressee parser, in both spellings.
         let l = load_doc(
-            "store: {kind: memory}\nsecurity:\n  policies:\n    - {match: {tool: \"fs.*\"}, action: ask, to: {role: user, labels: {team: fin}}}\n    - {match: {tool: \"db.*\"}, action: ask, to: \"*@fin.example\"}\n",
+            "store: {kind: memory}\nsecurity:\n  policies:\n    - {match: {tool: \"fs.*\"}, action: ask, to: {role: operator, labels: {team: fin}}}\n    - {match: {tool: \"db.*\"}, action: ask, to: \"operator\"}\n",
         )
         .unwrap();
         let p = &l.settings.security.policies;
-        assert_eq!(p[0].to.as_ref().unwrap().role, Some(Role::User));
-        assert_eq!(
-            p[1].to.as_ref().unwrap().id.as_deref(),
-            Some("*@fin.example")
-        );
+        assert_eq!(p[0].to.as_ref().unwrap().role, Some(Role::Operator));
+        assert_eq!(p[1].to.as_ref().unwrap().id.as_deref(), Some("operator"));
+        // A `to` naming anyone but an operator waits for someone who can
+        // never see the task: refused at load, naming who it named.
+        for (to, named) in [
+            ("{role: user, labels: {team: fin}}", "role user"),
+            ("\"*@fin.example\"", "*@fin.example"),
+            ("\"user:alice\"", "user:alice"),
+        ] {
+            let e = load_errors(&format!(
+                "security: {{policies: [{{match: {{tool: x}}, action: ask, to: {to}}}]}}\n"
+            ));
+            assert!(
+                e.contains("security.policies[0]")
+                    && e.contains(named)
+                    && e.contains("could never see the task"),
+                "{to}: {e}"
+            );
+        }
         // …and a rule without one stays unaddressed here (the runtime default
         // is the operator role).
         let l = load_doc(

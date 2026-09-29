@@ -17,7 +17,6 @@
 
 mod common;
 
-use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -27,16 +26,6 @@ fn sigterm(pid: u32) {
     unsafe {
         libc::kill(pid as i32, libc::SIGTERM);
     }
-}
-
-/// A free loopback port (bind :0, read the port, drop). A tiny TOCTOU window —
-/// agentd rebinds within milliseconds.
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }
 
 /// A JSON-RPC call whose `params` are handed over verbatim — the point of this
@@ -55,20 +44,6 @@ fn post_rpc(addr: &str, id: i64, method: &str, params: Value) -> Result<Value, S
 fn parse(reply: common::HttpReply) -> Result<Value, String> {
     serde_json::from_str(&reply.body)
         .map_err(|e| format!("non-JSON response ({e}): {:?}", reply.body))
-}
-
-fn wait_ready(addr: &str) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if TcpStream::connect(addr).is_ok() {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "a2a listener never became connectable"
-        );
-        std::thread::sleep(Duration::from_millis(25));
-    }
 }
 
 struct Daemon {
@@ -116,6 +91,21 @@ fn spawn_daemon(config: &str) -> Daemon {
     Daemon { child, stderr_path }
 }
 
+/// Spawn a daemon on [`config`] and return it with the A2A authority it
+/// confirmed binding and the config path to clean up — see
+/// [`common::spawn_bound`]. "The daemon keeps serving" is only evidence about
+/// this daemon if the listener answering is its own.
+fn spawn_bound(tag: &str) -> (Daemon, String, String) {
+    let cfg = common::unique_path(tag, "yaml");
+    let (daemon, addr) = common::spawn_bound(|port| {
+        std::fs::write(&cfg, config(port)).unwrap();
+        let daemon = spawn_daemon(&cfg);
+        let log = daemon.stderr_path.clone();
+        (daemon, log)
+    });
+    (daemon, addr, cfg)
+}
+
 /// A daemon serving A2A over plaintext loopback (⇒ operator). The intelligence
 /// endpoint is deliberately dead: no turn is ever run here, and `preflight:
 /// never` means nothing dials it, which keeps the test to one process. The
@@ -147,12 +137,7 @@ fn hello_frame(addr: &str, from_seq: u64) -> Value {
 
 #[test]
 fn malformed_send_params_are_refused_and_the_daemon_keeps_serving() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-    let cfg_path = common::unique_path("a2a-malformed", "yaml");
-    std::fs::write(&cfg_path, config(port)).unwrap();
-    let mut daemon = spawn_daemon(&cfg_path);
-    wait_ready(&addr);
+    let (mut daemon, addr, cfg_path) = spawn_bound("a2a-malformed");
 
     // Every shape a `params` field can take that is not "an object with an
     // object `message`". The first three reach the `IndexMut` rewrite, where an
@@ -225,12 +210,7 @@ fn malformed_send_params_are_refused_and_the_daemon_keeps_serving() {
 
 #[test]
 fn a_feed_cursor_ahead_of_the_feed_is_told_to_resync() {
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
-    let cfg_path = common::unique_path("a2a-malformed-feed", "yaml");
-    std::fs::write(&cfg_path, config(port)).unwrap();
-    let mut daemon = spawn_daemon(&cfg_path);
-    wait_ready(&addr);
+    let (mut daemon, addr, cfg_path) = spawn_bound("a2a-malformed-feed");
 
     // The control: a client starting from the beginning is caught up by replay,
     // not by re-bootstrapping.

@@ -422,11 +422,13 @@ suspended tool call.
 
 ### Who may answer
 
-By default, whoever holds the task. `to` narrows it to a named decider — a
-principal-id glob like `*@finance.example`, or `{role, labels}` — and a reply
-from anyone else is refused with an explanation while the gate stays open. That
-is what makes a gate's record worth keeping: "the finance lead approved this"
-means something only if someone else could not have satisfied it.
+By default, whoever holds the task. `to` narrows it to a named decider among
+the operators — `{role: operator}`, with labels such as `{team: finance}` to say
+which — and a reply from anyone else is refused with an explanation while the
+gate stays open. Only a task's owner and operators can see it, so a `to` naming
+anyone else is refused at load, naming the principal. That is what makes a
+gate's record worth keeping: "the finance lead approved this" means something
+only if someone else could not have satisfied it.
 
 Two consequences follow. An addressed gate is **never auto-answered**, whatever
 `agent.ask_human_fallback` or `agent.approval` say — a judge standing in for

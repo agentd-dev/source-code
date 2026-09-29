@@ -5,6 +5,427 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## v1.17.0 — A2A, and nothing beside it
+
+The A2A listener spoke a private dialect beside the specification: an
+anonymous `Pair` method that minted credentials, the card served as a JSON-RPC
+method, 0.3 aliases, `-32003` for every refusal, authentication configured
+under the UI's section, and a display client trusted because it was on
+loopback. An audit against A2A 1.0.1 found 66 defects, and most of them were
+that one defect seen from different sides (RFC 0043 maps each to the section
+that closes it).
+
+The boundary now sits where the specification draws it. agentd serves the 11
+A2A 1.0 JSON-RPC methods; `GET /.well-known/agent-card.json`, public and
+readable from any origin; three extensions it declares on the card, each
+active only when a request activates it; one declared custom binding for the
+unix socket; and an OAuth authorization server on the listener origin. It
+answers nothing else. The TUI and the web UI are ordinary A2A clients of that
+surface. `agentd tui` and `agentd ui` stay, as a thin launcher.
+
+No agentd-owned name carries a version any more. A version inside a name is a
+second name for the same thing, and both end up answered forever. An
+incompatible change takes a new name instead. Versions an external
+specification requires stay: A2A `1.0`, MCP's negotiated revision, JSON-RPC
+2.0, the instruction.md spec, and crate semver.
+
+### Breaking
+
+The listener:
+
+- **`A2A-Version` is required.** A request without it, or with anything but a
+  `1.0.x`, gets `-32009` with `supportedVersions`. a2a-rs clients up to 0.10
+  send no header, so they are refused.
+- **`Content-Type: application/json` is required** (anything else is a bare
+  415), and **so is a JSON-RPC `id`**: a notification is `-32600 "A2A requests
+  must carry an id"`. The envelope is checked in full: `jsonrpc: "2.0"`, a
+  method, a string or integer id, and object params.
+- **Only the 11 A2A 1.0 methods and the declared extension methods are
+  routed**, matched exactly, with no alias and no prefix strip. Any other name
+  is `-32601` for every caller, before authorization. Any other route is 404.
+- **An uncredentialed caller gets a 401** with a `WWW-Authenticate`
+  challenge, and a failed credential gets a 401 with `error="invalid_token"`.
+  A named caller refused a method or an op gets a 403 (`-31403`
+  PERMISSION_DENIED). Before, all of these were HTTP 200 with `-32003` or
+  `-32007`.
+- **The implicit operator needs a loopback bind with no credential mechanism
+  of any kind**, the device grant included. A request that carries `Origin`,
+  as every browser request does (`Origin: null` included), is never the
+  implicit operator. A request relayed from 127.0.0.1 to a wildcard listener
+  is never the operator. A TCP listener with no credential now logs a
+  `config.warning` saying that every local process presenting nothing is the
+  operator.
+- **The loopback-origin CORS trust is gone.** A browser reaches the listener
+  only from an origin listed exactly in `a2a.cors.origins`, loopback UIs
+  included. The one exception is the UI `agentd ui` launches: the launcher
+  admits that origin for its own process. The card GET answers every origin
+  with `Access-Control-Allow-Origin: *`.
+- **Browser tokens live in `sessionStorage` only**, bound to the endpoint
+  they were issued for. A browser always signs in.
+- **Activating the command extension
+  (`https://agentd.dev/a2a/ext/command`) is required.** A command needs the
+  URI in `A2A-Extensions` and in `message.extensions`, one envelope, no task
+  id of its own choosing, and arguments that the op's published schema
+  accepts. An argument an op does not take is refused. A command refusal's
+  `data` is `[BadRequest, ErrorInfo]`.
+- **Read ops reply with a Message** (`status`, `config`, `workflow.status`,
+  `subagent.status`, `plan.get`, the introspection reads). They create no
+  task and bind no conversation.
+- **Commands block unless `returnImmediately` is set**, as the specification
+  says a send does.
+- **Task ids are the server's: UUIDv4.** A message names a task only to
+  continue it. An unknown or invisible task is `-32001`, and a settled one is
+  `-32004`. A command that names a task is refused.
+- **A contextId is its caller's own name.** Each principal has its own
+  namespace, so two callers who both say `root` hold two conversations. An
+  operator addresses conversations by the runtime's key.
+- **Push notifications are in the 1.0 shape**: `authentication: {scheme,
+  credentials}` is honoured as registered, the body is a `StreamResponse`
+  carrying the task (`application/a2a+json`), Get and Delete need an `id`,
+  and push config ids are ULIDs. `CancelTask` on a settled task is `-32002`.
+- **The public card lists no workflows** and names no op beyond the static
+  vocabulary. The extended card lists what the caller may run and call.
+- **`capabilities.extendedAgentCard` is false when no scheme is declared**,
+  and `GetExtendedAgentCard` is `-32004` there. Reading it needs a credential
+  of a declared scheme. An `any`-rule caller or the implicit operator gets
+  401.
+- **The card's name and description are `agent.name` and
+  `agent.description`**, and `agent.description` is operator-only.
+
+Configuration:
+
+- **`a2a.url` is an origin** (`scheme://host[:port]`, no path, written
+  canonically) **and is required for a wildcard bind.** It is the card's
+  interface URL and the OAuth issuer.
+- **`a2a.principals[].id` is required for `bearer_ref` and `any` rules, and
+  is unique across rules.** A certificate names its holder as `cn=<CN>` or
+  `san=<SAN>`, so it can never spell a declared id. A rule may set only one
+  matcher. A `bearer_ref` secret may not equal `a2a.bearer`, another rule's
+  secret, or start with the session-token prefix.
+- **The device grant needs an operator credential** (`a2a.bearer`, or an
+  operator `bearer_ref` rule) and is refused beside `a2a.tls.client_ca` and on
+  a unix listener.
+- **`auth.device.approve` requires `as`.** A device principal is
+  `user:<name>`, and every session approved under one name is one principal.
+  A user-role principal id that a device was approved as is refused at load
+  and at reload, and an approval name that is, or ever was, a rule id is
+  refused.
+- **A gate may be addressed only to someone who can see its task.** A task is
+  visible only to its owner and to operators, so a `to:` must be absent (the
+  task's owner answers) or name an operator (`{role: operator}`, with any
+  labels, or the id `operator`). Any other `to:` is refused, naming the
+  principal: at load (exit 2) and at reload for `security.policies[].to` and a
+  workflow `human` step, at `workflow.create` and `workflow.update`, and when
+  `ask_human` is called with one.
+- **The policy-ask addressee defaults to the operator**: an `action: ask`
+  rule with no `to:` is addressed to `{role: operator}`, so the caller whose
+  call is judged does not approve it.
+- **An instance-tier spawn to a protected TCP parent needs a `{{secret:…}}`
+  bearer.** An inline `a2a.bearer` is never handed to a child, so the spawn
+  is refused (`instance.spawn.refused`) rather than run with its reports
+  refused.
+- **Environment variables are read only under `AGENTD_*`.** `AGENT_*`,
+  `SERVE_*` and unprefixed spellings are no longer read, `SERVE_BEARER`,
+  `AGENT_A2A_BEARER` and `AGENT_CONFIG` among them. The packaged
+  `/etc/default/agentd` sets `AGENTD_ARGS` and `AGENTD_*`.
+- **agentd identifiers carry no version.** The extensions are
+  `https://agentd.dev/a2a/ext/command`, `…/events` and
+  `…/task-annotations`, the unix binding is
+  `https://agentd.dev/a2a/binding/jsonrpc-unix`, and the launch grant type is
+  `https://agentd.dev/oauth/grant-type/launch`. The config schema's `$id` is
+  `https://agentd.dev/schema/config.json` and the workflow schema's is
+  `…/workflow.json`. A config document has no `config_version`, and a
+  workflow document has no `version`.
+- **`config::v2` is `config::settings`** for embedders, and `run_v2` is `run`.
+- **`--capabilities` drops `runtime` and `surfaces`**, `proc.start` drops
+  `runtime`, `config.valid` drops its schema marker, the store envelope drops
+  `v`, and the exit-code and metrics contract-version constants are gone.
+
+Workflows:
+
+- **`a2a.wait` needs `from`** (addressee syntax: whose reply it waits for). A
+  `wait {on: message}` without `from` hears only the run's own principal, an
+  operator or the runtime. `conversation` is a key, a contextId, or `"*"` for
+  any.
+- **A message wait's step output** carries `conversation` as the runtime's key
+  and `contextId` as the sender's name, for `a2a.wait` and `wait {on:
+  message}` alike.
+- **A workflow `a2a` start may not claim** the `_instance.` prefix or a
+  built-in op's name.
+
+Human-in-the-loop:
+
+- **An owned ask gates on core A2A.** An ask backed by a live task a caller
+  owns always gates while the listener serves, whatever the feed switch says.
+  An ask no caller owns gates only with `agent.ask_human_unowned: gate`, and
+  otherwise takes the fallback.
+- **An approved policy gate runs the call it approved**, and the asker gets
+  the tool's real result. The answer is `{decision: approve|deny}`.
+
+The launcher and the display clients:
+
+- **`agentd tui` and `agentd ui` are kept, as a thin launcher.** The daemon
+  runs with exactly the arguments it was given: the launcher forces no
+  configuration on (put `a2a.events.enabled` and `a2a.introspection.enabled`
+  in the config). It never hands `a2a.bearer` or a resolved secret to the
+  client, and it passes only the documented contract: `--endpoint`, plus
+  `--launch-fd` (TUI) or `--listen-fd` (web UI). The client signs in with a
+  single-use launch code the launcher mints in the daemon's process. The
+  launcher refuses a unix listener, `a2a.listen` port 0,
+  `a2a.tls.client_ca` and a non-loopback endpoint before it spawns anything.
+  The daemon's log goes to `--daemon-log`. `--debug` and `--inline` are gone
+  (the daemon answers an unknown argument).
+- **The display clients are ordinary A2A clients.** They discover the card,
+  send `A2A-Version`, activate only the extensions the card declares, and fall
+  back to a standards-only mode (ListTasks polling plus `SubscribeToTask`)
+  when there is no feed or `--no-extensions` asks for one.
+
+### Removed
+
+Named once, as history.
+
+- JSON-RPC methods: `Pair` and `interface.pair`; `GetAgentCard`, `agent/card`
+  and `agent/getAuthenticatedExtendedCard`; every `a2a.`-prefixed spelling;
+  the 0.3 method names; the bare `SubscribeToEvents`.
+- Routes: `/.well-known/agent.json`; agentd-ui's `/config.js`.
+- Command ops: `interface.info`, `config.set`, `pairing.code`,
+  `admin.lameduck`, and the argument aliases (`workflow.run` `name`,
+  `subagent.send` `text`, the reads' `id`).
+- Feed kinds `message`, `command` and `pairing`, the `interface` event
+  family, the feed's `after` cursor and the hello's `debug`.
+- Config keys: the `interface` section (`interface.enabled`, `.debug`,
+  `.display`, `.origins`, `.pairing`); `a2a.principals[].match.aauth_agent`;
+  `config_version`; a workflow's `version`, `start` and `nodes`; the push
+  target's `bearer` and the 0.3 `schemes[]`.
+- Launcher flags `--debug` and `--inline`, and `AGENTD_INTERFACE_LOG`.
+- agentd-tui's `--bearer` and `--code`; the web UI's `?bearer=`, its typed
+  bearer field, and credentials in `localStorage`.
+- `--serve-mcp`, `SERVE_MCP` and the other `--serve-*` spellings;
+  `--config-version`; the versioned `--config-schema` selector.
+- The approval spellings `await`, `human`, `accept_all` and `yes`.
+- The versioned identifiers: `config-1.json`, `workflow-3.json`,
+  `x-agentd-contract-version`, every extension, binding and grant URI with a
+  version segment, `interface/v1`, and the `agent://` alias.
+- The `workflow` cargo feature: workflows are always compiled.
+- Compatibility code for durable records written by earlier releases.
+
+Each removed key, flag, op, method, feed kind and launcher flag meets its
+layer's generic refusal: an unknown key, argument, op, method or extension.
+There are no removal tables and no removed sections in `--help`.
+
+### Security
+
+- **F01**: with `a2a.tls.client_ca` and `a2a.bearer` both set, any CA-signed
+  certificate that matched no rule was the operator without the bearer being
+  checked. Evidence is now resolved step by step, each kind deciding only for
+  itself: a presented bearer that matches nothing fails, and a certificate is
+  the operator only while no rule exists.
+- **F02**: `grants: ["*"]` on a user reached the operator-only ops, and
+  `pairing.code` minted operator sessions. Every op's authorization floor is
+  consulted before any grant, from one op table, and a grant naming an
+  operator-only op on a non-operator rule is a load error.
+- **F03**: any named caller could join, read and steer another principal's
+  conversation, the root included, by naming its contextId. contextIds are
+  per principal, a turn a listener message asks for runs only in a
+  conversation its caller owns (`turn.refused.not_owner`), and `message.send`
+  from a turn a non-operator drives is held to the same owner rule, so a
+  caller's model cannot message into the root or another principal's
+  conversation.
+- **F04**: the command ops that name a run or a subagent acted on any id.
+  Each now asks whose it is first, and a non-owner gets the same `-32001` as
+  an unknown id. The model's `workflow.cancel`, `workflow.signal` and
+  `subagent.*` tools are held to the same check, and a non-operator's model
+  cannot use the instance-wide workflow tools.
+- **F05**: `status` returned every principal's runs, outputs, conversations
+  and subagents to any named caller. It now answers each caller with its own
+  work and the instance's facts, from one visibility rule shared with the
+  feed. The operator's `status` reports `conversation_bindings`.
+- **F06**: `agentd ui` handed the operator's `a2a.bearer` to agentd-ui,
+  which served it as a cross-origin-includable `/config.js`. No credential
+  reaches the display client or the browser now, except a single-use,
+  60-second launch code minted in the daemon's process and redeemable only
+  from a loopback peer.
+- **F07**: the web UI sent its bearer to whatever `?endpoint=` named, took
+  credentials from the URL and kept them past disconnect. Sessions are bound
+  to their endpoint, kept in the tab, dropped at expiry and revoked on
+  disconnect.
+- **F08**: pairing was an always-armed 6-digit code behind one global lockout,
+  brute-forceable on a public listener. Sign-in is the RFC 8628 device grant: a
+  256-bit device code, per-source, per-network and global caps, and an
+  operator who approves each code under a name.
+- **F24**: missing, invalid and expired credentials get 401 and wrong-role
+  calls 403, each with its challenge.
+- **F25**: the extended card advertised per-workflow authorization nothing
+  enforced. `workflow.run` asks the grants and the default start node's
+  `roles:`, and the card lists exactly what that admits.
+- **F52**: the public card exposed every workflow and the operator, debug and
+  pairing op inventory. It now carries only what is true for every caller.
+- **The instruction freshness watch confirmed nothing** (present since
+  1.0.0). The official MCP SDK's client response cache answered re-reads
+  from memory within the server's `ttlMs` and replayed an expired entry as a
+  success when the registry was gone, so `unavailable: refuse` and a pinned
+  source's `freeze`, `drain` and `exit` never fired. The cache is off, and
+  every re-read asks the serving server by `mcp://<server>/<uri>`. Registry
+  load rises accordingly: `refresh` is the lever.
+- **Every child agentd spawns holds no inherited descriptor it was not
+  handed**, embedded in agentd-core or not, and without `/proc`: the exec
+  tool, subagents, instances and the launcher's client keep their stdio and
+  what they were given. A descriptor limit too high to mark is reported as
+  `process.inherited_fds_unmarked`.
+- The webhook listener's DNS-rebinding guard accepted any Origin whose host
+  began with `127.`. It now accepts only `localhost` or a loopback IP literal.
+- The auth-failure limiter counts failures, not callers: an origin refusal or
+  an uncredentialed request is never counted, and a live session token is
+  served past the limit.
+- A refused `--name=value` argument is echoed by name only.
+
+### Added
+
+- **The device grant** (`a2a.device_grant`): RFC 8628 device authorization,
+  RFC 6749 token, RFC 7009 revocation and RFC 8414 metadata on the listener
+  origin, declared on the card as an OAuth 2 device-code scheme. The operator
+  ops `auth.device.pending`, `auth.device.approve`, `auth.device.deny`,
+  `auth.sessions` and `auth.sessions.revoke`; revocation by session id closes
+  that session's open streams within a tick.
+- **Named device identities**: a device signs in as `user:<name>`, so what it
+  owns survives a re-login, and a durable identity registry keeps device names
+  and rule ids apart across restarts.
+- **The launch-code sign-in for `agentd tui` and `agentd ui`**: the TUI reads
+  the code from an inherited fd; the web UI gets it in a URL fragment through
+  a 0600 launch file (or printed with `--no-open`), and any later tab signs in
+  by a code typed at the launcher's terminal.
+- **The events extension** (`https://agentd.dev/a2a/ext/events`):
+  `agentd.events/SubscribeToEvents`, with a closed vocabulary of kinds, a
+  schema for each, and an `auth` kind. Switched by `a2a.events.enabled`.
+- **The task-annotations extension**
+  (`https://agentd.dev/a2a/ext/task-annotations`): agentd's facts about a task
+  under that URI, present only when activated.
+- **The unix binding** `https://agentd.dev/a2a/binding/jsonrpc-unix`, declared
+  on a unix listener's card.
+- **`Task.history`**: the caller's messages and the agent's status messages,
+  in order.
+- **Retention** (`store.retention.tasks {keep_last, ttl}`) for settled tasks.
+- **`observability.status_values`**: memory keys `status` publishes as
+  `values`.
+- `a2a.url`, `a2a.cors.origins`, `a2a.introspection.enabled`,
+  `agent.description`, `agent.ask_human_unowned` and
+  `security.policies[].to`.
+- `admin.set {path, value}`, an operator op over the runtime-settable paths.
+- `agentd --extensions` and `agentd --extension-schema <name>`, the registry
+  and schema bundles that agentd.dev serves at each extension's URI.
+- ListTasks honours every field it is sent (filters, paging with an opaque
+  cursor, `historyLength`, `includeArtifacts`), and ListTaskPushNotificationConfigs
+  pages.
+- The launcher's `--daemon-log`, and `agentd ui`'s `--port` and `--no-open`.
+- agentd-tui's `--launch-fd`, `--login [--scope user|operator]`,
+  `--bearer-file` and `--no-extensions`; agentd-ui's `--listen-fd`.
+
+### Fixed
+
+The protocol findings of the audit:
+
+- **C1**: SendMessage took a caller-chosen task id, reopened settled tasks and
+  started a new task for another principal's id.
+- **C2**: agentd's outbound `send` used the 0.3 role spelling, so every 1.0
+  server, agentd's own included, refused it.
+- **C3**: the server ignored every ListTasks field and did not sort.
+- **C4**: push config Get and Delete without an id read an arbitrary config
+  or deleted every one.
+- **C5**: an inline push config on SendMessage always failed for a new task.
+- **C6**: the conformance check for a disclaimed capability called a 0.3
+  method name and passed on any server.
+- **C7**: parts other than text or a command were refused or dropped;
+  `-32005` is now used for an unsupported media type.
+- **C8**: outbound delegation never read the peer's card and always streamed.
+- **C9**: the display clients had no standards-only mode.
+- **F09**: push credentials in the 1.0 shape were dropped.
+- **F10**: `Pair` was an undeclared, anonymous method that issued
+  credentials.
+- **F11**: `GetAgentCard` was a non-spec method and the clients' only
+  discovery.
+- **F12**: extension activation had no effect on the server.
+- **F13**: the command extension answered sends with results that were
+  neither a Task nor a Message.
+- **F14**: display-only ops sat under the generic command extension.
+- **F15**: the card declared `protocolVersion` 0.3.0 for a 1.0 interface.
+- **F16**: there was no `A2A-Version` negotiation on either side.
+- **F17**: the card declared no security schemes.
+- **F18**: the interface URL was the raw bind address.
+- **F19**: human-in-the-loop gates worked only with the UI flag on.
+- **F20**: sends used the 0.3 `configuration.blocking`.
+- **F21**: client messages omitted `Message.role` and could pair a contextId
+  with another context's task.
+- **F22**: the display clients did no card discovery.
+- **F23**: the display client used agentd's extensions without checking the
+  card.
+- **F26**: unknown methods got `-32003` instead of `-32601`.
+- **F27**: legacy method aliases and the `a2a.` prefix were served.
+- **F28**: the guard over non-spec methods could not see the listener's own
+  vocabulary.
+- **F29**: the `A2A-Extensions` echo misreported what was activated.
+- **F30**: CORS blocked `A2A-Version` and discovery, hid the echo, reflected
+  any origin and trusted every loopback origin.
+- **F31**: the well-known card answered 200 with `null` or an internal error,
+  with no validators.
+- **F32**: skills were emitted without their required description.
+- **F33**: the command extension under-declared its op space.
+- **F34**: the extension specs did not define what the extensions carry, and
+  the URIs 404'd.
+- **F35**: clients depended on undeclared internal payload shapes.
+- **F36**: the push body was a bare Task.
+- **F37**: rate-limit refusals came back as success, draining had two codes,
+  and CancelTask on a settled task returned it.
+- **F38**: SSE streams closed early, framed errors as SSE on 200, and
+  SubscribeToTask on a settled task opened a stream.
+- **F39**: listener authentication and CORS were configured under the UI
+  section.
+- **F40**: the daemon owned the display clients' chrome layout.
+- **F41**: the transcript reached clients only through a private feed.
+- **F42**: the clients' observation created a durable task on every poll.
+- **F43**: introspection, the log ring and runtime approval were gated on UI
+  flags.
+- **F44**: the client-daemon contract test ran only on interface changes and
+  asserted internals.
+- **F46**: the client's ListTasks ignored paging and never asked for
+  artifacts.
+- **F47**: the TS SSE parser handled only LF framing.
+- **F48**: the TS client dropped error information and retried auth and
+  version failures forever.
+- **F49**: client auth ignored the card's schemes and session expiry.
+- **F50**: the 0.2 discovery path was still routed.
+- **F51**: the docs and comments contradicted the code on what is A2A.
+- **F53**: the card name ignored `agent.name`.
+- **F54**: malformed envelopes got `-32700` or `-32003` instead of `-32600`.
+- **F55**: the feed resumed from the highest seen seq instead of the
+  goodbye's.
+- **F56**: the core audit path hard-coded one UI's polling.
+- **F57**: the daemon CLI embedded the Node clients' flags and forced UI
+  config.
+- **F58**: the client hard-coded agentd configuration knowledge.
+
+Also fixed on the way: a tool's `_meta` reaches an MCP server in
+`params._meta` (it was sent inside `arguments`, or not at all); a call's
+bound is honoured; the MCP notification stream carries its headers; operator
+headers go out once per POST; a slow or abandoned `tools/call` no longer
+holds up the next call on the same server.
+
+### Known limitations
+
+- A `tools/call` that agentd abandons at its bound (a step timeout, a lease
+  bound, a turn deadline) returns promptly but sends no
+  `notifications/cancelled`: rmcp 3.1.2's `call_tool` hides the request id
+  and its `input_required` retry helper is private. The server may keep
+  running the side effect, and a retry under the same idempotency key can
+  race it. Fixing it needs an rmcp change, or agentd driving the rounds
+  itself.
+
+### Crates
+
+agentd-mcp and agentd-net have breaking API removals: the vsock transport,
+the MCP server, the protocol version and era model, the native client and the
+NDJSON framing in agentd-mcp, and the vsock feature and public
+`validate_ca_pem` in agentd-net. The release bumps both to 2.0.0.
+
 ## v1.16.0 — a document configures what it is, not where it runs
 
 v1.12.1 established that a served document may not configure the terms it is

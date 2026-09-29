@@ -152,11 +152,19 @@ pub fn wait_a2a_bound(stderr_path: &str) -> String {
 /// [`wait_a2a_bound`] that gives up instead of panicking — a caller retrying a
 /// stolen port needs to distinguish "not yet" from "this daemon is dead".
 pub fn try_a2a_bound(stderr_path: &str, timeout: Duration) -> Option<String> {
+    try_bound(stderr_path, "a2a.listen", timeout)
+}
+
+/// The authority a daemon's listener ACTUALLY bound, from the `bound` field of
+/// its `event` line (`a2a.listen`, `webhooks.listen`); `None` once the daemon
+/// has exited or the timeout passes.
+pub fn try_bound(stderr_path: &str, event: &str, timeout: Duration) -> Option<String> {
     let deadline = Instant::now() + timeout;
+    let quoted = format!("\"{event}\"");
     loop {
         if let Ok(log) = std::fs::read_to_string(stderr_path) {
             for line in log.lines().rev() {
-                if !line.contains("\"a2a.listen\"") {
+                if !line.contains(&quoted) {
                     continue;
                 }
                 if let Some(rest) = line.split("\"bound\":\"").nth(1)
@@ -166,8 +174,12 @@ pub fn try_a2a_bound(stderr_path: &str, timeout: Duration) -> Option<String> {
                 }
             }
             // A daemon whose bind lost the race exits at once — do not wait out
-            // the whole timeout for a process that is already gone.
-            if log.contains("a2a listen") || log.contains("a2a.listen:") {
+            // the whole timeout for a process that is already gone. Keyed on
+            // the exit, not on the text `a2a.listen:`: a no-credential
+            // loopback daemon logs a `config.warning` starting with exactly
+            // that, before it binds, and reading it as a failed bind made a
+            // healthy daemon look dead whenever the poll landed in between.
+            if log.contains("\"proc.exit\"") || log.contains("\"config.invalid\"") {
                 return None;
             }
         }
@@ -176,6 +188,52 @@ pub fn try_a2a_bound(stderr_path: &str, timeout: Duration) -> Option<String> {
         }
         std::thread::sleep(Duration::from_millis(25));
     }
+}
+
+/// Spawn a test's daemon on a probed free port and return it with the A2A
+/// authority it CONFIRMED binding, once it is ready to answer.
+///
+/// `attempt(port)` writes a config listening on `port`, spawns the daemon and
+/// returns it with the path of its stderr log. The probe→bind gap is a real
+/// race under parallel load — another process can take the port — so the
+/// authority comes from the daemon's own `a2a.listen` line, never from the
+/// probe, and a daemon whose bind lost is dropped (its `Drop` stops it) and
+/// retried on a fresh port. A bare connect would instead talk to whoever holds
+/// the port. Ready means `proc.ready` too: the listener binds before the
+/// workflow registry is populated, so a request can otherwise arrive before
+/// the start node or workflow it names exists. The config must log at `info`,
+/// where both lines are written.
+pub fn spawn_bound<D>(attempt: impl FnMut(u16) -> (D, String)) -> (D, String) {
+    spawn_listener_bound("a2a.listen", attempt)
+}
+
+/// [`spawn_bound`] for a daemon whose listener under test is another one —
+/// `webhooks.listen` — named by its bind line's event.
+pub fn spawn_listener_bound<D>(
+    event: &str,
+    mut attempt: impl FnMut(u16) -> (D, String),
+) -> (D, String) {
+    let mut last = String::new();
+    for _ in 0..5 {
+        let (daemon, stderr_path) = attempt(free_port());
+        if let Some(addr) = try_bound(&stderr_path, event, Duration::from_secs(20)) {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                let log = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+                if log.contains("\"event\":\"proc.ready\"") {
+                    return (daemon, addr);
+                }
+                assert!(
+                    Instant::now() < deadline && !log.contains("\"proc.exit\""),
+                    "the daemon bound {addr} but never became ready; stderr:\n{log}"
+                );
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+        last = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+        drop(daemon);
+    }
+    panic!("the daemon never bound its {event} listener (5 attempts); last stderr:\n{last}")
 }
 
 // ── The A2A client harness ──────────────────────────────────────────────────

@@ -8,7 +8,8 @@
 //! the tables the listener, the card and the launcher are built from:
 //!
 //! - a JSON-RPC method a page names is one of the specification's eleven
-//!   ([`SpecMethod::ALL`]) or an extension method ([`EXTENSION_METHODS`]);
+//!   ([`SpecMethod::ALL`]) or an extension method ([`EXTENSION_METHODS`]) —
+//!   MCP's own, read from the mcp crate, aside;
 //! - an `https://agentd.dev/a2a/…` or `…/oauth/grant-type/…` URI is one
 //!   agentd declares — an extension, the unix binding, the launch grant — or a
 //!   file agentd.dev serves under one;
@@ -153,10 +154,50 @@ fn method_like(token: &str) -> bool {
         })
 }
 
+/// MCP's method and notification names, read from the constants the mcp
+/// crate speaks them by: a page shows them in MCP examples, and they are not
+/// the listener's to answer.
+fn mcp_methods() -> &'static [String] {
+    static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    NAMES.get_or_init(|| {
+        let src = std::fs::read_to_string(workspace_root().join("crates/mcp/src/wire.rs")).unwrap();
+        let (_, module) = src
+            .split_once("pub mod method {")
+            .expect("crates/mcp/src/wire.rs keeps its method names in `pub mod method`");
+        let module = module.split("\n}").next().unwrap();
+        let names: Vec<String> = module
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("pub const "))
+            .filter_map(|l| l.split_once("&str = \"")?.1.split_once('"'))
+            .map(|(name, _)| name.to_string())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "tools/call") && names.len() > 10,
+            "the mcp crate's method names were not found: {names:?}"
+        );
+        names
+    })
+}
+
+/// A value of a `method` key that is a JSON-RPC method name: PascalCase (an
+/// uppercase letter, then a lowercase one — `POST` is an HTTP verb), an
+/// `agentd.` namespace, or a lowercase `ns/method` path — A2A 0.x's
+/// `message/send` shape — that is not one of MCP's.
+fn rpc_method_value(value: &str) -> bool {
+    let mut chars = value.chars();
+    let pascal = chars.next().is_some_and(|c| c.is_ascii_uppercase())
+        && chars.next().is_some_and(|c| c.is_ascii_lowercase());
+    let path = value.starts_with(|c: char| c.is_ascii_lowercase())
+        && value.contains('/')
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-'));
+    pascal || value.starts_with("agentd.") || (path && !mcp_methods().iter().any(|m| m == value))
+}
+
 /// The method names a line uses: each backticked method-like token, each
-/// value of a `method` key that is PascalCase or `agentd.`-namespaced (MCP's
-/// `tools/call` and friends are lowercase and not the listener's), and each
-/// `agentd.<namespace>/<Method>` token.
+/// value of a `method` key that names a JSON-RPC method ([`rpc_method_value`])
+/// and each `agentd.<namespace>/<Method>` token.
 fn method_names(line: &str) -> Vec<String> {
     let mut out = Vec::new();
     // Backticked spans.
@@ -187,7 +228,7 @@ fn method_names(line: &str) -> Vec<String> {
             let Some(value) = rest[1..].split(q).next() else {
                 continue;
             };
-            if value.starts_with(|c: char| c.is_ascii_uppercase()) || value.starts_with("agentd.") {
+            if rpc_method_value(value) {
                 out.push(value.to_string());
             }
         }
@@ -294,8 +335,10 @@ fn declared_uris() -> Vec<&'static str> {
 
 /// Whether `uri` is a declared URI, or a file agentd.dev publishes under one
 /// (the schema bundle and golden examples beside each extension's spec).
+///
+/// Byte for byte: a peer's negotiation compares URIs exactly, so a trailing
+/// slash names an extension nothing activates.
 fn is_declared(uri: &str, declared: &[&str]) -> bool {
-    let uri = uri.trim_end_matches('/');
     if declared.contains(&uri) {
         return true;
     }
@@ -411,9 +454,7 @@ fn the_launcher_contract_is_documented() {
     // reader to the flag it replaced.
     let mut found = Vec::new();
     for (file, n, line) in scanned_lines() {
-        let lower = line.to_lowercase();
-        let names_launcher = lower.contains("agentd tui") || lower.contains("agentd ui");
-        if names_launcher && (lower.contains("was removed") || lower.contains("deprecated")) {
+        if says_launcher_gone(&line) {
             found.push(format!("{file}:{n}: says the launcher is gone: {line}"));
         }
         if line.contains("--spawn") {
@@ -421,6 +462,21 @@ fn the_launcher_contract_is_documented() {
         }
     }
     assert!(found.is_empty(), "{}", found.join("\n"));
+}
+
+/// Whether a line names `agentd tui` or `agentd ui` and, in the same line,
+/// says it went away — in any of the ways a page words that.
+fn says_launcher_gone(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    let names_launcher = ["agentd tui", "agentd ui"].iter().any(|l| {
+        lower.match_indices(l).any(|(at, _)| {
+            !lower[at + l.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '-')
+        })
+    });
+    names_launcher
+        && ["removed", "deprecated", "no longer", "gone", "replaced by"]
+            .iter()
+            .any(|claim| lower.contains(claim))
 }
 
 /// The matchers themselves: each shape is caught, and what merely resembles
@@ -434,6 +490,12 @@ fn the_matchers_find_each_shape_and_nothing_else() {
         (r#"  "method": "agentd.feed/Watch","#, "agentd.feed/Watch"),
         ("const m = { method: 'ListEverything' };", "ListEverything"),
         ("the agentd.interface/Pair method", "agentd.interface/Pair"),
+        (r#"{"method":"message/send","params":{}}"#, "message/send"),
+        (r#"  "method": "tasks/resubscribe","#, "tasks/resubscribe"),
+        (
+            r#"{"method": "agent/getAuthenticatedExtendedCard"}"#,
+            "agent/getAuthenticatedExtendedCard",
+        ),
     ] {
         assert!(
             method_names(line).contains(&want.to_string()),
@@ -445,6 +507,9 @@ fn the_matchers_find_each_shape_and_nothing_else() {
         "control messages (`Cancel`, `Ping`, `ToolResult`)",
         "see https://agentd.dev/a2a/ext/events",
         r#"{"method": "tools/call"}"#,
+        r#"{"jsonrpc":"2.0","method":"notifications/resources/updated"}"#,
+        r#"{"method": "POST"}"#,
+        "  method: \"GET\"",
         "a `DataPart` on a `Task`",
         "`SendMessage` and `agentd.events/SubscribeToEvents`",
     ] {
@@ -462,6 +527,7 @@ fn the_matchers_find_each_shape_and_nothing_else() {
         "https://agentd.dev/a2a/ext/interface.",
         "(https://agentd.dev/oauth/grant-type/device)",
         "https://agentd.dev/a2a/ext/events/schema-1.json",
+        "`https://agentd.dev/a2a/ext/command/`",
     ] {
         let uris = owned_uris(bad);
         assert!(
@@ -480,6 +546,26 @@ fn the_matchers_find_each_shape_and_nothing_else() {
             uris.iter().all(|u| is_declared(u, &declared)),
             "false hit on {good}: {uris:?}"
         );
+    }
+
+    for gone in [
+        "`agentd tui` was removed in 2.0",
+        "`agentd tui` has been removed",
+        "`agentd ui` is removed",
+        "agentd tui is gone",
+        "agentd ui no longer exists",
+        "agentd tui is deprecated",
+        "`agentd ui` was replaced by `agentd-ui`",
+    ] {
+        assert!(says_launcher_gone(gone), "missed: {gone}");
+    }
+    for kept in [
+        "`agentd tui` starts the daemon and the terminal client",
+        "the removed `--spawn` flag",
+        "`agentd-ui` is no longer bundled",
+        "agentd uinput is gone",
+    ] {
+        assert!(!says_launcher_gone(kept), "false hit: {kept}");
     }
 
     let page = "# T\n## Launcher\nx\n```\n# sample\n```\n### Sub\ny\n## Next\nz\n";

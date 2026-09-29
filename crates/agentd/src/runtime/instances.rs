@@ -470,10 +470,8 @@ impl Runtime {
         )
     }
 
-    /// Spawn the child daemon: same binary, `--config <path>`, config-alias env
-    /// scrubbed (the composed file is the child's whole config; only the
-    /// intelligence family passes through for credentials), own process group,
-    /// template rlimits, log to `<dir>/log`.
+    /// Spawn the child daemon ([`instance_command`], logging to `<dir>/log`)
+    /// under the reaper.
     fn spawn_instance_process(
         &mut self,
         config_path: &std::path::Path,
@@ -486,53 +484,7 @@ impl Runtime {
             .append(true)
             .open(dir.join("log"))
             .map_err(|e| format!("open log: {e}"))?;
-        let mut cmd = std::process::Command::new(exe);
-        cmd.arg("--config")
-            .arg(config_path)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::from(
-                log_file.try_clone().map_err(|e| e.to_string())?,
-            ))
-            .stderr(std::process::Stdio::from(log_file));
-        for (k, _) in std::env::vars() {
-            let alias = k.starts_with(crate::config::paths::ENV_PREFIX);
-            let keep = k.contains("INTELLIGENCE");
-            if alias && !keep {
-                cmd.env_remove(&k);
-            }
-        }
-        cmd.env(crate::supervisor::reap::INSTANCE_CHILD_ENV, "1");
-        let (memory_bytes, cpu_seconds) = parse_instance_rlimits(limits)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            unsafe {
-                cmd.pre_exec(move || {
-                    if libc::setpgid(0, 0) != 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    if let Some(b) = memory_bytes {
-                        let lim = libc::rlimit {
-                            rlim_cur: b,
-                            rlim_max: b,
-                        };
-                        if libc::setrlimit(libc::RLIMIT_AS, &lim) != 0 {
-                            return Err(std::io::Error::last_os_error());
-                        }
-                    }
-                    if let Some(c) = cpu_seconds {
-                        let lim = libc::rlimit {
-                            rlim_cur: c,
-                            rlim_max: c + 5,
-                        };
-                        if libc::setrlimit(libc::RLIMIT_CPU, &lim) != 0 {
-                            return Err(std::io::Error::last_os_error());
-                        }
-                    }
-                    Ok(())
-                });
-            }
-        }
+        let mut cmd = instance_command(&exe, config_path, log_file, limits)?;
         let child =
             crate::supervisor::reaper::spawn_tracked_pid(&self.children.reap_sender(), || {
                 cmd.spawn()
@@ -1011,6 +963,70 @@ impl Runtime {
     }
 }
 
+/// The instance daemon's command: same binary, `--config <path>`, config-alias
+/// env scrubbed (the composed file is the child's whole config; only the
+/// intelligence family passes through for credentials), own process group,
+/// template rlimits, stdout and stderr to `log_file` — and no other
+/// descriptor the process holds, however the process was started.
+fn instance_command(
+    exe: &std::path::Path,
+    config_path: &std::path::Path,
+    log_file: std::fs::File,
+    limits: &Option<Value>,
+) -> Result<std::process::Command, String> {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--config")
+        .arg(config_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(
+            log_file.try_clone().map_err(|e| e.to_string())?,
+        ))
+        .stderr(std::process::Stdio::from(log_file));
+    for (k, _) in std::env::vars() {
+        let alias = k.starts_with(crate::config::paths::ENV_PREFIX);
+        let keep = k.contains("INTELLIGENCE");
+        if alias && !keep {
+            cmd.env_remove(&k);
+        }
+    }
+    cmd.env(crate::supervisor::reap::INSTANCE_CHILD_ENV, "1");
+    let (memory_bytes, cpu_seconds) = parse_instance_rlimits(limits)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if let Some(b) = memory_bytes {
+                    let lim = libc::rlimit {
+                        rlim_cur: b,
+                        rlim_max: b,
+                    };
+                    if libc::setrlimit(libc::RLIMIT_AS, &lim) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                if let Some(c) = cpu_seconds {
+                    let lim = libc::rlimit {
+                        rlim_cur: c,
+                        rlim_max: c + 5,
+                    };
+                    if libc::setrlimit(libc::RLIMIT_CPU, &lim) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+    }
+    // An instance is handed its log and nothing else: every descriptor
+    // from 3 up is marked.
+    crate::signals::pass_only_stdio(&mut cmd);
+    Ok(cmd)
+}
+
 /// Instance rlimits: `{memory, cpu}` only (compile enforced it; parse here).
 fn parse_instance_rlimits(limits: &Option<Value>) -> Result<(Option<u64>, Option<u64>), String> {
     let Some(l) = limits else {
@@ -1372,5 +1388,28 @@ mod tests {
         .unwrap();
         assert_eq!(read_child_lifetime_tokens(&dir), Some(4242));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An embedder starts instances from its own binary, in a process the
+    /// agentd binary's start-up marking never ran in: a descriptor the host
+    /// left inheritable reaches a plain spawn, and not the instance.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_instance_holds_no_descriptor_the_host_left_open() {
+        use crate::signals::stray_fd::{StrayPipe, cleanup, lister, listing, lock, run};
+        let _g = lock();
+        let stray = StrayPipe::open();
+        let exe = lister("instance");
+        let plain = listing(&mut std::process::Command::new(&exe));
+        assert!(stray.held_in(&plain), "a plain spawn inherits it: {plain}");
+        let log = exe.with_file_name("log");
+        let file = std::fs::File::create(&log).unwrap();
+        let mut cmd = instance_command(&exe, std::path::Path::new("unused.yaml"), file, &None)
+            .expect("the command builds");
+        assert!(run(&mut cmd).status.success());
+        let fds = std::fs::read_to_string(&log).unwrap();
+        cleanup(&exe);
+        assert!(fds.contains("-> /dev/null"), "the listing ran: {fds}");
+        assert!(!stray.held_in(&fds), "the instance holds the stray: {fds}");
     }
 }

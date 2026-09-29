@@ -83,6 +83,9 @@ pub(crate) fn run_command(
             c.env(k, v);
         }
     }
+    // Nor any descriptor the host left inheritable: a model-chosen command
+    // gets its three pipes and nothing else, however agentd was started.
+    crate::signals::pass_only_stdio(&mut c);
     let mut child = c.spawn().map_err(|e| format!("spawn {cmd}: {e}"))?;
 
     // Feed stdin on a thread (so a child that writes before reading can't deadlock).
@@ -212,6 +215,37 @@ mod tests {
         .unwrap();
         assert_eq!(out["timed_out"], true, "killed at the deadline");
         std::fs::remove_dir_all(&wd).ok();
+    }
+
+    /// An embedder's process never ran the binary's start-up marking, so a
+    /// descriptor its host left inheritable is still inheritable here: the
+    /// exec tool's child holds none of it, while a plain spawn of the same
+    /// command does — the stray was there to leak.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_exec_child_holds_no_descriptor_the_host_left_open() {
+        use crate::signals::stray_fd::{StrayPipe, listing, lock};
+        let _g = lock();
+        let stray = StrayPipe::open();
+        let plain = listing(Command::new("ls").args(["-l", "/proc/self/fd"]));
+        assert!(stray.held_in(&plain), "a plain spawn inherits it: {plain}");
+
+        let wd = tmp_workdir("fds");
+        let cwd = resolve_cwd(&wd, None).unwrap();
+        let out = run_command(
+            "ls",
+            &["-l".into(), "/proc/self/fd".into()],
+            &cwd,
+            None,
+            Duration::from_secs(5),
+            64 * 1024,
+            &[],
+        )
+        .unwrap();
+        std::fs::remove_dir_all(&wd).ok();
+        let fds = out["stdout"].as_str().unwrap();
+        assert!(fds.contains("pipe:["), "the listing ran: {out}");
+        assert!(!stray.held_in(fds), "the exec child holds the stray: {fds}");
     }
 
     #[test]

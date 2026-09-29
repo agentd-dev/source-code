@@ -690,9 +690,19 @@ match (an admitted origin other than the code's, or any `Origin` on a TUI's code
 saved terminal, the daemon log — is close-on-exec, and the one a client is meant to have reaches
 fd 3 only in that client, between fork and exec. So no process the daemon spawns — the `exec`
 tool, an instance, a subagent — inherits the operator's terminal, the pipe or the UI socket.
-And at start, before it opens anything, every agentd process — the launcher, a daemon however it
-was started, a subagent — marks close-on-exec each descriptor it inherited beyond its stdio, so a
-pipe or socket its own parent left open reaches none of its children either.
+A descriptor agentd's own parent left open reaches none of its children either, by two rules.
+At start, before it opens anything, every process of the agentd binary — the launcher, the
+daemon, a subagent or instance re-exec — marks close-on-exec each descriptor it inherited beyond
+its stdio. And every child the daemon spawns — the `exec` tool's command, a subagent, an instance —
+has every descriptor from 3 up marked close-on-exec in the child, between fork and exec, so it
+keeps only its stdio whether agentd runs as its own binary or embedded in another's; the host's
+own descriptors are left as they are. The marking is one `close_range` call on Linux 5.11+.
+Where an older kernel or a seccomp profile refuses it, and off Linux, a process marks what
+`/proc/self/fd` (`/dev/fd` off Linux) lists, and without `/proc` (agentd as PID 1 in a bare
+container) tries each number below its descriptor limit, capped at 65536 — as a child between
+fork and exec always does, since it may not read a directory there. A limit above the cap leaves
+higher numbers unmarked, and the process says so at start in one
+`process.inherited_fds_unmarked` warning on stderr.
 
 **The session is the operator's.** It acts for the person who ran the launcher, who started
 this daemon in-process from their own configuration and credentials — and, on a no-auth

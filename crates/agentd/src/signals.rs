@@ -304,9 +304,45 @@ mod imp {
         }
     }
 
-    pub fn cloexec_inherited_fds() {
-        // One syscall on Linux 5.11+: it sets the flag on every descriptor
-        // from 3 up and closes none of them.
+    /// The fallback scan's reach when no listing of the descriptor table can
+    /// be read: every number below it is tried. A soft limit of a million —
+    /// common in containers — would cost a second of `fcntl` calls per spawn.
+    const FD_SCAN_CAP: libc::c_int = 65_536;
+
+    /// Where [`cloexec_by_range`] stops, and whether that is past every
+    /// descriptor this process can open (the soft `RLIMIT_NOFILE` is at or
+    /// under the cap). Read in the parent: `getrlimit` is not on the list of
+    /// calls a child may make between fork and exec.
+    pub fn fd_scan_bound() -> (libc::c_int, bool) {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+            return (FD_SCAN_CAP, false);
+        }
+        if lim.rlim_cur > FD_SCAN_CAP as libc::rlim_t {
+            (FD_SCAN_CAP, false)
+        } else {
+            (lim.rlim_cur as libc::c_int, true)
+        }
+    }
+
+    /// Set close-on-exec on `fd` if it is open and not yet marked. Two
+    /// `fcntl` calls, so a child between fork and exec may make it.
+    fn mark_cloexec(fd: libc::c_int) {
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
+                libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            }
+        }
+    }
+
+    /// One syscall on Linux 5.11+: it sets the flag on every descriptor from
+    /// 3 up and closes none of them. False on an older kernel, under a
+    /// seccomp profile that refuses it, and off Linux.
+    pub fn cloexec_by_close_range() -> bool {
         #[cfg(target_os = "linux")]
         {
             let rc = unsafe {
@@ -317,32 +353,86 @@ mod imp {
                     libc::CLOSE_RANGE_CLOEXEC,
                 )
             };
-            if rc == 0 {
-                return;
-            }
+            rc == 0
         }
-        // An older kernel, or another unix: walk the descriptor table. The
-        // listing's own descriptor is in it, already close-on-exec and closed
-        // by the time the flag is set, which `fcntl` refuses harmlessly.
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
+    /// Mark every descriptor the kernel lists for this process. False when
+    /// there is no listing to read — `/proc` unmounted, as it can be for
+    /// agentd as PID 1; on Linux `/dev/fd` is a link into `/proc`, so it is
+    /// no second path. The listing's own descriptor is in it, already
+    /// close-on-exec and closed by the time the flag is set, which `fcntl`
+    /// refuses harmlessly. It allocates, so it is for the process itself,
+    /// never a child between fork and exec.
+    pub fn cloexec_by_walk() -> bool {
         let dir = if cfg!(target_os = "linux") {
             "/proc/self/fd"
         } else {
             "/dev/fd"
         };
         let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
+            return false;
         };
         let fds: Vec<libc::c_int> = entries
             .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
             .filter(|fd| *fd >= 3)
             .collect();
         for fd in fds {
-            unsafe {
-                let flags = libc::fcntl(fd, libc::F_GETFD);
-                if flags >= 0 {
-                    libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            mark_cloexec(fd);
+        }
+        true
+    }
+
+    /// Try every number from 3 below `bound`, open or not. Needs no `/proc`
+    /// and makes only `fcntl` calls, so it is the last resort of both the
+    /// process and a child between fork and exec.
+    pub fn cloexec_by_range(bound: libc::c_int) {
+        for fd in 3..bound {
+            mark_cloexec(fd);
+        }
+    }
+
+    pub fn cloexec_inherited_fds() {
+        if cloexec_by_close_range() || cloexec_by_walk() {
+            return;
+        }
+        let (bound, complete) = fd_scan_bound();
+        cloexec_by_range(bound);
+        if !complete {
+            // No logger exists yet: this runs before the configuration is
+            // read. One line in the shape of the others, so an operator sees
+            // that a descriptor above the scan could still reach a child.
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "level": "warn",
+                    "event": "process.inherited_fds_unmarked",
+                    "scanned_below": bound,
+                    "msg": "close_range and /proc are unavailable and the descriptor limit exceeds the scan; a descriptor numbered above it keeps no close-on-exec",
+                })
+            );
+        }
+    }
+
+    pub fn pass_only_stdio(cmd: &mut std::process::Command) {
+        use std::os::unix::process::CommandExt;
+        let (bound, _) = fd_scan_bound();
+        // SAFETY: between fork and exec the closure makes only raw syscalls
+        // (close_range, fcntl) and touches no heap. std has placed the
+        // child's stdio on 0-2 before any closure runs, and its own
+        // exec-error pipe is close-on-exec already, so marking — never
+        // closing — leaves std's report of a failed exec intact.
+        unsafe {
+            cmd.pre_exec(move || {
+                if !cloexec_by_close_range() {
+                    cloexec_by_range(bound);
                 }
-            }
+                Ok(())
+            });
         }
     }
 
@@ -404,6 +494,7 @@ mod imp {
     }
     pub fn drain_wakeup() {}
     pub fn cloexec_inherited_fds() {}
+    pub fn pass_only_stdio(_cmd: &mut std::process::Command) {}
 }
 
 /// Mark every descriptor this process inherited beyond its stdio
@@ -419,8 +510,34 @@ mod imp {
 /// `exec` drops them. Nothing agentd hands a child arrives by inheritance
 /// from its own parent: the launcher's fd 3 is one it creates and places
 /// between fork and exec, so marking everything is the whole rule.
+///
+/// `close_range` does it in one call on Linux 5.11+; elsewhere the kernel's
+/// listing of the table is walked; with neither (an old kernel or a seccomp
+/// refusal, and no `/proc`) every number below the descriptor limit is tried,
+/// capped at 65536 — and past the cap one `process.inherited_fds_unmarked`
+/// warning says a higher descriptor was left as it was.
+///
+/// This covers the agentd binary's own processes. A child spawned through
+/// the library is covered however its host started — see
+/// [`pass_only_stdio`].
 pub fn cloexec_inherited_fds() {
     imp::cloexec_inherited_fds();
+}
+
+/// Arrange for `cmd`'s child to keep, across its `exec`, its stdio and no
+/// other descriptor it would inherit: every descriptor from 3 up is marked
+/// close-on-exec in the child, between fork and exec.
+///
+/// [`cloexec_inherited_fds`] runs only where the agentd binary's `main` does;
+/// an embedder of this crate spawns the exec tool, subagents and instances
+/// through its own `main`, and a descriptor its host left inheritable would
+/// reach each of them. Marking in the child covers every spawn site whoever
+/// started the process, and leaves the host's own descriptors alone. A site
+/// that hands the child a descriptor beyond its stdio places it in a
+/// `pre_exec` registered after this one: closures run in order, and a
+/// `dup2` copy carries no close-on-exec.
+pub fn pass_only_stdio(cmd: &mut std::process::Command) {
+    imp::pass_only_stdio(cmd);
 }
 
 /// Install SIGTERM/SIGINT/SIGCHLD/SIGPIPE handlers + the self-pipe. Call once
@@ -614,4 +731,175 @@ pub fn test_guard() -> SignalsTestGuard {
         .unwrap_or_else(|poison| poison.into_inner());
     reset_for_test();
     SignalsTestGuard(g)
+}
+
+/// A stray descriptor for the spawn-site tests: both ends of a pipe opened
+/// without close-on-exec, as a careless host would leave one, and a way to
+/// tell whether a child's `ls -l /proc/self/fd` shows it. Marking touches the
+/// whole descriptor table, so every test that plants a stray or marks the
+/// table holds [`stray_fd::lock`]: one test's marking would otherwise make
+/// another's stray close-on-exec before its child was spawned.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod stray_fd {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, MutexGuard};
+
+    static FD_TABLE: Mutex<()> = Mutex::new(());
+
+    pub(crate) fn lock() -> MutexGuard<'static, ()> {
+        FD_TABLE.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    pub(crate) struct StrayPipe {
+        pub(crate) fds: [libc::c_int; 2],
+        ino: u64,
+    }
+
+    impl StrayPipe {
+        /// A fresh pipe from plain `pipe(2)`: both ends inheritable.
+        pub(crate) fn open() -> StrayPipe {
+            let mut fds = [0 as libc::c_int; 2];
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::fstat(fds[0], &mut st) }, 0, "fstat");
+            let p = StrayPipe {
+                fds,
+                ino: st.st_ino,
+            };
+            assert!(
+                fds.iter().all(|fd| !cloexec(*fd)),
+                "the stray starts inheritable"
+            );
+            p
+        }
+
+        /// Whether an `ls -l /proc/self/fd` listing holds either end.
+        pub(crate) fn held_in(&self, listing: &str) -> bool {
+            listing.contains(&format!("pipe:[{}]", self.ino))
+        }
+    }
+
+    impl Drop for StrayPipe {
+        fn drop(&mut self) {
+            for fd in self.fds {
+                unsafe { libc::close(fd) };
+            }
+        }
+    }
+
+    pub(crate) fn cloexec(fd: libc::c_int) -> bool {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(flags >= 0, "fd {fd} is open");
+        flags & libc::FD_CLOEXEC != 0
+    }
+
+    /// A script in a fresh directory that lists the descriptors it holds on
+    /// its stdout and ignores its arguments, for a site whose command line
+    /// the test does not choose.
+    pub(crate) fn lister(name: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("agentd-fds-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("ls-fds.sh");
+        std::fs::write(&script, "#!/bin/sh\nexec ls -l /proc/self/fd\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    /// Run `cmd` to completion. A script just written can refuse to exec
+    /// while a concurrent test's fork still holds the writer's descriptor
+    /// (`ETXTBSY`) until that child execs; that passes.
+    pub(crate) fn run(cmd: &mut std::process::Command) -> std::process::Output {
+        for _ in 0..100 {
+            match cmd.output() {
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                r => return r.expect("run the lister"),
+            }
+        }
+        panic!("the lister stayed busy");
+    }
+
+    /// Run `cmd` to completion and return its stdout.
+    pub(crate) fn listing(cmd: &mut std::process::Command) -> String {
+        String::from_utf8_lossy(&run(cmd).stdout).into()
+    }
+
+    pub(crate) fn cleanup(script: &Path) {
+        if let Some(dir) = script.parent() {
+            std::fs::remove_dir_all(dir).ok();
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod fd_tests {
+    use super::stray_fd::{StrayPipe, cloexec, lock};
+    use std::process::{Command, Stdio};
+
+    /// The walk is what an older kernel, or a seccomp profile that refuses
+    /// `close_range`, relies on; called directly because `close_range`
+    /// succeeds on every kernel the tests run on.
+    #[test]
+    fn the_walk_marks_an_inheritable_pipe() {
+        let _g = lock();
+        let stray = StrayPipe::open();
+        assert!(super::imp::cloexec_by_walk(), "/proc/self/fd is readable");
+        for fd in stray.fds {
+            assert!(cloexec(fd), "fd {fd} is close-on-exec after the walk");
+        }
+    }
+
+    /// With neither `close_range` nor `/proc`, trying every number below
+    /// the limit needs nothing but `fcntl`.
+    #[test]
+    fn the_range_fallback_marks_an_inheritable_pipe_without_proc() {
+        let _g = lock();
+        let stray = StrayPipe::open();
+        let (bound, _) = super::imp::fd_scan_bound();
+        assert!(
+            stray.fds.iter().all(|fd| *fd < bound),
+            "the scan reaches the pipe"
+        );
+        super::imp::cloexec_by_range(bound);
+        for fd in stray.fds {
+            assert!(cloexec(fd), "fd {fd} is close-on-exec after the range");
+        }
+    }
+
+    #[test]
+    fn the_scan_bound_is_the_soft_limit_capped() {
+        let (bound, complete) = super::imp::fd_scan_bound();
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) }, 0);
+        assert_eq!(bound as libc::rlim_t, lim.rlim_cur.min(65_536));
+        assert_eq!(complete, lim.rlim_cur <= 65_536);
+    }
+
+    /// A child spawned with [`super::pass_only_stdio`] holds no stray the
+    /// process never marked — while the same child without it does, so the
+    /// stray was there to leak.
+    #[test]
+    fn a_child_spawned_with_pass_only_stdio_holds_no_stray() {
+        let _g = lock();
+        let stray = StrayPipe::open();
+        let run = |hygiene: bool| {
+            let mut cmd = Command::new("ls");
+            cmd.args(["-l", "/proc/self/fd"]).stdin(Stdio::null());
+            if hygiene {
+                super::pass_only_stdio(&mut cmd);
+            }
+            super::stray_fd::listing(&mut cmd)
+        };
+        assert!(stray.held_in(&run(false)), "a plain spawn inherits it");
+        let listing = run(true);
+        assert!(!stray.held_in(&listing), "{listing}");
+        for fd in stray.fds {
+            assert!(!cloexec(fd), "the parent's own descriptors are untouched");
+        }
+    }
 }

@@ -15,7 +15,7 @@
 //! `waitpid(-1)` it calls [`Subagent::mark_reaped`], so `Drop` will not signal
 //! a possibly-reused pid.
 
-use crate::subagent::protocol::{AgentMsg, ControlMsg, SUBAGENT_ENV, SpawnPayload};
+use crate::subagent::protocol::{AgentMsg, ControlMsg, Limits, SUBAGENT_ENV, SpawnPayload};
 use crate::supervisor::kill::kill_group;
 use crate::supervisor::tree::NodeId;
 use ::mcp::rpc::frame;
@@ -53,15 +53,11 @@ pub struct Subagent {
 /// Return `false` when the consumer is gone (stops the reader).
 pub type FrameSink = std::sync::Arc<dyn Fn(NodeId, AgentMsg) -> bool + Send + Sync>;
 
-/// Spawn a subagent that re-execs `exe` (normally `std::env::current_exe()`),
-/// delivering `payload`. Upward messages are handed to `events` tagged with
-/// `node`.
-pub fn spawn(
-    exe: &Path,
-    payload: &SpawnPayload,
-    node: NodeId,
-    events: FrameSink,
-) -> io::Result<Subagent> {
+/// The re-exec of `exe` as a subagent under `limits`: its stdio the control
+/// channel and the inherited stderr, its own process group, the declared
+/// rlimits — and no other descriptor the process holds, however the process
+/// was started.
+fn subagent_command(exe: &Path, limits: &Limits) -> Command {
     let mut cmd = Command::new(exe);
     cmd.env(SUBAGENT_ENV, "1")
         .stdin(Stdio::piped())
@@ -73,11 +69,11 @@ pub fn spawn(
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        // Copy the OS caps out of the payload: the pre_exec closure runs
+        // Copy the OS caps out of the limits: the pre_exec closure runs
         // between fork and exec and may only touch plain values.
-        let mem = payload.limits.memory_bytes;
-        let cpu = payload.limits.cpu_seconds;
-        let nice = payload.limits.nice;
+        let mem = limits.memory_bytes;
+        let cpu = limits.cpu_seconds;
+        let nice = limits.nice;
         // SAFETY: only async-signal-safe calls between fork and exec
         // (setpgid/setrlimit/setpriority all are).
         unsafe {
@@ -113,6 +109,22 @@ pub fn spawn(
             });
         }
     }
+    // A subagent is handed its control pipes and stderr, nothing else, so
+    // every descriptor from 3 up is marked.
+    crate::signals::pass_only_stdio(&mut cmd);
+    cmd
+}
+
+/// Spawn a subagent that re-execs `exe` (normally `std::env::current_exe()`),
+/// delivering `payload`. Upward messages are handed to `events` tagged with
+/// `node`.
+pub fn spawn(
+    exe: &Path,
+    payload: &SpawnPayload,
+    node: NodeId,
+    events: FrameSink,
+) -> io::Result<Subagent> {
+    let mut cmd = subagent_command(exe, &payload.limits);
 
     // Spawn, retrying a transient `EAGAIN` — the kernel refusing a `fork` under
     // process/memory pressure (a wide fan-out starting many subagents at once, or
@@ -236,5 +248,39 @@ impl Drop for Subagent {
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use crate::signals::stray_fd::{StrayPipe, cleanup, lister, listing, lock};
+
+    fn limits() -> Limits {
+        Limits {
+            max_steps: 1,
+            max_tokens: 1,
+            deadline_ms: 1_000,
+            max_depth: 1,
+            memory_bytes: None,
+            cpu_seconds: None,
+            nice: None,
+        }
+    }
+
+    /// An embedder re-execs its own binary as the subagent, from a process
+    /// the agentd binary's start-up marking never ran in: a descriptor the
+    /// host left inheritable reaches a plain spawn, and not the subagent.
+    #[test]
+    fn a_subagent_holds_no_descriptor_the_host_left_open() {
+        let _g = lock();
+        let stray = StrayPipe::open();
+        let exe = lister("subagent");
+        let plain = listing(&mut Command::new(&exe));
+        assert!(stray.held_in(&plain), "a plain spawn inherits it: {plain}");
+        let fds = listing(&mut subagent_command(&exe, &limits()));
+        cleanup(&exe);
+        assert!(fds.contains("pipe:["), "the listing ran: {fds}");
+        assert!(!stray.held_in(&fds), "the subagent holds the stray: {fds}");
     }
 }

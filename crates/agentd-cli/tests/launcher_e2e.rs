@@ -253,9 +253,19 @@ fn inherit_stray_pipe(cmd: &mut Command) {
         cmd.pre_exec(move || {
             // `ends` is moved in, so the pipe outlives this closure's use.
             let _ = &ends;
-            for (src, dst) in srcs.into_iter().zip(STRAY_FDS) {
-                // dup2 leaves the copy without close-on-exec: inherited.
-                if libc::dup2(src, dst) < 0 {
+            // Each end goes through a copy above both targets first: an end
+            // already numbered like a target would be overwritten by the
+            // other end's `dup2`, or — `dup2` onto itself doing nothing —
+            // keep its close-on-exec and never be inherited at all.
+            let mut tmps = [0 as libc::c_int; 2];
+            for (src, tmp) in srcs.into_iter().zip(&mut tmps) {
+                *tmp = libc::fcntl(src, libc::F_DUPFD_CLOEXEC, 200);
+                if *tmp < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            for (tmp, dst) in tmps.into_iter().zip(STRAY_FDS) {
+                if libc::dup2(tmp, dst) < 0 || libc::fcntl(dst, libc::F_SETFD, 0) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
             }
@@ -305,6 +315,34 @@ fn wait_exit(child: &mut Child, s: &Scratch) -> (ExitStatus, String) {
 fn launch(s: &Scratch, args: &[&str], env: &[(&str, &str)]) -> (ExitStatus, String) {
     let mut r = start(s, args, env, false);
     wait_exit(&mut r.child, s)
+}
+
+/// [`launch`], with the stub held up until the test has seen the launcher
+/// holding the stray pipe it inherited — so a client found without it shows
+/// the launcher kept it back, not that it never arrived.
+fn launch_holding_stray(s: &Scratch, args: &[&str], env: &[(&str, &str)]) -> (ExitStatus, String) {
+    s.write("hold", "");
+    let run = start(s, args, env, false);
+    s.wait_file("recorded", Duration::from_secs(20));
+    assert_holds_stray(run.child.id() as i32);
+    run.finish(s)
+}
+
+/// On Linux: `pid` holds a pipe on each of [`STRAY_FDS`] — the stray was
+/// planted, and a test that finds it missing from a child tests something.
+fn assert_holds_stray(pid: i32) {
+    if !cfg!(target_os = "linux") {
+        return;
+    }
+    for fd in STRAY_FDS {
+        let target = std::fs::read_link(format!("/proc/{pid}/fd/{fd}"))
+            .map(|t| t.display().to_string())
+            .map_err(|e| e.to_string());
+        assert!(
+            target.as_deref().is_ok_and(|t| t.starts_with("pipe:[")),
+            "process {pid} inherited the stray pipe on fd {fd}: {target:?}"
+        );
+    }
 }
 
 /// The variables the daemon's configuration reads, each holding a value the
@@ -388,7 +426,7 @@ fn the_launcher_passes_only_the_contract() {
     let mut env = SEKRIT_ENV.to_vec();
     env.push(("AGENTD_TUI_BIN", &stub));
     env.push(("LAUNCHER_E2E_PASSES", "through"));
-    let (status, err) = launch(&s, &["tui", "--config", &cfg], &env);
+    let (status, err) = launch_holding_stray(&s, &["tui", "--config", &cfg], &env);
     assert!(status.success(), "{status:?}: {err}");
     assert_eq!(
         s.read("argv").lines().collect::<Vec<_>>(),
@@ -431,7 +469,7 @@ fn the_launcher_passes_only_the_contract() {
     let stub = s.stub();
     let mut env = SEKRIT_ENV.to_vec();
     env.push(("AGENTD_UI_BIN", &stub));
-    let (status, err) = launch(
+    let (status, err) = launch_holding_stray(
         &s,
         &["ui", "--port", "0", "--no-open", "--config", &cfg],
         &env,
@@ -1451,6 +1489,7 @@ fn launcher_fds_never_reach_daemon_children() {
         let mut run = start(&s, &args, &env, true);
         s.wait_file("recorded", Duration::from_secs(20));
         let launcher = run.child.id() as i32;
+        assert_holds_stray(launcher);
         // What the client was handed on fd 3: the code's pipe, or the socket.
         let handed = s
             .client_fds()
@@ -1565,11 +1604,8 @@ fn a_daemon_hands_no_inherited_fd_to_its_children() {
         stdin: None,
     };
     let pid = daemon.child.id() as i32;
+    assert_holds_stray(pid);
     let stray = proc_fds(pid).get(&(STRAY_FDS[0] as u32)).cloned();
-    assert!(
-        stray.as_deref().is_some_and(|t| t.starts_with("pipe:[")),
-        "the daemon inherited the stray pipe: {stray:?}"
-    );
 
     let deadline = Instant::now() + Duration::from_secs(30);
     while std::net::TcpStream::connect(&addr).is_err() {

@@ -52,6 +52,11 @@ One more rule: **one process = one agent runtime.** The tool registry, signal
 handling, and metrics are process-global by design (the re-exec model requires
 it).
 
+Descriptors your host left open without close-on-exec stay yours: every child
+agentd spawns (the `exec` tool's command, a subagent, an instance) keeps only
+its stdio, marked in the child between fork and exec, so there is nothing to
+call for it ([security.md](security.md#the-launch-grant-threat-model)).
+
 ## What a registered tool can do
 
 Once registered, `shout` is:

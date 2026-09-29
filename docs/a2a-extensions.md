@@ -41,8 +41,8 @@ map, which is what those fields exist for.
 
 **None is `required`.** A client that sends no `A2A-Extensions` header at all
 gets the whole core protocol: it can converse, read, list and cancel tasks,
-subscribe to them and register webhooks. The extensions add reach, never a
-precondition.
+subscribe to them and, where `a2a.push.enabled` is on, register webhooks. The
+extensions add reach, never a precondition.
 
 **The URIs carry no version.** A2A 1.0.1 §4.6.3 makes a version in an
 extension URI a SHOULD, not a MUST; what §4.6.3 and §5.8 make a MUST is that a
@@ -271,8 +271,10 @@ unix socket) sets it `false` and answers `-32004`.
 
 The refusals the extensions add, beside the core table in
 [a2a.md](a2a.md#errors). Each carries a `google.rpc.ErrorInfo` in
-`error.data` whose `reason` names the case (`domain` `agentd.dev`), and a
-malformed command also a `google.rpc.BadRequest` naming the field. Nothing
+`error.data` whose `reason` names the case — under `domain` `agentd.dev`,
+except `CONTENT_TYPE_NOT_SUPPORTED`, which is the specification's own reason
+and carries `a2a-protocol.org` — and a malformed command also a
+`google.rpc.BadRequest` naming the field. Nothing
 refused is run, and no task is created.
 
 | Code | Reason | When |

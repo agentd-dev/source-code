@@ -311,13 +311,15 @@ pub struct Agent {
     /// is announced on the new channel.
     #[serde(skip)]
     pub document_gate_channels: crate::config::humans::GateChannels,
-    /// Which entries of `workflows` the instruction document's `:::!workflow`
-    /// blocks contributed, by index — DERIVED, never a config key. Once
-    /// spliced, a document's workflow is indistinguishable from an inline
-    /// entry, and a refusal of two definitions sharing a name has to say
-    /// which document each came from ([`Settings::workflow_entry_source`]).
+    /// Which entries of `workflows` the instruction document contributed, by
+    /// index — DERIVED, never a config key. A document adds workflows two
+    /// ways: its `:::!config` fragment's `workflows` (merged in FRONT of the
+    /// operator's) and its `:::!workflow` blocks (appended after). Once
+    /// spliced, either is indistinguishable from an inline entry, and a
+    /// refusal of two definitions sharing a name has to say which document
+    /// each came from ([`Settings::workflow_entry_source`]).
     #[serde(skip)]
-    pub document_workflows: std::ops::Range<usize>,
+    pub document_workflows: std::collections::BTreeSet<usize>,
     /// Where a pulled instruction came from (an `oci://` reference resolved at
     /// config load, RFC 0040) — DERIVED: the runtime uses it to log
     /// `instruction.loaded` with its version pin and to arm the freshness
@@ -4060,7 +4062,7 @@ impl Settings {
 
         let mut idoc_extraction: Option<crate::config::idoc::Extraction> = None;
         let mut gate_channels = crate::config::humans::GateChannels::new();
-        let mut document_workflows = 0..0;
+        let mut document_workflows = std::collections::BTreeSet::new();
         if let Some(instr) = doc
             .get("agent")
             .and_then(|a| a.get("instruction"))
@@ -4130,14 +4132,25 @@ impl Settings {
                         ));
                     }
                     if let Some(o) = doc.as_object_mut() {
+                        // `merge_missing` puts a fragment's array entries
+                        // AHEAD of the operator's, so the `:::!config`
+                        // workflows are the first ones — counted before the
+                        // merge, which drops them when `workflows` is not a
+                        // list to merge into.
+                        let fragment_workflows =
+                            match (o.get("workflows"), ex.config.get("workflows")) {
+                                (None | Some(Value::Array(_)), Some(Value::Array(a))) => a.len(),
+                                _ => 0,
+                            };
                         crate::config::idoc::merge_missing(o, ex.config.clone());
+                        document_workflows.extend(0..fragment_workflows);
                         if !ex.workflows.is_empty()
                             && let Some(w) = o
                                 .entry("workflows")
                                 .or_insert_with(|| Value::Array(Vec::new()))
                                 .as_array_mut()
                         {
-                            document_workflows = w.len()..w.len() + ex.workflows.len();
+                            document_workflows.extend(w.len()..w.len() + ex.workflows.len());
                             w.extend(ex.workflows.clone());
                         }
                     }
@@ -4226,6 +4239,10 @@ impl Settings {
         let Some(w) = self.workflows.get(i) else {
             return format!("workflows[{i}]");
         };
+        // The index the OPERATOR wrote: a document's `:::!config` workflows
+        // sit in front of theirs once merged, and `workflows[1]` for the one
+        // entry their file has sends them looking for a second.
+        let i = i - self.agent.document_workflows.range(..i).count();
         let s = |k: &str| w.get(k).and_then(Value::as_str);
         if let Some(f) = s("file") {
             format!("file {f} (workflows[{i}])")
@@ -7059,6 +7076,12 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
         let name = obj.get("name").and_then(Value::as_str).unwrap_or("");
         if name.trim().is_empty() {
             err(&mut d, format!("workflows[{i}] has no name"));
+        } else if !obj.contains_key("steps") {
+            // A `file:`/`url:`/`uri:` entry's name is not final here: the
+            // loader names it by its document's own `name:` and uses the
+            // entry's only when the document has none. Two references that
+            // share an entry name may define two different workflows, so the
+            // loader, which sees the resolved names, judges them.
         } else if let Some(&first) = wf_names.get(name) {
             err(
                 &mut d,
@@ -9583,6 +9606,86 @@ mod tests {
             )),
             "names the document it came from: {e}"
         );
+    }
+
+    /// The same collision through the document's OTHER door: a `:::!config`
+    /// fragment's `workflows`, which the merge puts ahead of the operator's
+    /// entries. The refusal still names the document, and the operator's entry
+    /// by the index their own file gives it.
+    #[test]
+    fn a_document_config_workflow_sharing_a_name_with_an_inline_one_names_the_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let doc = dir.path().join("agent.md");
+        std::fs::write(
+            &doc,
+            concat!(
+                "be terse\n\n",
+                ":::!config\n",
+                "workflows:\n",
+                "  - name: dup\n",
+                "    steps:\n",
+                "      s: { kind: once }\n",
+                "      f: { kind: finish, depends_on: [s], status: completed }\n",
+                ":::\n"
+            ),
+        )
+        .unwrap();
+        let cfg = dir.path().join("c.json");
+        std::fs::write(
+            &cfg,
+            json!({"agent": {"name": "a", "instruction": doc.to_string_lossy(), "preflight": "never"},
+                "store": {"kind": "memory"},
+                "workflows": [{"name": "dup", "steps": {
+                    "s": {"kind": "once"},
+                    "f": {"kind": "finish", "depends_on": ["s"], "status": "completed"}}}]})
+            .to_string(),
+        )
+        .unwrap();
+        let env: Vec<(String, String)> = Vec::new();
+        let Err(e) = super::load(&["-c".to_string(), cfg.to_string_lossy().to_string()], &env)
+        else {
+            panic!("two definitions of one name must not load");
+        };
+        let e = e.to_string();
+        assert!(
+            e.contains(&format!(
+                "workflow \"dup\" is defined twice — by the instruction document {} and by the inline definition workflows[0]",
+                doc.to_string_lossy()
+            )),
+            "names the document first and the operator's own entry as they wrote it: {e}"
+        );
+    }
+
+    /// A `file:` entry is named by its document's own `name:`, so two
+    /// entries sharing an ENTRY name are not two definitions of one workflow
+    /// unless their documents say so — the config check leaves them to the
+    /// loader, which sees the resolved names.
+    #[test]
+    fn a_reference_entry_sharing_an_entry_name_is_not_judged_before_it_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("y.yaml");
+        std::fs::write(
+            &file,
+            "name: y\nsteps:\n  s: { kind: once }\n  f: { kind: finish, depends_on: [s], status: completed }\n",
+        )
+        .unwrap();
+        let cfg = dir.path().join("c.json");
+        std::fs::write(
+            &cfg,
+            json!({"agent": {"name": "a", "instruction": "be terse", "preflight": "never"},
+                "store": {"kind": "memory"},
+                "workflows": [
+                    {"name": "x", "steps": {
+                        "s": {"kind": "once"},
+                        "f": {"kind": "finish", "depends_on": ["s"], "status": "completed"}}},
+                    {"name": "x", "file": file.to_string_lossy()}]})
+            .to_string(),
+        )
+        .unwrap();
+        let env: Vec<(String, String)> = Vec::new();
+        if let Err(e) = super::load(&["-c".to_string(), cfg.to_string_lossy().to_string()], &env) {
+            panic!("x and y are two workflows: {e}");
+        }
     }
 
     /// A distinct suffix per generated config file within one test.

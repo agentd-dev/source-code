@@ -436,7 +436,12 @@ holds up the next call on the same server.
 - **Two workflows with one name are refused, naming both sources.** A `dir:`
   or `file:` workflow sharing its name with another, or with an instruction
   document's `:::!workflow`, silently replaced it at load. Startup now exits
-  `2` and a reload is refused with the running set kept.
+  `2` and a reload is refused with nothing applied: a reload now reads and
+  parses its workflow definitions before applying any section, where one that
+  failed to load used to be refused after the new instruction, MCP servers,
+  tools and skills were already live. A runtime-stored definition that a
+  configured one of the same name keeps from loading is logged as
+  `workflow.stored.shadowed` instead of being skipped silently.
 
 ### Known limitations
 

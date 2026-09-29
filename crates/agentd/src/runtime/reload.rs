@@ -112,6 +112,54 @@ impl Runtime {
         }
         let new = loaded.settings;
         let old = std::mem::replace(&mut self.settings, new.clone());
+        // Workflows are staged FIRST, before any section applies: a set that
+        // cannot load (two definitions of one name, a file that does not
+        // parse, a fetch that fails) refuses the reload with the running
+        // configuration untouched. Staged last, the refusal came after the
+        // new instruction, MCP servers, tools and skills were already live,
+        // and `config.reload.invalid` described a reload that had half
+        // happened.
+        //
+        // Re-read whenever an entry names an external DOCUMENT, not only when
+        // the entries themselves differ: `file:`/`dir:`/`uri:`/`url:` point at
+        // content that changes without the config changing, and the entry
+        // comparison cannot see that. The retirement loop below keys off each
+        // definition's HASH, so an unchanged document reloads to the same hash
+        // and nothing churns.
+        let external = new.workflows.iter().any(|w| {
+            ["file", "dir", "uri", "url"]
+                .iter()
+                .any(|k| w.get(*k).is_some())
+        });
+        // The channels a document's gates are announced on ride on the
+        // definitions they belong to, so a document that moves only a
+        // `::!human`'s channel reloads the definitions too — their hashes
+        // stay, nothing retires, and the next gate is announced on the new
+        // channel.
+        let channels_moved = old.agent.document_gate_channels != new.agent.document_gate_channels;
+        let staged = if old.workflows != new.workflows || external || channels_moved {
+            let mut staged = super::steps::StagedWorkflows::default();
+            let docs = self.workflow_documents(&mut staged.errs);
+            // A `uri:` document is read through a connected MCP server. When
+            // this reload changes the servers, the ones it reads through are
+            // not connected yet, so those documents are staged after the MCP
+            // section below. They, and the checks of every definition against
+            // the rebuilt tool registry and the connected servers, can only
+            // run once those are live: the refusals that can still follow
+            // applied sections.
+            let servers_change = old.mcp != new.mcp;
+            let (now, after_mcp): (Vec<_>, Vec<_>) = docs
+                .into_iter()
+                .partition(|(d, _)| !(servers_change && reads_a_resource(d)));
+            self.stage_workflows(now, &mut staged);
+            if !staged.errs.is_empty() {
+                self.settings = old;
+                return Err(ReloadRefused::Invalid(staged.errs));
+            }
+            Some((staged, after_mcp))
+        } else {
+            None
+        };
         self.settings_doc = loaded.doc;
         let mut changed = Vec::new();
 
@@ -348,30 +396,14 @@ impl Runtime {
                 changed.push("skills");
             }
         }
-        // Workflows: reload definitions. Retirement (runtime::retire) gives
-        // every old version the same exit — unsubscribe what nothing else
-        // wants, pin for live runs, apply its own `unload:` policy — whether
-        // it was removed outright or replaced by a new hash.
-        // Re-read whenever an entry names an external DOCUMENT, not only when
-        // the entries themselves differ: `file:`/`dir:`/`uri:`/`url:` point at
-        // content that changes without the config changing, and the entry
-        // comparison cannot see that. `load_workflows` re-reads, and the
-        // retirement loop below already keys off each definition's HASH, so an
-        // unchanged document reloads to the same hash and nothing churns.
-        let external = new.workflows.iter().any(|w| {
-            ["file", "dir", "uri", "url"]
-                .iter()
-                .any(|k| w.get(*k).is_some())
-        });
-        // The channels a document's gates are announced on ride on the
-        // definitions they belong to, so a document that moves only a
-        // `::!human`'s channel reloads the definitions too — their hashes
-        // stay, nothing retires, and the next gate is announced on the new
-        // channel.
-        let channels_moved = old.agent.document_gate_channels != new.agent.document_gate_channels;
-        if old.workflows != new.workflows || external || channels_moved {
+        // Workflows: install the set staged above. Retirement (runtime::retire)
+        // gives every old version the same exit — unsubscribe what nothing
+        // else wants, pin for live runs, apply its own `unload:` policy —
+        // whether it was removed outright or replaced by a new hash.
+        if let Some((mut staged, after_mcp)) = staged {
+            self.stage_workflows(after_mcp, &mut staged);
             let previous = std::mem::take(&mut self.workflows);
-            if let Err(errs) = self.load_workflows() {
+            if let Err(errs) = self.install_workflows(staged) {
                 self.workflows = previous; // the running set stays authoritative
                 return Err(ReloadRefused::Invalid(errs));
             }
@@ -559,6 +591,12 @@ fn revise_origins(
 ) {
     *live.write().unwrap_or_else(|e| e.into_inner()) =
         crate::a2a::oauth::admitted_origins(configured, launch);
+}
+
+/// Whether a workflow entry's document is read as an MCP resource (`uri:`),
+/// the way `stage_workflows` decides it: a `file:` wins over a `uri:`.
+fn reads_a_resource(entry: &serde_json::Value) -> bool {
+    entry.get("file").is_none() && entry.get("uri").is_some()
 }
 
 /// Why a reload did not apply.

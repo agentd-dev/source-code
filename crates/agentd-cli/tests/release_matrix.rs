@@ -344,7 +344,24 @@ fn the_supply_chain_gate_judges_the_graph_the_release_ships() {
         "deny.toml's [graph] features must be release.yml's FEATURES exactly"
     );
     // release.yml builds with the default features on (`tls`), and neither
-    // narrows nor widens the graph beyond that list.
+    // narrows nor widens the graph beyond that list. Every other `[graph]`
+    // key narrows what is judged (`exclude` drops a crate, `targets` a
+    // platform, `exclude-dev`/`exclude-unpublished` a class of crates), so
+    // one appearing here is refused outright — `exclude = ["cel-interpreter"]`
+    // would re-hide the very advisory this graph exists to see.
+    let known = ["features", "no-default-features", "all-features"];
+    for l in graph.lines().map(str::trim) {
+        if l.is_empty() || l.starts_with('#') {
+            continue;
+        }
+        if let Some((name, _)) = l.split_once('=') {
+            assert!(
+                known.contains(&name.trim()),
+                "deny.toml's [graph] {} narrows the graph cargo deny judges below what the release ships",
+                name.trim()
+            );
+        }
+    }
     for (k, shipped) in [("no-default-features", "false"), ("all-features", "false")] {
         if let Some(v) = key(k) {
             assert_eq!(

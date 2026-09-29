@@ -2,7 +2,7 @@
 //! A workflow NAME is one definition, whichever sources it arrives from: an
 //! inline entry, a `file:`, a `dir:` folder, the instruction document's
 //! `:::!workflow`. Two that resolve to one name are refused — at startup with
-//! exit 2, at reload with the running set kept — and the refusal names BOTH
+//! exit 2, at reload with nothing applied — and the refusal names BOTH
 //! sources. Before, the later one silently replaced the earlier in the loaded
 //! map: the operator's workflow changed without a word, and a folder's file
 //! was invisible to the entry-level check because its name lives inside it.
@@ -110,11 +110,14 @@ fn a_folder_file_and_a_document_block_sharing_a_name_are_refused_naming_both() {
         refusal.contains(&format!("the instruction document {}", doc.display())),
         "names the document: {refusal}"
     );
-    // Neither definition ran: the refusal is the whole outcome.
+    // Neither definition ran: the refusal is the whole outcome. Nor is
+    // either reported loaded — a `workflow.loaded` for the first one, ahead
+    // of the refusal, read as if it had gone live.
     assert!(
         !stdout.contains("from-the-file") && !stdout.contains("from-the-document"),
         "stdout: {stdout}"
     );
+    assert!(events(&stderr, "workflow.loaded").is_empty(), "{stderr}");
 }
 
 #[test]
@@ -184,6 +187,74 @@ fn distinct_names_from_every_source_all_load() {
     }
 }
 
+/// A runtime-stored definition under a configured name does not load — the
+/// configuration is where that name lives — and the daemon SAYS so. A
+/// `workflow.update` of a configured workflow is stored and reported as
+/// success, and without the line the next start dropped it without a word.
+#[test]
+fn a_stored_definition_under_a_configured_name_is_reported_not_loaded() {
+    let t = tempfile::tempdir().unwrap();
+    let wf = t.path().join("workflows");
+    std::fs::create_dir(&wf).unwrap();
+    let file = wf.join("tick.yaml");
+    std::fs::write(&file, workflow_file("tick", "from-the-file")).unwrap();
+    let update = serde_json::json!({"turns": [
+        {"tool_calls": [{"name": "workflow.update", "arguments": {"name": "tick", "definition": {
+            "name": "tick", "steps": {
+                "s": {"kind": "manual"},
+                "f": {"kind": "finish", "depends_on": ["s"], "status": "completed"}}}}}]},
+        {"echo_tool_result": true}]});
+    let play = t.path().join("play.json");
+    let cfg = t.path().join("agent.yaml");
+    let write_cfg = |prompt: &str| {
+        std::fs::write(
+            &cfg,
+            format!(
+                "agent: {{ name: shadow, prompt: {prompt} }}\n\
+                 workflows:\n  - dir: {}\n\
+                 store: {{ kind: file, file: {{ path: {} }} }}\n\
+                 intelligence: {{ endpoints: \"mock:file:{}\", model: mock }}\n\
+                 lifecycle: {{ run_until: idle, idle_grace: 300ms }}\n\
+                 observability: {{ log_level: info, log_content: true }}\n",
+                wf.display(),
+                t.path().join("state").display(),
+                play.display()
+            ),
+        )
+        .unwrap();
+    };
+
+    std::fs::write(&play, update.to_string()).unwrap();
+    write_cfg("update");
+    let (code, _, stderr) = run(&cfg);
+    assert_eq!(code, Some(0), "stderr:\n{stderr}");
+    assert!(
+        events(&stderr, "workflow.defined")
+            .iter()
+            .any(|e| e["name"] == "tick" && e["op"] == "workflow.update"),
+        "the update is stored and reported: {stderr}"
+    );
+
+    std::fs::write(&play, r#"{"turns": [{"text": "done"}]}"#).unwrap();
+    write_cfg("again");
+    let (code, _, stderr) = run(&cfg);
+    assert_eq!(code, Some(0), "stderr:\n{stderr}");
+    let shadowed = events(&stderr, "workflow.stored.shadowed");
+    assert!(
+        shadowed.iter().any(|e| e["name"] == "tick"
+            && e["configured"]
+                .as_str()
+                .is_some_and(|c| c.contains(&format!("file {}", file.display())))),
+        "the stored definition is reported not loaded, naming the configured source: {stderr}"
+    );
+    assert!(
+        events(&stderr, "workflow.loaded")
+            .iter()
+            .all(|e| e["source"] != "store"),
+        "{stderr}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Reload: the same refusal, and the running definition stays.
 
@@ -244,17 +315,17 @@ impl Drop for Daemon {
     }
 }
 
-/// A long-lived config: the folder's scheduled `tick`, and an instruction
-/// that may or may not carry a block of its own.
+/// A long-lived config: the folder's scheduled `tick`, an instruction that
+/// may or may not carry a block of its own, and any further sections.
 #[cfg(feature = "hot-reload")]
-fn daemon_config(dir: &std::path::Path, instruction: &str) -> String {
+fn daemon_config(dir: &std::path::Path, instruction: &str, extra: &str) -> String {
     let indented: String = instruction.lines().map(|l| format!("    {l}\n")).collect();
     format!(
         "agent:\n  name: sources\n  instruction: |\n{indented}\
          workflows:\n  - dir: {}\n\
          store:\n  kind: memory\n\
          lifecycle:\n  run_until: drained\n\
-         observability:\n  log_level: info\n  log_content: true\n",
+         observability:\n  log_level: info\n  log_content: true\n{extra}",
         dir.display()
     )
 }
@@ -284,7 +355,7 @@ fn a_reload_that_would_define_a_name_twice_is_refused_and_the_running_one_stays(
     };
     std::fs::write(&file, tick("from-the-file")).unwrap();
     let cfg = t.path().join("agent.yaml");
-    std::fs::write(&cfg, daemon_config(&wf, "Keep ticking.")).unwrap();
+    std::fs::write(&cfg, daemon_config(&wf, "Keep ticking.", "")).unwrap();
     let d = Daemon::spawn(&cfg);
     d.wait_for(
         |l| done_with(l, "from-the-file") >= 1,
@@ -294,11 +365,16 @@ fn a_reload_that_would_define_a_name_twice_is_refused_and_the_running_one_stays(
 
     // The document now declares `tick` too — and the file changed in the
     // same edit, so a refusal that kept whatever had loaded before the
-    // collision (the file's NEW definition) would show as a new output.
+    // collision (the file's NEW definition) would show as a new output. The
+    // same edit adds an MCP server: a refused reload must not dial it.
     std::fs::write(&file, tick("from-the-file-v2")).unwrap();
     std::fs::write(
         &cfg,
-        daemon_config(&wf, &document("tick", "from-the-document")),
+        daemon_config(
+            &wf,
+            &document("tick", "from-the-document"),
+            "mcp:\n  servers:\n    - name: probe\n      endpoint: http://127.0.0.1:9/mcp\n",
+        ),
     )
     .unwrap();
     d.sighup();
@@ -335,4 +411,41 @@ fn a_reload_that_would_define_a_name_twice_is_refused_and_the_running_one_stays(
             .all(|e| e["workflow"] != "tick"),
         "{log}"
     );
+    // Nothing else of the refused edit applied either: the server it added
+    // was never dialed, and the file's new definition was never reported
+    // as loaded.
+    assert!(
+        events(&log, "mcp.connect")
+            .iter()
+            .chain(events(&log, "mcp.connect.fail").iter())
+            .all(|e| e["server"] != "probe"),
+        "the refused reload dialed its new MCP server:\n{log}"
+    );
+    assert_eq!(
+        events(&log, "workflow.loaded").len(),
+        1,
+        "only the startup load of tick is logged:\n{log}"
+    );
+
+    // …and the running config is the one it started with: putting the
+    // original files back and reloading changes nothing. Had the refused
+    // reload left its instruction and servers live, this one would report
+    // moving them back.
+    std::fs::write(&file, tick("from-the-file")).unwrap();
+    std::fs::write(&cfg, daemon_config(&wf, "Keep ticking.", "")).unwrap();
+    d.sighup();
+    let log = d.wait_for(
+        |l| !events(l, "config.reloaded").is_empty(),
+        "the restoring reload",
+        10,
+    );
+    let changed = events(&log, "config.reloaded")[0]["changed"].clone();
+    for section in ["agent.instruction", "mcp", "workflows"] {
+        assert!(
+            !changed
+                .as_array()
+                .is_some_and(|c| c.iter().any(|v| v == section)),
+            "the refused reload had applied {section}: {changed}\n{log}"
+        );
+    }
 }

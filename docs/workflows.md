@@ -806,8 +806,13 @@ A name is one definition. Two configured workflows that resolve to the same
 `uri:` fetch, the instruction's `:::!workflow` — are refused with
 `workflow "x" is defined twice — by <first> and by <second>`, at startup and
 on reload alike, instead of the later one replacing the earlier (the
-configuration doc §6.1). At runtime, `workflow.create` likewise refuses a
-name already loaded (`workflow "x" exists (use workflow.update)`).
+configuration doc §6.1). At runtime, `workflow.create` refuses a name already
+loaded (`workflow "x" exists (use workflow.update)`). `workflow.update` of a
+*configured* workflow is not refused: the new definition is stored and runs
+until the configured workflows next load (a restart, or a reload that re-reads
+them), but the configured definition is the one that loads then, and the stored one is skipped with `workflow.stored.shadowed`
+naming the configured source. Change a configured workflow in its
+configuration.
 
 | Cap | Value |
 |---|---|

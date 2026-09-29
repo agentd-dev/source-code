@@ -28,6 +28,24 @@ use std::collections::{BTreeMap, HashMap};
 /// The memory key prefix runtime-created workflow definitions are stored under.
 const WORKFLOW_DEF_PREFIX: &str = "_workflows/";
 
+/// Configured workflow definitions resolved and parsed but not yet live.
+/// Staging is side-effect free (it reads files, fetches and resources, and
+/// installs and logs nothing), which is what lets a reload refuse a set that
+/// cannot load BEFORE it applies any section: a refused reload changes
+/// nothing, rather than changing everything except the workflows.
+#[derive(Default)]
+pub(crate) struct StagedWorkflows {
+    /// The definitions, in source order.
+    defs: Vec<Workflow>,
+    /// name → the source that defined it first. A configured name is ONE
+    /// definition: installing by name would otherwise let whichever source
+    /// came later replace the other without a word — a folder's file and a
+    /// document's block sharing a name, say, which no check on the entries
+    /// can see before the files are read.
+    defined: HashMap<String, String>,
+    pub(crate) errs: Vec<String>,
+}
+
 impl Runtime {
     // ---- definitions -----------------------------------------------------------
 
@@ -71,7 +89,15 @@ impl Runtime {
     /// returned on the first failure, so one bad definition is refused with a
     /// message instead of hiding the rest.
     pub(crate) fn load_workflows(&mut self) -> Result<(), Vec<String>> {
-        let mut errs = Vec::new();
+        let mut staged = StagedWorkflows::default();
+        let docs = self.workflow_documents(&mut staged.errs);
+        self.stage_workflows(docs, &mut staged);
+        self.install_workflows(staged)
+    }
+
+    /// The configured workflow entries as a flat list of documents, each with
+    /// the source a refusal names it by. Reads folders; installs nothing.
+    pub(crate) fn workflow_documents(&self, errs: &mut Vec<String>) -> Vec<(Value, String)> {
         // A `{dir}` entry expands into one entry per matching file BEFORE
         // resolution, so everything downstream — parsing, naming, the duplicate
         // check — sees a plain list of documents and needs no directory case.
@@ -88,7 +114,7 @@ impl Runtime {
             // reference exactly once.
             let mut doc = doc;
             if doc.get("steps").is_none() {
-                substitute_config_vars(&mut doc, &self.settings.vars, "workflow entry", &mut errs);
+                substitute_config_vars(&mut doc, &self.settings.vars, "workflow entry", errs);
             }
             // `dir:` is the folder source shared with instructions: a path,
             // or `{path, glob, order}`. `glob` and `order` live INSIDE it —
@@ -144,12 +170,16 @@ impl Runtime {
                 }
             }
         }
-        // name → the source that defined it first. A configured name is ONE
-        // definition: the map insert below would otherwise let whichever
-        // source loaded later replace the other without a word — a folder's
-        // file and a document's block sharing a name, say, which no check on
-        // the entries can see before the files are read.
-        let mut defined: HashMap<String, String> = HashMap::new();
+        docs
+    }
+
+    /// Resolve and parse workflow documents into `staged`: read each `file:`,
+    /// fetch each `url:`, read each `uri:` resource, fold `{{config.*}}` and
+    /// parse. Installs nothing and logs nothing, so a reload can stage the
+    /// whole set BEFORE it applies any section and refuse with nothing
+    /// changed; `install_workflows` makes a staged set live.
+    pub(crate) fn stage_workflows(&self, docs: Vec<(Value, String)>, staged: &mut StagedWorkflows) {
+        let errs = &mut staged.errs;
         for (doc, source) in docs {
             // `{{config.*}}` folds in at load, in two passes: the ENTRY first —
             // so a var can sit in a `file:`, `url:` or `dir:` reference and in
@@ -165,7 +195,7 @@ impl Runtime {
             // it — the resolved pass below sees the same document, and running
             // both would report every unresolved reference twice.
             if doc.get("steps").is_none() {
-                substitute_config_vars(&mut doc, &self.settings.vars, "workflow entry", &mut errs);
+                substitute_config_vars(&mut doc, &self.settings.vars, "workflow entry", errs);
             }
             let resolved = match (
                 doc.get("file").and_then(Value::as_str),
@@ -243,7 +273,7 @@ impl Runtime {
                 _ => doc.clone(),
             };
             let mut resolved = resolved;
-            substitute_config_vars(&mut resolved, &self.settings.vars, "workflow", &mut errs);
+            substitute_config_vars(&mut resolved, &self.settings.vars, "workflow", errs);
             match parse_workflow(&resolved) {
                 Ok(mut w) => {
                     self.fill_durable_default(&mut w);
@@ -254,19 +284,36 @@ impl Runtime {
                     if let Some(ch) = self.settings.agent.document_gate_channels.get(&w.name) {
                         w.gate_channels = ch.clone();
                     }
-                    if let Some(first) = defined.get(&w.name) {
+                    if let Some(first) = staged.defined.get(&w.name) {
                         errs.push(crate::config::settings::duplicate_workflow(
                             &w.name, first, &source,
                         ));
                         continue;
                     }
-                    defined.insert(w.name.clone(), source);
-                    self.log.info("workflow.loaded", json!({"name": w.name, "hash": &w.hash[..12], "steps": w.steps.len(), "durable": w.durable, "starts": w.start_steps().iter().map(|s| s.kind.clone()).collect::<Vec<_>>()}));
-                    self.workflows
-                        .insert(w.name.clone(), std::sync::Arc::new(w));
+                    staged.defined.insert(w.name.clone(), source);
+                    staged.defs.push(w);
                 }
                 Err(e) => errs.extend(e),
             }
+        }
+    }
+
+    /// Make a staged set live: the configured definitions, then the
+    /// runtime-created ones from the store, then the checks against the
+    /// registry and the connected servers. `workflow.loaded` is logged only
+    /// once the whole set is accepted — a line for a definition that a later
+    /// refusal discards reads as if it went live.
+    pub(crate) fn install_workflows(&mut self, staged: StagedWorkflows) -> Result<(), Vec<String>> {
+        let StagedWorkflows {
+            defs,
+            defined,
+            mut errs,
+        } = staged;
+        let mut loaded: Vec<Value> = Vec::new();
+        for w in defs {
+            loaded.push(json!({"name": w.name, "hash": &w.hash[..12], "steps": w.steps.len(), "durable": w.durable, "starts": w.start_steps().iter().map(|s| s.kind.clone()).collect::<Vec<_>>()}));
+            self.workflows
+                .insert(w.name.clone(), std::sync::Arc::new(w));
         }
         // Runtime-created definitions (durable under memory/_workflows/<name>).
         if let Ok(list) = self.durable.list(Kind::Memory) {
@@ -278,18 +325,29 @@ impl Runtime {
                 ) else {
                     continue;
                 };
-                if let Some(name) = id.strip_prefix(WORKFLOW_DEF_PREFIX)
-                    && !self.workflows.contains_key(name)
-                    && let Ok(Some(env)) = self.durable.get(Kind::Memory, id)
+                let Some(name) = id.strip_prefix(WORKFLOW_DEF_PREFIX) else {
+                    continue;
+                };
+                // A configured name is one definition, and the configuration
+                // is where it lives: a stored one of the same name (a
+                // `workflow.update` of a configured workflow) does not load.
+                // Said out loud, because the update reported success and the
+                // operator would otherwise find it gone without a word.
+                if let Some(configured) = defined.get(name) {
+                    self.log.warn(
+                        "workflow.stored.shadowed",
+                        json!({"name": name, "configured": configured,
+                               "note": "a runtime-stored definition (workflow.create/update) of this name is not loaded; the configured one is. Change it in the configuration and reload"}),
+                    );
+                    continue;
+                }
+                if let Ok(Some(env)) = self.durable.get(Kind::Memory, id)
                     && let Some(def) = env.state.get("value")
                 {
                     match parse_workflow(def) {
                         Ok(mut w) => {
                             self.fill_durable_default(&mut w);
-                            self.log.info(
-                                "workflow.loaded",
-                                json!({"name": w.name, "source": "store"}),
-                            );
+                            loaded.push(json!({"name": w.name, "source": "store"}));
                             self.workflows
                                 .insert(w.name.clone(), std::sync::Arc::new(w));
                         }
@@ -374,7 +432,13 @@ impl Runtime {
                 }
             }
         }
-        if errs.is_empty() { Ok(()) } else { Err(errs) }
+        if !errs.is_empty() {
+            return Err(errs);
+        }
+        for l in loaded {
+            self.log.info("workflow.loaded", l);
+        }
+        Ok(())
     }
 
     /// Fetch a workflow definition over HTTP(S).

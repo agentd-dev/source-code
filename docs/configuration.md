@@ -1120,12 +1120,19 @@ a run started under one hash finishes under it.
 one its definition carries — a file's own `name:` wins over the entry's, and a
 file a `dir:` matched has only its own. Two definitions that resolve to one
 name, from any two sources (inline entries, files, folders, URLs, resources,
-the instruction document's `:::!workflow`), are refused: exit `2` at startup,
-a refused reload with the running set kept. The message names the workflow
-and both sources, and neither definition loads; nothing decides which one
-wins, because the later one silently replacing the other is how an operator's
-workflow changed without a word. Two files in one folder are named in folder
-order, so the message reads the same on every machine.
+the instruction document's `:::!workflow` blocks or `:::!config` workflows),
+are refused: exit `2` at startup, and a refused reload that applies nothing
+(§11). The message names the workflow and both sources, and neither
+definition loads; nothing decides which one wins, because the later one
+silently replacing the other is how an operator's workflow changed without a
+word. Two files in one folder are named in folder order, so the message reads
+the same on every machine. `--validate-config` reads no workflow file, so it
+judges only the names it can see — inline entries and the document's — and a
+collision involving a `file:`, `dir:`, `url:` or `uri:` document is found when
+the daemon loads it. A subagent template's workflows follow the same rule: a
+collision among its `:::!config` workflows, its `:::!workflow` blocks and the
+reporter and stream mirrors agentd composes for the child is refused at the
+parent's startup, naming the template.
 
 `dir:` is the same folder source an
 [instruction folder](#5a1a-a-folder-of-documents--dir) takes —
@@ -1399,7 +1406,15 @@ unit of work picks the new values up):
   fails to build refuses the reload and keeps the old one)
 - `skills` — the catalogue is re-discovered
 - `workflows` — definitions reload and re-arm; **live runs stay pinned** to the
-  definition hash they started with
+  definition hash they started with. The definitions are read and parsed
+  before any other section applies, so one that does not load (a file that
+  does not parse, a failed fetch, two definitions of one name) refuses the
+  reload with nothing changed. Two checks can only run once the new servers
+  and tool registry are live, and refuse the reload after those sections
+  applied, keeping the running workflows: a `tool` or `mcp.tool` step naming
+  what the new registry or servers do not have, and a `uri:` document when the
+  same reload changes `mcp` (it is read through the servers that reload
+  connects)
 - `limits`, `lifecycle.idle_grace`, `observability.log_level` /
   `log_content` / `status_values`, `memory`, `context`, and
   `store.retention` (the next sweep applies the new bound)

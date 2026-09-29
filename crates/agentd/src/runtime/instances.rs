@@ -314,7 +314,7 @@ impl Runtime {
                 .and_then(Value::as_str)
             {
                 a.push(json!({
-                    "name": "_agentd_report", "steps": {
+                    "name": crate::config::templates::REPORTER_WORKFLOW, "steps": {
                         "ev":   {"kind": "event", "on": "workflow.finished"},
                         "pick": {"kind": "switch", "depends_on": ["ev"],
                                  "on": "{{steps.ev.output.payload.workflow}}",
@@ -337,7 +337,7 @@ impl Runtime {
             // tell a mirrored event from one of its own.
             for m in t.spec.mirror_streams.iter().flatten() {
                 a.push(json!({
-                    "name": format!("_agentd_mirror_{m}"), "steps": {
+                    "name": crate::config::templates::mirror_workflow(m), "steps": {
                         "ev":   {"kind": "stream", "stream": m, "from": "new"},
                         "send": {"kind": "a2a.send", "depends_on": ["ev"], "to": "parent",
                                  "command": "_instance.emit",

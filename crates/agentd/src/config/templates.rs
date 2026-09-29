@@ -291,6 +291,51 @@ fn compile_one(
                     }
                 }
             }
+            // One name, one definition in the child too. Its `workflows` is
+            // composed from this template's `:::!config` workflows, its
+            // `:::!workflow` blocks and the reporter and mirrors agentd adds
+            // (`compose_instance_doc`, in that order). A collision among them
+            // is the template's, so it is refused HERE, at the parent's boot,
+            // naming the template: at spawn the child could only name two
+            // inline entries of a config nobody wrote.
+            let mut composed: Vec<(String, String)> = Vec::new();
+            for w in ex
+                .config
+                .get("workflows")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if w.get("steps").is_some()
+                    && let Some(n) = w.get("name").and_then(Value::as_str)
+                {
+                    composed.push((n.to_string(), format!("the template {name}'s :::!config")));
+                }
+            }
+            for n in &machinery_workflows {
+                composed.push((n.to_string(), format!("the template {name}'s :::!workflow")));
+            }
+            if result_wf.is_some() {
+                composed.push((
+                    REPORTER_WORKFLOW.to_string(),
+                    "the result reporter agentd composes for `mode: sync`".to_string(),
+                ));
+            }
+            for m in t.mirror_streams.iter().flatten() {
+                composed.push((
+                    mirror_workflow(m),
+                    format!("the mirror agentd composes for stream '{m}'"),
+                ));
+            }
+            let mut first: BTreeMap<&str, &str> = BTreeMap::new();
+            for (n, source) in &composed {
+                match first.get(n.as_str()) {
+                    Some(f) => errs.push(at(settings::duplicate_workflow(n, f, source))),
+                    None => {
+                        first.insert(n, source);
+                    }
+                }
+            }
             errs.extend(validate_instance_machinery(name, &ex, s));
         }
     }
@@ -309,6 +354,16 @@ fn compile_one(
     } else {
         Err(errs)
     }
+}
+
+/// The workflow agentd composes into a `mode: sync` child to report the
+/// result workflow's first completion to the parent.
+pub(crate) const REPORTER_WORKFLOW: &str = "_agentd_report";
+
+/// The workflow agentd composes into a child to mirror stream `stream` into
+/// the parent's same-named stream.
+pub(crate) fn mirror_workflow(stream: &str) -> String {
+    format!("_agentd_mirror_{stream}")
 }
 
 /// The instance-tier machinery checks that can be judged before params exist:
@@ -647,6 +702,44 @@ mod tests {
         );
         let c = compile_templates(&s).expect("a template may configure what describes the child");
         assert_eq!(c["room"].fragment["limits"]["max_runs"], json!(4));
+    }
+
+    /// A child's workflows are one name, one definition too, and a collision
+    /// among what the template contributes — its `:::!config` workflows, its
+    /// `:::!workflow` blocks, the reporter agentd composes — is refused at the
+    /// parent's boot naming the template, not at spawn naming two "inline"
+    /// entries of a config nobody wrote.
+    #[test]
+    fn a_templates_workflows_sharing_a_name_are_refused_naming_the_template() {
+        const W: &str = "        steps: {s: {kind: once}, f: {kind: finish, depends_on: [s], status: completed}}\n";
+        let s = settings_with(&format!(
+            "    room:\n      mode: sync\n      result: {{workflow: w}}\n      instruction: |\n        Be the room.\n\
+             \x20       :::!workflow{{name=w}}\n{W}        :::\n\
+             \x20       :::!workflow{{name=_agentd_report}}\n{W}        :::\n"
+        ));
+        let e = compile_templates(&s).expect_err("a block named like the reporter must not load");
+        assert!(
+            e.iter().any(|m| m.contains(
+                "workflow \"_agentd_report\" is defined twice — by the template room's :::!workflow \
+                 and by the result reporter agentd composes for `mode: sync`"
+            )),
+            "{e:?}"
+        );
+
+        let s = settings_with(&format!(
+            "    room:\n      instruction: |\n        Be the room.\n\
+             \x20       :::!config\n        workflows:\n          - name: dup\n    \
+             {W}        :::\n\
+             \x20       :::!workflow{{name=dup}}\n{W}        :::\n"
+        ));
+        let e = compile_templates(&s).expect_err("two definitions of dup must not load");
+        assert!(
+            e.iter().any(|m| m.contains(
+                "workflow \"dup\" is defined twice — by the template room's :::!config \
+                 and by the template room's :::!workflow"
+            )),
+            "{e:?}"
+        );
     }
 
     #[test]

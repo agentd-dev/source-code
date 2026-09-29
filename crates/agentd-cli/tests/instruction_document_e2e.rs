@@ -13,7 +13,13 @@ use std::process::Command;
 use serde_json::{Value, json};
 
 fn load(instruction: &str, capabilities: &[&str]) -> (bool, String, Value) {
-    let cfg = json!({
+    load_with(instruction, capabilities, Value::Null)
+}
+
+/// The configuration a document is loaded under, with `extra` top-level
+/// sections — what the deployment around the document provides.
+fn config_for(instruction: &str, capabilities: &[&str], extra: Value) -> Value {
+    let mut cfg = json!({
         "agent": {
             "name": "idoc-e2e", "preflight": "never",
             "instruction": instruction,
@@ -22,6 +28,15 @@ fn load(instruction: &str, capabilities: &[&str]) -> (bool, String, Value) {
         "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
         "store": {"kind": "memory"},
     });
+    if let (Some(cfg), Some(extra)) = (cfg.as_object_mut(), extra.as_object()) {
+        cfg.extend(extra.clone());
+    }
+    cfg
+}
+
+/// [`load`] under [`config_for`]`(…, extra)`.
+fn load_with(instruction: &str, capabilities: &[&str], extra: Value) -> (bool, String, Value) {
+    let cfg = config_for(instruction, capabilities, extra);
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let path = std::env::temp_dir().join(format!(
@@ -178,53 +193,197 @@ fn a_full_document_loads_every_element() {
     );
 }
 
-/// A document's workflow may address a `human` step to one of its own
-/// `::!human` declarations. idoc folds `@human/<name>` into that human's
-/// `channel` (its `principal` when it declares no channel), and a gate may
-/// wait only for an operator: a channel names no principal, so it is refused
-/// at load — saying what the reference became and why — while a human whose
-/// principal is the operator loads.
+/// Every family, granted.
+const ALL: [&str; 7] = [
+    "material",
+    "knowledge",
+    "interface",
+    "identity",
+    "compute",
+    "infra",
+    "compose",
+];
+
+/// Load `instruction` through agentd's own config loader — the one the
+/// daemon runs — with every family granted, under [`config_for`].
+fn settings(instruction: &str, extra: Value) -> agentd::config::settings::Settings {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "idoc-e2e-settings-{}-{}.json",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let cfg = config_for(instruction, &ALL, extra);
+    std::fs::write(&path, serde_json::to_vec(&cfg).unwrap()).unwrap();
+    let loaded = agentd::config::settings::load(
+        &["--config".to_string(), path.to_str().unwrap().to_string()],
+        &[],
+    );
+    let _ = std::fs::remove_file(&path);
+    loaded
+        .unwrap_or_else(|e| panic!("the document did not load: {e:?}"))
+        .0
+        .settings
+}
+
+/// Every `human` step of every workflow, as `(workflow, step, to)`.
+fn human_steps(s: &agentd::config::settings::Settings) -> Vec<(String, String, Value)> {
+    s.workflows
+        .iter()
+        .flat_map(|w| {
+            let name = w["name"].as_str().unwrap_or("?").to_string();
+            w["steps"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .filter(|(_, st)| st["kind"] == "human")
+                .map(move |(id, st)| (name.clone(), id.clone(), st["to"].clone()))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// The spec's own conformance examples address their `human` steps to the
+/// document's `::!human`s, which declare a `channel` and no principal. They
+/// load through agentd, each such gate answered by the operators — exactly as
+/// `to: operator` — and announced on the channel the document declared. The
+/// instruction crate's fold, and so the corpus's expected output, is
+/// untouched: agentd reads the principal and the channel from the parsed
+/// document rather than from the one folded string.
 #[test]
-fn a_gate_addressed_to_a_documents_human_loads_only_as_an_operator() {
-    let doc = |human: &str| {
+fn the_spec_corpus_documents_load_with_their_gates_answered_by_operators() {
+    let corpus = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../instruction/tests/conformance/corpus"
+    );
+    for (case, want) in [
+        (
+            "spec-example",
+            vec![("approve-refund", "ask", "@channel/ops")],
+        ),
+        (
+            "support-agent",
+            vec![
+                ("approve-refund", "ask", "@channel/ops"),
+                ("reopen", "notify", "@channel/ops"),
+            ],
+        ),
+        (
+            "deploy-runbook",
+            vec![
+                ("deploy", "gate1", "@channel/deploys"),
+                ("deploy", "gate2", "@channel/deploys"),
+                ("rollback", "page", "@channel/oncall"),
+            ],
+        ),
+        (
+            "orchestrator",
+            vec![("reroute", "which", "@channel/dispatch")],
+        ),
+        ("coding-agent", vec![("ci-triage", "ask", "@channel/eng")]),
+    ] {
+        // What a deployment provides around a document that declares an
+        // endpoint and a mounted secret: the webhook listener, and the file
+        // the secret is mounted at — here a scratch copy, so the one path the
+        // document names outside itself is the only thing that differs.
+        let secret = std::env::temp_dir().join(format!("idoc-e2e-secret-{}", std::process::id()));
+        std::fs::write(&secret, "s3cret").unwrap();
+        let doc = std::fs::read_to_string(format!("{corpus}/{case}/doc.md"))
+            .unwrap()
+            .replace("/var/run/secrets/deployer", secret.to_str().unwrap());
+        // Validated, never bound: nothing here starts the daemon.
+        let env = json!({"webhooks": {"listen": "http://127.0.0.1:18081"}});
+        // The binary's own validation, as a deployment runs it.
+        let (valid, err, _) = load_with(&doc, &ALL, env.clone());
+        assert!(valid, "{case} must load through agentd:\n{err}");
+        let s = settings(&doc, env);
+        let steps = human_steps(&s);
+        assert!(!steps.is_empty(), "{case}: no human step loaded");
+        for (wf, step, to) in &steps {
+            assert_eq!(
+                to,
+                &json!("operator"),
+                "{case}: {wf}.{step} is answered by the operators"
+            );
+        }
+        let mut got: Vec<(String, String, String)> = s
+            .agent
+            .document_gate_channels
+            .iter()
+            .flat_map(|(wf, steps)| {
+                steps
+                    .iter()
+                    .map(move |(st, ch)| (wf.clone(), st.clone(), ch.clone()))
+            })
+            .collect();
+        got.sort();
+        let mut want: Vec<(String, String, String)> = want
+            .into_iter()
+            .map(|(w, st, ch)| (w.to_string(), st.to_string(), ch.to_string()))
+            .collect();
+        want.sort();
+        assert_eq!(got, want, "{case}: each gate carries its declared channel");
+        let _ = std::fs::remove_file(&secret);
+    }
+}
+
+/// A `::!human` that names a `principal` addresses the gate to it, and the
+/// gate rule applies unchanged: the operator loads (its channel still
+/// carried), anyone else is refused with the usual reason. A reference to a
+/// human the document never declared stays a load error.
+#[test]
+fn a_documents_human_with_a_principal_is_held_to_the_gate_rule() {
+    let doc = |human: &str, to: &str| {
         format!(
             "---\nspec: \"1\"\n---\n# Refunds\n\n{human}\n\n\
              :::!workflow{{name=w}}\n\
              steps:\n\
              \x20 s:   {{kind: manual}}\n\
-             \x20 ask: {{kind: human, question: \"ok?\", to: \"@human/oncall\", depends_on: [s]}}\n\
+             \x20 ask: {{kind: human, question: \"ok?\", to: \"{to}\", depends_on: [s]}}\n\
              \x20 f:   {{kind: finish, depends_on: [ask]}}\n\
              :::\n"
         )
     };
-    let all = [
-        "material",
-        "knowledge",
-        "interface",
-        "identity",
-        "compute",
-        "infra",
-        "compose",
-    ];
-    for (human, named) in [
-        (":::!human{name=oncall channel=#ops}\n:::", "#ops"),
-        (
-            ":::!human{name=oncall}\nrole: approver\n:::",
-            "@human/oncall",
-        ),
-    ] {
-        let (valid, err, _) = load(&doc(human), &all);
-        assert!(!valid, "{human} must not load");
-        assert!(
-            err.contains(&format!("`to` names {named}, who could never see the task"))
-                && err.contains("a channel is not a principal"),
-            "the refusal names {named} and says what it became:\n{err}"
-        );
-    }
-    let (valid, err, _) = load(&doc(":::!human{name=oncall principal=operator}\n:::"), &all);
+    let operator = doc(
+        ":::!human{name=oncall principal=operator channel=#ops}\n:::",
+        "@human/oncall",
+    );
+    let (valid, err, _) = load(&operator, &ALL);
     assert!(
         valid,
         "a human who is the operator is a gate's decider:\n{err}"
+    );
+    let s = settings(&operator, Value::Null);
+    assert_eq!(human_steps(&s)[0].2, json!("operator"));
+    assert_eq!(
+        s.agent.document_gate_channels["w"]["ask"], "#ops",
+        "and the channel it declares is carried"
+    );
+
+    let (valid, err, _) = load(
+        &doc(
+            ":::!human{name=oncall principal=user:alice channel=#ops}\n:::",
+            "@human/oncall",
+        ),
+        &ALL,
+    );
+    assert!(!valid, "user:alice could never see the gate's task");
+    assert!(
+        err.contains("`to` names user:alice, who could never see the task")
+            && !err.contains("channel"),
+        "the refusal is the gate rule's own, about her:\n{err}"
+    );
+
+    let (valid, err, _) = load(
+        &doc(":::!human{name=oncall channel=#ops}\n:::", "@human/nobody"),
+        &ALL,
+    );
+    assert!(!valid, "a reference to an undeclared human must not load");
+    assert!(
+        err.contains("`to` names @human/nobody, who could never see the task")
+            && err.contains("resolves only inside the document that declares"),
+        "the refusal says the reference names no declared human:\n{err}"
     );
 }
 

@@ -160,6 +160,11 @@ pub struct Task {
     /// for — and the answer is already the right shape when it comes back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ask_schema: Option<Value>,
+    /// Where the gate is announced: the `channel` of the instruction
+    /// document's `::!human` it was addressed to. A place a bridge routes the
+    /// question to, never who may answer it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ask_channel: Option<String>,
     /// The command op that opened this task, when a command did (a built-in
     /// op, or a workflow's declared `a2a` command). What marks the result as
     /// the command vocabulary's data rather than an answer in prose.
@@ -206,6 +211,7 @@ impl Task {
         let now = now_ms();
         Task {
             ask_schema: None,
+            ask_channel: None,
             id: id.to_string(),
             context_id: context_id.to_string(),
             conversation: context_id.to_string(),

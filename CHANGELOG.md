@@ -119,10 +119,10 @@ Configuration:
   `ask_human` is called with one. Every operator is addressed as `operator`,
   whichever `a2a.principals` rule admitted it, so a rule's own id is refused
   too; its labels narrow a gate to it. A `to` that a step renders (a `{{…}}`
-  or `CEL:` anywhere in it) is checked when the step runs. An instruction
-  document's `@human/<name>` reaches the gate as that human's `channel` (its
-  `principal` when it declares no channel); a channel names no principal, so
-  it is refused, and the refusal says why.
+  or `CEL:` anywhere in it) is checked when the step runs. A `to:` is
+  principal syntax only: a channel (`#ops`) names no principal and is
+  refused, and the refusal says where a channel can come from — an
+  instruction document (below, under Added).
 - **The policy-ask addressee defaults to the operator**: an `action: ask`
   rule with no `to:` is addressed to `{role: operator}`, so the caller whose
   call is judged does not approve it.
@@ -318,6 +318,17 @@ There are no removal tables and no removed sections in `--help`.
 - `a2a.url`, `a2a.cors.origins`, `a2a.introspection.enabled`,
   `agent.description`, `agent.ask_human_unowned` and
   `security.policies[].to`.
+- **An instruction document's `@human/<name>` gate loads, and its channel is
+  announced.** A top-level `human` step a document addresses to one of its
+  `::!human`s goes to that human's `principal`, held to the gate rule
+  (`principal=operator` loads, `principal=user:alice` is refused), or, when
+  it names none, to the operators exactly as `to: operator`. The human's
+  `channel` is carried on the gate — `human.asked`'s `payload.channel` and
+  the task's `askChannel` annotation — for a workflow or a bridge to route
+  the question; it never decides who may answer, and no `to:` written
+  anywhere else can set one. The spec's own conformance examples, which
+  address their gates this way, now load; the instruction crate's fold and
+  its corpus are unchanged.
 - `admin.set {path, value}`, an operator op over the runtime-settable paths.
 - `agentd --extensions` and `agentd --extension-schema <name>`, the registry
   and schema bundles that agentd.dev serves at each extension's URI.

@@ -695,7 +695,9 @@ impl Runtime {
     /// opening: `human.asked` fires as an internal event, so a workflow
     /// (`{kind: event, on: human.asked}`) can escalate it out-of-band — mail
     /// the approver, ring a phone — instead of hoping someone is watching a
-    /// terminal.
+    /// terminal. The payload's `channel` is where the instruction document
+    /// said the gate is announced (`null` when it said nothing) — what such a
+    /// workflow routes on.
     pub(crate) fn push_pending(&mut self, p: super::reactor::PendingTool) {
         if let super::reactor::PendingKind::Human {
             task,
@@ -704,8 +706,15 @@ impl Runtime {
             ..
         } = &p.kind
         {
+            // Only a `human` step's gate has one: the document declares it
+            // per step (`config::humans`).
+            let channel = match &p.target {
+                super::reactor::Target::Step(run, step) => self.document_gate_channel(run, step),
+                _ => None,
+            };
             let payload = serde_json::json!({
                 "task": task, "question": question, "deadline_ms": deadline_ms,
+                "channel": channel,
             });
             self.fire_event_starts("human.asked", &payload);
         }

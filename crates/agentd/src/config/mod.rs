@@ -90,6 +90,7 @@ pub fn http_get(url: &str) -> Result<String, String> {
 } // encrypted-envelope detection (RFC 0041) — always compiled, no crypto
 pub mod envfile;
 pub mod file;
+pub mod humans; // a document's `@human/<name>` gates: who answers, and the channel they are announced on
 pub mod idoc;
 pub mod paths;
 pub mod prompt;

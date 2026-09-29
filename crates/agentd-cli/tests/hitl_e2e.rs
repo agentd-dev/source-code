@@ -22,7 +22,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use common::{SendMessage, rpc_result as rpc};
+use agentd::runtime::surface::TASK_ANNOTATIONS_EXTENSION;
+use common::{SendMessage, a2a_post, rpc_body, rpc_result as rpc};
 
 fn command(addr: &str, op: &str, args: Value) -> Value {
     SendMessage::command(op, args).result(addr)
@@ -656,6 +657,144 @@ fn an_addressed_operators_answer_records_who_she_is() {
         "the audit line carries the answerer's role\n{audited}"
     );
     assert!(!log.contains("human.answer.override"), "{log}");
+    std::fs::remove_file(&cfg).ok();
+}
+
+/// An instruction document addresses a gate to one of its `::!human`s that
+/// declares only a channel. The gate is the operators' — exactly as `to:
+/// operator` — and the channel is announced, never consulted: `human.asked`
+/// and the task's annotations carry it for a bridge to route the question,
+/// the user who started the run (and so can see its task) is refused as she
+/// is from any operator gate, and an operator's answer resolves it.
+#[test]
+fn a_documents_channel_gate_is_announced_and_answered_by_an_operator() {
+    const OP: &str = "hitl-e2e-channel-operator-bearer";
+    const ALICE: &str = "hitl-e2e-channel-alice-bearer";
+    let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
+    let cfg_for = |port: u16| {
+        format!(
+            "\
+             agent:\n  name: hitl-e2e\n  preflight: never\n  document_capabilities: [interface]\n\
+             \x20 instruction: |\n\
+             \x20   You approve refunds.\n\n\
+             \x20   :::!channel{{name=ops}}\n\
+             \x20   :::\n\n\
+             \x20   :::!human{{name=oncall channel=@channel/ops}}\n\
+             \x20   :::\n\n\
+             \x20   :::!workflow{{name=approve}}\n\
+             \x20   steps:\n\
+             \x20     s: {{kind: manual}}\n\
+             \x20     gate: {{kind: human, question: \"Approve the refund?\", to: \"@human/oncall\", depends_on: [s]}}\n\
+             \x20     f: {{kind: finish, depends_on: [gate], output: refunded}}\n\
+             \x20   :::\n\
+             intelligence:\n  endpoints: {llm}\n  model: mock\n\
+             store:\n  kind: memory\n\
+             a2a:\n  listen: http://127.0.0.1:{port}\n\
+             \x20 bearer: \"{{{{secret:HITL_OP}}}}\"\n\
+             \x20 principals:\n\
+             \x20   - id: alice\n\
+             \x20     match: {{ bearer_ref: \"{{{{secret:HITL_ALICE}}}}\" }}\n\
+             \x20     role: user\n\
+             \x20     grants: [\"*\"]\n\
+             lifecycle:\n  run_until: drained\n\
+             observability:\n  log_level: info\n  log_content: true\n\
+             workflows:\n\
+             \x20 - name: notifier\n    steps:\n\
+             \x20     saw: {{kind: event, on: human.asked}}\n\
+             \x20     f:   {{kind: finish, depends_on: [saw], output: \"announced on {{{{steps.saw.output.payload.channel}}}}\"}}\n",
+            llm = llm.uri
+        )
+    };
+    let (daemon, addr, cfg) = spawn_bound_with(cfg_for, |cfg| {
+        let stderr_path = common::unique_path("hitl-daemon", "log");
+        let errf = std::fs::File::create(&stderr_path).unwrap();
+        let child = Command::new(env!("CARGO_BIN_EXE_agentd"))
+            .args(["--config", cfg])
+            .env("HITL_OP", OP)
+            .env("HITL_ALICE", ALICE)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(errf))
+            .spawn()
+            .expect("spawn agentd daemon");
+        Daemon { child, stderr_path }
+    });
+
+    // Alice starts the run, so the gate lands on her task.
+    let started = SendMessage::command("workflow.run", json!({"workflow": "approve"}))
+        .bearer(ALICE)
+        .result(&addr);
+    let task_id = started["task"]["id"].as_str().unwrap().to_string();
+    let get_task = |bearer: &str| {
+        a2a_post(
+            &addr,
+            &rpc_body(900, "GetTask", json!({"id": task_id})),
+            &[
+                ("Authorization", &format!("Bearer {bearer}")),
+                ("A2A-Extensions", TASK_ANNOTATIONS_EXTENSION),
+            ],
+        )
+        .json()
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let gated = loop {
+        let t = get_task(ALICE);
+        if t["result"]["status"]["state"] == "TASK_STATE_INPUT_REQUIRED" {
+            break t;
+        }
+        assert!(Instant::now() < deadline, "the gate never opened: {t}");
+        std::thread::sleep(Duration::from_millis(80));
+    };
+    assert_eq!(
+        gated["result"]["metadata"][TASK_ANNOTATIONS_EXTENSION]["askChannel"], "@channel/ops",
+        "the task says where the gate is announced\n{gated}"
+    );
+    // `human.asked` carries the channel, for a workflow to route on.
+    let log = wait_log(&daemon, "announced on @channel/ops", 10);
+    assert!(
+        log.contains("\"event\":\"run.done\"") && log.contains("announced on @channel/ops"),
+        "{log}"
+    );
+
+    // Alice can see her task, but the gate is the operators': her answer is
+    // refused and the gate stays open.
+    let refused = SendMessage::text("approved")
+        .task(&task_id)
+        .return_immediately()
+        .bearer(ALICE)
+        .post(&addr);
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("this decision is for operator")),
+        "a user's answer to an operator gate is refused\n{refused}"
+    );
+    wait_log(&daemon, "\"event\":\"human.answer.not_addressed\"", 10);
+    assert_eq!(
+        get_task(OP)["result"]["status"]["state"],
+        "TASK_STATE_INPUT_REQUIRED"
+    );
+
+    // An operator's answer resolves it — as the addressee, not an override.
+    SendMessage::text("approved")
+        .task(&task_id)
+        .return_immediately()
+        .bearer(OP)
+        .result(&addr);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let t = get_task(OP);
+        if t["result"]["status"]["state"] == "TASK_STATE_COMPLETED" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the run never finished: {t}");
+        std::thread::sleep(Duration::from_millis(80));
+    }
+    let log = wait_log(&daemon, "\"event\":\"human.answered\"", 10);
+    assert!(
+        !log.contains("human.answer.override"),
+        "the operator is the gate's addressee\n{log}"
+    );
     std::fs::remove_file(&cfg).ok();
 }
 

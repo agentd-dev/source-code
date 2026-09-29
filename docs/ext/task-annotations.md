@@ -65,6 +65,7 @@ it.
 | `statusHistory` | yes | every state the task has been in, oldest first, each `{state, ts}` with the A2A `TaskState` name |
 | `principal` | no | who started the task |
 | `askSchema` | no | the JSON Schema of the answer an `INPUT_REQUIRED` gate asks for, so a client can render a control rather than a text box |
+| `askChannel` | no | where an `INPUT_REQUIRED` gate is also announced: the `channel` of the instruction document's `::!human` it is addressed to. A place a bridge routes the question to; it never decides who may answer |
 | `command` | no | the [command](command.md) op that started the task |
 
 The object is closed: the bundle refuses a member it does not name, so a fact

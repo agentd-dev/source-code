@@ -1999,6 +1999,15 @@ narrows to it. The same rule holds wherever a question is addressed with `to:`,
 a workflow's `human` step included; a step's `to` with a `{{…}}` placeholder or
 a `CEL:` expression in it is held to it when the step runs.
 
+A `to:` written here is principal syntax only: a channel (`#ops`) names no
+principal and is refused like any other. A channel reaches a gate only from an
+instruction document, where its meaning is declared: a document's `human` step
+addressed `to: "@human/<name>"` goes to that `::!human`'s `principal` (held to
+the rule above), or, when it names none, to the operators, as `to: operator`
+would, and the human's `channel` is announced on `human.asked` and on the task's
+`askChannel` annotation. It never decides who may answer
+([node-registry.md](node-registry.md#addressed-gates)).
+
 ### 12.7 What callers are shown, and for how long
 
 | Key | Default | Reload | Written by |

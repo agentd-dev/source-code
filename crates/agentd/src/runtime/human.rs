@@ -137,6 +137,25 @@ impl Runtime {
         }
     }
 
+    /// The channel a gate is announced on, when the instruction document
+    /// addressed the asking `human` step to one of its `::!human`s
+    /// (`config::humans`). Looked up by the step rather than read from its
+    /// `to`, because a channel is never part of a `to`: only the document's
+    /// own declaration can put one on a gate. Nor is it carried on the pending
+    /// ask or in the durable wait record: it is read from the settings the
+    /// runtime is running now whenever it is announced, so a reload that
+    /// changes it moves the next gate, and a restart re-derives it for a gate
+    /// it rebuilds.
+    pub(crate) fn document_gate_channel(&self, run: &str, step: &str) -> Option<String> {
+        let workflow = &self.runs.get(run)?.workflow;
+        self.settings
+            .agent
+            .document_gate_channels
+            .get(workflow)?
+            .get(step)
+            .cloned()
+    }
+
     /// The `ask_human` internal tool.
     pub(crate) fn ask_human_tool(
         &mut self,
@@ -366,6 +385,12 @@ impl Runtime {
     ) -> super::tools::ToolOutcome {
         use super::tools::ToolOutcome;
         use crate::a2a::tasks::{Link, State};
+        // Where the gate is announced, when the document addressed the asking
+        // `human` step to one of its humans. It never changes who may answer.
+        let channel = match (&caller.run, &caller.step) {
+            (Some(run), Some(step)) => self.document_gate_channel(run, step),
+            _ => None,
+        };
 
         // One live gate per task (asks within one unit are sequential anyway).
         if let Some(t) = &owned
@@ -437,13 +462,18 @@ impl Runtime {
             // only offer a text box and hope the person types one of the words
             // the schema would have listed.
             t.ask_schema = schema.clone();
+            // …and so does the channel it is announced on, for a client that
+            // shows where the question also went. Set on every gate, so a
+            // later gate on the same task that has none clears it.
+            t.ask_channel = channel.clone();
             t.transition(State::InputRequired, Some(question.clone()));
         }
         self.task_persist(&task_id);
         self.task_sync(&task_id);
         self.log.info(
             "human.ask",
-            json!({"task": task_id, "question": question, "deadline_ms": deadline_ms}),
+            json!({"task": task_id, "question": question, "deadline_ms": deadline_ms,
+                   "channel": channel}),
         );
         self.audit(super::audit::AuditEvent {
             action: "ask_human",

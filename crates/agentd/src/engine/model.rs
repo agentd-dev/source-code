@@ -2219,6 +2219,9 @@ fn parse_step(
             // refused here too — at load AND at `workflow.create`/`update`,
             // which both reach this validation. A templated `to` is only known
             // when the step runs, and `ask_human` holds it to the same rule.
+            // An instruction document's `@human/<name>` arrives here already
+            // addressed — to the human's principal, or to `operator` — by
+            // `config::humans`; its channel never enters the definition.
             if let Some(v) = spec.get("to") {
                 match crate::a2a::principals::Addressee::parse(v) {
                     Err(e) => errs.push(format!("{at}: human.to: {e}")),

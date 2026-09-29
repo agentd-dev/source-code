@@ -268,6 +268,10 @@ pub fn annotations(t: &Task) -> Value {
     if let Some(sch) = &t.ask_schema {
         a["askSchema"] = sch.clone();
     }
+    // Where the gate is also announced, for a client that shows it.
+    if let Some(ch) = &t.ask_channel {
+        a["askChannel"] = json!(ch);
+    }
     if let Some(op) = &t.command {
         a["command"] = json!(op);
     }

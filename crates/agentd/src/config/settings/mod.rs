@@ -300,6 +300,15 @@ pub struct Agent {
     /// runtime effect of each is delegated to a service per the spec.
     #[serde(skip)]
     pub document_declarations: std::collections::BTreeMap<String, Vec<Value>>,
+    /// The channel each gate the instruction document addressed to one of its
+    /// `::!human`s is announced on, per workflow and step — DERIVED, never a
+    /// config key (`config::humans`). Out of the definition on purpose: a `to`
+    /// written anywhere else stays principal syntax only, so nothing but the
+    /// document's own declaration can put a channel on a gate. Read live by
+    /// the runtime when a gate opens, so a reload that changes it takes effect
+    /// on the next gate.
+    #[serde(skip)]
+    pub document_gate_channels: crate::config::humans::GateChannels,
     /// Where a pulled instruction came from (an `oci://` reference resolved at
     /// config load, RFC 0040) — DERIVED: the runtime uses it to log
     /// `instruction.loaded` with its version pin and to arm the freshness
@@ -4041,6 +4050,7 @@ impl Settings {
         };
 
         let mut idoc_extraction: Option<crate::config::idoc::Extraction> = None;
+        let mut gate_channels = crate::config::humans::GateChannels::new();
         if let Some(instr) = doc
             .get("agent")
             .and_then(|a| a.get("instruction"))
@@ -4077,8 +4087,28 @@ impl Settings {
             // one dimension agentd can always answer about itself.
             let facts: std::collections::BTreeMap<String, String> =
                 [("agent".to_string(), "agentd".to_string())].into();
-            match crate::config::idoc::extract_with_facts(&instr, &granted, &facts) {
-                Ok(ex) => {
+            // Parsed here and folded with the same arguments `extract_with_facts`
+            // uses, rather than through it, because agentd needs the parsed
+            // document once more after the fold: a gate addressed to one of its
+            // `::!human`s takes that human's principal AND channel, of which the
+            // folded `to` keeps only one (`config::humans`).
+            let folded = crate::config::idoc::parse(&instr).and_then(|parsed| {
+                let mut ex = crate::config::idoc::fold_full(
+                    &parsed,
+                    &granted,
+                    &BTreeMap::new(),
+                    &facts,
+                    &|_| None,
+                    0,
+                    &std::collections::BTreeSet::new(),
+                )?;
+                let channels =
+                    crate::config::humans::address_document_gates(&parsed, &mut ex.workflows);
+                Ok((ex, channels))
+            });
+            match folded {
+                Ok((ex, channels)) => {
+                    gate_channels = channels;
                     if let Some(a) = doc.get_mut("agent").and_then(Value::as_object_mut) {
                         a.insert("instruction".into(), Value::String(ex.cleaned.clone()));
                     }
@@ -4162,6 +4192,7 @@ impl Settings {
             settings.agent.document_declarations = ex.declarations;
             settings.agent.document_config = ex.config;
         }
+        settings.agent.document_gate_channels = gate_channels;
         settings.agent.instruction_origin = instruction_origin;
         settings.agent.instruction_path = instruction_path;
         settings.agent.instruction_spec = instruction_spec;

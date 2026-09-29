@@ -112,6 +112,16 @@ beneath it becoming the workflow's `description` — and those two forms are
 the only ones `workflow` takes: a `:::!workflow[]` set table is refused, the
 message naming the two it does. `{armed=false}` loads the workflow disarmed.
 
+A top-level `human` step addressed `to: "@human/<name>"` names one of the
+document's `::!human` declarations (the `interface` grant). The spec's fold
+resolves the reference to one string — the channel when there is one — and
+agentd reads the declaration itself instead: the gate goes to the human's
+`principal`, held to the gate rule like any `to`, or to the operators when it
+names none, and the human's `channel` is announced on `human.asked` and the
+task's `askChannel` annotation without deciding who answers. A reference to a
+human the document does not declare is refused at load. See
+[Addressed gates](node-registry.md#addressed-gates).
+
 Two things happen to the *text*. The model reads the **cleaned** instruction,
 where the block became a one-line note — `[workflow "triage" is loaded and
 runs autonomously]` — so the prose and the machinery cannot double-speak (a

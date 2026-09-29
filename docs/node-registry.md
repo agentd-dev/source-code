@@ -70,7 +70,7 @@ matches on.
 | `schedule` | — | `cron` `every` `tz` `jitter` `catch_up` `at` `inputs` | Fires on a 5-field UTC cron or an `every` interval. `at` is one-shot and consumes itself. `tz`, `jitter` and `catch_up` parse but nothing reads them — a missed occurrence is always skipped, never replayed. |
 | `subscribe` | `server` `uri` | `debounce_ms` `coalesce` `filter` `deliver` `on_no_listener` `window` `inputs` | Fires when an MCP resource changes (notify-then-read). `debounce_ms` collapses bursts (the newest payload wins inside the window); `filter` drops uninteresting reads; `window: {samples: N}` delivers the last N read values (`output.window`) — the trend, not just the reading. `coalesce`, `deliver` and `on_no_listener` parse but nothing reads them. |
 | `signal` | `name` | `filter` `deliver` `inputs` | Fires on a named signal from another run, a tool, or an operator. |
-| `event` | `on` | `filter` `inputs` | Fires on an internal event — `workflow.finished\|failed`, `subagent.finished`, `budget.exhausted`, `config.reloaded`, `restore.done`, `human.asked`, `human.answered`, `human.timeout`, `lifecycle.shutdown` (the deinit hook: the drain waits for its runs). Output is `{event, payload: {…}}` — read `…output.payload.*`; the CEL `filter` sees the inner payload. |
+| `event` | `on` | `filter` `inputs` | Fires on an internal event — `workflow.finished\|failed`, `subagent.finished`, `budget.exhausted`, `config.reloaded`, `restore.done`, `human.asked`, `human.answered`, `human.timeout`, `lifecycle.shutdown` (the deinit hook: the drain waits for its runs). Output is `{event, payload: {…}}` — read `…output.payload.*`; the CEL `filter` sees the inner payload. `human.asked`'s payload is `{task, question, deadline_ms, channel}`, `channel` being where an instruction document's `::!human` said the gate is announced (`null` otherwise) — what an escalation workflow routes on. |
 | `stream` | `stream` | `subject` `filter` `from` `rate` `batch` `inputs` | Fires once per event on a declared stream — including events another workflow `emit`ted. `subject` matches exactly or by `prefix.*` glob; `from: earliest` replays the backlog into a consumer that did not exist when the events were published; the offset is durable, so a restart resumes where it left off, exactly once. A workflow never fires on its own emits; `rate: "<burst>/<per>"` paces consumption (events queue durably — `rate: "1/1d"` turns a stream into a worked-off daily queue). `batch: {size: 2..=1000, window?: <dur>}` makes one run per GROUP instead of per event — for anything that amortises, like a bulk write or one LLM call over a page — and the payload becomes `…output.events[]` / `…output.count` / `…output.full` (`full: false` means the window elapsed before the batch filled). `batch` and `rate` are mutually exclusive: both pace consumption and compose confusingly. Output is otherwise the event: `…output.subject`, `…output.data.*`, `…output.correlation`. |
 | `correlate` | `stream` `on` | `by` `window` `on_incomplete` `filter` `max_pending` `inputs` | Fires when a SET of events sharing one correlation value has arrived. `depends_on` joins steps; this joins events. `on` lists two or more subject patterns; `by` is a dot path into the event, defaulting to the envelope's own `correlation` (which `emit` sets). Half-collected sets live in durable start-state, so a restart resumes a join — which is why `window` is **required**: it bounds how long one is kept. `on_incomplete: fire_partial` fires the partial set when the window expires ("paid but never shipped" *is* the event); the default `discard` drops it. Output: `…output.events[]` in `on` order, `…output.correlation`, `…output.complete`, `…output.missing[]` — check `complete` before treating a partial firing as a finished join. `max_pending` (default 1000) caps the durable pending map; past it, new correlation values are refused and logged rather than growing without limit. |
 | `a2a` | — | `command` `roles` `schema` `into` `inputs` | Fires when a principal sends a message whose command matches. Declaring `command` REGISTERS it as an A2A command the listener accepts — the **built-in ops are reserved**, so a name like `status` or `admin.drain` is refused at validation rather than shadowing the operation it collides with; `schema` is the payload CONTRACT — a non-conforming command is refused at the listener, synchronously, naming the mismatch. `roles` narrows who may fire it. Output: `…output.args.*` (the typed payload), plus `parts`/`text`/`principal`. **`into: {stream, subject}`** appends the message to a stream instead of firing a run, after the principal and any `roles` filter have been applied — the peer-facing half of the same binding. |
@@ -165,7 +165,7 @@ matches on.
 | `summarize` | `input` | `length` `prompt` `skills` `model` | Shortens `input` to `length`. |
 | `judge` | `input` `rubric` | `prompt` `skills` `model` | Scores `input` against a `rubric`. |
 | `route` | `input` `choices` | `prompt` `skills` `model` | Picks one of `choices` for `input`. The model-driven alternative to `switch`. |
-| `human` | `question` | `schema` `to` `timeout` | Asks a person `question` and suspends durably until they answer — the answer can arrive after a restart. `schema` is ENFORCED on the reply: a mismatch re-asks with the reason rather than being accepted. `to` names **who must answer** (see [Addressed gates](#addressed-gates)); omit it and any watcher may answer. `reply_uri` is refused at load — nothing implements it. |
+| `human` | `question` | `schema` `to` `timeout` | Asks a person `question` and suspends durably until they answer — the answer can arrive after a restart. `schema` is ENFORCED on the reply: a mismatch re-asks with the reason rather than being accepted. `to` names **who must answer** (see [Addressed gates](#addressed-gates)); omit it and any watcher may answer. In an instruction document, `to: "@human/<name>"` addresses one of the document's `::!human`s: its principal, or the operators, with its channel announced ([below](#addressed-gates)). `reply_uri` is refused at load — nothing implements it. |
 
 `model` names an `intelligence.models` tier on any kind that makes a model
 call — the five shaping presets included, since those are the cheap
@@ -263,10 +263,30 @@ covers a model's call and a `to` rendered from a template. A `to` with a
 the step runs, so the load leaves it to that check. Every operator is
 addressed as `operator`, whichever `a2a.principals` rule admitted it: a rule's
 own id names no principal and is refused like any other, and its labels are
-how a gate narrows to it. An instruction document's `to: "@human/<name>"`
-arrives as that human's `channel` (its `principal` when it declares no
-channel); a channel names no principal, so it is refused too, and the refusal
-says why.
+how a gate narrows to it. A channel (`#ops`, `@channel/ops`) names no
+principal either, and a `to` written in config, in `workflow.create` or by a
+model is principal syntax only, so it is refused too, saying so.
+
+**An instruction document's `@human/<name>`.** A document declares the people
+it involves with `::!human` — a name, and a `principal` and/or a `channel` —
+and its `:::!workflow` addresses a top-level `human` step to one with
+`to: "@human/<name>"`. The loader reads both attributes from the document:
+
+- a human that names a **`principal`** addresses the gate to it, held to the
+  rule above unchanged — `principal=operator` loads, `principal=user:alice` is
+  refused with the usual reason;
+- a human that names **no principal** — only a `channel`, or neither — is
+  answered by the operators, exactly as `to: operator`;
+- the human's **`channel`** is carried on the gate: `human.asked` (as
+  `payload.channel`) and the task's `askChannel`
+  [annotation](ext/task-annotations.md) say where the question is announced,
+  so a workflow or a bridge can route it to Slack, a pager or mail. It never
+  changes who may answer.
+
+The channel stays out of the definition — `workflow.get` shows `to:
+operator` — and is looked up for the step when the gate opens, so nothing but
+the document's own declaration can put one on a gate. A reference to a human
+the document does not declare is refused at load.
 
 Three more declarations are load errors rather than accepted-and-ignored,
 because each produces a gate that *looks* routed and is not: one that names

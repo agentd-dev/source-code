@@ -4,6 +4,10 @@
   "additionalProperties": false,
   "description": "agentd's facts about a task, carried in Task.metadata under https://agentd.dev/a2a/ext/task-annotations on an answer to a request that activated it.",
   "properties": {
+    "askChannel": {
+      "description": "where an INPUT_REQUIRED gate is also announced: the channel of the instruction document's human it is addressed to",
+      "type": "string"
+    },
     "askSchema": {
       "description": "the JSON Schema of the answer an INPUT_REQUIRED gate asks for",
       "type": [

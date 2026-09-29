@@ -161,16 +161,23 @@ impl Addressee {
             return Ok(());
         }
         // No principal id starts with `@` or `#` (they are `operator`,
-        // `anonymous`, `user:…` and `agent:…`), so such a `to` is almost
-        // certainly an instruction document's `@human/<name>`, which idoc folds
-        // into that human's `channel` — a place to notify, not a principal —
-        // or leaves as written when the human declares neither a channel nor
-        // a principal. Saying so is what lets the document's author fix it.
+        // `anonymous`, `user:…` and `agent:…`), so such a `to` is a channel
+        // (`#ops`, `@channel/ops`) or a reference — a place to notify, not a
+        // principal. An instruction document's `@human/<name>` never arrives
+        // here resolved to its channel: the loader addresses it to the
+        // human's principal, or to the operators, and carries the channel
+        // alongside (`config::humans`). What does arrive is a channel written
+        // straight into a `to`, or a reference to a human the document never
+        // declared — and saying which is what lets the author fix it.
         let reference = match &self.id {
+            Some(id) if id.starts_with("@human/") => {
+                " (`@human/<name>` is an instruction document's reference, and it resolves only \
+                 inside the document that declares that human with `::!human`)"
+            }
             Some(id) if id.starts_with('@') || id.starts_with('#') => {
-                " (an instruction document's `@human/<name>` becomes that human's `channel`, \
-                 or its `principal` when it declares no channel; a channel is not a principal, \
-                 so address the gate with a `principal` of `operator` and no channel)"
+                " (a channel is not a principal: to announce a gate on a channel, address it \
+                 from an instruction document to a `::!human` that declares the channel — \
+                 operators answer it and the channel is carried on the gate)"
             }
             _ => "",
         };
@@ -342,26 +349,42 @@ mod tests {
         }
     }
 
-    /// An instruction document's `@human/<name>` reaches a gate as that
-    /// human's channel (or as written): the refusal says so, so the author
-    /// knows what to change — and a principal id never looks like one.
+    /// A channel or a reference that reaches a gate's `to` names no
+    /// principal. A document's `@human/<name>` never arrives as its channel
+    /// (the loader resolves it), so what does arrive is a channel written
+    /// into a `to` or a reference to an undeclared human: the refusal says
+    /// which — and a principal id never looks like either.
     #[test]
-    fn a_gate_addressed_to_a_document_reference_says_what_it_is() {
-        for reference in ["@human/oncall", "@channel/ops", "#ops"] {
+    fn a_gate_addressed_to_a_channel_or_reference_says_what_it_is() {
+        for (reference, why) in [
+            ("#ops", "a channel is not a principal"),
+            ("@channel/ops", "a channel is not a principal"),
+            (
+                "@human/oncall",
+                "resolves only inside the document that declares",
+            ),
+        ] {
             let e = Addressee::parse(&json!(reference))
                 .unwrap()
                 .check_gate()
                 .unwrap_err();
-            assert!(
-                e.contains(reference) && e.contains("a channel is not a principal"),
-                "{reference}: {e}"
-            );
+            assert!(e.contains(reference) && e.contains(why), "{reference}: {e}");
         }
         let e = Addressee::parse(&json!("user:alice"))
             .unwrap()
             .check_gate()
             .unwrap_err();
-        assert!(!e.contains("channel"), "{e}");
+        assert!(!e.contains("channel") && !e.contains("@human"), "{e}");
+    }
+
+    /// A `to` names who may answer and nothing else: where a gate is
+    /// announced is declared only by an instruction document's `::!human`
+    /// (`config::humans`), so a `to` that tries to carry a channel is a typo
+    /// like any other unknown field.
+    #[test]
+    fn a_to_cannot_declare_a_channel() {
+        let e = Addressee::parse(&json!({"role": "operator", "channel": "#ops"})).unwrap_err();
+        assert!(e.contains("unknown `to` field \"channel\""), "{e}");
     }
 
     /// A gate that will not take your answer has to say whose it wants.

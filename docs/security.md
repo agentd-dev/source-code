@@ -768,7 +768,10 @@ operators. So `to:` may be absent — the question goes to the task's owner, or,
 to `{role: operator}` — or name an operator. A `to:` that names any other principal is refused
 at load (exit `2`, and a reload is refused), naming the principal and saying it could never see
 the task. The rule holds wherever a question is addressed with `to:`, a workflow's `human` step
-included. Work no caller owns — a schedule, a webhook, a subagent — gates on the listener only
+included. An instruction document's `@human/<name>` is held to it too: the gate goes to that
+`::!human`'s `principal`, or to the operators when it names none, and the human's `channel` is only
+announced (`human.asked`, the task's `askChannel`), never consulted, so a channel cannot widen who
+answers. A `to:` anywhere else cannot name a channel at all. Work no caller owns — a schedule, a webhook, a subagent — gates on the listener only
 with `agent.ask_human_unowned: gate`.
 
 ### The remote posture

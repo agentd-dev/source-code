@@ -386,6 +386,10 @@ pub fn task_annotations_bundle() -> Value {
                 "description": "the JSON Schema of the answer an INPUT_REQUIRED gate asks for",
                 "type": ["object", "boolean"],
             },
+            "askChannel": {
+                "description": "where an INPUT_REQUIRED gate is also announced: the channel of the instruction document's human it is addressed to",
+                "type": "string",
+            },
             "command": {"description": "the command op that started the task", "type": "string"},
         },
         "additionalProperties": false,
@@ -1236,6 +1240,7 @@ mod tests {
             Link::Run { id: "r-1".into() },
         );
         full.ask_schema = Some(json!({"type": "object"}));
+        full.ask_channel = Some("@channel/ops".into());
         full.command = Some("workflow.run".into());
         full.transition(State::Working, None);
         full.transition(State::InputRequired, Some("which one?".into()));

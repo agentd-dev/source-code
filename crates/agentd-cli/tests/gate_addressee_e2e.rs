@@ -96,6 +96,23 @@ fn a_workflow_human_gate_addressed_to_anyone_but_an_operator_does_not_load() {
     assert_refused(code, &log, "human.to", "team=finance");
 }
 
+/// A `to` written in config is principal syntax only. A channel there names
+/// no principal and is refused, saying a channel reaches a gate only from an
+/// instruction document's `::!human` — where its meaning is declared — and a
+/// `to` cannot smuggle one in beside an operator either.
+#[test]
+fn a_config_gate_addressed_to_a_channel_does_not_load() {
+    let (code, log) = run(&[], &human_step("\"#ops\""));
+    assert_refused(code, &log, "human.to", "#ops");
+    assert!(
+        log.contains("a channel is not a principal") && log.contains("`::!human`"),
+        "the refusal says where a channel can come from\n{log}"
+    );
+    let (code, log) = run(&[], &human_step("{role: operator, channel: \"#ops\"}"));
+    assert_eq!(code, Some(2), "a `to` declares no channel\n{log}");
+    assert!(log.contains("unknown `to` field \"channel\""), "{log}");
+}
+
 /// The refusal is of who is named, not of addressing: every form that names
 /// an operator still loads, beside a policy and a step that name nobody.
 #[test]

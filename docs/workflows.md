@@ -629,7 +629,11 @@ that does not match re-asks the person with the reason, so a gate that wants
 *who* may answer to an operator — see [Addressed gates](node-registry.md#addressed-gates)
 for the forms, why a `to` naming anyone else is refused at load, the
 operator-override rule and why an addressed gate is never auto-answered. Both live in the durable wait record, so a restart
-rebuilds the gate exactly as declared rather than a weaker one.
+rebuilds the gate exactly as declared rather than a weaker one. In a workflow
+an instruction document declares, `to: "@human/<name>"` names one of the
+document's `::!human`s: the gate is addressed to its principal, or answered by
+the operators when it names none, and its channel is announced on `human.asked`
+(see [Addressed gates](node-registry.md#addressed-gates)).
 
 Two sharp edges. `wait on: condition` evaluates its CEL against a much smaller
 namespace than the rest of the workflow — only `runs`, `subagents`, `now_ms` and

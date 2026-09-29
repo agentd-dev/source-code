@@ -687,6 +687,103 @@ fn a_reload_rotates_webhook_auth_and_the_old_secret_stops_working() {
     std::fs::remove_file(&secret_path).ok();
 }
 
+/// A reload whose webhook routes cannot be built is refused while it is
+/// staged, with nothing of it applied — the other section it changes
+/// included — and the routes in force keep serving. It used to be logged and
+/// skipped at commit, with the reload reported applied over it.
+#[test]
+#[cfg(feature = "hot-reload")]
+fn a_reload_with_a_route_that_cannot_be_built_is_refused_and_nothing_applies() {
+    let llm = spawn_mock_llm(&json!({"turns": [{"content": "handled"}]}));
+    let secret_path = common::unique_path("hook-secret", "txt");
+    std::fs::write(&secret_path, "topsecret\n").unwrap();
+    // A directory passes the load's existence check and cannot be read as a
+    // secret: only building the route finds out.
+    let unreadable = common::unique_path("hook-secret-dir", "d");
+    std::fs::create_dir_all(&unreadable).unwrap();
+    let port_seen = std::cell::Cell::new(0u16);
+    let doc = |port: u16, secret: &str, level: &str| {
+        format!(
+            "\
+             agent:\n  name: rt\n  instruction: You handle webhooks.\n  preflight: never\n\
+             intelligence:\n  endpoints: {llm}\n  model: mock\n\
+             store:\n  kind: memory\n\
+             webhooks:\n  listen: http://127.0.0.1:{port}\n\
+             workflows:\n  - name: on-hook\n    steps:\n\
+             \x20     h: {{kind: webhook, path: /hooks/rt, methods: [POST], auth: {{hmac: {{secret: \"{{{{secret-file:{secret}}}}}\"}}}}}}\n\
+             \x20     f: {{kind: finish, depends_on: [h]}}\n\
+             lifecycle:\n  run_until: drained\n\
+             observability:\n  log_level: {level}\n",
+            llm = llm.uri
+        )
+    };
+    let (daemon, addr, cfg) = spawn_bound(
+        |port| {
+            port_seen.set(port);
+            doc(port, &secret_path, "info")
+        },
+        &[],
+    );
+    let port = port_seen.get();
+
+    // The route's secret can no longer be read, and the log level moves in
+    // the same edit.
+    std::fs::write(&cfg, doc(port, &unreadable, "debug")).unwrap();
+    unsafe { libc::kill(daemon.child.id() as i32, libc::SIGHUP) };
+    assert!(
+        wait_for(|| !daemon.events("config.reload.invalid").is_empty(), 10),
+        "the reload was not refused:\n{}",
+        daemon.stderr()
+    );
+    assert!(
+        daemon
+            .events("config.reload.invalid")
+            .iter()
+            .any(|e| e["error"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("webhooks:"))),
+        "{}",
+        daemon.stderr()
+    );
+    assert!(
+        daemon.events("config.reloaded").is_empty(),
+        "{}",
+        daemon.stderr()
+    );
+
+    // The route in force still serves.
+    let body = r#"{"n":1}"#;
+    let (code, _) = post(
+        &addr,
+        "/hooks/rt",
+        &[
+            ("X-Signature", &sign("topsecret", body)),
+            ("Idempotency-Key", "rt-1"),
+        ],
+        body,
+    );
+    assert_eq!(code, 202, "the route in force stopped serving");
+
+    // Nothing of the refused reload applied: putting the file back changes
+    // nothing.
+    std::fs::write(&cfg, doc(port, &secret_path, "info")).unwrap();
+    unsafe { libc::kill(daemon.child.id() as i32, libc::SIGHUP) };
+    assert!(
+        wait_for(|| !daemon.events("config.reloaded").is_empty(), 10),
+        "{}",
+        daemon.stderr()
+    );
+    assert_eq!(
+        daemon.events("config.reloaded")[0]["changed"],
+        json!(["nothing"]),
+        "{}",
+        daemon.stderr()
+    );
+    std::fs::remove_file(&cfg).ok();
+    std::fs::remove_file(&secret_path).ok();
+    std::fs::remove_dir_all(&unreadable).ok();
+}
+
 /// **`into: {stream, subject}` appends the request instead of firing a run.**
 ///
 /// This is the binding that gives a webhook replay-after-downtime (RFC 0035

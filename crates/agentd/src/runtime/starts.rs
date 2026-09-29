@@ -64,7 +64,7 @@ impl Runtime {
         // rides here rather than re-running on every reload.
         self.repair_orphaned_timer_waits();
         let all: Vec<String> = self.workflows.keys().cloned().collect();
-        self.arm_long_lived_starts_of(&all);
+        self.arm_long_lived_starts_of(&all, &[]);
     }
 
     /// Arm the long-lived starts of the workflows named: every one at boot,
@@ -73,7 +73,13 @@ impl Runtime {
     /// and a replaced one's `subscribe` unsubscribed by its retirement; an
     /// unchanged one is armed already, and arming it again would subscribe
     /// its resources twice.
-    pub(crate) fn arm_long_lived_starts_of(&mut self, names: &[String]) {
+    ///
+    /// `keep` names the `(workflow, node)` schedules a reload replaced with
+    /// the same spec: their deadline stands. Re-armed from now, an edit to an
+    /// unrelated step of an `every: 24h` workflow postponed its next run by a
+    /// day, one edited more often than its period never ran, and an unfired
+    /// one-shot `at:` moved back on every edit.
+    pub(crate) fn arm_long_lived_starts_of(&mut self, names: &[String], keep: &[(String, String)]) {
         let specs: Vec<StartSpec> = self
             .workflows
             .values()
@@ -87,7 +93,13 @@ impl Runtime {
             .collect();
         for (workflow, node, kind, spec) in specs {
             match kind.as_str() {
-                "schedule" => self.arm_schedule(&workflow, &node, &spec),
+                "schedule" => {
+                    let kept = keep.iter().any(|(w, n)| *w == workflow && *n == node)
+                        && self.start_state(&workflow, &node)["next_ms"].is_u64();
+                    if !kept {
+                        self.arm_schedule(&workflow, &node, &spec);
+                    }
+                }
                 "loop" => {
                     // A loop fires its first run immediately unless one is live.
                     let live = self
@@ -196,6 +208,68 @@ impl Runtime {
                 "start.subscribe.no_server",
                 json!({"workflow": workflow, "node": node, "server": server}),
             ),
+        }
+    }
+
+    /// Subscribe again, on a connection a reload dialed in place of a running
+    /// one, what the running one carried: the `subscribe` starts of the armed
+    /// workflows not in `skip` (those were just armed on it) and the
+    /// resources suspended `wait on: resource` steps wait on. A subscription
+    /// lives on its connection, so the old one took them with it when the
+    /// reload dropped it — and the start that never fired again, or the wait
+    /// that never resolved, said nothing.
+    pub(crate) fn resubscribe_on(&mut self, servers: &[String], skip: &[String]) {
+        if servers.is_empty() {
+            return;
+        }
+        let on = |s: Option<&str>| s.is_some_and(|s| servers.iter().any(|x| x == s));
+        let starts: Vec<StartSpec> = self
+            .workflows
+            .values()
+            .filter(|w| w.armed && !skip.contains(&w.name))
+            .flat_map(|w| {
+                w.start_steps()
+                    .into_iter()
+                    .filter(|s| s.kind == "subscribe" && on(s.field_str("server")))
+                    .map(|s| (w.name.clone(), s.id.clone(), s.kind.clone(), s.spec.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        for (workflow, node, _, spec) in starts {
+            self.arm_subscribe(&workflow, &node, &spec);
+        }
+        let mut waits: Vec<(String, String)> = Vec::new();
+        for run in self.runs.values() {
+            for st in run.steps.values() {
+                if st.status == crate::engine::run::StepStatus::Suspended
+                    && let Some(w) = &st.wait
+                    && w["kind"] == "resource"
+                    && on(w["server"].as_str())
+                {
+                    let key = (
+                        w["server"].as_str().unwrap_or_default().to_string(),
+                        w["uri"].as_str().unwrap_or_default().to_string(),
+                    );
+                    if !waits.contains(&key) {
+                        waits.push(key);
+                    }
+                }
+            }
+        }
+        for (server, uri) in waits {
+            let Some(c) = self.mcp.get(&server) else {
+                continue;
+            };
+            match c.subscribe(&uri) {
+                Ok(()) => self.log.info(
+                    "wait.resubscribed",
+                    json!({"server": server, "uri": uri, "reason": "reload"}),
+                ),
+                Err(e) => self.log.warn(
+                    "wait.resubscribe.fail",
+                    json!({"server": server, "uri": uri, "err": e.to_string()}),
+                ),
+            }
         }
     }
 

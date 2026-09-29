@@ -1393,15 +1393,14 @@ new MCP servers are dialed into a connection set beside the running one, and
 the tool registry, the workflows (their documents, and each step's tool and
 server references), the skills catalogue, a resource instruction and the
 intelligence token are built and checked against the servers the reload would
-run on. Anything that fails refuses the reload with `config.reload.invalid`
-naming the reason: the running configuration, instruction, servers, registry,
-skills and workflows are untouched, and the connections the reload dialed are
-closed (`mcp.disconnect`, `reason: "reload refused"`). Only when every piece is
-staged is it **committed**, in one step with nothing left that can fail. A
-reload is applied whole or not at all, and `config.reloaded` or
-`config.reload.invalid` says which. (The listener's principal rules and webhook
-routes, below, are rebuilt at commit; one that fails to build keeps the rules
-already in force and logs why.)
+run on — and so are the listener's principal rules and webhook routes.
+Anything that fails refuses the reload with `config.reload.invalid` naming the
+reason: the running configuration, instruction, servers, registry, skills,
+workflows, rules and routes are untouched, and the connections the reload
+dialed are closed (`mcp.disconnect`, `reason: "reload refused"`). Only when
+every piece is staged is it **committed**, in one step with nothing left that
+can fail. A reload is applied whole or not at all, and `config.reloaded` or
+`config.reload.invalid` says which.
 
 **Reloadable** (applied live at a quiesce boundary; the flat tree does most of
 the work — every turn worker is spawned fresh from the live settings, so the next
@@ -1412,7 +1411,9 @@ unit of work picks the new values up):
   token that cannot be resolved refuses the reload — and
   `intelligence.budget` (fresh windows, counters carried over)
 - `agent.instruction` (a resource instruction is read through the servers the
-  reload would run on, and one that cannot be read refuses the reload) and the
+  reload would run on, and one that cannot be read refuses the reload — also
+  when the instruction is unchanged but its server is removed or re-dialed:
+  re-dialed, it is read and subscribed again on the new connection) and the
   rest of
   `agent` — `description` (the public card follows it), `preflight`,
   `wake_on`, `tools`, `max_parallel_turns`, `on_workflow_finished`,
@@ -1420,7 +1421,14 @@ unit of work picks the new values up):
   `ask_human_unowned`
 - `mcp` — re-handshaked live: added or changed servers connect + initialize
   into the staged set, unchanged ones keep their live connection (never
-  re-dialed), removed ones disconnect when the reload applies. A server whose
+  re-dialed), removed ones disconnect when the reload applies. A server is
+  unchanged only when everything its dial reads is — endpoint, headers,
+  `auth`, `oauth`, `aauth`, `service`, the service's `rate` and its timeout —
+  so a rotated credential re-dials it; a change to its `tags` alone does not.
+  A re-dialed server is subscribed again for what the old connection carried
+  (the `subscribe` starts and the suspended `wait on: resource` steps on it).
+  Under `security.egress: closed` an endpoint with no service-catalog entry
+  refuses the reload before anything is dialed, as at startup. A server whose
   dial fails is logged (`mcp.connect.fail`) and left out, as at startup. A call
   already in flight on a removed server finishes on its connection; a step that
   starts after the reload fails with `mcp server "<name>" is not connected`
@@ -1429,31 +1437,41 @@ unit of work picks the new values up):
   fails to build refuses the reload)
 - `skills` — the catalogue is re-discovered
 - `workflows` — definitions reload and re-arm (a `schedule`, `loop` or
-  `subscribe` start of an added or changed definition is armed); **live runs
-  stay pinned** to the definition hash they started with. The definitions are
+  `subscribe` start of an added or changed definition is armed; a changed
+  definition whose `schedule` node is as it was keeps that schedule's next
+  deadline); **live runs stay pinned** to the definition hash they started
+  with. The definitions are
   read and parsed before any server is dialed, so one that does not load (a
   file that does not parse, a failed fetch, two definitions of one name)
   refuses the reload with nothing dialed. A `uri:` document is read through the
   servers the reload would run on, and every definition is checked against
   them and the rebuilt registry — also when only `mcp`, `tools`, `knowledge` or
   `search` changed — so a `tool` or `mcp.tool` step naming what they do not
-  have refuses the reload
+  have refuses the reload. That holds for the configuration's definitions. A
+  definition the agent stored (`workflow.create`/`update`) never refuses a
+  reload or a start: one naming what the reload takes away is left out of the
+  set, logged `workflow.stored.invalid`, and kept in the store, and it loads
+  again once what it names is back (the tools themselves refuse to store a
+  definition naming what the agent does not have). A `tool` step may not name
+  a workflow's tool — run that workflow with a `workflow` step
 - `limits`, `lifecycle.idle_grace`, `observability.log_level` /
   `log_content` / `status_values`, `memory`, `context`, and
   `store.retention` (the next sweep applies the new bound)
 - `a2a.principals` — the rules are recompiled and swapped into the live
   listener, so a demotion or a rotated `bearer_ref` takes effect on the next
   request, and so does the posture: the first rule added to a no-auth loopback
-  daemon ends the implicit operator at once. A rebuild that fails (an
+  daemon ends the implicit operator at once. Rules that cannot be built (an
   unresolvable `{{secret:…}}`, a malformed matcher, a `user`-role `id` an
-  approved device already owns — §12.5) keeps the rules already in force rather
-  than falling open, and logs `config.reload.principals`
+  approved device already owns — §12.5) refuse the reload, and the rules
+  already in force stay
 - `webhooks.default_auth` and the `webhook` routes themselves (which live in
   `workflows[]`) — the route table is rebuilt on every reload, so a
   `{{secret-file:…}}` rotated by a remounted Kubernetes Secret is picked up
-  even though the config *document* did not change. Live per-route state (the
-  in-flight count, the rate-limit bucket) is carried across the rebuild, so
-  reloading does not hand a caller a fresh burst allowance
+  even though the config *document* did not change. A route table that cannot
+  be built (a secret that cannot be read) refuses the reload, and the routes in
+  force keep serving. Live per-route state (the in-flight count, the
+  rate-limit bucket) is carried across the rebuild, so reloading does not hand
+  a caller a fresh burst allowance
 - `a2a.cors.origins` — the browser CORS allowlist is replaced in the live
   listener, so removing an origin actually revokes it
 - `a2a.introspection.enabled` — turning it on arms the log ring then and there

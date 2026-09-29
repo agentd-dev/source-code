@@ -471,14 +471,16 @@ The routine is, in order:
    documents (before anything is dialed), the intelligence token, the new MCP
    servers' connections, then — against those servers — the `uri:` workflow
    documents, the tool registry, every workflow's tool and server references,
-   the skills catalogue and a resource instruction. Any failure refuses the
+   the skills catalogue and a resource instruction; last, the listener's
+   principal rules and webhook routes. Any failure refuses the
    whole reload with `config.reload.invalid`: nothing running changed, and the
    connections it dialed are closed (`mcp.disconnect`, `reason: "reload
    refused"`).
 4. **Commit** the staged pieces in one step on the loop thread, with nothing
    left that can fail: settings, instruction, the MCP connection set, the
-   registry, skills and workflows switch together (live runs keep the
-   definition they started with, pinned by hash).
+   registry, skills, workflows, principal rules and webhook routes switch
+   together (live runs keep the definition they started with, pinned by
+   hash).
 
 `agentd --validate-config` runs the same validation as an admission gate before
 you ship the file, so a bad candidate fails fast (exit `2`) rather than at reload

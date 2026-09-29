@@ -638,7 +638,7 @@ spells another party in the audit trail.
 **One namespace across time.** A `user`-role rule id and a device name both spell `user:<x>`,
 and ownership is persisted by principal id, so the durable store keeps an identity registry
 (`runtime/identities.rs`): every declared `user`- or `agent`-role rule id is recorded at listener
-spawn and at every principals reload, and every approved name at approval. An approval of a name
+spawn and at every principals reload that applies, and every approved name at approval. An approval of a name
 any rule declares now, or one a `user`-role rule ever declared, is refused; a start (exit `2`) or a reload
 (the old rules stay) that declares a `user`-role id already approved as a device name is refused
 and logged `identity.collision`. So a device name and a rule id never share a principal across

@@ -7714,14 +7714,18 @@ pub fn duplicate_workflow(name: &str, first: &str, second: &str) -> String {
 /// there (a presigned link, `?token=${ENV}` expanded before settings), and a
 /// source is named in places a caller other than the operator reads — the
 /// workflow tools' refusal goes to the model.
+///
+/// The userinfo ends at the LAST `@` before the path, found before the query
+/// is cut: a raw `?` or `#` in a password would otherwise end the URL inside
+/// it and name the rest of the userinfo as the host.
 pub fn url_locator(url: &str) -> String {
-    let url = url.split(['?', '#']).next().unwrap_or_default();
     let Some((scheme, rest)) = url.split_once("://") else {
-        return url.to_string();
+        return url.split(['?', '#']).next().unwrap_or_default().to_string();
     };
-    let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
-    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-    format!("{scheme}://{host}{path}")
+    let authority = &rest[..rest.find('/').unwrap_or(rest.len())];
+    let rest = authority.rfind('@').map_or(rest, |at| &rest[at + 1..]);
+    let rest = rest.split(['?', '#']).next().unwrap_or_default();
+    format!("{scheme}://{rest}")
 }
 
 /// Whether a raw workflow document has a long-lived start node.

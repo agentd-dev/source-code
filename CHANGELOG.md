@@ -454,10 +454,33 @@ holds up the next call on the same server.
   state: added and changed servers are dialed into a connection set of their
   own (an unchanged server keeps its connection), and the registry, the
   workflows and their references, the skills, a resource instruction and the
-  intelligence token are built and checked against it. Any failure refuses
+  intelligence token are built and checked against it — and so are the
+  listener's principal rules and webhook routes, which used to be rebuilt
+  after everything else had switched, so rules or routes that failed to build
+  were logged and skipped while the reload reported applied and the settings
+  held the new rules. Any failure refuses
   the reload with nothing changed and closes what it dialed (`mcp.disconnect`,
   `reason: "reload refused"`); otherwise everything is switched in at once,
-  with nothing left that can fail. On the way: the workflows are re-checked
+  with nothing left that can fail. A server counts as unchanged only when
+  everything its dial reads is — endpoint, headers, `auth`, `oauth`, `aauth`,
+  `service`, rate and timeout; comparing the endpoint, headers and `aauth`
+  alone kept the old connection, and its old credential, when a credential
+  was rotated or revoked, while the reload reported `mcp`. A re-dialed
+  server is subscribed again for what the old connection carried: the
+  `subscribe` starts of unchanged workflows, suspended `wait on: resource`
+  steps and an unchanged resource instruction, which is read again through
+  the new connection (all three silently stopped firing); a reload removing
+  that instruction's server is refused, as a start is. A definition the agent
+  stored (`workflow.create`/`update`) can no longer refuse the operator's
+  reload or start: one naming a tool or server the reload takes away kept
+  the tool enabled and the server connected; it is now left out, logged
+  `workflow.stored.invalid`, kept in the store, and loads again once what it
+  names is back — and the tools refuse to store a definition naming a tool,
+  server or stream the agent does not have. A replaced workflow whose
+  `schedule` node is unchanged keeps its next deadline (every edit pushed it
+  back a full period). A `tool` step naming a workflow's tool is refused on
+  every path (a reload that kept the registry accepted what a start refused),
+  and a reload dials no endpoint closed egress does not admit. On the way: the workflows are re-checked
   whenever `mcp`, `tools`, `knowledge` or `search` change, so removing a
   server a workflow calls is refused rather than applied; a resource
   instruction served by a server the same reload adds is read through it
@@ -470,7 +493,9 @@ holds up the next call on the same server.
   never fired); a workflow document that resolves to something other than a
   mapping is refused naming its source (it panicked the daemon); and a failed
   `url:` workflow source is named by scheme, host and path in the log and the
-  refusal, with the fetch error scrubbed of the URL's userinfo and query. A
+  refusal, with the fetch error scrubbed of the URL's userinfo, query and
+  fragment (each on its own too, and a userinfo holding a raw `?` or `#`
+  whole). A
   run in flight on a server the reload removes finishes the call it already
   made; its next step on that server fails as not connected.
 - **A configured workflow cannot be edited or deleted at runtime.**

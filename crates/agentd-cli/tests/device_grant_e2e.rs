@@ -942,7 +942,9 @@ fn a_device_name_and_a_rule_id_never_share_a_principal() {
         )
         .unwrap();
         unsafe { libc::kill(d.child.id() as i32, libc::SIGHUP) };
-        d.wait_log(&["\"config.reload.principals\""]);
+        // Refused while the reload is staged, with nothing of it applied —
+        // not reported applied over rules that stayed as they were.
+        d.wait_log(&["\"config.reload.invalid\"", "user-role id \\\"alice\\\""]);
         d.wait_log(&["\"identity.collision\"", "user:alice"]);
         let as_alice = common::rpc_as(&addr, CI_TOKEN, 2, "ListTasks", json!({}));
         assert_eq!(

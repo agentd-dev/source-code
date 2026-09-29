@@ -8,12 +8,10 @@
 //! The same holds inside the reloadable partition. A reload is staged first:
 //! the new MCP servers are dialed into a connection set beside the running
 //! one, and the tool registry, the workflows, the skills and the instruction
-//! are built and checked against it. Only when all of it succeeds is it
-//! committed, in one step with nothing left that can fail. A reload is
-//! applied whole or refused with nothing changed, and what a refused one
-//! dialed is closed. (The listener's principal rules and webhook routes are
-//! rebuilt at commit; one that fails to build keeps the rules in force and
-//! says so, rather than falling open.)
+//! are built and checked against it — and so are the listener's principal
+//! rules and webhook routes. Only when all of it succeeds is it committed, in
+//! one step with nothing left that can fail. A reload is applied whole or
+//! refused with nothing changed, and what a refused one dialed is closed.
 //!
 //! The reloadable partition applies at the loop's quiesce boundary. The flat
 //! child tree makes most of it trivial: every turn worker is spawned fresh
@@ -210,11 +208,17 @@ impl Runtime {
             None
         };
         let mcp = if servers_change {
-            Some(self.stage_mcp()?)
+            Some(self.stage_mcp(old)?)
         } else {
             None
         };
-        match self.stage_on_servers(old, mcp.as_ref(), workflows) {
+        let staged = self.stage_on_servers(old, mcp.as_ref(), workflows);
+        #[cfg(feature = "a2a")]
+        let staged = staged.and_then(|rest| {
+            let listener = self.stage_listener(old, rest.workflows.as_ref())?;
+            Ok(StagedReload { listener, ..rest })
+        });
+        match staged {
             Ok(rest) => Ok(StagedReload {
                 intel_token,
                 mcp,
@@ -229,19 +233,95 @@ impl Runtime {
         }
     }
 
+    /// The listener's side of a reload, built and not yet served: the
+    /// principal rules compiled into a resolver, their ids checked against
+    /// the identity registry, and the webhook route table. Any of them that
+    /// cannot be built refuses the reload — a rule set that did not compile
+    /// used to be logged and skipped at commit, with the reload reported
+    /// applied, the new rules in `settings` and the old ones in force, and a
+    /// later reload of the same file seeing no change to retry.
+    ///
+    /// Staged LAST, because the rule ids are also claimed here: the claim is
+    /// a durable write, and one made for a reload that something after it
+    /// refused would hold a name no rule declares. Nothing after this can
+    /// refuse.
+    #[cfg(feature = "a2a")]
+    fn stage_listener(
+        &self,
+        old: &cfg::Settings,
+        workflows: Option<&super::steps::PreparedWorkflows>,
+    ) -> Result<StagedListener, Vec<String>> {
+        let new = &self.settings;
+        let env = self.env.clone();
+        let envmap = move |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+        // Webhook routes: built on every reload rather than under a
+        // `webhooks != webhooks` guard, because a route's identity is spread
+        // across TWO sections — its auth can come from `webhooks.default_auth`
+        // while the node itself lives in `workflows[]` — and a
+        // `{{secret-file:…}}` rotated by a remounted Secret changes no
+        // document at all. Building is cheap and carries live per-route
+        // state across.
+        let routes = match &self.webhook_handler {
+            Some(handler) => {
+                let live = workflows.map_or(&self.workflows, |p| &p.workflows);
+                let nodes = super::webhooks::webhook_nodes_of(live);
+                Some(
+                    handler
+                        .stage_routes(nodes, &new.webhooks, &envmap)
+                        .map_err(|e| vec![format!("webhooks: {e}")])?,
+                )
+            }
+            None => None,
+        };
+        // Principals: the rules compile into a `Resolver` (glob patterns,
+        // resolved bearer secrets). A `user`-role id an approved device
+        // already owns refuses them exactly as a rule that does not compile:
+        // the rule would be that device's principal and inherit its history.
+        // The registry is durable, so this holds for a name whose sessions
+        // are long gone, and across a restart between the approval and the
+        // declaration.
+        let principals = if old.a2a.principals != new.a2a.principals && self.a2a_serving.is_some() {
+            let resolver = crate::a2a::Resolver::build(&new.a2a, &envmap)
+                .map_err(|e| vec![format!("a2a.principals: {e}")])?;
+            let refused = |refused: crate::runtime::identities::Refused| {
+                if let Some(line) = refused.collision_line() {
+                    self.log.warn("identity.collision", line);
+                }
+                vec![refused.to_string()]
+            };
+            crate::runtime::identities::check_rules(&self.durable, &new.a2a).map_err(refused)?;
+            crate::runtime::identities::claim_rules(&self.durable, &new.a2a).map_err(refused)?;
+            Some(resolver)
+        } else {
+            None
+        };
+        Ok(StagedListener { principals, routes })
+    }
+
     /// The connection set the new `mcp` section describes, built beside the
     /// running one: an unchanged server's live connection is carried over
     /// (the same connection, never re-dialed); an added or changed server is
     /// dialed and initialized into the new set. A server whose dial fails is
     /// logged and left out, exactly as at startup — and a workflow that
     /// needs it refuses the reload below.
-    fn stage_mcp(&self) -> Result<StagedMcp, Vec<String>> {
+    fn stage_mcp(&self, old: &cfg::Settings) -> Result<StagedMcp, Vec<String>> {
         let new = &self.settings;
         // Every spec first: one that cannot be built refuses the reload
-        // before any server is dialed, as it refuses a start.
+        // before any server is dialed, as it refuses a start. So does an
+        // endpoint closed egress does not admit — the dial-time backstop a
+        // start applies behind validation, for whichever path assembled it.
         let mut specs = std::collections::BTreeMap::new();
         let mut errs = Vec::new();
         for s in &new.mcp.servers {
+            if let Err(e) = cfg::egress_allows(
+                &new.services,
+                new.security.egress,
+                cfg::ServiceKind::Mcp,
+                &s.endpoint,
+            ) {
+                errs.push(e);
+                continue;
+            }
             match s.to_spec() {
                 Ok(spec) => {
                     specs.insert(s.name.clone(), spec);
@@ -252,25 +332,31 @@ impl Runtime {
         if !errs.is_empty() {
             return Err(errs);
         }
-        let timeout = new
-            .mcp
-            .default_timeout
-            .map(|d| d.0)
-            .unwrap_or(Duration::from_secs(60));
         let mut set = std::collections::BTreeMap::new();
         let mut fresh = Vec::new();
         for s in &new.mcp.servers {
             let spec = &specs[&s.name];
-            let same = self.mcp_specs.get(&s.name).is_some_and(|old| {
-                old.endpoint == spec.endpoint
-                    && old.headers == spec.headers
-                    && old.aauth == spec.aauth
+            // Unchanged means everything the dial reads: the endpoint and
+            // headers, and also the credential (`auth`, `oauth`, `aauth`),
+            // the `service` its cached login is keyed by, its `rate` and its
+            // timeout. Comparing a subset carried the old connection over when
+            // a credential was rotated or revoked, while the reload reported
+            // `mcp`. Only the tags need no dial: they feed the registry, which
+            // is rebuilt from the new spec.
+            let same = self.mcp_specs.get(&s.name).is_some_and(|was| {
+                untagged(was) == untagged(spec)
+                    && old
+                        .mcp
+                        .servers
+                        .iter()
+                        .find(|o| o.name == s.name)
+                        .is_some_and(|o| server_timeout(old, o) == server_timeout(new, s))
             });
             if same && let Some(live) = self.mcp.get(&s.name) {
                 set.insert(s.name.clone(), live.clone());
                 continue;
             }
-            match crate::mcp::from_spec(spec, s.timeout.map(|d| d.0).unwrap_or(timeout))
+            match crate::mcp::from_spec(spec, server_timeout(new, s))
                 .and_then(|mut c| c.initialize().map(|()| c))
             {
                 Ok(mut c) => {
@@ -445,6 +531,28 @@ impl Runtime {
                 Some(t) => StagedInstruction::Text(t),
                 None => StagedInstruction::Text(String::new()),
             })
+        } else if let Some(m) = mcp
+            && let Some(t) = new.agent.instruction.as_deref()
+            && self.instruction.source == "resource"
+            && cfg::looks_like_resource_uri(t)
+            && self
+                .instruction
+                .server
+                .as_deref()
+                .is_some_and(|srv| !m.set.contains_key(srv) || m.fresh.iter().any(|f| f == srv))
+        {
+            // The instruction is unchanged, but the server it is read through
+            // is not: removed, or re-dialed. Removed, the reload is refused
+            // as a start with that configuration is (unless another server
+            // serves a bare URI). Re-dialed, it is read again through the new
+            // connection so the commit subscribes it THERE — the old
+            // connection, and its subscription, go with the reload, and the
+            // publisher's updates and revocations would stop arriving.
+            let (server, res) = super::instruction_resource(t);
+            Some(StagedInstruction::Reread(
+                self.fetch_instruction_mcp(conns, server, res)
+                    .map_err(|e| vec![format!("agent.instruction {t}: {e}")])?,
+            ))
         } else {
             None
         };
@@ -456,6 +564,8 @@ impl Runtime {
             skills,
             instruction,
             channels_moved: old.agent.document_gate_channels != new.agent.document_gate_channels,
+            #[cfg(feature = "a2a")]
+            listener: StagedListener::default(),
         })
     }
 
@@ -474,6 +584,8 @@ impl Runtime {
             skills,
             instruction,
             channels_moved,
+            #[cfg(feature = "a2a")]
+            listener,
         } = staged;
         let mut changed = Vec::new();
 
@@ -502,10 +614,55 @@ impl Runtime {
             self.arm_freshness();
             changed.push("agent.instruction.refresh");
         }
-        // Instruction (static text; a resource instruction re-subscribes).
-        if let Some(instruction) = instruction {
+        // MCP servers: the staged set replaces the running one whole. A
+        // connection the new set does not carry — a removed server's, or a
+        // changed one's — closes once the last holder lets go of it: a call
+        // already in flight on it finishes there, and a step that starts
+        // after this finds the server gone ("not connected").
+        let mut redialed: Vec<String> = Vec::new();
+        let mcp_moved = mcp.is_some();
+        if let Some(StagedMcp { set, specs, fresh }) = mcp {
+            let dropped: Vec<String> = self
+                .mcp
+                .keys()
+                .filter(|k| !set.contains_key(*k))
+                .cloned()
+                .collect();
+            redialed = fresh
+                .iter()
+                .filter(|f| self.mcp.contains_key(*f))
+                .cloned()
+                .collect();
+            let previous = std::mem::replace(&mut self.mcp, set);
+            self.mcp_specs = specs;
+            for r in &dropped {
+                if skills.is_none() {
+                    self.skills.forget_server(r);
+                }
+                self.log
+                    .info("mcp.disconnect", json!({"server": r, "reason": "reload"}));
+            }
+            for name in &fresh {
+                self.log
+                    .info("mcp.connect", json!({"server": name, "reason": "reload"}));
+            }
+            drop(previous);
+        }
+        // Instruction (static text; a resource instruction re-subscribes, on
+        // the connection it was read through — the staged one).
+        if let Some(StagedInstruction::Reread(fetched)) = instruction {
+            // Read again only because its server was re-dialed: a change
+            // only if the text is not what was running.
+            let before = self.instruction.text.clone();
+            self.adopt_instruction(fetched);
+            if self.instruction.text != before {
+                changed.push("agent.instruction");
+            }
+        } else if let Some(instruction) = instruction {
             match instruction {
-                StagedInstruction::Resource(fetched) => self.adopt_instruction(fetched),
+                StagedInstruction::Resource(fetched) | StagedInstruction::Reread(fetched) => {
+                    self.adopt_instruction(fetched)
+                }
                 StagedInstruction::Text(text) => {
                     self.instruction = super::reactor::Instruction {
                         text,
@@ -543,32 +700,7 @@ impl Runtime {
         if old.agent.approval != new.agent.approval {
             changed.push("agent.approval");
         }
-        // MCP servers: the staged set replaces the running one whole. A
-        // connection the new set does not carry — a removed server's, or a
-        // changed one's — closes once the last holder lets go of it: a call
-        // already in flight on it finishes there, and a step that starts
-        // after this finds the server gone ("not connected").
-        if let Some(StagedMcp { set, specs, fresh }) = mcp {
-            let dropped: Vec<String> = self
-                .mcp
-                .keys()
-                .filter(|k| !set.contains_key(*k))
-                .cloned()
-                .collect();
-            let previous = std::mem::replace(&mut self.mcp, set);
-            self.mcp_specs = specs;
-            for r in &dropped {
-                if skills.is_none() {
-                    self.skills.forget_server(r);
-                }
-                self.log
-                    .info("mcp.disconnect", json!({"server": r, "reason": "reload"}));
-            }
-            for name in &fresh {
-                self.log
-                    .info("mcp.connect", json!({"server": name, "reason": "reload"}));
-            }
-            drop(previous);
+        if mcp_moved {
             changed.push("mcp");
         }
         // Registry (overrides/disabled/tools) — rebuilt when tools/mcp/knowledge/search
@@ -596,6 +728,7 @@ impl Runtime {
         // gives every old version the same exit — unsubscribe what nothing
         // else wants, pin for live runs, apply its own `unload:` policy —
         // whether it was removed outright or replaced by a new hash.
+        let mut anew: Vec<String> = Vec::new();
         if let Some(prepared) = workflows {
             let previous = std::mem::take(&mut self.workflows);
             self.install_workflows(prepared);
@@ -615,13 +748,32 @@ impl Runtime {
                 self.retire_workflow(wf, reason);
             }
             self.arm_workflows();
-            let anew: Vec<String> = self
+            anew = self
                 .workflows
                 .iter()
                 .filter(|(n, w)| previous.get(*n).is_none_or(|p| p.hash != w.hash))
                 .map(|(n, _)| n.clone())
                 .collect();
-            self.arm_long_lived_starts_of(&anew);
+            // A replaced definition's schedule keeps its deadline when the
+            // schedule itself is what it was: only an edit to the start node
+            // re-arms it from now.
+            let keep: Vec<(String, String)> = anew
+                .iter()
+                .filter_map(|n| Some((n, previous.get(n)?, self.workflows.get(n)?)))
+                .flat_map(|(n, was, now)| {
+                    now.start_steps()
+                        .into_iter()
+                        .filter(|s| s.kind == "schedule")
+                        .filter(|s| {
+                            was.steps
+                                .get(&s.id)
+                                .is_some_and(|p| p.kind == s.kind && p.spec == s.spec)
+                        })
+                        .map(|s| (n.clone(), s.id.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            self.arm_long_lived_starts_of(&anew, &keep);
             // Say "workflows" only when the loaded SET actually differs. A
             // re-read of unchanged documents must not report a change it did
             // not make — the reverse of the defect above, and just as
@@ -634,6 +786,12 @@ impl Runtime {
                 changed.push("workflows");
             }
         }
+        // What the dropped connections carried: the subscriptions of the
+        // unchanged workflows' `subscribe` starts and of suspended resource
+        // waits, on each server this reload re-dialed. (The ones just armed
+        // subscribed on the new connection already; the instruction was read
+        // and subscribed through it above.)
+        self.resubscribe_on(&redialed, &anew);
         if registry_rebuilt {
             self.log_workflow_tools();
         }
@@ -646,97 +804,42 @@ impl Runtime {
         {
             changed.push("limits/lifecycle/observability/memory/context");
         }
-        // Principals: rebuild the rules and swap them into the live listener.
-        //
-        // The rules compile into a `Resolver` (glob patterns, resolved bearer
-        // secrets), which is why this was restart-only until now: the listener
-        // held one built at startup. A rebuild that FAILS — an unresolvable
-        // `{{secret:…}}`, a malformed matcher — must not take the listener's
-        // working rules away, so the old resolver stays and the reload says so
-        // rather than falling open on an empty rule set.
-        //
-        // The listener's posture is part of the resolver, so this one swap also
-        // moves it: a no-auth loopback daemon given its first rule stops
-        // treating local callers as the operator on the very next request.
-        // Nothing else holds a posture for a reload to miss.
-        //
-        // The new rule ids are claimed in the identity registry before the
-        // swap, and a `user`-role id an approved device already owns refuses
-        // the change exactly as a failed rebuild does: the rule would be that
-        // device's principal and inherit its history. The registry is
-        // durable, so this holds for a name whose sessions are long gone, and
-        // across a restart between the approval and the declaration.
+        // Principals: the rules staged above are swapped into the live
+        // listener. The listener's posture is part of the resolver, so this
+        // one swap also moves it: a no-auth loopback daemon given its first
+        // rule stops treating local callers as the operator on the very next
+        // request. Nothing else holds a posture for a reload to miss.
         #[cfg(feature = "a2a")]
-        if old.a2a.principals != new.a2a.principals
+        if let Some(r) = listener.principals
             && let Some(bridge) = self.a2a_serving.as_ref().map(|s| &s.bridge)
         {
-            let env = self.env.clone();
-            let envmap = move |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
-            // Built first, so a set that cannot compile claims no names.
-            let built = crate::a2a::Resolver::build(&new.a2a, &envmap).and_then(|r| {
-                crate::runtime::identities::register_rules(&self.durable, &new.a2a)
-                    .map(|()| r)
-                    .map_err(|refused| {
-                        if let Some(line) = refused.collision_line() {
-                            self.log.warn("identity.collision", line);
-                        }
-                        refused.to_string()
-                    })
-            });
-            match built {
-                Ok(r) => {
-                    bridge.set_resolver(r);
-                    // Who the model acts for moves with the rules, in the
-                    // same step: an entry kept from the old rules would let a
-                    // narrowed or removed principal's in-flight work keep its
-                    // old reach until it called again — and a removed one
-                    // never does. Callers named by their evidence alone are
-                    // re-indexed when next seen; until then they fail closed.
-                    self.principal_index = crate::a2a::principals::declared_principals(&new.a2a);
-                    changed.push("a2a.principals");
-                }
-                Err(e) => {
-                    self.log.warn(
-                        "config.reload.principals",
-                        json!({"err": e, "kept": "the principal rules in force before this reload"}),
-                    );
-                }
-            }
+            bridge.set_resolver(r);
+            // Who the model acts for moves with the rules, in the same step:
+            // an entry kept from the old rules would let a narrowed or
+            // removed principal's in-flight work keep its old reach until it
+            // called again — and a removed one never does. Callers named by
+            // their evidence alone are re-indexed when next seen; until then
+            // they fail closed.
+            self.principal_index = crate::a2a::principals::declared_principals(&new.a2a);
+            changed.push("a2a.principals");
         } else if old.a2a.principals != new.a2a.principals {
             // No listener to swap, but restored work still acts for its
             // owners through the model, with the rules as they now read.
             self.principal_index = crate::a2a::principals::declared_principals(&new.a2a);
         }
-        // Webhook routes: rebuild from the (already reloaded) workflows and the
-        // current `default_auth`, and install them.
-        //
-        // This runs unconditionally rather than under a `webhooks != webhooks`
-        // guard, because a route's identity is spread across TWO sections: its
-        // auth can come from `webhooks.default_auth` while the node itself
-        // lives in `workflows[]`. Gating on either alone reintroduces exactly
-        // the silent no-op this replaces. Rebuilding is cheap and carries live
-        // per-route state across.
+        // Webhook routes: the table staged above, from the workflows just
+        // installed and the current `default_auth`.
         #[cfg(feature = "a2a")]
-        if let Some(handler) = self.webhook_handler.clone() {
-            let nodes = self.webhook_nodes();
-            let env = self.env.clone();
-            let envmap = move |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
-            match handler.reload_routes(nodes, &self.settings.webhooks, &envmap) {
-                Ok(paths) => {
-                    if old.webhooks != new.webhooks || old.workflows != new.workflows {
-                        self.log.info(
-                            "webhooks.routes",
-                            json!({"routes": paths, "reason": "reload"}),
-                        );
-                        changed.push("webhooks");
-                    }
-                }
-                // A bad route definition leaves the SERVING table in place —
-                // the listener keeps working under the rules it had.
-                Err(e) => self.log.warn(
-                    "config.reload.webhooks",
-                    json!({"err": e, "kept": "the routes in force before this reload"}),
-                ),
+        if let Some(routes) = listener.routes
+            && let Some(handler) = self.webhook_handler.clone()
+        {
+            let paths = handler.install_routes(routes);
+            if old.webhooks != new.webhooks || old.workflows != new.workflows {
+                self.log.info(
+                    "webhooks.routes",
+                    json!({"routes": paths, "reason": "reload"}),
+                );
+                changed.push("webhooks");
             }
         }
         // `a2a.introspection.enabled` also lives as an atomic on the feed (it
@@ -792,6 +895,8 @@ struct StagedReload {
     skills: Option<crate::context::skills::Catalogue>,
     instruction: Option<StagedInstruction>,
     channels_moved: bool,
+    #[cfg(feature = "a2a")]
+    listener: StagedListener,
 }
 
 /// The connection set a reload that changes `mcp` would run on.
@@ -808,6 +913,36 @@ struct StagedMcp {
 enum StagedInstruction {
     Text(String),
     Resource(super::FetchedInstruction),
+    /// The unchanged resource instruction, read again because the server it
+    /// is read through was re-dialed.
+    Reread(super::FetchedInstruction),
+}
+
+/// The listener's part of a staged reload: `None` is a part left as it is.
+#[cfg(feature = "a2a")]
+#[derive(Default)]
+struct StagedListener {
+    principals: Option<crate::a2a::Resolver>,
+    routes: Option<super::webhooks::StagedRoutes>,
+}
+
+/// A spec with its tags cleared: what dialing a server reads.
+fn untagged(spec: &crate::config::McpServerSpec) -> crate::config::McpServerSpec {
+    crate::config::McpServerSpec {
+        tags: Vec::new(),
+        ..spec.clone()
+    }
+}
+
+/// The timeout a server is dialed with: its own, or the section's default.
+fn server_timeout(settings: &cfg::Settings, server: &cfg::McpServer) -> Duration {
+    server.timeout.map(|d| d.0).unwrap_or(
+        settings
+            .mcp
+            .default_timeout
+            .map(|d| d.0)
+            .unwrap_or(Duration::from_secs(60)),
+    )
 }
 
 /// Whether the reload moves what a turn worker dials the model with.

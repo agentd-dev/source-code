@@ -29,10 +29,14 @@ struct Daemon {
 
 impl Daemon {
     fn spawn(cfg: &std::path::Path) -> Daemon {
+        Daemon::spawn_env(cfg, &[])
+    }
+    fn spawn_env(cfg: &std::path::Path, env: &[(&str, &str)]) -> Daemon {
         let err_path = common::unique_path("reload-tx-daemon", "log");
         let errf = std::fs::File::create(&err_path).unwrap();
         let child = Command::new(env!("CARGO_BIN_EXE_agentd"))
             .args(["--config", &cfg.to_string_lossy()])
+            .envs(env.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(errf))
@@ -659,6 +663,559 @@ fn an_unreadable_intelligence_token_refuses_the_reload() {
             .any(|e| e["error"]
                 .as_str()
                 .is_some_and(|m| m.contains("intelligence token"))),
+        "{log}"
+    );
+    std::fs::write(&cfg, &original).unwrap();
+    let log = d.reload(1);
+    assert_eq!(changed(&outcomes(&log)[1]), ["nothing"], "{log}");
+}
+
+/// A step naming a tool only the server the reload adds provides is checked
+/// against the registry the reload builds — not the running one, which lacks
+/// it — so the reload applies and the step runs on the new server.
+#[test]
+fn a_step_naming_a_tool_only_the_new_server_has_applies_and_runs_on_it() {
+    let a = common::spawn_mock_mcp("mock://a", false);
+    let b = common::spawn_mock_mcp("mock://b", false);
+    let t = tempfile::tempdir().unwrap();
+    let cfg = t.path().join("agent.yaml");
+    std::fs::write(
+        &cfg,
+        config("Keep ticking.", &[("a", &a.uri())], &[TICK], ""),
+    )
+    .unwrap();
+    let d = Daemon::spawn(&cfg);
+    d.wait_for(|l| done_with(l, "tick") >= 1, "a first tick", 15);
+
+    let uses_b = "  - name: uses-b\n    steps:\n      s: {kind: schedule, every: 300ms}\n      x: {kind: tool, depends_on: [s], name: b.mock.ops}\n      f: {kind: finish, depends_on: [x], status: completed, output: uses-b}\n";
+    std::fs::write(
+        &cfg,
+        config(
+            "Keep ticking.",
+            &[("a", &a.uri()), ("b", &b.uri())],
+            &[TICK, uses_b],
+            "",
+        ),
+    )
+    .unwrap();
+    let log = d.reload(0);
+    assert_eq!(outcomes(&log)[0]["event"], "config.reloaded", "{log}");
+    d.wait_for(|l| done_with(l, "uses-b") >= 1, "the step running on b", 15);
+    assert!(calls(&b, "mock.ops") >= 1, "{}", b.log());
+}
+
+/// A reload that disables a tool a workflow step calls is refused — with no
+/// `mcp` change at all, so only the tools section moves what the workflows
+/// are checked against — and nothing of it applies: the tool stays enabled.
+#[test]
+fn disabling_a_tool_a_step_calls_refuses_the_reload_and_nothing_applies() {
+    let a = common::spawn_mock_mcp("mock://a", false);
+    let t = tempfile::tempdir().unwrap();
+    let cfg = t.path().join("agent.yaml");
+    let calls_a = "  - name: calls-a\n    steps:\n      s: {kind: manual}\n      x: {kind: tool, depends_on: [s], name: a.mock.ops}\n      f: {kind: finish, depends_on: [x], status: completed}\n";
+    let original = config("Keep ticking.", &[("a", &a.uri())], &[TICK, calls_a], "");
+    std::fs::write(&cfg, &original).unwrap();
+    let d = Daemon::spawn(&cfg);
+    d.wait_for(|l| done_with(l, "tick") >= 1, "a first tick", 15);
+
+    std::fs::write(
+        &cfg,
+        config(
+            "Keep ticking.",
+            &[("a", &a.uri())],
+            &[TICK, calls_a],
+            "tools:\n  disabled: [a.mock.ops]\n",
+        ),
+    )
+    .unwrap();
+    let log = d.reload(0);
+    assert_eq!(
+        outcomes(&log)[0]["event"],
+        "config.reload.invalid",
+        "the reload was not refused:\n{log}"
+    );
+    assert!(
+        events(&log, "config.reload.invalid")
+            .iter()
+            .any(|e| e["error"]
+                .as_str()
+                .is_some_and(|m| m.contains("tool \"a.mock.ops\" is unknown, disabled"))),
+        "{log}"
+    );
+    std::fs::write(&cfg, &original).unwrap();
+    let log = d.reload(1);
+    assert_eq!(changed(&outcomes(&log)[1]), ["nothing"], "{log}");
+}
+
+/// A reload that changes only the workflows — adding one that registers a
+/// tool — rebuilds the registry, so the new workflow tool is there. Kept, the
+/// registry would carry the old set's tools and the new one would be missing.
+#[test]
+fn a_reload_adding_a_tool_workflow_alone_registers_its_tool() {
+    let t = tempfile::tempdir().unwrap();
+    let cfg = t.path().join("agent.yaml");
+    let probe = "  - name: probe\n    tool: {name: probe.run, mode: async}\n    steps:\n      s: {kind: manual}\n      f: {kind: finish, depends_on: [s], status: completed}\n";
+    let probe2 = "  - name: probe2\n    tool: {name: probe2.run, mode: async}\n    steps:\n      s: {kind: manual}\n      f: {kind: finish, depends_on: [s], status: completed}\n";
+    std::fs::write(&cfg, config("Work.", &[], &[probe], "")).unwrap();
+    let d = Daemon::spawn(&cfg);
+    d.wait_for(|l| !events(l, "proc.ready").is_empty(), "the daemon", 15);
+
+    std::fs::write(&cfg, config("Work.", &[], &[probe, probe2], "")).unwrap();
+    let log = d.reload(0);
+    let outcome = &outcomes(&log)[0];
+    assert_eq!(outcome["event"], "config.reloaded", "{log}");
+    assert!(changed(outcome).iter().any(|c| c == "tools"), "{log}");
+    assert!(
+        events(&log, "registry.workflow_tools")
+            .iter()
+            .any(|e| e["tool"] == "probe2.run"),
+        "the new workflow's tool was not registered:\n{log}"
+    );
+}
+
+/// Skills are discovered through the servers the reload would run on, so a
+/// skills source on a server the same reload adds is found.
+#[test]
+fn skills_from_a_server_the_reload_adds_are_discovered() {
+    let b = common::spawn_mock_mcp("mock://b", false);
+    let t = tempfile::tempdir().unwrap();
+    let cfg = t.path().join("agent.yaml");
+    std::fs::write(&cfg, config("Work.", &[], &[], "")).unwrap();
+    let d = Daemon::spawn(&cfg);
+    d.wait_for(|l| !events(l, "proc.ready").is_empty(), "the daemon", 15);
+
+    std::fs::write(
+        &cfg,
+        config(
+            "Work.",
+            &[("b", &b.uri())],
+            &[],
+            "skills:\n  sources:\n    - {server: b, discover: resources}\n",
+        ),
+    )
+    .unwrap();
+    let log = d.reload(0);
+    let outcome = &outcomes(&log)[0];
+    assert_eq!(outcome["event"], "config.reloaded", "{log}");
+    assert!(
+        changed(outcome).iter().any(|c| c == "skills"),
+        "b's skills were not discovered: {:?}\n{log}",
+        changed(outcome)
+    );
+}
+
+/// A server is unchanged only when everything its dial reads is: a changed
+/// credential or timeout re-dials it, where comparing the endpoint, headers
+/// and AAuth flag alone kept the old connection — the old credential — while
+/// the reload reported `mcp`. A change to its tags alone, which only the
+/// registry reads, keeps the live connection.
+#[test]
+fn a_changed_credential_or_timeout_redials_the_server_and_its_tags_do_not() {
+    let a = common::spawn_mock_mcp("mock://a", false);
+    let t = tempfile::tempdir().unwrap();
+    let cfg = t.path().join("agent.yaml");
+    let server = |extra: &str| {
+        let mcp = format!(
+            "mcp:\n  servers:\n    - {{name: a, endpoint: \"{}\", ns: a{extra}}}\n",
+            a.uri()
+        );
+        config("Keep ticking.", &[], &[TICK], &mcp)
+    };
+    let redials = |log: &str| {
+        events(log, "mcp.connect")
+            .iter()
+            .filter(|e| e["server"] == "a" && e["reason"] == "reload")
+            .count()
+    };
+    std::fs::write(
+        &cfg,
+        server(", timeout: 30s, auth: {kind: static, token: \"{{secret:TX_TOKEN_ONE}}\"}"),
+    )
+    .unwrap();
+    let d = Daemon::spawn_env(
+        &cfg,
+        &[("TX_TOKEN_ONE", "token-one"), ("TX_TOKEN_TWO", "token-two")],
+    );
+    d.wait_for(|l| done_with(l, "tick") >= 1, "a first tick", 15);
+
+    // The credential is rotated.
+    std::fs::write(
+        &cfg,
+        server(", timeout: 30s, auth: {kind: static, token: \"{{secret:TX_TOKEN_TWO}}\"}"),
+    )
+    .unwrap();
+    let log = d.reload(0);
+    assert_eq!(outcomes(&log)[0]["event"], "config.reloaded", "{log}");
+    assert_eq!(
+        redials(&log),
+        1,
+        "a rotated credential kept the old connection:\n{log}"
+    );
+
+    // The timeout changes.
+    std::fs::write(
+        &cfg,
+        server(", timeout: 31s, auth: {kind: static, token: \"{{secret:TX_TOKEN_TWO}}\"}"),
+    )
+    .unwrap();
+    let log = d.reload(1);
+    assert_eq!(outcomes(&log)[1]["event"], "config.reloaded", "{log}");
+    assert_eq!(
+        redials(&log),
+        2,
+        "a changed timeout kept the old connection:\n{log}"
+    );
+
+    // Only the tags change.
+    std::fs::write(
+        &cfg,
+        server(", timeout: 31s, auth: {kind: static, token: \"{{secret:TX_TOKEN_TWO}}\"}, tags: {\"*\": [sensitive]}"),
+    )
+    .unwrap();
+    let log = d.reload(2);
+    assert_eq!(outcomes(&log)[2]["event"], "config.reloaded", "{log}");
+    assert_eq!(
+        redials(&log),
+        2,
+        "a tags-only change re-dialed the server:\n{log}"
+    );
+    let ticks = done_with(&log, "tick");
+    d.wait_for(|l| done_with(l, "tick") >= ticks + 2, "a still ticking", 15);
+}
+
+/// A subscription lives on its connection. A reload that re-dials a server
+/// subscribes again, on the new connection, what the old one carried: the
+/// `subscribe` start of a workflow the reload left unchanged, and the
+/// resource a suspended `wait` waits on. Counted where it lands — at the
+/// server.
+#[test]
+fn a_redialed_server_is_subscribed_again_for_unchanged_starts_and_waits() {
+    let a = common::spawn_mock_mcp("mock://a", false);
+    let t = tempfile::tempdir().unwrap();
+    let cfg = t.path().join("agent.yaml");
+    let watch = "  - name: watch\n    steps:\n      s: {kind: subscribe, server: a, uri: \"mock://a\"}\n      f: {kind: finish, depends_on: [s], status: completed}\n";
+    // The wait watches a resource of its own, so each is counted apart: a
+    // connection tracks a URI once, whoever subscribed it.
+    let waits = "  - name: waits\n    steps:\n      s: {kind: once}\n      w: {kind: wait, depends_on: [s], on: resource, server: a, uri: \"mock://waited\", timeout: 120s}\n      f: {kind: finish, depends_on: [w], status: completed}\n";
+    let server = |headers: &str| {
+        let mcp = format!(
+            "mcp:\n  servers:\n    - {{name: a, endpoint: \"{}\", ns: a{headers}}}\n",
+            a.uri()
+        );
+        config("Work.", &[], &[watch, waits], &mcp)
+    };
+    std::fs::write(&cfg, server("")).unwrap();
+    let d = Daemon::spawn(&cfg);
+    d.wait_for(
+        |_| a.subscribes("mock://a") >= 1 && a.subscribes("mock://waited") >= 1,
+        "the start and the wait subscribing",
+        15,
+    );
+    // (The per-URI protocol re-sends every URI a connection tracks with each
+    // new one, so the counts only ever say "more than before".)
+    let (start0, wait0) = (a.subscribes("mock://a"), a.subscribes("mock://waited"));
+
+    std::fs::write(&cfg, server(", headers: {X-Generation: \"2\"}")).unwrap();
+    let log = d.reload(0);
+    assert_eq!(outcomes(&log)[0]["event"], "config.reloaded", "{log}");
+    assert!(
+        events(&log, "mcp.connect")
+            .iter()
+            .any(|e| e["server"] == "a" && e["reason"] == "reload"),
+        "{log}"
+    );
+    let log = d.wait_for(
+        |_| a.subscribes("mock://a") > start0 && a.subscribes("mock://waited") > wait0,
+        "both subscribed again on the new connection",
+        15,
+    );
+    assert!(
+        events(&log, "wait.resubscribed")
+            .iter()
+            .any(|e| e["server"] == "a" && e["uri"] == "mock://waited"),
+        "{log}"
+    );
+}
+
+/// The resource instruction's server, with the instruction itself unchanged:
+/// a reload that removes it is refused, as a start with that configuration
+/// is; one that re-dials it reads the instruction again through the new
+/// connection and subscribes it there, so the publisher's updates keep
+/// arriving.
+#[test]
+fn the_instructions_server_cannot_be_removed_and_a_redial_resubscribes_it() {
+    let a = common::spawn_mock_mcp("mock://a", false);
+    let b = common::spawn_mock_mcp("mock://b", false);
+    let t = tempfile::tempdir().unwrap();
+    let cfg = t.path().join("agent.yaml");
+    let instruction = "mcp://b/mock://instruction";
+    let with_b = |headers: &str| {
+        let mcp = format!(
+            "mcp:\n  servers:\n    - {{name: a, endpoint: \"{}\", ns: a}}\n    - {{name: b, endpoint: \"{}\", ns: b{headers}}}\n",
+            a.uri(),
+            b.uri()
+        );
+        config(instruction, &[], &[TICK], &mcp)
+    };
+    let original = with_b("");
+    std::fs::write(&cfg, &original).unwrap();
+    let d = Daemon::spawn(&cfg);
+    d.wait_for(|l| done_with(l, "tick") >= 1, "a first tick", 15);
+    assert_eq!(b.reads("mock://instruction"), 1, "{}", b.log());
+    assert_eq!(b.subscribes("mock://instruction"), 1, "{}", b.log());
+
+    // b goes; the instruction does not change.
+    std::fs::write(&cfg, config(instruction, &[("a", &a.uri())], &[TICK], "")).unwrap();
+    let log = d.reload(0);
+    assert_eq!(
+        outcomes(&log)[0]["event"],
+        "config.reload.invalid",
+        "a reload removing the instruction's server applied:\n{log}"
+    );
+    assert!(
+        events(&log, "config.reload.invalid")
+            .iter()
+            .any(|e| e["error"]
+                .as_str()
+                .is_some_and(|m| m.contains("agent.instruction mcp://b/mock://instruction"))),
+        "{log}"
+    );
+
+    // b is re-dialed with a new header.
+    std::fs::write(&cfg, with_b(", headers: {X-Generation: \"2\"}")).unwrap();
+    let log = d.reload(1);
+    let outcome = &outcomes(&log)[1];
+    assert_eq!(outcome["event"], "config.reloaded", "{log}");
+    assert!(
+        !changed(outcome).iter().any(|c| c == "agent.instruction"),
+        "the same text was reported as a changed instruction:\n{log}"
+    );
+    assert_eq!(b.reads("mock://instruction"), 2, "{}", b.log());
+    assert_eq!(
+        b.subscribes("mock://instruction"),
+        2,
+        "the instruction was not subscribed on the new connection:\n{}",
+        b.log()
+    );
+}
+
+/// A reload that replaces a workflow for an edit that leaves its schedule as
+/// it was keeps the schedule's deadline. Re-armed from now, every edit
+/// pushed the next run back a whole period: this `every: 4s` workflow,
+/// edited each second, would not run until four seconds after the last edit.
+#[test]
+fn an_edit_that_leaves_a_schedule_alone_keeps_its_deadline() {
+    let t = tempfile::tempdir().unwrap();
+    let cfg = t.path().join("agent.yaml");
+    let sched = |n: usize| {
+        format!(
+            "  - name: sched\n    steps:\n      s: {{kind: schedule, every: 4s}}\n      f: {{kind: finish, depends_on: [s], status: completed, output: sched-{n}}}\n"
+        )
+    };
+    std::fs::write(&cfg, config("Work.", &[], &[&sched(0)], "")).unwrap();
+    let d = Daemon::spawn(&cfg);
+    d.wait_for(
+        |l| {
+            events(l, "start.schedule.armed")
+                .iter()
+                .any(|e| e["workflow"] == "sched")
+        },
+        "the schedule armed",
+        15,
+    );
+    let armed = Instant::now();
+    for n in 1..=3 {
+        std::thread::sleep(Duration::from_millis(900));
+        std::fs::write(&cfg, config("Work.", &[], &[&sched(n)], "")).unwrap();
+        let log = d.reload(n - 1);
+        assert_eq!(outcomes(&log)[n - 1]["event"], "config.reloaded", "{log}");
+    }
+    d.wait_for(
+        |l| {
+            events(l, "run.done")
+                .iter()
+                .any(|e| e["workflow"] == "sched")
+        },
+        "the first scheduled run",
+        15,
+    );
+    let took = armed.elapsed();
+    assert!(
+        took < Duration::from_millis(6_000),
+        "the edits postponed the schedule: first run {took:?} after it was armed\n{}",
+        d.stderr()
+    );
+}
+
+/// A document that resolves to something other than a mapping — here a
+/// `file:` holding a bare string — refuses the reload naming its source, and
+/// the daemon lives on: on a reload, a panic over it took the daemon down.
+#[test]
+fn a_file_that_is_not_a_definition_refuses_the_reload_and_the_daemon_lives() {
+    let t = tempfile::tempdir().unwrap();
+    let cfg = t.path().join("agent.yaml");
+    let scalar = t.path().join("scalar.yaml");
+    std::fs::write(&scalar, "just a sentence\n").unwrap();
+    let original = config("Work.", &[], &[TICK_LOCAL], "");
+    std::fs::write(&cfg, &original).unwrap();
+    let d = Daemon::spawn(&cfg);
+    d.wait_for(|l| done_with(l, "tick-local") >= 1, "a first tick", 15);
+
+    let entry = format!("  - name: scalar\n    file: {}\n", scalar.display());
+    std::fs::write(&cfg, config("Work.", &[], &[TICK_LOCAL, &entry], "")).unwrap();
+    let log = d.reload(0);
+    assert_eq!(outcomes(&log)[0]["event"], "config.reload.invalid", "{log}");
+    assert!(
+        events(&log, "config.reload.invalid")
+            .iter()
+            .any(|e| e["error"]
+                .as_str()
+                .is_some_and(|m| m.contains(&format!("workflow file {}", scalar.display())))),
+        "{log}"
+    );
+    let ticks = done_with(&log, "tick-local");
+    d.wait_for(
+        |l| done_with(l, "tick-local") >= ticks + 2,
+        "the daemon ticking on",
+        15,
+    );
+}
+
+/// A scheduled workflow that needs no server.
+const TICK_LOCAL: &str = "  - name: tick-local\n    steps:\n      s: {kind: schedule, every: 300ms}\n      f: {kind: finish, depends_on: [s], status: completed, output: tick-local}\n";
+
+/// A definition the agent stored at runtime cannot veto the operator: a
+/// reload that disables the tool it names applies — the tool IS disabled —
+/// and the stored definition is left out, said out loud, and kept; it loads
+/// again once the tool is back. And the agent cannot store one naming a tool
+/// this agent does not have in the first place.
+#[test]
+fn a_stored_definition_cannot_veto_a_reload_that_disables_its_tool() {
+    let a = common::spawn_mock_mcp("mock://a", false);
+    let t = tempfile::tempdir().unwrap();
+    let cfg = t.path().join("agent.yaml");
+    let play = t.path().join("play.json");
+    let def = |name: &str, tool: &str| {
+        serde_json::json!({"name": name, "steps": {
+            "s": {"kind": "manual"},
+            "x": {"kind": "tool", "depends_on": ["s"], "name": tool},
+            "f": {"kind": "finish", "depends_on": ["x"], "status": "completed"}}})
+    };
+    let create = |d: serde_json::Value| serde_json::json!({"tool_calls": [{"name": "workflow.create", "arguments": {"definition": d}}]});
+    std::fs::write(
+        &play,
+        serde_json::json!({"turns": [
+            create(def("mine", "a.mock.ops")),
+            create(def("bogus", "nosuch.tool")),
+            {"echo_tool_result": true}
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    let with = |extra: &str| {
+        format!(
+            "agent:\n  name: tx\n  prompt: go\n  instruction: Keep ticking.\n\
+             intelligence: {{ endpoints: \"mock:file:{}\", model: mock }}\n\
+             store:\n  kind: memory\n\
+             lifecycle:\n  run_until: drained\n\
+             observability:\n  log_level: info\n  log_content: true\n\
+             mcp:\n  servers:\n    - {{name: a, endpoint: \"{}\", ns: a}}\n\
+             workflows:\n{TICK}{extra}",
+            play.display(),
+            a.uri()
+        )
+    };
+    let original = with("");
+    std::fs::write(&cfg, &original).unwrap();
+    let d = Daemon::spawn(&cfg);
+    let log = d.wait_for(
+        |l| !events(l, "turn.reply").is_empty(),
+        "the agent's turn",
+        20,
+    );
+    assert!(
+        events(&log, "workflow.defined")
+            .iter()
+            .any(|e| e["name"] == "mine"),
+        "{log}"
+    );
+    assert!(
+        events(&log, "workflow.defined")
+            .iter()
+            .all(|e| e["name"] != "bogus"),
+        "a definition naming a tool this agent lacks was stored:\n{log}"
+    );
+    assert!(
+        events(&log, "turn.reply").iter().any(|e| e["text"]
+            .as_str()
+            .is_some_and(|m| m.contains("tool \"nosuch.tool\" is unknown"))),
+        "the refusal did not say why:\n{log}"
+    );
+
+    std::fs::write(&cfg, with("tools:\n  disabled: [a.mock.ops]\n")).unwrap();
+    let log = d.reload(0);
+    let outcome = &outcomes(&log)[0];
+    assert_eq!(
+        outcome["event"], "config.reloaded",
+        "a stored definition vetoed the operator's reload:\n{log}"
+    );
+    assert!(changed(outcome).iter().any(|c| c == "tools"), "{log}");
+    assert!(
+        events(&log, "workflow.stored.invalid")
+            .iter()
+            .any(|e| e["name"] == "mine"),
+        "{log}"
+    );
+    assert!(
+        events(&log, "workflow.unloaded")
+            .iter()
+            .any(|e| e["workflow"] == "mine" && e["reason"] == "removed"),
+        "{log}"
+    );
+
+    std::fs::write(&cfg, &original).unwrap();
+    let log = d.reload(1);
+    assert_eq!(outcomes(&log)[1]["event"], "config.reloaded", "{log}");
+    assert!(
+        events(&log, "workflow.loaded")
+            .iter()
+            .filter(|e| e["name"] == "mine" && e["source"] == "store")
+            .count()
+            == 1,
+        "the stored definition did not load again:\n{log}"
+    );
+}
+
+/// A `tool` step naming a workflow's tool is refused on every path. A start
+/// refuses it (the workflow tools are registered after the check), and so
+/// does a reload that rebuilds the registry; a reload that kept the registry
+/// — which already held the workflow tools — accepted it, applying a
+/// configuration the next start refuses.
+#[test]
+fn a_step_naming_a_workflow_tool_is_refused_by_a_reload_that_keeps_the_registry() {
+    let t = tempfile::tempdir().unwrap();
+    let cfg = t.path().join("agent.yaml");
+    let probe = "  - name: probe\n    tool: {name: probe.run, mode: async}\n    steps:\n      s: {kind: manual}\n      f: {kind: finish, depends_on: [s], status: completed}\n";
+    let original = config("Work.", &[], &[probe], "");
+    std::fs::write(&cfg, &original).unwrap();
+    let d = Daemon::spawn(&cfg);
+    d.wait_for(|l| !events(l, "proc.ready").is_empty(), "the daemon", 15);
+
+    // No `tool:` block moves, so the registry is kept.
+    let calls_probe = "  - name: calls-probe\n    steps:\n      s: {kind: manual}\n      x: {kind: tool, depends_on: [s], name: probe.run}\n      f: {kind: finish, depends_on: [x], status: completed}\n";
+    std::fs::write(&cfg, config("Work.", &[], &[probe, calls_probe], "")).unwrap();
+    let log = d.reload(0);
+    assert_eq!(
+        outcomes(&log)[0]["event"],
+        "config.reload.invalid",
+        "the reload accepted what a start refuses:\n{log}"
+    );
+    assert!(
+        events(&log, "config.reload.invalid")
+            .iter()
+            .any(|e| e["error"]
+                .as_str()
+                .is_some_and(|m| m.contains("tool \"probe.run\" is a workflow's tool"))),
         "{log}"
     );
     std::fs::write(&cfg, &original).unwrap();

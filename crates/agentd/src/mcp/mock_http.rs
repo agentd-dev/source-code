@@ -243,6 +243,15 @@ fn handle_request(req: Request, state: &State) -> (Response, bool) {
         }
         "resources/unsubscribe" => (Response::ok(req.id, json!({})), false),
         "resources/subscribe" => {
+            // Every subscribe that REACHED the server, like `MOCK_READ`: the
+            // server side's own count of what a client subscribed.
+            let asked = req
+                .params
+                .as_ref()
+                .and_then(|p| p.get("uri"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            eprintln!("MOCK_SUBSCRIBE {asked}");
             // Arm the one-shot push the GET SSE stream will deliver.
             if state.emit {
                 state.pending_emit.store(true, Ordering::SeqCst);

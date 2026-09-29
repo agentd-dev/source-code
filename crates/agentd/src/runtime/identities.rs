@@ -147,10 +147,20 @@ fn principal_id(role: Role, id: &str) -> String {
 /// Record every rule id `a2a` declares, refusing the whole set — before any
 /// of it is written — when a `user`-role id is already a device's name.
 ///
-/// Called at listener spawn and before a reload installs new rules, so a
-/// refusal leaves the rules in force as they were. An `agent`-role id never
-/// collides: it is `agent:<id>`, and a device is always `user:<name>`.
+/// Called at listener spawn. A reload runs the two halves apart: the check
+/// while it stages, so a collision refuses it with nothing changed, and the
+/// claim only once nothing else can refuse it — a claim written for a reload
+/// that was then refused would hold a name no rule declares. An `agent`-role
+/// id never collides: it is `agent:<id>`, and a device is always
+/// `user:<name>`.
 pub fn register_rules(durable: &Durable, a2a: &A2a) -> Result<(), Refused> {
+    check_rules(durable, a2a)?;
+    claim_rules(durable, a2a)
+}
+
+/// Whether `a2a`'s rules could be claimed: a `user`-role id an approved
+/// device already owns refuses them. Reads only.
+pub fn check_rules(durable: &Durable, a2a: &A2a) -> Result<(), Refused> {
     for (role, id) in rule_ids(a2a) {
         if role == Role::User
             && lookup(durable, &principal_id(role, id))? == Some(Registered::Device)
@@ -158,6 +168,12 @@ pub fn register_rules(durable: &Durable, a2a: &A2a) -> Result<(), Refused> {
             return Err(Refused::Collision { id: id.to_string() });
         }
     }
+    Ok(())
+}
+
+/// Record every rule id `a2a` declares that nobody has claimed yet — after
+/// [`check_rules`] passed.
+pub fn claim_rules(durable: &Durable, a2a: &A2a) -> Result<(), Refused> {
     for (role, id) in rule_ids(a2a) {
         let pid = principal_id(role, id);
         // First claim wins and keeps its `first_ms`; re-registering an id

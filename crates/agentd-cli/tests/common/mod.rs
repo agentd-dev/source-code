@@ -44,6 +44,13 @@ impl MockMcp {
         let want = format!("MOCK_READ {uri}");
         self.log().lines().filter(|l| *l == want).count()
     }
+    /// How many `resources/subscribe` calls for exactly `uri` reached the
+    /// mock. A subscription lives on its connection, so this is how a test
+    /// sees one made again on a connection that replaced another.
+    pub fn subscribes(&self, uri: &str) -> usize {
+        let want = format!("MOCK_SUBSCRIBE {uri}");
+        self.log().lines().filter(|l| *l == want).count()
+    }
     /// Stop the server mid-test: afterwards its port refuses connections.
     /// Idempotent — a second call (or the drop) is a no-op on a reaped child.
     pub fn stop(&mut self) {

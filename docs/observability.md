@@ -102,6 +102,7 @@ exhaustive.
 | `mcp.connect.fail` | `server`, `transport`, `err` |
 | `mcp.disconnect` | `server`, `reason` |
 | `start.schedule.armed` / `start.subscribe.armed` | `workflow`, `node` + `next_ms` (schedule) or `server`, `uri` (subscribe) — a start node armed |
+| `wait.resubscribed` / `wait.resubscribe.fail` | `server`, `uri` (+ `err`) — a reload re-dialed `server`, and a suspended `wait on: resource` was subscribed again on the new connection (a `subscribe` start logs `start.subscribe.armed` again) |
 | `start.fired` | `workflow`, `node`, `kind` — a start node fired; an A2A start logs `start.a2a.fired` (`conversation`, `command`, `role`) first |
 | `subscribe` | `resource_uri`, `server`, `by` (`config`/`agent`) |
 | `unsubscribe` | `resource_uri`, `server`, `by` |

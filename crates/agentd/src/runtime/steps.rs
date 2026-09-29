@@ -350,6 +350,8 @@ impl Runtime {
         // Stored definitions under a configured name: (store id, logged detail).
         let mut shadowed: Vec<(String, Value)> = Vec::new();
         let mut warnings: Vec<(&'static str, Value)> = Vec::new();
+        // Runtime-created definitions, checked apart from the configured ones.
+        let mut stored: Vec<Workflow> = Vec::new();
         for w in defs {
             loaded.push(json!({"name": w.name, "hash": &w.hash[..12], "steps": w.steps.len(), "durable": w.durable, "starts": w.start_steps().iter().map(|s| s.kind.clone()).collect::<Vec<_>>()}));
             workflows.insert(w.name.clone(), std::sync::Arc::new(w));
@@ -399,8 +401,7 @@ impl Runtime {
                     match parse_workflow(def) {
                         Ok(mut w) => {
                             self.fill_durable_default(&mut w);
-                            loaded.push(json!({"name": w.name, "source": "store"}));
-                            workflows.insert(w.name.clone(), std::sync::Arc::new(w));
+                            stored.push(w);
                         }
                         Err(e) => warnings.push((
                             "workflow.stored.invalid",
@@ -410,37 +411,32 @@ impl Runtime {
                 }
             }
         }
-        // Validate tool/server references against the registry.
+        // Validate tool/server/stream references against the registry and
+        // servers the set will run with. A configured definition that names
+        // what they lack refuses the start or the reload — the operator wrote
+        // both, and a reload that disables a tool a step calls is a mistake to
+        // say now, not on the day the step runs.
         for w in workflows.values() {
-            for s in w.steps.values() {
-                match s.kind.as_str() {
-                    "tool" => {
-                        if let Some(n) = s.field_str("name")
-                            && !registry.allowed(&Caller::Workflow, n)
-                        {
-                            errs.push(format!("workflow {:?} step {:?}: tool {n:?} is unknown, disabled or not granted to workflows", w.name, s.id));
-                        }
-                    }
-                    "mcp.tool" => {
-                        if let Some(srv) = s.field_str("server")
-                            && !mcp.contains_key(srv)
-                        {
-                            errs.push(format!(
-                                "workflow {:?} step {:?}: mcp server {srv:?} is not connected",
-                                w.name, s.id
-                            ));
-                        }
-                    }
-                    k if (k.starts_with("memory.")
-                        || k.starts_with("artifact.")
-                        || k.starts_with("knowledge.")
-                        || k.starts_with("search."))
-                        && !registry.allowed(&Caller::Workflow, k) =>
-                    {
-                        errs.push(format!("workflow {:?} step {:?}: {k} is unavailable (map it with tools.overrides or configure its server)", w.name, s.id));
-                    }
-                    _ => {}
-                }
+            errs.extend(self.reference_errors(w, registry, mcp));
+        }
+        // A stored one (workflow.create/update) cannot refuse anything: only
+        // the operator's configuration may. Checked the same way it would
+        // otherwise veto the operator — a definition the agent wrote naming
+        // a tool would keep that tool enabled against every reload that
+        // disables it, and a server connected against every reload that
+        // removes it. It is left out of the set instead, said out loud, and
+        // kept in the store: it loads again once what it names is back.
+        for w in stored {
+            let problems = self.reference_errors(&w, registry, mcp);
+            if problems.is_empty() {
+                loaded.push(json!({"name": w.name, "source": "store"}));
+                workflows.insert(w.name.clone(), std::sync::Arc::new(w));
+            } else {
+                warnings.push((
+                    "workflow.stored.invalid",
+                    json!({"name": w.name, "errors": problems,
+                           "note": "not loaded; the stored definition is kept and loads once what it names is available"}),
+                ));
             }
         }
         // Mixed durability is legal but has one sharp edge worth a loud line:
@@ -467,21 +463,6 @@ impl Runtime {
                 }
             }
         }
-        // Streams are fail-closed at load: an `emit` or `stream` node naming an
-        // undeclared stream is a config error now, not a step failure later.
-        for w in workflows.values() {
-            for st in w.steps.values() {
-                if matches!(st.kind.as_str(), "emit" | "stream")
-                    && let Some(name) = st.field_str("stream")
-                    && !self.settings.streams.contains_key(name)
-                {
-                    errs.push(format!(
-                        "workflow {:?} step {:?}: stream {name:?} is not declared under `streams:`",
-                        w.name, st.id
-                    ));
-                }
-            }
-        }
         if !errs.is_empty() {
             return Err(errs);
         }
@@ -492,6 +473,75 @@ impl Runtime {
             shadowed,
             warnings,
         })
+    }
+
+    /// What `w` names that the registry and servers it would run with do not
+    /// have: a tool, an MCP server, a mapped contract, a declared stream.
+    /// One check for a configured definition, a stored one and one the agent
+    /// is writing now, so none of them is held to a different line.
+    pub(crate) fn reference_errors(
+        &self,
+        w: &Workflow,
+        registry: &crate::registry::Registry,
+        mcp: &BTreeMap<String, std::sync::Arc<crate::mcp::client::McpClient>>,
+    ) -> Vec<String> {
+        let mut errs = Vec::new();
+        for s in w.steps.values() {
+            match s.kind.as_str() {
+                "tool" => {
+                    let Some(n) = s.field_str("name") else {
+                        continue;
+                    };
+                    // A workflow's tool is refused whether or not the registry
+                    // checked against holds it yet. At startup and on a reload
+                    // that rebuilds the registry it does not (the workflow
+                    // tools are registered after this check); on one that
+                    // keeps it, it does — so allowing it here would accept a
+                    // configuration the next start refuses.
+                    if registry
+                        .get(n)
+                        .is_some_and(|t| t.class == crate::registry::ToolClass::Workflow)
+                    {
+                        errs.push(format!("workflow {:?} step {:?}: tool {n:?} is a workflow's tool; run that workflow with a `workflow` step", w.name, s.id));
+                    } else if !registry.allowed(&Caller::Workflow, n) {
+                        errs.push(format!("workflow {:?} step {:?}: tool {n:?} is unknown, disabled or not granted to workflows", w.name, s.id));
+                    }
+                }
+                "mcp.tool" => {
+                    if let Some(srv) = s.field_str("server")
+                        && !mcp.contains_key(srv)
+                    {
+                        errs.push(format!(
+                            "workflow {:?} step {:?}: mcp server {srv:?} is not connected",
+                            w.name, s.id
+                        ));
+                    }
+                }
+                k if (k.starts_with("memory.")
+                    || k.starts_with("artifact.")
+                    || k.starts_with("knowledge.")
+                    || k.starts_with("search."))
+                    && !registry.allowed(&Caller::Workflow, k) =>
+                {
+                    errs.push(format!("workflow {:?} step {:?}: {k} is unavailable (map it with tools.overrides or configure its server)", w.name, s.id));
+                }
+                // Streams are fail-closed at load: an `emit` or `stream` node
+                // naming an undeclared stream is a config error now, not a
+                // step failure later.
+                "emit" | "stream" => {
+                    if let Some(name) = s.field_str("stream")
+                        && !self.settings.streams.contains_key(name)
+                    {
+                        errs.push(format!(
+                            "workflow {:?} step {:?}: stream {name:?} is not declared under `streams:`",
+                            w.name, s.id
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+        errs
     }
 
     /// Make a prepared set live: it replaces the installed set whole. Nothing
@@ -3609,6 +3659,15 @@ impl Runtime {
                                 w.name
                             ));
                         }
+                        // Checked now against what is running, as a start
+                        // checks a configured one: a definition naming a
+                        // tool, server or stream this agent does not have is
+                        // refused here rather than stored to fail when it
+                        // runs.
+                        let problems = self.reference_errors(&w, &self.registry, &self.mcp);
+                        if !problems.is_empty() {
+                            return err(format!("{name}: {}", problems.join("; ")));
+                        }
                         let (wname, hash) = (w.name.clone(), w.hash.clone());
                         // Durable definition (memory/_workflows/<name>).
                         let rec = crate::context::memory::Record {
@@ -3788,15 +3847,28 @@ pub(crate) fn read_resource_any(
 /// error goes where the URL may not: the log and a reload's refusal.
 fn scrub_url(text: &str, url: &str) -> String {
     let mut out = text.replace(url, &crate::config::settings::url_locator(url));
-    let cut = url.find(['?', '#']).unwrap_or(url.len());
-    let (base, tail) = url.split_at(cut);
-    if !tail.is_empty() {
-        out = out.replace(tail, "");
-    }
-    if let Some((_, rest)) = base.split_once("://") {
+    // The userinfo runs to the last `@` of the authority, found before any
+    // `?` or `#` is looked for: a raw one inside a password does not end it.
+    let mut after_userinfo = 0;
+    if let Some(start) = url.find("://").map(|i| i + 3) {
+        let rest = &url[start..];
         let authority = &rest[..rest.find('/').unwrap_or(rest.len())];
-        if let Some((userinfo, _)) = authority.rsplit_once('@') {
-            out = out.replace(&format!("{userinfo}@"), "");
+        if let Some(at) = authority.rfind('@') {
+            out = out.replace(&format!("{}@", &authority[..at]), "");
+            after_userinfo = start + at + 1;
+        }
+    }
+    // The query and the fragment each on its own, as well as together: an
+    // error echoing the request line carries the query without the fragment.
+    let tail = &url[after_userinfo..];
+    if let Some(q) = tail.find(['?', '#']) {
+        let tail = &tail[q..];
+        out = out.replace(tail, "");
+        let (query, fragment) = tail.split_at(tail.find('#').unwrap_or(tail.len()));
+        for part in [query, fragment] {
+            if part.len() > 1 {
+                out = out.replace(part, "");
+            }
         }
     }
     out
@@ -3824,6 +3896,20 @@ mod tests {
         );
         let query_alone = "GET /defs.yaml?token=s3cr3t#frag: HTTP 404";
         assert_eq!(scrub_url(query_alone, url), "GET /defs.yaml: HTTP 404");
+        // The request line an HTTP client sends carries the query without
+        // the fragment.
+        let request_line = "GET /defs.yaml?token=s3cr3t: HTTP 404";
+        assert_eq!(scrub_url(request_line, url), "GET /defs.yaml: HTTP 404");
+        // A raw `?` or `#` inside the password does not end the userinfo.
+        let raw = "http://ops:p?w#d@host.example/defs.yaml";
+        assert_eq!(
+            scrub_url("host `ops:p?w#d@host.example` rejected", raw),
+            "host `host.example` rejected"
+        );
+        assert_eq!(
+            crate::config::settings::url_locator(raw),
+            "http://host.example/defs.yaml"
+        );
         // A URL with nothing to hide leaves the text as it was.
         assert_eq!(
             scrub_url("HTTP 404", "https://defs.example/a.yaml"),

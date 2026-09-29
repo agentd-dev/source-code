@@ -280,19 +280,27 @@ impl WebhookHandler {
         *self.routes.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(routes);
     }
 
-    /// Rebuild the table from the current configuration, carrying live state
-    /// across, and install it. Errors leave the serving table untouched.
-    pub(crate) fn reload_routes(
+    /// Build the table a reload would serve, carrying live state across,
+    /// WITHOUT installing it: a route that cannot be built (an unresolvable
+    /// secret, a bad `rate`) refuses the reload while it is staged, and
+    /// [`install_routes`](Self::install_routes) puts the table in only once
+    /// the whole reload applies.
+    pub(crate) fn stage_routes(
         &self,
         nodes: Vec<WebhookNode>,
         webhooks: &Webhooks,
         env: &dyn Fn(&str) -> Option<String>,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<StagedRoutes, String> {
         let prev = self.routes();
-        let next = build_routes(nodes, webhooks, env, Some(&prev))?;
-        let paths: Vec<String> = next.keys().cloned().collect();
-        self.set_routes(next);
-        Ok(paths)
+        let map = build_routes(nodes, webhooks, env, Some(&prev))?;
+        let paths: Vec<String> = map.keys().cloned().collect();
+        Ok(StagedRoutes { map, paths })
+    }
+
+    /// Serve a staged table. Returns its paths.
+    pub(crate) fn install_routes(&self, staged: StagedRoutes) -> Vec<String> {
+        self.set_routes(staged.map);
+        staged.paths
     }
 
     /// The `{method, path, headers, body, raw_body}` payload handed to the workflow.
@@ -581,6 +589,12 @@ fn overflow_of(spec: &Map<String, Value>) -> Overflow {
 /// The live route table, swapped wholesale by a reload.
 type RouteMap = HashMap<String, Route>;
 
+/// A route table built for a reload and not yet served.
+pub(crate) struct StagedRoutes {
+    map: RouteMap,
+    paths: Vec<String>,
+}
+
 /// Compile the `webhook` start nodes into a route table.
 ///
 /// `prev` is the table currently being served, when this is a REBUILD: live
@@ -766,19 +780,29 @@ impl crate::runtime::reactor::Runtime {
     /// two copies of "which nodes are routes" would drift the way the
     /// long-lived-start lists did.
     pub(crate) fn webhook_nodes(&self) -> Vec<WebhookNode> {
-        self.workflows
-            .values()
-            .flat_map(|wf| {
-                let low = wf.priority == crate::engine::model::Priority::Low;
-                wf.steps
-                    .values()
-                    .filter(|s| s.kind == "webhook")
-                    .map(|s| (wf.name.clone(), s.id.clone(), s.spec.clone(), low))
-                    .collect::<Vec<_>>()
-            })
-            .collect()
+        webhook_nodes_of(&self.workflows)
     }
+}
 
+/// The `webhook` start nodes of a workflow set — the running one, or the one
+/// a reload has staged and not yet installed.
+pub(crate) fn webhook_nodes_of(
+    workflows: &std::collections::BTreeMap<String, Arc<crate::engine::Workflow>>,
+) -> Vec<WebhookNode> {
+    workflows
+        .values()
+        .flat_map(|wf| {
+            let low = wf.priority == crate::engine::model::Priority::Low;
+            wf.steps
+                .values()
+                .filter(|s| s.kind == "webhook")
+                .map(|s| (wf.name.clone(), s.id.clone(), s.spec.clone(), low))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+impl crate::runtime::reactor::Runtime {
     /// Handle a webhook request on the single-writer loop: deduplicate durably by
     /// idempotency key, then fire the workflow's `webhook` start node.
     pub(crate) fn on_webhook_request(&mut self, req: WebhookRequest) {

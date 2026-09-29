@@ -202,6 +202,49 @@ fn the_local_gate_runs_the_same_rows_as_ci() {
     );
 }
 
+/// deny.toml is enforced, in CI and before a push. It sat unenforced from
+/// v1.16.0 on, failing on licences nobody saw, because no job ran it. And
+/// agentd's own AGPL is excepted per crate, never allowed: on the allow-list
+/// it would admit an AGPL dependency without a word.
+#[test]
+fn the_supply_chain_gate_runs_in_ci_and_locally() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let read = |p: &str| std::fs::read_to_string(root.join(p)).unwrap();
+
+    let ci = workflow("ci.yml");
+    let job = ci
+        .split("\n  deny:\n")
+        .nth(1)
+        .expect("ci.yml has a `deny` job");
+    let job = job.split("\n\n").next().unwrap_or(job);
+    assert!(
+        job.lines().any(|l| l.trim() == "- run: cargo deny check"),
+        "ci.yml's deny job does not run `cargo deny check`:\n{job}"
+    );
+    assert!(
+        read("scripts/ci-gate.sh")
+            .lines()
+            .any(|l| l.trim().starts_with("cargo deny check")),
+        "scripts/ci-gate.sh does not run `cargo deny check`"
+    );
+
+    let deny = read("deny.toml");
+    let allow = deny
+        .split("\nallow = [")
+        .nth(1)
+        .and_then(|s| s.split("\n]").next())
+        .expect("deny.toml has a [licenses] allow list");
+    let allowed: Vec<&str> = allow
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with('#'))
+        .collect();
+    assert!(
+        !allowed.iter().any(|l| l.contains("AGPL")),
+        "deny.toml allows AGPL for every dependency; except agentd's own crates by name instead: {allowed:?}"
+    );
+}
+
 /// The `[features]` a manifest declares, by name.
 fn declared_features(manifest: &str) -> Vec<String> {
     let text = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(manifest))

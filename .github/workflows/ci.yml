@@ -63,6 +63,30 @@ jobs:
             exit 1
           fi
 
+  # The supply-chain gate (deny.toml): advisories, bans, licences, sources.
+  # A pinned, checksum-verified cargo-deny release rather than
+  # cargo-deny-action: the action floats with its major tag and defaults to
+  # `--all-features`, so CI would judge a different graph, with a different
+  # cargo-deny, than `scripts/ci-gate.sh` does locally. Here both run the same
+  # binary with the same command line.
+  deny:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_DENY_VERSION: "0.19.5"
+      CARGO_DENY_SHA256: 5ea64ae09959b5fe1072d898f95caaa89b374678ba6728d5e9ed1366745479b0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-deny
+        run: |
+          name="cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl"
+          curl -sSfL -o "$RUNNER_TEMP/deny.tgz" \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/${name}.tar.gz"
+          echo "${CARGO_DENY_SHA256}  $RUNNER_TEMP/deny.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/deny.tgz" -C "$RUNNER_TEMP"
+          install -m 0755 "$RUNNER_TEMP/${name}/cargo-deny" "$HOME/.cargo/bin/cargo-deny"
+      - run: cargo deny check
+
   # The display clients (interface/): a separate Node package, gated on every
   # push like the daemon — a change on either side of the wire can break the
   # other, so neither side's gate is filtered to its own paths. Build first:

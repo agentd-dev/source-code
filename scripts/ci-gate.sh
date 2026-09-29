@@ -54,6 +54,18 @@ for F in "${ROWS[@]}"; do
 done
 [ $fail -eq 0 ] && echo "  all rows clean"
 
+# ci.yml's `deny` job. It runs in quick mode too: it reads the lockfile and
+# builds nothing. Without cargo-deny the step is announced as NOT run rather
+# than passed over — a clean verdict here would otherwise claim a check that
+# never happened.
+step "cargo deny (advisories, bans, licences, sources)"
+if command -v cargo-deny >/dev/null 2>&1; then
+  cargo deny check || fail=1
+else
+  echo "  SKIPPED  cargo-deny is not installed — CI's deny job will run it"
+  echo "           (install: cargo install cargo-deny --locked)"
+fi
+
 if [ "${1:-}" != "quick" ]; then
   step "test (workspace, all features)"
   cargo test --workspace --all-features --no-fail-fast || fail=1

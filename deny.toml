@@ -18,13 +18,29 @@ multiple-versions = "warn"
 version = 2
 # Permissive-only. Adding a license here is a deliberate act — it documents
 # exactly what licences the (tiny) dependency set carries.
-# Exactly the licences the current dependency set carries (default + all
-# features) — verified by `cargo deny check` reporting no unmatched allowance.
+# Exactly the licences the dependency set `cargo deny check` walks carries
+# (the workspace at its default features) — verified by `cargo deny check
+# licenses` reporting no unmatched allowance.
 allow = [
     "MIT",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
     "BSD-3-Clause",
+    # Permissive and MIT-style (the OpenBSD licence). The rustls stack's
+    # crypto carries it: ring ("Apache-2.0 AND ISC"), rustls-webpki and
+    # untrusted.
+    "ISC",
     "Unicode-3.0",
     "CDLA-Permissive-2.0",
+]
+# agentd's own licence is not a dependency policy: AGPL-3.0-only applies to
+# agentd itself, so it is excepted for these workspace crates BY NAME rather
+# than allowed — an allow-list entry would let an AGPL dependency in unseen.
+# agentd-instruction is MIT OR Apache-2.0 and needs no exception.
+exceptions = [
+    { allow = ["AGPL-3.0-only"], crate = "agentd-core" },
+    { allow = ["AGPL-3.0-only"], crate = "agentd-cli" },
+    { allow = ["AGPL-3.0-only"], crate = "agentd-mcp" },
+    { allow = ["AGPL-3.0-only"], crate = "agentd-net" },
+    { allow = ["AGPL-3.0-only"], crate = "agentd-conformance" },
 ]

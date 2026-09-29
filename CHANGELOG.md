@@ -438,6 +438,13 @@ holds up the next call on the same server.
   race it. Fixing it needs an rmcp change, or agentd driving the rounds
   itself.
 
+### Tooling
+
+- **`cargo deny check` passes and CI runs it** (a `deny` job, and a step in
+  `scripts/ci-gate.sh`): ISC is allowed (ring, rustls-webpki, untrusted), and
+  AGPL-3.0-only is excepted for agentd's own five crates by name, not allowed
+  for dependencies.
+
 ### Crates
 
 agentd-mcp and agentd-net have breaking API removals: the vsock transport,

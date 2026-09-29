@@ -90,11 +90,11 @@ store:
   kind: memory            # see §4 for making the session durable
 
 a2a:
-  listen: http://127.0.0.1:8420   # loopback ⇒ you are the operator, no credential
-
-interface:
-  enabled: true           # the TUI/web-UI surface (default OFF)
-  debug: false            # turn on per-session with /set when you need internals
+  listen: http://127.0.0.1:8420   # loopback, no credential ⇒ your terminal is the operator
+  events:
+    enabled: true         # the live feed the TUI/web UI watch (default OFF)
+  introspection:
+    enabled: false        # transcripts, run detail, the log ring — /set it on when you need internals
 
 security:
   exec:
@@ -119,8 +119,11 @@ export OPENAI_API_KEY=sk-…
 agentd tui --config coding.yaml
 ```
 
-That starts the daemon *and* the terminal UI, ties their lifetimes, and puts
-the daemon's log lines in a file instead of your screen. Prefer them separate?
+That starts the daemon *and* the terminal UI, ties their lifetimes, signs the
+TUI in with a single-use launch code the daemon mints in its own process, and
+puts the daemon's log lines in a file instead of your screen. The launcher
+adds nothing to `coding.yaml`: the feed is on because the file turns it on.
+Prefer them separate?
 Run `agentd --config coding.yaml` in one shell and `agentd-tui --endpoint
 http://127.0.0.1:8420` in another — now quitting the UI leaves the agent
 working. See [interface.md](interface.md) for the client surface in full.
@@ -241,17 +244,22 @@ What happens when nobody is watching is a policy you set
   composer pulls one in).
 - **Start read-only.** `[git, rg, ls, cat]` for a day. Widen when the agent has
   earned it, not before.
-- **Keep `interface.debug` off, and flip it when you need it:**
-  `/set interface.debug true` opens the feed, per-step run detail and the log
-  tail live, for every attached client at once. Turn it back off after.
+- **Keep introspection off, and flip it when you need it:**
+  `/set a2a.introspection.enabled true` opens transcripts, per-step run detail
+  and the log tail live, for every attached client at once. Turn it back off
+  after; the next reload of the file does too.
 - **`/pause` before you edit the tree yourself.** It parks dispatch (intake
   continues), so you and the agent are not writing the same file. `/resume`
   when you are done — nothing is lost, unlike a cancel.
-- **Watch from a second surface.** Leave the TUI at your desk and open the web
-  UI on another screen or your phone; both render the same session live. From
-  another machine, `/pair` gives a rotating code — `agentd-tui --endpoint … --code 483921`
-  — so no bearer needs copying around
-  ([Pairing-code login](interface.md#54-pairing-code-login-interfacepairing)).
+- **Watch from a second surface.** Every attached client renders the same
+  session live. A second terminal on this machine is one more
+  `agentd-tui --endpoint http://127.0.0.1:8420`. A browser, or another
+  person, signs in: give the daemon an operator credential (`a2a.bearer`) and
+  the device grant (`a2a.device_grant.enabled`), list the web UI's origin in
+  `a2a.cors.origins`, and the other client shows a code you approve from your
+  TUI with `/approve <code> <name>` — no bearer is copied around
+  ([Signing in](interface.md#signing-in)). With a credential configured your
+  own console still signs in through `agentd tui`'s launch code.
 - **Delegate exploration.** "Check whether this pattern appears elsewhere" is a
   subagent's job: it runs in its own process with its own context and reports a
   distillate, so a wide search never floods the conversation you are reading.
@@ -303,16 +311,18 @@ waited overnight because the run is durable.
   purpose ([security.md](security.md)).
 - **MCP servers must speak HTTP(S).** There is no stdio transport, so a
   stdio-only server needs a bridge you run.
-- **Loopback is operator.** A local client is fully privileged with no
-  credential — correct for your laptop, wrong for a shared host. Bind
-  non-loopback and you must configure client auth (mTLS, bearer, or pairing).
+- **Loopback is operator.** On a loopback listener with no credential
+  configured, a local terminal client is fully privileged — correct for your
+  laptop, wrong for a shared host. (A browser never is: a request carrying
+  `Origin` always signs in.) Bind non-loopback and you must configure client
+  auth (mTLS or a bearer), and people then sign in with the device grant.
 
 ---
 
 ## See also
 
 - [interface.md](interface.md) — the TUI and web UI in full: screens, the
-  composer's `/ @ # $`, pairing, debug mode, chrome configuration.
+  composer's `/ @ # $`, signing in, the debug screen, chrome configuration.
 - [security.md](security.md) — the `exec` fence, the trifecta rule, secrets.
 - [use-cases.md](use-cases.md) — the other shapes (triage, audit, fan-out).
 - [configuration.md](configuration.md) — every key, and precedence.

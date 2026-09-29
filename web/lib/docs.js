@@ -92,7 +92,7 @@ export const DOCS = [
     file: "docs/a2a-extensions.md",
     title: "A2A extensions",
     group: "concepts",
-    blurb: "Everything agentd speaks beyond core A2A: declaration, the A2A-Extensions handshake, the command DataPart, and what keeps it conformant.",
+    blurb: "Everything agentd speaks beyond core A2A — the command, events and task-annotations extensions and the unix binding — each specified at its own URI under agentd.dev/a2a/ext/.",
   },
   {
     slug: "subagents",
@@ -148,7 +148,7 @@ export const DOCS = [
     file: "docs/node-registry.md",
     title: "Node registry",
     group: "reference",
-    blurb: "All 73 workflow nodes with their required fields, generated from the binary's own registry — plus the six things that are easy to get wrong.",
+    blurb: "All 73 workflow nodes with their required fields, as the binary's own registry enforces them — plus the six things that are easy to get wrong.",
   },
 
   // ── Operate ───────────────────────────────────────────────────
@@ -187,7 +187,7 @@ export const DOCS = [
     title: "Interface — TUI & web UI",
     group: "operate",
     blurb:
-      "The display clients: one daemon, many synchronized surfaces — pairing-code login, live activity, approvals, steering.",
+      "The display clients: ordinary A2A clients of one daemon — the launcher, signing in, live activity, approvals, steering.",
   },
   {
     slug: "hosting-the-ui",
@@ -201,7 +201,7 @@ export const DOCS = [
     file: "docs/operations.md",
     title: "Operations",
     group: "operate",
-    blurb: "Operating a daemon over A2A — drain / lameduck / pause / resume and hot reload.",
+    blurb: "Operating a daemon over A2A — the admin ops (drain, pause, resume, cancel, set), discovery and hot reload.",
   },
   {
     slug: "security",

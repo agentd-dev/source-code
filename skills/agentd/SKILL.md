@@ -155,17 +155,34 @@ agentd tui -c agent.yaml     # daemon + fullscreen terminal UI (--inline for in-
 agentd ui  -c agent.yaml     # daemon + web UI in a browser
 ```
 
-Both need `interface.enabled: true` (the subcommand sets it) and an `a2a`
-listener. Detached instead — the daemon keeps working when the client quits:
+The launcher forces no configuration: the daemon runs exactly as
+`agentd -c agent.yaml` would, so the config needs its own loopback listener,
+and `a2a.events.enabled: true` for the live feed (without it the clients fall
+back to core A2A):
+
+```yaml
+a2a:
+  listen: http://127.0.0.1:8420
+  events: { enabled: true }          # restart-only
+  introspection: { enabled: false }  # transcripts, run detail, log tail; /set it live
+```
+
+The launcher signs its client in with a single-use launch code minted inside
+the daemon — never pass it a token. Detached instead — the daemon keeps working
+when the client quits:
 
 ```sh
 agentd -c agent.yaml &
 npm i -g @agentd-dev/cli && agentd-tui --endpoint http://127.0.0.1:8420
 ```
 
-Loopback callers are the operator with no credential. **Binding non-loopback
-requires client auth** (mTLS, bearer, or a rotating pairing code) — never
-suggest `0.0.0.0` without it.
+On a loopback listener with no credential configured, a local terminal client
+is the operator with no credential; a browser never is (a request carrying
+`Origin` always signs in, and its origin must be listed in `a2a.cors.origins`).
+**Binding non-loopback requires client auth** (mTLS or `a2a.bearer`, and a
+wildcard bind needs `a2a.url`) — never suggest `0.0.0.0` without it. People sign
+in with the device grant (`a2a.device_grant`, `agentd-tui --login`), approved
+by an operator under a name — never by copying the bearer.
 
 Clients are projections: N of them show the same state, and none of them hold
 capabilities. If something is missing in the UI, fix the daemon, not the client.

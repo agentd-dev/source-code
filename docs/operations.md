@@ -29,15 +29,23 @@ channel: peers, display clients and operators all arrive here.
 | Form | Meaning | Auth |
 |---|---|---|
 | `https://0.0.0.0:8443` + `a2a.tls.cert`/`.key`/`.client_ca` | TLS with **mutual-TLS** client auth | a verified client cert → matched against `a2a.principals` |
-| `https://0.0.0.0:8443` + `a2a.bearer` | TLS with a **bearer token** | a constant-time-matched `Authorization: Bearer …` → operator (unless a principal claims it) |
-| `http://127.0.0.1:8080` | **loopback only**, no auth (dev) | any loopback peer → operator, while `a2a.principals` is empty |
+| `https://0.0.0.0:8443` + `a2a.bearer` | TLS with a **bearer token** | a constant-time-matched `Authorization: Bearer …` → operator; a `bearer_ref` rule → its principal |
+| `http://127.0.0.1:8080` | **loopback only**, no auth (dev) | a local non-browser process that presents nothing → operator, while no credential mechanism and no principal rule is configured |
 
 Trust is never derived from the transport alone. Validation refuses to start if:
 
 - `a2a.listen` is `https://` but `a2a.tls.cert` / `a2a.tls.key` are unset;
-- the bind is **non-loopback** and none of `a2a.tls.client_ca`, `a2a.bearer` or
-  `interface.pairing` is configured — there is no open control plane;
-- the bind is non-loopback and the scheme is plaintext `http://`.
+- the bind is **non-loopback** and neither `a2a.tls.client_ca` nor `a2a.bearer`
+  is configured — there is no open control plane;
+- the bind is non-loopback and the scheme is plaintext `http://`;
+- the bind is a wildcard (`0.0.0.0`, `::`) and `a2a.url` is unset — a wildcard
+  is no address a caller can dial, so the card and the OAuth issuer publish
+  `a2a.url` instead.
+
+A signed-in client — a person's terminal or browser, approved by an operator
+under a name — arrives through the listener's OAuth device grant
+(`a2a.device_grant`), never with a copy of the daemon's bearer; see
+[a2a.md](a2a.md#the-device-authorization-grant).
 
 Arming the listener makes the instance a **daemon**, and a daemon must be
 durable: naming no `store` section gets it `kind: file` on the local
@@ -62,6 +70,7 @@ store:
     server: state
 a2a:
   listen: https://0.0.0.0:8443
+  url: https://agent.internal:8443     # what callers dial; required on a wildcard bind
   tls:
     cert: /etc/agentd/tls/server.crt
     key: /etc/agentd/tls/server.key
@@ -88,25 +97,32 @@ fixed at startup — only the PEM contents rotate.
 ### 1.1 Principals — the trust gate
 
 Every request resolves to a **principal**: an identity (mTLS SAN or subject, a
-matched bearer, an AAuth agent id) plus a **role**. The role decides what the
+matched bearer, a signed-in session) plus a **role**. The role decides what the
 caller may do; there is no in-band flag a caller can set.
 
 | Role | May do |
 |---|---|
-| `operator` | everything: the admin family, every command op, every read |
-| `user` | conversations and their own tasks, plus `workflow.run` / `workflow.status` / `workflow.cancel` / `subagent.send` / `subagent.status` / `plan.get` / `ask_human` |
+| `operator` | everything: the admin family, every command op, every read, every task |
+| `user` | conversations and their own tasks, plus the command ops the op table opens to `user` |
 | `agent` | conversations and their own tasks, plus `workflow.run` / `workflow.status` |
-| `anonymous` | nothing (only the pairing handshake, when `interface.pairing` is on) |
+| `anonymous` | nothing — a rule with `role: anonymous` names nobody |
 
-`status` is granted to every non-anonymous role. `a2a.principals[].grants` adds
-explicit tool-name patterns on top of a role's defaults, and
-`a2a.principals[].quotas` attaches a per-principal rate limit and token budget.
+`status` is open to every named role. `a2a.principals[].grants` adds explicit
+op-name patterns on top of a role's defaults, and `a2a.principals[].quotas`
+attaches a per-principal rate limit and token budget. Which op each role
+reaches, and which are the operator's alone, is the op table of the
+[command extension](https://agentd.dev/a2a/ext/command).
 
-Matching order is: the configured `a2a.principals` rules in order, first match
-wins; then the operator defaults (a transport-authenticated peer when
-`a2a.bearer` is set, or a loopback peer while no principals are configured);
-then anonymous. Declaring **any** principal turns the loopback-operator default
-off — which is what you want in production.
+The evidence is read in a fixed order — a unix-socket peer of the daemon's own
+uid, then a session token or bearer, then a verified client certificate, then
+an `any` rule, then the implicit operator —
+and each kind decides only for itself: a bearer that names nobody is a `401`,
+never a fall-through to what else the request carried
+([a2a.md](a2a.md#the-evidence-in-order)). The implicit operator — a local
+process presenting nothing to a loopback-bound listener — exists only while no
+credential mechanism and no principal rule is configured, and never for a
+request carrying `Origin`. Declaring **any** principal ends it, which is what
+you want in production.
 
 The **admin family is operator-only**. A `user` or `agent` principal that calls
 one is refused; an anonymous caller is refused before dispatch. So a delegating
@@ -116,10 +132,13 @@ peer can never drain or pause the instance it is talking to.
 
 ## 2. The operator admin ops
 
-These five operations steer a running instance without an in-band config
-change. They are **command ops**: an ordinary A2A `SendMessage` carrying a
-DataPart, which is how the protocol expresses "do this specific thing", so any
-A2A client can call them without knowing anything agentd-specific.
+These five operations steer a running instance without restarting it. They
+are **command ops** of agentd's [command
+extension](https://agentd.dev/a2a/ext/command): an ordinary A2A `SendMessage`
+carrying a DataPart, which is how the protocol expresses "do this specific
+thing". A command is a command only when the request activates the extension
+twice — the `A2A-Extensions` header names its URI, and the message lists it in
+`message.extensions` — so a client never sends one by accident.
 
 | Op | What it does | Exits the process? |
 |---|---|---|
@@ -127,17 +146,26 @@ A2A client can call them without knowing anything agentd-specific.
 | `admin.pause` | Hold the whole instance, or one run, at a safe boundary | no |
 | `admin.resume` | Clear a prior `admin.pause` | no |
 | `admin.cancel` | Cancel one run by id | no |
+| `admin.set` | Set a runtime-settable path (`agent.approval`, `a2a.introspection.enabled`) until the next reload | no |
 
-```jsonc
-{ "jsonrpc":"2.0", "id":1, "method":"SendMessage",
-  "params": { "message": { "role":"ROLE_USER", "messageId":"m-1", "parts": [
-      { "data": { "agentd": { "op":"admin.drain", "reason":"rolling update" } } }
-  ] } } }
+```console
+$ curl -sS --cert ops.crt --key ops.key --cacert ca.crt https://agent.internal:8443/ \
+    -H 'content-type: application/json' \
+    -H 'A2A-Version: 1.0' \
+    -H 'A2A-Extensions: https://agentd.dev/a2a/ext/command' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{
+         "role":"ROLE_USER","messageId":"m-1",
+         "extensions":["https://agentd.dev/a2a/ext/command"],
+         "parts":[{"data":{"agentd":{"op":"admin.drain","reason":"rolling update"}}}]}}}'
 ```
 
-The reply is a completed **Task** whose result carries the acknowledgement
-(`{"ok":true,"state":"draining",…}`). Every op takes an optional `reason`
-(default `"operator request"`), carried into the logs and the audit record.
+The reply is a completed **Task** whose `<taskId>.result` artifact carries the
+acknowledgement (`{"ok":true,"state":"draining",…}`). `drain`, `pause` and
+`cancel` take an optional `reason` (default `"operator request"`), carried
+into the logs and the audit record; an argument the op's
+schema does not name is refused, never ignored. The shorter snippets below
+show the method and the parts; each is sent with the header and the
+`extensions` marker above.
 
 **Operator-only, by role alone.** Unlike an ordinary command op, an explicit
 `grants:` entry does not reach these — not even `grants: ["*"]`. A principal
@@ -154,7 +182,8 @@ then the process exits **`0`** (a clean drain is `0`, never `143`). It returns
 
 ```jsonc
 // params are the args directly (no nested "arguments")
-{ "jsonrpc":"2.0", "id":1, "method":"SendMessage", "params": { "message": { "parts": [
+{ "jsonrpc":"2.0", "id":1, "method":"SendMessage", "params": { "message": {
+    "extensions": ["https://agentd.dev/a2a/ext/command"], "parts": [
     { "data": { "agentd": { "op":"admin.drain", "reason":"rolling update" } } } ] } } }
 // result
 { "ok":true, "state":"draining", "reason":"rolling update" }
@@ -196,9 +225,10 @@ scheduler skips paused runs and every other run keeps moving.
 ```
 
 Pause is **reversible** and is **not** a drain: readiness is unchanged and the
-instance stays a member of the fleet. Pausing an already-terminal run is an
-`INVALID_PARAMS` error; resuming a run that is not paused is too; an unknown run
-id is a task-not-found error. The instance-wide hold is reported as
+instance stays a member of the fleet. `admin.resume` with a `run` releases that
+run alone (`{"ok":true,"resumed":"…"}`). Pausing an already-terminal run is a
+`-32602` invalid-params error; resuming a run that is not paused is too; an
+unknown run id is `-32001`. The instance-wide hold is reported as
 `paused: true` in the `status` view.
 
 ### 2.3 `admin.cancel` — kill one run, keep the pod
@@ -212,10 +242,20 @@ the pod running (unlike `drain`, which also exits).
 { "ok":true, "cancelled":"reconcile-01J8…" }
 ```
 
-Omitting `run` is an `INVALID_PARAMS` error (`cancel needs a run id`). To cancel
-a *task* rather than a run — one conversation turn or one delegated unit of work
-— use the standard A2A `CancelTask` method instead, which any non-anonymous
-principal may call on its own tasks.
+Omitting `run` is refused before anything runs: the op's envelope requires it
+(`-32602`, reason `INVALID_COMMAND_ARGS`, naming `run`). To cancel a *task*
+rather than a run — one conversation turn or one delegated unit of work — use
+the standard A2A `CancelTask` method instead, which any named principal may call
+on its own tasks.
+
+### 2.4 `admin.set` — change one setting until the next reload
+
+`admin.set {path, value}` sets one of the runtime-settable paths — today
+`agent.approval` and `a2a.introspection.enabled` — without touching the file.
+The value lasts until the next reload re-reads the file, and the feed's
+`config` event says that `admin.set` moved it. A path outside that list is
+refused by the op's schema; the extended card lists the paths as the command
+extension's `settable` param for a caller who may run the op.
 
 ---
 
@@ -226,24 +266,31 @@ first. There is no unauthenticated status port.
 
 | Read | How | Who |
 |---|---|---|
-| instance status | `SendMessage` with a `status` command DataPart | any non-anonymous role |
+| instance status | `SendMessage` with a `status` command DataPart | any named role, each seeing what it may |
 | effective config | `SendMessage` with a `config` command DataPart | operator |
 | one task | `GetTask` | the task's owner (operator sees all) |
 | all tasks | `ListTasks` | as above |
 | task updates | `SubscribeToTask` (SSE) | as above |
-| identity + skills | `GetAgentCard` | pre-auth |
-| the live event feed | `SubscribeToEvents` (SSE) | any non-anonymous role, with `interface.enabled` |
-| the log ring | `debug.events` command DataPart | operator, with `interface.debug` |
+| identity | `GET /.well-known/agent-card.json` | anyone, no credential |
+| what this caller may run | `GetExtendedAgentCard` | a caller named by a declared scheme |
+| the live event feed | `agentd.events/SubscribeToEvents` (SSE) | any named role, with `a2a.events.enabled` and the events extension activated |
+| transcripts, run and subagent detail | `conversation.get` / `run.get` / `subagent.get` command DataParts | a `user` or a grant, on what the caller owns; an operator on anything — with `a2a.introspection.enabled` |
+| the log ring | `debug.events` command DataPart | operator, with `a2a.introspection.enabled` |
 
 A command is a **DataPart** on an ordinary A2A message — `{"data": {"agentd":
 {"op": "<name>", …args}}}` — so one method (`SendMessage`) carries both natural
-language and the machine control surface:
+language and the machine control surface. A read op answers with a `Message`,
+not a task, so polling it leaves nothing behind in any task list:
 
 ```console
-$ curl -sS --cert ops.crt --key ops.key --cacert ca.crt https://agent.internal:8443 \
+$ curl -sS --cert ops.crt --key ops.key --cacert ca.crt https://agent.internal:8443/ \
     -H 'content-type: application/json' \
-    -d '{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":
-         {"message":{"messageId":"m1","parts":[{"data":{"agentd":{"op":"status"}}}]}}}'
+    -H 'A2A-Version: 1.0' \
+    -H 'A2A-Extensions: https://agentd.dev/a2a/ext/command' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{
+         "role":"ROLE_USER","messageId":"m1",
+         "extensions":["https://agentd.dev/a2a/ext/command"],
+         "parts":[{"data":{"agentd":{"op":"status"}}}]}}}'
 ```
 
 **`status`** answers with the instance view: `instance`, `run_id`, `uptime_ms`,
@@ -265,7 +312,9 @@ without a collector round-trip. It takes `{after?, limit?, level?, prefix?}` and
 returns `{events, oldest_seq, newest_seq, dropped}`; the ring is bounded
 (`observability.events_ring`, 1024 lines by default), lossy by design, and
 never blocks the loop — a slow reader loses old lines and sees it in `dropped`.
-It requires `interface.debug`, which also installs the ring.
+It requires `a2a.introspection.enabled`; turning introspection on — at startup,
+by reload or with `admin.set` — also installs the ring. While it is off, the
+introspection ops answer `-32004` saying so.
 
 ---
 
@@ -288,26 +337,32 @@ $ agentd --capabilities -c /etc/agentd/ops.yaml
   "intelligence":{ "model":null, "endpoints":1 },
   "mcp_servers":["state"], "internal_tools":[…], "tools":{ "overrides":[], "disabled":[] },
   "workflows":[…], "knowledge":{…}, "search":{…}, "skills":{ "sources":0 },
-  "a2a":{ "listen":"https://0.0.0.0:8443", "tls":true, "mtls":true, "bearer":false,
-          "methods":["SendMessage","SendStreamingMessage","GetTask","CancelTask",
-                     "ListTasks","SubscribeToTask","GetAgentCard"],
+  "a2a":{ "methods":["SendMessage","SendStreamingMessage","GetTask","ListTasks",
+                     "CancelTask","SubscribeToTask","…","GetExtendedAgentCard"],
           "command_ops":["status","config","workflow.run","…",
-                         "admin.drain","admin.pause","admin.resume","admin.cancel"],
-          "extensions":["https://agentd.dev/a2a/ext/command","…"],
-          "principals":[…], "loopback_operator":false },
-  "interface":{…}, "store":"mcp",
+                         "admin.drain","admin.pause","admin.resume","admin.cancel",
+                         "admin.set","auth.sessions","auth.sessions.revoke"],
+          "extensions":["https://agentd.dev/a2a/ext/command",
+                        "https://agentd.dev/a2a/ext/task-annotations"],
+          "url":"https://agent.internal:8443",
+          "auth":{ "bearer":false, "mtls":true, "device":false, "required":true,
+                   "implicit_operator":false },
+          "events":false, "introspection":false, "cors_origins":0 },
+  "store":"mcp",
   "lifecycle":{ "run_until":"auto", "daemon":true } }
 ```
 
 The three fields a controller branches on:
 
 - **`a2a`** — `null` when no listener is configured. Its presence is the
-  graceful-degradation contract: `command_ops` and `extensions` are exactly what
-  this instance serves — the same two lists the agent card publishes, as its
-  skills and its declared extensions — so a controller drives only what is
-  declared. `methods` names the core JSON-RPC calls a controller drives; the
-  listener answers a few beyond it — the push-notification-config calls and
-  `GetExtendedAgentCard` — which [`a2a.md`](a2a.md) tabulates in full.
+  graceful-degradation contract: `methods`, `command_ops` and `extensions` are
+  exactly what this instance serves — `methods` is the eleven A2A methods plus
+  the method of each declared extension (`agentd.events/SubscribeToEvents` while
+  `events` is on), read from the table the listener routes by; `command_ops`
+  and `extensions` are the lists the agent card publishes — so a controller
+  drives only what is declared. `auth` is the listener's posture, the same value
+  the card's security schemes are derived from, and `url` is `null` until a
+  bind names it (a `:0` port, a unix socket).
 - **`lifecycle.daemon`** — `true` when the instance is long-lived (a listener,
   or a workflow with a `loop` / `schedule` / `subscribe` / `signal` / `event`
   start node). A `false` here means a Job, not a Deployment.
@@ -339,7 +394,7 @@ $ agentd --validate-config -c /etc/agentd/ops.yaml
 {"event":"config.valid","files":["/etc/agentd/ops.yaml"]}
 
 $ agentd --validate-config -c /etc/agentd/broken.yaml
-{"event":"config.invalid","msg":"a2a.listen on a non-loopback address needs client auth: a2a.bearer, interface.pairing, or a2a.tls.client_ca (mTLS — then EVERY caller needs a client certificate, bearer-only and paired included)"}
+{"event":"config.invalid","msg":"a2a.listen on a non-loopback address needs client auth: a2a.bearer or a2a.tls.client_ca (mTLS — then EVERY caller needs a client certificate, bearer-only included)"}
 ```
 
 Both flags are in every build.
@@ -379,10 +434,11 @@ inputs, so a flag still overrides the new file. `RESTART_ONLY_PATHS` in
 | `intelligence` (endpoints, model, token) | `agent.name` |
 | `intelligence.budget` (windows; counters carry over) | `store.kind`, `store.prefix`, `store.mcp`, `store.http`, `store.file` |
 | `agent.instruction` (static text or a resource URI) | `lifecycle.run_until`, `.drain_timeout`, `.run_id`, `.exit_code_map`, `.watch_config` |
-| `agent` (preflight, wake_on, tools, parallelism, budget) | `a2a.listen`, `a2a.tls`, `a2a.bearer` |
+| `agent` (preflight, wake_on, tools, parallelism, budget) | `a2a.listen`, `a2a.url`, `a2a.tls`, `a2a.bearer`, `a2a.device_grant`, `a2a.events` |
 | `mcp` (live re-handshake) | `observability.otel`, `.metrics_addr`, `.health_file`, `.events_ring`, `.traceparent` |
 | `tools`, `knowledge`, `search` (registry rebuild) | `security` |
-| `skills` (sources re-discovered) | — |
+| `skills` (sources re-discovered) | `webhooks.listen`, `webhooks.tls` |
+| `a2a.principals`, `a2a.cors`, `a2a.introspection`, `a2a.push`, `a2a.peers` | — |
 | `workflows` (live runs stay pinned to their hash) | |
 | `limits`, `lifecycle.idle_grace`, `observability.log_level` / `.log_content`, `memory`, `context` | |
 

@@ -35,7 +35,7 @@ resolved from env / mounted files — never inline values.
 | Token budget | `intelligence.budget.windows` (rate-limit the burn) | — |
 | MCP servers | `mcp.servers: [{name, endpoint}]` | `--mcp name=<endpoint>` |
 | Durable store | `store.kind: file\|mcp\|http\|memory\|none` (defaults: `file` for a long-lived instance, `none` for a one-shot), `store.file.path`, `store.mcp.server` | — |
-| **A2A listener** | `a2a.listen`, `a2a.tls`, `a2a.principals`, `a2a.bearer` | — |
+| **A2A listener** | `a2a.listen`, `a2a.url` (required on a wildcard bind), `a2a.tls`, `a2a.principals`, `a2a.bearer` | `--listen` |
 | **A2A peers** | `a2a.peers: [{name, endpoint}]` | — |
 | Workflows / triggers | `workflows: [{name, steps}]` (start nodes: once/manual/loop/schedule/subscribe/stream/correlate/signal/event/a2a/webhook) | — |
 | Limits | `limits.max_runs`, `limits.run.{steps,tokens,deadline}`, `limits.subagents.depth` | `--max-steps` / `--deadline` |
@@ -143,7 +143,10 @@ mcp:
     - { name: tickets, endpoint: https://mcp-tickets.internal/mcp }
     - { name: state,   endpoint: https://mcp-state.internal/mcp }
 store: { kind: mcp, mcp: { server: state } }
-a2a:   { listen: https://0.0.0.0:8443, tls: { cert: /tls/cert.pem, key: /tls/key.pem, client_ca: /tls/ca.pem } }
+a2a:
+  listen: https://0.0.0.0:8443
+  url: https://agent-triage.example.com:8443     # a wildcard bind publishes this origin
+  tls: { cert: /tls/cert.pem, key: /tls/key.pem, client_ca: /tls/ca.pem }
 workflows:
   - name: triage
     steps:
@@ -384,8 +387,9 @@ daemon is healthy — liveness tracks the runtime, not whether work is flowing.
 > **A2A** (`a2a.listen`, `--features a2a`) — an HTTPS listener with
 > trust minted per request by mTLS or a bearer token, resolved to a **principal**
 > and authorized against a role matrix. A non-loopback bind must authenticate
-> (`a2a.tls.client_ca`, `a2a.bearer`, and/or `interface.pairing`) and must be
-> `https://`; validation rejects both omissions with exit `2`.
+> (`a2a.tls.client_ca` and/or `a2a.bearer`) and must be `https://`, and a
+> wildcard bind (`0.0.0.0`) must name the origin callers dial in `a2a.url`;
+> validation rejects each omission with exit `2`.
 
 ---
 
@@ -659,8 +663,9 @@ either send `SIGHUP` or run `--watch-config`:
   re-subscribe); tool overrides; skills; workflow definitions; and
   limits / observability / context. An invalid candidate keeps the running
   config — nothing is half-applied. A diff that touches a **restart-only** path
-  (`agent.name`, the `store.*` binding, `lifecycle.*`, `a2a.listen`/`tls`/`bearer`,
-  the `observability` listeners, `security`) is **refused** with
+  (`agent.name`, the `store.*` binding, `lifecycle.*`,
+  `a2a.listen`/`url`/`tls`/`bearer`/`device_grant`/`events`, the `observability`
+  listeners, `security`) is **refused** with
   `reason="restart_required"` and logged as `config.reload.restart_required` —
   roll the pod.
 - **`SIGHUP`** (`hot-reload` feature) is the portable trigger if you would rather
@@ -698,10 +703,14 @@ mounted Secret files at load/reload ([`configuration.md`](configuration.md)).
 
 The **A2A listener** (`a2a.listen`, `--features a2a`) is also the management
 transport. Over it an operator issues the admin family as command ops — `admin.drain`,
-`admin.pause`, `admin.resume`, `admin.cancel` — and the read
+`admin.pause`, `admin.resume`, `admin.cancel`, `admin.set` — and the read
 commands `status` and `config` (the effective merged document, with secret
 references left unresolved). Workflow control rides the same channel:
 `workflow.run` / `workflow.status` / `workflow.cancel` / `workflow.signal`.
+Each is a `SendMessage` DataPart of agentd's [command
+extension](https://agentd.dev/a2a/ext/command), sent with `A2A-Version: 1.0`,
+the extension's URI in the `A2A-Extensions` header and in
+`message.extensions` ([operations.md](operations.md#2-the-operator-admin-ops)).
 
 Trust is minted per request, never by the transport: **mutual TLS**
 (`a2a.tls.cert` / `.key` / `.client_ca`) or a **bearer token** (`a2a.bearer`),

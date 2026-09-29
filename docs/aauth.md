@@ -78,9 +78,14 @@ identity, inherited via the spawn payload like `--tls-ca`.
 **The intelligence dial is signed too.** When an identity is installed, agentd
 signs its requests to the `--intelligence` endpoint with the same RFC 9421
 headers. This lets a model gateway attest the *individual agent* by signature
-instead of source IP — the inbound side of the identity story. A plain LLM
-endpoint ignores the headers, and the endpoint's bearer token (if any) rides
-alongside — signing is additive.
+instead of source IP. A plain LLM endpoint ignores the headers, and the
+endpoint's bearer token (if any) rides alongside — signing is additive.
+
+**Signing is outbound only.** agentd is the AAuth *agent*: it signs the
+requests it makes and verifies no AAuth signature on the requests it receives.
+Its A2A listener names a caller from a bearer, a signed-in session, a client
+certificate or the connection itself ([a2a.md](a2a.md#who-is-calling)); no
+`a2a.principals` rule matches an AAuth identity.
 
 **agentd reacts to what a server asks for.** If, at connect, discovery
 (`/.well-known/aauth-resource.json`) says the server requires body integrity,

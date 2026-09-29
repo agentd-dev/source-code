@@ -114,7 +114,11 @@ exhaustive.
 | (no event) | the lethal-trifecta refusal happens inside `validate()`, **before the logger exists**, so it surfaces as a plain-text refusal message on stderr with exit 2 — as a `config.invalid` diagnostic line under `--validate-config` and `--effective-config` — never as a structured log event; an allowed trifecta (`--allow-trifecta` / `security.allow_trifecta`) emits nothing at all |
 | `cgroup.armed` | `memory_max`, `memory_current`, `memory_high` — cgroup-v2 awareness (best-effort, quiet off-cgroup) |
 | `a2a.conn` / `a2a.send` / `a2a.delegate` | `err` / `run`, `step`, `to` / `run`, `step`, `peer` — a connection could not be served (level `debug`), an A2A message was sent to a peer, or a run was delegated to one (`--features a2a`) |
-| `a2a.denied` | an authorization refusal (the admin ops are audited, not logged — see below) |
+| `a2a.denied` | `principal`, `rule`, `method`, `op`, `reason`, `status` — a listener refusal (see the operability table below; the admin ops themselves are audited, not logged) |
+| `turn.refused.not_owner` | `ctx`, `principal`, `reason` — a turn queued for a conversation its principal does not own (a `message.send` its own model aimed at the root or at another caller's key) was refused, and its task failed, rather than run in somebody else's conversation |
+| `lifecycle.until_signal.refused` | `signal`, `principal` — the `lifecycle.until_signal` signal arrived from a sender that may not retire the instance; only the operator or the runtime drains it |
+| `instance.spawn.refused` | `template`, `reason` — an instance-tier subagent was refused before anything was created: the parent's TCP listener requires a credential and the child would carry none, so every report it sent home would be refused (make `a2a.bearer` a `{{secret:…}}` reference, or listen on a unix socket) |
+| `instruction.unavailable` | `uri`, `server`, `err`, `policy`, `trust_pinned` — the instruction source could not be re-read before its deadline; `server` names the MCP server that stopped answering, and `policy` is what `agent.instruction.unavailable` did about it |
 | `run.start` · `run.done` / `run.deadline` / `run.refused` / `run.stalled` / `run.dropped` | a workflow run's start + its terminal outcome |
 | `workflow.finished` / `workflow.failed` · `workflow.run` / `define` / `loaded` / `deleted` | workflow lifecycle |
 
@@ -160,9 +164,9 @@ each lives in [`docs/operations.md`](operations.md).
 
 | Event | `comp` | Fields beyond canonical |
 |---|---|---|
-| `a2a.listen` | `supervisor` | `authority`, `bound`, `tls`, `mtls`, `require_auth`, `interface`, `pairing` — the listener bound |
+| `a2a.listen` | `supervisor` | `authority`, `bound`, `url`, `tls`, `mtls`, `required`, `implicit_operator`, `device_grant`, `events`, `introspection` — the listener bound, and the posture it enforces |
 | `a2a.conn` | `supervisor` | `err` — a connection could not be served (level `debug`) |
-| `a2a.denied` | `supervisor` | `principal`, `method`, `op` — an authorization refusal |
+| `a2a.denied` | `supervisor` | `principal`, `rule`, `method`, `op`, `reason`, `status`, plus `sid` for a signed-in session — a refusal: `reason` is `unauthenticated`, `invalid_credential`, `no_role`, `not_permitted`, `rate_limited` or `auth_failures_limited`; `rule` is the declared id of the principal rule that named the caller. The refusals a stranger can provoke for free are written once per source and reason per minute, with `suppressed` counting what the window left out; a named principal's are written every time |
 | `drain.start` / `drain.done` / `drain.abandon` | `supervisor` | the `admin.drain` op and SIGTERM share this path (see the lifecycle table above) |
 | `agent.paused` / `agent.resumed` | `supervisor` | `reason` — an instance-wide `admin.pause` hold went on or came off |
 | `run.paused` / `run.resumed` | `supervisor` | `run`, `reason` — a single run was held or released |
@@ -225,7 +229,7 @@ not a filter that silently matches nothing.
 
 The obvious implementation would tee the in-memory ring the `debug.events`
 command op drains. That ring is explicitly lossy oldest-evicted and is installed
-only when `interface.enabled` and `interface.debug` are both on, so teeing it
+only once `a2a.introspection.enabled` is on, so teeing it
 would produce silent gaps in exactly the consumer being sold, and in the default
 deployment would do nothing at all.
 This taps the emission itself, beside the existing ring and OTLP taps.
@@ -466,14 +470,15 @@ answer the time-series and alerting questions.
 
 | Read | How | Who | Body |
 |---|---|---|---|
-| instance status | `SendMessage` with a `status` command DataPart | any non-anonymous role | instance id, run id, uptime, `draining` / `paused`, the durable store (kind, degraded, generation), armed workflows, live runs, conversations, subagents, OS children, timers, inbox backlog, token budget, tool/skill counts, lifetime counters, instruction source+version, active model, recent activity |
+| instance status | `SendMessage` with a `status` command DataPart | any named role, each seeing what it may | instance id, run id, uptime, `draining` / `paused`, the durable store (kind, degraded, generation), armed workflows, live runs, conversations, subagents, OS children, timers, inbox backlog, token budget, tool/skill counts, lifetime counters, instruction source+version, active model, recent activity |
 | effective config | `SendMessage` with a `config` command DataPart | operator | the merged settings document — `{{secret:…}}` **references** only, never resolved values |
 | one task | `GetTask` | the task's owner (operator sees all) | the durable task: state, history, artifacts |
 | all tasks | `ListTasks` | as above | the task/run projection |
 | task updates | `SubscribeToTask` (SSE) | as above | status-update frames until terminal |
-| identity + skills | `GetAgentCard` | public (pre-auth discovery) | name, description, protocol version, capabilities, the workflows offered as skills |
-| the live event feed | `SubscribeToEvents` (SSE) | any non-anonymous role, needs `interface.enabled` | the observation feed: runs, conversations, subagents, tasks, messages, activity, lifecycle and audit — principal-scoped |
-| the log ring | `debug.events` command DataPart | operator, needs `interface.debug` | a cursor window of the JSON log lines — see below |
+| identity | `GET /.well-known/agent-card.json` | anyone, no credential | name, description, the interface URL and protocol version, capabilities, declared extensions, security schemes |
+| what this caller may run | `GetExtendedAgentCard` | a caller named by a declared scheme | the public card plus the workflows, ops and commands this caller may run |
+| the live event feed | `agentd.events/SubscribeToEvents` (SSE) | any named role; needs `a2a.events.enabled` and the events extension activated | the observation feed ([below](#the-observation-feed)) — per-event visibility |
+| the log ring | `debug.events` command DataPart | operator, needs `a2a.introspection.enabled` | a cursor window of the JSON log lines — see below |
 
 > The redaction discipline is the same as the capabilities manifest and the
 > intel-swap log line: the `status` and `config` reads carry structural names,
@@ -482,7 +487,7 @@ answer the time-series and alerting questions.
 
 ### `debug.events` — the live log ring
 
-With `interface.debug` on, the same JSON log lines are mirrored into a bounded
+With `a2a.introspection.enabled` on, the same JSON log lines are mirrored into a bounded
 in-memory ring you can tail over A2A — the operator live-tail, without a
 collector round-trip. Its capacity is `observability.events_ring` (flag
 `--events-ring`). A read drains a bounded window with a sequence cursor and
@@ -498,7 +503,37 @@ lossy-by-design ring outran it:
 The cursor and filters are command arguments: `after` (advance to the last `seq`
 you saw), `limit` (default 200, capped at 500), `level` (exact level match), and
 `prefix` (a dotted event prefix). The ring never blocks the loop — a slow reader
-loses old lines (reflected in `dropped`), never stalls the daemon.
+loses old lines (reflected in `dropped`), never stalls the daemon. The part is a
+command of the [command extension](https://agentd.dev/a2a/ext/command), so the
+message lists its URI in `message.extensions` and the request names it in the
+`A2A-Extensions` header.
+
+### The observation feed
+
+`agentd.events/SubscribeToEvents` is the method of agentd's [events
+extension](https://agentd.dev/a2a/ext/events), declared on the card while
+`a2a.events.enabled` is on (restart-only). It is an SSE stream: a `hello` frame,
+then `event` frames `{seq, ts, kind, data}`, then a `goodbye` whose `seq` a
+reconnect resumes from with `fromSeq`. Its kinds are a closed vocabulary:
+
+| Kinds | What they carry |
+|---|---|
+| `task` · `task.removed` | a task changed, or left the store |
+| `run` · `run.removed` · `step` | a workflow run's summary, its departure, a step starting or finishing |
+| `conversation` · `conversation.removed` | a conversation's status, or its departure |
+| `subagent` · `subagent.removed` · `child` · `child.removed` | the subagent tree and the OS children |
+| `activity` · `activity.removed` | live activity of a unit of work: phase, tool, round, tokens |
+| `status` | the instance's slim status |
+| `lifecycle` | draining began, or the instance was paused or resumed as a whole |
+| `config` | settings moved, and whether a reload or `admin.set` moved them |
+| `audit` | the audit mirror, to operators while `a2a.introspection.enabled` |
+| `auth` | a device sign-in pending, approved or denied; a session revoked; a launch |
+
+Each event is sent only to the subscribers its visibility admits — an operator
+sees every event, a named caller the ones its principal owns and the ones that
+reach everybody — so the `seq` values one subscriber reads have gaps. The
+extension's specification is the authority on each kind's schema and audience;
+the extended card lists the kinds this caller's feed can carry.
 
 ---
 
@@ -582,7 +617,7 @@ The A2A/hot-reload surfaces add these to the frozen set:
 
 - **`agent_paused`** *(gauge, 0/1)* — `1` while an `admin.pause` hold is in effect;
   `0` after `admin.resume`. **Pause is not readiness** — `agent_ready` ignores it
-  (it tracks only drain / lame-duck), so a paused instance can still read
+  (it tracks only drain), so a paused instance can still read
   `agent_ready 1`. The instance-wide `admin.pause` / `admin.resume` handlers set
   the gauge on both edges, and the A2A `status` command's `paused` field reports
   the same state; a per-run hold (`admin.pause` with a `run`) moves neither.

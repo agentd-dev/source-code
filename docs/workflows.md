@@ -256,9 +256,28 @@ Invalid inputs are not an error you can catch: the event is logged as
 There are 73 kinds, and all of them are wired. The four A2A ones split by
 direction and by whether they block: `a2a` is a START node (an inbound message
 whose command matches begins a run), `a2a.send` notifies a peer without waiting,
-`a2a.wait` suspends until a message lands on a conversation, and `a2a.delegate`
-is the request/response pairing of the two — send an objective, block, take the
-result.
+`a2a.wait` suspends until a message from the principal it names in `from`
+lands on a conversation, and `a2a.delegate` is the two joined into one
+request/response step — send an objective, block, take the result.
+
+A message wait says **whose** message it waits for, because a conversation id
+is the sender's to choose: naming the conversation alone would let anyone who
+names it answer. `a2a.wait` requires `from` — the reply it waits for is a
+peer's, and no default can name that peer — in the addressee syntax a `human`
+gate's `to` uses:
+
+```yaml
+ask:    { kind: a2a.send, to: reviewer, parts: [{text: "Review PR {{inputs.pr}}"}] }
+answer: { kind: a2a.wait, depends_on: [ask], from: "agent:reviewer", conversation: "*", timeout: 1h }
+```
+
+`wait {on: message}` takes the same `from` optionally; without it, only the
+run's own principal, an operator or the runtime wakes it. Both take
+`conversation` as a runtime key, the `contextId` the sender used, or `"*"` for
+any — left out, the run's own conversation — and both output
+`{conversation, contextId, message, principal}`: `conversation` is the runtime's
+key, which a `message {to:}` in the same run takes to answer, and `contextId` is
+the name the sender used.
 
 Every step also accepts the cross-cutting fields, on any kind:
 `kind`, `depends_on`, `when`, `retry`, `timeout`, `on_error`, `idempotent`,
@@ -296,6 +315,7 @@ validation error.
 | `mcp.resource` | **`server`**, **`op`**, `uri`, `name`, `arguments`, `reference`, `argument` |
 | `tool` | **`name`**, `args` |
 | `a2a.delegate` | **`peer`**, `objective`, `command`, `args`, `output_contract`, `timeout`, `idempotency`, `breaker`, `rate` |
+| `a2a.send` | **`to`**, `parts`, `command`, `args`, `context`, `timeout`, `idempotency`, `breaker`, `rate` |
 | `memory.get` / `.set` / `.push` / `.shift` / `.pop` / `.list` / `.delete` | `key`, `value`, `ttl`, `prefix`, `limit` |
 | `artifact.create` / `.get` / `.delete` | `name`, `mime`, `content`, `from_step`, `sensitive`, `id` |
 | `knowledge.search` / `.get`, `search.query` / `.fetch` | `query`, `top_k`, `filters`, `id`, `uri`, `url`, `kind`, `limit`, `freshness`, `max_bytes` |
@@ -420,7 +440,8 @@ variable named after the step id when `writes` is absent. `mode` is
 
 | Kind | Fields (**required** in bold) |
 |---|---|
-| `wait` | **`on`**, `server`, `uri`, `condition`, `signal`, `run`, `subagent`, `conversation`, `webhook`, `stream`, `subject`, `match`, `timeout`, `on_timeout` |
+| `wait` | **`on`**, `server`, `uri`, `condition`, `signal`, `run`, `subagent`, `conversation`, `from`, `webhook`, `stream`, `subject`, `match`, `timeout`, `on_timeout` |
+| `a2a.wait` | **`from`**, `conversation`, `timeout` |
 | `message` | **`to`**, `text`, `parts`, `wait`, `timeout`, `on_timeout` |
 | `sleep` | **`duration`** |
 | `join` | **`handles`**, `timeout`, `min`, `partials` |

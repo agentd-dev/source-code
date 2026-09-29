@@ -288,12 +288,26 @@ $ agentd tui --config agent.yaml       # daemon + terminal UI, one command
 $ agentd ui  --config agent.yaml       # …or the browser
 ```
 
-The subcommand turns the display surface on for you (it is off by default) and
-ties the two lifetimes together. Keep them separate — `agentd --config …` in
+The launcher runs the daemon exactly as `agentd --config agent.yaml` would and
+forces no configuration on it, so `agent.yaml` names the listener itself — on
+loopback, since the launched client redeems its sign-in code only from a
+loopback peer — and turns on the live feed the clients watch:
+
+```yaml
+a2a:
+  listen: http://127.0.0.1:8420
+  events: { enabled: true }      # the feed; without it the client runs in core mode
+```
+
+It ties the two lifetimes together and signs its client in with a single-use
+launch code minted in the daemon's own process, so no credential of the
+daemon's ever reaches the client. Keep them separate — `agentd --config …` in
 one shell, `agentd-tui --endpoint http://127.0.0.1:8420` in another — and
 quitting the client leaves the agent working, because the **daemon** owns the
-session, not the client. Attach a second surface any time; they all render the
-same live state.
+session, not the client. (A TUI started by hand against a loopback listener
+with no credential configured is the local operator; anywhere else it signs in,
+see [interface.md](interface.md#signing-in).) Attach a second surface any time;
+they all render the same live state.
 
 The clients live in [`interface/`](../interface) and are not part of the Rust
 build: `npm install -g @agentd-dev/cli` (one package, both binaries), or build
@@ -302,8 +316,8 @@ from source with `cd interface && npm install && npm run build`.
 ## Where to go next
 
 - **[interface.md](interface.md)** — the TUI and web UI: screens, the composer
-  (`/` commands, `@skill`, `#target`, `$value`), approvals, pairing-code login,
-  debug mode.
+  (`/` commands, `@skill`, `#target`, `$value`), approvals, signing in, the
+  debug screen.
 - **[coding-agent.md](coding-agent.md)** — the full recipe for a
   pair-programming agent on a repository: giving it hands (`exec` vs MCP),
   approvals, budgets, and the practices that keep it safe.

@@ -170,6 +170,13 @@ terminal UI together:
 $ agentd tui --config agent.yaml     # or: agentd ui -c agent.yaml (browser)
 ```
 
+The launcher adds nothing to the configuration: `agent.yaml` names its own
+listener (`a2a.listen`, on loopback — the launched client redeems its sign-in
+code only from a loopback peer) and turns on the live feed the clients watch
+(`a2a.events.enabled`). It signs its client in with a single-use
+launch code minted in the daemon's own process, so no credential of the
+daemon's ever reaches the client.
+
 ```
 agentd · prod-agent                              chat  tasks  subagents  debug
 you › Deploy api-gateway to staging
@@ -180,10 +187,13 @@ agent › Deploy checks passed. Rolling out v2.4.1 — 3 pods cycling, ETA 90s.
 
 Because the daemon owns the session, **several surfaces watch the same one at
 once** — a terminal at your desk, a browser on another screen, a colleague's
-machine paired with a rotating code — and quitting a client leaves the agent
-working. Approvals (`ask_human`) render as answerable rows in every attached
-client and survive a restart; a debug mode exposes the live event feed,
-per-step run detail and the log tail when you ask for it.
+machine signed in with a code an operator approves under their name — and
+quitting a client leaves the agent working. Approvals (`ask_human`) render as
+answerable rows in every attached client and survive a restart; with
+`a2a.introspection.enabled` the debug screen shows transcripts, per-step run
+detail and the log tail. The clients are ordinary A2A 1.0 clients: they read
+the agent card, speak an agentd extension only when the card declares it, and
+fall back to core A2A when it does not.
 
 Both clients ship as one npm package — `npm i -g @agentd-dev/cli`, source under
 [`interface/`](interface) — built on a shared thin-client core that the package
@@ -212,8 +222,9 @@ document (see
 ```yaml
 intelligence: { endpoints: https://gw.example/v1, model: gpt-… }
 store: { kind: mcp, mcp: { server: state } }         # a daemon needs a durable store
-a2a:   { listen: https://0.0.0.0:8443,
-         tls: { cert: …, key: …, client_ca: … } }    # the external channel
+a2a:   { listen: https://0.0.0.0:8443,                # the external channel
+         url: https://agent.example.com:8443,        # what callers dial; required on a wildcard bind
+         tls: { cert: …, key: …, client_ca: … } }
 workflows:
   - name: watch
     steps:
@@ -225,8 +236,10 @@ lifecycle: { run_until: drained }                    # a daemon
 
 A non-loopback `a2a.listen` is **refused at startup** unless the endpoint has
 client auth — `a2a.tls.client_ca` (mTLS, and then *every* caller needs a client
-certificate), `a2a.bearer`, or `interface.pairing`. `--traceparent` continues an
-upstream W3C trace.
+certificate) or `a2a.bearer` — and a wildcard bind is refused without the
+`a2a.url` callers dial. People sign in through the listener's OAuth device grant
+(`a2a.device_grant`) rather than with a copy of the bearer. `--traceparent`
+continues an upstream W3C trace.
 
 ## Workflows
 
@@ -362,18 +375,22 @@ every child is one `SIGKILL` from gone.
   `--allow-trifecta`.
 - **Authenticated everything.** Outbound: bearer/OAuth 2.1 client-credentials +
   bundled webpki roots (+ `--tls-ca` for private PKI). Inbound: mTLS client CA
-  and/or constant-time bearer; **operator verbs (the `admin.*` ops) require the
-  operator role** — granted by a matching `a2a.principals` rule, by a verified
-  `a2a.bearer`, by any client certificate `a2a.tls.client_ca` accepted that no
-  rule claims (on a listener that sets a bearer or declares no principals), or
-  by a loopback caller when no principals are configured. Discovery stays
-  public, though: the unauthenticated agent card advertises the whole command
-  surface, `admin.*` included, and only the authenticated
-  `GetExtendedAgentCard` narrows the skills to the ops that caller may actually
-  run.
-- **Hardened served surface.** Cross-origin requests are rejected (403 — only
-  loopback and the origins listed in `interface.origins` are admitted);
-  plaintext serving is loopback-only.
+  and/or constant-time bearer, and sessions from the OAuth device grant an
+  operator approves under a name; **operator verbs (the `admin.*` ops) require
+  the operator role** — granted by a matching `a2a.principals` rule, by a
+  verified `a2a.bearer`, by a client certificate while no rule exists, by a
+  session approved with the `operator` scope or started by the launcher
+  (`agentd tui` / `agentd ui`), or — on a loopback-bound
+  listener with no credential mechanism at all — to a local non-browser caller
+  that presents nothing. No grant lifts another role to an operator verb.
+  Discovery stays public, though: the unauthenticated agent card lists the
+  command extension's whole op vocabulary, `admin.*` included, and only the
+  authenticated `GetExtendedAgentCard` narrows it to the ops that caller may
+  actually run.
+- **Hardened served surface.** A request carrying `Origin` is refused (403)
+  unless its origin is listed in `a2a.cors.origins` — the one exception is the
+  page `agentd ui` itself launched — and a browser is never the implicit
+  operator; plaintext serving is loopback-only.
 - **Secrets discipline.** Tokens come from env or mounted files
   (`--intelligence-token-file` rotates live) and are never logged; telemetry
   logs lengths, not contents, unless you opt in with `--log-content`.
@@ -415,15 +432,16 @@ terminal outcome is the `proc.exit` event and the A2A task artifact —
 Prometheus `/metrics` + `/healthz` + `/readyz` via `--metrics-addr`
 (`--features metrics`), OTLP spans with GenAI semconv via `--features otel`, a
 liveness heartbeat file via `--health-file`, and the live log ring tailed with
-the `debug.events` command op (needs `interface.enabled` + `interface.debug`).
+the `debug.events` command op (needs `a2a.introspection.enabled`).
 
 **Discovery:** `agentd --capabilities` prints a machine-readable manifest of
 exactly what is compiled and configured in, and exits — feature-detect from
 this, not the version string.
 
 **Control plane:** an operator-role principal drives the served endpoint with
-the `admin.drain` / `admin.pause` / `admin.resume` / `admin.cancel` command
-ops — each a DataPart on an ordinary A2A `SendMessage`,
+the `admin.drain` / `admin.pause` / `admin.resume` / `admin.cancel` /
+`admin.set` command ops — each a DataPart on an ordinary A2A `SendMessage`
+under agentd's [command extension](https://agentd.dev/a2a/ext/command),
 not a custom JSON-RPC method. `SIGTERM` starts a graceful drain
 (`--drain-timeout` < pod grace).
 

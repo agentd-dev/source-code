@@ -2,6 +2,10 @@ import Link from "next/link";
 import Mermaid from "./components/Mermaid";
 import ConsoleDemos from "./components/ConsoleDemos";
 import InstallTabs from "./components/InstallTabs";
+// The extensions agentd declares, and the URI each one's specification is
+// served at — generated from the binary (scripts/gen-schemas.sh), so the
+// landing page cannot link a URI agentd does not declare, nor miss one it does.
+import extensions from "../lib/extensions.json";
 
 /* ── page furniture ──────────────────────────────────────────────── */
 
@@ -74,7 +78,7 @@ const ARCH_DIAGRAM = `flowchart TB
   store[("durable store")]
 
   trig --> sup
-  ext <-->|"A2A · mTLS / bearer"| sup
+  ext <-->|"A2A · mTLS / bearer / session"| sup
   sup -->|"spawn / reap"| a1
   sup -->|"spawn / reap"| a2
   a1 -->|spawn| a3
@@ -131,12 +135,12 @@ const CAPS = [
   {
     tag: "authenticated",
     title: "Identity + the Rule of Two",
-    body: "Trust is a verified mTLS cert or a constant-time bearer — never the transport. Tools are tagged untrusted-input / sensitive / egress; granting one agent all three legs is refused at startup. Scope narrows monotonically; secrets are redacted everywhere.",
+    body: "Trust is a verified mTLS cert, a constant-time bearer, or a session an operator approved under a name — never the transport. Tools are tagged untrusted-input / sensitive / egress; granting one agent all three legs is refused at startup. Scope narrows monotonically; secrets are redacted everywhere.",
   },
   {
     tag: "attachable",
     title: "A terminal or a browser, live",
-    body: "The daemon owns the session; the TUI and web UI are thin projections of it. Several surfaces watch the same conversation at once, quitting a client leaves the agent working, and approvals render as answerable rows in every attached client — with a rotating pairing code instead of a copied token.",
+    body: "The daemon owns the session; the TUI and web UI are thin projections of it. Several surfaces watch the same conversation at once, quitting a client leaves the agent working, and approvals render as answerable rows in every attached client. A person signs in with a code an operator approves under their name, never with a copied token.",
   },
 ];
 
@@ -248,8 +252,9 @@ export default function Home() {
           <Term title="agentd — daemon + terminal UI">{TUI_CMD}</Term>
           <div className="grid gap-4">
             <Card tag="one command" title="Daemon and client together">
-              <span className="kbd">agentd tui -c agent.yaml</span> runs both and ties their
-              lifetimes. Or run the daemon alone and attach later, from anywhere.
+              <span className="kbd">agentd tui -c agent.yaml</span> runs both, ties their
+              lifetimes, and signs the client in with a single-use code minted inside the daemon.
+              Or run the daemon alone and attach later, from anywhere.
             </Card>
             <Card tag="answerable" title="Approvals reach every surface">
               When the agent asks a question, it renders as an answerable row in every attached
@@ -311,20 +316,29 @@ export default function Home() {
             answers with live update frames.
           </Card>
           <Card tag="authenticate" title="A principal, per request">
-            An mTLS certificate or a bearer resolves to operator / user / agent, checked against a
-            role matrix before anything runs. A non-loopback listener without auth is a startup
-            error, not a warning.
+            An mTLS certificate, a bearer, or a session from the OAuth device grant resolves to
+            operator / user / agent, checked against a role matrix before anything runs. A
+            non-loopback listener without auth is a startup error, not a warning.
           </Card>
           <Card tag="discover" title="The card is a promise">
-            <span className="kbd">GetAgentCard</span> advertises what this build actually does.
-            What it claims is exercisable and what it disclaims is refused cleanly — both
-            directions are covered by the conformance suite.
+            <span className="kbd">/.well-known/agent-card.json</span> says what this listener does
+            and nothing more: a stream it advertises runs to the end, and push notifications it
+            disclaims are refused with the spec&apos;s <span className="kbd">-32003</span>.
+            Everything beyond core A2A is a declared extension a client may ignore.
           </Card>
         </div>
-        <div className="mt-4">
-          <Link href="/docs/a2a/" className="text-sm text-[var(--green)] hover:underline">
+        <div className="mt-4 flex flex-wrap items-center gap-x-5 gap-y-2 text-sm">
+          <Link href="/docs/a2a/" className="text-[var(--green)] hover:underline">
             The inbound channel in full →
           </Link>
+          <span className="text-[var(--dimmer)]">extension specs:</span>
+          {extensions
+            .filter((e) => e.kind === "extension")
+            .map((e) => (
+              <Link key={e.path} href={`/${e.path}/`} className="font-mono text-[var(--green)] hover:underline">
+                {e.path.split("/").pop()}
+              </Link>
+            ))}
         </div>
       </Section>
 
@@ -443,7 +457,7 @@ ENTRYPOINT ["/agentd"]
         <div className="grid gap-4 lg:grid-cols-2">
           <Term title="install and check">{`$ curl -fsSL https://agentd.dev/install.sh | sh
 $ agentd --validate-config -c agent.yaml
-{"event":"config.valid","files":["agent.yaml"],"schema":"1"}`}</Term>
+{"event":"config.valid","files":["agent.yaml"]}`}</Term>
           <Term title="or in a container">{`$ docker run --rm ghcr.io/agentd-dev/agentd:latest \\
     --prompt "summarise the incident channel" \\
     --intelligence https://gateway.internal/v1 \\

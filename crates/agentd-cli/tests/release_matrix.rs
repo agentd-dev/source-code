@@ -309,6 +309,69 @@ fn the_supply_chain_gate_runs_in_ci_and_locally() {
     );
 }
 
+/// cargo deny judges the graph the release SHIPS. It judged the default graph
+/// only, where Zlib (foldhash, zlib-rs) and `paste` (through cel-interpreter)
+/// never appear — so the licence and the advisory the release actually carries
+/// passed unseen. deny.toml's `[graph] features` is release.yml's FEATURES,
+/// exactly, and the release's default features stay on in both.
+#[test]
+fn the_supply_chain_gate_judges_the_graph_the_release_ships() {
+    let deny =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deny.toml"))
+            .unwrap();
+    let graph = deny
+        .split("\n[graph]\n")
+        .nth(1)
+        .and_then(|s| s.split("\n[").next())
+        .expect("deny.toml has a [graph] section");
+    let key = |k: &str| {
+        graph.lines().find_map(|l| {
+            let (name, v) = l.split_once('=')?;
+            (name.trim() == k).then(|| v.trim().to_string())
+        })
+    };
+    let features: Vec<String> = key("features")
+        .expect("deny.toml's [graph] names the features it judges")
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .split(',')
+        .map(|f| f.trim().trim_matches('"').to_string())
+        .filter(|f| !f.is_empty())
+        .collect();
+    assert_eq!(
+        features,
+        release_features(),
+        "deny.toml's [graph] features must be release.yml's FEATURES exactly"
+    );
+    // release.yml builds with the default features on (`tls`), and neither
+    // narrows nor widens the graph beyond that list.
+    for (k, shipped) in [("no-default-features", "false"), ("all-features", "false")] {
+        if let Some(v) = key(k) {
+            assert_eq!(
+                v, shipped,
+                "deny.toml's [graph] {k} judges a graph the release does not build"
+            );
+        }
+    }
+
+    // A waived advisory says why, in the file, where the next reader sees it.
+    let ignore = deny
+        .split("\nignore = [")
+        .nth(1)
+        .and_then(|s| s.split("\n]").next())
+        .unwrap_or("");
+    for entry in ignore
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+    {
+        assert!(
+            entry.starts_with("{ id = \"") && entry.contains("reason = \""),
+            "an advisory ignore without its reason: {entry}"
+        );
+    }
+}
+
 /// The `[features]` a manifest declares, by name.
 fn declared_features(manifest: &str) -> Vec<String> {
     let text = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(manifest))

@@ -448,10 +448,13 @@ holds up the next call on the same server.
 - **`cargo deny check` passes and CI runs it** (a `deny` job, and a step in
   `scripts/ci-gate.sh`): ISC is allowed (ring, rustls-webpki, untrusted), and
   AGPL-3.0-only is excepted for agentd's own five crates by name, not allowed
-  for dependencies. It judges the workspace at its default features only. The
-  feature set the release ships is not yet checked, and under it the policy
-  still fails: Zlib (foldhash, zlib-rs) is not allowed, and `paste`
-  (RUSTSEC-2024-0436, unmaintained) comes in through cel-interpreter.
+  for dependencies. It judges the graph the release ships: deny.toml's
+  `[graph] features` is release.yml's `FEATURES` (default features on), and a
+  test fails if the two differ. That graph adds Zlib (foldhash, zlib-rs, both
+  in the `a2a` stack), now allowed, and `paste` (RUSTSEC-2024-0436,
+  unmaintained, a compile-time proc-macro through cel-interpreter with no
+  known vulnerability), ignored with that reason until cel-interpreter moves
+  off it. Nothing else is waived.
 
 ### Crates
 

@@ -2988,12 +2988,25 @@ mod tests {
         // form `render` rewrites, not only a templated string.
         for templated in [
             json!("{{ inputs.who }}"),
-            json!("CEL: inputs.who"),
             json!({"id": "{{ inputs.who }}"}),
             json!({"role": "operator", "id": "{{ inputs.who }}"}),
             json!({"role": "operator", "labels": {"team": "{{ inputs.team }}"}}),
         ] {
             assert!(gate(templated.clone()).is_ok(), "{templated}");
+        }
+        // A `CEL:` addressee is held like any templated one — where CEL is
+        // compiled in. Without it every `CEL:` field is refused at load, naming
+        // the feature, rather than loading a gate nothing can address.
+        #[cfg(feature = "cel")]
+        assert!(gate(json!("CEL: inputs.who")).is_ok());
+        #[cfg(not(feature = "cel"))]
+        {
+            let e = gate(json!("CEL: inputs.who")).unwrap_err();
+            assert!(
+                e.iter()
+                    .any(|m| m.contains("to:") && m.contains(crate::cel::FEATURE_MSG)),
+                "a `CEL:` addressee without the cel feature should name it, got {e:?}"
+            );
         }
         // Anyone but an operator could never see the gate's task.
         for (bad, named) in [

@@ -2,17 +2,27 @@
 # `cargo deny check` enforces: no security advisories, no wildcard deps, and an
 # explicit license allow-list — so an "unearned" or unvetted dependency cannot
 # slip in unnoticed.
-#
-# What it judges is the workspace at its DEFAULT features (`tls` only). The
-# graph the release ships — release.yml's FEATURES — is NOT yet checked, and
-# under it this policy fails today: Zlib (foldhash, zlib-rs) is not on the
-# allow-list, and `paste` (RUSTSEC-2024-0436, unmaintained) arrives through
-# cel-interpreter. Widening the gate to the shipped graph waits on those two
-# decisions; until then a dependency only a feature brings in passes unseen.
+
+# What it judges is the graph the release SHIPS: the workspace with its default
+# features (`tls`) plus release.yml's FEATURES, exactly. A dependency that only
+# a shipped feature brings in is a dependency the release carries, so a gate
+# over the default graph alone would let it in unseen. release_matrix.rs holds
+# this list to release.yml's, so the two cannot drift.
+[graph]
+features = ["a2a", "metrics", "cron", "otel", "hot-reload", "config-watch", "aauth", "oauth", "cel", "sign", "oci", "decrypt"]
 
 [advisories]
 version = 2
 yanked = "deny"
+# Each ignore carries its reason and the condition that ends it; nothing else
+# is waived.
+ignore = [
+    # `paste` is unmaintained, not vulnerable: no advisory names a flaw in it.
+    # It is a compile-time proc-macro (nothing of it runs in the binary) that
+    # arrives only through cel-interpreter, the `cel` feature's one crate.
+    # Drop this when cel-interpreter moves off paste.
+    { id = "RUSTSEC-2024-0436", reason = "unmaintained compile-time proc-macro pulled in by cel-interpreter; no known vulnerability" },
+]
 
 [bans]
 # A wildcard version requirement is unpinned supply-chain risk.
@@ -26,7 +36,7 @@ version = 2
 # Permissive-only. Adding a license here is a deliberate act — it documents
 # exactly what licences the (tiny) dependency set carries.
 # Exactly the licences the dependency set `cargo deny check` walks carries
-# (the workspace at its default features) — verified by `cargo deny check
+# (the shipped graph, [graph] above) — verified by `cargo deny check
 # licenses` reporting no unmatched allowance.
 allow = [
     "MIT",
@@ -38,6 +48,11 @@ allow = [
     # untrusted.
     "ISC",
     "Unicode-3.0",
+    # Permissive (the zlib licence: use, alter and redistribute, keep the
+    # notice). Only the shipped `a2a` graph carries it: foldhash (the hasher
+    # of buffa and its hashbrown) and zlib-rs (the pure-Rust deflate behind
+    # connectrpc's flate2).
+    "Zlib",
     "CDLA-Permissive-2.0",
 ]
 # agentd's own licence is not a dependency policy: AGPL-3.0-only applies to

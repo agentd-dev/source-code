@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The **`agentd tui` / `agentd ui` launcher**: run the daemon and one display
-//! client as one command, and hand the client nothing but its endpoint.
+//! client as one command, and sign the client in without handing it a
+//! credential the daemon was configured with.
 //!
 //! The daemon runs exactly as `agentd <args>` would — the launcher adds no
 //! config key, flag or variable, so what an operator sees under the launcher is
@@ -9,8 +10,17 @@
 //! [`LAUNCH_CONTRACT`](agentd::runtime::surface::launch::LAUNCH_CONTRACT) lists and the launcher's environment minus every
 //! variable the config loader reads and every `{{secret:NAME}}` the loaded
 //! settings reference. It never gets `a2a.bearer`: a display client that holds
-//! the daemon's root credential is one more place to steal it from, and the
-//! web UI used to serve it to any page that asked.
+//! the daemon's root credential is one more place to steal it from.
+//!
+//! What it gets instead is a **single-use launch code** from the
+//! [`LaunchSlot`] the launcher installs in the daemon's own process — the one
+//! place a code can be minted. The TUI reads it from an inherited pipe. The
+//! web UI's travels only in a URL fragment, which a browser never sends over
+//! HTTP: in a 0600 launch file handed to the desktop's opener, or printed on
+//! the launcher's terminal. A browser that can be given neither (a sandboxed
+//! one, an SSH forward, a second tab) asks the daemon for a sign-in and shows
+//! a short code, which the person types here: the launcher's terminal is the
+//! trust anchor for every sign-in after the first.
 //!
 //! Lifetimes are tied: the client exiting drains the daemon (SIGTERM to self);
 //! the daemon exiting sends the client SIGTERM, then SIGKILL.
@@ -22,18 +32,30 @@
 //! Descriptor hygiene: every fd the launcher creates is close-on-exec in this
 //! process, because the daemon spawns processes of its own — the exec tool,
 //! instances, subagents — and none of them may inherit the operator's
-//! terminal or the UI's socket. The one fd a client is meant to have reaches
-//! descriptor 3 only in that client, between fork and exec.
+//! terminal, the pipe holding a launch code or the UI's socket. The one fd a
+//! client is meant to have reaches descriptor 3 only in that client, between
+//! fork and exec.
+//!
+//! Child processes: the daemon's reaper collects every exited child of this
+//! process (`waitpid(-1)`), the launcher's own included, so the client and the
+//! opener are registered with it and their exit is read from whichever side
+//! reaped them first.
 
+use agentd::a2a::oauth::{LaunchBind, LaunchSlot};
 use agentd::config::settings::{self, Ask};
 use agentd::exit;
 use agentd::runtime::surface::launch::{
-    DEFAULT_UI_PORT, LAUNCH_FD, LAUNCHER_DOCS, LaunchClient, launch_client, launch_endpoint,
+    DEFAULT_UI_PORT, LAUNCH_CODE_TTL, LAUNCH_FD, LAUNCH_FD_FLAG, LAUNCHER_DOCS, LaunchClient,
+    launch_client, launch_endpoint,
 };
+use agentd::supervisor::{reap::Reaped, reaper};
+use std::io::{BufRead, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -42,6 +64,15 @@ use std::time::{Duration, Instant};
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a client gets to exit on SIGTERM before it is killed.
 const CLIENT_GRACE: Duration = Duration::from_secs(3);
+/// The terminal prompt waits this long for a burst of sign-in requests to
+/// end, so a burst is one prompt that counts them…
+const PROMPT_COALESCE: Duration = Duration::from_millis(250);
+/// …but never longer than this, so a steady stream cannot hold the prompt
+/// back.
+const PROMPT_COALESCE_MAX: Duration = Duration::from_secs(1);
+/// What the launcher's terminal says when a browser tab asks to be signed in.
+const PROMPT: &str =
+    "A browser tab asks to sign in to agentd: type the code it shows (Enter to skip)";
 
 /// The launcher's own flags, split from the daemon's.
 #[derive(Debug, Clone, PartialEq)]
@@ -138,18 +169,27 @@ pub fn run(sub: &str, args: &[String], env: &[(String, String)]) -> i32 {
     } else {
         None
     };
-    let ui_url = ui_listener
+    // The page's origin is exactly the socket bound above: the one origin the
+    // slot binds a code to and the listener's CORS list gains.
+    let ui_origin = ui_listener
         .as_ref()
         .and_then(|l| l.local_addr().ok())
-        .map(|a| format!("http://127.0.0.1:{}/", a.port()));
+        .map(|a| format!("http://127.0.0.1:{}", a.port()));
+    let slot = match LaunchSlot::new(ui_origin.as_deref()) {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            eprintln!("agentd {sub}: {e}");
+            return exit::USAGE;
+        }
+    };
 
     let log_path = opts
         .daemon_log
         .clone()
         .unwrap_or_else(|| default_log_path(sub, env));
-    match &ui_url {
-        Some(url) => {
-            eprintln!("agentd {sub}: endpoint {endpoint} · web UI {url} · daemon logs → {log_path}")
+    match &ui_origin {
+        Some(o) => {
+            eprintln!("agentd {sub}: endpoint {endpoint} · web UI {o}/ · daemon logs → {log_path}")
         }
         None => eprintln!("agentd {sub}: endpoint {endpoint} · daemon logs → {log_path}"),
     }
@@ -161,7 +201,23 @@ pub fn run(sub: &str, args: &[String], env: &[(String, String)]) -> i32 {
         }
     };
 
-    let child_slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
+    let launch_file: Arc<Mutex<Option<LaunchFile>>> = Arc::new(Mutex::new(None));
+    if ui_origin.is_some() {
+        // The file is worth nothing once its code is spent, so it goes the
+        // moment the daemon consumes the code — whoever presented it.
+        let lf = Arc::clone(&launch_file);
+        slot.on_consume(move || {
+            remove_launch_file(&lf);
+        });
+        if let Err(e) = terminal_sign_in(&slot, &tty) {
+            let _ = tty_println(
+                &tty,
+                &format!("agentd {sub}: the terminal cannot sign browser tabs in: {e}"),
+            );
+        }
+    }
+
+    let child_slot: Arc<Mutex<Option<Tracked>>> = Arc::new(Mutex::new(None));
     let done = Arc::new(AtomicBool::new(false));
     let failed = Arc::new(AtomicBool::new(false));
     let watcher = spawn_watcher(Watch {
@@ -169,7 +225,11 @@ pub fn run(sub: &str, args: &[String], env: &[(String, String)]) -> i32 {
         endpoint,
         env: child_env,
         ui_listener,
-        open_url: ui_url.filter(|_| opts.open),
+        ui_origin,
+        open: opts.open,
+        launch_dir: launch_dir_base(env),
+        launch_file: Arc::clone(&launch_file),
+        slot: Arc::clone(&slot),
         tty,
         child_slot: Arc::clone(&child_slot),
         done: Arc::clone(&done),
@@ -177,24 +237,21 @@ pub fn run(sub: &str, args: &[String], env: &[(String, String)]) -> i32 {
     });
 
     agentd::state::record_config_digest(&inv.loaded.settings);
-    let code = agentd::runtime::run(&inv.loaded, &inv.args, &inv.env);
+    let code = agentd::runtime::run_with(
+        &inv.loaded,
+        &inv.args,
+        &inv.env,
+        agentd::runtime::RunOpts { launch: Some(slot) },
+    );
 
     // The daemon is down: reap the client (graceful first) and let the
     // watcher wind down.
     done.store(true, Ordering::Relaxed);
     if let Some(mut child) = child_slot.lock().unwrap_or_else(|e| e.into_inner()).take() {
-        unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
-        let deadline = Instant::now() + CLIENT_GRACE;
-        while Instant::now() < deadline {
-            if matches!(child.try_wait(), Ok(Some(_))) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        let _ = child.kill();
-        let _ = child.wait();
+        child.stop();
     }
     let _ = watcher.join();
+    remove_launch_file(&launch_file);
     // A client that never started is a failed launch, however cleanly the
     // daemon then drained.
     if failed.load(Ordering::Relaxed) && code == exit::SUCCESS {
@@ -293,9 +350,16 @@ struct Watch {
     endpoint: String,
     env: Vec<(String, String)>,
     ui_listener: Option<std::net::TcpListener>,
-    open_url: Option<String>,
+    /// `agentd ui`: the origin the web UI is served at.
+    ui_origin: Option<String>,
+    /// `agentd ui`: hand the code to the desktop's opener (not `--no-open`).
+    open: bool,
+    /// Where the launch file's directory is made.
+    launch_dir: Option<PathBuf>,
+    launch_file: Arc<Mutex<Option<LaunchFile>>>,
+    slot: Arc<LaunchSlot>,
     tty: Tty,
-    child_slot: Arc<Mutex<Option<Child>>>,
+    child_slot: Arc<Mutex<Option<Tracked>>>,
     done: Arc<AtomicBool>,
     failed: Arc<AtomicBool>,
 }
@@ -317,8 +381,9 @@ fn dial_authority(endpoint: &str) -> String {
 }
 
 /// The client's command: its binary, exactly the contract's argv, the
-/// scrubbed environment, and its stdio.
-fn client_command(w: &Watch) -> Result<(Command, String), String> {
+/// scrubbed environment, and its stdio. `code_pipe` is the read end of the
+/// pipe holding a TUI's launch code.
+fn client_command(w: &Watch, code_pipe: Option<&OwnedFd>) -> Result<(Command, String), String> {
     let bin = std::env::var(w.client.bin_env).unwrap_or_else(|_| w.client.bin.to_string());
     let mut cmd = Command::new(&bin);
     cmd.env_clear().envs(w.env.iter().map(|(k, v)| (k, v)));
@@ -337,6 +402,11 @@ fn client_command(w: &Watch) -> Result<(Command, String), String> {
                     .ok_or("the web UI's listener was never bound")?;
                 inherit_as_launch_fd(&mut cmd, listener.as_raw_fd());
             }
+            LAUNCH_FD_FLAG => {
+                cmd.arg(LAUNCH_FD.to_string());
+                let pipe = code_pipe.ok_or("no launch code was minted for the client")?;
+                inherit_as_launch_fd(&mut cmd, pipe.as_raw_fd());
+            }
             other => {
                 return Err(format!(
                     "the launch contract names {other}, which this launcher cannot supply"
@@ -344,7 +414,8 @@ fn client_command(w: &Watch) -> Result<(Command, String), String> {
             }
         }
     }
-    // The web UI reads no terminal input; the launcher keeps the terminal.
+    // The web UI reads no terminal input; the launcher keeps the terminal
+    // for the sign-in prompt.
     let stdin = if w.ui_listener.is_some() {
         Stdio::null()
     } else {
@@ -354,6 +425,31 @@ fn client_command(w: &Watch) -> Result<(Command, String), String> {
         .stdout(Stdio::from(clone(&w.tty.stdout)?))
         .stderr(Stdio::from(clone(&w.tty.stderr)?));
     Ok((cmd, bin))
+}
+
+/// A pipe for a launch code, both ends close-on-exec from the moment they
+/// exist: the daemon may be spawning a child on another thread right now, and
+/// a copy of either end in it would leak the code (the read end) or keep the
+/// TUI from ever seeing end-of-file (the write end).
+fn launch_pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [0 as libc::c_int; 2];
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    // Darwin has no pipe2: the flag is set straight after, which leaves an
+    // instant in which a concurrent fork could copy the ends.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    let rc = unsafe {
+        let rc = libc::pipe(fds.as_mut_ptr());
+        if rc == 0 {
+            libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC);
+            libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+        rc
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
 }
 
 /// Deliver `src` to the client as descriptor [`LAUNCH_FD`], and only to it.
@@ -378,8 +474,8 @@ fn inherit_as_launch_fd(cmd: &mut Command, src: i32) {
     }
 }
 
-/// Wait for the listener, spawn the display client on the saved terminal, and
-/// SIGTERM the daemon (graceful drain) when the client exits.
+/// Wait for the listener, spawn the display client on the saved terminal,
+/// sign it in, and SIGTERM the daemon (graceful drain) when the client exits.
 fn spawn_watcher(mut w: Watch) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("launcher-client".into())
@@ -409,18 +505,42 @@ fn spawn_watcher(mut w: Watch) -> std::thread::JoinHandle<()> {
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            // 2. Spawn the client.
-            let spawned = client_command(&w).and_then(|(mut cmd, bin)| {
-                cmd.spawn().map_err(|e| {
-                    format!(
-                        "agentd {sub}: cannot start {bin:?}: {e}\n  set {} to the display client's path — see {LAUNCHER_DOCS}",
-                        w.client.bin_env
-                    )
-                })
-            });
-            // The client holds its copy now; this process never needs the
-            // UI's socket again, and a later child must not inherit it.
+            // 2. A terminal client's code, on a pipe only it will hold. Minted
+            // whatever the posture: a reload that adds principals later must
+            // not strand a console that signed in as the implicit operator.
+            let tui_code = if w.client.argv.contains(&LAUNCH_FD_FLAG) {
+                let minted = w
+                    .slot
+                    .issue(LaunchBind::NoOrigin, w.client.client_id)
+                    .and_then(|code| launch_pipe().map(|pipe| (code, pipe)));
+                match minted {
+                    Ok(m) => Some(m),
+                    Err(e) => {
+                        give_up(&w, &format!("agentd {sub}: cannot mint the launch code: {e}"));
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            // 3. Spawn the client.
+            let spawned = client_command(&w, tui_code.as_ref().map(|(_, (read, _))| read))
+                .and_then(|(mut cmd, bin)| {
+                    Tracked::spawn(&mut cmd).map_err(|e| {
+                        format!(
+                            "agentd {sub}: cannot start {bin:?}: {e}\n  set {} to the display client's path — see {LAUNCHER_DOCS}",
+                            w.client.bin_env
+                        )
+                    })
+                });
+            // The client holds its copies now; this process never needs the
+            // UI's socket or the pipe's read end again, and a later child must
+            // not inherit them.
             w.ui_listener = None;
+            let tui_code = tui_code.map(|(code, (read, write))| {
+                drop(read);
+                (code, write)
+            });
             let child = match spawned {
                 Ok(c) => c,
                 Err(msg) => {
@@ -430,10 +550,30 @@ fn spawn_watcher(mut w: Watch) -> std::thread::JoinHandle<()> {
             };
             let pid = child.id();
             *w.child_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
-            if let Some(url) = &w.open_url {
-                open_browser(url, &w.env);
+            // 4. Hand over the code. The TUI's: one line, then end-of-file,
+            // which is what its read waits for. The web UI's: once the UI is
+            // serving (its socket was bound before the spawn, so a browser's
+            // connection waits in the backlog), in a URL fragment.
+            if let Some((code, write)) = tui_code {
+                let mut pipe = std::fs::File::from(write);
+                if let Err(e) = pipe.write_all(format!("{code}\n").as_bytes()) {
+                    let _ = tty_println(
+                        &w.tty,
+                        &format!("agentd {sub}: cannot hand the client its launch code: {e}"),
+                    );
+                }
+            } else if let Some(origin) = w.ui_origin.clone() {
+                match w.slot.issue(LaunchBind::Origin(origin.clone()), w.client.client_id) {
+                    Ok(code) => deliver_ui_code(&w, &origin, &code),
+                    Err(e) => {
+                        let _ = tty_println(
+                            &w.tty,
+                            &format!("agentd {sub}: cannot mint the launch code ({e}); a tab can still ask this terminal to sign it in"),
+                        );
+                    }
+                }
             }
-            // 3. Wait for the client to exit, then drain the daemon.
+            // 5. Wait for the client to exit, then drain the daemon.
             loop {
                 if w.done.load(Ordering::Relaxed) {
                     return; // the daemon beat us to it; main reaps the child
@@ -443,7 +583,7 @@ fn spawn_watcher(mut w: Watch) -> std::thread::JoinHandle<()> {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .as_mut()
-                    .map(|c| matches!(c.try_wait(), Ok(Some(_))))
+                    .map(|c| c.exited().is_some())
                     .unwrap_or(true);
                 if exited {
                     let _ = tty_println(
@@ -459,27 +599,337 @@ fn spawn_watcher(mut w: Watch) -> std::thread::JoinHandle<()> {
         .expect("spawn launcher watcher")
 }
 
-/// Open `url` in the desktop's browser. Best effort: a headless host has no
-/// opener, and the URL is already on the terminal.
-fn open_browser(url: &str, env: &[(String, String)]) {
+/// A child of this process whose exit the daemon's reaper may collect first.
+///
+/// The daemon reaps with `waitpid(-1)`, which takes any exited child of the
+/// process, the launcher's own included. A plain `try_wait` then answers
+/// `ECHILD` forever and the launcher would wait on a client long gone, so the
+/// pid is registered with the reaper at the fork, and its exit is read from
+/// whichever side collected it.
+struct Tracked {
+    child: Child,
+    reaped: Receiver<Reaped>,
+    /// `Some(clean)` once the exit is known.
+    outcome: Option<bool>,
+}
+
+impl Tracked {
+    fn spawn(cmd: &mut Command) -> std::io::Result<Tracked> {
+        let (tx, reaped) = mpsc::channel();
+        let child = reaper::spawn_tracked_pid(&tx, || cmd.spawn())?;
+        Ok(Tracked {
+            child,
+            reaped,
+            outcome: None,
+        })
+    }
+
+    fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// `Some(clean)` once the child has exited, `None` while it runs.
+    fn exited(&mut self) -> Option<bool> {
+        if self.outcome.is_none() {
+            self.outcome = match self.child.try_wait() {
+                Ok(Some(status)) => {
+                    reaper::deregister(self.child.id() as i32);
+                    Some(status.success())
+                }
+                Ok(None) => None,
+                // Reaped by the daemon: the status is on the route (or about
+                // to be — the reaper sends right after its waitpid).
+                Err(_) => self.reaped.try_recv().ok().map(|r| r.outcome.is_clean()),
+            };
+        }
+        self.outcome
+    }
+
+    /// Wait up to `limit` for the exit (`None`: for as long as it takes).
+    fn wait_for(&mut self, limit: Option<Duration>) -> Option<bool> {
+        let deadline = limit.map(|l| Instant::now() + l);
+        loop {
+            if let Some(clean) = self.exited() {
+                return Some(clean);
+            }
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    /// SIGTERM, then SIGKILL after [`CLIENT_GRACE`].
+    fn stop(&mut self) {
+        if self.exited().is_some() {
+            return;
+        }
+        unsafe { libc::kill(self.id() as i32, libc::SIGTERM) };
+        if self.wait_for(Some(CLIENT_GRACE)).is_none() {
+            let _ = self.child.kill();
+            self.wait_for(Some(CLIENT_GRACE));
+        }
+    }
+}
+
+// ---- the web UI's launch code -----------------------------------------------
+
+/// The launch file and the directory made for it alone.
+struct LaunchFile {
+    dir: PathBuf,
+    file: PathBuf,
+}
+
+/// Where the launch file's directory goes: `$HOME` — which a snap-confined
+/// browser may read and other users may not — else `$XDG_RUNTIME_DIR`.
+fn launch_dir_base(env: &[(String, String)]) -> Option<PathBuf> {
+    let var = |name: &str| {
+        env.iter()
+            .find(|(k, v)| k == name && !v.is_empty())
+            .map(|(_, v)| PathBuf::from(v))
+    };
+    var("HOME").or_else(|| var("XDG_RUNTIME_DIR"))
+}
+
+/// Delete the launch file and its directory, if they are still there. `true`
+/// when this call removed them — the code in them was never consumed.
+fn remove_launch_file(lf: &Mutex<Option<LaunchFile>>) -> bool {
+    let Some(f) = lf.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+        return false;
+    };
+    let _ = std::fs::remove_file(&f.file);
+    let _ = std::fs::remove_dir(&f.dir);
+    true
+}
+
+/// The page a launch file holds: a same-document redirect to `url`, by
+/// script and by meta refresh, so a browser with scripts off follows it too.
+/// `url` is `http://127.0.0.1:<port>/#launch=<code>` — nothing in it needs
+/// escaping in HTML or in a string literal.
+fn launch_page(url: &str) -> String {
+    format!(
+        "<!doctype html>\n<meta charset=\"utf-8\">\n<meta name=\"referrer\" content=\"no-referrer\">\n\
+         <meta http-equiv=\"refresh\" content=\"0;url={url}\">\n<title>agentd</title>\n\
+         <script>location.replace(\"{url}\")</script>\n<a href=\"{url}\">Open agentd</a>\n"
+    )
+}
+
+/// Write the launch file: a fresh 0700 directory under `base` that is not
+/// hidden (a sandboxed browser's portal may refuse dot-directories), holding
+/// one 0600 file created exclusively, so nothing planted can be written
+/// through and no other user can read the code.
+fn write_launch_file(base: &Path, url: &str) -> std::io::Result<LaunchFile> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    let mut attempts = 0;
+    let dir = loop {
+        let dir = base.join(format!(
+            "agentd-launch-{}",
+            agentd::sec::random::hex_token(6)?
+        ));
+        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => break dir,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempts < 8 => {
+                attempts += 1
+            }
+            Err(e) => return Err(e),
+        }
+    };
+    // The mode above is masked by the umask; this one is not.
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    let file = dir.join("agentd.html");
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .mode(0o600)
+        .open(&file)
+        .and_then(|mut f| f.write_all(launch_page(url).as_bytes()));
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_dir(&dir);
+        return Err(e);
+    }
+    Ok(LaunchFile { dir, file })
+}
+
+/// Give the web UI its code: through the desktop's opener when there is one,
+/// else — `--no-open`, no opener, or one that failed — on this terminal.
+fn deliver_ui_code(w: &Watch, origin: &str, code: &str) {
+    let url = format!("{origin}/#launch={code}");
+    let port = origin.rsplit(':').next().unwrap_or_default().to_string();
+    let print_url = {
+        let out = w.tty.stderr.try_clone().ok();
+        let url = url.clone();
+        move || {
+            if let Some(fd) = out.as_ref().and_then(|o| o.try_clone().ok()) {
+                let _ = writeln!(
+                    std::fs::File::from(fd),
+                    "agentd ui: sign in by opening {url}\n  (it works once, within {}s; over SSH forward the same port: ssh -L {port}:127.0.0.1:{port} …)\n  after that, a tab that asks is signed in here: type the code it shows",
+                    LAUNCH_CODE_TTL.as_secs()
+                );
+            }
+        }
+    };
+    let base = match (&w.launch_dir, w.open) {
+        (Some(base), true) => base.clone(),
+        _ => return print_url(),
+    };
+    let lf = match write_launch_file(&base, &url) {
+        Ok(lf) => lf,
+        Err(e) => {
+            let _ = tty_println(
+                &w.tty,
+                &format!(
+                    "agentd ui: cannot write the launch file under {}: {e}",
+                    base.display()
+                ),
+            );
+            return print_url();
+        }
+    };
+    let path = lf.file.clone();
+    *w.launch_file.lock().unwrap_or_else(|e| e.into_inner()) = Some(lf);
+    // Unconsumed after its code's lifetime, the file is only a stale copy.
+    let expire = Arc::clone(&w.launch_file);
+    std::thread::spawn(move || {
+        std::thread::sleep(LAUNCH_CODE_TTL);
+        remove_launch_file(&expire);
+    });
     let opener = if cfg!(target_os = "macos") {
         "open"
     } else {
         "xdg-open"
     };
-    let _ = Command::new(opener)
-        .arg(url)
+    // The opener is given the file's path, never the URL: a process's argv
+    // is readable by every user on the host.
+    let mut cmd = Command::new(opener);
+    cmd.arg(&path)
         .env_clear()
-        .envs(env.iter().map(|(k, v)| (k, v)))
+        .envs(w.env.iter().map(|(k, v)| (k, v)))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map(|mut c| {
-            // Reaped on its own thread so an opener that lingers never
-            // becomes a zombie of the launcher.
-            std::thread::spawn(move || c.wait());
-        });
+        .stderr(Stdio::null());
+    let lf = Arc::clone(&w.launch_file);
+    // Waited on its own thread: an opener may linger as long as the browser
+    // it started, and the launcher must not.
+    std::thread::spawn(move || {
+        let opened = Tracked::spawn(&mut cmd)
+            .ok()
+            .and_then(|mut c| c.wait_for(None))
+            .unwrap_or(false);
+        if !opened && remove_launch_file(&lf) {
+            print_url();
+        }
+    });
+}
+
+// ---- the terminal sign-in ---------------------------------------------------
+
+/// What the terminal prompt reacts to.
+enum PromptEvent {
+    /// A browser tab asked to be signed in.
+    Request,
+    /// The person typed a line.
+    Line(String),
+    /// The terminal's input ended: nothing more can be approved.
+    Eof,
+}
+
+/// Let the person at this terminal sign browser tabs in: a tab that asks
+/// shows a code, and typing it here approves exactly that tab. One prompt is
+/// shown however many tabs ask at once, with a count of the others.
+fn terminal_sign_in(slot: &Arc<LaunchSlot>, tty: &Tty) -> std::io::Result<()> {
+    let input = std::fs::File::from(tty.stdin.try_clone()?);
+    let out = tty.stderr.try_clone()?;
+    let (tx, rx) = mpsc::channel();
+    let requests = Mutex::new(tx.clone());
+    slot.on_request(move || {
+        let _ = requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .send(PromptEvent::Request);
+    });
+    std::thread::Builder::new()
+        .name("launcher-stdin".into())
+        .spawn(move || {
+            let mut lines = std::io::BufReader::new(input);
+            loop {
+                let mut line = String::new();
+                match lines.read_line(&mut line) {
+                    Ok(n) if n > 0 => {
+                        if tx.send(PromptEvent::Line(line)).is_err() {
+                            return;
+                        }
+                    }
+                    _ => {
+                        let _ = tx.send(PromptEvent::Eof);
+                        return;
+                    }
+                }
+            }
+        })?;
+    let slot = Arc::clone(slot);
+    std::thread::Builder::new()
+        .name("launcher-prompt".into())
+        .spawn(move || prompt_loop(&slot, &rx, &mut std::fs::File::from(out)))?;
+    Ok(())
+}
+
+/// The prompt's state machine, apart from the threads that feed it.
+///
+/// A prompt is `showing` from when it is printed until the next line is typed;
+/// requests that arrive meanwhile print nothing. A burst is gathered first, so
+/// the one prompt counts it. After a line, a prompt is shown again only if a
+/// request arrived since the last one — Enter really skips.
+fn prompt_loop(slot: &LaunchSlot, rx: &Receiver<PromptEvent>, out: &mut impl Write) {
+    let mut showing = false;
+    let mut unseen = false;
+    while let Ok(first) = rx.recv() {
+        let mut events = vec![first];
+        if matches!(events[0], PromptEvent::Request) {
+            let gather_until = Instant::now() + PROMPT_COALESCE_MAX;
+            while Instant::now() < gather_until {
+                match rx.recv_timeout(PROMPT_COALESCE) {
+                    Ok(PromptEvent::Request) => events.push(PromptEvent::Request),
+                    Ok(other) => {
+                        events.push(other);
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        for ev in events {
+            match ev {
+                PromptEvent::Request => unseen = true,
+                PromptEvent::Line(line) => {
+                    showing = false;
+                    let typed = line.trim();
+                    if typed.is_empty() {
+                        continue;
+                    }
+                    let said = if slot.approve_user_code(typed) {
+                        "agentd ui: signed in"
+                    } else {
+                        "agentd ui: no tab is showing that code"
+                    };
+                    let _ = writeln!(out, "{said}");
+                }
+                PromptEvent::Eof => return,
+            }
+        }
+        if unseen && !showing {
+            unseen = false;
+            let waiting = slot.waiting();
+            if waiting > 0 {
+                let _ = match waiting - 1 {
+                    0 => writeln!(out, "{PROMPT}"),
+                    more => writeln!(out, "{PROMPT} [{more} more waiting]"),
+                };
+                showing = true;
+            }
+        }
+    }
 }
 
 /// Print a line to the SAVED terminal (the daemon's own stderr is redirected).
@@ -525,6 +975,33 @@ mod tests {
         // daemon's to accept or refuse.
         let (_, daemon) = split_args("tui", &args(&["--no-open", "--config", "a.yaml"])).unwrap();
         assert_eq!(daemon, args(&["--no-open", "--config", "a.yaml"]));
+    }
+
+    /// The daemon's reaper may collect the client before the launcher asks
+    /// after it (`waitpid(-1)` takes any child). The exit still counts, read
+    /// from the route the spawn registered — else the launcher would wait on
+    /// a client long gone and never drain the daemon.
+    #[test]
+    fn a_child_reaped_by_the_daemon_still_counts_as_exited() {
+        let (tx, reaped) = mpsc::channel();
+        let child = Command::new("true").spawn().expect("spawn true");
+        let pid = child.id() as i32;
+        let mut t = Tracked {
+            child,
+            reaped,
+            outcome: None,
+        };
+        // Collect it the way the daemon's reaper would.
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert_eq!(t.exited(), None, "gone, but its status is not in yet");
+        tx.send(Reaped {
+            pid,
+            outcome: agentd::supervisor::reap::classify_status(status),
+        })
+        .unwrap();
+        assert_eq!(t.exited(), Some(true), "the route's status is the exit");
+        assert_eq!(t.exited(), Some(true), "and it is kept");
     }
 
     #[test]

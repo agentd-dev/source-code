@@ -1207,6 +1207,18 @@ impl LaunchSlot {
         true
     }
 
+    /// How many browser tabs are waiting for the terminal right now: the
+    /// launcher shows one prompt however many asked, and says how many more
+    /// there are.
+    pub fn waiting(&self) -> usize {
+        let now = (self.clock)();
+        self.table()
+            .requests
+            .values()
+            .filter(|r| !r.expired(now) && !r.approved)
+            .count()
+    }
+
     /// Hand the slot the daemon's logger, once the listener is up.
     pub(crate) fn attach_log(&self, log: crate::obs::log::Logger) {
         let _ = self.log.set(log);
@@ -3296,6 +3308,29 @@ mod tests {
         });
         f.requested();
         assert_eq!(asked.load(Ordering::SeqCst), 1);
+    }
+
+    /// What the launcher's one prompt counts: requests still waiting — not
+    /// one approved, expired or displaced.
+    #[test]
+    fn waiting_counts_the_requests_the_terminal_can_still_approve() {
+        let f = Launch::new(Some(UI), false);
+        assert_eq!(f.slot.waiting(), 0);
+        let (_, first) = f.requested();
+        f.requested();
+        assert_eq!(f.slot.waiting(), 2);
+        assert!(f.slot.approve_user_code(&first));
+        assert_eq!(f.slot.waiting(), 1, "an approved request waits no more");
+        for _ in 0..2 * LAUNCH_PENDING_MAX {
+            f.requested();
+        }
+        assert_eq!(
+            f.slot.waiting(),
+            LAUNCH_PENDING_MAX,
+            "displaced ones do not count"
+        );
+        f.advance(LAUNCH_REQUEST_TTL);
+        assert_eq!(f.slot.waiting(), 0, "nor expired ones");
     }
 
     /// A code or a request presented from off the host is refused, and the

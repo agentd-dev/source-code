@@ -3,7 +3,8 @@
 //!
 //! `agentd tui` and `agentd ui` are a thin launcher: they run the daemon
 //! exactly as `agentd <args>` would, and start one display client beside it
-//! with nothing but its endpoint. Everything that promise depends on — which
+//! with its endpoint and a single-use launch code — never a credential the
+//! daemon was configured with. Everything that promise depends on — which
 //! binary, which flags, which grant the client signs in with and for how long —
 //! is written down here, once, so the launcher, the daemon's launch grant, the
 //! docs guard and the TypeScript clients' guard all read one source instead of
@@ -24,6 +25,10 @@ pub struct LaunchClient {
     pub bin: &'static str,
     /// The environment variable that overrides the binary.
     pub bin_env: &'static str,
+    /// The OAuth `client_id` its launch code is issued to, and which it
+    /// presents when it redeems the code: a code minted for one client is
+    /// refused to the other.
+    pub client_id: &'static str,
     /// The flags the client is given, in order, each followed by its value.
     /// Exactly these: the launcher passes no other flag, and never a
     /// credential.
@@ -34,25 +39,34 @@ pub struct LaunchClient {
 pub const ENDPOINT_FLAG: &str = "--endpoint";
 /// The flag naming the listening socket `agentd ui` hands its server.
 pub const LISTEN_FD_FLAG: &str = "--listen-fd";
+/// The flag naming the pipe `agentd tui` hands its client the launch code on.
+pub const LAUNCH_FD_FLAG: &str = "--launch-fd";
 /// The descriptor number an inherited socket or pipe arrives on in the client.
 pub const LAUNCH_FD: i32 = 3;
 
 /// Every client the launcher starts, and exactly what it is given.
 ///
+/// `tui` always gets a launch code on a pipe, whatever the listener's posture:
+/// the code costs nothing on a daemon without principals, and the session it
+/// buys outlives a reload that adds some — so the argv never depends on the
+/// posture, and a console is never stranded by a later edit.
+///
 /// `ui` gets a TCP listener the launcher bound on loopback itself, so no other
 /// local process can hold the UI's port and receive whatever the browser opens
-/// there.
+/// there. Its code travels in a URL fragment, never on its argv.
 pub const LAUNCH_CONTRACT: &[LaunchClient] = &[
     LaunchClient {
         sub: "tui",
         bin: "agentd-tui",
         bin_env: "AGENTD_TUI_BIN",
-        argv: &[ENDPOINT_FLAG],
+        client_id: "agentd-tui",
+        argv: &[ENDPOINT_FLAG, LAUNCH_FD_FLAG],
     },
     LaunchClient {
         sub: "ui",
         bin: "agentd-ui",
         bin_env: "AGENTD_UI_BIN",
+        client_id: "agentd-ui",
         argv: &[ENDPOINT_FLAG, LISTEN_FD_FLAG],
     },
 ];
@@ -83,24 +97,25 @@ pub const LAUNCH_SESSION_TTL: std::time::Duration = std::time::Duration::from_se
 ///
 /// The display clients present no certificate and are signed in only from a
 /// loopback peer, so the listener must be one they can reach and be admitted
-/// to: http(s) on a fixed port, without `client_ca`, at a loopback host. The
-/// endpoint is `a2a.url` when set — what the card advertises, so an https
-/// certificate matches the name the client dials — else the concrete bind (a
-/// wildcard bind requires `a2a.url` anyway).
+/// to: http(s) on a fixed port, without `client_ca`, at a loopback host. Each
+/// of those is checked on its own, first, so the refusal names its cause.
+///
+/// The endpoint itself is [`configured_url`](super::auth::configured_url) —
+/// the URL the card advertises, so an https certificate matches the name the
+/// client dials — and never derived here a second way that could disagree.
 pub fn launch_endpoint(s: &crate::config::settings::Settings) -> Result<String, String> {
     let listen = s
         .a2a
         .listen
         .as_deref()
         .ok_or("the display client needs an A2A listener: a2a.listen is not set")?;
-    let crate::config::ServeTarget::Http { bind, tls } =
+    let crate::config::ServeTarget::Http { bind, .. } =
         crate::config::ServeTarget::parse(listen).map_err(|e| format!("a2a.listen: {e}"))?
     else {
         return Err(
             "a2a.listen is a unix socket, which the display clients cannot dial; add a loopback http(s) listener".into(),
         );
     };
-    let host = crate::config::serve_host_of(&bind);
     let port = bind.rsplit_once(':').map(|(_, p)| p).unwrap_or("");
     if port.is_empty() || port == "0" {
         return Err(
@@ -112,17 +127,12 @@ pub fn launch_endpoint(s: &crate::config::settings::Settings) -> Result<String, 
             "the listener requires client certificates (a2a.tls.client_ca) and the display clients present none".into(),
         );
     }
-    let endpoint = match &s.a2a.url {
-        Some(url) => url.trim_end_matches('/').to_string(),
-        None => {
-            let scheme = if tls { "https" } else { "http" };
-            if host.contains(':') {
-                format!("{scheme}://[{host}]:{port}")
-            } else {
-                format!("{scheme}://{host}:{port}")
-            }
-        }
-    };
+    let endpoint = super::auth::configured_url(s)
+        .ok_or(
+            "a2a.listen binds every interface, so it names no host a client can dial; set a2a.url to the loopback URL it answers at",
+        )?
+        .trim_end_matches('/')
+        .to_string();
     let endpoint_host = endpoint
         .split_once("://")
         .map(|(_, rest)| crate::config::serve_host_of(rest))
@@ -183,6 +193,29 @@ mod tests {
                 .contains("client_ca")
         );
         assert!(no(serde_json::json!({})).contains("a2a.listen"));
+        // A wildcard bind names no host: without a2a.url there is nothing to
+        // dial, and the refusal says what to set.
+        let wildcard = no(serde_json::json!({"listen": "https://0.0.0.0:9443"}));
+        assert!(wildcard.contains("a2a.url"), "{wildcard}");
+    }
+
+    /// The launcher dials exactly the URL the card advertises — one
+    /// derivation, so the two can never name different hosts.
+    #[test]
+    fn the_endpoint_is_the_configured_url() {
+        for a2a in [
+            serde_json::json!({"listen": "https://0.0.0.0:9443", "url": "https://localhost:9443/"}),
+            serde_json::json!({"listen": "http://127.0.0.1:8420"}),
+            serde_json::json!({"listen": "http://[::1]:8420"}),
+        ] {
+            let s = settings(a2a.clone());
+            let url = super::super::auth::configured_url(&s).expect("a URL");
+            assert_eq!(
+                launch_endpoint(&s).unwrap(),
+                url.trim_end_matches('/'),
+                "{a2a}"
+            );
+        }
     }
 
     #[test]

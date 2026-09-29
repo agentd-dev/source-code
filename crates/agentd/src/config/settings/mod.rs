@@ -7982,10 +7982,18 @@ pub fn help_text() -> String {
          \x20                            The daemon args load exactly as `agentd <args>` would:\n\
          \x20                            the launcher adds no setting (put a2a.events.enabled and\n\
          \x20                            a2a.introspection.enabled in the config). The client gets\n\
-         \x20                            only its endpoint, never a2a.bearer or a config secret;\n\
-         \x20                            it needs a loopback http(s) listener with a fixed port and\n\
-         \x20                            no client_ca, and each exits with the other. Daemon logs go\n\
-         \x20                            to --daemon-log (default $XDG_RUNTIME_DIR/agentd-<sub>-<pid>.log).\n\
+         \x20                            its endpoint and a single-use operator sign-in code (60 s),\n\
+         \x20                            never a2a.bearer or a config secret: the TUI on a pipe; the\n\
+         \x20                            web UI in a URL fragment, through a 0600 file handed to the\n\
+         \x20                            browser or, with --no-open, printed here. A ui code is bound\n\
+         \x20                            to the UI's origin: a page from an origin the listener does\n\
+         \x20                            not admit (Origin: null included) gets 403 and burns nothing;\n\
+         \x20                            an admitted but different origin gets invalid_grant and\n\
+         \x20                            burns it. A tab without the code shows a short code: type\n\
+         \x20                            it at this terminal to sign that tab in. It needs a loopback\n\
+         \x20                            http(s) listener with a fixed port and no client_ca, and\n\
+         \x20                            each exits with the other. Daemon logs go to --daemon-log\n\
+         \x20                            (default $XDG_RUNTIME_DIR/agentd-<sub>-<pid>.log).\n\
          \x20                            Anything else: run `agentd -c …`, then `agentd-<sub> --endpoint <url>`.\n\
          \nCONTROL:\n\
          \x20 -c, --config <PATH>        a settings file (repeatable; `=` form too; or AGENTD_CONFIG=a.yaml:b.yaml)\n\

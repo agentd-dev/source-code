@@ -3,8 +3,8 @@
 //!
 //! This is the single highest-leverage minimalism decision: one
 //! ~250-line module replaces the `ureq`/`url`→IDNA→ICU dependency tax. It
-//! carries the intelligence wire over TCP, TLS, unix sockets, and vsock
-//! alike — the transport is just the stream.
+//! carries the intelligence wire over TCP, TLS and unix sockets alike — the
+//! transport is just the stream.
 //!
 //! Two request paths: [`send`] buffers the whole response (the LLM/intelligence
 //! path), and [`send_streaming`] returns the status + headers plus a live reader

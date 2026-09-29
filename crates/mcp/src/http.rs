@@ -6,13 +6,14 @@
 //! message) or a `text/event-stream` (SSE) carrying one or more messages. A
 //! server-assigned `Mcp-Session-Id` (returned on `initialize`) is echoed on every
 //! subsequent request. Server→client notifications ride an optional long-lived
-//! `GET` SSE stream.
+//! `GET` SSE stream. Which headers the protocol needs beyond those — the
+//! negotiated `MCP-Protocol-Version` among them — is the SDK's to say: it hands
+//! them to [`HttpTransport::send`] per request.
 //!
-//! The transport is stream-agnostic (it reuses the hand-rolled [`net::http`]
-//! client): `https://` runs over TCP+TLS (optionally mutual TLS), `http://` over
-//! plain TCP (a local sidecar), `unix:` over a unix socket, and `vsock:` over
-//! AF_VSOCK. None of these spawns a process: the transport has no local exec
-//! surface, so a hostile server config cannot turn into command execution here.
+//! The transport reuses the hand-rolled [`net::http`] client: `https://` runs
+//! over TCP+TLS (optionally mutual TLS), `http://` over plain TCP (a local
+//! sidecar). Neither spawns a process: the transport has no local exec surface,
+//! so a hostile server config cannot turn into command execution here.
 
 use net::http::{self, SseEvent, Url};
 #[cfg(feature = "tls")]
@@ -33,39 +34,12 @@ pub enum McpEndpoint {
         path: String,
         host_header: String,
     },
-    /// `unix:/socket/path` — HTTP over a unix socket to a local sidecar.
-    Unix { socket: String, path: String },
-    /// `vsock:cid:port` — HTTP over AF_VSOCK to an enclave/microVM peer.
-    Vsock { cid: u32, port: u32, path: String },
 }
 
 impl McpEndpoint {
-    /// Parse a `--mcp name=<url>` endpoint. Accepts `https://`, `http://`,
-    /// `unix:/path`, and `vsock:cid:port`. For `unix:`/`vsock:` the HTTP request
-    /// path defaults to `/` (the sidecar routes); use `https://` for a specific
-    /// server path (e.g. `/mcp`).
+    /// Parse an MCP server's endpoint URL: `https://…` or `http://…`, with the
+    /// server's path (e.g. `/mcp`).
     pub fn parse(s: &str) -> Result<McpEndpoint, String> {
-        if let Some(sock) = s.strip_prefix("unix:") {
-            if sock.is_empty() {
-                return Err(format!("empty unix socket path: {s}"));
-            }
-            return Ok(McpEndpoint::Unix {
-                socket: sock.to_string(),
-                path: "/".to_string(),
-            });
-        }
-        if let Some(rest) = s.strip_prefix("vsock:") {
-            let (cid, port) = rest
-                .split_once(':')
-                .and_then(|(c, p)| Some((c.trim().parse().ok()?, p.trim().parse().ok()?)))
-                .ok_or_else(|| format!("bad vsock endpoint (want vsock:cid:port): {s}"))?;
-            return Ok(McpEndpoint::Vsock {
-                cid,
-                port,
-                path: "/".to_string(),
-            });
-        }
-        // http(s)
         let url = Url::parse(s)?;
         Ok(McpEndpoint::Tcp {
             tls: url.is_tls(),
@@ -81,23 +55,18 @@ impl McpEndpoint {
         match self {
             McpEndpoint::Tcp { tls: true, .. } => "https",
             McpEndpoint::Tcp { tls: false, .. } => "http",
-            McpEndpoint::Unix { .. } => "unix",
-            McpEndpoint::Vsock { .. } => "vsock",
         }
     }
 
     fn http_path(&self) -> &str {
         match self {
-            McpEndpoint::Tcp { path, .. }
-            | McpEndpoint::Unix { path, .. }
-            | McpEndpoint::Vsock { path, .. } => path,
+            McpEndpoint::Tcp { path, .. } => path,
         }
     }
 
     fn host_header(&self) -> &str {
         match self {
             McpEndpoint::Tcp { host_header, .. } => host_header,
-            McpEndpoint::Unix { .. } | McpEndpoint::Vsock { .. } => "localhost",
         }
     }
 }
@@ -107,11 +76,9 @@ impl McpEndpoint {
 pub enum HttpError {
     Connect(io::Error),
     Http(io::Error),
-    /// A non-2xx HTTP status, with the (capped) response body — carried so the
-    /// caller can classify a modern JSON-RPC error (era detection, `-32022`
-    /// version retry) from the body rather than just the status code.
-    Status(u16, Vec<u8>),
-    /// The build lacks the feature this endpoint needs (e.g. `vsock`).
+    /// A non-2xx HTTP status.
+    Status(u16),
+    /// The build lacks the feature this endpoint needs (e.g. `tls`).
     Unsupported(String),
     /// No JSON-RPC response matched the request id before the stream ended.
     NoResponse,
@@ -122,7 +89,7 @@ impl std::fmt::Display for HttpError {
         match self {
             HttpError::Connect(e) => write!(f, "mcp-http: connect: {e}"),
             HttpError::Http(e) => write!(f, "mcp-http: {e}"),
-            HttpError::Status(s, _) => write!(f, "mcp-http: server returned HTTP {s}"),
+            HttpError::Status(s) => write!(f, "mcp-http: server returned HTTP {s}"),
             HttpError::Unsupported(m) => write!(f, "mcp-http: {m}"),
             HttpError::NoResponse => write!(f, "mcp-http: no JSON-RPC response before stream end"),
         }
@@ -131,8 +98,7 @@ impl std::fmt::Display for HttpError {
 impl std::error::Error for HttpError {}
 
 /// The `Host` authority (host[:port]) of an MCP endpoint URL — the `@authority`
-/// AAuth signs over. `localhost` for non-TCP endpoints. Best-effort (a parse
-/// failure yields an empty string).
+/// AAuth signs over. Best-effort (a parse failure yields an empty string).
 pub fn authority_of(endpoint: &str) -> String {
     McpEndpoint::parse(endpoint)
         .map(|e| e.host_header().to_string())
@@ -215,11 +181,6 @@ pub struct HttpTransport {
     #[cfg(feature = "tls")]
     identity: Option<ClientIdentity>,
     session: Mutex<Option<String>>,
-    /// The protocol version negotiated at `initialize`, echoed on every later
-    /// request as `MCP-Protocol-Version`, which Streamable HTTP requires. `None`
-    /// until the client sets it, so the `initialize` request itself carries no
-    /// header — there is no agreed version to declare before the handshake.
-    protocol_version: Mutex<Option<String>>,
     /// An optional per-request AAuth signer. `None` = the endpoint is called
     /// unsigned (the default; static-bearer/mTLS auth is unaffected).
     signer: Option<std::sync::Arc<dyn RequestSigner>>,
@@ -233,7 +194,6 @@ impl HttpTransport {
             #[cfg(feature = "tls")]
             identity: None,
             session: Mutex::new(None),
-            protocol_version: Mutex::new(None),
             signer: None,
         }
     }
@@ -248,25 +208,6 @@ impl HttpTransport {
     #[cfg(feature = "tls")]
     pub fn set_identity(&mut self, identity: Option<ClientIdentity>) {
         self.identity = identity;
-    }
-
-    /// Record the negotiated protocol version, sent as `MCP-Protocol-Version` on
-    /// every subsequent request (called by the client after `initialize`/discovery).
-    pub fn set_protocol_version(&self, version: String) {
-        *self
-            .protocol_version
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(version);
-    }
-
-    /// Clear the negotiated version — the legacy `initialize` request must carry no
-    /// `MCP-Protocol-Version` header (nothing agreed yet), so this resets what a
-    /// prior modern probe set.
-    pub fn clear_protocol_version(&self) {
-        *self
-            .protocol_version
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     pub fn scheme(&self) -> &'static str {
@@ -297,27 +238,6 @@ impl HttpTransport {
                     }
                 } else {
                     Ok(Box::new(tcp))
-                }
-            }
-            McpEndpoint::Unix { socket, .. } => {
-                // `net::unixsock::connect` exists on every platform (a non-unix
-                // build returns an Unsupported error), matching the intel path.
-                let s = net::unixsock::connect(socket, timeout).map_err(HttpError::Connect)?;
-                Ok(Box::new(s))
-            }
-            McpEndpoint::Vsock { cid, port, .. } => {
-                #[cfg(feature = "vsock")]
-                {
-                    let s =
-                        net::vsock::connect(*cid, *port, timeout).map_err(HttpError::Connect)?;
-                    Ok(Box::new(s))
-                }
-                #[cfg(not(feature = "vsock"))]
-                {
-                    let _ = (cid, port);
-                    Err(HttpError::Unsupported(
-                        "vsock: MCP requires building with --features vsock".into(),
-                    ))
                 }
             }
         }
@@ -422,18 +342,8 @@ impl HttpTransport {
         if let Some(sid) = &session {
             headers.push(("Mcp-Session-Id", sid));
         }
-        // MCP-Protocol-Version on every post-initialize request (a Streamable HTTP
-        // MUST). `None` only before/at initialize, when no version is agreed yet.
-        let protocol = self
-            .protocol_version
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        if let Some(v) = &protocol {
-            headers.push(("MCP-Protocol-Version", v));
-        }
-        // Caller-supplied per-request headers (the modern era's Mcp-Method /
-        // Mcp-Name routing headers).
+        // Caller-supplied per-request headers: what the SDK says this request
+        // needs, the negotiated `MCP-Protocol-Version` among them.
         for (k, v) in extra_headers {
             headers.push((k, v));
         }
@@ -491,10 +401,7 @@ impl HttpTransport {
         }
 
         if !resp.is_success() {
-            // Capture the body so the caller can classify a modern JSON-RPC error.
-            let status = resp.status;
-            let body = resp.into_body().unwrap_or_default();
-            return Ok(SendOutcome::Error(HttpError::Status(status, body)));
+            return Ok(SendOutcome::Error(HttpError::Status(resp.status)));
         }
 
         // A notification POST is acknowledged with an empty body (often 202).
@@ -543,16 +450,6 @@ impl HttpTransport {
         if let Some(sid) = &session {
             headers.push(("Mcp-Session-Id", sid));
         }
-        // The notification stream is opened post-initialize (from subscribe), so
-        // the negotiated version is always known here (Streamable HTTP MUST).
-        let protocol = self
-            .protocol_version
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        if let Some(v) = &protocol {
-            headers.push(("MCP-Protocol-Version", v));
-        }
         for (k, v) in &self.headers {
             headers.push((k.as_str(), v.as_str()));
         }
@@ -576,72 +473,11 @@ impl HttpTransport {
         )
         .map_err(HttpError::Http)?;
         if !resp.is_success() {
-            let status = resp.status;
-            let body = resp.into_body().unwrap_or_default();
-            return Err(HttpError::Status(status, body));
+            return Err(HttpError::Status(resp.status));
         }
         if !resp.is_event_stream() {
             return Err(HttpError::Unsupported(
                 "server has no GET SSE notification stream".into(),
-            ));
-        }
-        Ok(resp.sse())
-    }
-
-    /// Open the MODERN long-lived notification stream via a `subscriptions/listen`
-    /// POST. The modern era has no GET stream, so this response IS the push
-    /// channel. `body` is the full pre-built JSON-RPC request (its `_meta`
-    /// already injected); `routing`
-    /// are the Mcp-Method/Mcp-Name headers. The server answers with an SSE stream
-    /// that stays open, carrying the opted-in notifications; returns its reader.
-    pub fn open_listen(
-        &self,
-        read_timeout: Duration,
-        body: &[u8],
-        routing: &[(&str, &str)],
-    ) -> Result<EventStream, HttpError> {
-        let stream = self.connect(read_timeout)?;
-        let mut headers: Vec<(&str, &str)> = vec![
-            ("Content-Type", "application/json"),
-            ("Accept", "text/event-stream"),
-        ];
-        let protocol = self
-            .protocol_version
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        if let Some(v) = &protocol {
-            headers.push(("MCP-Protocol-Version", v));
-        }
-        for (k, v) in routing {
-            headers.push((k, v));
-        }
-        for (k, v) in &self.headers {
-            headers.push((k.as_str(), v.as_str()));
-        }
-        // Signed like any other POST: the modern era's listen stream IS the
-        // notification channel, so an unsigned dial loses reactivity the same way.
-        let signed = self.auth_headers("POST", body);
-        for (k, v) in &signed {
-            headers.push((k.as_str(), v.as_str()));
-        }
-        let resp = http::send_streaming(
-            stream,
-            self.endpoint.host_header(),
-            "POST",
-            self.endpoint.http_path(),
-            &headers,
-            body,
-        )
-        .map_err(HttpError::Http)?;
-        if !resp.is_success() {
-            let status = resp.status;
-            let body = resp.into_body().unwrap_or_default();
-            return Err(HttpError::Status(status, body));
-        }
-        if !resp.is_event_stream() {
-            return Err(HttpError::Unsupported(
-                "subscriptions/listen did not return an SSE stream".into(),
             ));
         }
         Ok(resp.sse())
@@ -681,47 +517,26 @@ mod tests {
         assert_eq!(e.scheme(), "https");
         assert_eq!(e.http_path(), "/mcp");
         assert_eq!(e.host_header(), "mcp.example.com");
-        match e {
-            McpEndpoint::Tcp {
-                host, port, tls, ..
-            } => {
-                assert_eq!(host, "mcp.example.com");
-                assert_eq!(port, 443);
-                assert!(tls);
-            }
-            _ => panic!("expected Tcp"),
-        }
+        let McpEndpoint::Tcp {
+            host, port, tls, ..
+        } = e;
+        assert_eq!(host, "mcp.example.com");
+        assert_eq!(port, 443);
+        assert!(tls);
     }
 
     #[test]
-    fn parse_http_unix_vsock() {
-        assert_eq!(
-            McpEndpoint::parse("http://localhost:8080/mcp")
-                .unwrap()
-                .scheme(),
-            "http"
-        );
-        let u = McpEndpoint::parse("unix:/run/fs.sock").unwrap();
-        assert_eq!(u.scheme(), "unix");
-        assert_eq!(u.host_header(), "localhost");
-        assert_eq!(u.http_path(), "/");
-        let v = McpEndpoint::parse("vsock:3:5000").unwrap();
-        assert_eq!(v.scheme(), "vsock");
-        assert!(matches!(
-            v,
-            McpEndpoint::Vsock {
-                cid: 3,
-                port: 5000,
-                ..
-            }
-        ));
+    fn parse_http_endpoint() {
+        let e = McpEndpoint::parse("http://localhost:8080/mcp").unwrap();
+        assert_eq!(e.scheme(), "http");
+        assert_eq!(e.host_header(), "localhost:8080");
+        assert_eq!(e.http_path(), "/mcp");
     }
 
     #[test]
     fn parse_rejects_bad_endpoints() {
-        assert!(McpEndpoint::parse("unix:").is_err());
-        assert!(McpEndpoint::parse("vsock:nope").is_err());
         assert!(McpEndpoint::parse("ftp://x/").is_err());
+        assert!(McpEndpoint::parse("not-a-url").is_err());
     }
 
     #[test]

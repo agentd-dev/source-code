@@ -3,7 +3,7 @@
 The transport layer [agentd](https://agentd.dev) is built on, published
 separately because it is useful on its own: a blocking HTTP/1.1 client and SSE
 reader written against `Read + Write`, so the same request path works over TCP,
-TLS, a unix socket or AF_VSOCK with no branch.
+TLS or a unix socket with no branch.
 
 ```rust
 use agentd_net::http::{connect_tcp, send, Url};
@@ -33,7 +33,6 @@ assert!(resp.is_success());
 - **X.509 field extraction** — a dependency-free DER walk lifting the subject CN
   and SANs from a verified leaf, so a SPIFFE `spiffe://` URI SAN reaches your
   own authorization rules.
-- **AF_VSOCK** (feature `vsock`) — enclave and microVM transport.
 
 ## Scope
 

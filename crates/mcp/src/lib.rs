@@ -1,38 +1,28 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! **mcp** — the Model Context Protocol base library.
+//! **mcp** — agentd's Model Context Protocol client layer.
 //!
-//! A reusable, agentd-independent core for speaking MCP across every protocol
-//! revision. Two protocol **eras** coexist (see [`version`]):
+//! A blocking facade over the official `rmcp` SDK ([`client`], [`rmcp_client`]),
+//! run over agentd's own credentialed Streamable-HTTP socket ([`http`],
+//! [`rmcp_transport`]): the SDK owns the protocol — the handshake, the version
+//! negotiation, the typed requests and notifications — and agentd keeps the
+//! connection, so a request signer and an mTLS client identity apply to every
+//! dial. [`wire`] holds agentd's own view of the message types,
+//! [`inbound`] the host seam for server→client elicitation, and [`rpc`] the
+//! JSON-RPC codec agentd's other channels share.
 //!
-//! * **Legacy** (`2025-11-25` and earlier): an `initialize` handshake establishes
-//!   a session; the negotiated version + capabilities are learned once, and
-//!   server→client messages ride a session-scoped SSE stream.
-//! * **Modern** (`2026-07-28`+, "stateless"): no handshake and no session — every
-//!   request carries its protocol version, client identity, and capabilities in
-//!   `_meta` (mirrored to `MCP-Protocol-Version` / `Mcp-Method` / `Mcp-Name`
-//!   headers on Streamable HTTP), any request can hit any server instance, and
-//!   long-lived notifications ride a `subscriptions/listen` response stream.
-//!
-//! This crate keeps that era logic in one place so a client or server built on it
-//! can be **dual-era** without branching everywhere. [`wire`] holds the message
-//! types and [`version`] the era model; the [`client`], [`http`] transport, and
-//! [`server`] base build on them.
+//! [`http_server`] is a raw HTTP/1.1 listener (TLS-terminated, `Origin`-guarded)
+//! for embedders that serve plain HTTP, such as agentd's webhook listener. It
+//! serves no MCP.
 //!
 //! Dependencies: the official `rmcp` SDK and the async seam it needs, over
-//! agentd's own `net` transport — plus serde/serde_json, and `vsock` only when
-//! the `vsock` feature asks the server to listen on one. (The header in
-//! `Cargo.toml` says the same thing; this copy said "serde + serde_json only",
-//! which stopped being true when the SDK was adopted.)
+//! agentd's own `net` transport — plus serde/serde_json.
 
 pub mod client;
 pub mod http;
 pub mod http_server;
 pub mod inbound;
-pub mod modern;
 pub mod rmcp_client;
 /// agentd's credentialed socket under the SDK's transport trait.
 pub mod rmcp_transport;
 pub mod rpc;
-pub mod server;
-pub mod version;
 pub mod wire;

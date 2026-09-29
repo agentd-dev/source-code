@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Shared JSON-RPC 2.0 codec.
 //!
-//! One set of wire types serves three surfaces: the MCP client (to external
-//! servers), the self-MCP server, and the private supervisor↔subagent
-//! control channel. They differ only in *framing* (see [`frame`]): MCP stdio
-//! is newline-delimited; the control channel is length-prefixed.
+//! One set of wire types serves agentd's JSON-RPC surfaces — the private
+//! supervisor↔subagent control channel (length-prefixed, see [`frame`]), the
+//! A2A client's envelopes, and the notifications the MCP client queues for its
+//! host.
 //!
 //! Keeping every wire type behind `serde` in this one module is deliberate: it
 //! is the single isolation point from which the codec could be swapped to a
@@ -167,8 +167,6 @@ pub const INVALID_REQUEST: i64 = -32600;
 pub const METHOD_NOT_FOUND: i64 = -32601;
 pub const INVALID_PARAMS: i64 = -32602;
 pub const INTERNAL_ERROR: i64 = -32603;
-/// MCP server-defined: a `resources/read` for a URI the server doesn't have.
-pub const RESOURCE_NOT_FOUND: i64 = -32002;
 
 #[cfg(test)]
 mod tests {

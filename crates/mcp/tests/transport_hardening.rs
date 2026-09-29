@@ -2,27 +2,27 @@
 //! Transport hardening: the three places where a stream, not a request, is the
 //! thing that has to be right.
 //!
-//! * The server→client notification stream is a DIAL like any other, and a
-//!   signed server rejects an unsigned one — silently, from the daemon's point
-//!   of view, because nothing fails except the waking up.
+//! * The server→client notification stream (the `GET` dial) is a DIAL like any
+//!   other, and a signed server rejects an unsigned one — silently, from the
+//!   daemon's point of view, because nothing fails except the waking up.
 //! * A server may interleave a request of its own on the response stream of a
 //!   POST and block until it is answered. Frames that are collected and handed
 //!   over afterwards arrive after the server gave up.
-//! * The inbound reader parses a request head before anyone has authenticated,
-//!   so its bounds are the only thing between a remote peer and our memory.
+//! * The raw listener's reader parses a request head before anyone has
+//!   authenticated, so its bounds are the only thing between a remote peer and
+//!   our memory.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use mcp::http::{HttpTransport, McpEndpoint, RequestSigner};
-use mcp::http_server::{AllowAll, HttpAcceptor, bind_tcp, spawn_accept_http};
+use mcp::http_server::{
+    HttpAcceptor, RawHandler, RawRequest, RawResponse, bind_tcp, spawn_accept_raw,
+};
 use mcp::inbound::{Answer, Handler as InboundHandler, Inbound};
 use mcp::rmcp_client::RmcpBuilder;
-use mcp::rpc::{Request, Response};
-use mcp::server::{Handler, PeerOrigin, SharedWriter, SubRegistry};
 use serde_json::{Value, json};
 
 // ---------------------------------------------------------------- shared bits
@@ -140,22 +140,12 @@ fn the_notification_stream_dial_carries_the_request_signature() {
     let signer: Arc<dyn RequestSigner> = Arc::new(StubSigner);
     let t = HttpTransport::new(McpEndpoint::parse(&ep).unwrap(), vec![])
         .with_signer(Some(Arc::clone(&signer)));
-    t.set_protocol_version("2025-11-25".to_string());
 
-    // The legacy era's long-lived GET stream.
     t.open_events(Duration::from_secs(5))
         .expect("the stub answers with an event stream");
-    // …and the modern era's `subscriptions/listen` stream, which replaces it.
-    let listen = br#"{"jsonrpc":"2.0","id":1,"method":"subscriptions/listen","params":{}}"#;
-    t.open_listen(
-        Duration::from_secs(5),
-        listen,
-        &[("Mcp-Method", "subscriptions/listen")],
-    )
-    .expect("the stub answers with an event stream");
 
     let dials = seen.lock().unwrap().clone();
-    assert_eq!(dials.len(), 2, "two dials expected: {dials:?}");
+    assert_eq!(dials.len(), 1, "one dial expected: {dials:?}");
 
     let authority = ep
         .trim_start_matches("http://")
@@ -176,14 +166,6 @@ fn the_notification_stream_dial_carries_the_request_signature() {
         header(headers, "aauth-capabilities"),
         Some("interaction"),
         "the capabilities advert rides the dial too: {headers:?}"
-    );
-
-    let (line, headers) = &dials[1];
-    assert!(line.starts_with("POST "), "{line}");
-    let sig = header(headers, "signature").unwrap_or_default();
-    assert!(
-        sig.starts_with("sig1=:POST ") && sig.ends_with(&format!(" {}:", listen.len())),
-        "the listen dial must be signed as a POST over its body: {sig}"
     );
 }
 
@@ -332,7 +314,7 @@ fn a_request_interleaved_on_a_post_stream_is_answered_not_buffered() {
         .expect("connect");
 
     let out = client
-        .call_tool("ask", Some(json!({})))
+        .call_tool_with_meta("ask", Some(json!({})), None)
         .expect("tools/call must complete — the server is waiting on our answer");
     assert_eq!(
         out["content"][0]["text"], "answered",
@@ -342,7 +324,7 @@ fn a_request_interleaved_on_a_post_stream_is_answered_not_buffered() {
     // The answer is a JSON-RPC RESPONSE, which the server acks `202` with no
     // body — a transport that waited for a reply to it would fail that send.
     let again = client
-        .call_tool("ask", Some(json!({})))
+        .call_tool_with_meta("ask", Some(json!({})), None)
         .expect("the session survives having answered");
     assert_eq!(again["content"][0]["text"], "answered", "{again}");
 
@@ -364,25 +346,21 @@ fn a_request_interleaved_on_a_post_stream_is_answered_not_buffered() {
 
 // ------------------------------------- 3. the inbound head reader is bounded
 
-/// The smallest handler that answers a tool call.
+/// The smallest handler that answers a request.
 struct Trivial;
-impl Handler for Trivial {
-    fn dispatch(&self, req: Request, _o: PeerOrigin, _w: &SharedWriter, _c: u64) -> Response {
-        Response::ok(req.id, json!({"ok": true}))
+impl RawHandler for Trivial {
+    fn handle(&self, _req: &RawRequest) -> RawResponse {
+        RawResponse::json(200, "OK", br#"{"ok":true}"#.to_vec())
     }
 }
 
 fn spawn_bounded_server() -> String {
-    let subs: SubRegistry = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let listener = bind_tcp("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
-    spawn_accept_http(
+    spawn_accept_raw(
         listener,
         Arc::new(HttpAcceptor::Plain),
         Arc::new(Trivial),
-        Arc::new(AllowAll),
-        subs,
-        Arc::new(AtomicU64::new(0)),
         Duration::from_secs(5),
     )
     .unwrap();
@@ -414,7 +392,7 @@ fn an_oversized_request_head_is_refused_431() {
     // EXACTLY: the reader stops one byte past the budget, and a server that
     // closes with bytes still unread resets the connection, which would destroy
     // the 431 before the client could read it.
-    let line = "POST /mcp HTTP/1.1\r\n";
+    let line = "POST /hook HTTP/1.1\r\n";
     let filler = 64 * 1024 - line.len() - "X-Huge: ".len() + 1;
     let mut req = Vec::from(line);
     req.extend_from_slice(b"X-Huge: ");
@@ -430,9 +408,9 @@ fn an_oversized_request_head_is_refused_431() {
     assert_eq!(status_of(&addr, &req), 431, "an unbounded header count");
 
     // …and an ordinary request is untouched by either bound.
-    let call = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{}}"#;
+    let call = r#"{"event":"push"}"#;
     let ok = format!(
-        "POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{call}",
+        "POST /hook HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{call}",
         call.len()
     );
     assert_eq!(status_of(&addr, ok.as_bytes()), 200);

@@ -9,7 +9,7 @@
 //! rmcp's own reqwest client has no notion of: an AAuth request signature
 //! (RFC 9421) with its challenge/re-sign loop, an AWS SigV4 signature computed
 //! per request, an mTLS client identity presented during the handshake, an OAuth
-//! token refreshed when it expires, and an SSRF guard on every dial. Adopting
+//! token refreshed when it expires. Adopting
 //! the SDK's transport wholesale would mean dropping all of that to gain a
 //! protocol implementation we can have anyway — so the SDK plugs into our
 //! socket rather than replacing it.
@@ -172,15 +172,10 @@ impl StreamableHttpClient for AgentdHttp {
     async fn delete_session(
         &self,
         _uri: Arc<str>,
-        session_id: Arc<str>,
-        auth_header: Option<String>,
-        custom_headers: HashMap<http::HeaderName, http::HeaderValue>,
+        _session_id: Arc<str>,
+        _auth_header: Option<String>,
+        _custom_headers: HashMap<http::HeaderName, http::HeaderValue>,
     ) -> Result<(), StreamableHttpError<Self::Error>> {
-        let http = Arc::clone(&self.http);
-        let timeout = self.timeout;
-        let extra = header_pairs(auth_header, custom_headers);
-        let sid = session_id.to_string();
-        let _ = (http, timeout, extra, sid);
         // agentd's transport ends a session by dropping the connection; there is
         // no separate DELETE to make, and a server that keeps a session it will
         // never hear from again ages it out.

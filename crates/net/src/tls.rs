@@ -72,10 +72,9 @@ pub fn extra_ca_count() -> usize {
 }
 
 /// Side-effect-free content check for a CA PEM bundle (parseable + every cert
-/// addable as a trust anchor) — the `--validate-config` half of
-/// [`install_extra_ca`], which performs exactly this before installing.
-/// Returns the anchor count.
-pub fn validate_ca_pem(ca_pem: &[u8]) -> io::Result<usize> {
+/// addable as a trust anchor), which [`install_extra_ca`] runs before
+/// installing anything. Returns the anchor count.
+fn validate_ca_pem(ca_pem: &[u8]) -> io::Result<usize> {
     roots_from_pem(ca_pem).map(|r| r.len())
 }
 

@@ -1,20 +1,23 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! MCP wire types — the Model Context Protocol message surface, shared by the
-//! client and the served-MCP side.
+//! MCP wire types — agentd's own view of the Model Context Protocol results the
+//! client hands its host. The SDK's typed results are converted into these
+//! through JSON (see [`crate::rmcp_client`]), so agentd's call sites never name
+//! an `rmcp` type.
 //!
 //! Method/notification names are constants (typos become compile errors).
-//! Result/param structs use `camelCase` to match the spec. `content[]` and
+//! Result structs use `camelCase` to match the spec. `content[]` and
 //! resource `contents[]` are kept as `Vec<Value>` with text-extraction helpers
 //! rather than a brittle tagged enum, so an unknown content type from a newer
 //! server is preserved, not a parse error (forward-compat).
-//!
-//! The protocol version + era model lives in [`crate::version`]; it is re-exported
-//! here so `mcp::wire::{PROTOCOL_VERSION, negotiate_version, …}` resolves.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub use crate::version::*;
+/// The MCP revision rmcp advertises (`ProtocolVersion::LATEST`) and agentd's
+/// mock server answers — MCP 2025-11-25 basic/lifecycle. The SDK negotiates the
+/// revision on every real connection; this is only the one agentd's own test
+/// server speaks, pinned to rmcp's by `tests/rmcp_backend.rs`.
+pub const PROTOCOL_VERSION: &str = "2025-11-25";
 
 /// Method + notification names. Constants, so a typo is a compile error rather
 /// than a `-32601` at runtime.
@@ -34,26 +37,10 @@ pub mod method {
     pub const COMPLETION_COMPLETE: &str = "completion/complete";
     pub const LOGGING_SET_LEVEL: &str = "logging/setLevel";
 
-    // Tasks extension (io.modelcontextprotocol/tasks): async long-running requests.
-    pub const TASKS_GET: &str = "tasks/get";
-    pub const TASKS_UPDATE: &str = "tasks/update";
-    pub const TASKS_CANCEL: &str = "tasks/cancel";
-    pub const NOTIFY_TASKS: &str = "notifications/tasks";
-
-    // Modern (2026-07-28+, stateless) methods.
-    /// Query a server's supported versions + capabilities + identity in one call
-    /// (the stateless replacement for the `initialize` capability exchange).
-    pub const SERVER_DISCOVER: &str = "server/discover";
-    /// Open the long-lived notification stream (its SSE response carries the
-    /// change notifications the client opted in to — the stateless replacement
-    /// for the removed GET SSE stream).
-    pub const SUBSCRIPTIONS_LISTEN: &str = "subscriptions/listen";
-
     // Notifications (no id, no response).
     pub const NOTIFY_RESOURCES_UPDATED: &str = "notifications/resources/updated";
     pub const NOTIFY_RESOURCES_LIST_CHANGED: &str = "notifications/resources/list_changed";
     pub const NOTIFY_TOOLS_LIST_CHANGED: &str = "notifications/tools/list_changed";
-    pub const NOTIFY_SUBSCRIPTIONS_ACK: &str = "notifications/subscriptions/acknowledged";
     pub const NOTIFY_CANCELLED: &str = "notifications/cancelled";
     pub const NOTIFY_PROGRESS: &str = "notifications/progress";
     pub const NOTIFY_MESSAGE: &str = "notifications/message";
@@ -67,65 +54,6 @@ pub struct Implementation {
     pub version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
-}
-
-/// Capabilities a client declares. Only declare what the client can actually
-/// service: a server is entitled to call anything advertised here, and a
-/// declared-but-unanswerable capability strands it waiting on a reply.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ClientCapabilities {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub experimental: Option<Value>,
-    /// `{}` when this client can deliver a server's `elicitation/create` to a
-    /// human. Omitted otherwise — a server must not ask what we cannot answer.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub elicitation: Option<Value>,
-    /// `{"listChanged": bool}` when this client answers `roots/list`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub roots: Option<Value>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct InitializeParams {
-    pub protocol_version: String,
-    pub capabilities: ClientCapabilities,
-    pub client_info: Implementation,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct InitializeResult {
-    pub protocol_version: String,
-    #[serde(default)]
-    pub capabilities: ServerCapabilities,
-    #[serde(default)]
-    pub server_info: Option<Implementation>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub instructions: Option<String>,
-}
-
-/// Result of `server/discover` (modern era): the server's supported protocol
-/// versions, capabilities, and identity in a single call — the stateless
-/// replacement for the legacy `initialize` capability exchange. `resultType` and
-/// the caching fields (`ttlMs`/`cacheScope`) are carried for forward-compat.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DiscoverResult {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub result_type: Option<String>,
-    #[serde(default)]
-    pub supported_versions: Vec<String>,
-    #[serde(default)]
-    pub capabilities: ServerCapabilities,
-    #[serde(default)]
-    pub server_info: Option<Implementation>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub instructions: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ttl_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_scope: Option<String>,
 }
 
 /// What a server says it can do. Every call is gated on these, and the gate is
@@ -199,21 +127,6 @@ pub struct Tool {
     pub output_schema: Option<Value>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ListToolsResult {
-    pub tools: Vec<Tool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next_cursor: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CallToolParams {
-    pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub arguments: Option<Value>,
-}
-
 /// Result of `tools/call`. `is_error: true` is a **tool-domain** failure (fed
 /// to the model as an observation so it can adapt), distinct from a JSON-RPC
 /// transport error, which fails the call outright.
@@ -257,19 +170,6 @@ pub struct Resource {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ListResourcesResult {
-    pub resources: Vec<Resource>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next_cursor: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReadResourceParams {
-    pub uri: String,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReadResourceResult {
     /// Each entry is a `{uri, mimeType, text}` or `{uri, mimeType, blob}`
     /// object; kept as `Value` for forward-compat. Use [`Self::text`].
@@ -297,86 +197,6 @@ pub struct ResourceTemplate {
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ListResourceTemplatesResult {
-    pub resource_templates: Vec<ResourceTemplate>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next_cursor: Option<String>,
-}
-
-/// `resources/subscribe` / `resources/unsubscribe` params. Per-URI only: a
-/// subscription names one concrete resource, never a [`ResourceTemplate`], since
-/// a template matches an open-ended set with no item to watch.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SubscribeParams {
-    pub uri: String,
-}
-
-/// Payload of `notifications/resources/updated` — **URI only**, never a diff.
-/// The notification is a wake-up, not the data: the reader re-reads the URI on
-/// wake, so a burst of updates collapses into one read of the current state and
-/// a missed notification costs freshness, not correctness.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResourceUpdatedParams {
-    pub uri: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
-}
-
-// ---- tasks extension (io.modelcontextprotocol/tasks) ----
-
-/// The tasks extension identifier — advertised in `capabilities.extensions` to
-/// opt into task-augmented (async long-running) requests.
-pub const TASKS_EXTENSION: &str = "io.modelcontextprotocol/tasks";
-
-/// A durable async-task handle (the tasks extension). A supported request (e.g.
-/// `tools/call`) may return one (`resultType: "task"`) instead of blocking; the
-/// client polls [`method::TASKS_GET`] until a terminal `status`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Task {
-    pub task_id: String,
-    /// `working` | `input_required` | `completed` | `failed` | `cancelled`.
-    #[serde(default)]
-    pub status: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status_message: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ttl_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub poll_interval_ms: Option<u64>,
-    /// On `completed`: what the original request would have returned.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub result: Option<Value>,
-    /// On `failed`: the JSON-RPC error.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<Value>,
-    /// On `input_required`: the server's outstanding input requests (MRTR).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub input_requests: Option<Value>,
-}
-
-impl Task {
-    /// A terminal status (`completed`/`failed`/`cancelled`) — polling stops.
-    pub fn is_terminal(&self) -> bool {
-        matches!(self.status.as_str(), "completed" | "failed" | "cancelled")
-    }
-    pub fn needs_input(&self) -> bool {
-        self.status == "input_required"
-    }
-}
-
-/// If a result value is a task handle (`resultType: "task"`), parse it — the
-/// polymorphic shape a task-augmented request returns instead of its normal result.
-pub fn as_task_result(result: &Value) -> Option<Task> {
-    if result.get("resultType").and_then(Value::as_str) == Some("task") {
-        serde_json::from_value(result.clone()).ok()
-    } else {
-        None
-    }
 }
 
 // ---- prompts ----
@@ -407,22 +227,6 @@ pub struct PromptArgument {
     pub required: Option<bool>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ListPromptsResult {
-    pub prompts: Vec<Prompt>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next_cursor: Option<String>,
-}
-
-/// `prompts/get` params — the template name + its argument fills (all strings).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GetPromptParams {
-    pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub arguments: Option<Value>,
-}
-
 /// `prompts/get` result — the rendered messages. `messages[]` is kept as
 /// `Vec<Value>` (each `{role, content}`) for forward-compat with content types.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -434,19 +238,6 @@ pub struct GetPromptResult {
 }
 
 // ---- completion ----
-
-/// `completion/complete` params: what to complete (a `ref` to a prompt or
-/// resource template) and the argument being typed. Kept as `Value` — the `ref`
-/// shape varies by target and revision (forward-compat).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CompleteParams {
-    #[serde(rename = "ref")]
-    pub reference: Value,
-    pub argument: Value,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context: Option<Value>,
-}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CompleteResult {
@@ -487,19 +278,14 @@ fn content_text(items: &[Value]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
-    fn initialize_result_parses_capabilities() {
-        let json = r#"{
-            "protocolVersion": "2025-11-25",
-            "capabilities": {"tools": {"listChanged": true}, "resources": {"subscribe": true}},
-            "serverInfo": {"name": "fs", "version": "1.0"}
-        }"#;
-        let r: InitializeResult = serde_json::from_str(json).unwrap();
-        assert_eq!(r.protocol_version, "2025-11-25");
-        assert!(r.capabilities.supports_tools());
-        assert!(r.capabilities.supports_subscribe());
+    fn server_capabilities_parse_from_the_handshake_shape() {
+        let json = r#"{"tools": {"listChanged": true}, "resources": {"subscribe": true}}"#;
+        let caps: ServerCapabilities = serde_json::from_str(json).unwrap();
+        assert!(caps.supports_tools());
+        assert!(caps.supports_subscribe());
+        assert_eq!(caps.tools.unwrap().list_changed, Some(true));
     }
 
     #[test]
@@ -524,71 +310,14 @@ mod tests {
     }
 
     #[test]
-    fn updated_notification_is_uri_only() {
-        let json = r#"{"uri": "file:///data/in.json"}"#;
-        let p: ResourceUpdatedParams = serde_json::from_str(json).unwrap();
-        assert_eq!(p.uri, "file:///data/in.json");
-        assert!(p.title.is_none());
-    }
-
-    #[test]
-    fn tool_list_pagination_cursor() {
-        let json = r#"{"tools": [{"name": "read_file", "inputSchema": {"type": "object"}}], "nextCursor": "abc"}"#;
-        let r: ListToolsResult = serde_json::from_str(json).unwrap();
-        assert_eq!(r.tools.len(), 1);
-        assert_eq!(r.next_cursor.as_deref(), Some("abc"));
-    }
-
-    #[test]
-    fn discover_result_parses() {
-        let json = r#"{
-            "resultType": "complete",
-            "supportedVersions": ["2026-07-28", "2025-11-25"],
-            "capabilities": {"tools": {}, "resources": {"subscribe": true}, "prompts": {}},
-            "serverInfo": {"name": "s", "version": "1"},
-            "ttlMs": 3600000, "cacheScope": "public"
-        }"#;
-        let d: DiscoverResult = serde_json::from_str(json).unwrap();
-        assert_eq!(d.supported_versions, ["2026-07-28", "2025-11-25"]);
-        assert!(d.capabilities.supports_tools());
-        assert!(d.capabilities.supports_subscribe());
-        assert!(d.capabilities.supports_prompts());
-        assert_eq!(d.ttl_ms, Some(3_600_000));
-    }
-
-    #[test]
-    fn task_result_detected_and_lifecycle() {
-        // A tools/call result that is actually a task handle.
-        let create = json!({"resultType": "task", "taskId": "t-1", "status": "working",
-            "pollIntervalMs": 250, "ttlMs": 60000});
-        let t = as_task_result(&create).expect("is a task result");
-        assert_eq!(t.task_id, "t-1");
-        assert_eq!(t.poll_interval_ms, Some(250));
-        assert!(!t.is_terminal());
-        // A normal (non-task) result is not a task.
-        assert!(as_task_result(&json!({"content": []})).is_none());
-        // Terminal / input states.
-        let done: Task = serde_json::from_value(
-            json!({"taskId": "t-1", "status": "completed", "result": {"content": []}}),
-        )
-        .unwrap();
-        assert!(done.is_terminal() && !done.needs_input());
-        let ask: Task = serde_json::from_value(
-            json!({"taskId": "t-1", "status": "input_required", "inputRequests": {}}),
-        )
-        .unwrap();
-        assert!(ask.needs_input() && !ask.is_terminal());
-    }
-
-    #[test]
     fn prompts_and_completion_parse() {
-        let list: ListPromptsResult = serde_json::from_str(
-            r#"{"prompts": [{"name": "greet", "arguments": [{"name": "who", "required": true}]}]}"#,
+        let prompt: Prompt = serde_json::from_str(
+            r#"{"name": "greet", "arguments": [{"name": "who", "required": true}]}"#,
         )
         .unwrap();
-        assert_eq!(list.prompts[0].name, "greet");
-        assert_eq!(list.prompts[0].arguments[0].name, "who");
-        assert_eq!(list.prompts[0].arguments[0].required, Some(true));
+        assert_eq!(prompt.name, "greet");
+        assert_eq!(prompt.arguments[0].name, "who");
+        assert_eq!(prompt.arguments[0].required, Some(true));
 
         let got: GetPromptResult = serde_json::from_str(
             r#"{"description": "d", "messages": [{"role": "user", "content": {"type": "text", "text": "hi"}}]}"#,

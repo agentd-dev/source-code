@@ -3,7 +3,7 @@
 //! agentd's intel client. One blocking HTTP/1.1 client over any `Read + Write`
 //! (the single highest-leverage minimalism decision — avoids the url→IDNA→ICU and
 //! async-runtime taxes) with buffered + streaming/SSE request paths, plus
-//! unix-socket and the feature-gated tls/vsock connects, and an SSRF egress
+//! unix-socket and the feature-gated tls connects, and an SSRF egress
 //! classifier. Deliberately serde-free: nothing here parses a payload, so the
 //! transport layer adds no deserialization attack surface.
 
@@ -19,6 +19,3 @@ pub mod tls;
 // TLS; pure DER parsing, no new dependency.
 #[cfg(feature = "tls")]
 pub mod x509;
-
-#[cfg(feature = "vsock")]
-pub mod vsock;

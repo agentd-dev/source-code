@@ -47,10 +47,11 @@ let out = mcp.call_tool("list_issues", None)?;
 - **Notifications reach you** — `resources/updated` and the list-changed family
   land in a queue you drain, which is what makes a subscribe-and-react daemon
   possible.
-- **The version/era model** — the legacy and stateless revisions, and which
-  subscription mechanism each defines.
-- **A JSON-RPC codec and an HTTP server framework**, used by agentd's own
-  listeners.
+- **Subscriptions by the negotiated revision** — `resources/subscribe` up to
+  2025-11-25, `subscriptions/listen` from 2026-07-28 on, decided from the
+  revision rmcp negotiated rather than one this crate picks.
+- **A JSON-RPC codec and a raw HTTP listener**, used by agentd's subagent
+  channel and webhook listener.
 
 ## Scope
 

@@ -2,18 +2,17 @@
 //! The **official SDK**, wrapped so the rest of agentd stays blocking.
 //!
 //! [`rmcp`] — the Rust SDK maintained alongside the protocol — owns the
-//! handshake and the core operations (tools, resources, subscriptions), so
-//! spec-tracking for those is inherited rather than hand-maintained. The
-//! hand-rolled client in [`crate::client`] still serves the surface the SDK does
-//! not cover (prompts, completion, resource templates, ping, the tasks
-//! extension) over the same socket.
+//! handshake and every operation (tools, resources, prompts, completion,
+//! subscriptions), so spec-tracking is inherited rather than hand-maintained.
+//! [`crate::client::McpClient`] is the builder agentd holds; this is what it
+//! connects.
 //!
-//! **Blocking on the outside.** agentd has no async runtime: the supervisor is a
-//! single-threaded reactor and the turn worker is a straight-line state machine,
-//! both blocking. rmcp is async. Rather than colour the entire codebase, this
-//! facade owns a private current-thread runtime and blocks on it, exposing the
-//! same synchronous methods the native client does. The runtime lives as long as
-//! the client and dies with it.
+//! **Blocking on the outside.** agentd's runtime is blocking: the supervisor is
+//! a single-threaded reactor and the turn worker is a straight-line state
+//! machine. rmcp is async. Rather than colour the entire codebase, this facade
+//! owns a private runtime (multi-threaded, for the reason given at
+//! [`RmcpBuilder::connect`]) and blocks on it, exposing synchronous methods.
+//! The runtime lives as long as the client and dies with it.
 //!
 //! **The protocol version is the SDK's to choose.** rmcp pins
 //! `ProtocolVersion::LATEST` at `2025-11-25` even though the newer stateless
@@ -23,7 +22,8 @@
 //! adopts an SDK. So this backend speaks whatever rmcp says is current, and
 //! picks up the stateless revision automatically on the release that promotes
 //! it. Everything version-dependent here (notably [`RmcpClient::subscribe`])
-//! therefore branches on the *negotiated* version, never on a hard-coded era.
+//! therefore branches on the *negotiated* version, compared against rmcp's own
+//! constants.
 //!
 //! **No response cache.** SEP-2549 lets a client reuse a `resources/read` or
 //! list result for the server's `ttlMs`, and serve an expired one when a
@@ -53,13 +53,6 @@ use rmcp::service::{RoleClient, RunningService};
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::{ClientHandler, ServiceExt};
 
-/// The host's inbound policy, shared with the rmcp handler.
-#[derive(Clone)]
-struct Inbound {
-    caps: inbound::Capabilities,
-    handler: Option<Arc<dyn inbound::Handler>>,
-}
-
 /// Bridges rmcp's `ClientHandler` onto agentd: a server's elicitation reaches
 /// the host that can answer it, and a server's notifications reach the queue the
 /// reactor drains.
@@ -71,7 +64,9 @@ struct Inbound {
 #[derive(Clone)]
 struct Handler {
     info: ClientInfo,
-    inbound: Inbound,
+    /// The host's elicitation answerer; `None` when the capability is not
+    /// declared, which is also what the handshake told the server.
+    elicitation: Option<Arc<dyn inbound::Handler>>,
     /// Where a server's notifications land until the reactor drains them.
     queue: Arc<Mutex<Vec<rpc::Notification>>>,
 }
@@ -112,22 +107,20 @@ impl ClientHandler for Handler {
             ),
             _ => return Ok(declined()),
         };
-        if !self.inbound.caps.elicitation {
+        let Some(handler) = &self.elicitation else {
             return Ok(declined());
-        }
-        let answer = self.inbound.handler.as_ref().and_then(|h| {
-            h.handle(inbound::Inbound::Elicit {
-                message,
-                requested_schema,
-            })
+        };
+        let answer = handler.handle(inbound::Inbound::Elicit {
+            message,
+            requested_schema,
         });
         Ok(match answer {
             Some(inbound::Answer::Accept(content)) => {
                 ElicitResult::new(ElicitationAction::Accept).with_content(content)
             }
             Some(inbound::Answer::Decline) => declined(),
-            // No handler, nothing to ask, or a roots answer to an elicitation:
-            // cancel is the honest outcome, and it is not an error.
+            // Nothing could ask: cancel is the honest outcome, and it is not an
+            // error.
             _ => ElicitResult::new(ElicitationAction::Cancel),
         })
     }
@@ -189,8 +182,9 @@ pub struct RmcpClient {
     rt: tokio::runtime::Runtime,
     service: RunningService<RoleClient, Handler>,
     caps: ServerCapabilities,
-    protocol_version: Option<String>,
-    timeout: Duration,
+    /// The revision the handshake settled on, kept as rmcp's own type so the
+    /// version-dependent branches compare it the way rmcp does.
+    protocol_version: Option<ProtocolVersion>,
     tool_meta: Option<Value>,
     notifications: Arc<Mutex<Vec<rpc::Notification>>>,
     /// Every URI the host asked for; one `listen` subscription covers them all.
@@ -207,7 +201,7 @@ pub struct RmcpBuilder {
     headers: Vec<(String, String)>,
     timeout: Duration,
     client_info: Implementation,
-    inbound: Inbound,
+    elicitation: Option<Arc<dyn inbound::Handler>>,
     /// agentd's authenticated socket. Present whenever the connection carries a
     /// credential the SDK's own client could not (a request signer, an mTLS
     /// identity); absent only in tests that dial a bare loopback server.
@@ -231,16 +225,13 @@ impl RmcpBuilder {
                 version: env!("CARGO_PKG_VERSION").into(),
                 title: None,
             },
-            inbound: Inbound {
-                caps: inbound::Capabilities::default(),
-                handler: None,
-            },
+            elicitation: None,
             http: None,
         }
     }
 
     /// Use agentd's socket for this connection — the one carrying its request
-    /// signer, mTLS identity and SSRF guard.
+    /// signer and mTLS identity.
     pub fn with_http(mut self, http: Arc<crate::http::HttpTransport>) -> Self {
         self.http = Some(http);
         self
@@ -251,11 +242,10 @@ impl RmcpBuilder {
         self
     }
 
-    /// Declare `elicitation` and route it to `handler` — the same host seam the
-    /// native backend uses, so `ask_human` is reached identically either way.
+    /// Declare `elicitation` and route it to `handler`, the host seam that
+    /// reaches `ask_human`.
     pub fn with_elicitation(mut self, handler: Arc<dyn inbound::Handler>) -> Self {
-        self.inbound.caps.elicitation = true;
-        self.inbound.handler = Some(handler);
+        self.elicitation = Some(handler);
         self
     }
 
@@ -290,7 +280,7 @@ impl RmcpBuilder {
         }
 
         let mut caps = ClientCapabilities::default();
-        if self.inbound.caps.elicitation {
+        if self.elicitation.is_some() {
             caps.elicitation = Some(ElicitationCapability::new());
         }
 
@@ -310,12 +300,12 @@ impl RmcpBuilder {
             // decision (follow the SDK) and not an omission.
             info: ClientInfo::new(caps, implementation)
                 .with_protocol_version(ProtocolVersion::default()),
-            inbound: self.inbound.clone(),
+            elicitation: self.elicitation.clone(),
         };
 
         let name = self.name.clone();
         // The SDK speaks the protocol; agentd supplies the socket, so a
-        // connection keeps its signer, its mTLS identity and its SSRF guard.
+        // connection keeps its signer and its mTLS identity.
         let socket = match &self.http {
             Some(h) => Arc::clone(h),
             None => Arc::new(crate::http::HttpTransport::new(
@@ -343,7 +333,7 @@ impl RmcpBuilder {
         );
 
         let info = service.peer_info();
-        let protocol_version = info.as_ref().map(|i| i.protocol_version.to_string());
+        let protocol_version = info.as_ref().map(|i| i.protocol_version.clone());
         let info_json = info
             .as_ref()
             .and_then(|i| serde_json::to_value(i.as_ref()).ok());
@@ -355,7 +345,6 @@ impl RmcpBuilder {
             service,
             caps,
             protocol_version,
-            timeout: self.timeout,
             tool_meta: None,
             notifications,
             uris: Mutex::new(std::collections::BTreeSet::new()),
@@ -380,16 +369,12 @@ fn rpc_err(name: &str, op: &str, e: impl std::fmt::Display) -> McpError {
 }
 
 impl RmcpClient {
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
     pub fn capabilities(&self) -> &ServerCapabilities {
         &self.caps
     }
 
     pub fn protocol_version(&self) -> Option<&str> {
-        self.protocol_version.as_deref()
+        self.protocol_version.as_ref().map(ProtocolVersion::as_str)
     }
 
     pub fn set_tool_meta(&mut self, meta: Value) {
@@ -414,10 +399,6 @@ impl RmcpClient {
             .block_on(self.service.list_all_tools())
             .map_err(|e| rpc_err(&self.name, "tools/list", e))?;
         self.convert(&res, "tools/list")
-    }
-
-    pub fn call_tool(&self, name: &str, args: Option<Value>) -> Result<Value, McpError> {
-        self.call_tool_with_meta(name, args, None)
     }
 
     /// `_meta` (run id, idempotency key) rides on the arguments object, which is
@@ -517,14 +498,15 @@ impl RmcpClient {
     /// Subscribe to a resource, by whichever mechanism the negotiated revision
     /// actually defines.
     ///
-    /// The two eras disagree: legacy uses `resources/subscribe`, and the
-    /// stateless revision replaces it with `subscriptions/listen` (rmcp marks
-    /// the former deprecated *for that version only*). Because this backend
-    /// speaks whatever revision the SDK negotiates, the choice must be read off
-    /// the negotiated version rather than hard-coded — calling the wrong one
-    /// leaves the host with a subscription the server never honours.
+    /// The revisions disagree: up to 2025-11-25 a client calls
+    /// `resources/subscribe`, and from 2026-07-28 on `subscriptions/listen`
+    /// replaces it (rmcp marks the former deprecated *for those versions
+    /// only*). Because this backend speaks whatever revision the SDK
+    /// negotiates, the choice must be read off the negotiated version rather
+    /// than hard-coded — calling the wrong one leaves the host with a
+    /// subscription the server never honours.
     ///
-    /// In the modern case one subscription covers every tracked URI: adding a
+    /// From 2026-07-28 on, one subscription covers every tracked URI: adding a
     /// URI reopens it with the widened filter, and its notifications pump into
     /// the queue the host drains.
     pub fn subscribe(&self, uri: &str) -> Result<(), McpError> {
@@ -545,11 +527,11 @@ impl RmcpClient {
                 return Ok(());
             }
         }
-        // Legacy: the server holds a per-URI subscription, so it needs an
-        // explicit `resources/unsubscribe` — narrowing a filter would not
-        // reach it. Modern: reopening the listen with the narrowed filter is
-        // the cancellation.
-        if !self.modern() {
+        // Before 2026-07-28 the server holds a per-URI subscription, so it
+        // needs an explicit `resources/unsubscribe` — narrowing a filter would
+        // not reach it. From then on, reopening the listen with the narrowed
+        // filter is the cancellation.
+        if !self.listens() {
             return self
                 .rt
                 .block_on(
@@ -564,11 +546,11 @@ impl RmcpClient {
     /// (Re)open the single subscription covering every tracked URI, and pump its
     /// notifications into the drain queue on a background task.
     fn relisten(&self) -> Result<(), McpError> {
-        // Legacy revisions have no `subscriptions/listen`; the per-URI
-        // `resources/subscribe` is the correct call there, and is marked
-        // deprecated only relative to the newer dialect.
-        if !self.modern() {
-            return self.legacy_subscribe_all();
+        // Revisions before 2026-07-28 have no `subscriptions/listen`; the
+        // per-URI `resources/subscribe` is the correct call there, and is
+        // marked deprecated only relative to the newer revisions.
+        if !self.listens() {
+            return self.subscribe_each();
         }
         let uris: Vec<String> = self
             .uris
@@ -609,18 +591,21 @@ impl RmcpClient {
         Ok(())
     }
 
-    /// Is the negotiated revision the stateless (modern) one?
-    fn modern(&self) -> bool {
+    /// Does the negotiated revision define `subscriptions/listen`? Every
+    /// revision from 2026-07-28 on does — compared with `>=` exactly as rmcp's
+    /// own client decides the same question (`service/client.rs`), so a later
+    /// revision rmcp negotiates keeps the listen path rather than falling back
+    /// to a method that revision removed.
+    fn listens(&self) -> bool {
         self.protocol_version
-            .as_deref()
-            .map(|v| matches!(crate::version::era_of(v), crate::version::Era::Modern))
-            .unwrap_or(false)
+            .as_ref()
+            .is_some_and(|v| *v >= ProtocolVersion::V_2026_07_28)
     }
 
-    /// Legacy subscription: one `resources/subscribe` per URI. Notifications
+    /// Per-URI subscription: one `resources/subscribe` per URI. Notifications
     /// arrive through the handler's channel rather than a subscription handle.
     #[allow(deprecated)]
-    fn legacy_subscribe_all(&self) -> Result<(), McpError> {
+    fn subscribe_each(&self) -> Result<(), McpError> {
         let uris: Vec<String> = self
             .uris
             .lock()
@@ -639,15 +624,10 @@ impl RmcpClient {
         Ok(())
     }
 
-    /// Drain notifications the handler queued (same contract as the native
-    /// client: take what has arrived, leave the queue empty).
+    /// Drain notifications the handler queued: take what has arrived, leave
+    /// the queue empty.
     pub fn drain_notifications(&self) -> Vec<rpc::Notification> {
         std::mem::take(&mut *self.notifications.lock().unwrap_or_else(|e| e.into_inner()))
-    }
-
-    /// The configured per-request timeout, for parity with the native client.
-    pub fn timeout(&self) -> Duration {
-        self.timeout
     }
 }
 
@@ -685,13 +665,13 @@ mod tests {
     }
 
     #[test]
-    fn the_stateless_revision_exists_but_the_sdk_still_pins_the_older_stable() {
+    fn the_sdk_still_pins_a_revision_before_the_listen_one() {
         // The backend deliberately asks for `ProtocolVersion::default()` —
-        // rmcp's `LATEST`, currently 2025-11-25. This only records that the
-        // newer stateless constant exists and still differs, so the day rmcp
-        // promotes it this test is the tripwire.
-        let ours = ProtocolVersion::V_2026_07_28;
-        assert_eq!(ours.to_string(), crate::version::LATEST_MODERN_VERSION);
-        assert_ne!(ours.to_string(), ProtocolVersion::LATEST.to_string());
+        // rmcp's `LATEST`, currently 2025-11-25 — so against a server that
+        // echoes it, subscriptions take the per-URI path. This records that
+        // the listen revision exists and still sorts after `LATEST`, so the day
+        // rmcp promotes it this test is the tripwire.
+        assert_eq!(ProtocolVersion::default(), ProtocolVersion::LATEST);
+        assert!(ProtocolVersion::LATEST < ProtocolVersion::V_2026_07_28);
     }
 }

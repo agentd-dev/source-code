@@ -17,7 +17,6 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -138,15 +137,6 @@ fn spawn_server(seen: Shared, push: Option<Value>) -> String {
                 }
 
                 match method {
-                    // A modern probe: refuse so the client falls back to the
-                    // legacy handshake, which is the path that carries
-                    // `capabilities` we want to inspect.
-                    "server/discover" => {
-                        let _ = w.write_all(&json_response(&json!({
-                            "jsonrpc": "2.0", "id": msg["id"],
-                            "error": {"code": -32601, "message": "no discover"}
-                        })));
-                    }
                     "initialize" => {
                         seen.lock().unwrap().init_capabilities = msg["params"]["capabilities"]
                             .as_object()
@@ -284,26 +274,4 @@ fn an_undeclared_capability_is_refused_rather_than_ignored() {
     let resp = await_response(&seen, 5).expect("no refusal was sent");
     assert_eq!(resp["id"], 5);
     assert_eq!(resp["error"]["code"], -32601);
-}
-
-#[test]
-fn the_stop_flag_still_ends_the_event_thread() {
-    // The router runs on the event thread; a client that cannot be dropped
-    // cleanly would leak a thread per MCP server.
-    let seen: Shared = Arc::default();
-    let ep = spawn_server(Arc::clone(&seen), None);
-    let mut c = McpClient::connect("mock", &ep, vec![], Duration::from_secs(2)).unwrap();
-    c.initialize().unwrap();
-    let _ = c.subscribe("file:///x");
-    let stopped = Arc::new(AtomicBool::new(false));
-    let flag = Arc::clone(&stopped);
-    std::thread::spawn(move || {
-        drop(c);
-        flag.store(true, Ordering::SeqCst);
-    });
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline && !stopped.load(Ordering::SeqCst) {
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    assert!(stopped.load(Ordering::SeqCst), "dropping the client hung");
 }

@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use mcp::inbound::{Answer, Handler, Inbound};
 use mcp::rmcp_client::RmcpBuilder;
+use rmcp::model::ProtocolVersion;
 use serde_json::{Value, json};
 
 #[derive(Default)]
@@ -69,6 +70,12 @@ fn respond(w: &mut TcpStream, body: &Value) {
 /// A minimal Streamable-HTTP MCP server: answers initialize, tools/list and
 /// resources/list, and records the handshake for assertions.
 fn spawn_server(seen: Shared) -> String {
+    spawn_server_speaking(seen, None)
+}
+
+/// [`spawn_server`], answering `initialize` with `revision` instead of echoing
+/// the client's — the way a server settles on a revision of its own.
+fn spawn_server_speaking(seen: Shared, revision: Option<&'static str>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     std::thread::spawn(move || {
@@ -104,8 +111,11 @@ fn spawn_server(seen: Shared) -> String {
                                 "jsonrpc": "2.0", "id": id,
                                 "result": {
                                     // Echo what the client asked for, the way a
-                                    // real server does when it can speak it.
-                                    "protocolVersion": msg["params"]["protocolVersion"],
+                                    // real server does when it can speak it —
+                                    // unless the test chose the revision.
+                                    "protocolVersion": revision
+                                        .map(Value::from)
+                                        .unwrap_or_else(|| msg["params"]["protocolVersion"].clone()),
                                     "capabilities": {"tools": {}, "resources": {"subscribe": true}},
                                     "serverInfo": {"name": "mock", "version": "0"}
                                 }
@@ -158,7 +168,7 @@ fn the_handshake_speaks_whatever_revision_the_sdk_supports() {
     // `LATEST`, so it adopts the stateless revision on the release that
     // promotes it — without a change here. Pinning our own constant would mean
     // asking servers for a dialect the SDK may not fully implement.
-    let expected = rmcp::model::ProtocolVersion::LATEST.to_string();
+    let expected = ProtocolVersion::LATEST.to_string();
     let seen: Shared = Arc::default();
     let ep = spawn_server(Arc::clone(&seen));
     let client = RmcpBuilder::new("mock", &ep, vec![], Duration::from_secs(5))
@@ -172,43 +182,64 @@ fn the_handshake_speaks_whatever_revision_the_sdk_supports() {
         .expect("no initialize seen");
     assert_eq!(init["protocolVersion"], expected, "handshake: {init}");
     assert_eq!(client.protocol_version(), Some(expected.as_str()));
-    // …and it is a revision our own version table recognises, so the SDK and
-    // this crate cannot drift apart unnoticed.
-    assert!(mcp::version::is_supported_version(&expected));
+    // …and agentd's mock server answers the same revision, so the SDK and the
+    // one constant this crate keeps cannot drift apart unnoticed.
+    assert_eq!(mcp::wire::PROTOCOL_VERSION, expected);
 }
 
 #[test]
 fn subscribing_uses_the_method_the_negotiated_revision_defines() {
-    // The eras disagree: legacy has `resources/subscribe`, the stateless
-    // revision replaces it with `subscriptions/listen`. Whichever rmcp
-    // negotiates, we must call the one that version actually defines — a
-    // `listen` against a legacy server is an unknown method.
-    let seen: Shared = Arc::default();
-    let ep = spawn_server(Arc::clone(&seen));
-    let client = RmcpBuilder::new("mock", &ep, vec![], Duration::from_secs(5))
-        .connect()
-        .expect("connect");
-    client.subscribe("file:///a.txt").expect("subscribe");
+    // The revisions disagree: up to 2025-11-25 a client calls
+    // `resources/subscribe`; from 2026-07-28 on `subscriptions/listen` replaces
+    // it. Whichever revision the handshake settles on, we must call the one it
+    // defines — a `listen` against an older server is an unknown method, and a
+    // `subscribe` against a newer one is a method that revision removed. A
+    // revision LATER than 2026-07-28 still listens: it is compared the way rmcp
+    // compares it, not matched against one date.
+    let later = "2027-03-01";
+    assert!(ProtocolVersion::V_2026_07_28.as_str() < later);
+    let cases: [(Option<&'static str>, bool); 4] = [
+        // rmcp's own `LATEST`, echoed back.
+        (
+            None,
+            ProtocolVersion::LATEST >= ProtocolVersion::V_2026_07_28,
+        ),
+        (Some(ProtocolVersion::V_2025_06_18.as_str()), false),
+        (Some(ProtocolVersion::V_2026_07_28.as_str()), true),
+        (Some(later), true),
+    ];
+    for (revision, listens) in cases {
+        let seen: Shared = Arc::default();
+        let ep = spawn_server_speaking(Arc::clone(&seen), revision);
+        let client = RmcpBuilder::new("mock", &ep, vec![], Duration::from_secs(5))
+            .connect()
+            .expect("connect");
+        let result = client.subscribe("file:///a.txt");
 
-    let called = seen.lock().unwrap().methods.clone();
-    let modern = matches!(
-        mcp::version::era_of(client.protocol_version().unwrap_or("")),
-        mcp::version::Era::Modern
-    );
-    if modern {
-        assert!(
-            called.iter().any(|m| m == "subscriptions/listen"),
-            "modern revision should listen, saw: {called:?}"
-        );
-    } else {
-        assert!(
-            called.iter().any(|m| m == "resources/subscribe"),
-            "legacy revision should subscribe, saw: {called:?}"
-        );
-        assert!(
-            !called.iter().any(|m| m == "subscriptions/listen"),
-            "listen is not defined at this revision: {called:?}"
-        );
+        let called = seen.lock().unwrap().methods.clone();
+        let at = client.protocol_version().unwrap_or("").to_string();
+        if listens {
+            // The mock does not acknowledge a listen, so the subscribe itself
+            // fails; which method it reached for is what is under test.
+            assert!(
+                called.iter().any(|m| m == "subscriptions/listen"),
+                "{at} should listen, saw: {called:?}"
+            );
+            assert!(
+                !called.iter().any(|m| m == "resources/subscribe"),
+                "{at} removed resources/subscribe: {called:?}"
+            );
+        } else {
+            result.expect("subscribe");
+            assert!(
+                called.iter().any(|m| m == "resources/subscribe"),
+                "{at} should subscribe, saw: {called:?}"
+            );
+            assert!(
+                !called.iter().any(|m| m == "subscriptions/listen"),
+                "listen is not defined at {at}: {called:?}"
+            );
+        }
     }
 }
 
@@ -275,7 +306,7 @@ fn a_tool_call_round_trips() {
         .expect("connect");
     client.set_tool_meta(json!({"agent/run_id": "r1"}));
     let out = client
-        .call_tool("echo", Some(json!({"s": "hi"})))
+        .call_tool_with_meta("echo", Some(json!({"s": "hi"})), None)
         .expect("tools/call");
     assert_eq!(out["content"][0]["text"], "echoed");
 }

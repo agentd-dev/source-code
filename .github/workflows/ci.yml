@@ -43,19 +43,25 @@ jobs:
       # red test binary must not hide the verdict of every binary (and every
       # check) that comes after it.
       - run: cargo test --workspace --all-features --no-fail-fast
-      # The published JSON Schemas are generated from the binary and committed,
-      # because the site build has no Rust toolchain. Regenerate and diff: a
-      # schema that has drifted from the loader is worse than none, since an
-      # editor then reports valid documents as broken.
+      # The published JSON Schemas — the config and workflow schemas, and the
+      # A2A extension registry and bundles served at each extension's URI — are
+      # generated from the binary and committed, because the site build has no
+      # Rust toolchain. Regenerate and compare: a schema that has drifted from
+      # the code is worse than none, since an editor or a peer then judges
+      # valid documents broken. `git status`, not `git diff`, so a file the
+      # generator newly writes and nobody committed fails too.
       - name: published schemas are current
         if: ${{ !cancelled() }}
         run: |
           cargo build -p agentd-cli --all-features
           ./scripts/gen-schemas.sh
-          git diff --exit-code -- web/public/schema web/lib/workflow-nodes.json || {
-            echo "::error::web/public/schema is stale — run ./scripts/gen-schemas.sh and commit"
+          stale=$(git status --porcelain -- web/public/schema web/lib/workflow-nodes.json web/public/a2a web/lib/extensions.json)
+          if [ -n "$stale" ]; then
+            echo "$stale"
+            git diff -- web/public/schema web/lib/workflow-nodes.json web/public/a2a web/lib/extensions.json
+            echo "::error::the published schemas are stale — run ./scripts/gen-schemas.sh and commit"
             exit 1
-          }
+          fi
 
   # The capability-pruning story, proven in CI: every feature combination an
   # operator is likely to ship must build + test clean on its own (feature

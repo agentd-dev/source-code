@@ -98,10 +98,15 @@ if [ "${1:-}" != "quick" ]; then
   step "published schemas are current"
   cargo build -p agentd-cli --all-features >/dev/null 2>&1
   ./scripts/gen-schemas.sh >/dev/null
-  git diff --exit-code -- web/public/schema web/lib/workflow-nodes.json >/dev/null || {
-    echo "  web/public/schema or web/lib/workflow-nodes.json is stale — commit the regenerated files"
+  # The paths ci.yml compares. `git status` so an uncommitted NEW file (a new
+  # extension's bundle) is stale too, not only a changed one.
+  stale=$(git status --porcelain -- web/public/schema web/lib/workflow-nodes.json \
+            web/public/a2a web/lib/extensions.json)
+  if [ -n "$stale" ]; then
+    echo "$stale" | sed 's/^/        /'
+    echo "  the published schemas are stale — commit the regenerated files"
     fail=1
-  }
+  fi
 fi
 
 printf '\n%s\n' "$([ $fail -eq 0 ] && echo 'GATE CLEAN' || echo 'GATE FAILED')"

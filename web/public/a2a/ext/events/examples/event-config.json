@@ -1,0 +1,11 @@
+{
+  "event": {
+    "seq": 122,
+    "ts": 1790676903001,
+    "kind": "config",
+    "data": {
+      "paths": ["a2a.introspection.enabled"],
+      "source": "admin.set"
+    }
+  }
+}

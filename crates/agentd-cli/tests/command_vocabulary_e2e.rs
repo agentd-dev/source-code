@@ -24,7 +24,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use agentd::runtime::surface::{Floor, Handler, INSTANCE_OPS, OPS, RUNTIME_SETTABLE, Reply};
+use agentd::runtime::surface::{Floor, Handler, INSTANCE_OPS, OPS, Reply};
 use serde_json::{Value, json};
 
 use common::{SendMessage, error_of, rpc_as, rpc_result};
@@ -837,8 +837,14 @@ fn subagent_get_answers_the_owner_and_the_operator_only() {
     );
 }
 
+// The reload is a SIGHUP, and only a `hot-reload` build installs a handler
+// for it: without the feature SIGHUP keeps its default disposition and ends
+// the daemon, so there is no reload to announce and no feed left to announce
+// it on. That is the feature's documented contract, not a gap in this path.
 #[test]
+#[cfg(feature = "hot-reload")]
 fn a_reload_announces_what_it_put_back_after_admin_set() {
+    use agentd::runtime::surface::RUNTIME_SETTABLE;
     let llm = spawn_mock_llm();
     let d = spawn(config(&llm.uri, "  events:\n    enabled: true\n", ""));
     let feed = watch_feed(&d.addr);

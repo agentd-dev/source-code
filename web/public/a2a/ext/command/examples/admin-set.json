@@ -1,0 +1,7 @@
+{
+  "agentd": {
+    "op": "admin.set",
+    "path": "a2a.introspection.enabled",
+    "value": true
+  }
+}

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Emit the published JSON Schemas into web/public/schema/.
+# Emit the published JSON Schemas into web/public/schema/, and the A2A
+# extension registry and schema bundles into web/lib/ and web/public/a2a/.
 #
 # They are GENERATED from the binary — the same functions the validator uses —
 # and committed, because the site build has no Rust toolchain. CI regenerates
@@ -49,4 +50,27 @@ if missing:
     print(f"  NOTE: new node kind(s) need a category in web/lib/workflow-nodes.json: {missing}", file=sys.stderr)
 PYGEN
 
-echo "wrote $OUT/{config,workflow}.json + web/lib/workflow-nodes.json"
+# Every A2A extension and binding URI agentd publishes, and each extension's
+# schema bundle at `<uri>/schema.json`: A2A's extension guidance says a
+# third-party extension's spec should be hosted at its URI, so the site serves
+# the spec page at the URI's path and the bundle beside it. The list comes from
+# the binary too (`--extensions`), so a new extension is published by adding
+# it to the registry — nothing here names one. A stale bundle is removed
+# first, like the schemas above; the hand-written examples beside each one are
+# not generated and are kept.
+rm -f web/public/a2a/ext/*/schema.json
+"$BIN" --extensions > web/lib/extensions.json
+python3 - "$BIN" web/lib/extensions.json <<'PYEXT'
+import json, os, subprocess, sys
+binary, registry = sys.argv[1], sys.argv[2]
+for entry in json.load(open(registry)):
+    if not entry["schema"]:
+        continue  # a binding: a spec page, no bundle
+    name = entry["path"].rsplit("/", 1)[-1]
+    out = os.path.join("web/public", entry["path"], "schema.json")
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    with open(out, "w") as f:
+        subprocess.run([binary, "--extension-schema", name], stdout=f, check=True)
+PYEXT
+
+echo "wrote $OUT/{config,workflow}.json + web/lib/workflow-nodes.json + web/lib/extensions.json + web/public/a2a/ext/*/schema.json"

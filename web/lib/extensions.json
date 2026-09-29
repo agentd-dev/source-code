@@ -1,0 +1,34 @@
+[
+  {
+    "kind": "extension",
+    "path": "a2a/ext/command",
+    "required": false,
+    "schema": "https://agentd.dev/a2a/ext/command/schema.json",
+    "spec": "docs/ext/command.md",
+    "uri": "https://agentd.dev/a2a/ext/command"
+  },
+  {
+    "kind": "extension",
+    "path": "a2a/ext/events",
+    "required": false,
+    "schema": "https://agentd.dev/a2a/ext/events/schema.json",
+    "spec": "docs/ext/events.md",
+    "uri": "https://agentd.dev/a2a/ext/events"
+  },
+  {
+    "kind": "extension",
+    "path": "a2a/ext/task-annotations",
+    "required": false,
+    "schema": "https://agentd.dev/a2a/ext/task-annotations/schema.json",
+    "spec": "docs/ext/task-annotations.md",
+    "uri": "https://agentd.dev/a2a/ext/task-annotations"
+  },
+  {
+    "kind": "binding",
+    "path": "a2a/binding/jsonrpc-unix",
+    "required": false,
+    "schema": null,
+    "spec": "docs/ext/binding-jsonrpc-unix.md",
+    "uri": "https://agentd.dev/a2a/binding/jsonrpc-unix"
+  }
+]

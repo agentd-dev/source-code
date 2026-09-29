@@ -1,0 +1,1196 @@
+{
+  "$defs": {
+    "event": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "task"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "$ref": "#/$defs/kinds/$defs/task"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "task.removed"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "$ref": "#/$defs/kinds/$defs/task.removed"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "run"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "$ref": "#/$defs/kinds/$defs/run"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "run.removed"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "$ref": "#/$defs/kinds/$defs/run.removed"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "step"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "$ref": "#/$defs/kinds/$defs/step"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "conversation"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "$ref": "#/$defs/kinds/$defs/conversation"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "conversation.removed"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "$ref": "#/$defs/kinds/$defs/conversation.removed"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "subagent"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "$ref": "#/$defs/kinds/$defs/subagent"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "subagent.removed"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "$ref": "#/$defs/kinds/$defs/subagent.removed"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "child"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "$ref": "#/$defs/kinds/$defs/child"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "child.removed"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "$ref": "#/$defs/kinds/$defs/child.removed"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "activity"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "$ref": "#/$defs/kinds/$defs/activity"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "activity.removed"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "$ref": "#/$defs/kinds/$defs/activity.removed"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "status"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "$ref": "#/$defs/kinds/$defs/status"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "lifecycle"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "$ref": "#/$defs/kinds/$defs/lifecycle"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "config"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "$ref": "#/$defs/kinds/$defs/config"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "audit"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "$ref": "#/$defs/kinds/$defs/audit"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "auth"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "$ref": "#/$defs/kinds/$defs/auth"
+              }
+            }
+          }
+        }
+      ],
+      "properties": {
+        "data": {
+          "type": "object"
+        },
+        "kind": {
+          "enum": [
+            "task",
+            "task.removed",
+            "run",
+            "run.removed",
+            "step",
+            "conversation",
+            "conversation.removed",
+            "subagent",
+            "subagent.removed",
+            "child",
+            "child.removed",
+            "activity",
+            "activity.removed",
+            "status",
+            "lifecycle",
+            "config",
+            "audit",
+            "auth"
+          ]
+        },
+        "seq": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "ts": {
+          "description": "epoch milliseconds",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "seq",
+        "ts",
+        "kind",
+        "data"
+      ],
+      "type": "object"
+    },
+    "frame": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "hello": {
+              "$ref": "#/$defs/hello"
+            }
+          },
+          "required": [
+            "hello"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "event": {
+              "$ref": "#/$defs/event"
+            }
+          },
+          "required": [
+            "event"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "goodbye": {
+              "$ref": "#/$defs/goodbye"
+            }
+          },
+          "required": [
+            "goodbye"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "goodbye": {
+      "additionalProperties": false,
+      "properties": {
+        "reason": {
+          "enum": [
+            "deadline",
+            "revoked"
+          ]
+        },
+        "seq": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "seq",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "hello": {
+      "additionalProperties": false,
+      "properties": {
+        "introspection": {
+          "type": "boolean"
+        },
+        "resume": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "resync": {
+          "type": "boolean"
+        },
+        "seq": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "version": {
+          "description": "the agentd build, not a protocol version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "seq",
+        "resume",
+        "resync",
+        "introspection",
+        "version"
+      ],
+      "type": "object"
+    },
+    "kinds": {
+      "$defs": {
+        "activity": {
+          "additionalProperties": false,
+          "properties": {
+            "ctx": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "id": {
+              "type": "string"
+            },
+            "phase": {
+              "type": "string"
+            },
+            "round": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "started_ms": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "task": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tokens_in": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "tokens_out": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "tool": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "updated_ms": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "id",
+            "task",
+            "ctx",
+            "phase",
+            "tool",
+            "round",
+            "tokens_in",
+            "tokens_out",
+            "started_ms",
+            "updated_ms"
+          ],
+          "type": "object"
+        },
+        "activity.removed": {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "type": "object"
+        },
+        "audit": {
+          "additionalProperties": false,
+          "properties": {
+            "action": {
+              "type": "string"
+            },
+            "outcome": {
+              "type": "string"
+            },
+            "principal": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "role": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "sid": {
+              "type": "string"
+            },
+            "target": true,
+            "ts": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "ts",
+            "principal",
+            "role",
+            "action",
+            "target",
+            "outcome"
+          ],
+          "type": "object"
+        },
+        "auth": {
+          "additionalProperties": false,
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "event": {
+                    "enum": [
+                      "pending",
+                      "approved",
+                      "denied"
+                    ]
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "user_code"
+                ]
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "event": {
+                    "enum": [
+                      "revoked"
+                    ]
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "sid"
+                ]
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "event": {
+                    "enum": [
+                      "launch"
+                    ]
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "scope": {
+                    "const": "operator"
+                  }
+                },
+                "required": [
+                  "sid"
+                ]
+              }
+            }
+          ],
+          "properties": {
+            "client_id": {
+              "type": "string"
+            },
+            "event": {
+              "enum": [
+                "pending",
+                "approved",
+                "denied",
+                "revoked",
+                "launch"
+              ]
+            },
+            "name": {
+              "type": "string"
+            },
+            "peer": {
+              "type": "string"
+            },
+            "scope": {
+              "enum": [
+                "user",
+                "operator"
+              ]
+            },
+            "sid": {
+              "type": "string"
+            },
+            "user_code": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "event",
+            "client_id",
+            "scope"
+          ],
+          "type": "object"
+        },
+        "child": {
+          "additionalProperties": false,
+          "properties": {
+            "age_ms": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "cancelled": {
+              "type": "boolean"
+            },
+            "kind": {
+              "type": "string"
+            },
+            "node": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "pid": {
+              "type": "integer"
+            },
+            "tokens": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "node",
+            "pid",
+            "kind",
+            "age_ms",
+            "tokens",
+            "cancelled"
+          ],
+          "type": "object"
+        },
+        "child.removed": {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "type": "object"
+        },
+        "config": {
+          "additionalProperties": false,
+          "properties": {
+            "paths": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "source": {
+              "enum": [
+                "reload",
+                "admin.set"
+              ]
+            }
+          },
+          "required": [
+            "paths",
+            "source"
+          ],
+          "type": "object"
+        },
+        "conversation": {
+          "additionalProperties": false,
+          "properties": {
+            "contextId": {
+              "type": "string"
+            },
+            "est_tokens": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "id": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string"
+            },
+            "messages": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "plan": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "principal": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "skills": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "turns": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "updated": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "version": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "id",
+            "contextId",
+            "kind",
+            "version",
+            "messages",
+            "est_tokens",
+            "turns",
+            "principal",
+            "skills",
+            "plan",
+            "updated"
+          ],
+          "type": "object"
+        },
+        "conversation.removed": {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "type": "object"
+        },
+        "lifecycle": {
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "draining": {
+                  "const": true
+                },
+                "reason": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "draining",
+                "reason"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "paused": {
+                  "const": true
+                },
+                "reason": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "paused",
+                "reason"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "paused": {
+                  "const": false
+                }
+              },
+              "required": [
+                "paused"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "run": {
+          "additionalProperties": false,
+          "properties": {
+            "created": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "error": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "finished": {
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "id": {
+              "type": "string"
+            },
+            "output": true,
+            "principal": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "start": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string"
+            },
+            "steps": {
+              "additionalProperties": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "object"
+            },
+            "task": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tokens": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "updated": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "workflow": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "workflow",
+            "status",
+            "start",
+            "steps",
+            "tokens",
+            "created",
+            "updated",
+            "finished",
+            "output",
+            "error",
+            "task",
+            "principal"
+          ],
+          "type": "object"
+        },
+        "run.removed": {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "type": "object"
+        },
+        "status": {
+          "additionalProperties": false,
+          "properties": {
+            "budget": {
+              "type": "object"
+            },
+            "counters": {
+              "type": "object"
+            },
+            "draining": {
+              "type": "boolean"
+            },
+            "inbox_pending": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "instance": {
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "skill_prefix": {
+              "type": "string"
+            },
+            "store": {
+              "additionalProperties": false,
+              "properties": {
+                "degraded": {
+                  "type": "boolean"
+                },
+                "kind": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "degraded"
+              ],
+              "type": "object"
+            },
+            "values": {
+              "type": "object"
+            },
+            "version": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "instance",
+            "model",
+            "version",
+            "draining",
+            "inbox_pending",
+            "counters",
+            "budget",
+            "store",
+            "values",
+            "skill_prefix"
+          ],
+          "type": "object"
+        },
+        "step": {
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "attempt": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "kind": {
+                  "type": "string"
+                },
+                "phase": {
+                  "const": "start"
+                },
+                "run": {
+                  "type": "string"
+                },
+                "step": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "run",
+                "step",
+                "kind",
+                "phase",
+                "attempt"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "attempt": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "err": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "phase": {
+                  "const": "done"
+                },
+                "run": {
+                  "type": "string"
+                },
+                "status": {
+                  "type": "string"
+                },
+                "step": {
+                  "type": "string"
+                },
+                "tokens": {
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "run",
+                "step",
+                "phase",
+                "status",
+                "attempt",
+                "tokens",
+                "err"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "subagent": {
+          "additionalProperties": false,
+          "properties": {
+            "error": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "handle": {
+              "type": "string"
+            },
+            "mode": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string"
+            },
+            "tokens": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "updated": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "handle",
+            "mode",
+            "status",
+            "tokens",
+            "error",
+            "updated"
+          ],
+          "type": "object"
+        },
+        "subagent.removed": {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "type": "object"
+        },
+        "task": {
+          "additionalProperties": false,
+          "properties": {
+            "task": {
+              "properties": {
+                "artifacts": {
+                  "items": {
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "contextId": {
+                  "type": "string"
+                },
+                "history": {
+                  "items": {
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "id": {
+                  "type": "string"
+                },
+                "metadata": {
+                  "type": "object"
+                },
+                "status": {
+                  "properties": {
+                    "state": {
+                      "pattern": "^TASK_STATE_",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "state"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "id",
+                "contextId",
+                "status"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "task"
+          ],
+          "type": "object"
+        },
+        "task.removed": {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    "params": {
+      "additionalProperties": false,
+      "properties": {
+        "fromSeq": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "$id": "https://agentd.dev/a2a/ext/events/schema.json",
+  "$ref": "#/$defs/frame",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The result of each agentd.events/SubscribeToEvents frame: exactly one of hello, event or goodbye. $defs/params is the method's params; $defs/kinds/$defs/<kind> is each kind's data.",
+  "title": "agentd events"
+}

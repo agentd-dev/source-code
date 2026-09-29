@@ -18,8 +18,11 @@ use crate::config::settings::Settings;
 // identifier agentd owns is a second name for the same thing. An
 // incompatible change takes a NEW URI under a new name — never a `/vN`
 // suffix — because §4.6.3/§5.8 say a URI's meaning MUST NOT change under a
-// peer that already speaks it. Each URI is an exact identifier: a peer is
-// not expected to fetch it, and neither case nor a trailing slash is forgiven.
+// peer that already speaks it. Each URI is an exact identifier — neither
+// case nor a trailing slash is forgiven — and it is also an address: A2A's
+// extension guidance says a third-party extension's specification should be
+// hosted at its URI, so agentd.dev serves each one's spec page there and its
+// schema bundle at `<uri>/schema.json` ([`registry`] lists them).
 
 /// Structured operations invoked as a DataPart on `SendMessage`. A profile
 /// extension: it adds no method and changes no core structure, so it is never
@@ -237,6 +240,156 @@ pub fn declarations(s: &Settings) -> Vec<Value> {
 /// The published schema of an extension: served next to its URI.
 pub fn schema_of(uri: &str) -> String {
     format!("{uri}/schema.json")
+}
+
+// ── What agentd.dev publishes for each URI ──────────────────────────────────
+
+/// The site every agentd URI lives under. A URI's path below it is where the
+/// site serves its spec page, so the path is read off the URI rather than
+/// kept beside it.
+pub const URI_BASE: &str = "https://agentd.dev/";
+
+/// The protocol bindings agentd defines: a spec page each, and no schema —
+/// a binding carries the JSON-RPC binding's own messages.
+pub const BINDINGS: &[&str] = &[UNIX_BINDING];
+
+/// The last segment of an agentd URI: what `--extension-schema` takes and
+/// what its spec file is named after.
+pub fn name_of(uri: &str) -> &str {
+    uri.rsplit('/').next().unwrap_or(uri)
+}
+
+/// Where an agentd URI's spec page is served on the site: the URI's path.
+pub fn path_of(uri: &str) -> &str {
+    uri.strip_prefix(URI_BASE).unwrap_or(uri)
+}
+
+impl Ext {
+    /// The name `--extension-schema` takes: the URI's last segment.
+    pub fn name(self) -> &'static str {
+        name_of(self.uri())
+    }
+
+    /// The extension `name` names, matched exactly.
+    pub fn of_name(name: &str) -> Option<Ext> {
+        Ext::ALL.iter().copied().find(|e| e.name() == name)
+    }
+
+    /// The extension's schema bundle, published at [`schema_of`] its URI.
+    /// Each is built by the module that owns what it describes, from the
+    /// same values the listener checks against.
+    pub fn schema_bundle(self) -> Value {
+        match self {
+            Ext::Command => super::ops::schema_bundle(),
+            Ext::Events => super::events::schema_bundle(),
+            Ext::TaskAnnotations => task_annotations_bundle(),
+        }
+    }
+}
+
+/// The schema bundle of the extension called `name`, or `None` when no
+/// extension is — the binding included, which has a spec page and no bundle.
+pub fn bundle_of(name: &str) -> Option<Value> {
+    Ext::of_name(name).map(Ext::schema_bundle)
+}
+
+/// The normative spec of an agentd URI, as a path in agentd's source tree:
+/// `docs/ext/<name>.md` for an extension, `docs/ext/binding-<name>.md` for a
+/// binding. The site renders this file at the URI.
+pub fn spec_doc(uri: &str) -> String {
+    let name = name_of(uri);
+    if BINDINGS.contains(&uri) {
+        format!("docs/ext/binding-{name}.md")
+    } else {
+        format!("docs/ext/{name}.md")
+    }
+}
+
+/// Every URI agentd publishes, as `agentd --extensions` prints it and
+/// `scripts/gen-schemas.sh` writes it to `web/lib/extensions.json`:
+/// `[{uri, path, kind, required, spec, schema}]`, extensions in registry
+/// order, then the bindings. `kind` is `extension` or `binding` — what the
+/// site routes the page under; `required` is whether the card requires it
+/// (a binding is chosen, never required); `schema` is `null` for a binding.
+pub fn registry() -> Value {
+    let extensions = Ext::ALL.iter().map(|e| {
+        let uri = e.uri();
+        json!({
+            "uri": uri,
+            "path": path_of(uri),
+            "kind": "extension",
+            // Read off the declarations rather than restated: whatever the
+            // card says of the extension, the registry says too.
+            "required": declared_when(true).iter().any(|d| d.ext == *e && d.required),
+            "spec": spec_doc(uri),
+            "schema": schema_of(uri),
+        })
+    });
+    let bindings = BINDINGS.iter().map(|uri| {
+        json!({
+            "uri": uri,
+            "path": path_of(uri),
+            "kind": "binding",
+            "required": false,
+            "spec": spec_doc(uri),
+            "schema": Value::Null,
+        })
+    });
+    Value::Array(extensions.chain(bindings).collect())
+}
+
+/// The task-annotations extension's schema bundle: the object a task carries
+/// under `metadata[<uri>]`.
+///
+/// Written from the code that builds it (`a2a::wire::annotations`), which
+/// always sets the link, the creation time and the status history, and the
+/// rest only when the task has them.
+pub fn task_annotations_bundle() -> Value {
+    let string = || json!({"type": "string"});
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": schema_of(TASK_ANNOTATIONS_EXTENSION),
+        "title": "agentd task-annotations",
+        "description": format!(
+            "agentd's facts about a task, carried in Task.metadata under \
+             {TASK_ANNOTATIONS_EXTENSION} on an answer to a request that activated it."
+        ),
+        "type": "object",
+        "required": ["link", "created", "statusHistory"],
+        "properties": {
+            "link": {
+                "description": "what the task tracks: a workflow run, a subagent, or a conversation turn",
+                "type": "object",
+                "required": ["kind", "id"],
+                "properties": {
+                    "kind": {"enum": ["run", "subagent", "turn"]},
+                    "id": string(),
+                },
+                "additionalProperties": false,
+            },
+            "created": {"type": "string", "format": "date-time"},
+            "statusHistory": {
+                "description": "every state the task has been in, oldest first",
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["state", "ts"],
+                    "properties": {
+                        "state": {"type": "string", "pattern": "^TASK_STATE_"},
+                        "ts": {"type": "string", "format": "date-time"},
+                    },
+                    "additionalProperties": false,
+                },
+            },
+            "principal": {"description": "who started the task", "type": "string"},
+            "askSchema": {
+                "description": "the JSON Schema of the answer an INPUT_REQUIRED gate asks for",
+                "type": ["object", "boolean"],
+            },
+            "command": {"description": "the command op that started the task", "type": "string"},
+        },
+        "additionalProperties": false,
+    })
 }
 
 /// `[{op, reply}]` for `ops`, as the command extension's `params.ops` spells
@@ -639,5 +792,346 @@ mod tests {
             let name = owner.uri().rsplit('/').next().unwrap();
             assert_eq!(ns, format!("agentd.{name}"), "{method}");
         }
+    }
+
+    // ── The published contract: registry, spec pages, schema bundles ──────
+
+    /// The workspace root, where `docs/` and `web/` live.
+    fn repo() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+    }
+
+    fn read_repo(rel: &str) -> String {
+        std::fs::read_to_string(repo().join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
+    }
+
+    /// The rows of the first table under the heading line `heading` in `doc`,
+    /// header and separator dropped, each cell trimmed. A spec states its
+    /// vocabulary in these tables, and the tests below hold them to the code.
+    fn table_under(doc: &str, heading: &str) -> Vec<Vec<String>> {
+        let mut lines = doc.lines().skip_while(|l| l.trim() != heading);
+        assert!(lines.next().is_some(), "no {heading:?} section");
+        let rows: Vec<Vec<String>> = lines
+            .skip_while(|l| !l.starts_with('|'))
+            .take_while(|l| l.starts_with('|'))
+            .map(|l| {
+                l.trim()
+                    .trim_matches('|')
+                    .split('|')
+                    .map(|c| c.trim().to_string())
+                    .collect()
+            })
+            .collect();
+        assert!(rows.len() > 2, "{heading:?} has no table rows");
+        rows[2..].to_vec()
+    }
+
+    /// A cell naming one identifier: `` `name` `` → `name`.
+    fn ident(cell: &str) -> &str {
+        cell.trim_matches('`')
+    }
+
+    /// Every URI agentd publishes — each extension and the unix binding —
+    /// has exactly one registry entry, its path read off the URI, a spec file
+    /// that names the URI and says it carries no version, and a schema bundle
+    /// served beside it whose `$id` is that address (the binding: none). No
+    /// spec file under `docs/ext/` belongs to nothing.
+    #[test]
+    fn every_extension_uri_has_its_spec_and_registry_entry() {
+        let registry = registry();
+        let entries = registry.as_array().unwrap();
+        let uris: Vec<&str> = Ext::ALL
+            .iter()
+            .map(|e| e.uri())
+            .chain(BINDINGS.iter().copied())
+            .collect();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|e| e["uri"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            uris,
+            "one entry per URI, in registry order"
+        );
+        for (entry, uri) in entries.iter().zip(&uris) {
+            let binding = BINDINGS.contains(uri);
+            let path = entry["path"].as_str().unwrap();
+            assert_eq!(format!("{URI_BASE}{path}"), *uri, "{entry}");
+            assert!(
+                path.starts_with(if binding { "a2a/binding/" } else { "a2a/ext/" }),
+                "{entry}"
+            );
+            assert_eq!(entry["kind"], if binding { "binding" } else { "extension" });
+            assert_eq!(entry["required"], false, "{entry}");
+            let spec = entry["spec"].as_str().unwrap();
+            let text = read_repo(spec);
+            assert!(
+                text.contains(&format!("`{uri}`")),
+                "{spec} never names {uri}"
+            );
+            assert!(
+                text.contains("carries no version"),
+                "{spec} does not say that its URI carries no version"
+            );
+            let name = name_of(uri);
+            match bundle_of(name) {
+                Some(bundle) => {
+                    assert!(!binding, "{uri}");
+                    assert_eq!(entry["schema"], schema_of(uri), "{entry}");
+                    assert_eq!(bundle["$id"], entry["schema"], "{name}");
+                    assert_eq!(
+                        bundle["$schema"],
+                        "https://json-schema.org/draft/2020-12/schema"
+                    );
+                }
+                None => {
+                    assert!(binding, "{uri} has no bundle");
+                    assert!(entry["schema"].is_null(), "{entry}");
+                }
+            }
+        }
+        let specs: Vec<&str> = entries
+            .iter()
+            .map(|e| e["spec"].as_str().unwrap())
+            .collect();
+        for f in std::fs::read_dir(repo().join("docs/ext")).unwrap() {
+            let f = f.unwrap().file_name().into_string().unwrap();
+            let rel = format!("docs/ext/{f}");
+            assert!(
+                specs.contains(&rel.as_str()),
+                "{rel} specifies no URI agentd publishes"
+            );
+        }
+    }
+
+    /// The label a spec's op table gives each [`Floor`], [`Gate`] and reply.
+    fn floor_label(spec: &super::super::ops::OpSpec) -> String {
+        use super::super::ops::Floor;
+        match spec.floor {
+            Floor::Operator => "operator".into(),
+            Floor::AnyNamed => "any named caller".into(),
+            Floor::Granted if spec.defaults.is_empty() => "a grant".into(),
+            Floor::Granted => {
+                let roles: Vec<String> = spec
+                    .defaults
+                    .iter()
+                    .map(|r| format!("`{}`", serde_json::to_value(r).unwrap().as_str().unwrap()))
+                    .collect();
+                format!("{} or a grant", roles.join(", "))
+            }
+        }
+    }
+
+    fn gate_label(spec: &super::super::ops::OpSpec) -> &'static str {
+        use super::super::ops::{Gate, Handler};
+        if spec.handler == Handler::Reserved {
+            return "never";
+        }
+        match spec.gate {
+            Gate::Always => "always",
+            Gate::Introspection => "`a2a.introspection.enabled`",
+            Gate::DeviceGrant => "`a2a.device_grant.enabled`",
+            Gate::Listener => "a TCP listener",
+        }
+    }
+
+    /// The keys `card.rs` sets under each extension's `params` when it
+    /// narrows a declaration to its caller, read from the source: each
+    /// `ext["params"]["<key>"]` belongs to the `uri == <CONST>` branch it
+    /// sits in. The declarations' own keys are read from the values.
+    fn narrowed_keys() -> Vec<(&'static str, String)> {
+        let src = read_repo("crates/agentd/src/runtime/a2a_server/card.rs");
+        let body = src
+            .split_once("\nfn narrow(")
+            .map(|(_, rest)| rest.split("\n}\n").next().unwrap_or_default())
+            .expect("card.rs has fn narrow");
+        let consts = [
+            ("COMMAND_EXTENSION", COMMAND_EXTENSION),
+            ("EVENTS_EXTENSION", EVENTS_EXTENSION),
+            ("TASK_ANNOTATIONS_EXTENSION", TASK_ANNOTATIONS_EXTENSION),
+        ];
+        let mut out = Vec::new();
+        let mut owner: Option<&'static str> = None;
+        for line in body.lines() {
+            if let Some((_, uri)) = consts
+                .iter()
+                .find(|(c, _)| line.contains(&format!("uri == {c}")))
+            {
+                owner = Some(uri);
+            }
+            let mut rest = line;
+            while let Some(i) = rest.find("[\"params\"][\"") {
+                rest = &rest[i + "[\"params\"][\"".len()..];
+                let key = rest.split('"').next().unwrap_or_default();
+                let uri = owner
+                    .unwrap_or_else(|| panic!("card.rs sets params.{key} outside a uri branch"));
+                out.push((uri, key.to_string()));
+            }
+        }
+        assert!(
+            !out.is_empty(),
+            "the scan found no narrowed params in card.rs"
+        );
+        out
+    }
+
+    /// Each spec states the vocabulary it publishes, and the code is the
+    /// authority on it:
+    ///
+    /// * the command spec's op table is [`OPS`] — every listed op, then the
+    ///   reserved `_instance.*` members and the names served by nothing — with
+    ///   each op's reply, who may call it, when it is served and its
+    ///   description, in table order;
+    /// * the events spec's kinds table is [`FeedKind::ALL`], each with its
+    ///   audience;
+    /// * each spec's params table is exactly the keys its declaration
+    ///   carries on the public card and the keys `card.rs` adds on the
+    ///   extended one, each marked with the card it is on.
+    #[test]
+    fn extension_specs_document_the_whole_vocabulary() {
+        use super::super::events::{Audience, FeedKind};
+        use super::super::ops::{INSTANCE_OPS, OPS, Reply};
+
+        let command = read_repo(&spec_doc(COMMAND_EXTENSION));
+        let rows = table_under(&command, "## Ops");
+        let mut want: Vec<[String; 5]> = Vec::new();
+        for spec in OPS {
+            let reply = match spec.reply {
+                Reply::Message => "message",
+                Reply::Task => "task",
+            };
+            let row = |name: &str, description: &str| {
+                [
+                    name.to_string(),
+                    reply.to_string(),
+                    floor_label(spec),
+                    gate_label(spec).to_string(),
+                    description.to_string(),
+                ]
+            };
+            if spec.name.ends_with('.') {
+                for m in INSTANCE_OPS
+                    .iter()
+                    .filter(|m| m.name.starts_with(spec.name))
+                {
+                    want.push(row(m.name, m.description));
+                }
+            } else {
+                want.push(row(spec.name, spec.description));
+            }
+        }
+        let got: Vec<[String; 5]> = rows
+            .iter()
+            .map(|r| {
+                assert_eq!(r.len(), 5, "an op row has five cells: {r:?}");
+                [
+                    ident(&r[0]).to_string(),
+                    r[1].clone(),
+                    r[2].clone(),
+                    r[3].clone(),
+                    r[4].clone(),
+                ]
+            })
+            .collect();
+        assert_eq!(got, want, "docs/ext/command.md's op table is not OPS");
+
+        let events = read_repo(&spec_doc(EVENTS_EXTENSION));
+        let got: Vec<(String, String)> = table_under(&events, "## Kinds")
+            .iter()
+            .map(|r| (ident(&r[0]).to_string(), r[1].clone()))
+            .collect();
+        let want: Vec<(String, String)> = FeedKind::ALL
+            .iter()
+            .map(|k| {
+                let who = match k.audience() {
+                    Audience::All => "every subscriber",
+                    Audience::Owner => "its owner and operators",
+                    Audience::Operator => "operators",
+                };
+                // `kinds_for` holds audit back while introspection is off.
+                let who = if *k == FeedKind::Audit {
+                    format!("{who}, while `a2a.introspection.enabled`")
+                } else {
+                    who.to_string()
+                };
+                (k.as_str().to_string(), who)
+            })
+            .collect();
+        assert_eq!(
+            got, want,
+            "docs/ext/events.md's kinds table is not FeedKind::ALL"
+        );
+
+        let narrowed = narrowed_keys();
+        for ext in Ext::ALL {
+            let public = ext.declaration()["params"].clone();
+            let mut want: Vec<(String, &str)> = public
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(|k| (k.clone(), "public"))
+                .collect();
+            for (uri, key) in &narrowed {
+                if *uri == ext.uri() && !want.iter().any(|(k, _)| k == key) {
+                    want.push((key.clone(), "extended"));
+                }
+            }
+            want.sort();
+            let doc = read_repo(&spec_doc(ext.uri()));
+            let mut got: Vec<(String, &str)> = table_under(&doc, "## Params")
+                .iter()
+                .map(|r| {
+                    let card = match r[2].as_str() {
+                        "public" => "public",
+                        "extended" => "extended",
+                        other => panic!("{:?}: the card column says {other:?}", ext.name()),
+                    };
+                    (ident(&r[0]).to_string(), card)
+                })
+                .collect();
+            got.sort();
+            assert_eq!(
+                got,
+                want,
+                "the params table of {} is not the card's",
+                ext.name()
+            );
+        }
+    }
+
+    /// The task-annotations bundle accepts what the wire writes on a task
+    /// that has every optional fact, and one that has none — and is closed,
+    /// so a fact the wire adds without the schema is caught here.
+    #[cfg(feature = "a2a")]
+    #[test]
+    fn task_annotations_bundle_accepts_what_the_wire_writes() {
+        use crate::a2a::tasks::{Link, State, Task};
+        let bundle = task_annotations_bundle();
+        let mut full = Task::new(
+            "t-1",
+            "ctx-1",
+            Some("user:alice"),
+            Link::Run { id: "r-1".into() },
+        );
+        full.ask_schema = Some(json!({"type": "object"}));
+        full.command = Some("workflow.run".into());
+        full.transition(State::Working, None);
+        full.transition(State::InputRequired, Some("which one?".into()));
+        let bare = Task::new(
+            "t-2",
+            "ctx-2",
+            None,
+            Link::Subagent {
+                handle: "sa-1".into(),
+            },
+        );
+        for t in [&full, &bare] {
+            let a = crate::a2a::wire::annotations(t);
+            let r = crate::jsonschema::validate(&bundle, &a);
+            assert!(r.is_ok(), "{a}: {r:?}");
+        }
+        let mut extra = crate::a2a::wire::annotations(&full);
+        extra["unpublished"] = json!(1);
+        assert!(crate::jsonschema::validate(&bundle, &extra).is_err());
     }
 }

@@ -1,0 +1,7 @@
+{
+  "agentd": {
+    "op": "workflow.run",
+    "workflow": "triage",
+    "inputs": {"ticket": 42}
+  }
+}

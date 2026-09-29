@@ -4614,11 +4614,19 @@ pub enum Ask {
     Login(String),
     /// `--logout <target>`: evict a cached credential.
     Logout(String),
+    /// `--extension-schema <name>`: print the schema bundle agentd.dev
+    /// publishes for the extension called `name` (its URI's last segment), so
+    /// the published file is generated from the values the listener checks
+    /// against rather than written beside them.
+    ExtensionSchema(String),
+    /// `--extensions`: print every URI agentd publishes — its extensions and
+    /// its binding — with where the site serves each one's spec and schema.
+    Extensions,
 }
 
 /// The ask a flag makes, when it makes one: the flags that want something
-/// other than a run. `Login` and `Logout` come back with an empty target — the
-/// loader reads it from the next argument.
+/// other than a run. `Login`, `Logout` and `ExtensionSchema` come back with an
+/// empty argument — the loader reads it from the next one.
 fn ask_flag(flag: &str) -> Option<Ask> {
     Some(match flag {
         "-h" | "--help" => Ask::Help,
@@ -4631,6 +4639,8 @@ fn ask_flag(flag: &str) -> Option<Ask> {
         "--effective-config" => Ask::EffectiveConfig,
         "--login" => Ask::Login(String::new()),
         "--logout" => Ask::Logout(String::new()),
+        "--extension-schema" => Ask::ExtensionSchema(String::new()),
+        "--extensions" => Ask::Extensions,
         _ => return None,
     })
 }
@@ -4795,6 +4805,11 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
                     Ask::Logout(_) => Ask::Logout(it.next().cloned().ok_or_else(|| {
                         usage("--logout requires a target (e.g. mcp:<name>)".into())
                     })?),
+                    Ask::ExtensionSchema(_) => {
+                        Ask::ExtensionSchema(it.next().cloned().ok_or_else(|| {
+                            usage("--extension-schema requires a name (e.g. command)".into())
+                        })?)
+                    }
                     other => other,
                 };
             continue;
@@ -5010,7 +5025,11 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
         && ask != Ask::Schema
         && ask != Ask::WorkflowSchema
         && ask != Ask::ContextTemplate
-        && !matches!(ask, Ask::Login(_) | Ask::Logout(_))
+        && ask != Ask::Extensions
+        && !matches!(
+            ask,
+            Ask::Login(_) | Ask::Logout(_) | Ask::ExtensionSchema(_)
+        )
         && let Some(first) = diags.errors.first()
     {
         // ALL of them, not the first. Failing on whichever error happens to
@@ -7976,6 +7995,9 @@ pub fn help_text() -> String {
          \x20 --config-schema            print the settings JSON Schema and exit\n\
          \x20 --context-template        print the built-in system-prompt template and exit\n\
      \x20 --workflow-schema          print the workflow JSON Schema + node registry and exit\n\
+         \x20 --extensions               print every A2A extension and binding URI agentd publishes and exit\n\
+         \x20 --extension-schema <name>  print the schema bundle of the extension <name> (the last segment\n\
+         \x20                            of its URI in --extensions) and exit\n\
          \x20 --capabilities             print the capabilities manifest and exit\n\
          \x20 --login <target>           complete an OAuth device-login for an endpoint (e.g. mcp:<name>) and cache the token\n\
          \x20 --logout <target>          evict a cached credential\n\
@@ -11230,6 +11252,20 @@ mod tests {
         // even with no config file present (no intelligence endpoint, etc.).
         let (_, ask) = load(&args(&["--workflow-schema"]), &[]).unwrap();
         assert_eq!(ask, Ask::WorkflowSchema);
+        // So are the extension asks: what agentd.dev publishes does not
+        // depend on a config, so an invalid one — a feed with no listener to
+        // serve it on — must not stop them.
+        let invalid = ["--a2a-events-enabled"];
+        assert!(
+            load(&args(&invalid), &[]).is_err(),
+            "the fixture is invalid"
+        );
+        let (_, ask) = load(&args(&[&["--extensions"][..], &invalid].concat()), &[]).unwrap();
+        assert_eq!(ask, Ask::Extensions);
+        let asked = [&["--extension-schema", "events"][..], &invalid].concat();
+        let (_, ask) = load(&args(&asked), &[]).unwrap();
+        assert_eq!(ask, Ask::ExtensionSchema("events".into()));
+        assert!(load(&args(&["--extension-schema"]), &[]).is_err());
         assert!(help_section().contains("intelligence.model"));
     }
 

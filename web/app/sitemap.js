@@ -1,11 +1,13 @@
 export const dynamic = "force-static";
 
-// /sitemap.xml — generated at build from the docs registry, so a page added
-// to lib/docs.js is in the sitemap by construction. lastModified comes from
+// /sitemap.xml — generated at build from the docs registry and the A2A
+// extension registry, so a page added to lib/docs.js, or a URI agentd starts
+// publishing, is in the sitemap by construction. lastModified comes from
 // the source markdown's mtime (the git checkout the site builds from).
 import { statSync } from "node:fs";
 import { join } from "node:path";
 import { DOCS } from "../lib/docs";
+import EXTENSIONS from "../lib/extensions.json";
 
 const BASE = "https://agentd.dev";
 const REPO = join(process.cwd(), "..");
@@ -31,5 +33,13 @@ export default function sitemap() {
     changeFrequency: "weekly",
     priority: 0.8,
   }));
-  return [...top, ...docs];
+  // Each A2A extension and binding URI agentd publishes is also the page
+  // that specifies it; the list is the one the binary prints.
+  const specs = EXTENSIONS.map((e) => ({
+    url: `${BASE}/${e.path}/`,
+    lastModified: mtime(e.spec),
+    changeFrequency: "monthly",
+    priority: 0.6,
+  }));
+  return [...top, ...docs, ...specs];
 }

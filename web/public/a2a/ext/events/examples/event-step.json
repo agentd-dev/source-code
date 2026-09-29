@@ -1,0 +1,16 @@
+{
+  "event": {
+    "seq": 121,
+    "ts": 1790676902410,
+    "kind": "step",
+    "data": {
+      "run": "triage-01J9Z8X4K2",
+      "step": "classify",
+      "phase": "done",
+      "status": "completed",
+      "attempt": 1,
+      "tokens": 812,
+      "err": null
+    }
+  }
+}

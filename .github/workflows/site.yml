@@ -33,6 +33,35 @@ jobs:
       - run: cp install.sh web/public/install.sh
       - run: npm run build
         working-directory: web
+        # Every URI agentd publishes is also the page that specifies it, with
+        # its schema bundle beside it (A2A: an extension's spec should be
+        # hosted at its URI). web/lib/extensions.json is the binary's own list
+        # (scripts/gen-schemas.sh), so this fails when a declared URI would
+        # 404, serve the wrong bundle, or be missing from the sitemap.
+      - name: every extension URI serves its spec page and schema
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          entries = json.load(open("web/lib/extensions.json"))
+          sitemap = open("web/out/sitemap.xml").read()
+          bad = []
+          for e in entries:
+              page = os.path.join("web/out", e["path"], "index.html")
+              if not os.path.isfile(page):
+                  bad.append(f"{e['uri']}: no page at {page}")
+              if e["schema"]:
+                  f = os.path.join("web/out", e["path"], "schema.json")
+                  if not os.path.isfile(f):
+                      bad.append(f"{e['uri']}: no schema at {f}")
+                  elif json.load(open(f)).get("$id") != e["schema"]:
+                      bad.append(f"{e['uri']}: {f} does not carry $id {e['schema']}")
+              url = f"https://agentd.dev/{e['path']}/"
+              if f"<loc>{url}</loc>" not in sitemap:
+                  bad.append(f"{e['uri']}: {url} is not in the sitemap")
+          for b in bad:
+              print(f"::error::{b}")
+          sys.exit(1 if bad else 0)
+          PY
         # Served from the custom apex domain agentd.dev at the root —
         # no basePath/assetPrefix. The CNAME ships in web/public/.
       - uses: actions/upload-pages-artifact@v3

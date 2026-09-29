@@ -32,7 +32,9 @@ const ROOTS: &[&str] = &[
     ".github",
     "packaging",
     "web/public/schema",
+    "web/public/a2a",
     "web/lib/workflow-nodes.json",
+    "web/lib/extensions.json",
     "contrib/schemastore-catalog-entry.json",
     "Dockerfile",
 ];

@@ -1,0 +1,13 @@
+{
+  "event": {
+    "seq": 123,
+    "ts": 1790676904500,
+    "kind": "auth",
+    "data": {
+      "event": "pending",
+      "client_id": "agentd-ui",
+      "scope": "user",
+      "user_code": "WDJB-MJHT"
+    }
+  }
+}

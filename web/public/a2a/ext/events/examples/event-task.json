@@ -1,0 +1,32 @@
+{
+  "event": {
+    "seq": 119,
+    "ts": 1790676902130,
+    "kind": "task",
+    "data": {
+      "task": {
+        "id": "01J9Z8X4K2M7Q3T5V8W0Y2Z4A6",
+        "contextId": "chat1",
+        "status": {"state": "TASK_STATE_WORKING", "timestamp": "2026-09-29T10:15:02.130Z"},
+        "history": [
+          {
+            "messageId": "m-1",
+            "role": "ROLE_USER",
+            "parts": [{"text": "Triage ticket 42"}]
+          }
+        ],
+        "metadata": {
+          "https://agentd.dev/a2a/ext/task-annotations": {
+            "link": {"kind": "turn", "id": "chat1"},
+            "created": "2026-09-29T10:15:02.114Z",
+            "statusHistory": [
+              {"state": "TASK_STATE_SUBMITTED", "ts": "2026-09-29T10:15:02.114Z"},
+              {"state": "TASK_STATE_WORKING", "ts": "2026-09-29T10:15:02.130Z"}
+            ],
+            "principal": "user:alice"
+          }
+        }
+      }
+    }
+  }
+}

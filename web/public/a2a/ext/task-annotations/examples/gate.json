@@ -1,0 +1,15 @@
+{
+  "link": {"kind": "run", "id": "deploy-01J9Z9A1B2"},
+  "created": "2026-09-29T11:02:40.003Z",
+  "statusHistory": [
+    {"state": "TASK_STATE_SUBMITTED", "ts": "2026-09-29T11:02:40.003Z"},
+    {"state": "TASK_STATE_WORKING", "ts": "2026-09-29T11:02:40.010Z"},
+    {"state": "TASK_STATE_INPUT_REQUIRED", "ts": "2026-09-29T11:02:41.250Z"}
+  ],
+  "principal": "operator",
+  "askSchema": {
+    "type": "object",
+    "required": ["approve"],
+    "properties": {"approve": {"type": "boolean"}}
+  }
+}

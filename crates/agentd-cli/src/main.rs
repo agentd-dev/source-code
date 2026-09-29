@@ -154,6 +154,37 @@ fn run(args: &[String], env: &[(String, String)]) -> i32 {
             );
             exit::SUCCESS
         }
+        // What agentd.dev publishes next to each extension URI, printed from
+        // the values the listener checks against: `scripts/gen-schemas.sh`
+        // writes the site's copies from these, and CI diffs them.
+        Ask::ExtensionSchema(name) => {
+            use agentd::runtime::surface::{Ext, bundle_of};
+            match bundle_of(&name) {
+                Some(bundle) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&bundle).unwrap_or_else(|_| "{}".to_string())
+                    );
+                    exit::SUCCESS
+                }
+                None => {
+                    let known: Vec<&str> = Ext::ALL.iter().map(|e| e.name()).collect();
+                    eprintln!(
+                        "agentd: no extension is called {name:?}; the extensions with a schema are {}",
+                        known.join(", ")
+                    );
+                    exit::USAGE
+                }
+            }
+        }
+        Ask::Extensions => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&agentd::runtime::surface::registry())
+                    .unwrap_or_else(|_| "[]".to_string())
+            );
+            exit::SUCCESS
+        }
         Ask::Validate => {
             for w in &loaded.warnings {
                 eprintln!("{}", json!({"event": "config.warning", "msg": w}));

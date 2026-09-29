@@ -1,0 +1,11 @@
+{
+  "link": {"kind": "run", "id": "triage-01J9Z8X4K2"},
+  "created": "2026-09-29T10:15:02.114Z",
+  "statusHistory": [
+    {"state": "TASK_STATE_SUBMITTED", "ts": "2026-09-29T10:15:02.114Z"},
+    {"state": "TASK_STATE_WORKING", "ts": "2026-09-29T10:15:02.130Z"},
+    {"state": "TASK_STATE_COMPLETED", "ts": "2026-09-29T10:15:04.870Z"}
+  ],
+  "principal": "user:alice",
+  "command": "workflow.run"
+}

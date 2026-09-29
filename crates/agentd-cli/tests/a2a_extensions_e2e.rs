@@ -403,10 +403,15 @@ fn the_card_follows_a_principals_reload() {
     );
     assert_eq!(card["capabilities"]["extendedAgentCard"], true, "{card}");
     assert_ne!(before.body, after.body, "the card did not change");
-    // The well-known route's validator changes with the body it names.
-    if let Some(etag) = before.header("etag") {
-        assert_ne!(after.header("etag"), Some(etag), "the ETag did not change");
-    }
+    // The well-known route's validator changes with the body it names. The
+    // route always sends one, so its absence is a failure here, not a pass.
+    let etag = before
+        .header("etag")
+        .expect("the well-known card carries an ETag");
+    let changed = after
+        .header("etag")
+        .expect("the reloaded card carries an ETag");
+    assert_ne!(changed, etag, "the ETag did not change");
 
     let ext = extended_as(&addr, CI);
     assert_eq!(ext["capabilities"]["extendedAgentCard"], true, "{ext}");

@@ -1,0 +1,2621 @@
+{
+  "$defs": {
+    "envelope": {
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "op": {
+                "const": "status"
+              }
+            },
+            "required": [
+              "op"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/envelopes/$defs/status"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "op": {
+                "const": "config"
+              }
+            },
+            "required": [
+              "op"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/envelopes/$defs/config"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "op": {
+                "const": "workflow.run"
+              }
+            },
+            "required": [
+              "op"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/envelopes/$defs/workflow.run"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "op": {
+                "const": "workflow.status"
+              }
+            },
+            "required": [
+              "op"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/envelopes/$defs/workflow.status"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "op": {
+                "const": "workflow.cancel"
+              }
+            },
+            "required": [
+              "op"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/envelopes/$defs/workflow.cancel"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "op": {
+                "const": "workflow.signal"
+              }
+            },
+            "required": [
+              "op"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/envelopes/$defs/workflow.signal"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "op": {
+                "const": "subagent.send"
+              }
+            },
+            "required": [
+              "op"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/envelopes/$defs/subagent.send"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "op": {
+                "const": "subagent.kill"
+              }
+            },
+            "required": [
+              "op"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/envelopes/$defs/subagent.kill"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "op": {
+                "const": "subagent.status"
+              }
+            },
+            "required": [
+              "op"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/envelopes/$defs/subagent.status"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "op": {
+                "const": "plan.get"
+              }
+            },
+            "required": [
+              "op"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/envelopes/$defs/plan.get"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "op": {
+                "const": "conversation.get"
+              }
+            },
+            "required": [
+              "op"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/envelopes/$defs/conversation.get"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "op": {
+                "const": "run.get"
+              }
+            },
+            "required": [
+              "op"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/envelopes/$defs/run.get"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "op": {
+                "const": "subagent.get"
+              }
+            },
+            "required": [
+              "op"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/envelopes/$defs/subagent.get"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "op": {
+                "const": "debug.events"
+              }
+            },
+            "required": [
+              "op"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/envelopes/$defs/debug.events"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "op": {
+                "const": "admin.drain"
+              }
+            },
+            "required": [
+              "op"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/envelopes/$defs/admin.drain"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "op": {
+                "const": "admin.pause"
+              }
+            },
+            "required": [
+              "op"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/envelopes/$defs/admin.pause"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "op": {
+                "const": "admin.resume"
+              }
+            },
+            "required": [
+              "op"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/envelopes/$defs/admin.resume"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "op": {
+                "const": "admin.cancel"
+              }
+            },
+            "required": [
+              "op"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/envelopes/$defs/admin.cancel"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "op": {
+                "const": "admin.set"
+              }
+            },
+            "required": [
+              "op"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/envelopes/$defs/admin.set"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "op": {
+                "const": "auth.device.pending"
+              }
+            },
+            "required": [
+              "op"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/envelopes/$defs/auth.device.pending"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "op": {
+                "const": "auth.device.approve"
+              }
+            },
+            "required": [
+              "op"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/envelopes/$defs/auth.device.approve"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "op": {
+                "const": "auth.device.deny"
+              }
+            },
+            "required": [
+              "op"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/envelopes/$defs/auth.device.deny"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "op": {
+                "const": "auth.sessions"
+              }
+            },
+            "required": [
+              "op"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/envelopes/$defs/auth.sessions"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "op": {
+                "const": "auth.sessions.revoke"
+              }
+            },
+            "required": [
+              "op"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/envelopes/$defs/auth.sessions.revoke"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "op": {
+                "const": "_instance.result"
+              }
+            },
+            "required": [
+              "op"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/envelopes/$defs/_instance.result"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "op": {
+                "const": "_instance.emit"
+              }
+            },
+            "required": [
+              "op"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/envelopes/$defs/_instance.emit"
+          }
+        }
+      ],
+      "properties": {
+        "op": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "op"
+      ],
+      "type": "object"
+    },
+    "envelopes": {
+      "$defs": {
+        "_instance.emit": {
+          "additionalProperties": false,
+          "properties": {
+            "event": {
+              "description": "The child's stream event: subject, correlation, data and id",
+              "type": "object"
+            },
+            "handle": {
+              "description": "The parent's handle for the child",
+              "minLength": 1,
+              "type": "string"
+            },
+            "op": {
+              "const": "_instance.emit"
+            },
+            "stream": {
+              "description": "The stream, by the name both sides declare",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "op",
+            "handle",
+            "stream",
+            "event"
+          ],
+          "type": "object"
+        },
+        "_instance.result": {
+          "additionalProperties": false,
+          "properties": {
+            "handle": {
+              "description": "The parent's handle for the child",
+              "minLength": 1,
+              "type": "string"
+            },
+            "op": {
+              "const": "_instance.result"
+            },
+            "output": {
+              "description": "The child's run output"
+            },
+            "status": {
+              "description": "The child's run status"
+            }
+          },
+          "required": [
+            "op",
+            "handle"
+          ],
+          "type": "object"
+        },
+        "admin.cancel": {
+          "additionalProperties": false,
+          "properties": {
+            "op": {
+              "const": "admin.cancel"
+            },
+            "reason": {
+              "description": "Why, for the log and the feed",
+              "type": "string"
+            },
+            "run": {
+              "description": "The run id",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "op",
+            "run"
+          ],
+          "type": "object"
+        },
+        "admin.drain": {
+          "additionalProperties": false,
+          "properties": {
+            "op": {
+              "const": "admin.drain"
+            },
+            "reason": {
+              "description": "Why, for the log and the feed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "op"
+          ],
+          "type": "object"
+        },
+        "admin.pause": {
+          "additionalProperties": false,
+          "properties": {
+            "op": {
+              "const": "admin.pause"
+            },
+            "reason": {
+              "description": "Why, for the log and the feed",
+              "type": "string"
+            },
+            "run": {
+              "description": "Pause this run; without it, the whole instance",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "op"
+          ],
+          "type": "object"
+        },
+        "admin.resume": {
+          "additionalProperties": false,
+          "properties": {
+            "op": {
+              "const": "admin.resume"
+            },
+            "run": {
+              "description": "Resume this run; without it, the whole instance",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "op"
+          ],
+          "type": "object"
+        },
+        "admin.set": {
+          "additionalProperties": false,
+          "properties": {
+            "op": {
+              "const": "admin.set"
+            },
+            "path": {
+              "enum": [
+                "agent.approval",
+                "a2a.introspection.enabled"
+              ]
+            },
+            "value": {
+              "description": "What the config file accepts at `path`"
+            }
+          },
+          "required": [
+            "op",
+            "path",
+            "value"
+          ],
+          "type": "object"
+        },
+        "auth.device.approve": {
+          "additionalProperties": false,
+          "properties": {
+            "as": {
+              "description": "The name the device signs in as: every session approved as one name is one principal",
+              "not": {
+                "enum": [
+                  "operator",
+                  "anonymous",
+                  "unknown",
+                  "launcher",
+                  "runtime",
+                  "system"
+                ]
+              },
+              "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+              "type": "string"
+            },
+            "op": {
+              "const": "auth.device.approve"
+            },
+            "scope": {
+              "enum": [
+                "user",
+                "operator"
+              ]
+            },
+            "user_code": {
+              "description": "The code the device shows",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "op",
+            "user_code",
+            "as"
+          ],
+          "type": "object"
+        },
+        "auth.device.deny": {
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "required": [
+                "user_code"
+              ]
+            },
+            {
+              "properties": {
+                "all": {
+                  "const": true
+                }
+              },
+              "required": [
+                "all"
+              ]
+            }
+          ],
+          "properties": {
+            "all": {
+              "type": "boolean"
+            },
+            "op": {
+              "const": "auth.device.deny"
+            },
+            "user_code": {
+              "description": "The code the device shows",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "op"
+          ],
+          "type": "object"
+        },
+        "auth.device.pending": {
+          "additionalProperties": false,
+          "properties": {
+            "op": {
+              "const": "auth.device.pending"
+            }
+          },
+          "required": [
+            "op"
+          ],
+          "type": "object"
+        },
+        "auth.sessions": {
+          "additionalProperties": false,
+          "properties": {
+            "op": {
+              "const": "auth.sessions"
+            }
+          },
+          "required": [
+            "op"
+          ],
+          "type": "object"
+        },
+        "auth.sessions.revoke": {
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "required": [
+                "sid"
+              ]
+            },
+            {
+              "required": [
+                "name"
+              ]
+            },
+            {
+              "properties": {
+                "all": {
+                  "const": true
+                }
+              },
+              "required": [
+                "all"
+              ]
+            }
+          ],
+          "properties": {
+            "all": {
+              "type": "boolean"
+            },
+            "name": {
+              "description": "Every session approved as this name",
+              "minLength": 1,
+              "type": "string"
+            },
+            "op": {
+              "const": "auth.sessions.revoke"
+            },
+            "sid": {
+              "description": "One session",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "op"
+          ],
+          "type": "object"
+        },
+        "config": {
+          "additionalProperties": false,
+          "properties": {
+            "op": {
+              "const": "config"
+            }
+          },
+          "required": [
+            "op"
+          ],
+          "type": "object"
+        },
+        "conversation.get": {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "description": "The conversation, as the caller names it",
+              "minLength": 1,
+              "type": "string"
+            },
+            "limit": {
+              "description": "The newest messages to return (default 200, at most 1000)",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "op": {
+              "const": "conversation.get"
+            }
+          },
+          "required": [
+            "op",
+            "id"
+          ],
+          "type": "object"
+        },
+        "debug.events": {
+          "additionalProperties": false,
+          "properties": {
+            "after": {
+              "description": "Lines after this sequence number",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "level": {
+              "description": "Only lines of this level",
+              "type": "string"
+            },
+            "limit": {
+              "description": "At most this many (default 200, at most 500)",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "op": {
+              "const": "debug.events"
+            },
+            "prefix": {
+              "description": "Only events whose name starts with this",
+              "type": "string"
+            }
+          },
+          "required": [
+            "op"
+          ],
+          "type": "object"
+        },
+        "plan.get": {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "description": "The conversation, as the caller names it; without it, the root",
+              "minLength": 1,
+              "type": "string"
+            },
+            "op": {
+              "const": "plan.get"
+            }
+          },
+          "required": [
+            "op"
+          ],
+          "type": "object"
+        },
+        "run.get": {
+          "additionalProperties": false,
+          "properties": {
+            "op": {
+              "const": "run.get"
+            },
+            "run": {
+              "description": "The run id",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "op",
+            "run"
+          ],
+          "type": "object"
+        },
+        "status": {
+          "additionalProperties": false,
+          "properties": {
+            "op": {
+              "const": "status"
+            }
+          },
+          "required": [
+            "op"
+          ],
+          "type": "object"
+        },
+        "subagent.get": {
+          "additionalProperties": false,
+          "properties": {
+            "handle": {
+              "description": "The subagent handle",
+              "minLength": 1,
+              "type": "string"
+            },
+            "op": {
+              "const": "subagent.get"
+            }
+          },
+          "required": [
+            "op",
+            "handle"
+          ],
+          "type": "object"
+        },
+        "subagent.kill": {
+          "additionalProperties": false,
+          "properties": {
+            "handle": {
+              "description": "The subagent handle",
+              "type": "string"
+            },
+            "op": {
+              "const": "subagent.kill"
+            },
+            "reason": {
+              "description": "Why",
+              "type": "string"
+            }
+          },
+          "required": [
+            "op",
+            "handle"
+          ],
+          "type": "object"
+        },
+        "subagent.send": {
+          "additionalProperties": false,
+          "properties": {
+            "handle": {
+              "description": "The subagent handle",
+              "type": "string"
+            },
+            "message": {
+              "description": "The message",
+              "type": "string"
+            },
+            "op": {
+              "const": "subagent.send"
+            }
+          },
+          "required": [
+            "op",
+            "handle",
+            "message"
+          ],
+          "type": "object"
+        },
+        "subagent.status": {
+          "additionalProperties": false,
+          "properties": {
+            "handle": {
+              "description": "The subagent handle",
+              "type": "string"
+            },
+            "op": {
+              "const": "subagent.status"
+            }
+          },
+          "required": [
+            "op",
+            "handle"
+          ],
+          "type": "object"
+        },
+        "workflow.cancel": {
+          "additionalProperties": false,
+          "properties": {
+            "op": {
+              "const": "workflow.cancel"
+            },
+            "run": {
+              "description": "The run id",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "op",
+            "run"
+          ],
+          "type": "object"
+        },
+        "workflow.run": {
+          "additionalProperties": false,
+          "properties": {
+            "inputs": {
+              "description": "The run's inputs",
+              "type": "object"
+            },
+            "op": {
+              "const": "workflow.run"
+            },
+            "workflow": {
+              "description": "The workflow to start",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "op",
+            "workflow"
+          ],
+          "type": "object"
+        },
+        "workflow.signal": {
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "description": "The signal a `wait: {on: signal}` step waits for",
+              "minLength": 1,
+              "type": "string"
+            },
+            "op": {
+              "const": "workflow.signal"
+            },
+            "payload": {
+              "description": "What the waiting step receives"
+            },
+            "run": {
+              "description": "Deliver to this run only; without it, to every waiter the caller owns",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "op",
+            "name"
+          ],
+          "type": "object"
+        },
+        "workflow.status": {
+          "additionalProperties": false,
+          "properties": {
+            "op": {
+              "const": "workflow.status"
+            },
+            "run": {
+              "description": "One run; without it, every run the caller may see",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "op"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    "ops": {
+      "admin.cancel": {
+        "args": {
+          "additionalProperties": false,
+          "properties": {
+            "reason": {
+              "description": "Why, for the log and the feed",
+              "type": "string"
+            },
+            "run": {
+              "description": "The run id",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "run"
+          ],
+          "type": "object"
+        },
+        "description": "Cancel one run by id, whoever started it",
+        "reply": "task",
+        "result": {
+          "additionalProperties": false,
+          "properties": {
+            "cancelled": {
+              "type": "string"
+            },
+            "ok": {
+              "const": true
+            }
+          },
+          "required": [
+            "ok",
+            "cancelled"
+          ],
+          "type": "object"
+        }
+      },
+      "admin.drain": {
+        "args": {
+          "additionalProperties": false,
+          "properties": {
+            "reason": {
+              "description": "Why, for the log and the feed",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "description": "Begin a graceful drain, then exit 0",
+        "reply": "task",
+        "result": {
+          "additionalProperties": false,
+          "properties": {
+            "ok": {
+              "const": true
+            },
+            "reason": {
+              "type": "string"
+            },
+            "state": {
+              "const": "draining"
+            }
+          },
+          "required": [
+            "ok",
+            "state",
+            "reason"
+          ],
+          "type": "object"
+        }
+      },
+      "admin.pause": {
+        "args": {
+          "additionalProperties": false,
+          "properties": {
+            "reason": {
+              "description": "Why, for the log and the feed",
+              "type": "string"
+            },
+            "run": {
+              "description": "Pause this run; without it, the whole instance",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "description": "Hold the instance, or one run, at a safe boundary",
+        "reply": "task",
+        "result": {
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "ok": {
+                  "const": true
+                },
+                "paused": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "ok",
+                "paused"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "ok": {
+                  "const": true
+                },
+                "reason": {
+                  "type": "string"
+                },
+                "state": {
+                  "const": "paused"
+                }
+              },
+              "required": [
+                "ok",
+                "state",
+                "reason"
+              ],
+              "type": "object"
+            }
+          ]
+        }
+      },
+      "admin.resume": {
+        "args": {
+          "additionalProperties": false,
+          "properties": {
+            "run": {
+              "description": "Resume this run; without it, the whole instance",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "description": "Clear a prior pause",
+        "reply": "task",
+        "result": {
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "ok": {
+                  "const": true
+                },
+                "resumed": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "ok",
+                "resumed"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "ok": {
+                  "const": true
+                },
+                "state": {
+                  "const": "running"
+                }
+              },
+              "required": [
+                "ok",
+                "state"
+              ],
+              "type": "object"
+            }
+          ]
+        }
+      },
+      "admin.set": {
+        "args": {
+          "additionalProperties": false,
+          "properties": {
+            "path": {
+              "enum": [
+                "agent.approval",
+                "a2a.introspection.enabled"
+              ]
+            },
+            "value": {
+              "description": "What the config file accepts at `path`"
+            }
+          },
+          "required": [
+            "path",
+            "value"
+          ],
+          "type": "object"
+        },
+        "description": "Set a runtime-settable path (agent.approval, a2a.introspection.enabled) until the next reload",
+        "reply": "task",
+        "result": {
+          "additionalProperties": false,
+          "properties": {
+            "path": {
+              "enum": [
+                "agent.approval",
+                "a2a.introspection.enabled"
+              ]
+            },
+            "value": {
+              "description": "as parsed"
+            }
+          },
+          "required": [
+            "path",
+            "value"
+          ],
+          "type": "object"
+        }
+      },
+      "auth.device.approve": {
+        "args": {
+          "additionalProperties": false,
+          "properties": {
+            "as": {
+              "description": "The name the device signs in as: every session approved as one name is one principal",
+              "not": {
+                "enum": [
+                  "operator",
+                  "anonymous",
+                  "unknown",
+                  "launcher",
+                  "runtime",
+                  "system"
+                ]
+              },
+              "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+              "type": "string"
+            },
+            "scope": {
+              "enum": [
+                "user",
+                "operator"
+              ]
+            },
+            "user_code": {
+              "description": "The code the device shows",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "user_code",
+            "as"
+          ],
+          "type": "object"
+        },
+        "description": "Approve a device sign-in {user_code, as, scope?}; every session approved as one name is one principal",
+        "reply": "task",
+        "result": {
+          "additionalProperties": false,
+          "properties": {
+            "approved": {
+              "additionalProperties": false,
+              "properties": {
+                "client_id": {
+                  "type": "string"
+                },
+                "existing": {
+                  "type": "boolean"
+                },
+                "peer": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "principal": {
+                  "type": "string"
+                },
+                "scope": {
+                  "enum": [
+                    "user",
+                    "operator"
+                  ]
+                },
+                "user_code": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "user_code",
+                "client_id",
+                "scope",
+                "peer",
+                "principal",
+                "existing"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "approved"
+          ],
+          "type": "object"
+        }
+      },
+      "auth.device.deny": {
+        "args": {
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "required": [
+                "user_code"
+              ]
+            },
+            {
+              "properties": {
+                "all": {
+                  "const": true
+                }
+              },
+              "required": [
+                "all"
+              ]
+            }
+          ],
+          "properties": {
+            "all": {
+              "type": "boolean"
+            },
+            "user_code": {
+              "description": "The code the device shows",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "description": "Refuse a pending device sign-in {user_code}, or all of them {all: true}",
+        "reply": "task",
+        "result": {
+          "additionalProperties": false,
+          "properties": {
+            "denied": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "denied"
+          ],
+          "type": "object"
+        }
+      },
+      "auth.device.pending": {
+        "args": {
+          "additionalProperties": false,
+          "properties": {},
+          "required": [],
+          "type": "object"
+        },
+        "description": "Device sign-ins waiting for an operator's decision",
+        "reply": "message",
+        "result": {
+          "additionalProperties": false,
+          "properties": {
+            "pending": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "client_id": {
+                    "type": "string"
+                  },
+                  "expires_at": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "peer": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "requested_at": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "scope": {
+                    "enum": [
+                      "user",
+                      "operator"
+                    ]
+                  },
+                  "user_code": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "user_code",
+                  "client_id",
+                  "scope",
+                  "peer",
+                  "requested_at",
+                  "expires_at"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "pending"
+          ],
+          "type": "object"
+        }
+      },
+      "auth.sessions": {
+        "args": {
+          "additionalProperties": false,
+          "properties": {},
+          "required": [],
+          "type": "object"
+        },
+        "description": "The signed-in sessions: kind, name, principal and expiry",
+        "reply": "message",
+        "result": {
+          "additionalProperties": false,
+          "properties": {
+            "sessions": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "approved_by": {
+                    "type": "string"
+                  },
+                  "approved_rule": {
+                    "type": "string"
+                  },
+                  "client_id": {
+                    "type": "string"
+                  },
+                  "created_at": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "expires_at": {
+                    "minimum": 0,
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "kind": {
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "principal": {
+                    "type": "string"
+                  },
+                  "role": {
+                    "type": "string"
+                  },
+                  "sid": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "sid",
+                  "kind",
+                  "principal",
+                  "role",
+                  "client_id",
+                  "created_at",
+                  "expires_at",
+                  "approved_by"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "sessions"
+          ],
+          "type": "object"
+        }
+      },
+      "auth.sessions.revoke": {
+        "args": {
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "required": [
+                "sid"
+              ]
+            },
+            {
+              "required": [
+                "name"
+              ]
+            },
+            {
+              "properties": {
+                "all": {
+                  "const": true
+                }
+              },
+              "required": [
+                "all"
+              ]
+            }
+          ],
+          "properties": {
+            "all": {
+              "type": "boolean"
+            },
+            "name": {
+              "description": "Every session approved as this name",
+              "minLength": 1,
+              "type": "string"
+            },
+            "sid": {
+              "description": "One session",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "description": "End one session {sid}, every session of a name {name}, or all {all: true}",
+        "reply": "task",
+        "result": {
+          "additionalProperties": false,
+          "properties": {
+            "revoked": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "revoked"
+          ],
+          "type": "object"
+        }
+      },
+      "config": {
+        "args": {
+          "additionalProperties": false,
+          "properties": {},
+          "required": [],
+          "type": "object"
+        },
+        "description": "The effective configuration, credentials redacted",
+        "reply": "message",
+        "result": {
+          "additionalProperties": false,
+          "properties": {
+            "config": {
+              "description": "credentials redacted to their {{secret:…}} references",
+              "type": "object"
+            }
+          },
+          "required": [
+            "config"
+          ],
+          "type": "object"
+        }
+      },
+      "conversation.get": {
+        "args": {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "description": "The conversation, as the caller names it",
+              "minLength": 1,
+              "type": "string"
+            },
+            "limit": {
+              "description": "The newest messages to return (default 200, at most 1000)",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "type": "object"
+        },
+        "description": "One conversation's transcript, message bodies included",
+        "reply": "message",
+        "result": {
+          "additionalProperties": false,
+          "properties": {
+            "conversation": {
+              "additionalProperties": false,
+              "properties": {
+                "est_tokens": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "id": {
+                  "type": "string"
+                },
+                "kind": true,
+                "messages": {
+                  "items": {
+                    "description": "strings truncated at 4096 bytes"
+                  },
+                  "type": "array"
+                },
+                "plan": true,
+                "principal": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "skills": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "summary": true,
+                "task": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "total_messages": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "turns": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "updated": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "version": {
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "id",
+                "kind",
+                "version",
+                "turns",
+                "est_tokens",
+                "principal",
+                "task",
+                "skills",
+                "plan",
+                "summary",
+                "total_messages",
+                "messages",
+                "updated"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "conversation"
+          ],
+          "type": "object"
+        }
+      },
+      "debug.events": {
+        "args": {
+          "additionalProperties": false,
+          "properties": {
+            "after": {
+              "description": "Lines after this sequence number",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "level": {
+              "description": "Only lines of this level",
+              "type": "string"
+            },
+            "limit": {
+              "description": "At most this many (default 200, at most 500)",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "prefix": {
+              "description": "Only events whose name starts with this",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "description": "A cursor read of the live log ring, across every principal",
+        "reply": "message",
+        "result": {
+          "additionalProperties": false,
+          "properties": {
+            "dropped": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "events": {
+              "items": {
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "newest_seq": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "oldest_seq": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "events",
+            "newest_seq",
+            "oldest_seq",
+            "dropped"
+          ],
+          "type": "object"
+        }
+      },
+      "plan.get": {
+        "args": {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "description": "The conversation, as the caller names it; without it, the root",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "description": "One conversation's current plan and its progress",
+        "reply": "message",
+        "result": {
+          "additionalProperties": false,
+          "properties": {
+            "conversation": {
+              "type": "string"
+            },
+            "plan": {
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "progress": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "conversation",
+            "plan",
+            "progress"
+          ],
+          "type": "object"
+        }
+      },
+      "run.get": {
+        "args": {
+          "additionalProperties": false,
+          "properties": {
+            "run": {
+              "description": "The run id",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "run"
+          ],
+          "type": "object"
+        },
+        "description": "One run with per-step status, timings, errors and output",
+        "reply": "message",
+        "result": {
+          "additionalProperties": false,
+          "properties": {
+            "run": {
+              "additionalProperties": false,
+              "properties": {
+                "created": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "error": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "finished": {
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "id": {
+                  "type": "string"
+                },
+                "output": true,
+                "principal": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "start": {
+                  "type": "string"
+                },
+                "status": {
+                  "type": "string"
+                },
+                "steps": {
+                  "additionalProperties": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "attempt": {
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "error": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "finished": {
+                        "minimum": 0,
+                        "type": [
+                          "integer",
+                          "null"
+                        ]
+                      },
+                      "output": {
+                        "description": "strings truncated at 2048 bytes"
+                      },
+                      "started": {
+                        "minimum": 0,
+                        "type": [
+                          "integer",
+                          "null"
+                        ]
+                      },
+                      "status": true,
+                      "wait": true
+                    },
+                    "required": [
+                      "status",
+                      "attempt",
+                      "started",
+                      "finished",
+                      "error",
+                      "wait",
+                      "output"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "object"
+                },
+                "task": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "tokens": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "updated": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "vars": {
+                  "type": "object"
+                },
+                "workflow": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "workflow",
+                "status",
+                "start",
+                "steps",
+                "tokens",
+                "created",
+                "updated",
+                "finished",
+                "output",
+                "error",
+                "task",
+                "principal",
+                "vars"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "run"
+          ],
+          "type": "object"
+        }
+      },
+      "status": {
+        "args": {
+          "additionalProperties": false,
+          "properties": {},
+          "required": [],
+          "type": "object"
+        },
+        "description": "Liveness and a snapshot of this instance, as the caller may see it: its runs, conversations and activity; an operator sees everything",
+        "reply": "message",
+        "result": {
+          "properties": {
+            "activity": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "ctx": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "id": {
+                    "type": "string"
+                  },
+                  "phase": {
+                    "type": "string"
+                  },
+                  "round": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "started_ms": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "task": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "tokens_in": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "tokens_out": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "tool": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "updated_ms": {
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "id",
+                  "task",
+                  "ctx",
+                  "phase",
+                  "tool",
+                  "round",
+                  "tokens_in",
+                  "tokens_out",
+                  "started_ms",
+                  "updated_ms"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "conversations": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "contextId": {
+                    "type": "string"
+                  },
+                  "est_tokens": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "id": {
+                    "type": "string"
+                  },
+                  "kind": {
+                    "type": "string"
+                  },
+                  "messages": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "plan": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "principal": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "skills": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "turns": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "updated": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "version": {
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "id",
+                  "contextId",
+                  "kind",
+                  "version",
+                  "messages",
+                  "est_tokens",
+                  "turns",
+                  "principal",
+                  "skills",
+                  "plan",
+                  "updated"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "draining": {
+              "type": "boolean"
+            },
+            "instance": {
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "paused": {
+              "type": "boolean"
+            },
+            "runs": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "created": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "error": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "finished": {
+                    "minimum": 0,
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "id": {
+                    "type": "string"
+                  },
+                  "output": true,
+                  "principal": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "start": {
+                    "type": "string"
+                  },
+                  "status": {
+                    "type": "string"
+                  },
+                  "steps": {
+                    "additionalProperties": {
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "type": "object"
+                  },
+                  "task": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "tokens": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "updated": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "workflow": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "id",
+                  "workflow",
+                  "status",
+                  "start",
+                  "steps",
+                  "tokens",
+                  "created",
+                  "updated",
+                  "finished",
+                  "output",
+                  "error",
+                  "task",
+                  "principal"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "skill_prefix": {
+              "type": "string"
+            },
+            "skills": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "uptime_ms": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "values": {
+              "type": "object"
+            },
+            "version": {
+              "type": "string"
+            },
+            "workflows": {
+              "items": {
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "instance",
+            "uptime_ms",
+            "draining",
+            "paused",
+            "model",
+            "version",
+            "skills",
+            "skill_prefix",
+            "values",
+            "workflows",
+            "runs",
+            "conversations",
+            "activity"
+          ],
+          "type": "object"
+        }
+      },
+      "subagent.get": {
+        "args": {
+          "additionalProperties": false,
+          "properties": {
+            "handle": {
+              "description": "The subagent handle",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "handle"
+          ],
+          "type": "object"
+        },
+        "description": "One subagent's instruction, attempts, result and error",
+        "reply": "message",
+        "result": {
+          "additionalProperties": false,
+          "properties": {
+            "subagent": {
+              "additionalProperties": false,
+              "properties": {
+                "attempt": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "created": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "error": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "handle": {
+                  "type": "string"
+                },
+                "instruction": true,
+                "mode": true,
+                "node": {
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "requested_by": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "result": true,
+                "status": true,
+                "tokens": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "updated": {
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "handle",
+                "mode",
+                "status",
+                "attempt",
+                "tokens",
+                "instruction",
+                "result",
+                "error",
+                "requested_by",
+                "created",
+                "updated",
+                "node"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "subagent"
+          ],
+          "type": "object"
+        }
+      },
+      "subagent.kill": {
+        "args": {
+          "additionalProperties": false,
+          "properties": {
+            "handle": {
+              "description": "The subagent handle",
+              "type": "string"
+            },
+            "reason": {
+              "description": "Why",
+              "type": "string"
+            }
+          },
+          "required": [
+            "handle"
+          ],
+          "type": "object"
+        },
+        "description": "Stop a subagent",
+        "reply": "task",
+        "result": {
+          "properties": {
+            "handle": {
+              "type": "string"
+            },
+            "ok": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "ok"
+          ],
+          "type": "object"
+        }
+      },
+      "subagent.send": {
+        "args": {
+          "additionalProperties": false,
+          "properties": {
+            "handle": {
+              "description": "The subagent handle",
+              "type": "string"
+            },
+            "message": {
+              "description": "The message",
+              "type": "string"
+            }
+          },
+          "required": [
+            "handle",
+            "message"
+          ],
+          "type": "object"
+        },
+        "description": "Send a message to a warm subagent",
+        "reply": "task",
+        "result": {
+          "properties": {
+            "handle": {
+              "type": "string"
+            },
+            "ok": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "ok"
+          ],
+          "type": "object"
+        }
+      },
+      "subagent.status": {
+        "args": {
+          "additionalProperties": false,
+          "properties": {
+            "handle": {
+              "description": "The subagent handle",
+              "type": "string"
+            }
+          },
+          "required": [
+            "handle"
+          ],
+          "type": "object"
+        },
+        "description": "The status of one subagent, and its result once it has one",
+        "reply": "message",
+        "result": {
+          "properties": {
+            "error": {
+              "type": "string"
+            },
+            "handle": {
+              "type": "string"
+            },
+            "mode": {
+              "type": "string"
+            },
+            "result": {},
+            "status": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "handle",
+            "status"
+          ],
+          "type": "object"
+        }
+      },
+      "workflow.cancel": {
+        "args": {
+          "additionalProperties": false,
+          "properties": {
+            "run": {
+              "description": "The run id",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "run"
+          ],
+          "type": "object"
+        },
+        "description": "Cancel one run by id",
+        "reply": "task",
+        "result": false
+      },
+      "workflow.run": {
+        "args": {
+          "additionalProperties": false,
+          "properties": {
+            "inputs": {
+              "description": "The run's inputs",
+              "type": "object"
+            },
+            "workflow": {
+              "description": "The workflow to start",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "workflow"
+          ],
+          "type": "object"
+        },
+        "description": "Start a workflow; the reply is the task it runs under",
+        "reply": "task",
+        "result": {
+          "description": "the run's output, once the run finishes"
+        }
+      },
+      "workflow.signal": {
+        "args": {
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "description": "The signal a `wait: {on: signal}` step waits for",
+              "minLength": 1,
+              "type": "string"
+            },
+            "payload": {
+              "description": "What the waiting step receives"
+            },
+            "run": {
+              "description": "Deliver to this run only; without it, to every waiter the caller owns",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "name"
+          ],
+          "type": "object"
+        },
+        "description": "Deliver a signal a workflow is waiting on",
+        "reply": "task",
+        "result": {
+          "additionalProperties": false,
+          "properties": {
+            "delivered": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "signal": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "signal",
+            "delivered"
+          ],
+          "type": "object"
+        }
+      },
+      "workflow.status": {
+        "args": {
+          "additionalProperties": false,
+          "properties": {
+            "run": {
+              "description": "One run; without it, every run the caller may see",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "description": "The status of one run, or of every run the caller started",
+        "reply": "message",
+        "result": {
+          "additionalProperties": false,
+          "properties": {
+            "runs": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "error": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "output": true,
+                  "run": {
+                    "type": "string"
+                  },
+                  "status": {
+                    "type": "string"
+                  },
+                  "workflow": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "run",
+                  "workflow",
+                  "status",
+                  "output",
+                  "error"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "runs"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    "reserved": {
+      "_instance.emit": {
+        "args": {
+          "additionalProperties": false,
+          "properties": {
+            "event": {
+              "description": "The child's stream event: subject, correlation, data and id",
+              "type": "object"
+            },
+            "handle": {
+              "description": "The parent's handle for the child",
+              "minLength": 1,
+              "type": "string"
+            },
+            "stream": {
+              "description": "The stream, by the name both sides declare",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "handle",
+            "stream",
+            "event"
+          ],
+          "type": "object"
+        },
+        "description": "reserved: one event of a child's `mirror_streams` stream, appended to the parent's stream of the same name; operator only",
+        "reply": "task",
+        "result": false
+      },
+      "_instance.result": {
+        "args": {
+          "additionalProperties": false,
+          "properties": {
+            "handle": {
+              "description": "The parent's handle for the child",
+              "minLength": 1,
+              "type": "string"
+            },
+            "output": {
+              "description": "The child's run output"
+            },
+            "status": {
+              "description": "The child's run status"
+            }
+          },
+          "required": [
+            "handle"
+          ],
+          "type": "object"
+        },
+        "description": "reserved: a `mode: sync` child's first result, recorded on the parent's handle; operator only",
+        "reply": "task",
+        "result": false
+      }
+    }
+  },
+  "$id": "https://agentd.dev/a2a/ext/command/schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The data of a command DataPart. $defs/envelopes/$defs/<op> is each op's envelope; $defs/ops/<op> and $defs/reserved/<op> give its reply kind (message or task), arguments and result — for a message op the document its reply carries, for a task op the data of the result artifact it completes with (false: none). Reserved ops are operator only and never listed in params.ops.",
+  "properties": {
+    "agentd": {
+      "$ref": "#/$defs/envelope"
+    }
+  },
+  "required": [
+    "agentd"
+  ],
+  "title": "agentd command",
+  "type": "object"
+}

@@ -813,7 +813,13 @@ fn is_informational(args: &[String]) -> bool {
     args.iter().any(|a| {
         matches!(
             a.as_str(),
-            "-h" | "--help" | "-V" | "--version" | "--config-schema" | "--workflow-schema"
+            "-h" | "--help"
+                | "-V"
+                | "--version"
+                | "--config-schema"
+                | "--workflow-schema"
+                | "--extensions"
+                | "--extension-schema"
         )
     })
 }

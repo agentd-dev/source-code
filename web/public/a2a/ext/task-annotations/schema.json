@@ -1,0 +1,77 @@
+{
+  "$id": "https://agentd.dev/a2a/ext/task-annotations/schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "agentd's facts about a task, carried in Task.metadata under https://agentd.dev/a2a/ext/task-annotations on an answer to a request that activated it.",
+  "properties": {
+    "askSchema": {
+      "description": "the JSON Schema of the answer an INPUT_REQUIRED gate asks for",
+      "type": [
+        "object",
+        "boolean"
+      ]
+    },
+    "command": {
+      "description": "the command op that started the task",
+      "type": "string"
+    },
+    "created": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "link": {
+      "additionalProperties": false,
+      "description": "what the task tracks: a workflow run, a subagent, or a conversation turn",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "run",
+            "subagent",
+            "turn"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "id"
+      ],
+      "type": "object"
+    },
+    "principal": {
+      "description": "who started the task",
+      "type": "string"
+    },
+    "statusHistory": {
+      "description": "every state the task has been in, oldest first",
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "state": {
+            "pattern": "^TASK_STATE_",
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state",
+          "ts"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "link",
+    "created",
+    "statusHistory"
+  ],
+  "title": "agentd task-annotations",
+  "type": "object"
+}

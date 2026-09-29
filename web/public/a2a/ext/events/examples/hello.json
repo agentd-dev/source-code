@@ -1,0 +1,9 @@
+{
+  "hello": {
+    "seq": 118,
+    "resume": 0,
+    "resync": false,
+    "introspection": true,
+    "version": "1.17.0"
+  }
+}

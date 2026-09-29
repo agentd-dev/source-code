@@ -288,9 +288,10 @@ loader reads both attributes from the document:
 The channel stays out of the definition — `workflow.get` shows `to:
 operator` — and is bound to the definition the document loaded, looked up for
 the step when the gate opens. A definition `workflow.create` or
-`workflow.update` writes carries none, even under the document's workflow
-name, so nothing but the document's own declaration can put one on a gate. A
-reference to a human the document does not declare is refused at load.
+`workflow.update` writes carries none, and neither can write under the
+document's workflow name — a configured name is refused to both — so nothing
+but the document's own declaration can put one on a gate. A reference to a
+human the document does not declare is refused at load.
 
 A subagent template's instruction is a document too, and its gates are
 addressed the same way, so its child loads them. Its channels are not

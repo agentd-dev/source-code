@@ -807,12 +807,22 @@ A name is one definition. Two configured workflows that resolve to the same
 `workflow "x" is defined twice — by <first> and by <second>`, at startup and
 on reload alike, instead of the later one replacing the earlier (the
 configuration doc §6.1). At runtime, `workflow.create` refuses a name already
-loaded (`workflow "x" exists (use workflow.update)`). `workflow.update` of a
-*configured* workflow is not refused: the new definition is stored and runs
+loaded (`workflow "x" exists (use workflow.update)`).
+
+A configured workflow is changed in its configuration, and only there.
+`workflow.create`, `workflow.update` and `workflow.delete` of a name the
+configuration defines — from any of the sources above — are refused, naming
+where it is defined: `workflow.update: workflow "deploy" is defined in the
+configuration (file workflows/deploy.yaml (workflows[0])) — change it there
+and reload`, logged as `workflow.refused`. Whatever they wrote would last only
 until the configured workflows next load (a restart, or a reload that re-reads
-them), but the configured definition is the one that loads then, and the stored one is skipped with `workflow.stored.shadowed`
-naming the configured source. Change a configured workflow in its
-configuration.
+them), which would put the configured definition back. A workflow created at
+runtime stays editable. If a reload or restart later defines its name in the
+configuration, the configured definition loads, the stored one is skipped with
+`workflow.stored.shadowed` naming the configured source, and from then on the
+name is refused like any configured one. The stored record is kept: when the
+configuration stops defining the name, the stored definition loads again and
+is the runtime's to change, and a name nothing stores is free to create.
 
 | Cap | Value |
 |---|---|

@@ -329,15 +329,17 @@ impl Runtime {
                     continue;
                 };
                 // A configured name is one definition, and the configuration
-                // is where it lives: a stored one of the same name (a
-                // `workflow.update` of a configured workflow) does not load.
-                // Said out loud, because the update reported success and the
-                // operator would otherwise find it gone without a word.
+                // is where it lives: a stored one of the same name (a workflow
+                // created at runtime under a name the configuration has since
+                // taken) does not load. Said out loud, because the model or
+                // operator that created it would otherwise find it replaced
+                // without a word. The record stays: were the configuration to
+                // drop the name, it is the runtime's definition again.
                 if let Some(configured) = defined.get(name) {
                     self.log.warn(
                         "workflow.stored.shadowed",
                         json!({"name": name, "configured": configured,
-                               "note": "a runtime-stored definition (workflow.create/update) of this name is not loaded; the configured one is. Change it in the configuration and reload"}),
+                               "note": "a runtime-stored definition (workflow.create/update) of this name is not loaded; the configured one is, and while it is the name is changed only in the configuration"}),
                     );
                     continue;
                 }
@@ -438,6 +440,9 @@ impl Runtime {
         for l in loaded {
             self.log.info("workflow.loaded", l);
         }
+        // Only once the set is accepted: a refused reload keeps the running
+        // set, and with it the names that set's configuration owns.
+        self.configured_workflows = defined;
         Ok(())
     }
 
@@ -1002,6 +1007,28 @@ impl Runtime {
                 "{tool}: workflow definitions are immutable \
                  (security.workflows.immutable) — edit the config, file or \
                  directory they load from and reload"
+            )}),
+            true,
+        ))
+    }
+
+    /// Refuse a definition-mutating tool on a name the configuration defines.
+    ///
+    /// The configuration is where that name lives: whatever the tool wrote,
+    /// the next restart or workflow reload loads the configured definition in
+    /// its place (a stored one is shadowed, a deleted one comes back). A
+    /// success that is quietly undone later is worse than a refusal now, so
+    /// the refusal names the source to change instead.
+    fn workflow_configured(&self, tool: &str, name: &str) -> Option<super::tools::ToolOutcome> {
+        let source = self.configured_workflows.get(name)?;
+        self.log.warn(
+            "workflow.refused",
+            json!({"tool": tool, "name": name, "configured": source}),
+        );
+        Some(super::tools::ToolOutcome::Ready(
+            json!({"error": format!(
+                "{tool}: workflow {name:?} is defined in the configuration \
+                 ({source}) — change it there and reload"
             )}),
             true,
         ))
@@ -3491,6 +3518,20 @@ impl Runtime {
                     return e;
                 }
                 let def = args["definition"].clone();
+                // Before the definition is judged: a configured name is refused
+                // whatever it would be replaced with, and `create` must not
+                // answer "exists (use workflow.update)" for one. The `name`
+                // argument is checked too, so an update aimed at a configured
+                // workflow is refused as that, not as a missing name.
+                for n in [args.get("name"), def.get("name")]
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                {
+                    if let Some(e) = self.workflow_configured(name, n) {
+                        return e;
+                    }
+                }
                 match parse_workflow(&def) {
                     Err(e) => err(format!("{name}: {}", e.join("; "))),
                     Ok(w) if w.tool.is_some() => err(format!(
@@ -3550,6 +3591,9 @@ impl Runtime {
                     return e;
                 }
                 let wname = args["name"].as_str().unwrap_or("").to_string();
+                if let Some(e) = self.workflow_configured(name, &wname) {
+                    return e;
+                }
                 let Some(wf) = self.workflows.remove(&wname) else {
                     return err(format!("no such workflow {wname:?}"));
                 };

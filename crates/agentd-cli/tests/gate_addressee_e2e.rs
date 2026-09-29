@@ -457,13 +457,14 @@ fn a_documents_nested_gate_is_announced_on_its_channel() {
     );
 }
 
-/// The channel belongs to the document's definition, not to its name. A
-/// model that `workflow.update`s the workflow — same name, same step path,
-/// its own `to` — gets a gate announced nowhere: nothing but the document's
-/// own declaration puts a channel on a gate.
+/// The channel belongs to the document's definition, and the definition to
+/// the document. A model that `workflow.update`s the workflow — same name,
+/// same step path, its own `to` — is refused, naming the document, so the gate
+/// that opens is the document's own, announced on its human's channel: nothing
+/// at runtime can put a definition without that channel under the name.
 #[cfg(feature = "a2a")]
 #[test]
-fn a_workflow_update_under_the_documents_name_carries_no_channel() {
+fn a_workflow_update_under_the_documents_name_is_refused() {
     let rewritten = serde_json::json!({
         "name": "approve",
         "steps": {
@@ -483,13 +484,20 @@ fn a_workflow_update_under_the_documents_name_carries_no_channel() {
         ),
     );
     assert!(
-        log.contains("\"op\":\"workflow.update\""),
-        "the update must be what ran\n{log}"
+        log.lines()
+            .any(|l| l.contains("\"event\":\"workflow.refused\"")
+                && l.contains("\"name\":\"approve\"")
+                && l.contains("the instruction document")),
+        "the update must be refused, naming the document\n{log}"
+    );
+    assert!(
+        !log.contains("\"op\":\"workflow.update\""),
+        "the update must not be stored\n{log}"
     );
     assert_eq!(
         asked_channels(&log),
-        [serde_json::Value::Null],
-        "the rewritten gate opens once, announced nowhere\n{log}"
+        [serde_json::json!("@channel/ops")],
+        "the document's gate opens once, announced on @channel/ops\n{log}"
     );
 }
 

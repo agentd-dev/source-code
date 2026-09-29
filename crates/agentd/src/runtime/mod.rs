@@ -635,6 +635,7 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         skills: catalogue,
         governor: Governor::new(&settings.intelligence.budget),
         workflows: BTreeMap::new(),
+        configured_workflows: Default::default(),
         runs: BTreeMap::new(),
         children: children::Children::new(exe, child_tx, reap_tx),
         timers: timers::Timers::new(),

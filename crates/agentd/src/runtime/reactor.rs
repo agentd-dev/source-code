@@ -381,6 +381,13 @@ pub struct Runtime {
     /// sessions are one owner, and what it owns outlives a re-login.
     pub(crate) principal_index: BTreeMap<String, crate::a2a::Principal>,
     pub(crate) workflows: BTreeMap<String, std::sync::Arc<Workflow>>,
+    /// name → the source that defines it, for every workflow the
+    /// configuration defines. Replaced whole by each install that succeeds,
+    /// so it follows the configuration across reloads. `workflow.create`,
+    /// `update` and `delete` refuse these names: the next load would put the
+    /// configured definition back, and a change reported as made would be
+    /// undone without a word.
+    pub(crate) configured_workflows: std::collections::HashMap<String, String>,
     pub(crate) runs: BTreeMap<String, RunState>,
     pub(crate) children: Children,
     pub(crate) timers: Timers,

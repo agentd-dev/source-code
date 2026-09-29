@@ -447,7 +447,7 @@ pub fn contracts() -> Vec<Contract> {
     c(
         "workflow.create",
         "workflow",
-        "Define a new workflow at runtime.",
+        "Define a new workflow at runtime. A name the configuration defines is refused.",
         obj(
             json!({"definition": {"type": "object"}, "arm": {"type": "boolean"}}),
             &["definition"],
@@ -462,7 +462,7 @@ pub fn contracts() -> Vec<Contract> {
     c(
         "workflow.update",
         "workflow",
-        "Replace a workflow definition (live runs keep their pinned hash).",
+        "Replace a workflow defined at runtime (live runs keep their pinned hash). A workflow the configuration defines is refused: change it there.",
         obj(
             json!({"name": s("Workflow name"), "definition": {"type": "object"}}),
             &["name", "definition"],
@@ -477,7 +477,7 @@ pub fn contracts() -> Vec<Contract> {
     c(
         "workflow.delete",
         "workflow",
-        "Delete a workflow definition (disarms it; live runs finish).",
+        "Delete a workflow defined at runtime (disarms it; live runs finish). A workflow the configuration defines is refused: remove it there.",
         obj(json!({"name": s("Workflow name")}), &["name"]),
         open_obj(json!({"ok": {"type": "boolean"}}), &["ok"]),
         true,

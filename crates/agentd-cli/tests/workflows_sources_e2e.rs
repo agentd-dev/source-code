@@ -6,6 +6,10 @@
 //! sources. Before, the later one silently replaced the earlier in the loaded
 //! map: the operator's workflow changed without a word, and a folder's file
 //! was invisible to the entry-level check because its name lives inside it.
+//!
+//! And a configured name is changed where it is configured: the workflow
+//! tools refuse to update, delete or create it, naming its source, while a
+//! workflow created at runtime stays theirs to change.
 #![cfg(unix)]
 
 mod common;
@@ -187,64 +191,271 @@ fn distinct_names_from_every_source_all_load() {
     }
 }
 
-/// A runtime-stored definition under a configured name does not load — the
-/// configuration is where that name lives — and the daemon SAYS so. A
-/// `workflow.update` of a configured workflow is stored and reported as
-/// success, and without the line the next start dropped it without a word.
+// ---------------------------------------------------------------------------
+// Runtime edits: a configured name is changed in its configuration.
+//
+// `workflow.update` of a configured workflow used to be stored and reported as
+// success, and the next start or workflow reload quietly put the configured
+// definition back; a `workflow.delete` came back the same way. Now the tools
+// refuse the name, saying where it is defined, and a workflow the runtime
+// created stays the runtime's to change.
+
+/// A definition the model may write: a manual start, so it never runs.
+fn definition(name: &str) -> serde_json::Value {
+    serde_json::json!({"name": name, "steps": {
+        "s": {"kind": "manual"},
+        "f": {"kind": "finish", "depends_on": ["s"], "status": "completed"}}})
+}
+
+/// A playbook that makes each call in its own turn, then answers with the
+/// last call's result. The mock picks a turn by how many tool results the
+/// transcript holds, so one call per turn keeps the order the list gives —
+/// and a conversation a file store kept from an earlier run starts `past`
+/// results in, so that many turns are never reached.
+fn one_call_per_turn(past: usize, calls: &[serde_json::Value]) -> String {
+    let mut turns = vec![serde_json::json!({"content": "never reached"}); past];
+    turns.extend(calls.iter().map(|c| serde_json::json!({"tool_calls": [c]})));
+    turns.push(serde_json::json!({"echo_tool_result": true}));
+    serde_json::json!({ "turns": turns }).to_string()
+}
+
+/// What the model answered, in order: the playbooks end by echoing the last
+/// tool result, so this is what that tool handed the model.
+fn replies(stderr: &str) -> String {
+    events(stderr, "turn.reply")
+        .iter()
+        .filter_map(|e| e["text"].as_str().map(str::to_string))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn call(tool: &str, args: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"name": tool, "arguments": args})
+}
+
+/// A job whose model plays `play`: the folder's workflows, the document's,
+/// and a file store, so what one run stores the next one loads.
+fn model_config(
+    t: &std::path::Path,
+    dir: &std::path::Path,
+    instruction: &std::path::Path,
+) -> String {
+    format!(
+        "agent: {{ name: edits, prompt: go, instruction: {} }}\n\
+         workflows:\n  - dir: {}\n\
+         store: {{ kind: file, file: {{ path: {} }} }}\n\
+         intelligence: {{ endpoints: \"mock:file:{}\", model: mock }}\n\
+         lifecycle: {{ run_until: idle, idle_grace: 300ms }}\n\
+         observability: {{ log_level: info, log_content: true }}\n",
+        instruction.display(),
+        dir.display(),
+        t.join("state").display(),
+        t.join("play.json").display()
+    )
+}
+
+/// The `(tool, name, configured source)` of every refused edit.
+fn refused(stderr: &str) -> Vec<(String, String, String)> {
+    events(stderr, "workflow.refused")
+        .iter()
+        .map(|e| {
+            let s = |k: &str| e[k].as_str().unwrap_or_default().to_string();
+            (s("tool"), s("name"), s("configured"))
+        })
+        .collect()
+}
+
+/// `(op, name)` of every definition the tools wrote.
+fn defined(stderr: &str) -> Vec<(String, String)> {
+    events(stderr, "workflow.defined")
+        .iter()
+        .map(|e| {
+            let s = |k: &str| e[k].as_str().unwrap_or_default().to_string();
+            (s("op"), s("name"))
+        })
+        .collect()
+}
+
 #[test]
-fn a_stored_definition_under_a_configured_name_is_reported_not_loaded() {
+fn a_configured_workflow_is_refused_to_update_create_and_delete_naming_its_source() {
     let t = tempfile::tempdir().unwrap();
     let wf = t.path().join("workflows");
     std::fs::create_dir(&wf).unwrap();
     let file = wf.join("tick.yaml");
     std::fs::write(&file, workflow_file("tick", "from-the-file")).unwrap();
-    let update = serde_json::json!({"turns": [
-        {"tool_calls": [{"name": "workflow.update", "arguments": {"name": "tick", "definition": {
-            "name": "tick", "steps": {
-                "s": {"kind": "manual"},
-                "f": {"kind": "finish", "depends_on": ["s"], "status": "completed"}}}}}]},
-        {"echo_tool_result": true}]});
-    let play = t.path().join("play.json");
+    let doc = t.path().join("agent.md");
+    std::fs::write(&doc, document("doc", "from-the-document")).unwrap();
     let cfg = t.path().join("agent.yaml");
-    let write_cfg = |prompt: &str| {
-        std::fs::write(
-            &cfg,
-            format!(
-                "agent: {{ name: shadow, prompt: {prompt} }}\n\
-                 workflows:\n  - dir: {}\n\
-                 store: {{ kind: file, file: {{ path: {} }} }}\n\
-                 intelligence: {{ endpoints: \"mock:file:{}\", model: mock }}\n\
-                 lifecycle: {{ run_until: idle, idle_grace: 300ms }}\n\
-                 observability: {{ log_level: info, log_content: true }}\n",
-                wf.display(),
-                t.path().join("state").display(),
-                play.display()
-            ),
-        )
-        .unwrap();
-    };
+    std::fs::write(&cfg, model_config(t.path(), &wf, &doc)).unwrap();
+    std::fs::write(
+        t.path().join("play.json"),
+        one_call_per_turn(
+            0,
+            &[
+                call(
+                    "workflow.update",
+                    serde_json::json!({"name": "tick", "definition": definition("tick")}),
+                ),
+                call(
+                    "workflow.create",
+                    serde_json::json!({"definition": definition("tick")}),
+                ),
+                call(
+                    "workflow.update",
+                    serde_json::json!({"name": "doc", "definition": definition("doc")}),
+                ),
+                call("workflow.delete", serde_json::json!({"name": "doc"})),
+                call("workflow.delete", serde_json::json!({"name": "tick"})),
+            ],
+        ),
+    )
+    .unwrap();
 
-    std::fs::write(&play, update.to_string()).unwrap();
-    write_cfg("update");
     let (code, _, stderr) = run(&cfg);
     assert_eq!(code, Some(0), "stderr:\n{stderr}");
+    let from_file = format!("file {}", file.display());
+    let from_doc = format!("the instruction document {}", doc.display());
+    let got = refused(&stderr);
+    for (tool, name, source) in [
+        ("workflow.update", "tick", &from_file),
+        ("workflow.create", "tick", &from_file),
+        ("workflow.update", "doc", &from_doc),
+        ("workflow.delete", "doc", &from_doc),
+        ("workflow.delete", "tick", &from_file),
+    ] {
+        assert!(
+            got.iter()
+                .any(|(t, n, s)| t == tool && n == name && s.contains(source.as_str())),
+            "{tool} of {name} refused naming {source}: {got:?}\n{stderr}"
+        );
+    }
+    // A refusal writes nothing and removes nothing.
+    assert!(defined(&stderr).is_empty(), "{stderr}");
+    assert!(events(&stderr, "workflow.deleted").is_empty(), "{stderr}");
+    // What the model reads says where to change it: the last refusal, echoed.
+    let answer = replies(&stderr);
     assert!(
-        events(&stderr, "workflow.defined")
+        answer.contains("workflow.delete: workflow \\\"tick\\\" is defined in the configuration")
+            && answer.contains(&from_file)
+            && answer.contains("change it there"),
+        "the model's answer: {answer}"
+    );
+}
+
+#[test]
+fn a_workflow_created_at_runtime_is_updated_and_deleted() {
+    let t = tempfile::tempdir().unwrap();
+    let wf = t.path().join("workflows");
+    std::fs::create_dir(&wf).unwrap();
+    std::fs::write(wf.join("tick.yaml"), workflow_file("tick", "from-the-file")).unwrap();
+    let doc = t.path().join("agent.md");
+    std::fs::write(&doc, document("doc", "from-the-document")).unwrap();
+    let cfg = t.path().join("agent.yaml");
+    std::fs::write(&cfg, model_config(t.path(), &wf, &doc)).unwrap();
+    std::fs::write(
+        t.path().join("play.json"),
+        one_call_per_turn(
+            0,
+            &[
+                call(
+                    "workflow.create",
+                    serde_json::json!({"definition": definition("mine")}),
+                ),
+                call(
+                    "workflow.update",
+                    serde_json::json!({"name": "mine", "definition": definition("mine")}),
+                ),
+                call("workflow.delete", serde_json::json!({"name": "mine"})),
+            ],
+        ),
+    )
+    .unwrap();
+
+    let (code, _, stderr) = run(&cfg);
+    assert_eq!(code, Some(0), "stderr:\n{stderr}");
+    assert_eq!(
+        defined(&stderr),
+        [
+            ("workflow.create".to_string(), "mine".to_string()),
+            ("workflow.update".to_string(), "mine".to_string())
+        ],
+        "{stderr}"
+    );
+    assert!(
+        events(&stderr, "workflow.deleted")
             .iter()
-            .any(|e| e["name"] == "tick" && e["op"] == "workflow.update"),
-        "the update is stored and reported: {stderr}"
+            .any(|e| e["name"] == "mine"),
+        "{stderr}"
+    );
+    assert!(refused(&stderr).is_empty(), "{stderr}");
+    assert!(replies(&stderr).contains("\"ok\":true"), "{stderr}");
+}
+
+/// A name the runtime created that the configuration later defines is the
+/// configuration's from then on: its definition loads, the stored one is
+/// reported not loaded, and an edit is refused. A name the configuration
+/// stops defining is the runtime's again — the stored definition loads back,
+/// and a name nothing stores can be created. Across restarts here; the
+/// reload test below takes the same steps through SIGHUP.
+#[test]
+fn a_name_moves_between_the_runtime_and_the_configuration_across_restarts() {
+    let t = tempfile::tempdir().unwrap();
+    let wf = t.path().join("workflows");
+    std::fs::create_dir(&wf).unwrap();
+    std::fs::write(wf.join("keep.yaml"), workflow_file("keep", "kept")).unwrap();
+    let doc = t.path().join("agent.md");
+    std::fs::write(&doc, "Keep things tidy.\n").unwrap();
+    let cfg = t.path().join("agent.yaml");
+    std::fs::write(&cfg, model_config(t.path(), &wf, &doc)).unwrap();
+    let play = t.path().join("play.json");
+    let tick = wf.join("tick.yaml");
+    let gone = wf.join("gone.yaml");
+
+    // The runtime creates `tick`.
+    std::fs::write(
+        &play,
+        one_call_per_turn(
+            0,
+            &[call(
+                "workflow.create",
+                serde_json::json!({"definition": definition("tick")}),
+            )],
+        ),
+    )
+    .unwrap();
+    let (code, _, stderr) = run(&cfg);
+    assert_eq!(code, Some(0), "stderr:\n{stderr}");
+    assert_eq!(
+        defined(&stderr),
+        [("workflow.create".to_string(), "tick".to_string())],
+        "{stderr}"
     );
 
-    std::fs::write(&play, r#"{"turns": [{"text": "done"}]}"#).unwrap();
-    write_cfg("again");
+    // The configuration now defines `tick` (and `gone`): the file's runs, the
+    // stored one is reported shadowed, and the model's update is refused.
+    std::fs::write(&tick, workflow_file("tick", "from-the-file")).unwrap();
+    std::fs::write(&gone, workflow_file("gone", "configured")).unwrap();
+    std::fs::write(
+        &play,
+        one_call_per_turn(
+            1,
+            &[call(
+                "workflow.update",
+                serde_json::json!({"name": "tick", "definition": definition("tick")}),
+            )],
+        ),
+    )
+    .unwrap();
     let (code, _, stderr) = run(&cfg);
     assert_eq!(code, Some(0), "stderr:\n{stderr}");
-    let shadowed = events(&stderr, "workflow.stored.shadowed");
+    let from_file = format!("file {}", tick.display());
     assert!(
-        shadowed.iter().any(|e| e["name"] == "tick"
-            && e["configured"]
-                .as_str()
-                .is_some_and(|c| c.contains(&format!("file {}", file.display())))),
+        events(&stderr, "workflow.stored.shadowed")
+            .iter()
+            .any(|e| e["name"] == "tick"
+                && e["configured"]
+                    .as_str()
+                    .is_some_and(|c| c.contains(&from_file))),
         "the stored definition is reported not loaded, naming the configured source: {stderr}"
     );
     assert!(
@@ -253,6 +464,58 @@ fn a_stored_definition_under_a_configured_name_is_reported_not_loaded() {
             .all(|e| e["source"] != "store"),
         "{stderr}"
     );
+    assert!(
+        events(&stderr, "run.done")
+            .iter()
+            .any(|e| e["workflow"] == "tick" && e["output"] == "from-the-file"),
+        "the file's tick ran: {stderr}"
+    );
+    assert!(
+        refused(&stderr)
+            .iter()
+            .any(|(t, n, s)| t == "workflow.update" && n == "tick" && s.contains(&from_file)),
+        "{stderr}"
+    );
+    assert!(defined(&stderr).is_empty(), "{stderr}");
+
+    // Both files go: the stored `tick` loads again and takes an update, and
+    // `gone`, which nothing stores, can be created.
+    std::fs::remove_file(&tick).unwrap();
+    std::fs::remove_file(&gone).unwrap();
+    std::fs::write(
+        &play,
+        one_call_per_turn(
+            2,
+            &[
+                call(
+                    "workflow.update",
+                    serde_json::json!({"name": "tick", "definition": definition("tick")}),
+                ),
+                call(
+                    "workflow.create",
+                    serde_json::json!({"definition": definition("gone")}),
+                ),
+            ],
+        ),
+    )
+    .unwrap();
+    let (code, _, stderr) = run(&cfg);
+    assert_eq!(code, Some(0), "stderr:\n{stderr}");
+    assert!(
+        events(&stderr, "workflow.loaded")
+            .iter()
+            .any(|e| e["name"] == "tick" && e["source"] == "store"),
+        "{stderr}"
+    );
+    assert_eq!(
+        defined(&stderr),
+        [
+            ("workflow.update".to_string(), "tick".to_string()),
+            ("workflow.create".to_string(), "gone".to_string())
+        ],
+        "{stderr}"
+    );
+    assert!(refused(&stderr).is_empty(), "{stderr}");
 }
 
 // ---------------------------------------------------------------------------
@@ -448,4 +711,122 @@ fn a_reload_that_would_define_a_name_twice_is_refused_and_the_running_one_stays(
             "the refused reload had applied {section}: {changed}\n{log}"
         );
     }
+}
+
+/// The same moves through SIGHUP: a reload that newly defines a name the
+/// runtime created makes it the configuration's, and a reload that drops a
+/// configured name frees it. The set of configured names follows every
+/// reload, not only the start.
+#[cfg(all(feature = "hot-reload", feature = "a2a"))]
+#[test]
+fn a_reload_moves_a_name_between_the_runtime_and_the_configuration() {
+    let t = tempfile::tempdir().unwrap();
+    let wf = t.path().join("workflows");
+    std::fs::create_dir(&wf).unwrap();
+    std::fs::write(wf.join("keep.yaml"), workflow_file("keep", "kept")).unwrap();
+    let play = t.path().join("play.json");
+    let cfg = t.path().join("agent.yaml");
+    let (d, addr) = common::spawn_bound(|port| {
+        std::fs::write(
+            &cfg,
+            daemon_config(
+                &wf,
+                "Keep things tidy.",
+                &format!(
+                    "intelligence: {{ endpoints: \"mock:file:{}\", model: mock }}\n\
+                     a2a: {{ listen: \"http://127.0.0.1:{port}\" }}\n",
+                    play.display()
+                ),
+            ),
+        )
+        .unwrap();
+        let d = Daemon::spawn(&cfg);
+        let log = d.err_path.clone();
+        (d, log)
+    });
+    // One conversation per step: each starts its playbook from the top.
+    let converse = |calls: &[serde_json::Value]| {
+        std::fs::write(&play, one_call_per_turn(0, calls)).unwrap();
+        let sent = common::SendMessage::text("go").post(&addr);
+        assert_eq!(
+            sent["result"]["task"]["status"]["state"], "TASK_STATE_COMPLETED",
+            "{sent}"
+        );
+    };
+    let reload = |n: usize| {
+        d.sighup();
+        d.wait_for(
+            |l| events(l, "config.reloaded").len() >= n,
+            "the reload",
+            10,
+        )
+    };
+
+    converse(&[call(
+        "workflow.create",
+        serde_json::json!({"definition": definition("tick")}),
+    )]);
+    assert_eq!(
+        defined(&d.stderr()),
+        [("workflow.create".to_string(), "tick".to_string())],
+        "{}",
+        d.stderr()
+    );
+
+    let tick = wf.join("tick.yaml");
+    let gone = wf.join("gone.yaml");
+    std::fs::write(&tick, workflow_file("tick", "from-the-file")).unwrap();
+    std::fs::write(&gone, workflow_file("gone", "configured")).unwrap();
+    let log = reload(1);
+    let from_file = format!("file {}", tick.display());
+    assert!(
+        events(&log, "workflow.stored.shadowed")
+            .iter()
+            .any(|e| e["name"] == "tick"),
+        "{log}"
+    );
+    converse(&[
+        call(
+            "workflow.update",
+            serde_json::json!({"name": "tick", "definition": definition("tick")}),
+        ),
+        call("workflow.delete", serde_json::json!({"name": "gone"})),
+    ]);
+    let log = d.stderr();
+    let got = refused(&log);
+    assert!(
+        got.iter()
+            .any(|(t, n, s)| t == "workflow.update" && n == "tick" && s.contains(&from_file)),
+        "the reload made tick the configuration's: {got:?}\n{log}"
+    );
+    assert!(
+        got.iter()
+            .any(|(t, n, _)| t == "workflow.delete" && n == "gone"),
+        "{got:?}\n{log}"
+    );
+    assert_eq!(defined(&log).len(), 1, "{log}");
+
+    std::fs::remove_file(&tick).unwrap();
+    std::fs::remove_file(&gone).unwrap();
+    reload(2);
+    converse(&[
+        call(
+            "workflow.update",
+            serde_json::json!({"name": "tick", "definition": definition("tick")}),
+        ),
+        call(
+            "workflow.create",
+            serde_json::json!({"definition": definition("gone")}),
+        ),
+    ]);
+    let log = d.stderr();
+    assert_eq!(
+        defined(&log)[1..],
+        [
+            ("workflow.update".to_string(), "tick".to_string()),
+            ("workflow.create".to_string(), "gone".to_string())
+        ],
+        "the reload that dropped them freed both names:\n{log}"
+    );
+    assert_eq!(refused(&log).len(), 2, "{log}");
 }

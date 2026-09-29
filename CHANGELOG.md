@@ -442,6 +442,17 @@ holds up the next call on the same server.
   tools and skills were already live. A runtime-stored definition that a
   configured one of the same name keeps from loading is logged as
   `workflow.stored.shadowed` instead of being skipped silently.
+- **A configured workflow cannot be edited or deleted at runtime.**
+  `workflow.update` of a workflow the configuration defines (inline, `file:`,
+  `dir:`, `url:`, `uri:`, an instruction document's `:::!workflow` or
+  `:::!config` workflows, a subagent template's) was stored and reported as
+  success, and the next restart or workflow reload put the configured
+  definition back; `workflow.delete` of one came back the same way. Both, and
+  `workflow.create` of such a name, are now refused, naming the source to
+  change (`workflow.refused` in the log). A workflow created at runtime stays
+  editable; when a reload defines its name in the configuration, the
+  configured one loads and the name is refused from then on, and when the
+  configuration drops a name it is the runtime's again.
 - **An `exec` workflow step keeps its command's exit status.** The daemon's
   reactor reaps every exited child in the process, and the `exec` runner
   polled its own child with `try_wait`: when a tick landed between the

@@ -19,7 +19,6 @@
 
 mod common;
 
-use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -94,38 +93,31 @@ impl Drop for Daemon {
 }
 
 /// Start a daemon on a free loopback port, with `a2a_extra` appended under
-/// `a2a:`; returns it and the authority it serves.
+/// `a2a:`; returns it and the authority it CONFIRMED binding — from its own
+/// `a2a.listen` line, so a lost probe→bind race never leaves a test talking
+/// to another test's listener.
 fn spawn(llm: &str, a2a_extra: &str) -> (Daemon, String) {
-    let port = common::free_port();
-    let cfg = common::unique_path("admission", "yaml");
-    std::fs::write(&cfg, config(llm, port, a2a_extra)).unwrap();
-    let stderr_path = common::unique_path("admission-daemon", "log");
-    let errf = std::fs::File::create(&stderr_path).unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_agentd"))
-        .args(["--config", &cfg])
-        .env("AGENTD_ADMISSION_OPS", OPS_TOKEN)
-        .env("AGENTD_ADMISSION_CI", CI_TOKEN)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(errf))
-        .spawn()
-        .expect("spawn agentd");
-    let daemon = Daemon {
-        child,
-        stderr_path,
-        cfg,
-    };
-    let addr = format!("127.0.0.1:{port}");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while TcpStream::connect(&addr).is_err() {
-        assert!(
-            Instant::now() < deadline,
-            "the listener never came up:\n{}",
-            daemon.stderr()
-        );
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    (daemon, addr)
+    common::spawn_bound(|port| {
+        let cfg = common::unique_path("admission", "yaml");
+        std::fs::write(&cfg, config(llm, port, a2a_extra)).unwrap();
+        let stderr_path = common::unique_path("admission-daemon", "log");
+        let errf = std::fs::File::create(&stderr_path).unwrap();
+        let child = Command::new(env!("CARGO_BIN_EXE_agentd"))
+            .args(["--config", &cfg])
+            .env("AGENTD_ADMISSION_OPS", OPS_TOKEN)
+            .env("AGENTD_ADMISSION_CI", CI_TOKEN)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(errf))
+            .spawn()
+            .expect("spawn agentd");
+        let daemon = Daemon {
+            child,
+            stderr_path: stderr_path.clone(),
+            cfg,
+        };
+        (daemon, stderr_path)
+    })
 }
 
 fn config(llm: &str, port: u16, a2a_extra: &str) -> String {

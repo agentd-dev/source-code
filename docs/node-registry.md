@@ -258,7 +258,15 @@ answer — or names an operator: `{role: operator}` with any labels, or the id
 starting with `*`, `role: user`, labels with no role) is refused at load and at
 `workflow.create`/`workflow.update`, naming the principal and saying it could
 never see the task; `ask_human` refuses such a `to` when it is called, which
-covers a model's call and a `to` rendered from a template.
+covers a model's call and a `to` rendered from a template. A `to` with a
+`{{…}}` placeholder or a `CEL:` expression anywhere in it is only known when
+the step runs, so the load leaves it to that check. Every operator is
+addressed as `operator`, whichever `a2a.principals` rule admitted it: a rule's
+own id names no principal and is refused like any other, and its labels are
+how a gate narrows to it. An instruction document's `to: "@human/<name>"`
+arrives as that human's `channel` (its `principal` when it declares no
+channel); a channel names no principal, so it is refused too, and the refusal
+says why.
 
 Three more declarations are load errors rather than accepted-and-ignored,
 because each produces a gate that *looks* routed and is not: one that names
@@ -273,10 +281,12 @@ asks, not about a gate that names someone.
 **Any operator can still answer**, and this is deliberate. Refusing one whose
 labels do not match would be theatre — an operator can already rewrite the
 config, the store or the definition — so what matters instead is that it is
-*visible*: the answer is recorded as `operator_override`, logged, and audited
-under the id of whoever actually replied. The audit line names the person
-rather than "human", which is what makes "the finance lead approved this
-refund" a record instead of a claim.
+*visible*: the answer is recorded as `operator_override` rather than `human`,
+logged, and audited. What the record holds is the answering principal's id
+(`operator`, for every operator), how it answered, and the session id when it
+signed in with one — so "the finance lead approved this refund" is a record
+when the gate named `{role: operator, labels: {team: finance}}` and the answer
+is not an override, and a claim otherwise.
 
 Both the addressee and the answer schema live in the run's **durable wait
 record**, so a restart rebuilds the gate exactly as declared. That matters more

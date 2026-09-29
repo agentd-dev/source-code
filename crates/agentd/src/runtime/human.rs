@@ -494,14 +494,19 @@ impl Runtime {
     /// used to carry `via` — "human" or "auto" — in the principal field, which
     /// says HOW a gate was answered and not by WHOM. An addressed gate makes
     /// that load-bearing: "the finance lead approved" is only a record if the
-    /// record names them.
+    /// record names them — and since every operator's id is `operator`, what
+    /// tells them apart is the session they signed in with and the labels
+    /// their rule gave them, so both are recorded too.
     pub(crate) fn human_answer(
         &mut self,
         i: usize,
         text: &str,
         via: &str,
-        answered_by: Option<&str>,
+        answerer: Option<&crate::a2a::Principal>,
     ) {
+        let answered_by = answerer.map(|p| p.id.as_str());
+        let role = answerer.map(|p| format!("{:?}", p.role).to_lowercase());
+        let sid = answerer.and_then(|p| p.session.as_deref());
         let p = self.pending.remove(i);
         let PendingKind::Human {
             task,
@@ -575,9 +580,9 @@ impl Runtime {
                 target: json!({"task": task}),
                 outcome: "undelivered",
                 principal: answered_by.or(Some(via)),
-                role: None,
+                role: role.as_deref(),
                 request_id: None,
-                sid: None,
+                sid,
             });
             return;
         }
@@ -589,7 +594,8 @@ impl Runtime {
         self.human_task_settle(&task, standalone, note);
         self.log.info(
             "human.answered",
-            json!({"task": task, "via": via, "by": answered_by}),
+            json!({"task": task, "via": via, "by": answered_by, "sid": sid,
+                   "labels": answerer.map(|p| &p.labels)}),
         );
         // The record names WHO, not just how: an addressed gate is only worth
         // declaring if the audit line can be read back as "this person decided
@@ -599,9 +605,9 @@ impl Runtime {
             target: json!({"task": task}),
             outcome: via,
             principal: answered_by.or(Some(via)),
-            role: None,
+            role: role.as_deref(),
             request_id: None,
-            sid: None,
+            sid,
         });
         // A tool result must match `ask_human`'s DECLARED output shape,
         // `{reply, timed_out}` (see `registry/internal.rs`). Consumers read

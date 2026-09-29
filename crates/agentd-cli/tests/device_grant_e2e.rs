@@ -111,21 +111,39 @@ fn start(cfg: &str) -> Daemon {
     }
 }
 
-/// Start `agentd` on `yaml` and wait until `addr` accepts connections.
+/// Start `agentd` on `yaml` and wait until it has bound `addr`'s port itself.
 fn spawn(yaml: &str, addr: &str) -> Daemon {
     let cfg = common::unique_path("device-grant", "yaml");
     std::fs::write(&cfg, yaml).unwrap();
-    let mut daemon = start(&cfg);
+    let daemon = start(&cfg);
+    wait_bound(&daemon, addr);
+    daemon
+}
+
+/// Wait until `daemon` has bound `addr`'s port and is ready — confirmed from
+/// its own `a2a.listen` line, never by a connect, which reaches just as
+/// happily another test's listener that took the port in the probe→bind gap.
+/// A port that must stay fixed (a restart on the same store) cannot be
+/// retried on a fresh one, so a lost race fails here, naming what was bound.
+fn wait_bound(daemon: &Daemon, addr: &str) {
+    let port = addr.rsplit_once(':').map(|(_, p)| p.to_string());
+    let bound = common::try_a2a_bound(&daemon.stderr_path, Duration::from_secs(15))
+        .unwrap_or_else(|| panic!("the listener never came up:\n{}", daemon.stderr()));
+    assert_eq!(
+        bound.rsplit_once(':').map(|(_, p)| p.to_string()),
+        port,
+        "the daemon bound {bound}, not {addr}:\n{}",
+        daemon.stderr()
+    );
     let deadline = Instant::now() + Duration::from_secs(15);
-    while TcpStream::connect(addr).is_err() {
+    while !daemon.stderr().contains("\"event\":\"proc.ready\"") {
         assert!(
-            daemon.alive() && Instant::now() < deadline,
-            "the listener never came up:\n{}",
+            Instant::now() < deadline,
+            "the daemon bound {bound} but never became ready:\n{}",
             daemon.stderr()
         );
         std::thread::sleep(Duration::from_millis(25));
     }
-    daemon
 }
 
 /// A playbook: a message containing `SLOWPLEASE` is answered eight seconds
@@ -173,15 +191,20 @@ const CI_RULE: &str = "\x20 principals:\n\
      \x20     role: user\n\
      \x20     grants: [\"*\"]\n";
 
-/// A loopback daemon on a fresh port: it and its authority.
+/// A loopback daemon on a fresh port: it and the authority it confirmed
+/// binding, retried on another port when the probed one was taken.
 fn loopback(a2a_extra: &str, store: &str) -> (Daemon, String) {
-    let port = common::free_port();
-    let addr = format!("127.0.0.1:{port}");
-    let daemon = spawn(
-        &config(&format!("http://127.0.0.1:{port}"), a2a_extra, store),
-        &addr,
-    );
-    (daemon, addr)
+    common::spawn_bound(|port| {
+        let cfg = common::unique_path("device-grant", "yaml");
+        std::fs::write(
+            &cfg,
+            config(&format!("http://127.0.0.1:{port}"), a2a_extra, store),
+        )
+        .unwrap();
+        let daemon = start(&cfg);
+        let stderr_path = daemon.stderr_path.clone();
+        (daemon, stderr_path)
+    })
 }
 
 // ---- the grant, from the client's side --------------------------------------
@@ -1063,11 +1086,12 @@ fn launched(a2a_extra: &str, origin: Option<&str>) -> (Daemon, String, String) {
         stderr_path,
         cfg,
     };
+    wait_bound(&daemon, &addr);
     let deadline = Instant::now() + Duration::from_secs(15);
-    while TcpStream::connect(&addr).is_err() || !std::path::Path::new(&code_path).exists() {
+    while !std::path::Path::new(&code_path).exists() {
         assert!(
             daemon.alive() && Instant::now() < deadline,
-            "the launched daemon never came up:\n{}",
+            "the launched daemon never wrote its code:\n{}",
             daemon.stderr()
         );
         std::thread::sleep(Duration::from_millis(25));

@@ -580,6 +580,85 @@ fn an_operator_answering_someone_elses_gate_is_recorded_as_an_override() {
     std::fs::remove_file(&cfg).ok();
 }
 
+/// Every operator's id is `operator`, so an answer recorded under the id
+/// alone could not say WHICH operator decided. The record carries what tells
+/// them apart — the labels their rule gave them, in the log line, and their
+/// role in the audit line — so a gate addressed to finance's operator and
+/// answered by her reads back as exactly that, not as an override.
+#[test]
+fn an_addressed_operators_answer_records_who_she_is() {
+    const FIN: &str = "hitl-e2e-finance-operator-bearer";
+    let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
+    // Under `observability:`, where `base_config` ends.
+    let extra = "  audit:\n    sink: [log]\n\
+         workflows:\n  - name: approve\n    steps:\n      s: {kind: manual}\n      gate: {kind: human, question: \"Approve the refund?\", to: {role: operator, labels: {team: finance}}, depends_on: [s]}\n      f: {kind: finish, depends_on: [gate], output: \"refunded\"}\n";
+    let principals = "  principals:\n\
+         \x20   - id: fin\n\
+         \x20     match: { bearer_ref: \"{{secret:HITL_FIN}}\" }\n\
+         \x20     role: operator\n\
+         \x20     labels: { team: finance }\n";
+    let (daemon, addr, cfg) = spawn_bound_with(
+        |port| {
+            base_config(&llm.uri, port, false, extra)
+                .replace("\nlifecycle:", &format!("\n{principals}lifecycle:"))
+        },
+        |cfg| {
+            let stderr_path = common::unique_path("hitl-daemon", "log");
+            let errf = std::fs::File::create(&stderr_path).unwrap();
+            let child = Command::new(env!("CARGO_BIN_EXE_agentd"))
+                .args(["--config", cfg])
+                .env("HITL_FIN", FIN)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::from(errf))
+                .spawn()
+                .expect("spawn agentd daemon");
+            Daemon { child, stderr_path }
+        },
+    );
+
+    let started = SendMessage::command("workflow.run", json!({"workflow": "approve"}))
+        .bearer(FIN)
+        .result(&addr);
+    let task_id = started["task"]["id"].as_str().unwrap().to_string();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let t = common::rpc_as(&addr, FIN, 900, "GetTask", json!({"id": task_id}));
+        if t["result"]["status"]["state"] == "TASK_STATE_INPUT_REQUIRED" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the gate never opened: {t}");
+        std::thread::sleep(Duration::from_millis(80));
+    }
+    SendMessage::text("approved")
+        .task(&task_id)
+        .return_immediately()
+        .bearer(FIN)
+        .result(&addr);
+    let log = wait_log(&daemon, "\"event\":\"human.answered\"", 10);
+    let answered = log
+        .lines()
+        .find(|l| l.contains("\"event\":\"human.answered\""))
+        .unwrap();
+    assert!(
+        answered.contains("\"via\":\"human\"")
+            && answered.contains("\"by\":\"operator\"")
+            && answered.contains("\"labels\":{\"team\":\"finance\"}"),
+        "the answer names the operator by her labels, as the addressee\n{answered}"
+    );
+    let log = wait_log(&daemon, "\"action\":\"ask_human.answered\"", 10);
+    let audited = log
+        .lines()
+        .find(|l| l.contains("\"action\":\"ask_human.answered\""))
+        .unwrap();
+    assert!(
+        audited.contains("\"role\":\"operator\"") && audited.contains("\"outcome\":\"human\""),
+        "the audit line carries the answerer's role\n{audited}"
+    );
+    assert!(!log.contains("human.answer.override"), "{log}");
+    std::fs::remove_file(&cfg).ok();
+}
+
 /// The gate's enforcement lives in the DURABLE wait record, not only in the
 /// in-memory pending ask — a restart rebuilds the pending from that record, so
 /// anything missing from it is silently dropped on restart. That mattered

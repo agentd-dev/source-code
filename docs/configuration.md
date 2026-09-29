@@ -1980,12 +1980,12 @@ addressee once it times out. An **addressed** gate is never judged — every
 `security.policies` gate is addressed — it times out and takes its
 `on_timeout`.
 
-**`security.policies[].to`** says who may answer an `action: ask` gate: a
-principal-id glob, or `{id, role, labels}`. It is refused on a rule that never
-asks. Unset, a policy gate is addressed to `{role: operator}`: the gate usually
-lands on the task of the very caller whose call is being judged, and a policy
-exists because the operator wanted a say, so that caller does not approve its
-own call unless the operator names it.
+**`security.policies[].to`** says which operator may answer an `action: ask`
+gate: `{role: operator}` with any labels, or the id `operator` (see below). It
+is refused on a rule that never asks. Unset, a policy gate is addressed to
+`{role: operator}`: the gate usually lands on the task of the very caller whose
+call is being judged, and a policy exists because the operator wanted a say, so
+that caller never approves its own call — unless it is itself an operator.
 
 **An addressee must be able to see the task.** A task is visible only to its
 owner and to operators, so a gate addressed to anyone else could never be
@@ -1993,8 +1993,11 @@ answered. `to:` may therefore be absent — the question goes to the task's
 owner, or for a policy gate to the operator — or name an operator. A `to:` that
 names any other principal is refused at load (exit `2`, and a reload is
 refused); the refusal names the principal and says it could never see the task.
-The same rule holds wherever a question is addressed with `to:`, a workflow's
-`human` step included.
+Every operator is addressed as `operator`, whichever `a2a.principals` rule
+admitted it, so a rule's own id is refused too; its labels are how a gate
+narrows to it. The same rule holds wherever a question is addressed with `to:`,
+a workflow's `human` step included; a step's `to` with a `{{…}}` placeholder or
+a `CEL:` expression in it is held to it when the step runs.
 
 ### 12.7 What callers are shown, and for how long
 

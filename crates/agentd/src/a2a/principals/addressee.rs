@@ -17,21 +17,23 @@ use serde_json::Value;
 /// Declared either as a bare principal-id glob:
 ///
 /// ```yaml
-/// to: "*@finance.acme.example"
+/// to: "operator"
 /// ```
 ///
 /// or structurally, when identity is better described than enumerated:
 ///
 /// ```yaml
-/// to: {role: user, labels: {team: finance}}
+/// to: {role: operator, labels: {team: finance}}
 /// ```
 ///
 /// Labels are the durable form — people change, teams do not — and they come
 /// from `a2a.principals[].labels`, which is operator-declared and closed.
 ///
-/// The same syntax says whose reply a message wait hears (`from`). A GATE's
-/// `to` is further held to [`Addressee::check_gate`]: only an operator can
+/// A GATE's `to` is held to [`Addressee::check_gate`]: only an operator can
 /// see a task it does not own, so only an operator can be a gate's decider.
+/// The same syntax says whose reply a message wait hears (`from`), and there
+/// it names any principal — `"*@finance.acme.example"`, `{role: user}` —
+/// since a wait's sender needs to see nothing.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Addressee {
     /// Principal-id glob (`*` suffix, or exact).
@@ -141,10 +143,12 @@ impl Addressee {
     /// a gate that waits for someone who can never see it. What remains is an
     /// operator: `{role: operator}` (narrowed by labels if the operator
     /// likes), or an id glob that can only match `operator`, the one id every
-    /// operator principal carries. A glob that starts with `*`, or labels
-    /// with no role, could match a `user:`/`agent:` principal too, and the
-    /// load cannot prove it does not. `from` on a message wait uses the same
-    /// syntax for a peer and is not held to this.
+    /// operator principal carries — whichever `a2a.principals` rule admitted
+    /// it, so a rule's own id (`ops`) names no principal and is refused like
+    /// any other; its labels are how a gate narrows to it. A glob that starts
+    /// with `*`, or labels with no role, could match a `user:`/`agent:`
+    /// principal too, and the load cannot prove it does not. `from` on a
+    /// message wait uses the same syntax for a peer and is not held to this.
     pub fn check_gate(&self) -> Result<(), String> {
         let operator_only = match (self.role, &self.id) {
             (Some(Role::Operator), None) => true,
@@ -156,10 +160,26 @@ impl Addressee {
         if operator_only {
             return Ok(());
         }
+        // No principal id starts with `@` or `#` (they are `operator`,
+        // `anonymous`, `user:…` and `agent:…`), so such a `to` is almost
+        // certainly an instruction document's `@human/<name>`, which idoc folds
+        // into that human's `channel` — a place to notify, not a principal —
+        // or leaves as written when the human declares neither a channel nor
+        // a principal. Saying so is what lets the document's author fix it.
+        let reference = match &self.id {
+            Some(id) if id.starts_with('@') || id.starts_with('#') => {
+                " (an instruction document's `@human/<name>` becomes that human's `channel`, \
+                 or its `principal` when it declares no channel; a channel is not a principal, \
+                 so address the gate with a `principal` of `operator` and no channel)"
+            }
+            _ => "",
+        };
         Err(format!(
-            "`to` names {}, who could never see the task: a task is visible only to its \
-             owner and to operators — leave `to` unset to ask the task's owner, or name an \
-             operator ({{role: operator}})",
+            "`to` names {}, who could never see the task{reference}: a task is visible only \
+             to its owner and to operators, and every operator is addressed as `operator` \
+             whichever `a2a.principals` rule admitted it — leave `to` unset to ask the task's \
+             owner, or name an operator ({{role: operator}}, narrowed by the rule's labels: \
+             {{role: operator, labels: {{…}}}})",
             self.describe()
         ))
     }
@@ -306,6 +326,13 @@ mod tests {
             ),
             (json!({"labels": {"team": "finance"}}), "team=finance"),
             (json!({"id": "user:*", "role": "operator"}), "user:*"),
+            // A principals rule's own id is not a principal id: every
+            // operator is `operator`, whichever rule admitted it.
+            (json!("ops"), "every operator is addressed as `operator`"),
+            (
+                json!({"id": "ops", "role": "operator"}),
+                "ops, role operator",
+            ),
         ] {
             let e = Addressee::parse(&bad).unwrap().check_gate().unwrap_err();
             assert!(
@@ -313,6 +340,28 @@ mod tests {
                 "{bad}: {e}"
             );
         }
+    }
+
+    /// An instruction document's `@human/<name>` reaches a gate as that
+    /// human's channel (or as written): the refusal says so, so the author
+    /// knows what to change — and a principal id never looks like one.
+    #[test]
+    fn a_gate_addressed_to_a_document_reference_says_what_it_is() {
+        for reference in ["@human/oncall", "@channel/ops", "#ops"] {
+            let e = Addressee::parse(&json!(reference))
+                .unwrap()
+                .check_gate()
+                .unwrap_err();
+            assert!(
+                e.contains(reference) && e.contains("a channel is not a principal"),
+                "{reference}: {e}"
+            );
+        }
+        let e = Addressee::parse(&json!("user:alice"))
+            .unwrap()
+            .check_gate()
+            .unwrap_err();
+        assert!(!e.contains("channel"), "{e}");
     }
 
     /// A gate that will not take your answer has to say whose it wants.

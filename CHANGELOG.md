@@ -116,7 +116,13 @@ Configuration:
   labels, or the id `operator`). Any other `to:` is refused, naming the
   principal: at load (exit 2) and at reload for `security.policies[].to` and a
   workflow `human` step, at `workflow.create` and `workflow.update`, and when
-  `ask_human` is called with one.
+  `ask_human` is called with one. Every operator is addressed as `operator`,
+  whichever `a2a.principals` rule admitted it, so a rule's own id is refused
+  too; its labels narrow a gate to it. A `to` that a step renders (a `{{…}}`
+  or `CEL:` anywhere in it) is checked when the step runs. An instruction
+  document's `@human/<name>` reaches the gate as that human's `channel` (its
+  `principal` when it declares no channel); a channel names no principal, so
+  it is refused, and the refusal says why.
 - **The policy-ask addressee defaults to the operator**: an `action: ask`
   rule with no `to:` is addressed to `{role: operator}`, so the caller whose
   call is judged does not approve it.
@@ -136,7 +142,7 @@ Configuration:
   `https://agentd.dev/schema/config.json` and the workflow schema's is
   `…/workflow.json`. A config document has no `config_version`, and a
   workflow document has no `version`.
-- **`config::v2` is `config::settings`** for embedders, and `run_v2` is `run`.
+- **`config::v2` is `config::settings`** for embedders.
 - **`--capabilities` drops `runtime` and `surfaces`**, `proc.start` drops
   `runtime`, `config.valid` drops its schema marker, the store envelope drops
   `v`, and the exit-code and metrics contract-version constants are gone.
@@ -270,7 +276,9 @@ There are no removal tables and no removed sections in `--help`.
 - **Every child agentd spawns holds no inherited descriptor it was not
   handed**, embedded in agentd-core or not, and without `/proc`: the exec
   tool, subagents, instances and the launcher's client keep their stdio and
-  what they were given. A descriptor limit too high to mark is reported as
+  what they were given. Where `close_range` is refused and the descriptor
+  limit is above 65536, a child's scan reaches past the highest descriptor
+  `/proc/self/fd` lists; with no `/proc` either, the first such spawn reports
   `process.inherited_fds_unmarked`.
 - The webhook listener's DNS-rebinding guard accepted any Origin whose host
   began with `127.`. It now accepts only `localhost` or a loopback IP literal.

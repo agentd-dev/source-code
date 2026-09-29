@@ -30,6 +30,9 @@ fn run(args: &[&str], cfg_text: &str) -> (Option<i32>, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_agentd"))
         .args(["--config", &cfg])
         .args(args)
+        // The one secret a config here may reference: a principals rule's
+        // bearer.
+        .env("OPS", "gate-addressee-ops-bearer")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .output()
@@ -114,12 +117,19 @@ fn a_gate_addressed_to_an_operator_still_loads() {
 /// the reply, which `log_content` writes to the log — the tool result's own
 /// text, as the model read it.
 fn converse(play: &str) -> String {
-    let cfg = "\
-         agent: { name: gates, prompt: \"go\" }\n\
-         store: { kind: memory }\n\
-         observability: { log_level: info, log_content: true }\n\
-         intelligence: { endpoints: \"mock:file:__DIR__/play.json\", model: mock }\n\
-         lifecycle: { run_until: idle, idle_grace: 2s }\n";
+    converse_with("", play)
+}
+
+/// [`converse`] with `extra` appended to the config.
+fn converse_with(extra: &str, play: &str) -> String {
+    let cfg = format!(
+        "\
+         agent: {{ name: gates, prompt: \"go\" }}\n\
+         store: {{ kind: memory }}\n\
+         observability: {{ log_level: info, log_content: true }}\n\
+         intelligence: {{ endpoints: \"mock:file:__DIR__/play.json\", model: mock }}\n\
+         lifecycle: {{ run_until: idle, idle_grace: 2s }}\n{extra}"
+    );
     let dir = common::unique_path("gate-addressee-play", "d");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(format!("{dir}/play.json"), play).unwrap();
@@ -209,4 +219,149 @@ fn ask_human_refuses_a_to_addressed_to_anyone_but_an_operator() {
         !log.contains("\"event\":\"human.ask\""),
         "and no gate may open for him\n{log}"
     );
+}
+
+/// Every operator is addressed as `operator`, whichever `a2a.principals` rule
+/// admitted it, so a rule's own id names no principal: `to: ops` is refused
+/// with that reason, and the rule's labels are how a gate narrows to it.
+#[cfg(feature = "a2a")]
+#[test]
+fn a_gate_addressed_to_an_operator_rules_id_is_refused_saying_how_to_name_it() {
+    let principals = "a2a:\n  listen: http://127.0.0.1:1\n  principals:\n    - {id: ops, match: {bearer_ref: \"{{secret:OPS}}\"}, role: operator, labels: {team: sec}}\n";
+    let with_ops = |cfg: String| format!("{cfg}{principals}");
+    let (code, log) = run(&[], &with_ops(policy("ops")));
+    assert_refused(code, &log, "security.policies[0]", "ops");
+    assert!(
+        log.contains("every operator is addressed as `operator`"),
+        "the refusal says why a rule id is not an addressee\n{log}"
+    );
+    let (code, log) = run(
+        &["--validate-config"],
+        &with_ops(policy("{role: operator, labels: {team: sec}}")),
+    );
+    assert_eq!(code, Some(0), "the rule's labels name it\n{log}");
+}
+
+/// A `to` the step renders is only known when it runs, in any form `render`
+/// rewrites, so the load leaves it to `ask_human` — which refuses the value
+/// it renders to when that names someone who could never see the task, and
+/// the step fails rather than opening a gate nobody can answer.
+#[test]
+fn a_templated_gate_addressee_is_held_to_the_rule_when_the_step_runs() {
+    for to in [
+        "\"{{ inputs.who }}\"",
+        "{id: \"{{ inputs.who }}\"}",
+        "{role: operator, id: \"{{ inputs.who }}\"}",
+    ] {
+        let (code, log) = run(&["--validate-config"], &human_step(to));
+        assert_eq!(code, Some(0), "to: {to} is only known when it runs\n{log}");
+    }
+    let log = converse_with(
+        "workflows:\n\
+         \x20 - name: approve\n\
+         \x20   steps:\n\
+         \x20     s: {kind: manual}\n\
+         \x20     g: {kind: human, question: \"Refund?\", to: \"{{ inputs.who }}\", depends_on: [s]}\n\
+         \x20     f: {kind: finish, depends_on: [g]}\n",
+        r#"{"turns": [
+             {"tool_calls": [{"name": "workflow.run", "arguments": {"name": "approve", "inputs": {"who": "user:mallory"}, "wait": true, "timeout": "10s"}}]},
+             {"echo_tool_result": true}]}"#,
+    );
+    assert!(
+        log.contains("`to` names user:mallory, who could never see the task"),
+        "the rendered addressee is refused, naming her\n{log}"
+    );
+    assert!(
+        !log.contains("\"event\":\"human.ask\""),
+        "and no gate opens for her\n{log}"
+    );
+}
+
+/// A reload is held to the same rule as the load: a `to` naming a principal
+/// who could never see the task is refused, naming them, and the running
+/// configuration stays — a later valid reload changes only what it changes,
+/// which it would not if the refused one had half-applied.
+#[cfg(feature = "hot-reload")]
+#[test]
+fn a_reload_that_addresses_a_gate_to_anyone_but_an_operator_is_refused() {
+    use std::io::{BufRead, BufReader};
+    use std::time::{Duration, Instant};
+
+    let cfg_for = |to: &str, instruction: &str| {
+        policy(to)
+            .replace(
+                "agent: { name: gates }",
+                &format!("agent: {{ name: gates, instruction: {instruction} }}"),
+            )
+            .replace(
+                "run_until: idle, idle_grace: 1s",
+                "run_until: drained, drain_timeout: 5s",
+            )
+    };
+    let dir = common::unique_path("gate-addressee-reload", "d");
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = format!("{dir}/c.yaml");
+    std::fs::write(&cfg, cfg_for("operator", "first")).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .args(["--config", &cfg])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn agentd");
+    let pid = child.id() as i32;
+    let (tx, rx) = std::sync::mpsc::channel::<serde_json::Value>();
+    let stderr = child.stderr.take().unwrap();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if let Ok(v) = serde_json::from_str(&line) {
+                let _ = tx.send(v);
+            }
+        }
+    });
+    let wait = |name: &str| {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(left) {
+                Ok(v) if v["event"] == name => return v,
+                Ok(v) if v["event"] == "config.reloaded" => panic!("reloaded: {v}"),
+                Ok(_) => continue,
+                Err(_) => panic!("timed out waiting for {name}"),
+            }
+        }
+    };
+    wait("proc.ready");
+
+    std::fs::write(&cfg, cfg_for("\"user:alice\"", "first")).unwrap();
+    unsafe { libc::kill(pid, libc::SIGHUP) };
+    let refused = wait("config.reload.invalid");
+    let e = refused["error"].as_str().unwrap_or_default();
+    assert!(
+        e.contains("security.policies[0]")
+            && e.contains("user:alice")
+            && e.contains("could never see the task"),
+        "the reload is refused, naming user:alice: {refused}"
+    );
+    assert!(child.try_wait().unwrap().is_none(), "still running");
+
+    std::fs::write(&cfg, cfg_for("operator", "second")).unwrap();
+    unsafe { libc::kill(pid, libc::SIGHUP) };
+    let reloaded = loop {
+        let v = rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("config.reloaded");
+        if v["event"] == "config.reloaded" {
+            break v;
+        }
+    };
+    let changed = reloaded["changed"].to_string();
+    assert!(
+        changed.contains("agent.instruction") && !changed.contains("security"),
+        "the refused reload applied nothing, so only the instruction changed: {reloaded}"
+    );
+
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dir);
 }

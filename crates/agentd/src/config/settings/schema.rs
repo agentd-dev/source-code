@@ -363,11 +363,11 @@ fn top_level_properties(
                         "on_timeout": { "enum": ["allow", "deny", "ask", "shadow"], "description": "what an unanswered `ask` becomes (default deny)" },
                         "timeout": { "type": "string" },
                         "to": { "oneOf": [
-                            { "type": "string", "description": "a principal-id glob" },
+                            { "type": "string", "description": "an operator addressee: the id `operator` (docs/configuration.md §12.6)" },
                             { "type": "object", "additionalProperties": false, "properties": {
                                 "id": { "type": "string" }, "role": { "enum": ["operator", "user", "agent"] },
                                 "labels": { "type": "object", "additionalProperties": { "type": "string" } } } } ],
-                            "description": "who may answer an `ask` gate (only with action: ask); unset = {role: operator}" } } } },
+                            "description": "which operator may answer an `ask` gate (only with action: ask): {role: operator} narrowed by labels, or the id `operator` — anyone else could never see the task and is refused (docs/configuration.md §12.6); unset = {role: operator}" } } } },
                 "workflows": { "type": "object", "additionalProperties": false, "properties": {
                     "immutable": { "type": "boolean", "description": "refuse workflow.create/update/delete at runtime — definitions become read-only for the model, subagents and operators alike; loading from config/file/url/dir is unaffected" } } },
                 "tls_ca": { "type": "string" },

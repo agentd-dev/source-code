@@ -638,9 +638,10 @@ pub fn contracts() -> Vec<Contract> {
     // one was refused, leaving that mode reachable only through a `default`
     // buried in the schema.
     //
-    // There is deliberately no addressee. A gate is answered by whoever holds
-    // the task, and routing to a named person is a different feature (an
-    // addressee, a quorum, a decider) rather than an argument.
+    // `to` narrows who may decide to an operator: a gate is a task, and only
+    // its owner and operators can see a task, so an addressee anyone else
+    // could never answer. `runtime/human.rs` holds the value a model passes to
+    // that rule when the call is made; unset, the task's owner answers.
     c(
         "ask_human",
         "human",

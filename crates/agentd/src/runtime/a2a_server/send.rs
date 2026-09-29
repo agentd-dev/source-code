@@ -355,7 +355,8 @@ impl Runtime {
                 via = "operator_override";
                 self.log.warn(
                     "human.answer.override",
-                    json!({"task": tid, "by": principal.id, "addressee": a.describe()}),
+                    json!({"task": tid, "by": principal.id, "sid": principal.session,
+                           "addressee": a.describe()}),
                 );
             }
             // The answer enters the gate task's history before the gate
@@ -364,7 +365,7 @@ impl Runtime {
             if let Some(t) = self.tasks.get_mut(tid) {
                 t.record_inbound(message);
             }
-            self.human_answer(i, text, via, Some(&principal.id.clone()));
+            self.human_answer(i, text, via, Some(&principal.clone()));
             return self.task_reply(tid);
         }
         let (task_id, ctx_id) = match existing {

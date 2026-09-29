@@ -435,8 +435,8 @@ Two consequences follow. An addressed gate is **never auto-answered**, whatever
 the named decider makes the record a lie. And an operator *can* still answer,
 because refusing them would be theatre when they can already rewrite the config
 or the store; instead the override is marked `operator_override` in the task,
-the log and the audit stream, and the audit line names the person who actually
-replied.
+the log and the audit stream, with the answering principal's id (`operator`)
+and its session id when it signed in with one.
 
 Steering is a small closed verb set over the same surface: `/signal <name> [run]`
 fires a workflow signal, `/send <handle> <text>` messages a warm subagent,

@@ -699,10 +699,13 @@ keeps only its stdio whether agentd runs as its own binary or embedded in anothe
 own descriptors are left as they are. The marking is one `close_range` call on Linux 5.11+.
 Where an older kernel or a seccomp profile refuses it, and off Linux, a process marks what
 `/proc/self/fd` (`/dev/fd` off Linux) lists, and without `/proc` (agentd as PID 1 in a bare
-container) tries each number below its descriptor limit, capped at 65536 — as a child between
-fork and exec always does, since it may not read a directory there. A limit above the cap leaves
-higher numbers unmarked, and the process says so at start in one
-`process.inherited_fds_unmarked` warning on stderr.
+container) tries each number below its descriptor limit, capped at 65536. A child between fork
+and exec may not read a directory, so it always tries each number below a bound its parent chose
+before the fork: the limit, capped at 65536, or — when the limit is higher — just past the highest
+descriptor `/proc/self/fd` lists. With neither `close_range` nor `/proc` and a limit above the
+cap, higher numbers stay unmarked, and one `process.inherited_fds_unmarked` warning on stderr
+says so: at start in the agentd binary, and at the first such spawn in any process, embedded or
+not.
 
 **The session is the operator's.** It acts for the person who ran the launcher, who started
 this daemon in-process from their own configuration and credentials — and, on a no-auth

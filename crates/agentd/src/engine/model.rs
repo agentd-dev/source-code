@@ -2222,7 +2222,11 @@ fn parse_step(
             if let Some(v) = spec.get("to") {
                 match crate::a2a::principals::Addressee::parse(v) {
                     Err(e) => errs.push(format!("{at}: human.to: {e}")),
-                    Ok(_) if v.as_str().is_some_and(|s| s.contains("{{")) => {}
+                    // Every form `render` rewrites — a `CEL:` string, or a
+                    // placeholder anywhere in the object form — not only a
+                    // templated string: `{role: operator, id: "{{ inputs.who }}"}`
+                    // may well render to an operator.
+                    Ok(_) if crate::engine::template::is_templated(v) => {}
                     Ok(a) => {
                         if let Err(e) = a.check_gate() {
                             errs.push(format!("{at}: human.to: {e}"));
@@ -2968,8 +2972,17 @@ mod tests {
         assert!(gate(json!({"role": "operator"})).is_ok());
         assert!(gate(json!({"role": "operator", "labels": {"team": "finance"}})).is_ok());
         assert!(gate(json!("operator")).is_ok());
-        // Known only when the step runs; `ask_human` holds it then.
-        assert!(gate(json!("{{ inputs.who }}")).is_ok());
+        // Known only when the step runs; `ask_human` holds it then — in every
+        // form `render` rewrites, not only a templated string.
+        for templated in [
+            json!("{{ inputs.who }}"),
+            json!("CEL: inputs.who"),
+            json!({"id": "{{ inputs.who }}"}),
+            json!({"role": "operator", "id": "{{ inputs.who }}"}),
+            json!({"role": "operator", "labels": {"team": "{{ inputs.team }}"}}),
+        ] {
+            assert!(gate(templated.clone()).is_ok(), "{templated}");
+        }
         // Anyone but an operator could never see the gate's task.
         for (bad, named) in [
             (json!("*@finance.example"), "*@finance.example"),

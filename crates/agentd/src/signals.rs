@@ -339,16 +339,27 @@ mod imp {
         }
     }
 
-    /// One syscall on Linux 5.11+: it sets the flag on every descriptor from
-    /// 3 up and closes none of them. False on an older kernel, under a
-    /// seccomp profile that refuses it, and off Linux.
-    pub fn cloexec_by_close_range() -> bool {
+    /// Test-only: behave as a kernel or seccomp profile that refuses
+    /// `close_range` does, in this process and in every child it forks from
+    /// now on, so the fallbacks are what a test exercises. An atomic, because
+    /// a child between fork and exec reads it.
+    #[cfg(test)]
+    pub static REFUSE_CLOSE_RANGE: AtomicBool = AtomicBool::new(false);
+
+    /// `close_range(first, u32::MAX, CLOSE_RANGE_CLOEXEC)`: true when the
+    /// kernel took it. A raw syscall, so a child between fork and exec may
+    /// make it.
+    fn close_range_cloexec(first: libc::c_uint) -> bool {
+        #[cfg(test)]
+        if REFUSE_CLOSE_RANGE.load(Ordering::Relaxed) {
+            return false;
+        }
         #[cfg(target_os = "linux")]
         {
             let rc = unsafe {
                 libc::syscall(
                     libc::SYS_close_range,
-                    3 as libc::c_uint,
+                    first,
                     libc::c_uint::MAX,
                     libc::CLOSE_RANGE_CLOEXEC,
                 )
@@ -357,30 +368,54 @@ mod imp {
         }
         #[cfg(not(target_os = "linux"))]
         {
+            let _ = first;
             false
         }
     }
 
-    /// Mark every descriptor the kernel lists for this process. False when
-    /// there is no listing to read — `/proc` unmounted, as it can be for
+    /// One syscall on Linux 5.11+: it sets the flag on every descriptor from
+    /// 3 up and closes none of them. False on an older kernel, under a
+    /// seccomp profile that refuses it, and off Linux.
+    pub fn cloexec_by_close_range() -> bool {
+        close_range_cloexec(3)
+    }
+
+    /// Whether [`cloexec_by_close_range`] would work here, asked without
+    /// marking anything: a range that starts past every possible descriptor
+    /// is a no-op the kernel still validates, flag included. A child inherits
+    /// its parent's kernel and seccomp filter, so the answer holds for it.
+    fn close_range_available() -> bool {
+        close_range_cloexec(libc::c_uint::MAX)
+    }
+
+    /// The descriptors the kernel lists for this process, from 3 up; `None`
+    /// when there is no listing to read — `/proc` unmounted, as it can be for
     /// agentd as PID 1; on Linux `/dev/fd` is a link into `/proc`, so it is
     /// no second path. The listing's own descriptor is in it, already
-    /// close-on-exec and closed by the time the flag is set, which `fcntl`
-    /// refuses harmlessly. It allocates, so it is for the process itself,
-    /// never a child between fork and exec.
-    pub fn cloexec_by_walk() -> bool {
+    /// close-on-exec and closed by the time anyone acts on it. It allocates,
+    /// so it is for the process itself, never a child between fork and exec.
+    fn listed_fds() -> Option<Vec<libc::c_int>> {
         let dir = if cfg!(target_os = "linux") {
             "/proc/self/fd"
         } else {
             "/dev/fd"
         };
-        let Ok(entries) = std::fs::read_dir(dir) else {
+        let entries = std::fs::read_dir(dir).ok()?;
+        Some(
+            entries
+                .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+                .filter(|fd| *fd >= 3)
+                .collect(),
+        )
+    }
+
+    /// Mark every descriptor the kernel lists for this process; false when
+    /// there is no listing (see [`listed_fds`]), in which case `fcntl`
+    /// refusing the listing's own closed descriptor is harmless.
+    pub fn cloexec_by_walk() -> bool {
+        let Some(fds) = listed_fds() else {
             return false;
         };
-        let fds: Vec<libc::c_int> = entries
-            .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
-            .filter(|fd| *fd >= 3)
-            .collect();
         for fd in fds {
             mark_cloexec(fd);
         }
@@ -396,6 +431,20 @@ mod imp {
         }
     }
 
+    /// The one line saying a descriptor numbered at or above `bound` can
+    /// still reach a child: what an operator needs to know when nothing could
+    /// mark past the scan. The shape of every other log line, because it is
+    /// written straight to stderr — at start no logger exists yet, and an
+    /// embedder's children are spawned under whatever logger its host has.
+    pub fn unmarked_warning(bound: libc::c_int, why: &str) -> serde_json::Value {
+        serde_json::json!({
+            "level": "warn",
+            "event": "process.inherited_fds_unmarked",
+            "scanned_below": bound,
+            "msg": format!("{why}; a descriptor numbered at or above {bound} keeps no close-on-exec"),
+        })
+    }
+
     pub fn cloexec_inherited_fds() {
         if cloexec_by_close_range() || cloexec_by_walk() {
             return;
@@ -403,24 +452,69 @@ mod imp {
         let (bound, complete) = fd_scan_bound();
         cloexec_by_range(bound);
         if !complete {
-            // No logger exists yet: this runs before the configuration is
-            // read. One line in the shape of the others, so an operator sees
-            // that a descriptor above the scan could still reach a child.
             eprintln!(
                 "{}",
-                serde_json::json!({
-                    "level": "warn",
-                    "event": "process.inherited_fds_unmarked",
-                    "scanned_below": bound,
-                    "msg": "close_range and /proc are unavailable and the descriptor limit exceeds the scan; a descriptor numbered above it keeps no close-on-exec",
-                })
+                unmarked_warning(
+                    bound,
+                    "close_range and /proc are unavailable and the descriptor limit exceeds the scan"
+                )
             );
         }
     }
 
+    /// How far a child's fallback scan must reach, decided in the parent —
+    /// the child may neither read a directory nor ask for its limit — and
+    /// whether that reach is past every descriptor it could inherit.
+    ///
+    /// The capped limit is enough when the limit is under the cap, and
+    /// irrelevant when `close_range` works, since the child then marks
+    /// everything in one call. Otherwise a descriptor the host numbered past
+    /// the cap would reach the child unmarked, so the scan runs to just past
+    /// the highest one the kernel lists instead. A descriptor another host
+    /// thread opens inheritable between that listing and the fork can still
+    /// slip past it: the listing is the best a parent can know. With no
+    /// listing either, the reach stays capped and says so.
+    pub fn child_scan_bound(
+        (bound, complete): (libc::c_int, bool),
+        close_range: impl FnOnce() -> bool,
+        listed: impl FnOnce() -> Option<Vec<libc::c_int>>,
+    ) -> (libc::c_int, bool) {
+        if complete || close_range() {
+            return (bound, true);
+        }
+        match listed() {
+            Some(fds) => (
+                fds.into_iter()
+                    .map(|fd| fd.saturating_add(1))
+                    .fold(bound, libc::c_int::max),
+                true,
+            ),
+            None => (bound, false),
+        }
+    }
+
+    /// One warning per process, however many children it spawns: the
+    /// condition is the host's and does not change between them.
+    static UNMARKED_WARNED: std::sync::Once = std::sync::Once::new();
+
     pub fn pass_only_stdio(cmd: &mut std::process::Command) {
         use std::os::unix::process::CommandExt;
-        let (bound, _) = fd_scan_bound();
+        let (bound, complete) =
+            child_scan_bound(fd_scan_bound(), close_range_available, listed_fds);
+        if !complete {
+            // `cloexec_inherited_fds` reports the same gap only in the agentd
+            // binary, at start; an embedder's host never runs it, so the
+            // spawn site is the one place every process passes through.
+            UNMARKED_WARNED.call_once(|| {
+                eprintln!(
+                    "{}",
+                    unmarked_warning(
+                        bound,
+                        "a child is spawned where close_range and /proc are unavailable and the descriptor limit exceeds the scan"
+                    )
+                );
+            });
+        }
         // SAFETY: between fork and exec the closure makes only raw syscalls
         // (close_range, fcntl) and touches no heap. std has placed the
         // child's stdio on 0-2 before any closure runs, and its own
@@ -515,7 +609,7 @@ mod imp {
 /// listing of the table is walked; with neither (an old kernel or a seccomp
 /// refusal, and no `/proc`) every number below the descriptor limit is tried,
 /// capped at 65536 — and past the cap one `process.inherited_fds_unmarked`
-/// warning says a higher descriptor was left as it was.
+/// warning on stderr says a higher descriptor was left as it was.
 ///
 /// This covers the agentd binary's own processes. A child spawned through
 /// the library is covered however its host started — see
@@ -536,6 +630,13 @@ pub fn cloexec_inherited_fds() {
 /// that hands the child a descriptor beyond its stdio places it in a
 /// `pre_exec` registered after this one: closures run in order, and a
 /// `dup2` copy carries no close-on-exec.
+///
+/// The child uses `close_range` where the kernel allows it; otherwise it
+/// tries each number below a bound the parent chose — the descriptor limit
+/// capped at 65536, or past the highest descriptor `/proc/self/fd` lists
+/// when the limit is higher. With neither `close_range` nor `/proc` and a
+/// limit over the cap, the first such spawn writes one
+/// `process.inherited_fds_unmarked` warning on stderr.
 pub fn pass_only_stdio(cmd: &mut std::process::Command) {
     imp::pass_only_stdio(cmd);
 }
@@ -901,5 +1002,74 @@ mod fd_tests {
         for fd in stray.fds {
             assert!(!cloexec(fd), "the parent's own descriptors are untouched");
         }
+    }
+
+    /// Refuses `close_range` for as long as it lives, however the test ends.
+    struct NoCloseRange;
+    impl NoCloseRange {
+        fn on() -> NoCloseRange {
+            super::imp::REFUSE_CLOSE_RANGE.store(true, std::sync::atomic::Ordering::SeqCst);
+            NoCloseRange
+        }
+    }
+    impl Drop for NoCloseRange {
+        fn drop(&mut self) {
+            super::imp::REFUSE_CLOSE_RANGE.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// What an older kernel, or a seccomp profile that refuses `close_range`,
+    /// leaves the child: its own scan between fork and exec. `close_range`
+    /// succeeds on every kernel the tests run on, so it is refused here, or
+    /// the scan would never be what the test exercises.
+    #[test]
+    fn a_child_spawned_where_close_range_is_refused_holds_no_stray() {
+        let _g = lock();
+        let stray = StrayPipe::open();
+        let _refused = NoCloseRange::on();
+        let mut cmd = Command::new("ls");
+        cmd.args(["-l", "/proc/self/fd"]).stdin(Stdio::null());
+        super::pass_only_stdio(&mut cmd);
+        let listing = super::stray_fd::listing(&mut cmd);
+        assert!(!stray.held_in(&listing), "{listing}");
+    }
+
+    /// The child's scan reaches past every descriptor the parent could hand
+    /// it, whatever the limit: past the highest one the kernel lists when the
+    /// limit is over the cap and `close_range` is refused — and it admits to
+    /// falling short only when there is no listing either.
+    #[test]
+    fn a_childs_scan_reaches_past_every_listed_descriptor() {
+        use super::imp::child_scan_bound;
+        let never = || -> Option<Vec<libc::c_int>> { panic!("no listing is needed") };
+        // A limit under the cap is the whole table.
+        assert_eq!(
+            child_scan_bound((1024, true), || false, never),
+            (1024, true)
+        );
+        // `close_range` marks everything in the child; the bound is moot.
+        assert_eq!(
+            child_scan_bound((65_536, false), || true, never),
+            (65_536, true)
+        );
+        // Over the cap without it: past the highest listed descriptor…
+        assert_eq!(
+            child_scan_bound((65_536, false), || false, || Some(vec![3, 9, 70_000])),
+            (70_001, true)
+        );
+        // …never below the cap…
+        assert_eq!(
+            child_scan_bound((65_536, false), || false, || Some(vec![3, 9])),
+            (65_536, true)
+        );
+        // …and with no listing, capped and incomplete: what the warning says.
+        assert_eq!(
+            child_scan_bound((65_536, false), || false, || None),
+            (65_536, false)
+        );
+        let w = super::imp::unmarked_warning(65_536, "why");
+        assert_eq!(w["event"], "process.inherited_fds_unmarked");
+        assert_eq!(w["level"], "warn");
+        assert_eq!(w["scanned_below"], 65_536);
     }
 }

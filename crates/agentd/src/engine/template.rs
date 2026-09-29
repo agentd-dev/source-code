@@ -103,6 +103,19 @@ fn resolve_placeholder(inner: &str, data: &Data) -> Result<Value, String> {
     }
 }
 
+/// Whether rendering could change `v`: some string inside it is a `CEL:`
+/// expression or holds a `{{…}}` placeholder — the two things [`render_str`]
+/// rewrites. What such a value will be is only known when its step runs, so a
+/// load-time check of it has to wait for the rendered value.
+pub fn is_templated(v: &Value) -> bool {
+    match v {
+        Value::String(s) => s.contains("{{") || s.trim_start().starts_with("CEL:"),
+        Value::Array(a) => a.iter().any(is_templated),
+        Value::Object(o) => o.values().any(is_templated),
+        _ => false,
+    }
+}
+
 /// Look up a dotted or JSON-pointer path in the data.
 pub fn lookup(path: &str, data: &Data) -> Option<Value> {
     if path.is_empty() {
@@ -246,5 +259,34 @@ mod tests {
             json!(3)
         );
         assert!(render(&json!("CEL: nope.x"), &d).is_err());
+    }
+
+    /// `is_templated` says yes exactly where `render` would rewrite something,
+    /// at any depth — and no to a value `render` returns as it is.
+    #[test]
+    fn a_value_is_templated_where_render_would_rewrite_it() {
+        for yes in [
+            json!("{{inputs.who}}"),
+            json!("  CEL: inputs.who"),
+            json!({"role": "operator", "id": "{{inputs.who}}"}),
+            json!({"labels": {"team": "CEL: inputs.team"}}),
+            json!([1, ["x {{vars.y}}"]]),
+        ] {
+            assert!(is_templated(&yes), "{yes}");
+        }
+        for no in [
+            json!("operator"),
+            json!("a CEL: in the middle"),
+            json!({"role": "operator", "labels": {"team": "finance"}}),
+            json!(7),
+            Value::Null,
+        ] {
+            assert!(!is_templated(&no), "{no}");
+            assert_eq!(
+                render(&no, &data()).unwrap(),
+                no,
+                "render leaves {no} as it is"
+            );
+        }
     }
 }

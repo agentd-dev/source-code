@@ -178,6 +178,56 @@ fn a_full_document_loads_every_element() {
     );
 }
 
+/// A document's workflow may address a `human` step to one of its own
+/// `::!human` declarations. idoc folds `@human/<name>` into that human's
+/// `channel` (its `principal` when it declares no channel), and a gate may
+/// wait only for an operator: a channel names no principal, so it is refused
+/// at load — saying what the reference became and why — while a human whose
+/// principal is the operator loads.
+#[test]
+fn a_gate_addressed_to_a_documents_human_loads_only_as_an_operator() {
+    let doc = |human: &str| {
+        format!(
+            "---\nspec: \"1\"\n---\n# Refunds\n\n{human}\n\n\
+             :::!workflow{{name=w}}\n\
+             steps:\n\
+             \x20 s:   {{kind: manual}}\n\
+             \x20 ask: {{kind: human, question: \"ok?\", to: \"@human/oncall\", depends_on: [s]}}\n\
+             \x20 f:   {{kind: finish, depends_on: [ask]}}\n\
+             :::\n"
+        )
+    };
+    let all = [
+        "material",
+        "knowledge",
+        "interface",
+        "identity",
+        "compute",
+        "infra",
+        "compose",
+    ];
+    for (human, named) in [
+        (":::!human{name=oncall channel=#ops}\n:::", "#ops"),
+        (
+            ":::!human{name=oncall}\nrole: approver\n:::",
+            "@human/oncall",
+        ),
+    ] {
+        let (valid, err, _) = load(&doc(human), &all);
+        assert!(!valid, "{human} must not load");
+        assert!(
+            err.contains(&format!("`to` names {named}, who could never see the task"))
+                && err.contains("a channel is not a principal"),
+            "the refusal names {named} and says what it became:\n{err}"
+        );
+    }
+    let (valid, err, _) = load(&doc(":::!human{name=oncall principal=operator}\n:::"), &all);
+    assert!(
+        valid,
+        "a human who is the operator is a gate's decider:\n{err}"
+    );
+}
+
 #[test]
 fn an_ungranted_family_is_refused_naming_the_grant() {
     // The same document with NO grants: the gated families are refused, each

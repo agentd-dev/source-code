@@ -1104,9 +1104,10 @@ pub struct Workflow {
     /// The channel each gate of THIS definition is announced on, by step path
     /// (`config::humans`). Never parsed from a definition: the runtime sets it
     /// only on a definition it loaded from the configuration, from the
-    /// instruction document's `::!human`s, so a definition `workflow.create`
-    /// or `workflow.update` wrote — or the store restored — carries none, and
-    /// a run of it announces nothing, whatever name it shares.
+    /// instruction document's `::!human`s. `workflow.create` and
+    /// `workflow.update` cannot write under a configured name, and a
+    /// definition they wrote under any other — or the store restored —
+    /// carries none, so a run of it announces nothing.
     #[serde(skip)]
     pub gate_channels: BTreeMap<String, String>,
 }

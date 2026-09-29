@@ -328,8 +328,9 @@ There are no removal tables and no removed sections in `--help`.
   the task's `askChannel` annotation — for a workflow or a bridge to route
   the question; it never decides who may answer, and no `to:` written
   anywhere else can set one. It is bound to the definition the document
-  loaded: one `workflow.update` writes under the same name announces
-  nothing. A subagent template's document addresses its gates the same way,
+  loaded: `workflow.create` and `workflow.update` cannot write under the
+  document's workflow name (a configured name is refused), and a definition
+  they write under any other name announces nothing. A subagent template's document addresses its gates the same way,
   so its child loads them, but a template's channels are not announced (the
   parent's boot warns). The spec's own conformance examples, which
   address their gates this way, now load; the instruction crate's fold and
@@ -441,7 +442,8 @@ holds up the next call on the same server.
   failed to load used to be refused after the new instruction, MCP servers,
   tools and skills were already live. A runtime-stored definition that a
   configured one of the same name keeps from loading is logged as
-  `workflow.stored.shadowed` instead of being skipped silently.
+  `workflow.stored.shadowed` instead of being skipped silently, and
+  discarded.
 - **A configured workflow cannot be edited or deleted at runtime.**
   `workflow.update` of a workflow the configuration defines (inline, `file:`,
   `dir:`, `url:`, `uri:`, an instruction document's `:::!workflow` or
@@ -449,10 +451,14 @@ holds up the next call on the same server.
   success, and the next restart or workflow reload put the configured
   definition back; `workflow.delete` of one came back the same way. Both, and
   `workflow.create` of such a name, are now refused, naming the source to
-  change (`workflow.refused` in the log). A workflow created at runtime stays
+  change (`workflow.refused` in the log; a `url:` source is named by scheme,
+  host and path, never its userinfo or query). A workflow created at runtime stays
   editable; when a reload defines its name in the configuration, the
-  configured one loads and the name is refused from then on, and when the
-  configuration drops a name it is the runtime's again.
+  configured one loads, the stored one is discarded (logged, with its hash,
+  as `workflow.stored.shadowed`) and the name is refused from then on, and
+  when the configuration drops a name it is free to create again. A stored
+  definition is never armed in place of a workflow the configuration
+  stopped defining.
 - **An `exec` workflow step keeps its command's exit status.** The daemon's
   reactor reaps every exited child in the process, and the `exec` runner
   polled its own child with `try_wait`: when a tick landed between the

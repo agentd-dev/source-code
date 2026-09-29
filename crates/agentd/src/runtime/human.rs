@@ -143,8 +143,10 @@ impl Runtime {
     /// `to`, because a channel is never part of a `to`: only the document's
     /// own declaration can put one on a gate. It is read from the definition
     /// the run executes — the one it started with, by hash — and only a
-    /// definition loaded from the configuration carries any, so a run of one
-    /// `workflow.update` rewrote under the same name announces nothing. Nor is
+    /// definition loaded from the configuration carries any. The workflow
+    /// tools cannot write under a configured name, so a definition the
+    /// runtime stored (created at runtime, or restored from the store)
+    /// announces nothing. Nor is
     /// it carried on the pending ask or in the durable wait record: a restart
     /// re-derives it for a gate it rebuilds, and a reload that changes it
     /// reloads the definitions, which moves the next gate.

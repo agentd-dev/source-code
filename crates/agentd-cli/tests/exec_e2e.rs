@@ -62,16 +62,22 @@ fn run(cfg: &str) -> Daemon {
 }
 
 fn config(workdir: &str, cmd_step: &str) -> String {
+    config_with(workdir, cmd_step, "")
+}
+
+/// [`config`], with further workflow entries after `run`.
+fn config_with(workdir: &str, cmd_step: &str, more_workflows: &str) -> String {
     format!(
         "\
          agent:\n  name: exec\n  instruction: x\n  preflight: never\n\
          intelligence:\n  endpoints: http://127.0.0.1:1\n  model: m\n\
          store:\n  kind: memory\n\
-         security:\n  exec:\n    enabled: true\n    allow: [echo]\n    workdir: {workdir}\n    timeout: 10s\n\
+         security:\n  exec:\n    enabled: true\n    allow: [echo, sh]\n    workdir: {workdir}\n    timeout: 10s\n\
          workflows:\n  - name: run\n    steps:\n\
          \x20     s:    {{kind: once}}\n\
          {cmd_step}\n\
          \x20     done: {{kind: finish, depends_on: [run], output: \"{{{{steps.run.output}}}}\"}}\n\
+         {more_workflows}\
          lifecycle:\n  run_until: idle\n  idle_grace: 1s\n\
          observability:\n  log_level: info\n  log_content: true\n"
     )
@@ -123,6 +129,14 @@ fn an_allow_listed_command_runs_and_a_denied_one_is_refused() {
 /// The daemon's reactor reaps every exited child in the process while a
 /// workflow's `exec` step waits on its own: run the step many times, several
 /// at once, and every one still reports its command's exit.
+///
+/// The reactor reaps on each pass of its loop, and it passes on events and
+/// at its tick — rarely enough, left alone, that an exec child's exit would
+/// seldom fall between one pass and the runner's next look. So each command
+/// outlives the runner's first look (a short sleep), and a second workflow
+/// firing every few milliseconds keeps the reactor passing: an exit the
+/// runner did not own the route of would be taken by the reactor nearly
+/// every time.
 #[test]
 fn every_exec_step_reports_its_exit_while_the_reactor_reaps() {
     const RUNS: usize = 30;
@@ -134,15 +148,38 @@ fn every_exec_step_reports_its_exit_while_the_reactor_reaps() {
         .join(", ");
     let fan = format!(
         "\x20     run:  {{kind: foreach, depends_on: [s], over: [{over}], batch: {{size: 1, parallel: 4}},\n\
-         \x20            body: {{steps: {{x: {{kind: tool, name: exec, args: {{cmd: echo, args: [\"n-{{{{item}}}}\"]}}}}}}}}}}"
+         \x20            body: {{steps: {{x: {{kind: tool, name: exec, args: {{cmd: sh, args: [\"-c\", \"/bin/sleep 0.02; echo n-{{{{item}}}}\"]}}}}}}}}}}"
     );
-    let d = run(&config(&workdir, &fan));
+    let ticker = "\x20 - name: ticker\n    steps:\n\
+                  \x20     s: {kind: schedule, every: 3ms}\n\
+                  \x20     f: {kind: finish, depends_on: [s], status: completed}\n";
+    let d = run(&config_with(&workdir, &fan, ticker));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let done = loop {
+        let done: Vec<Value> = d
+            .events("run.done")
+            .into_iter()
+            .filter(|e| e["workflow"] == "run")
+            .collect();
+        if !done.is_empty() {
+            break done;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the exec workflow finished:\n{}",
+            d.stderr()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
     assert!(
-        d.wait_done(60),
-        "the exec workflow finished:\n{}",
+        d.events("run.done")
+            .iter()
+            .filter(|e| e["workflow"] == "ticker")
+            .count()
+            >= 5,
+        "the ticker kept the reactor passing:\n{}",
         d.stderr()
     );
-    let done = d.events("run.done");
     let outs = done[0]["output"]
         .as_array()
         .unwrap_or_else(|| panic!("one output per run: {}", done[0]))

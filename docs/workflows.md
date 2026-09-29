@@ -818,11 +818,13 @@ and reload`, logged as `workflow.refused`. Whatever they wrote would last only
 until the configured workflows next load (a restart, or a reload that re-reads
 them), which would put the configured definition back. A workflow created at
 runtime stays editable. If a reload or restart later defines its name in the
-configuration, the configured definition loads, the stored one is skipped with
-`workflow.stored.shadowed` naming the configured source, and from then on the
-name is refused like any configured one. The stored record is kept: when the
-configuration stops defining the name, the stored definition loads again and
-is the runtime's to change, and a name nothing stores is free to create.
+configuration, the configured definition loads and from then on the name is
+refused like any configured one. The stored definition is discarded once the
+configuration that defines the name is accepted — logged as
+`workflow.stored.shadowed` with the configured source, the stored hash and who
+wrote it — so a workflow removed from the configuration is gone, and an old
+runtime edit of it is not armed in its place. A name the configuration stops
+defining is free to create again.
 
 | Cap | Value |
 |---|---|

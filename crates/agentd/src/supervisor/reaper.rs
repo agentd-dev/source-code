@@ -36,10 +36,11 @@
 //! exit while a reactor ticks gets its exit status in one of two ways:
 //!
 //!  * **It needs the status** — the `exec` tool's command, the launcher's display
-//!    client: the child is spawned through [`spawn_owned`] / [`spawn_tracked_pid`],
-//!    so the pid is routed from the fork on, and the status arrives on the route
-//!    whichever side collected it. [`OwnedChild`] also collects it itself, under
-//!    the same lock, when no reactor ticks at all.
+//!    client and opener: the child is spawned through [`spawn_owned`], so the pid
+//!    is routed from the fork on, and the status arrives on the route whichever
+//!    side collected it. [`OwnedChild`] also collects it itself, under the same
+//!    lock, when no reactor ticks at all. (An instance-tier child is routed the
+//!    same way, [`spawn_tracked_pid`], to the reactor that supervises it.)
 //!  * **It does not** — a subagent's `Subagent::kill`/`Drop`, and every component
 //!    that detects its child's death through its own channel (the warm/async
 //!    `AgentMsg` channel): the child is torn down and its status discarded, and
@@ -107,23 +108,35 @@ pub fn spawn_tracked_pid(
 /// waits when no reactor ticks.
 const OWNED_POLL: Duration = Duration::from_millis(15);
 
-/// A child whose spawner needs its exit status — the `exec` tool's command.
+/// A child whose spawner needs its exit status — the `exec` tool's command,
+/// the launcher's display client.
 ///
 /// Its pid is routed to its own channel from the fork on ([`spawn_owned`]), and
 /// the status is taken in exactly one of two places, both under the routes
 /// lock: [`reap_and_dispatch`] (which removes the route and sends the status
 /// before it lets go of the lock), or [`OwnedChild`]'s own
-/// `waitpid(pid, WNOHANG)`, which runs only while the route is still present
-/// and removes it on success. So neither side can lose the status or reap it
-/// twice, and a waiter that finds the route gone finds the status already on
-/// its channel. The std [`Child`](std::process::Child) is kept only for its
-/// pipes and never waited on: its `try_wait` is the unlocked
-/// `waitpid(pid)` this type exists to replace.
+/// `waitpid(pid, WNOHANG)`, which runs only while no status is on the channel
+/// and removes the route on success. So neither side can lose the status or
+/// reap it twice. The waitpid must stay under the lock: outside it, a dispatch
+/// could reap the pid first and a later fork reuse it, and the waitpid would
+/// then collect that other child's exit.
+///
+/// Under the lock, then, a status on the channel means the pid is gone; no
+/// status and not `lost` means the pid is still this child's, running or a
+/// zombie — nothing else can take it while the lock is held. `lost` is the
+/// one exit from that: a `waitpid` outside the registry (an embedder's own,
+/// or `SIGCHLD` set to `SIG_IGN`) took the status, the pid may already name
+/// another process, and it is never waited on or signalled again.
+///
+/// The std [`Child`](std::process::Child) is kept only for its pipes and
+/// never waited on: its `try_wait` is the unlocked `waitpid(pid)` this type
+/// exists to replace.
 pub struct OwnedChild {
     child: std::process::Child,
     pid: i32,
     exit: Receiver<Reaped>,
     outcome: Option<WaitOutcome>,
+    lost: bool,
 }
 
 /// Spawn a child whose exit status its spawner reads ([`OwnedChild`]). As in
@@ -131,6 +144,12 @@ pub struct OwnedChild {
 /// reaper can `waitpid` the pid before it is routed. The parent only holds the
 /// lock; the forked child never touches it, so whatever `pre_exec` work the
 /// command carries (`signals::pass_only_stdio`'s marking) runs as before.
+///
+/// The hold covers all of std's spawn, which on the fork path waits for the
+/// child's `execve` to succeed or fail — and the reactor's tick takes the same
+/// lock to reap. A command whose `execve` blocks (a binary on a hung network
+/// mount) holds the reactor with it for as long; the `exec` allow-list is
+/// what keeps that an operator's choice rather than the model's.
 pub fn spawn_owned(
     spawn_fn: impl FnOnce() -> io::Result<std::process::Child>,
 ) -> io::Result<OwnedChild> {
@@ -144,7 +163,15 @@ pub fn spawn_owned(
         pid,
         exit,
         outcome: None,
+        lost: false,
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Runs just before [`OwnedChild::try_wait`]'s own `waitpid`, so a test
+    /// can put a reaper in that window.
+    static BEFORE_OWN_WAITPID: std::cell::Cell<Option<fn()>> = const { std::cell::Cell::new(None) };
 }
 
 impl OwnedChild {
@@ -161,20 +188,33 @@ impl OwnedChild {
         self.child.stderr.take()
     }
 
-    /// The exit status if the child has exited, without blocking.
-    pub fn try_wait(&mut self) -> io::Result<Option<WaitOutcome>> {
-        if self.outcome.is_some() {
-            return Ok(self.outcome);
-        }
-        let mut routes = routes();
-        // The reaper sends under this lock, so a status it dispatched is on
-        // the channel by now.
-        if let Ok(r) = self.exit.try_recv() {
+    /// Whether the exit is known (or can never be), taking a status the
+    /// reaper dispatched. Call with the routes lock held: the reaper sends
+    /// under it, so a status it dispatched is on the channel by then.
+    fn settled(&mut self) -> bool {
+        if self.outcome.is_none()
+            && !self.lost
+            && let Ok(r) = self.exit.try_recv()
+        {
             self.outcome = Some(r.outcome);
-            return Ok(self.outcome);
         }
-        // Not dispatched: the route is still present and, while this lock is
-        // held, nobody else reaps the pid.
+        self.outcome.is_some() || self.lost
+    }
+
+    /// The exit status if the child has exited, without blocking. An error
+    /// means the status was taken outside the registry and is gone for good.
+    pub fn try_wait(&mut self) -> io::Result<Option<WaitOutcome>> {
+        let mut routes = routes();
+        if self.settled() {
+            return match self.outcome {
+                Some(o) => Ok(Some(o)),
+                None => Err(io::Error::from_raw_os_error(libc::ECHILD)),
+            };
+        }
+        #[cfg(test)]
+        if let Some(hook) = BEFORE_OWN_WAITPID.get() {
+            hook();
+        }
         let mut status: libc::c_int = 0;
         match unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) } {
             0 => Ok(None),
@@ -186,11 +226,15 @@ impl OwnedChild {
             _ => {
                 let e = io::Error::last_os_error();
                 if e.kind() == io::ErrorKind::Interrupted {
-                    Ok(None)
-                } else {
-                    // Only a waitpid outside this registry takes a routed pid.
-                    Err(e)
+                    return Ok(None);
                 }
+                // Only a waitpid outside this registry takes a routed pid.
+                // The pid is free for reuse from then on, so the route goes
+                // now, while the lock still holds: a later fork's child must
+                // not find its exit sent here, nor be signalled as this one.
+                routes.remove(&self.pid);
+                self.lost = true;
+                Err(e)
             }
         }
     }
@@ -213,8 +257,6 @@ impl OwnedChild {
                 }
             };
             // Parked on the route: a reactor's dispatch ends the nap at once.
-            // A disconnect (the route removed with nothing sent) ends it too,
-            // and the next `try_wait` names it.
             if let Ok(r) = self.exit.recv_timeout(nap) {
                 self.outcome = Some(r.outcome);
                 return Ok(self.outcome);
@@ -222,30 +264,30 @@ impl OwnedChild {
         }
     }
 
-    /// SIGKILL the child if it has not been reaped. A pid still routed is
-    /// this child's, live or a zombie, and cannot be reaped (and so reused)
-    /// while the lock is held; once the route is gone the pid may already
-    /// name another process, so it is not signalled.
+    /// Send `sig` to the child if it has not been reaped. Under the lock, an
+    /// unsettled child's pid is still its own (see [`OwnedChild`]), so this
+    /// never signals a reused pid.
+    pub fn signal(&mut self, sig: libc::c_int) {
+        let _routes = routes();
+        if !self.settled() {
+            unsafe { libc::kill(self.pid, sig) };
+        }
+    }
+
+    /// SIGKILL the child if it has not been reaped.
     pub fn kill(&mut self) {
-        if self.outcome.is_some() {
-            return;
-        }
-        let routes = routes();
-        if routes.contains_key(&self.pid) {
-            unsafe { libc::kill(self.pid, libc::SIGKILL) };
-        }
+        self.signal(libc::SIGKILL);
     }
 }
 
 impl Drop for OwnedChild {
     /// An owned child is never left running or unreaped: with no reactor,
-    /// nothing else would collect it.
+    /// nothing else would collect it. A lost one has no pid left to touch,
+    /// and a wait that errs leaves it lost.
     fn drop(&mut self) {
-        if self.outcome.is_none() {
+        if self.outcome.is_none() && !self.lost {
             self.kill();
-            if self.wait_until(None).is_err() {
-                deregister(self.pid);
-            }
+            let _ = self.wait_until(None);
         }
     }
 }
@@ -276,6 +318,143 @@ pub fn deregister(pid: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
+
+    fn spawn(cmd: &str, args: &[&str]) -> OwnedChild {
+        spawn_owned(|| Command::new(cmd).args(args).spawn()).expect("spawn")
+    }
+
+    /// Block until `pid` has exited WITHOUT reaping it: its status stays for
+    /// whoever collects it next.
+    fn until_exited(pid: i32) {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let r = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        assert_eq!(r, 0, "waitid {pid}: {}", io::Error::last_os_error());
+    }
+
+    fn gone(pid: i32) -> bool {
+        // A zombie still answers signal 0; only a reaped pid is ESRCH.
+        let r = unsafe { libc::kill(pid, 0) };
+        r == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }
+
+    /// A child dropped while it runs is killed and reaped — with no reactor,
+    /// nothing else would collect it — and its route goes with it.
+    #[test]
+    fn a_dropped_child_is_killed_and_reaped() {
+        let child = spawn("sleep", &["30"]);
+        let pid = child.id();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            drop(child);
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("the drop killed the child rather than wait out its sleep");
+        assert!(gone(pid), "pid {pid} is still there (running or a zombie)");
+        assert!(routes().get(&pid).is_none(), "the route went with it");
+    }
+
+    const REAPER_CHILD: &str = "AGENTD_OWNED_CHILD_REAPER";
+
+    /// The interleavings with a reactor, made deterministic. Run in a child
+    /// test process: `reap_and_dispatch` and a bare `waitpid` would take the
+    /// children of every other test in this binary.
+    #[test]
+    fn an_owned_child_keeps_its_exit_whoever_reaps_it() {
+        if std::env::var_os(REAPER_CHILD).is_some() {
+            return interleavings();
+        }
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "supervisor::reaper::tests::an_owned_child_keeps_its_exit_whoever_reaps_it",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(REAPER_CHILD, "1")
+            .output()
+            .expect("spawn the test binary");
+        let log = String::from_utf8_lossy(&out.stdout).into_owned()
+            + &String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "the child failed:\n{log}");
+        assert!(log.contains("1 passed"), "the child ran nothing:\n{log}");
+    }
+
+    fn interleavings() {
+        // 1. The reactor dispatched the exit before the owner looked: the
+        // status is the one on the channel, not the ECHILD its own waitpid
+        // would answer now.
+        let mut child = spawn("true", &[]);
+        until_exited(child.id());
+        reap_and_dispatch();
+        assert_eq!(
+            child.try_wait().unwrap(),
+            Some(WaitOutcome::Exited(0)),
+            "the dispatched status is the exit"
+        );
+
+        // 2. The same, and the owner kills rather than waits (a timeout that
+        // raced the exit): the dispatched status settles it, so the pid —
+        // reaped, and free for any later fork — is not signalled.
+        let mut child = spawn("true", &[]);
+        until_exited(child.id());
+        reap_and_dispatch();
+        child.kill();
+        assert_eq!(
+            child.outcome,
+            Some(WaitOutcome::Exited(0)),
+            "kill took the dispatched status instead of signalling the pid"
+        );
+
+        // 3. A reactor ticks in the window between the owner's look at its
+        // channel and its own waitpid. The routes lock holds it off until
+        // the waitpid is done; without the lock it would reap the pid and
+        // the owner would answer ECHILD.
+        let mut child = spawn("true", &[]);
+        until_exited(child.id());
+        static TICK: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
+        BEFORE_OWN_WAITPID.set(Some(|| {
+            *TICK.lock().unwrap() = Some(std::thread::spawn(reap_and_dispatch));
+            std::thread::sleep(Duration::from_millis(200));
+        }));
+        let got = child.try_wait();
+        BEFORE_OWN_WAITPID.set(None);
+        TICK.lock().unwrap().take().unwrap().join().unwrap();
+        assert_eq!(
+            got.unwrap(),
+            Some(WaitOutcome::Exited(0)),
+            "the owner's own waitpid ran under the lock"
+        );
+
+        // 4. A waitpid outside the registry took the status: the owner says
+        // so, and drops the route at once — the pid is free for reuse, and a
+        // later fork that is given it must not be routed here.
+        let mut child = spawn("true", &[]);
+        let pid = child.id();
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(child.try_wait().is_err(), "the status is gone");
+        assert!(routes().get(&pid).is_none(), "the route went with it");
+        // …and it never touches that pid again: a route a later fork put
+        // there is someone else's.
+        let (tx, _rx) = mpsc::channel();
+        routes().insert(pid, tx);
+        assert!(child.try_wait().is_err());
+        child.kill();
+        drop(child);
+        assert!(
+            routes().remove(&pid).is_some(),
+            "the lost child left the reused pid's route alone"
+        );
+    }
 
     #[test]
     fn deregister_of_an_unknown_pid_is_a_noop() {

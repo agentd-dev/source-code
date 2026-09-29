@@ -305,6 +305,18 @@ fn a_configured_workflow_is_refused_to_update_create_and_delete_naming_its_sourc
                     serde_json::json!({"name": "doc", "definition": definition("doc")}),
                 ),
                 call("workflow.delete", serde_json::json!({"name": "doc"})),
+                // The name the definition is stored under is the one parsing
+                // settles: padded, it is still `tick`.
+                call(
+                    "workflow.update",
+                    serde_json::json!({"name": "other", "definition": definition(" tick ")}),
+                ),
+                // An update aimed at `tick` is refused as that, whatever the
+                // definition it carries is called.
+                call(
+                    "workflow.update",
+                    serde_json::json!({"name": "tick", "definition": definition("mine")}),
+                ),
                 call("workflow.delete", serde_json::json!({"name": "tick"})),
             ],
         ),
@@ -329,6 +341,12 @@ fn a_configured_workflow_is_refused_to_update_create_and_delete_naming_its_sourc
             "{tool} of {name} refused naming {source}: {got:?}\n{stderr}"
         );
     }
+    let updates_of_tick = got
+        .iter()
+        .filter(|(t, n, s)| t == "workflow.update" && n == "tick" && s.contains(&from_file))
+        .count();
+    assert_eq!(updates_of_tick, 3, "{got:?}\n{stderr}");
+    assert_eq!(got.len(), 7, "every edit was refused: {got:?}\n{stderr}");
     // A refusal writes nothing and removes nothing.
     assert!(defined(&stderr).is_empty(), "{stderr}");
     assert!(events(&stderr, "workflow.deleted").is_empty(), "{stderr}");
@@ -393,9 +411,9 @@ fn a_workflow_created_at_runtime_is_updated_and_deleted() {
 
 /// A name the runtime created that the configuration later defines is the
 /// configuration's from then on: its definition loads, the stored one is
-/// reported not loaded, and an edit is refused. A name the configuration
-/// stops defining is the runtime's again — the stored definition loads back,
-/// and a name nothing stores can be created. Across restarts here; the
+/// reported discarded, and an edit is refused. A name the configuration
+/// stops defining is free again — nothing stored comes back in its place,
+/// and it can be created. Across restarts here; the
 /// reload test below takes the same steps through SIGHUP.
 #[test]
 fn a_name_moves_between_the_runtime_and_the_configuration_across_restarts() {
@@ -455,8 +473,9 @@ fn a_name_moves_between_the_runtime_and_the_configuration_across_restarts() {
             .any(|e| e["name"] == "tick"
                 && e["configured"]
                     .as_str()
-                    .is_some_and(|c| c.contains(&from_file))),
-        "the stored definition is reported not loaded, naming the configured source: {stderr}"
+                    .is_some_and(|c| c.contains(&from_file))
+                && e["hash"].as_str().is_some_and(|h| h.len() == 12)),
+        "the stored definition is reported discarded, naming the configured source and its own hash: {stderr}"
     );
     assert!(
         events(&stderr, "workflow.loaded")
@@ -478,8 +497,10 @@ fn a_name_moves_between_the_runtime_and_the_configuration_across_restarts() {
     );
     assert!(defined(&stderr).is_empty(), "{stderr}");
 
-    // Both files go: the stored `tick` loads again and takes an update, and
-    // `gone`, which nothing stores, can be created.
+    // Both files go, and both names are free: the stored `tick` was
+    // discarded when the configuration took the name, so nothing loads in
+    // its place — the old runtime definition is not armed again — and each
+    // name can be created.
     std::fs::remove_file(&tick).unwrap();
     std::fs::remove_file(&gone).unwrap();
     std::fs::write(
@@ -488,8 +509,8 @@ fn a_name_moves_between_the_runtime_and_the_configuration_across_restarts() {
             2,
             &[
                 call(
-                    "workflow.update",
-                    serde_json::json!({"name": "tick", "definition": definition("tick")}),
+                    "workflow.create",
+                    serde_json::json!({"definition": definition("tick")}),
                 ),
                 call(
                     "workflow.create",
@@ -504,13 +525,13 @@ fn a_name_moves_between_the_runtime_and_the_configuration_across_restarts() {
     assert!(
         events(&stderr, "workflow.loaded")
             .iter()
-            .any(|e| e["name"] == "tick" && e["source"] == "store"),
-        "{stderr}"
+            .all(|e| e["source"] != "store"),
+        "the discarded definition came back: {stderr}"
     );
     assert_eq!(
         defined(&stderr),
         [
-            ("workflow.update".to_string(), "tick".to_string()),
+            ("workflow.create".to_string(), "tick".to_string()),
             ("workflow.create".to_string(), "gone".to_string())
         ],
         "{stderr}"
@@ -714,8 +735,8 @@ fn a_reload_that_would_define_a_name_twice_is_refused_and_the_running_one_stays(
 }
 
 /// The same moves through SIGHUP: a reload that newly defines a name the
-/// runtime created makes it the configuration's, and a reload that drops a
-/// configured name frees it. The set of configured names follows every
+/// runtime created makes it the configuration's (and discards the stored
+/// one), and a reload that drops a configured name frees it. The set of configured names follows every
 /// reload, not only the start.
 #[cfg(all(feature = "hot-reload", feature = "a2a"))]
 #[test]
@@ -811,8 +832,8 @@ fn a_reload_moves_a_name_between_the_runtime_and_the_configuration() {
     reload(2);
     converse(&[
         call(
-            "workflow.update",
-            serde_json::json!({"name": "tick", "definition": definition("tick")}),
+            "workflow.create",
+            serde_json::json!({"definition": definition("tick")}),
         ),
         call(
             "workflow.create",
@@ -823,10 +844,103 @@ fn a_reload_moves_a_name_between_the_runtime_and_the_configuration() {
     assert_eq!(
         defined(&log)[1..],
         [
-            ("workflow.update".to_string(), "tick".to_string()),
+            ("workflow.create".to_string(), "tick".to_string()),
             ("workflow.create".to_string(), "gone".to_string())
         ],
         "the reload that dropped them freed both names:\n{log}"
     );
     assert_eq!(refused(&log).len(), 2, "{log}");
+}
+
+/// A reload refused while it installs its workflows keeps the running set —
+/// and with it the names that set's configuration owns. The refused edit
+/// drops `tick` from the configuration; were the refused set's names taken
+/// anyway, the still-running configured `tick` could be edited, and the next
+/// load would undo it.
+#[cfg(all(feature = "hot-reload", feature = "a2a"))]
+#[test]
+fn a_refused_reload_keeps_the_names_the_running_configuration_owns() {
+    let t = tempfile::tempdir().unwrap();
+    let wf = t.path().join("workflows");
+    std::fs::create_dir(&wf).unwrap();
+    let tick = wf.join("tick.yaml");
+    std::fs::write(&tick, workflow_file("tick", "from-the-file")).unwrap();
+    let play = t.path().join("play.json");
+    let cfg = t.path().join("agent.yaml");
+    let (d, addr) = common::spawn_bound(|port| {
+        std::fs::write(
+            &cfg,
+            daemon_config(
+                &wf,
+                "Keep things tidy.",
+                &format!(
+                    "intelligence: {{ endpoints: \"mock:file:{}\", model: mock }}\n\
+                     a2a: {{ listen: \"http://127.0.0.1:{port}\" }}\n",
+                    play.display()
+                ),
+            ),
+        )
+        .unwrap();
+        let d = Daemon::spawn(&cfg);
+        let log = d.err_path.clone();
+        (d, log)
+    });
+
+    // The edit: `tick` goes, and a workflow that can only be refused at
+    // install (its tool is known to no registry) arrives.
+    std::fs::remove_file(&tick).unwrap();
+    std::fs::write(
+        wf.join("bad.yaml"),
+        "name: bad\nsteps:\n\
+         \x20 s: {kind: manual}\n\
+         \x20 x: {kind: tool, depends_on: [s], name: no_such_tool}\n\
+         \x20 f: {kind: finish, depends_on: [x], status: completed}\n",
+    )
+    .unwrap();
+    d.sighup();
+    let log = d.wait_for(
+        |l| !events(l, "config.reload.invalid").is_empty(),
+        "the reload refusal",
+        10,
+    );
+    assert!(
+        events(&log, "config.reload.invalid")
+            .iter()
+            .any(|e| e["error"]
+                .as_str()
+                .is_some_and(|m| m.contains("no_such_tool"))),
+        "refused for the unknown tool:\n{log}"
+    );
+
+    std::fs::write(
+        &play,
+        one_call_per_turn(
+            0,
+            &[
+                call(
+                    "workflow.update",
+                    serde_json::json!({"name": "tick", "definition": definition("tick")}),
+                ),
+                call("workflow.delete", serde_json::json!({"name": "tick"})),
+            ],
+        ),
+    )
+    .unwrap();
+    let sent = common::SendMessage::text("go").post(&addr);
+    assert_eq!(
+        sent["result"]["task"]["status"]["state"], "TASK_STATE_COMPLETED",
+        "{sent}"
+    );
+    let log = d.stderr();
+    let from_file = format!("file {}", tick.display());
+    let got = refused(&log);
+    for tool in ["workflow.update", "workflow.delete"] {
+        assert!(
+            got.iter()
+                .any(|(t, n, s)| t == tool && n == "tick" && s.contains(&from_file)),
+            "{tool} of the running configured tick is refused: {got:?}\n{log}"
+        );
+    }
+    assert!(defined(&log).is_empty(), "{log}");
+    assert!(events(&log, "workflow.deleted").is_empty(), "{log}");
 }

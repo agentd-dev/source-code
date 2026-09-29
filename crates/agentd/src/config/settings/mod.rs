@@ -4247,7 +4247,7 @@ impl Settings {
         if let Some(f) = s("file") {
             format!("file {f} (workflows[{i}])")
         } else if let Some(u) = s("url") {
-            format!("url {u} (workflows[{i}])")
+            format!("url {} (workflows[{i}])", url_locator(u))
         } else if let Some(u) = s("uri") {
             format!("uri {u} (workflows[{i}])")
         } else if let Some(d) = w.get("dir") {
@@ -7709,6 +7709,21 @@ pub fn duplicate_workflow(name: &str, first: &str, second: &str) -> String {
     )
 }
 
+/// A `url:` source as it is named back: scheme, host and path, without the
+/// userinfo, query or fragment. A definitions URL can carry its credential
+/// there (a presigned link, `?token=${ENV}` expanded before settings), and a
+/// source is named in places a caller other than the operator reads — the
+/// workflow tools' refusal goes to the model.
+pub fn url_locator(url: &str) -> String {
+    let url = url.split(['?', '#']).next().unwrap_or_default();
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    format!("{scheme}://{host}{path}")
+}
+
 /// Whether a raw workflow document has a long-lived start node.
 pub fn workflow_is_long_lived(w: &Value) -> bool {
     w.get("steps")
@@ -8173,6 +8188,24 @@ pub fn help_text() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_url_source_is_named_without_its_credentials() {
+        for (url, named) in [
+            (
+                "https://u:p@defs.example/wf/tick.yaml?X-Amz-Signature=abc#top",
+                "https://defs.example/wf/tick.yaml",
+            ),
+            ("https://defs.example?token=s3cret", "https://defs.example"),
+            (
+                "http://defs.example:8080/a@b/c",
+                "http://defs.example:8080/a@b/c",
+            ),
+            ("not a url?q", "not a url"),
+        ] {
+            assert_eq!(super::url_locator(url), named, "{url}");
+        }
+    }
+
     use super::*;
     use std::io::Write;
 

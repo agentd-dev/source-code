@@ -771,8 +771,10 @@ the task. The rule holds wherever a question is addressed with `to:`, a workflow
 included. An instruction document's `@human/<name>` is held to it too: the gate goes to that
 `::!human`'s `principal`, or to the operators when it names none, and the human's `channel` is only
 announced (`human.asked`, the task's `askChannel`), never consulted, so a channel cannot widen who
-answers. A `to:` anywhere else cannot name a channel at all, and a definition `workflow.update`
-writes under the document's workflow name carries none. Work no caller owns — a schedule, a webhook, a subagent — gates on the listener only
+answers. A `to:` anywhere else cannot name a channel at all. The channel is bound to the definition
+the document loaded: `workflow.create` and `workflow.update` cannot write under the document's
+workflow name (a configured name is refused), and a definition they write under any other name
+carries none. Work no caller owns — a schedule, a webhook, a subagent — gates on the listener only
 with `agent.ask_human_unowned: gate`.
 
 ### The remote posture
@@ -827,7 +829,7 @@ security:
 | timeout | `min(requested, max)`, default 30s; the child is killed and reaped (`exec.rs::run_command`) | a request can shorten but never extend the ceiling |
 | output cap | default 1 MiB; the reader drains past the cap and discards the excess (`exec.rs::read_capped`) | bounded capture, and no deadlock on a full pipe |
 | minimal env | `env_clear()` then rebuild from the named list (`exec.rs::run_command`) | the agent's environment, and its secrets, are never inherited |
-| off the reactor | a named `tool:exec` thread; stdin fed from a further thread | a child that writes before reading cannot stall the daemon |
+| off the reactor | a named `tool:exec` thread; stdin fed from a further thread | a child that writes before reading cannot stall the daemon. One coupling remains: the spawn holds the reaper's lock until the child's `execve` returns, and the reactor's tick takes that lock, so a command whose `execve` blocks (a binary on a hung network mount) holds the reactor as long — which binaries can run at all is the operator's allow-list |
 | its own exit status | the child's pid is routed to the runner's channel from the fork (`supervisor/reaper.rs::spawn_owned`); the runner takes the status from the daemon's reaper or reaps the pid itself, never both | the reactor reaps every exited child in the process, and a workflow step used to lose its command's exit to it |
 | audit | `exec.run{cmd, argc, cwd, timeout_ms, caller}` (`runtime/tools.rs::exec_tool`) | the confinement is logged, never the output |
 

@@ -50,12 +50,12 @@ use agentd::runtime::surface::launch::{
     DEFAULT_UI_PORT, LAUNCH_CODE_TTL, LAUNCH_FD, LAUNCH_FD_FLAG, LAUNCHER_DOCS, LaunchClient,
     launch_client, launch_endpoint,
 };
-use agentd::supervisor::{reap::Reaped, reaper};
+use agentd::supervisor::{reap, reaper};
 use std::io::{BufRead, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
@@ -606,58 +606,36 @@ fn spawn_watcher(mut w: Watch) -> std::thread::JoinHandle<()> {
 /// The daemon reaps with `waitpid(-1)`, which takes any exited child of the
 /// process, the launcher's own included. A plain `try_wait` then answers
 /// `ECHILD` forever and the launcher would wait on a client long gone, so the
-/// pid is registered with the reaper at the fork, and its exit is read from
-/// whichever side collected it.
-struct Tracked {
-    child: Child,
-    reaped: Receiver<Reaped>,
-    /// `Some(clean)` once the exit is known.
-    outcome: Option<bool>,
-}
+/// child is the reaper's [`OwnedChild`](reaper::OwnedChild): routed from the
+/// fork, its exit read from whichever side collected it, and never signalled
+/// once its pid may name another process.
+struct Tracked(reaper::OwnedChild);
 
 impl Tracked {
     fn spawn(cmd: &mut Command) -> std::io::Result<Tracked> {
-        let (tx, reaped) = mpsc::channel();
-        let child = reaper::spawn_tracked_pid(&tx, || cmd.spawn())?;
-        Ok(Tracked {
-            child,
-            reaped,
-            outcome: None,
-        })
+        reaper::spawn_owned(|| cmd.spawn()).map(Tracked)
     }
 
-    fn id(&self) -> u32 {
-        self.child.id()
+    fn id(&self) -> i32 {
+        self.0.id()
     }
 
     /// `Some(clean)` once the child has exited, `None` while it runs.
     fn exited(&mut self) -> Option<bool> {
-        if self.outcome.is_none() {
-            self.outcome = match self.child.try_wait() {
-                Ok(Some(status)) => {
-                    reaper::deregister(self.child.id() as i32);
-                    Some(status.success())
-                }
-                Ok(None) => None,
-                // Reaped by the daemon: the status is on the route (or about
-                // to be — the reaper sends right after its waitpid).
-                Err(_) => self.reaped.try_recv().ok().map(|r| r.outcome.is_clean()),
-            };
-        }
-        self.outcome
+        Self::clean(self.0.try_wait())
     }
 
     /// Wait up to `limit` for the exit (`None`: for as long as it takes).
     fn wait_for(&mut self, limit: Option<Duration>) -> Option<bool> {
-        let deadline = limit.map(|l| Instant::now() + l);
-        loop {
-            if let Some(clean) = self.exited() {
-                return Some(clean);
-            }
-            if deadline.is_some_and(|d| Instant::now() >= d) {
-                return None;
-            }
-            std::thread::sleep(Duration::from_millis(25));
+        Self::clean(self.0.wait_until(limit.map(|l| Instant::now() + l)))
+    }
+
+    /// A status something outside the registry took is gone for good: the
+    /// child has exited all the same, and nothing says it went cleanly.
+    fn clean(waited: std::io::Result<Option<reap::WaitOutcome>>) -> Option<bool> {
+        match waited {
+            Ok(outcome) => outcome.map(|o| o.is_clean()),
+            Err(_) => Some(false),
         }
     }
 
@@ -666,9 +644,9 @@ impl Tracked {
         if self.exited().is_some() {
             return;
         }
-        unsafe { libc::kill(self.id() as i32, libc::SIGTERM) };
+        self.0.signal(libc::SIGTERM);
         if self.wait_for(Some(CLIENT_GRACE)).is_none() {
-            let _ = self.child.kill();
+            self.0.kill();
             self.wait_for(Some(CLIENT_GRACE));
         }
     }
@@ -993,31 +971,29 @@ mod tests {
         assert_eq!(daemon, args(&["--no-open", "--config", "a.yaml"]));
     }
 
-    /// The daemon's reaper may collect the client before the launcher asks
-    /// after it (`waitpid(-1)` takes any child). The exit still counts, read
-    /// from the route the spawn registered — else the launcher would wait on
-    /// a client long gone and never drain the daemon.
+    /// A client whose status a `waitpid` outside the reaper's registry took
+    /// still counts as exited — else the launcher would wait on a client long
+    /// gone and never drain the daemon. (The daemon's own reaper hands the
+    /// status over on the route: `supervisor::reaper`'s tests.)
     #[test]
-    fn a_child_reaped_by_the_daemon_still_counts_as_exited() {
-        let (tx, reaped) = mpsc::channel();
-        let child = Command::new("true").spawn().expect("spawn true");
-        let pid = child.id() as i32;
-        let mut t = Tracked {
-            child,
-            reaped,
-            outcome: None,
-        };
-        // Collect it the way the daemon's reaper would.
+    fn a_client_whose_status_is_gone_still_counts_as_exited() {
+        let mut t = Tracked::spawn(&mut Command::new("true")).expect("spawn true");
         let mut status = 0;
-        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
-        assert_eq!(t.exited(), None, "gone, but its status is not in yet");
-        tx.send(Reaped {
-            pid,
-            outcome: agentd::supervisor::reap::classify_status(status),
-        })
-        .unwrap();
-        assert_eq!(t.exited(), Some(true), "the route's status is the exit");
-        assert_eq!(t.exited(), Some(true), "and it is kept");
+        assert_eq!(unsafe { libc::waitpid(t.id(), &mut status, 0) }, t.id());
+        assert_eq!(t.exited(), Some(false), "gone, with no status to say how");
+        assert_eq!(t.wait_for(None), Some(false), "and it stays gone");
+    }
+
+    #[test]
+    fn a_client_exit_is_its_own_status() {
+        let mut ok = Tracked::spawn(&mut Command::new("true")).expect("spawn true");
+        assert_eq!(ok.wait_for(Some(Duration::from_secs(10))), Some(true));
+        let mut bad = Tracked::spawn(&mut Command::new("false")).expect("spawn false");
+        assert_eq!(bad.wait_for(Some(Duration::from_secs(10))), Some(false));
+        let mut slow = Tracked::spawn(Command::new("sleep").arg("30")).expect("spawn sleep");
+        assert_eq!(slow.exited(), None, "still running");
+        slow.stop();
+        assert_eq!(slow.exited(), Some(false), "stopped by a signal");
     }
 
     #[test]

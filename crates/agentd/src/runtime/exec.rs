@@ -108,20 +108,19 @@ pub(crate) fn run_command(
     let oh = out.map(|r| std::thread::spawn(move || read_capped(r, max_output)));
     let eh = err.map(|r| std::thread::spawn(move || read_capped(r, max_output)));
 
-    // Wait with a deadline; past it, kill and still collect the exit, so a
-    // timed-out command leaves no zombie behind.
+    // Wait with a deadline; past it, kill. Either way the child is collected
+    // before the output is read: dropping an `OwnedChild` kills and reaps
+    // whatever is left, so a timed-out command leaves no zombie behind.
     let deadline = Instant::now() + timeout;
     let status = match child.wait_until(Some(deadline)) {
         Ok(Some(s)) => Some(s),
         Ok(None) => {
             child.kill();
-            child
-                .wait_until(None)
-                .map_err(|e| format!("wait {cmd}: {e}"))?;
             None
         }
         Err(e) => return Err(format!("wait {cmd}: {e}")),
     };
+    drop(child);
 
     let stdout = oh.and_then(|h| h.join().ok()).unwrap_or_default();
     let stderr = eh.and_then(|h| h.join().ok()).unwrap_or_default();

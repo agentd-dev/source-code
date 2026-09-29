@@ -310,6 +310,8 @@ impl Runtime {
             mut errs,
         } = staged;
         let mut loaded: Vec<Value> = Vec::new();
+        // Stored definitions under a configured name: (store id, logged detail).
+        let mut shadowed: Vec<(String, Value)> = Vec::new();
         for w in defs {
             loaded.push(json!({"name": w.name, "hash": &w.hash[..12], "steps": w.steps.len(), "durable": w.durable, "starts": w.start_steps().iter().map(|s| s.kind.clone()).collect::<Vec<_>>()}));
             self.workflows
@@ -331,16 +333,27 @@ impl Runtime {
                 // A configured name is one definition, and the configuration
                 // is where it lives: a stored one of the same name (a workflow
                 // created at runtime under a name the configuration has since
-                // taken) does not load. Said out loud, because the model or
-                // operator that created it would otherwise find it replaced
-                // without a word. The record stays: were the configuration to
-                // drop the name, it is the runtime's definition again.
+                // taken, or a runtime edit of a configured one from before
+                // such edits were refused) does not load — and is discarded
+                // once this set is accepted. Kept, it would be armed again the
+                // day the configuration drops the name: removing a workflow
+                // from the configuration would bring back an old runtime
+                // edit of it as a live standing instruction. Said out loud,
+                // because whoever wrote it would otherwise find it gone
+                // without a word.
                 if let Some(configured) = defined.get(name) {
-                    self.log.warn(
-                        "workflow.stored.shadowed",
-                        json!({"name": name, "configured": configured,
-                               "note": "a runtime-stored definition (workflow.create/update) of this name is not loaded; the configured one is, and while it is the name is changed only in the configuration"}),
-                    );
+                    let stored = self.durable.get(Kind::Memory, id).ok().flatten();
+                    let hash = stored
+                        .as_ref()
+                        .and_then(|env| env.state.get("value"))
+                        .and_then(|def| parse_workflow(def).ok())
+                        .map(|w| w.hash[..12].to_string());
+                    shadowed.push((
+                        id.to_string(),
+                        json!({"name": name, "configured": configured, "hash": hash,
+                               "by": stored.as_ref().and_then(|env| env.state.get("by")),
+                               "note": "a runtime-stored definition (workflow.create/update) of this name is discarded; the configured one loads, and while it does the name is changed only in the configuration"}),
+                    ));
                     continue;
                 }
                 if let Ok(Some(env)) = self.durable.get(Kind::Memory, id)
@@ -439,6 +452,10 @@ impl Runtime {
         }
         for l in loaded {
             self.log.info("workflow.loaded", l);
+        }
+        for (id, detail) in shadowed {
+            let _ = self.durable.delete(Kind::Memory, &id);
+            self.log.warn("workflow.stored.shadowed", detail);
         }
         // Only once the set is accepted: a refused reload keeps the running
         // set, and with it the names that set's configuration owns.
@@ -3518,21 +3535,26 @@ impl Runtime {
                     return e;
                 }
                 let def = args["definition"].clone();
-                // Before the definition is judged: a configured name is refused
-                // whatever it would be replaced with, and `create` must not
-                // answer "exists (use workflow.update)" for one. The `name`
-                // argument is checked too, so an update aimed at a configured
-                // workflow is refused as that, not as a missing name.
-                for n in [args.get("name"), def.get("name")]
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str)
+                // The `name` argument names the workflow the call is aimed
+                // at, so an update of a configured workflow is refused as
+                // that, not as a missing name, whatever the definition says.
+                if let Some(n) = args.get("name").and_then(Value::as_str)
+                    && let Some(e) = self.workflow_configured(name, n.trim())
                 {
-                    if let Some(e) = self.workflow_configured(name, n) {
-                        return e;
-                    }
+                    return e;
                 }
-                match parse_workflow(&def) {
+                let parsed = parse_workflow(&def);
+                // …and the name the definition would be stored and installed
+                // under is the one parsing settled (trimmed), not the string
+                // as sent: `" tick "` is `tick`. Judged before anything else
+                // about the definition, so `create` never answers "exists
+                // (use workflow.update)" for a configured name.
+                if let Ok(w) = &parsed
+                    && let Some(e) = self.workflow_configured(name, &w.name)
+                {
+                    return e;
+                }
+                match parsed {
                     Err(e) => err(format!("{name}: {}", e.join("; "))),
                     Ok(w) if w.tool.is_some() => err(format!(
                         "{name}: a `tool:` block may only be declared in the startup config.                          The tool registry is built once and validated fail-closed; minting                          or shadowing a tool name at runtime would put no operator in the                          loop. (workflow {:?})",

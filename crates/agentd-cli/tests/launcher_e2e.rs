@@ -1288,7 +1288,12 @@ fn the_terminal_approves_a_tab_that_never_saw_the_code() {
         t.contains("no tab is showing that code")
     });
     run.type_line(&user_code.to_lowercase());
-    s.wait_terminal("the right code approved", |t| t.contains("signed in"));
+    // The exact line: the launcher's banner also says "signed in", so a
+    // substring match passed before the code was even typed and the poll
+    // below raced the approval.
+    s.wait_terminal("the right code approved", |t| {
+        t.lines().any(|l| l == "agentd ui: signed in")
+    });
     let token = operator_token(&poll(&request));
     assert_operator_session(&addr, &token);
 

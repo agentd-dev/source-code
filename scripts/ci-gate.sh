@@ -93,31 +93,33 @@ if [ "${1:-}" != "quick" ]; then
   # version is a real question, and that is exactly the state a release is in
   # once it bumps.
   #
-  # agentd-cli is the one crate this cannot answer early: cargo resolves its
-  # agentd-core dependency from the INDEX, so at a new version it is
-  # unverifiable until agentd-core is published at that same version. The
-  # release publishes in dependency order for that reason; verifying
-  # agentd-core is the meaningful half.
+  # The unpublished crates are dry-run TOGETHER, in one `cargo publish`: cargo
+  # then resolves a dependency on a sibling that is also unpublished (cli on
+  # core, core on mcp, mcp on net) from the packages it just built instead of
+  # from the index, so every crate the release will upload is packaged and
+  # verified here — none has to wait until its dependency is on crates.io.
+  pending=()
   for c in agentd-net agentd-mcp agentd-instruction agentd-core agentd-cli; do
     v=$(cargo metadata --no-deps --format-version 1 2>/dev/null \
         | python3 -c "import json,sys;print(next(p['version'] for p in json.load(sys.stdin)['packages'] if p['name']=='$c'))")
     if [ "$(curl -s -o /dev/null -w '%{http_code}' -A 'agentd-ci-gate' \
             "https://crates.io/api/v1/crates/$c/$v")" = "200" ]; then
       echo "  --    $c $v already on crates.io (a release skips it)"
-      continue
-    fi
-    if [ "$c" = "agentd-cli" ]; then
-      echo "  --    $c $v verifiable only after agentd-core $v publishes"
-      continue
-    fi
-    if cargo publish -p "$c" --dry-run --allow-dirty >/tmp/ci-gate-pub.log 2>&1; then
-      echo "  ok    $c $v"
     else
-      echo "  FAIL  $c $v"
-      grep -m3 -E '^(error|  )' /tmp/ci-gate-pub.log | sed 's/^/        /'
-      fail=1
+      pending+=("$c")
     fi
   done
+  if [ ${#pending[@]} -gt 0 ]; then
+    args=()
+    for c in "${pending[@]}"; do args+=(-p "$c"); done
+    if cargo publish --dry-run --allow-dirty "${args[@]}" >/tmp/ci-gate-pub.log 2>&1; then
+      echo "  ok    ${pending[*]} (packaged and verified together)"
+    else
+      echo "  FAIL  ${pending[*]}"
+      grep -m6 -E '^(error|  )' /tmp/ci-gate-pub.log | sed 's/^/        /'
+      fail=1
+    fi
+  fi
 
   step "published schemas are current"
   cargo build -p agentd-cli --all-features >/dev/null 2>&1

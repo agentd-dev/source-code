@@ -936,7 +936,7 @@ impl Caller for HttpConn {
             &headers,
             &body,
         )
-        .map_err(|e| format!("a2a: {method}: {e}"))?;
+        .map_err(|e| transport_error(method, &e))?;
         if !resp.is_success() {
             return Err(format!("a2a: {method} HTTP {}", resp.status));
         }
@@ -968,6 +968,21 @@ fn mint_message_id() -> String {
 /// The per-request socket timeout: capped by [`REQUEST_TIMEOUT`] but never longer
 /// than the time left to the delegation deadline (and never zero — a tiny floor
 /// so the connect/read can at least attempt).
+/// A read or write that stopped because the socket's timeout ran out is a
+/// timeout, whatever the platform calls it: Linux reports an expired
+/// `SO_RCVTIMEO` as `EAGAIN` (`WouldBlock`), not `TimedOut`. The socket timeout
+/// is the delegation deadline (or the per-request cap), so without this a
+/// deadline that runs out mid-call surfaced as "Resource temporarily
+/// unavailable" instead of the timeout it is.
+fn transport_error(method: &str, e: &std::io::Error) -> String {
+    match e.kind() {
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
+            format!("a2a: {method}: timed out waiting for the peer")
+        }
+        _ => format!("a2a: {method}: {e}"),
+    }
+}
+
 fn request_timeout(deadline: Instant) -> Duration {
     let remaining = deadline.saturating_duration_since(Instant::now());
     remaining.min(REQUEST_TIMEOUT).max(Duration::from_millis(1))
@@ -1370,6 +1385,31 @@ mod tests {
         let url = serve_http_fixture(vec![task("h-w", TaskState::TASK_STATE_WORKING, None)]);
         let ep = A2aEndpoint::parse(&url).unwrap();
         let deadline = Instant::now() + Duration::from_millis(300);
+        match delegate(&ep, PeerAuth::default(), "obj", None, None, None, deadline) {
+            DelegateOutcome::Error(e) => assert!(e.contains("timed out"), "got: {e}"),
+            DelegateOutcome::Distillate(s) => panic!("expected timeout, got: {s}"),
+        }
+    }
+
+    #[test]
+    fn a_deadline_that_runs_out_inside_a_call_is_a_timeout() {
+        // SendMessage is answered at once; every later call (GetTask) is held
+        // past the deadline, so the deadline always expires mid-read — on
+        // Linux as EAGAIN, which must still read as a timeout. Without
+        // transport_error this reports "Resource temporarily unavailable".
+        let mut first = true;
+        let url = serve(move |req| {
+            if is_card_get(req) {
+                return no_card();
+            }
+            if !std::mem::take(&mut first) {
+                thread::sleep(Duration::from_millis(900));
+            }
+            Answer::Rpc(json!({ "result": task("h-d", TaskState::TASK_STATE_WORKING, None) }))
+        })
+        .0;
+        let ep = A2aEndpoint::parse(&url).unwrap();
+        let deadline = Instant::now() + Duration::from_millis(400);
         match delegate(&ep, PeerAuth::default(), "obj", None, None, None, deadline) {
             DelegateOutcome::Error(e) => assert!(e.contains("timed out"), "got: {e}"),
             DelegateOutcome::Distillate(s) => panic!("expected timeout, got: {s}"),

@@ -1,90 +1,272 @@
 # The interface — TUI & web UI
 
-agentd ships two **display clients** — a terminal UI and a web UI — built as
-separate Node projects under [`interface/`](../interface). They are *thin* by
-design: **agentd hosts all state, tools and secrets; the clients
-only render daemon state and forward your intent.** Open both at once — plus a
-colleague's browser — and every surface shows the same conversation, tasks and
-runs, live, because each one watches the same daemon feed. None of them holds
-any truth of its own.
+agentd ships two **display clients** — a terminal UI and a web UI — in one Node
+package under [`interface/`](../interface). They are *thin* by design: **agentd
+hosts all state, tools and secrets; the clients only render what the daemon
+says and forward your intent.** Open both at once — plus a colleague's browser —
+and every surface shows the same conversation, tasks and runs, live, because
+each one watches the same daemon. None of them holds any truth of its own.
+
+Nothing about them is privileged. Each is an ordinary **A2A 1.0 client** of the
+daemon's listener: it reads the Agent Card, sends `A2A-Version: 1.0`, speaks an
+agentd extension only when the card declares it, signs in the way the card
+says, and falls back to the core protocol when an extension is absent — so the
+same client drives any A2A 1.0 agent, and any A2A client can do what these do
+([a2a.md](a2a.md) is the listener's side of that contract).
 
 ```mermaid
 flowchart LR
     D["agentd\nstate · tools · secrets"] --- L["A2A listener\n(a2a.listen)"]
-    L -- "SubscribeToEvents — the SSE feed" --> C["agentd-tui · agentd-ui\nbrowser…"]
-    C -- "SendMessage / Cancel" --> L
+    C["agentd-tui · agentd-ui\nany A2A client"] -- "GET /.well-known/agent-card.json" --> L
+    C -- "SendMessage · ListTasks · CancelTask" --> L
+    L -- "agentd.events/SubscribeToEvents (SSE)\nor SubscribeToTask in core mode" --> C
 ```
 
-## 1. Enable it
+## What the daemon needs
 
-The interface is **off by default**. Turn it on in the config:
+A listener, and the two switches that decide how much the clients can show:
 
 ```yaml
 a2a:
-  listen: http://127.0.0.1:8420     # the interface rides the A2A listener
-interface:
-  enabled: true                     # serve the display-client surface
-  debug: false                      # extra information (see §5)
+  listen: http://127.0.0.1:8420
+  events:
+    enabled: true          # the live feed the clients watch (restart-only)
+  introspection:
+    enabled: false         # transcripts, per-step run detail, the log ring (reloadable)
 ```
 
-With `enabled: false` the daemon serves no interface surface at all — the event
-feed and the interface reads answer with a clear "the interface surface is
-disabled" error, and nothing is buffered for them.
+- **`a2a.events.enabled`** declares the events extension and serves its
+  observation feed. Without it the clients still work, in [core
+  mode](#events-mode-and-core-mode).
+- **`a2a.introspection.enabled`** serves the reads that expose content and
+  internals (see [Debug](#debug)). It is reloadable, and an operator can set
+  it at runtime with `/set a2a.introspection.enabled true`.
 
-Auth is the A2A listener's: on a plaintext loopback listener with no
-principals a local client is the **operator** with zero setup; a remote client
-presents `a2a.bearer` / an mTLS identity and sees only what its role and
-ownership allow.
+Who may connect is the listener's business, not the clients': on a plaintext
+loopback listener with nothing configured, a local non-browser process is the
+operator; everything else signs in (see [Signing in](#signing-in)). The
+listener answers a web page only from an origin listed in `a2a.cors.origins`
+([hosting-the-ui.md](hosting-the-ui.md)).
 
-## 2. One command: `agentd tui` / `agentd ui`
+## Launcher
 
-The passthrough runs the daemon **and** its display client together:
+`agentd tui` and `agentd ui` run the daemon **and** one display client as one
+command:
 
 ```sh
-agentd tui --config code.yaml            # daemon + terminal UI
-agentd ui  --config code.yaml            # daemon + web UI (opens the browser)
-agentd tui --config code.yaml --debug    # …with the debug surface on
+agentd tui -c code.yaml                       # the daemon + the terminal UI
+agentd ui  -c code.yaml                       # the daemon + the web UI, opened in your browser
+agentd ui  -c code.yaml --port 4180 --no-open # …on another port, sign-in URL printed instead
 ```
 
-The subcommand forces `interface.enabled` on, redirects the daemon's log lines
-to a file (the path is printed first; `AGENTD_INTERFACE_LOG` overrides), hands
-the terminal to the client, and ties the lifetimes: quitting the client drains
-the daemon gracefully; the daemon exiting closes the client. The client binary
-is found on PATH (`npm install -g @agentd-dev/cli`, which ships both;
-`AGENTD_TUI_BIN` / `AGENTD_UI_BIN` override).
+**The daemon runs exactly as `agentd <args>` would.** The launcher adds no
+configuration key, flag or environment variable, and forces nothing on: the
+feed needs `a2a.events.enabled` and the debug surface
+`a2a.introspection.enabled` in your own configuration, as they would without
+the launcher. Every argument that is not one of the launcher's own goes to the
+daemon, which refuses one it does not know the way it always does —
+`unknown argument: <flag>`, exit 2.
 
-## 3. Detached: connect to any running agentd
+The launcher's own flags:
 
-Run the daemon on its own and attach displays whenever you like:
+| Flag | Subcommand | Meaning |
+|---|---|---|
+| `--daemon-log PATH` | both | where the daemon's output goes (below) |
+| `--port N` | `ui` | the loopback port the web UI is served on; default 4173, `0` picks a free one |
+| `--no-open` | `ui` | print the sign-in URL on the terminal instead of opening a browser |
+
+**The client.** `agentd tui` starts `agentd-tui` from `PATH`, or the binary
+`AGENTD_TUI_BIN` names; `agentd ui` starts `agentd-ui`, or `AGENTD_UI_BIN`
+(`npm install -g @agentd-dev/cli` provides both). It gets exactly this argv and
+nothing else — never a credential:
+
+| Subcommand | Client argv |
+|---|---|
+| `tui` | `--endpoint <url> --launch-fd 3` — fd 3 is a pipe holding the TUI's launch code |
+| `ui` | `--endpoint <url> --listen-fd 3` — fd 3 is the socket the launcher bound on `127.0.0.1:<port>` |
+
+A client that cannot be started is named with its override variable and a
+link to this section.
+
+**The endpoint** is `a2a.url`, else the concrete bind — the URL the card
+advertises, so an https certificate matches the name the client dials. The
+launcher refuses, with exit 2 and before anything is spawned, a listener its
+clients could not use, and each refusal names its cause and suggests running
+the daemon with `agentd -c …` and the client with `agentd-<sub> --endpoint
+<url>` against it:
+
+- **no `a2a.listen`**, or a **unix socket** — the display clients dial http(s);
+- **port `0`** — the endpoint has to name a fixed port (the configuration
+  loader already refuses `:0` in `a2a.listen`, before the launcher looks);
+- **`a2a.tls.client_ca`** — the display clients present no certificate, so the
+  TLS handshake would fail before a launch code could ever be redeemed;
+- **a wildcard bind without `a2a.url`** — it names no host a client can dial;
+- **an endpoint whose host is not loopback** (127.0.0.0/8, `::1`,
+  `localhost`) — the launch code is redeemed only from a loopback peer. A
+  remote daemon's console signs in with `agentd-tui --endpoint … --login`.
+
+**The terminal and the log.** An interactive client and a JSON-lines daemon
+cannot share a terminal, so the daemon's output goes to `--daemon-log`, by
+default `$XDG_RUNTIME_DIR/agentd-<sub>-<pid>.log`, else the same name in the
+temp directory. The file is created new, mode 0600, without following a
+symlink: a file or link already at that path is refused rather than written
+through. The path is printed before anything else:
+
+```
+$ agentd tui -c release.yaml
+agentd tui: endpoint http://127.0.0.1:8420 · daemon logs → /run/user/1000/agentd-tui-903989.log
+```
+
+`agentd-tui` gets the terminal on stdin, stdout and stderr. `agentd-ui` gets
+stdout and stderr; its stdin is `/dev/null`, because the launcher keeps the
+terminal's input for [signing browser tabs in](#a-tab-that-asks-the-terminal).
+
+**Lifetimes are tied.** Quitting the client drains the daemon; the daemon
+exiting sends the client SIGTERM, then SIGKILL after 3 seconds.
+
+**The environment** is the launcher's own, minus every variable the
+configuration loader reads (every path's variable under every prefix and alias
+— including the ones that set `a2a.bearer`), minus every `NAME` a
+`{{secret:NAME}}` reference in the loaded settings names, minus `AGENTD_BEARER`
+(the TUI reads it as a credential and refuses it beside `--launch-fd`). Nothing
+is added. The promise is narrow on purpose: the client never receives
+`a2a.bearer` or a resolved configuration secret. Credentials read by code other
+than the loader — the `AWS_*` chain an endpoint's SigV4 signing uses — and
+secrets referenced only from separately loaded documents pass through, and a
+process running as the same user can read the launcher's environment through
+`/proc` anyway.
+
+**File descriptors.** Everything the launcher opens is close-on-exec, so
+nothing the daemon spawns — the exec tool, instances, subagents — inherits the
+terminal, the pipe or the UI's socket; the one descriptor a client is meant to
+have reaches fd 3 in that client only.
+
+### How the launched client signs in
+
+The client gets a **single-use launch code**, minted in the daemon's own
+process — there is no op, route or configuration key that mints one — and
+redeems it at `/oauth2/token` with the extension grant type
+`https://agentd.dev/oauth/grant-type/launch` (RFC 6749 §4.5) for an
+**operator session**: it acts for the person who ran the command, on a daemon
+they started from their own configuration. A code lives 60 seconds, is spent by
+its first presentation, is bound to its client (`client_id` `agentd-tui` or
+`agentd-ui`) and — for the web UI — to the launched page's origin, and is
+redeemed only from a loopback peer. The grant is not declared on the card and
+changes nothing the listener's posture decides.
+
+- **`agentd tui`** always hands its client a code, whatever the listener's
+  posture, on the pipe at fd 3. The TUI reads it, closes the descriptor and
+  exchanges it once; the session lives only in the TUI's memory and has no
+  expiry, so a reload that later adds principals does not strand the console.
+  It ends when it is revoked or the launcher exits. A refused code stops the
+  TUI with *"the launch code was refused (already used or expired): restart
+  `agentd tui`"*; a session that ends later says *"session ended — restart
+  `agentd tui`, or sign in with --login"*.
+- **`agentd ui`** binds `127.0.0.1:<port>` itself and hands the socket to
+  `agentd-ui`, so no other local process can hold the port the browser is sent
+  to. That page's origin, `http://127.0.0.1:<port>`, is the one origin the
+  daemon admits without listing it in `a2a.cors.origins`, for that process
+  only. The code travels only in a URL fragment — `#launch=<code>`, which a
+  browser never sends over HTTP — inside a 0600 launch file in a fresh 0700
+  directory under `$HOME` (`agentd-launch-XXXXXX`, readable by a
+  snap-confined browser; `$XDG_RUNTIME_DIR` when `$HOME` is unset), which the
+  launcher opens with `xdg-open` (`open` on macOS), passing the file's path,
+  never the URL. The file is deleted the moment the code is spent, after 60
+  seconds, and at exit. The page strips the fragment before its first
+  request, exchanges the code only with the endpoint its own server names, and
+  keeps the session — eight hours — in the tab's `sessionStorage`.
+- **With `--no-open`**, or when the opener fails, the full URL is printed on
+  the launcher's terminal (never in the daemon log):
+
+  ```
+  agentd ui: sign in by opening http://127.0.0.1:4173/#launch=agentd_lc_…
+    (it works once, within 60s; over SSH forward the same port: ssh -L 4173:127.0.0.1:4173 …)
+    after that, a tab that asks is signed in here: type the code it shows
+  ```
+
+### A tab that asks the terminal
+
+Every later browser tab of `agentd ui` signs in through the launcher's
+terminal: a sandboxed (snap or flatpak) browser that cannot read the launch
+file, an SSH forward, a `--no-open` URL opened after its 60 seconds, a second
+tab, and a tab whose eight hours ran out — all without restarting anything.
+
+The page asks the daemon for a sign-in (`POST /oauth2/launch_authorization`)
+and shows:
+
+```
+Type this code in the terminal that runs `agentd ui`: BCDF-GHJK
+```
+
+and the launcher's terminal says:
+
+```
+A browser tab asks to sign in to agentd: type the code it shows (Enter to skip)
+```
+
+Typing the code there (case and the dash do not matter) signs in exactly that
+tab — `agentd ui: signed in`; anything else approves nothing — `agentd ui: no
+tab is showing that code`. A request lives two minutes and the page asks for a
+fresh code on its own when one lapses; at most 16 wait at once. The terminal is
+the trust anchor: another web origin cannot start a request, and another local
+process can start one but cannot make you type its code. The prompt stops when
+the terminal's input ends.
+
+**Over SSH**, forward the same port on both ends — `ssh -L 4173:127.0.0.1:4173
+host` — because the code is bound to the page's origin, port included; the
+forwarded connection arrives from the remote host's loopback, where it may be
+redeemed.
+
+**No device grant here.** A daemon with no operator credential (no
+`a2a.bearer` and no operator `bearer_ref` rule) cannot offer the device grant —
+there would be nobody to approve with — so on such a daemon a browser signs in
+only through `agentd ui`.
+
+## Connect by hand
+
+Run the daemon on its own and attach displays whenever you like, several at
+once:
 
 ```sh
-agentd --config code.yaml                       # the daemon
-agentd-tui --endpoint http://127.0.0.1:8420     # a terminal, any time
+agentd -c code.yaml                                  # the daemon
+agentd-tui --endpoint http://127.0.0.1:8420          # a terminal, any time
 agentd-ui  --endpoint http://127.0.0.1:8420 --open   # a local web UI
 ```
 
-- `agentd-tui` flags: `--endpoint` (or `AGENTD_ENDPOINT`), `--bearer` (or
-  `AGENTD_BEARER`), `--code` (pairing login, §4.3), `--debug` (open on the
-  debug screen), `--inline` (§3.1), `--insecure` (self-signed dev TLS).
-- `agentd-ui` serves the built web app on `127.0.0.1:4173` (`--port`) with the
-  endpoint pre-filled; `--open` launches the browser. The page also takes
-  `?endpoint=…` and remembers your last connection.
-- **Hosted web UI:** `interface/dist/web/` is a static site — deploy it
-  anywhere, then allow its origin on each daemon it should reach:
+`agentd-tui`:
 
-  ```yaml
-  interface:
-    enabled: true
-    origins: ["https://ui.example.com"]
-  ```
+| Flag | Environment | Meaning |
+|---|---|---|
+| `--endpoint`, `-e URL` | `AGENTD_ENDPOINT` | the agent: its base URL or its card's URL |
+| `--bearer-file PATH` | `AGENTD_BEARER` | a bearer token, read from a file (the variable is read, then deleted from the process's environment) |
+| `--login [--scope user\|operator]` | | sign in with the device grant the card offers |
+| `--launch-fd N` | | the launcher's sign-in; not for hand use |
+| `--no-extensions` | | speak core A2A only ([core mode](#events-mode-and-core-mode)) |
+| `--top`, `--bottom items` | `AGENTD_TUI_TOP`, `AGENTD_TUI_BOTTOM` | the chrome ([Layout](#layout)) |
+| `--debug` | | open on the debug screen (shown only while the daemon offers introspection) |
+| `--inline` | `AGENTD_TUI_INLINE=1` | render into the scrollback instead of fullscreen |
+| `--insecure` | `AGENTD_INSECURE=1` | skip TLS verification (a self-signed development daemon only) |
 
-  Loopback origins (an `agentd-ui` on the same machine) never need listing.
-  Any other cross-site origin remains rejected (the DNS-rebinding guard).
-- Connecting to a **remote** daemon is the same `--endpoint https://…` plus its
-  bearer; everything a client can see or do is decided by the daemon's
-  principal rules, not by the client.
+One credential at a time: two sources given together are refused rather than
+ranked, and `--launch-fd` combines with none. A token is never a command-line
+argument, since every local user can read argv through `ps`. An unknown option
+exits 2 with `unknown option "<flag>" — see --help`, echoing only what comes
+before an `=`, so a value typed by mistake is not printed back.
 
-### 3.1 Fullscreen (default) vs `--inline`
+`agentd-ui` serves the built web app on `127.0.0.1:4173` (`--port N`, or
+`--listen-fd N` for an inherited socket), names the endpoint to the page
+(`--endpoint`, or `AGENTD_ENDPOINT`), and `--open` opens the page. It holds no
+credential and reads none from its environment or a URL: the tab signs itself
+in. Its origin — `http://127.0.0.1:4173` here — must be listed in
+`a2a.cors.origins`; only the page `agentd ui` launches is admitted without
+that. The page also takes `?endpoint=…`, which pre-fills the form and waits
+for you to connect, and remembers the last endpoint.
+
+A **remote** daemon is the same `--endpoint https://…` plus a sign-in; what a
+client can see or do is decided by the daemon's principal rules, never by the
+client.
+
+### Fullscreen (default) vs `--inline`
 
 The TUI takes over the terminal — the **alternate screen**, like `vim` or
 `htop` — so the layout is stable and your shell is restored untouched when you
@@ -100,10 +282,156 @@ and stay there after you quit — handy for copying a session, piping, or
 keeping the transcript in your shell history. A non-interactive run (a pipe,
 CI) degrades to inline automatically.
 
-## 4. The screens
+## Finding the agent
+
+`--endpoint` (the web UI's Connect field) names where the **card** is, not
+where JSON-RPC goes: a base URL finds it at its origin's
+`/.well-known/agent-card.json`, and a URL already ending in that path is used
+as it is.
+
+- **The card is public.** It is fetched with no credential and no custom
+  header, refused if a redirect answers or it exceeds 1 MiB, and kept in memory
+  for as long as its `Cache-Control: max-age` allows (agentd sends 60 seconds);
+  after that it is revalidated with its ETag, and a `304` keeps it for another
+  `max-age`. `no-store` keeps nothing. A browser reading a card from another
+  origin cannot see its ETag and simply fetches it again.
+- **The interface** is the first `supportedInterfaces` entry that is JSON-RPC
+  at A2A 1.0 with an http(s) URL. A unix-socket interface (the binding
+  `https://agentd.dev/a2a/binding/jsonrpc-unix`), a `unix:` URL, a wildcard
+  host and a URL carrying credentials are passed over by name; when nothing is
+  left, the agent is refused with the list of what it offered. An interface on
+  another origin than the card is followed only when no credential of yours is
+  in play, the hop is https (or http on loopback), and it does not lead closer
+  to your machine than the card came from.
+- **The extended card.** When the card sets `extendedAgentCard` and the client
+  holds a credential, it reads `GetExtendedAgentCard`: what *this* caller may
+  do — the ops it may run, the workflows it may start, the paths it may set.
+  Otherwise the client works from the public card, whose command vocabulary is
+  the same for every caller, and learns whether introspection is on from the
+  feed.
+
+A card the client can never use — no interface it speaks, an extension it does
+not know marked `required`, only sign-in methods it cannot perform — stops it
+with the reason, instead of probing until something answers.
+
+## Events mode and core mode
+
+The agentd extensions the clients speak, each used only when the card declares
+that exact URI and activated per request with the `A2A-Extensions` header
+([a2a-extensions.md](a2a-extensions.md)):
+
+| URI | What the clients use it for |
+|---|---|
+| `https://agentd.dev/a2a/ext/events` | the live feed, `agentd.events/SubscribeToEvents` |
+| `https://agentd.dev/a2a/ext/command` | the slash commands that are ops: `status`, `admin.set`, `workflow.run`, `auth.device.approve`, … |
+| `https://agentd.dev/a2a/ext/task-annotations` | a task's link, principal and a gate's answer schema |
+
+**Events mode** — the card declares the events extension. The client
+bootstraps (`status` when the card offers it, plus paged `ListTasks`), then
+holds the feed: a `hello`, the events past its cursor, live events, and a
+`goodbye` carrying the cursor it resumes from. When `hello.resync` says its
+cursor could not be honoured (after a daemon restart, or when it fell further
+behind than the feed's 1024 events), it re-bootstraps instead of applying the
+replay on top. The status bar reads `● live`.
+
+**Core mode** — the card declares no events extension, you asked for core A2A
+(`agentd-tui --no-extensions`; `?extensions=off` on the web UI's URL), or the
+agent does not serve the feed it declared. The client uses A2A core methods
+only: `ListTasks` polled every 1.5 seconds for what changed, and
+`SubscribeToTask` on the tasks that are moving; the transcript comes from each
+task's `history`. The status bar reads `◐ polling` — this daemon serves no
+feed, not a bad network. With `--no-extensions` the client also sends no
+command, so only the slash commands that are its own remain, and a card that
+*requires* one of agentd's extensions is refused.
+
+Both modes fold into the same state, so renderers never learn the difference.
+The one client-side write is an optimistic echo of the prompt you type,
+reconciled by `messageId` when the task's history carries it — which is why N
+clients converge on one transcript, each rendering every other client's
+prompts, labelled by principal.
+
+## Signing in
+
+The card's security declarations say how, and the client follows them:
+
+- **Nothing declared** (a plaintext loopback listener with nothing
+  configured): `agentd-tui` connects with no credential and is the implicit
+  operator — it never sends an `Origin` header. A browser is **never** the
+  implicit operator: a request carrying `Origin` always authenticates, so the
+  web UI signs in on every daemon.
+- **The device grant** (`a2a.device_grant`): `agentd-tui --login` — or plain
+  `agentd-tui` on a terminal, when the card offers no anonymous way in —
+  prints `To sign in, open <uri> and enter <code>, or ask an operator to run:
+  /approve <code> <name>` and waits. `/login [user|operator]` does the same
+  from inside the TUI. The web UI's Connect screen offers a **sign in**
+  button, and the scope to ask for when the grant offers more than one.
+- **A bearer token**: `agentd-tui --bearer-file PATH`, or `AGENTD_BEARER`. The
+  web UI takes no bearer.
+- **Launched** by `agentd tui` / `agentd ui`: the [launch code](#launcher).
+
+**Approving a device.** An operator runs `/devices` to see what waits,
+`/approve <code> <name>` (append `operator` for an operator session, which
+`a2a.device_grant.scopes` must allow) and confirms it (`y` in the TUI), or
+`/deny <code>` (`/deny all`). The **name** — lowercase letters, digits, `.`, `_`, `-` — is
+who the device signs in as: the session acts as `user:<name>`, and every
+session approved under one name is **one principal**. They share its tasks,
+runs, subagents and conversations, its status scope and its rate limit, so a
+person keeps their work across signing in again and token expiry. The flip
+side: reusing a name for a different person hands them that name's history.
+The approval says so — its `existing` flag is set, and the client adds
+`<name> signed in before: this device shares every task, run and conversation
+that name owns`. Reserved names (`operator`, …) and configured principal ids
+are refused.
+
+**Sessions and revocation.** `/sessions` lists the signed-in sessions by sid
+(`ds_…` for a device, `ls_…` for a launch); `/revoke <sid>` ends one,
+`/revoke name <name>` every session of a name, `/revoke all` all of them.
+Revoking one sid leaves the name's other sessions working, and never deletes
+what the principal owns. The revoked client's streams close within a tenth of
+a second.
+
+**Where a credential lives, and for how long.**
+
+- **The TUI** keeps it in memory only. A device session lasts
+  `a2a.device_grant.token_ttl` (8 hours by default); there are no refresh
+  tokens, so the TUI warns a minute before expiry and then asks you to `/login`
+  again. `/logout` revokes the session at the daemon (RFC 7009) and forgets it.
+- **The browser** keeps it in `sessionStorage` only (`agentd-ui.cred`), bound
+  to the endpoint it was issued for: one tab, one visit, gone when the tab
+  closes. `localStorage` holds only the last endpoint (`agentd-ui`) and your
+  layout (`agentd.layout`), never a credential, and no credential is ever read
+  from or written to a URL's query string. An expired or revoked session sends
+  the tab back to sign in; `/disconnect` revokes the session and clears it.
+
+## When something is wrong
+
+The `conn` item of the status bar says what state the connection is in, and a
+stop says what would fix it:
+
+| `conn` | Meaning | The client… |
+|---|---|---|
+| `○ connecting` | discovery or a reconnect in progress | waits |
+| `● live` | holding the events feed | — |
+| `◐ polling` | core mode | polls |
+| `✗ unauthenticated` | the credential is missing, refused, expired or revoked | stops; names the fix (`/login`, `--bearer-file`, restart `agentd tui`) |
+| `✗ forbidden` | this principal may not observe this agent | stops; an operator can grant it |
+| `✗ incompatible` | the agent speaks nothing this client can use (not A2A 1.0, no usable interface, a required extension it does not know) | stops; check `--endpoint` |
+| `✗ <error>` | a network failure, a 5xx, a rate limit, a draining daemon | retries — after `Retry-After` when the agent sends one, else with backoff |
+| `○ closed` | the client stopped observing (you signed out) | — |
+
+The three stops are drawn as an inverse block and never retried: signing in
+again, or pointing the client at another agent, is what fixes them. A slash
+command the card does not list for you is not sent — the client says the
+agent does not offer it — and a command the agent refuses shows the agent's
+words and code in the transcript. A browser cannot tell a CORS refusal from a
+dead network, so the web UI names the likelier fix: list its origin in
+`a2a.cors.origins`.
+
+## The screens
 
 Four screens, cycled with `Tab` (or jumped to with `/chat`, `/tasks`,
-`/subagents`, `/debug`). The web UI has the same four as tabs.
+`/subagents`, `/debug`); the debug screen is there only while the daemon offers
+introspection. The web UI has the same four as tabs.
 
 Every frame below is **the real program** — rendered by the shipped TUI against
 a mirror driven with daemon-shaped events, captured by
@@ -181,8 +509,9 @@ stop sa-review? y to confirm, any other key to cancel
 ● live http://127.0.0.1:8420 [subagents] tab:screens esc:cancel /:cmd ^c:quit
 ```
 
-`instruction` and `result` need `interface.debug`; without it the view shows the
-summary the feed carries and says which fields are missing and why.
+`instruction` and `result` need introspection (`a2a.introspection.enabled`);
+without it the view shows the summary the feed carries and says which fields
+are missing and why.
 
 ### Debug — what the daemon is doing
 
@@ -222,8 +551,7 @@ master–detail split for subagents, so the list stays on screen while you read
 one child — a tree is watched while it moves, and losing sight of the siblings
 is exactly the wrong thing when a second one starts misbehaving.
 
-## 5. Everything the clients can do
-
+## Everything the clients can do
 
 Both clients speak the same surface:
 
@@ -234,16 +562,20 @@ Both clients speak the same surface:
   working task.
 - **The composer speaks four prefixes** (suggestions appear as you type; Tab
   accepts):
-  - `/` — commands: `/help /new /chat /tasks /subagents /debug /status
-    /config [path] /set <path> <value> /workflow <name> /signal <name> [run]
-    /send <handle> <text> /pause [run] /resume [run] /plan /cancel [task]
-    /conversations /pair /drain /quit` — **plus every workflow as a shortcut**
-    (`/deploy` runs the `deploy` workflow; system names win).
+  - `/` — commands: `/help /new /tasks /subagents /debug /chat /status
+    /config [path] /set <path> <value> /workflow <name> /cancel [task]
+    /signal <name> [run] /send <handle> <text> /pause [run] /resume [run] /plan
+    /conversations /devices /approve /deny /sessions /revoke /drain /layout
+    /login /logout /quit` — **plus every workflow as a shortcut** (`/deploy`
+    runs the `deploy` workflow; system names win). A command that sends an op
+    is offered only while the card lists that op for you, so `/help` and the
+    suggestions show what this agent lets *you* do. The web UI adds
+    `/disconnect`.
   - `@` — **skills**: `@skill:release-notes` autocompletes from the daemon's
     catalogue and stays in the text (agentd preloads referenced skills). The
-    completion inserts the full `@skill:` form because that is what the daemon
-    matches on — `skills.reference_prefix`, default `@skill:`. A bare `@name`
-    is ordinary prose and means whatever your deployment decides.
+    completion inserts the full form because that is what the daemon matches
+    on — `skills.reference_prefix`, default `@skill:`, which the `status`
+    document publishes. A bare `@name` is ordinary prose.
   - `#` — **targets**: start a message with `#task-…` to answer/continue that
     task (the way to answer a specific input-required question), or `#<ctx>`
     to address that conversation. Inline `#…` is plain text.
@@ -266,61 +598,51 @@ Both clients speak the same surface:
   declaring `to:` is for a named decider: a reply from anyone else is refused
   with an explanation and the gate stays open, and an operator answering one
   is recorded as an override rather than as the addressee deciding. Configure
-  what happens when NOBODY can answer with
-  `agent.ask_human_fallback`: `fail` (default), `wait` (park until the ask
-  timeout), or `auto` — an LLM judge answers on the operator's behalf,
-  conservatively, always marked as auto (it also fires when a rendered gate
-  times out unanswered).
+  what happens when NOBODY can answer with `agent.ask_human_fallback`: `fail`
+  (default), `wait` (park until the ask timeout), or `auto` — an LLM judge
+  answers on the operator's behalf, conservatively, always marked as auto.
 - **Steering** — `/signal <name> [run]` fires a workflow signal;
   `/send <handle> <text>` messages a warm subagent; `/pause [run]` /
   `/resume [run]` hold one run or the whole instance (reversible — intake
   continues, execution parks; the status bar shows PAUSED); `/plan` reads a
-  conversation's working plan.
+  conversation's working plan; `/drain` drains the daemon gracefully.
 - **Subagents** — the live list (handle · mode · status · tokens); select/click
-  one for the detail view (instruction, result, attempts, errors — needs
-  debug) and step back to the list. TUI: `↑/↓` + Enter, `Esc` back.
-- The status bar shows the connection (`● live` = feed; `◐ polling` = a daemon
-  without the feed — the clients degrade to polling automatically), counters,
-  and a prominent DRAINING notice.
+  one for the detail view (instruction, result, attempts, errors — those need
+  introspection) and step back to the list. TUI: `↑/↓` + Enter, `Esc` back.
 
-### 5.1 Configure the chrome (`interface.display`)
+### Layout
 
-The **daemon** decides what its clients render in the top (header) and bottom
-(status bar) edges — every attached surface lays out the same:
+The chrome — the header and the status bar — is **the client's own**: half of
+what it shows (the connection, the endpoint, the screen, the keys, the clock)
+is client state no daemon knows. Each client has a default, and you reshape it
+locally:
 
-```yaml
-interface:
-  display:
-    top: [name, model, instance, debug]
-    bottom: [conn, tokens, turns, runs, subagents, clock]
-```
+- **TUI:** `--top` / `--bottom` (or `AGENTD_TUI_TOP` / `AGENTD_TUI_BOTTOM`),
+  comma-separated — `agentd-tui --bottom conn,model,tokens,clock`. An unknown
+  item is refused with the list of known ones.
+- **Both:** `/layout` shows the current edges and every item;
+  `/layout top|bottom <items,…>` reshapes one edge, `/layout reset` restores
+  the default. The TUI's change lasts for the session; the web UI remembers
+  its layout in `localStorage` (`agentd.layout`).
 
 Items: `name` `version` `instance` `model` `endpoint` `conn` `debug`
-`draining` (the lifecycle notice — shows **DRAINING** or **PAUSED**) `active`
-`turns` `tokens` `tool_calls` `runs` `subagents` `conversations` `screen`
-`keys` `clock`. Unknown items are skipped (a warning
-at config validation); `screen`/`keys` are TUI-only. Omit `display` for the
-defaults. The layout is also **runtime-shapeable**:
-`/set interface.display.bottom ["conn","model","tokens"]` re-shapes every
-connected client at once.
+`draining` (shows **DRAINING** or **PAUSED**) `active` `turns` `tokens`
+`tool_calls` `runs` `subagents` `conversations` `clock`, and on the TUI only
+`screen` and `keys`. The counters (`turns`, `tokens`, `tool_calls`) are in the
+operator's status only; for anyone else they take no slot rather than claiming
+zero.
 
-### 5.2 Status values a workflow maintains (`memory:<key>`)
+### Status values a workflow maintains (`memory:<key>`)
 
 The chrome's vocabulary is fixed, because a client has to know how to render
 each item. But a `memory:<key>` item renders whatever a **workflow** wrote to
 that key — which makes the status line extensible without the daemon learning to
-compute anything.
-
-That distinction matters. agentd executes nothing locally, so it cannot shell
-out to `git` to find your branch. It does not have to: a workflow reads the
-value from wherever it actually lives — an MCP server, an HTTP endpoint, a
-webhook — and writes it to a key the chrome names.
+compute anything. The operator chooses which keys the daemon publishes, and the
+`status` document carries them as `status.values`:
 
 ```yaml
-interface:
-  display:
-    top: [name, model, "memory:git.branch", "memory:git.pr"]
-    bottom: [conn, tokens, "memory:deploy.state"]
+observability:
+  status_values: [git.branch, git.pr, deploy.state]
 
 workflows:
   - name: repo-status
@@ -332,7 +654,14 @@ workflows:
       fin:    { kind: finish, depends_on: [branch], status: completed }
 ```
 
-Two behaviours are deliberate:
+```sh
+agentd-tui --endpoint http://127.0.0.1:8420 --top name,model,memory:git.branch,memory:git.pr
+```
+
+agentd executes nothing locally, so it cannot shell out to `git` to find your
+branch. It does not have to: a workflow reads the value from wherever it
+actually lives — an MCP server, an HTTP endpoint, a webhook — and writes it to
+a key the operator publishes. Two behaviours are deliberate:
 
 - **An unset key renders nothing**, not an empty slot — a blank status reads as
   broken, an absent one reads as not-yet-filled.
@@ -341,96 +670,80 @@ Two behaviours are deliberate:
   branch name still sitting there after its producer died is worse than no
   branch name, because it looks current.
 
-The same mechanism carries anything worth watching: a PR number, a deploy
-state, a queue depth, an on-call name. The client renders the value without
-knowing what it means.
+### Runtime settings (`/set`) — and their deliberate limit
 
-### 5.3 Runtime settings (`/set`) — and their deliberate limit
+`/set` sends `admin.set`, an operator op, and is offered only when the card
+lists it for you. It changes exactly the paths the card lists as settable, in
+the running daemon, until the next reload:
 
-`config.set` (operator) updates a whitelisted set of knobs in the running
-daemon, no restart:
+- `/set a2a.introspection.enabled true` — open the debug surface (and back off);
+- `/set agent.approval ask|auto|accept` — how closely you want to be asked.
 
-- `/set interface.debug true` — open up the debug surface live (and back off);
-- `/set interface.display.top …` / `…bottom …` — reshape the chrome (§4.1).
-
-Everything else answers with the whitelist and stays where it belongs: the
-config file + SIGHUP hot reload (see configuration.md §11) — the daemon never
-mutates config it doesn't own. `/config` prints the full effective document,
+Everything else answers with the list and stays where it belongs: the config
+file plus a SIGHUP reload ([configuration.md](configuration.md)) — the daemon
+never writes configuration. `/config` prints the effective document,
 `/config a2a.listen` one value.
 
-### 5.4 Pairing-code login (`interface.pairing`)
-
-The no-copy way to connect a browser or a remote TUI:
+## Debug
 
 ```yaml
 a2a:
-  listen: http://127.0.0.1:8420   # the interface is served on this listener
-interface:
-  enabled: true
-  pairing:
-    enabled: true      # default off
-    role: operator     # what a paired client becomes (operator | user)
-    ttl: 12h           # session lifetime
+  introspection:
+    enabled: true        # or, live: /set a2a.introspection.enabled true
 ```
 
-Flow: the **operator** runs `/pair` in their TUI (or web UI) — it prints a
-**6-digit code that rotates every minute** plus a ready-made connect command.
-The joiner enters the code — `agentd-tui --endpoint … --code 483921`, or the
-code field on the web connect form — and receives a **session token** used
-automatically from then on. The code is only a bootstrap: verification is
-constant-time and rate-limited (5 misses per minute lock it out), the minted
-token is 32 bytes of OS randomness, and sessions live in memory — restarting
-the daemon revokes everything. On a non-loopback listener, pairing counts as
-client auth (you can run TLS + pairing with no static bearer at all).
+Introspection is a **daemon-side** switch. The clients learn it from the card
+(the extended card lists the introspection ops) or from the feed's
+`hello.introspection`, and only then show the debug screen and the `debug`
+badge. It serves:
 
-## 6. Debug mode — the extra information
-
-```yaml
-interface:
-  enabled: true
-  debug: true        # or: agentd tui -c … --debug
-```
-
-`debug` is a **daemon-side** switch: clients learn it from `interface.info`
-and only then render their debug screens. It unlocks:
-
-- the **feed tail** — every observation event as it happens (tasks, messages,
-  runs, subagents, audit records);
+- the **feed tail** with `audit` records among the events;
 - **runs** with per-step detail (`run.get`: status, attempts, timings, errors,
   waits, outputs);
 - **conversation transcripts** with message bodies (`conversation.get`) —
-  the one read that exposes content, which is why it rides this gate;
+  the read that exposes content, which is why it rides this switch;
+- **subagent detail** (`subagent.get`: the instruction and the result);
 - the **live log ring** (`debug.events`) — the daemon's own JSON-lines
   telemetry, tailed in the client.
 
-Treat `debug: true` as operator-grade exposure; leave it off in production
-unless you need it.
+A caller reads the conversations, runs and subagents it owns (an operator,
+all of them); the log ring and the audit records are the operator's. Treat
+introspection as operator-grade exposure; leave it off in production unless
+you need it.
 
-## 7. The protocol (for other clients)
+## For other clients
 
-Everything above is plain A2A JSON-RPC plus the interface additions below —
-any program can be a display client:
+Everything above is A2A 1.0 plus the extensions the card declares — any
+program can be a display client:
 
-- `SubscribeToEvents {fromSeq}` — the SSE feed: `hello` → `event`* → `goodbye`;
-  reconnect with the goodbye cursor; `hello.resync` means re-bootstrap via the
-  `status` command. Events are principal-scoped.
-- Taskless reads (command DataParts): `interface.info`, and under debug
-  `conversation.get`, `run.get`, `subagent.get`, `debug.events`.
-- The reply to any prompt arrives as its task's terminal artifact on the feed —
-  the same event every other client folds in.
+- **Discover**: `GET /.well-known/agent-card.json`, then the extended card
+  with a credential when `extendedAgentCard` is set.
+- **Converse**: `SendMessage` / `SendStreamingMessage`, `GetTask`, `ListTasks`,
+  `CancelTask`, `SubscribeToTask` — with `A2A-Version: 1.0` on every request.
+- **Observe**: `agentd.events/SubscribeToEvents {fromSeq}` under the events
+  extension — `hello` → `event`* → `goodbye`; reconnect from the goodbye's
+  `seq`; `hello.resync` means re-bootstrap from `status` and `ListTasks`.
+  Events are scoped to what the caller may see.
+- **Command**: one DataPart `{"agentd": {"op": …}}` on `SendMessage` under the
+  command extension, for `status`, `config`, the steering and auth ops, and
+  the introspection reads.
+- **Sign in**: the device grant at the listener origin's `/oauth2/*`.
 
-The reference implementation is the shared TypeScript core in
-[`@agentd-dev/cli`](../interface) (wire + state mirror + observation driver
-with poll fallback, exported as the package's library entry point); both
-shipped UIs are ~thin renderers over it.
+The normative pages are [a2a.md](a2a.md) and the extension specifications
+linked from [a2a-extensions.md](a2a-extensions.md). The reference
+implementation is the shared TypeScript core in
+[`@agentd-dev/cli`](../interface) — discovery, the wire, the state mirror and
+the observation driver with its core-mode fallback, exported as the package's
+library entry point; both shipped UIs are thin renderers over it.
 
-## 8. Building the clients
+## Building the clients
 
 ```sh
 cd interface
 npm install
 npm run build          # the client core + the TUI, then the web bundle
 npm test               # unit + render tests
+npm run frames         # re-capture the frames on this page from the shipped TUI
 ```
 
 Node ≥ 20. One package, `@agentd-dev/cli`, provides both binaries

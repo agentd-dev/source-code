@@ -62,7 +62,7 @@ A flag reaches wherever the schema says it can and nowhere else. It reaches into
 a free-form map with the key's exact spelling preserved
 (`--intelligence.headers.x-team ops`), but reaching into a scalar or an array
 element is a *named* error, not a guess. Values are coerced by their declared
-kind — a bare `--interface.enabled` means `true`, and an enum names its set:
+kind — a bare `--a2a.events.enabled` means `true`, and an enum names its set:
 
 ```
 $ agentd -c app.yaml --mcp.servers.0.name fs --validate-config
@@ -100,8 +100,8 @@ of them:
 $ agentd -c app.yaml --validate-config
 {"event":"config.invalid","msg":"store.kind is none but the instance is long-lived (serves A2A / webhooks / a goal watchdog / has a loop|schedule|subscribe|signal|event|stream|correlate|a2a|webhook start node) — configure a durable store (store.kind: file | mcp | http), or drop store.kind to get the local file store by default"}
 {"event":"config.invalid","msg":"a2a.listen is https:// but a2a.tls.cert / a2a.tls.key are not set"}
-{"event":"config.invalid","msg":"a2a.listen on a non-loopback address needs client auth: a2a.bearer, interface.pairing, or a2a.tls.client_ca (mTLS — then EVERY caller needs a client certificate, bearer-only and paired included)"}
-{"event":"config.invalid","msg":"interface.origins: \"https://ops.example.com/\" is not an origin (want scheme://host[:port], no path)"}
+{"event":"config.invalid","msg":"a2a.listen on a non-loopback address needs client auth: a2a.bearer or a2a.tls.client_ca (mTLS — then EVERY caller needs a client certificate, bearer-only included)"}
+{"event":"config.invalid","msg":"a2a.cors.origins: \"https://ops.example.com/\": an origin has no path, query or fragment (want scheme://host[:port])"}
 {"event":"config.invalid","msg":"config file: intelligence.token carries an inline credential; use {{secret:NAME}} / {{secret-file:PATH}} (or set it from env/flag)"}
 $ echo $?
 2
@@ -278,98 +278,107 @@ integer compare before any allocation.
 
 The daemon's live state has the same shape as its configuration: one source of
 truth, projected. That source is a bounded ring of observation events (1024,
-reported as `feed.ring`) served over `SubscribeToEvents` as SSE. Every event
-carries a visibility tag — `all` for lifecycle, `op` for operator concerns like
-global state, audit and logs, or the owning principal — and a subscriber sees
-only what its tag allows; the cursor advances past the rest.
+published as the `ring` of the events extension's declaration on the extended
+card) served as SSE by `agentd.events/SubscribeToEvents`, the method the
+events extension adds to A2A while `a2a.events.enabled` is on. Every event
+carries a visibility tag — every subscriber for lifecycle notices, operators
+only for global state, audit and logs, or the owning principal — and a
+subscriber sees only what its tag allows; the cursor advances past the rest.
+The `status` op filters its document with the same rule, so what a principal
+can poll and what it can watch cannot drift apart.
 
 ```mermaid
 sequenceDiagram
   autonumber
   participant C as client mirror
   participant D as agentd A2A listener
-  C->>D: GetAgentCard, then interface.info
+  C->>D: GET /.well-known/agent-card.json
   alt the card declares no events extension
-    D-->>C: error -32004 UNSUPPORTED_OPERATION
     loop every 1500 ms, status shows polling
-      C->>D: status + ListTasks
+      C->>D: ListTasks changed since the last poll
+      C->>D: SubscribeToTask on the tasks that are moving
     end
-  else surface on
-    D-->>C: debug, ops, display, pairing, feed.ring
+  else the card declares the events extension
     C->>D: status + ListTasks (bootstrap)
-    C->>D: SubscribeToEvents fromSeq = lastSeq
-    D-->>C: hello with seq, resume, resync
+    C->>D: agentd.events/SubscribeToEvents fromSeq = lastSeq
+    D-->>C: hello with seq, resume, resync, introspection
     alt resync is true
       C->>D: status + ListTasks (re-bootstrap)
     end
     loop until the stream deadline
       D-->>C: event with seq, ts, kind, data
     end
-    D-->>C: goodbye with cursor
-    C->>D: SubscribeToEvents from the goodbye cursor
+    D-->>C: goodbye with the cursor
+    C->>D: agentd.events/SubscribeToEvents from the goodbye cursor
   end
 ```
 
 Two details make this usable rather than merely live. Resume is cursor-based
 with a re-bootstrap signal: if your cursor predates the replay window,
 `hello.resync` is true and the client re-reads `status` and `ListTasks` instead
-of silently missing state. And the fallback is invisible: an answer of -32004
-switches the driver to polling every 1.5 s, and renderers never learn the
-difference — only the indicator changes from `● live` to `◐ polling`. A `◐`
-means this daemon serves no feed, not that the network is bad.
+of silently missing state. And the fallback is invisible: a card that declares
+no events extension — or an agent that does not serve the feed it declared —
+puts the client in core mode, where it follows tasks with A2A core methods
+alone, and renderers never learn the difference; only the indicator changes
+from `● live` to `◐ polling`. A `◐` means this daemon serves no feed, not that
+the network is bad.
 
-Because the feed is the truth, clients are projections. The only client-side
+Because the daemon is the truth, clients are projections. The only client-side
 write to the mirror is an optimistic echo of the prompt you type, reconciled by
-`messageId` when the daemon's `message` event arrives. That one rule is why N
-clients converge on a single transcript: each renders every other client's
-prompts, labelled by principal.
+`messageId` when the task's history carries the same message. That one rule is
+why N clients converge on a single transcript: each renders every other
+client's prompts, labelled by principal.
 
 ## Attaching a terminal or a browser
 
-The display surface is off by default and, when on, rides the existing A2A
-listener — there is no second socket. With `interface.enabled: false` those
-methods answer `UNSUPPORTED_OPERATION` and the core A2A surface is
-byte-identical to one that never had them. Enabling it without `a2a.listen`
-is a hard error. One command runs the daemon and a client together:
+The display clients are A2A clients of the existing listener — there is no
+second socket, and nothing is served to them that is not served to every
+client. The feed exists only while `a2a.events.enabled` is on; without it the
+card declares no events extension and the clients poll. Turning it on without
+`a2a.listen` is a hard error. One command runs the daemon and a client
+together:
 
 ```
 $ agentd tui -c release.yaml
-agentd tui: endpoint http://127.0.0.1:8420 · daemon logs → /tmp/agentd-tui-903989.log
+agentd tui: endpoint http://127.0.0.1:8420 · daemon logs → /run/user/1000/agentd-tui-903989.log
 ```
 
 That banner is the important part. An interactive TUI and a JSON-lines daemon
-cannot share a terminal, so the passthrough keeps the real stdio for the child
+cannot share a terminal, so the launcher keeps the real stdio for the client
 and points the daemon's output at a log file — named *before* the switch. Miss
-that line and the daemon looks silent. The subcommand turns the interface on by
-appending real argv flags rather than mutating settings in memory, so the choice
-survives a SIGHUP reload (which re-reads argv). Quitting the client SIGTERMs the
+that line and the daemon looks silent. The launcher runs the daemon exactly as
+`agentd <args>` would — it adds no flag and no setting — so what you see under
+it is what you get without it, and it hands the client a single-use launch
+code (the TUI over a pipe, the web UI in a URL fragment) instead of any
+credential the daemon was configured with. Quitting the client SIGTERMs the
 daemon so it drains to 0; the daemon exiting SIGTERMs the client, waits 3 s,
-then kills it.
+then kills it. [interface.md](interface.md#launcher) has the whole contract.
 
 You can also attach to a running daemon — `agentd-tui --endpoint …`,
 `agentd-ui --endpoint … --open` — and several at once. On a plaintext loopback
-listener with no client CA and no bearer, a local client *is* the operator with
-no setup at all. Otherwise `interface.pairing` avoids pasting a token: `/pair`
-prints a six-digit code that rotates every 60 seconds (the previous window is
-still accepted), verification is constant-time and limited to five misses per
-window, and success mints a `pat-` session token with a 12-hour default TTL.
-Pairing counts as client authentication on a non-loopback listener, so TLS plus
-pairing needs no static bearer — but sessions live in memory, so a restart
-revokes them all.
+listener with nothing configured, a local TUI *is* the operator with no setup
+at all; a browser is never the implicit operator and always signs in.
+Otherwise the listener's OAuth device grant avoids pasting a token: the client
+shows a code, an operator approves it under a name with `/approve <code>
+<name>`, and the session acts as `user:<name>` — every session approved under
+that name is one principal, so a person's tasks and conversations survive
+signing in again. Session tokens are held as their SHA-256 in memory, there
+are no refresh tokens, and a restart revokes them all.
 
-The daemon also owns the client chrome: `interface.display.top` and `.bottom`
-come from `interface.info`, and every attached surface lays out the same items.
-`config.set` changes exactly four paths at runtime — `interface.debug`,
-`interface.display.top`, `interface.display.bottom`, and `agent.approval`
-(`ask` | `auto` | `accept`, because how closely you want to be asked is a
-decision made *during* a session). Anything else is refused with the whitelist
-and a pointer to the config file plus SIGHUP; the daemon never writes
+The chrome is the client's own: `--top` / `--bottom` and `/layout` shape it,
+and a `memory:<key>` item shows a value a workflow keeps, for the keys the
+operator publishes in `observability.status_values`. `admin.set` changes
+exactly two paths at runtime — `a2a.introspection.enabled` and
+`agent.approval` (`ask` | `auto` | `accept`, because how closely you want to be
+asked is a decision made *during* a session). Anything else is refused with
+the list and a pointer to the config file plus SIGHUP; the daemon never writes
 configuration, so provenance stays with your documents.
 
-`interface.debug` is the single gate on the four reads that expose content and
-internals — `conversation.get` (message bodies), `run.get`, `subagent.get`, and
-`debug.events` (the live log ring) — and any operator can toggle it over the
-wire. Treat it as operator-grade exposure.
+`a2a.introspection.enabled` is the single gate on the four reads that expose
+content and internals — `conversation.get` (message bodies), `run.get`,
+`subagent.get`, and `debug.events` (the live log ring) — and on the audit
+records in the feed, and an operator can toggle it over the wire. Treat it as
+operator-grade exposure.
 
 ## Approvals and steering
 
@@ -397,8 +406,8 @@ stateDiagram-v2
 ```
 
 `agent.ask_human_fallback` decides what happens when nobody *can* answer, and
-the default is `fail`: with the interface off, an agent that asks a question
-errors immediately rather than blocking forever. `wait` parks until the ask
+the default is `fail`: with no A2A listener to ask on, an agent that asks a
+question errors immediately rather than blocking forever. `wait` parks until the ask
 timeout (24 h by default). `auto` hands the decision to an LLM judge — and it
 also fires when a *rendered* gate times out unanswered, so an unattended
 terminal can delegate with nobody watching. Auto answers are marked as such in
@@ -453,7 +462,7 @@ next.
    `select(.event=="proc.exit")` for the token and timing totals.
 4. Attach — `agentd tui -c app.yaml`, or `agentd-tui --endpoint …` — and watch
    the working row (`thinking · 12s · 1.2k tok · round 2`).
-5. `/set interface.debug true` opens the feed tail, per-step run detail,
+5. `/set a2a.introspection.enabled true` opens the feed tail, per-step run detail,
    conversation transcripts and the live log ring, on every attached client at
    once. Turn it back off when you are done.
 6. Answer whatever the agent is waiting on, then quit — under `agentd tui` that
@@ -468,8 +477,8 @@ These limits are consequences of the design above, not gaps in it.
   and nothing else, which keeps the 1024-event replay ring meaningful.
 - **Validation checks the document, not the world.** It cannot tell you an MCP
   server is down; that is startup's job, and it is exit 6.
-- **Runtime reconfiguration is four keys.** Everything else is the config file
+- **Runtime reconfiguration is two keys.** Everything else is the config file
   plus SIGHUP, and a diff under a restart-only path refuses the whole reload.
-- **Paired sessions are in memory**, and **a turn's human gate does not survive
+- **Sign-in sessions are in memory**, and **a turn's human gate does not survive
   a restart** — only run-linked gates are re-armed.
 - **`--validate-config` reports on stderr.** Capture the right stream.

@@ -1,11 +1,11 @@
 # 03 — Thin-Client TUI/UI over A2A (Ink)
 
-Status: **IMPLEMENTED** (2026-08-16) — the contract became **RFC 0032** (`rfcs/0032-interface-and-observation-plane.md`),
-the daemon side shipped as the `interface` config + `SubscribeToEvents` feed + taskless reads + `agentd tui|ui`
-passthrough, and the clients live under `interface/` (one package, `@agentd-dev/cli`); operator guide in
-`docs/interface.md`. This document remains as the design rationale; where it and RFC 0032 differ, the RFC (and code) win —
-notably: the observation plane shipped as the feed + taskless command reads (no `agent://` resources), and Phase 0/1/3
-landed together.
+Status: **IMPLEMENTED.** The clients live under `interface/` (one package, `@agentd-dev/cli`); the
+operator guide is `docs/interface.md`. They are ordinary A2A 1.0 clients: the boundary they speak —
+the core methods, the three declared extensions, the device and launch grants, the thin launcher — is
+**RFC 0043**, and the observation plane's design is **RFC 0032**. This document is the design
+rationale: why the clients are thin, why observing and commanding are separate channels, and the Ink
+rules that bite. Where it and the RFCs or the code differ, those win.
 
 > **Thesis.** `agentd` is the single source of truth. The TUI (Ink/React) and any web UI are
 > **stateless projections** of daemon state — they hold no agent logic, no tools, no secrets, no
@@ -13,10 +13,9 @@ landed together.
 > client owns any truth, multiple clients (a terminal + a browser + a CI script) can attach and
 > detach from the same daemon and each render independently, in sync, for free.
 
-This document (a) states the thin-client architecture, (b) maps it onto agentd's **actual** network
-surface today, (c) is honest about the gap between that surface and the full vision, (d) proposes the
-minimal, moat-preserving agentd-side additions that close the gap, and (e) specifies the Ink client —
-component tree, transport, state model, layouts, and the performance rules that actually bite.
+This document (a) states the thin-client architecture, (b) maps it onto the surface agentd serves
+its clients, (c) explains the observation plane and its fallback, and (d) specifies the Ink client —
+component tree, transport, state model, and the performance rules that actually bite.
 
 ---
 
@@ -24,14 +23,13 @@ component tree, transport, state model, layouts, and the performance rules that 
 
 1. [The thin-client principle](#1-the-thin-client-principle)
 2. [Reference architectures (why this shape)](#2-reference-architectures)
-3. [agentd's real surface today](#3-agentds-real-surface-today)
-4. [The gap: the observation plane](#4-the-gap-the-observation-plane)
-5. [Proposed agentd-side additions](#5-proposed-agentd-side-additions)
+3. [The surface the clients speak](#3-the-surface-the-clients-speak)
+4. [The observation plane](#4-the-observation-plane)
+5. [What the daemon serves for them](#5-what-the-daemon-serves-for-them)
 6. [The Ink client](#6-the-ink-client)
 7. [Ink best practices that actually bite](#7-ink-best-practices-that-actually-bite)
 8. [Multi-surface: TUI + web from one daemon](#8-multi-surface-tui--web-from-one-daemon)
-9. [Phased plan](#9-phased-plan)
-10. [Open decisions](#10-open-decisions)
+9. [Decisions](#9-decisions)
 
 ---
 
@@ -76,164 +74,93 @@ Distilled into two rules we adopt:
 - **Two channels.** A *command* channel (unary request/response: send, cancel, list, drain) and an
   *observation* channel (one long-lived server→client stream carrying every state change). The reply
   to a prompt arrives on the observation channel, exactly like it arrives for every other client.
-- **Resumable, replayable stream.** Events carry a monotonic id; a reconnecting *or newly-attaching*
-  client replays from a cursor (SSE's `Last-Event-ID`) rather than losing history. This is the
-  backbone of attach/detach and of a late-joining second client catching up.
+- **Resumable, replayable stream.** Events carry a monotonic sequence number; a reconnecting *or
+  newly-attaching* client replays from a cursor rather than losing history. This is the backbone of
+  attach/detach and of a late-joining second client catching up.
 
 ---
 
-## 3. agentd's real surface today
+## 3. The surface the clients speak
 
-`agentd` 2.0 has exactly **three inbound network surfaces** (`runtime/mod.rs:526-617`):
+agentd has exactly one inbound surface a client talks to: the **A2A listener** (`a2a.listen`). The
+webhook listener is ingress for workflows and the metrics probe serves health; neither is for a
+display client. So "the UI talks to agentd" means **"the UI speaks A2A"** — and nothing it speaks is
+served to it alone.
 
-| Surface | Purpose | Use for the UI? |
-|---|---|---|
-| **A2A HTTPS listener** (`a2a.listen`) | The only external control+observe channel; JSON-RPC 2.0 framed | **Yes — this is the client transport** |
-| Webhook listener (`webhooks.listen`) | Inbound HMAC → workflow-run | No (ingress only) |
-| Obs probe (`observability.metrics_addr`) | Unauthenticated GET `/metrics` `/healthz` `/readyz` | Health widget only |
+- **The card.** `GET /.well-known/agent-card.json` is public. It names the JSON-RPC interface, the
+  security schemes the listener enforces, and the extensions it declares. `GetExtendedAgentCard`
+  answers an authenticated caller with what *it* may do.
+- **Core A2A 1.0.** JSON-RPC over HTTP POST, `A2A-Version: 1.0` on every request: `SendMessage`,
+  `SendStreamingMessage`, `GetTask`, `ListTasks`, `CancelTask`, `SubscribeToTask` (SSE), and the push
+  configuration methods. Tasks are durable, so `GetTask` works across daemon lives and attach/detach
+  is real, not cosmetic.
+- **Three declared extensions**, each used only when the card declares its exact URI and activated
+  per request with `A2A-Extensions`:
+  - **events** (`https://agentd.dev/a2a/ext/events`) adds one method,
+    `agentd.events/SubscribeToEvents` — the observation channel (§4);
+  - **command** (`https://agentd.dev/a2a/ext/command`) carries operations as one DataPart on
+    `SendMessage` — `status`, `config`, the steering and admin ops, the auth ops, the introspection
+    reads — each listed on the card for the caller who may run it;
+  - **task-annotations** (`https://agentd.dev/a2a/ext/task-annotations`) puts agentd's own facts
+    about a task (its link, principal, status history, a gate's answer schema) under `metadata`.
+- **Sign-in.** The listener origin is an OAuth 2.0 authorization server for the device grant; the
+  `agentd tui` / `agentd ui` launcher signs its own client in with a single-use launch code. A local
+  non-browser process on a no-auth loopback listener is the implicit operator; a browser never is.
 
-So "the UI talks to agentd" means **"the UI speaks A2A."** The `web/` directory is the marketing
-site, not a client — there is no existing display client to model against.
-
-### 3.1 The transport (good news for a local client)
-
-- **JSON-RPC 2.0 over HTTP POST.** PascalCase methods (`SendMessage`, `GetTask`, …). The request path
-  is ignored — POST to `/` (`http_server.rs:623`). One request per TCP connection (`Connection:
-  close`). Body cap 8 MiB.
-- **Streaming = SSE over the POST response.** A request whose method is `SendStreamingMessage` or
-  `SubscribeToTask` is upgraded to `text/event-stream` (`http_server.rs:297`); each frame is a full
-  JSON-RPC response reusing the request `id`; 15 s keep-alive comments; terminal frame then close.
-- **Loopback = operator, zero config.** A plaintext loopback listener with no `a2a.principals`
-  configured maps *every* caller to `operator` — full management, including the `a2a.*` admin family
-  (`a2a_server.rs:280`, `principals.rs:216`). **The local TUI needs no credential setup.** (Configure
-  `a2a.principals` and this default turns off — then a local caller needs an `{any:true}` rule or a
-  bearer/cert.)
-- **Durable tasks.** Tasks survive restart (`GetTask` works across daemon lives), so attach/detach is
-  real, not cosmetic.
-
-### 3.2 The methods (the whole contract)
-
-Seven A2A methods + the card (`a2a_server.rs:40-47`):
-
-| Method | Shape | Streaming | Notes |
-|---|---|---|---|
-| `SendMessage` | `{message, configuration?:{blocking}}` → `{task}` | no | `blocking` defaults **true** (polls to terminal, 120 s cap). Set `false` for the working task immediately. |
-| `SendStreamingMessage` | same → SSE frames | **yes** | status/artifact frames, terminal frame closes |
-| `GetTask` | `{id}` → **`Task` (bare)** | no | drop-recovery + cross-restart read |
-| `CancelTask` | `{id}` → **`Task` (bare)** | no | cascades to linked run / subagent |
-| `ListTasks` | `{}` → `{tasks:[Task], totalSize, pageSize, nextPageToken}` | no | snapshot, one page; operator sees all, others own-only. The tasks are `Task`s without `artifacts`. |
-| `SubscribeToTask` | `{id}` → SSE frames | **yes** | re-attach to a live task; `-32001` if unknown |
-| `GetAgentCard` | `{}` → `AgentCard` | no | **public**; `skills` = workflows only |
-
-One shape asymmetry the client must handle: **wrapped vs bare** — `SendMessage` wraps in `{task}`,
-`GetTask`/`CancelTask` return the `Task` directly. Every task is otherwise the same object, so
-`status.state` is the only place a state is ever read, and agentd's own facts (`agentd/link`,
-`agentd/principal`, `agentd/statusHistory`) live under `metadata`, which is where proto3 puts
-extensions. `status.timestamp` is an RFC 3339 string, not epoch millis — it is a
-`google.protobuf.Timestamp`.
-
-### 3.3 The read surface (one command carries almost everything)
-
-There is **no `agent://` resource surface served** — RFC 0029 §8's read-model is deferred ("D7").
-The entire global read is one command: a message with a **DataPart** `{"data":{"agentd":{"op":"status"}}}`
-returns `status_value()` (`reactor.rs:766`) — the master state document:
-
-```json
-{ "instance","run_id","uptime_ms","job_shape","draining",
-  "store":{"kind","degraded","generation"},
-  "workflows":[{"name","hash","armed","starts"}],
-  "runs":[{"id","workflow","status","steps":{"done":3,"running":1},"tokens","output","error","task","principal"}],
-  "conversations":[{"id","kind","messages","est_tokens","turns","principal","skills","plan","updated"}],
-  "subagents":[{"handle","mode","status","tokens"}],
-  "children":[{"node","pid","kind","age_ms","tokens","cancelled"}],
-  "budget":{…},"timers":{…},"inbox_pending":0,
-  "tools":42,"skills":[…],
-  "counters":{"turns","tool_calls","runs_started","runs_finished","tokens_in","tokens_out"},
-  "instruction":{"source","uri","version","bytes"} }
-```
-
-Implemented command ops: `status`, `config` (operator; effective config, secret refs unresolved),
-`workflow.run`, `workflow.status`, `workflow.cancel`. Everything else → `-32004`.
-
-**This is enough to build the conversational core and a polling status dashboard today.** It is *not*
-enough for the full "watch everything live, debug mode, multi-client convergence" vision — §4.
+One shape asymmetry the client handles once, at the transport boundary: `SendMessage` answers with a
+`Task` or a `Message`, while `GetTask`/`CancelTask` return the `Task` directly. Every task is otherwise
+the same object, so `status.state` is the only place a state is ever read.
 
 ---
 
-## 4. The gap: the observation plane
+## 4. The observation plane
 
-The honest part. The vision needs a live, addressable, broadcastable view of *all* daemon state. Here
-is exactly what exists vs what's missing.
+The vision needs a live view of *all* the state a caller may see, not one task's. A2A streams one
+task at a time (`SubscribeToTask`); a display client needs the instance. That is what the events
+extension adds:
 
-| Capability the vision needs | State today | Evidence |
-|---|---|---|
-| Global live event feed (everything happening) | **Missing** — only per-task SSE | `events.rs` is the loop's *internal* vocabulary; no client feed |
-| Addressable read resources (`agent://runs`, `…/subagents`, `…/events`, `…/capabilities`) | **Missing** — deferred "D7" | RFC 0029 §8; no `resources/read` handler exists |
-| Token-level model streaming | **By-design absent** — status/artifact only | RFC 0009 invariant; frames are working→artifact→terminal |
-| Conversation / turn message history | **Missing** — only counts + plan progress | `context/mod.rs:524` exposes no bodies |
-| Per-node/edge run-graph (DAG) | **Missing** — only a status→count histogram | `engine/run.rs:380` `progress()` |
-| Steering commands over A2A (`subagent.send`, `workflow.signal`/`pause`/`resume`, `plan.get`) | **Granted by matrix, not dispatchable** → `-32004` | `a2a_server.rs:843`; model-only via NL turns |
-| Human-in-the-loop / approval (reply into `input-required`) | **Not wired** — `ask_human` is a stub; `Gate` msgs ignored | `tools.rs:525`, `reactor.rs:479` |
-| Multi-observer broadcast / convergence | **Missing** — principal-scoped shared state, **poll-based** | no push; each client polls `status` |
-| Live capability/introspection endpoint | **Missing** — `--capabilities` is offline CLI; card lists workflows only | `runtime/mod.rs:675` |
-| Browser (non-loopback) client | **Blocked** by DNS-rebind `Origin` guard (403) | `http_server.rs:634` |
-| `subscriptions/listen` (MCP) on agentd | **Dead** — framework present, agentd never registers/notifies | opens a stream that never emits data |
+- **One feed, principal-scoped.** Every state transition — tasks, runs and their steps,
+  conversations, subagents, children, activity, lifecycle — is an event with a monotonic `seq`, kept
+  in a bounded ring (1024). A subscriber sees only what it may see, by the same visibility rule the
+  `status` op applies to its snapshot, so what a principal can poll and what it can watch cannot drift
+  apart.
+- **Resumable.** `hello` → `event`* → `goodbye`. The goodbye carries the cursor the client resumes
+  from; `hello.resync` says the cursor could not be honoured (evicted, or a daemon restart), and the
+  client re-bootstraps from `status` and `ListTasks` instead of applying a replay on top.
+- **Revocable.** A session revoked mid-stream gets `goodbye{reason: "revoked"}` within one tick.
 
-The shape of the work is therefore **two layers**:
-
-- **Core loop** — prompt → task → SSE/poll → artifact; list; cancel; drain. **A2A has this today.**
-- **Observation plane** — a global event feed + an addressable read-model + (optional) token stream +
-  HITL replies + multi-observer broadcast. **Internal-only; not network-served.** This is what makes
-  "hosts all state, thin client displays it," debug mode, and TUI+web-in-sync real.
-
-Your thin-client instinct is *correct*. It just requires exposing that second layer on the wire.
+**Core mode is first-class, not a degradation path to apologise for.** When the card declares no
+events extension — or the person asked for core A2A, or the agent does not serve the feed it
+declared — the same state model is fed by core methods alone: `ListTasks` polled for what changed and
+`SubscribeToTask` on the tasks that are moving, with the transcript from each task's `history`. The UI
+code does not change; only the source does. That is also what lets the same client drive any A2A 1.0
+agent.
 
 ---
 
-## 5. Proposed agentd-side additions
+## 5. What the daemon serves for them
 
-All additive, all behind existing features, all **moat-preserving** — they reuse the SSE machinery
-already in the `mcp` crate (`http_server.rs`) and the existing `status_value()` projections. Zero new
-Rust dependencies; the default 3-dep build (libc/serde/serde_json) is untouched. The **TUI itself is a
-separate Node/React subproject** and has no bearing on the Rust moat at all.
+Each of these exists because a client needed it, and each is a declared, specified part of the
+listener rather than a private channel:
 
-Ordered by leverage:
-
-1. **`SubscribeToEvents` — a global observation stream (the keystone).** A new streaming A2A method
-   (peer of `SubscribeToTask`) that emits a principal-scoped feed of *every* state transition the
-   caller may see: `task.*`, `run.step`, `conversation.turn`, `subagent.spawned/exited`,
-   `budget.tick`, `drain`. Reuse `serve_stream`; drive it off the same shared snapshot the loop
-   already republishes on every transition (`a2a_server.rs:1007 task_sync`) generalized to a bus.
-   Each event carries a monotonic `seq`; accept `Last-Event-ID` and replay from a bounded ring so a
-   late-joining or reconnecting client catches up. **This single method delivers multi-client
-   convergence, live debug, and attach/detach in one stroke.**
-
-2. **Implement RFC 0029 §8 read-model ("D7") as addressable reads.** Expose the existing
-   `status_value()` sub-projections as read ops (either `agent://…` resources once a `resources/read`
-   handler is added, or, cheaper, discrete DataPart command ops: `runs.list`, `run.get`,
-   `conversation.get` *with turn history*, `subagents.list`, `capabilities`). The data already exists;
-   this is projection + routing, not new engine work. Adds the run-graph and conversation-history
-   reads the debug view needs.
-
-3. **Wire HITL over A2A.** Connect `input-required` ↔ `SendMessage(taskId)` so a workflow `human`
-   node suspends to `input-required` and a client reply resumes it (today `Gate` messages are ignored
-   and `ask_human` is a stub). This is the single biggest *interaction* unlock — approvals, clarifying
-   questions, steering.
-
-4. **Dispatch the granted steering commands.** Add `a2a_command` arms for `subagent.send`,
-   `workflow.signal`/`pause`/`resume`, `plan.get` — they're already in the authz matrix; only the
-   dispatch is missing. Turns "steer by hoping the model calls a tool" into direct control.
-
-5. **(Decision-gated) operator-facing token stream.** A richer, opt-in token stream *on the operator
-   conversation channel only* — explicitly **not** the subagent distillate boundary (RFC 0009 stays
-   intact for subagent→parent). Gives the Claude-Code-style live-typing feel. See §10.
-
-6. **Browser origin story.** Extend the DNS-rebind guard with a configurable allowlist (or document
-   "serve the web UI from loopback") so a browser client isn't 403'd. Bearer over a fetch-based SSE
-   reader for remote (EventSource can't set headers — §7).
-
-Items 1–2 alone are enough for a first-class debug/observability TUI. 3–4 make it *interactive* rather
-than observational. This is worth its own RFC (`0032-observation-plane`), which this doc seeds.
+1. **The feed** (§4), declared while `a2a.events.enabled` is on. This single method delivers
+   multi-client convergence, live debug and attach/detach.
+2. **The read model as command ops.** `status` is the snapshot the feed is folded onto. The reads
+   that expose content and internals — `conversation.get` (message bodies), `run.get` (per-step
+   detail), `subagent.get`, `debug.events` (the log ring) — are served only while
+   `a2a.introspection.enabled` is on, and the card lists them only then, so the client knows without
+   asking.
+3. **Human-in-the-loop over core A2A.** A gate is a task in `input-required` with the question as its
+   status message; a reply is `SendMessage` naming that `taskId`. Every client already renders tasks,
+   so each renders an answerable row with no special channel.
+4. **Steering as ops.** `workflow.signal`, `admin.pause` / `admin.resume`, `subagent.send`,
+   `plan.get`, `admin.drain` — direct control instead of hoping the model calls a tool.
+5. **Live activity instead of a token stream.** The daemon reports phase, tool, round and tokens on
+   *change*; elapsed time ticks in the client. One small event per phase change keeps every attached
+   surface in sync for a fixed cost (§9.1).
+6. **Browsers.** The listener answers a page only from an origin listed in `a2a.cors.origins`, and a
+   browser always signs in — the device grant, or the tab `agentd ui` opens. Streams are read with
+   `fetch`, never `EventSource`, which cannot set headers (§7).
 
 ---
 
@@ -245,90 +172,74 @@ than observational. This is worth its own RFC (`0032-observation-plane`), which 
 flowchart LR
   subgraph Client["Ink TUI (stateless projection)"]
     IN["input → intent"] --> CMD
-    RED["event reducer\n(daemon state mirror)"] --> VIEW["React/Ink render"]
+    RED["Mirror\n(daemon state)"] --> VIEW["React/Ink render"]
   end
-  CMD["Command channel\n(JSON-RPC POST)"] -->|SendMessage / Cancel / ListTasks / a2a.drain| D
-  D["agentd\n(source of truth)"] -->|SubscribeToEvents (SSE)| OBS["Observation channel"]
+  CMD["Command channel\n(JSON-RPC POST)"] -->|SendMessage / CancelTask / ListTasks / command ops| D
+  D["agentd\n(source of truth)"] -->|agentd.events/SubscribeToEvents, or SubscribeToTask in core mode| OBS["Observation channel"]
   OBS --> RED
 ```
 
-The client is two thin adapters around a React tree:
+The client is three thin modules around a React tree, all in the shared core (`src/client`):
 
-- **`AgentdClient`** — a tiny transport module (no UI): `send(message)`, `cancel(id)`,
-  `listTasks()`, `getTask(id)`, `subscribeEvents(fromSeq)`, `drain()`. It owns the HTTP/SSE plumbing
-  and nothing else. **This module is shared verbatim with the web UI** (§8).
-- **Event reducer** — folds the observation stream into a plain in-memory mirror of daemon state
-  (`tasks`, `runs`, `conversations`, `subagents`, `budget`, `counters`). The UI reads *only* this
-  mirror; it never derives truth locally. `Last-Event-ID`/`seq` drives replay and reconnect.
+- **Discovery + `AgentdClient`** — reads the card, picks the interface, reads the extended card when
+  it may, and builds a client that can call only what the card offers (`send`, `cancelTask`,
+  `listTasks`, the command ops). It owns the HTTP/SSE plumbing and nothing else.
+- **`Mirror`** — folds bootstrap snapshots and feed events into a plain in-memory projection
+  (`tasks`, `runs`, `conversations`, `subagents`, counters, the transcript). The UI reads *only*
+  this; it never derives truth locally.
+- **`Observation`** — keeps the mirror converged: discovery, then events mode or core mode, with
+  backoff, `Retry-After`, and a terminal stop for failures retrying cannot fix (unauthenticated,
+  forbidden, incompatible).
 
-Everything the user does becomes a command; everything the user sees comes from the reducer. That is
+Everything the user does becomes a command; everything the user sees comes from the mirror. That is
 the whole design.
 
-### 6.2 Component tree (Screen / Part / Common taxonomy)
+### 6.2 Component tree
 
 ```
-<App>                         render(); useInput global keymap; owns AgentdClient + reducer
+<App>                         render(); useInput global keymap; owns the Observation + Mirror
+├─ <Edge top>                 the header, from the client's layout
 ├─ <Screen: Chat>             the default working surface
-│  ├─ <Static><Transcript/>   past turns + tool/command results  ← scrollback, never redrawn
-│  ├─ <LiveTurn/>             the in-progress turn (status line / streaming artifact)  ← the ONLY dynamic block
-│  ├─ <Composer/>             prompt input (ink-text-input); slash-commands; multiline
-│  └─ <StatusBar/>            spinner · model · tokens · budget · draining? · #tasks
-├─ <Screen: Debug>            "extra debug mode" — toggled (e.g. F2 / ctrl-d)
-│  ├─ <RunGraph/>             runs + steps histogram (→ DAG once read-model lands)
-│  ├─ <SubagentTree/>         flat leaf view: handle · mode · status · tokens · pid · age
-│  ├─ <EventFeed/>            live tail of SubscribeToEvents (the raw truth)
-│  ├─ <BudgetPanel/>          governor + timers + counters
-│  └─ <WireInspector/>        raw JSON-RPC frames in/out (invaluable while building the protocol)
-├─ <Screen: Tasks>           ListTasks browser; select → attach (SubscribeToTask) / cancel
-├─ <Overlay: Approval>       when a task hits input-required → inline approve/deny/answer (needs §5.3)
-├─ <Overlay: Palette>        command palette: /workflows, /drain, /config, /switch-conversation
-└─ <Common>                  TextInput, Select, Spinner, KeyHint, JsonView, Badge
+│  ├─ <Transcript/>           every client's prompts, command results, replies, answerable gates
+│  ├─ <GatePrompt/>           a form-shaped gate: number keys pick an option
+│  ├─ working row             what the agent is doing right now (phase · elapsed · tokens · round)
+│  └─ composer                multiline input; `/` `@` `#` `$` suggestions
+├─ <Screen: Tasks>            the tasks this principal may see; cancel
+├─ <Screen: Subagents>        live list → detail (m message · k stop, confirmed)
+├─ <Screen: Debug>            only while introspection is offered: feed tail, runs with steps,
+│                             subagents/children, the log ring
+└─ <StatusBar>                the bottom edge: conn · endpoint · DRAINING/PAUSED · counters · keys
 ```
 
-Screens are full views; Parts are reusable regions; Common are leaf inputs. Only **one** screen is
-mounted at a time; overlays mount above.
+Only **one** screen is mounted at a time. The chrome (both edges) is the client's own layout — half
+its items are client state no daemon can know — shaped with `--top`/`--bottom` and `/layout`.
 
 ### 6.3 State model
 
-- **One reducer, event-sourced.** `SubscribeToEvents` frames are the only writes. On (re)connect,
-  replay from `seq` then live-tail. Optimistic UI is allowed for the *local* echo of a just-sent
-  prompt, reconciled when its `conversation.turn` event arrives.
-- **Handle the shape asymmetries in the client, once.** Normalize wrapped/bare envelopes and
-  nested/flat `state` at the transport boundary so the reducer sees one canonical `Task` shape.
-- **Degrade gracefully to polling.** Until `SubscribeToEvents` exists (§5.1), the same reducer can be
-  fed by a `status`-command poll loop (e.g. 1 s) plus per-task `SubscribeToTask` for the active task.
-  The UI code doesn't change when the push feed lands — only the source does. **This lets the TUI ship
-  against today's surface and get strictly better as §5 lands.**
+- **One mirror, event-sourced.** Bootstrap (`status` when offered, paged `ListTasks`), then feed
+  events. On reconnect, resume from the goodbye's cursor; on `resync`, re-bootstrap.
+- **One optimistic write.** The local echo of a just-sent prompt, reconciled by `messageId` when the
+  task's history carries it — which works the same in core mode, because history is an A2A field.
+- **Handle the shape asymmetries in the client, once.** Normalize envelopes at the transport
+  boundary so the mirror sees one canonical `Task` shape.
 
-### 6.4 Layout (Chat screen)
+### 6.4 Layout
 
-```
-┌────────────────────────────────────────────────────────────────┐
-│ agentd · inst-7a3 · daemon · store:mcp gen 3 · ● ready          │  header (1 line)
-├────────────────────────────────────────────────────────────────┤
-│  you › summarize the incident and open a workflow               │  ┐
-│  ▸ command status ✓                                             │  │ <Static>
-│  ▸ workflow.run "triage" → task-91c  ✓                          │  │ transcript
-│  agent › Started triage. 3 steps queued.                        │  │ (scrollback)
-│  ▸ subagent warm:researcher  running  1.2k tok                  │  ┘
-│  agent › ⣾ working — step 2/3 (analyze)…                        │  ← LiveTurn (dynamic, 1–2 lines)
-├────────────────────────────────────────────────────────────────┤
-│ › _                                                             │  Composer
-│ ⣾ working · claude-opus · 4.1k/8k tok · $0.12 · esc cancel · F2 │  StatusBar
-└────────────────────────────────────────────────────────────────┘
-```
-
-Tree-structured, short lines, tool/command results as `▸` blocks — reads well in a small window and
-maps 1:1 onto the event stream. The **transcript is committed to `<Static>`** (terminal scrollback);
-only the `LiveTurn` + Composer + StatusBar are dynamic (§7).
+The frames in `docs/interface.md` are captured from the shipped TUI (`interface/tools/frames.mjs`),
+so they are the layout reference; this note does not keep a drawing that could drift from them.
+Short lines, tool and command results as `▸` blocks, one dynamic region (the working row and the
+composer) — it reads well in a small window and maps 1:1 onto the event stream.
 
 ### 6.5 Keyboard model
 
-- `useInput` global keymap at `<App>`; `useFocus`/`useFocusManager` for pane focus in Debug.
-- Enter = send · Shift/Alt-Enter = newline · `/` = palette · Esc = cancel active task · Tab = cycle
-  focus · F2/ctrl-d = Debug · ctrl-c = confirm-then-`unmount()`.
-- Slash-commands are client sugar that compile to A2A: `/drain` → `a2a.drain`; `/workflow triage` →
-  `workflow.run`; `/tasks` → Tasks screen; `/config` → `config` command into `<JsonView>`.
+- `useInput` global keymap at `<App>`.
+- Enter = send · Alt/Option-Enter, Ctrl-J or a trailing `\` = newline (Shift-Enter is not
+  distinguishable from Enter in a terminal) · Tab = accept a suggestion, else cycle screens ·
+  `↑`/`↓` = select · Esc = back from a detail, else cancel the newest working task · PgUp/PgDn =
+  scroll the fullscreen transcript · Ctrl-C = quit.
+- Slash commands compile to A2A: `/drain` → `admin.drain`; `/workflow triage` → `workflow.run`;
+  `/config` → the `config` op. A command whose op the card does not list for this caller is not
+  offered.
 
 ---
 
@@ -336,13 +247,12 @@ only the `LiveTurn` + Composer + StatusBar are dynamic (§7).
 
 | Concern | Rule | Why |
 |---|---|---|
-| **Flicker / perf** | Keep the dynamic region **shorter than the terminal height**; commit finished lines to `<Static>`. | Ink redraws the *entire* dynamic tree on every state change; exceeding terminal height triggers a full-screen clear-and-redraw. `<Static>` writes to scrollback once and is never re-rendered (a virtual list for the terminal). This is the technique behind Claude Code / Jest output. |
-| **Streaming into the transcript** | Render the streaming turn as the single dynamic `LiveTurn`; on completion, *move* it into `<Static>`. | Only ever one growing block is live. |
-| **SSE in Node** | Do **not** use `EventSource` — it can't set headers, so bearer auth fails. Use a fetch-based reader (`@microsoft/fetch-event-source` or undici streaming); send `Last-Event-ID` to resume. | Remote/auth’d agentd needs `Authorization`; loopback-operator can skip it but keep one code path. |
-| **Logging** | Never `console.log` while Ink runs — it corrupts layout. Route logs to a file or the Debug `<EventFeed>`. | Ink `patchConsole` helps but don't rely on it; keep stdout for the render tree only. |
-| **Layout** | Everything is flexbox `<Box>`. Use `useWindowSize`/`measureElement` for responsive panes; `<Spacer>` to push the StatusBar to the bottom. | Terminal resizes are first-class. |
-| **Testing** | `ink-testing-library` for component snapshots; a **fake `AgentdClient`** that replays a recorded event stream to drive the reducer in tests. | The two-adapter split makes the UI trivially testable without a live daemon. |
-| **Ecosystem** | `ink-text-input`, `ink-select-input`, `ink-spinner`, `ink-table`, plus a small `<JsonView>` for `config`/wire frames. | Don't hand-roll inputs. |
+| **Flicker / perf** | Fullscreen (the default) takes the alternate screen and owns its scrolling; `--inline` commits settled lines to `<Static>` and keeps the dynamic region shorter than the terminal. | Ink redraws the *entire* dynamic tree on every state change; exceeding terminal height triggers a full-screen clear-and-redraw. `<Static>` writes to scrollback once and is never re-rendered. |
+| **SSE in Node** | Do **not** use `EventSource` — it can't set headers, so neither `Authorization` nor `A2A-Version` can be sent. Read the stream with `fetch` and a WHATWG-conformant parser (the client's own, in `wire.ts`). | One code path for the feed, task streams and every credential. |
+| **Logging** | Never `console.log` while Ink runs — it corrupts layout. The daemon's own log goes to a file under the launcher, and to the Debug screen through `debug.events`. | Keep stdout for the render tree only. |
+| **Layout** | Everything is flexbox `<Box>`. Use `useWindowSize` for responsive panes. | Terminal resizes are first-class. |
+| **Testing** | `ink-testing-library` for render tests; a fake A2A agent (`test/fake-a2a.mjs`) that serves a card and replays daemon-shaped events. | The module split makes the UI testable without a live daemon. |
+| **Dependencies** | `ink` and `react` only; the composer is a small multiline editor of its own. | Nothing to audit that the client does not need. |
 
 ---
 
@@ -350,57 +260,36 @@ only the `LiveTurn` + Composer + StatusBar are dynamic (§7).
 
 Because state lives in agentd and both clients are projections:
 
-- **The `AgentdClient` transport module + event reducer are shared code** (a TS package, e.g.
-  `packages/agentd-client`). The Ink TUI and a React web UI import the *same* module; only the render
-  layer differs (Ink `<Box>` vs DOM). This is the OpenCode "TUI is just one client" property, made
-  literal.
-- **Convergence is automatic** once `SubscribeToEvents` (§5.1) exists: both clients subscribe, both
-  replay from `seq`, both see the same turns/tasks/runs. No client-to-client channel. A prompt typed
-  in the TUI appears in the browser because both are watching the daemon's feed.
-- **Same principal ⇒ same view.** Loopback TUI is operator (sees all). A browser must clear the
-  **DNS-rebind origin guard** (serve from loopback, or the §5.6 allowlist) and present a bearer via
-  the fetch-based SSE reader.
-- **Attach/detach is free.** Durable tasks + replayable feed mean a client can close and reopen (or a
-  second one can join) and reconstruct the current state from the cursor.
+- **The client core is shared code** — one package, `@agentd-dev/cli`, whose library entry point
+  is the discovery, wire, mirror and observation modules. The Ink TUI and the React web UI import the
+  *same* core; only the render layer differs (Ink `<Box>` vs DOM). This is the OpenCode "TUI is just
+  one client" property, made literal.
+- **Convergence is automatic**: both clients watch the same feed, both resume from a cursor, both see
+  the same turns/tasks/runs. No client-to-client channel. A prompt typed in the TUI appears in the
+  browser because both are watching the daemon.
+- **Each sees what its principal may see.** A TUI on a no-auth loopback daemon is the operator; a
+  browser always signs in and is served only from a listed origin.
+- **Attach/detach is free.** Durable tasks + a replayable feed mean a client can close and reopen (or
+  a second one can join) and reconstruct the current state from the cursor.
 
 ---
 
-## 9. Phased plan
+## 9. Decisions
 
-- **Phase 0 — Core loop on today's surface.** Ink app; `AgentdClient` (send/cancel/list/get +
-  `SubscribeToTask`); reducer fed by a `status` poll + active-task SSE; Chat screen; loopback-operator
-  (no auth). *Ships against the daemon as it exists now.* Delivers the prompting UX.
-- **Phase 1 — Observation plane (RFC 0032).** `SubscribeToEvents` (§5.1) + read-model D7 (§5.2).
-  Swap the reducer's source from poll → push; Debug screen (EventFeed, RunGraph, SubagentTree,
-  WireInspector) comes alive. Delivers "display all state" + multi-client convergence.
-- **Phase 2 — Interaction.** HITL/approval overlay (§5.3) + steering commands (§5.4). Delivers
-  side-by-side working (approve, answer, steer, pause).
-- **Phase 3 — Web UI.** Extract `packages/agentd-client`; React web renderer over the shared module;
-  origin-guard/bearer story (§5.6). Delivers simultaneous TUI + web.
-- **Phase 4 — Polish.** Optional token stream (§5.5, decision-gated), themes, config editor,
-  multi-conversation switcher.
-
----
-
-## 10. Open decisions
-
-1. **Token-level streaming?** RFC 0009 keeps the *subagent→parent* boundary at distillate/status by
-   design. A live-typing operator UX needs a token stream on the *operator conversation* channel only.
-   Options: (a) leave it status/artifact-level (simplest, honest, no invariant touched); (b) add an
-   opt-in operator token stream scoped to top-level turns. **Recommendation: ship Phase 0–2 at
-   status/artifact level; revisit (b) as Phase 4 behind a flag.**
-2. **Read-model transport: resources vs commands?** Full `agent://…` `resources/read` (spec-faithful,
-   more work) vs discrete DataPart command ops (cheaper, ships sooner). **Recommendation: command ops
-   first; promote to resources if/when an MCP management surface is wired.**
-3. **Web transport: SSE vs WebSocket?** SSE reuses existing machinery and is unidirectional-perfect
-   for the observation channel (commands stay POST). WebSocket only if we later need high-frequency
-   bidirectional (e.g. a PTY). **Recommendation: SSE + POST; defer WS.**
-4. **Where does the client core live?** Same repo (`packages/agentd-client`, `packages/tui`) vs a
-   separate repo. **Recommendation: in-repo package so the TS client and the Rust protocol evolve
-   together and share conformance fixtures.**
-5. **Auth for remote.** Bearer via fetch-based SSE is settled; open question is whether the TUI grows
-   a `login`-style flow reusing the RFC 0031 `agentd login` credential cache, or stays loopback-only
-   initially. **Recommendation: loopback-only for Phase 0; bearer in Phase 3 with the web UI.**
+1. **Token-level streaming? No.** A live-typing UX needs a token stream to every watcher, which
+   multiplies the daemon's outbound traffic by the number of attached surfaces and floods the replay
+   ring. The clients show live *activity* instead — phase, tool, round, tokens, with elapsed time
+   ticking locally — which keeps every surface in sync at a fixed cost.
+2. **Read model: resources or commands? Commands.** Discrete ops on the command extension, each
+   listed on the card for the caller who may run it, rather than a resource surface agentd would have
+   to serve alongside A2A.
+3. **Web transport: SSE or WebSocket? SSE + POST.** SSE is unidirectional-perfect for the
+   observation channel and is what A2A streams already are; commands stay POST.
+4. **Where does the client core live? In the repository**, as one package, so the TS client and the
+   Rust protocol evolve together and are tested against each other.
+5. **Auth for a remote daemon? The listener's own OAuth device grant.** A person signs in under a
+   name an operator approves; no credential the daemon was configured with is ever copied into a
+   client, and the launcher's clients sign in with a single-use code instead.
 
 ---
 

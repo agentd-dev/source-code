@@ -6,7 +6,7 @@
 # agentd's own `net` transport — plus serde/serde_json.
 [package]
 name = "agentd-mcp"
-version = "1.0.1"
+version = "2.0.0"
 edition = "2024"
 rust-version = "1.96"
 description = "Blocking MCP client over the official rmcp SDK on a credentialed Streamable-HTTP socket, plus a raw HTTP listener"
@@ -27,7 +27,7 @@ tls = ["net/tls"]
 
 [dependencies]
 # Shared transport primitives (the HTTP/1.1+SSE client, the TLS connect).
-net = { package = "agentd-net", path = "../net", version = "1.0.0" }
+net = { package = "agentd-net", path = "../net", version = "2.0.0" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # The OFFICIAL MCP SDK — the client, not an alternative to one. `default-features

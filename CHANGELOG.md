@@ -520,6 +520,11 @@ holds up the next call on the same server.
   processes` and no `exit_code`. The command is now spawned through the
   reaper's pid registry, so its status reaches the runner whichever side
   collects it, and a timed-out command is still killed and reaped.
+- **A delegation whose deadline runs out mid-call reports a timeout.** An
+  outbound A2A call whose deadline expired while a `GetTask` read was in
+  flight failed with `Resource temporarily unavailable (os error 11)`: Linux
+  reports an expired socket read timeout as `EAGAIN`. Both kinds now read as
+  `timed out waiting for the peer`.
 
 ### Known limitations
 
@@ -543,6 +548,10 @@ holds up the next call on the same server.
   unmaintained, a compile-time proc-macro through cel-interpreter with no
   known vulnerability), ignored with that reason until cel-interpreter moves
   off it. Nothing else is waived.
+- `scripts/ci-gate.sh` dry-runs every unpublished crate together in one
+  `cargo publish`, so a crate whose sibling dependency bumped in the same
+  release (cli on core, core on mcp, mcp on net) is packaged and verified
+  before the tag instead of after its dependency reaches crates.io.
 
 ### Crates
 

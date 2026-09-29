@@ -285,8 +285,8 @@ Ideas worth prototyping, none of which are promises:
 7. **Voice-only field debugging.** The TUI attaches over the A2A listener; on
    a robot the same surface is reachable over the maintenance port — or the
    dialogue agent *is* the debug interface, with the operator's role gating
-   what it may do. `agentd tui --endpoint http://robot-07:8420` on a laptop
-   in the field is the whole story.
+   what it may do. `agentd-tui --endpoint https://robot-07:8443 --login` on a
+   laptop in the field is the whole story.
 8. **Simulation parity.** The same config boots as PID 1 on the robot and as
    an ordinary process against simulated driver servers in CI — because the
    userland *is* the config, "test what you ship" is one file diff:

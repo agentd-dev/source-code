@@ -211,8 +211,10 @@ cat <<EOF
   next
     agentd --help                            every flag
     agentd --validate-config --config a.yaml check a config without running it
-    agentd tui --config a.yaml               run it with a terminal UI attached
+    agentd tui -c a.yaml                     run it with a terminal UI attached
+    agentd-tui --endpoint <url>              attach a terminal UI to a running daemon
+                                             (both need agentd-tui: npm install -g @agentd-dev/cli)
 
   docs  ${DOCS}/docs/getting-started/
-  TUI   ${DOCS}/docs/interface/   (needs \`interface.enabled\`)
+  TUI   ${DOCS}/docs/interface/   (the live feed needs \`a2a.events.enabled\`)
 EOF

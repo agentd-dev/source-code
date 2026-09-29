@@ -359,7 +359,7 @@ says otherwise.
 | `a2a.peers` | another agent this one dials — the same class as `mcp.servers`, and covered by the same closed-egress sweep (`:::peer` declares one) |
 | `context`, `goal`, `knowledge`, `search`, `memory`, `limits` | how it thinks, remembers and bounds itself |
 | `intelligence.model(s)`, `.budget`, `.dialect`, `.timeout`, `.default`, `.swap_policy`, `.structured_output`, `.preflight_model` | WHICH model and how much of it |
-| `agent.name`, `.approval`, `.ask_human_fallback`, `.conversation_budget`, `.max_parallel_turns`, `.on_workflow_finished`, `.preflight`, `.wake_on` | the agent loop's own shape |
+| `agent.name`, `.approval`, `.ask_human_fallback`, `.ask_human_unowned`, `.conversation_budget`, `.max_parallel_turns`, `.on_workflow_finished`, `.preflight`, `.wake_on` | the agent loop's own shape |
 | `tools.narrow`, `tools.disabled` | `narrow` only ADDS trifecta tags and descriptions — more dangerous than the operator said, never less; `disabled` only takes capability AWAY, and is the spec's `deny` form |
 | `skills.max_bytes`, `.max_loaded`, `.reference_prefix` | caps on the skill loader |
 | `store.kind`, `.durability`, `.checkpoint`, `.on_error`, `.timeout`, `.max_value_bytes`, `.prefix` | the durability CLASS and the caps around it — never the PLACE |
@@ -370,17 +370,19 @@ says otherwise.
 |---|---|
 | `agent.document_capabilities` | it is the grant set deciding which families this document may activate |
 | `agent.instruction.*`, `agent.prompt` | source, `trust` and `decrypt` — a document that rewrites these points the next read at itself |
+| `agent.description` | what the public agent card tells strangers this agent is — a document rewriting it would describe itself in the operator's name |
 | `agent.tools`, `tools.overrides` | the tool grant, and re-routing a built-in onto a server. Arrays CONCATENATE, so a document naming tools could only ever widen the operator's list |
 | `security.*` | the gates: trifecta, egress, `exec`, policies, TLS trust, AAuth |
 | `services` | the catalogue `security.egress: closed` is checked AGAINST. A gate whose allow-list the gated party writes is not a gate |
 | `identity.*` | who work is done on behalf of |
-| `a2a.listen`, `.tls`, `.bearer`, `.principals`, `.push`, `.conversation_ttl` | who may talk to THIS agent and as what, over which socket, with which credential |
-| `interface.*`, `webhooks.*` | the human control plane, and inbound sockets with the auth on them. A document declares a `:::endpoint` ROUTE; the listener it is served on is the operator's |
+| `a2a.listen`, `.url`, `.tls`, `.bearer`, `.principals`, `.device_grant`, `.cors`, `.push`, `.conversation_ttl` | who may talk to THIS agent and as what, over which socket, from which browser origin, with which credential |
+| `a2a.events`, `a2a.introspection` | what the listener shows its clients — the observation feed, and the reads that expose transcripts and internals |
+| `webhooks.*` | inbound sockets with the auth on them. A document declares a `:::endpoint` ROUTE; the listener it is served on is the operator's |
 | `intelligence.endpoints`, `.token`, `.token_file`, `.headers`, `.auth` | where the conversation goes and the credential it goes with |
 | `subagents.*` | a whole child agent — its own source, grants and identity. A document REFERENCES a template (`:::agent template=…`); defining one is the operator's |
 | `store.file`, `.http`, `.mcp`, `.audit`, `.retention` | WHERE state lives — a path on the host, or a remote the deployment must be willing to reach — and the audit record |
 | `lifecycle.drain_timeout`, `.exit_code_map`, `.run_id`, `.watch_config` | the orchestration contract: what an orchestrator sees, and whether the process watches its own config file |
-| `observability.log_content`, `.audit`, `.otel`, `.metrics_addr`, `.health_file`, `.report_file`, `.events_ring`, `.traceparent` | `log_content` puts conversation TEXT into the operator's log pipeline; `otel.endpoint` is the one egress `closed` deliberately does not cover; the rest name sockets and files |
+| `observability.log_content`, `.audit`, `.otel`, `.metrics_addr`, `.health_file`, `.report_file`, `.events_ring`, `.traceparent`, `.status_values` | `log_content` puts conversation TEXT into the operator's log pipeline; `otel.endpoint` is the one egress `closed` deliberately does not cover; `status_values` decides which of the agent's memory every status reader is shown; the rest name sockets and files |
 | `skills.dir`, `skills.sources` | where skills are READ FROM — a folder or source whose contents become prompt text |
 
 The check is by **path**, not by top-level key name — the fragment merges deep

@@ -159,9 +159,10 @@ workflows:
         on_error: continue
 
       # ── The irreversible half ─────────────────────────────────────────────
-      # `to` narrows WHO may answer. `role: operator` is an authenticated
-      # session on the A2A listener — the TUI, the web UI, a paired phone. The
-      # room cannot satisfy this gate, and that is the whole security story of a
+      # `to` narrows WHO may answer. `role: operator` is a caller the A2A
+      # listener authenticates as one — the TUI on the daemon's own host, or a
+      # device signed in with the device grant at operator scope. The room
+      # cannot satisfy this gate, and that is the whole security story of a
       # voice assistant allowed near a lock: sound is not identity.
       #
       # A reply from anyone else is refused with an explanation and the gate

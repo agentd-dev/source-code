@@ -93,8 +93,9 @@ well-formed intent object — the intent cannot be its own check.
 ## Confirmation, and why a voice cannot give it
 
 The `human` gate in `hands.yaml` carries `to: {role: operator}`. An operator is
-an authenticated session on the A2A listener: the TUI, the web UI, a paired
-phone. The room is not a principal, so the room cannot answer.
+a caller the A2A listener authenticates as one: the TUI on the daemon's own
+host, or a device signed in with the device grant and approved with operator
+scope. The room is not a principal, so the room cannot answer.
 
 A reply from anyone else is refused with an explanation and the gate **stays
 open**, rather than the answer vanishing into a conversation.

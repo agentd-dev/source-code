@@ -33,8 +33,10 @@ run and renders as an answerable question in every attached client — and the r
 survives a restart while it waits.
 
 **You can attach to it.** `agentd tui -c agent.yaml` runs the daemon and a
-terminal UI together; there is a web UI too. The daemon holds all the state, so
-quitting a client leaves the agent working.
+terminal UI together, and `agentd ui` the same with a web UI (the clients are
+`npm install -g @agentd-dev/cli`). The launcher forces no configuration: the
+live feed the clients watch is `a2a.events.enabled` in your own file. The daemon
+holds all the state, so quitting a client leaves the agent working.
 
 ## In 20 lines
 

@@ -102,18 +102,24 @@ break.
 
 ## Talking to it and steering it
 
-The hiring manager is an A2A principal with `role: user` on the intake instance:
+The hiring manager is an A2A principal with `role: user` on the intake instance,
+recognised by the client certificate the listener's `client_ca` verifies. Any A2A
+client presenting that certificate talks to it at
+`https://hiring-intake.internal:8444`.
 
-```sh
-agentd tui -c intake.yaml     # terminal
-agentd ui  -c intake.yaml     # browser
-```
+agentd's own TUI and web UI present no client certificate, so they cannot reach
+an mTLS listener (`agentd tui` refuses one before starting anything). To give the
+hiring manager the TUI, authenticate the listener with `a2a.bearer` and
+`a2a.device_grant` instead of `client_ca`; they then run
+`agentd-tui --endpoint https://hiring-intake.internal:8444 --login` and
+talent-ops approves the code under their name (`/approve <code> <name>`).
 
 They can ask about any candidate, and because intake holds the analysis and the
-JD it can answer with evidence. Steering during a run uses the same surface:
-pause/resume a run, or send a signal a workflow is waiting on. Anything with a
-side effect still routes through `hiring-actions` — the agent will tell you so
-rather than pretending it wrote a file.
+JD it can answer with evidence. Steering a run is an operator's: talent-ops can
+pause and resume one, and a principal rule whose `grants` name `workflow.signal`
+lets its holder send a signal a workflow is waiting on. Anything with a side
+effect still routes through `hiring-actions` — the agent will tell you so rather
+than pretending it wrote a file.
 
 The two `human` nodes are the real human-in-the-loop points: an injection-flagged
 CV (24h timeout) and a `Review` decision (72h). Both suspend durably — the answer

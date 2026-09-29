@@ -80,7 +80,8 @@ a2a:
     key: /etc/agentd/tls/key.pem
     client_ca: /etc/agentd/tls/hiring-ca.pem
   principals:
-    # The hiring manager talks to the agent here (TUI, web UI, or any A2A client).
+    # The hiring manager talks to the agent here, from any A2A client that
+    # presents this certificate.
     - match: { san: "hm@example.com" }
       role: user
     - match: { san: "talent-ops@example.com" }

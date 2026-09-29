@@ -110,6 +110,11 @@ agentd tui -c agent.yaml      # run it with a terminal UI attached
 agentd ui  -c agent.yaml      # run it with a browser UI attached
 ```
 
+`agentd tui` / `agentd ui` are a launcher: the daemon runs exactly as
+`agentd -c agent.yaml` would, and the client signs in with a single-use code
+only the launcher can mint. The live feed the clients watch is
+`a2a.events.enabled` in your own configuration; the launcher forces nothing on.
+
 stdout carries the result; **stderr carries JSON-lines telemetry**, one
 structured event per line, trace-correlated.
 
@@ -146,8 +151,8 @@ the file's); the repeatable named flags `--mcp`, `--a2a-peer`, `--workflow`
 
 `vars`, `services`, `streams`, `agent`, `goal`, `intelligence`, `mcp`, `tools`,
 `store`, `memory`, `context`, `knowledge`, `search`, `skills`, `workflows`,
-`subagents`, `webhooks`, `limits`, `lifecycle`, `a2a`, `interface`,
-`observability`, `security`, `identity`.
+`subagents`, `webhooks`, `limits`, `lifecycle`, `a2a`, `observability`,
+`security`, `identity`.
 
 Every section rejects unknown keys, so a misspelled name is exit `2` naming the
 key — never a silently ignored setting.
@@ -168,8 +173,10 @@ Most-used options:
 | `lifecycle.run_until` | `auto` (default) · `idle` · `drained` |
 | `lifecycle.exit_code_map` | remap the *policy* codes 3 and 7 (e.g. so a budget stop is not a pod failure) |
 | `a2a.listen` | serve the A2A surface (needs client auth off loopback) |
+| `a2a.url` | the origin callers dial — required on a wildcard bind |
 | `webhooks.listen` | serve inbound webhooks — required by any `webhook` node (§5.7) |
-| `interface.enabled` | allow TUI/web clients to attach |
+| `a2a.events.enabled` | serve the observation feed the TUI and web UI watch (without it they poll core A2A) |
+| `a2a.device_grant` | let a client sign in with a code an operator approves under a name |
 | `security.exec.enabled` | the local command runner — off at two layers |
 
 ### 5.4 Config files and discovery
@@ -382,7 +389,7 @@ Required fields in **bold**.
 | `http` | an outbound request — **`url`**, `method`, `headers`, `body`/`json`, `expect`, `allow_private`, `sign`. SSRF-guarded: resolved once and dialled by vetted address |
 | `a2a.send` | notify a peer and continue — **`to`**, `parts`, `context`, `timeout`. Does NOT wait for a result |
 | `a2a.delegate` | delegate an objective to a **`peer`** and block for the result; `output_contract`, `timeout` |
-| `a2a.wait` | suspend until a message arrives on a `conversation`; `timeout`. The reply half of `a2a.send` |
+| `a2a.wait` | suspend until a message from the principal named in **`from`** (e.g. `agent:reviewer`) arrives on a `conversation`; `timeout`. The reply half of `a2a.send` |
 | `workflow.signal` | send **`name`** to a waiting run; `payload`, `run` |
 | `workflow.wait` / `.cancel` | await or cancel **`run`**; `timeout`, `reason` |
 | `emit` | append an event to a declared stream — **`stream`** and **`subject`** travel together (one without the other is a load error); `data`, `correlation`, `forward`. `stream`/`correlate` starts consume it. Without a stream: writes `note` to the root transcript, logs `audit`, returns `value` |
@@ -463,8 +470,9 @@ Required fields in **bold**.
 - **A2A** (`a2a.listen`) — other agents and your own display clients send
   messages, commands and tasks. Push notifications are supported and guarded.
 - **TUI / web UI** — `agentd tui` / `agentd ui`, or detached with
-  `npm i -g @agentd-dev/cli` then `agentd-tui --endpoint <url>`. They are thin
-  clients: all state lives in the daemon.
+  `npm i -g @agentd-dev/cli` then `agentd-tui --endpoint <url>` (add `--login`
+  to sign in with the device grant). They are ordinary A2A clients: all state
+  lives in the daemon, and without `a2a.events.enabled` they poll core A2A.
 - **No served MCP** — agentd is an MCP *client* only; nothing addresses it over
   MCP. A2A is the only agent-facing protocol
   served inbound — the second inbound listener is `webhooks.listen` (§5.7), which turns an HTTP

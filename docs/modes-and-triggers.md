@@ -109,6 +109,7 @@ work (this alone makes `run_until: auto` a daemon):
 ```yaml
 a2a:
   listen: https://0.0.0.0:8443
+  url:   https://agent.internal:8443   # a wildcard bind names the origin callers dial
   tls:   { cert: /tls/cert.pem, key: /tls/key.pem, client_ca: /tls/ca.pem }
   principals:
     - match: { san: "spiffe://team/*" }
@@ -118,9 +119,10 @@ a2a:
 
 - A **natural-language** message becomes a durable conversation turn; the answer
   comes back as the A2A task's artifact.
-- A **command** DataPart (`{"data":{"agentd":{"op":"workflow.run","name":"…"}}}`)
-  runs a registry action directly, with no model in the path — deterministic
-  dispatch rather than prose the receiving agent has to interpret.
+- A **command** DataPart (`{"data":{"agentd":{"op":"workflow.run","workflow":"…"}}}`),
+  sent with the [command extension](ext/command.md) activated, runs a registry
+  action directly, with no model in the path — deterministic dispatch rather
+  than prose the receiving agent has to interpret.
 - Every call is resolved to a **principal** (mTLS / bearer → `operator | user |
   agent | anonymous`), authorized against a role matrix, and (optionally)
   **audited** (`observability.audit`).

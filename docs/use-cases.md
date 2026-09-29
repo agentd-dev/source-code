@@ -35,7 +35,7 @@ and an orchestrator can drive another agent that is itself reactive.
 | Split a big task into parallel narrowed workers | any | — | **fan-out** |
 | Let an untrusted reader feed a trusted actor safely | any | — | **trust-partition** |
 | Run a long-lived worker an orchestrator drives + steers | an `a2a.listen` daemon | `Deployment` | **served** |
-| **Pair with a human on a codebase, in a terminal or browser** | an `a2a.listen` daemon + `interface.enabled` | your laptop / a dev box | optional |
+| **Pair with a human on a codebase, in a terminal or browser** | an `a2a.listen` daemon + `a2a.events.enabled` | your laptop / a dev box | optional |
 
 Every flag below is in [`configuration.md`](configuration.md); the mechanics are
 in [`modes-and-triggers.md`](modes-and-triggers.md), [`subagents.md`](subagents.md),
@@ -314,6 +314,7 @@ store: { kind: mcp, mcp: { server: state } }
 mcp:   { servers: [ { name: state, endpoint: https://mcp-state.internal/mcp } ] }
 a2a:
   listen: https://0.0.0.0:8443
+  url:    https://reviewer.internal:8443   # a wildcard bind names the origin callers dial
   tls:    { cert: /tls/cert.pem, key: /tls/key.pem }
   bearer: "{{secret:REVIEWER_TOKEN}}"
 ```
@@ -370,8 +371,9 @@ agent:
     Explore before you edit; ask before anything destructive.
   ask_human_fallback: wait          # a question parks until you answer it
 store:    { kind: memory }          # a daemon needs a store; see coding-agent.md §4 to make it durable
-a2a:      { listen: "http://127.0.0.1:8420" }
-interface: { enabled: true }        # the TUI/web-UI surface (default OFF)
+a2a:
+  listen: "http://127.0.0.1:8420"
+  events: { enabled: true }         # the live feed the TUI/web UI watch (default OFF)
 security:
   exec:                             # needs --features exec; default-OFF twice over
     enabled: true
@@ -384,8 +386,9 @@ $ agentd tui --config coding.yaml
 ```
 
 **Why this shape.** The daemon owns the conversation, so quitting the terminal
-does not end the work and a browser (or a colleague, via a rotating pairing
-code) can attach to the same session. `ask_human` gates render as answerable
+does not end the work and a browser (or a colleague, signed in with the
+device grant under a name an operator approves) can attach to the same
+session. `ask_human` gates render as answerable
 rows in every attached client and survive a restart — the approval prompt is
 server-side, not a property of your terminal. The `exec` fence (allow-list,
 workdir confinement, no shell, minimal env) is what bounds the blast radius;
@@ -395,7 +398,7 @@ the model's cooperation is not a control.
 exec`); its registry contract carries `sensitive` + `egress`, so keep
 `untrusted_input`-tagged servers off this agent and read them in a child
 instead (use case 5); and a non-loopback listener demands client auth
-(`a2a.tls.client_ca`, `a2a.bearer`, or `interface.pairing`) or refuses to start.
+(`a2a.bearer` or `a2a.tls.client_ca`) or refuses to start.
 
 Full recipe, including the practices: **[coding-agent.md](coding-agent.md)**.
 

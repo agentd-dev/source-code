@@ -45,11 +45,11 @@ store:
   kind: memory                # see §5 — the session dies with the daemon
 
 a2a:
-  listen: http://127.0.0.1:8420   # loopback ⇒ you are the operator
-
-interface:
-  enabled: true
-  debug: false                # flip per-session with /set when you need internals
+  listen: http://127.0.0.1:8420   # plaintext loopback, no credential ⇒ your terminal is the operator
+  events:
+    enabled: true             # the live feed the TUI and web UI watch
+  introspection:
+    enabled: false            # /set a2a.introspection.enabled true when you need internals
 
 security:
   exec:
@@ -137,8 +137,11 @@ Workflow `human` steps gate the same way and survive a daemon restart.
   lost, unlike a cancel.
 - **Delegate exploration to subagents** — they run in their own context and
   report a distillate, so a wide search never floods your conversation.
-- **Watch from a second surface** — `/pair` gives a rotating code, so no bearer
-  needs copying to another machine.
+- **Watch from a second surface** — a second `agentd-tui --endpoint
+  http://127.0.0.1:8420` attaches to the same session. From another machine,
+  give the listener client auth and `a2a.device_grant`: that machine's
+  `agentd-tui --login` prints a code you approve under a name
+  (`/approve <code> <name>`), so no credential is copied anywhere.
 
 ## 8. Honest limits
 
@@ -147,4 +150,6 @@ Workflow `human` steps gate the same way and survive a daemon restart.
 - No built-in editing tools — §4 is the whole story.
 - `exec` is not in release binaries, on purpose.
 - MCP servers must speak HTTP(S); no stdio transport.
-- Loopback is operator: correct for a laptop, wrong for a shared host.
+- A plaintext loopback listener with nothing configured makes every local
+  non-browser client the operator: correct for a laptop, wrong for a shared
+  host.

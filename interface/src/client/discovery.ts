@@ -448,10 +448,10 @@ export interface Capabilities {
   streaming: boolean;
   /** These capabilities come from GetExtendedAgentCard, not the public card. */
   extendedCard: boolean;
-  /** events/v1, when declared. */
+  /** events, when declared. */
   events: { ring?: number; kinds: string[] } | null;
   /**
-   * command/v2, when declared. Read from the extended card, `ops` is what
+   * command, when declared. Read from the extended card, `ops` is what
    * THIS caller may run; from the public card it is the daemon's static
    * vocabulary — every op an agentd can serve, the same for every caller.
    */
@@ -462,7 +462,7 @@ export interface Capabilities {
     /** The paths `admin.set` accepts from this caller. */
     settable: string[];
   } | null;
-  /** task-annotations/v1 is declared. */
+  /** task-annotations is declared. */
   annotations: boolean;
   /**
    * The introspection reads are offered to this caller: `true` or `false` when
@@ -480,8 +480,6 @@ export interface Capabilities {
   login: LoginOption[];
   /** No anonymous way in is declared. */
   authRequired: boolean;
-  /** Declared extension URIs this client does not implement (not required ones). */
-  ignored: string[];
 }
 
 function strings(v: Json | undefined): string[] {
@@ -512,8 +510,9 @@ export function capabilitiesOf(pub: AgentCard, ext: AgentCard | null, o: { noExt
   if (cmd) {
     const ops = new Set<string>();
     for (const raw of Array.isArray(cmd.params.ops) ? cmd.params.ops : []) {
-      // `[{op, reply}]`; a bare name is read the same way.
-      const op = typeof raw === 'string' ? raw : str(obj(raw)?.op);
+      // Each entry is `{op, reply}`: the reply kind is part of what the op
+      // promises, so an entry without that shape names no op.
+      const op = str(obj(raw)?.op);
       if (op !== undefined) ops.add(op);
     }
     const commands: { op: string; workflow: string; schema?: Json }[] = [];
@@ -549,7 +548,6 @@ export function capabilitiesOf(pub: AgentCard, ext: AgentCard | null, o: { noExt
     workflows,
     login,
     authRequired: !login.some((l) => l.method === 'none'),
-    ignored: decls.filter((d) => !CLIENT_EXTENSIONS.has(d.uri)).map((d) => d.uri),
   };
 }
 
@@ -582,11 +580,6 @@ const EXTENDED_CARD_UNSERVED: ReadonlySet<number> = new Set([
   UNSUPPORTED_OPERATION,
   METHOD_NOT_FOUND,
 ]);
-
-/** A URI without its trailing `/vN`: two versions of one extension share it. */
-function unversioned(uri: string): string {
-  return uri.replace(/\/v\d+$/, '');
-}
 
 /**
  * Discover the agent behind `configured` and settle how to talk to it: read
@@ -633,7 +626,8 @@ export async function openSession(configured: string, o: OpenOptions = {}): Prom
       // An agent that declares the extended card but does not serve it is
       // wrong, not unusable: the public card still describes it. A2A 1.0
       // names that case -32007; agentd answers -32004 when nothing on its
-      // listener authenticates a caller, and an older server -32601.
+      // listener authenticates a caller, and a server without the method
+      // answers JSON-RPC -32601.
       if (!(e instanceof RpcError) || !EXTENDED_CARD_UNSERVED.has(e.code)) throw e;
       warnings.push(`the agent declares an extended card but does not serve it (${inert(e.message)}); using the public card`);
     }
@@ -644,9 +638,5 @@ export async function openSession(configured: string, o: OpenOptions = {}): Prom
   if (extended !== null) refuseRequired(extended);
 
   const caps = capabilitiesOf(card, extended, { noExtensions: o.noExtensions });
-  for (const uri of caps.ignored) {
-    const ours = [...CLIENT_EXTENSIONS].find((c) => unversioned(c) === unversioned(uri));
-    if (ours !== undefined) warnings.push(`agent offers ${inert(uri)}; this client speaks ${ours}`);
-  }
   return { cardUrl, card, extended, ep, caps, warnings };
 }

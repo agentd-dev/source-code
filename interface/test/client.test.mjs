@@ -183,8 +183,9 @@ test('activation headers and echo verification', async (t) => {
   });
   const header = (i) => calls[i].headers['a2a-extensions'];
 
-  // Declared: a command activates command/v2 (+ annotations), the feed
-  // events/v1 (+ annotations), a core task call the annotations alone.
+  // Declared: a command activates the command extension (+ annotations), the
+  // feed the events extension (+ annotations), a core task call the
+  // annotations alone.
   const c = new AgentdClient(EP, FULL());
   await c.status();
   const bye = await c.subscribeEvents(3, () => {}, () => {});
@@ -205,7 +206,7 @@ test('activation headers and echo verification', async (t) => {
   await plain.send('hi');
   assert.equal(header(0), COMMAND_EXTENSION);
   assert.equal(header(1), undefined);
-  // A card without task-annotations/v1 gets no annotations read, whatever
+  // A card without task-annotations gets no annotations read, whatever
   // the reply carries under that key.
   assert.equal((await plain.send('hi')).task.principal, undefined);
 
@@ -233,7 +234,8 @@ test('activation headers and echo verification', async (t) => {
   echo = ANN;
   await rejects(c.command(OPS.adminPause), 'extension-not-activated');
   await rejects(c.status(), 'extension-not-activated');
-  // …and a feed opened without events/v1 is refused before a frame lands.
+  // …and a feed opened without the events extension is refused before a
+  // frame lands.
   let frames = 0;
   await rejects(c.subscribeEvents(0, () => frames++, () => frames++), 'extension-not-activated');
   assert.equal(frames, 0);
@@ -346,28 +348,6 @@ test('normalizeTask reads only URI-keyed annotations and core history', () => {
   assert.equal(bare.principal, undefined);
   assert.equal(bare.state, 'TASK_STATE_WORKING');
 
-  // The pre-1.17 shapes are not read: `agentd/*` metadata keys, flat
-  // top-level fields, a numeric timestamp.
-  const old = normalizeTask({
-    id: 't3',
-    contextId: 'c3',
-    state: 'TASK_STATE_WORKING',
-    principal: 'operator',
-    link: { run: { id: 'r1' } },
-    updated: 9,
-    status: { timestamp: 9 },
-    metadata: {
-      'agentd/principal': 'operator',
-      'agentd/link': { run: { id: 'r1' } },
-      'agentd/statusHistory': [{ state: 'TASK_STATE_SUBMITTED', ts: 1 }],
-      'agentd/ask_schema': { type: 'string' },
-    },
-  });
-  assert.equal(old.state, 'TASK_STATE_UNSPECIFIED');
-  assert.equal(old.updated, 0);
-  for (const k of ['principal', 'link', 'statusHistory', 'askSchema', 'message']) assert.equal(old[k], undefined, k);
-  assert.deepEqual(old.history, []);
-
   // A link of a kind the extension does not define is not a link.
   assert.equal(normalizeTask({ id: 't', metadata: { [ANN]: { link: { kind: 'bogus', id: 'x' } } } }).link, undefined);
   assert.equal(normalizeTask({ noId: true }), null);
@@ -426,12 +406,6 @@ test('extension URIs, op names and JSON-RPC methods have one home', () => {
     }
   }
   for (const m of ['SendMessage', 'ListTasks', 'SubscribeToTask']) assert.ok(seen.has(m), `the scan saw ${m}`);
-
-  // The removed surface stays removed.
-  for (const token of ['GetAgentCard', "'Pair'", '"Pair"', '"blocking"', "'blocking'", 'blocking:', 'agentd/link']) {
-    const hits = files.filter((f) => f.text.includes(token)).map((f) => f.path);
-    assert.deepEqual(hits, [], `${token} appears in ${hits.join(', ')}`);
-  }
 });
 
 // ---- the SSE parser and the mirror ----------------------------------------------
@@ -535,13 +509,6 @@ test('feed cases: lifecycle, config and auth notes; the deleted kinds are not re
     'agentd-tui signed in through the launcher (session ls_1)',
   ]);
   assert.deepEqual(s.transcript.map((e) => e.key), [1, 2, 3, 4, 5, 6].map((n) => `feed-0-${n}`));
-  // The pre-1.17 kinds make no row: a prompt is in the task's history now,
-  // and the command/pairing surfaces are gone.
-  m.apply({ seq: 7, ts: 7, kind: 'message', data: { messageId: 'm1', contextId: 'c', text: 'old shape' } });
-  m.apply({ seq: 8, ts: 8, kind: 'command', data: { op: 'status' } });
-  m.apply({ seq: 9, ts: 9, kind: 'pairing', data: { sessions: 2 } });
-  assert.equal(s.transcript.length, 6);
-  assert.equal(s.feedLog.length, 9, 'every kind still reaches the feed log');
 });
 
 test('input-required surfaces as an answerable agent row', () => {

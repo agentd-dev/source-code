@@ -2,40 +2,38 @@
 /**
  * agentd's extension vocabulary, in one place: every extension URI, the one
  * extension method, the command envelope key and the op names the client
- * reaches for. This is their only home — a URI or op that changes version
- * changes here and nowhere else, and a source scan in client.test.mjs fails
- * the build when another file under src/ spells one.
+ * reaches for. This is their only home — a source scan in client.test.mjs
+ * fails the build when another file under src/ spells one.
  *
  * Everything here is an A2A extension (or, for {@link UNIX_BINDING}, a custom
  * binding) that agentd DECLARES on its card. The client uses one only when the
- * card declares that exact URI: the version is part of the URI, and there is
- * no fallback from one version to another.
+ * card declares that exact URI.
  *
  * The specs live at the URIs themselves (https://agentd.dev/a2a/…); each must
  * equal the daemon's constant of the same name in `runtime/surface/ext.rs`.
  */
 
 /**
- * command/v2 — structured operations sent as one DataPart on SendMessage.
+ * command — structured operations sent as one DataPart on SendMessage.
  * A profile extension: it adds no method, and a client that ignores it can
- * still converse. Spec: https://agentd.dev/a2a/ext/command/v2
+ * still converse. Spec: https://agentd.dev/a2a/ext/command
  */
-export const COMMAND_EXTENSION = 'https://agentd.dev/a2a/ext/command/v2';
+export const COMMAND_EXTENSION = 'https://agentd.dev/a2a/ext/command';
 
 /**
- * events/v1 — the instance-wide observation feed, a method extension
+ * events — the instance-wide observation feed, a method extension
  * carrying {@link EVENTS_METHOD}. Declared only when the daemon runs with
- * the feed on. Spec: https://agentd.dev/a2a/ext/events/v1
+ * the feed on. Spec: https://agentd.dev/a2a/ext/events
  */
-export const EVENTS_EXTENSION = 'https://agentd.dev/a2a/ext/events/v1';
+export const EVENTS_EXTENSION = 'https://agentd.dev/a2a/ext/events';
 
 /**
- * task-annotations/v1 — agentd's own facts about a task (what it is linked
+ * task-annotations — agentd's own facts about a task (what it is linked
  * to, its principal, its status history, a gate's answer schema), carried
  * under `metadata[<this URI>]` only while the extension is active.
- * Spec: https://agentd.dev/a2a/ext/task-annotations/v1
+ * Spec: https://agentd.dev/a2a/ext/task-annotations
  */
-export const TASK_ANNOTATIONS_EXTENSION = 'https://agentd.dev/a2a/ext/task-annotations/v1';
+export const TASK_ANNOTATIONS_EXTENSION = 'https://agentd.dev/a2a/ext/task-annotations';
 
 /**
  * The extensions this client implements. A card that marks any OTHER
@@ -51,9 +49,9 @@ export const CLIENT_EXTENSIONS: ReadonlySet<string> = new Set([
 /**
  * The protocol binding a unix-socket interface declares: JSON-RPC over a path
  * no browser or `fetch` can dial. Known here only so interface selection can
- * name it when it refuses it. Spec: https://agentd.dev/a2a/binding/jsonrpc-unix/v1
+ * name it when it refuses it. Spec: https://agentd.dev/a2a/binding/jsonrpc-unix
  */
-export const UNIX_BINDING = 'https://agentd.dev/a2a/binding/jsonrpc-unix/v1';
+export const UNIX_BINDING = 'https://agentd.dev/a2a/binding/jsonrpc-unix';
 
 /**
  * The one method outside A2A core the client may call, declared by
@@ -66,7 +64,7 @@ export const EVENTS_METHOD = 'agentd.events/SubscribeToEvents';
 export const COMMAND_DATA_KEY = 'agentd';
 
 /**
- * Every command/v2 op the client sends, keyed by the `AgentdClient` method
+ * Every command op the client sends, keyed by the `AgentdClient` method
  * that sends it. Whether an agent SERVES one is its card's business
  * (`params.ops`); this is only the spelling.
  */
@@ -98,7 +96,7 @@ export const OPS = Object.freeze({
 } as const);
 
 /**
- * The slash commands that are command/v2 ops, keyed by the word a person
+ * The slash commands that are command ops, keyed by the word a person
  * types. A slash command is offered only while the card lists its op.
  */
 export const SLASH_OPS: Readonly<Record<string, string>> = Object.freeze({

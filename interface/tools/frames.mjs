@@ -32,14 +32,30 @@ const ENDPOINT = 'http://127.0.0.1:8420';
 const at = (s) => new Date(Date.UTC(2026, 8, 1, 9, 0, s)).toISOString();
 
 /**
+ * The ops that answer with a Message — the reads, as the daemon's op table
+ * has them. Every other op answers with a Task.
+ */
+const READS = new Set([
+  OPS.status,
+  OPS.config,
+  OPS.workflowStatus,
+  OPS.subagentStatus,
+  OPS.planGet,
+  ...INTROSPECTION_OPS,
+  OPS.authDevicePending,
+  OPS.authSessions,
+]);
+
+/**
  * The card: the fake agent's, declaring what an agentd with the feed and
  * introspection on declares to its operator.
  */
 function card() {
   const c = defaultCard(ENDPOINT);
   c.name = 'agentd';
+  const ops = Object.values(OPS).map((op) => ({ op, reply: READS.has(op) ? 'message' : 'task' }));
   c.capabilities.extensions = [
-    { uri: COMMAND_EXTENSION, params: { ops: [...Object.values(OPS)], settable: [] } },
+    { uri: COMMAND_EXTENSION, params: { ops, settable: [] } },
     { uri: EVENTS_EXTENSION, params: { ring: 1024, kinds: ['task', 'run', 'step', 'subagent'] } },
     { uri: TASK_ANNOTATIONS_EXTENSION, params: {} },
   ];

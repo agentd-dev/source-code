@@ -41,12 +41,6 @@ if (args.includes('-h') || args.includes('--help')) {
   );
   process.exit(0);
 }
-// The v1.16 server read the operator's bearer from here and served it to any
-// page that asked. Ignoring the variable would leave the operator believing
-// the tab is signed in with it; refusing says where sign-in went instead.
-if (process.env.AGENTD_BEARER !== undefined) {
-  refuse('agentd-ui no longer reads AGENTD_BEARER: the page signs in with the device grant, or run `agentd ui` for a signed-in tab');
-}
 const endpoint = opt('endpoint', process.env.AGENTD_ENDPOINT ?? '');
 const port = Number(opt('port', '4173'));
 const listenFd = opt('listen-fd', args.includes('--listen-fd') ? '' : undefined);

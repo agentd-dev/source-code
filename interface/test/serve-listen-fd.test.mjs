@@ -148,7 +148,7 @@ test('--listen-fd refuses what it cannot serve on', async (t) => {
   assert.match(r.err, /exclusive/);
 
   // A socket bound to every address is not served: the Host check is no
-  // access control, and the page and config.js would be on the network.
+  // access control, and the page and its bootstrap would be on the network.
   const wide = net.createServer();
   await new Promise((resolve) => wide.listen(0, '0.0.0.0', resolve));
   t.after(() => wide.close());

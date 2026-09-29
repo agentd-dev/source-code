@@ -41,7 +41,7 @@ export interface SystemCommand {
   name: string;
   hint: string;
   /**
-   * The command/v2 op the command sends. It is offered only while the card
+   * The command op the command sends. It is offered only while the card
    * lists that op for this caller; a command without one is the client's own.
    */
   needs?: string;
@@ -90,7 +90,7 @@ export const SYSTEM_COMMANDS: ReadonlyArray<SystemCommand> = Object.freeze(
   ),
 );
 
-/** The ops the card offers this caller; empty before a session or without command/v2. */
+/** The ops the card offers this caller; empty before a session or without the command extension. */
 function offeredOps(s: MirrorState): ReadonlySet<string> {
   return s.session?.caps.command?.ops ?? new Set();
 }

@@ -4,7 +4,15 @@
 // built from core Task.history, and task stream frames folded in.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { EVENTS_EXTENSION, EVENTS_METHOD, Mirror, Observation, normalizeTask } from '../dist/client/index.js';
+import {
+  COMMAND_EXTENSION,
+  EVENTS_EXTENSION,
+  EVENTS_METHOD,
+  Mirror,
+  Observation,
+  TASK_ANNOTATIONS_EXTENSION,
+  normalizeTask,
+} from '../dist/client/index.js';
 import { cardCache } from '../dist/client/discovery.js';
 import { startFakeA2a } from './fake-a2a.mjs';
 
@@ -24,7 +32,7 @@ async function until(pred, ms = 3000, what = 'condition') {
 const hello = (seq, resume, resync = false) => ({ hello: { seq, resume, resync, introspection: false, version: '1.17.0' } });
 const event = (seq, kind, data) => ({ event: { seq, ts: 1000 + seq, kind, data } });
 
-/** A fake agent whose card declares the events/v1 feed. */
+/** A fake agent whose card declares the events feed. */
 async function feedAgent() {
   // Ports are reused across fakes, and the card cache is keyed by URL.
   cardCache.clear();
@@ -222,7 +230,7 @@ test('the transcript comes from Task.history and reconciles the local echo', () 
 
   // 4. A command: a user message that is only data is one `command` row,
   // named by the annotation, and no user row.
-  const ann = { 'https://agentd.dev/a2a/ext/task-annotations/v1': { command: 'admin.pause' } };
+  const ann = { [TASK_ANNOTATIONS_EXTENSION]: { command: 'admin.pause' } };
   m.adoptTasks([task({
     id: 't3', contextId: 'c',
     status: { state: 'TASK_STATE_WORKING', timestamp: at(4) },
@@ -384,7 +392,7 @@ test('feed events that arrive during a resync re-bootstrap are applied after it'
     return { stream: [hello(2, 0, true), event(1, 'run', { id: 'r-new', status: 'running' })], hold: sleep(2000) };
   });
   // The status snapshot is slow, and older than the run event.
-  fake.card.capabilities.extensions.push({ uri: 'https://agentd.dev/a2a/ext/command/v2', params: { ops: [{ op: 'status', reply: 'message' }] } });
+  fake.card.capabilities.extensions.push({ uri: COMMAND_EXTENSION, params: { ops: [{ op: 'status', reply: 'message' }] } });
   let statusReads = 0;
   fake.handle('SendMessage', async () => {
     statusReads++;

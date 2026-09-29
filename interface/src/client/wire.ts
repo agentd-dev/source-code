@@ -132,8 +132,8 @@ function isErrorObject(v: unknown): v is ErrorObject {
 /**
  * The error a response carries, with everything the caller might act on: the
  * JSON-RPC data (the `@type`d google.rpc details), the HTTP status, the parsed
- * `WWW-Authenticate` challenge and `Retry-After`. Dropping any of these was
- * how a revoked session and a rate limit both used to read as "HTTP 401".
+ * `WWW-Authenticate` challenge and `Retry-After`. Each is kept: without them
+ * a revoked session and a rate limit both read as "HTTP 401".
  */
 function rpcErrorOf(err: ErrorObject, res: Response): RpcError {
   return new RpcError(err.code, err.message, {

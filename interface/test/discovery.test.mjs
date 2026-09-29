@@ -29,7 +29,7 @@ import { ClientError, RpcError } from '../dist/client/types.js';
 import { classify } from '../dist/client/errors.js';
 import { startFakeA2a } from './fake-a2a.mjs';
 
-// The command/v2 op vocabulary a public card publishes: every op an agentd
+// The command op vocabulary a public card publishes: every op an agentd
 // can serve, the same for every caller (the daemon's `static_vocabulary()`).
 const STATIC_OPS = [
   { op: 'status', reply: 'message' },
@@ -394,6 +394,12 @@ test('capabilities come from the card', async (t) => {
   assert.equal(anon.caps.introspection, null, 'the static list cannot say whether introspection is on — not "off"');
   assert.equal(anon.caps.authRequired, true);
   assert.deepEqual(anon.caps.workflows, []);
+  // An op is an `{op, reply}` entry; one without that shape names no op.
+  const shapes = capabilitiesOf(
+    { capabilities: { extensions: [{ uri: COMMAND_EXTENSION, params: { ops: ['status', { op: 'config', reply: 'message' }] } }] } },
+    null,
+  );
+  assert.deepEqual([...shapes.command.ops], ['config']);
 
   // A credential, and a card that offers the extended card: read, with the
   // bearer and A2A-Version, and it narrows what this caller may do.
@@ -481,32 +487,33 @@ test('capabilities come from the card', async (t) => {
   });
   f.extendedCard = narrowed;
 
-  // An agentd extension at a version this client does not speak is ignored,
-  // with a note naming both; a foreign one is ignored silently.
-  const v1 = COMMAND_EXTENSION.replace(/v2$/, 'v1');
+  // A URI that is not exactly one this client speaks is someone else's
+  // extension, however close its spelling — even agentd's own with a version
+  // appended: not used, and nothing to say about it.
+  const near = `${COMMAND_EXTENSION}/v2`;
   const caps = capabilitiesOf(
-    { capabilities: { extensions: [{ uri: v1 }, { uri: 'https://other.example/ext/x/v1' }] } },
+    { capabilities: { extensions: [{ uri: near }, { uri: 'https://other.example/ext/x/v1' }] } },
     null,
   );
   assert.equal(caps.command, null);
-  assert.deepEqual(caps.ignored, [v1, 'https://other.example/ext/x/v1']);
-  f.card.capabilities = { extensions: [{ uri: v1 }, { uri: 'https://other.example/ext/x/v1' }] };
-  const old = await openSession(f.url, { cache: new CardCache() });
-  assert.deepEqual(old.warnings, [`agent offers ${v1}; this client speaks ${COMMAND_EXTENSION}`]);
+  f.card.capabilities = { extensions: [{ uri: near }, { uri: 'https://other.example/ext/x/v1' }] };
+  const other = await openSession(f.url, { cache: new CardCache() });
+  assert.equal(other.caps.command, null);
+  assert.deepEqual(other.warnings, []);
 });
 
 // ---- the vocabulary and the core client ----------------------------------------
 
 test('a2a.ts messages', async (t) => {
-  // The vocabulary: three URIs, all versioned, all under one module.
+  // The vocabulary: three URIs under one module, and no agentd-owned name
+  // carries a version.
   assert.deepEqual([...CLIENT_EXTENSIONS], [COMMAND_EXTENSION, EVENTS_EXTENSION, TASK_ANNOTATIONS_EXTENSION]);
-  for (const uri of CLIENT_EXTENSIONS) assert.match(uri, /\/v\d+$/);
+  for (const uri of [...CLIENT_EXTENSIONS, UNIX_BINDING]) assert.doesNotMatch(uri, /\/v\d+$/);
   assert.equal(SLASH_OPS.set, 'admin.set');
   assert.ok(INTROSPECTION_OPS.every((op) => !Object.values(SLASH_OPS).includes(op)));
 
   // A2A 1.0 has exactly eleven methods.
   assert.equal(CORE_METHODS.length, 11);
-  assert.ok(!CORE_METHODS.includes('GetAgentCard'));
 
   // A natural-language message: ROLE_USER, and a taskId is never paired with
   // a contextId.
@@ -534,12 +541,11 @@ test('a2a.ts messages', async (t) => {
   const f = await fake(t);
   const c = new A2aClient({ url: f.url });
 
-  // SendMessage: returnImmediately is always explicit; `blocking` is gone.
+  // SendMessage: returnImmediately is always explicit.
   const sent = await c.sendMessage(plain, { returnImmediately: true });
   assert.ok(sent.task.id);
   const body = f.rpcCalls('SendMessage')[0].params;
   assert.deepEqual(body.configuration, { returnImmediately: true });
-  assert.equal(JSON.stringify(body).includes('blocking'), false);
   // The core client activates no extension on its own.
   assert.equal(f.rpcCalls('SendMessage')[0].headers['a2a-extensions'], undefined);
 

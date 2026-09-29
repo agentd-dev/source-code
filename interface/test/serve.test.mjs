@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// `agentd-ui` holds no credential of any kind. The v1.16 server read the
-// operator's bearer from AGENTD_BEARER and served it as /config.js — a script
-// any page could include — so the page could connect without asking. Now the
-// page signs in on its own, and this server hands it only the endpoint, as a
-// JSON document only the page's own origin may read.
+// `agentd-ui` holds no credential of any kind. The page signs in on its own,
+// and this server hands it only the endpoint, as a JSON document only the
+// page's own origin may read. Nor does it read one from its environment: a
+// bearer variable there is ignored like any other variable it does not read.
 //
 // serve.mjs runs from a temporary copy beside a stub dist/web, so the test
 // needs no web build and never touches the real dist/.
@@ -45,11 +44,9 @@ function tree(dir) {
   return out.sort();
 }
 
-/** The environment the server runs with: this one, minus anything that names a credential. */
+/** The environment the server runs with: this one, plus `extra`. */
 function envWith(extra) {
-  const env = { ...process.env, ...extra };
-  if (!('AGENTD_BEARER' in extra)) delete env.AGENTD_BEARER;
-  return env;
+  return { ...process.env, ...extra };
 }
 
 /**
@@ -129,36 +126,26 @@ test('agentd-ui never holds a credential', async (t) => {
   const root = stubRoot(t);
   const before = tree(root);
 
-  // AGENTD_BEARER is refused by name, before anything is served: the operator
-  // who still sets it learns where sign-in went instead of believing the tab
-  // is signed in with it.
-  const refused = await start(t, root, ['--endpoint', ENDPOINT, '--port', '0'], envWith({ AGENTD_BEARER: 'sekrit' }));
-  assert.equal(refused.code, 2, `exits 2 (got ${refused.code}: ${refused.err})`);
-  assert.match(refused.err, /agentd-ui no longer reads AGENTD_BEARER: the page signs in with the device grant, or run `agentd ui` for a signed-in tab/);
-  assert.doesNotMatch(refused.out, /serving on/, 'nothing was served');
-  assert.doesNotMatch(refused.err + refused.out, /sekrit/, 'and the value is not echoed');
-
-  const s = await start(t, root, ['--endpoint', ENDPOINT, '--port', '0'], envWith({}));
-  assert.ok(s.child, `serves without it (${s.code}: ${s.err})`);
+  // A bearer in the environment is not this server's to read: it serves as
+  // it would without one, and the value reaches no response.
+  const s = await start(t, root, ['--endpoint', ENDPOINT, '--port', '0'], envWith({ AGENTD_BEARER: 'sekrit' }));
+  assert.ok(s.child, `serves (${s.code}: ${s.err})`);
+  assert.doesNotMatch(s.out, /sekrit/);
   const { port } = s;
   const self = `http://127.0.0.1:${port}`;
 
   // The page, hardened.
   const page = await get(port, '/');
   assert.equal(page.status, 200);
+  assert.doesNotMatch(page.body + JSON.stringify(page.headers), /sekrit/);
   assertHardened(page, '/');
-
-  // The removed script route is gone: nothing answers it but a 404.
-  const cfg = await get(port, '/config.js');
-  assert.equal(cfg.status, 404);
-  assert.doesNotMatch(cfg.body, /AGENTD_DEFAULTS|bearer/i);
-  assertHardened(cfg, '/config.js');
 
   // The bootstrap document is the endpoint and nothing else, never cached.
   for (const headers of [{}, { 'sec-fetch-site': 'same-origin' }, { 'sec-fetch-site': 'none' }, { 'sec-fetch-site': 'same-origin', origin: self }]) {
     const b = await get(port, '/bootstrap.json', headers);
     assert.equal(b.status, 200, JSON.stringify(headers));
     assert.deepEqual(JSON.parse(b.body), { endpoint: ENDPOINT });
+    assert.doesNotMatch(b.body + JSON.stringify(b.headers), /sekrit/);
     assert.match(b.headers['content-type'], /^application\/json/);
     assert.equal(b.headers['cache-control'], 'no-store');
     assertHardened(b, '/bootstrap.json');

@@ -6,7 +6,7 @@
  * call, and the {@link AgentdClient} built from it refuses the rest. Then one
  * of two modes, both first-class:
  *
- * - **events** (the card declares events/v1): bootstrap (`status` when the
+ * - **events** (the card declares events): bootstrap (`status` when the
  *   card offers it, plus paged ListTasks), then hold the feed, resuming from
  *   the goodbye's cursor across the server's stream deadline.
  * - **core** (no feed declared, `--no-extensions`, or the agent does not
@@ -278,7 +278,7 @@ export class Observation {
 
   /**
    * The bootstrap: the `status` document when the card offers the op (a
-   * command/v2 read — never sent to an agent that did not declare it), one
+   * command read — never sent to an agent that did not declare it), one
    * listing per live state so no gate is lost past page one, and the newest
    * pages with enough history for the transcript.
    */
@@ -317,7 +317,7 @@ export class Observation {
   // ---- events mode -------------------------------------------------------
 
   /**
-   * Hold the events/v1 feed. Returns 'core' when the agent does not serve the
+   * Hold the events feed. Returns 'core' when the agent does not serve the
    * feed it declared, 'done' when the session was aborted; throws anything
    * else to `run`.
    */

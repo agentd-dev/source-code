@@ -3,13 +3,11 @@
  * The chrome — the top and bottom edges both display clients draw around the
  * conversation — and what each item in it shows.
  *
- * The layout is the CLIENT's business. The daemon used to own the item
- * vocabulary, the defaults and even their validation, although half the
- * items (`conn`, `endpoint`, `screen`, `keys`, `clock`) are client state no
- * daemon can know. Now the vocabulary lives here, once, for the TUI and the
- * web UI alike; each surface picks its own default; and a person reshapes it
- * locally (`--top`/`--bottom` and `/layout` in the TUI, `/layout` in the
- * browser). The one thing only the daemon can supply is a value a workflow
+ * The layout is the CLIENT's business: half the items (`conn`, `endpoint`,
+ * `screen`, `keys`, `clock`) are client state no daemon can know. So the
+ * vocabulary lives here, once, for the TUI and the web UI alike; each surface
+ * picks its own default; and a person reshapes it locally (`--top`/`--bottom`
+ * and `/layout` in the TUI, `/layout` in the browser). The one thing only the daemon can supply is a value a workflow
  * keeps in memory, which it publishes as `status.values` for the keys the
  * operator listed in `observability.status_values` — `memory:<key>` reads it.
  *

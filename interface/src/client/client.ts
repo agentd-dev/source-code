@@ -3,8 +3,8 @@
  * `AgentdClient` — agentd's declared extensions on top of the core A2A client.
  *
  * {@link A2aClient} speaks what any A2A 1.0 agent understands. This class adds
- * command/v2 (structured ops as a DataPart), events/v1 (the observation feed)
- * and task-annotations/v1 (agentd's facts about a task) — each only when the
+ * command (structured ops as a DataPart), events (the observation feed)
+ * and task-annotations (agentd's facts about a task) — each only when the
  * card this session was opened from DECLARES it. A call the card does not
  * back is refused here, before anything reaches the wire: a command DataPart
  * sent to an agent that never promised to read one as a command is just a
@@ -63,7 +63,7 @@ function partsOf(parts: Json | undefined): { text: string[]; data: Json[] } {
 
 const LINK_KINDS: ReadonlySet<string> = new Set(['run', 'subagent', 'turn']);
 
-/** Read the task-annotations/v1 object into the view's annotation fields. */
+/** Read the task-annotations object into the view's annotation fields. */
 function annotationsOf(a: Obj): Partial<TaskView> {
   const out: Partial<TaskView> = {};
   const link = obj(a.link);
@@ -95,7 +95,7 @@ function annotationsOf(a: Obj): Partial<TaskView> {
 /** How {@link normalizeTask} reads a task. */
 export interface NormalizeOptions {
   /**
-   * Read `metadata[task-annotations/v1]`. False when the reply showed the
+   * Read `metadata[task-annotations]`. False when the reply showed the
    * extension was not active for the call: what sits under the key then was
    * not written under the extension's contract, so it is not read as such.
    */
@@ -104,10 +104,7 @@ export interface NormalizeOptions {
 
 /**
  * Flatten an A2A `Task` into the client view. Core fields come from the Task;
- * agentd's own facts only from `metadata[<task-annotations/v1 URI>]`. The old
- * `agentd/*` metadata keys and the flat top-level fields are not read: a
- * v1.17 daemon writes neither, and reading them would keep a private shape
- * alive in every client that copied this one.
+ * agentd's own facts only from `metadata[<task-annotations URI>]`.
  */
 export function normalizeTask(t: Json, o: NormalizeOptions = {}): TaskView | null {
   const task = obj(t);
@@ -218,7 +215,7 @@ export class AgentdClient {
   }
 
   /**
-   * task-annotations/v1 rides every call that returns tasks, when declared —
+   * task-annotations rides every call that returns tasks, when declared —
    * it is what carries a task's link, principal and gate schema.
    */
   private annotated(): string[] {
@@ -257,9 +254,9 @@ export class AgentdClient {
   }
 
   /**
-   * Send one command/v2 op. Refused locally — no request is made — when the
+   * Send one command op. Refused locally — no request is made — when the
    * card declares no command extension or does not offer `op`. The call
-   * activates command/v2 and REQUIRES it: a present echo without it means the
+   * activates the command extension and REQUIRES it: a present echo without it means the
    * agent did not run this as a command, and its answer is not trusted.
    */
   async command(
@@ -467,7 +464,7 @@ export class AgentdClient {
   // ---- streams -----------------------------------------------------------
 
   /**
-   * Attach to the events/v1 observation feed. `onHello`/`onEvent` fire as
+   * Attach to the events observation feed. `onHello`/`onEvent` fire as
    * frames land. Resolves with the goodbye — the cursor to resume from and
    * why the server ended the stream — or `undefined` when the stream ended
    * without one. Rejects on a transport or server error (the transport

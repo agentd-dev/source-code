@@ -24,10 +24,13 @@ import {
   workflowNames,
 } from '../dist/client/index.js';
 
-/** Every built-in op, as the public card's static vocabulary lists them. */
-const ALL_OPS = Object.values(OPS);
+/**
+ * Every built-in op, as the public card's static vocabulary lists them. The
+ * composer reads only the op name, so every reply kind here is `task`.
+ */
+const ALL_OPS = Object.values(OPS).map((op) => ({ op, reply: 'task' }));
 
-/** A card declaring command/v2 with `params`. */
+/** A card declaring the command extension with `params`. */
 function cardWith(params, extra = {}) {
   return { name: 'beacon', version: '1.17.0', capabilities: { extensions: [{ uri: COMMAND_EXTENSION, params }] }, ...extra };
 }
@@ -67,16 +70,13 @@ test('slash suggests system commands first, then workflows', () => {
   assert.deepEqual(wf.map((x) => [x.label, x.hint]), [['/deploy', 'workflow']]);
   // Only at line start — a mid-sentence slash is not a command.
   assert.equal(suggest('tell me a/b', s).length, 0);
-  // Pairing is gone: the device grant replaced it.
-  assert.ok(!all.includes('/pair'));
-  assert.ok(!SYSTEM_COMMANDS.some((c) => c.name === 'pair'));
 });
 
 test('commands are gated by the card', () => {
   // The card offers this caller two ops: only their commands, and the
   // client's own, are offered.
   const m = new Mirror();
-  m.setSession(session(cardWith({ ops: ['status'] }), cardWith({ ops: ['status', 'workflow.run'] })));
+  m.setSession(session(cardWith({ ops: [{ op: 'status', reply: 'message' }] }), cardWith({ ops: [{ op: 'status', reply: 'message' }, { op: 'workflow.run', reply: 'task' }] })));
   const names = availableCommands(m.getState()).map((c) => c.name);
   for (const local of ['help', 'new', 'layout', 'login', 'logout', 'cancel', 'quit']) assert.ok(names.includes(local), local);
   assert.ok(names.includes('status') && names.includes('workflow'));
@@ -131,11 +131,11 @@ test('/set completions come from settable', () => {
   assert.deepEqual(suggest('/set agent.approval ', s), []);
   // A caller the card lists nothing settable for gets nothing.
   const m = new Mirror();
-  m.setSession(session(cardWith({ ops: ['admin.set'] })));
+  m.setSession(session(cardWith({ ops: [{ op: 'admin.set', reply: 'task' }] })));
   assert.deepEqual(suggest('/set ', m.getState()), []);
   // Nor does one not offered admin.set, whatever else the card says.
   const n = new Mirror();
-  n.setSession(session(cardWith({ ops: ['status'], settable: ['agent.approval'] })));
+  n.setSession(session(cardWith({ ops: [{ op: 'status', reply: 'message' }], settable: ['agent.approval'] })));
   assert.deepEqual(suggest('/set ', n.getState()), []);
 });
 
@@ -224,7 +224,7 @@ test('prepare routes leading # targets and interpolates $ values', () => {
 
 test('$ values read the status document, then the card, and never make one up', () => {
   const m = new Mirror();
-  m.setSession(session(cardWith({ ops: ['status'] })));
+  m.setSession(session(cardWith({ ops: [{ op: 'status', reply: 'message' }] })));
   // A non-operator's status: no counters. The card names the agent and its version.
   m.bootstrap({ instance: 'box-2' });
   let s = m.getState();

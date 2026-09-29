@@ -8,9 +8,8 @@
  * should offer them.
  *
  * Deliberately a small subset of JSON Schema: the shapes a person can be asked
- * for in one interaction. Anything else falls back to free text, which is what
- * happened to every gate before this existed, so the fallback is not a
- * regression.
+ * for in one interaction. Anything else falls back to free text: a question
+ * and a text box, which any schema can still be answered through.
  */
 import type { Json } from './types.js';
 
@@ -21,7 +20,7 @@ export type AskForm =
   | { kind: 'many'; options: string[]; other: boolean; def?: string[] }
   /** Yes or no. */
   | { kind: 'bool'; def?: boolean }
-  /** Anything else — a text box, as before. */
+  /** Anything else — a text box. */
   | { kind: 'text'; def?: string };
 
 function enumOf(v: Json | undefined): string[] | null {

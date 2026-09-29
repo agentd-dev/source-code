@@ -43,16 +43,7 @@ export const TERMINAL_STATES: ReadonlySet<TaskState> = new Set([
   'TASK_STATE_REJECTED',
 ]);
 
-/**
- * The states in which a task has stopped to wait for someone: an answer
- * (input) or a credential (auth). Neither is terminal, and neither is working.
- */
-export const INTERRUPTED_STATES: ReadonlySet<TaskState> = new Set([
-  'TASK_STATE_INPUT_REQUIRED',
-  'TASK_STATE_AUTH_REQUIRED',
-]);
-
-/** What a task is attached to (task-annotations/v1 `link`). */
+/** What a task is attached to (task-annotations `link`). */
 export interface TaskLink {
   kind: 'run' | 'subagent' | 'turn';
   id: string;
@@ -71,7 +62,7 @@ export interface HistoryMessage {
 /**
  * The client's view of one A2A `Task`, flattened once at the edge. The core
  * fields come from the Task itself; agentd's own facts (`link` … `askSchema`)
- * come ONLY from `metadata[task-annotations/v1]`, and only while that
+ * come ONLY from `metadata[task-annotations]`, and only while that
  * extension is active — there is no other key and no flat fallback.
  */
 export interface TaskView {
@@ -88,7 +79,7 @@ export interface TaskView {
   history: HistoryMessage[];
   link?: TaskLink;
   principal?: string;
-  /** The command/v2 op this task runs, when a command opened it. */
+  /** The command op this task runs, when a command opened it. */
   command?: string;
   /** Epoch ms the task was created. */
   created?: number;
@@ -100,7 +91,7 @@ export interface TaskView {
   updated: number;
 }
 
-/** One events/v1 feed event. */
+/** One events feed event. */
 export interface FeedEvent {
   seq: number;
   ts: number;
@@ -116,7 +107,7 @@ export interface FeedHello {
   resync: boolean;
   /** The daemon serves the introspection reads right now. */
   introspection: boolean;
-  /** The agentd build, not a protocol number: the version is in the URI. */
+  /** The agentd build (its release semver), not a protocol number. */
   version: string;
 }
 
@@ -214,9 +205,9 @@ export interface MirrorState {
   runs: Map<string, Json>;
   /** Per-run step detail, newest last, keyed by run id.
    *
-   * The feed used to carry run-level counts only — "3 done, 1 running" — so a
-   * client could see that a run was moving but never WHAT was moving. The
-   * daemon now emits a `step` event per transition; this is where they land. */
+   * Run-level counts alone — "3 done, 1 running" — show that a run is moving
+   * but never WHAT is moving, so the daemon emits a `step` event per
+   * transition; this is where they land. */
   steps: Map<string, StepRow[]>;
   conversations: Map<string, Json>;
   subagents: Map<string, Json>;

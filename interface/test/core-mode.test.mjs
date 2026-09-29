@@ -255,7 +255,7 @@ test('a rate limit waits out Retry-After; 5xx and a card that is not ready are r
   assert.equal(c.terminal.length, 0);
 });
 
-test('events/v1 when declared, core mode on -32601', async (t) => {
+test('the events feed when declared, core mode on -32601', async (t) => {
   // Declared and served: the feed, one stream at a time, resumed after each
   // goodbye, with the extension activated and echoed.
   const feed = await startFakeA2a();

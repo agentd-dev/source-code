@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 /**
  * The tasks screen: every task the principal may see, selectable, cancelable.
- * The `link` column is what task-annotations/v1 says the task belongs to — a
+ * The `link` column is what task-annotations says the task belongs to — a
  * workflow run, a subagent, or a conversation turn — spelled as the daemon
  * spells the kind, so it can be matched against the other screens and `/…`
  * commands; without the extension the column is empty, not guessed.

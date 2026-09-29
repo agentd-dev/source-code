@@ -234,7 +234,7 @@ test('slash commands are gated on the card, and an approval asks first', async (
     await tick(60);
   };
   try {
-    mirror.setSession(opsSession(['auth.device.approve']));
+    mirror.setSession(opsSession([{ op: 'auth.device.approve', reply: 'task' }]));
     mirror.setConn('ready');
     await tick();
     await type('/set agent.approval never');

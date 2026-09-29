@@ -73,7 +73,7 @@ export function userMessage(text: string, to: MessageTarget = {}): Obj {
 }
 
 /**
- * A command/v2 message: exactly one application/json DataPart holding
+ * A command message: exactly one application/json DataPart holding
  * `{agentd: {op, …args}}`, marked in `Message.extensions` so the peer knows the
  * DataPart is a command and not data for a model to read. A command opens its
  * own task, so it never carries a `taskId`.

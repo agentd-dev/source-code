@@ -104,9 +104,16 @@ exhaustive.
 | `start.schedule.armed` / `start.subscribe.armed` | `workflow`, `node` + `next_ms` (schedule) or `server`, `uri` (subscribe) — a start node armed |
 | `wait.resubscribed` / `wait.resubscribe.fail` | `server`, `uri` (+ `err`) — a reload re-dialed `server`, and a suspended `wait on: resource` was subscribed again on the new connection (a `subscribe` start logs `start.subscribe.armed` again) |
 | `start.fired` | `workflow`, `node`, `kind` — a start node fired; an A2A start logs `start.a2a.fired` (`conversation`, `command`, `role`) first |
-| `start.shed` / `start.frozen` / `start.inbox.failed` | `workflow`, `node`, `kind`, plus `cause` (`err` for the inbox) — a firing was refused: resource pressure, a §7.7 freshness freeze, or a failed write of the durable inbox. A `stream` or `correlate` consumer's line also names what it holds — `stream` with `seq` and `event_id` (one event), `from`, `to` and `events` (a batch) or `correlation` and `events` (a join) — and that stays unconsumed and is offered again on later passes, so the line is written once when the consumer starts being held, not on every pass |
+| `start.shed` / `start.frozen` / `start.inbox.failed` | `workflow`, `node`, `kind`, plus `cause` (`err` for the inbox) — a firing was refused: resource pressure, a §7.7 freshness freeze, or a failed write of the durable inbox. A `stream` or `correlate` consumer's line also names what it holds — `stream` with `seq` and `event_id` (one event), `from`, `to`, `events`, `seqs` and `event_ids` (a batch) or `correlation`, `events`, `seqs` and `event_ids` (a join) — and that stays unconsumed and is offered again on later passes; a held consumer reads no further until it is admitted. The line is written once when the consumer starts being held, not on every pass |
 | `start.inputs.invalid` | `workflow`, `node`, `kind`, `err`, plus the same stream fields — the start's `inputs` mapping did not render and the firing is cancelled. The same event would fail the same way every time, so a stream consumer moves past it, and this line is its record |
-| `stream.consumer.skipped` | `stream`, `workflow`, `node`, `from`, `to`, `events` — retention trimmed events this consumer had not read yet; they are gone, and the consumer continues from the oldest event still kept |
+| `start.too_large` | `workflow`, `node`, `kind`, `err`, plus the same stream fields — the start event is larger than `store.max_value_bytes`, so the durable inbox refused it. Like `start.inputs.invalid`, it would be refused the same way every time: a stream consumer moves past it (a whole batch or join, every event of which the line names), and a webhook answers `413` |
+| `stream.consumer.skipped` | `stream`, `workflow`, `node`, `from`, `to`, `events` — events this consumer had not read yet are gone: retention trimmed them, or their record is missing or (after a `stream.event.corrupt` line) unreadable. The consumer continues from the next event still kept |
+| `stream.read.failed` | `stream`, `seq`, `workflow`, `node`, `err` — the store did not answer a consumer's read of `seq`. The event may well be there, so the consumer holds at it and reads it again on later passes; written once when the hold starts |
+| `stream.event.corrupt` | `stream`, `seq`, `workflow`, `node`, `err` — the record at `seq` is there but does not parse; the consumer reports it with the next `stream.consumer.skipped` line and moves on |
+| `stream.head.recovered` | `stream`, `from`, `to`, `complete` — an append found events already stored past the stream head the manifest recorded (a crash between an append and the head's flush, or a second writer sharing this stream's store identity) and moved the head over them, keeping them. `complete: false`: the gap was longer than one append walks (1024 keys); the head is recorded as far as it got, the append is refused, and the next one carries on |
+| `webhook.idempotency.unrecorded` | `workflow`, `node`, `err` — a kept delivery's idempotency marker could not be written. The delivery stands and was answered `2xx`; a replay of it is processed again (a second run, or a second copy of the event under the same id, which stream consumers drop) |
+| `webhook.idempotency.expired` | `markers` — the sweep deleted that many markers past their seven-day TTL |
+| `webhook.idempotency.sweep.fail` | `err` — a marker sweep pass failed; it is tried again on the next sweep |
 | `subscribe` | `resource_uri`, `server`, `by` (`config`/`agent`) |
 | `unsubscribe` | `resource_uri`, `server`, `by` |
 | `subagent.spawn` | `node`, `depth` (the child re-exec'd) |
@@ -706,7 +713,8 @@ the gauges that do move. The same reservation covers `agent_active_subagents`,
   consumer is held (pressure, a freshness freeze) or paced (`rate`), and an
   alert on it fires before retention trims past the consumer — the trim itself
   is the `stream.consumer.skipped` line. Events a `batch` or `correlate` start
-  has already collected into its durable state count as consumed. A consumer a
+  has already collected into its durable state count as consumed; a held one
+  reads no further, so its lag grows like any held consumer's. A consumer a
   reload removed stops being exported. Each start kind exports up to 32
   consumers by name; the rest fold into one
   `{stream="other",consumer="other"}` series carrying the largest of their

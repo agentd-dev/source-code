@@ -19,6 +19,7 @@
 //! pressure system gates them like every other way of creating durable work.
 
 use crate::state::{Kind, kill_point, now_ms};
+use crate::store::StoreError;
 use serde_json::{Value, json};
 
 /// How many events one consumer advances per reactor pass — bounds the time
@@ -32,6 +33,9 @@ const DEDUP_RING: usize = 64;
 /// keeps a long unflushed backlog (or a store that answers "exists" for every
 /// key) from holding the single-writer loop.
 const HEAD_PROBES: usize = 1024;
+/// The line a consumer holding on a store read writes, once per hold — and
+/// its mark in `start_held`.
+const READ_HELD: &str = "stream.read.failed";
 
 /// Subject match: exact, or a `prefix.*` glob (one trailing star).
 pub fn subject_matches(pattern: &str, subject: &str) -> bool {
@@ -43,6 +47,25 @@ pub fn subject_matches(pattern: &str, subject: &str) -> bool {
 
 fn key(stream: &str, seq: u64) -> String {
     format!("{stream}/e{seq:020}")
+}
+
+/// Why an append was refused.
+#[derive(Debug)]
+pub(crate) enum AppendError {
+    /// The event is larger than `store.max_value_bytes`: no retry of it fits,
+    /// so a producer outside this process is told not to send it again.
+    TooLarge(String),
+    /// Everything else — an undeclared stream, pressure, a store that did not
+    /// answer, a head still recovering — may pass on a retry.
+    Refused(String),
+}
+
+impl std::fmt::Display for AppendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AppendError::TooLarge(m) | AppendError::Refused(m) => f.write_str(m),
+        }
+    }
 }
 
 impl super::reactor::Runtime {
@@ -57,13 +80,26 @@ impl super::reactor::Runtime {
         id: &str,
         source: &str,
     ) -> Result<u64, String> {
+        self.append(stream, subject, correlation, data, id, source)
+            .map_err(|e| e.to_string())
+    }
+
+    fn append(
+        &mut self,
+        stream: &str,
+        subject: &str,
+        correlation: Option<&str>,
+        data: Value,
+        id: &str,
+        source: &str,
+    ) -> Result<u64, AppendError> {
         let Some(cfg) = self.settings.streams.get(stream).cloned() else {
-            return Err(format!(
+            return Err(AppendError::Refused(format!(
                 "stream {stream:?} is not declared (add it under `streams:`)"
-            ));
+            )));
         };
         if let Some(cause) = self.pressure.refusal(false) {
-            return Err(format!("emit refused: {cause}"));
+            return Err(AppendError::Refused(format!("emit refused: {cause}")));
         }
         let mut meta = self
             .durable
@@ -94,7 +130,13 @@ impl super::reactor::Runtime {
             let created = self
                 .durable
                 .create(Kind::Event, &key(stream, seq), event)
-                .map_err(|e| format!("stream {stream:?} append: {e}"))?;
+                .map_err(|e| {
+                    let msg = format!("stream {stream:?} append: {e}");
+                    match e {
+                        StoreError::TooLarge { .. } => AppendError::TooLarge(msg),
+                        _ => AppendError::Refused(msg),
+                    }
+                })?;
             if created.is_some() {
                 break;
             }
@@ -111,11 +153,14 @@ impl super::reactor::Runtime {
                     "stream.head.recovered",
                     json!({"stream": stream, "from": head + 1, "to": seq, "complete": false}),
                 );
-                return Err(format!(
+                // The head now covers events no consumer has seen: wake them
+                // in this iteration, as a successful append does.
+                self.stream_dirty = true;
+                return Err(AppendError::Refused(format!(
                     "stream {stream:?} append: the stream head is still recovering \
                      (seq {} to {seq} were already written); retry",
                     head + 1
-                ));
+                )));
             }
             seq += 1;
         }
@@ -194,11 +239,13 @@ impl super::reactor::Runtime {
         data: Value,
         id: &str,
         source: &str,
-    ) -> Result<u64, String> {
-        let seq = self.append_event(stream, subject, correlation, data, id, source)?;
-        self.durable
-            .flush(true)
-            .map_err(|e| format!("stream {stream:?} append: the stream head was not saved: {e}"))?;
+    ) -> Result<u64, AppendError> {
+        let seq = self.append(stream, subject, correlation, data, id, source)?;
+        self.durable.flush(true).map_err(|e| {
+            AppendError::Refused(format!(
+                "stream {stream:?} append: the stream head was not saved: {e}"
+            ))
+        })?;
         Ok(seq)
     }
 
@@ -283,6 +330,15 @@ impl super::reactor::Runtime {
     }
 
     pub(crate) fn poll_stream_starts(&mut self) {
+        // A hold belongs to an armed consumer. One that a reload removed or
+        // disarmed would otherwise keep its entry, and the first refusal of a
+        // consumer re-armed under the same name would go unsaid.
+        let armed: std::collections::HashSet<String> = ["stream", "correlate"]
+            .into_iter()
+            .flat_map(|k| self.stream_consumers(k))
+            .map(|(w, n, _)| format!("{w}.{n}"))
+            .collect();
+        self.start_held.retain(|k, _| armed.contains(k));
         let consumers = self.stream_consumers("stream");
         let mut lags = Vec::with_capacity(consumers.len());
         for (workflow, node, spec) in consumers {
@@ -361,21 +417,25 @@ impl super::reactor::Runtime {
                 .unwrap_or_default();
             let mut batch_since = st.get("batch_since").and_then(Value::as_u64);
             let mut fired = 0usize;
-            while offset < meta.seq && fired < BATCH {
+            let mut gone = 0usize;
+            while offset < meta.seq && fired + gone < BATCH {
                 let next = offset + 1;
-                let Some(env) = self
-                    .durable
-                    .get(Kind::Event, &key(stream, next))
-                    .ok()
-                    .flatten()
-                else {
+                let event = match self.consumer_read(stream, &workflow, &node, next) {
+                    Read::Event(event) => event,
                     // Gone underneath us: as lost as a trimmed event, and
-                    // reported with them.
-                    skipped.note(next, next);
-                    offset = next;
-                    continue;
+                    // reported with them. Counted against the pass, so a long
+                    // run of missing records is still worked off in bounded
+                    // steps.
+                    Read::Gone => {
+                        skipped.note(next, next);
+                        offset = next;
+                        gone += 1;
+                        continue;
+                    }
+                    // The store did not answer: the event may well be there,
+                    // so the consumer holds here, as it does for a refusal.
+                    Read::Unavailable => break,
                 };
-                let event = env.state;
                 offset = next;
                 let subject = event.get("subject").and_then(Value::as_str).unwrap_or("");
                 if let Some(pat) = spec.get("subject").and_then(Value::as_str)
@@ -520,12 +580,76 @@ impl super::reactor::Runtime {
         full: bool,
     ) -> super::starts::Admission {
         let seq = |e: Option<&Value>| e.and_then(|e| e.get("seq")).cloned();
+        // Every event by name: a batch that is discarded (`inputs_invalid`,
+        // `too_large`) has this line as its only record, and the range alone
+        // cannot say which events a filtered stream put in it.
+        let field = |f: &str| -> Vec<Value> {
+            batch
+                .iter()
+                .map(|e| e.get(f).cloned().unwrap_or(Value::Null))
+                .collect()
+        };
         let origin = json!({
             "stream": stream, "from": seq(batch.first()), "to": seq(batch.last()),
-            "events": batch.len(),
+            "events": batch.len(), "seqs": field("seq"), "event_ids": field("id"),
         });
         let payload = json!({"events": batch, "count": batch.len(), "full": full});
         self.fire_stream_start(workflow, node, spec, payload, "stream", origin)
+    }
+
+    /// Read the event at `seq` for the consumer `workflow`/`node`.
+    ///
+    /// A store that did not answer is not a missing event: moving past it
+    /// would consume, unfired, an event that is still there — during an
+    /// outage, a consumer's whole backlog in one pass. So it holds the
+    /// consumer, said once per hold like a refused firing; the next read that
+    /// answers lifts it. A record that is there but cannot be parsed is as
+    /// lost as a trimmed one, and is named before it is skipped.
+    fn consumer_read(&mut self, stream: &str, workflow: &str, node: &str, seq: u64) -> Read {
+        let held = format!("{workflow}.{node}");
+        let read = match self.durable.get(Kind::Event, &key(stream, seq)) {
+            Ok(Some(env)) => Read::Event(env.state),
+            Ok(None) => Read::Gone,
+            Err(e) => return self.consumer_read_failed(stream, workflow, node, seq, e),
+        };
+        if self.start_held.get(&held) == Some(&READ_HELD) {
+            self.start_held.remove(&held);
+        }
+        read
+    }
+
+    fn consumer_read_failed(
+        &mut self,
+        stream: &str,
+        workflow: &str,
+        node: &str,
+        seq: u64,
+        err: StoreError,
+    ) -> Read {
+        match err {
+            StoreError::Corrupt(e) => {
+                self.log.warn(
+                    "stream.event.corrupt",
+                    json!({"stream": stream, "seq": seq, "workflow": workflow,
+                           "node": node, "err": e}),
+                );
+                Read::Gone
+            }
+            e => {
+                if self
+                    .start_held
+                    .insert(format!("{workflow}.{node}"), READ_HELD)
+                    != Some(READ_HELD)
+                {
+                    self.log.warn(
+                        READ_HELD,
+                        json!({"stream": stream, "seq": seq, "workflow": workflow,
+                               "node": node, "err": e.to_string()}),
+                    );
+                }
+                Read::Unavailable
+            }
+        }
     }
 
     /// Say that retention (or a missing record) took events this consumer had
@@ -540,6 +664,15 @@ impl super::reactor::Runtime {
             );
         }
     }
+}
+
+/// What a consumer found at one seq.
+enum Read {
+    Event(Value),
+    /// Nothing is there, or nothing readable: no retry brings it back.
+    Gone,
+    /// The store did not answer; the event may be there.
+    Unavailable,
 }
 
 /// The events one consumer pass moved past without reading: the range they
@@ -828,41 +961,46 @@ impl crate::runtime::reactor::Runtime {
                 .cloned()
                 .unwrap_or_default();
 
-            // A set that completed on an earlier pass but was not admitted then
-            // (shed, frozen, a failed inbox write) waits in `pending` and goes
-            // first. Taking it out BEFORE the window sweep matters: a complete
-            // join is not an expired one, and the sweep would discard it.
-            let mut ready: Vec<(String, Value)> = Vec::new();
-            let complete: Vec<String> = pending
-                .iter()
-                .filter(|(_, v)| {
-                    v["events"]
-                        .as_object()
-                        .is_some_and(|got| subjects.iter().all(|s| got.contains_key(s)))
-                })
-                .map(|(k, _)| k.clone())
-                .collect();
-            for corr in complete {
-                if let Some(set) = pending.remove(&corr) {
-                    ready.push((corr, set));
-                }
-            }
+            // What is due goes first: a set that completed on an earlier pass
+            // but was not admitted then (shed, frozen, a failed inbox write),
+            // and a set whose window has run out. A consumer holding a refused
+            // set does not walk the stream at all, exactly as a `stream`
+            // consumer holds its offset: the stream stays the queue, so a hold
+            // neither grows `pending` past `max_pending` nor lets a new event
+            // for a held correlation land in a slot the refused set then
+            // overwrites.
+            let due = self.due_sets(
+                &workflow,
+                &node,
+                stream,
+                &mut pending,
+                &subjects,
+                window_ms,
+                fire_partial,
+            );
+            let mut held = !self.offer_sets(
+                &workflow,
+                &node,
+                &spec,
+                stream,
+                &subjects,
+                due,
+                &mut pending,
+            );
             let mut consumed = 0usize;
-            while offset < meta.seq && consumed < BATCH {
+            while !held && offset < meta.seq && consumed < BATCH {
                 let next = offset + 1;
-                let Some(env) = self
-                    .durable
-                    .get(Kind::Event, &key(stream, next))
-                    .ok()
-                    .flatten()
-                else {
-                    skipped.note(next, next);
-                    offset = next;
-                    continue;
-                };
-                let event = env.state;
-                offset = next;
                 consumed += 1;
+                let event = match self.consumer_read(stream, &workflow, &node, next) {
+                    Read::Event(event) => event,
+                    Read::Gone => {
+                        skipped.note(next, next);
+                        offset = next;
+                        continue;
+                    }
+                    Read::Unavailable => break,
+                };
+                offset = next;
                 // The same admission rules a `stream` start applies, in the
                 // same order — a join must not see events a consumer would not.
                 if event.get("source").and_then(Value::as_str) == Some(workflow.as_str()) {
@@ -917,8 +1055,23 @@ impl crate::runtime::reactor::Runtime {
                 let complete = slot["events"]
                     .as_object()
                     .is_some_and(|got| subjects.iter().all(|s| got.contains_key(s)));
-                if complete && let Some(done) = pending.remove(&corr) {
-                    ready.push((corr.clone(), done));
+                if complete {
+                    // Offered the moment it completes. A refused set stays in
+                    // `pending` — the event that completed it is consumed into
+                    // it — and the walk stops here, so nothing after it can
+                    // reach the same correlation before the set is admitted.
+                    if let Some(done) = pending.remove(&corr) {
+                        held = !self.offer_sets(
+                            &workflow,
+                            &node,
+                            &spec,
+                            stream,
+                            &subjects,
+                            vec![(corr, done)],
+                            &mut pending,
+                        );
+                    }
+                    continue;
                 }
                 // Bound the durable state. Refusing the NEWEST key rather than
                 // evicting an old one keeps a half-collected join that may
@@ -934,66 +1087,28 @@ impl crate::runtime::reactor::Runtime {
                 }
             }
 
-            // Window sweep: a set that never completed inside its window either
-            // fires partial (the escalation shape — "paid but never shipped" IS
-            // the event) or is discarded.
-            let now = now_ms();
-            let expired: Vec<String> = pending
-                .iter()
-                .filter(|(_, v)| {
-                    v.get("first_ms")
-                        .and_then(Value::as_u64)
-                        .is_some_and(|t| now.saturating_sub(t) >= window_ms)
-                })
-                .map(|(k, _)| k.clone())
-                .collect();
-            for corr in expired {
-                let Some(part) = pending.remove(&corr) else {
-                    continue;
-                };
-                if fire_partial {
-                    ready.push((corr, part));
-                } else {
-                    self.log.info(
-                        "correlate.expired",
-                        json!({"workflow": workflow, "node": node, "stream": stream,
-                               "correlation": corr, "window_ms": window_ms}),
-                    );
-                }
-            }
-
-            // The events of a set are consumed from the stream already — they
-            // live in the durable `pending` — so a set that is not admitted
-            // goes back there, intact, and is offered again on a later pass.
-            // Once one is refused the rest would be too: they wait with it
-            // rather than each writing the same refusal.
-            let mut refused = false;
-            for (corr, set) in ready {
-                if refused {
-                    pending.insert(corr, set);
-                    continue;
-                }
-                let events: Vec<Value> = subjects
-                    .iter()
-                    .filter_map(|s| set["events"].get(s).cloned())
-                    .collect();
-                let missing: Vec<&String> = subjects
-                    .iter()
-                    .filter(|s| set["events"].get(s.as_str()).is_none())
-                    .collect();
-                let origin = json!({"stream": stream, "correlation": corr, "events": events.len()});
-                let payload = json!({
-                    "correlation": corr,
-                    "events": events,
-                    "complete": missing.is_empty(),
-                    "missing": missing,
-                });
-                let outcome =
-                    self.fire_stream_start(&workflow, &node, &spec, payload, "correlate", origin);
-                if !outcome.consumed() {
-                    refused = true;
-                    pending.insert(corr, set);
-                }
+            // A set whose window ran out while this pass walked. Its fire
+            // waits for nothing: the window sweep runs every tick, which is
+            // what makes `on_incomplete: fire_partial` escalate on time.
+            if !held {
+                let due = self.due_sets(
+                    &workflow,
+                    &node,
+                    stream,
+                    &mut pending,
+                    &subjects,
+                    window_ms,
+                    fire_partial,
+                );
+                self.offer_sets(
+                    &workflow,
+                    &node,
+                    &spec,
+                    stream,
+                    &subjects,
+                    due,
+                    &mut pending,
+                );
             }
             self.log_skipped(stream, &workflow, &node, &skipped);
             lags.push((
@@ -1013,6 +1128,113 @@ impl crate::runtime::reactor::Runtime {
             }
         }
         crate::obs::metrics::set_stream_lag("correlate", lags);
+    }
+
+    /// Take out of `pending` every set that is due: complete ones (a set is
+    /// only left complete there when its firing was refused), and ones whose
+    /// window has run out — fired partial (the escalation shape: "paid but
+    /// never shipped" IS the event) or discarded with a line. A complete set
+    /// is never treated as an expired one, whatever its age.
+    #[allow(clippy::too_many_arguments)]
+    fn due_sets(
+        &self,
+        workflow: &str,
+        node: &str,
+        stream: &str,
+        pending: &mut serde_json::Map<String, Value>,
+        subjects: &[String],
+        window_ms: u64,
+        fire_partial: bool,
+    ) -> Vec<(String, Value)> {
+        let now = now_ms();
+        let due: Vec<(String, bool)> = pending
+            .iter()
+            .filter_map(|(k, v)| {
+                let complete = v["events"]
+                    .as_object()
+                    .is_some_and(|got| subjects.iter().all(|s| got.contains_key(s)));
+                let expired = v
+                    .get("first_ms")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|t| now.saturating_sub(t) >= window_ms);
+                (complete || expired).then(|| (k.clone(), complete))
+            })
+            .collect();
+        let mut ready = Vec::new();
+        for (corr, complete) in due {
+            let Some(set) = pending.remove(&corr) else {
+                continue;
+            };
+            if complete || fire_partial {
+                ready.push((corr, set));
+            } else {
+                self.log.info(
+                    "correlate.expired",
+                    json!({"workflow": workflow, "node": node, "stream": stream,
+                           "correlation": corr, "window_ms": window_ms}),
+                );
+            }
+        }
+        ready
+    }
+
+    /// Offer each set as one run. The events of a set are consumed from the
+    /// stream already — they live in the durable `pending` — so one that is
+    /// not admitted goes back there, intact, and is offered again on a later
+    /// pass. Once one is refused the rest would be too: they go back with it
+    /// rather than each writing the same refusal. `false` when anything went
+    /// back: the consumer is held.
+    #[allow(clippy::too_many_arguments)]
+    fn offer_sets(
+        &mut self,
+        workflow: &str,
+        node: &str,
+        spec: &serde_json::Map<String, Value>,
+        stream: &str,
+        subjects: &[String],
+        sets: Vec<(String, Value)>,
+        pending: &mut serde_json::Map<String, Value>,
+    ) -> bool {
+        let mut refused = false;
+        for (corr, set) in sets {
+            if refused {
+                pending.insert(corr, set);
+                continue;
+            }
+            let events: Vec<Value> = subjects
+                .iter()
+                .filter_map(|s| set["events"].get(s).cloned())
+                .collect();
+            let missing: Vec<&String> = subjects
+                .iter()
+                .filter(|s| set["events"].get(s.as_str()).is_none())
+                .collect();
+            // Every event by name: a discarded set has this line as its only
+            // record.
+            let field = |f: &str| -> Vec<Value> {
+                events
+                    .iter()
+                    .map(|e| e.get(f).cloned().unwrap_or(Value::Null))
+                    .collect()
+            };
+            let origin = json!({
+                "stream": stream, "correlation": corr, "events": events.len(),
+                "seqs": field("seq"), "event_ids": field("id"),
+            });
+            let payload = json!({
+                "correlation": corr,
+                "events": events,
+                "complete": missing.is_empty(),
+                "missing": missing,
+            });
+            let outcome =
+                self.fire_stream_start(workflow, node, spec, payload, "correlate", origin);
+            if !outcome.consumed() {
+                refused = true;
+                pending.insert(corr, set);
+            }
+        }
+        !refused
     }
 }
 

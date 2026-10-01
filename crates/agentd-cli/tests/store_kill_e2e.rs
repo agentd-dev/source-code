@@ -125,3 +125,82 @@ fn an_event_kept_before_a_crash_survives_and_the_next_append_takes_a_new_seq() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// **A head far behind the store recovers in bounded steps.**
+///
+/// Every occupied key past the head is one store write on the single-writer
+/// loop, so one append steps over at most 1024 of them. Here 1029 events
+/// sit past the head — far more than a crash leaves, which is the point: the
+/// first append records the head as far as it walked, says the recovery is
+/// not complete, and is refused so its producer retries; the next append
+/// finishes the walk and takes the first free seq.
+#[test]
+fn a_long_gap_past_the_head_is_recovered_across_appends() {
+    let dir = common::unique_path("store-gap", "d");
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = format!("{dir}/c.yaml");
+    std::fs::write(&cfg, config(&dir, "first", false)).unwrap();
+    let (status, l1) = life(&cfg, None);
+    assert_eq!(status.code(), Some(0), "{l1}");
+
+    // Copies of event #1 on keys #2..=#1030, as if written by lives whose
+    // head was never saved.
+    fn find(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+        for ent in std::fs::read_dir(dir).ok()?.flatten() {
+            let p = ent.path();
+            if p.file_name().is_some_and(|n| n == name) {
+                return Some(p);
+            }
+            if p.is_dir()
+                && let Some(found) = find(&p, name)
+            {
+                return Some(found);
+            }
+        }
+        None
+    }
+    let first = find(std::path::Path::new(&dir), "e00000000000000000001.json").expect("event #1");
+    for seq in 2..=1030u64 {
+        std::fs::copy(&first, first.with_file_name(format!("e{seq:020}.json"))).unwrap();
+    }
+
+    std::fs::write(&cfg, config(&dir, "second", false)).unwrap();
+    let (_, l2) = life(&cfg, None);
+    let recovered = events(&l2, "stream.head.recovered");
+    assert_eq!(recovered.len(), 1, "{l2}");
+    assert_eq!(
+        (
+            &recovered[0]["from"],
+            &recovered[0]["to"],
+            &recovered[0]["complete"]
+        ),
+        (&Value::from(2), &Value::from(1025), &Value::from(false)),
+        "{l2}"
+    );
+    assert!(
+        events(&l2, "stream.emit").is_empty(),
+        "the append is refused:\n{l2}"
+    );
+
+    std::fs::write(&cfg, config(&dir, "third", false)).unwrap();
+    let (status, l3) = life(&cfg, None);
+    assert_eq!(status.code(), Some(0), "{l3}");
+    let recovered = events(&l3, "stream.head.recovered");
+    assert_eq!(recovered.len(), 1, "{l3}");
+    assert_eq!(
+        (
+            &recovered[0]["from"],
+            &recovered[0]["to"],
+            &recovered[0]["complete"]
+        ),
+        (&Value::from(1026), &Value::from(1030), &Value::from(true)),
+        "the head the refused append recorded stands:\n{l3}"
+    );
+    let emitted: Vec<u64> = events(&l3, "stream.emit")
+        .iter()
+        .filter_map(|e| e["seq"].as_u64())
+        .collect();
+    assert_eq!(emitted, [1031], "{l3}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

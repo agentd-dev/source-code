@@ -355,11 +355,12 @@ pub struct Runtime {
     pub(crate) memory_keys: std::collections::HashMap<String, Vec<String>>,
     /// An `emit` appended since the last stream poll (same-iteration wake).
     pub(crate) stream_dirty: bool,
-    /// Stream consumers (`workflow.node`) whose offered event was refused, and
-    /// why — so a consumer that offers the same event every pass writes its
-    /// refusal once, not once per tick. In memory: after a restart the first
-    /// refusal is worth saying again.
-    pub(crate) start_held: std::collections::HashMap<String, super::starts::Admission>,
+    /// Stream consumers (`workflow.node`) that are held — their offered event
+    /// was refused, or could not be read — and the line that said why, so a
+    /// consumer that offers the same event every pass writes it once, not
+    /// once per tick. In memory: after a restart the first refusal is worth
+    /// saying again.
+    pub(crate) start_held: std::collections::HashMap<String, &'static str>,
     pub(crate) log: Logger,
     pub(crate) instance: String,
     pub(crate) run_id: String,
@@ -760,10 +761,21 @@ impl Runtime {
         principal: Option<String>,
         payload: Value,
     ) -> Result<String, String> {
+        self.accept_event_store(kind, principal, payload)
+            .map_err(|e| format!("inbox: {e}"))
+    }
+
+    /// [`accept_event`](Self::accept_event), with the store's refusal kept
+    /// whole: a start firing has to tell a value that can never fit from a
+    /// store that may come back.
+    pub(crate) fn accept_event_store(
+        &mut self,
+        kind: &str,
+        principal: Option<String>,
+        payload: Value,
+    ) -> Result<String, crate::store::StoreError> {
         let ev = InboxEvent::new(kind, principal, payload);
-        self.durable
-            .inbox_put(&ev)
-            .map_err(|e| format!("inbox: {e}"))?;
+        self.durable.inbox_put(&ev)?;
         let id = ev.id.clone();
         self.log
             .info("inbox.accepted", json!({"inbox_event": id, "kind": kind}));

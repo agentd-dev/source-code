@@ -33,6 +33,7 @@ use crate::engine::model::RESERVED_HOOK_PREFIX;
 use crate::obs::log::Logger;
 use crate::runtime::events::Event;
 use crate::runtime::starts::Admission;
+use crate::runtime::streams::AppendError;
 use crate::state::{Durable, Kind, now_ms};
 
 /// Where the idempotency markers live in `Kind::Memory`. `_`-prefixed like
@@ -53,29 +54,49 @@ pub(crate) const IDEM_PREFIX: &str = "_wh_idem/";
 /// which the sweep bounds; a shorter one would let a late retry through.
 pub(crate) const IDEM_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
-/// How often the tick sweeps expired markers, and how soon it comes back
-/// while a sweep has more to look at than one pass reads.
+/// How often the tick looks for markers to sweep, and how soon it comes back
+/// while a sweep has more to delete than one pass may.
 const IDEM_SWEEP_EVERY: Duration = Duration::from_secs(600);
 const IDEM_SWEEP_BACKLOG: Duration = Duration::from_secs(1);
 
-/// Markers one sweep pass reads. Each read is a store call on the
-/// single-writer loop, so a pass is bounded and a large set is worked through
-/// across passes.
+/// Markers one sweep pass deletes. Each delete is a store call on the
+/// single-writer loop, so a pass is bounded and a large bucket is worked
+/// through across passes.
 const IDEM_SWEEP_BUDGET: usize = 512;
 
-/// Where the marker sweep is: when it runs next (`None`: now), and the last
-/// marker the previous pass read when it stopped on its budget.
+/// The record that says which marker bucket is the oldest that may still
+/// hold markers. Under the marker prefix, so `memory.*` refuses it too.
+const IDEM_FLOOR: &str = "_wh_idem/floor";
+
+/// Where the marker sweep is: when it runs next (`None`: now), the oldest
+/// bucket that may hold markers (read from the store once a life, `None`
+/// until then), and the markers of that bucket still to delete.
 #[derive(Debug, Default)]
 pub(crate) struct IdemSweep {
     next: Option<std::time::Instant>,
-    cursor: Option<String>,
+    floor: Option<Option<u64>>,
+    queue: Vec<String>,
 }
 
-/// The marker id for a delivery: per route, keyed by a hash of the sender's
-/// idempotency key so the key's bytes never become part of a store key.
-pub(crate) fn idem_marker_id(workflow: &str, node: &str, key: &str) -> String {
+/// The bucket a marker written at `at` lives in: [`IDEM_TTL_MS`]-wide,
+/// numbered from the epoch.
+///
+/// The bucket is what makes expiry cheap to find. A marker in bucket `b` was
+/// written before `(b + 1) × TTL`, so it has expired by `(b + 2) × TTL`: every
+/// bucket older than the one before the current one holds only expired
+/// markers, and the sweep deletes it whole without reading one. Live markers
+/// are never listed or read by it, however many a busy route keeps.
+fn idem_bucket(at: u64) -> u64 {
+    at / IDEM_TTL_MS
+}
+
+/// The marker id for a delivery seen at `at`: per bucket and route, keyed by
+/// a hash of the sender's idempotency key so the key's bytes never become
+/// part of a store key.
+pub(crate) fn idem_marker_id(workflow: &str, node: &str, key: &str, at: u64) -> String {
     format!(
-        "{IDEM_PREFIX}{workflow}/{node}/{}",
+        "{IDEM_PREFIX}b{}/{workflow}/{node}/{}",
+        idem_bucket(at),
         crate::sha::sha256_hex(key.as_bytes())
     )
 }
@@ -90,53 +111,115 @@ fn marker_live(state: &Value, now: u64) -> bool {
         .is_some_and(|at| now < at.saturating_add(IDEM_TTL_MS))
 }
 
-/// Whether the marker `id` still answers a replay at `now`. An expired marker
-/// that the sweep has not reached yet answers nothing, so expiry does not
-/// depend on the sweep.
-fn is_replay(d: &Durable, id: &str, now: u64) -> bool {
-    matches!(d.get(Kind::Memory, id), Ok(Some(env)) if marker_live(&env.state, now))
+/// Whether a delivery of `key` to `workflow`/`node` is a replay at `now`: a
+/// live marker in the current bucket or the one before it — no older bucket
+/// can hold one. An expired marker that the sweep has not reached yet
+/// answers nothing, so expiry does not depend on the sweep.
+fn is_replay(d: &Durable, workflow: &str, node: &str, key: &str, now: u64) -> bool {
+    [now, now.saturating_sub(IDEM_TTL_MS)].iter().any(|&at| {
+        matches!(
+            d.get(Kind::Memory, &idem_marker_id(workflow, node, key, at)),
+            Ok(Some(env)) if marker_live(&env.state, now)
+        )
+    })
+}
+
+/// The oldest bucket that may hold markers, as recorded; `None` when no
+/// marker was ever written.
+fn idem_floor(d: &Durable) -> Result<Option<u64>, crate::store::StoreError> {
+    Ok(d.get(Kind::Memory, IDEM_FLOOR)?
+        .and_then(|env| env.state.get("bucket").and_then(Value::as_u64)))
+}
+
+/// Write the marker for a delivery of `key` kept at `now`.
+///
+/// The recorded floor is made to cover the marker's bucket first: the sweep
+/// starts at the floor, so a marker below it would never be deleted. The
+/// floor is read once a life and written when it moves down — once ever (the
+/// first marker), unless the clock goes back.
+fn record_marker(
+    d: &Durable,
+    sweep: &mut IdemSweep,
+    workflow: &str,
+    node: &str,
+    key: &str,
+    now: u64,
+) -> Result<(), crate::store::StoreError> {
+    let bucket = idem_bucket(now);
+    let floor = match sweep.floor {
+        Some(f) => f,
+        None => *sweep.floor.insert(idem_floor(d)?),
+    };
+    if floor.is_none_or(|f| bucket < f) {
+        d.put(Kind::Memory, IDEM_FLOOR, json!({"bucket": bucket}), None)?;
+        sweep.floor = Some(Some(bucket));
+    }
+    d.put(
+        Kind::Memory,
+        &idem_marker_id(workflow, node, key, now),
+        json!({"at": now}),
+        None,
+    )?;
+    Ok(())
 }
 
 /// One sweep pass's result.
 #[derive(Debug, PartialEq)]
 struct SweepPass {
     removed: usize,
-    /// The last marker read when the budget ran out; `None` when the pass
-    /// reached the end.
-    resume_after: Option<String>,
+    /// Whether there is more to delete now — a later pass should come soon.
+    more: bool,
 }
 
-/// Delete the markers past their TTL, reading at most `budget` of them, in
-/// key order after `after`.
-fn sweep_markers(
+/// One bounded sweep pass: delete up to `budget` markers from the oldest
+/// bucket that has expired whole, listing that bucket only when the last
+/// listing of it is used up, and moving the floor past a bucket that lists
+/// empty.
+fn sweep_pass(
     d: &Durable,
+    sweep: &mut IdemSweep,
     now: u64,
-    after: Option<&str>,
     budget: usize,
 ) -> Result<SweepPass, crate::store::StoreError> {
-    let mut ids: Vec<String> = d
-        .list(Kind::Memory)?
-        .iter()
-        .filter_map(|ks| crate::store::parse_key(d.prefix(), d.instance(), &ks.key))
-        .map(|(_, id)| id)
-        .filter(|id| id.starts_with(IDEM_PREFIX) && after.is_none_or(|a| *id > a))
-        .map(str::to_string)
-        .collect();
-    ids.sort();
-    let more = ids.len() > budget;
-    ids.truncate(budget);
+    let floor = match sweep.floor {
+        Some(f) => f,
+        None => *sweep.floor.insert(idem_floor(d)?),
+    };
+    // Nothing was ever marked, or every expired bucket is gone.
+    let Some(floor) = floor.filter(|&f| f + 1 < idem_bucket(now)) else {
+        return Ok(SweepPass {
+            removed: 0,
+            more: false,
+        });
+    };
+    if sweep.queue.is_empty() {
+        sweep.queue = d
+            .list_prefix(Kind::Memory, &format!("{IDEM_PREFIX}b{floor}/"))?
+            .iter()
+            .filter_map(|ks| crate::store::parse_key(d.prefix(), d.instance(), &ks.key))
+            .map(|(_, id)| id.to_string())
+            .collect();
+        if sweep.queue.is_empty() {
+            d.put(Kind::Memory, IDEM_FLOOR, json!({"bucket": floor + 1}), None)?;
+            sweep.floor = Some(Some(floor + 1));
+            return Ok(SweepPass {
+                removed: 0,
+                more: floor + 2 < idem_bucket(now),
+            });
+        }
+    }
+    let take = sweep.queue.len().min(budget);
     let mut removed = 0;
-    for id in &ids {
-        if let Ok(Some(env)) = d.get(Kind::Memory, id)
-            && !marker_live(&env.state, now)
-            && d.delete(Kind::Memory, id).is_ok()
-        {
+    for id in sweep.queue.drain(..take) {
+        if d.delete(Kind::Memory, &id).is_ok() {
             removed += 1;
         }
     }
+    // A bucket is listed again once its queue is used up, so a delete that
+    // failed is retried, and the floor moves only past a bucket seen empty.
     Ok(SweepPass {
         removed,
-        resume_after: if more { ids.pop() } else { None },
+        more: true,
     })
 }
 
@@ -150,6 +233,7 @@ fn not_fired(admitted: Admission) -> WebhookReply {
         Admission::Frozen => "frozen",
         Admission::InboxFailed => "inbox_failed",
         Admission::InputsInvalid => "inputs_invalid",
+        Admission::TooLarge => "too_large",
     };
     if admitted == Admission::InputsInvalid {
         WebhookReply::ok(
@@ -157,6 +241,8 @@ fn not_fired(admitted: Admission) -> WebhookReply {
             "Unprocessable Entity",
             json!({"error": "the delivery does not render the start node's inputs", "cause": cause}),
         )
+    } else if admitted == Admission::TooLarge {
+        too_large(cause)
     } else {
         WebhookReply::ok(
             503,
@@ -164,6 +250,17 @@ fn not_fired(admitted: Admission) -> WebhookReply {
             json!({"error": "the run was not started", "cause": cause}),
         )
     }
+}
+
+/// The answer to a delivery too large for the store to keep: `413`, because
+/// a retry of the same delivery is refused the same way.
+fn too_large(cause: &str) -> WebhookReply {
+    WebhookReply::ok(
+        413,
+        "Payload Too Large",
+        json!({"error": "the delivery is larger than the store keeps (store.max_value_bytes)",
+               "cause": cause}),
+    )
 }
 
 /// A webhook request awaiting a loop-computed reply.
@@ -979,11 +1076,9 @@ impl crate::runtime::reactor::Runtime {
         // `duplicate` and never re-fires. The marker is written below, only once
         // the run is in the inbox or the event is on its stream — a delivery
         // that was refused leaves no marker, so the sender's retry is processed.
-        let marker = idem_key
-            .as_deref()
-            .map(|key| idem_marker_id(&workflow, &node, key));
-        if let (Some(id), Some(key)) = (&marker, &idem_key)
-            && is_replay(&self.durable, id, now_ms())
+        let marker = idem_key.as_deref();
+        if let Some(key) = marker
+            && is_replay(&self.durable, &workflow, &node, key, now_ms())
         {
             self.log.info(
                 "webhook.duplicate",
@@ -1037,38 +1132,14 @@ impl crate::runtime::reactor::Runtime {
                 // payload — the hook→workflow.signal→finish boilerplate
                 // collapses into one field. The run still fires (it is the
                 // audit trail); a workflow that exists only to relay is just
-                // the start plus a finish.
-                if let Some(tpl) = spec.get("signal").and_then(Value::as_str) {
-                    let data: crate::engine::template::Data = payload
-                        .as_object()
-                        .map(|o| o.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-                        .unwrap_or_default();
-                    match crate::engine::template::render_str(tpl, &data) {
-                        Ok(Value::String(name)) if !name.is_empty() => {
-                            let resumed = self.deliver_signal(
-                                &name,
-                                payload.clone(),
-                                None,
-                                None,
-                                &super::waits::SignalSender::Runtime,
-                            );
-                            self.log.info(
-                                "webhook.signal",
-                                json!({"workflow": workflow, "node": node,
-                                       "signal": name, "resumed": resumed}),
-                            );
-                        }
-                        Ok(other) => self.log.warn(
-                            "webhook.signal.invalid",
-                            json!({"workflow": workflow, "node": node,
-                                   "err": format!("signal template must render to a string, got {other}")}),
-                        ),
-                        Err(e) => self.log.warn(
-                            "webhook.signal.invalid",
-                            json!({"workflow": workflow, "node": node, "err": e}),
-                        ),
-                    }
-                }
+                // the start plus a finish. The signal goes out only once the
+                // delivery is kept (`deliver_kept`): a refused one is retried
+                // by its sender, and a signal sent on each attempt would wake
+                // a waiter once per retry.
+                let signal = spec
+                    .get("signal")
+                    .and_then(Value::as_str)
+                    .map(|tpl| (tpl.to_string(), payload.clone()));
                 // `into: {stream, subject}` — APPEND the request instead of
                 // firing a run (RFC 0035 §5). This is what gives a webhook
                 // replay-after-downtime: a run fired at request time is lost
@@ -1089,7 +1160,7 @@ impl crate::runtime::reactor::Runtime {
                     let correlation = idem_key.as_deref();
                     // `_acked`: the `202` below tells the sender the event is
                     // kept, so the stream head is saved before it is sent.
-                    let (status, body) = match self.append_event_acked(
+                    let answer = match self.append_event_acked(
                         stream,
                         subject,
                         correlation,
@@ -1103,9 +1174,10 @@ impl crate::runtime::reactor::Runtime {
                                 json!({"workflow": workflow, "node": node,
                                            "stream": stream, "subject": subject, "seq": seq}),
                             );
-                            self.mark_delivered(marker.as_deref(), &workflow, &node);
-                            (
+                            self.deliver_kept(marker, &workflow, &node, signal);
+                            WebhookReply::ok(
                                 202,
+                                "Accepted",
                                 json!({"status": "appended", "stream": stream, "seq": seq}),
                             )
                         }
@@ -1118,17 +1190,19 @@ impl crate::runtime::reactor::Runtime {
                             self.log.warn(
                                 "webhook.into.refused",
                                 json!({"workflow": workflow, "node": node,
-                                           "stream": stream, "err": e}),
+                                           "stream": stream, "err": e.to_string()}),
                             );
-                            (503, json!({"error": "stream append refused"}))
+                            match e {
+                                AppendError::TooLarge(_) => too_large("too_large"),
+                                AppendError::Refused(_) => WebhookReply::ok(
+                                    503,
+                                    "Service Unavailable",
+                                    json!({"error": "stream append refused"}),
+                                ),
+                            }
                         }
                     };
-                    let reason = if status == 202 {
-                        "Accepted"
-                    } else {
-                        "Service Unavailable"
-                    };
-                    let _ = reply.send(WebhookReply::ok(status, reason, body));
+                    let _ = reply.send(answer);
                     return;
                 }
                 if respond_sync {
@@ -1145,7 +1219,7 @@ impl crate::runtime::reactor::Runtime {
                         Some(&run_id),
                     );
                     if admitted == Admission::Accepted {
-                        self.mark_delivered(marker.as_deref(), &workflow, &node);
+                        self.deliver_kept(marker, &workflow, &node, signal);
                     } else if let Some(reply) = self.webhook_sync.remove(&run_id) {
                         // No run will reach a terminal status to answer it.
                         let _ = reply.send(not_fired(admitted));
@@ -1155,7 +1229,7 @@ impl crate::runtime::reactor::Runtime {
                     // A `202` for a firing that was refused would tell the sender
                     // to stop retrying an event nothing kept.
                     let answer = if admitted == Admission::Accepted {
-                        self.mark_delivered(marker.as_deref(), &workflow, &node);
+                        self.deliver_kept(marker, &workflow, &node, signal);
                         WebhookReply::ok(
                             202,
                             "Accepted",
@@ -1177,23 +1251,76 @@ impl crate::runtime::reactor::Runtime {
         }
     }
 
-    /// Record that a delivery was kept, so a replay of its idempotency key is
-    /// answered `duplicate`. Called in the same pass as the firing or append it
+    /// What follows a delivery that was kept — its run admitted or its event
+    /// appended, in this same pass: the route's `signal:` goes out, and the
+    /// idempotency marker is written so a replay is answered `duplicate`.
+    /// Neither happens for a delivery that was refused, because its sender
+    /// retries it.
+    fn deliver_kept(
+        &mut self,
+        key: Option<&str>,
+        workflow: &str,
+        node: &str,
+        signal: Option<(String, Value)>,
+    ) {
+        if let Some((tpl, payload)) = signal {
+            self.webhook_signal(&tpl, payload, workflow, node);
+        }
+        self.mark_delivered(key, workflow, node);
+    }
+
+    /// Fire a route's `signal:` template with the delivery's payload.
+    fn webhook_signal(&mut self, tpl: &str, payload: Value, workflow: &str, node: &str) {
+        let data: crate::engine::template::Data = payload
+            .as_object()
+            .map(|o| o.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default();
+        match crate::engine::template::render_str(tpl, &data) {
+            Ok(Value::String(name)) if !name.is_empty() => {
+                let resumed = self.deliver_signal(
+                    &name,
+                    payload,
+                    None,
+                    None,
+                    &super::waits::SignalSender::Runtime,
+                );
+                self.log.info(
+                    "webhook.signal",
+                    json!({"workflow": workflow, "node": node,
+                           "signal": name, "resumed": resumed}),
+                );
+            }
+            Ok(other) => self.log.warn(
+                "webhook.signal.invalid",
+                json!({"workflow": workflow, "node": node,
+                       "err": format!("signal template must render to a string, got {other}")}),
+            ),
+            Err(e) => self.log.warn(
+                "webhook.signal.invalid",
+                json!({"workflow": workflow, "node": node, "err": e}),
+            ),
+        }
+    }
+
+    /// Record that a delivery of `key` was kept, so a replay of it is answered
+    /// `duplicate`. Called in the same pass as the firing or append it
     /// records, and only after it succeeded.
     ///
     /// A marker that cannot be written does not undo the delivery, which
     /// happened: the sender still gets its `2xx`, and a replay is processed
     /// again — a second run, or a second copy of the event under the same id,
     /// which stream consumers deduplicate. The line says so.
-    fn mark_delivered(&mut self, marker: Option<&str>, workflow: &str, node: &str) {
-        let Some(id) = marker else {
+    fn mark_delivered(&mut self, key: Option<&str>, workflow: &str, node: &str) {
+        let Some(key) = key else {
             return;
         };
-        if let Err(e) = self.durable.put(
-            crate::state::Kind::Memory,
-            id,
-            json!({"at": now_ms()}),
-            None,
+        if let Err(e) = record_marker(
+            &self.durable,
+            &mut self.idem_sweep,
+            workflow,
+            node,
+            key,
+            now_ms(),
         ) {
             self.log.warn(
                 "webhook.idempotency.unrecorded",
@@ -1204,23 +1331,21 @@ impl crate::runtime::reactor::Runtime {
 
     /// The tick's share of marker expiry: at most once per
     /// [`IDEM_SWEEP_EVERY`] (or sooner while a pass is still working through a
-    /// backlog), delete the markers whose [`IDEM_TTL_MS`] has passed.
+    /// backlog), delete the markers of buckets that have expired whole.
     ///
     /// A marker past its TTL already answers nothing — the read checks the
     /// age — so this is about the store, which would otherwise keep one record
     /// per delivery for ever. A store that cannot `list` cannot be swept; its
-    /// expired markers stay where they are, ignored, and are replaced by the
-    /// next delivery that reuses their key.
+    /// expired markers stay where they are, ignored.
     pub(crate) fn sweep_idem_markers(&mut self) {
         let now = std::time::Instant::now();
         if self.idem_sweep.next.is_some_and(|next| now < next) {
             return;
         }
-        let cursor = self.idem_sweep.cursor.take();
-        let wait = match sweep_markers(
+        let wait = match sweep_pass(
             &self.durable,
+            &mut self.idem_sweep,
             now_ms(),
-            cursor.as_deref(),
             IDEM_SWEEP_BUDGET,
         ) {
             Ok(pass) => {
@@ -1230,8 +1355,7 @@ impl crate::runtime::reactor::Runtime {
                         json!({"markers": pass.removed}),
                     );
                 }
-                self.idem_sweep.cursor = pass.resume_after;
-                if self.idem_sweep.cursor.is_some() {
+                if pass.more {
                     IDEM_SWEEP_BACKLOG
                 } else {
                     IDEM_SWEEP_EVERY
@@ -1373,23 +1497,29 @@ mod idempotency_tests {
     #[test]
     fn memory_set_refuses_a_webhook_marker_key() {
         let d = durable();
-        let id = idem_marker_id("on-hook", "h", "evt-1");
         let mut m = Memory::new(1024, 10);
-        let e = m
-            .set(&d, &id, json!({"at": now_ms()}), None, None)
-            .unwrap_err();
-        assert!(e.contains("reserved"), "{e}");
-        assert!(m.delete(&d, &id).is_err(), "nor can it delete one");
-        assert!(m.get(&d, &id).is_err(), "nor read one");
-        assert!(
-            d.get(Kind::Memory, &id).unwrap().is_none(),
-            "nothing was written"
-        );
+        for id in [
+            idem_marker_id("on-hook", "h", "evt-1", now_ms()),
+            IDEM_FLOOR.to_string(),
+        ] {
+            let e = m
+                .set(&d, &id, json!({"at": now_ms()}), None, None)
+                .unwrap_err();
+            assert!(e.contains("reserved"), "{e}");
+            assert!(m.delete(&d, &id).is_err(), "nor can it delete one");
+            assert!(m.get(&d, &id).is_err(), "nor read one");
+            assert!(
+                d.get(Kind::Memory, &id).unwrap().is_none(),
+                "nothing was written"
+            );
+        }
     }
 
     #[test]
     fn a_marker_answers_replays_for_its_ttl_and_then_nothing() {
-        let at = 1_000_000;
+        // Late in a bucket, so the TTL runs into the next one: the lookup
+        // has to find it there.
+        let at = 5 * IDEM_TTL_MS + IDEM_TTL_MS - 10;
         let m = json!({"at": at});
         assert!(marker_live(&m, at));
         assert!(marker_live(&m, at + IDEM_TTL_MS - 1));
@@ -1401,51 +1531,143 @@ mod idempotency_tests {
         // The lookup a delivery makes applies the same rule, whether or not
         // the sweep has removed the marker yet.
         let d = durable();
-        let id = idem_marker_id("w", "h", "k");
-        assert!(!is_replay(&d, &id, at), "no marker, no replay");
-        d.put(Kind::Memory, &id, m, None).unwrap();
-        assert!(is_replay(&d, &id, at + 1));
-        assert!(!is_replay(&d, &id, at + IDEM_TTL_MS), "an expired marker");
+        assert!(!is_replay(&d, "w", "h", "k", at), "no marker, no replay");
+        d.put(Kind::Memory, &idem_marker_id("w", "h", "k", at), m, None)
+            .unwrap();
+        assert!(is_replay(&d, "w", "h", "k", at + 1));
+        assert!(
+            is_replay(&d, "w", "h", "k", at + IDEM_TTL_MS - 1),
+            "from the next bucket"
+        );
+        assert!(
+            !is_replay(&d, "w", "h", "k", at + IDEM_TTL_MS),
+            "an expired marker"
+        );
+        assert!(!is_replay(&d, "w", "h", "other", at + 1), "another key");
+        assert!(!is_replay(&d, "w", "h2", "k", at + 1), "another route");
+    }
+
+    /// A store that counts what the sweep asks of it.
+    struct Counting {
+        inner: MemoryStore,
+        ops: std::sync::Mutex<Vec<(&'static str, String)>>,
+    }
+    impl crate::store::Store for Counting {
+        fn put(
+            &self,
+            key: &str,
+            seq: u64,
+            env: &Value,
+        ) -> Result<crate::store::PutOutcome, crate::store::StoreError> {
+            self.inner.put(key, seq, env)
+        }
+        fn get(
+            &self,
+            key: &str,
+            seq: Option<u64>,
+        ) -> Result<Option<Value>, crate::store::StoreError> {
+            self.ops.lock().unwrap().push(("get", key.to_string()));
+            self.inner.get(key, seq)
+        }
+        fn list(
+            &self,
+            prefix: &str,
+        ) -> Result<Vec<crate::store::KeySeq>, crate::store::StoreError> {
+            self.ops.lock().unwrap().push(("list", prefix.to_string()));
+            self.inner.list(prefix)
+        }
+        fn delete(&self, key: &str) -> Result<(), crate::store::StoreError> {
+            self.ops.lock().unwrap().push(("delete", key.to_string()));
+            self.inner.delete(key)
+        }
+        fn kind(&self) -> &'static str {
+            "memory"
+        }
     }
 
     /// The sweep deletes what has expired and nothing else — not a live
-    /// marker, not another `_` system key, not a user key — and a pass that
-    /// runs out of budget resumes where it stopped.
+    /// marker, not another `_` system key, not a user key — and the work it
+    /// does is bounded by what it deletes: it lists only buckets that have
+    /// expired whole, reads no marker, and deletes at most its budget a pass.
     #[test]
-    fn markers_expire_and_the_sweep_removes_only_expired_markers() {
-        let d = durable();
-        let now = 10 * IDEM_TTL_MS;
-        let old = now - IDEM_TTL_MS;
-        let put = |id: &str, at: u64| {
-            d.put(Kind::Memory, id, json!({"at": at}), None).unwrap();
+    fn markers_expire_and_the_sweep_touches_only_expired_buckets() {
+        let store = Arc::new(Counting {
+            inner: MemoryStore::new(),
+            ops: Default::default(),
+        });
+        let d = Durable::new(store.clone(), "agentd", "i", Policy::default(), None);
+        let now = 10 * IDEM_TTL_MS + 5;
+        // Recorded the way a delivery records them, by a life of its own.
+        let mut writer = IdemSweep::default();
+        let mut mark = |key: &str, at: u64| {
+            record_marker(&d, &mut writer, "w", "h", key, at).unwrap();
+            idem_marker_id("w", "h", key, at)
         };
-        let expired_a = idem_marker_id("w", "h", "a");
-        let expired_b = idem_marker_id("w", "h", "b");
-        let live = idem_marker_id("w", "h", "c");
-        put(&expired_a, old);
-        put(&expired_b, old - 1);
-        put(&live, now - 1);
-        put("_workflows/w", old);
-        put("notes", old);
+        // Two buckets that have expired whole, three markers between them;
+        // one marker in the previous bucket that is still live, and one in
+        // the current bucket.
+        let old_a = mark("a", 7 * IDEM_TTL_MS + 1);
+        let old_b = mark("b", 7 * IDEM_TTL_MS + 2);
+        let old_c = mark("c", 8 * IDEM_TTL_MS + 1);
+        let live_prev = mark("d", now - IDEM_TTL_MS + 1);
+        let live_now = mark("e", now - 1);
+        d.put(Kind::Memory, "_workflows/w", json!({"at": 1}), None)
+            .unwrap();
+        d.put(Kind::Memory, "notes", json!({"at": 1}), None)
+            .unwrap();
+        store.ops.lock().unwrap().clear();
 
-        // One marker per pass: the cursor carries the sweep across passes.
-        let mut after: Option<String> = None;
+        let mut sweep = IdemSweep::default();
         let mut removed = 0;
-        for _ in 0..4 {
-            let pass = sweep_markers(&d, now, after.as_deref(), 1).unwrap();
+        let mut passes = 0;
+        loop {
+            let pass = sweep_pass(&d, &mut sweep, now, 1).unwrap();
+            assert!(pass.removed <= 1, "the budget bounds a pass");
             removed += pass.removed;
-            after = pass.resume_after;
-            if after.is_none() {
+            passes += 1;
+            if !pass.more {
                 break;
             }
+            assert!(passes < 20, "the sweep ends");
         }
-        assert_eq!(after, None, "the sweep reached the end");
-        assert_eq!(removed, 2);
-        assert!(d.get(Kind::Memory, &expired_a).unwrap().is_none());
-        assert!(d.get(Kind::Memory, &expired_b).unwrap().is_none());
-        assert!(d.get(Kind::Memory, &live).unwrap().is_some(), "live stays");
-        assert!(d.get(Kind::Memory, "_workflows/w").unwrap().is_some());
-        assert!(d.get(Kind::Memory, "notes").unwrap().is_some());
+        let ops = store.ops.lock().unwrap().clone();
+        assert_eq!(removed, 3);
+        for gone in [&old_a, &old_b, &old_c] {
+            assert!(d.get(Kind::Memory, gone).unwrap().is_none(), "{gone}");
+        }
+        for kept in [&live_prev, &live_now, "_workflows/w", "notes"] {
+            assert!(d.get(Kind::Memory, kept).unwrap().is_some(), "{kept}");
+        }
+        assert_eq!(idem_floor(&d).unwrap(), Some(idem_bucket(now) - 1));
+
+        let marker = |k: &str| k.contains(IDEM_PREFIX) && !k.ends_with("/floor");
+        assert!(
+            !ops.iter().any(|(op, k)| *op == "get" && marker(k)),
+            "no marker is read: {ops:?}"
+        );
+        let listed: Vec<&String> = ops
+            .iter()
+            .filter(|(op, _)| *op == "list")
+            .map(|(_, k)| k)
+            .collect();
+        assert!(
+            listed
+                .iter()
+                .all(|k| k.ends_with("/_wh_idem/b7/") || k.ends_with("/_wh_idem/b8/")),
+            "only buckets that expired whole are listed: {listed:?}"
+        );
+        // Nothing more to do now: the next pass touches nothing but the
+        // floor it already holds.
+        store.ops.lock().unwrap().clear();
+        let pass = sweep_pass(&d, &mut sweep, now, 1).unwrap();
+        assert_eq!(
+            pass,
+            SweepPass {
+                removed: 0,
+                more: false
+            }
+        );
+        assert!(store.ops.lock().unwrap().is_empty());
     }
 }
 

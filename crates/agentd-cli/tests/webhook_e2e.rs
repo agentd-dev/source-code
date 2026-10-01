@@ -1001,15 +1001,17 @@ fn a_webhook_into_answered_202_is_on_the_stream_after_a_crash() {
 }
 
 /// The idempotency marker records a delivery that was KEPT. A delivery whose
-/// append is refused answers `503` and leaves no marker, so the sender's retry
-/// is processed instead of being answered `duplicate` for an event nothing
-/// kept — and once the retry is kept, a further retry IS a duplicate.
+/// append is refused leaves no marker, so the sender's retry is processed
+/// instead of being answered `duplicate` for an event nothing kept — and once
+/// the retry is kept, a further retry IS a duplicate.
 ///
 /// The refusal is engineered with `store.max_value_bytes`: life 1 caps the
-/// store below the delivery's size, so its append fails; life 2 lifts the cap,
-/// as an operator who saw the refusals would, and the sender retries.
+/// store below the delivery's size, so its append fails — `413`, because the
+/// same delivery is refused the same way however often it is sent. Life 2
+/// lifts the cap, as an operator who saw the refusals would, and the sender
+/// retries.
 #[test]
-fn a_webhook_into_refused_with_503_is_appended_once_on_the_senders_retry() {
+fn a_refused_webhook_into_leaves_no_marker_and_its_retry_is_appended_once() {
     let secret = "retry-secret";
     let dir = common::unique_path("wh-retry", "d");
     std::fs::create_dir_all(&dir).unwrap();
@@ -1023,7 +1025,8 @@ fn a_webhook_into_refused_with_503_is_appended_once_on_the_senders_retry() {
         &[("INTO_SECRET", secret)],
     );
     let (code, resp) = post(&addr, "/hooks/in", &headers, &body);
-    assert_eq!(code, 503, "a refused append is not acknowledged: {resp}");
+    assert_eq!(code, 413, "a refused append is not acknowledged: {resp}");
+    assert!(resp.contains("too_large"), "{resp}");
     assert!(
         wait_for(|| !daemon.events("webhook.into.refused").is_empty(), 5),
         "{}",
@@ -1076,7 +1079,7 @@ fn a_webhook_whose_run_does_not_start_is_not_acknowledged() {
                 "\
                  agent:\n  name: unfired\n  instruction: You handle webhooks.\n  preflight: never\n\
                  intelligence:\n  endpoints: [\"http://127.0.0.1:1/v1\"]\n  model: mock\n\
-                 store:\n  kind: memory\n\
+                 store:\n  kind: memory\n  max_value_bytes: 4096\n\
                  webhooks:\n  listen: http://127.0.0.1:{port}\n\
                  workflows:\n  - name: ack\n    steps:\n\
                  \x20     h: {{kind: webhook, path: /hooks/ack, methods: [POST], inputs: {{who: \"{{{{payload.body.who}}}}\"}}}}\n\
@@ -1103,6 +1106,13 @@ fn a_webhook_whose_run_does_not_start_is_not_acknowledged() {
     assert_eq!(code, 200, "{resp}");
     assert!(resp.contains("duplicate"), "{resp}");
 
+    // A delivery larger than the store keeps can never start its run:
+    // `413`, not a `503` its sender would retry for ever.
+    let big = format!(r#"{{"who":"{}"}}"#, "x".repeat(6000));
+    let (code, resp) = post(&addr, "/hooks/ack", &[("Idempotency-Key", "u-2")], &big);
+    assert_eq!(code, 413, "{resp}");
+    assert!(resp.contains("too_large"), "{resp}");
+
     let (code, resp) = post(&addr, "/hooks/held", &[], "{}");
     assert_eq!(code, 422, "a sync route answers at once: {resp}");
     assert!(
@@ -1111,4 +1121,91 @@ fn a_webhook_whose_run_does_not_start_is_not_acknowledged() {
         daemon.stderr()
     );
     std::fs::remove_file(&cfg).ok();
+}
+
+/// A firing the runtime refused is not acknowledged, sends nothing on, and
+/// leaves nothing behind: a §7.7 freshness freeze answers `503` with its
+/// cause, the route's `signal:` does not go out, and no marker is written —
+/// so the sender's retry, once the freeze is gone, starts the run and sends
+/// the signal, once, and a further retry is a duplicate.
+///
+/// (Pressure cannot stand in for the freeze here: the listener answers it
+/// with `429` before the delivery reaches the loop.)
+#[cfg(feature = "internal-mocks")]
+#[test]
+fn a_frozen_webhook_is_503_sends_no_signal_and_its_retry_is_processed_once() {
+    let dir = common::unique_path("wh-frozen", "d");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut mock = common::spawn_mock_mcp("mock://watched", false);
+    let config = |port: u16, agent: &str, servers: &str| {
+        format!(
+            "\
+             agent:\n  name: frozen\n  preflight: never\n{agent}\
+             {servers}\
+             intelligence:\n  endpoints: [\"http://127.0.0.1:1/v1\"]\n  model: mock\n\
+             store:\n  kind: file\n  file:\n    path: {dir}/state\n  checkpoint:\n    debounce_ms: 0\n\
+             webhooks:\n  listen: http://127.0.0.1:{port}\n\
+             workflows:\n  - name: go\n    steps:\n\
+             \x20     h: {{kind: webhook, path: /hooks/go, methods: [POST], signal: \"go/{{{{ body.id }}}}\"}}\n\
+             \x20     f: {{kind: finish, depends_on: [h], status: completed}}\n\
+             lifecycle:\n  run_until: drained\n\
+             observability:\n  log_level: info\n"
+        )
+    };
+    let registry = format!(
+        "mcp:\n  servers:\n    - {{name: registry, endpoint: \"{}/mcp\"}}\n",
+        mock.uri()
+    );
+    let (daemon, addr, cfg) = spawn_bound(
+        |port| {
+            config(
+                port,
+                "  instruction:\n    mcp: \"instruction://ins_mock@stable\"\n    refresh: 1s\n    unavailable: freeze\n  document_capabilities: [compute]\n",
+                &registry,
+            )
+        },
+        &[],
+    );
+    assert!(
+        wait_for(|| !daemon.events("instruction.loaded").is_empty(), 15),
+        "{}",
+        daemon.stderr()
+    );
+    mock.stop();
+    assert!(
+        wait_for(|| !daemon.events("instruction.unavailable").is_empty(), 15),
+        "{}",
+        daemon.stderr()
+    );
+    let key = [("Idempotency-Key", "g-1")];
+    let (code, resp) = post(&addr, "/hooks/go", &key, r#"{"id":"a"}"#);
+    assert_eq!(code, 503, "a refused firing is not acknowledged: {resp}");
+    assert!(resp.contains("frozen"), "{resp}");
+    assert!(
+        daemon.events("webhook.signal").is_empty(),
+        "nothing is sent on for a delivery that was refused:\n{}",
+        daemon.stderr()
+    );
+    drop(daemon);
+
+    // The freeze is gone; the sender retries.
+    let (daemon2, addr2, cfg2) = spawn_bound(
+        |port| config(port, "  instruction: You relay webhooks.\n", ""),
+        &[],
+    );
+    let (code, resp) = post(&addr2, "/hooks/go", &key, r#"{"id":"a"}"#);
+    assert_eq!(
+        code, 202,
+        "the retry of a refused delivery is processed: {resp}"
+    );
+    let (code, resp) = post(&addr2, "/hooks/go", &key, r#"{"id":"a"}"#);
+    assert_eq!(code, 200, "{resp}");
+    assert!(resp.contains("duplicate"), "{resp}");
+    let signals = daemon2.events("webhook.signal");
+    assert_eq!(signals.len(), 1, "{}", daemon2.stderr());
+    assert_eq!(signals[0]["signal"], "go/a");
+
+    std::fs::remove_file(&cfg).ok();
+    std::fs::remove_file(&cfg2).ok();
+    std::fs::remove_dir_all(&dir).ok();
 }

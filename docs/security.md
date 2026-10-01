@@ -924,8 +924,10 @@ request is in:
   answer a real delivery `200 duplicate`, nor delete one, which would let a replay fire
   twice. A marker is written only after the delivery is kept (its run is in the durable
   inbox, or its event and the stream head are saved), so a refused delivery is processed when
-  the sender retries; it answers replays for seven days, and a sweep removes it after that
-  (`IDEM_TTL_MS`, `Runtime::sweep_idem_markers`).
+  the sender retries; a route's `signal:` waits for the same point, so a retried delivery
+  wakes a waiter once. Under `store.on_error: degrade` a failed write is reported as made,
+  and "kept" is only as true as the store. A marker answers replays for seven days, and a
+  sweep removes it after that (`IDEM_TTL_MS`, `Runtime::sweep_idem_markers`).
 - **`/hooks/_` is reserved.** A `wait {on: webhook}` without a fixed path is armed at
   `/hooks/_cb/<token>`, and configured routes are matched before those callbacks. A route
   under the prefix could therefore take a suspended run's callback, so a `webhook` start

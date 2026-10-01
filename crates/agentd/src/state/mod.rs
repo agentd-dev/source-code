@@ -474,6 +474,16 @@ impl Restored {
     }
 }
 
+/// Who holds a key a create-only write found taken.
+enum Holder {
+    /// The write itself: the store applied it and its answer was lost.
+    Ours,
+    /// A tombstone at this seq: the key is free.
+    Tombstone(u64),
+    /// A live record that is not this write.
+    Other,
+}
+
 /// The durability façade: the single writer's view of the store.
 pub struct Durable {
     store: SharedStore,
@@ -571,7 +581,8 @@ impl Durable {
     }
 
     /// Write a record that must not exist yet: `Ok(None)` when the key already
-    /// holds one, which is left exactly as it is.
+    /// holds one, which is left exactly as it is — whatever this life has
+    /// already read or written there.
     ///
     /// [`put`](Durable::put) adopts a record it finds on a key it has not
     /// touched in this life — right for an entity this instance rewrites,
@@ -582,8 +593,36 @@ impl Durable {
     /// have been told was kept. Adopting it would overwrite that event. A
     /// create-only write hands the collision back so the caller can move past
     /// it instead.
+    ///
+    /// A key is free only when nothing live is stored there, so the first
+    /// attempt writes seq 1 whatever this life remembers of the key: a seq
+    /// warmed by a read would otherwise be stepped past, and the CAS would
+    /// accept an overwrite. A conflict is then read back, because it has
+    /// three causes that need three answers: a tombstone (the key is free,
+    /// written past it), this very write (its answer was lost and the retry
+    /// found it — created), or a record that is someone's event (occupied).
     pub fn create(&self, kind: Kind, id: &str, state: Value) -> Result<Option<u64>, StoreError> {
         self.write(kind, id, state, None, true)
+    }
+
+    /// Who holds a key a create-only put of `env` conflicted on.
+    fn create_conflict(
+        &self,
+        key: &str,
+        env: &Envelope,
+        latest_seq: Option<u64>,
+    ) -> Result<Holder, StoreError> {
+        let stored = crate::store::with_retry(|| self.store.get(key, None), self.policy.retries)?;
+        Ok(match stored {
+            // Tombstones read as absent: the record is gone, the key free.
+            None => latest_seq.map_or(Holder::Other, Holder::Tombstone),
+            Some(v) => {
+                let ours = ["seq", "ts", "instance", "state"]
+                    .iter()
+                    .all(|f| v.get(f) == env.to_value().get(f));
+                if ours { Holder::Ours } else { Holder::Other }
+            }
+        })
     }
 
     fn write(
@@ -609,9 +648,13 @@ impl Durable {
             }
         }
         let mut adopted = false;
+        // Create-only: the seq of a tombstone found on the key, written past.
+        let mut tombstone: Option<u64> = None;
         let started = std::time::Instant::now();
         loop {
-            let (seq, warmed) = {
+            let (seq, warmed) = if create_only {
+                (tombstone.map_or(1, |t| t + 1), false)
+            } else {
                 let seqs = self.seqs.lock().unwrap_or_else(|e| e.into_inner());
                 match seqs.get(&key).copied() {
                     Some(s) => (s + 1, true),
@@ -627,10 +670,20 @@ impl Durable {
                 state.clone(),
             );
             kill_point("state.before_put");
-            let outcome = crate::store::with_retry(
+            let mut outcome = crate::store::with_retry(
                 || self.store.put(&key, seq, &env.to_value()),
                 self.policy.retries,
             );
+            if create_only && let Ok(PutOutcome::Conflict { latest_seq }) = outcome {
+                match self.create_conflict(&key, &env, latest_seq)? {
+                    Holder::Ours => outcome = Ok(PutOutcome::Ok),
+                    Holder::Tombstone(t) if tombstone.is_none() => {
+                        tombstone = Some(t);
+                        continue;
+                    }
+                    Holder::Tombstone(_) | Holder::Other => {}
+                }
+            }
             match outcome {
                 Ok(PutOutcome::Ok) => {
                     self.seqs
@@ -762,7 +815,20 @@ impl Durable {
 
     /// The store's `list` for a kind (optional).
     pub fn list(&self, kind: Kind) -> Result<Vec<KeySeq>, StoreError> {
-        let prefix = format!("{}/{}/{}/", self.prefix, self.instance, kind.as_str());
+        self.list_prefix(kind, "")
+    }
+
+    /// The store's `list` for the ids of a kind under `id_prefix`, which ends
+    /// at a `/` (the file store lists by directory). One namespace is listed
+    /// without listing — and on the file store reading — every record of the
+    /// kind.
+    pub fn list_prefix(&self, kind: Kind, id_prefix: &str) -> Result<Vec<KeySeq>, StoreError> {
+        let prefix = format!(
+            "{}/{}/{}/{id_prefix}",
+            self.prefix,
+            self.instance,
+            kind.as_str()
+        );
         self.store.list(&prefix)
     }
 
@@ -1189,6 +1255,101 @@ mod tests {
                 .put(Kind::Event, "s/e1", json!({"id": "over"}), None)
                 .unwrap(),
             2
+        );
+    }
+
+    /// A key this life has already READ is no freer than one it has not:
+    /// the seq the read warmed must not become the next write's seq, or the
+    /// CAS accepts an overwrite of the record the read just saw.
+    #[test]
+    fn a_create_after_a_read_of_the_same_key_still_finds_it_taken() {
+        let mem = Arc::new(MemoryStore::new());
+        durable(mem.clone())
+            .create(Kind::Event, "s/e1", json!({"id": "kept"}))
+            .unwrap();
+        let next = durable(mem.clone());
+        assert!(next.get(Kind::Event, "s/e1").unwrap().is_some(), "warmed");
+        assert_eq!(
+            next.create(Kind::Event, "s/e1", json!({"id": "late"}))
+                .unwrap(),
+            None
+        );
+        let env = next.get(Kind::Event, "s/e1").unwrap().unwrap();
+        assert_eq!((env.state["id"].clone(), env.seq), (json!("kept"), 1));
+    }
+
+    /// A tombstone frees its key: a create-only write goes past it rather
+    /// than reporting a deleted record as one to keep.
+    #[test]
+    fn a_create_writes_past_a_tombstone() {
+        let mem = Arc::new(MemoryStore::new());
+        let d = durable(mem.clone());
+        let key = d.key(Kind::Event, "s/e1");
+        mem.put(
+            &key,
+            3,
+            &json!({"kind": "event", "id": "s/e1", "seq": 3, "ts": 0,
+                                 "instance": "inst", "state": null}),
+        )
+        .unwrap();
+        assert_eq!(
+            durable(mem.clone())
+                .create(Kind::Event, "s/e1", json!({"id": "new"}))
+                .unwrap(),
+            Some(4)
+        );
+        let env = d.get(Kind::Event, "s/e1").unwrap().unwrap();
+        assert_eq!(env.state["id"], json!("new"));
+    }
+
+    /// A store that applies a write and then loses its answer: the retry of
+    /// the same create finds the key taken — by itself. Reporting that as
+    /// occupied made an append step over its OWN event and write a second
+    /// copy of it at the next seq.
+    #[test]
+    fn a_create_whose_answer_was_lost_is_created_not_occupied() {
+        struct LostAnswer {
+            inner: Arc<MemoryStore>,
+            lose: std::sync::atomic::AtomicBool,
+        }
+        impl crate::store::Store for LostAnswer {
+            fn put(&self, key: &str, seq: u64, env: &Value) -> Result<PutOutcome, StoreError> {
+                let out = self.inner.put(key, seq, env)?;
+                if self.lose.swap(false, Ordering::SeqCst) {
+                    return Err(StoreError::Io("connection reset after the write".into()));
+                }
+                Ok(out)
+            }
+            fn get(&self, key: &str, seq: Option<u64>) -> Result<Option<Value>, StoreError> {
+                self.inner.get(key, seq)
+            }
+            fn list(&self, prefix: &str) -> Result<Vec<KeySeq>, StoreError> {
+                self.inner.list(prefix)
+            }
+            fn delete(&self, key: &str) -> Result<(), StoreError> {
+                self.inner.delete(key)
+            }
+            fn kind(&self) -> &'static str {
+                "memory"
+            }
+        }
+        let mem = Arc::new(MemoryStore::new());
+        let store = Arc::new(LostAnswer {
+            inner: mem.clone(),
+            lose: std::sync::atomic::AtomicBool::new(true),
+        });
+        let d = Durable::new(store, "agentd", "inst", Policy::default(), None);
+        assert_eq!(
+            d.create(Kind::Event, "s/e1", json!({"id": "once"}))
+                .unwrap(),
+            Some(1),
+            "the retry found its own write"
+        );
+        // And an occupied key is still occupied through the same path.
+        assert_eq!(
+            d.create(Kind::Event, "s/e1", json!({"id": "other"}))
+                .unwrap(),
+            None
         );
     }
 

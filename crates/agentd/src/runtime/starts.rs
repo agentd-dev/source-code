@@ -44,6 +44,10 @@ pub(crate) enum Admission {
     /// The `inputs` mapping did not render against this payload. Offering
     /// the same payload again would fail the same way.
     InputsInvalid,
+    /// The start event is larger than `store.max_value_bytes`, so the inbox
+    /// refused it before trying the store. Like [`Self::InputsInvalid`],
+    /// offering it again fails the same way.
+    TooLarge,
 }
 
 impl Admission {
@@ -51,7 +55,10 @@ impl Admission {
     /// it can never fire and was discarded with a line naming it. Every other
     /// outcome is temporary, and the event is offered again later.
     pub(crate) fn consumed(self) -> bool {
-        matches!(self, Admission::Accepted | Admission::InputsInvalid)
+        matches!(
+            self,
+            Admission::Accepted | Admission::InputsInvalid | Admission::TooLarge
+        )
     }
 }
 
@@ -595,15 +602,30 @@ impl Runtime {
         // `start.fired` and the start-state bookkeeping: a firing whose inbox
         // write failed did not happen, and must neither say it did nor count
         // a loop iteration it never ran.
-        if let Err(e) = self.accept_event(kinds::START_FIRED, Some(acting), ev) {
-            let line = fields(json!({"err": e}));
-            return self.refuse(
-                workflow,
-                node,
-                origin.is_some(),
-                Admission::InboxFailed,
-                line,
-            );
+        match self.accept_event_store(kinds::START_FIRED, Some(acting), ev) {
+            Ok(_) => {}
+            // A size the store refuses before it is even asked is refused the
+            // same way on every offer, so holding it would wedge a stream
+            // consumer behind it for ever — the `inputs_invalid` case again.
+            // It is discarded, and this line, naming it, is its record.
+            Err(e @ crate::store::StoreError::TooLarge { .. }) => {
+                self.log.warn(
+                    "start.too_large",
+                    fields(json!({"err": format!("inbox: {e}")})),
+                );
+                self.start_held.remove(&Self::start_key(workflow, node));
+                return Admission::TooLarge;
+            }
+            Err(e) => {
+                let line = fields(json!({"err": format!("inbox: {e}")}));
+                return self.refuse(
+                    workflow,
+                    node,
+                    origin.is_some(),
+                    Admission::InboxFailed,
+                    line,
+                );
+            }
         }
         self.start_held.remove(&Self::start_key(workflow, node));
         self.log.info("start.fired", fields(json!({})));
@@ -640,8 +662,8 @@ impl Runtime {
         if held
             && self
                 .start_held
-                .insert(Self::start_key(workflow, node), outcome)
-                == Some(outcome)
+                .insert(Self::start_key(workflow, node), event)
+                == Some(event)
         {
             return outcome;
         }

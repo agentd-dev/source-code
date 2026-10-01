@@ -904,6 +904,36 @@ pub fn names() -> Vec<&'static str> {
     contracts().into_iter().map(|c| c.name).collect()
 }
 
+/// Where an internal contract hands the text it is given, beyond answering
+/// its caller. The stream-taint check (`config::taint`) follows these edges
+/// from a model that read outside input: each is a way to put that text in
+/// front of another model, as a `message`, `workflow` or `subagent` step does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Onward {
+    /// Into one of the agent's own conversations: a turn under the root grant.
+    Root,
+    /// A run of any workflow, with inputs the model chose.
+    Workflows,
+    /// A run listening for a signal — started by it, or resumed with its
+    /// payload.
+    Signal,
+    /// A child: one it spawns, or a warm one it steers.
+    Children,
+}
+
+/// The contracts that hand text onward, and where. Kept beside the table
+/// above so a contract that gains such an edge is classified where it is
+/// written; the test below holds every name to a contract.
+pub fn onward(name: &str) -> Option<Onward> {
+    match name {
+        "message.send" => Some(Onward::Root),
+        "workflow.run" => Some(Onward::Workflows),
+        "workflow.signal" => Some(Onward::Signal),
+        "subagent.run" | "subagent.send" => Some(Onward::Children),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -948,6 +978,25 @@ mod tests {
                 .is_err(),
             "an unknown field is still refused"
         );
+    }
+
+    /// Every contract `onward` classifies exists: a renamed one would drop
+    /// out of the taint check's edges without a word.
+    #[test]
+    fn every_onward_edge_names_a_contract() {
+        let names = names();
+        for n in [
+            "message.send",
+            "workflow.run",
+            "workflow.signal",
+            "subagent.run",
+            "subagent.send",
+        ] {
+            assert!(names.contains(&n), "{n} is not a contract");
+            assert!(onward(n).is_some(), "{n} has no onward edge");
+        }
+        let classified: Vec<&str> = names.into_iter().filter(|n| onward(n).is_some()).collect();
+        assert_eq!(classified.len(), 5, "{classified:?}");
     }
 
     #[test]

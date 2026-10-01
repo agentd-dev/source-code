@@ -140,6 +140,101 @@ fn a_mirrored_child_stream_lands_in_the_parents_stream() {
     );
 }
 
+/// A child's report lands only in a stream its template mirrors. That list is
+/// what the stream-taint check judges as fed from a child at load; an
+/// `_instance.emit` naming any other stream would put a child's text where the
+/// check saw nothing outside feeding it.
+#[test]
+fn an_instance_report_into_a_stream_its_template_does_not_mirror_is_refused() {
+    let dir = common::unique_path("pb-mirror", "d");
+    std::fs::create_dir_all(&dir).unwrap();
+    let port = common::free_port();
+    let cfg = format!("{dir}/c.yaml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "agent: {{ name: parent }}\nstore: {{ kind: memory }}\n\
+             lifecycle: {{ run_until: drained }}\n\
+             observability: {{ log_level: info }}\n\
+             a2a: {{ listen: \"http://127.0.0.1:{port}\" }}\n\
+             streams: {{ orders: {{}}, ledger: {{}} }}\n\
+             subagents:\n\
+            \x20 templates:\n\
+            \x20   desk:\n\
+            \x20     instruction: |\n\
+            \x20       The desk.\n\
+            \x20       :::!stream{{name=orders}}\n\
+            \x20       retention: {{ max_events: 10 }}\n\
+            \x20       :::\n\
+            \x20     mirror_streams: [orders]\n\
+            \x20     singleton: true\n\
+            \x20     ttl: 30s\n\
+             workflows:\n\
+            \x20 - name: spawner\n    steps:\n\
+            \x20     s:     {{ kind: once }}\n\
+            \x20     spawn: {{ kind: subagent, template: desk, depends_on: [s] }}\n\
+            \x20     f:     {{ kind: finish, depends_on: [spawn], status: completed }}\n"
+        ),
+    )
+    .unwrap();
+    let log_path = format!("{dir}/stderr.log");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .args(["--config", &cfg])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&log_path).unwrap())
+        .env("AGENTD_STATE_DIR", format!("{dir}/state"))
+        .spawn()
+        .expect("spawn agentd");
+    let addr = common::wait_a2a_bound(&log_path);
+    let log = || std::fs::read_to_string(&log_path).unwrap_or_default();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let handle = loop {
+        if let Some(h) = events(&log(), "instance.spawn")
+            .first()
+            .and_then(|e| e["handle"].as_str().map(str::to_string))
+        {
+            break h;
+        }
+        assert!(std::time::Instant::now() < deadline, "no spawn:\n{}", log());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let emit = |stream: &str| {
+        common::send_command(
+            &addr,
+            "_instance.emit",
+            serde_json::json!({"handle": handle, "stream": stream,
+                               "event": {"id": "e1", "subject": "x", "data": {}}}),
+        )
+    };
+    let refused = emit("ledger");
+    let mirrored = emit("orders");
+    let _ = child.kill();
+    let _ = child.wait();
+    let log = log();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("not one of instance child")),
+        "a report into an unmirrored stream was accepted: {refused}\n{log}"
+    );
+    assert!(
+        !events(&log, "instance.mirror")
+            .iter()
+            .any(|e| e["stream"] == "ledger"),
+        "{log}"
+    );
+    // The control: the stream it does mirror takes the report.
+    assert!(mirrored.get("error").is_none(), "{mirrored}\n{log}");
+    assert!(
+        events(&log, "instance.mirror")
+            .iter()
+            .any(|e| e["stream"] == "orders"),
+        "{log}"
+    );
+}
+
 #[test]
 fn a_catalog_breaker_default_opens_for_a_failing_service() {
     // The entry declares the breaker; the referencing server's steps inherit

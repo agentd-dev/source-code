@@ -500,3 +500,101 @@ fn a_reload_that_only_adds_a_mirror_rechecks_the_stored_definitions() {
         d.log()
     );
 }
+
+/// A reload that changes only the service catalog still re-checks the
+/// definitions: an instance template's servers resolve against it, so a
+/// catalog entry gaining `egress` hands a stored consumer that spawns the
+/// template the other leg — and that reload leaves it out.
+#[cfg(all(feature = "hot-reload", feature = "a2a"))]
+#[test]
+fn a_reload_that_only_retags_a_service_rechecks_the_stored_definitions() {
+    let t = tempfile::tempdir().unwrap();
+    let play = t.path().join("play.json");
+    std::fs::write(
+        &play,
+        serde_json::json!({"turns": [
+            {"tool_calls": [{"name": "workflow.create", "arguments": {"definition": {
+                "name": "reader", "steps": {
+                    "s": {"kind": "stream", "stream": "inbox"},
+                    "c": {"kind": "subagent", "depends_on": ["s"], "template": "desk"},
+                    "f": {"kind": "finish", "depends_on": ["c"], "status": "completed"}}}}}]},
+            {"echo_tool_result": true}
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    let a2a = common::free_port();
+    let body = |tags: &str| {
+        format!(
+            "agent:\n  name: taint\n  prompt: go\n  instruction: Triage the inbox.\n\
+             intelligence: {{ endpoints: \"mock:file:{}\", model: mock }}\n\
+             store: {{kind: memory}}\n\
+             lifecycle: {{run_until: drained}}\n\
+             observability:\n  log_level: info\n\
+             a2a: {{ listen: \"http://127.0.0.1:{a2a}\" }}\n\
+             services:\n  crm: {{kind: mcp, endpoint: \"https://crm.invalid/mcp\", tags: {{\"*\": [{tags}]}}}}\n\
+             streams:\n  inbox: {{}}\n\
+             subagents:\n  templates:\n    desk:\n      instruction: |\n        The desk.\n        \
+             :::!stream{{name=inbox}}\n        retention: {{ max_events: 10 }}\n        :::\n        \
+             :::!mcp{{name=crm}}\n        service: crm\n        :::\n      \
+             mirror_streams: [inbox]\n\
+             workflows:\n\
+             \x20 - name: tick\n    steps:\n      s: {{kind: schedule, every: 1h}}\n      f: {{kind: finish, depends_on: [s], status: completed}}\n",
+            play.display()
+        )
+    };
+    let cfg = t.path().join("agent.yaml");
+    std::fs::write(&cfg, body("sensitive")).unwrap();
+    let d = Daemon::spawn(&cfg);
+    d.wait_for(|d| !d.events("turn.reply").is_empty(), "the agent's turn");
+    assert!(
+        d.events("workflow.defined")
+            .iter()
+            .any(|e| e["name"] == "reader"),
+        "a mirrored stream into a sensitive service is two legs:\n{}",
+        d.log()
+    );
+
+    std::fs::write(&cfg, body("sensitive, egress")).unwrap();
+    d.sighup();
+    d.wait_for(|d| !d.events("config.reloaded").is_empty(), "the reload");
+    assert!(
+        d.events("workflow.stored.invalid")
+            .iter()
+            .any(|e| e["name"] == "reader"
+                && e["errors"].as_array().is_some_and(|es| es.iter().any(|m| m
+                    .as_str()
+                    .is_some_and(|m| m.contains("mcp server \"crm\" of template \"desk\""))))),
+        "{}",
+        d.log()
+    );
+}
+
+/// The tools that hand text on are the steps that do, spelled as tools: a
+/// reader narrowed to `notes` that can call `workflow.run` starts the run
+/// holding `mail`, and one that can call `message.send` hands the text to the
+/// root grant. Both are refused; without them the reader loads.
+#[test]
+fn a_reader_holding_a_tool_that_hands_text_on_is_refused() {
+    let t = tempfile::tempdir().unwrap();
+    let send = "  - name: send\n    steps:\n      s: {kind: manual}\n      \
+                a: {kind: agent, depends_on: [s], instruction: \"Send it.\", servers: [mail], tools: [\"mail.*\"]}\n      \
+                f: {kind: finish, depends_on: [a], status: completed}\n";
+    let reader = |extra: &str| {
+        format!(
+            "  - name: triage\n    steps:\n      s: {{kind: stream, stream: inbox}}\n      \
+             a: {{kind: agent, depends_on: [s], instruction: \"Read it.\", servers: [notes], tools: [\"notes.*\"{extra}]}}\n      \
+             f: {{kind: finish, depends_on: [a], status: completed}}\n"
+        )
+    };
+    let (code, err) = validate(t.path(), &config(&[WEBHOOK_INTO, &reader(""), send], ""));
+    assert_eq!(code, 0, "{err}");
+    for tool in ["workflow.run", "message.send"] {
+        let (code, err) = validate(
+            t.path(),
+            &config(&[WEBHOOK_INTO, &reader(&format!(", \"{tool}\"")), send], ""),
+        );
+        assert_eq!(code, 2, "{tool}: {err}");
+        assert!(err.contains("lethal-trifecta refused"), "{tool}: {err}");
+    }
+}

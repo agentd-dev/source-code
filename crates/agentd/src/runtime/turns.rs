@@ -170,8 +170,14 @@ impl Runtime {
             .unwrap_or_default())
     }
 
-    /// The tool definitions + routing for a caller.
-    pub(crate) fn tool_plan(&self, caller: &Caller, allow: Option<&[String]>) -> ToolPlan {
+    /// The tool definitions + routing for a caller. `servers`, when given,
+    /// is the only set of MCP servers whose tools the plan holds.
+    pub(crate) fn tool_plan(
+        &self,
+        caller: &Caller,
+        allow: Option<&[String]>,
+        servers: Option<&[String]>,
+    ) -> ToolPlan {
         let select = match caller {
             Caller::Root => Some(&self.settings.agent.tools),
             _ => None,
@@ -181,6 +187,18 @@ impl Runtime {
             defs.retain(|d| {
                 a.iter()
                     .any(|p| crate::registry::pattern_matches(p, &d.name))
+            });
+        }
+        // A step's `servers:` is the cap on what its MCP tools reach — the
+        // stream-taint check (`config::taint`) and the docs both read it as
+        // one. It used to pick only which servers the worker dials, while the
+        // plan still offered every server's tools: one a policy might gate is
+        // served by the supervisor, over its own connection, so a step
+        // narrowed to `notes` could call `mail` as soon as a rule covered it.
+        if let Some(servers) = servers {
+            defs.retain(|d| match self.registry.get(&d.name).map(|t| &t.imp) {
+                Some(crate::registry::Impl::Mcp { server, .. }) => servers.contains(server),
+                _ => true,
             });
         }
         // Which policy caller this plan is being built for. A plan is per
@@ -402,7 +420,7 @@ impl Runtime {
         // the root tool plan. An instance has one operator, so there is no
         // narrower per-conversation grant to apply; per-principal narrowing
         // happens at the A2A boundary, not here.
-        let (tools, internal, routes) = self.tool_plan(&Caller::Root, None);
+        let (tools, internal, routes) = self.tool_plan(&Caller::Root, None, None);
         let servers: Vec<String> = routes
             .values()
             .map(|(s, _)| s.clone())

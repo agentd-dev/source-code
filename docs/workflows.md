@@ -980,6 +980,10 @@ workflows:
     steps: {…}
 ```
 
+`grant` gates the tool the way a contract's default grant gates it: a caller the
+grant leaves out is neither offered the tool nor allowed to call it. It defaults to
+root and workflows.
+
 What this adds over an MCP tool is everything the engine already has: a call
 that takes thirty minutes, survives a restart, and has retry, breaker,
 idempotency and a human gate *inside* it. It is also better for the
@@ -1005,7 +1009,8 @@ reload).
 gate something the agent-editable half of the config asserts about itself.
 Instead a workflow tool inherits the union of the tags of the tools its steps
 actually reach, plus `egress` for steps that reach outside by construction
-(`http`, `a2a.send`, `a2a.delegate`). What was derived is logged at startup, so
+(`http`, `a2a.send`, `a2a.delegate`), plus the taint its run carries — `untrusted_input`
+when it reads a stream outside input feeds ([security.md](security.md#streams-carry-the-taint-of-what-feeds-them)). What was derived is logged at startup, so
 an operator can inspect the conclusion.
 
 ## See also

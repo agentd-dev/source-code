@@ -892,7 +892,7 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
     {
         let defs: Vec<&crate::engine::Workflow> =
             rt.workflows.values().map(|w| w.as_ref()).collect();
-        let errs = rt.registry.register_workflow_tools(&defs);
+        let errs = rt.registry.register_workflow_tools(&rt.settings, &defs);
         if !errs.is_empty() {
             for e in &errs {
                 log.error("config.invalid", json!({"error": e}));
@@ -1367,21 +1367,26 @@ pub fn capabilities(loaded: &Loaded) -> Value {
         },
         // The routes an operator actually exposed, and whether each is
         // authenticated. Absent entirely before, so a configured listener and
-        // its routes were invisible to anything reading the manifest.
+        // its routes were invisible to anything reading the manifest. Read
+        // through the one list of what opens a route, so a wait nested in a
+        // body is listed as the listener serves it. Over the inline
+        // definitions: the manifest is built from the configuration, before
+        // `file:`, `url:` and `dir:` definitions resolve.
         "webhooks": s.webhooks.listen.as_ref().map(|l| json!({
             "listen": l,
             "default_auth": s.webhooks.default_auth.is_some(),
             "routes": s.workflows.iter().flat_map(|w| {
                 let wf = w["name"].as_str().unwrap_or("").to_string();
-                w["steps"].as_object().into_iter().flatten()
-                    .filter(|(_, n)| n["kind"] == "webhook")
-                    .map(move |(id, n)| json!({
-                        "workflow": wf, "node": id,
-                        "path": n["path"], "methods": n["methods"],
+                crate::engine::model::inbound_routes(w).into_iter().map(move |r| {
+                    let route = r.route.unwrap_or(&Value::Null);
+                    json!({
+                        "workflow": wf, "node": r.step, "what": r.what,
+                        "path": route["path"], "methods": route["methods"],
                         // Whether THIS route carries its own auth; the default
                         // above applies when it does not.
-                        "auth": n.get("auth").is_some(),
-                    })).collect::<Vec<_>>()
+                        "auth": r.auth.is_some(),
+                    })
+                }).collect::<Vec<_>>()
             }).collect::<Vec<_>>(),
         })),
         // The instruction document as an agent: what the trust ladder granted,
@@ -2239,6 +2244,53 @@ mod bearer_tests {
         assert!(
             !err.contains("static"),
             "an error never carries a credential"
+        );
+    }
+}
+
+#[cfg(test)]
+mod manifest_tests {
+    use serde_json::json;
+
+    /// The manifest lists the routes the listener serves, through the one
+    /// list of what opens a route: a `wait {on: webhook}` nested in a body is
+    /// one, with its path and auth where the wait carries them.
+    #[test]
+    fn the_manifest_lists_every_route_the_listener_serves() {
+        let settings = crate::config::settings::Settings::from_document(
+            json!({
+                "agent": {"instruction": "x"},
+                "webhooks": {"listen": "http://127.0.0.1:9"},
+                "workflows": [{"name": "w", "steps": {
+                    "s": {"kind": "webhook", "path": "/in", "methods": "POST"},
+                    "each": {"kind": "foreach", "depends_on": ["s"], "over": "{{inputs.x}}",
+                             "body": {"steps": {
+                                 "cb": {"kind": "wait", "on": "webhook",
+                                        "webhook": {"path": "/cb", "auth": {"hmac": {"secret": "{{secret:K}}"}}}}
+                             }}},
+                    "f": {"kind": "finish", "depends_on": ["each"], "status": "completed"}
+                }}]
+            }),
+            "test",
+        )
+        .unwrap();
+        let loaded = crate::config::settings::Loaded {
+            settings,
+            doc: json!({}),
+            file_doc: json!({}),
+            files: Vec::new(),
+            warnings: Vec::new(),
+            trace: Default::default(),
+        };
+        let routes = super::capabilities(&loaded)["webhooks"]["routes"].clone();
+        assert_eq!(
+            routes,
+            json!([
+                {"workflow": "w", "node": "each/cb", "what": "a `wait {on: webhook}`",
+                 "path": "/cb", "methods": null, "auth": true},
+                {"workflow": "w", "node": "s", "what": "a `webhook` start",
+                 "path": "/in", "methods": "POST", "auth": false}
+            ])
         );
     }
 }

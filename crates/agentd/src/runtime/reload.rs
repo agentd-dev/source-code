@@ -172,16 +172,19 @@ impl Runtime {
         // going live to fail on the day it runs.
         let registry_inputs_moved =
             old.tools != new.tools || old.knowledge != new.knowledge || old.search != new.search;
-        // …and whenever the subagent templates change: what a spawn reaches
-        // and which streams a child mirrors in are inputs to the stream-taint
-        // check the definitions are held to.
-        let templates_moved = old.subagents != new.subagents;
+        // …and whenever anything the stream-taint check reads moves — the
+        // subagent templates (what a spawn reaches, which streams a child
+        // mirrors in), the service catalog an instance template's servers
+        // resolve against, `security.allow_trifecta` — so a stored definition,
+        // which nothing else re-checks, is held to the new line. The check
+        // names its own inputs, so this cannot fall behind what it reads.
+        let taint_inputs_moved = crate::config::taint::inputs_moved(old, new);
         let workflows = if old.workflows != new.workflows
             || external
             || channels_moved
             || servers_change
             || registry_inputs_moved
-            || templates_moved
+            || taint_inputs_moved
         {
             let mut staged = super::steps::StagedWorkflows::default();
             let docs = self.workflow_documents(&mut staged.errs);
@@ -475,7 +478,7 @@ impl Runtime {
             Some(mut r) => {
                 let live = workflows.as_ref().map_or(&self.workflows, |p| &p.workflows);
                 let defs: Vec<&crate::engine::Workflow> = live.values().map(|w| &**w).collect();
-                let errs = r.register_workflow_tools(&defs);
+                let errs = r.register_workflow_tools(&self.settings, &defs);
                 if !errs.is_empty() {
                     return Err(errs);
                 }

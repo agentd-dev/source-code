@@ -183,31 +183,57 @@ So every declared stream gets a tag set from every producer the configuration de
 - a webhook `into:` and an A2A `into:` add `untrusted_input` — a valid signature says who
   sent the text, not that it is safe to obey;
 - a subagent template's `mirror_streams` adds `untrusted_input`: the child's own producers
-  are compiled at spawn, into another process, and cannot be judged here;
-- an `emit` from a run that reads a tainted stream carries that stream's tags to its
-  target. Every `emit` target is static, so this is a fixed point over the workflow
-  graph.
+  are compiled at spawn, into another process, and cannot be judged here. The parent
+  enforces the list: an `_instance.emit` report into any stream the child's template does
+  not mirror is refused (`instance.mirror.fail`);
+- an `emit` from a run that carries taint puts it on its target. Every `emit` target is
+  static — a templated one is taken to be every declared stream — so this is a fixed point
+  over the workflow graph.
 
 A run started from a tainted stream (`stream` or `correlate` start) or waiting on one
-(`wait {on: event}`) carries its tags, and so does a run that such a run starts — a
-`workflow` step, or a workflow tool one of its agents can call. Each such workflow is
-then put through `check_trifecta` with its tags folded together with every server its
-model-driven steps can reach (`config/taint.rs::Reach`):
+(`wait {on: event}`; a templated stream name is any tainted stream) carries its tags, and
+so does a run that such a run starts: a `workflow` step, a workflow tool one of its agents
+can call, or the `workflow.run` / `workflow.signal` tools (a signal reaches every workflow
+with a `signal` start or a `wait {on: signal}`). Each such workflow is then put through
+`check_trifecta` with its tags folded together with every server its model-driven steps can
+reach (`config/taint.rs::Reach`):
 
-- an `agent` step reaches its `servers:`, or every configured server without the list;
-  a `subagent` step reaches its template's servers, or its own;
-- a step that can call `subagent.run` (no `tools:` list, or one that names it) reaches
-  whatever a child can be handed: every server, unless `subagents.allow_freeform: false`,
-  and every template's servers;
+- an `agent` step reaches its `servers:`, or every configured server without the list. A
+  templated entry reaches every server. With the list, the step is offered the MCP tools
+  of those servers alone — a tool a policy might gate included, which the supervisor
+  serves over its own connections (`runtime/turns.rs::tool_plan`);
+- a `subagent` step reaches its template's servers, or its own. A flat child is offered
+  no internal tool (`subagent/control.rs::NoSelfTools`) — except one a policy rule might
+  touch, which it routes back up for the supervisor to serve under the subagent grant
+  (`runtime/subagents.rs`, `gated_tools`); such a tool is the child's, judged by the same
+  `could_apply` the runtime asks. Of the MCP tools, only its own servers' are routed back
+  up;
+- a step (or a child) that can call a tool that hands text on reaches what that tool hands
+  it to, by the grant the registry gives the tool (`registry/internal.rs::onward`): `subagent.run`
+  and `subagent.send` whatever a child can be handed — every server, unless
+  `subagents.allow_freeform: false`, and every template's servers; `message.send` the root
+  grant. A `tools:` entry that is templated may name any tool. A deterministic `tool` step
+  naming one of these is the same hand-off;
 - `exec`, when it runs locally or is mapped off-box, is `sensitive` + `egress` on its own;
+  an internal tool mapped onto a server — a `tools.overrides` entry, or `knowledge.*` /
+  `search.*` on `knowledge.server` / `search.server` — reaches that server;
 - a `message` step hands the text to the agent's own conversation, which holds the root
   grant.
 
+A route's own run is the operator's call. A `webhook` or `a2a` start that fires a run, a
+`wait {on: webhook}`, and a webhook start's `signal:` relay hand a caller's text to a run
+directly; that run, and a run it starts, are not judged on their own reach — the operator
+who opened the route decided what its work may do (`examples/startup/sre.yaml`). What such
+a run puts on a stream is judged like `into:`: its `emit` taints the target, and the
+stream's consumers are checked.
+
 All three legs and no `security.allow_trifecta` is exit `2` — from `--validate-config` for
 the inline definitions, and at the start and on every reload for the whole set once
-`file:`, `url:` and `dir:` definitions resolve. A refused reload keeps the running
-configuration. The message names the workflow, the stream, what feeds it and the servers
-that brought the other two legs:
+`file:`, `url:` and `dir:` definitions resolve. A reload that moves anything the check
+reads (`config/taint.rs::inputs_moved`: the servers, the service catalog, the templates,
+the streams, the tools, the policies) re-judges the definitions, the stored ones included. A refused
+reload keeps the running configuration. The message names the workflow, the stream, what
+feeds it and the servers that brought the other two legs:
 
 ```text
 workflow "triage": lethal-trifecta refused — it consumes stream "inbox" (fed by webhook
@@ -219,11 +245,33 @@ A definition the agent writes is held to the same line: `workflow.create`/`updat
 refuses one that would complete the trifecta, and a stored one that a reload makes
 complete it is left out (`workflow.stored.invalid`), not allowed to veto the reload.
 
+A workflow tool's tags include the taint its run carries
+(`registry/mod.rs::register_workflow_tools`), so a policy matching `untrusted_input` sees
+it.
+
 This is coarse and static on purpose — per stream, not per value, and per server, like
-gate 1. It is a grant-level check, not data-flow tracking. The fix it points at is the
-[reader/actor split](#the-injection-firewall): the step that reads the stream holds no
-`sensitive` or `egress` server (narrow its `servers:` and give it a `tools:` list without
-`subagent.run`), and what it distils goes to an actor that never saw the raw text.
+gate 1. It is a grant-level check, not data-flow tracking. What it accepts is what it
+judges: every model-driven step of a run the outside text reaches — the run that reads
+the stream and any run it starts or feeds — is judged together, so a reader and an actor
+in one run, or an actor in a run the reader starts, are refused alike. A run that has to
+act on what it read does it either with no model-driven step holding both other legs
+(narrow `servers:` and give the step a `tools:` list that leaves out the tools that hand
+text on), or through a deterministic step.
+
+What it does not follow, so an operator knows where the line is:
+
+- **Deterministic steps.** `mcp.tool`, `http`, `a2a.send` and `a2a.delegate` are not
+  counted: their target is fixed in the definition and no model picks it. Their
+  *arguments* are templated, though, and can carry what a model that read the outside
+  text produced — give that model an `output_schema` so what reaches the arguments is
+  constrained.
+- **Shared state and results read back.** Text a model writes to memory or an artifact,
+  and a run's result read back through `workflow.run {wait}`, `workflow.wait`,
+  `workflow.status` or a workflow tool's reply, is not traced to whoever reads it.
+- **A definition the agent writes that opens a route.** `workflow.create`/`update` does
+  not refuse a `webhook` start or a `wait {on: webhook}` — only the configuration's
+  documents are held to the `interface` grant ([Inbound webhooks](#inbound-webhooks)).
+  `security.workflows.immutable` closes the tool.
 
 ### The tag floor and closed egress
 

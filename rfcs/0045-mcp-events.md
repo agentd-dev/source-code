@@ -1124,7 +1124,7 @@ flowchart LR
 10. **D10.** A URI is inserted into `uris` only after the server call succeeds, and the per-URI path subscribes only the new URI.
 11. **D11.** The webhook dedup marker is written only after a successful fire or append, in the same reactor pass. The key becomes `_wh_idem/…` outright (rule 1: nothing reads the old key). Markers gain an expiry sweep.
 12. **Reserve `/hooks/_`** at load for agentd's own routes. This protects today's `_cb` callbacks and, later, the MCP routes.
-13. **File the pre-existing RFC 0042 gap** (no `interface` gate on `kind: webhook` starts inside `:::!workflow`) as its own issue.
+13. **File the pre-existing RFC 0042 gap** (no `interface` gate on `kind: webhook` starts inside `:::!workflow`) as its own issue. *Done in `9d8b0db6`, not filed: a document's every spelling of a route (`:::!workflow`, `:::!config`, and what either references) needs the `interface` grant, and a template opens none. Still open, and recorded in `docs/security.md`: a definition the agent writes with `workflow.create`/`update` may open a route.*
 
 **Tests:**
 

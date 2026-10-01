@@ -339,7 +339,13 @@ impl Runtime {
         // Which of this child's tools a policy rule might touch. It calls its
         // MCP servers directly, so anything named here has to come back to the
         // supervisor or the rule silently never applies to the caller an
-        // operator is most likely narrowing.
+        // operator is most likely narrowing. Of the MCP tools, only those of
+        // the servers it was handed: the supervisor serves a gated call over
+        // its own connections, so an MCP tool gated beyond those would be one
+        // the child's model could call by name and reach a server the spawn
+        // never gave it. (An internal tool a rule might touch is served the
+        // same way, deliberately: `status`, `ask_human` and the rest are
+        // granted to subagents, and the stream-taint check counts them.)
         let gated_tools: Vec<String> = if self.settings.security.policies.is_empty() {
             Vec::new()
         } else {
@@ -347,6 +353,10 @@ impl Runtime {
                 .defs_for(&crate::registry::Caller::Subagent { allow: None }, None)
                 .iter()
                 .map(|d| d.name.clone())
+                .filter(|n| match self.registry.get(n).map(|t| &t.imp) {
+                    Some(crate::registry::Impl::Mcp { server, .. }) => servers.contains(server),
+                    _ => true,
+                })
                 .filter(|n| {
                     crate::sec::policy::could_apply(
                         &self.settings.security.policies,

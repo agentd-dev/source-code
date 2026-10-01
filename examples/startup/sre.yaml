@@ -248,10 +248,14 @@ workflows:
         subject: "incident.*"
         from: earliest
 
+      # The incident text it reads began as an alert body, so this agent
+      # reads only: infra's read verbs, and no tool that spawns a child or
+      # starts a run (one could be handed the public status page).
       write:
         kind: agent
         depends_on: take
         servers: [infra]
+        tools: ["get_*", "list_*", "query_*"]
         instruction: |
           Write a short blameless postmortem for this incident:
           {{ steps.take.output.data }}

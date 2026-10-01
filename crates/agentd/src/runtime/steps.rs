@@ -2438,6 +2438,12 @@ impl Runtime {
             ),
             None => self.system_prompt_named(None, extra.as_deref(), step_template.as_deref()),
         };
+        let listed: Option<Vec<String>> = spec.get("servers").and_then(Value::as_array).map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        });
         let (tools, internal, routes) = if is_think {
             (Vec::new(), Vec::new(), BTreeMap::new())
         } else {
@@ -2447,14 +2453,10 @@ impl Runtime {
                     .map(str::to_string)
                     .collect()
             });
-            self.tool_plan(&Caller::Workflow, allow.as_deref())
+            self.tool_plan(&Caller::Workflow, allow.as_deref(), listed.as_deref())
         };
-        let servers: Vec<String> = match spec.get("servers").and_then(Value::as_array) {
-            Some(a) => a
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect(),
+        let servers: Vec<String> = match listed {
+            Some(listed) => listed,
             None => routes
                 .values()
                 .map(|(s, _)| s.clone())

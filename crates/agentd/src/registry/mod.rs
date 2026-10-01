@@ -283,13 +283,7 @@ impl Registry {
         //    bare name unless it collides, then `<server>.<tool>`. A profile
         //    tool (`knowledge.*`, `search.*`, `code.run`) advertised by the
         //    configured profile server BECOMES that contract's implementation.
-        let profile_servers: BTreeMap<&str, &str> = [
-            ("knowledge", settings.knowledge.server.as_deref()),
-            ("search", settings.search.server.as_deref()),
-        ]
-        .into_iter()
-        .filter_map(|(k, v)| v.map(|v| (k, v)))
-        .collect();
+        let profile_servers = profile_servers(settings);
         for srv in servers {
             reg.servers.push(srv.name.clone());
             // Per-server admission control (`mcp.servers[].allow`/`exclude`),
@@ -435,13 +429,20 @@ impl Registry {
     /// `tags: [sensitive, egress]` would make the one static instance-wide
     /// security gate something the agent-editable half of the config asserts
     /// about itself; instead a workflow tool inherits the union of the tags of
-    /// the tools its steps actually reach, so the trifecta fold sees the truth
-    /// about what the procedure can do.
+    /// the tools its steps actually reach, plus the taint of whatever its run
+    /// reads from outside, so a policy matching on tags — and an operator
+    /// reading the derived tags logged at startup — sees the truth about what
+    /// the procedure can do.
     pub fn register_workflow_tools(
         &mut self,
+        settings: &Settings,
         workflows: &[&crate::engine::Workflow],
     ) -> Vec<String> {
         let mut errors = Vec::new();
+        // What each run carries from a tainted stream (or from a caller
+        // outside the boundary) is part of what calling the tool reaches: its
+        // result is that run's output (RFC 0045 §5.11.3).
+        let taint = crate::config::taint::run_tags(settings, workflows);
         for w in workflows {
             let Some(t) = &w.tool else { continue };
             if let Some(existing) = self.tools.get(&t.name) {
@@ -458,7 +459,12 @@ impl Registry {
                 ));
                 continue;
             }
-            let tags = self.derived_tags(w);
+            let mut tags = self.derived_tags(w);
+            for t in taint.get(&w.name).into_iter().flatten() {
+                if !tags.contains(t) {
+                    tags.push(*t);
+                }
+            }
             self.tools.insert(
                 t.name.clone(),
                 ToolSpec {
@@ -668,12 +674,16 @@ impl Registry {
         if !t.is_available() {
             return false;
         }
+        // A workflow tool's `grant` is the operator's, declared on the
+        // workflow exactly as a contract's default is declared in the table:
+        // both gate. Only MCP and code tools have no grant to consult.
+        let ungranted = matches!(t.class, ToolClass::Mcp | ToolClass::Code);
         match caller {
-            Caller::Root => t.grant.root || t.class != ToolClass::Internal,
-            Caller::Workflow => t.grant.workflows || t.class != ToolClass::Internal,
+            Caller::Root => t.grant.root || ungranted,
+            Caller::Workflow => t.grant.workflows || ungranted,
             Caller::Subagent { allow } => match allow {
                 Some(list) => list.iter().any(|p| pattern_matches(p, name)),
-                None => t.grant.subagents || t.class != ToolClass::Internal,
+                None => t.grant.subagents || ungranted,
             },
             Caller::Principal { role, grants } => match role {
                 Role::Operator => true,
@@ -853,6 +863,21 @@ impl Registry {
             })).collect::<Vec<_>>(),
         })
     }
+}
+
+/// The profile families whose mapping-only contracts a configured server
+/// implements: `knowledge.*` on `knowledge.server`, `search.*` on
+/// `search.server`, when that server advertises them. One table for the
+/// registry that maps them and the stream-taint check that has to know which
+/// server a call to one reaches (`config::taint`).
+pub fn profile_servers(settings: &Settings) -> BTreeMap<&'static str, &str> {
+    [
+        ("knowledge", settings.knowledge.server.as_deref()),
+        ("search", settings.search.server.as_deref()),
+    ]
+    .into_iter()
+    .filter_map(|(k, v)| v.map(|v| (k, v)))
+    .collect()
 }
 
 /// `memory.*` / `workflow.run` / `*` style pattern match.
@@ -1197,6 +1222,77 @@ mod tests {
         assert!(
             joined.contains("does not advertise tool \"missing\""),
             "{joined}"
+        );
+    }
+
+    /// A workflow tool's `grant` gates as a contract's does: declared
+    /// `workflows: false`, a workflow step is not offered it and cannot call
+    /// it — the stream-taint check counts on exactly that.
+    #[test]
+    fn a_workflow_tools_grant_is_enforced() {
+        let wf = |name: &str, grant: Value| {
+            crate::engine::model::parse_workflow(&json!({
+                "name": name, "tool": {"name": format!("{name}.go"), "grant": grant},
+                "steps": {"s": {"kind": "manual"},
+                          "f": {"kind": "finish", "depends_on": ["s"], "status": "completed"}}
+            }))
+            .unwrap()
+        };
+        let (open, shut) = (
+            wf("open", json!({})),
+            wf(
+                "shut",
+                json!({"root": false, "workflows": false, "subagents": false}),
+            ),
+        );
+        let s = settings(json!({}));
+        let mut reg = Registry::build(&s, &[]).unwrap();
+        assert!(reg.register_workflow_tools(&s, &[&open, &shut]).is_empty());
+        assert!(reg.allowed(&Caller::Root, "open.go"));
+        assert!(reg.allowed(&Caller::Workflow, "open.go"));
+        assert!(!reg.allowed(&Caller::Subagent { allow: None }, "open.go"));
+        for caller in [
+            Caller::Root,
+            Caller::Workflow,
+            Caller::Subagent { allow: None },
+        ] {
+            assert!(!reg.allowed(&caller, "shut.go"), "{caller:?}");
+        }
+        assert!(
+            !reg.defs_for(&Caller::Workflow, None)
+                .iter()
+                .any(|d| d.name == "shut.go")
+        );
+    }
+
+    /// RFC 0045 §5.11.3: what a workflow tool's run reads from a tainted
+    /// stream is in the tool's tags, so a policy matching `untrusted_input`
+    /// sees it.
+    #[test]
+    fn a_workflow_tool_reading_a_tainted_stream_carries_untrusted_input() {
+        let parse = |v: Value| crate::engine::model::parse_workflow(&v).unwrap();
+        let intake = parse(json!({"name": "intake", "steps": {
+            "s": {"kind": "webhook", "path": "/in", "into": {"stream": "inbox", "subject": "m"}}
+        }}));
+        let reader = parse(
+            json!({"name": "reader", "tool": {"name": "inbox.next"}, "steps": {
+                "s": {"kind": "manual"},
+                "w": {"kind": "wait", "depends_on": ["s"], "on": "event", "stream": "inbox"},
+                "f": {"kind": "finish", "depends_on": ["w"], "status": "completed"}
+            }}),
+        );
+        let s = settings(json!({"streams": {"inbox": {}}}));
+        let mut reg = Registry::build(&s, &[]).unwrap();
+        assert!(reg.register_workflow_tools(&s, &[&reader]).is_empty());
+        assert!(reg.get("inbox.next").unwrap().tags.is_empty());
+        let mut reg = Registry::build(&s, &[]).unwrap();
+        assert!(
+            reg.register_workflow_tools(&s, &[&intake, &reader])
+                .is_empty()
+        );
+        assert_eq!(
+            reg.get("inbox.next").unwrap().tags,
+            vec![TrifectaTag::UntrustedInput]
         );
     }
 

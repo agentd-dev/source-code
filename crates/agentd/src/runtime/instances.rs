@@ -826,6 +826,26 @@ impl Runtime {
             }
             InstanceOp::Emit => {
                 let stream = args["stream"].as_str().unwrap_or("").to_string();
+                // Only into a stream the child's template mirrors. That list
+                // is the producer set the stream-taint check judges at load
+                // (`config::taint`); a report into any other stream would put
+                // a child's text where the check saw nothing outside feeding.
+                let mirrored = self
+                    .subagents
+                    .get(&handle)
+                    .and_then(|r| r.template.as_deref())
+                    .and_then(|t| self.settings.subagents.templates.get(t))
+                    .is_some_and(|t| t.mirror_streams.iter().flatten().any(|m| *m == stream));
+                if !mirrored {
+                    self.log.warn(
+                        "instance.mirror.fail",
+                        json!({"handle": handle, "stream": stream,
+                               "err": "not one of the template's mirror_streams"}),
+                    );
+                    return Err(format!(
+                        "stream {stream:?} is not one of instance child {handle:?}'s mirror_streams"
+                    ));
+                }
                 let event = args.get("event").cloned().unwrap_or(Value::Null);
                 let subject = event["subject"].as_str().unwrap_or("").to_string();
                 let correlation = event["correlation"].as_str().map(str::to_string);

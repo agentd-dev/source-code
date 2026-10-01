@@ -1675,6 +1675,21 @@ pub struct InboundRoute<'a> {
     /// start carries it at the top level, a wait under `webhook.auth`
     /// (`runtime::webhooks::webhook_wait`).
     pub auth: Option<&'a Value>,
+    /// The route's own fields (`path`, `methods`), where the listener reads
+    /// them: the start itself, or a wait's `webhook` block.
+    pub route: Option<&'a Value>,
+}
+
+/// What a step of `kind` opens on the webhook listener, in the words a
+/// refusal uses — `on` is a `wait`'s. The one judgement [`inbound_routes`]
+/// walks a raw definition with, and the stream-taint check walks a parsed one
+/// with (`config::taint`: what such a route hands a run came from outside).
+pub fn route_opener(kind: &str, on: Option<&str>) -> Option<&'static str> {
+    match (kind, on) {
+        ("webhook", _) => Some("a `webhook` start"),
+        ("wait", Some("webhook")) => Some("a `wait {on: webhook}`"),
+        _ => None,
+    }
 }
 
 /// Every step of a raw workflow definition that opens an inbound route on the
@@ -1685,9 +1700,11 @@ pub struct InboundRoute<'a> {
 ///
 /// THE list. Every judgement of "does this workflow open a route" reads it —
 /// the listener and auth checks at load, a served document's boundary (a
-/// document opens one only under the `interface` grant), and the instance
-/// child's refusal (a child has no listener) — so a new inbound shape is added
-/// once, and no check can see a route another misses. An `a2a` start is not in
+/// document opens one only under the `interface` grant), the instance child's
+/// refusal (a child has no listener) and the run manifest's route listing; the
+/// stream-taint check reads the same [`route_opener`] over a parsed
+/// definition — so a new inbound shape is added once, and no check can see a
+/// route another misses. An `a2a` start is not in
 /// it: it answers on the A2A listener, whose callers and their roles are the
 /// operator's (`a2a.principals`), where a webhook route brings its own path and
 /// its own `auth`.
@@ -1698,19 +1715,21 @@ pub fn inbound_routes(def: &Value) -> Vec<InboundRoute<'_>> {
         };
         for (id, st) in steps {
             let step = format!("{prefix}{id}");
-            match st.get("kind").and_then(Value::as_str) {
-                Some("webhook") => out.push(InboundRoute {
+            let kind = st.get("kind").and_then(Value::as_str).unwrap_or("");
+            if let Some(what) = route_opener(kind, st.get("on").and_then(Value::as_str)) {
+                // A start is its own route; a wait carries its route under
+                // `webhook`.
+                let route = if kind == "webhook" {
+                    Some(st)
+                } else {
+                    st.get("webhook")
+                };
+                out.push(InboundRoute {
                     step: step.clone(),
-                    what: "a `webhook` start",
-                    auth: st.get("auth"),
-                }),
-                Some("wait") if st.get("on").and_then(Value::as_str) == Some("webhook") => out
-                    .push(InboundRoute {
-                        step: step.clone(),
-                        what: "a `wait {on: webhook}`",
-                        auth: st.get("webhook").and_then(|w| w.get("auth")),
-                    }),
-                _ => {}
+                    what,
+                    auth: route.and_then(|r| r.get("auth")),
+                    route,
+                });
             }
             if let Some(body) = st.get("body").and_then(|b| b.get("steps")) {
                 walk(body, &format!("{step}/"), out);

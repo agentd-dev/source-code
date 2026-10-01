@@ -210,6 +210,7 @@ impl super::reactor::Runtime {
 
     pub(crate) fn poll_stream_starts(&mut self) {
         let consumers = self.stream_consumers("stream");
+        let mut lags = Vec::with_capacity(consumers.len());
         for (workflow, node, spec) in consumers {
             let Some(stream) = spec.get("stream").and_then(Value::as_str) else {
                 continue;
@@ -240,9 +241,15 @@ impl super::reactor::Runtime {
                     }
                 }
             };
+            // Taken before the trim check below, so that skipping forward is
+            // itself a change that persists: otherwise every pass would find
+            // the same gap and report it again.
+            let start_offset = offset;
+            let mut skipped = Skipped::default();
             // Retention may have trimmed past a lagging consumer.
             if offset + 1 < meta.first {
-                offset = meta.first.saturating_sub(1);
+                skipped.note(offset + 1, meta.first - 1);
+                offset = meta.first - 1;
             }
             let mut ids: Vec<Value> = st
                 .get("last_ids")
@@ -279,7 +286,6 @@ impl super::reactor::Runtime {
                 .cloned()
                 .unwrap_or_default();
             let mut batch_since = st.get("batch_since").and_then(Value::as_u64);
-            let start_offset = offset;
             let mut fired = 0usize;
             while offset < meta.seq && fired < BATCH {
                 let next = offset + 1;
@@ -289,7 +295,10 @@ impl super::reactor::Runtime {
                     .ok()
                     .flatten()
                 else {
-                    offset = next; // trimmed underneath us — skip forward
+                    // Gone underneath us: as lost as a trimmed event, and
+                    // reported with them.
+                    skipped.note(next, next);
+                    offset = next;
                     continue;
                 };
                 let event = env.state;
@@ -336,24 +345,44 @@ impl super::reactor::Runtime {
                         break;
                     }
                 }
-                match batch_size {
+                // A refused firing is handled exactly like being paced out:
+                // the event stays on the stream and is offered again on a
+                // later pass. Shed, frozen and a failed inbox write are all
+                // temporary, and moving the offset past them would lose the
+                // event for good.
+                let admitted = match batch_size {
                     Some(n) => {
                         batch_since.get_or_insert_with(now_ms);
                         batch.push(event);
                         if batch.len() >= n {
-                            let events = std::mem::take(&mut batch);
-                            batch_since = None;
-                            let count = events.len();
-                            self.fire_start(
-                                &workflow,
-                                &node,
-                                &spec,
-                                json!({"events": events, "count": count, "full": true}),
-                                "stream",
-                            );
+                            let outcome =
+                                self.fire_batch(&workflow, &node, &spec, stream, &batch, true);
+                            if outcome.consumed() {
+                                batch.clear();
+                                batch_since = None;
+                            } else {
+                                // The rest of the batch is durable start-state
+                                // already; only the event that filled it goes
+                                // back to the stream.
+                                batch.pop();
+                                if batch.is_empty() {
+                                    batch_since = None;
+                                }
+                            }
+                            outcome.consumed()
+                        } else {
+                            true
                         }
                     }
-                    None => self.fire_start(&workflow, &node, &spec, event, "stream"),
+                    None => {
+                        let origin = json!({"stream": stream, "seq": next, "event_id": id});
+                        self.fire_stream_start(&workflow, &node, &spec, event, "stream", origin)
+                            .consumed()
+                    }
+                };
+                if !admitted {
+                    offset -= 1;
+                    break;
                 }
                 if !id.is_null() {
                     ids.push(id);
@@ -367,22 +396,25 @@ impl super::reactor::Runtime {
             // A batch that never fills would otherwise hold events for ever on
             // a quiet stream: `window` is what bounds that latency, and the
             // sweep runs every tick rather than only when an event arrives —
-            // the last event of a burst must not wait for the next burst.
+            // the last event of a burst must not wait for the next burst. A
+            // refused partial batch stays as it is and is offered again by the
+            // next sweep.
             if let (Some(_), Some(win), Some(since)) = (batch_size, batch_window_ms, batch_since)
                 && !batch.is_empty()
                 && now_ms().saturating_sub(since) >= win
+                && self
+                    .fire_batch(&workflow, &node, &spec, stream, &batch, false)
+                    .consumed()
             {
-                let events = std::mem::take(&mut batch);
+                batch.clear();
                 batch_since = None;
-                let count = events.len();
-                self.fire_start(
-                    &workflow,
-                    &node,
-                    &spec,
-                    json!({"events": events, "count": count, "full": false}),
-                    "stream",
-                );
             }
+            self.log_skipped(stream, &workflow, &node, &skipped);
+            lags.push((
+                stream.to_string(),
+                format!("{workflow}/{node}"),
+                meta.seq.saturating_sub(offset),
+            ));
             let batch_changed = batch_size.is_some()
                 && (st.get("batch") != Some(&Value::Array(batch.clone()))
                     || st.get("batch_since").and_then(Value::as_u64) != batch_since);
@@ -399,6 +431,57 @@ impl super::reactor::Runtime {
                 self.set_start_state_pub(&workflow, &node, st);
             }
         }
+        crate::obs::metrics::set_stream_lag("stream", lags);
+    }
+
+    /// Offer a batch as ONE run. `full` says whether `size` filled it or its
+    /// `window` ran out, so a run can tell the two apart.
+    fn fire_batch(
+        &mut self,
+        workflow: &str,
+        node: &str,
+        spec: &serde_json::Map<String, Value>,
+        stream: &str,
+        batch: &[Value],
+        full: bool,
+    ) -> super::starts::Admission {
+        let seq = |e: Option<&Value>| e.and_then(|e| e.get("seq")).cloned();
+        let origin = json!({
+            "stream": stream, "from": seq(batch.first()), "to": seq(batch.last()),
+            "events": batch.len(),
+        });
+        let payload = json!({"events": batch, "count": batch.len(), "full": full});
+        self.fire_stream_start(workflow, node, spec, payload, "stream", origin)
+    }
+
+    /// Say that retention (or a missing record) took events this consumer had
+    /// not read. The consumer cannot get them back, but the operator can size
+    /// `retention` or `rate` for next time — and only if the loss is visible.
+    fn log_skipped(&self, stream: &str, workflow: &str, node: &str, skipped: &Skipped) {
+        if let Some(from) = skipped.from {
+            self.log.warn(
+                "stream.consumer.skipped",
+                json!({"stream": stream, "workflow": workflow, "node": node,
+                       "from": from, "to": skipped.to, "events": skipped.events}),
+            );
+        }
+    }
+}
+
+/// The events one consumer pass moved past without reading: the range they
+/// span and how many there were.
+#[derive(Default)]
+struct Skipped {
+    from: Option<u64>,
+    to: u64,
+    events: u64,
+}
+
+impl Skipped {
+    fn note(&mut self, from: u64, to: u64) {
+        self.from.get_or_insert(from);
+        self.to = to;
+        self.events += to - from + 1;
     }
 }
 
@@ -591,7 +674,9 @@ impl crate::runtime::reactor::Runtime {
     /// correlation value whose partner never arrives would be kept for ever,
     /// which is why `window` is mandatory and `max_pending` is enforced.
     pub(crate) fn poll_correlate_starts(&mut self) {
-        for (workflow, node, spec) in self.stream_consumers("correlate") {
+        let consumers = self.stream_consumers("correlate");
+        let mut lags = Vec::with_capacity(consumers.len());
+        for (workflow, node, spec) in consumers {
             let Some(stream) = spec.get("stream").and_then(Value::as_str) else {
                 continue;
             };
@@ -652,8 +737,11 @@ impl crate::runtime::reactor::Runtime {
                     }
                 }
             };
+            let start_offset = offset;
+            let mut skipped = Skipped::default();
             if offset + 1 < meta.first {
-                offset = meta.first.saturating_sub(1);
+                skipped.note(offset + 1, meta.first - 1);
+                offset = meta.first - 1;
             }
             let mut pending: serde_json::Map<String, Value> = st
                 .get("pending")
@@ -666,8 +754,25 @@ impl crate::runtime::reactor::Runtime {
                 .cloned()
                 .unwrap_or_default();
 
-            let start_offset = offset;
+            // A set that completed on an earlier pass but was not admitted then
+            // (shed, frozen, a failed inbox write) waits in `pending` and goes
+            // first. Taking it out BEFORE the window sweep matters: a complete
+            // join is not an expired one, and the sweep would discard it.
             let mut ready: Vec<(String, Value)> = Vec::new();
+            let complete: Vec<String> = pending
+                .iter()
+                .filter(|(_, v)| {
+                    v["events"]
+                        .as_object()
+                        .is_some_and(|got| subjects.iter().all(|s| got.contains_key(s)))
+                })
+                .map(|(k, _)| k.clone())
+                .collect();
+            for corr in complete {
+                if let Some(set) = pending.remove(&corr) {
+                    ready.push((corr, set));
+                }
+            }
             let mut consumed = 0usize;
             while offset < meta.seq && consumed < BATCH {
                 let next = offset + 1;
@@ -677,6 +782,7 @@ impl crate::runtime::reactor::Runtime {
                     .ok()
                     .flatten()
                 else {
+                    skipped.note(next, next);
                     offset = next;
                     continue;
                 };
@@ -782,7 +888,17 @@ impl crate::runtime::reactor::Runtime {
                 }
             }
 
+            // The events of a set are consumed from the stream already — they
+            // live in the durable `pending` — so a set that is not admitted
+            // goes back there, intact, and is offered again on a later pass.
+            // Once one is refused the rest would be too: they wait with it
+            // rather than each writing the same refusal.
+            let mut refused = false;
             for (corr, set) in ready {
+                if refused {
+                    pending.insert(corr, set);
+                    continue;
+                }
                 let events: Vec<Value> = subjects
                     .iter()
                     .filter_map(|s| set["events"].get(s).cloned())
@@ -791,14 +907,26 @@ impl crate::runtime::reactor::Runtime {
                     .iter()
                     .filter(|s| set["events"].get(s.as_str()).is_none())
                     .collect();
+                let origin = json!({"stream": stream, "correlation": corr, "events": events.len()});
                 let payload = json!({
                     "correlation": corr,
                     "events": events,
                     "complete": missing.is_empty(),
                     "missing": missing,
                 });
-                self.fire_start(&workflow, &node, &spec, payload, "correlate");
+                let outcome =
+                    self.fire_stream_start(&workflow, &node, &spec, payload, "correlate", origin);
+                if !outcome.consumed() {
+                    refused = true;
+                    pending.insert(corr, set);
+                }
             }
+            self.log_skipped(stream, &workflow, &node, &skipped);
+            lags.push((
+                stream.to_string(),
+                format!("{workflow}/{node}"),
+                meta.seq.saturating_sub(offset),
+            ));
 
             if offset != start_offset
                 || !anchored
@@ -810,6 +938,7 @@ impl crate::runtime::reactor::Runtime {
                 self.set_start_state_pub(&workflow, &node, st);
             }
         }
+        crate::obs::metrics::set_stream_lag("correlate", lags);
     }
 }
 

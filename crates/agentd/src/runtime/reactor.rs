@@ -355,6 +355,11 @@ pub struct Runtime {
     pub(crate) memory_keys: std::collections::HashMap<String, Vec<String>>,
     /// An `emit` appended since the last stream poll (same-iteration wake).
     pub(crate) stream_dirty: bool,
+    /// Stream consumers (`workflow.node`) whose offered event was refused, and
+    /// why — so a consumer that offers the same event every pass writes its
+    /// refusal once, not once per tick. In memory: after a restart the first
+    /// refusal is worth saying again.
+    pub(crate) start_held: std::collections::HashMap<String, super::starts::Admission>,
     pub(crate) log: Logger,
     pub(crate) instance: String,
     pub(crate) run_id: String,

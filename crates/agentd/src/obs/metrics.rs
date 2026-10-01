@@ -434,6 +434,24 @@ pub fn set_work_backlog(runs_active: u64, turns_queued: u64) {
     let _ = (runs_active, turns_queued);
 }
 
+/// Point-in-time `agent_stream_lag{stream,consumer}` for every consumer of
+/// one start `kind` (`stream`, `correlate`): how many events on its stream it
+/// has not consumed yet. Each call REPLACES that kind's set, so a consumer a
+/// reload removed stops being exported instead of freezing at its last value.
+/// `consumer` is `<workflow>/<node>` — both declared names, so the label set
+/// is bounded by the configuration; past [`STREAM_LAG_SLOTS`] consumers of a
+/// kind the rest fold into one `other` series carrying their largest lag.
+pub fn set_stream_lag(kind: &'static str, lags: Vec<(String, String, u64)>) {
+    #[cfg(feature = "metrics")]
+    imp::REGISTRY.set_stream_lag(kind, lags);
+    #[cfg(not(feature = "metrics"))]
+    let _ = (kind, lags);
+}
+
+/// How many `{stream,consumer}` series one start kind exports before the rest
+/// fold into `other`.
+pub const STREAM_LAG_SLOTS: usize = 32;
+
 /// Render the current counters (+ live cgroup memory gauges) as Prometheus text.
 #[cfg(feature = "metrics")]
 pub fn render_prometheus() -> String {
@@ -625,6 +643,18 @@ mod imp {
         store_latency_ms_sum: AtomicU64,
         pub(super) inbox_pending: AtomicU64,
         pub(super) context_tokens: AtomicU64,
+
+        // --- stream consumer lag, by start kind ------------------------------
+        // Replaced whole per kind on every consumer pass; see `set_stream_lag`.
+        stream_lag: std::sync::Mutex<std::collections::BTreeMap<&'static str, StreamLag>>,
+    }
+
+    /// One start kind's consumers as of their last pass: the named series, and
+    /// the largest lag among those past the slot limit (`None` when none were).
+    #[derive(Default)]
+    struct StreamLag {
+        named: Vec<(String, String, u64)>,
+        other: Option<u64>,
     }
 
     impl Registry {
@@ -676,7 +706,25 @@ mod imp {
                 store_latency_ms_sum: AtomicU64::new(0),
                 inbox_pending: AtomicU64::new(0),
                 context_tokens: AtomicU64::new(0),
+                stream_lag: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             }
+        }
+
+        pub(super) fn set_stream_lag(
+            &self,
+            kind: &'static str,
+            mut lags: Vec<(String, String, u64)>,
+        ) {
+            let other = lags
+                .get(super::STREAM_LAG_SLOTS..)
+                .and_then(|rest| rest.iter().map(|(_, _, lag)| *lag).max());
+            lags.truncate(super::STREAM_LAG_SLOTS);
+            // Poisoning is ignored: telemetry must never crash the agent.
+            let mut table = match self.stream_lag.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            table.insert(kind, StreamLag { named: lags, other });
         }
 
         pub(super) fn record_run(&self, outcome: RunOutcome) {
@@ -1258,6 +1306,35 @@ mod imp {
                 "Estimated token size of the largest live conversation context.",
                 g(&self.context_tokens),
             );
+
+            // --- stream consumers ----------------------------------------------
+            // One series per armed `stream`/`correlate` consumer, so a consumer
+            // that falls behind is visible before retention trims past it (the
+            // trim itself is the `stream.consumer.skipped` line). No consumers,
+            // no samples: a 0 would claim a consumer that does not exist.
+            {
+                let table = match self.stream_lag.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                let name = "agent_stream_lag";
+                let _ = writeln!(
+                    s,
+                    "# HELP {name} Events on a stream that its consumer has not consumed yet."
+                );
+                let _ = writeln!(s, "# TYPE {name} gauge");
+                for (stream, consumer, lag) in table.values().flat_map(|k| &k.named) {
+                    let _ = writeln!(
+                        s,
+                        "{name}{{stream={:?},consumer={:?}}} {lag}",
+                        stream.as_str(),
+                        consumer.as_str()
+                    );
+                }
+                if let Some(other) = table.values().filter_map(|k| k.other).max() {
+                    let _ = writeln!(s, "{name}{{stream=\"other\",consumer=\"other\"}} {other}");
+                }
+            }
             s
         }
     }
@@ -1541,6 +1618,57 @@ mod imp {
             assert!(out.contains("agent_inflight_reactions 1"));
             assert!(out.contains("agent_subscriptions_active 9"));
             assert!(out.contains("agent_reaction_lag_ms 250"));
+        }
+
+        #[test]
+        fn stream_lag_is_one_series_per_consumer_and_replaced_per_kind() {
+            let r = Registry::new();
+            // No consumer, no sample: the family is discoverable, but a 0 would
+            // claim a consumer that does not exist.
+            let out = r.render();
+            assert!(out.contains("# TYPE agent_stream_lag gauge"));
+            assert!(!out.contains("agent_stream_lag{"));
+            r.set_stream_lag(
+                "stream",
+                vec![
+                    ("orders".into(), "fulfil/take".into(), 3),
+                    ("ticks".into(), "bulk/take".into(), 0),
+                ],
+            );
+            r.set_stream_lag("correlate", vec![("orders".into(), "join/both".into(), 7)]);
+            let out = r.render();
+            assert!(out.contains("agent_stream_lag{stream=\"orders\",consumer=\"fulfil/take\"} 3"));
+            assert!(out.contains("agent_stream_lag{stream=\"ticks\",consumer=\"bulk/take\"} 0"));
+            assert!(out.contains("agent_stream_lag{stream=\"orders\",consumer=\"join/both\"} 7"));
+            assert_eq!(out.matches("# TYPE agent_stream_lag gauge").count(), 1);
+            // A pass replaces its kind's set whole: a consumer a reload removed
+            // stops being exported rather than freezing at its last value, and
+            // the other kind is untouched.
+            r.set_stream_lag("stream", vec![("orders".into(), "fulfil/take".into(), 1)]);
+            let out = r.render();
+            assert!(out.contains("consumer=\"fulfil/take\"} 1"));
+            assert!(!out.contains("bulk/take"));
+            assert!(out.contains("consumer=\"join/both\"} 7"));
+            // Past the slot limit the rest fold into ONE `other` series that
+            // carries the worst of them, so the cardinality stays bounded and
+            // a lagging consumer is never invisible.
+            let many = (0..super::super::STREAM_LAG_SLOTS + 3)
+                .map(|i| ("s".to_string(), format!("w{i}/n"), i as u64))
+                .collect();
+            r.set_stream_lag("stream", many);
+            let out = r.render();
+            let worst = super::super::STREAM_LAG_SLOTS + 2;
+            assert!(out.contains(&format!(
+                "agent_stream_lag{{stream=\"other\",consumer=\"other\"}} {worst}"
+            )));
+            assert!(!out.contains(&format!("consumer=\"w{worst}/n\"")));
+            assert_eq!(
+                out.lines()
+                    .filter(|l| l.starts_with("agent_stream_lag{"))
+                    .count(),
+                super::super::STREAM_LAG_SLOTS + 2,
+                "the named slots, join/both, and other"
+            );
         }
 
         #[test]

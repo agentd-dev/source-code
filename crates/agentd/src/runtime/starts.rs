@@ -23,6 +23,38 @@ use serde_json::{Map, Value, json};
 /// `(workflow, node, kind, spec)` — a start node identity + its config.
 type StartSpec = (String, String, String, Map<String, Value>);
 
+/// What became of one start firing.
+///
+/// Most starts fire once per occurrence and have nothing to do with the
+/// answer: a shed schedule is skipped and the next tick of the clock is a new
+/// occurrence. A durable stream consumer is different — the event it offered
+/// is still on the stream, and moving its offset past an event that never
+/// became a run loses that event for good. So the outcome is returned, and
+/// the consumer decides with [`Admission::consumed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Admission {
+    /// The start event is in the durable inbox: a run will start.
+    Accepted,
+    /// Resource pressure refused new work.
+    Shed,
+    /// A §7.7 freshness freeze refused new work.
+    Frozen,
+    /// The inbox write-ahead failed, so nothing durable records the firing.
+    InboxFailed,
+    /// The `inputs` mapping did not render against this payload. Offering
+    /// the same payload again would fail the same way.
+    InputsInvalid,
+}
+
+impl Admission {
+    /// Whether a durable consumer may move past what it offered: it fired, or
+    /// it can never fire and was discarded with a line naming it. Every other
+    /// outcome is temporary, and the event is offered again later.
+    pub(crate) fn consumed(self) -> bool {
+        matches!(self, Admission::Accepted | Admission::InputsInvalid)
+    }
+}
+
 impl Runtime {
     /// The manifest key for a start node's state.
     fn start_key(workflow: &str, node: &str) -> String {
@@ -117,7 +149,9 @@ impl Runtime {
                             .and_then(|d| crate::config::parse_duration(d).ok());
                         match delay {
                             Some(d) if !d.is_zero() => self.set_start_state(&workflow, &node, json!({"iteration": iteration, "next_ms": now_ms() + d.as_millis() as u64})),
-                            _ => self.fire_start(&workflow, &node, &spec, json!({"iteration": iteration}), "loop"),
+                            _ => {
+                                self.fire_start(&workflow, &node, &spec, json!({"iteration": iteration}), "loop");
+                            }
                         }
                     }
                 }
@@ -392,8 +426,8 @@ impl Runtime {
         spec: &Map<String, Value>,
         payload: Value,
         kind: &str,
-    ) {
-        self.fire_start_run(workflow, node, spec, payload, kind, None);
+    ) -> Admission {
+        self.fire_start_run(workflow, node, spec, payload, kind, None)
     }
 
     /// Like [`Runtime::fire_start`], with an optional pre-generated `run_id` (so a
@@ -406,7 +440,53 @@ impl Runtime {
         payload: Value,
         kind: &str,
         run_id: Option<&str>,
-    ) {
+    ) -> Admission {
+        self.admit_start(workflow, node, spec, payload, kind, run_id, None)
+    }
+
+    /// A durable stream consumer (`stream`, its `batch`, `correlate`) offers
+    /// what it read. `origin` names it — `stream` plus the seq and event id, or
+    /// the range a batch covers — and rides on every line this firing writes,
+    /// because a refusal that does not say WHICH event it held is one an
+    /// operator cannot match to the stream.
+    ///
+    /// The caller moves its offset only when the outcome is
+    /// [`Admission::consumed`]; anything else is offered again on a later pass,
+    /// so a refusal here is a delay, never a loss.
+    pub(crate) fn fire_stream_start(
+        &mut self,
+        workflow: &str,
+        node: &str,
+        spec: &Map<String, Value>,
+        payload: Value,
+        kind: &str,
+        origin: Value,
+    ) -> Admission {
+        self.admit_start(workflow, node, spec, payload, kind, None, Some(origin))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn admit_start(
+        &mut self,
+        workflow: &str,
+        node: &str,
+        spec: &Map<String, Value>,
+        payload: Value,
+        kind: &str,
+        run_id: Option<&str>,
+        origin: Option<Value>,
+    ) -> Admission {
+        // Every line about this firing carries the same identity, plus the
+        // stream position when a consumer is offering an event.
+        let fields = |extra: Value| -> Value {
+            let mut f = json!({"workflow": workflow, "node": node, "kind": kind});
+            for add in [origin.as_ref(), Some(&extra)].into_iter().flatten() {
+                if let (Some(f), Some(add)) = (f.as_object_mut(), add.as_object()) {
+                    f.extend(add.iter().map(|(k, v)| (k.clone(), v.clone())));
+                }
+            }
+            f
+        };
         // Admission gate: a fired start under pressure is SKIPPED — logged with
         // its cause, so a schedule that quietly stopped firing while the disk
         // filled is a story the log tells, not a mystery. In-flight runs keep
@@ -417,22 +497,17 @@ impl Runtime {
             .get(workflow)
             .is_some_and(|w| w.priority == crate::engine::model::Priority::Low);
         if let Some(cause) = self.pressure.refusal(low) {
-            self.log.warn(
-                "start.shed",
-                json!({"workflow": workflow, "node": node, "kind": kind, "cause": cause}),
-            );
-            return;
+            let line = fields(json!({"cause": cause}));
+            return self.refuse(workflow, node, origin.is_some(), Admission::Shed, line);
         }
         // §7.7 revocation: a stale signed instruction source refuses NEW work
         // (live runs keep draining). The freeze clears on the next reachable
         // re-read.
         if self.freshness_frozen {
-            self.log.warn(
-                "start.frozen",
-                json!({"workflow": workflow, "node": node, "kind": kind,
-                       "cause": "signed instruction source is stale past its freshness deadline (§7.7)"}),
-            );
-            return;
+            let line = fields(json!({
+                "cause": "signed instruction source is stale past its freshness deadline (§7.7)"
+            }));
+            return self.refuse(workflow, node, origin.is_some(), Admission::Frozen, line);
         }
         let inputs = match spec.get("inputs") {
             Some(mapping) => {
@@ -449,27 +524,19 @@ impl Runtime {
                         // render cancels the firing rather than starting the
                         // run with silently-empty inputs, so a typo in the
                         // mapping surfaces as one line here instead of as a
-                        // mystery three steps later.
-                        self.log.warn(
-                            "start.inputs.invalid",
-                            json!({"workflow": workflow, "node": node, "kind": kind, "err": e}),
-                        );
-                        return;
+                        // mystery three steps later. Offering the same event
+                        // again would fail the same way for ever, so a stream
+                        // consumer moves past it — this line, naming the
+                        // event, is its record.
+                        self.log
+                            .warn("start.inputs.invalid", fields(json!({"err": e})));
+                        self.start_held.remove(&Self::start_key(workflow, node));
+                        return Admission::InputsInvalid;
                     }
                 }
             }
             None => json!({}),
         };
-        self.log.info(
-            "start.fired",
-            json!({"workflow": workflow, "node": node, "kind": kind}),
-        );
-        let mut st = self.start_state(workflow, node);
-        st["last_fired"] = json!(now_ms());
-        if kind == "loop" {
-            st["iteration"] = json!(st["iteration"].as_u64().unwrap_or(0) + 1);
-        }
-        self.set_start_state(workflow, node, st);
         let mut ev =
             json!({"workflow": workflow, "node": node, "payload": payload, "inputs": inputs});
         // The logical thing this run is ABOUT, rendered here because this is
@@ -524,7 +591,62 @@ impl Runtime {
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| self.settings.identity.autonomous_id().to_string());
-        let _ = self.accept_event(kinds::START_FIRED, Some(acting), ev);
+        // The write-ahead decides whether this fired at all, so it comes before
+        // `start.fired` and the start-state bookkeeping: a firing whose inbox
+        // write failed did not happen, and must neither say it did nor count
+        // a loop iteration it never ran.
+        if let Err(e) = self.accept_event(kinds::START_FIRED, Some(acting), ev) {
+            let line = fields(json!({"err": e}));
+            return self.refuse(
+                workflow,
+                node,
+                origin.is_some(),
+                Admission::InboxFailed,
+                line,
+            );
+        }
+        self.start_held.remove(&Self::start_key(workflow, node));
+        self.log.info("start.fired", fields(json!({})));
+        let mut st = self.start_state(workflow, node);
+        st["last_fired"] = json!(now_ms());
+        if kind == "loop" {
+            st["iteration"] = json!(st["iteration"].as_u64().unwrap_or(0) + 1);
+        }
+        self.set_start_state(workflow, node, st);
+        Admission::Accepted
+    }
+
+    /// Log a refused firing and return its outcome.
+    ///
+    /// A stream consumer offers the SAME event again every pass until it is
+    /// admitted, so writing the refusal each time would be a line per tick for
+    /// as long as a freeze or a full disk lasts — on the very disk that may be
+    /// full. It is written when a consumer starts being held, or held for a
+    /// different reason; the next `start.fired` ends the hold. Every other
+    /// start fires once per occurrence and logs every refusal, as before.
+    fn refuse(
+        &mut self,
+        workflow: &str,
+        node: &str,
+        held: bool,
+        outcome: Admission,
+        line: Value,
+    ) -> Admission {
+        let event = match outcome {
+            Admission::Shed => "start.shed",
+            Admission::Frozen => "start.frozen",
+            _ => "start.inbox.failed",
+        };
+        if held
+            && self
+                .start_held
+                .insert(Self::start_key(workflow, node), outcome)
+                == Some(outcome)
+        {
+            return outcome;
+        }
+        self.log.warn(event, line);
+        outcome
     }
 
     /// A `loop`'s run finished: re-arm the next iteration (interval / backoff /

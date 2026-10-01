@@ -736,6 +736,7 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         recent_signals: BTreeMap::new(),
         memory_keys: std::collections::HashMap::new(),
         stream_dirty: false,
+        start_held: Default::default(),
         settings,
         log: log.clone(),
     };

@@ -104,6 +104,9 @@ exhaustive.
 | `start.schedule.armed` / `start.subscribe.armed` | `workflow`, `node` + `next_ms` (schedule) or `server`, `uri` (subscribe) — a start node armed |
 | `wait.resubscribed` / `wait.resubscribe.fail` | `server`, `uri` (+ `err`) — a reload re-dialed `server`, and a suspended `wait on: resource` was subscribed again on the new connection (a `subscribe` start logs `start.subscribe.armed` again) |
 | `start.fired` | `workflow`, `node`, `kind` — a start node fired; an A2A start logs `start.a2a.fired` (`conversation`, `command`, `role`) first |
+| `start.shed` / `start.frozen` / `start.inbox.failed` | `workflow`, `node`, `kind`, plus `cause` (`err` for the inbox) — a firing was refused: resource pressure, a §7.7 freshness freeze, or a failed write of the durable inbox. A `stream` or `correlate` consumer's line also names what it holds — `stream` with `seq` and `event_id` (one event), `from`, `to` and `events` (a batch) or `correlation` and `events` (a join) — and that stays unconsumed and is offered again on later passes, so the line is written once when the consumer starts being held, not on every pass |
+| `start.inputs.invalid` | `workflow`, `node`, `kind`, `err`, plus the same stream fields — the start's `inputs` mapping did not render and the firing is cancelled. The same event would fail the same way every time, so a stream consumer moves past it, and this line is its record |
+| `stream.consumer.skipped` | `stream`, `workflow`, `node`, `from`, `to`, `events` — retention trimmed events this consumer had not read yet; they are gone, and the consumer continues from the oldest event still kept |
 | `subscribe` | `resource_uri`, `server`, `by` (`config`/`agent`) |
 | `unsubscribe` | `resource_uri`, `server`, `by` |
 | `subagent.spawn` | `node`, `depth` (the child re-exec'd) |
@@ -595,7 +598,8 @@ the features below):
 **Cardinality discipline (binding):** **never** put `run_id`, `agent_id`,
 `agent_path`, `call_id`, or resource URIs into metric labels — they are unbounded
 and live in logs/traces only. Labels use bounded values only: `server`, `tool`,
-`kind`, `route`, `status`, `limit`, `signal`, `reason`, `type` (the `model` label
+`kind`, `route`, `status`, `limit`, `signal`, `reason`, `type`, and the declared
+`stream` and `consumer` names (the `model` label
 is reserved in the frozen schema but never emitted — see the note above).
 
 ### `metrics` feature — Prometheus text (`--features metrics`)
@@ -693,6 +697,21 @@ the gauges that do move. The same reservation covers `agent_active_subagents`,
 - **`agent_runs_active`** — workflow runs in a non-terminal state.
 - **`agent_turns_queued`** — conversation turns waiting for a dispatch slot
   (parallelism, pause, drain, or shed — the event stream says which).
+
+#### Stream consumer gauge
+
+- **`agent_stream_lag{stream,consumer}`** — how many events on `stream` the
+  consumer has not consumed yet, written on every pass of every armed `stream`
+  and `correlate` start; `consumer` is `<workflow>/<node>`. It grows while a
+  consumer is held (pressure, a freshness freeze) or paced (`rate`), and an
+  alert on it fires before retention trims past the consumer — the trim itself
+  is the `stream.consumer.skipped` line. Events a `batch` or `correlate` start
+  has already collected into its durable state count as consumed. A consumer a
+  reload removed stops being exported. Each start kind exports up to 32
+  consumers by name; the rest fold into one
+  `{stream="other",consumer="other"}` series carrying the largest of their
+  lags. With no consumers the family renders its `# HELP` / `# TYPE` lines and
+  no sample.
 
 (The unlabelled bare series — `agent_runs_started_total`, `agent_tokens_input_total`,
 `agent_reactions_total`, etc. — are emitted alongside the frozen set, so a scrape

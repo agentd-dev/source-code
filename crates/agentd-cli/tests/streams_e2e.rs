@@ -11,7 +11,7 @@ mod common;
 
 use std::process::{Command, Stdio};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 fn events(stderr: &str, name: &str) -> Vec<Value> {
     stderr
@@ -424,4 +424,487 @@ fn a_forwarded_emit_notifies_a_webhook_and_still_appends() {
 
     std::fs::remove_file(&cfg_path).ok();
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Write `cfg` as a JSON config and run one life of the daemon on it.
+fn life_json(cfg: &Value) -> (Option<i32>, String) {
+    let path = common::unique_path("streams-cfg", "json");
+    std::fs::write(&path, serde_json::to_vec(cfg).unwrap()).unwrap();
+    let out = life(&path);
+    let _ = std::fs::remove_file(&path);
+    out
+}
+
+/// The outputs of the completed runs whose output starts with `prefix`.
+fn outputs(log: &str, prefix: &str) -> Vec<String> {
+    let mut out: Vec<String> = events(log, "run.done")
+        .iter()
+        .filter(|e| e["status"] == "completed")
+        .filter_map(|e| e["output"].as_str().map(str::to_string))
+        .filter(|o| o.starts_with(prefix))
+        .collect();
+    out.sort();
+    out
+}
+
+/// A file store under `dir`, flushed on every write so each life starts from
+/// exactly what the last one left.
+fn file_store(dir: &str, min_free: Option<&str>) -> Value {
+    let mut file = json!({"path": format!("{dir}/state")});
+    if let Some(m) = min_free {
+        file["min_free"] = json!(m);
+    }
+    json!({"kind": "file", "file": file, "checkpoint": {"debounce_ms": 0}})
+}
+
+/// A `once` workflow that emits `order.paid` and then `order.shipped` for
+/// orders 1..=3, each carrying its order as the correlation.
+fn order_producer() -> Value {
+    let emits = |subject: &str| {
+        json!({"steps": {"pub": {"kind": "emit", "stream": "orders", "subject": subject,
+                                 "correlation": "o-{{item}}", "data": {"n": "{{item}}"}}}})
+    };
+    json!({"name": "producer", "steps": {
+        "s": {"kind": "once", "policy": "always"},
+        "paid": {"kind": "foreach", "depends_on": ["s"], "over": [1, 2, 3],
+                 "batch": {"size": 1, "parallel": 1}, "body": emits("order.paid")},
+        "shipped": {"kind": "foreach", "depends_on": ["paid"], "over": [1, 2, 3],
+                    "batch": {"size": 1, "parallel": 1}, "body": emits("order.shipped")},
+        "f": {"kind": "finish", "depends_on": ["shipped"], "status": "completed"}
+    }})
+}
+
+/// The three ways a workflow consumes a stream: one run per event, one run
+/// per batch, one run per joined set.
+fn order_consumers() -> Vec<Value> {
+    let finish = |dep: &str, output: &str| json!({"kind": "finish", "depends_on": [dep], "status": "completed", "output": output});
+    vec![
+        json!({"name": "each", "steps": {
+            "take": {"kind": "stream", "stream": "orders", "subject": "order.paid", "from": "earliest"},
+            "f": finish("take", "each #{{steps.take.output.data.n}}")
+        }}),
+        json!({"name": "bulk", "steps": {
+            "take": {"kind": "stream", "stream": "orders", "subject": "order.*", "from": "earliest",
+                     "batch": {"size": 3}},
+            "f": finish("take", "bulk of {{steps.take.output.count}} from #{{steps.take.output.events.0.seq}}")
+        }}),
+        json!({"name": "join", "steps": {
+            "both": {"kind": "correlate", "stream": "orders", "on": ["order.paid", "order.shipped"],
+                     "by": "correlation", "window": "24h", "on_incomplete": "discard"},
+            "f": finish("both", "join {{steps.both.output.correlation}} complete={{steps.both.output.complete}}")
+        }}),
+    ]
+}
+
+fn orders_config(dir: &str, workflows: Vec<Value>, min_free: Option<&str>) -> Value {
+    json!({
+        "agent": {"name": "consumers"},
+        "store": file_store(dir, min_free),
+        "streams": {"orders": {"retention": {"max_events": 100}}},
+        "workflows": workflows,
+        "lifecycle": {"run_until": "idle", "idle_grace": "900ms"},
+        "observability": {"log_level": "info", "log_content": true}
+    })
+}
+
+/// **A consumer advances only past events it actually fired** (RFC 0045 D1).
+///
+/// A start refused under resource pressure used to be consumed anyway: the
+/// offset moved before the firing, the firing was shed, and the event was
+/// gone. Here every consumer shape meets a shedding daemon with events
+/// waiting — one run per event, a batch, a join — and fires NOTHING; the next
+/// life, with the pressure gone, fires every one of them exactly once.
+#[test]
+fn a_shed_firing_leaves_its_events_on_the_stream_for_every_consumer_shape() {
+    let dir = common::unique_path("streams-shed", "d");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Life 1: the events, with no consumer yet.
+    let (code, l1) = life_json(&orders_config(&dir, vec![order_producer()], None));
+    assert_eq!(code, Some(0), "{l1}");
+    assert_eq!(events(&l1, "stream.emit").len(), 6, "{l1}");
+
+    // Life 2: the consumers arrive on a daemon that sheds everything (a
+    // min_free no real filesystem has).
+    let (code, l2) = life_json(&orders_config(&dir, order_consumers(), Some("999999GB")));
+    assert_eq!(code, Some(0), "{l2}");
+    assert!(!events(&l2, "pressure.shed").is_empty(), "{l2}");
+    assert!(
+        events(&l2, "start.fired").is_empty(),
+        "nothing fires while shedding:\n{l2}"
+    );
+    let shed = events(&l2, "start.shed");
+    let by = |w: &str| {
+        shed.iter()
+            .filter(|e| e["workflow"] == w)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    // Each consumer offers the same thing every pass; the refusal is written
+    // once, when it starts being held, and names what it holds.
+    let each = by("each");
+    assert_eq!(each.len(), 1, "one line per hold, not one per tick:\n{l2}");
+    assert_eq!(each[0]["stream"], "orders", "{l2}");
+    assert_eq!(each[0]["seq"], 1, "{l2}");
+    assert!(
+        each[0]["event_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()),
+        "{l2}"
+    );
+    let bulk = by("bulk");
+    assert_eq!(bulk.len(), 1, "{l2}");
+    assert_eq!(
+        (&bulk[0]["from"], &bulk[0]["to"], &bulk[0]["events"]),
+        (&json!(1), &json!(3), &json!(3)),
+        "{l2}"
+    );
+    let join = by("join");
+    assert_eq!(join.len(), 1, "{l2}");
+    assert_eq!(join[0]["stream"], "orders", "{l2}");
+    assert!(
+        join[0]["correlation"]
+            .as_str()
+            .is_some_and(|c| c.starts_with("o-")),
+        "{l2}"
+    );
+
+    // Life 3: no pressure. Every event the shed life held fires now, once.
+    let (code, l3) = life_json(&orders_config(&dir, order_consumers(), None));
+    assert_eq!(code, Some(0), "{l3}");
+    assert_eq!(
+        outputs(&l3, "each "),
+        ["each #1", "each #2", "each #3"],
+        "{l3}"
+    );
+    assert_eq!(
+        outputs(&l3, "bulk "),
+        ["bulk of 3 from #1", "bulk of 3 from #4"],
+        "{l3}"
+    );
+    assert_eq!(
+        outputs(&l3, "join "),
+        [
+            "join o-1 complete=true",
+            "join o-2 complete=true",
+            "join o-3 complete=true"
+        ],
+        "{l3}"
+    );
+
+    // Life 4: and they were consumed — nothing fires twice.
+    let (code, l4) = life_json(&orders_config(&dir, order_consumers(), None));
+    assert_eq!(code, Some(0), "{l4}");
+    assert!(events(&l4, "start.fired").is_empty(), "{l4}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **An event whose `inputs` cannot render is discarded, by name.**
+///
+/// It is the one refusal that is not temporary — the same payload fails the
+/// same mapping every time — so holding it would wedge the consumer behind it
+/// for ever. The consumer moves past it, and the line it writes names the
+/// stream, the seq and the event id: that line is the event's only record.
+#[test]
+fn an_event_whose_inputs_cannot_render_is_skipped_with_a_line_naming_it() {
+    let dir = common::unique_path("streams-inputs", "d");
+    std::fs::create_dir_all(&dir).unwrap();
+    let consumer = |inputs: Value| {
+        json!({"name": "each", "steps": {
+            "take": {"kind": "stream", "stream": "orders", "subject": "order.paid",
+                     "from": "earliest", "inputs": inputs},
+            "f": {"kind": "finish", "depends_on": ["take"], "status": "completed", "output": "each fired"}
+        }})
+    };
+    let broken = consumer(json!({"who": "{{payload.no_such_field.at_all}}"}));
+    let (code, l1) = life_json(&orders_config(&dir, vec![order_producer(), broken], None));
+    assert_eq!(code, Some(0), "{l1}");
+    let invalid = events(&l1, "start.inputs.invalid");
+    let seqs: Vec<&Value> = invalid.iter().map(|e| &e["seq"]).collect();
+    assert_eq!(
+        seqs,
+        [&json!(1), &json!(2), &json!(3)],
+        "each paid event once:\n{l1}"
+    );
+    assert!(
+        invalid.iter().all(|e| e["stream"] == "orders"
+            && e["workflow"] == "each"
+            && e["event_id"].as_str().is_some_and(|id| !id.is_empty())),
+        "{l1}"
+    );
+    assert!(outputs(&l1, "each ").is_empty(), "{l1}");
+
+    // The offset moved past them: a consumer whose mapping is fixed does not
+    // go back for events it already discarded.
+    let fixed = consumer(json!({"who": "{{payload.subject}}"}));
+    let (code, l2) = life_json(&orders_config(&dir, vec![fixed], None));
+    assert_eq!(code, Some(0), "{l2}");
+    assert!(events(&l2, "start.fired").is_empty(), "{l2}");
+    assert!(events(&l2, "start.inputs.invalid").is_empty(), "{l2}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A consumer of `ticks`, a stream that keeps only its last three events.
+fn tail_config(dir: &str, producer: bool, consumer: bool, extra: Value) -> Value {
+    let mut workflows = Vec::new();
+    if producer {
+        workflows.push(json!({"name": "producer", "steps": {
+            "s": {"kind": "once", "policy": "always"},
+            "each": {"kind": "foreach", "depends_on": ["s"], "over": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+                     "batch": {"size": 1, "parallel": 1},
+                     "body": {"steps": {"pub": {"kind": "emit", "stream": "ticks", "subject": "tick",
+                                                "data": {"n": "{{item}}"}}}}},
+            "f": {"kind": "finish", "depends_on": ["each"], "status": "completed"}
+        }}));
+    }
+    if consumer {
+        workflows.push(json!({"name": "tail", "steps": {
+            "take": {"kind": "stream", "stream": "ticks", "from": "earliest"},
+            "f": {"kind": "finish", "depends_on": ["take"], "status": "completed",
+                  "output": "tail #{{steps.take.output.data.n}}"}
+        }}));
+    }
+    let mut cfg = json!({
+        "agent": {"name": "tail"},
+        "store": file_store(dir, None),
+        "streams": {"ticks": {"retention": {"max_events": 3}}},
+        "workflows": workflows,
+        "lifecycle": {"run_until": "idle", "idle_grace": "900ms"},
+        "observability": {"log_level": "info", "log_content": true}
+    });
+    if let (Some(cfg), Some(extra)) = (cfg.as_object_mut(), extra.as_object()) {
+        for (k, v) in extra {
+            cfg.insert(k.clone(), v.clone());
+        }
+    }
+    cfg
+}
+
+/// Lives 1 and 2 of the trim tests: the consumer anchors at the start of an
+/// empty stream, then ten events arrive while it is away — and retention
+/// keeps only the last three.
+fn consumer_falls_behind(dir: &str) {
+    let (code, l1) = life_json(&tail_config(dir, false, true, json!({})));
+    assert_eq!(code, Some(0), "{l1}");
+    let (code, l2) = life_json(&tail_config(dir, true, false, json!({})));
+    assert_eq!(code, Some(0), "{l2}");
+    assert_eq!(events(&l2, "stream.emit").len(), 10, "{l2}");
+}
+
+/// **Retention trimming past a consumer is said, not done in silence**
+/// (RFC 0045 D3). The seven events the consumer never read are gone; the line
+/// says which and how many, once, and the three that remain fire.
+#[test]
+fn a_consumer_trimmed_past_logs_what_it_skipped() {
+    let dir = common::unique_path("streams-trim", "d");
+    std::fs::create_dir_all(&dir).unwrap();
+    consumer_falls_behind(&dir);
+
+    let (code, l3) = life_json(&tail_config(&dir, false, true, json!({})));
+    assert_eq!(code, Some(0), "{l3}");
+    let skipped = events(&l3, "stream.consumer.skipped");
+    assert_eq!(skipped.len(), 1, "{l3}");
+    let s = &skipped[0];
+    assert_eq!(
+        (&s["stream"], &s["workflow"], &s["node"]),
+        (&json!("ticks"), &json!("tail"), &json!("take")),
+        "{l3}"
+    );
+    assert_eq!(
+        (&s["from"], &s["to"], &s["events"]),
+        (&json!(1), &json!(7), &json!(7)),
+        "{l3}"
+    );
+    assert_eq!(
+        outputs(&l3, "tail "),
+        ["tail #10", "tail #8", "tail #9"],
+        "{l3}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **`agent_stream_lag` shows a consumer falling behind** (RFC 0045 D3): one
+/// that was trimmed past and is now held by a shedding daemon still has the
+/// three retained events to consume, and the gauge says three.
+#[cfg(feature = "metrics")]
+#[test]
+fn the_lag_gauge_counts_what_a_held_consumer_has_not_consumed() {
+    let dir = common::unique_path("streams-lag", "d");
+    std::fs::create_dir_all(&dir).unwrap();
+    consumer_falls_behind(&dir);
+
+    let mut cfg = tail_config(
+        &dir,
+        false,
+        true,
+        json!({"observability": {"log_level": "info", "metrics_addr": "127.0.0.1:0"},
+               "lifecycle": {"run_until": "drained"}}),
+    );
+    cfg["store"]["file"]["min_free"] = json!("999999GB");
+    let cfg_path = common::unique_path("streams-lag", "json");
+    std::fs::write(&cfg_path, serde_json::to_vec(&cfg).unwrap()).unwrap();
+    let err_path = common::unique_path("streams-lag", "log");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .args(["--config", &cfg_path])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(std::fs::File::create(&err_path).unwrap()))
+        .spawn()
+        .expect("spawn");
+    let log = || std::fs::read_to_string(&err_path).unwrap_or_default();
+    let want = "agent_stream_lag{stream=\"ticks\",consumer=\"tail/take\"} 3";
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut scraped = String::new();
+    while std::time::Instant::now() < deadline {
+        let addr = events(&log(), "metrics.serving")
+            .first()
+            .and_then(|e| e["addr"].as_str().map(str::to_string));
+        if let Some(addr) = addr {
+            scraped = common::http_get(&addr, "/metrics").body;
+            if scraped.contains(want) {
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    // A few more passes: the skip forward persisted, so it is not found, and
+    // reported, again on each of them.
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    let _ = child.kill();
+    let _ = child.wait();
+    let l3 = log();
+    assert!(scraped.contains(want), "{scraped}\n{l3}");
+    assert_eq!(events(&l3, "stream.consumer.skipped").len(), 1, "{l3}");
+    assert!(events(&l3, "start.fired").is_empty(), "{l3}");
+
+    let _ = std::fs::remove_file(&cfg_path);
+    let _ = std::fs::remove_file(&err_path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **A freshness freeze holds a consumer; it does not consume** (RFC 0045 D1).
+///
+/// The §7.7 freeze refuses new work while a signed instruction source cannot
+/// be confirmed. A stream consumer used to treat that refusal as done and
+/// move on. Here the registry dies, the freeze sets in, and only THEN does a
+/// run that was already live emit three events: the consumer holds all three,
+/// and the next life — on an instruction that needs no registry — fires each
+/// exactly once.
+///
+/// The producer waits for the freeze on the runtime-events stream rather than
+/// on a clock, so the order the test depends on is the order it observes.
+#[cfg(feature = "internal-mocks")]
+#[test]
+fn a_frozen_consumer_holds_its_events_until_it_can_fire_them() {
+    let dir = common::unique_path("streams-frozen", "d");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut mock = common::spawn_mock_mcp("mock://watched", false);
+    let consumer = json!({"name": "each", "steps": {
+        "take": {"kind": "stream", "stream": "orders", "subject": "order.paid", "from": "earliest"},
+        "f": {"kind": "finish", "depends_on": ["take"], "status": "completed",
+              "output": "each #{{steps.take.output.data.n}}"}
+    }});
+    let producer = json!({"name": "producer", "steps": {
+        "s": {"kind": "once", "policy": "always"},
+        "frozen": {"kind": "wait", "depends_on": ["s"], "on": "event", "stream": "_rt",
+                   "subject": "instruction.unavailable", "timeout": "30s"},
+        "paid": {"kind": "foreach", "depends_on": ["frozen"], "over": [1, 2, 3],
+                 "batch": {"size": 1, "parallel": 1},
+                 "body": {"steps": {"pub": {"kind": "emit", "stream": "orders", "subject": "order.paid",
+                                            "data": {"n": "{{item}}"}}}}},
+        "f": {"kind": "finish", "depends_on": ["paid"], "status": "completed"}
+    }});
+    let cfg = json!({
+        "agent": {"name": "frozen", "preflight": "never",
+                  "instruction": {"mcp": "instruction://ins_mock@stable", "refresh": "1s",
+                                  "unavailable": "freeze"},
+                  "document_capabilities": ["compute"]},
+        "mcp": {"servers": [{"name": "registry", "endpoint": format!("{}/mcp", mock.uri())}]},
+        "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
+        "store": file_store(&dir, None),
+        "streams": {"orders": {"retention": {"max_events": 100}},
+                    "_rt": {"retention": {"max_events": 1000}}},
+        "workflows": [producer, consumer.clone()],
+        "lifecycle": {"run_until": "drained"},
+        "observability": {"log_level": "info", "log_content": true,
+                          "runtime_events": {"stream": "_rt", "include": ["instruction"]}}
+    });
+    let cfg_path = common::unique_path("streams-frozen", "json");
+    std::fs::write(&cfg_path, serde_json::to_vec(&cfg).unwrap()).unwrap();
+    let err_path = common::unique_path("streams-frozen", "log");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .args(["--config", &cfg_path])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(std::fs::File::create(&err_path).unwrap()))
+        .spawn()
+        .expect("spawn");
+    let log = || std::fs::read_to_string(&err_path).unwrap_or_default();
+    let wait_for = |what: &str, cond: &dyn Fn(&str) -> bool| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let l = log();
+            if cond(&l) {
+                return l;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}:\n{l}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    };
+    wait_for("the instruction to load", &|l| {
+        !events(l, "instruction.loaded").is_empty()
+    });
+    mock.stop();
+    wait_for("the producer to finish under the freeze", &|l| {
+        events(l, "run.done")
+            .iter()
+            .any(|e| e["workflow"] == "producer")
+            && !events(l, "start.frozen").is_empty()
+    });
+    // Let a few more passes go by: a held consumer must stay held, quietly.
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let _ = child.wait();
+    let l1 = log();
+    assert_eq!(events(&l1, "stream.emit").len(), 3, "{l1}");
+    assert!(
+        outputs(&l1, "each ").is_empty(),
+        "nothing fires while frozen:\n{l1}"
+    );
+    let frozen: Vec<Value> = events(&l1, "start.frozen")
+        .into_iter()
+        .filter(|e| e["workflow"] == "each")
+        .collect();
+    assert_eq!(frozen.len(), 1, "one line per hold:\n{l1}");
+    assert_eq!(
+        (&frozen[0]["stream"], &frozen[0]["seq"]),
+        (&json!("orders"), &json!(1)),
+        "{l1}"
+    );
+
+    // Life 2: an instruction with nothing to re-read, so nothing freezes.
+    let (code, l2) = life_json(&json!({
+        "agent": {"name": "frozen", "instruction": "You consume orders.", "preflight": "never"},
+        "store": file_store(&dir, None),
+        "streams": {"orders": {"retention": {"max_events": 100}}},
+        "workflows": [consumer],
+        "lifecycle": {"run_until": "idle", "idle_grace": "900ms"},
+        "observability": {"log_level": "info", "log_content": true}
+    }));
+    assert_eq!(code, Some(0), "{l2}");
+    assert_eq!(
+        outputs(&l2, "each "),
+        ["each #1", "each #2", "each #3"],
+        "{l2}"
+    );
+
+    let _ = std::fs::remove_file(&cfg_path);
+    let _ = std::fs::remove_file(&err_path);
+    let _ = std::fs::remove_dir_all(&dir);
 }

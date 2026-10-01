@@ -200,6 +200,11 @@ pub enum ListenEvent {
     Ended { reason: String, retry_ms: u64 },
     /// A re-listen succeeded: the subscription covers every URI again.
     Resumed,
+    /// The server acknowledged a listen without these URIs, which it held
+    /// before: it no longer notifies for them, and the connection no longer
+    /// counts them as subscribed. The host asks for them again, where a
+    /// server that keeps refusing is said as the refusal it is.
+    Narrowed { dropped: Vec<String> },
 }
 
 /// The first wait before re-listening after a listen stream ended. Doubled on
@@ -224,12 +229,19 @@ pub struct RmcpClient {
     protocol_version: Option<ProtocolVersion>,
     notifications: Arc<Mutex<Vec<rpc::Notification>>>,
     /// Every URI the server ACCEPTED a subscription for — inserted only once
-    /// the server call succeeded, so a URI whose subscribe failed is asked
-    /// for again on the next try rather than reported as already covered. At
-    /// a stateless revision one `listen` subscription covers them all. Held
-    /// across the server call, so two subscribes cannot each widen the filter
-    /// from the same old set.
-    uris: Mutex<std::collections::BTreeSet<String>>,
+    /// the server call succeeded, and at a stateless revision only if the
+    /// listen's acknowledgment names it, so a URI the server did not take is
+    /// asked for again on the next try rather than reported as already
+    /// covered. At a stateless revision one `listen` subscription covers them
+    /// all. Shared with the listen pump, which drops what a re-listen's
+    /// acknowledgment leaves out; locked only for a read or a write, never
+    /// across a server call, because the pump runs on the runtime's one
+    /// worker and a host thread holding this lock inside `block_on` would
+    /// stall the very task that call waits on.
+    uris: Arc<Mutex<std::collections::BTreeSet<String>>>,
+    /// Held across a whole subscribe or unsubscribe, so two of them cannot
+    /// each widen the filter from the same old set. Never taken by the pump.
+    subscribing: Mutex<()>,
     /// The task pumping that subscription into `notifications`, re-listening
     /// when it ends. Aborted, not merely dropped, when the filter changes: a
     /// dropped tokio handle detaches its task, which would go on listening
@@ -418,7 +430,8 @@ impl RmcpBuilder {
             caps,
             protocol_version,
             notifications,
-            uris: Mutex::new(std::collections::BTreeSet::new()),
+            uris: Arc::default(),
+            subscribing: Mutex::new(()),
             pump: Mutex::new(None),
             listen_events: Arc::default(),
         })
@@ -633,7 +646,10 @@ impl RmcpClient {
     /// Either way the server must have advertised `resources.subscribe`: a
     /// server that did not would accept the call, or ignore the URI in a
     /// listen filter, and never notify — a wait that parks forever with
-    /// nothing in any log. That is a [`McpError::Capability`] here instead.
+    /// nothing in any log. That is a [`McpError::Capability`] here instead,
+    /// and so is a listen whose acknowledgment leaves the URI out: rmcp lets a
+    /// server accept a narrower filter than the one asked for, and then drops
+    /// every update for what it left out.
     ///
     /// The URI is recorded only once the server accepted it, so a failed
     /// subscribe is a real retry next time rather than "already covered". At
@@ -641,38 +657,67 @@ impl RmcpClient {
     /// From 2026-07-28 on, one subscription covers every tracked URI: adding a
     /// URI reopens it with the widened filter, and its notifications pump into
     /// the queue the host drains.
-    #[allow(deprecated)]
+    ///
+    /// Only the socket's timeout on each silence ends the server call; a
+    /// caller on a thread that must not stall bounds it with
+    /// [`Self::subscribe_within`].
     pub fn subscribe(&self, uri: &str) -> Result<(), McpError> {
+        self.subscribe_bounded(uri, None)
+    }
+
+    /// [`Self::subscribe`], abandoned as a transport error after `bound` (the
+    /// host's management bound). A server that accepts the connection and
+    /// answers slowly would otherwise hold the caller for the connection's
+    /// whole timeout, per URI.
+    pub fn subscribe_within(&self, uri: &str, bound: Duration) -> Result<(), McpError> {
+        self.subscribe_bounded(uri, Some(bound))
+    }
+
+    #[allow(deprecated)]
+    fn subscribe_bounded(&self, uri: &str, bound: Option<Duration>) -> Result<(), McpError> {
         if !self.caps.supports_subscribe() {
             return Err(McpError::Capability(format!(
                 "mcp server '{}' does not offer resources.subscribe; {uri} cannot be watched",
                 self.name
             )));
         }
-        let mut uris = self.uris.lock().unwrap_or_else(|e| e.into_inner());
-        if uris.contains(uri) {
+        let _serial = self.subscribing.lock().unwrap_or_else(|e| e.into_inner());
+        let held = self.subscribed_set();
+        if held.contains(uri) {
             return Ok(()); // already covered by the live subscription
         }
+        let op = format!("resources/subscribe {uri}");
         if self.listens() {
-            let mut widened = uris.clone();
+            let mut widened = held;
             widened.insert(uri.to_string());
-            self.listen_on(&widened)?;
-        } else {
-            self.rt
-                .block_on(
-                    self.service
-                        .subscribe(rmcp::model::SubscribeRequestParams::new(uri.to_string())),
-                )
-                .map_err(|e| self.fail(&format!("resources/subscribe {uri}"), e))?;
+            let acked = self.listen_on(&widened, bound, Some(uri))?;
+            if !acked.contains(uri) {
+                return Err(McpError::Capability(format!(
+                    "mcp server '{}' acknowledged the listen without {uri}; it will not notify for it",
+                    self.name
+                )));
+            }
+            return Ok(());
         }
-        uris.insert(uri.to_string());
+        self.bounded(
+            bound,
+            &op,
+            self.service
+                .subscribe(rmcp::model::SubscribeRequestParams::new(uri.to_string())),
+        )?
+        .map_err(|e| self.fail(&op, e))?;
+        self.uris
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(uri.to_string());
         Ok(())
     }
 
     #[allow(deprecated)]
     pub fn unsubscribe(&self, uri: &str) -> Result<(), McpError> {
-        let mut uris = self.uris.lock().unwrap_or_else(|e| e.into_inner());
-        if !uris.remove(uri) {
+        let _serial = self.subscribing.lock().unwrap_or_else(|e| e.into_inner());
+        let mut narrowed = self.subscribed_set();
+        if !narrowed.remove(uri) {
             return Ok(());
         }
         // Before 2026-07-28 the server holds a per-URI subscription, so it
@@ -680,6 +725,10 @@ impl RmcpClient {
         // not reach it. From then on, reopening the listen with the narrowed
         // filter is the cancellation.
         if !self.listens() {
+            self.uris
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(uri);
             return self
                 .rt
                 .block_on(
@@ -688,7 +737,36 @@ impl RmcpClient {
                 )
                 .map_err(|e| self.fail(&format!("resources/unsubscribe {uri}"), e));
         }
-        self.listen_on(&uris)
+        self.listen_on(&narrowed, None, None).map(|_| ())
+    }
+
+    /// A copy of the accepted set, taken under its lock and released at once.
+    fn subscribed_set(&self) -> std::collections::BTreeSet<String> {
+        self.uris.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Run `f` on the runtime, abandoned as a timeout after `bound` if there
+    /// is one.
+    fn bounded<F: std::future::Future>(
+        &self,
+        bound: Option<Duration>,
+        op: &str,
+        f: F,
+    ) -> Result<F::Output, McpError> {
+        match bound {
+            // The timer is built inside the runtime: it needs its clock.
+            Some(b) => self
+                .rt
+                .block_on(async { tokio::time::timeout(b, f).await })
+                .map_err(|_| {
+                    rpc_err(
+                        &self.name,
+                        op,
+                        format!("timed out after {} ms", b.as_millis()),
+                    )
+                }),
+            None => Ok(self.rt.block_on(f)),
+        }
     }
 
     /// (Re)open the single subscription covering `uris`, and pump its
@@ -696,10 +774,21 @@ impl RmcpClient {
     /// again whenever the stream ends. The previous pump is stopped only once
     /// the new listen is acknowledged, so a refused widening leaves the URIs
     /// already held still watched.
-    fn listen_on(&self, uris: &std::collections::BTreeSet<String>) -> Result<(), McpError> {
+    ///
+    /// Returns the URIs the acknowledgment names — the accepted set from now
+    /// on, since the new listen replaces the old one. A held URI it leaves
+    /// out (anything but `asking`, which the caller reports) is said as
+    /// [`ListenEvent::Narrowed`].
+    fn listen_on(
+        &self,
+        uris: &std::collections::BTreeSet<String>,
+        bound: Option<Duration>,
+        asking: Option<&str>,
+    ) -> Result<std::collections::BTreeSet<String>, McpError> {
         if uris.is_empty() {
             self.stop_pump();
-            return Ok(());
+            self.uris.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            return Ok(Default::default());
         }
         let mut filter = SubscriptionFilter::builder().resources_list_changed();
         for u in uris {
@@ -709,19 +798,35 @@ impl RmcpClient {
 
         let peer = self.service.peer().clone();
         let subscription = self
-            .rt
-            .block_on(peer.listen(filter.clone()))
+            .bounded(bound, "subscriptions/listen", peer.listen(filter.clone()))?
             .map_err(|e| self.fail("subscriptions/listen", e))?;
+        let acked = acknowledged(subscription.acknowledged());
+        let dropped: Vec<String> = uris
+            .iter()
+            .filter(|u| !acked.contains(*u) && Some(u.as_str()) != asking)
+            .cloned()
+            .collect();
         self.stop_pump();
+        *self.uris.lock().unwrap_or_else(|e| e.into_inner()) = acked.clone();
+        if !dropped.is_empty() {
+            self.listen_events
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(ListenEvent::Narrowed { dropped });
+        }
+        // Re-listen with what the server took, not with what was asked: the
+        // URIs it left out are the host's to ask for again.
+        let filter = subscription.acknowledged().clone();
         let handle = self.rt.spawn(pump(
             subscription,
             peer,
             filter,
             Arc::clone(&self.notifications),
             Arc::clone(&self.listen_events),
+            Arc::clone(&self.uris),
         ));
         *self.pump.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
-        Ok(())
+        Ok(acked)
     }
 
     fn stop_pump(&self) {
@@ -751,6 +856,32 @@ impl RmcpClient {
     pub fn drain_notifications(&self) -> Vec<rpc::Notification> {
         std::mem::take(&mut *self.notifications.lock().unwrap_or_else(|e| e.into_inner()))
     }
+
+    /// Take over what `lost` received and the host has not drained yet, ahead
+    /// of anything this connection has queued since. A re-dial replaces the
+    /// connection whole, and the queues are the connection's: an update that
+    /// reached the old one just before the server restarted is often the last
+    /// wake before it, and would be dropped with it.
+    pub(crate) fn inherit_queues(&self, lost: &RmcpClient) {
+        let mut notes = lost.drain_notifications();
+        let mut q = self.notifications.lock().unwrap_or_else(|e| e.into_inner());
+        notes.append(&mut q);
+        *q = notes;
+        let mut events = lost.drain_listen_events();
+        let mut q = self.listen_events.lock().unwrap_or_else(|e| e.into_inner());
+        events.append(&mut q);
+        *q = events;
+    }
+}
+
+/// The URIs a listen acknowledgment names.
+fn acknowledged(filter: &SubscriptionFilter) -> std::collections::BTreeSet<String> {
+    filter
+        .resource_subscriptions
+        .iter()
+        .flatten()
+        .cloned()
+        .collect()
 }
 
 /// Pump one listen subscription into `queue`, and when it ends — the server
@@ -759,12 +890,19 @@ impl RmcpClient {
 /// and was not reopened left every subscribed URI without a wake, with nothing
 /// in any log; the wait before each retry doubles from [`RELISTEN_MIN`] to
 /// [`RELISTEN_MAX`], so a server that refuses to hold one is not hammered.
+///
+/// A re-listen the server acknowledges with fewer URIs than it held leaves
+/// those out of `held` and says so ([`ListenEvent::Narrowed`]), and the pump
+/// listens on with what was acknowledged: rmcp drops every update outside the
+/// acknowledgment, so a URI kept in `held` would read as watched and never
+/// wake.
 async fn pump(
     mut subscription: Subscription,
     peer: rmcp::service::Peer<RoleClient>,
-    filter: SubscriptionFilter,
+    mut filter: SubscriptionFilter,
     queue: Arc<Mutex<Vec<rpc::Notification>>>,
     events: Arc<Mutex<Vec<ListenEvent>>>,
+    held: Arc<Mutex<std::collections::BTreeSet<String>>>,
 ) {
     let report = |e: ListenEvent| events.lock().unwrap_or_else(|p| p.into_inner()).push(e);
     let mut wait = RELISTEN_MIN;
@@ -804,8 +942,20 @@ async fn pump(
             wait = (wait * 2).min(RELISTEN_MAX);
             match peer.listen(filter.clone()).await {
                 Ok(s) => {
+                    let acked = acknowledged(s.acknowledged());
+                    let dropped: Vec<String> = acknowledged(&filter)
+                        .into_iter()
+                        .filter(|u| !acked.contains(u))
+                        .collect();
                     subscription = s;
                     report(ListenEvent::Resumed);
+                    if !dropped.is_empty() {
+                        held.lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .retain(|u| acked.contains(u));
+                        filter = subscription.acknowledged().clone();
+                        report(ListenEvent::Narrowed { dropped });
+                    }
                     break;
                 }
                 Err(e) => reason = format!("subscriptions/listen: {e}"),
@@ -839,5 +989,86 @@ mod tests {
         // rmcp promotes it this test is the tripwire.
         assert_eq!(ProtocolVersion::default(), ProtocolVersion::LATEST);
         assert!(ProtocolVersion::LATEST < ProtocolVersion::V_2026_07_28);
+    }
+
+    /// The SDK's own messages — a notification it sends, the answer to a
+    /// server's elicitation — meet a forgotten session as rmcp's
+    /// `SessionExpired`, on which rmcp by default handshakes again and
+    /// replays, behind the host's back: the subscriptions the old session
+    /// held would be gone while every call succeeded. The connection is built
+    /// so it does not; the host re-dials and restores them instead.
+    #[test]
+    fn a_forgotten_session_never_makes_the_sdk_handshake_again_by_itself() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        // A server that issues `s-<generation>` and forgets it on a restart.
+        let generation = Arc::new(AtomicU64::new(0));
+        let initializes = Arc::new(AtomicU64::new(0));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let ep = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let (g, inits) = (Arc::clone(&generation), Arc::clone(&initializes));
+        std::thread::spawn(move || {
+            for conn in listener.incoming().flatten() {
+                let mut w = conn.try_clone().unwrap();
+                let mut r = BufReader::new(conn);
+                let mut line = String::new();
+                if r.read_line(&mut line).unwrap_or(0) == 0 {
+                    continue;
+                }
+                let (mut len, mut session) = (0usize, None);
+                loop {
+                    let mut h = String::new();
+                    if r.read_line(&mut h).unwrap_or(0) == 0 || h.trim().is_empty() {
+                        break;
+                    }
+                    let (k, v) = h.split_once(':').unwrap_or_default();
+                    match k.trim().to_ascii_lowercase().as_str() {
+                        "content-length" => len = v.trim().parse().unwrap_or(0),
+                        "mcp-session-id" => session = Some(v.trim().to_string()),
+                        _ => {}
+                    }
+                }
+                let mut body = vec![0u8; len];
+                let _ = r.read_exact(&mut body);
+                let msg: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                let live = format!("s-{}", g.load(Ordering::SeqCst));
+                let reply: &[u8] = if line.starts_with("GET") {
+                    b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n"
+                } else if msg["method"] == "initialize" {
+                    inits.fetch_add(1, Ordering::SeqCst);
+                    let b = json!({"jsonrpc": "2.0", "id": msg["id"], "result": {
+                        "protocolVersion": msg["params"]["protocolVersion"],
+                        "capabilities": {}, "serverInfo": {"name": "s", "version": "0"}}})
+                    .to_string();
+                    let _ = write!(
+                        w,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: {live}\r\nContent-Length: {}\r\n\r\n{b}",
+                        b.len()
+                    );
+                    continue;
+                } else if session.is_some_and(|s| s != live) {
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
+                } else {
+                    b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n"
+                };
+                let _ = w.write_all(reply);
+            }
+        });
+
+        let client = RmcpBuilder::new("s", &ep, vec![], Duration::from_secs(5))
+            .connect()
+            .expect("connect");
+        assert_eq!(initializes.load(Ordering::SeqCst), 1);
+        generation.fetch_add(1, Ordering::SeqCst);
+        let peer = client.service.peer().clone();
+        let _ = client.rt.block_on(peer.notify_roots_list_changed());
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(client.session_lost(), "the 404 was seen");
+        assert_eq!(
+            initializes.load(Ordering::SeqCst),
+            1,
+            "no handshake the host did not ask for"
+        );
     }
 }

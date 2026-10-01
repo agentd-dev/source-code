@@ -53,8 +53,26 @@ pub const REDIAL_MAX: Duration = Duration::from_secs(30);
 #[derive(Default)]
 struct Redial {
     failures: u32,
+    /// How many re-dials in a row replaced a session that had lived less
+    /// than [`REDIAL_MAX`]. A handshake that succeeds proves only that the
+    /// server answers `initialize`: one that loses each new session at once
+    /// (crash-looping after the handshake, or answering the notification
+    /// stream's `GET` with `404` where the spec says `405`) would otherwise
+    /// be re-dialed about once a second for ever, each time re-subscribing
+    /// everything and leaving a session behind on the server.
+    flaps: u32,
+    /// When the live connection's session was handshaken.
+    dialed: Option<Instant>,
     not_before: Option<Instant>,
 }
+
+/// The wait before the next attempt after `n` reasons to slow down:
+/// [`REDIAL_MIN`] doubled per reason, up to [`REDIAL_MAX`]. Public so a host
+/// retrying what a re-dial restores keeps the same schedule.
+pub fn redial_backoff(n: u32) -> Duration {
+    REDIAL_MIN.saturating_mul(1u32 << n.min(5)).min(REDIAL_MAX)
+}
+
 impl std::error::Error for McpError {}
 
 /// A connected (and, after [`McpClient::initialize`], handshaken) remote MCP
@@ -208,6 +226,10 @@ impl McpClient {
     pub fn initialize_within(&mut self, timeout: Duration) -> Result<(), McpError> {
         let c = self.dial(Arc::clone(&self.http), timeout, None)?;
         *self.rmcp.get_mut().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(c));
+        self.redial
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .dialed = Some(Instant::now());
         Ok(())
     }
 
@@ -277,22 +299,38 @@ impl McpClient {
     /// connection's own timeout. On failure the lost connection stays in place
     /// — its URIs with it, for the next attempt — and the next attempt is due
     /// after a wait that doubles per failure, [`REDIAL_MIN`] to [`REDIAL_MAX`].
+    /// A success that replaced a session younger than [`REDIAL_MAX`] keeps
+    /// doubling the wait before the next one, so a server that loses every
+    /// new session at once settles to a re-dial every [`REDIAL_MAX`].
+    ///
+    /// What the lost connection received and the host had not drained yet
+    /// moves to the new one, so the drain after the re-dial still sees it.
     pub fn redial_within(&self, bound: Duration) -> Result<Vec<String>, McpError> {
         let lost = self.sdk()?;
         let fresh = match self.dial(Arc::new(self.http.redial_copy()), self.timeout, Some(bound)) {
             Ok(c) => c,
             Err(e) => {
                 let mut r = self.redial.lock().unwrap_or_else(|p| p.into_inner());
-                let wait = REDIAL_MIN
-                    .saturating_mul(1u32 << r.failures.min(5))
-                    .min(REDIAL_MAX);
+                let wait = redial_backoff(r.failures + r.flaps);
                 r.failures += 1;
                 r.not_before = Some(Instant::now() + wait);
                 return Err(e);
             }
         };
-        *self.redial.lock().unwrap_or_else(|e| e.into_inner()) = Redial::default();
-        *self.rmcp.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(fresh));
+        {
+            let mut r = self.redial.lock().unwrap_or_else(|e| e.into_inner());
+            let now = Instant::now();
+            let short_lived = r.dialed.is_some_and(|t| now.duration_since(t) < REDIAL_MAX);
+            r.flaps = if short_lived { r.flaps + 1 } else { 0 };
+            r.failures = 0;
+            r.dialed = Some(now);
+            r.not_before = (r.flaps > 0).then(|| now + redial_backoff(r.flaps - 1));
+        }
+        let fresh = Arc::new(fresh);
+        *self.rmcp.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&fresh));
+        // After the swap, so nothing the lost connection queued up to it is
+        // left behind on a client no one drains again.
+        fresh.inherit_queues(&lost);
         Ok(lost.subscribed())
     }
 
@@ -457,6 +495,14 @@ impl McpClient {
     /// fires.
     pub fn subscribe(&self, uri: &str) -> Result<(), McpError> {
         self.sdk()?.subscribe(uri)
+    }
+
+    /// [`Self::subscribe`], abandoned as a transport error after `bound` — the
+    /// host's management bound, for a subscribe made on a thread that must not
+    /// stall. Without it a server that accepts the connection and answers
+    /// slowly holds the caller for the connection's whole timeout per URI.
+    pub fn subscribe_within(&self, uri: &str, bound: Duration) -> Result<(), McpError> {
+        self.sdk()?.subscribe_within(uri, bound)
     }
 
     pub fn unsubscribe(&self, uri: &str) -> Result<(), McpError> {

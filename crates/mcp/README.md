@@ -58,6 +58,11 @@ let out = mcp.call_tool("list_issues", None)?;
 - **A lost session said, not papered over** — a server that answers `404` to
   the session is `SessionExpired`, never a quiet re-initialize; the host
   re-dials in place (`redial_within`) and gets back the URIs to subscribe again.
+  What the lost connection had queued carries over to the new one, and a
+  server that loses each new session at once is re-dialed on a growing wait.
+- **A subscription only once the server took it** — at a stateless revision a
+  URI the listen's acknowledgment leaves out is refused, not recorded; a
+  re-listen that comes back narrower says which URIs it dropped.
 - **A JSON-RPC codec and a raw HTTP listener**, used by agentd's subagent
   channel and webhook listener.
 

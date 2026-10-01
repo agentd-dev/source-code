@@ -625,6 +625,7 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         durable,
         mcp,
         mcp_specs,
+        resubscribe_retry: BTreeMap::new(),
         registry,
         contexts: Contexts::new(model_window),
         memory: Memory::new(
@@ -1136,7 +1137,7 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
     // ever. Here, with the definitions loaded and the pins restored, because
     // a wait that can never be woken fails its step, and failing a step
     // resolves it against the definition its run started with.
-    rt.resubscribe_waits(None, "boot");
+    rt.resubscribe_waits(&|_, _| true, "boot");
     rt.arm_goal();
     rt.arm_freshness();
     rt.respawn_restored_subagents();
@@ -2099,13 +2100,33 @@ impl Runtime {
             delivered_digest,
             canonical,
         } = fetched;
-        if c.capabilities().supports_resources()
-            && let Err(e) = c.subscribe(&res)
-        {
-            self.log.warn(
-                "instruction.subscribe.fail",
-                json!({"server": name, "uri": res, "err": e.to_string()}),
-            );
+        // Watched only where the server offers subscriptions. A server that
+        // serves resources and no subscriptions is followed by the refresh
+        // re-read alone — said once, when the instruction is first read from
+        // it, not on every re-read.
+        let first_read = self.instruction.server.as_deref() != Some(name.as_str())
+            || self.instruction.uri.as_deref() != Some(res.as_str());
+        if !c.capabilities().supports_subscribe() {
+            if first_read {
+                self.log.info(
+                    "instruction.subscribe.unsupported",
+                    json!({"server": name, "uri": res}),
+                );
+            }
+        } else {
+            // Bounded: a reload, a re-dial and the freshness watch all come
+            // here from the loop.
+            let subscribed = c.subscribe_within(&res, crate::obs::health::management_timeout());
+            crate::obs::health::tick();
+            if let Err(e) = subscribed {
+                self.log.warn(
+                    "instruction.subscribe.fail",
+                    json!({"server": name, "uri": res, "err": e.to_string()}),
+                );
+                if !matches!(e, crate::mcp::client::McpError::Capability(_)) {
+                    self.retry_subscribe(&name, &res);
+                }
+            }
         }
         let changed = self.instruction.text != text;
         let old_version_id = self.instruction.version_id.clone();
@@ -2144,8 +2165,13 @@ impl Runtime {
     /// recorded: the tool catalogue is rebuilt from a fresh `tools/list` at the
     /// next config reload, so a server cannot change what this agent may call
     /// without an operator-initiated reload.
+    ///
+    /// A lost session is re-dialed first: what the lost connection had queued
+    /// moves to the new one, so the drain below still sees it.
     pub(crate) fn poll_mcp_notifications(&mut self) {
         self.redial_lost_sessions();
+        self.retry_subscriptions();
+        let mut narrowed: Vec<(String, String)> = Vec::new();
         for (name, c) in &self.mcp {
             for e in c.drain_listen_events() {
                 match e {
@@ -2156,8 +2182,20 @@ impl Runtime {
                     ::mcp::rmcp_client::ListenEvent::Resumed => {
                         self.log.info("mcp.listen.resumed", json!({"server": name}))
                     }
+                    ::mcp::rmcp_client::ListenEvent::Narrowed { dropped } => {
+                        self.log.warn(
+                            "mcp.listen.narrowed",
+                            json!({"server": name, "dropped": dropped}),
+                        );
+                        narrowed.extend(dropped.into_iter().map(|u| (name.clone(), u)));
+                    }
                 }
             }
+        }
+        // Asked for again: a server that keeps leaving a URI out answers the
+        // retry with the refusal its owner is told of.
+        for (server, uri) in narrowed {
+            self.retry_subscribe(&server, &uri);
         }
         let mut updated_instruction = false;
         let mut tools_changed = Vec::new();
@@ -2186,22 +2224,8 @@ impl Runtime {
                 }
             }
         }
-        if updated_instruction && let Some(full) = self.instruction.source_ref() {
-            let before = self.instruction.version;
-            if self.subscribe_instruction(&full).is_ok() && self.instruction.version != before {
-                self.log.info(
-                    "instruction.updated",
-                    json!({"version": self.instruction.version}),
-                );
-                if self
-                    .settings
-                    .agent
-                    .wake_on()
-                    .contains(&crate::config::settings::WakeEvent::InstructionUpdated)
-                {
-                    self.note_root("instruction.updated: the instruction resource changed; re-read it with instruction.read".into());
-                }
-            }
+        if updated_instruction {
+            let _ = self.reread_instruction();
         }
         for (server, uri) in resource_updates {
             self.on_resource_updated(&server, &uri); // `wait` steps
@@ -2212,60 +2236,168 @@ impl Runtime {
         }
     }
 
-    /// Re-dial every server that forgot its session, and subscribe again
-    /// everything the lost session was subscribed to.
+    /// Read the resource instruction again and subscribe it on the live
+    /// connection; a changed text is `instruction.updated`, and wakes the
+    /// root when `wake_on` asks for it.
+    fn reread_instruction(&mut self) -> Result<(), String> {
+        let Some(full) = self.instruction.source_ref() else {
+            return Ok(());
+        };
+        let before = self.instruction.version;
+        self.subscribe_instruction(&full)?;
+        if self.instruction.version != before {
+            self.log.info(
+                "instruction.updated",
+                json!({"version": self.instruction.version}),
+            );
+            if self
+                .settings
+                .agent
+                .wake_on()
+                .contains(&crate::config::settings::WakeEvent::InstructionUpdated)
+            {
+                self.note_root("instruction.updated: the instruction resource changed; re-read it with instruction.read".into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Re-dial a server that forgot its session, and subscribe again on the
+    /// new connection everything an owner wants there.
     ///
     /// A server that restarts loses its sessions, and with them every
     /// subscription agentd held — the `subscribe` starts, the suspended
     /// resource waits, a resource instruction. Without this the connection
     /// failed every call until a reload, and every watch went quiet with
-    /// nothing in any log. The re-dial runs here, on the loop, with the short
-    /// management bound on the handshake, so a server that is still coming up
-    /// costs the heartbeat at most that; a failed attempt is retried on a
-    /// backoff the client keeps.
+    /// nothing in any log. What is subscribed again is read off the owners,
+    /// not off the lost connection's set, through the code a reload's re-dial
+    /// takes: a server that came back without `resources.subscribe` fails the
+    /// waits on it and says `start.subscribe.unsupported`, as it does at boot;
+    /// the instruction is read again, since the publisher may have changed it
+    /// while the server was down; and a subscribe that fails in a way that
+    /// may pass is asked again on a backoff.
+    ///
+    /// This runs on the loop. One server per pass, each call bounded by the
+    /// management timeout and followed by a heartbeat, so several servers
+    /// lost at once cannot hold the loop past the liveness window. A failed
+    /// re-dial is retried on a backoff the client keeps.
     pub(crate) fn redial_lost_sessions(&mut self) {
-        let lost: Vec<(String, Arc<McpClient>)> = self
+        let Some((name, c)) = self
             .mcp
             .iter()
-            .filter(|(_, c)| c.redial_due())
+            .find(|(_, c)| c.redial_due())
             .map(|(n, c)| (n.clone(), Arc::clone(c)))
-            .collect();
-        for (name, c) in lost {
-            if c.redial_failures() == 0 {
-                self.log.warn(
-                    "mcp.disconnect",
-                    json!({"server": name, "reason": "session_lost"}),
-                );
-            }
-            let uris = match c.redial_within(crate::obs::health::management_timeout()) {
-                Ok(uris) => uris,
-                Err(e) => {
-                    self.log.warn(
-                        "mcp.connect.fail",
-                        json!({"server": name, "err": e.to_string(), "reason": "session_lost"}),
-                    );
-                    crate::obs::metrics::record_mcp_connect_failure(&name);
-                    continue;
-                }
-            };
-            self.log.info(
-                "mcp.connect",
-                json!({"server": name, "reason": "session_lost", "resubscribing": uris.len()}),
+        else {
+            return;
+        };
+        if c.redial_failures() == 0 {
+            self.log.warn(
+                "mcp.disconnect",
+                json!({"server": name, "reason": "session_lost"}),
             );
-            for uri in uris {
-                match c.subscribe(&uri) {
-                    Ok(()) => self.log.info(
-                        "mcp.resubscribed",
-                        json!({"server": name, "uri": uri, "reason": "session_lost"}),
-                    ),
-                    Err(e) => self.log.error(
-                        "mcp.resubscribe.fail",
-                        json!({"server": name, "uri": uri, "err": e.to_string()}),
-                    ),
-                }
+        }
+        let redialed = c.redial_within(crate::obs::health::management_timeout());
+        crate::obs::health::tick();
+        if let Err(e) = redialed {
+            self.log.warn(
+                "mcp.connect.fail",
+                json!({"server": name, "err": e.to_string(), "reason": "session_lost"}),
+            );
+            crate::obs::metrics::record_mcp_connect_failure(&name);
+            return;
+        }
+        self.log.info(
+            "mcp.connect",
+            json!({"server": name, "reason": "session_lost"}),
+        );
+        // Everything is asked for below, a pending retry's URIs included.
+        self.resubscribe_retry.remove(&name);
+        self.restore_subscriptions(&name, None, "session_lost");
+    }
+
+    /// Subscribe again, on `server`'s live connection, what an owner wants
+    /// there — the `subscribe` starts of the armed workflows, the resources
+    /// suspended waits wait on, the resource instruction — or, with `only`,
+    /// just those of its URIs. The owners are the one record of what is
+    /// wanted; a connection only knows what it holds.
+    pub(crate) fn restore_subscriptions(
+        &mut self,
+        server: &str,
+        only: Option<&std::collections::BTreeSet<String>>,
+        reason: &str,
+    ) {
+        let wanted = |s: &str, u: &str| s == server && only.is_none_or(|o| o.contains(u));
+        self.resubscribe_where(&wanted, &[], reason);
+        if self.instruction.source == "resource"
+            && let (Some(s), Some(u)) = (&self.instruction.server, &self.instruction.uri)
+            && wanted(s, u)
+        {
+            let uri = u.clone();
+            if let Err(e) = self.reread_instruction() {
+                self.log.warn(
+                    "instruction.reread.fail",
+                    json!({"server": server, "uri": uri, "reason": reason, "err": e}),
+                );
+                self.retry_subscribe(server, &uri);
             }
         }
     }
+
+    /// An owner's subscribe to `uri` on `server` failed in a way that may
+    /// pass — a timeout, a `5xx`, the session lost mid-call, a listen the
+    /// server acknowledged without it. Left there, the URI is in no set and
+    /// nothing asks for it again: the start never fires, the wait parks until
+    /// its timeout or for ever. So it is asked for again from the loop, on
+    /// the schedule a re-dial keeps (1s doubling to 30s).
+    pub(crate) fn retry_subscribe(&mut self, server: &str, uri: &str) {
+        self.resubscribe_retry
+            .entry(server.to_string())
+            .or_insert_with(|| SubscribeRetry {
+                not_before_ms: now_ms() + ::mcp::client::redial_backoff(0).as_millis() as u64,
+                ..Default::default()
+            })
+            .uris
+            .insert(uri.to_string());
+    }
+
+    /// Ask again for the subscriptions of one server whose retry is due. A
+    /// server no longer connected is dropped (a reload that connects it
+    /// subscribes everything there), and so is one whose session is lost (its
+    /// re-dial does).
+    fn retry_subscriptions(&mut self) {
+        let now = now_ms();
+        let Some(server) = self
+            .resubscribe_retry
+            .iter()
+            .find(|(_, r)| r.not_before_ms <= now)
+            .map(|(s, _)| s.clone())
+        else {
+            return;
+        };
+        let Some(due) = self.resubscribe_retry.remove(&server) else {
+            return;
+        };
+        if self.mcp.get(&server).is_none_or(|c| c.session_lost()) {
+            return;
+        }
+        self.restore_subscriptions(&server, Some(&due.uris), "retry");
+        // Whatever failed again was recorded afresh; it waits longer.
+        if let Some(again) = self.resubscribe_retry.get_mut(&server) {
+            again.failures = due.failures + 1;
+            again.not_before_ms =
+                now_ms() + ::mcp::client::redial_backoff(again.failures).as_millis() as u64;
+        }
+    }
+}
+
+/// The subscriptions one server's owners want and its live connection does
+/// not hold, and when to ask for them again.
+#[derive(Default)]
+pub(crate) struct SubscribeRetry {
+    pub(crate) uris: std::collections::BTreeSet<String>,
+    /// Rounds in a row that left something to ask again.
+    pub(crate) failures: u32,
+    pub(crate) not_before_ms: u64,
 }
 
 #[cfg(test)]

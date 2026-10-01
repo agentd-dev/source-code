@@ -20,7 +20,17 @@
 //! every session it issued (a request still carrying one is answered `404`,
 //! as Streamable HTTP has a server say "no such session") and closes its open
 //! notification streams, the way a process that exits drops its sockets. That
-//! is how an e2e watches agentd notice a lost session and re-subscribe.
+//! is how an e2e watches agentd notice a lost session and re-subscribe. Called
+//! with `{"subscribe": false}` it comes back without `resources.subscribe`;
+//! after a restart `mock://instruction` reads differently, as a publisher's
+//! edit made while the server was down would. `mock.refuse_subscribe` refuses
+//! the next `count` subscribes, as a server still warming up does.
+//!
+//! [`run_listening`] speaks the stateless revision instead: a subscription is
+//! a `subscriptions/listen` stream, which the mock acknowledges, sends one
+//! update down (for `<uri>`, when it is in the filter) and then closes, as a
+//! server that drops it does. `mock.narrow` makes every later acknowledgment
+//! leave a URI out.
 
 use ::mcp::rpc::{self as json, Incoming, Request, Response};
 use ::mcp::wire::{PROTOCOL_VERSION, method};
@@ -43,8 +53,14 @@ struct State {
     uri: String,
     emit: bool,
     /// Advertise `resources.subscribe`. Off, the mock is a server that offers
-    /// resources but no subscriptions.
-    subscribe: bool,
+    /// resources but no subscriptions. A restart may turn it off.
+    subscribe: AtomicBool,
+    /// `resources/subscribe` calls still to refuse (`mock.refuse_subscribe`).
+    refuse_subscribes: AtomicU64,
+    /// Speak the stateless revision: subscriptions are `subscriptions/listen`.
+    listen: bool,
+    /// URIs every listen acknowledgment leaves out (`mock.narrow`).
+    narrow: std::sync::Mutex<Vec<String>>,
     pending_emit: AtomicBool,
     /// Bumped by `mock.restart`; the session the mock issues is
     /// `mock-<generation>`, so every earlier one is forgotten.
@@ -77,6 +93,16 @@ pub fn run(addr_file: &str, uri: &str, emit: bool) -> i32 {
 /// [`run`], advertising `resources.subscribe` only when `subscribe` is set —
 /// a server that serves resources but offers no subscriptions.
 pub fn run_offering(addr_file: &str, uri: &str, emit: bool, subscribe: bool) -> i32 {
+    serve(addr_file, uri, emit, subscribe, false)
+}
+
+/// [`run`] at the stateless revision, where a subscription is a
+/// `subscriptions/listen` stream (see the module docs).
+pub fn run_listening(addr_file: &str, uri: &str) -> i32 {
+    serve(addr_file, uri, true, true, true)
+}
+
+fn serve(addr_file: &str, uri: &str, emit: bool, subscribe: bool, listen: bool) -> i32 {
     let listener = match TcpListener::bind("127.0.0.1:0") {
         Ok(l) => l,
         Err(e) => {
@@ -91,7 +117,10 @@ pub fn run_offering(addr_file: &str, uri: &str, emit: bool, subscribe: bool) -> 
     let state = Arc::new(State {
         uri: uri.to_string(),
         emit,
-        subscribe,
+        subscribe: AtomicBool::new(subscribe),
+        refuse_subscribes: AtomicU64::new(0),
+        listen,
+        narrow: std::sync::Mutex::new(Vec::new()),
         pending_emit: AtomicBool::new(false),
         generation: AtomicU64::new(0),
         store: std::sync::Mutex::new(std::collections::BTreeMap::new()),
@@ -128,7 +157,13 @@ fn handle_conn(mut stream: TcpStream, state: Arc<State>) {
         serve_notifications(&mut stream, &state);
         return;
     }
-    // POST: the JSON-RPC frame.
+    // POST: the JSON-RPC frame. A listen answers with a stream of its own.
+    if let Ok(Incoming::Request(req)) = &frame
+        && req.method == "subscriptions/listen"
+    {
+        serve_listen(&mut stream, req, &state);
+        return;
+    }
     match frame {
         Ok(Incoming::Request(req)) => {
             let (resp, session) = handle_request(req, &state);
@@ -153,8 +188,8 @@ fn handle_request(req: Request, state: &State) -> (Response, bool) {
             Response::ok(
                 req.id,
                 json!({
-                    "protocolVersion": PROTOCOL_VERSION,
-                    "capabilities": {"resources": {"subscribe": state.subscribe, "listChanged": true}, "tools": {}, "prompts": {"listChanged": true}},
+                    "protocolVersion": if state.listen { "2026-07-28" } else { PROTOCOL_VERSION },
+                    "capabilities": {"resources": {"subscribe": state.subscribe.load(Ordering::SeqCst), "listChanged": true}, "tools": {}, "prompts": {"listChanged": true}},
                     "serverInfo": {"name": "agentd-mock-http", "version": crate::VERSION}
                 }),
             ),
@@ -174,6 +209,8 @@ fn handle_request(req: Request, state: &State) -> (Response, bool) {
                     {"name": "mock.ops", "description": "the state.* calls performed so far", "inputSchema": {"type": "object"}},
                     {"name": "mock.slow", "description": "answer after `ms` milliseconds", "inputSchema": {"type": "object"}},
                     {"name": "mock.restart", "description": "forget every session, as a restarted server does", "inputSchema": {"type": "object"}},
+                    {"name": "mock.narrow", "description": "leave `uri` out of every later listen acknowledgment", "inputSchema": {"type": "object"}},
+                    {"name": "mock.refuse_subscribe", "description": "refuse the next `count` resources/subscribe calls", "inputSchema": {"type": "object"}},
                     {"name": "knowledge.search", "description": "RAG search over the mock corpus", "inputSchema": {"type": "object"}},
                     {"name": "knowledge.get", "description": "fetch a mock document", "inputSchema": {"type": "object"}},
                     {"name": "knowledge.list", "description": "list mock documents", "inputSchema": {"type": "object"}},
@@ -218,7 +255,12 @@ fn handle_request(req: Request, state: &State) -> (Response, bool) {
             }
             let (mime, text) = match asked.as_str() {
                 "skill://incident-runbook" => ("text/x-skill+markdown", "# Incident runbook\n1. Acknowledge the alert. 2. Find the blast radius. 3. Mitigate first, root-cause later. 4. Write the timeline.".to_string()),
-                "mock://instruction" => ("text/plain", "You are the mock-served agent. Follow the served instruction.".to_string()),
+                // A restart reads differently: the publisher's edit made
+                // while the server was down.
+                "mock://instruction" => ("text/plain", match state.generation.load(Ordering::SeqCst) {
+                    0 => "You are the mock-served agent. Follow the served instruction.".to_string(),
+                    g => format!("You are the mock-served agent, restarted {g} time(s). Follow the served instruction."),
+                }),
                 _ => ("text/plain", "the watched resource changed".to_string()),
             };
             let uri_out = if asked.is_empty() { uri.clone() } else { asked };
@@ -290,6 +332,16 @@ fn handle_request(req: Request, state: &State) -> (Response, bool) {
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
             eprintln!("MOCK_SUBSCRIBE {asked}");
+            let refused = state
+                .refuse_subscribes
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok();
+            if refused {
+                return (
+                    Response::err(req.id, json::INTERNAL_ERROR, "subscribe refused"),
+                    false,
+                );
+            }
             // Arm the one-shot push the GET SSE stream will deliver.
             if state.emit {
                 state.pending_emit.store(true, Ordering::SeqCst);
@@ -383,9 +435,33 @@ fn handle_tool_call(req: Request, state: &State) -> Response {
         // subscribes again on a new session.
         Some("mock.restart") => {
             state.pending_emit.store(false, Ordering::SeqCst);
+            if let Some(sub) = args.get("subscribe").and_then(serde_json::Value::as_bool) {
+                state.subscribe.store(sub, Ordering::SeqCst);
+            }
             let generation = state.generation.fetch_add(1, Ordering::SeqCst) + 1;
             eprintln!("MOCK_RESTART {generation}");
             tool_ok(req.id, json!({"ok": true, "generation": generation}))
+        }
+        Some("mock.narrow") => {
+            let uri = args
+                .get("uri")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            state
+                .narrow
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(uri);
+            tool_ok(req.id, json!({"ok": true}))
+        }
+        Some("mock.refuse_subscribe") => {
+            let n = args
+                .get("count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(1);
+            state.refuse_subscribes.store(n, Ordering::SeqCst);
+            tool_ok(req.id, json!({"ok": true, "count": n}))
         }
         Some("mock.fault") => {
             let n = args
@@ -572,6 +648,53 @@ fn corpus() -> Vec<(&'static str, &'static str, &'static str)> {
             "Employees accrue 2 days of vacation per month; requests go to the manager two weeks ahead.",
         ),
     ]
+}
+
+/// One `subscriptions/listen`: acknowledge the filter (less what `mock.narrow`
+/// left out), send one `resources/updated` for the mock's resource when the
+/// acknowledgment holds it, and close the stream without a final result — a
+/// server that dropped it. Every listen that reached the mock is logged
+/// `MOCK_LISTEN <uris>`.
+fn serve_listen(stream: &mut TcpStream, req: &Request, state: &State) {
+    let mut filter = req
+        .params
+        .as_ref()
+        .and_then(|p| p.get("notifications"))
+        .cloned()
+        .unwrap_or(json!({}));
+    let narrow = state
+        .narrow
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    if let Some(uris) = filter["resourceSubscriptions"].as_array_mut() {
+        uris.retain(|u| !narrow.iter().any(|n| u == n));
+    }
+    let uris: Vec<&str> = filter["resourceSubscriptions"]
+        .as_array()
+        .map(|a| a.iter().filter_map(serde_json::Value::as_str).collect())
+        .unwrap_or_default();
+    eprintln!("MOCK_LISTEN {}", uris.join(","));
+    let meta = json!({"io.modelcontextprotocol/subscriptionId": serde_json::to_value(&req.id).unwrap_or_default()});
+    let mut frames = vec![json!({
+        "jsonrpc": "2.0", "method": "notifications/subscriptions/acknowledged",
+        "params": {"_meta": meta, "notifications": filter}
+    })];
+    if uris.contains(&state.uri.as_str()) {
+        frames.push(json!({
+            "jsonrpc": "2.0", "method": method::NOTIFY_RESOURCES_UPDATED,
+            "params": {"_meta": meta, "uri": state.uri}
+        }));
+    }
+    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+    if stream.write_all(head.as_bytes()).is_err() {
+        return;
+    }
+    for f in frames {
+        let _ = stream.write_all(format!("data: {f}\n\n").as_bytes());
+        let _ = stream.flush();
+    }
+    std::thread::sleep(Duration::from_millis(50));
 }
 
 /// The long-lived `GET` SSE stream: hold it open and deliver the one-shot

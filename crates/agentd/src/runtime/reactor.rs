@@ -367,6 +367,11 @@ pub struct Runtime {
     pub(crate) durable: Durable,
     pub(crate) mcp: BTreeMap<String, Arc<McpClient>>,
     pub(crate) mcp_specs: BTreeMap<String, crate::config::McpServerSpec>,
+    /// Per server, the subscriptions an owner wants and the live connection
+    /// does not hold after a failure that may pass, and when to ask again
+    /// ([`Runtime::retry_subscribe`]). In memory: a restart subscribes every
+    /// owner again anyway.
+    pub(crate) resubscribe_retry: BTreeMap<String, super::SubscribeRetry>,
     pub(crate) registry: Registry,
     pub(crate) contexts: Contexts,
     pub(crate) memory: Memory,

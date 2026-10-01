@@ -1242,7 +1242,10 @@ flowchart LR
 | Streams carry derived taint, checked at load | P0 | A config where a webhook-`into:` or A2A-`into:` fed workflow reaches `sensitive` + `egress` servers fails validation (or warns first, Q8). That can include existing workflows' agent steps. |
 | Dead `subscribe`, `signal` and `schedule` fields removed | P0 | A config naming them fails validation with the generic unknown-field error. Four shipped examples and the docs change in the same commit. |
 | `resources/subscribe` refused without the capability | P0 | A server that silently ignored the subscription now produces a visible failure |
-| A failed resource subscribe is retried for real | P0 | Waits that silently parked with no subscription now subscribe |
+| A failed resource subscribe is retried for real | P0 | Waits that silently parked with no subscription now subscribe; a subscribe that fails in a way that may pass is asked again on a 1s→30s backoff |
+| Subscriptions are restored after a lost session, from the starts, waits and instruction that want them | P0 | A server back without `resources.subscribe` fails its resource waits and says `start.subscribe.unsupported`, as at boot; the instruction is read again |
+| A restored or re-dialed resource wait that can never be woken fails | P0 | At boot, and on a server a reload drops: the server gone from the config, or without `resources.subscribe`. A server that is configured but not connected leaves its waits parked, said at error level, until a reload connects it |
+| A stateless listen's acknowledgment is checked | P0 | A URI the server leaves out is refused (a wait on it fails), not recorded as watched |
 | Webhook idempotency marker written after the append, under `_wh_idem/` | P0 | A retry after a `503` is processed. Markers written by an older release are ignored, so a replay that straddles the upgrade may fire once more. |
 | `/hooks/_` reserved | P0 | A configured route under it fails validation |
 | rmcp ≥ 3.5.0 with the `Auto` lifecycle | P1 | `2026-07-28` servers get stateless requests and `subscriptions/listen` |

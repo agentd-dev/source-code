@@ -937,6 +937,59 @@ fn a_redialed_server_is_subscribed_again_for_unchanged_starts_and_waits() {
     );
 }
 
+/// A reload that removes a server takes the subscriptions on it with it. A
+/// suspended wait on that server can never be woken, and fails loudly — as it
+/// does at boot — rather than parking with nothing in any log.
+#[test]
+fn a_wait_on_a_server_the_reload_removes_fails() {
+    let a = common::spawn_mock_mcp("mock://a", false);
+    let b = common::spawn_mock_mcp("mock://b", false);
+    let t = tempfile::tempdir().unwrap();
+    let cfg = t.path().join("agent.yaml");
+    let waits = "  - name: waits\n    steps:\n      s: {kind: once}\n      w: {kind: wait, depends_on: [s], on: resource, server: b, uri: \"mock://waited\", timeout: 120s}\n      f: {kind: finish, depends_on: [w], status: completed}\n";
+    std::fs::write(
+        &cfg,
+        config(
+            "Work.",
+            &[("a", &a.uri()), ("b", &b.uri())],
+            &[TICK, waits],
+            "",
+        ),
+    )
+    .unwrap();
+    let d = Daemon::spawn(&cfg);
+    d.wait_for(
+        |_| b.subscribes("mock://waited") >= 1,
+        "the wait subscribing on b",
+        15,
+    );
+
+    // b goes, and the workflow that named it; the run keeps its definition.
+    std::fs::write(&cfg, config("Work.", &[("a", &a.uri())], &[TICK], "")).unwrap();
+    let log = d.reload(0);
+    assert_eq!(outcomes(&log)[0]["event"], "config.reloaded", "{log}");
+    let log = d.wait_for(
+        |l| {
+            events(l, "run.done")
+                .iter()
+                .any(|e| e["workflow"] == "waits" && e["status"] == "failed")
+        },
+        "the wait on the removed server to fail",
+        15,
+    );
+    assert!(
+        events(&log, "wait.resubscribe.fail")
+            .iter()
+            .any(|e| e["level"] == "error"
+                && e["server"] == "b"
+                && e["reason"] == "reload"
+                && e["err"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("no longer configured"))),
+        "{log}"
+    );
+}
+
 /// The resource instruction's server, with the instruction itself unchanged:
 /// a reload that removes it is refused, as a start with that configuration
 /// is; one that re-dials it reads the instruction again through the new

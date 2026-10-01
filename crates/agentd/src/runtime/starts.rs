@@ -162,7 +162,7 @@ impl Runtime {
                         }
                     }
                 }
-                "subscribe" => self.arm_subscribe(&workflow, &node, &spec),
+                "subscribe" => self.arm_subscribe(&workflow, &node, &spec, None),
                 _ => {}
             }
         }
@@ -231,47 +231,84 @@ impl Runtime {
         None
     }
 
-    fn arm_subscribe(&mut self, workflow: &str, node: &str, spec: &Map<String, Value>) {
+    /// Subscribe a `subscribe` start's resource. `reason` says why it is
+    /// asked again (`reload`, `session_lost`, `retry`); `None` is its first
+    /// arm.
+    ///
+    /// Bounded by the management timeout, with a heartbeat after: a reload,
+    /// a re-dial and a retry all come here from the loop. A failure that may
+    /// pass is asked again on a backoff (`retry_subscribe`) — said once and
+    /// left, the start never fired again.
+    fn arm_subscribe(
+        &mut self,
+        workflow: &str,
+        node: &str,
+        spec: &Map<String, Value>,
+        reason: Option<&str>,
+    ) {
         let server = spec.get("server").and_then(Value::as_str).unwrap_or("");
         let uri = spec.get("uri").and_then(Value::as_str).unwrap_or("");
-        match self.mcp.get(server) {
-            Some(c) => match c.subscribe(uri) {
-                Ok(()) => self.log.info(
-                    "start.subscribe.armed",
-                    json!({"workflow": workflow, "node": node, "server": server, "uri": uri}),
-                ),
-                // The server offers no subscriptions: this start can never
-                // fire. Said at error level and by its own name, because it is
-                // a configuration that cannot work, not a server that failed.
-                Err(e @ crate::mcp::client::McpError::Capability(_)) => self.log.error(
-                    "start.subscribe.unsupported",
-                    json!({"workflow": workflow, "node": node, "server": server, "uri": uri, "err": e.to_string()}),
-                ),
-                Err(e) => self.log.warn(
-                    "start.subscribe.fail",
-                    json!({"workflow": workflow, "node": node, "err": e.to_string()}),
-                ),
-            },
-            None => self.log.warn(
+        let Some(c) = self.mcp.get(server).cloned() else {
+            self.log.warn(
                 "start.subscribe.no_server",
                 json!({"workflow": workflow, "node": node, "server": server}),
+            );
+            return;
+        };
+        let subscribed = c.subscribe_within(uri, crate::obs::health::management_timeout());
+        crate::obs::health::tick();
+        match subscribed {
+            Ok(()) => {
+                let mut armed =
+                    json!({"workflow": workflow, "node": node, "server": server, "uri": uri});
+                if let Some(r) = reason {
+                    armed["reason"] = json!(r);
+                }
+                self.log.info("start.subscribe.armed", armed)
+            }
+            // The server offers no subscriptions: this start can never
+            // fire. Said at error level and by its own name, because it is
+            // a configuration that cannot work, not a server that failed.
+            Err(e @ crate::mcp::client::McpError::Capability(_)) => self.log.error(
+                "start.subscribe.unsupported",
+                json!({"workflow": workflow, "node": node, "server": server, "uri": uri, "err": e.to_string()}),
             ),
+            Err(e) => {
+                self.log.warn(
+                    "start.subscribe.fail",
+                    json!({"workflow": workflow, "node": node, "server": server, "uri": uri, "err": e.to_string()}),
+                );
+                self.retry_subscribe(server, uri);
+            }
         }
     }
 
-    /// Subscribe again, on a connection a reload dialed in place of a running
-    /// one, what the running one carried: the `subscribe` starts of the armed
-    /// workflows not in `skip` (those were just armed on it) and the
-    /// resources suspended `wait on: resource` steps wait on. A subscription
-    /// lives on its connection, so the old one took them with it when the
-    /// reload dropped it — and the start that never fired again, or the wait
-    /// that never resolved, said nothing. The waits go through
-    /// `resubscribe_waits`, the one path boot takes for a restored wait.
+    /// Subscribe again, on a connection a reload dialed, what an owner wants
+    /// there: the `subscribe` starts of the armed workflows not in `skip`
+    /// (those were just armed on it) and the resources suspended
+    /// `wait on: resource` steps wait on. `servers` are the ones the reload
+    /// dialed — in place of a running connection, or for the first time —
+    /// and the ones it dropped, whose waits fail or stay parked by the rule
+    /// boot applies. A subscription lives on its connection, so the old one
+    /// took them with it — and the start that never fired again, or the wait
+    /// that never resolved, said nothing.
     pub(crate) fn resubscribe_on(&mut self, servers: &[String], skip: &[String]) {
         if servers.is_empty() {
             return;
         }
-        let on = |s: Option<&str>| s.is_some_and(|s| servers.iter().any(|x| x == s));
+        self.resubscribe_where(&|s, _| servers.iter().any(|x| x == s), skip, "reload");
+    }
+
+    /// The starts and waits half of every restore — a reload's, a re-dial's,
+    /// a retry's — for the `(server, uri)` pairs `wanted` takes. The waits go
+    /// through `resubscribe_waits`, the one path boot takes for a restored
+    /// wait.
+    pub(crate) fn resubscribe_where(
+        &mut self,
+        wanted: &dyn Fn(&str, &str) -> bool,
+        skip: &[String],
+        reason: &str,
+    ) {
         let starts: Vec<StartSpec> = self
             .workflows
             .values()
@@ -279,15 +316,21 @@ impl Runtime {
             .flat_map(|w| {
                 w.start_steps()
                     .into_iter()
-                    .filter(|s| s.kind == "subscribe" && on(s.field_str("server")))
+                    .filter(|s| {
+                        s.kind == "subscribe"
+                            && wanted(
+                                s.field_str("server").unwrap_or(""),
+                                s.field_str("uri").unwrap_or(""),
+                            )
+                    })
                     .map(|s| (w.name.clone(), s.id.clone(), s.kind.clone(), s.spec.clone()))
                     .collect::<Vec<_>>()
             })
             .collect();
         for (workflow, node, _, spec) in starts {
-            self.arm_subscribe(&workflow, &node, &spec);
+            self.arm_subscribe(&workflow, &node, &spec, Some(reason));
         }
-        self.resubscribe_waits(Some(servers), "reload");
+        self.resubscribe_waits(wanted, reason);
     }
 
     /// Every tick: fire due `schedule`/`loop` starts and flush debounced

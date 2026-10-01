@@ -627,7 +627,11 @@ impl Runtime {
         // changed one's — closes once the last holder lets go of it: a call
         // already in flight on it finishes there, and a step that starts
         // after this finds the server gone ("not connected").
-        let mut redialed: Vec<String> = Vec::new();
+        // The servers this reload dialed — in place of a running connection,
+        // or for the first time (added, or down until now) — and the ones it
+        // dropped: their owners' subscriptions are restored, or their waits
+        // fail or stay parked, below.
+        let mut touched: Vec<String> = Vec::new();
         let mcp_moved = mcp.is_some();
         if let Some(StagedMcp { set, specs, fresh }) = mcp {
             let dropped: Vec<String> = self
@@ -636,11 +640,11 @@ impl Runtime {
                 .filter(|k| !set.contains_key(*k))
                 .cloned()
                 .collect();
-            redialed = fresh
-                .iter()
-                .filter(|f| self.mcp.contains_key(*f))
-                .cloned()
-                .collect();
+            touched = fresh.iter().chain(&dropped).cloned().collect();
+            for t in &touched {
+                // What a pending retry would ask for is asked for below.
+                self.resubscribe_retry.remove(t);
+            }
             let previous = std::mem::replace(&mut self.mcp, set);
             self.mcp_specs = specs;
             for r in &dropped {
@@ -794,12 +798,14 @@ impl Runtime {
                 changed.push("workflows");
             }
         }
-        // What the dropped connections carried: the subscriptions of the
+        // What the replaced connections carried, and what a server dialed
+        // for the first time was never given: the subscriptions of the
         // unchanged workflows' `subscribe` starts and of suspended resource
-        // waits, on each server this reload re-dialed. (The ones just armed
-        // subscribed on the new connection already; the instruction was read
-        // and subscribed through it above.)
-        self.resubscribe_on(&redialed, &anew);
+        // waits. A dropped server's waits fail, or stay parked while it is
+        // still configured, by the rule boot applies. (The workflows just
+        // armed subscribed on the new connections already; the instruction
+        // was read and subscribed through its connection above.)
+        self.resubscribe_on(&touched, &anew);
         if registry_rebuilt {
             self.log_workflow_tools();
         }

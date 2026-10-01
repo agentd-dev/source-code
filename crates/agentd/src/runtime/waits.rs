@@ -876,22 +876,29 @@ impl Runtime {
     }
 
     /// Subscribe again the resources the suspended `wait on: resource` steps
-    /// wait on — those on `servers`, or every one when `servers` is `None`.
+    /// wait on — those whose `(server, uri)` `wanted` takes.
     ///
     /// A subscription lives on its connection, while the wait it serves is
     /// durable: a restart restores the step parked on a connection that no
-    /// longer exists, and a reload that re-dials a server drops the one it
-    /// was subscribed on. Either way the wait would park until its timeout,
-    /// or for ever, with nothing in any log. Boot (`servers: None`, after the
-    /// restore) and the reload (`resubscribe_on`, the servers it re-dialed)
-    /// both come here, so the two cannot drift apart.
+    /// longer exists, and a reload or a re-dial replaces the one it was
+    /// subscribed on. Either way the wait would park until its timeout, or
+    /// for ever, with nothing in any log. Boot (every wait, after the
+    /// restore), a reload (the servers it dialed or dropped), a re-dial after
+    /// a lost session and a retry all come here, so they cannot drift apart.
     ///
     /// A wait that can never be woken fails its step, as a fresh wait does in
-    /// `step_wait`: its server is not connected (gone from the config, or
-    /// down at boot), or it does not advertise `resources.subscribe`. Any
-    /// other failure leaves the wait parked under its own deadline, said at
-    /// warn level.
-    pub(crate) fn resubscribe_waits(&mut self, servers: Option<&[String]>, reason: &str) {
+    /// `step_wait`: its server is gone from the config, or it does not
+    /// advertise `resources.subscribe`. A server that is configured but not
+    /// connected — down when the daemon came up, or its reload re-dial
+    /// failed — is said at error level and its waits stay parked under their
+    /// own deadlines: an outage that passes is not a reason to fail durable
+    /// runs, and a reload that connects the server subscribes them. Any
+    /// other failure is said at warn level and asked again on a backoff
+    /// (`retry_subscribe`).
+    ///
+    /// Each subscribe is bounded by the management timeout and followed by a
+    /// heartbeat: all but boot run on the loop.
+    pub(crate) fn resubscribe_waits(&mut self, wanted: &dyn Fn(&str, &str) -> bool, reason: &str) {
         // One subscribe per resource, however many steps wait on it: a
         // connection tracks a URI once, whoever subscribed it.
         let mut waits: std::collections::BTreeMap<(String, String), Vec<(String, String)>> =
@@ -906,10 +913,10 @@ impl Runtime {
                     && w["kind"] == "resource"
                 {
                     let server = w["server"].as_str().unwrap_or_default();
-                    if servers.is_some_and(|s| !s.iter().any(|x| x == server)) {
+                    let uri = w["uri"].as_str().unwrap_or_default();
+                    if !wanted(server, uri) {
                         continue;
                     }
-                    let uri = w["uri"].as_str().unwrap_or_default();
                     waits
                         .entry((server.to_string(), uri.to_string()))
                         .or_default()
@@ -919,26 +926,40 @@ impl Runtime {
         }
         for ((server, uri), steps) in waits {
             let refused = match self.mcp.get(&server).cloned() {
-                None => format!("wait resource: server {server:?} is not connected"),
-                Some(c) => match c.subscribe(&uri) {
-                    Ok(()) => {
-                        self.log.info(
-                            "wait.resubscribed",
-                            json!({"server": server, "uri": uri, "reason": reason}),
-                        );
-                        continue;
+                None if self.mcp_specs.contains_key(&server) => {
+                    self.log.error(
+                        "wait.resubscribe.fail",
+                        json!({"server": server, "uri": uri, "reason": reason, "parked": steps.len(),
+                               "err": format!("server {server:?} is configured but not connected; the wait stays parked until a reload connects it")}),
+                    );
+                    continue;
+                }
+                None => format!("wait resource: server {server:?} is no longer configured"),
+                Some(c) => {
+                    let subscribed =
+                        c.subscribe_within(&uri, crate::obs::health::management_timeout());
+                    crate::obs::health::tick();
+                    match subscribed {
+                        Ok(()) => {
+                            self.log.info(
+                                "wait.resubscribed",
+                                json!({"server": server, "uri": uri, "reason": reason}),
+                            );
+                            continue;
+                        }
+                        Err(e @ crate::mcp::client::McpError::Capability(_)) => {
+                            format!("wait resource: subscribe {uri}: {e}")
+                        }
+                        Err(e) => {
+                            self.log.warn(
+                                "wait.resubscribe.fail",
+                                json!({"server": server, "uri": uri, "reason": reason, "err": e.to_string()}),
+                            );
+                            self.retry_subscribe(&server, &uri);
+                            continue;
+                        }
                     }
-                    Err(e @ crate::mcp::client::McpError::Capability(_)) => {
-                        format!("wait resource: subscribe {uri}: {e}")
-                    }
-                    Err(e) => {
-                        self.log.warn(
-                            "wait.resubscribe.fail",
-                            json!({"server": server, "uri": uri, "reason": reason, "err": e.to_string()}),
-                        );
-                        continue;
-                    }
-                },
+                }
             };
             self.log.error(
                 "wait.resubscribe.fail",

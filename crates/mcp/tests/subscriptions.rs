@@ -36,6 +36,16 @@ struct Server {
     refuse_handshake: AtomicBool,
     /// Refuse a `resources/subscribe` for these URIs, once each.
     refuse_once: Mutex<Vec<String>>,
+    /// Refuse the next `subscriptions/listen` with a JSON-RPC error.
+    refuse_listen_once: AtomicBool,
+    /// Leave these URIs out of every listen acknowledgment: a server that
+    /// takes a narrower filter than it was asked for, which rmcp allows.
+    narrow: Mutex<Vec<String>>,
+    /// Answer every notification-stream `GET` with `404`, where the spec says
+    /// `405` — a framework that routes only `POST`.
+    get_404: AtomicBool,
+    /// Hold each `resources/subscribe` this long before answering.
+    slow_subscribe_ms: AtomicU64,
     /// Every `(method, session the request carried, uri param)` that reached it.
     seen: Mutex<Vec<Seen>>,
     /// Open `GET` notification streams, closed by a restart the way a process
@@ -53,6 +63,17 @@ impl Server {
         self.generation.fetch_add(1, Ordering::SeqCst);
         for s in self.streams.lock().unwrap().drain(..) {
             let _ = s.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
+    /// Push `resources/updated` for `uri` down every open notification
+    /// stream.
+    fn push(&self, uri: &str) {
+        let note = json!({"jsonrpc": "2.0", "method": "notifications/resources/updated",
+                          "params": {"uri": uri}});
+        for s in self.streams.lock().unwrap().iter_mut() {
+            let _ = s.write_all(format!("data: {note}\n\n").as_bytes());
+            let _ = s.flush();
         }
     }
 
@@ -156,7 +177,7 @@ fn serve(conn: TcpStream, server: &Server, revision: Option<&'static str>) {
     // A session this server no longer holds: Streamable HTTP's `404`.
     let stale = req.session.as_ref().is_some_and(|s| *s != server.session());
     if req.method == "GET" {
-        if stale {
+        if stale || server.get_404.load(Ordering::SeqCst) {
             let _ = w.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
             return;
         }
@@ -232,6 +253,9 @@ fn serve(conn: TcpStream, server: &Server, revision: Option<&'static str>) {
             );
         }
         "resources/subscribe" => {
+            std::thread::sleep(Duration::from_millis(
+                server.slow_subscribe_ms.load(Ordering::SeqCst),
+            ));
             let uri = uri.unwrap_or_default();
             let refused = {
                 let mut once = server.refuse_once.lock().unwrap();
@@ -254,7 +278,17 @@ fn serve(conn: TcpStream, server: &Server, revision: Option<&'static str>) {
             // Acknowledge the filter, send one update for each URI in it, then
             // close the stream without a final result — a server that dropped
             // the connection, or restarted between two listens.
-            let filter = msg["params"]["notifications"].clone();
+            if server.refuse_listen_once.swap(false, Ordering::SeqCst) {
+                let body = json!({"jsonrpc": "2.0", "id": id,
+                                  "error": {"code": -32603, "message": "listen refused"}});
+                respond(&mut w, &body, None);
+                return;
+            }
+            let mut filter = msg["params"]["notifications"].clone();
+            let narrow = server.narrow.lock().unwrap().clone();
+            if let Some(uris) = filter["resourceSubscriptions"].as_array_mut() {
+                uris.retain(|u| !narrow.iter().any(|n| u == n));
+            }
             let meta = json!({"io.modelcontextprotocol/subscriptionId": id});
             let mut frames = vec![json!({
                 "jsonrpc": "2.0", "method": "notifications/subscriptions/acknowledged",
@@ -616,5 +650,167 @@ fn a_redial_the_server_refuses_keeps_the_lost_uris_and_backs_off() {
         client.redial_failures(),
         0,
         "a success starts the count over"
+    );
+}
+
+/// A 2026-07-28 connection, made through the SDK backend directly.
+fn listening(server: &Arc<Server>) -> mcp::rmcp_client::RmcpClient {
+    let ep = spawn(
+        Arc::clone(server),
+        Some(ProtocolVersion::V_2026_07_28.as_str()),
+    );
+    RmcpBuilder::new("forgetful", &ep, vec![], Duration::from_secs(5))
+        .connect()
+        .expect("connect")
+}
+
+#[test]
+fn a_listen_acknowledged_without_the_uri_is_refused_and_not_recorded() {
+    // rmcp lets a server acknowledge a narrower filter than it was asked for,
+    // and then drops every update outside it. Recorded anyway, the URI read
+    // as "already covered" on every later try while nothing ever woke it.
+    let server: Arc<Server> = Arc::default();
+    let client = listening(&server);
+    client.subscribe("file:///a").expect("a");
+    server.narrow.lock().unwrap().push("file:///b".into());
+    match client.subscribe("file:///b") {
+        Err(McpError::Capability(m)) => assert!(m.contains("file:///b"), "{m}"),
+        other => panic!("a URI the server left out must be refused: {other:?}"),
+    }
+    assert_eq!(
+        client.subscribed(),
+        ["file:///a"],
+        "only what was acknowledged"
+    );
+
+    // The server takes it now: asking again reaches it, and holds.
+    server.narrow.lock().unwrap().clear();
+    let before = server.count("subscriptions/listen");
+    client
+        .subscribe("file:///b")
+        .expect("b, acknowledged this time");
+    assert_eq!(server.count("subscriptions/listen"), before + 1);
+    assert_eq!(client.subscribed(), ["file:///a", "file:///b"]);
+}
+
+#[test]
+fn a_refused_listen_is_asked_again() {
+    // The 2026-07-28 half of "a failed subscribe is retried for real".
+    let server: Arc<Server> = Arc::default();
+    let client = listening(&server);
+    server.refuse_listen_once.store(true, Ordering::SeqCst);
+    client.subscribe("file:///a").expect_err("refused");
+    assert!(client.subscribed().is_empty());
+    client
+        .subscribe("file:///a")
+        .expect("the retry reaches the server");
+    assert_eq!(
+        server.uris("subscriptions/listen")[..2],
+        ["file:///a", "file:///a"]
+    );
+    assert_eq!(client.subscribed(), ["file:///a"]);
+}
+
+#[test]
+fn a_re_listen_acknowledged_narrower_drops_the_uris_and_says_so() {
+    // The pump's own re-listen gets the same check: a URI the server stopped
+    // taking leaves the accepted set, and the host hears which.
+    let server: Arc<Server> = Arc::default();
+    let client = listening(&server);
+    client.subscribe("file:///a").expect("a");
+    client.subscribe("file:///b").expect("a,b");
+    server.narrow.lock().unwrap().push("file:///b".into());
+    let mut events = Vec::new();
+    wait_until("the re-listen to come back narrower", || {
+        events.extend(client.drain_listen_events());
+        events
+            .iter()
+            .any(|e| matches!(e, ListenEvent::Narrowed { .. }))
+    });
+    assert!(
+        events.contains(&ListenEvent::Narrowed {
+            dropped: vec!["file:///b".into()]
+        }),
+        "{events:?}"
+    );
+    assert_eq!(client.subscribed(), ["file:///a"]);
+}
+
+#[test]
+fn an_update_queued_on_the_lost_connection_survives_the_redial() {
+    // The server's last wake before it restarted reached the old connection,
+    // and the host had not drained it yet. The re-dial replaces the
+    // connection whole; the update must not go with it.
+    let server: Arc<Server> = Arc::default();
+    let ep = spawn(Arc::clone(&server), None);
+    let client = connect(&ep);
+    client.subscribe("file:///a").expect("subscribe");
+    wait_until("the notification stream to open", || {
+        !server.streams.lock().unwrap().is_empty()
+    });
+    server.push("file:///a");
+    std::thread::sleep(Duration::from_millis(300));
+
+    server.restart();
+    let _ = client.list_tools();
+    assert!(client.session_lost());
+    client
+        .redial_within(Duration::from_secs(5))
+        .expect("redial");
+    let updates: Vec<_> = client
+        .drain_notifications()
+        .into_iter()
+        .filter(|n| n.method == "notifications/resources/updated")
+        .collect();
+    assert_eq!(
+        updates.len(),
+        1,
+        "the queued update is still there to drain"
+    );
+}
+
+#[test]
+fn a_server_that_loses_every_new_session_is_re_dialed_on_a_growing_wait() {
+    // A server that answers the notification stream's `GET` with `404` makes
+    // every session look lost the moment it opens. Each handshake succeeds,
+    // so a schedule that started over on every success re-dialed it about
+    // once a second, for ever.
+    let server: Arc<Server> = Arc::default();
+    server.get_404.store(true, Ordering::SeqCst);
+    let ep = spawn(Arc::clone(&server), None);
+    let client = connect(&ep);
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(4) {
+        if client.redial_due() {
+            client
+                .redial_within(Duration::from_secs(5))
+                .expect("the handshake itself succeeds");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Re-dials at 0, +1s and +3s, the next due at +7s: three, where a reset
+    // schedule makes one per GET retry.
+    let redials = server.count("initialize") - 1;
+    assert!(
+        (2..=3).contains(&redials),
+        "re-dialed {redials} times in 4s"
+    );
+}
+
+#[test]
+fn a_bounded_subscribe_gives_up_at_its_bound() {
+    let server: Arc<Server> = Arc::default();
+    server.slow_subscribe_ms.store(3_000, Ordering::SeqCst);
+    let ep = spawn(Arc::clone(&server), None);
+    let client = connect(&ep);
+    let t = Instant::now();
+    match client.subscribe_within("file:///a", Duration::from_millis(200)) {
+        Err(McpError::Transport(m)) => assert!(m.contains("timed out"), "{m}"),
+        other => panic!("a slow server is a timeout at the bound: {other:?}"),
+    }
+    assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    assert!(
+        client.subscribe("file:///a").is_ok(),
+        "unbounded, the same subscribe waits the server out"
     );
 }

@@ -9,7 +9,10 @@
 //! in any log.
 //!
 //! A restored wait that can never be woken is a loud failure instead: its
-//! server is gone from the config, or no longer offers subscriptions.
+//! server is gone from the config, or no longer offers subscriptions. One
+//! whose server is configured but down when the daemon comes up is said, and
+//! stays parked: an outage that passes is no reason to fail a durable run,
+//! and the reload that connects the server subscribes it.
 #![cfg(unix)]
 
 mod common;
@@ -54,6 +57,9 @@ fn config(dir: &str, server: Option<&str>) -> String {
 
 /// Whether the store holds the suspended wait's record: the run, written
 /// with the wait it parked on (`since_ms` is the wait record's own field).
+/// Only a record in place counts: the store writes a hidden temp file and
+/// renames it over the record, and a kill between the two leaves the next
+/// life restoring the run from before the wait.
 fn wait_is_durable(dir: &str) -> bool {
     fn walk(p: &std::path::Path) -> bool {
         let Ok(entries) = std::fs::read_dir(p) else {
@@ -63,6 +69,9 @@ fn wait_is_durable(dir: &str) -> bool {
             let path = e.path();
             if path.is_dir() {
                 return walk(&path);
+            }
+            if e.file_name().to_string_lossy().starts_with('.') {
+                return false;
             }
             std::fs::read_to_string(&path).is_ok_and(|s| {
                 s.contains("\"since_ms\"")
@@ -197,7 +206,7 @@ fn a_restored_wait_whose_server_is_gone_fails_at_boot() {
             && e["reason"] == "boot"
             && e["err"]
                 .as_str()
-                .is_some_and(|s| s.contains("not connected"))),
+                .is_some_and(|s| s.contains("no longer configured"))),
         "the wait that can never be woken is said at error level:\n{l2}"
     );
     assert!(
@@ -242,5 +251,94 @@ fn a_restored_wait_on_a_server_without_subscriptions_fails_at_boot() {
     );
     assert!(events(&l2, "wait.resubscribed").is_empty(), "{l2}");
     let _ = std::fs::remove_file(&addr_file);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The server is down when the next life comes up — agentd and its MCP
+/// server restarting together, and agentd winning the race. The restored wait
+/// is said and stays parked; once a reload connects the server, it is
+/// subscribed there and the next update resolves it.
+#[cfg(feature = "hot-reload")]
+#[test]
+fn a_restored_wait_whose_server_is_down_at_boot_stays_parked_until_a_reload_connects_it() {
+    let (dir, cfg) = first_life("wait-resource-down");
+
+    // Nothing listens on the endpoint the next life dials.
+    let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}/mcp", dead.local_addr().unwrap());
+    drop(dead);
+    std::fs::write(&cfg, config(&dir, Some(&endpoint))).unwrap();
+    let err_path = common::unique_path("wait-resource", "log");
+    let errf = std::fs::File::create(&err_path).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .args(["--config", &cfg])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(errf))
+        .spawn()
+        .expect("spawn agentd");
+    let log = || std::fs::read_to_string(&err_path).unwrap_or_default();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !events(&log(), "wait.resubscribe.fail")
+        .iter()
+        .any(|e| e["reason"] == "boot")
+    {
+        assert!(Instant::now() < deadline, "no word on the wait:\n{}", log());
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let l = log();
+    assert!(
+        events(&l, "wait.resubscribe.fail")
+            .iter()
+            .any(|e| e["level"] == "error"
+                && e["server"] == "a"
+                && e["parked"] == 1
+                && e["err"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("configured but not connected"))),
+        "the parked wait is said at error level:\n{l}"
+    );
+    // Past the idle grace: a failed run would have let the daemon go idle.
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(
+        child.try_wait().expect("try_wait").is_none(),
+        "the restored run was failed for an outage:\n{}",
+        log()
+    );
+    assert!(events(&log(), "run.done").is_empty(), "{}", log());
+
+    // The server is up; a reload connects it.
+    let pushing = common::spawn_mock_mcp(WAITED, true);
+    std::fs::write(&cfg, config(&dir, Some(&format!("{}/mcp", pushing.uri())))).unwrap();
+    unsafe { libc::kill(child.id() as i32, libc::SIGHUP) };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(s) = child.try_wait().expect("try_wait") {
+            break s;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the reload never resolved the parked wait:\n{}", log());
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    let l = log();
+    assert_eq!(status.code(), Some(0), "{l}");
+    assert!(
+        events(&l, "wait.resubscribed")
+            .iter()
+            .any(|e| e["server"] == "a" && e["reason"] == "reload"),
+        "the reload subscribed the parked wait on the server it connected:\n{l}"
+    );
+    assert!(
+        events(&l, "run.done")
+            .iter()
+            .any(|e| e["workflow"] == "waits"
+                && e["status"] == "completed"
+                && e["output"] == "woken"),
+        "{l}"
+    );
+    let _ = std::fs::remove_file(&err_path);
     let _ = std::fs::remove_dir_all(&dir);
 }

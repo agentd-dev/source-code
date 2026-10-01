@@ -100,8 +100,12 @@ exhaustive.
 | `config.invalid` / `config.warning` / `config.reloaded` | `error` / `warning` — one validation or reload finding, never a secret value; `config.reloaded` carries `trigger` and `changed` |
 | `mcp.connect` | `server`, `transport`, `tools` (count), `resources` (count) |
 | `mcp.connect.fail` | `server`, `transport`, `err` |
-| `mcp.disconnect` | `server`, `reason` |
+| `mcp.disconnect` | `server`, `reason` (`reload`, `reload refused`, or `session_lost`: the server answered `404` to the connection's session, and agentd re-dials it) |
+| `mcp.connect` (`reason: session_lost`) / `mcp.connect.fail` (`reason: session_lost`) | `server`, `resubscribing` (count) / `err` — the re-dial after a lost session; a failed one is retried on a 1s→30s backoff |
+| `mcp.resubscribed` / `mcp.resubscribe.fail` | `server`, `uri` (+ `err`, at error level) — a URI the lost session held, subscribed again on the re-dialed connection |
+| `mcp.listen.ended` / `mcp.listen.resumed` | `server` + `reason`, `retry_ms` — a `subscriptions/listen` stream ended and is opened again after `retry_ms` (stateless revisions only) |
 | `start.schedule.armed` / `start.subscribe.armed` | `workflow`, `node` + `next_ms` (schedule) or `server`, `uri` (subscribe) — a start node armed |
+| `start.subscribe.unsupported` | `workflow`, `node`, `server`, `uri`, `err` — at error level: the server does not advertise `resources.subscribe`, so this start can never fire |
 | `wait.resubscribed` / `wait.resubscribe.fail` | `server`, `uri` (+ `err`) — a reload re-dialed `server`, and a suspended `wait on: resource` was subscribed again on the new connection (a `subscribe` start logs `start.subscribe.armed` again) |
 | `start.fired` | `workflow`, `node`, `kind` — a start node fired; an A2A start logs `start.a2a.fired` (`conversation`, `command`, `role`) first |
 | `start.shed` / `start.frozen` / `start.inbox.failed` | `workflow`, `node`, `kind`, plus `cause` (`err` for the inbox) — a firing was refused: resource pressure, a §7.7 freshness freeze, or a failed write of the durable inbox. A `stream` or `correlate` consumer's line also names what it holds — `stream` with `seq` and `event_id` (one event), `from`, `to`, `events`, `seqs` and `event_ids` (a batch) or `correlation`, `events`, `seqs` and `event_ids` (a join) — and that stays unconsumed and is offered again on later passes; a held consumer reads no further until it is admitted. The line is written once when the consumer starts being held, not on every pass |

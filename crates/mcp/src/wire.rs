@@ -56,10 +56,16 @@ pub struct Implementation {
     pub title: Option<String>,
 }
 
-/// What a server says it can do. Every call is gated on these, and the gate is
-/// fail-closed — an absent capability is a refusal, not a maybe: no `tools/call`
-/// unless `tools` is present; no `resources/subscribe` unless
-/// `resources.subscribe == Some(true)`.
+/// What a server says it can do. The calls whose silence would be mistaken for
+/// success are gated on these, and the gate is fail-closed — an absent
+/// capability is a refusal, not a maybe: no subscription (`resources/subscribe`,
+/// or a URI in a `subscriptions/listen` filter) unless
+/// `resources.subscribe == Some(true)`, so a server that would never notify is
+/// an error at subscribe time rather than a wait that parks forever; no
+/// `prompts/get` without `prompts`; no `completion/complete` without
+/// `completions`; and `resources/templates/list` without `resources` is empty.
+/// `tools/list` and `tools/call` are not gated: a server without tools answers
+/// them with an error of its own.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ServerCapabilities {
     #[serde(default, skip_serializing_if = "Option::is_none")]

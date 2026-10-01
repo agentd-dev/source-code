@@ -212,7 +212,7 @@ fn streamable_http_full_lifecycle() {
     // Version negotiation: the client advertised its latest (2025-11-25) but the
     // server responded with 2025-06-18 — the client must ADOPT the server's choice.
     assert_eq!(
-        client.protocol_version(),
+        client.protocol_version().as_deref(),
         Some("2025-06-18"),
         "the client adopts the version the server negotiated"
     );

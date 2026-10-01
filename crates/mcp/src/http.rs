@@ -21,6 +21,7 @@ use net::tls::ClientIdentity;
 use serde_json::Value;
 use std::io;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// A resolved MCP endpoint: where to connect + the HTTP `path`/`Host` to send.
@@ -187,6 +188,13 @@ pub struct HttpTransport {
     #[cfg(feature = "tls")]
     identity: Option<ClientIdentity>,
     session: Mutex<Option<String>>,
+    /// Set once the server answered `404` to a request that carried this
+    /// socket's `Mcp-Session-Id`: Streamable HTTP's way of saying it no longer
+    /// knows the session (a restart, an expiry). Every subscription the server
+    /// held for it is gone, and only a new handshake gets a working session
+    /// back — on a fresh socket, see [`Self::redial_copy`]. Never cleared: the
+    /// session it describes never comes back.
+    session_lost: AtomicBool,
     /// An optional per-request AAuth signer. `None` = the endpoint is called
     /// unsigned (the default; static-bearer/mTLS auth is unaffected).
     signer: Option<std::sync::Arc<dyn RequestSigner>>,
@@ -200,7 +208,41 @@ impl HttpTransport {
             #[cfg(feature = "tls")]
             identity: None,
             session: Mutex::new(None),
+            session_lost: AtomicBool::new(false),
             signer: None,
+        }
+    }
+
+    /// The same endpoint, headers, signer and mTLS identity with none of this
+    /// socket's session: what a re-dial after a lost session handshakes on.
+    /// A fresh socket rather than this one with its session cleared, so a
+    /// straggler of the lost connection — its notification stream redialling,
+    /// a call abandoned at its bound — can neither carry the new session nor
+    /// mark it lost.
+    pub fn redial_copy(&self) -> HttpTransport {
+        HttpTransport {
+            endpoint: self.endpoint.clone(),
+            headers: self.headers.clone(),
+            #[cfg(feature = "tls")]
+            identity: self.identity.clone(),
+            session: Mutex::new(None),
+            session_lost: AtomicBool::new(false),
+            signer: self.signer.clone(),
+        }
+    }
+
+    /// Has the server forgotten this socket's session? See `session_lost`.
+    pub fn session_lost(&self) -> bool {
+        self.session_lost.load(Ordering::SeqCst)
+    }
+
+    /// Record a `404` answered to a request that carried a session: the one
+    /// status Streamable HTTP gives a session the server no longer holds. A
+    /// `404` to a request with no session (the `initialize` itself, a server
+    /// that never issued one) says nothing about a session.
+    fn note_status(&self, status: u16, carried_session: bool) {
+        if status == 404 && carried_session {
+            self.session_lost.store(true, Ordering::SeqCst);
         }
     }
 
@@ -407,6 +449,7 @@ impl HttpTransport {
         }
 
         if !resp.is_success() {
+            self.note_status(resp.status, session.is_some());
             return Ok(SendOutcome::Error(HttpError::Status(resp.status)));
         }
 
@@ -490,6 +533,7 @@ impl HttpTransport {
         )
         .map_err(HttpError::Http)?;
         if !resp.is_success() {
+            self.note_status(resp.status, session.is_some());
             return Err(HttpError::Status(resp.status));
         }
         if !resp.is_event_stream() {

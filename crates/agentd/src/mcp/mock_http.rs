@@ -15,6 +15,12 @@
 //! `notifications/resources/updated` on the long-lived `GET` SSE stream (unless
 //! `emit` is off), so a reactive agent reached over HTTP has something to react
 //! to.
+//!
+//! It can also **restart** without exiting: the `mock.restart` tool forgets
+//! every session it issued (a request still carrying one is answered `404`,
+//! as Streamable HTTP has a server say "no such session") and closes its open
+//! notification streams, the way a process that exits drops its sockets. That
+//! is how an e2e watches agentd notice a lost session and re-subscribe.
 
 use ::mcp::rpc::{self as json, Incoming, Request, Response};
 use ::mcp::wire::{PROTOCOL_VERSION, method};
@@ -22,7 +28,7 @@ use serde_json::json;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Cross-connection server state: a subscribe (on a POST) arms a one-shot push
@@ -36,7 +42,13 @@ use std::time::Duration;
 struct State {
     uri: String,
     emit: bool,
+    /// Advertise `resources.subscribe`. Off, the mock is a server that offers
+    /// resources but no subscriptions.
+    subscribe: bool,
     pending_emit: AtomicBool,
+    /// Bumped by `mock.restart`; the session the mock issues is
+    /// `mock-<generation>`, so every earlier one is forgotten.
+    generation: AtomicU64,
     /// The checkpointer store: key → (seq → envelope). Monotonic per key.
     store: std::sync::Mutex<
         std::collections::BTreeMap<String, std::collections::BTreeMap<u64, serde_json::Value>>,
@@ -49,9 +61,22 @@ struct State {
     ops: std::sync::Mutex<Vec<String>>,
 }
 
+impl State {
+    /// The session the mock issues now.
+    fn session(&self) -> String {
+        format!("mock-{}", self.generation.load(Ordering::SeqCst))
+    }
+}
+
 /// Serve the mock on loopback TCP until the process is killed, announcing the
 /// bound address through `addr_file`. Returns the process exit code.
 pub fn run(addr_file: &str, uri: &str, emit: bool) -> i32 {
+    run_offering(addr_file, uri, emit, true)
+}
+
+/// [`run`], advertising `resources.subscribe` only when `subscribe` is set —
+/// a server that serves resources but offers no subscriptions.
+pub fn run_offering(addr_file: &str, uri: &str, emit: bool, subscribe: bool) -> i32 {
     let listener = match TcpListener::bind("127.0.0.1:0") {
         Ok(l) => l,
         Err(e) => {
@@ -66,7 +91,9 @@ pub fn run(addr_file: &str, uri: &str, emit: bool) -> i32 {
     let state = Arc::new(State {
         uri: uri.to_string(),
         emit,
+        subscribe,
         pending_emit: AtomicBool::new(false),
+        generation: AtomicU64::new(0),
         store: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         flaky_calls: std::sync::atomic::AtomicU64::new(0),
         fail_next: std::sync::atomic::AtomicU64::new(0),
@@ -83,20 +110,30 @@ pub fn run(addr_file: &str, uri: &str, emit: bool) -> i32 {
 /// One HTTP request per connection (the client sends `Connection: close`). A
 /// `GET` is the notification SSE stream; a `POST` is one JSON-RPC frame.
 fn handle_conn(mut stream: TcpStream, state: Arc<State>) {
-    let Some((method_line, body)) = read_http(&stream) else {
+    let Some((method_line, session, body)) = read_http(&stream) else {
         return;
     };
+    // A session from before the last `mock.restart`: this server no longer
+    // knows it. A request with no session at all (the handshake, a test's own
+    // control call) is served.
+    let frame = serde_json::from_slice::<Incoming>(&body);
+    let handshake = matches!(&frame, Ok(Incoming::Request(r)) if r.method == "initialize");
+    if !handshake && session.is_some_and(|s| s != state.session()) {
+        let _ = stream
+            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        return;
+    }
     let is_get = method_line.starts_with("GET ");
     if is_get {
         serve_notifications(&mut stream, &state);
         return;
     }
-    // POST: parse the JSON-RPC frame.
-    match serde_json::from_slice::<Incoming>(&body) {
+    // POST: the JSON-RPC frame.
+    match frame {
         Ok(Incoming::Request(req)) => {
             let (resp, session) = handle_request(req, &state);
             let payload = serde_json::to_value(resp).unwrap_or(serde_json::Value::Null);
-            write_json(&mut stream, payload, session);
+            write_json(&mut stream, payload, session.then(|| state.session()));
         }
         // A notification POST (e.g. notifications/initialized) → 202, no body.
         Ok(Incoming::Notification(_)) | Ok(Incoming::Response(_)) | Err(_) => {
@@ -117,7 +154,7 @@ fn handle_request(req: Request, state: &State) -> (Response, bool) {
                 req.id,
                 json!({
                     "protocolVersion": PROTOCOL_VERSION,
-                    "capabilities": {"resources": {"subscribe": true, "listChanged": true}, "tools": {}, "prompts": {"listChanged": true}},
+                    "capabilities": {"resources": {"subscribe": state.subscribe, "listChanged": true}, "tools": {}, "prompts": {"listChanged": true}},
                     "serverInfo": {"name": "agentd-mock-http", "version": crate::VERSION}
                 }),
             ),
@@ -136,6 +173,7 @@ fn handle_request(req: Request, state: &State) -> (Response, bool) {
                     {"name": "mock.fault", "description": "fail the next N state.* calls", "inputSchema": {"type": "object"}},
                     {"name": "mock.ops", "description": "the state.* calls performed so far", "inputSchema": {"type": "object"}},
                     {"name": "mock.slow", "description": "answer after `ms` milliseconds", "inputSchema": {"type": "object"}},
+                    {"name": "mock.restart", "description": "forget every session, as a restarted server does", "inputSchema": {"type": "object"}},
                     {"name": "knowledge.search", "description": "RAG search over the mock corpus", "inputSchema": {"type": "object"}},
                     {"name": "knowledge.get", "description": "fetch a mock document", "inputSchema": {"type": "object"}},
                     {"name": "knowledge.list", "description": "list mock documents", "inputSchema": {"type": "object"}},
@@ -340,6 +378,15 @@ fn handle_tool_call(req: Request, state: &State) -> Response {
         }
     }
     match name {
+        // A restart: every session issued so far is forgotten, and the
+        // subscriptions with them — nothing is pushed until a client
+        // subscribes again on a new session.
+        Some("mock.restart") => {
+            state.pending_emit.store(false, Ordering::SeqCst);
+            let generation = state.generation.fetch_add(1, Ordering::SeqCst) + 1;
+            eprintln!("MOCK_RESTART {generation}");
+            tool_ok(req.id, json!({"ok": true, "generation": generation}))
+        }
         Some("mock.fault") => {
             let n = args
                 .get("count")
@@ -538,7 +585,12 @@ fn serve_notifications(stream: &mut TcpStream, state: &State) {
         return;
     }
     let _ = stream.flush();
+    let generation = state.generation.load(Ordering::SeqCst);
     loop {
+        // A restart drops the stream, as an exiting process drops its sockets.
+        if state.generation.load(Ordering::SeqCst) != generation {
+            return;
+        }
         if state.pending_emit.swap(false, Ordering::SeqCst) {
             let note = json::Notification::new(
                 method::NOTIFY_RESOURCES_UPDATED,
@@ -558,15 +610,16 @@ fn serve_notifications(stream: &mut TcpStream, state: &State) {
 }
 
 /// Read one HTTP request (request line, headers, Content-Length body) off a
-/// clone of `stream`. Returns `(request_line, body)` — headers beyond
-/// Content-Length are unused by the mock.
-fn read_http(stream: &TcpStream) -> Option<(String, Vec<u8>)> {
+/// clone of `stream`. Returns `(request_line, mcp_session_id, body)` — the
+/// other headers are unused by the mock.
+fn read_http(stream: &TcpStream) -> Option<(String, Option<String>, Vec<u8>)> {
     let mut reader = BufReader::new(stream.try_clone().ok()?);
     let mut request_line = String::new();
     if reader.read_line(&mut request_line).ok()? == 0 {
         return None;
     }
     let mut content_length = 0usize;
+    let mut session = None;
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line).ok()? == 0 {
@@ -581,21 +634,24 @@ fn read_http(stream: &TcpStream) -> Option<(String, Vec<u8>)> {
         {
             content_length = v.trim().parse().unwrap_or(0);
         }
+        if let Some((k, v)) = line.split_once(':')
+            && k.trim().eq_ignore_ascii_case("mcp-session-id")
+        {
+            session = Some(v.trim().to_string());
+        }
     }
     let mut body = vec![0u8; content_length];
     reader.read_exact(&mut body).ok()?;
-    Some((request_line, body))
+    Some((request_line, session, body))
 }
 
 /// Write an `application/json` HTTP response carrying `payload`, optionally
 /// stamping the `Mcp-Session-Id` header.
-fn write_json(stream: &mut TcpStream, payload: serde_json::Value, session: bool) {
+fn write_json(stream: &mut TcpStream, payload: serde_json::Value, session: Option<String>) {
     let body = serde_json::to_vec(&payload).unwrap_or_default();
-    let session_hdr = if session {
-        "Mcp-Session-Id: mock\r\n"
-    } else {
-        ""
-    };
+    let session_hdr = session
+        .map(|s| format!("Mcp-Session-Id: {s}\r\n"))
+        .unwrap_or_default();
     let head = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{session_hdr}Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()

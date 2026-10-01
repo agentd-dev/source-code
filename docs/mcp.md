@@ -128,9 +128,15 @@ model into someone else's.
 (e.g. structured tool output requires ≥ `2025-06-18`). A version it cannot speak,
 or a handshake that doesn't finish inside that server's request timeout
 (`mcp.servers[].timeout`, else `mcp.default_timeout`, default **60s**), is a
-connect failure. The negotiated capability set is then **frozen** and gates
-every subsequent call: agentd never sends `resources/subscribe` to a server that
-didn't advertise `resources.subscribe`; it degrades instead.
+connect failure. The negotiated capability set then belongs to that connection
+(a re-dial after a lost session, below, negotiates afresh) and gates the calls
+whose silence would pass for success: agentd never subscribes — neither
+`resources/subscribe` nor a URI in a `subscriptions/listen` filter — on a server
+that didn't advertise `resources.subscribe`. That is a loud failure, never a
+watch that silently never fires: a `subscribe` start logs
+`start.subscribe.unsupported` at error level, a `wait {on: resource}` step fails
+with the missing capability named, and a resource instruction logs
+`instruction.subscribe.fail` and is followed by its `refresh` re-read alone.
 
 A server that fails its handshake is logged (`mcp.connect.fail`) and simply
 omitted from the catalogue — its tools are unavailable, the rest of the run goes
@@ -238,7 +244,26 @@ content. So agentd does **notify-then-read**: on wake it issues a fresh
    at startup, and again after a config reload — so a restart restores every
    watched URI. Underneath, the notification stream reconnects on its own after
    a transient drop; a server with no push channel at all leaves the client
-   pull-only rather than failing.
+   pull-only rather than failing. A URI counts as subscribed only once the
+   server accepted it, so a subscribe that failed is sent again on the next
+   try, and adding a URI sends that URI alone.
+3. **A server that restarts** forgets the session, and every subscription it
+   held goes with it. The server says so with a `404` to the next request that
+   carries the session — on an idle daemon, the notification stream's redial.
+   agentd does not let the SDK re-initialize quietly behind it: it logs
+   `mcp.disconnect` (`reason: session_lost`), re-dials with a fresh handshake
+   (bounded like any reactor-thread management call, retried on a 1s→30s
+   backoff while the server refuses), logs `mcp.connect`, and subscribes again
+   every URI the lost session held (`mcp.resubscribed`, or
+   `mcp.resubscribe.fail` at error level). Calls made on the lost session in
+   the meantime fail as `session expired`. Sessions exist up to `2025-11-25`;
+   the stateless revisions have none.
+4. **At a stateless revision** the subscriptions ride one
+   `subscriptions/listen` stream per connection. When it ends — the server
+   closed or completed it, or the client fell behind — agentd logs
+   `mcp.listen.ended` (with the reason and the wait) and listens again with the
+   same filter after a wait that doubles from 250ms to 30s, then logs
+   `mcp.listen.resumed`.
 
 **Two distinct mechanisms — never conflated:**
 
@@ -267,8 +292,9 @@ The runtime issues `resources/subscribe` for the URI, then idles and fires a run
 on each update (notify-then-read).
 
 > **Reactivity rides Streamable HTTP.** Subscriptions are `resources/subscribe`
-> against the owning MCP server; the client holds the SSE stream open and processes
-> pushed `notifications/resources/updated` (notify-then-read).
+> against the owning MCP server (a `subscriptions/listen` filter at a stateless
+> revision); the client holds the SSE stream open and processes pushed
+> `notifications/resources/updated` (notify-then-read).
 
 ### 1.7 Liveness and lifecycle
 

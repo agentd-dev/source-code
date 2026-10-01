@@ -49,7 +49,7 @@ use rmcp::model::{
     ElicitationAction, ElicitationCapability, Implementation as RmcpImpl, ProtocolVersion,
     ReadResourceRequestParams, RequestMetaObject, SubscriptionFilter,
 };
-use rmcp::service::{RoleClient, RunningService};
+use rmcp::service::{RoleClient, RunningService, Subscription, SubscriptionEnd};
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::{ClientHandler, ServiceExt};
 
@@ -189,20 +189,54 @@ impl ClientHandler for Handler {
     }
 }
 
+/// What happened to a connection's `subscriptions/listen` stream, for the host
+/// to log. The stream is the connection's only source of `resources/updated`
+/// at a stateless revision, so its end is never silent: the pump says it ended
+/// and why, and that it is open again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListenEvent {
+    /// The stream ended (or a re-listen failed); the pump listens again in
+    /// `retry_ms`.
+    Ended { reason: String, retry_ms: u64 },
+    /// A re-listen succeeded: the subscription covers every URI again.
+    Resumed,
+}
+
+/// The first wait before re-listening after a listen stream ended. Doubled on
+/// each consecutive end, up to [`RELISTEN_MAX`].
+pub const RELISTEN_MIN: Duration = Duration::from_millis(250);
+/// The longest wait between re-listens — and how long a stream must have
+/// stayed open for its end to start the backoff over. A server that closes
+/// every listen at once is re-asked at most this often, not in a tight loop.
+pub const RELISTEN_MAX: Duration = Duration::from_secs(30);
+
 /// A blocking MCP client backed by the official SDK.
 pub struct RmcpClient {
     name: String,
     rt: tokio::runtime::Runtime,
     service: RunningService<RoleClient, Handler>,
+    /// The socket the connection runs on, read for whether the server has
+    /// forgotten the session ([`crate::http::HttpTransport::session_lost`]).
+    http: Arc<crate::http::HttpTransport>,
     caps: ServerCapabilities,
     /// The revision the handshake settled on, kept as rmcp's own type so the
     /// version-dependent branches compare it the way rmcp does.
     protocol_version: Option<ProtocolVersion>,
     notifications: Arc<Mutex<Vec<rpc::Notification>>>,
-    /// Every URI the host asked for; one `listen` subscription covers them all.
+    /// Every URI the server ACCEPTED a subscription for — inserted only once
+    /// the server call succeeded, so a URI whose subscribe failed is asked
+    /// for again on the next try rather than reported as already covered. At
+    /// a stateless revision one `listen` subscription covers them all. Held
+    /// across the server call, so two subscribes cannot each widen the filter
+    /// from the same old set.
     uris: Mutex<std::collections::BTreeSet<String>>,
-    /// The task pumping that subscription into `notifications`.
+    /// The task pumping that subscription into `notifications`, re-listening
+    /// when it ends. Aborted, not merely dropped, when the filter changes: a
+    /// dropped tokio handle detaches its task, which would go on listening
+    /// with the old filter beside the new one.
     pump: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// What the pump reports about the listen stream, until the host drains it.
+    listen_events: Arc<Mutex<Vec<ListenEvent>>>,
 }
 
 /// Builder state, so the host can declare capabilities before connecting (the
@@ -220,6 +254,11 @@ pub struct RmcpBuilder {
     /// credential the SDK's own client could not (a request signer, an mTLS
     /// identity); absent only in tests that dial a bare loopback server.
     http: Option<Arc<crate::http::HttpTransport>>,
+    /// A bound on the handshake alone, below the connection's own `timeout`
+    /// (which stays the per-silence bound of every later call). A host that
+    /// re-dials from a thread that must not stall — the reactor — passes its
+    /// short management bound here.
+    handshake_bound: Option<Duration>,
 }
 
 impl RmcpBuilder {
@@ -241,7 +280,14 @@ impl RmcpBuilder {
             },
             elicitation: None,
             http: None,
+            handshake_bound: None,
         }
+    }
+
+    /// Bound the handshake as a whole; see `handshake_bound`.
+    pub fn with_handshake_bound(mut self, bound: Duration) -> Self {
+        self.handshake_bound = Some(bound);
+        self
     }
 
     /// Use agentd's socket for this connection — the one carrying its request
@@ -283,10 +329,18 @@ impl RmcpBuilder {
         // The caller's headers are the socket's, never the SDK's too: the SDK
         // hands its custom headers to the socket on every request, so a copy
         // here put each one — `Authorization` included — on the wire twice.
+        //
+        // No re-initialization behind our back. When a server forgets the
+        // session, the SDK would by default handshake again inside the
+        // transport and replay the request — and the subscriptions the old
+        // session held would be gone with nothing to say so, while every call
+        // succeeded. The host is told instead (`McpError::SessionExpired`),
+        // and re-dials and re-subscribes what the lost session carried.
         let config =
             rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(
                 self.endpoint.clone(),
-            );
+            )
+            .reinit_on_expired_session(false);
 
         let mut caps = ClientCapabilities::default();
         if self.elicitation.is_some() {
@@ -323,11 +377,19 @@ impl RmcpBuilder {
                 self.headers.clone(),
             )),
         };
-        let client = crate::rmcp_transport::AgentdHttp::new(socket, self.timeout);
+        let client = crate::rmcp_transport::AgentdHttp::new(Arc::clone(&socket), self.timeout);
+        let bound = self.handshake_bound;
         let service = rt
             .block_on(async move {
                 let transport = StreamableHttpClientTransport::with_client(client, config);
-                handler.serve(transport).await
+                match bound {
+                    // The timer is built inside the runtime: it needs its clock.
+                    Some(b) => tokio::time::timeout(b, handler.serve(transport))
+                        .await
+                        .map_err(|_| format!("handshake timed out after {} ms", b.as_millis()))?
+                        .map_err(|e| e.to_string()),
+                    None => handler.serve(transport).await.map_err(|e| e.to_string()),
+                }
             })
             .map_err(|e| McpError::Transport(format!("mcp server '{name}': {e}")))?;
         // Before any request can be issued (`initialize` itself is not cached):
@@ -352,11 +414,13 @@ impl RmcpBuilder {
             name: self.name,
             rt,
             service,
+            http: socket,
             caps,
             protocol_version,
             notifications,
             uris: Mutex::new(std::collections::BTreeSet::new()),
             pump: Mutex::new(None),
+            listen_events: Arc::default(),
         })
     }
 }
@@ -385,6 +449,37 @@ impl RmcpClient {
         self.protocol_version.as_ref().map(ProtocolVersion::as_str)
     }
 
+    /// Has the server forgotten this connection's session? Once it has, every
+    /// call fails with [`McpError::SessionExpired`] and the subscriptions it
+    /// held are gone; only a re-dial gets them back.
+    pub fn session_lost(&self) -> bool {
+        self.http.session_lost()
+    }
+
+    /// The error one failed server call becomes. A call that failed because
+    /// the server no longer knows the session is said as exactly that — the
+    /// SDK surfaces it as a transport failure like any other (the request's
+    /// stream was already handed over when the `404` arrived), so the socket's
+    /// record of the `404` is what tells them apart.
+    fn fail(&self, op: &str, e: impl std::fmt::Display) -> McpError {
+        if self.http.session_lost() {
+            return McpError::SessionExpired(format!("mcp server '{}': {op}: {e}", self.name));
+        }
+        rpc_err(&self.name, op, e)
+    }
+
+    /// The URIs the server accepted a subscription for on this connection —
+    /// what a re-dial must subscribe again, since a subscription lives and
+    /// dies with its session.
+    pub fn subscribed(&self) -> Vec<String> {
+        self.uris
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .collect()
+    }
+
     /// Convert an rmcp value into our wire type. Both sides are the same JSON
     /// shape, so this is exact — and it does not need updating when rmcp adds a
     /// field we do not model.
@@ -401,7 +496,7 @@ impl RmcpClient {
         let res = self
             .rt
             .block_on(self.service.list_all_tools())
-            .map_err(|e| rpc_err(&self.name, "tools/list", e))?;
+            .map_err(|e| self.fail("tools/list", e))?;
         self.convert(&res, "tools/list")
     }
 
@@ -449,7 +544,7 @@ impl RmcpClient {
                 })?,
             None => self.rt.block_on(call),
         }
-        .map_err(|e| rpc_err(&self.name, &op, e))?;
+        .map_err(|e| self.fail(&op, e))?;
         serde_json::to_value(&res).map_err(|e| rpc_err(&self.name, "tools/call", e))
     }
 
@@ -457,7 +552,7 @@ impl RmcpClient {
         let res = self
             .rt
             .block_on(self.service.list_all_resources())
-            .map_err(|e| rpc_err(&self.name, "resources/list", e))?;
+            .map_err(|e| self.fail("resources/list", e))?;
         self.convert(&res, "resources/list")
     }
 
@@ -468,7 +563,7 @@ impl RmcpClient {
                 self.service
                     .read_resource(ReadResourceRequestParams::new(uri.to_string())),
             )
-            .map_err(|e| rpc_err(&self.name, &format!("resources/read {uri}"), e))?;
+            .map_err(|e| self.fail(&format!("resources/read {uri}"), e))?;
         self.convert(&res, "resources/read")
     }
 
@@ -476,7 +571,7 @@ impl RmcpClient {
         let res = self
             .rt
             .block_on(self.service.list_all_prompts())
-            .map_err(|e| rpc_err(&self.name, "prompts/list", e))?;
+            .map_err(|e| self.fail("prompts/list", e))?;
         self.convert(&res, "prompts/list")
     }
 
@@ -490,7 +585,7 @@ impl RmcpClient {
         let res = self
             .rt
             .block_on(self.service.get_prompt(params))
-            .map_err(|e| rpc_err(&self.name, &format!("prompts/get {name}"), e))?;
+            .map_err(|e| self.fail(&format!("prompts/get {name}"), e))?;
         self.convert(&res, "prompts/get")
     }
 
@@ -512,7 +607,7 @@ impl RmcpClient {
                 self.service
                     .complete(rmcp::model::CompleteRequestParams::new(r#ref, argument)),
             )
-            .map_err(|e| rpc_err(&self.name, "completion/complete", e))?;
+            .map_err(|e| self.fail("completion/complete", e))?;
         self.convert(&res, "completion/complete")
     }
 
@@ -520,7 +615,7 @@ impl RmcpClient {
         let res = self
             .rt
             .block_on(self.service.list_all_resource_templates())
-            .map_err(|e| rpc_err(&self.name, "resources/templates/list", e))?;
+            .map_err(|e| self.fail("resources/templates/list", e))?;
         self.convert(&res, "resources/templates/list")
     }
 
@@ -535,26 +630,50 @@ impl RmcpClient {
     /// than hard-coded — calling the wrong one leaves the host with a
     /// subscription the server never honours.
     ///
+    /// Either way the server must have advertised `resources.subscribe`: a
+    /// server that did not would accept the call, or ignore the URI in a
+    /// listen filter, and never notify — a wait that parks forever with
+    /// nothing in any log. That is a [`McpError::Capability`] here instead.
+    ///
+    /// The URI is recorded only once the server accepted it, so a failed
+    /// subscribe is a real retry next time rather than "already covered". At
+    /// 2025-11-25 only the new URI is sent; the ones already held stay held.
     /// From 2026-07-28 on, one subscription covers every tracked URI: adding a
     /// URI reopens it with the widened filter, and its notifications pump into
     /// the queue the host drains.
+    #[allow(deprecated)]
     pub fn subscribe(&self, uri: &str) -> Result<(), McpError> {
-        {
-            let mut uris = self.uris.lock().unwrap_or_else(|e| e.into_inner());
-            if !uris.insert(uri.to_string()) {
-                return Ok(()); // already covered by the live subscription
-            }
+        if !self.caps.supports_subscribe() {
+            return Err(McpError::Capability(format!(
+                "mcp server '{}' does not offer resources.subscribe; {uri} cannot be watched",
+                self.name
+            )));
         }
-        self.relisten()
+        let mut uris = self.uris.lock().unwrap_or_else(|e| e.into_inner());
+        if uris.contains(uri) {
+            return Ok(()); // already covered by the live subscription
+        }
+        if self.listens() {
+            let mut widened = uris.clone();
+            widened.insert(uri.to_string());
+            self.listen_on(&widened)?;
+        } else {
+            self.rt
+                .block_on(
+                    self.service
+                        .subscribe(rmcp::model::SubscribeRequestParams::new(uri.to_string())),
+                )
+                .map_err(|e| self.fail(&format!("resources/subscribe {uri}"), e))?;
+        }
+        uris.insert(uri.to_string());
+        Ok(())
     }
 
     #[allow(deprecated)]
     pub fn unsubscribe(&self, uri: &str) -> Result<(), McpError> {
-        {
-            let mut uris = self.uris.lock().unwrap_or_else(|e| e.into_inner());
-            if !uris.remove(uri) {
-                return Ok(());
-            }
+        let mut uris = self.uris.lock().unwrap_or_else(|e| e.into_inner());
+        if !uris.remove(uri) {
+            return Ok(());
         }
         // Before 2026-07-28 the server holds a per-URI subscription, so it
         // needs an explicit `resources/unsubscribe` — narrowing a filter would
@@ -567,57 +686,48 @@ impl RmcpClient {
                     self.service
                         .unsubscribe(rmcp::model::UnsubscribeRequestParams::new(uri.to_string())),
                 )
-                .map_err(|e| rpc_err(&self.name, &format!("resources/unsubscribe {uri}"), e));
+                .map_err(|e| self.fail(&format!("resources/unsubscribe {uri}"), e));
         }
-        self.relisten()
+        self.listen_on(&uris)
     }
 
-    /// (Re)open the single subscription covering every tracked URI, and pump its
-    /// notifications into the drain queue on a background task.
-    fn relisten(&self) -> Result<(), McpError> {
-        // Revisions before 2026-07-28 have no `subscriptions/listen`; the
-        // per-URI `resources/subscribe` is the correct call there, and is
-        // marked deprecated only relative to the newer revisions.
-        if !self.listens() {
-            return self.subscribe_each();
-        }
-        let uris: Vec<String> = self
-            .uris
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .cloned()
-            .collect();
-        // Dropping the previous handle cancels the previous listen.
-        *self.pump.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    /// (Re)open the single subscription covering `uris`, and pump its
+    /// notifications into the drain queue on a background task that listens
+    /// again whenever the stream ends. The previous pump is stopped only once
+    /// the new listen is acknowledged, so a refused widening leaves the URIs
+    /// already held still watched.
+    fn listen_on(&self, uris: &std::collections::BTreeSet<String>) -> Result<(), McpError> {
         if uris.is_empty() {
+            self.stop_pump();
             return Ok(());
         }
-
         let mut filter = SubscriptionFilter::builder().resources_list_changed();
-        for u in &uris {
+        for u in uris {
             filter = filter.resource_subscription(u.clone());
         }
         let filter = filter.build();
 
         let peer = self.service.peer().clone();
-        let mut subscription = self
+        let subscription = self
             .rt
-            .block_on(peer.listen(filter))
-            .map_err(|e| rpc_err(&self.name, "subscriptions/listen", e))?;
-
-        let queue = Arc::clone(&self.notifications);
-        let handle = self.rt.spawn(async move {
-            while let Ok(Some(note)) = subscription.next().await {
-                if let Ok(v) = serde_json::to_value(&note)
-                    && let Ok(n) = serde_json::from_value::<rpc::Notification>(v)
-                {
-                    queue.lock().unwrap_or_else(|e| e.into_inner()).push(n);
-                }
-            }
-        });
+            .block_on(peer.listen(filter.clone()))
+            .map_err(|e| self.fail("subscriptions/listen", e))?;
+        self.stop_pump();
+        let handle = self.rt.spawn(pump(
+            subscription,
+            peer,
+            filter,
+            Arc::clone(&self.notifications),
+            Arc::clone(&self.listen_events),
+        ));
         *self.pump.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
         Ok(())
+    }
+
+    fn stop_pump(&self) {
+        if let Some(old) = self.pump.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            old.abort();
+        }
     }
 
     /// Does the negotiated revision define `subscriptions/listen`? Every
@@ -631,32 +741,88 @@ impl RmcpClient {
             .is_some_and(|v| *v >= ProtocolVersion::V_2026_07_28)
     }
 
-    /// Per-URI subscription: one `resources/subscribe` per URI. Notifications
-    /// arrive through the handler's channel rather than a subscription handle.
-    #[allow(deprecated)]
-    fn subscribe_each(&self) -> Result<(), McpError> {
-        let uris: Vec<String> = self
-            .uris
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .cloned()
-            .collect();
-        for uri in uris {
-            self.rt
-                .block_on(
-                    self.service
-                        .subscribe(rmcp::model::SubscribeRequestParams::new(uri.clone())),
-                )
-                .map_err(|e| rpc_err(&self.name, &format!("resources/subscribe {uri}"), e))?;
-        }
-        Ok(())
+    /// What the listen pump reported since the last drain.
+    pub fn drain_listen_events(&self) -> Vec<ListenEvent> {
+        std::mem::take(&mut *self.listen_events.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     /// Drain notifications the handler queued: take what has arrived, leave
     /// the queue empty.
     pub fn drain_notifications(&self) -> Vec<rpc::Notification> {
         std::mem::take(&mut *self.notifications.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+}
+
+/// Pump one listen subscription into `queue`, and when it ends — the server
+/// closed it, completed it, cancelled it, or the client lagged — say so on
+/// `events` and listen again with the same filter. A listen stream that ended
+/// and was not reopened left every subscribed URI without a wake, with nothing
+/// in any log; the wait before each retry doubles from [`RELISTEN_MIN`] to
+/// [`RELISTEN_MAX`], so a server that refuses to hold one is not hammered.
+async fn pump(
+    mut subscription: Subscription,
+    peer: rmcp::service::Peer<RoleClient>,
+    filter: SubscriptionFilter,
+    queue: Arc<Mutex<Vec<rpc::Notification>>>,
+    events: Arc<Mutex<Vec<ListenEvent>>>,
+) {
+    let report = |e: ListenEvent| events.lock().unwrap_or_else(|p| p.into_inner()).push(e);
+    let mut wait = RELISTEN_MIN;
+    loop {
+        let opened = tokio::time::Instant::now();
+        let mut reason = loop {
+            match subscription.next().await {
+                // The SDK's notification serializes as `{method, params}` with
+                // no `jsonrpc` member, so it is rebuilt from those two rather
+                // than parsed as a whole frame — which failed on every one of
+                // them and dropped each wake without a word.
+                Ok(Some(note)) => {
+                    if let Ok(v) = serde_json::to_value(&note)
+                        && let Some(method) = v.get("method").and_then(Value::as_str)
+                    {
+                        queue
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .push(rpc::Notification::new(method, v.get("params").cloned()));
+                    }
+                }
+                Ok(None) => break ended(subscription.end()),
+                Err(e) => break format!("subscriptions/listen: {e}"),
+            }
+        };
+        // A stream that stayed open a good while ended for a reason of its
+        // own, and starts the backoff over; one that ended at once did not.
+        if opened.elapsed() >= RELISTEN_MAX {
+            wait = RELISTEN_MIN;
+        }
+        loop {
+            report(ListenEvent::Ended {
+                reason,
+                retry_ms: wait.as_millis() as u64,
+            });
+            tokio::time::sleep(wait).await;
+            wait = (wait * 2).min(RELISTEN_MAX);
+            match peer.listen(filter.clone()).await {
+                Ok(s) => {
+                    subscription = s;
+                    report(ListenEvent::Resumed);
+                    break;
+                }
+                Err(e) => reason = format!("subscriptions/listen: {e}"),
+            }
+        }
+    }
+}
+
+/// Why a listen stream ended, in words for the log line.
+fn ended(end: Option<&SubscriptionEnd>) -> String {
+    match end {
+        Some(SubscriptionEnd::Graceful(_)) => "the server completed the subscription".into(),
+        Some(SubscriptionEnd::Cancelled) => "the subscription was cancelled".into(),
+        Some(SubscriptionEnd::Lagged { capacity }) => {
+            format!("notifications outran the {capacity}-slot buffer")
+        }
+        _ => "the stream closed".into(),
     }
 }
 

@@ -17,14 +17,18 @@ use crate::wire::{
 };
 use serde_json::Value;
 use std::fmt;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 #[derive(Debug)]
 pub enum McpError {
     Transport(String),
     /// The server doesn't advertise the capability the call needs.
     Capability(String),
+    /// The server no longer knows this connection's session (Streamable
+    /// HTTP's `404`): every call on it fails, and every subscription it held
+    /// is gone. [`McpClient::redial_within`] gets a working connection back.
+    SessionExpired(String),
 }
 
 impl fmt::Display for McpError {
@@ -32,8 +36,24 @@ impl fmt::Display for McpError {
         match self {
             McpError::Transport(m) => write!(f, "mcp: transport: {m}"),
             McpError::Capability(m) => write!(f, "mcp: capability: {m}"),
+            McpError::SessionExpired(m) => write!(f, "mcp: session expired: {m}"),
         }
     }
+}
+
+/// The first wait before re-dialing again after a failed re-dial; doubled on
+/// each failure up to [`REDIAL_MAX`]. A server that lost the session because
+/// it is restarting may refuse a few handshakes before it is back.
+pub const REDIAL_MIN: Duration = Duration::from_secs(1);
+/// The longest wait between re-dial attempts.
+pub const REDIAL_MAX: Duration = Duration::from_secs(30);
+
+/// When a lost connection may be re-dialed next: after how many failed
+/// attempts, and not before when.
+#[derive(Default)]
+struct Redial {
+    failures: u32,
+    not_before: Option<Instant>,
 }
 impl std::error::Error for McpError {}
 
@@ -41,16 +61,21 @@ impl std::error::Error for McpError {}
 /// server over Streamable HTTP.
 pub struct McpClient {
     name: String,
+    /// The socket the first handshake runs on, and the one a re-dial copies
+    /// its endpoint, headers, signer and identity from.
     http: Arc<HttpTransport>,
-    caps: ServerCapabilities,
-    /// The protocol version negotiated at `initialize`; `None` until then.
-    protocol_version: Option<String>,
     timeout: Duration,
     /// The official SDK, which answers every operation. `None` before
     /// `initialize`; this type is a connection *builder* until then, and every
     /// operation on an unconnected client is a transport error rather than a
-    /// panic.
-    rmcp: Option<crate::rmcp_client::RmcpClient>,
+    /// panic. Swapped whole by a re-dial, behind a lock held only to clone the
+    /// handle — so everyone holding this client reaches the new connection,
+    /// and a call in flight finishes on the one it started on. The negotiated
+    /// capabilities and revision are the connection's, read through it: a
+    /// server that restarted may answer a re-dial with different ones.
+    rmcp: Mutex<Option<Arc<crate::rmcp_client::RmcpClient>>>,
+    /// The re-dial schedule after a lost session.
+    redial: Mutex<Redial>,
     /// What the SDK needs to build its side of the connection. The socket
     /// itself is `http` above — that is how a request signer and an mTLS
     /// identity survive the SDK owning the protocol, and it is also the ONE
@@ -103,10 +128,9 @@ impl McpClient {
         Ok(McpClient {
             name: name.to_string(),
             http: Arc::new(HttpTransport::new(ep, headers).with_signer(signer)),
-            caps: ServerCapabilities::default(),
-            protocol_version: None,
             timeout,
-            rmcp: None,
+            rmcp: Mutex::new(None),
+            redial: Mutex::default(),
             endpoint: endpoint.to_string(),
             elicitation: None,
             tool_meta: None,
@@ -153,8 +177,12 @@ impl McpClient {
     pub fn name(&self) -> &str {
         &self.name
     }
-    pub fn capabilities(&self) -> &ServerCapabilities {
-        &self.caps
+    /// What the server advertised on the live connection; nothing before
+    /// `initialize`.
+    pub fn capabilities(&self) -> ServerCapabilities {
+        self.sdk()
+            .map(|c| c.capabilities().clone())
+            .unwrap_or_default()
     }
 
     /// Set the `_meta` stamped onto every `tools/call` (e.g. the run id), so a
@@ -178,6 +206,18 @@ impl McpClient {
     /// reported as `mcp.connect.fail`, and the server is simply treated as
     /// absent rather than failing the reload.
     pub fn initialize_within(&mut self, timeout: Duration) -> Result<(), McpError> {
+        let c = self.dial(Arc::clone(&self.http), timeout, None)?;
+        *self.rmcp.get_mut().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(c));
+        Ok(())
+    }
+
+    /// One handshake on `http`.
+    fn dial(
+        &self,
+        http: Arc<HttpTransport>,
+        timeout: Duration,
+        handshake_bound: Option<Duration>,
+    ) -> Result<crate::rmcp_client::RmcpClient, McpError> {
         // The SDK owns the handshake and every operation after it — over *this*
         // connection's transport, so a request signer (AAuth's challenge loop,
         // AWS SigV4) and an mTLS client identity still apply. Adopting the SDK
@@ -186,28 +226,91 @@ impl McpClient {
         // the SDK's own come on top of them per request.
         let mut b =
             crate::rmcp_client::RmcpBuilder::new(&self.name, &self.endpoint, Vec::new(), timeout)
-                .with_http(Arc::clone(&self.http))
+                .with_http(http)
                 .with_client_info(self.client_info.clone());
         if let Some(h) = &self.elicitation {
             b = b.with_elicitation(Arc::clone(h));
         }
-        let c = b.connect()?;
-        self.caps = c.capabilities().clone();
-        self.protocol_version = c.protocol_version().map(str::to_string);
-        self.rmcp = Some(c);
-        Ok(())
+        if let Some(bound) = handshake_bound {
+            b = b.with_handshake_bound(bound);
+        }
+        b.connect()
     }
 
-    /// The protocol version negotiated with the server (`None` before connect).
-    pub fn protocol_version(&self) -> Option<&str> {
-        self.protocol_version.as_deref()
+    /// Has the server forgotten the live connection's session? Then every call
+    /// on it fails with [`McpError::SessionExpired`], its subscriptions are
+    /// gone, and the host re-dials ([`Self::redial_within`]).
+    pub fn session_lost(&self) -> bool {
+        self.sdk().is_ok_and(|c| c.session_lost())
+    }
+
+    /// Is a re-dial of a lost session due — not inside the wait a failed one
+    /// set? The host polls this; the schedule lives here so every host gets
+    /// the same backoff.
+    pub fn redial_due(&self) -> bool {
+        self.session_lost()
+            && self
+                .redial
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .not_before
+                .is_none_or(|t| Instant::now() >= t)
+    }
+
+    /// How many re-dials of the current loss have failed so far — 0 when the
+    /// next attempt is the first, which is when a host reports the loss.
+    pub fn redial_failures(&self) -> u32 {
+        self.redial
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .failures
+    }
+
+    /// Replace a connection whose session the server forgot with a fresh
+    /// handshake on a fresh socket, and return the URIs the lost session was
+    /// subscribed to. None of them is subscribed on the new connection: the
+    /// host subscribes each again, so the new set holds exactly what the
+    /// server accepted this time.
+    ///
+    /// `bound` caps the handshake alone (the host's management bound when it
+    /// re-dials from a thread that must not stall); later calls keep the
+    /// connection's own timeout. On failure the lost connection stays in place
+    /// — its URIs with it, for the next attempt — and the next attempt is due
+    /// after a wait that doubles per failure, [`REDIAL_MIN`] to [`REDIAL_MAX`].
+    pub fn redial_within(&self, bound: Duration) -> Result<Vec<String>, McpError> {
+        let lost = self.sdk()?;
+        let fresh = match self.dial(Arc::new(self.http.redial_copy()), self.timeout, Some(bound)) {
+            Ok(c) => c,
+            Err(e) => {
+                let mut r = self.redial.lock().unwrap_or_else(|p| p.into_inner());
+                let wait = REDIAL_MIN
+                    .saturating_mul(1u32 << r.failures.min(5))
+                    .min(REDIAL_MAX);
+                r.failures += 1;
+                r.not_before = Some(Instant::now() + wait);
+                return Err(e);
+            }
+        };
+        *self.redial.lock().unwrap_or_else(|e| e.into_inner()) = Redial::default();
+        *self.rmcp.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(fresh));
+        Ok(lost.subscribed())
+    }
+
+    /// The protocol version negotiated on the live connection (`None` before
+    /// connect).
+    pub fn protocol_version(&self) -> Option<String> {
+        self.sdk()
+            .ok()
+            .and_then(|c| c.protocol_version().map(str::to_string))
     }
 
     /// The SDK connection, or the error every operation on an unconnected
     /// client reports.
-    fn sdk(&self) -> Result<&crate::rmcp_client::RmcpClient, McpError> {
+    fn sdk(&self) -> Result<Arc<crate::rmcp_client::RmcpClient>, McpError> {
         self.rmcp
-            .as_ref()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
             .ok_or_else(|| McpError::Transport("the MCP connection is not established".into()))
     }
 
@@ -309,7 +412,7 @@ impl McpClient {
         name: &str,
         arguments: Option<Value>,
     ) -> Result<GetPromptResult, McpError> {
-        if !self.caps.supports_prompts() {
+        if !self.capabilities().supports_prompts() {
             return Err(McpError::Capability(format!(
                 "server '{}' has no prompts",
                 self.name
@@ -321,7 +424,7 @@ impl McpClient {
     /// `completion/complete` — argument autocompletion for a prompt / resource-
     /// template `reference`. Gated on the server advertising `completions`.
     pub fn complete(&self, reference: Value, argument: Value) -> Result<CompleteResult, McpError> {
-        if !self.caps.supports_completions() {
+        if !self.capabilities().supports_completions() {
             return Err(McpError::Capability(format!(
                 "server '{}' has no completions",
                 self.name
@@ -333,7 +436,7 @@ impl McpClient {
     /// `resources/templates/list`, paginated. Empty when the server doesn't
     /// advertise `resources`.
     pub fn list_resource_templates(&self) -> Result<Vec<ResourceTemplate>, McpError> {
-        if !self.caps.supports_resources() {
+        if !self.capabilities().supports_resources() {
             return Ok(Vec::new());
         }
         // The SDK walks the cursor; pagination is its problem, not ours.
@@ -349,6 +452,9 @@ impl McpClient {
 
     /// Subscribe to `uri`'s updates, by whichever mechanism the negotiated
     /// revision defines (see [`crate::rmcp_client::RmcpClient::subscribe`]).
+    /// A server that does not advertise `resources.subscribe` is a
+    /// [`McpError::Capability`], never a subscription that silently never
+    /// fires.
     pub fn subscribe(&self, uri: &str) -> Result<(), McpError> {
         self.sdk()?.subscribe(uri)
     }
@@ -361,10 +467,17 @@ impl McpClient {
     /// `notifications/resources/updated`). The reactive router
     /// (`triggers/mode.rs`) drains these between runs to drive re-reactions.
     pub fn drain_notifications(&self) -> Vec<rpc::Notification> {
-        match &self.rmcp {
-            Some(c) => c.drain_notifications(),
-            None => Vec::new(),
-        }
+        self.sdk()
+            .map(|c| c.drain_notifications())
+            .unwrap_or_default()
+    }
+
+    /// Drain what the live connection's listen pump reported (a stream that
+    /// ended, one opened again) since the last drain, for the host to log.
+    pub fn drain_listen_events(&self) -> Vec<crate::rmcp_client::ListenEvent> {
+        self.sdk()
+            .map(|c| c.drain_listen_events())
+            .unwrap_or_default()
     }
 }
 

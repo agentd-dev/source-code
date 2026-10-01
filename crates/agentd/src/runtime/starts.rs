@@ -240,6 +240,13 @@ impl Runtime {
                     "start.subscribe.armed",
                     json!({"workflow": workflow, "node": node, "server": server, "uri": uri}),
                 ),
+                // The server offers no subscriptions: this start can never
+                // fire. Said at error level and by its own name, because it is
+                // a configuration that cannot work, not a server that failed.
+                Err(e @ crate::mcp::client::McpError::Capability(_)) => self.log.error(
+                    "start.subscribe.unsupported",
+                    json!({"workflow": workflow, "node": node, "server": server, "uri": uri, "err": e.to_string()}),
+                ),
                 Err(e) => self.log.warn(
                     "start.subscribe.fail",
                     json!({"workflow": workflow, "node": node, "err": e.to_string()}),

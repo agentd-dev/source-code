@@ -51,7 +51,13 @@ let out = mcp.call_tool("list_issues", None)?;
   possible.
 - **Subscriptions by the negotiated revision** — `resources/subscribe` up to
   2025-11-25, `subscriptions/listen` from 2026-07-28 on, decided from the
-  revision rmcp negotiated rather than one this crate picks.
+  revision rmcp negotiated rather than one this crate picks. Only on a server
+  that advertises `resources.subscribe` (otherwise a `Capability` error), a URI
+  recorded only once the server accepted it, and a listen stream that ends is
+  opened again on a backoff and reported for the host to log.
+- **A lost session said, not papered over** — a server that answers `404` to
+  the session is `SessionExpired`, never a quiet re-initialize; the host
+  re-dials in place (`redial_within`) and gets back the URIs to subscribe again.
 - **A JSON-RPC codec and a raw HTTP listener**, used by agentd's subagent
   channel and webhook listener.
 

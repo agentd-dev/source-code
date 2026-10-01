@@ -2138,6 +2138,20 @@ impl Runtime {
     /// next config reload, so a server cannot change what this agent may call
     /// without an operator-initiated reload.
     pub(crate) fn poll_mcp_notifications(&mut self) {
+        self.redial_lost_sessions();
+        for (name, c) in &self.mcp {
+            for e in c.drain_listen_events() {
+                match e {
+                    ::mcp::rmcp_client::ListenEvent::Ended { reason, retry_ms } => self.log.warn(
+                        "mcp.listen.ended",
+                        json!({"server": name, "reason": reason, "retry_ms": retry_ms}),
+                    ),
+                    ::mcp::rmcp_client::ListenEvent::Resumed => {
+                        self.log.info("mcp.listen.resumed", json!({"server": name}))
+                    }
+                }
+            }
+        }
         let mut updated_instruction = false;
         let mut tools_changed = Vec::new();
         let mut resource_updates: Vec<(String, String)> = Vec::new();
@@ -2188,6 +2202,61 @@ impl Runtime {
         }
         for s in tools_changed {
             self.log.info("mcp.tools_changed", json!({"server": s, "note": "recorded only; the tool catalogue is rebuilt at the next config reload"}));
+        }
+    }
+
+    /// Re-dial every server that forgot its session, and subscribe again
+    /// everything the lost session was subscribed to.
+    ///
+    /// A server that restarts loses its sessions, and with them every
+    /// subscription agentd held — the `subscribe` starts, the suspended
+    /// resource waits, a resource instruction. Without this the connection
+    /// failed every call until a reload, and every watch went quiet with
+    /// nothing in any log. The re-dial runs here, on the loop, with the short
+    /// management bound on the handshake, so a server that is still coming up
+    /// costs the heartbeat at most that; a failed attempt is retried on a
+    /// backoff the client keeps.
+    pub(crate) fn redial_lost_sessions(&mut self) {
+        let lost: Vec<(String, Arc<McpClient>)> = self
+            .mcp
+            .iter()
+            .filter(|(_, c)| c.redial_due())
+            .map(|(n, c)| (n.clone(), Arc::clone(c)))
+            .collect();
+        for (name, c) in lost {
+            if c.redial_failures() == 0 {
+                self.log.warn(
+                    "mcp.disconnect",
+                    json!({"server": name, "reason": "session_lost"}),
+                );
+            }
+            let uris = match c.redial_within(crate::obs::health::management_timeout()) {
+                Ok(uris) => uris,
+                Err(e) => {
+                    self.log.warn(
+                        "mcp.connect.fail",
+                        json!({"server": name, "err": e.to_string(), "reason": "session_lost"}),
+                    );
+                    crate::obs::metrics::record_mcp_connect_failure(&name);
+                    continue;
+                }
+            };
+            self.log.info(
+                "mcp.connect",
+                json!({"server": name, "reason": "session_lost", "resubscribing": uris.len()}),
+            );
+            for uri in uris {
+                match c.subscribe(&uri) {
+                    Ok(()) => self.log.info(
+                        "mcp.resubscribed",
+                        json!({"server": name, "uri": uri, "reason": "session_lost"}),
+                    ),
+                    Err(e) => self.log.error(
+                        "mcp.resubscribe.fail",
+                        json!({"server": name, "uri": uri, "err": e.to_string()}),
+                    ),
+                }
+            }
         }
     }
 }

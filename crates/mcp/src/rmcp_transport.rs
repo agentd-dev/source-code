@@ -180,6 +180,15 @@ impl StreamableHttpClient for AgentdHttp {
             Some(Pumped::Message(v)) | Some(Pumped::Done(Ok(Some(v)))) => v,
             // A notification: nothing came back, and nothing should have.
             Some(Pumped::Done(Ok(None))) => return Ok(StreamableHttpPostResponse::Accepted),
+            // The server no longer knows the session this message carried.
+            // Said as exactly that, because it is the SDK's one signal for it;
+            // the connection is built with `reinit_on_expired_session(false)`,
+            // so the SDK hands it back rather than handshaking again behind the
+            // host's back — and the host, which knows what the lost session
+            // held, re-dials and re-subscribes.
+            Some(Pumped::Done(Err(_))) if self.http.session_lost() => {
+                return Err(StreamableHttpError::SessionExpired);
+            }
             Some(Pumped::Done(Err(e))) => {
                 return Err(StreamableHttpError::Client(TransportError(e)));
             }
@@ -241,6 +250,12 @@ impl StreamableHttpClient for AgentdHttp {
     /// A stream handed back unopened would instead look like one that opened
     /// and ended — which the SDK redials, every second, for the life of the
     /// connection.
+    ///
+    /// A `404` to a dial that carried the session is recorded on the socket
+    /// ([`HttpTransport::session_lost`]) before it is handed back like any
+    /// other failure: on an idle connection the stream's redial is the only
+    /// request there is, so it is how the host learns the server forgot the
+    /// session — and re-dials the connection, which ends this stream with it.
     ///
     /// Every other failure is handed back as a stream that ends at once. The
     /// SDK takes an error from the connection's FIRST dial as final — it never

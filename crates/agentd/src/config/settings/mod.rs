@@ -320,6 +320,13 @@ pub struct Agent {
     /// each came from ([`Settings::workflow_entry_source`]).
     #[serde(skip)]
     pub document_workflows: std::collections::BTreeSet<usize>,
+    /// The families the instruction document was folded under — grant ∩
+    /// ceiling ∩ author-attested (§7.6 step 5) — DERIVED, never a config key.
+    /// Kept because a document's workflow REFERENCES (`file:`, `url:`, `uri:`,
+    /// `dir:`) resolve after this point, and what they define is held to the
+    /// same grants as its inline machinery ([`document_route_refusals`]).
+    #[serde(skip)]
+    pub document_grants: std::collections::BTreeSet<String>,
     /// Where a pulled instruction came from (an `oci://` reference resolved at
     /// config load, RFC 0040) — DERIVED: the runtime uses it to log
     /// `instruction.loaded` with its version pin and to arm the freshness
@@ -1069,8 +1076,9 @@ pub const OPERATOR_ONLY: &[&str] = &[
     "a2a.tls",
     "a2a.url",
     // Inbound sockets and the auth on them. A document declares a ROUTE (an
-    // `:::endpoint` block, gated by the `interface` family); the listener the
-    // route is served on is the operator's.
+    // `:::endpoint` block, or a workflow with a `webhook` start or wait — all
+    // gated by the `interface` family, `document_route_refusals`); the
+    // listener the route is served on is the operator's.
     "webhooks",
     // WHERE durable state lives — a path on the host, or a remote the
     // deployment has to be willing to reach — and the audit history, which is
@@ -1165,6 +1173,55 @@ pub(crate) fn document_wrote_operator_config(fragment: &Map<String, Value>) -> V
     let mut found = Vec::new();
     walk(fragment, "", &mut found);
     found
+}
+
+/// The instruction document, in the words a refusal names it by.
+fn document_label(path: Option<&str>) -> String {
+    match path {
+        Some(p) => format!("the instruction document {p}"),
+        None => "the instruction document".to_string(),
+    }
+}
+
+/// The routes a served document's workflows would open on the operator's
+/// webhook listener without the grant that opens one, each named with its
+/// workflow, its step and `document` — empty when `granted` holds it.
+///
+/// The grant is the one `:::!endpoint` needs, read from the vendored
+/// specification rather than written here: an endpoint block folds into a
+/// workflow with a `webhook` start, so a document that may not declare the
+/// block may not declare the workflow it becomes either. One rule for every
+/// spelling of a route, held by one list of what opens one
+/// ([`crate::engine::model::inbound_routes`]).
+pub(crate) fn document_route_refusals<'a>(
+    workflows: impl IntoIterator<Item = &'a Value>,
+    granted: &std::collections::BTreeSet<String>,
+    document: &str,
+) -> Vec<String> {
+    let Some(grant) = crate::config::idoc::grant_of("endpoint") else {
+        return Vec::new();
+    };
+    if granted.contains(grant) {
+        return Vec::new();
+    }
+    workflows
+        .into_iter()
+        .flat_map(|w| {
+            let name = w.get("name").and_then(Value::as_str).unwrap_or("?");
+            crate::engine::model::inbound_routes(w)
+                .into_iter()
+                .map(move |r| {
+                    format!(
+                        "workflow {name:?} step {:?} from {document} is {}, which opens an inbound \
+                         route on the operator's webhook listener — a served document may open one \
+                         only under the `{grant}` grant, the one `:::!endpoint` needs \
+                         (`agent.document_capabilities: [{grant}]`); grant it, or declare the \
+                         workflow in the operator's configuration",
+                        r.step, r.what
+                    )
+                })
+        })
+        .collect()
 }
 
 /// A folder of documents, combined into one — the result of a `dir:` source.
@@ -4063,6 +4120,7 @@ impl Settings {
         let mut idoc_extraction: Option<crate::config::idoc::Extraction> = None;
         let mut gate_channels = crate::config::humans::GateChannels::new();
         let mut document_workflows = std::collections::BTreeSet::new();
+        let mut document_grants = std::collections::BTreeSet::new();
         if let Some(instr) = doc
             .get("agent")
             .and_then(|a| a.get("instruction"))
@@ -4131,6 +4189,32 @@ impl Settings {
                             forbidden.join(", ")
                         ));
                     }
+                    // `workflows` is the document's to write, but a route on
+                    // the operator's webhook listener is not what the agent IS:
+                    // it is an inbound socket answering whoever can reach it,
+                    // with the auth the route itself names. `:::!endpoint` —
+                    // which folds into exactly such a workflow — needs the
+                    // `interface` grant, so the same workflow written as a
+                    // `:::!workflow` (or under `:::!config`) needs it too.
+                    // Without this the grant gated one spelling of the route.
+                    // Judged here for the inline definitions, so
+                    // `--validate-config` reports it; the references resolve
+                    // later and are judged where they do.
+                    let refused = document_route_refusals(
+                        ex.workflows.iter().chain(
+                            ex.config
+                                .get("workflows")
+                                .and_then(Value::as_array)
+                                .into_iter()
+                                .flatten(),
+                        ),
+                        &granted,
+                        &document_label(instruction_path.as_deref()),
+                    );
+                    if !refused.is_empty() {
+                        return Err(format!("{source}: {}", refused.join("\n  ")));
+                    }
+                    document_grants = granted.clone();
                     if let Some(o) = doc.as_object_mut() {
                         // `merge_missing` puts a fragment's array entries
                         // AHEAD of the operator's, so the `:::!config`
@@ -4218,6 +4302,7 @@ impl Settings {
         }
         settings.agent.document_gate_channels = gate_channels;
         settings.agent.document_workflows = document_workflows;
+        settings.agent.document_grants = document_grants;
         settings.agent.instruction_origin = instruction_origin;
         settings.agent.instruction_path = instruction_path;
         settings.agent.instruction_spec = instruction_spec;
@@ -4231,10 +4316,7 @@ impl Settings {
     /// file, folder, URL or resource it points at, or the inline definition).
     pub fn workflow_entry_source(&self, i: usize) -> String {
         if self.agent.document_workflows.contains(&i) {
-            return match &self.agent.instruction_path {
-                Some(p) => format!("the instruction document {p}"),
-                None => "the instruction document".to_string(),
-            };
+            return document_label(self.agent.instruction_path.as_deref());
         }
         let Some(w) = self.workflows.get(i) else {
             return format!("workflows[{i}]");
@@ -7337,10 +7419,10 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                     let mut nodes = 0usize;
                     for w in &s.workflows {
                         let wf = w.get("name").and_then(Value::as_str).unwrap_or("?");
-                        for (node, auth) in webhook_nodes(w) {
+                        for route in crate::engine::model::inbound_routes(w) {
                             nodes += 1;
-                            if !webhook_auth_verifies(auth) {
-                                open.push(format!("{wf}/{node}"));
+                            if !webhook_auth_verifies(route.auth) {
+                                open.push(format!("{wf}/{}", route.step));
                             }
                         }
                     }
@@ -7753,45 +7835,10 @@ pub fn workflow_is_long_lived(w: &Value) -> bool {
 }
 
 /// Whether a raw workflow document uses the inbound webhook surface — a
-/// `webhook` start node, or a `wait: {on: webhook}` callback (either needs
-/// `webhooks.listen`).
+/// `webhook` start node, or a `wait: {on: webhook}` callback, at any depth
+/// (either needs `webhooks.listen`).
 pub fn workflow_uses_webhook(w: &Value) -> bool {
-    w.get("steps")
-        .and_then(Value::as_object)
-        .is_some_and(|steps| {
-            steps.values().any(|st| {
-                let kind = st.get("kind").and_then(Value::as_str);
-                kind == Some("webhook")
-                    || (kind == Some("wait")
-                        && st.get("on").and_then(Value::as_str) == Some("webhook"))
-            })
-        })
-}
-
-/// The inbound-webhook routes a raw workflow document arms, as
-/// `(node id, declared auth)`. Two shapes, matching what the listener reads: a
-/// `webhook` start node carries its `auth` at the top level, while a
-/// `wait: {on: webhook}` callback carries it under `webhook.auth`
-/// (`runtime::webhooks::webhook_wait`).
-fn webhook_nodes(w: &Value) -> Vec<(&str, Option<&Value>)> {
-    let Some(steps) = w.get("steps").and_then(Value::as_object) else {
-        return Vec::new();
-    };
-    steps
-        .iter()
-        .filter_map(|(id, st)| {
-            let kind = st.get("kind").and_then(Value::as_str);
-            if kind == Some("webhook") {
-                Some((id.as_str(), st.get("auth")))
-            } else if kind == Some("wait")
-                && st.get("on").and_then(Value::as_str) == Some("webhook")
-            {
-                Some((id.as_str(), st.get("webhook").and_then(|c| c.get("auth"))))
-            } else {
-                None
-            }
-        })
-        .collect()
+    !crate::engine::model::inbound_routes(w).is_empty()
 }
 
 /// Whether a node's declared `auth` actually verifies the caller. This mirrors
@@ -9746,6 +9793,125 @@ mod tests {
             )),
             "names the document first and the operator's own entry as they wrote it: {e}"
         );
+    }
+
+    /// Load a config whose instruction is `doc` (a file), with a loopback
+    /// webhook listener so a route's only possible refusal is the document
+    /// boundary. `agent` and `top` merge into the config.
+    fn load_with_document(doc: &str, agent: Value, top: Value) -> Result<Loaded, String> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.md");
+        std::fs::write(&path, doc).unwrap();
+        let mut cfg = json!({"agent": {"name": "a", "instruction": path.to_string_lossy(), "preflight": "never"},
+            "store": {"kind": "memory"},
+            "webhooks": {"listen": "http://127.0.0.1:1"}});
+        crate::config::idoc::merge_missing(cfg.as_object_mut().unwrap(), agent_and(agent, top));
+        let file = dir.path().join("c.json");
+        std::fs::write(&file, cfg.to_string()).unwrap();
+        let env: Vec<(String, String)> = Vec::new();
+        super::load(
+            &["-c".to_string(), file.to_string_lossy().to_string()],
+            &env,
+        )
+        .map(|(l, _)| l)
+        .map_err(|e| {
+            e.to_string()
+                .replace(&path.to_string_lossy().to_string(), "<doc>")
+        })
+    }
+
+    fn agent_and(agent: Value, top: Value) -> Map<String, Value> {
+        let mut m = top.as_object().cloned().unwrap_or_default();
+        m.insert("agent".into(), agent);
+        m
+    }
+
+    /// The three spellings of a route a document can write: a `:::!workflow`
+    /// with a `webhook` start, the same under `:::!config`, and a
+    /// `wait {on: webhook}` inside a body.
+    const DOCUMENT_ROUTES: &[(&str, &str, &str)] = &[
+        (
+            ":::!workflow{name=intake}\nsteps:\n  hook: {kind: webhook, path: /in}\n  f: {kind: finish, depends_on: [hook], status: completed}\n:::\n",
+            "workflow \"intake\" step \"hook\"",
+            "a `webhook` start",
+        ),
+        (
+            ":::!config\nworkflows:\n  - name: intake\n    steps:\n      hook: {kind: webhook, path: /in}\n      f: {kind: finish, depends_on: [hook], status: completed}\n:::\n",
+            "workflow \"intake\" step \"hook\"",
+            "a `webhook` start",
+        ),
+        (
+            ":::!workflow{name=callback}\nsteps:\n  s: {kind: once}\n  each:\n    kind: foreach\n    depends_on: [s]\n    over: [1]\n    body:\n      steps:\n        w: {kind: wait, on: webhook, webhook: {path: /cb}, timeout: 30s}\n  f: {kind: finish, depends_on: [each], status: completed}\n:::\n",
+            "workflow \"callback\" step \"each/w\"",
+            "a `wait {on: webhook}`",
+        ),
+    ];
+
+    /// RFC 0042 left a hole RFC 0045 found: `workflows` is the document's to
+    /// write, and a `webhook` start in one opens a route on the OPERATOR's
+    /// listener. `:::!endpoint` — the block that folds into exactly that
+    /// workflow — needs the `interface` grant; the same route written as a
+    /// workflow needed nothing. Refused at load, naming the workflow, the
+    /// step and the document.
+    #[test]
+    fn a_document_workflow_opening_a_webhook_route_is_refused_without_the_interface_grant() {
+        for (block, names, what) in DOCUMENT_ROUTES {
+            let Err(e) = load_with_document(
+                &format!("You are the desk.\n\n{block}"),
+                json!({}),
+                json!({}),
+            ) else {
+                panic!("a document's route loaded without the grant:\n{block}");
+            };
+            for want in [
+                *names,
+                "from the instruction document <doc>",
+                *what,
+                "`interface` grant",
+            ] {
+                assert!(e.contains(want), "{want:?} missing from: {e}");
+            }
+        }
+    }
+
+    /// The grant is the operator's way to open it, and `:::!endpoint` keeps
+    /// working under it — the control that shows the refusal is the grant's,
+    /// not a blanket one.
+    #[test]
+    fn the_interface_grant_lets_a_document_open_a_route() {
+        for (block, ..) in DOCUMENT_ROUTES {
+            if let Err(e) = load_with_document(
+                &format!("You are the desk.\n\n{block}"),
+                json!({"document_capabilities": ["interface"]}),
+                json!({}),
+            ) {
+                panic!("granted, and still refused: {e}\n{block}");
+            }
+        }
+        if let Err(e) = load_with_document(
+            "You are the desk.\n\n:::!endpoint{name=in path=/in}\ninto: {stream: inbox, subject: msg}\n:::\n",
+            json!({"document_capabilities": ["interface"]}),
+            json!({"streams": {"inbox": {}}}),
+        ) {
+            panic!("an endpoint block under its grant: {e}");
+        }
+    }
+
+    /// A route the OPERATOR configures is theirs to open: the same workflow,
+    /// written in the config beside a document with machinery of its own,
+    /// loads with no grant at all.
+    #[test]
+    fn an_operator_configured_webhook_workflow_still_loads() {
+        let doc = "You are the desk.\n\n:::!workflow{name=tick}\nsteps:\n  s: {kind: once}\n  f: {kind: finish, depends_on: [s], status: completed}\n:::\n";
+        if let Err(e) = load_with_document(
+            doc,
+            json!({}),
+            json!({"workflows": [{"name": "intake", "steps": {
+                "hook": {"kind": "webhook", "path": "/in"},
+                "f": {"kind": "finish", "depends_on": ["hook"], "status": "completed"}}}]}),
+        ) {
+            panic!("the operator's own route was refused: {e}");
+        }
     }
 
     /// A `file:` entry is named by its document's own `name:`, so two

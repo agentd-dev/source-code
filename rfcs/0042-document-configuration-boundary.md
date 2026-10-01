@@ -219,6 +219,15 @@ One composition fix rides along: a child instance's `services` is now assigned
 catalogue of its own, so a parent with none left in place whatever the template
 wrote. Composition must not depend on a check somewhere else still holding.
 
+> **Amended 2026-10-01.** The path rule could not see one operator surface:
+> `workflows` is `DOCUMENT_MAY_WRITE`, and a `webhook` start inside one opens a
+> route on the operator's listener (RFC 0045 §8 P0 item 13). A document now
+> opens a route — a `webhook` start or a `wait {on: webhook}`, in a
+> `:::!workflow`, a `:::!config` entry or a reference it names — only under the
+> `interface` grant `:::!endpoint` already needed; a template's machinery opens
+> none through either door, since a child has no listener. See
+> `docs/security.md`, "Inbound webhooks".
+
 ## 6. The forcing function
 
 `every_config_path_is_classified_for_documents` walks the **generated** settings

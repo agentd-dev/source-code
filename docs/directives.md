@@ -390,7 +390,7 @@ says otherwise.
 | `identity.*` | who work is done on behalf of |
 | `a2a.listen`, `.url`, `.tls`, `.bearer`, `.principals`, `.device_grant`, `.cors`, `.push`, `.conversation_ttl` | who may talk to THIS agent and as what, over which socket, from which browser origin, with which credential |
 | `a2a.events`, `a2a.introspection` | what the listener shows its clients — the observation feed, and the reads that expose transcripts and internals |
-| `webhooks.*` | inbound sockets with the auth on them. A document declares a `:::endpoint` ROUTE; the listener it is served on is the operator's |
+| `webhooks.*` | inbound sockets with the auth on them. A document declares a `:::endpoint` ROUTE; the listener it is served on is the operator's. A route is the `interface` family's however the document spells it — a `:::!workflow` or `:::!config` workflow with a `webhook` start or `wait {on: webhook}` needs the grant `:::!endpoint` needs ([security](security.md#inbound-webhooks)) |
 | `intelligence.endpoints`, `.token`, `.token_file`, `.headers`, `.auth` | where the conversation goes and the credential it goes with |
 | `subagents.*` | a whole child agent — its own source, grants and identity. A document REFERENCES a template (`:::agent template=…`); defining one is the operator's |
 | `store.file`, `.http`, `.mcp`, `.audit`, `.retention` | WHERE state lives — a path on the host, or a remote the deployment must be willing to reach — and the audit record |

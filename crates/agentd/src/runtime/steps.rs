@@ -28,6 +28,19 @@ use std::collections::{BTreeMap, HashMap};
 /// The memory key prefix runtime-created workflow definitions are stored under.
 const WORKFLOW_DEF_PREFIX: &str = "_workflows/";
 
+/// One configured workflow entry as a single document to resolve — a `dir:`
+/// entry becomes one per matching file.
+pub(crate) struct WorkflowDocument {
+    pub(crate) entry: Value,
+    /// Where it came from, in the words a refusal names it by.
+    pub(crate) source: String,
+    /// Whether the instruction document contributed it. A document's
+    /// reference (`file:`, `url:`, `uri:`, `dir:`) resolves only here, and the
+    /// definition it resolves to is held to the document's grants exactly as
+    /// its inline machinery was at config load.
+    pub(crate) from_document: bool,
+}
+
 /// Configured workflow definitions resolved and parsed but not yet live.
 /// Staging is side-effect free (it reads files, fetches and resources, and
 /// installs and logs nothing), which is what lets a reload refuse a set that
@@ -120,14 +133,15 @@ impl Runtime {
 
     /// The configured workflow entries as a flat list of documents, each with
     /// the source a refusal names it by. Reads folders; installs nothing.
-    pub(crate) fn workflow_documents(&self, errs: &mut Vec<String>) -> Vec<(Value, String)> {
+    pub(crate) fn workflow_documents(&self, errs: &mut Vec<String>) -> Vec<WorkflowDocument> {
         // A `{dir}` entry expands into one entry per matching file BEFORE
         // resolution, so everything downstream — parsing, naming, the duplicate
         // check — sees a plain list of documents and needs no directory case.
         // Each document travels with where it came from, so two that resolve
         // to one name can be refused naming both.
-        let mut docs: Vec<(Value, String)> = Vec::new();
+        let mut docs: Vec<WorkflowDocument> = Vec::new();
         for (i, doc) in self.settings.workflows.clone().into_iter().enumerate() {
+            let from_document = self.settings.agent.document_workflows.contains(&i);
             // The ENTRY fold runs here, BEFORE the dir expansion, because a
             // `dir:` is consumed by that expansion and would never reach the
             // per-document fold below — `{{config.wf_dir}}` went to the
@@ -163,7 +177,11 @@ impl Runtime {
                 },
             };
             match entry_dir {
-                None => docs.push((doc, self.settings.workflow_entry_source(i))),
+                None => docs.push(WorkflowDocument {
+                    entry: doc,
+                    source: self.settings.workflow_entry_source(i),
+                    from_document,
+                }),
                 Some(dir) => {
                     let pattern = dir.glob().unwrap_or("*.yaml,*.yml,*.json");
                     match expand_dir_ordered(dir.path(), pattern, dir.order()) {
@@ -185,7 +203,11 @@ impl Runtime {
                                     "file {path} (from {})",
                                     self.settings.workflow_entry_source(i)
                                 );
-                                docs.push((d, source));
+                                docs.push(WorkflowDocument {
+                                    entry: d,
+                                    source,
+                                    from_document,
+                                });
                             }
                         }
                         Err(e) => errs.push(format!("workflow dir {}: {e}", dir.path())),
@@ -208,12 +230,17 @@ impl Runtime {
     /// beside the running set — not the ones running now.
     pub(crate) fn stage_workflows(
         &self,
-        docs: Vec<(Value, String)>,
+        docs: Vec<WorkflowDocument>,
         mcp: &BTreeMap<String, std::sync::Arc<crate::mcp::client::McpClient>>,
         staged: &mut StagedWorkflows,
     ) {
         let errs = &mut staged.errs;
-        for (doc, source) in docs {
+        for WorkflowDocument {
+            entry: doc,
+            source,
+            from_document,
+        } in docs
+        {
             // `{{config.*}}` folds in at load, in two passes: the ENTRY first —
             // so a var can sit in a `file:`, `url:` or `dir:` reference and in
             // the headers that fetch it — and the RESOLVED document after, so a
@@ -304,6 +331,20 @@ impl Runtime {
             };
             let mut resolved = resolved;
             substitute_config_vars(&mut resolved, &self.settings.vars, "workflow", errs);
+            // A document's reference is the document's machinery one hop
+            // away: `url:` names content the document chose, so a route it
+            // defines faces the grant an inline one faced at config load.
+            if from_document {
+                let refused = crate::config::settings::document_route_refusals(
+                    std::iter::once(&resolved),
+                    &self.settings.agent.document_grants,
+                    &source,
+                );
+                if !refused.is_empty() {
+                    errs.extend(refused);
+                    continue;
+                }
+            }
             match parse_workflow(&resolved) {
                 Ok(mut w) => {
                     self.fill_durable_default(&mut w);

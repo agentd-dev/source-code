@@ -1663,6 +1663,77 @@ fn check_hook_path(path: Option<&Value>, at: &str, errs: &mut Vec<String>) {
     }
 }
 
+/// A step that opens an inbound HTTP route on the webhook listener.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InboundRoute<'a> {
+    /// The step's id, behind the ids of the steps whose bodies it sits in
+    /// (`fan/each/w`) — how a refusal names it.
+    pub step: String,
+    /// What opens the route, in the words a refusal uses.
+    pub what: &'static str,
+    /// The `auth` the route is armed with, where the listener reads it: a
+    /// start carries it at the top level, a wait under `webhook.auth`
+    /// (`runtime::webhooks::webhook_wait`).
+    pub auth: Option<&'a Value>,
+}
+
+/// Every step of a raw workflow definition that opens an inbound route on the
+/// webhook listener: a `webhook` start serves its path to every request, and a
+/// `wait {on: webhook}` serves its `webhook.path` (or one it mints) until the
+/// first verified call. Bodies and branches are walked, because a wait inside a
+/// `foreach` arms the same route as one at the top.
+///
+/// THE list. Every judgement of "does this workflow open a route" reads it —
+/// the listener and auth checks at load, a served document's boundary (a
+/// document opens one only under the `interface` grant), and the instance
+/// child's refusal (a child has no listener) — so a new inbound shape is added
+/// once, and no check can see a route another misses. An `a2a` start is not in
+/// it: it answers on the A2A listener, whose callers and their roles are the
+/// operator's (`a2a.principals`), where a webhook route brings its own path and
+/// its own `auth`.
+pub fn inbound_routes(def: &Value) -> Vec<InboundRoute<'_>> {
+    fn walk<'a>(steps: &'a Value, prefix: &str, out: &mut Vec<InboundRoute<'a>>) {
+        let Some(steps) = steps.as_object() else {
+            return;
+        };
+        for (id, st) in steps {
+            let step = format!("{prefix}{id}");
+            match st.get("kind").and_then(Value::as_str) {
+                Some("webhook") => out.push(InboundRoute {
+                    step: step.clone(),
+                    what: "a `webhook` start",
+                    auth: st.get("auth"),
+                }),
+                Some("wait") if st.get("on").and_then(Value::as_str) == Some("webhook") => out
+                    .push(InboundRoute {
+                        step: step.clone(),
+                        what: "a `wait {on: webhook}`",
+                        auth: st.get("webhook").and_then(|w| w.get("auth")),
+                    }),
+                _ => {}
+            }
+            if let Some(body) = st.get("body").and_then(|b| b.get("steps")) {
+                walk(body, &format!("{step}/"), out);
+            }
+            for (b, bv) in st
+                .get("branches")
+                .and_then(Value::as_object)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(body) = bv.get("steps") {
+                    walk(body, &format!("{step}/{b}/"), out);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    if let Some(steps) = def.get("steps") {
+        walk(steps, "", &mut out);
+    }
+    out
+}
+
 fn parse_step(
     wf: &str,
     id: &str,

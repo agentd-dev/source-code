@@ -190,7 +190,7 @@ impl Runtime {
             // reload would run on, once that is staged below.
             let (now, after_mcp): (Vec<_>, Vec<_>) = docs
                 .into_iter()
-                .partition(|(d, _)| !(servers_change && reads_a_resource(d)));
+                .partition(|d| !(servers_change && reads_a_resource(&d.entry)));
             self.stage_workflows(now, &self.mcp, &mut staged);
             if !staged.errs.is_empty() {
                 return Err(staged.errs);
@@ -408,7 +408,7 @@ impl Runtime {
         mcp: Option<&StagedMcp>,
         workflows: Option<(
             super::steps::StagedWorkflows,
-            Vec<(serde_json::Value, String)>,
+            Vec<super::steps::WorkflowDocument>,
         )>,
     ) -> Result<StagedReload, Vec<String>> {
         let new = &self.settings;

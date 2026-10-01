@@ -403,19 +403,31 @@ fn validate_instance_machinery(name: &str, ex: &idoc::Extraction, s: &Settings) 
     // No webhook starts and no webhook waits: an instance child has no
     // listener of its own, so external events must enter through the parent's
     // static HMAC-verified routes and reach the child as commands or signals.
-    for wf in &ex.workflows {
+    // Both doors a template's machinery has into the child's `workflows` —
+    // its `:::!workflow` blocks and its `:::!config` fragment's inline
+    // entries — because `compose_instance_doc` puts both there; judging only
+    // the blocks accepted the fragment's route here and left the child to
+    // refuse it at every spawn. (A fragment's `file:`/`url:` entry resolves
+    // in the child, which has no listener to serve it on.)
+    let fragment_workflows = ex
+        .config
+        .get("workflows")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|w| (w, ":::!config"));
+    for (wf, door) in ex
+        .workflows
+        .iter()
+        .map(|w| (w, ":::!workflow"))
+        .chain(fragment_workflows)
+    {
         let wname = wf.get("name").and_then(Value::as_str).unwrap_or("?");
-        if let Some(steps) = wf.get("steps").and_then(Value::as_object) {
-            for (sid, step) in steps {
-                let kind = step.get("kind").and_then(Value::as_str).unwrap_or("");
-                let waits_webhook =
-                    kind == "wait" && step.get("on").and_then(Value::as_str) == Some("webhook");
-                if kind == "webhook" || waits_webhook {
-                    errs.push(at(format!(
-                        "workflow '{wname}' step '{sid}': instance children have no webhook listener — the parent's routes forward events as commands or signals"
-                    )));
-                }
-            }
+        for r in crate::engine::model::inbound_routes(wf) {
+            errs.push(at(format!(
+                "workflow '{wname}' (its {door}) step '{}' is {}: instance children have no webhook listener — the parent's routes forward events as commands or signals",
+                r.step, r.what
+            )));
         }
     }
     // The composed MCP set: catalog resolution (the child inherits the
@@ -862,6 +874,36 @@ mod tests {
         );
         let e = compile_templates(&s).unwrap_err();
         assert!(e.iter().any(|m| m.contains("no webhook listener")), "{e:?}");
+    }
+
+    /// The template's OTHER door into the child's `workflows`: its
+    /// `:::!config` fragment's inline entries, which `compose_instance_doc`
+    /// puts there beside the `:::!workflow` blocks. A route there was accepted
+    /// at the parent's boot and refused by the child at every spawn — and a
+    /// wait nested in a body was missed by the block check too.
+    #[test]
+    fn a_template_config_workflow_may_not_open_a_webhook_route_either() {
+        for (fragment, names) in [
+            (
+                "workflows:\n          - name: w\n            steps: {s: {kind: webhook, path: /x}, f: {kind: finish, depends_on: [s], status: completed}}",
+                "workflow 'w' (its :::!config) step 's' is a `webhook` start",
+            ),
+            (
+                "workflows:\n          - name: w\n            steps: {s: {kind: once}, b: {kind: subgraph, depends_on: [s], body: {steps: {cb: {kind: wait, on: webhook, timeout: 30s}}}}, f: {kind: finish, depends_on: [b], status: completed}}",
+                "workflow 'w' (its :::!config) step 'b/cb' is a `wait {on: webhook}`",
+            ),
+        ] {
+            let s = settings_with(&format!(
+                "    room:\n      instruction: |\n        Room.\n        :::!config\n        {fragment}\n        :::\n"
+            ));
+            let e = compile_templates(&s).unwrap_err();
+            assert!(
+                e.iter().any(|m| m.starts_with("subagents.templates.room: ")
+                    && m.contains(names)
+                    && m.contains("no webhook listener")),
+                "{names}: {e:?}"
+            );
+        }
     }
 
     #[test]

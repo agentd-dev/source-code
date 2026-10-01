@@ -991,6 +991,23 @@ request is in:
   `path` or a `wait` `webhook.path` under `/hooks/_` is refused when the workflow is parsed —
   at load for a configured workflow, and when an agent-stored one is registered
   (`engine/model.rs::RESERVED_HOOK_PREFIX`).
+- **A served document opens a route only under the `interface` grant.** `workflows` is a
+  document's to write, but a `webhook` start or a `wait {on: webhook}` in one opens a route on
+  the operator's listener, answering whoever reaches it with the auth the route itself names.
+  `:::!endpoint` — which folds into exactly such a workflow — needs `interface` in
+  `agent.document_capabilities` (capped by what a signature attests), and so does every other
+  spelling of the route: a `:::!workflow` block, a `:::!config` `workflows:` entry, and a
+  `file:`/`url:`/`uri:`/`dir:` entry the document names. Without the grant the load is refused,
+  naming the workflow, the step and the document — inline definitions at config load (so
+  `--validate-config` reports them), references once they resolve at startup or on a reload
+  (`config/settings/mod.rs::document_route_refusals`). The same workflow in the operator's own
+  configuration needs no grant. A subagent template's machinery opens no route at all, through
+  either door into the child's `workflows`: a child has no listener, and the parent's routes
+  reach it as commands or signals (`config/templates.rs::validate_instance_machinery`). What
+  opens a route is one list — a `webhook` start or a `wait {on: webhook}`, at any depth inside
+  a body (`engine/model.rs::inbound_routes`) — and the listener and auth checks read it too. An
+  `a2a` start is not on it: it answers on the A2A listener, whose callers and their roles are
+  the operator's.
 
 ## SSRF defenses
 

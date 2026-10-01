@@ -893,3 +893,222 @@ fn a_webhook_into_a_stream_appends_and_replays_into_a_later_consumer() {
     std::fs::remove_file(&cfg2).ok();
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ---- what a 2xx promises: kept, durably, exactly once -----------------------
+
+/// A webhook `into:` config on a file store whose checkpoint debounce is long:
+/// nothing but an explicit flush records the stream head inside a test, so a
+/// crash lands in the window between the event record and the head.
+/// `store_extra` is spliced into `store:`; `consumer` adds a workflow that
+/// reads the stream from the start.
+fn kept_config(dir: &str, port: u16, store_extra: &str, consumer: bool) -> String {
+    let consumer = if consumer {
+        "  - name: drain\n    steps:\n\
+         \x20     take: {kind: stream, stream: inbox, subject: \"webhook.*\", from: earliest}\n\
+         \x20     f:    {kind: finish, depends_on: [take], status: completed, output: \"got {{steps.take.output.data.body.order}} at {{steps.take.output.seq}}\"}\n"
+    } else {
+        ""
+    };
+    format!(
+        "\
+         agent:\n  name: kept\n  instruction: You handle webhooks.\n  preflight: never\n\
+         intelligence:\n  endpoints: [\"http://127.0.0.1:1/v1\"]\n  model: mock\n\
+         store:\n  kind: file\n  file:\n    path: {dir}/state\n  checkpoint:\n    debounce_ms: 60000\n{store_extra}\
+         streams:\n  inbox:\n    retention: {{ max_events: 100 }}\n\
+         webhooks:\n  listen: http://127.0.0.1:{port}\n\
+         workflows:\n  - name: catch\n    steps:\n\
+         \x20     h: {{kind: webhook, path: /hooks/in, methods: [POST],\n\
+         \x20         auth: {{hmac: {{secret: \"{{{{secret:INTO_SECRET}}}}\"}}}},\n\
+         \x20         into: {{stream: inbox, subject: \"webhook.received\"}}}}\n{consumer}\
+         lifecycle:\n  run_until: drained\n\
+         observability:\n  log_level: info\n  log_content: true\n"
+    )
+}
+
+/// Kill the daemon the way a crash does: no drain, no final checkpoint.
+fn crash(daemon: &mut Daemon) {
+    unsafe {
+        libc::kill(daemon.child.id() as i32, libc::SIGKILL);
+    }
+    let _ = daemon.child.wait();
+}
+
+fn drained(daemon: &Daemon) -> Vec<String> {
+    daemon
+        .events("run.done")
+        .iter()
+        .filter(|e| e["workflow"] == "drain")
+        .filter_map(|e| e["output"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// A `202` from a webhook `into:` says the event is kept. The event record is
+/// written at once, but the stream head that makes consumers see it is in the
+/// debounced manifest — so the head is saved BEFORE the `202` goes out. A
+/// daemon killed right after answering must come back with the event on the
+/// stream, reachable by a consumer without waiting for some later append.
+#[test]
+fn a_webhook_into_answered_202_is_on_the_stream_after_a_crash() {
+    let secret = "kept-secret";
+    let dir = common::unique_path("wh-kept", "d");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let (mut daemon, addr, cfg) = spawn_bound(
+        |port| kept_config(&dir, port, "", false),
+        &[("INTO_SECRET", secret)],
+    );
+    let body = r#"{"order":"o-1"}"#;
+    let (code, resp) = post(
+        &addr,
+        "/hooks/in",
+        &[
+            ("X-Signature", &sign(secret, body)),
+            ("Idempotency-Key", "k-1"),
+        ],
+        body,
+    );
+    assert_eq!(code, 202, "{resp}");
+    crash(&mut daemon);
+
+    // The next life reads the stream from the start, and nothing new arrives.
+    let (daemon2, addr2, cfg2) = spawn_bound(
+        |port| kept_config(&dir, port, "", true),
+        &[("INTO_SECRET", secret)],
+    );
+    assert!(
+        wait_for(|| !drained(&daemon2).is_empty(), 10),
+        "the acknowledged event reached the consumer after the crash:\n{}",
+        daemon2.stderr()
+    );
+    assert_eq!(drained(&daemon2), ["got o-1 at 1"]);
+    // And the next append takes the next seq.
+    let body2 = r#"{"order":"o-2"}"#;
+    let (code, resp) = post(
+        &addr2,
+        "/hooks/in",
+        &[
+            ("X-Signature", &sign(secret, body2)),
+            ("Idempotency-Key", "k-2"),
+        ],
+        body2,
+    );
+    assert_eq!(code, 202, "{resp}");
+    assert!(resp.contains("\"seq\":2"), "{resp}");
+
+    std::fs::remove_file(&cfg).ok();
+    std::fs::remove_file(&cfg2).ok();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The idempotency marker records a delivery that was KEPT. A delivery whose
+/// append is refused answers `503` and leaves no marker, so the sender's retry
+/// is processed instead of being answered `duplicate` for an event nothing
+/// kept — and once the retry is kept, a further retry IS a duplicate.
+///
+/// The refusal is engineered with `store.max_value_bytes`: life 1 caps the
+/// store below the delivery's size, so its append fails; life 2 lifts the cap,
+/// as an operator who saw the refusals would, and the sender retries.
+#[test]
+fn a_webhook_into_refused_with_503_is_appended_once_on_the_senders_retry() {
+    let secret = "retry-secret";
+    let dir = common::unique_path("wh-retry", "d");
+    std::fs::create_dir_all(&dir).unwrap();
+    let body = format!(r#"{{"order":"o-big","pad":"{}"}}"#, "x".repeat(6000));
+    let sig = sign(secret, &body);
+    let headers = [("X-Signature", sig.as_str()), ("Idempotency-Key", "r-1")];
+
+    // Life 1: the append is refused, and the sender is told so.
+    let (daemon, addr, cfg) = spawn_bound(
+        |port| kept_config(&dir, port, "  max_value_bytes: 4096\n", false),
+        &[("INTO_SECRET", secret)],
+    );
+    let (code, resp) = post(&addr, "/hooks/in", &headers, &body);
+    assert_eq!(code, 503, "a refused append is not acknowledged: {resp}");
+    assert!(
+        wait_for(|| !daemon.events("webhook.into.refused").is_empty(), 5),
+        "{}",
+        daemon.stderr()
+    );
+    drop(daemon);
+
+    // Life 2: the sender retries the same delivery.
+    let (daemon2, addr2, cfg2) = spawn_bound(
+        |port| kept_config(&dir, port, "", true),
+        &[("INTO_SECRET", secret)],
+    );
+    let (code, resp) = post(&addr2, "/hooks/in", &headers, &body);
+    assert_eq!(
+        code, 202,
+        "the retry of a refused delivery is processed, not a duplicate: {resp}"
+    );
+    let (code, resp) = post(&addr2, "/hooks/in", &headers, &body);
+    assert_eq!(code, 200, "a retry of a kept delivery is: {resp}");
+    assert!(resp.contains("duplicate"), "{resp}");
+    assert!(
+        wait_for(|| !drained(&daemon2).is_empty(), 10),
+        "{}",
+        daemon2.stderr()
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        drained(&daemon2),
+        ["got o-big at 1"],
+        "appended exactly once:\n{}",
+        daemon2.stderr()
+    );
+    assert_eq!(daemon2.events("webhook.into").len(), 1);
+
+    std::fs::remove_file(&cfg).ok();
+    std::fs::remove_file(&cfg2).ok();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A `2xx` is an acknowledgement, so a delivery whose run did not start gets
+/// none — and no idempotency marker, so the sender's next attempt is judged
+/// on its own. Here the start node's `inputs` cannot render the delivery,
+/// which retrying cannot fix: `422`, for both reply modes. (A `respond: sync`
+/// route used to park the reply for a run that would never finish.)
+#[test]
+fn a_webhook_whose_run_does_not_start_is_not_acknowledged() {
+    let (daemon, addr, cfg) = spawn_bound(
+        |port| {
+            format!(
+                "\
+                 agent:\n  name: unfired\n  instruction: You handle webhooks.\n  preflight: never\n\
+                 intelligence:\n  endpoints: [\"http://127.0.0.1:1/v1\"]\n  model: mock\n\
+                 store:\n  kind: memory\n\
+                 webhooks:\n  listen: http://127.0.0.1:{port}\n\
+                 workflows:\n  - name: ack\n    steps:\n\
+                 \x20     h: {{kind: webhook, path: /hooks/ack, methods: [POST], inputs: {{who: \"{{{{payload.body.who}}}}\"}}}}\n\
+                 \x20     f: {{kind: finish, depends_on: [h], status: completed}}\n\
+                 \x20 - name: held\n    steps:\n\
+                 \x20     h: {{kind: webhook, path: /hooks/held, methods: [POST], respond: sync, inputs: {{who: \"{{{{payload.body.who}}}}\"}}}}\n\
+                 \x20     f: {{kind: finish, depends_on: [h], status: completed}}\n\
+                 lifecycle:\n  run_until: drained\n\
+                 observability:\n  log_level: info\n"
+            )
+        },
+        &[],
+    );
+    let key = [("Idempotency-Key", "u-1")];
+    let (code, resp) = post(&addr, "/hooks/ack", &key, "{}");
+    assert_eq!(code, 422, "{resp}");
+    assert!(resp.contains("inputs_invalid"), "{resp}");
+    let (code, resp) = post(&addr, "/hooks/ack", &key, "{}");
+    assert_eq!(code, 422, "no marker was left by the refusal: {resp}");
+    // The same key, now carrying what the mapping needs, starts the run once.
+    let (code, resp) = post(&addr, "/hooks/ack", &key, r#"{"who":"x"}"#);
+    assert_eq!(code, 202, "{resp}");
+    let (code, resp) = post(&addr, "/hooks/ack", &key, r#"{"who":"x"}"#);
+    assert_eq!(code, 200, "{resp}");
+    assert!(resp.contains("duplicate"), "{resp}");
+
+    let (code, resp) = post(&addr, "/hooks/held", &[], "{}");
+    assert_eq!(code, 422, "a sync route answers at once: {resp}");
+    assert!(
+        wait_for(|| daemon.events("start.inputs.invalid").len() >= 3, 5),
+        "{}",
+        daemon.stderr()
+    );
+    std::fs::remove_file(&cfg).ok();
+}

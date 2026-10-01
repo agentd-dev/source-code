@@ -40,6 +40,8 @@ pub enum Kind {
     /// One event on a named stream, keyed `<stream>/e<seq>`.
     /// Not manifest-indexed: streams keep their own head/tail counters in
     /// [`Manifest::streams`], and events are walked by sequence, never listed.
+    /// Written only with [`Durable::create`]: an event, once kept, is never
+    /// overwritten.
     Event,
     Audit,
     /// A cached endpoint credential: an OAuth/OIDC/AWS/SPIFFE access +
@@ -564,6 +566,34 @@ impl Durable {
         state: Value,
         hash: Option<String>,
     ) -> Result<u64, StoreError> {
+        self.write(kind, id, state, hash, false)
+            .map(|seq| seq.expect("only a create-only write reports an existing key"))
+    }
+
+    /// Write a record that must not exist yet: `Ok(None)` when the key already
+    /// holds one, which is left exactly as it is.
+    ///
+    /// [`put`](Durable::put) adopts a record it finds on a key it has not
+    /// touched in this life — right for an entity this instance rewrites,
+    /// which is what such a record is after a restore gap. It is wrong for a
+    /// stream event: the event key is derived from the stream head, the head
+    /// lives in the debounced manifest, and after a crash inside that window
+    /// the next append derives a key that already holds an event a caller may
+    /// have been told was kept. Adopting it would overwrite that event. A
+    /// create-only write hands the collision back so the caller can move past
+    /// it instead.
+    pub fn create(&self, kind: Kind, id: &str, state: Value) -> Result<Option<u64>, StoreError> {
+        self.write(kind, id, state, None, true)
+    }
+
+    fn write(
+        &self,
+        kind: Kind,
+        id: &str,
+        state: Value,
+        hash: Option<String>,
+        create_only: bool,
+    ) -> Result<Option<u64>, StoreError> {
         let key = self.key(kind, id);
         // Bound the value BEFORE the CAS loop: measured once, on the state
         // rather than the envelope, so the answer does not drift with a seq
@@ -619,7 +649,25 @@ impl Durable {
                         "ok",
                         started.elapsed().as_millis() as u64,
                     );
-                    return Ok(seq);
+                    return Ok(Some(seq));
+                }
+                Ok(PutOutcome::Conflict { latest_seq }) if create_only => {
+                    // The record that is there stays. Its seq is remembered so
+                    // a later delete that has to tombstone it writes past it.
+                    if let Some(l) = latest_seq {
+                        self.seqs
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(key.clone(), l);
+                    }
+                    // Counted as an answered operation, not a conflict: that
+                    // label means a second writer shares this identity, and
+                    // an occupied create-only key means nothing of the kind.
+                    crate::obs::metrics::record_store_op(
+                        "ok",
+                        started.elapsed().as_millis() as u64,
+                    );
+                    return Ok(None);
                 }
                 Ok(PutOutcome::Conflict { latest_seq }) => {
                     if !warmed && !adopted {
@@ -662,7 +710,7 @@ impl Durable {
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .insert(key.clone(), seq);
-                        return Ok(seq);
+                        return Ok(Some(seq));
                     }
                     return Err(e);
                 }
@@ -1103,6 +1151,45 @@ mod tests {
             },
             None,
         )
+    }
+
+    /// The restore gap a crash leaves behind: a record written by a life
+    /// whose manifest never said so. `put` adopts it (an entity is rewritten
+    /// by design); `create` leaves it exactly as it is and says it is there.
+    #[test]
+    fn a_create_only_write_never_replaces_a_record_from_an_earlier_life() {
+        let mem = Arc::new(MemoryStore::new());
+        let first = durable(mem.clone());
+        assert_eq!(
+            first
+                .create(Kind::Event, "s/e1", json!({"id": "kept"}))
+                .unwrap(),
+            Some(1)
+        );
+        // The next life has not touched the key: no warmed seq.
+        let next = durable(mem.clone());
+        assert_eq!(
+            next.create(Kind::Event, "s/e1", json!({"id": "late"}))
+                .unwrap(),
+            None,
+            "an occupied key is reported, not written"
+        );
+        let env = next.get(Kind::Event, "s/e1").unwrap().unwrap();
+        assert_eq!(env.state["id"], json!("kept"));
+        assert_eq!(env.seq, 1);
+        // A free key is written at seq 1, as `put` would.
+        assert_eq!(
+            next.create(Kind::Event, "s/e2", json!({"id": "late"}))
+                .unwrap(),
+            Some(1)
+        );
+        // The contrast that makes `create` necessary: `put` adopts.
+        assert_eq!(
+            durable(mem)
+                .put(Kind::Event, "s/e1", json!({"id": "over"}), None)
+                .unwrap(),
+            2
+        );
     }
 
     #[test]

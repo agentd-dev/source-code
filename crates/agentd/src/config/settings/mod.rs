@@ -8741,6 +8741,50 @@ mod tests {
         .expect("a correct workflow validates");
     }
 
+    /// `/hooks/_` is agentd's: a `wait {on: webhook}` callback is armed at
+    /// `/hooks/_cb/<token>`, and a configured route is matched before any
+    /// callback, so one under the prefix could take a suspended run's
+    /// callback. Both route shapes a workflow can name are refused at load,
+    /// with the reason; a path merely near the prefix is not.
+    #[test]
+    fn a_webhook_route_under_the_reserved_prefix_is_refused_at_load() {
+        let cfg = |start: &str, wait: &str| {
+            format!(
+                "store: {{kind: memory}}\nwebhooks: {{listen: \"http://127.0.0.1:9\"}}\n\
+                 workflows:\n  - name: w\n    steps:\n\
+                 \x20     h: {{kind: webhook, path: \"{start}\", methods: [POST]}}\n\
+                 \x20     cb: {{kind: wait, depends_on: [h], on: webhook, webhook: {{path: \"{wait}\"}}}}\n\
+                 \x20     f: {{kind: finish, depends_on: [cb], status: completed}}\n"
+            )
+        };
+        let refused = |yaml: String| {
+            let f = write_tmp(&yaml, "yaml");
+            let e = load(
+                &args(&["--config", f.path().to_str().unwrap(), "--validate-config"]),
+                &base_env(),
+            )
+            .unwrap_err();
+            format!("{e}")
+        };
+        let msg = refused(cfg("/hooks/_cb/steal", "/hooks/done"));
+        assert!(
+            // The message arrives inside a JSON log line, its quotes escaped.
+            msg.contains("/hooks/_cb/steal") && msg.contains("reserves for its own"),
+            "the start route is refused with the reason: {msg}"
+        );
+        let msg = refused(cfg("/hooks/in", "/hooks/_mine"));
+        assert!(
+            msg.contains(": webhook.path") && msg.contains("/hooks/_mine"),
+            "a wait's fixed callback path is refused the same way: {msg}"
+        );
+        let ok = write_tmp(&cfg("/hooks/cb", "/hooks_/done"), "yaml");
+        load(
+            &args(&["--config", ok.path().to_str().unwrap(), "--validate-config"]),
+            &base_env(),
+        )
+        .expect("paths outside the prefix validate");
+    }
+
     #[test]
     fn a_prompt_is_a_message_not_a_sugar_workflow() {
         // A prompt is delivered into the agent's ROOT context at startup, so

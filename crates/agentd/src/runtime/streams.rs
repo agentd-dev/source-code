@@ -18,7 +18,7 @@
 //! (count-based eagerly, age-based amortized). Appends are admissions: the
 //! pressure system gates them like every other way of creating durable work.
 
-use crate::state::{Kind, now_ms};
+use crate::state::{Kind, kill_point, now_ms};
 use serde_json::{Value, json};
 
 /// How many events one consumer advances per reactor pass — bounds the time
@@ -27,6 +27,11 @@ use serde_json::{Value, json};
 const BATCH: usize = 32;
 /// Recent event ids each consumer remembers for at-least-once dedup.
 const DEDUP_RING: usize = 64;
+/// How many occupied event keys one append steps over before it gives up and
+/// leaves the rest to the next append. Each is one store write; the bound
+/// keeps a long unflushed backlog (or a store that answers "exists" for every
+/// key) from holding the single-writer loop.
+const HEAD_PROBES: usize = 1024;
 
 /// Subject match: exact, or a `prefix.*` glob (one trailing star).
 pub fn subject_matches(pattern: &str, subject: &str) -> bool {
@@ -70,16 +75,58 @@ impl super::reactor::Runtime {
         if meta.first == 0 {
             meta.first = 1;
         }
-        meta.seq += 1;
-        let seq = meta.seq;
-        let event = json!({
-            "id": id, "stream": stream, "subject": subject, "seq": seq,
-            "ts": now_ms(), "source": source,
-            "correlation": correlation, "data": data,
-        });
-        self.durable
-            .put(Kind::Event, &key(stream, seq), event, None)
-            .map_err(|e| format!("stream {stream:?} append: {e}"))?;
+        // The head in the manifest can be behind the store: events are written
+        // at once, the manifest is flushed debounced, and a crash between the
+        // two leaves events past the head that the next life does not know
+        // about. Each one may have been acknowledged. So the event key is
+        // create-only, and a key that is already taken moves the head past
+        // it: the event that was there is kept, and becomes visible because
+        // the head now covers it.
+        let head = meta.seq;
+        let mut seq = head + 1;
+        let mut probes = 0usize;
+        loop {
+            let event = json!({
+                "id": id, "stream": stream, "subject": subject, "seq": seq,
+                "ts": now_ms(), "source": source,
+                "correlation": correlation, "data": &data,
+            });
+            let created = self
+                .durable
+                .create(Kind::Event, &key(stream, seq), event)
+                .map_err(|e| format!("stream {stream:?} append: {e}"))?;
+            if created.is_some() {
+                break;
+            }
+            probes += 1;
+            if probes == HEAD_PROBES {
+                // A gap this long is a backlog the next append finishes, not
+                // a reason to block the loop: keep what was found (those
+                // events exist) and refuse this one, so its sender retries.
+                meta.seq = seq;
+                self.durable.manifest_update(|m| {
+                    m.streams.insert(stream.to_string(), meta);
+                });
+                self.log.warn(
+                    "stream.head.recovered",
+                    json!({"stream": stream, "from": head + 1, "to": seq, "complete": false}),
+                );
+                return Err(format!(
+                    "stream {stream:?} append: the stream head is still recovering \
+                     (seq {} to {seq} were already written); retry",
+                    head + 1
+                ));
+            }
+            seq += 1;
+        }
+        kill_point("stream.after_append");
+        if seq > head + 1 {
+            self.log.warn(
+                "stream.head.recovered",
+                json!({"stream": stream, "from": head + 1, "to": seq - 1, "complete": true}),
+            );
+        }
+        meta.seq = seq;
         // Retention. Count-based is exact; age-based is amortized (a few head
         // reads per append) — either way a trim is an EVENT-adjacent fact
         // worth one log line, never silence.
@@ -125,6 +172,33 @@ impl super::reactor::Runtime {
         // produce->consume pipeline advances at tick cadence (up to 200 ms
         // per hop) instead of engine speed.
         self.stream_dirty = true;
+        Ok(seq)
+    }
+
+    /// Append an event whose producer is answered OUTSIDE this process — the
+    /// `2xx` of a webhook `into:`.
+    ///
+    /// The event record is durable when [`append_event`](Self::append_event)
+    /// returns, but the stream head that makes consumers see it is in the
+    /// debounced manifest. A crash before that flush would leave an event the
+    /// sender was told was kept and that no consumer reaches until some later
+    /// append steps over it. So the head is flushed first, and a head that
+    /// cannot be saved is a refused append: the sender retries, and the copy
+    /// it appends carries the same id, which consumers deduplicate.
+    #[cfg(feature = "a2a")]
+    pub(crate) fn append_event_acked(
+        &mut self,
+        stream: &str,
+        subject: &str,
+        correlation: Option<&str>,
+        data: Value,
+        id: &str,
+        source: &str,
+    ) -> Result<u64, String> {
+        let seq = self.append_event(stream, subject, correlation, data, id, source)?;
+        self.durable
+            .flush(true)
+            .map_err(|e| format!("stream {stream:?} append: the stream head was not saved: {e}"))?;
         Ok(seq)
     }
 

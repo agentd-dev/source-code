@@ -695,6 +695,8 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         #[cfg(feature = "a2a")]
         tasks_swept: Instant::now(),
         #[cfg(feature = "a2a")]
+        idem_sweep: Default::default(),
+        #[cfg(feature = "a2a")]
         conv_index: Default::default(),
         #[cfg(feature = "a2a")]
         #[cfg(feature = "a2a")]

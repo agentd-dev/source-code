@@ -462,6 +462,10 @@ pub struct Runtime {
     /// tick that calls it can run many scheduling passes a second.
     #[cfg(feature = "a2a")]
     pub(crate) tasks_swept: Instant,
+    /// The webhook idempotency-marker sweep (see
+    /// `Runtime::sweep_idem_markers`).
+    #[cfg(feature = "a2a")]
+    pub(crate) idem_sweep: super::webhooks::IdemSweep,
     /// Each non-operator's `contextId`s, bound to the conversations they name
     /// (see `runtime::conversations`). Rebuilt from the tasks and contexts at
     /// restore.
@@ -583,6 +587,9 @@ impl Runtime {
             }
             // 3.5. Retiring workflows whose drain deadline passed.
             self.retire_tick();
+            // 3.6. Webhook idempotency markers past their TTL (rate-limited).
+            #[cfg(feature = "a2a")]
+            self.sweep_idem_markers();
             // 4. Timers.
             let now = now_ms();
             for t in self.timers.fire(&self.durable, now) {

@@ -1644,6 +1644,25 @@ pub fn parse_workflow(doc: &Value) -> Result<Workflow, Vec<String>> {
     Ok(wf)
 }
 
+/// The webhook paths agentd serves for itself: a `wait {on: webhook}`
+/// callback without a fixed path is armed at `/hooks/_cb/<token>`. A
+/// configured route is matched before those callbacks, so one under this
+/// prefix could answer a callback meant for a suspended run — the prefix is
+/// refused in every workflow, wherever it comes from.
+pub const RESERVED_HOOK_PREFIX: &str = "/hooks/_";
+
+/// Refuse a webhook route under [`RESERVED_HOOK_PREFIX`].
+fn check_hook_path(path: Option<&Value>, at: &str, errs: &mut Vec<String>) {
+    if let Some(p) = path.and_then(Value::as_str)
+        && p.starts_with(RESERVED_HOOK_PREFIX)
+    {
+        errs.push(format!(
+            "{at} {p:?} is under {RESERVED_HOOK_PREFIX:?}, which agentd reserves for its own \
+             routes (the `wait {{on: webhook}}` callbacks) — choose a path outside it"
+        ));
+    }
+}
+
 fn parse_step(
     wf: &str,
     id: &str,
@@ -1896,6 +1915,7 @@ fn parse_step(
         // `a2a.principals[].quotas.rate`. Checked here so a typo surfaces with
         // the other definition errors, not as a startup refusal.
         "webhook" => {
+            check_hook_path(spec.get("path"), &format!("{at}: path"), errs);
             if let Some(r) = spec.get("rate") {
                 let ok = r.as_str().is_some_and(|r| {
                     r.split_once('/').is_some_and(|(b, p)| {
@@ -1972,6 +1992,13 @@ fn parse_step(
         // it): the reply it waits for is a peer's, and no default names a
         // peer. A malformed one is a load error, not a wait that hears no one.
         "a2a.wait" | "wait" => {
+            if spec.get("on").and_then(Value::as_str) == Some("webhook") {
+                check_hook_path(
+                    spec.get("webhook").and_then(|w| w.get("path")),
+                    &format!("{at}: webhook.path"),
+                    errs,
+                );
+            }
             if let Some(v) = spec.get("from") {
                 if kind == "wait" && spec.get("on").and_then(Value::as_str) != Some("message") {
                     errs.push(format!("{at}: `from` belongs to `wait {{on: message}}`"));

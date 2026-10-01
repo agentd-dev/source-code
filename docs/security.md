@@ -908,6 +908,31 @@ to a shell. Each child gets its own process group so the kill ladder can target 
 subtree, an optional cgroup leaf whose `Drop` writes `cgroup.kill`, and `PR_SET_PDEATHSIG`
 so a supervisor death collapses it.
 
+## Inbound webhooks
+
+A `webhook` route authenticates per node — HMAC-SHA256 over the raw body, a header match or
+a bearer, compared in constant time — and a non-loopback `webhooks.listen` refuses to start
+with an unauthenticated route
+(`runtime/webhooks.rs::build_verify`, the `webhooks.listen` block of
+`config/settings/mod.rs::validate`). Two further rules protect what the listener does once a
+request is in:
+
+- **Replay markers are agentd's, not the agent's.** A delivery's idempotency key is recorded
+  under `_wh_idem/` in the instance's memory (`runtime/webhooks.rs::idem_marker_id`). The
+  `memory.*` tools refuse every `_`-prefixed key (`context/memory.rs::check_key`), so a model
+  — one steered by an injected payload included — can neither forge a marker, which would
+  answer a real delivery `200 duplicate`, nor delete one, which would let a replay fire
+  twice. A marker is written only after the delivery is kept (its run is in the durable
+  inbox, or its event and the stream head are saved), so a refused delivery is processed when
+  the sender retries; it answers replays for seven days, and a sweep removes it after that
+  (`IDEM_TTL_MS`, `Runtime::sweep_idem_markers`).
+- **`/hooks/_` is reserved.** A `wait {on: webhook}` without a fixed path is armed at
+  `/hooks/_cb/<token>`, and configured routes are matched before those callbacks. A route
+  under the prefix could therefore take a suspended run's callback, so a `webhook` start
+  `path` or a `wait` `webhook.path` under `/hooks/_` is refused when the workflow is parsed —
+  at load for a configured workflow, and when an agent-stored one is registered
+  (`engine/model.rs::RESERVED_HOOK_PREFIX`).
+
 ## SSRF defenses
 
 The SSRF classifier guards the outbound surfaces where the URL is not purely operator

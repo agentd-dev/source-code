@@ -265,7 +265,8 @@ impl Runtime {
     /// resources suspended `wait on: resource` steps wait on. A subscription
     /// lives on its connection, so the old one took them with it when the
     /// reload dropped it — and the start that never fired again, or the wait
-    /// that never resolved, said nothing.
+    /// that never resolved, said nothing. The waits go through
+    /// `resubscribe_waits`, the one path boot takes for a restored wait.
     pub(crate) fn resubscribe_on(&mut self, servers: &[String], skip: &[String]) {
         if servers.is_empty() {
             return;
@@ -286,39 +287,7 @@ impl Runtime {
         for (workflow, node, _, spec) in starts {
             self.arm_subscribe(&workflow, &node, &spec);
         }
-        let mut waits: Vec<(String, String)> = Vec::new();
-        for run in self.runs.values() {
-            for st in run.steps.values() {
-                if st.status == crate::engine::run::StepStatus::Suspended
-                    && let Some(w) = &st.wait
-                    && w["kind"] == "resource"
-                    && on(w["server"].as_str())
-                {
-                    let key = (
-                        w["server"].as_str().unwrap_or_default().to_string(),
-                        w["uri"].as_str().unwrap_or_default().to_string(),
-                    );
-                    if !waits.contains(&key) {
-                        waits.push(key);
-                    }
-                }
-            }
-        }
-        for (server, uri) in waits {
-            let Some(c) = self.mcp.get(&server) else {
-                continue;
-            };
-            match c.subscribe(&uri) {
-                Ok(()) => self.log.info(
-                    "wait.resubscribed",
-                    json!({"server": server, "uri": uri, "reason": "reload"}),
-                ),
-                Err(e) => self.log.warn(
-                    "wait.resubscribe.fail",
-                    json!({"server": server, "uri": uri, "err": e.to_string()}),
-                ),
-            }
-        }
+        self.resubscribe_waits(Some(servers), "reload");
     }
 
     /// Every tick: fire due `schedule`/`loop` starts and flush debounced

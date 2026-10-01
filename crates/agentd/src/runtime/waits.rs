@@ -875,6 +875,88 @@ impl Runtime {
         d
     }
 
+    /// Subscribe again the resources the suspended `wait on: resource` steps
+    /// wait on — those on `servers`, or every one when `servers` is `None`.
+    ///
+    /// A subscription lives on its connection, while the wait it serves is
+    /// durable: a restart restores the step parked on a connection that no
+    /// longer exists, and a reload that re-dials a server drops the one it
+    /// was subscribed on. Either way the wait would park until its timeout,
+    /// or for ever, with nothing in any log. Boot (`servers: None`, after the
+    /// restore) and the reload (`resubscribe_on`, the servers it re-dialed)
+    /// both come here, so the two cannot drift apart.
+    ///
+    /// A wait that can never be woken fails its step, as a fresh wait does in
+    /// `step_wait`: its server is not connected (gone from the config, or
+    /// down at boot), or it does not advertise `resources.subscribe`. Any
+    /// other failure leaves the wait parked under its own deadline, said at
+    /// warn level.
+    pub(crate) fn resubscribe_waits(&mut self, servers: Option<&[String]>, reason: &str) {
+        // One subscribe per resource, however many steps wait on it: a
+        // connection tracks a URI once, whoever subscribed it.
+        let mut waits: std::collections::BTreeMap<(String, String), Vec<(String, String)>> =
+            Default::default();
+        for (rid, run) in &self.runs {
+            if run.status.is_terminal() {
+                continue;
+            }
+            for (sid, st) in &run.steps {
+                if st.status == StepStatus::Suspended
+                    && let Some(w) = &st.wait
+                    && w["kind"] == "resource"
+                {
+                    let server = w["server"].as_str().unwrap_or_default();
+                    if servers.is_some_and(|s| !s.iter().any(|x| x == server)) {
+                        continue;
+                    }
+                    let uri = w["uri"].as_str().unwrap_or_default();
+                    waits
+                        .entry((server.to_string(), uri.to_string()))
+                        .or_default()
+                        .push((rid.clone(), sid.clone()));
+                }
+            }
+        }
+        for ((server, uri), steps) in waits {
+            let refused = match self.mcp.get(&server).cloned() {
+                None => format!("wait resource: server {server:?} is not connected"),
+                Some(c) => match c.subscribe(&uri) {
+                    Ok(()) => {
+                        self.log.info(
+                            "wait.resubscribed",
+                            json!({"server": server, "uri": uri, "reason": reason}),
+                        );
+                        continue;
+                    }
+                    Err(e @ crate::mcp::client::McpError::Capability(_)) => {
+                        format!("wait resource: subscribe {uri}: {e}")
+                    }
+                    Err(e) => {
+                        self.log.warn(
+                            "wait.resubscribe.fail",
+                            json!({"server": server, "uri": uri, "reason": reason, "err": e.to_string()}),
+                        );
+                        continue;
+                    }
+                },
+            };
+            self.log.error(
+                "wait.resubscribe.fail",
+                json!({"server": server, "uri": uri, "reason": reason, "err": refused, "failed": steps.len()}),
+            );
+            for (run, step) in steps {
+                self.finish_step_pub(
+                    &run,
+                    &step,
+                    StepStatus::Failed,
+                    None,
+                    Some(refused.clone()),
+                    0,
+                );
+            }
+        }
+    }
+
     /// A resource update arrived: resolve `wait resource` steps on it.
     ///
     /// The notify-then-read runs on an executor thread, never here. This is the

@@ -1130,6 +1130,13 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
     }
     rt.arm_workflows();
     rt.arm_long_lived_starts();
+    // A restored `wait on: resource` was subscribed on the previous life's
+    // connection, which this life never dialed: without a subscribe here the
+    // server never notifies, and the wait sits until its timeout, or for
+    // ever. Here, with the definitions loaded and the pins restored, because
+    // a wait that can never be woken fails its step, and failing a step
+    // resolves it against the definition its run started with.
+    rt.resubscribe_waits(None, "boot");
     rt.arm_goal();
     rt.arm_freshness();
     rt.respawn_restored_subagents();

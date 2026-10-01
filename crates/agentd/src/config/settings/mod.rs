@@ -7636,6 +7636,7 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             }
         }
     }
+    let mut inline = Vec::new();
     for w in &s.workflows {
         // A reference — file, uri, url or dir — resolves at startup, so there
         // is nothing to parse here. Only inline definitions are checkable.
@@ -7656,9 +7657,10 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             }
             continue;
         }
-        if let Err(errs) = crate::engine::model::parse_workflow(w) {
+        match crate::engine::model::parse_workflow(w) {
             // The parser's messages already name the workflow and the step.
-            d.errors.extend(errs);
+            Err(errs) => d.errors.extend(errs),
+            Ok(parsed) => inline.push(parsed),
         }
         // Fan-out is checked HERE rather than in the parser because the ceiling
         // is a config value the parser cannot see.
@@ -7685,6 +7687,15 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                 }
             }
         }
+    }
+    // Trifecta over what reaches a run through a stream. The root fold above
+    // judges the servers; this judges the input a webhook or peer appends to a
+    // stream and the agent steps that read it. Over the inline definitions
+    // only, as the checks above — the loader runs it again over the whole set
+    // once file, URL and directory definitions resolve, and a refusal here is
+    // one there too (the analysis only grows with the set).
+    for e in crate::config::taint::refusals(s, &inline.iter().collect::<Vec<_>>()) {
+        err(&mut d, e);
     }
     d
 }

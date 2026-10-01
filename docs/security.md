@@ -113,7 +113,8 @@ conservative default.
 
 ### Where the gate runs
 
-Two enforcement points, both consulting the same `security.allow_trifecta` setting.
+Two enforcement points over servers, both consulting the same `security.allow_trifecta`
+setting — and a third over what reaches a run through a stream, [below](#streams-carry-the-taint-of-what-feeds-them).
 
 ```mermaid
 flowchart TB
@@ -167,6 +168,62 @@ tools sit outside the accounting: they are inserted with `Grant::all()` and an e
 vector — the tool literal that `registry/mod.rs::Registry::build` writes for a code
 tool — so an embedder whose native tool does egress or reads secrets defeats the budget
 silently.
+
+### Streams carry the taint of what feeds them
+
+Gates 1 and 2 judge servers. Neither sees input that reaches a run **through a stream**:
+a webhook `into:` appends whatever its caller posted, an A2A `into:` appends a peer's
+message, and the workflow consuming the stream hands that text to an agent. A config
+whose servers are all tagged — one of them `sensitive` + `egress`, which is two legs —
+passes gate 1, and then feeds a webhook body to the agent holding both.
+
+So every declared stream gets a tag set from every producer the configuration declares
+(`config/taint.rs::propagate`):
+
+- a webhook `into:` and an A2A `into:` add `untrusted_input` — a valid signature says who
+  sent the text, not that it is safe to obey;
+- a subagent template's `mirror_streams` adds `untrusted_input`: the child's own producers
+  are compiled at spawn, into another process, and cannot be judged here;
+- an `emit` from a run that reads a tainted stream carries that stream's tags to its
+  target. Every `emit` target is static, so this is a fixed point over the workflow
+  graph.
+
+A run started from a tainted stream (`stream` or `correlate` start) or waiting on one
+(`wait {on: event}`) carries its tags, and so does a run that such a run starts — a
+`workflow` step, or a workflow tool one of its agents can call. Each such workflow is
+then put through `check_trifecta` with its tags folded together with every server its
+model-driven steps can reach (`config/taint.rs::Reach`):
+
+- an `agent` step reaches its `servers:`, or every configured server without the list;
+  a `subagent` step reaches its template's servers, or its own;
+- a step that can call `subagent.run` (no `tools:` list, or one that names it) reaches
+  whatever a child can be handed: every server, unless `subagents.allow_freeform: false`,
+  and every template's servers;
+- `exec`, when it runs locally or is mapped off-box, is `sensitive` + `egress` on its own;
+- a `message` step hands the text to the agent's own conversation, which holds the root
+  grant.
+
+All three legs and no `security.allow_trifecta` is exit `2` — from `--validate-config` for
+the inline definitions, and at the start and on every reload for the whole set once
+`file:`, `url:` and `dir:` definitions resolve. A refused reload keeps the running
+configuration. The message names the workflow, the stream, what feeds it and the servers
+that brought the other two legs:
+
+```text
+workflow "triage": lethal-trifecta refused — it consumes stream "inbox" (fed by webhook
+`into:` at workflow "intake" step "hook"), and its model-driven steps reach mcp server
+"mail" [sensitive, egress]: untrusted input + sensitive + egress in one run. …
+```
+
+A definition the agent writes is held to the same line: `workflow.create`/`update`
+refuses one that would complete the trifecta, and a stored one that a reload makes
+complete it is left out (`workflow.stored.invalid`), not allowed to veto the reload.
+
+This is coarse and static on purpose — per stream, not per value, and per server, like
+gate 1. It is a grant-level check, not data-flow tracking. The fix it points at is the
+[reader/actor split](#the-injection-firewall): the step that reads the stream holds no
+`sensitive` or `egress` server (narrow its `servers:` and give it a `tools:` list without
+`subagent.run`), and what it distils goes to an actor that never saw the raw text.
 
 ### The tag floor and closed egress
 

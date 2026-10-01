@@ -172,11 +172,16 @@ impl Runtime {
         // going live to fail on the day it runs.
         let registry_inputs_moved =
             old.tools != new.tools || old.knowledge != new.knowledge || old.search != new.search;
+        // …and whenever the subagent templates change: what a spawn reaches
+        // and which streams a child mirrors in are inputs to the stream-taint
+        // check the definitions are held to.
+        let templates_moved = old.subagents != new.subagents;
         let workflows = if old.workflows != new.workflows
             || external
             || channels_moved
             || servers_change
             || registry_inputs_moved
+            || templates_moved
         {
             let mut staged = super::steps::StagedWorkflows::default();
             let docs = self.workflow_documents(&mut staged.errs);

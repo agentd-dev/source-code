@@ -419,6 +419,13 @@ impl Runtime {
         for w in workflows.values() {
             errs.extend(self.reference_errors(w, registry, mcp));
         }
+        // The stream-taint trifecta check over the whole configured set, now
+        // that file, URL and directory definitions have resolved: `validate`
+        // could only see the inline ones.
+        errs.extend(crate::config::taint::refusals(
+            &self.settings,
+            &workflows.values().map(AsRef::as_ref).collect::<Vec<_>>(),
+        ));
         // A stored one (workflow.create/update) cannot refuse anything: only
         // the operator's configuration may. Checked the same way it would
         // otherwise veto the operator — a definition the agent wrote naming
@@ -427,7 +434,20 @@ impl Runtime {
         // removes it. It is left out of the set instead, said out loud, and
         // kept in the store: it loads again once what it names is back.
         for w in stored {
-            let problems = self.reference_errors(&w, registry, mcp);
+            let mut problems = self.reference_errors(&w, registry, mcp);
+            // …and the taint check over the set it would join: a stored
+            // definition that feeds a configured consumer's stream, or reads
+            // one into an agent holding sensitive + egress, stays out.
+            if problems.is_empty() {
+                problems = crate::config::taint::refusals(
+                    &self.settings,
+                    &workflows
+                        .values()
+                        .map(AsRef::as_ref)
+                        .chain(std::iter::once(&w))
+                        .collect::<Vec<_>>(),
+                );
+            }
             if problems.is_empty() {
                 loaded.push(json!({"name": w.name, "source": "store"}));
                 workflows.insert(w.name.clone(), std::sync::Arc::new(w));
@@ -3664,7 +3684,22 @@ impl Runtime {
                         // tool, server or stream this agent does not have is
                         // refused here rather than stored to fail when it
                         // runs.
-                        let problems = self.reference_errors(&w, &self.registry, &self.mcp);
+                        let mut problems = self.reference_errors(&w, &self.registry, &self.mcp);
+                        // The taint check, over the running set with this
+                        // definition in place of any it replaces — the same
+                        // line a configured definition is held to at load.
+                        if problems.is_empty() {
+                            problems = crate::config::taint::refusals(
+                                &self.settings,
+                                &self
+                                    .workflows
+                                    .values()
+                                    .map(AsRef::as_ref)
+                                    .filter(|o: &&Workflow| o.name != w.name)
+                                    .chain(std::iter::once(&w))
+                                    .collect::<Vec<_>>(),
+                            );
+                        }
                         if !problems.is_empty() {
                             return err(format!("{name}: {}", problems.join("; ")));
                         }

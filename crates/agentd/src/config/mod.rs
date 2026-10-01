@@ -95,6 +95,7 @@ pub mod idoc;
 pub mod paths;
 pub mod prompt;
 pub mod settings;
+pub mod taint; // RFC 0045 §5.11.3: streams carry the taint of what feeds them, checked at load
 pub mod templates;
 #[cfg(all(unix, feature = "config-watch"))]
 pub mod watch;

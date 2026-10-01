@@ -742,10 +742,12 @@ fn deliver_ui_code(w: &Watch, origin: &str, code: &str) {
         let url = url.clone();
         move || {
             if let Some(fd) = out.as_ref().and_then(|o| o.try_clone().ok()) {
-                let _ = writeln!(
-                    std::fs::File::from(fd),
-                    "agentd ui: sign in by opening {url}\n  (it works once, within {}s; over SSH forward the same port: ssh -L {port}:127.0.0.1:{port} …)\n  after that, a tab that asks is signed in here: type the code it shows",
-                    LAUNCH_CODE_TTL.as_secs()
+                let _ = put_line(
+                    &mut std::fs::File::from(fd),
+                    &format!(
+                        "agentd ui: sign in by opening {url}\n  (it works once, within {}s; over SSH forward the same port: ssh -L {port}:127.0.0.1:{port} …)\n  after that, a tab that asks is signed in here: type the code it shows",
+                        LAUNCH_CODE_TTL.as_secs()
+                    ),
                 );
             }
         }
@@ -893,7 +895,7 @@ fn prompt_loop(slot: &LaunchSlot, rx: &Receiver<PromptEvent>, out: &mut impl Wri
                     } else {
                         "agentd ui: no tab is showing that code"
                     };
-                    let _ = writeln!(out, "{said}");
+                    let _ = put_line(out, said);
                 }
                 PromptEvent::Eof => return,
             }
@@ -903,8 +905,8 @@ fn prompt_loop(slot: &LaunchSlot, rx: &Receiver<PromptEvent>, out: &mut impl Wri
             let waiting = slot.waiting();
             if waiting > 0 {
                 let _ = match waiting - 1 {
-                    0 => writeln!(out, "{PROMPT}"),
-                    more => writeln!(out, "{PROMPT} [{more} more waiting]"),
+                    0 => put_line(out, PROMPT),
+                    more => put_line(out, &format!("{PROMPT} [{more} more waiting]")),
                 };
                 showing = true;
             }
@@ -914,10 +916,16 @@ fn prompt_loop(slot: &LaunchSlot, rx: &Receiver<PromptEvent>, out: &mut impl Wri
 
 /// Print a line to the SAVED terminal (the daemon's own stderr is redirected).
 fn tty_println(tty: &Tty, msg: &str) -> std::io::Result<()> {
-    use std::io::Write;
     // Through a close-on-exec duplicate, so the saved fd stays open.
-    let mut f = std::fs::File::from(tty.stderr.try_clone()?);
-    writeln!(f, "{msg}")
+    put_line(&mut std::fs::File::from(tty.stderr.try_clone()?), msg)
+}
+
+/// Write `line` and its newline in ONE write. The terminal is unbuffered and
+/// shared — the prompt, the watcher and the opener's thread all print to it —
+/// and `writeln!` issues a write per formatting piece, so another line could
+/// land inside this one, and a reader could see a prompt without its count.
+fn put_line(out: &mut impl Write, line: &str) -> std::io::Result<()> {
+    out.write_all(format!("{line}\n").as_bytes())
 }
 
 #[cfg(test)]
@@ -940,6 +948,61 @@ mod tests {
             assert!(flags >= 0, "fd {fd}: {}", std::io::Error::last_os_error());
             assert_ne!(flags & libc::FD_CLOEXEC, 0, "fd {fd} is inheritable");
         }
+    }
+
+    /// Every line the terminal gets is ONE write — the prompt with its count
+    /// too. A line written in pieces can be read half done, or have another
+    /// thread's line land inside it: the e2e flood test once read a prompt
+    /// whose count had not been written yet.
+    #[test]
+    fn every_terminal_line_is_one_write() {
+        struct Writes(Vec<String>);
+        impl Write for Writes {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.push(String::from_utf8_lossy(b).into_owned());
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        use agentd::a2a::oauth::{Authority, Sessions, system_clock};
+        let origin = "http://127.0.0.1:4555";
+        let slot = Arc::new(LaunchSlot::new(Some(origin)).unwrap());
+        let auth = Authority::new(
+            None,
+            Some(Arc::clone(&slot)),
+            Arc::new(Sessions::new(system_clock())),
+        );
+        // Three tabs ask, so the prompt carries a count.
+        for _ in 0..3 {
+            let r = auth.launch_authorization(
+                Some("application/x-www-form-urlencoded"),
+                b"client_id=agentd-ui",
+                Some([127, 0, 0, 1].into()),
+                Some(origin),
+            );
+            assert_eq!(r.status, 200, "{r:?}");
+        }
+        let (tx, rx) = mpsc::channel();
+        for ev in [
+            PromptEvent::Request,
+            PromptEvent::Request,
+            PromptEvent::Request,
+            PromptEvent::Line("WRONG-CODE\n".into()),
+            PromptEvent::Eof,
+        ] {
+            tx.send(ev).unwrap();
+        }
+        let mut out = Writes(Vec::new());
+        prompt_loop(&slot, &rx, &mut out);
+        assert_eq!(
+            out.0,
+            [
+                "agentd ui: no tab is showing that code\n".to_string(),
+                format!("{PROMPT} [2 more waiting]\n"),
+            ]
+        );
     }
 
     /// The daemon loads exactly what it was given: the launcher takes its own

@@ -177,11 +177,14 @@ impl Scratch {
         }
     }
 
-    /// Wait until the launcher's terminal output satisfies `ok`.
+    /// Wait until the launcher's terminal output satisfies `ok`. Only whole
+    /// lines are judged: the file is read while the launcher writes it, and a
+    /// line whose newline has not landed yet may still be growing.
     fn wait_terminal(&self, what: &str, ok: impl Fn(&str) -> bool) -> String {
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
-            let err = self.read("launcher.err");
+            let mut err = self.read("launcher.err");
+            err.truncate(err.rfind('\n').map_or(0, |i| i + 1));
             if ok(&err) {
                 return err;
             }

@@ -242,6 +242,13 @@ binary.
 Families are a **closed vocabulary**: `include: [pressur]` is a startup error,
 not a filter that silently matches nothing.
 
+Either stream carries what runs produced — `run.done` carries a run's error (and
+its output under `log_content`), an audit record the question an `ask_human`
+put — so the load-time taint check counts it as fed by every run, whatever the
+families: a workflow consuming it is judged with the taint of every run that
+read outside text ([security](security.md), "Streams carry the taint of what
+feeds them").
+
 ### Why not the event ring
 
 The obvious implementation would tee the in-memory ring the `debug.events`

@@ -419,9 +419,13 @@ impl Registry {
     /// Register every workflow carrying a `tool:` block as a first-class
     /// contract, replacing whatever an earlier set registered: after the
     /// startup workflow load, on the registry a reload builds or re-derives,
-    /// and when `workflow.create`/`update`/`delete` changes the installed set
-    /// — the tags below are derived from the whole set, so a definition that
-    /// is not a tool can still move them.
+    /// when `workflow.create`/`update` changes the installed set, when a
+    /// definition is retired (a `workflow.delete`, or a reload that removes
+    /// or replaces it), and when the last run of a retired one lands — the
+    /// tags below are derived from the whole set, so a definition that is not
+    /// a tool can still move them. `workflows` may hold a retired definition
+    /// beside the one that replaced it, tool taken off, for the runs still
+    /// pinned to it.
     ///
     /// Configuration-only is the whole safety argument. The registry is
     /// otherwise built from settings plus connected servers and validated
@@ -441,11 +445,12 @@ impl Registry {
     /// reading the derived tags logged at startup — sees the truth about what
     /// the procedure can do.
     ///
-    /// The contracts that hand a run's result back (`workflow.run`,
-    /// `workflow.wait`, `workflow.status`, `internal::read_back`) carry the
-    /// union of every run's taint the same way: any run's output may be what
-    /// they return, and the stream-taint check judges their callers as
-    /// having read it.
+    /// The contracts that hand a run's or a child's result back
+    /// (`internal::read_back`: `workflow.run {wait}`, `workflow.wait`,
+    /// `workflow.status`, the `subagent` reads by handle, the `plan.update`
+    /// binding) carry the union of every run's taint the same way: any run's
+    /// output may be what they return, and the stream-taint check judges
+    /// their callers as having read it.
     pub fn register_workflow_tools(
         &mut self,
         settings: &Settings,

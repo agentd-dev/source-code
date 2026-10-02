@@ -82,23 +82,41 @@ test that fails on the old code.
   them: a workflow could read a tainted run's output and act on it holding
   both other legs. A caller that reads a result back now carries the run's
   taint and is judged with it: through a sync workflow tool's reply, a
-  `workflow` step that is not `detached`, `workflow.run` with `wait`,
-  `workflow.wait` (tool or step), `wait {on: run}` and `workflow.status`. The
-  root conversation is a caller too, through those tools and through the note
-  `agent.on_workflow_finished` leaves in its transcript (by default, a failed
-  run's error). A root holding `sensitive` and `egress` beside a webhook or
-  A2A route is refused at load unless its read-back is taken away:
-  `tools.disabled` without `workflow.run`, `workflow.wait` and
-  `workflow.status` (or an `agent.tools.internal` list), a workflow tool's
-  `grant.root: false` or `mode: async`, and `agent.on_workflow_finished:
-  ignore`. A result taints only with text its reader was not handed already,
-  so a route's own run reading back its child stays the operator's call. The
+  `workflow` step that is not `detached`, a `join`, `workflow.run` with
+  `wait`, `workflow.wait` (tool or step), `wait {on: run}`,
+  `workflow.status`, a child read back by handle (`subagent.status`,
+  `subagent.await`, `subagent.list`, `wait {on: subagent}` — a child carries
+  what the run that spawned or steered it handed it), a `plan.update` that
+  binds a run or a child (its outcome is written into the plan the model
+  reads every turn), and a stream the daemon's telemetry is tapped onto
+  (`observability.runtime_events`, an audit `sink: [stream]`), which every
+  run feeds. The root conversation is a caller too, through those tools, a
+  child it spawns, the note `agent.on_workflow_finished` leaves in its
+  transcript (by default, a failed run's error) and the notes a child's
+  result (`agent.wake_on: [subagent_result]`, a default) and a warm child's
+  every turn leave there. A root holding `sensitive` and `egress` beside a
+  webhook or A2A route is refused at load unless its read-back is taken
+  away: list the read-back tools and the `subagent` tools in
+  `tools.disabled`, or leave them out of an `agent.tools.internal` list; give
+  a workflow tool `grant.root: false` or `mode: async`; set
+  `agent.on_workflow_finished: ignore` and leave `subagent_result` out of
+  `agent.wake_on`. A result taints only with text its reader was not handed
+  already, so a route's own run reading back its child stays the operator's
+  call — decided once what each reader was handed has settled, so the
+  verdict does not depend on the order the definitions are listed in. The
   refusal names the edge. `examples/startup/sre.yaml`,
   `examples/voice/hands.yaml` and `examples/hiring/actions.yaml` were refused
-  under this rule and now disable the read-back tools and the note.
-  `workflow.run`, `workflow.wait` and `workflow.status` carry the run taint in
-  their tags, as a sync workflow tool does, so a policy matching
-  `untrusted_input` sees it.
+  under this rule and now disable the read-back and `subagent` tools,
+  `plan.update`, and the note. The read-back contracts carry the run taint
+  in their tags, as a sync workflow tool does, so a policy matching
+  `untrusted_input` sees it, and the check counts them as tools such a
+  policy routes back up from a flat child.
+- **A wait's `on` cannot be templated.** It was rendered at dispatch, while
+  every load-time judgement of what a wait opens or reads — the route list
+  and its `interface` grant, the taint check — read it as written: a stored
+  `wait {on: "{{inputs.mode}}"}` passed both and opened a webhook route,
+  with the auth the agent chose, once a run said `webhook`. A templated `on`
+  is refused at load and by `workflow.create`/`update`.
 - **Webhook idempotency markers are agentd's own.** They lived under
   `wh_idem/`, which `memory.*` did not reserve, so a model steered by an
   injected payload could forge a marker (a real delivery then answered
@@ -111,7 +129,10 @@ test that fails on the old code.
   when the registry was built, so a reload that changed only the workflows
   kept the tags the previous set derived, and a definition written at runtime
   never moved them. They are re-derived on every workflow change: a reload
-  that re-reads the workflows, and `workflow.create`/`update`/`delete`.
+  that re-reads the workflows, `workflow.create`/`update`, and a retirement.
+  A retired definition whose runs are still live counts until the last of
+  them lands, so its runs' taint stays on the contracts that can still read
+  their results back — across a restart too.
 
 ### Fixed
 

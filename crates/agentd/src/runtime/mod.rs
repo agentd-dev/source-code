@@ -885,15 +885,22 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         );
         return crate::exit::USAGE;
     }
-    // Workflow tools: registered here from the configuration, and again by a
-    // reload that rebuilds the registry. The configuration is the only door
+    // Workflow tools: registered here from the configuration, and re-derived
+    // on every change to the installed set (`Registry::register_workflow_tools`
+    // names each caller). The configuration is the only door
     // — `workflow.create`/`update` refuse a `tool:` block —
     // because the registry is otherwise built once and validated fail-closed,
     // and a root turn that could mint or shadow a tool name would make it a
-    // mutable index with no operator in the loop.
+    // mutable index with no operator in the loop. A restored run pinned to a
+    // retired definition counts for the read-back contracts' taint.
     {
-        let defs: Vec<&crate::engine::Workflow> =
-            rt.workflows.values().map(|w| w.as_ref()).collect();
+        let retired = rt.retired_with_live_runs();
+        let defs: Vec<&crate::engine::Workflow> = rt
+            .workflows
+            .values()
+            .map(|w| w.as_ref())
+            .chain(&retired)
+            .collect();
         let errs = rt.registry.register_workflow_tools(&rt.settings, &defs);
         if !errs.is_empty() {
             for e in &errs {

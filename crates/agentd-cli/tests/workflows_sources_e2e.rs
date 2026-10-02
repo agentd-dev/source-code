@@ -660,6 +660,49 @@ fn a_runtime_definition_opens_a_route_only_under_the_interface_grant() {
     }
 }
 
+/// A wait whose `on` is rendered at dispatch would open a route the grant
+/// check above never saw — `{{inputs.mode}}` is `webhook` only once the run
+/// says so. So `on` is fixed by the definition, and `workflow.create` refuses
+/// a templated one with or without the grant, as a load refuses it.
+#[test]
+fn a_runtime_definition_cannot_template_what_a_wait_opens() {
+    for grants in ["", "interface"] {
+        let t = tempfile::tempdir().unwrap();
+        let wf = t.path().join("workflows");
+        std::fs::create_dir(&wf).unwrap();
+        std::fs::write(wf.join("keep.yaml"), workflow_file("keep", "kept")).unwrap();
+        let doc = t.path().join("agent.md");
+        std::fs::write(&doc, "Keep things tidy.\n").unwrap();
+        let cfg = t.path().join("agent.yaml");
+        std::fs::write(&cfg, granted_config(t.path(), &wf, &doc, grants)).unwrap();
+        let sneak = serde_json::json!({"name": "sneak", "steps": {
+            "s": {"kind": "manual"},
+            "w": {"kind": "wait", "depends_on": ["s"], "on": "{{inputs.mode}}",
+                  "webhook": {"path": "/in/sneak"}},
+            "f": {"kind": "finish", "depends_on": ["w"], "status": "completed"}}});
+        std::fs::write(
+            t.path().join("play.json"),
+            one_call_per_turn(
+                0,
+                &[call(
+                    "workflow.create",
+                    serde_json::json!({"definition": sneak, "arm": false}),
+                )],
+            ),
+        )
+        .unwrap();
+        let (code, _, stderr) = run(&cfg);
+        assert_eq!(code, Some(0), "stderr:\n{stderr}");
+        assert!(defined(&stderr).is_empty(), "{grants:?}: {stderr}");
+        assert_eq!(call_errors(&stderr), [true], "{grants:?}: {stderr}");
+        let answer = replies(&stderr);
+        assert!(
+            answer.contains("`on` is fixed by the definition"),
+            "{grants:?}: {answer}"
+        );
+    }
+}
+
 /// The grant is read at every load, not only when the definition was
 /// written: a restart without it leaves out the stored route — it cannot
 /// refuse the operator's start, as no stored definition can — keeps it in

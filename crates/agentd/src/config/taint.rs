@@ -23,13 +23,17 @@
 //! dodges is a check only for the operator who happened to write the other.
 //!
 //! It is followed back as well as forward. A run's result is the text it was
-//! handed, worked over: a caller that reads it back — a sync workflow tool's
-//! reply, a `workflow` step, `workflow.run {wait}`, `workflow.wait`,
-//! `workflow.status`, a `wait {on: run}`, or the note
-//! `agent.on_workflow_finished` writes into the root transcript — has the
-//! outside text in front of it, and is judged with it in reach. The root
-//! conversation is such a caller too, judged with everything the root grant
-//! reaches.
+//! handed, worked over, and so is the result of a child it spawned: a caller
+//! that reads one back — a sync workflow tool's reply, a `workflow` step that
+//! is not detached, a `join`, a `wait {on: run}` or `{on: subagent}`, a
+//! read-back contract (`registry::internal::read_back`: `workflow.run
+//! {wait}`, `workflow.wait`, `workflow.status`, the `subagent.status`,
+//! `.await` and `.list` that read a child by handle, and the `plan.update`
+//! binding whose run or child settles its outcome into the plan), a stream
+//! the daemon's own telemetry is tapped onto, or the notes a finished run and
+//! a child's result leave in the root transcript — has the outside text in
+//! front of it, and is judged with it in reach. The root conversation is such
+//! a caller too, judged with everything the root grant reaches.
 //!
 //! Coarse and static on purpose: per stream, not per value, and per server, as
 //! the root fold is. It is a grant-level check, not data-flow tracking — it
@@ -50,10 +54,14 @@ use std::collections::{BTreeMap, BTreeSet};
 /// such a result back holding both. Unless `security.allow_trifecta` is set,
 /// which lifts this check with every other trifecta gate.
 ///
-/// `workflows` is the whole set the configuration would run. The analysis is
-/// monotone in it — another definition can only add producers, consumers and
-/// edges — so a refusal over part of the set (the inline definitions
-/// `validate` can see) is also a refusal over all of it.
+/// `workflows` is the whole set the configuration would run. Another
+/// definition can only add producers, consumers and edges, and every one of
+/// them only adds taint — with one exception that errs toward refusing: it
+/// can hand a reader an origin, and a result whose every origin the reader
+/// was handed already taints it with nothing new. So a refusal over part of
+/// the set (the definitions `validate` can read without dialling) is a
+/// refusal over all of it, except a read-back the rest of the set would have
+/// handed the reader; the start re-judges the whole set.
 pub fn refusals(s: &Settings, workflows: &[&Workflow]) -> Vec<String> {
     let ctx = Reach::new(s, workflows);
     let (streams, runs) = propagate(&ctx, workflows);
@@ -103,13 +111,15 @@ pub fn refusals(s: &Settings, workflows: &[&Workflow]) -> Vec<String> {
                 "the root conversation: lethal-trifecta refused — {}, and the root grant reaches \
                  {legs}: untrusted input + sensitive + egress in one conversation. A result read \
                  back carries the outside text its run was handed: take the root's read-back \
-                 away (`tools.disabled` or `agent.tools.internal` without {}, a workflow tool's \
-                 `grant.root: false` or `mode: async`, `agent.on_workflow_finished: ignore`), \
-                 narrow the root's servers, or set security.allow_trifecta (audited)",
+                 away — list {} in `tools.disabled`, or leave them out of an \
+                 `agent.tools.internal` list; give a workflow tool `grant.root: false` or `mode: \
+                 async`; set `agent.on_workflow_finished: ignore` and leave `subagent_result` out \
+                 of `agent.wake_on` — narrow the root's servers, or set security.allow_trifecta \
+                 (audited)",
                 by_edge(&reads),
-                ctx.read_back
+                ctx.root_read_tools()
                     .iter()
-                    .map(|(n, _)| format!("`{n}`"))
+                    .map(|n| format!("`{n}`"))
                     .collect::<Vec<_>>()
                     .join(", "),
             ));
@@ -123,9 +133,11 @@ pub fn refusals(s: &Settings, workflows: &[&Workflow]) -> Vec<String> {
 fn by_edge(reads: &[(String, String)]) -> String {
     let mut edges: Vec<(&str, Vec<String>)> = Vec::new();
     for (target, via) in reads {
+        let target = format!("{target:?}");
         match edges.iter_mut().find(|(v, _)| v == via) {
-            Some((_, targets)) => targets.push(format!("{target:?}")),
-            None => edges.push((via, vec![format!("{target:?}")])),
+            Some((_, targets)) if targets.contains(&target) => {}
+            Some((_, targets)) => targets.push(target),
+            None => edges.push((via, vec![target])),
         }
     }
     edges
@@ -202,6 +214,10 @@ pub fn inputs_moved(old: &Settings, new: &Settings) -> bool {
         || old.agent.tools != new.agent.tools
         || old.agent.on_workflow_finished != new.agent.on_workflow_finished
         || old.agent.wake_on != new.agent.wake_on
+        // The streams the daemon's own telemetry is tapped onto, each fed by
+        // every run.
+        || old.observability.runtime_events != new.observability.runtime_events
+        || old.observability.audit != new.observability.audit
 }
 
 /// What feeds one stream.
@@ -222,8 +238,9 @@ struct RunTaint {
     tags: Vec<TrifectaTag>,
     streams: BTreeSet<String>,
     callers: BTreeSet<String>,
-    /// The results of tainted runs it reads back, each named with the edge.
-    reads: BTreeSet<String>,
+    /// The results of tainted runs it reads back: each edge, as a refusal
+    /// names it, and the workflow it reads.
+    reads: BTreeSet<(String, String)>,
     /// Where the outside text it carries entered: an outside caller's route
     /// (a direct start, a relayed signal, or an `into:` onto a stream it
     /// reads), or a mirrored stream. A result read back taints its reader
@@ -264,7 +281,14 @@ impl RunTaint {
             })
             .collect();
         why.extend(self.callers.iter().map(|c| format!("it is run by {c}")));
-        why.extend(self.reads.iter().cloned());
+        let reads: Vec<(String, String)> = self
+            .reads
+            .iter()
+            .map(|(via, target)| (target.clone(), format!("at {via}")))
+            .collect();
+        if !reads.is_empty() {
+            why.push(by_edge(&reads));
+        }
         why.join("; ")
     }
 }
@@ -362,9 +386,35 @@ fn route_origin(name: &str) -> String {
 /// because an `emit` target and a `workflow` step's target are static (or,
 /// when templated, every one there is): a run reading a tainted stream taints
 /// what it emits into, and the workflows it starts.
+///
+/// Twice. A read-back is judged against the origins the reader was HANDED —
+/// by its route, the streams it reads and the runs that start it — and those
+/// have to be settled before any read is decided: judged mid-pass, a read
+/// would see whatever part of them the pass had reached, so the verdict would
+/// hang on the order the workflows are listed in (`--validate-config` lists
+/// them as declared, a start by name). So the first pass follows the forward
+/// edges alone, and the second decides every read against what the first
+/// settled. That keeps the second monotone: what a reader was handed is fixed
+/// in it, and a target's taint only grows, so a read once new stays new.
 fn propagate(
     ctx: &Reach,
     workflows: &[&Workflow],
+) -> (BTreeMap<String, StreamTaint>, BTreeMap<String, RunTaint>) {
+    let handed = settle(ctx, workflows, None);
+    let handed: BTreeMap<String, BTreeSet<String>> = handed
+        .1
+        .into_iter()
+        .map(|(name, r)| (name, r.origins))
+        .collect();
+    settle(ctx, workflows, Some(&handed))
+}
+
+/// One pass of [`propagate`]: the forward edges, and — given what each run
+/// was handed — the read-back edges.
+fn settle(
+    ctx: &Reach,
+    workflows: &[&Workflow],
+    handed: Option<&BTreeMap<String, BTreeSet<String>>>,
 ) -> (BTreeMap<String, StreamTaint>, BTreeMap<String, RunTaint>) {
     let untrusted = [TrifectaTag::UntrustedInput];
     let mut streams: BTreeMap<String, StreamTaint> = BTreeMap::new();
@@ -455,8 +505,31 @@ fn propagate(
             (*w, steps)
         })
         .collect();
+    let none = BTreeSet::new();
     loop {
         let mut grew = false;
+        // The daemon's own telemetry, tapped onto a stream: `run.done`
+        // carries every run's error (and its output under
+        // `observability.log_content`), a step's or tool's event its text,
+        // an audit record the question an `ask_human` put. Which run's text a
+        // given event carries is only known when it is logged, so the tap is
+        // fed by every run, as a read-back of each.
+        for (stream, producer) in &ctx.taps {
+            let (mut tags, mut origins) = (Vec::new(), BTreeSet::new());
+            for r in runs.values() {
+                union(&mut tags, &r.tags);
+                origins.extend(r.origins.iter().cloned());
+            }
+            if tags.is_empty() {
+                continue;
+            }
+            let t = streams.entry(stream.clone()).or_default();
+            grew |= union(&mut t.tags, &tags);
+            grew |= t.producers.insert(producer.clone());
+            for o in origins {
+                grew |= t.origins.insert(o);
+            }
+        }
         for (w, steps) in &edges {
             for (st, _, e) in steps {
                 for name in consumes(st, &streams) {
@@ -468,10 +541,19 @@ fn propagate(
                         grew |= run.origins.insert(o.clone());
                     }
                 }
+                let Some(handed) = handed else {
+                    continue;
+                };
                 // A result read back puts its run's text in front of the
                 // reader — unless every origin of that text is one the reader
-                // holds already ([`RunTaint::origins`]).
+                // was handed already ([`RunTaint::origins`]).
+                let mine = handed.get(&w.name).unwrap_or(&none);
                 for (target, via) in &e.read {
+                    // Another run of its own workflow carries nothing the
+                    // reader's own edges do not judge it for already.
+                    if *target == w.name {
+                        continue;
+                    }
                     let Some((tags, origins)) = runs
                         .get(target)
                         .filter(|r| !r.tags.is_empty())
@@ -479,21 +561,18 @@ fn propagate(
                     else {
                         continue;
                     };
-                    let run = runs.entry(w.name.clone()).or_default();
                     // A tainted run always has an origin; one without would
                     // be a path that lost it, and is read as new, not as
                     // nothing.
-                    if !origins.is_empty() && origins.is_subset(&run.origins) {
+                    if !origins.is_empty() && origins.is_subset(mine) {
                         continue;
                     }
+                    let run = runs.entry(w.name.clone()).or_default();
                     for o in origins {
                         grew |= run.origins.insert(o);
                     }
                     grew |= union(&mut run.tags, &tags);
-                    grew |= run.reads.insert(format!(
-                        "it reads back the result of workflow {target:?}, a run the outside text \
-                         reaches, at {via}"
-                    ));
+                    grew |= run.reads.insert((via.clone(), target.clone()));
                 }
             }
         }
@@ -611,12 +690,15 @@ type StepEdges<'w> = (&'w Step, String, Edges);
 
 /// What one step does with its run's text: the capabilities a model it
 /// drives can reach, the workflows it starts, and the workflows whose result
-/// it reads back.
+/// it reads back — and whether it hands the text to a child, and may leave
+/// that child warm.
 #[derive(Debug, Default)]
 struct Edges {
     held: Vec<Held>,
     started: Started,
     read: Started,
+    spawns: bool,
+    warm: bool,
 }
 
 /// What the configuration lets a model-driven step reach, server by server.
@@ -658,6 +740,15 @@ struct Reach<'a> {
     /// The workflows a signal reaches: a `signal` start, or a
     /// `wait {on: signal}` anywhere in the run.
     receivers: Vec<String>,
+    /// The workflows whose runs hand their text to a child — spawn one or
+    /// steer one — so a child's result read back by handle may be theirs;
+    /// each with whether the child may be warm, whose every turn leaves a
+    /// note in the root transcript.
+    spawners: Vec<(String, bool)>,
+    /// The streams the daemon's own telemetry is tapped onto
+    /// (`observability.runtime_events`, an audit `sink: [stream]`), each as
+    /// a refusal names its producer.
+    taps: Vec<(String, String)>,
 }
 
 impl<'a> Reach<'a> {
@@ -751,7 +842,36 @@ impl<'a> Reach<'a> {
             })
             .map(|w| w.name.clone())
             .collect();
-        Reach {
+        let mut taps = Vec::new();
+        if let Some(stream) = s
+            .observability
+            .runtime_events
+            .as_ref()
+            .and_then(|r| r.stream.as_ref())
+        {
+            taps.push((
+                stream.clone(),
+                "the runtime-events tap (`observability.runtime_events`), which carries \
+                 every run's events"
+                    .to_string(),
+            ));
+        }
+        if let Some(stream) = &s.observability.audit.stream
+            && s.observability
+                .audit
+                .sink
+                .iter()
+                .flatten()
+                .any(|k| *k == crate::config::settings::AuditSink::Stream)
+        {
+            taps.push((
+                stream.clone(),
+                "the audit stream (`observability.audit`), which carries what every run's \
+                 tool calls and questions name"
+                    .to_string(),
+            ));
+        }
+        let mut reach = Reach {
             s,
             exec: (cfg!(feature = "exec") && s.security.exec.enabled)
                 || s.tools.overrides.contains_key("exec"),
@@ -786,7 +906,22 @@ impl<'a> Reach<'a> {
                 })
                 .collect(),
             receivers,
-        }
+            spawners: Vec::new(),
+            taps,
+        };
+        // Whether a run spawns is read off its own edges, which the
+        // spawners themselves do not feed.
+        reach.spawners = workflows
+            .iter()
+            .filter_map(|w| {
+                let mut e = Edges::default();
+                for st in all_steps(w) {
+                    reach.step(st, "", &mut e);
+                }
+                e.spawns.then(|| (w.name.clone(), e.warm))
+            })
+            .collect();
+        reach
     }
 
     fn all(&self) -> Vec<Held> {
@@ -795,6 +930,19 @@ impl<'a> Reach<'a> {
 
     fn disabled(&self, tool: &str) -> bool {
         self.s.tools.disabled.iter().any(|d| d == tool)
+    }
+
+    /// The contracts through which the root reads a result back, as its
+    /// refusal names them: the read-back contracts, and the ones that reach
+    /// a child, which can read one back for it.
+    fn root_read_tools(&self) -> Vec<&'static str> {
+        let mut names: Vec<&'static str> = self.read_back.iter().map(|(n, _)| *n).collect();
+        for (n, o) in &self.onward {
+            if *o == Onward::Children && !names.contains(n) {
+                names.push(n);
+            }
+        }
+        names
     }
 
     /// The tools a refusal advises leaving out of a `tools` list: the ones
@@ -833,28 +981,43 @@ impl<'a> Reach<'a> {
         out
     }
 
-    /// The workflows whose result the root conversation reads back, each
-    /// with the edge: a read-back contract the root may call (granted, not
-    /// disabled, in `agent.tools.internal` — the root's plan filters by it),
-    /// a sync workflow tool granted to the root, and the note
-    /// `agent.on_workflow_finished` leaves in its transcript, which carries
-    /// the run's output or error.
-    fn root_reads(&self) -> Started {
-        let mut out = Started::new();
+    /// Whether the root conversation holds the internal contract `tool`:
+    /// granted to the root, not disabled, and in `agent.tools.internal` —
+    /// the root's plan filters by it, by name or family.
+    fn root_holds(&self, tool: &str) -> bool {
         let select = &self.s.agent.tools.internal;
-        for (tool, _) in &self.read_back {
-            let Some((grant, family)) = self.grants.get(tool) else {
-                continue;
-            };
-            if grant.root && !self.disabled(tool) && (select.allows(tool) || select.allows(family))
-            {
-                out.extend(
-                    self.names
-                        .iter()
-                        .map(|n| (n.clone(), format!("through `{tool}`"))),
-                );
+        self.grants.get(tool).is_some_and(|(grant, family)| {
+            grant.root && !self.disabled(tool) && (select.allows(tool) || select.allows(family))
+        })
+    }
+
+    /// The workflows whose result the root conversation reads back, each
+    /// with the edge: a read-back contract the root holds, a child it spawns
+    /// or steers that can read one back (its result is the root's to read),
+    /// a sync workflow tool granted to the root, the note
+    /// `agent.on_workflow_finished` leaves in its transcript, which carries
+    /// the run's output or error, and the note a child's result or warm turn
+    /// leaves there.
+    fn root_reads(&self) -> Started {
+        let mut e = Edges::default();
+        for (tool, read) in &self.read_back {
+            if self.root_holds(tool) {
+                self.read_back_of(*read, None, format!("through `{tool}`"), &mut e);
             }
         }
+        if let Some((tool, _)) = self
+            .onward
+            .iter()
+            .find(|(t, o)| *o == Onward::Children && self.root_holds(t))
+        {
+            let mut child = Edges::default();
+            self.any_spawn(
+                &format!("by a child it reaches through `{tool}`"),
+                &mut child,
+            );
+            e.read.extend(child.read);
+        }
+        let mut out = e.read;
         for (tool, target, grant, sync) in &self.wf_tools {
             if *sync && grant.root && !self.disabled(tool) {
                 out.push((target.clone(), format!("through its tool {tool:?}")));
@@ -873,6 +1036,20 @@ impl<'a> Reach<'a> {
                 )
             }));
         }
+        // A child's result is noted only under `subagent_result`; a warm
+        // child's every turn is noted whatever the wake policy says.
+        let results = wake.contains(&WakeEvent::SubagentResult);
+        out.extend(
+            self.spawners
+                .iter()
+                .filter(|(_, warm)| results || *warm)
+                .map(|(n, _)| {
+                    (
+                        n.clone(),
+                        "the note a child's result leaves in its transcript".to_string(),
+                    )
+                }),
+        );
         out
     }
 
@@ -881,6 +1058,14 @@ impl<'a> Reach<'a> {
     /// rule matching on tags reads.
     fn tool_tags(&self, tool: &str) -> Vec<TrifectaTag> {
         let mut tags = Vec::new();
+        // A read-back contract carries the taint of every run whose result
+        // it may return (`registry::register_workflow_tools`). That is only
+        // known once this check has run; taken as untrusted here, it is the
+        // same answer whenever it matters — a read-back adds a refusal only
+        // when some run is tainted, and then the registry tags it so.
+        if crate::registry::internal::read_back(tool).is_some() {
+            union(&mut tags, &[TrifectaTag::UntrustedInput]);
+        }
         if tool == "exec" {
             union(&mut tags, &exec_held().tags);
         }
@@ -942,6 +1127,9 @@ impl<'a> Reach<'a> {
     /// unless freeform spawns are off — any configured server; and what the
     /// child's tools reach under any allow-list it may be given.
     fn any_spawn(&self, at: &str, e: &mut Edges) {
+        // A model picks the mode, and a steered child is warm already.
+        e.spawns = true;
+        e.warm = true;
         if self.s.subagents.allow_freeform != Some(false) {
             e.held.extend(self.all());
             self.tools(Who::Child(None), at, e);
@@ -1009,6 +1197,29 @@ impl<'a> Reach<'a> {
                     .extend(self.names.iter().map(|n| (n.clone(), via.clone()))),
                 None => e.read.extend(self.workflows_named(args, "name", &via)),
             },
+            // A handle names no workflow either: it may be any spawner's
+            // child.
+            ReadBack::Child => e
+                .read
+                .extend(self.spawners.iter().map(|(n, _)| (n.clone(), via.clone()))),
+            // What the binding names: a model may bind either; a
+            // deterministic call binds what its `bind` says, and a templated
+            // one may say either.
+            ReadBack::Bound => {
+                let bind = match args {
+                    None => None,
+                    Some(a) => match a.get("bind") {
+                        None => return,
+                        Some(b) => b.as_object(),
+                    },
+                };
+                if bind.is_none_or(|b| b.contains_key("run")) {
+                    self.read_back_of(ReadBack::Run, None, via.clone(), e);
+                }
+                if bind.is_none_or(|b| b.contains_key("subagent")) {
+                    self.read_back_of(ReadBack::Child, None, via, e);
+                }
+            }
         }
     }
 
@@ -1094,6 +1305,11 @@ impl<'a> Reach<'a> {
     /// child's tools reach, under the template's `tools` or the spawn's own,
     /// whichever way the spawn is spelled.
     fn spawn(&self, spec: &Map<String, Value>, at: &str, e: &mut Edges) {
+        e.spawns = true;
+        e.warm |= spec
+            .get("mode")
+            .and_then(Value::as_str)
+            .is_some_and(|m| m == "warm" || templated(m));
         match spec.get("template").and_then(Value::as_str) {
             Some(t) => match self.templates.get(t) {
                 Some(reach) => {
@@ -1165,6 +1381,16 @@ impl<'a> Reach<'a> {
                 self.read_back_of(ReadBack::Run, None, at.to_string(), e)
             }
             "workflow.wait" => self.read_back_of(ReadBack::Run, None, at.to_string(), e),
+            // A child waited on by handle hands the step its result.
+            "wait" if st.field_str("on") == Some("subagent") => {
+                self.read_back_of(ReadBack::Child, None, at.to_string(), e)
+            }
+            // A `join` hands back each handle's output: a run's (an async
+            // `workflow` step's, or one `workflow.run` started) or a child's.
+            "join" => {
+                self.read_back_of(ReadBack::Run, None, at.to_string(), e);
+                self.read_back_of(ReadBack::Child, None, at.to_string(), e);
+            }
             _ => {}
         }
     }
@@ -1198,13 +1424,26 @@ mod tests {
         refusals(s, &ws.iter().collect::<Vec<_>>())
     }
 
+    /// [`check`]'s refusals of workflows alone. A step that can spawn may
+    /// leave a child warm, whose every turn is noted to the root — so beside
+    /// such a step the root, holding `mail`, is refused as well; the tests
+    /// that judge the workflow count only its own.
+    fn wf_check(s: &Settings, ws: &[Workflow]) -> Vec<String> {
+        check(s, ws)
+            .into_iter()
+            .filter(|e| e.starts_with("workflow "))
+            .collect()
+    }
+
     /// `mail` holds both legs the root fold allows together; `notes` is
-    /// sensitive alone. The root reads no run's result back — with `mail`
-    /// in its grant it would otherwise be refused beside every workflow
-    /// these tests judge; [`root`] gives it the read-back to test that.
+    /// sensitive alone. The root reads no run's or child's result back —
+    /// with `mail` in its grant it would otherwise be refused beside every
+    /// workflow these tests judge; [`root`] gives it the read-back to test
+    /// that.
     fn servers(extra: Value) -> Settings {
         let mut v = json!({
-            "agent": {"on_workflow_finished": "ignore", "tools": {"internal": "none"}},
+            "agent": {"on_workflow_finished": "ignore", "tools": {"internal": "none"},
+                      "wake_on": ["human_reply"]},
             "streams": {"inbox": {}, "work": {}},
             "mcp": {"servers": [
                 {"name": "mail", "endpoint": "https://mail.invalid/mcp",
@@ -1364,7 +1603,7 @@ mod tests {
             "a": {"kind": "agent", "depends_on": ["s"], "instruction": "x", "servers": ["notes"]},
             "f": {"kind": "finish", "depends_on": ["a"], "status": "completed"}
         }}));
-        let errs = check(&servers(json!({})), &[intake("webhook"), w.clone()]);
+        let errs = wf_check(&servers(json!({})), &[intake("webhook"), w.clone()]);
         assert_eq!(errs.len(), 1, "{errs:?}");
         // …and with every tool that hands text on disabled it reaches `notes`
         // alone.
@@ -1602,7 +1841,7 @@ mod tests {
     fn subagent_send_steers_a_child_that_can_hold_anything() {
         let s = servers(json!({}));
         assert_eq!(
-            check(&s, &[intake("webhook"), reader(&["subagent.send"])]).len(),
+            wf_check(&s, &[intake("webhook"), reader(&["subagent.send"])]).len(),
             1
         );
     }
@@ -1639,7 +1878,7 @@ mod tests {
         );
         // The event names the tool: `subagent.run`, say.
         assert_eq!(
-            check(
+            wf_check(
                 &s,
                 &[
                     intake("webhook"),
@@ -1715,7 +1954,8 @@ mod tests {
         // operator's call about their own route.
         let own = wf(json!({"name": "incident", "steps": {
             "s": {"kind": "webhook", "path": "/alert"},
-            "a": {"kind": "agent", "depends_on": ["s"], "instruction": "x", "servers": ["mail"]},
+            "a": {"kind": "agent", "depends_on": ["s"], "instruction": "x", "servers": ["mail"],
+                  "tools": ["mail.*"]},
             "f": {"kind": "finish", "depends_on": ["a"], "status": "completed"}
         }}));
         assert!(check(&s, &[own]).is_empty());
@@ -1921,6 +2161,9 @@ mod tests {
             json!({"agent": {"on_workflow_finished": "ignore", "tools": {"internal": "all"}}}),
             json!({"agent": {"on_workflow_finished": "ignore", "tools": {"internal": "none"},
                              "wake_on": ["workflow_finished"]}}),
+            // The streams the daemon's telemetry is tapped onto.
+            json!({"observability": {"runtime_events": {"stream": "work", "include": ["run"]}}}),
+            json!({"observability": {"audit": {"sink": ["stream"], "stream": "work"}}}),
         ] {
             assert!(inputs_moved(&base, &servers(change.clone())), "{change}");
         }
@@ -1966,11 +2209,17 @@ mod tests {
             .filter(|e| e.starts_with("workflow \"caller\""))
             .collect();
         for e in &mine {
-            for want in [
-                "it reads back the result of workflow \"fetch\"",
-                edge,
-                "mcp server \"mail\" [sensitive, egress]",
-            ] {
+            // One edge may read several workflows back, named together.
+            let read = e
+                .split("it reads back the result of workflow")
+                .skip(1)
+                .any(|r| {
+                    r.split(" (")
+                        .next()
+                        .is_some_and(|t| t.contains("\"fetch\""))
+                });
+            assert!(read, "missing the read of \"fetch\" in {e}");
+            for want in [edge, "mcp server \"mail\" [sensitive, egress]"] {
                 assert!(e.contains(want), "missing {want:?} in {e}");
             }
         }
@@ -2261,5 +2510,362 @@ mod tests {
         let mut s = root(json!({}));
         s.mcp.servers.retain(|m| m.name == "notes");
         assert!(check(&s, &[intake("webhook"), fetch(Value::Null)]).is_empty());
+    }
+
+    // ---- children, plans, joins and taps (the read-backs by handle) -------
+
+    /// `fetch`, handing what it read to a child: what the child returns is
+    /// that text, so a child read back by handle may be `fetch`'s result.
+    fn spawner(mode: &str) -> Workflow {
+        wf(json!({"name": "fetch", "steps": {
+            "s": {"kind": "stream", "stream": "inbox"},
+            "c": {"kind": "subagent", "depends_on": ["s"], "instruction": "x",
+                  "servers": ["notes"], "tools": ["notes.*"], "mode": mode},
+            "f": {"kind": "finish", "depends_on": ["c"], "status": "completed"}
+        }}))
+    }
+
+    fn model(tool: &str) -> Value {
+        json!({"kind": "agent", "instruction": "x", "servers": [], "tools": [tool]})
+    }
+
+    #[test]
+    fn a_join_reads_back_any_run_or_child() {
+        let s = servers(json!({}));
+        // `workflow.run` without `wait` hands back a run id, which is no
+        // read; the `join` on that id is.
+        let joined = |join: bool| {
+            let mut steps = json!({
+                "s": {"kind": "manual"},
+                "r0": {"kind": "tool", "depends_on": ["s"], "name": "workflow.run",
+                       "args": {"name": "fetch"}},
+                "r": {"kind": "join", "depends_on": ["r0"],
+                      "handles": ["{{steps.r0.output.run}}"]},
+                "a": {"kind": "agent", "depends_on": ["r"], "instruction": "x",
+                      "servers": ["mail"], "tools": ["mail.*"]},
+                "f": {"kind": "finish", "depends_on": ["a"], "status": "completed"}
+            });
+            if !join {
+                steps["r"] = json!({"kind": "sleep", "depends_on": ["r0"], "duration": "1s"});
+            }
+            wf(json!({"name": "caller", "steps": steps}))
+        };
+        let edge = "at workflow \"caller\" step \"r\"";
+        assert!(caller_refused(
+            &s,
+            &[intake("webhook"), fetch(Value::Null), joined(true)],
+            edge
+        ));
+        assert!(!caller_refused(
+            &s,
+            &[intake("webhook"), fetch(Value::Null), joined(false)],
+            ""
+        ));
+        // A handle may be a child's as well.
+        assert!(caller_refused(
+            &s,
+            &[intake("webhook"), spawner("async"), joined(true)],
+            edge
+        ));
+    }
+
+    #[test]
+    fn a_child_read_back_by_handle_is_its_spawners_result() {
+        let s = servers(json!({}));
+        let refused = |ws: &[Workflow], edge: &str| caller_refused(&s, ws, edge);
+        let with = |read: Value| [intake("webhook"), spawner("async"), caller(read)];
+        for tool in ["subagent.status", "subagent.await", "subagent.list"] {
+            assert!(
+                refused(&with(model(tool)), &format!("(through {tool})")),
+                "{tool}"
+            );
+            // A run that spawns nothing has no child to read.
+            assert!(
+                !refused(
+                    &[intake("webhook"), fetch(Value::Null), caller(model(tool))],
+                    ""
+                ),
+                "{tool}"
+            );
+        }
+        let step = "at workflow \"caller\" step \"r\"";
+        assert!(refused(
+            &with(json!({"kind": "tool", "name": "subagent.await",
+                         "args": {"handle": "{{inputs.h}}"}})),
+            step
+        ));
+        assert!(refused(
+            &with(json!({"kind": "wait", "on": "subagent", "subagent": "{{inputs.h}}"})),
+            step
+        ));
+    }
+
+    #[test]
+    fn a_plan_binding_reads_back_what_it_binds() {
+        let s = servers(json!({}));
+        let refused = |ws: &[Workflow], edge: &str| caller_refused(&s, ws, edge);
+        let bind = |bind: Value| {
+            caller(json!({"kind": "tool", "name": "plan.update",
+                          "args": {"item": 1, "bind": bind}}))
+        };
+        // A model may bind any run, or any child.
+        let plan = "(through plan.update)";
+        assert!(refused(
+            &[
+                intake("webhook"),
+                fetch(Value::Null),
+                caller(model("plan.update"))
+            ],
+            plan
+        ));
+        assert!(refused(
+            &[
+                intake("webhook"),
+                spawner("async"),
+                caller(model("plan.update"))
+            ],
+            plan
+        ));
+        // A deterministic call binds what it says.
+        let step = "at workflow \"caller\" step \"r\"";
+        assert!(refused(
+            &[
+                intake("webhook"),
+                fetch(Value::Null),
+                bind(json!({"run": "{{inputs.run}}"}))
+            ],
+            step
+        ));
+        assert!(!refused(
+            &[
+                intake("webhook"),
+                fetch(Value::Null),
+                bind(json!({"subagent": "{{inputs.h}}"}))
+            ],
+            ""
+        ));
+        assert!(refused(
+            &[
+                intake("webhook"),
+                spawner("async"),
+                bind(json!({"subagent": "{{inputs.h}}"}))
+            ],
+            step
+        ));
+        assert!(!refused(
+            &[
+                intake("webhook"),
+                fetch(Value::Null),
+                caller(json!({"kind": "tool", "name": "plan.update",
+                              "args": {"item": 1, "status": "done"}}))
+            ],
+            ""
+        ));
+    }
+
+    /// A flat child is offered the internal tools a policy rule might touch,
+    /// and a read-back contract carries the run taint in the registry — so a
+    /// rule on `untrusted_input` hands the child `workflow.status`, and what
+    /// it reads back is its spawner's to act on.
+    #[test]
+    fn a_policy_on_the_run_taint_hands_a_child_the_read_back() {
+        let spawn = wf(json!({"name": "caller", "steps": {
+            "s": {"kind": "manual"},
+            "r": {"kind": "subagent", "depends_on": ["s"], "template": "reader"},
+            "a": {"kind": "agent", "depends_on": ["r"], "instruction": "x",
+                  "servers": ["mail"], "tools": ["mail.*"]},
+            "f": {"kind": "finish", "depends_on": ["a"], "status": "completed"}
+        }}));
+        let with = |policy: Value| {
+            let mut s = servers(json!({"security": {"policies": [
+                {"match": policy, "action": "allow"}
+            ]}}));
+            s.subagents.templates.insert(
+                "reader".into(),
+                serde_json::from_value(json!({"instruction": "x", "servers": ["notes"]})).unwrap(),
+            );
+            s
+        };
+        let ws = [intake("webhook"), fetch(Value::Null), spawn];
+        assert!(caller_refused(
+            &with(json!({"tags": ["untrusted_input"]})),
+            &ws,
+            "(through workflow.status)"
+        ));
+        assert!(!caller_refused(&with(json!({"tags": ["egress"]})), &ws, ""));
+    }
+
+    #[test]
+    fn the_root_reads_back_through_plans_children_and_their_notes() {
+        let ws = [intake("webhook"), fetch(Value::Null)];
+        let spawning = [intake("webhook"), spawner("async")];
+        let quiet = |internal: Value| {
+            root(
+                json!({"on_workflow_finished": "ignore", "wake_on": ["human_reply"],
+                        "tools": {"internal": internal}}),
+            )
+        };
+        // The plan binding, by name or by family.
+        for select in [json!(["plan.update"]), json!(["plan"])] {
+            assert!(root_refused(&quiet(select), &ws, "(through `plan.update`)"));
+        }
+        let mut s = quiet(json!(["plan"]));
+        s.tools.disabled = vec!["plan.update".into()];
+        assert!(!root_refused(&s, &ws, ""));
+        // A child read back by handle.
+        assert!(root_refused(
+            &quiet(json!(["subagent.status"])),
+            &spawning,
+            "(through `subagent.status`)"
+        ));
+        // A child the root spawns reads back what a rule hands it.
+        let mut s = quiet(json!(["subagent.run"]));
+        assert!(!root_refused(&s, &ws, ""));
+        s.security.policies = serde_json::from_value(
+            json!([{"match": {"tool": "workflow.status"}, "action": "allow"}]),
+        )
+        .unwrap();
+        assert!(root_refused(
+            &s,
+            &ws,
+            "(by a child it reaches through `subagent.run` (through workflow.status))"
+        ));
+        // The note a child's result leaves: under `subagent_result` for any
+        // child, and for a warm one whatever the wake policy says.
+        let note = "(the note a child's result leaves in its transcript)";
+        let wake = |on: Value| {
+            root(json!({"on_workflow_finished": "ignore", "wake_on": on,
+                        "tools": {"internal": "none"}}))
+        };
+        assert!(root_refused(
+            &wake(json!(["subagent_result"])),
+            &spawning,
+            note
+        ));
+        assert!(!root_refused(&wake(json!(["human_reply"])), &spawning, ""));
+        assert!(root_refused(
+            &wake(json!(["human_reply"])),
+            &[intake("webhook"), spawner("warm")],
+            note
+        ));
+    }
+
+    /// The verdict is the same whatever order the workflows are listed in:
+    /// each read-back is decided against what the reader was handed once
+    /// that has settled. A route's own descendant reading back another of
+    /// its descendants — or the route's own run — reads nothing new.
+    #[test]
+    fn a_read_back_verdict_does_not_hang_on_the_order() {
+        let s = servers(json!({}));
+        let start =
+            |name: &str, mode: &str| json!({"kind": "workflow", "name": name, "mode": mode});
+        let mk = |name: &str, steps: Value| wf(json!({"name": name, "steps": steps}));
+        let acting = json!({"kind": "agent", "instruction": "x", "servers": ["mail"],
+                            "tools": ["mail.*"]});
+        let fin =
+            |after: &str| json!({"kind": "finish", "depends_on": [after], "status": "completed"});
+        let z = mk(
+            "z",
+            json!({
+                "s": {"kind": "webhook", "path": "/z"},
+                "b": {"depends_on": ["s"], "kind": "workflow", "name": "b", "mode": "detached"},
+                "t": {"depends_on": ["s"], "kind": "workflow", "name": "t", "mode": "detached"},
+                "f": {"kind": "finish", "depends_on": ["b", "t"], "status": "completed"}
+            }),
+        );
+        let b = mk(
+            "b",
+            json!({
+                "s": {"kind": "manual"},
+                "c": {"depends_on": ["s"], "kind": "workflow", "name": "c", "mode": "detached"},
+                "f": fin("c")
+            }),
+        );
+        let mut c_read = start("t", "sync");
+        c_read["depends_on"] = json!(["s"]);
+        let mut c_act = acting.clone();
+        c_act["depends_on"] = json!(["r"]);
+        let c = mk(
+            "c",
+            json!({"s": {"kind": "manual"}, "r": c_read, "a": c_act, "f": fin("a")}),
+        );
+        let t = mk("t", json!({"s": {"kind": "manual"}, "f": fin("s")}));
+        let set = [z, b, c, t];
+        for order in [[0, 1, 2, 3], [1, 2, 3, 0], [3, 2, 1, 0], [2, 0, 3, 1]] {
+            let ws: Vec<Workflow> = order.iter().map(|i| set[*i].clone()).collect();
+            assert!(check(&s, &ws).is_empty(), "{order:?}: {:?}", check(&s, &ws));
+        }
+        // The route's child reading back the route's own run, and a sibling
+        // the route started: both were handed what they read.
+        let hook = mk(
+            "hook",
+            json!({
+                "s": {"kind": "webhook", "path": "/hook"},
+                "c": {"depends_on": ["s"], "kind": "workflow", "name": "child"},
+                "d": {"depends_on": ["s"], "kind": "workflow", "name": "sib", "mode": "detached"},
+                "f": {"kind": "finish", "depends_on": ["c", "d"], "status": "completed"}
+            }),
+        );
+        let sib = mk("sib", json!({"s": {"kind": "manual"}, "f": fin("s")}));
+        for target in ["hook", "sib"] {
+            let mut a = acting.clone();
+            a["depends_on"] = json!(["r"]);
+            let child = mk(
+                "child",
+                json!({
+                    "s": {"kind": "manual"},
+                    "r": {"kind": "tool", "depends_on": ["s"], "name": "workflow.status",
+                          "args": {"name": target}},
+                    "a": a, "f": fin("a")
+                }),
+            );
+            for ws in [
+                [hook.clone(), child.clone(), sib.clone()],
+                [child.clone(), sib.clone(), hook.clone()],
+            ] {
+                assert!(check(&s, &ws).is_empty(), "{target}: {:?}", check(&s, &ws));
+            }
+        }
+    }
+
+    #[test]
+    fn a_stream_the_daemons_telemetry_is_tapped_onto_carries_every_runs_taint() {
+        let tapped = |obs: Value| servers(json!({"observability": obs}));
+        let runtime = json!({"runtime_events": {"stream": "work", "include": ["run"]}});
+        let audit = json!({"audit": {"sink": ["stream"], "stream": "work"}});
+        for (obs, producer) in [
+            (runtime, "the runtime-events tap"),
+            (audit, "the audit stream"),
+        ] {
+            let s = tapped(obs);
+            let errs = check(
+                &s,
+                &[
+                    intake("webhook"),
+                    fetch(Value::Null),
+                    consumer("work", &["mail"]),
+                ],
+            );
+            assert_eq!(errs.len(), 1, "{errs:?}");
+            assert!(
+                errs[0].starts_with("workflow \"triage\"") && errs[0].contains(producer),
+                "{}",
+                errs[0]
+            );
+            // No run carries outside text: the tap carries none either.
+            assert!(check(&s, &[consumer("work", &["mail"])]).is_empty());
+        }
+        // Untapped, `work` is fed by nothing.
+        assert!(
+            check(
+                &servers(json!({})),
+                &[
+                    intake("webhook"),
+                    fetch(Value::Null),
+                    consumer("work", &["mail"])
+                ]
+            )
+            .is_empty()
+        );
     }
 }

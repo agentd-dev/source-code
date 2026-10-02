@@ -631,6 +631,36 @@ const FETCH: &str = "  - name: fetch\n    tool: {name: inbox.next, grant: {root:
      a: {kind: agent, depends_on: [w], instruction: \"Read it.\", servers: [notes], tools: [\"notes.*\"]}\n      \
      f: {kind: finish, depends_on: [a], status: completed}\n";
 
+/// [`FETCH`], handing what it read to a child, whose result is that text.
+const FETCH_SPAWNS: &str = "  - name: fetch\n    steps:\n      \
+     s: {kind: manual}\n      \
+     w: {kind: wait, depends_on: [s], on: event, stream: inbox}\n      \
+     c: {kind: subagent, depends_on: [w], mode: async, instruction: \"Read it.\", servers: [notes], tools: [\"notes.*\"]}\n      \
+     f: {kind: finish, depends_on: [c], status: completed}\n";
+
+/// `workflows` refused at load naming the caller, its read of `fetch` and
+/// `edge`, and loaded under the explicit allow.
+fn refused_and_allowed(dir: &Path, workflows: &[&str], edge: &str) {
+    let (code, err) = validate(dir, &config(workflows, ""));
+    assert_eq!(code, 2, "{edge}: {err}");
+    // An edge that may read any workflow names every tainted one it reads,
+    // together.
+    for want in [
+        "workflow \\\"caller\\\": lethal-trifecta refused",
+        "it reads back the result of workflow",
+        "\\\"fetch\\\"",
+        edge,
+        "mcp server \\\"mail\\\" [sensitive, egress]",
+    ] {
+        assert!(err.contains(want), "{edge}: no {want:?} in\n{err}");
+    }
+    let (code, err) = validate(
+        dir,
+        &config(workflows, "security:\n  allow_trifecta: true\n"),
+    );
+    assert_eq!(code, 0, "{edge}: {err}");
+}
+
 /// A manually started workflow whose step `r` reads something back before
 /// an agent holding `mail` — both other legs — acts.
 fn caller(read: &str) -> String {
@@ -678,23 +708,59 @@ fn a_caller_reading_back_a_tainted_result_is_refused_through_each_path() {
             "kind: agent, instruction: \"Look.\", servers: [], tools: [workflow.status]",
             "(through workflow.status)",
         ),
+        // A plan item bound to a run is settled with its output.
+        (
+            "kind: agent, instruction: \"Look.\", servers: [], tools: [plan.update]",
+            "(through plan.update)",
+        ),
+        (
+            "kind: tool, name: plan.update, args: {item: 1, bind: {run: \"{{inputs.run}}\"}}",
+            "step \\\"r\\\"",
+        ),
     ] {
-        let workflows = [WEBHOOK_INTO, FETCH, &caller(read)];
-        let (code, err) = validate(t.path(), &config(&workflows, ""));
-        assert_eq!(code, 2, "{read}: {err}");
-        for want in [
-            "workflow \\\"caller\\\": lethal-trifecta refused",
-            "it reads back the result of workflow \\\"fetch\\\"",
-            edge,
-            "mcp server \\\"mail\\\" [sensitive, egress]",
-        ] {
-            assert!(err.contains(want), "{read}: no {want:?} in\n{err}");
-        }
-        let (code, err) = validate(
+        refused_and_allowed(t.path(), &[WEBHOOK_INTO, FETCH, &caller(read)], edge);
+    }
+    // A `join` reads back the run a `workflow.run` without `wait` started —
+    // which hands back only its id.
+    let join = |r: &str| {
+        format!(
+            "  - name: caller\n    steps:\n      s: {{kind: manual}}\n      \
+             r0: {{kind: tool, depends_on: [s], name: workflow.run, args: {{name: fetch}}}}\n      \
+             r: {{depends_on: [r0], {r}}}\n      \
+             a: {{kind: agent, depends_on: [r], instruction: \"Act.\", servers: [mail], tools: [\"mail.*\"]}}\n      \
+             f: {{kind: finish, depends_on: [a], status: completed}}\n"
+        )
+    };
+    refused_and_allowed(
+        t.path(),
+        &[
+            WEBHOOK_INTO,
+            FETCH,
+            &join("kind: join, handles: [\"{{steps.r0.output.run}}\"]"),
+        ],
+        "step \\\"r\\\"",
+    );
+    let (code, err) = validate(
+        t.path(),
+        &config(
+            &[WEBHOOK_INTO, FETCH, &join("kind: sleep, duration: 1s")],
+            "",
+        ),
+    );
+    assert_eq!(code, 0, "{err}");
+    // A child's result read back by handle is its spawner's.
+    for tool in ["subagent.status", "subagent.await", "subagent.list"] {
+        refused_and_allowed(
             t.path(),
-            &config(&workflows, "security:\n  allow_trifecta: true\n"),
+            &[
+                WEBHOOK_INTO,
+                FETCH_SPAWNS,
+                &caller(&format!(
+                    "kind: agent, instruction: \"Look.\", servers: [], tools: [{tool}]"
+                )),
+            ],
+            &format!("(through {tool})"),
         );
-        assert_eq!(code, 0, "{read}: {err}");
     }
     // The control: a child it never reads back hands it nothing.
     let (code, err) = validate(
@@ -785,10 +851,104 @@ fn a_workflow_only_reload_retags_the_workflow_tools() {
     );
 }
 
+/// A reload that replaces a definition whose run is still live keeps that
+/// run's taint in what the tools carry until the run lands: its result is
+/// still there to read back. The old `fetch` takes an A2A peer's text
+/// directly; the new one does not, so the set the reload stages alone would
+/// leave `inbox.next` untainted while the old run still waits. So does a
+/// restart, which restores the run pinned to the old definition.
+#[cfg(all(feature = "hot-reload", feature = "a2a"))]
+#[test]
+fn a_reload_keeps_a_retired_definitions_taint_while_its_run_is_live() {
+    let t = tempfile::tempdir().unwrap();
+    let cfg = t.path().join("agent.yaml");
+    let state = t.path().join("state");
+    let fetch = |peer: &str| {
+        format!(
+            "  - name: fetch\n    tool: {{name: inbox.next, grant: {{root: false}}}}\n    steps:\n{peer}      \
+             s: {{kind: manual}}\n      \
+             w: {{kind: wait, depends_on: [s], on: signal, signal: go}}\n      \
+             f: {{kind: finish, depends_on: [w], status: completed}}\n"
+        )
+    };
+    let body = |port: u16, workflow: &str| {
+        format!(
+            "agent:\n  name: taint\n  instruction: Triage the inbox.\n\
+             store: {{kind: file, file: {{path: {}}}}}\n\
+             lifecycle: {{run_until: drained}}\n\
+             observability:\n  log_level: info\n\
+             a2a: {{ listen: \"http://127.0.0.1:{port}\" }}\n\
+             workflows:\n{workflow}",
+            state.display()
+        )
+    };
+    let peer = "      peer: {kind: a2a, command: poke}\n";
+    let (d, bound) = common::spawn_bound(|port| {
+        std::fs::write(&cfg, body(port, &fetch(peer))).unwrap();
+        let d = Daemon::spawn(&cfg);
+        let log = d.log.to_string_lossy().into_owned();
+        (d, log)
+    });
+    let addr = common::wait_a2a_bound(&d.log.to_string_lossy());
+    let port: u16 = bound
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse().ok())
+        .unwrap_or_else(|| panic!("no port in {bound}"));
+    let last = |d: &Daemon| -> serde_json::Value {
+        d.events("registry.workflow_tools")
+            .iter()
+            .rfind(|e| e["tool"] == "inbox.next")
+            .map(|e| e["tags"].clone())
+            .unwrap_or_default()
+    };
+    let tainted = serde_json::json!(["untrusted_input"]);
+    assert_eq!(last(&d), tainted, "{}", d.log());
+    let started =
+        common::SendMessage::command("workflow.run", serde_json::json!({"workflow": "fetch"}))
+            .return_immediately()
+            .post(&addr);
+    assert!(started.get("error").is_none(), "{started}");
+    d.wait_for(
+        |d| d.events("step.start").iter().any(|e| e["step"] == "w"),
+        "the run waiting",
+    );
+
+    std::fs::write(&cfg, body(port, &fetch(""))).unwrap();
+    d.sighup();
+    d.wait_for(
+        |d| !d.events("workflow.retiring").is_empty(),
+        "the retirement",
+    );
+    assert_eq!(last(&d), tainted, "{}", d.log());
+
+    // Restarted on the new definition, the run comes back pinned to the old.
+    drop(d);
+    let (d, _) = common::spawn_bound(|port| {
+        std::fs::write(&cfg, body(port, &fetch(""))).unwrap();
+        let d = Daemon::spawn(&cfg);
+        let log = d.log.to_string_lossy().into_owned();
+        (d, log)
+    });
+    let addr = common::wait_a2a_bound(&d.log.to_string_lossy());
+    d.wait_for(
+        |d| !d.events("workflow.pin_restored").is_empty(),
+        "the restored pin",
+    );
+    assert_eq!(last(&d), tainted, "{}", d.log());
+
+    let sent = common::SendMessage::command("workflow.signal", serde_json::json!({"name": "go"}))
+        .post(&addr);
+    assert!(sent.get("error").is_none(), "{sent}");
+    d.wait_for(
+        |d| last(d) == serde_json::json!([]),
+        "the taint to go with the run",
+    );
+}
+
 /// A definition the agent writes moves the workflow tools' tags too: one
 /// that appends an A2A peer's text to `inbox` taints what `fetch`'s tool
 /// returns, though it is no tool itself. Re-derived at the write, as a
-/// reload re-derives them.
+/// reload re-derives them — and at the delete, which takes the taint away.
 #[test]
 fn a_definition_the_agent_writes_retags_the_workflow_tools() {
     let t = tempfile::tempdir().unwrap();
@@ -800,6 +960,7 @@ fn a_definition_the_agent_writes_retags_the_workflow_tools() {
                 "name": "feed", "steps": {
                     "hook": {"kind": "a2a", "command": "note",
                              "into": {"stream": "inbox", "subject": "msg"}}}}}}]},
+            {"tool_calls": [{"name": "workflow.delete", "arguments": {"name": "feed"}}]},
             {"echo_tool_result": true}
         ]})
         .to_string(),
@@ -832,8 +993,68 @@ fn a_definition_the_agent_writes_retags_the_workflow_tools() {
         tags,
         [
             serde_json::json!([]),
-            serde_json::json!(["untrusted_input"])
+            serde_json::json!(["untrusted_input"]),
+            serde_json::json!([])
         ],
         "{err}"
     );
+}
+
+/// A retired definition's live runs keep their taint in the read-back
+/// contracts until the last of them lands. `hold` takes an A2A peer's text
+/// directly, so `workflow.status` — which may return its run's output —
+/// carries `untrusted_input`, and a rule on that tag denies it. Deleting
+/// `hold` while a run of it still waits keeps the tag (the run's result is
+/// still readable); the run finishing takes it away.
+#[test]
+fn a_retired_definitions_live_runs_keep_the_read_back_taint() {
+    let t = tempfile::tempdir().unwrap();
+    let play = t.path().join("play.json");
+    let call = |name: &str, args: serde_json::Value| serde_json::json!({"tool_calls": [{"name": name, "arguments": args}]});
+    let status = || call("workflow.status", serde_json::json!({}));
+    std::fs::write(
+        &play,
+        serde_json::json!({"turns": [
+            call("workflow.create", serde_json::json!({"definition": {
+                "name": "hold", "steps": {
+                    "peer": {"kind": "a2a", "command": "poke"},
+                    "m": {"kind": "manual"},
+                    "w": {"kind": "wait", "depends_on": ["m"], "on": "signal", "signal": "go"},
+                    "f": {"kind": "finish", "depends_on": ["w"], "status": "completed"}}}})),
+            call("workflow.run", serde_json::json!({"name": "hold", "start": "m"})),
+            status(),
+            call("workflow.delete", serde_json::json!({"name": "hold"})),
+            status(),
+            call("workflow.signal", serde_json::json!({"name": "go"})),
+            call("sleep", serde_json::json!({"duration": "1s"})),
+            status(),
+            {"echo_tool_result": true}
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    let cfg = t.path().join("agent.yaml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "agent:\n  name: taint\n  prompt: go\n  instruction: Look after it.\n\
+             intelligence: {{ endpoints: \"mock:file:{}\", model: mock }}\n\
+             store: {{kind: memory}}\n\
+             lifecycle: {{run_until: idle, idle_grace: 300ms}}\n\
+             observability:\n  log_level: info\n\
+             security:\n  policies:\n\
+             \x20   - {{match: {{tool: workflow.status, tags: [untrusted_input]}}, action: deny}}\n",
+            play.display()
+        ),
+    )
+    .unwrap();
+    let (code, err) = agentd(&["--config", &cfg.to_string_lossy()]);
+    assert_eq!(code, 0, "{err}");
+    let denied: Vec<bool> = err
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["event"] == "tool.result" && v["tool"] == "workflow.status")
+        .map(|v| v["is_error"].as_bool().unwrap_or(false))
+        .collect();
+    assert_eq!(denied, [true, true, false], "{err}");
 }

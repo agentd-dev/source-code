@@ -460,10 +460,17 @@ impl Runtime {
     /// the set installed now. They carry the taint of the runs whose result
     /// they return, which the whole set decides — so a definition the agent
     /// writes or deletes, which is never a tool itself, can still move them.
-    /// Logged only when something moved.
+    /// A retired definition's live runs count until the last one lands
+    /// ([`Self::retired_with_live_runs`]). Logged only when something moved.
     pub(crate) fn retag_workflow_tools(&mut self) {
         let mut registry = self.registry.clone();
-        let defs: Vec<&Workflow> = self.workflows.values().map(AsRef::as_ref).collect();
+        let retired = self.retired_with_live_runs();
+        let defs: Vec<&Workflow> = self
+            .workflows
+            .values()
+            .map(AsRef::as_ref)
+            .chain(&retired)
+            .collect();
         let errs = registry.register_workflow_tools(&self.settings, &defs);
         // The tool names are the installed set's, already registered once,
         // so a collision cannot appear here; were one to, the running
@@ -472,6 +479,22 @@ impl Runtime {
             self.registry = registry;
             self.log_workflow_tools();
         }
+    }
+
+    /// The retired definitions a live run still executes against (pinned by
+    /// `retire_workflow`), for the taint the read-back
+    /// contracts carry: those runs' results stay readable until the last one
+    /// lands, so a policy matching that taint keeps applying to reads of
+    /// them. Each without its `tool:` — a retired definition registers
+    /// nothing. `retire_sweep` re-derives when a pin is released.
+    pub(crate) fn retired_with_live_runs(&self) -> Vec<Workflow> {
+        self.pinned
+            .values()
+            .map(|w| Workflow {
+                tool: None,
+                ..(**w).clone()
+            })
+            .collect()
     }
 
     /// What `w` names that the registry and servers it would run with do not
@@ -3748,9 +3771,9 @@ impl Runtime {
                 // live runs keep resolving `definition_for_run` mid-flight, and
                 // applies the workflow's `unload:` policy to them. Delete means
                 // "stop being a workflow", not "strand whatever is in flight".
+                // It also re-derives the read-back contracts' tags.
                 self.retire_workflow(&wf, "deleted");
                 self.log.info("workflow.deleted", json!({"name": wname}));
-                self.retag_workflow_tools();
                 ToolOutcome::Ready(json!({"ok": true}), false)
             }
             "workflow.signal" => {

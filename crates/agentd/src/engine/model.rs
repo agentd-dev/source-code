@@ -2072,6 +2072,21 @@ fn parse_step(
         // it): the reply it waits for is a peer's, and no default names a
         // peer. A malformed one is a load error, not a wait that hears no one.
         "a2a.wait" | "wait" => {
+            // What a wait listens on decides what it opens and what it reads:
+            // a route on the webhook listener, a stream, another run's
+            // result. Every load-time judgement of those — the route list
+            // ([`inbound_routes`]) and its grants, the stream-taint check —
+            // reads the definition as written, so an `on` rendered at
+            // dispatch would open or read what none of them saw.
+            if kind == "wait"
+                && let Some(on) = spec.get("on").and_then(Value::as_str)
+                && on.contains("{{")
+            {
+                errs.push(format!(
+                    "{at}: `on` is fixed by the definition — it decides what the wait opens \
+                     or reads, which is checked at load — so it cannot be templated"
+                ));
+            }
             if spec.get("on").and_then(Value::as_str) == Some("webhook") {
                 check_hook_path(
                     spec.get("webhook").and_then(|w| w.get("path")),
@@ -3074,6 +3089,51 @@ mod tests {
                 with(ok.clone()).err()
             );
         }
+    }
+
+    /// What a wait listens on is fixed by the definition: rendered at
+    /// dispatch, `on: "{{inputs.mode}}"` would open a webhook route, or read a
+    /// stream or a run, that the route list and the stream-taint check —
+    /// both reading the definition as written — never saw. Nested too: a
+    /// wait in a body is the same wait.
+    #[test]
+    fn a_wait_cannot_template_what_it_listens_on() {
+        let with = |steps: Value| {
+            wf(serde_json::json!({"name": "w", "steps": steps}))
+                .err()
+                .unwrap_or_default()
+        };
+        let wait = serde_json::json!({"kind": "wait", "on": "{{inputs.mode}}",
+                                      "webhook": {"path": "/in/sneak"}});
+        let mut top = wait.clone();
+        top["depends_on"] = serde_json::json!(["go"]);
+        let errs = with(serde_json::json!({"go": {"kind": "once"}, "w": top}));
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("`on` is fixed by the definition")),
+            "{errs:?}"
+        );
+        let errs = with(serde_json::json!({
+            "go": {"kind": "once"},
+            "each": {"kind": "foreach", "depends_on": ["go"], "over": "{{inputs.xs}}",
+                     "body": {"steps": {"w": wait}}}
+        }));
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("`on` is fixed by the definition")),
+            "{errs:?}"
+        );
+        // A literal `on` loads, and a switch's `on` is still a value.
+        assert!(
+            with(serde_json::json!({
+                "go": {"kind": "once"},
+                "w": {"kind": "wait", "depends_on": ["go"], "on": "signal", "signal": "s"},
+                "r": {"kind": "switch", "depends_on": ["w"], "on": "{{steps.w.output.x}}",
+                      "cases": {"a": "fin"}, "default": "fin"},
+                "fin": {"kind": "finish", "depends_on": ["r"], "status": "completed"}
+            }))
+            .is_empty()
+        );
     }
 
     /// `workflow.run` starts a workflow at its default start, so that start's

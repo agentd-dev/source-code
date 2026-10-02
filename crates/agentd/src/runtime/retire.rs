@@ -159,6 +159,8 @@ impl super::reactor::Runtime {
                 "workflow.unloaded",
                 json!({"workflow": wf.name, "hash": &wf.hash[..12.min(wf.hash.len())], "reason": reason, "live_runs": 0}),
             );
+            // Gone with nothing in flight: what it tainted goes with it.
+            self.retag_workflow_tools();
             return;
         }
 
@@ -201,6 +203,11 @@ impl super::reactor::Runtime {
                 );
             }
         }
+        // 5. The read-back contracts' taint: the live runs' results stay
+        //    readable, so the pinned definition counts until `retire_sweep`
+        //    releases it. Re-derived here, the one exit every retirement —
+        //    a delete, a reload — takes, after the pin it reads.
+        self.retag_workflow_tools();
     }
 
     /// Tick half: a `drain` whose deadline passed cancels what remains. Cheap —
@@ -264,5 +271,10 @@ impl super::reactor::Runtime {
             self.pin_written.remove(hash);
         }
         self.retiring.retain(|hash, _| referenced.contains(hash));
+        // A released pin no longer has a run whose result a read-back could
+        // return, so the taint it kept in the read-back contracts goes.
+        if !dropped.is_empty() {
+            self.retag_workflow_tools();
+        }
     }
 }

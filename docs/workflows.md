@@ -587,7 +587,10 @@ A step that cannot complete now writes a durable
 is checkpointed; a per-tick sweep resolves it. Nothing about a wait lives only in
 memory. `wait.on` accepts `resource`, `condition`, `signal`, `run`, `subagent`,
 `message`, `event`, `webhook` and `deadline` — `webhook` needs the `a2a` build
-feature, as does `a2a.delegate`.
+feature, as does `a2a.delegate`. It is written out, never templated: what a wait
+listens on decides the route it opens and what it reads, which the load-time checks
+read from the definition, so a templated `on` is refused at load and by
+`workflow.create`/`update`.
 
 `on: event` is the one that parks on the durable log:
 

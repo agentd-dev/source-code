@@ -946,17 +946,31 @@ pub enum ReadBack {
     Run,
     /// A run named by id, or every run of a workflow named by `name`.
     Runs,
+    /// A child named by handle — whose spawner only the handle knows. What a
+    /// child returns is what the run that spawned (or steered) it handed it,
+    /// worked over, so it is that run's result too.
+    Child,
+    /// A run or a child the call binds a plan item to (`bind: {run}` or
+    /// `{subagent}`): when it finishes, its output or error is written into
+    /// the item's note, which the plan block puts in front of the caller's
+    /// model on every turn after.
+    Bound,
 }
 
-/// The contracts whose reply carries a run's result, and which run. Kept
-/// beside [`onward`] for the same reason; the test below holds every name to a
-/// contract. `workflow.list` is not one: it names runs and their status, never
-/// what they produced.
+/// The contracts whose reply carries a run's or a child's result, and which.
+/// Kept beside [`onward`] for the same reason; the test below derives the set
+/// from the contracts' own shapes, so a contract that starts returning a
+/// result cannot be left out. `workflow.list` is not one: it names runs and
+/// their status, never what they produced.
 pub fn read_back(name: &str) -> Option<ReadBack> {
     match name {
         "workflow.run" => Some(ReadBack::Started),
         "workflow.wait" => Some(ReadBack::Run),
         "workflow.status" => Some(ReadBack::Runs),
+        // `subagent.list` too: it hands back the opening of each child's
+        // instruction, which is the spawner's text.
+        "subagent.status" | "subagent.await" | "subagent.list" => Some(ReadBack::Child),
+        "plan.update" => Some(ReadBack::Bound),
         _ => None,
     }
 }
@@ -965,26 +979,43 @@ pub fn read_back(name: &str) -> Option<ReadBack> {
 mod tests {
     use super::*;
 
-    /// Every contract `read_back` classifies exists, and each one's output
-    /// schema really carries a result — a renamed contract would drop out of
-    /// the taint check's read-back edges without a word.
+    /// The read-back edges are the contracts whose reply can carry what a
+    /// run or a child produced — read off each contract's own shape, so one
+    /// that starts returning a result is classified or this fails. A result
+    /// is handed back under one of these output fields, or settled later
+    /// through a binding (`plan.update`'s `bind`). `subagent.run` alone
+    /// returns a result and is no read-back: its child is the one the call
+    /// spawns, with the caller's own text, which the check follows forward
+    /// ([`Onward::Children`]).
     #[test]
-    fn every_read_back_edge_names_a_contract_that_returns_a_result() {
-        let all = contracts();
-        let classified: Vec<&Contract> =
-            all.iter().filter(|c| read_back(c.name).is_some()).collect();
-        assert_eq!(
-            classified.iter().map(|c| c.name).collect::<Vec<_>>(),
-            ["workflow.run", "workflow.status", "workflow.wait"]
-        );
-        for c in classified {
-            let out = c.output["properties"].to_string();
-            assert!(
-                out.contains("\"output\"") || out.contains("\"runs\""),
-                "{} hands back no result: {out}",
-                c.name
+    fn every_contract_that_hands_back_a_result_is_a_read_back_edge() {
+        const RESULT: [&str; 4] = ["output", "result", "runs", "subagents"];
+        let mut classified = Vec::new();
+        for c in contracts() {
+            let carries = c.output["properties"]
+                .as_object()
+                .is_some_and(|p| RESULT.iter().any(|f| p.contains_key(*f)))
+                || c.input["properties"].get("bind").is_some();
+            let spawns = onward(c.name) == Some(Onward::Children);
+            assert_eq!(
+                read_back(c.name).is_some(),
+                carries && !spawns,
+                "{}: read_back says {:?}, its shape says it {} a result",
+                c.name,
+                read_back(c.name),
+                if carries {
+                    "hands back"
+                } else {
+                    "hands back no"
+                }
             );
+            if read_back(c.name).is_some() {
+                classified.push(c.name);
+            }
         }
+        // Not vacuous: the shapes above really are the contracts'.
+        assert!(classified.contains(&"workflow.status"), "{classified:?}");
+        assert!(classified.contains(&"plan.update"), "{classified:?}");
     }
 
     /// `ask_human`'s contract has to say what the implementation does, in both

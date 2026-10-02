@@ -115,7 +115,7 @@ fn compile_one(
         Ok((ex, channels))
     }) {
         Ok(folded) => folded,
-        Err(es) => return Err(es.into_iter().map(at).collect()),
+        Err(es) => return Err(es.iter().map(|e| at(e.to_string())).collect()),
     };
     let has_config = !ex.config.is_empty();
     let tier = if has_config || !ex.workflows.is_empty() {

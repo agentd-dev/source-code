@@ -4286,7 +4286,10 @@ impl Settings {
                 Err(errs) => {
                     return Err(format!(
                         "{source}: agent.instruction:\n  {}",
-                        errs.join("\n  ")
+                        errs.iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join("\n  ")
                     ));
                 }
             }

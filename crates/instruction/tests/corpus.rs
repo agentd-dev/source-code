@@ -483,22 +483,32 @@ fn the_shared_refusal_corpus_matches() {
                 },
             ),
         };
-        // The matching rule both runners use: message equality, and line
-        // equality when the fixture's line is not null.
+        // The matching rule (the Go port's
+        // TestRefusalCasesYieldThePinnedMessages): every pinned refusal is
+        // matched by one we produce with the same line — a `null` line
+        // matches only a refusal that names none — the same code, and the
+        // same message. Extra refusals are allowed: a reader may say more.
         let mut msgs = Vec::new();
         for w in &want {
-            let wmsg = w["message"].as_str().unwrap_or("");
             let wline = w["line"].as_u64();
-            let hit = got.iter().any(|g| {
-                g.message_body() == wmsg && (wline.is_none() || g.line.map(u64::from) == wline)
-            });
+            let wcode = w["code"].as_str().unwrap_or("");
+            let wmsg = w["message"].as_str().unwrap_or("");
+            // A code no reader can produce is a fixture problem, not a
+            // pending one: a re-vendor that adds a condition must add its
+            // code to CODES first.
+            if !instruction_core::CODES.contains(&wcode) {
+                ledger.structural.push(format!(
+                    "refusals/{name}: pinned code {wcode:?} is not in CODES"
+                ));
+            }
+            let hit = got
+                .iter()
+                .any(|g| g.line.map(u64::from) == wline && g.code == wcode && g.message == wmsg);
             if !hit {
                 msgs.push(format!(
-                    "  want {:?} (line {:?}); got: {}",
-                    wmsg,
-                    wline,
+                    "  want [{wline:?}] {wcode} {wmsg:?}; got: {}",
                     got.iter()
-                        .map(|g| format!("[{:?}] {:?}", g.line, g.message_body()))
+                        .map(|g| format!("[{:?}] {} {:?}", g.line, g.code, g.message))
                         .collect::<Vec<_>>()
                         .join(" | ")
                 ));
@@ -607,5 +617,57 @@ fn the_vendored_corpus_matches_upstream_when_present() {
     eprintln!(
         "conformance drift check: {} files identical to {upstream}",
         uf.len()
+    );
+}
+
+/// `CODES` is the specification's Appendix B code column, when a checkout of
+/// it is at hand: every code the table gives a condition is one this crate
+/// knows, and every code this crate knows is in the table or is one of the
+/// non-catalogue codes the fixtures pin. The README is not vendored, so like
+/// the drift checks this runs against the pinned checkout CI makes, and fails
+/// rather than skips when `INSTRUCTION_SPEC_REPO` names one without it.
+#[test]
+fn the_refusal_codes_are_appendix_b_when_present() {
+    let explicit = std::env::var("INSTRUCTION_SPEC_REPO");
+    let upstream = explicit
+        .clone()
+        .unwrap_or_else(|_| "/root/instruction-md/specification".into());
+    let Ok(readme) = std::fs::read_to_string(Path::new(&upstream).join("README.md")) else {
+        assert!(
+            explicit.is_err(),
+            "INSTRUCTION_SPEC_REPO={upstream:?} was set but has no README.md — fail, not skip"
+        );
+        eprintln!("no upstream checkout; Appendix B check skipped");
+        return;
+    };
+    let start = readme
+        .find("\n## Appendix B")
+        .expect("the README has an Appendix B");
+    let end = readme[start..]
+        .find("\n## Appendix C")
+        .map_or(readme.len(), |e| start + e);
+    // The code is the second cell of a table row, written in backticks; the
+    // row for a condition that is not a refusal has `—` there instead.
+    let table: BTreeSet<&str> = readme[start..end]
+        .lines()
+        .filter_map(|row| row.strip_prefix('|')?.split('|').nth(1))
+        .filter_map(|cell| cell.trim().strip_prefix('`')?.strip_suffix('`'))
+        .collect();
+    assert!(
+        table.len() > 40,
+        "only {} codes read from Appendix B",
+        table.len()
+    );
+    let ours: BTreeSet<&str> = instruction_core::CODES.iter().copied().collect();
+    // Pinned by refusals/non-integer-version, with no row in Appendix B.
+    let non_catalogue: BTreeSet<&str> = ["schema"].into();
+    let missing: Vec<_> = table.difference(&ours).collect();
+    let extra: Vec<_> = ours
+        .difference(&table)
+        .filter(|c| !non_catalogue.contains(*c))
+        .collect();
+    assert!(
+        missing.is_empty() && extra.is_empty(),
+        "CODES differs from Appendix B in {upstream}: missing {missing:?}, not in the table {extra:?}"
     );
 }

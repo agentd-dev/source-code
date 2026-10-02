@@ -11,6 +11,9 @@
 //! $ cargo run -p agentd-instruction --example dump -- refusals doc.md         > refusals.json
 //! ```
 //!
+//! `refusals` prints the `refusals.json` fixture shape, `[{line, code,
+//! message}]`, with the line as data and never inside the message.
+//!
 //! `ctx.json` (optional): `{"grants": ["compute", …], "params": {"env": "prod"},
 //! "includes": {"<id>": "<inline document text>"}}` — includes are given
 //! inline so a fixture is one directory with no resolver of its own.

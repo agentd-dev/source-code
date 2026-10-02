@@ -27,7 +27,10 @@ fn main() {
     let doc = match idoc::parse(&text) {
         Ok(d) => d,
         Err(errs) => {
-            eprintln!("refused:\n  {}", errs.join("\n  "));
+            eprintln!("refused:");
+            for e in errs {
+                eprintln!("  {e}");
+            }
             std::process::exit(2);
         }
     };
@@ -72,7 +75,10 @@ fn main() {
     ) {
         Ok(ex) => print!("{}", ex.cleaned),
         Err(errs) => {
-            eprintln!("refused:\n  {}", errs.join("\n  "));
+            eprintln!("refused:");
+            for e in errs {
+                eprintln!("  {e}");
+            }
             std::process::exit(2);
         }
     }

@@ -307,6 +307,18 @@ anonymous `MUST:` stays valid. The conformance runner accounts for every
 vendored artifact; the ones this release does not meet yet are listed in the
 test as pending, and an artifact that starts passing must leave the list.
 
+Instruction refusals carry their Appendix B code; config.invalid text is
+unchanged. agentd-instruction's `Refusal` is now `{line, code, message}`
+from `doc::parse` to the API: `doc::parse`, `fold`, `fold_with_params`,
+`fold_full`, `extract`, `extract_with_facts` and `check_grants` return or
+push `Vec<Refusal>` instead of `Vec<String>`. `message` no longer carries
+the `line N:` prefix, and `Display` puts it back, so the printed text is
+what it was. `From<String>`, `message_body()` and the string-parsing path
+behind them are removed. New `CODES` lists every code (Appendix B, plus the
+`schema` code a fixture pins), and `UNDETECTED` names the Appendix B codes
+this crate never emits, with the reason. The refusal fixtures are matched by
+line, code and message.
+
 ## v1.17.0 — A2A, and nothing beside it
 
 The A2A listener spoke a private dialect beside the specification: an

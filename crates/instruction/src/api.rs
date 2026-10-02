@@ -8,49 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::Refusal;
 use crate::doc::{self, Block, BodyKind, Disposition, Document, Form};
-
-/// One refusal: the line it names (when it names one) and the message, shaped
-/// per Appendix B — the construct, and what to write instead.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct Refusal {
-    pub line: Option<u32>,
-    pub message: String,
-}
-
-impl Refusal {
-    /// The message WITHOUT its `line N: ` prefix — the fixture-corpus wire
-    /// form (`line` travels as its own field there).
-    pub fn message_body(&self) -> &str {
-        match (self.line, self.message.split_once(": ")) {
-            (Some(_), Some((head, rest))) if head.starts_with("line ") => rest,
-            _ => &self.message,
-        }
-    }
-}
-
-impl std::fmt::Display for Refusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The wire/display form is the full message (which already leads with
-        // `line N: …` when a line is known) — byte-identical to what agentd
-        // has always printed.
-        f.write_str(&self.message)
-    }
-}
-
-impl From<String> for Refusal {
-    fn from(message: String) -> Refusal {
-        let line = message
-            .strip_prefix("line ")
-            .and_then(|r| r.split_once(':'))
-            .and_then(|(n, _)| n.trim().parse().ok());
-        Refusal { line, message }
-    }
-}
-
-fn refusals(errs: Vec<String>) -> Vec<Refusal> {
-    errs.into_iter().map(Refusal::from).collect()
-}
 
 /// The delivery context: what this reader is entitled to and who it is.
 #[derive(Default)]
@@ -114,7 +73,7 @@ pub struct Variants {
 /// Parse a document to its block tree, or return every problem found —
 /// fail-closed and specific, nothing half-parsed.
 pub fn parse(text: &str) -> Result<Document, Vec<Refusal>> {
-    doc::parse(text).map_err(refusals)
+    doc::parse(text)
 }
 
 /// Validate a parsed document for a reader with `ctx.grants`: the trust
@@ -124,7 +83,7 @@ pub fn parse(text: &str) -> Result<Document, Vec<Refusal>> {
 pub fn validate(document: &Document, ctx: &Context) -> Vec<Refusal> {
     match doc::fold(document, &ctx.grants) {
         Ok(_) => Vec::new(),
-        Err(errs) => refusals(errs),
+        Err(errs) => errs,
     }
 }
 
@@ -144,8 +103,7 @@ pub fn deliver(document: &Document, ctx: &Context) -> Result<Delivery, Vec<Refus
         &resolver,
         0,
         &BTreeSet::new(),
-    )
-    .map_err(refusals)?;
+    )?;
     Ok(Delivery {
         text: ex.cleaned,
         manifest: build_manifest(document, ctx, resolver),
@@ -404,7 +362,13 @@ mod tests {
         // A refusal carries its line as data.
         let errs = parse(":::workflow{name=w}\nsteps: {}\n:::").unwrap_err();
         assert_eq!(errs[0].line, Some(1));
-        assert!(errs[0].message.contains("is a machinery kind"));
+        assert_eq!(errs[0].code, "bare-machinery-kind");
+        assert!(
+            errs[0]
+                .message
+                .starts_with("\"workflow\" is a machinery kind")
+        );
+        assert_eq!(errs[0].to_string(), format!("line 1: {}", errs[0].message));
     }
 
     #[test]

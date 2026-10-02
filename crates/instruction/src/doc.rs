@@ -23,6 +23,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
+use crate::Refusal;
+
 /// How a block reaches (or does not reach) the model at delivery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Disposition {
@@ -421,7 +423,7 @@ impl Document {
 ///
 /// Fail-closed and specific: each error names the line and what to write
 /// instead. Nothing is half-parsed — a document with any error yields no tree.
-pub fn parse(text: &str) -> Result<Document, Vec<String>> {
+pub fn parse(text: &str) -> Result<Document, Vec<Refusal>> {
     let mut errs = Vec::new();
     let (front, body_start) = parse_front_matter(text, &mut errs);
     let body = &text[body_start..];
@@ -580,7 +582,7 @@ fn parse_fence(
     open_idx: usize,
     of: OpenFence,
     line_base: usize,
-    errs: &mut Vec<String>,
+    errs: &mut Vec<Refusal>,
 ) -> (Vec<Block>, usize) {
     let line_no = line_base + open_idx + 1;
     let form = if of.is_set {
@@ -606,11 +608,15 @@ fn parse_fence(
     let (children, body_lines, raw_lines, close_idx, closed) =
         collect_body(lines, open_idx + 1, of.len, line_base, verbatim, lift, errs);
     if !closed {
-        errs.push(format!(
-            "line {line_no}: :::{}{} is never closed (expected a line of ≥{} colons)",
-            if of.sigil { "!" } else { "" },
-            of.kind,
-            of.len
+        errs.push(Refusal::at(
+            line_no,
+            "unclosed-fence",
+            format!(
+                ":::{}{} is never closed (expected a line of ≥{} colons)",
+                if of.sigil { "!" } else { "" },
+                of.kind,
+                of.len
+            ),
         ));
     }
 
@@ -645,7 +651,7 @@ fn parse_fence(
 }
 
 /// Parse a `::kind{attrs}` leaf — one instance, no body.
-fn parse_leaf(lf: LeafTok, line_no: usize, errs: &mut Vec<String>) -> Option<Block> {
+fn parse_leaf(lf: LeafTok, line_no: usize, errs: &mut Vec<Refusal>) -> Option<Block> {
     let disposition = classify(&lf.kind, lf.sigil, Form::Leaf, line_no, errs)?;
     let attrs = attrs_or_empty(&lf.attr_src, &lf.kind, line_no, errs);
     let name = attrs.get("name").cloned();
@@ -673,7 +679,7 @@ fn parse_section(
     open_idx: usize,
     sec: SectionTok,
     line_base: usize,
-    errs: &mut Vec<String>,
+    errs: &mut Vec<Refusal>,
 ) -> (Option<Block>, usize) {
     let line_no = line_base + open_idx + 1;
     let end = section_extent(lines, open_idx + 1, sec.level);
@@ -721,14 +727,18 @@ fn parse_section(
                 )
             }
             None => {
-                errs.push(format!(
-                    "line {line_no}: a {} section must contain exactly one fenced {} block",
-                    sec.kind,
-                    if lookup(&sec.kind).map(|k| k.body) == Some(BodyKind::Code) {
-                        "code"
-                    } else {
-                        "yaml"
-                    }
+                errs.push(Refusal::at(
+                    line_no,
+                    "section-without-fence",
+                    format!(
+                        "a {} section must contain exactly one fenced {} block",
+                        sec.kind,
+                        if lookup(&sec.kind).map(|k| k.body) == Some(BodyKind::Code) {
+                            "code"
+                        } else {
+                            "yaml"
+                        }
+                    ),
                 ));
                 (None, end)
             }
@@ -899,7 +909,7 @@ fn collect_body(
     line_base: usize,
     verbatim: bool,
     lift: bool,
-    errs: &mut Vec<String>,
+    errs: &mut Vec<Refusal>,
 ) -> (Vec<Block>, Vec<String>, Vec<String>, usize, bool) {
     let mut children = Vec::new();
     let mut body = Vec::new();
@@ -983,7 +993,7 @@ fn collect_range(
     from: usize,
     end: usize,
     line_base: usize,
-    errs: &mut Vec<String>,
+    errs: &mut Vec<Refusal>,
 ) -> (Vec<Block>, Vec<String>, Vec<String>) {
     let mut children = Vec::new();
     let mut prose = Vec::new();
@@ -1051,17 +1061,21 @@ fn classify(
     sigil: bool,
     form: Form,
     line_no: usize,
-    errs: &mut Vec<String>,
+    errs: &mut Vec<Refusal>,
 ) -> Option<Disposition> {
     match lookup(kind) {
         // Sub-blocks (`case`, `override`, `signature`, `schema`, `preview`) are
         // written UNSIGILED — the parent's fence and sigil govern them.
         Some(k) if k.sub_of.is_some() => {
             if sigil {
-                errs.push(format!(
-                    "line {line_no}: `{kind}` is a sub-block — write it bare (no `!`) \
-                     inside its `!{}`",
-                    k.sub_of.as_deref().unwrap_or("")
+                // A sigiled sub-block is no machinery kind of its own.
+                errs.push(Refusal::at(
+                    line_no,
+                    "unknown-machinery-kind",
+                    format!(
+                        "`{kind}` is a sub-block — write it bare (no `!`) inside its `!{}`",
+                        k.sub_of.as_deref().unwrap_or("")
+                    ),
                 ));
                 return None;
             }
@@ -1078,40 +1092,52 @@ fn classify(
             // bare heading never reaches here (section_open needs the `!`).
             if form != Form::Section {
                 if want_sigil && !sigil {
-                    errs.push(format!(
-                        "line {line_no}: {kind:?} is a machinery kind — did you mean :::!{kind}"
+                    errs.push(Refusal::at(
+                        line_no,
+                        "bare-machinery-kind",
+                        format!("{kind:?} is a machinery kind — did you mean :::!{kind}"),
                     ));
                     return None;
                 }
                 if !want_sigil && sigil {
-                    errs.push(format!(
-                        "line {line_no}: {kind:?} is a {} kind — did you mean :::{kind}",
+                    // A sigiled structural kind is the same mistake: the `!`
+                    // on a kind that is not machinery.
+                    errs.push(Refusal::at(
+                        line_no,
+                        "sigiled-prose-kind",
+                        format!(
+                            "{kind:?} is a {} kind — did you mean :::{kind}",
+                            if k.disposition == Disposition::Prose {
+                                "prose"
+                            } else {
+                                "structural"
+                            }
+                        ),
+                    ));
+                    return None;
+                }
+            } else if !want_sigil {
+                errs.push(Refusal::at(
+                    line_no,
+                    "sigiled-prose-kind",
+                    format!(
+                        "`## !{kind}` — the section form is machinery only, and `{kind}` is {}",
                         if k.disposition == Disposition::Prose {
                             "prose"
                         } else {
                             "structural"
                         }
-                    ));
-                    return None;
-                }
-            } else if !want_sigil {
-                errs.push(format!(
-                    "line {line_no}: `## !{kind}` — the section form is machinery only, and \
-                     `{kind}` is {}",
-                    if k.disposition == Disposition::Prose {
-                        "prose"
-                    } else {
-                        "structural"
-                    }
+                    ),
                 ));
                 return None;
             }
             if !k.forms.contains(&form) {
                 if form == Form::Set && k.body == BodyKind::Deflist {
                     // Its container body is ALREADY a list of entries (§4.3.3).
-                    errs.push(format!(
-                        "line {line_no}: {} is already a list — write :::{}",
-                        k.name, k.name
+                    errs.push(Refusal::at(
+                        line_no,
+                        "redundant-set",
+                        format!("{} is already a list — write :::{}", k.name, k.name),
                     ));
                 } else {
                     errs.push(form_refusal(k, form, line_no));
@@ -1128,11 +1154,15 @@ fn classify(
                     .take(3)
                     .map(String::as_str)
                     .collect();
-                errs.push(format!(
-                    "line {line_no}: unknown machinery kind {kind:?} — this reader implements \
-                     version {} (known: {}, …)",
-                    registry().version(),
-                    head.join(", ")
+                errs.push(Refusal::at(
+                    line_no,
+                    "unknown-machinery-kind",
+                    format!(
+                        "unknown machinery kind {kind:?} — this reader implements version {} \
+                         (known: {}, …)",
+                        registry().version(),
+                        head.join(", ")
+                    ),
                 ));
                 None
             } else {
@@ -1145,7 +1175,7 @@ fn classify(
 
 /// The refusal for a kind written in a form it does not accept, naming the
 /// forms it does. A body-required message for the common leaf case.
-fn form_refusal(k: &Kind, form: Form, line_no: usize) -> String {
+fn form_refusal(k: &Kind, form: Form, line_no: usize) -> Refusal {
     if form == Form::Leaf && k.body != BodyKind::None {
         // Machinery names what the body is; a keyword-capable prose kind
         // points at the one-line spelling first.
@@ -1167,16 +1197,17 @@ fn form_refusal(k: &Kind, form: Form, line_no: usize) -> String {
             ""
         };
         // A keyword-capable prose kind points at the one-line spelling first.
-        return match registry().keyword_kind_reverse(&k.name) {
+        let message = match registry().keyword_kind_reverse(&k.name) {
             Some(kw) => format!(
-                "line {line_no}: {} requires a body ({noun}) — write \"{kw}: …\" or use :::{}",
+                "{} requires a body ({noun}) — write \"{kw}: …\" or use :::{}",
                 k.name, k.name
             ),
             None => format!(
-                "line {line_no}: {} requires a body ({noun}) — use :::{sig}{}",
+                "{} requires a body ({noun}) — use :::{sig}{}",
                 k.name, k.name
             ),
         };
+        return Refusal::at(line_no, "body-required", message);
     }
     let names: Vec<&str> = k
         .forms
@@ -1198,10 +1229,14 @@ fn form_refusal(k: &Kind, form: Form, line_no: usize) -> String {
         Form::Keyword => "a keyword",
         Form::Alert => "an alert",
     };
-    format!(
-        "line {line_no}: `{}` does not take {wrote} — its forms are: {}",
-        k.name,
-        names.join(", ")
+    Refusal::at(
+        line_no,
+        "form-not-accepted",
+        format!(
+            "`{}` does not take {wrote} — its forms are: {}",
+            k.name,
+            names.join(", ")
+        ),
     )
 }
 
@@ -1213,7 +1248,7 @@ fn parse_set_body(
     shared: &BTreeMap<String, String>,
     body_lines: &[String],
     line_no: usize,
-    errs: &mut Vec<String>,
+    errs: &mut Vec<Refusal>,
 ) -> Vec<Block> {
     let first = body_lines.iter().find(|l| !l.trim().is_empty());
     let Some(first) = first else {
@@ -1234,15 +1269,17 @@ fn parse_table_set(
     shared: &BTreeMap<String, String>,
     body_lines: &[String],
     line_no: usize,
-    errs: &mut Vec<String>,
+    errs: &mut Vec<Refusal>,
 ) -> Vec<Block> {
     let rows: Vec<&String> = body_lines
         .iter()
         .filter(|l| l.trim_start().starts_with('|'))
         .collect();
     if rows.len() < 2 {
-        errs.push(format!(
-            "line {line_no}: a set body must be a table or a definition list ({kind}[])"
+        errs.push(Refusal::at(
+            line_no,
+            "set-body-mixed",
+            format!("a set body must be a table or a definition list ({kind}[])"),
         ));
         return Vec::new();
     }
@@ -1257,8 +1294,10 @@ fn parse_table_set(
     if let Some(known) = registry().attrs_of(kind) {
         for col in &header {
             if !known.contains(col) {
-                errs.push(format!(
-                    "line {line_no}: {col:?} is not an attribute of {kind}"
+                errs.push(Refusal::at(
+                    line_no,
+                    "unknown-column",
+                    format!("{col:?} is not an attribute of {kind}"),
                 ));
             }
         }
@@ -1274,8 +1313,10 @@ fn parse_table_set(
             }
         }
         if wants_name && attrs.get("name").is_none_or(|n| n.is_empty()) {
-            errs.push(format!(
-                "line {line_no}: row {row_no} has no name — every member of {kind}[] needs one"
+            errs.push(Refusal::at(
+                line_no,
+                "set-row-without-name",
+                format!("row {row_no} has no name — every member of {kind}[] needs one"),
             ));
             continue;
         }
@@ -1305,7 +1346,7 @@ fn parse_deflist_set(
     shared: &BTreeMap<String, String>,
     body_lines: &[String],
     line_no: usize,
-    errs: &mut Vec<String>,
+    errs: &mut Vec<Refusal>,
 ) -> Vec<Block> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -1319,8 +1360,10 @@ fn parse_deflist_set(
         let (name, attr_src) = match parse_deflist_term(line) {
             Some(t) => t,
             None => {
-                errs.push(format!(
-                    "line {line_no}: a set body must be a table or a definition list ({kind}[])"
+                errs.push(Refusal::at(
+                    line_no,
+                    "set-body-mixed",
+                    format!("a set body must be a table or a definition list ({kind}[])"),
                 ));
                 i += 1;
                 continue;
@@ -1425,12 +1468,10 @@ fn attrs_or_empty(
     src: &str,
     kind: &str,
     line_no: usize,
-    errs: &mut Vec<String>,
+    errs: &mut Vec<Refusal>,
 ) -> BTreeMap<String, String> {
-    let (attrs, attr_errs) = parse_attrs(src, kind);
-    for e in attr_errs {
-        errs.push(format!("line {line_no}: {e}"));
-    }
+    let (attrs, attr_errs) = parse_attrs(src, kind, line_no);
+    errs.extend(attr_errs);
     attrs
 }
 
@@ -1592,7 +1633,7 @@ fn code_fence_len(line: &str) -> Option<usize> {
 /// only when the kind's schema declares it (or `verbatim`) — `{name=on call}`
 /// refuses `"call"` with the quote-it fix, instead of minting a flag out of a
 /// value that lost its quotes. `#id`/`.class` shorthands are named refusals.
-fn parse_attrs(src: &str, kind: &str) -> (BTreeMap<String, String>, Vec<String>) {
+fn parse_attrs(src: &str, kind: &str, line_no: usize) -> (BTreeMap<String, String>, Vec<Refusal>) {
     let mut out = BTreeMap::new();
     let mut errs = Vec::new();
     let src = src.trim();
@@ -1600,7 +1641,11 @@ fn parse_attrs(src: &str, kind: &str) -> (BTreeMap<String, String>, Vec<String>)
         return (out, errs);
     }
     let Some(inner) = src.strip_prefix('{').and_then(|s| s.strip_suffix('}')) else {
-        errs.push("attributes must be wrapped in { }".into());
+        errs.push(Refusal::at(
+            line_no,
+            "malformed-attributes",
+            "attributes must be wrapped in { }",
+        ));
         return (out, errs);
     };
     let flag_ok = |key: &str| {
@@ -1624,13 +1669,19 @@ fn parse_attrs(src: &str, kind: &str) -> (BTreeMap<String, String>, Vec<String>)
                     .skip_while(|&x| x != '#')
                     .take_while(|x| !x.is_whitespace())
                     .collect();
-                errs.push(format!(
-                    "{token:?} is not an attribute — identity is name={}",
-                    token.trim_start_matches('#')
+                errs.push(Refusal::at(
+                    line_no,
+                    "id-class-shorthand",
+                    format!(
+                        "{token:?} is not an attribute — identity is name={}",
+                        token.trim_start_matches('#')
+                    ),
                 ));
             }
-            errs.push(format!(
-                "attributes: expected key=value, found \"{c}\" — quote values with spaces"
+            errs.push(Refusal::at(
+                line_no,
+                "malformed-attributes",
+                format!("attributes: expected key=value, found \"{c}\" — quote values with spaces"),
             ));
             chars.next();
             continue;
@@ -1644,7 +1695,11 @@ fn parse_attrs(src: &str, kind: &str) -> (BTreeMap<String, String>, Vec<String>)
             chars.next();
         }
         if key.is_empty() {
-            errs.push("empty attribute name".into());
+            errs.push(Refusal::at(
+                line_no,
+                "malformed-attributes",
+                "empty attribute name",
+            ));
             chars.next();
             continue;
         }
@@ -1653,11 +1708,19 @@ fn parse_attrs(src: &str, kind: &str) -> (BTreeMap<String, String>, Vec<String>)
         if chars.peek() != Some(&'=') {
             if flag_ok(&key) {
                 if out.insert(key.clone(), String::new()).is_some() {
-                    errs.push(format!("attribute {key:?} is repeated"));
+                    errs.push(Refusal::at(
+                        line_no,
+                        "repeated-attribute",
+                        format!("attribute {key:?} is repeated"),
+                    ));
                 }
             } else {
-                errs.push(format!(
-                    "attributes: expected key=value, found {key:?} — quote values with spaces"
+                errs.push(Refusal::at(
+                    line_no,
+                    "malformed-attributes",
+                    format!(
+                        "attributes: expected key=value, found {key:?} — quote values with spaces"
+                    ),
                 ));
             }
             continue;
@@ -1687,8 +1750,12 @@ fn parse_attrs(src: &str, kind: &str) -> (BTreeMap<String, String>, Vec<String>)
                     if c == '}' {
                         // §3.2: a bare value runs to whitespace or `}` — an
                         // embedded `}` means the closer was inside the value.
-                        errs.push(format!(
-                            "bare value {val:?} runs into '}}' — quote values containing '}}'"
+                        errs.push(Refusal::at(
+                            line_no,
+                            "malformed-attributes",
+                            format!(
+                                "bare value {val:?} runs into '}}' — quote values containing '}}'"
+                            ),
                         ));
                         return (out, errs);
                     }
@@ -1698,7 +1765,11 @@ fn parse_attrs(src: &str, kind: &str) -> (BTreeMap<String, String>, Vec<String>)
             }
         }
         if out.insert(key.clone(), val).is_some() {
-            errs.push(format!("attribute {key:?} is repeated"));
+            errs.push(Refusal::at(
+                line_no,
+                "repeated-attribute",
+                format!("attribute {key:?} is repeated"),
+            ));
         }
     }
     (out, errs)
@@ -1708,7 +1779,7 @@ fn parse_attrs(src: &str, kind: &str) -> (BTreeMap<String, String>, Vec<String>)
 /// offset where the body begins. A document with no front matter, or one whose
 /// front matter lacks `spec`, is version 1 (spec rule `front-matter-absent`);
 /// a document pinning a higher version is refused rather than mis-read.
-fn parse_front_matter(text: &str, errs: &mut Vec<String>) -> (BTreeMap<String, Value>, usize) {
+fn parse_front_matter(text: &str, errs: &mut Vec<Refusal>) -> (BTreeMap<String, Value>, usize) {
     let mut map = BTreeMap::new();
     let Some(rest) = text.strip_prefix("---\n") else {
         return (map, 0);
@@ -1723,8 +1794,14 @@ fn parse_front_matter(text: &str, errs: &mut Vec<String>) -> (BTreeMap<String, V
                 map.insert(kk, v);
             }
         }
-        Ok(_) => errs.push("front matter must be a YAML mapping".into()),
-        Err(e) => errs.push(format!("front matter is not valid YAML: {e}")),
+        Ok(_) => errs.push(Refusal::new(
+            "front-matter-yaml",
+            "front matter must be a YAML mapping",
+        )),
+        Err(e) => errs.push(Refusal::new(
+            "front-matter-yaml",
+            format!("front matter is not valid YAML: {e}"),
+        )),
     }
     if let Some(spec) = map.get("spec") {
         let s = spec
@@ -1743,13 +1820,20 @@ fn parse_front_matter(text: &str, errs: &mut Vec<String>) -> (BTreeMap<String, V
         // spec this agentd does not implement — refused rather than mis-read.
         let trimmed = s.trim_matches('"');
         if !trimmed.chars().all(|c| c.is_ascii_digit()) || trimmed.is_empty() {
-            errs.push(format!(
-                "front matter: spec {trimmed:?} is not a version — versions are integers"
+            errs.push(Refusal::new(
+                "non-integer-version",
+                format!("front matter: spec {trimmed:?} is not a version — versions are integers"),
             ));
-            errs.push("/frontMatter/spec: must match pattern \"^[0-9]+$\"".to_string());
+            // The second refusal the fixture pins: the schema's own pattern on
+            // `spec`, as a schema-validating reader reports it.
+            errs.push(Refusal::new(
+                "schema",
+                "/frontMatter/spec: must match pattern \"^[0-9]+$\"",
+            ));
         } else if major > 1 {
-            errs.push(format!(
-                "front matter: spec {trimmed:?} is not implemented by this reader"
+            errs.push(Refusal::new(
+                "unimplemented-version",
+                format!("front matter: spec {trimmed:?} is not implemented by this reader"),
             ));
         }
     }
@@ -1765,7 +1849,7 @@ fn parse_front_matter(text: &str, errs: &mut Vec<String>) -> (BTreeMap<String, V
 
 /// Identity: `name` unique per kind (top-level only — sub-blocks are
 /// parent-scoped and exempt).
-fn check_identity(blocks: &[&Block], errs: &mut Vec<String>) {
+fn check_identity(blocks: &[&Block], errs: &mut Vec<Refusal>) {
     let mut seen: BTreeMap<(String, String), usize> = BTreeMap::new();
     for b in blocks {
         // A required name is the `name` ATTRIBUTE and nothing else. A
@@ -1778,15 +1862,23 @@ fn check_identity(blocks: &[&Block], errs: &mut Vec<String>) {
             && b.set_group.is_none()
             && b.name.as_deref().unwrap_or("").is_empty()
         {
-            errs.push(format!("line {}: {} requires name", b.line, b.kind));
+            errs.push(Refusal::at(
+                b.line,
+                "missing-attribute",
+                format!("{} requires name", b.kind),
+            ));
         }
         if let Some(name) = &b.name
             && lookup(&b.kind).is_some_and(|k| k.sub_of.is_none())
         {
             match seen.get(&(b.kind.clone(), name.clone())) {
-                Some(first) => errs.push(format!(
-                    "line {}: duplicate {}/{name} (first declared at line {first})",
-                    b.line, b.kind
+                Some(first) => errs.push(Refusal::at(
+                    b.line,
+                    "duplicate-identity",
+                    format!(
+                        "duplicate {}/{name} (first declared at line {first})",
+                        b.kind
+                    ),
                 )),
                 None => {
                     seen.insert((b.kind.clone(), name.clone()), b.line);
@@ -1798,7 +1890,7 @@ fn check_identity(blocks: &[&Block], errs: &mut Vec<String>) {
 
 /// `@kind/name` references: every one must resolve to a declared block, and the
 /// graph must be acyclic. References live in attribute values.
-fn check_refs(blocks: &[&Block], errs: &mut Vec<String>) {
+fn check_refs(blocks: &[&Block], errs: &mut Vec<Refusal>) {
     let mut ids: BTreeSet<(String, String)> = BTreeSet::new();
     for b in blocks {
         if let Some(n) = &b.name {
@@ -1817,22 +1909,25 @@ fn check_refs(blocks: &[&Block], errs: &mut Vec<String>) {
                 let (kind, name) = match target.split_once('/') {
                     Some((k, n)) => (k.to_string(), n.to_string()),
                     None => {
-                        errs.push(format!(
-                            "line {}: {attr}=@{target} must be qualified as @kind/name",
-                            b.line
+                        errs.push(Refusal::at(
+                            b.line,
+                            "attribute-value",
+                            format!("{attr}=@{target} must be qualified as @kind/name"),
                         ));
                         continue;
                     }
                 };
                 if lookup(&kind).is_some_and(|k| k.sub_of.is_some()) {
-                    errs.push(format!(
-                        "line {}: {kind}/{name}: sub-blocks cannot be referenced",
-                        b.line
+                    errs.push(Refusal::at(
+                        b.line,
+                        "subblock-reference",
+                        format!("{kind}/{name}: sub-blocks cannot be referenced"),
                     ));
                 } else if !ids.contains(&(kind.clone(), name.clone())) {
-                    errs.push(format!(
-                        "line {}: @{kind}/{name} does not resolve — no {kind} named {name:?}",
-                        b.line
+                    errs.push(Refusal::at(
+                        b.line,
+                        "dangling-reference",
+                        format!("@{kind}/{name} does not resolve — no {kind} named {name:?}"),
                     ));
                 }
             }
@@ -1862,7 +1957,10 @@ fn check_refs(blocks: &[&Block], errs: &mut Vec<String>) {
     let mut state: BTreeMap<(String, String), u8> = BTreeMap::new();
     for node in edges.keys() {
         if has_cycle(node, &edges, &mut state) {
-            errs.push(format!("reference cycle through {}/{}", node.0, node.1));
+            errs.push(Refusal::new(
+                "reference-cycle",
+                format!("reference cycle through {}/{}", node.0, node.1),
+            ));
             break;
         }
     }
@@ -1872,7 +1970,7 @@ fn check_refs(blocks: &[&Block], errs: &mut Vec<String>) {
 /// whose kind is a known kind must resolve to a declared block of that kind.
 /// Dangling ones are refused — the class of bug a real check catches that
 /// eyeballing does not. Refs inside fenced code are inert (code-suspends).
-fn check_inline_refs(nodes: &[Node], body: &str, base: usize, errs: &mut Vec<String>) {
+fn check_inline_refs(nodes: &[Node], body: &str, base: usize, errs: &mut Vec<Refusal>) {
     let mut ids: BTreeSet<(String, String)> = BTreeSet::new();
     for n in nodes {
         if let Node::Block(b) = n
@@ -1901,12 +1999,16 @@ fn check_inline_refs(nodes: &[Node], body: &str, base: usize, errs: &mut Vec<Str
         for (kind, name) in refs {
             let line_no = base + i + 1;
             if lookup(&kind).is_some_and(|k| k.sub_of.is_some()) {
-                errs.push(format!(
-                    "line {line_no}: {kind}/{name}: sub-blocks cannot be referenced"
+                errs.push(Refusal::at(
+                    line_no,
+                    "subblock-reference",
+                    format!("{kind}/{name}: sub-blocks cannot be referenced"),
                 ));
             } else if lookup(&kind).is_some() && !ids.contains(&(kind.clone(), name.clone())) {
-                errs.push(format!(
-                    "line {line_no}: [[{kind}/{name}]] does not resolve — no {kind} named {name:?}"
+                errs.push(Refusal::at(
+                    line_no,
+                    "dangling-reference",
+                    format!("[[{kind}/{name}]] does not resolve — no {kind} named {name:?}"),
                 ));
             }
         }
@@ -1991,15 +2093,19 @@ pub fn families_used(doc: &Document) -> BTreeSet<String> {
 /// Refuse any block whose grant is not held by `document_capabilities`.
 /// Fail-closed: names the block, the grant, and the exact token to add. Keys on
 /// the spec's `x-grant`, so default-rung machinery (`!data`, `!override`) passes.
-pub fn check_grants(doc: &Document, granted: &BTreeSet<String>, errs: &mut Vec<String>) {
-    fn recur(b: &Block, granted: &BTreeSet<String>, errs: &mut Vec<String>) {
+pub fn check_grants(doc: &Document, granted: &BTreeSet<String>, errs: &mut Vec<Refusal>) {
+    fn recur(b: &Block, granted: &BTreeSet<String>, errs: &mut Vec<Refusal>) {
         if let Some(grant) = b.grant()
             && !granted.contains(grant)
         {
-            errs.push(format!(
-                "line {}: `:::!{}` needs the `{grant}` capability — add it to \
-                 `agent.document_capabilities`",
-                b.line, b.kind
+            errs.push(Refusal::at(
+                b.line,
+                "ungranted-family",
+                format!(
+                    "`:::!{}` needs the `{grant}` capability — add it to \
+                     `agent.document_capabilities`",
+                    b.kind
+                ),
             ));
         }
         for c in &b.children {
@@ -2014,14 +2120,15 @@ pub fn check_grants(doc: &Document, granted: &BTreeSet<String>, errs: &mut Vec<S
 /// Sub-block placement (spec §5.4): a sub-block appears only inside its parent.
 /// A top-level sub-block, or one inside the wrong parent, is refused naming the
 /// parent it needs.
-fn check_placement(blocks: &[&Block], errs: &mut Vec<String>) {
-    fn walk(b: &Block, parent_kind: Option<&str>, errs: &mut Vec<String>) {
+fn check_placement(blocks: &[&Block], errs: &mut Vec<Refusal>) {
+    fn walk(b: &Block, parent_kind: Option<&str>, errs: &mut Vec<Refusal>) {
         if let Some(want) = lookup(&b.kind).and_then(|k| k.sub_of.as_deref())
             && parent_kind != Some(want)
         {
-            errs.push(format!(
-                "line {}: {} is valid only inside a {want}",
-                b.line, b.kind
+            errs.push(Refusal::at(
+                b.line,
+                "subblock-out-of-place",
+                format!("{} is valid only inside a {want}", b.kind),
             ));
         }
         for c in &b.children {
@@ -2066,7 +2173,7 @@ pub struct Extraction {
 /// config loader and the subagent-template compiler call. `granted` is the
 /// operator's `document_capabilities`; the trust ladder refuses any block whose
 /// family is not in it.
-pub fn extract(text: &str, granted: &BTreeSet<String>) -> Result<Extraction, Vec<String>> {
+pub fn extract(text: &str, granted: &BTreeSet<String>) -> Result<Extraction, Vec<Refusal>> {
     let doc = parse(text)?;
     fold(&doc, granted)
 }
@@ -2077,7 +2184,7 @@ pub fn extract_with_facts(
     text: &str,
     granted: &BTreeSet<String>,
     facts: &BTreeMap<String, String>,
-) -> Result<Extraction, Vec<String>> {
+) -> Result<Extraction, Vec<Refusal>> {
     let doc = parse(text)?;
     fold_full(
         &doc,
@@ -2137,23 +2244,25 @@ fn push_into<'a>(
 
 /// A machinery block's body parsed as a YAML mapping, with `{attr}` merged over
 /// it and a `name` guaranteed present when required.
-fn body_map(b: &Block, errs: &mut Vec<String>) -> Option<serde_json::Map<String, Value>> {
+fn body_map(b: &Block, errs: &mut Vec<Refusal>) -> Option<serde_json::Map<String, Value>> {
     let mut m = if b.body.trim().is_empty() {
         serde_json::Map::new()
     } else {
         match crate::yaml::parse(&b.body) {
             Ok(Value::Object(m)) => m,
             Ok(_) => {
-                errs.push(format!(
-                    "line {}: :::!{} body must be a YAML mapping",
-                    b.line, b.kind
+                errs.push(Refusal::at(
+                    b.line,
+                    "invalid-yaml-body",
+                    format!(":::!{} body must be a YAML mapping", b.kind),
                 ));
                 return None;
             }
             Err(e) => {
-                errs.push(format!(
-                    "line {}: :::!{} body is not valid YAML: {e}",
-                    b.line, b.kind
+                errs.push(Refusal::at(
+                    b.line,
+                    "invalid-yaml-body",
+                    format!(":::!{} body is not valid YAML: {e}", b.kind),
                 ));
                 return None;
             }
@@ -2323,7 +2432,7 @@ const INCLUDE_DEPTH_CAP: usize = 8;
 
 /// Fold a parsed document into configuration + delivered prose, after checking
 /// grants. The whole document is refused if any block errors — no partial load.
-pub fn fold(doc: &Document, granted: &BTreeSet<String>) -> Result<Extraction, Vec<String>> {
+pub fn fold(doc: &Document, granted: &BTreeSet<String>) -> Result<Extraction, Vec<Refusal>> {
     fold_with_params(doc, granted, &BTreeMap::new())
 }
 
@@ -2334,7 +2443,7 @@ pub fn fold_with_params(
     doc: &Document,
     granted: &BTreeSet<String>,
     overrides: &BTreeMap<String, String>,
-) -> Result<Extraction, Vec<String>> {
+) -> Result<Extraction, Vec<Refusal>> {
     fold_full(
         doc,
         granted,
@@ -2360,7 +2469,7 @@ pub fn fold_full(
     resolve: IncludeResolver,
     depth: usize,
     seen: &BTreeSet<String>,
-) -> Result<Extraction, Vec<String>> {
+) -> Result<Extraction, Vec<Refusal>> {
     let mut errs = Vec::new();
     check_grants(doc, granted, &mut errs);
     let mut out = Extraction {
@@ -2490,7 +2599,7 @@ pub fn fold_full(
 
 /// Fold one block into CONFIGURATION only (delivery is separate). Prose and
 /// structural blocks contribute no configuration.
-fn fold_config(b: &Block, out: &mut Extraction, errs: &mut Vec<String>) {
+fn fold_config(b: &Block, out: &mut Extraction, errs: &mut Vec<Refusal>) {
     if b.disposition == Disposition::Machinery {
         fold_machinery(b, out, errs);
     }
@@ -3267,11 +3376,12 @@ pub(crate) fn tree_deflist_entries(body: &str) -> Vec<(String, String)> {
 /// append-only, folded into real registry config: disable, add trifecta tags,
 /// append an operator annotation. It may only make a tool MORE careful, and it
 /// delivers nothing (the spec gives it no acknowledgement).
-fn fold_override(b: &Block, out: &mut Extraction, errs: &mut Vec<String>) {
+fn fold_override(b: &Block, out: &mut Extraction, errs: &mut Vec<Refusal>) {
     let Some(target) = b.attrs.get("target").cloned() else {
-        errs.push(format!(
-            "line {}: `override` needs a target=<tool> (the server tool to narrow)",
-            b.line
+        errs.push(Refusal::at(
+            b.line,
+            "missing-attribute",
+            "`override` needs a target=<tool> (the server tool to narrow)",
         ));
         return;
     };
@@ -3281,9 +3391,10 @@ fn fold_override(b: &Block, out: &mut Extraction, errs: &mut Vec<String>) {
     if b.attrs.get("disabled").map(String::as_str) == Some("false")
         || body.get("disabled").and_then(Value::as_bool) == Some(false)
     {
-        errs.push(format!(
-            "line {}: override may not re-enable a tool — overrides only narrow",
-            b.line
+        errs.push(Refusal::at(
+            b.line,
+            "widening-override",
+            "override may not re-enable a tool — overrides only narrow",
         ));
         return;
     }
@@ -3323,7 +3434,7 @@ fn fold_override(b: &Block, out: &mut Extraction, errs: &mut Vec<String>) {
     }
 }
 
-fn fold_machinery(b: &Block, out: &mut Extraction, errs: &mut Vec<String>) {
+fn fold_machinery(b: &Block, out: &mut Extraction, errs: &mut Vec<Refusal>) {
     check_pins(b, errs);
     match b.kind.as_str() {
         // ── core: fold into real agentd configuration ───────────────────────
@@ -3349,10 +3460,13 @@ fn fold_machinery(b: &Block, out: &mut Extraction, errs: &mut Vec<String>) {
                     "instruction",
                 ] {
                     if m.contains_key(key) {
-                        errs.push(format!(
-                            "line {}: !config may not write `{key}` — it is operator \
-                             configuration, not a document's to set",
-                            b.line
+                        errs.push(Refusal::at(
+                            b.line,
+                            "self-grant",
+                            format!(
+                                "!config may not write `{key}` — it is operator \
+                                 configuration, not a document's to set"
+                            ),
                         ));
                     }
                 }
@@ -3379,7 +3493,11 @@ fn fold_machinery(b: &Block, out: &mut Extraction, errs: &mut Vec<String>) {
                             }
                         }
                     }
-                    None => errs.push(format!("line {}: mcp requires name", b.line)),
+                    None => errs.push(Refusal::at(
+                        b.line,
+                        "missing-attribute",
+                        "mcp requires name",
+                    )),
                 }
             }
         }
@@ -3392,7 +3510,11 @@ fn fold_machinery(b: &Block, out: &mut Extraction, errs: &mut Vec<String>) {
                     Some(name) => {
                         frag(&mut out.config, "streams").insert(name.clone(), Value::Object(m));
                     }
-                    None => errs.push(format!("line {}: stream requires name", b.line)),
+                    None => errs.push(Refusal::at(
+                        b.line,
+                        "missing-attribute",
+                        "stream requires name",
+                    )),
                 }
             }
         }
@@ -3412,7 +3534,11 @@ fn fold_machinery(b: &Block, out: &mut Extraction, errs: &mut Vec<String>) {
                     body: b.delivery_body().to_string(),
                 });
             }
-            None => errs.push(format!("line {}: skill requires name", b.line)),
+            None => errs.push(Refusal::at(
+                b.line,
+                "missing-attribute",
+                "skill requires name",
+            )),
         },
         // ── extended families: cleanly map to real config where one exists ───
         "endpoint" => {
@@ -3421,7 +3547,11 @@ fn fold_machinery(b: &Block, out: &mut Extraction, errs: &mut Vec<String>) {
             // run); otherwise it fires the workflow. The listener address is
             // `webhooks.listen` (agent-level); this block declares the ROUTE.
             let Some(name) = b.name.clone().or_else(|| b.attrs.get("name").cloned()) else {
-                errs.push(format!("line {}: endpoint requires name", b.line));
+                errs.push(Refusal::at(
+                    b.line,
+                    "missing-attribute",
+                    "endpoint requires name",
+                ));
                 return;
             };
             let body = body_map(b, errs).unwrap_or_default();
@@ -3471,16 +3601,18 @@ fn fold_machinery(b: &Block, out: &mut Extraction, errs: &mut Vec<String>) {
                                 }
                             }
                             Ok(_) => {
-                                errs.push(format!(
-                                    "line {}: :::!{other} body must be a YAML mapping",
-                                    b.line
+                                errs.push(Refusal::at(
+                                    b.line,
+                                    "invalid-yaml-body",
+                                    format!(":::!{other} body must be a YAML mapping"),
                                 ));
                                 return;
                             }
                             Err(e) => {
-                                errs.push(format!(
-                                    "line {}: :::!{other} body is not valid YAML: {e}",
-                                    b.line
+                                errs.push(Refusal::at(
+                                    b.line,
+                                    "invalid-yaml-body",
+                                    format!(":::!{other} body is not valid YAML: {e}"),
                                 ));
                                 return;
                             }
@@ -3561,7 +3693,7 @@ pub(crate) fn table_rows(body: &str) -> Vec<Value> {
 /// The `pins` semantic rule (§5.3): image digests required, remote media/asset
 /// sources content-addressed, `network: any` refused, and no literal
 /// credential anywhere in a machinery body.
-fn check_pins(b: &Block, errs: &mut Vec<String>) {
+fn check_pins(b: &Block, errs: &mut Vec<Refusal>) {
     match b.kind.as_str() {
         "image" => {
             if !b
@@ -3569,10 +3701,13 @@ fn check_pins(b: &Block, errs: &mut Vec<String>) {
                 .get("digest")
                 .is_some_and(|d| d.starts_with("sha256:"))
             {
-                errs.push(format!(
-                    "line {}: image {:?} is not digest-pinned",
+                errs.push(Refusal::at(
                     b.line,
-                    b.name.as_deref().unwrap_or("")
+                    "mutable-image-tag",
+                    format!(
+                        "image {:?} is not digest-pinned",
+                        b.name.as_deref().unwrap_or("")
+                    ),
                 ));
             }
         }
@@ -3580,11 +3715,14 @@ fn check_pins(b: &Block, errs: &mut Vec<String>) {
             if b.attrs.get("network").map(String::as_str) == Some("any")
                 || b.body.lines().any(|l| l.trim() == "network: any")
             {
-                errs.push(format!(
-                    "line {}: runtime {:?}: network: any is refused — the sandbox boundary \
-                     is the security boundary",
+                errs.push(Refusal::at(
                     b.line,
-                    b.name.as_deref().unwrap_or("")
+                    "network-any",
+                    format!(
+                        "runtime {:?}: network: any is refused — the sandbox boundary is the \
+                         security boundary",
+                        b.name.as_deref().unwrap_or("")
+                    ),
                 ));
             }
         }
@@ -3594,7 +3732,11 @@ fn check_pins(b: &Block, errs: &mut Vec<String>) {
                 .get("src")
                 .is_some_and(|s| s.starts_with("http://") || s.starts_with("https://"));
             if remote && !b.attrs.contains_key("sha256") {
-                errs.push(format!("line {}: remote src requires sha256", b.line));
+                errs.push(Refusal::at(
+                    b.line,
+                    "unpinned-remote-asset",
+                    "remote src requires sha256",
+                ));
             }
         }
         _ => {}
@@ -3603,9 +3745,10 @@ fn check_pins(b: &Block, errs: &mut Vec<String>) {
     // refused by CLASS, naming its line — values belong in a `!secret-ref`.
     for (i, line) in b.body.lines().enumerate() {
         if let Some(label) = credential_class(line) {
-            errs.push(format!(
-                "line {}: a literal credential is never allowed ({label}) — use a secret-ref",
-                b.line + 1 + i
+            errs.push(Refusal::at(
+                b.line + 1 + i,
+                "literal-credential",
+                format!("a literal credential is never allowed ({label}) — use a secret-ref"),
             ));
         }
     }
@@ -3683,13 +3826,13 @@ mod tests {
         // Bare machinery name — the forgotten-sigil trap — is refused.
         let e = parse(":::workflow{name=w}\nsteps: {}\n:::").unwrap_err();
         assert!(
-            e[0].contains("is a machinery kind") && e[0].contains(":::!workflow"),
+            e[0].message.contains("is a machinery kind") && e[0].message.contains(":::!workflow"),
             "{e:?}"
         );
         // Sigiled prose — the symmetric error.
         let e = parse(":::!note\nhi\n:::").unwrap_err();
         assert!(
-            e[0].contains("is a prose kind") && e[0].contains(":::note"),
+            e[0].message.contains("is a prose kind") && e[0].message.contains(":::note"),
             "{e:?}"
         );
     }
@@ -3703,7 +3846,7 @@ mod tests {
         assert_eq!(d.blocks().next().unwrap().disposition, Disposition::Prose);
         // Unknown MACHINERY fails closed.
         let e = parse(":::!whatever\nx\n:::").unwrap_err();
-        assert!(e[0].contains("unknown machinery"), "{e:?}");
+        assert!(e[0].message.contains("unknown machinery"), "{e:?}");
     }
 
     #[test]
@@ -3740,7 +3883,7 @@ mod tests {
     fn duplicate_names_per_kind_are_refused() {
         let e = parse(":::!workflow{name=dup}\na: {}\n:::\n:::!workflow{name=dup}\nb: {}\n:::")
             .unwrap_err();
-        assert!(e[0].contains("duplicate workflow/dup"), "{e:?}");
+        assert!(e[0].message.contains("duplicate workflow/dup"), "{e:?}");
         // Same name, DIFFERENT kinds is fine.
         assert!(parse(":::!workflow{name=x}\na: {}\n:::\n:::!stream{name=x}\nr: {}\n:::").is_ok());
     }
@@ -3749,10 +3892,13 @@ mod tests {
     fn refs_must_resolve_and_be_qualified_and_acyclic() {
         // Unresolvable.
         let e = parse(":::!function{name=f target=@runtime/missing}\nx\n:::").unwrap_err();
-        assert!(e[0].contains("does not resolve"), "{e:?}");
+        assert!(e[0].message.contains("does not resolve"), "{e:?}");
         // Unqualified.
         let e = parse(":::!function{name=f target=@bare}\nx\n:::").unwrap_err();
-        assert!(e.iter().any(|m| m.contains("must be qualified")), "{e:?}");
+        assert!(
+            e.iter().any(|m| m.message.contains("must be qualified")),
+            "{e:?}"
+        );
         // Resolvable + qualified is fine.
         assert!(parse(
             ":::!runtime{name=r}\nimage: x\n:::\n:::!function{name=f runtime=@runtime/r}\nx\n:::"
@@ -3798,7 +3944,8 @@ mod tests {
         assert!(parse(":::must\nCite sources.\n:::\nMUST: be brief.\n").is_ok());
         let e = parse(":::!workflow\nsteps: []\n:::").unwrap_err();
         assert!(
-            e.iter().any(|m| m.contains("workflow requires name")),
+            e.iter()
+                .any(|m| m.message.contains("workflow requires name")),
             "{e:?}"
         );
         assert_eq!(lookup("context").unwrap().disposition, Disposition::Prose);
@@ -3960,8 +4107,14 @@ template: reviewer
         }
         // Without the grants, the same document is refused, naming each family.
         let none = fold(&d, &grants(&[])).unwrap_err();
-        assert!(none.iter().any(|m| m.contains("compute")), "{none:?}");
-        assert!(none.iter().any(|m| m.contains("material")), "{none:?}");
+        assert!(
+            none.iter().any(|m| m.message.contains("compute")),
+            "{none:?}"
+        );
+        assert!(
+            none.iter().any(|m| m.message.contains("material")),
+            "{none:?}"
+        );
     }
 
     #[test]
@@ -4020,7 +4173,7 @@ description: ENG queue only
         let orphan = "---\nspec: \"1\"\n---\n:::override{target=x}\ndisabled: true\n:::";
         let e = parse(orphan).unwrap_err();
         assert!(
-            e[0].contains("valid only inside a mcp"),
+            e[0].message.contains("valid only inside a mcp"),
             "orphan override names its parent: {e:?}"
         );
     }
@@ -4054,7 +4207,8 @@ into: {stream: s, subject: x.y}
         let mut errs = Vec::new();
         check_grants(&d, &none, &mut errs);
         assert!(
-            errs.iter().any(|e| e.contains("`compute` capability")),
+            errs.iter()
+                .any(|e| e.message.contains("`compute` capability")),
             "{errs:?}"
         );
         // Granted → clean.
@@ -4078,12 +4232,12 @@ into: {stream: s, subject: x.y}
         // A leaf of a body-required kind is refused, pointing at the container.
         let e = parse("::!workflow{name=drain}").unwrap_err();
         assert!(
-            e[0].contains("requires a body") && e[0].contains(":::!workflow"),
+            e[0].message.contains("requires a body") && e[0].message.contains(":::!workflow"),
             "{e:?}"
         );
         // A bare leaf shadowing machinery is the same reserved-bare trap.
         let e = parse("::human{name=x}").unwrap_err();
-        assert!(e[0].contains("is a machinery kind"), "{e:?}");
+        assert!(e[0].message.contains("is a machinery kind"), "{e:?}");
     }
 
     #[test]
@@ -4217,7 +4371,7 @@ into: {stream: s, subject: x.y}
     fn a_section_form_is_machinery_only() {
         // A sigiled heading for a prose kind is refused (§4.4 rule 5).
         let e = parse("## !note something\n\nbody").unwrap_err();
-        assert!(e[0].contains("machinery only"), "{e:?}");
+        assert!(e[0].message.contains("machinery only"), "{e:?}");
         // A bare heading is always just a heading — the guard never applies.
         assert!(parse("## workflow oncall\n\nfree prose").is_ok());
     }
@@ -4227,7 +4381,10 @@ into: {stream: s, subject: x.y}
         // `!image` is leaf-only (its body is none); a container is refused.
         let e =
             parse("---\nspec: \"1\"\n---\n:::!image{name=x}\ndigest: sha256:a\n:::").unwrap_err();
-        assert!(e[0].contains("does not take the container form"), "{e:?}");
+        assert!(
+            e[0].message.contains("does not take the container form"),
+            "{e:?}"
+        );
     }
 
     #[test]
@@ -4237,7 +4394,7 @@ into: {stream: s, subject: x.y}
         assert!(parse(ok).is_ok());
         let bad = "::!human{name=oncall role=approver}\n\nAsk [[human/ghost]] first.";
         let e = parse(bad).unwrap_err();
-        assert!(e[0].contains("human/ghost"), "{e:?}");
+        assert!(e[0].message.contains("human/ghost"), "{e:?}");
         // A fragment link resolves the same way.
         let frag = "::!human{name=oncall role=approver}\n\nSee [the approver](#human/oncall).";
         assert!(parse(frag).is_ok());
@@ -4324,7 +4481,7 @@ into: {stream: s, subject: x.y}
             let e = fold(&parse(&doc).unwrap(), &grants(&[])).unwrap_err();
             assert!(
                 e.iter()
-                    .any(|m| m.contains(key) && m.contains("may not write")),
+                    .any(|m| m.message.contains(key) && m.message.contains("may not write")),
                 "!config writing {key} is refused: {e:?}"
             );
         }

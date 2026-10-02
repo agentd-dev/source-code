@@ -1658,7 +1658,10 @@ impl Runtime {
                         Err(errs) => {
                             return Err(format!(
                                 "re-pulled instruction no longer folds: {}",
-                                errs.join("; ")
+                                errs.iter()
+                                    .map(ToString::to_string)
+                                    .collect::<Vec<_>>()
+                                    .join("; ")
                             ));
                         }
                     }
@@ -2073,7 +2076,10 @@ impl Runtime {
                             Err(errs) => {
                                 return Err(format!(
                                     "instruction no longer folds: {}",
-                                    errs.join("; ")
+                                    errs.iter()
+                                        .map(ToString::to_string)
+                                        .collect::<Vec<_>>()
+                                        .join("; ")
                                 ));
                             }
                         }

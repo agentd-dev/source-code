@@ -131,6 +131,79 @@ fn every_shipped_example_config_validates() {
     );
 }
 
+/// The roots that hold `sensitive` and `egress` beside a webhook or an A2A
+/// route keep their read-back tools — and the tools that reach a child, whose
+/// result they read back — with the implicit notes at their defaults: a
+/// tainted result is withheld from them at runtime (RFC 0045 §5.11.3), so
+/// nothing is taken away for the check to pass. The tools are the registry's
+/// own table, and on a build that can answer it, each still validates.
+#[test]
+fn the_roots_beside_a_tainted_route_keep_their_read_backs() {
+    use agentd::registry::internal::{Onward, contracts, onward, read_back};
+    let kept: Vec<&str> = contracts()
+        .into_iter()
+        .map(|c| c.name)
+        .filter(|n| read_back(n).is_some() || onward(n) == Some(Onward::Children))
+        .collect();
+    assert!(
+        kept.contains(&"plan.update") && kept.contains(&"subagent.run"),
+        "{kept:?}"
+    );
+    for rel in [
+        "startup/sre.yaml",
+        "voice/hands.yaml",
+        "hiring/actions.yaml",
+    ] {
+        let f = examples_root().join(rel);
+        let catalog = f.with_file_name("services.yaml");
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_agentd"));
+        if catalog.exists() {
+            cmd.arg("-c").arg(&catalog);
+        }
+        let out = cmd
+            .arg("-c")
+            .arg(&f)
+            .arg("--effective-config")
+            .output()
+            .unwrap();
+        let eff: serde_json::Value = serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|e| panic!("{rel}: {e}\n{}", String::from_utf8_lossy(&out.stderr)));
+        let disabled = &eff["config"]["tools"]["disabled"];
+        for tool in &kept {
+            assert!(
+                !disabled
+                    .as_array()
+                    .is_some_and(|d| d.iter().any(|t| t == tool)),
+                "{rel} disables {tool}: {disabled}"
+            );
+        }
+        assert!(
+            eff["config"]["agent"].get("on_workflow_finished").is_none(),
+            "{rel}: {}",
+            eff["config"]["agent"]
+        );
+        #[cfg(all(feature = "cel", feature = "sign", feature = "cron"))]
+        {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_agentd"));
+            cmd.arg("--validate-config");
+            let mut text = std::fs::read_to_string(&f).unwrap();
+            if catalog.exists() {
+                cmd.arg("-c").arg(&catalog);
+                text.push_str(&std::fs::read_to_string(&catalog).unwrap());
+            }
+            for name in secret_names(&text) {
+                cmd.env(name, "test-value");
+            }
+            let out = cmd.arg("-c").arg(&f).output().unwrap();
+            assert!(
+                out.status.success(),
+                "{rel}:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+}
+
 /// The shipped FRAGMENT is a fragment, and its refusal is the lesson.
 ///
 /// `examples/mcp-servers.fragment.json` carries `mcp.servers` and nothing else,

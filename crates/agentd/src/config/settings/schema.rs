@@ -120,8 +120,8 @@ fn top_level_properties(
                         "oci": oci_source() } }
                 ] },
                     "preflight": { "enum": ["never", "auto", "always"] },
-                    "wake_on": { "type": "array", "items": { "enum": ["a2a_message", "human_reply", "subagent_result", "workflow_finished", "workflow_failed", "instruction_updated", "budget_resumed"] } },
-                    "on_workflow_finished": { "enum": ["ignore", "note", "think"] },
+                    "wake_on": { "type": "array", "items": { "enum": ["a2a_message", "human_reply", "subagent_result", "workflow_finished", "workflow_failed", "instruction_updated", "budget_resumed"] }, "description": "the events that wake (or leave a note for) the root conversation; default a2a_message, human_reply, workflow_failed. subagent_result is opt-in: it notes each child's result, and every turn of a warm child, in the root transcript — withheld there, as any read-back is, when the child may carry outside input and the root holds sensitive and egress" },
+                    "on_workflow_finished": { "enum": ["ignore", "note", "think"], "description": "what a finished run leaves in the root transcript, for the runs wake_on names: ignore (default), note (a note with its output or error), or think (that note delivered, starting a turn). Withheld there, as any read-back is, when the run may carry outside input and the root holds sensitive and egress" },
                     "tools": { "type": "object", "additionalProperties": false, "properties": {
                         "internal": tool_select, "mcp": tool_select, "code": tool_select } },
                     "max_parallel_turns": { "type": "integer", "minimum": 1 },

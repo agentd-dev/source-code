@@ -324,8 +324,11 @@ fn subagent_send_injects_into_a_warm_subagent_and_plan_get_reads_the_plan() {
         .post(&addr);
     assert_eq!(resp["error"]["code"], -32001, "{resp}");
 
-    // plan.get on the root conversation (operator).
-    let plan = command(&addr, "plan.get", json!({}));
+    // plan.get on the conversation the message ran in (operator). Named, not
+    // left to the default: the root conversation exists only once something
+    // writes to it, and a warm child's turns no longer note into it unasked.
+    let conversation = sent["task"]["contextId"].as_str().expect("contextId");
+    let plan = command(&addr, "plan.get", json!({"id": conversation}));
     assert!(
         artifact_json(&plan).get("plan").is_some(),
         "plan.get answers (plan may be null): {plan}"

@@ -38,8 +38,8 @@ So a one-shot prompt runs with the **full root tool surface** — it can create 
 workflow, spawn a subagent, or write memory.
 
 `agent.wake_on` selects *which* events are worth telling the agent about;
-`agent.on_workflow_finished` decides what telling means. `note` (the default)
-appends a `[note]` to the root context, which the *next* turn happens to read
+`agent.on_workflow_finished` decides what telling means. `ignore` (the default)
+leaves nothing. `note` appends a `[note]` to the root context, which the *next* turn happens to read
 — so if nothing messages the agent afterwards, nobody reads it. `think`
 **delivers**, which starts a turn: the difference between leaving a message and
 making the call. A one-shot job deliberately does neither, since there is no

@@ -430,13 +430,16 @@ pub enum AskHumanUnowned {
 impl Agent {
     /// The wake set used when the operator declares none: the events that
     /// carry information the agent cannot get any other way. A finished
-    /// workflow is deliberately absent — success needs no attention.
+    /// workflow is deliberately absent — success needs no attention. So is a
+    /// child's result: `subagent_result` leaves a note in the root
+    /// transcript with what a child returned (and what a warm child returns
+    /// every turn), and an implicit note of a result is opt-in — the agent
+    /// reads one it asked for with `subagent.await` (RFC 0045 §5.11.3).
     pub fn wake_on(&self) -> Vec<WakeEvent> {
         self.wake_on.clone().unwrap_or_else(|| {
             vec![
                 WakeEvent::A2aMessage,
                 WakeEvent::HumanReply,
-                WakeEvent::SubagentResult,
                 WakeEvent::WorkflowFailed,
             ]
         })
@@ -1395,11 +1398,15 @@ pub enum WakeEvent {
     BudgetResumed,
 }
 
+/// What a finished run leaves in the root transcript. `ignore` by default:
+/// the note carries the run's output or error, and an implicit note of a
+/// result is opt-in (RFC 0045 §5.11.3) — the agent reads a run it asked for
+/// with `workflow.wait` or `workflow.status`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum OnWorkflowFinished {
-    Ignore,
     #[default]
+    Ignore,
     Note,
     Think,
 }

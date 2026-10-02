@@ -482,13 +482,15 @@ impl Runtime {
                 if !errs.is_empty() {
                     return Err(errs);
                 }
-                Some(r)
+                Some((r, true))
             }
             // Workflows re-staged on a registry that is kept still move what
-            // the workflow tools and the read-back contracts carry: the taint
+            // the workflow tools and the read-back contracts carry — the taint
             // of the runs whose result they return, which the whole set
-            // decides. Re-derived on a copy, and swapped in only when a tag
-            // moved, so a reload that changed nothing still says so.
+            // decides — and what a read-back withholds from whom. Re-derived
+            // on a copy, swapped in when either moved, and reported as a
+            // change of the tools only when a tag moved, so a reload that
+            // changed nothing callers see still says so.
             None if workflows.is_some() => {
                 let live = workflows.as_ref().map_or(&self.workflows, |p| &p.workflows);
                 let defs: Vec<&crate::engine::Workflow> = live.values().map(|w| &**w).collect();
@@ -497,7 +499,8 @@ impl Runtime {
                 if !errs.is_empty() {
                     return Err(errs);
                 }
-                (!r.same_tools(&self.registry)).then_some(r)
+                let tools_moved = !r.same_tools(&self.registry);
+                (tools_moved || !r.same_withholding(&self.registry)).then_some((r, tools_moved))
             }
             None => None,
         };
@@ -732,13 +735,15 @@ impl Runtime {
         }
         // Registry (overrides/disabled/tools) — rebuilt when tools/mcp/knowledge/search
         // or the workflow tools changed.
-        let registry_rebuilt = registry.is_some();
-        if let Some(r) = registry {
+        let registry_rebuilt = registry.as_ref().is_some_and(|(_, moved)| *moved);
+        if let Some((r, moved)) = registry {
             for w in &r.warnings {
                 self.log.warn("registry.warning", json!({"warning": w}));
             }
             self.registry = r;
-            changed.push("tools");
+            if moved {
+                changed.push("tools");
+            }
         }
         if let Some(cat) = skills {
             // Rebuilt on every reload when a local folder is configured, so
@@ -919,7 +924,9 @@ struct StagedReload {
     /// The resolved intelligence token, when intelligence changed.
     intel_token: Option<Option<String>>,
     mcp: Option<StagedMcp>,
-    registry: Option<Registry>,
+    /// The registry to switch in, and whether the tools callers see moved
+    /// (a rebuild is always reported); `None` keeps the running one.
+    registry: Option<(Registry, bool)>,
     workflows: Option<super::steps::PreparedWorkflows>,
     skills: Option<crate::context::skills::Catalogue>,
     instruction: Option<StagedInstruction>,

@@ -242,9 +242,11 @@ than trusting the cap.
 Where it lands depends on who asked. A tool caller gets
 `{handle, status, result, error}`. A workflow step completes with that value as
 its output. The root context gets a note (`subagent <handle> <status>:` plus a
-400-character distillate) only if `agent.wake_on` includes `subagent_result` —
-warm per-turn notes are appended unconditionally and skip that policy. Any plan
-item bound to the handle advances automatically, in every context.
+400-character distillate) only if `agent.wake_on` includes `subagent_result`,
+which the default does not — and so does each turn of a warm child. A note, like
+any read-back, is withheld from a root holding `sensitive` and `egress` when the
+child may carry outside input (docs/security.md). Any plan item bound to the
+handle advances automatically, in every context.
 
 ## Lifecycle, cancellation, and the kill path
 

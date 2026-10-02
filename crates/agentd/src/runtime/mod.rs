@@ -47,6 +47,7 @@ pub mod turns;
 pub mod waits;
 #[cfg(feature = "a2a")]
 pub mod webhooks;
+pub(crate) mod withhold; // a tainted result read back by a context holding sensitive + egress
 pub mod worker;
 
 pub use reactor::Runtime;

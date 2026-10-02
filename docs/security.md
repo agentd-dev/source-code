@@ -227,61 +227,62 @@ who opened the route decided what its work may do (`examples/startup/sre.yaml`).
 a run puts on a stream is judged like `into:`: its `emit` taints the target, and the
 stream's consumers are checked.
 
-**A result read back taints its reader.** A run's result is the text it was handed, worked
-over — and so is the result of a child it spawned or steered — so a caller that reads it back
-carries that run's tags and is judged with them: the same check, over the caller's own
-reach. The read-back edges, in every spelling (`registry/internal.rs::read_back` classifies
-the tools, and a test holds every contract whose reply can carry a result to it):
+**A result read back is withheld.** A run's result is the text it was handed, worked over
+— and so is the result of a child it spawned or steered. A context that reads one back
+while it holds both `sensitive` and `egress` would complete the trifecta, so the runtime
+answers it with the run's (or the child's) status and the text replaced by a marker that
+says why, and logs `readback.withheld` (`runtime/withhold.rs`, docs/observability.md):
 
-- a sync workflow tool's reply (an `async` one returns a run id; reading that run is its own
-  edge);
-- a `workflow` step, unless `mode: detached` — `sync` waits for the child's output, and an
-  `async` one's handle is read by a `join`;
-- a `join`, which hands back each handle's output: a run's (an `async` `workflow` step's, or
-  one `workflow.run` started without `wait`) or a child's;
-- `workflow.run` with `wait: true` — a model holding the tool can ask for it on any workflow,
-  and a deterministic `tool` step only when its `wait` is `true` or templated;
-- `workflow.wait`, the `workflow.wait` step and `wait {on: run}`: a run id names any
-  workflow's run;
-- `workflow.status`, whose runs carry their `output` and `error`: by run id any workflow, by
-  `name` that workflow's runs;
-- a child read back by handle — `subagent.status`, `subagent.await`, `wait {on: subagent}`,
-  and `subagent.list`, which hands back the opening of each child's instruction: a handle
-  may be the child of any workflow whose runs spawn or steer one;
+```text
+output withheld: this run carries outside input (it consumes stream "inbox" (fed by webhook
+`into:` at workflow "intake" step "hook")); this conversation holds sensitive and egress tools
+```
+
+What is replaced is the text: `output`, `result` and `error`, the opening of a child's
+`instruction`, and a run's step outputs and variables. The status, the ids and the
+timings stay. Every read-back the code has is answered this way
+(`registry/internal.rs::read_back` classifies the tools, and a test holds every contract
+whose reply can carry a result to it):
+
+- a sync workflow tool's reply, and `workflow.run` with `wait: true`;
+- `workflow.wait`, the `workflow.wait` step and `wait {on: run}`;
+- `workflow.status`, whose runs carry their `output` and `error` (and, by run id, their
+  step outputs and variables);
+- a `workflow` step that is not `detached`, and a `join`, which hands back each handle's
+  output — a run's or a child's;
+- a child read back by handle: `subagent.status`, `subagent.await`, `wait {on: subagent}`,
+  and `subagent.list`, which hands back the opening of each child's instruction;
 - `plan.update` with `bind: {run}` or `bind: {subagent}`: when the bound run or child
-  finishes, its output or error is written into the item's note, and the plan block puts
-  that in front of the model on every turn after. A model may bind any run or child; a
-  `tool` step binds what its `bind` names;
-- a stream the daemon's own telemetry is tapped onto — `observability.runtime_events`
-  (`run.done` carries every run's error, and its output under `log_content`) or an audit
-  `sink: [stream]` (an `ask_human` question is in its record) — is fed by every run, so its
-  consumers are judged with every run's taint;
-- for the root conversation, also the note `agent.on_workflow_finished` leaves in its
-  transcript when a run finishes or fails (by default, a failed run's error), the note a
-  child's result leaves under `agent.wake_on: [subagent_result]` (a default), and the note
-  every turn of a warm child leaves whatever the wake policy says.
+  finishes, its output or error is written into the item's note, which the plan block puts
+  in front of the model on every turn after;
+- the notes a finished run (`agent.on_workflow_finished`) and a child's result
+  (`subagent_result` in `agent.wake_on`, which also notes every turn of a warm child) leave
+  in the root transcript. Both are opt-in: `on_workflow_finished` defaults to `ignore`, and
+  `subagent_result` is not in the default `wake_on`.
 
-A result taints its reader only with text the reader was not already handed. Each run's
-taint records where the outside text entered — an outside caller's route, or a mirrored
-stream — and a stream carries the origins of its producers, so a route's own run that reads
-back a child it started, or what a consumer made of the text its own route put on a stream,
-reads back nothing new and stays the operator's call. Reading back what another route was
-handed is new, and is judged. What a reader was handed is settled before any read is
-decided, so the verdict does not depend on the order the definitions are listed in.
+Who holds both legs is worked out with the reach the load-time check judges by
+(`config/taint.rs::Withholding`, derived with the registry on every workflow change): a
+conversation by everything the root grant reaches; a run by what its model-driven steps
+reach and what everything it hands its text on to reaches — the runs it starts or signals,
+the runs consuming a stream it emits onto; a flat child by its template's servers and tools,
+or, freeform, every server. A run carries outside input when its definition can be handed
+some (the taint above), when an A2A peer's own request started it, or when a run that
+carries it started it; a child carries what the run or child that spawned it carried —
+and, when a policy rule routes a read-back contract up to it and it holds a leg less, any
+run's. A result is withheld only for text the reader was not handed already: each run
+records where its outside text entered (an outside caller's route, or a mirrored stream),
+so a route's own run reading back a child it started reads nothing new. The telemetry taps
+are not read-backs: a stream the daemon's events are tapped onto
+(`observability.runtime_events`, an audit `sink: [stream]`) is fed by every run, and its
+consumers are judged as any consumer is.
 
-The root conversation is a caller too. When it can read back a tainted run's result — a
-read-back contract it may call (granted, not in `tools.disabled`, and in
-`agent.tools.internal`), a child it spawns or steers whose tools can read one back (a flat
-child holds an internal tool only when a policy rule routes it back up), a sync workflow
-tool granted to the root, or one of the notes above — it is judged with everything the root
-grant reaches. A root holding both `sensitive` and `egress` beside a tainted run is refused
-unless its read-back is taken away: list `workflow.run`, `workflow.wait`, `workflow.status`,
-`plan.update` and the `subagent` tools in `tools.disabled`, or leave them out of an
-`agent.tools.internal` list; give a workflow tool `grant.root: false` or `mode: async`; set
-`agent.on_workflow_finished: ignore` and leave `subagent_result` out of `agent.wake_on`; and
-spawn no warm child from a tainted run. An operator reads a run's outcome over A2A — the
-`workflow.status` op and the run's task — which none of these touch
-(`examples/startup/sre.yaml`).
+A context that holds a leg less is handed the text whole, as before — and then carries it:
+its own result is withheld in turn from a reader holding both, and what it starts or feeds
+is judged as a run that read a tainted stream would be. So a read-back is never refused at
+load: a reader holding both legs is withheld from, and one holding a leg less can hand the
+text only to what its own reach covers. An operator reading a run over A2A — the
+`workflow.status` op, the run's task — is no model's context, and reads it whole.
+`security.allow_trifecta` lifts the withholding with every other trifecta gate.
 
 All three legs and no `security.allow_trifecta` is exit `2` — from `--validate-config` for
 the inline definitions and those in local files and folders (`file:`, `dir:`, the adopted
@@ -289,12 +290,10 @@ the inline definitions and those in local files and folders (`file:`, `dir:`, th
 and `uri:` definitions resolve. A reload that moves anything the check
 reads (`config/taint.rs::inputs_moved`: the servers, the service catalog, the templates,
 the streams, the tools, the policies, the telemetry taps — `observability.runtime_events`,
-`observability.audit` — and what the root reads back — `agent.tools`,
-`agent.on_workflow_finished`, `agent.wake_on`) re-judges the definitions, the stored ones
-included. A refused
+`observability.audit`) re-judges the definitions, the stored ones included, and works out
+again what is withheld from whom. A refused
 reload keeps the running configuration. The message names the workflow, the stream, what
-feeds it — or the result it reads back, and the edge it reads it through — and the servers
-that brought the other two legs:
+feeds it, and the servers that brought the other two legs:
 
 ```text
 workflow "triage": lethal-trifecta refused — it consumes stream "inbox" (fed by webhook
@@ -308,7 +307,8 @@ complete it is left out (`workflow.stored.invalid`), not allowed to veto the rel
 
 A workflow tool's tags include the taint its run carries, and the read-back contracts
 (`registry/internal.rs::read_back`) carry the taint of every run, since any run's output may
-be what they return (`registry/mod.rs::register_workflow_tools`) — so a policy matching
+be what they return to a caller holding a leg less (`registry/mod.rs::register_workflow_tools`)
+— so a policy matching
 `untrusted_input` sees both, and the check counts a read-back contract as one such a policy
 routes back up from a flat child. They are re-derived whenever the workflow set changes: at
 startup, on every reload that re-reads the workflows (a workflow-only one included), when
@@ -320,8 +320,7 @@ lands, a restart that restores one included: its result can still be read back.
 This is coarse and static on purpose — per stream, not per value, and per server, like
 gate 1. It is a grant-level check, not data-flow tracking. What it accepts is what it
 judges: every model-driven step of a run the outside text reaches — the run that reads
-the stream, any run it starts or feeds, and any caller that reads its result back — is
-judged together, so a reader and an actor
+the stream, and any run it starts or feeds — is judged together, so a reader and an actor
 in one run, or an actor in a run the reader starts, are refused alike. A run that has to
 act on what it read does it either with no model-driven step holding both other legs
 (narrow `servers:` and give the step a `tools:` list that leaves out the tools that hand

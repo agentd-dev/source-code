@@ -41,12 +41,13 @@ agent:
       - One matrix row per candidate. Update it; never append a duplicate.
       - If a fact you need is missing, say what is missing. Do not invent an
         address, a score, or a requirement.
-  # No run's or child's result is read back into this conversation (the note
-  # a finished or failed run would leave, and `tools.disabled` below): each
-  # run's text is the intake agent's analysis of a CV, and this root holds
-  # `drive` and `email`, the other two legs. RFC 0045 §5.11.3;
-  # docs/security.md, "Streams carry the taint of what feeds them".
-  on_workflow_finished: ignore
+  # Each run's text is the intake agent's analysis of a CV, and the models
+  # here hold `drive` and `email`, the other two legs. They keep their
+  # read-back tools, their plans and their subagents all the same: a run's
+  # or a child's result handed back to one of them carries that text, so the
+  # runtime answers with the status and the text withheld
+  # (`readback.withheld` in the log). RFC 0045 §5.11.3; docs/security.md,
+  # "A result read back is withheld".
 
 intelligence:
   endpoints: https://gateway.internal/v1
@@ -71,19 +72,6 @@ mcp:
 store:
   kind: file
   file: { path: /var/lib/agentd/hiring-actions }
-
-# Nothing here reads a run's or a child's result back. `workflow.run` with
-# `wait`, `workflow.wait` and `workflow.status` hand the caller what a run was
-# handed; `plan.update` binds a plan item to a run or a child and writes its
-# outcome into the plan; the `subagent` tools hand text to a child, whose
-# result (and every turn of a warm one) is noted to this conversation, and
-# read a child's result back by handle. The models on this instance hold both
-# of the other legs. Whoever needs a run's outcome reads it over A2A (the
-# `workflow.status` op, the run's task), which these do not touch.
-tools:
-  disabled: [workflow.run, workflow.wait, workflow.status, plan.update,
-             subagent.run, subagent.send, subagent.status, subagent.await,
-             subagent.list]
 
 a2a:
   listen: "https://0.0.0.0:8444"

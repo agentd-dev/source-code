@@ -292,6 +292,19 @@ impl Runtime {
                 self.workflow_tool(caller, "workflow.run", wargs)
             }
         };
+        // A run's or a child's result read back is withheld from a caller
+        // holding both other legs when it may carry outside input
+        // (`withhold`). The read-back table names the contracts whose reply
+        // carries one; a wait that defers is withheld where it is answered.
+        let out = match out {
+            ToolOutcome::Ready(mut v, false)
+                if crate::registry::internal::read_back(name).is_some() =>
+            {
+                self.withhold_reply(self.reader_of(caller).as_ref(), &mut v, name);
+                ToolOutcome::Ready(v, false)
+            }
+            other => other,
+        };
         // Output validation for ready results.
         match out {
             ToolOutcome::Ready(v, false) => match self.registry.validate_result(name, &v) {
@@ -1312,21 +1325,46 @@ impl Runtime {
         for p in self.pending.iter() {
             let t = &p.target;
             match &p.kind {
-                PendingKind::Await { condition, deadline_ms } => {
+                PendingKind::Await {
+                    condition,
+                    deadline_ms,
+                } => {
                     let data = self.await_data();
-                    let vars: Vec<(&str, &Value)> = data.iter().map(|(k, v)| (k.as_str(), v)).collect();
-                    match crate::cel::eval_bool(condition.trim().trim_start_matches("CEL:").trim(), &vars) {
+                    let vars: Vec<(&str, &Value)> =
+                        data.iter().map(|(k, v)| (k.as_str(), v)).collect();
+                    match crate::cel::eval_bool(
+                        condition.trim().trim_start_matches("CEL:").trim(),
+                        &vars,
+                    ) {
                         Ok(true) => done.push((t.clone(), json!({"satisfied": true}), false)),
-                        Ok(false) if now >= *deadline_ms => done.push((t.clone(), json!({"satisfied": false, "timed_out": true}), false)),
+                        Ok(false) if now >= *deadline_ms => done.push((
+                            t.clone(),
+                            json!({"satisfied": false, "timed_out": true}),
+                            false,
+                        )),
                         Ok(false) => {}
-                        Err(e) => done.push((t.clone(), Value::String(format!("await: {e}")), true)),
+                        Err(e) => {
+                            done.push((t.clone(), Value::String(format!("await: {e}")), true))
+                        }
                     }
                 }
                 PendingKind::Run { run, deadline_ms } => match self.runs.get(run) {
-                    Some(r) if r.status.is_terminal() => done.push((t.clone(), json!({"run": run, "status": r.status, "output": r.output, "error": r.error}), false)),
-                    Some(_) if now >= *deadline_ms => done.push((t.clone(), json!({"run": run, "status": "running", "timed_out": true}), false)),
+                    Some(r) if r.status.is_terminal() => {
+                        let mut v = json!({"run": run, "status": r.status, "output": r.output, "error": r.error});
+                        self.withhold_reply(Some(&self.reader_at(t)), &mut v, &p.name);
+                        done.push((t.clone(), v, false))
+                    }
+                    Some(_) if now >= *deadline_ms => done.push((
+                        t.clone(),
+                        json!({"run": run, "status": "running", "timed_out": true}),
+                        false,
+                    )),
                     Some(_) => {}
-                    None => done.push((t.clone(), Value::String(format!("run {run:?} does not exist")), true)),
+                    None => done.push((
+                        t.clone(),
+                        Value::String(format!("run {run:?} does not exist")),
+                        true,
+                    )),
                 },
                 PendingKind::Subagent { handle } => {
                     // A terminal child always resolves the wait; an instance
@@ -1340,7 +1378,9 @@ impl Runtime {
                                 && s.mode == "sync"
                                 && s.result.is_some()))
                     {
-                        done.push((t.clone(), json!({"handle": handle, "status": s.status, "result": s.result, "error": s.error}), false));
+                        let mut v = json!({"handle": handle, "status": s.status, "result": s.result, "error": s.error});
+                        self.withhold_reply(Some(&self.reader_at(t)), &mut v, &p.name);
+                        done.push((t.clone(), v, false));
                     }
                 }
                 // Human gates run their own pass (auto-judge + prune + timeout).

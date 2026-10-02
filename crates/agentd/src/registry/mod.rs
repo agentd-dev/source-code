@@ -189,6 +189,11 @@ pub struct Registry {
     /// taint was folded in ([`Registry::register_workflow_tools`]), so a
     /// re-registration starts from them rather than from the last set's.
     read_back_base: BTreeMap<String, Vec<TrifectaTag>>,
+    /// What a read-back withholds, and from whom, for the workflow set last
+    /// registered (`config::taint::Withholding`; `runtime::withhold` reads
+    /// it). Derived beside the tags below, from the same pass, so the two
+    /// cannot describe different sets.
+    withholding: crate::config::taint::Withholding,
     /// Non-fatal findings from the build (collisions, missing profile tools).
     pub warnings: Vec<String>,
 }
@@ -449,8 +454,10 @@ impl Registry {
     /// (`internal::read_back`: `workflow.run {wait}`, `workflow.wait`,
     /// `workflow.status`, the `subagent` reads by handle, the `plan.update`
     /// binding) carry the union of every run's taint the same way: any run's
-    /// output may be what they return, and the stream-taint check judges
-    /// their callers as having read it.
+    /// output may be what they return to a caller that holds a leg less, so
+    /// a policy matching the tag sees it. The [`Registry::withholding`] the
+    /// runtime replaces that output by for a caller holding both is derived
+    /// here too.
     pub fn register_workflow_tools(
         &mut self,
         settings: &Settings,
@@ -472,7 +479,8 @@ impl Registry {
         // What each run carries from a tainted stream (or from a caller
         // outside the boundary) is part of what calling the tool reaches: its
         // result is that run's output (RFC 0045 §5.11.3).
-        let taint = crate::config::taint::run_tags(settings, workflows);
+        self.withholding = crate::config::taint::withholding(settings, workflows);
+        let taint = self.withholding.run_tags();
         let any_run: Vec<TrifectaTag> = taint.values().flatten().fold(Vec::new(), |mut acc, t| {
             if !acc.contains(t) {
                 acc.push(*t);
@@ -561,6 +569,17 @@ impl Registry {
     /// a reload asks of a re-derived registry before it reports a change.
     pub fn same_tools(&self, other: &Registry) -> bool {
         self.tools == other.tools
+    }
+
+    /// Whether `other` withholds the same results from the same callers: a
+    /// re-derived registry that differs only here is still switched in.
+    pub fn same_withholding(&self, other: &Registry) -> bool {
+        self.withholding == other.withholding
+    }
+
+    /// What a read-back withholds, and from whom, for the registered set.
+    pub fn withholding(&self) -> &crate::config::taint::Withholding {
+        &self.withholding
     }
 
     /// The trifecta tags a workflow's steps actually reach — the union over

@@ -77,40 +77,37 @@ test that fails on the old code.
   restart-only, so a reload cannot drop it; a start without it leaves a
   stored route out (`workflow.stored.invalid`) and keeps it in the store
   until the grant is back.
-- **A tainted run's result read back taints its caller.** The taint check
-  followed outside text forward into the runs it reached and not back out of
-  them: a workflow could read a tainted run's output and act on it holding
-  both other legs. A caller that reads a result back now carries the run's
-  taint and is judged with it: through a sync workflow tool's reply, a
-  `workflow` step that is not `detached`, a `join`, `workflow.run` with
-  `wait`, `workflow.wait` (tool or step), `wait {on: run}`,
-  `workflow.status`, a child read back by handle (`subagent.status`,
-  `subagent.await`, `subagent.list`, `wait {on: subagent}` — a child carries
-  what the run that spawned or steered it handed it), a `plan.update` that
-  binds a run or a child (its outcome is written into the plan the model
-  reads every turn), and a stream the daemon's telemetry is tapped onto
-  (`observability.runtime_events`, an audit `sink: [stream]`), which every
-  run feeds. The root conversation is a caller too, through those tools, a
-  child it spawns, the note `agent.on_workflow_finished` leaves in its
-  transcript (by default, a failed run's error) and the notes a child's
-  result (`agent.wake_on: [subagent_result]`, a default) and a warm child's
-  every turn leave there. A root holding `sensitive` and `egress` beside a
-  webhook or A2A route is refused at load unless its read-back is taken
-  away: list the read-back tools and the `subagent` tools in
-  `tools.disabled`, or leave them out of an `agent.tools.internal` list; give
-  a workflow tool `grant.root: false` or `mode: async`; set
-  `agent.on_workflow_finished: ignore` and leave `subagent_result` out of
-  `agent.wake_on`. A result taints only with text its reader was not handed
-  already, so a route's own run reading back its child stays the operator's
-  call — decided once what each reader was handed has settled, so the
-  verdict does not depend on the order the definitions are listed in. The
-  refusal names the edge. `examples/startup/sre.yaml`,
-  `examples/voice/hands.yaml` and `examples/hiring/actions.yaml` were refused
-  under this rule and now disable the read-back and `subagent` tools,
-  `plan.update`, and the note. The read-back contracts carry the run taint
-  in their tags, as a sync workflow tool does, so a policy matching
-  `untrusted_input` sees it, and the check counts them as tools such a
-  policy routes back up from a flat child.
+- **A tainted result read back by a context holding `sensitive` and
+  `egress` is withheld.** The taint check followed outside text forward into
+  the runs it reached and not back out of them: a workflow, or the root
+  conversation, could read a tainted run's output and act on it holding both
+  other legs. Every way a run's or a child's result is read back — a sync
+  workflow tool's reply, `workflow.run` with `wait`, `workflow.wait` (tool or
+  step), `wait {on: run}`, `workflow.status`, a `workflow` step that is not
+  `detached`, a `join`, `subagent.status`, `subagent.await`,
+  `subagent.list`, `wait {on: subagent}`, a `plan.update` binding's note, and
+  the notes a finished run or a child's result leave in the root transcript —
+  now answers a context that holds both legs with the run's or child's status
+  and its text (output, error, step outputs, a child's instruction) replaced
+  by a marker naming why, and logs `readback.withheld`. Who holds both legs is
+  worked out from the same reach the load-time check judges: the root grant;
+  a run's model-driven steps and everything it hands its text on to; a
+  child's template. A run carries outside input when its definition can be
+  handed some, when an A2A peer's own request started it, or when a run that
+  carries it started it, and a child carries what its spawner carried. A
+  result is withheld only for text the reader was not handed already, so a
+  route's own run reading back its child gets it whole. A context that holds
+  a leg less is handed the text whole and carries it on: its own result is
+  withheld in turn, and what it starts or feeds is judged. No read-back is
+  refused at load. The read-back contracts carry the run taint in their
+  tags, as a sync workflow tool does, so a policy matching `untrusted_input`
+  sees it.
+- **Implicit notes are opt-in.** `agent.on_workflow_finished` defaults to
+  `ignore` (it was `note`), and `subagent_result` is no longer in the default
+  `agent.wake_on`; a warm child's per-turn note now reaches the root only
+  under `subagent_result`, where it was written whatever the wake policy
+  said. Each carried a run's or a child's text into the root transcript
+  unasked. A root that relies on either note sets it.
 - **A wait's `on` cannot be templated.** It was rendered at dispatch, while
   every load-time judgement of what a wait opens or reads — the route list
   and its `interface` grant, the taint check — read it as written: a stored

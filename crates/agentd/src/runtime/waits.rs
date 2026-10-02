@@ -14,6 +14,7 @@
 use super::events::kinds;
 use super::reactor::{PendingKind, Runtime, Target};
 use super::tools::{ToolCaller, ToolOutcome};
+use super::withhold::{Reader, Source};
 use crate::context::ROOT;
 use crate::engine::model::Step;
 use crate::engine::run::StepStatus;
@@ -770,10 +771,18 @@ impl Runtime {
                             Err(e) => resolve.push((rid.clone(), sid.clone(), StepStatus::Failed, Value::Null, Some(format!("wait condition: {e}")))),
                         }
                     }
+                    // A run or a child waited on, and each handle a `join`
+                    // collects, is read back into this run: withheld when it
+                    // holds both other legs and the result may carry outside
+                    // input it was not handed (`withhold`).
                     Some("run") => {
                         let target = w["run"].as_str().unwrap_or("");
                         match self.runs.get(target) {
-                            Some(t) if t.status.is_terminal() => resolve.push((rid.clone(), sid.clone(), StepStatus::Done, json!({"run": target, "status": t.status, "output": t.output, "error": t.error}), None)),
+                            Some(t) if t.status.is_terminal() => {
+                                let mut out = json!({"run": target, "status": t.status, "output": t.output, "error": t.error});
+                                self.withhold_record(&Reader::Run(rid.clone()), Source::Run(target), &mut out, "wait on: run");
+                                resolve.push((rid.clone(), sid.clone(), StepStatus::Done, out, None))
+                            }
                             None => resolve.push((rid.clone(), sid.clone(), StepStatus::Failed, Value::Null, Some(format!("wait run: no such run {target:?}")))),
                             _ if timed_out => resolve.push((rid.clone(), sid.clone(), StepStatus::Timeout, json!({"run": target, "timed_out": true}), Some("wait timed out".into()))),
                             _ => {}
@@ -782,7 +791,12 @@ impl Runtime {
                     Some("subagent") => {
                         let handle = w["handle"].as_str().unwrap_or("");
                         match self.subagents.get(handle) {
-                            Some(s) if super::reactor::is_terminal_status(&s.status) => resolve.push((rid.clone(), sid.clone(), if s.status == "completed" { StepStatus::Done } else { StepStatus::Failed }, json!({"handle": handle, "status": s.status, "result": s.result, "error": s.error}), (s.status != "completed").then(|| s.error.clone().unwrap_or_else(|| format!("subagent {}", s.status))))),
+                            Some(s) if super::reactor::is_terminal_status(&s.status) => {
+                                let mut out = json!({"handle": handle, "status": s.status, "result": s.result, "error": s.error});
+                                let withheld = self.withhold_record(&Reader::Run(rid.clone()), Source::Child(handle), &mut out, "wait on: subagent");
+                                let err = (s.status != "completed").then(|| withheld.unwrap_or_else(|| s.error.clone().unwrap_or_else(|| format!("subagent {}", s.status))));
+                                resolve.push((rid.clone(), sid.clone(), if s.status == "completed" { StepStatus::Done } else { StepStatus::Failed }, out, err))
+                            }
                             None if !handle.is_empty() => resolve.push((rid.clone(), sid.clone(), StepStatus::Failed, Value::Null, Some(format!("wait subagent: no such subagent {handle:?}")))),
                             _ if timed_out => resolve.push((rid.clone(), sid.clone(), StepStatus::Timeout, json!({"handle": handle, "timed_out": true}), Some("wait timed out".into()))),
                             _ => {}
@@ -797,12 +811,16 @@ impl Runtime {
                             if let Some(t) = self.runs.get(h) {
                                 if t.status.is_terminal() {
                                     done += 1;
-                                    results.insert(h.clone(), json!({"kind": "run", "status": t.status, "output": t.output, "error": t.error}));
+                                    let mut out = json!({"kind": "run", "status": t.status, "output": t.output, "error": t.error});
+                                    self.withhold_record(&Reader::Run(rid.clone()), Source::Run(h), &mut out, "join");
+                                    results.insert(h.clone(), out);
                                 }
                             } else if let Some(s) = self.subagents.get(h) {
                                 if super::reactor::is_terminal_status(&s.status) {
                                     done += 1;
-                                    results.insert(h.clone(), json!({"kind": "subagent", "status": s.status, "result": s.result, "error": s.error}));
+                                    let mut out = json!({"kind": "subagent", "status": s.status, "result": s.result, "error": s.error});
+                                    self.withhold_record(&Reader::Run(rid.clone()), Source::Child(h), &mut out, "join");
+                                    results.insert(h.clone(), out);
                                 }
                             } else {
                                 results.insert(h.clone(), json!({"error": "unknown handle"}));

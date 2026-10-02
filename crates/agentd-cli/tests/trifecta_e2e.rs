@@ -19,11 +19,8 @@ use std::path::Path;
 use std::process::Command;
 
 /// A sensitive + egress server — the two legs the root fold allows together —
-/// and the stream an outside edge can append to. The root reads no run's
-/// result back: holding `mail`, it would otherwise be refused beside every
-/// workflow these tests judge.
+/// and the stream an outside edge can append to.
 const BASE: &str = "agent:\n  name: taint\n  instruction: Triage the inbox.\n\
-     \x20 on_workflow_finished: ignore\n  tools: {internal: [workflow.create]}\n\
      store: {kind: memory}\n\
      mcp:\n  servers:\n\
      \x20   - {name: mail, endpoint: \"https://mail.invalid/mcp\", tags: {\"*\": [sensitive, egress]}}\n\
@@ -405,7 +402,6 @@ fn an_agent_written_definition_is_held_to_the_same_check() {
     let body = |a_tags: &str| {
         format!(
             "agent:\n  name: taint\n  prompt: go\n  instruction: Triage the inbox.\n\
-             \x20 on_workflow_finished: ignore\n  tools: {{internal: [workflow.create]}}\n\
              intelligence: {{ endpoints: \"mock:file:{}\", model: mock }}\n\
              store: {{kind: memory}}\n\
              lifecycle: {{run_until: drained}}\n\
@@ -629,12 +625,11 @@ fn a_reader_holding_a_tool_that_hands_text_on_is_refused() {
     }
 }
 
-// ---- results read back (RFC 0045 §5.11.3, "follow it") --------------------
+// ---- results read back (RFC 0045 §5.11.3): withheld, not refused ---------
 
 /// `fetch` reads `inbox` into an agent holding `notes` alone — two legs, and
 /// allowed — and is a sync tool, so its reply is what it read, worked over.
-/// Not granted to the root, which these tests keep from reading back.
-const FETCH: &str = "  - name: fetch\n    tool: {name: inbox.next, grant: {root: false}}\n    steps:\n      \
+const FETCH: &str = "  - name: fetch\n    tool: {name: inbox.next}\n    steps:\n      \
      s: {kind: manual}\n      \
      w: {kind: wait, depends_on: [s], on: event, stream: inbox}\n      \
      a: {kind: agent, depends_on: [w], instruction: \"Read it.\", servers: [notes], tools: [\"notes.*\"]}\n      \
@@ -647,29 +642,6 @@ const FETCH_SPAWNS: &str = "  - name: fetch\n    steps:\n      \
      c: {kind: subagent, depends_on: [w], mode: async, instruction: \"Read it.\", servers: [notes], tools: [\"notes.*\"]}\n      \
      f: {kind: finish, depends_on: [c], status: completed}\n";
 
-/// `workflows` refused at load naming the caller, its read of `fetch` and
-/// `edge`, and loaded under the explicit allow.
-fn refused_and_allowed(dir: &Path, workflows: &[&str], edge: &str) {
-    let (code, err) = validate(dir, &config(workflows, ""));
-    assert_eq!(code, 2, "{edge}: {err}");
-    // An edge that may read any workflow names every tainted one it reads,
-    // together.
-    for want in [
-        "workflow \\\"caller\\\": lethal-trifecta refused",
-        "it reads back the result of workflow",
-        "\\\"fetch\\\"",
-        edge,
-        "mcp server \\\"mail\\\" [sensitive, egress]",
-    ] {
-        assert!(err.contains(want), "{edge}: no {want:?} in\n{err}");
-    }
-    let (code, err) = validate(
-        dir,
-        &config(workflows, "security:\n  allow_trifecta: true\n"),
-    );
-    assert_eq!(code, 0, "{edge}: {err}");
-}
-
 /// A manually started workflow whose step `r` reads something back before
 /// an agent holding `mail` — both other legs — acts.
 fn caller(read: &str) -> String {
@@ -681,133 +653,59 @@ fn caller(read: &str) -> String {
     )
 }
 
-/// Every spelling of a result read back makes its caller carry the text the
-/// run was handed: refused at load naming the edge, and loaded under the
-/// explicit allow.
+/// Every spelling of a result read back, by a caller that holds both other
+/// legs, loads: the runtime hands that caller the result's status with its
+/// text withheld (`readback_withhold_e2e.rs`), so the read cannot complete
+/// the trifecta, and nothing is refused for it.
 #[test]
-fn a_caller_reading_back_a_tainted_result_is_refused_through_each_path() {
+fn a_caller_reading_back_a_tainted_result_loads_through_each_path() {
     let t = tempfile::tempdir().unwrap();
-    for (read, edge) in [
-        (
-            "kind: agent, instruction: \"Look.\", servers: [], tools: [inbox.next]",
-            "(through its tool \\\"inbox.next\\\")",
-        ),
-        ("kind: workflow, name: fetch", "step \\\"r\\\""),
-        (
-            "kind: tool, name: workflow.run, args: {name: fetch, wait: true}",
-            "step \\\"r\\\"",
-        ),
-        (
-            "kind: agent, instruction: \"Look.\", servers: [], tools: [workflow.run]",
-            "(through workflow.run)",
-        ),
-        (
-            "kind: workflow.wait, run: \"{{inputs.run}}\"",
-            "step \\\"r\\\"",
-        ),
-        (
-            "kind: wait, on: run, run: \"{{inputs.run}}\"",
-            "step \\\"r\\\"",
-        ),
-        (
-            "kind: agent, instruction: \"Look.\", servers: [], tools: [workflow.wait]",
-            "(through workflow.wait)",
-        ),
-        (
-            "kind: agent, instruction: \"Look.\", servers: [], tools: [workflow.status]",
-            "(through workflow.status)",
-        ),
-        // A plan item bound to a run is settled with its output.
-        (
-            "kind: agent, instruction: \"Look.\", servers: [], tools: [plan.update]",
-            "(through plan.update)",
-        ),
-        (
-            "kind: tool, name: plan.update, args: {item: 1, bind: {run: \"{{inputs.run}}\"}}",
-            "step \\\"r\\\"",
-        ),
-    ] {
-        refused_and_allowed(t.path(), &[WEBHOOK_INTO, FETCH, &caller(read)], edge);
+    let agent =
+        |tool: &str| format!("kind: agent, instruction: \"Look.\", servers: [], tools: [{tool}]");
+    let by_run = [
+        agent("inbox.next"),
+        "kind: workflow, name: fetch".to_string(),
+        "kind: tool, name: workflow.run, args: {name: fetch, wait: true}".to_string(),
+        agent("workflow.run"),
+        "kind: workflow.wait, run: \"{{inputs.run}}\"".to_string(),
+        "kind: wait, on: run, run: \"{{inputs.run}}\"".to_string(),
+        agent("workflow.wait"),
+        agent("workflow.status"),
+        agent("plan.update"),
+        "kind: tool, name: plan.update, args: {item: 1, bind: {run: \"{{inputs.run}}\"}}"
+            .to_string(),
+        "kind: join, handles: [\"{{inputs.run}}\"]".to_string(),
+    ];
+    for read in &by_run {
+        let (code, err) = validate(t.path(), &config(&[WEBHOOK_INTO, FETCH, &caller(read)], ""));
+        assert_eq!(code, 0, "{read}: {err}");
     }
-    // A `join` reads back the run a `workflow.run` without `wait` started —
-    // which hands back only its id.
-    let join = |r: &str| {
-        format!(
-            "  - name: caller\n    steps:\n      s: {{kind: manual}}\n      \
-             r0: {{kind: tool, depends_on: [s], name: workflow.run, args: {{name: fetch}}}}\n      \
-             r: {{depends_on: [r0], {r}}}\n      \
-             a: {{kind: agent, depends_on: [r], instruction: \"Act.\", servers: [mail], tools: [\"mail.*\"]}}\n      \
-             f: {{kind: finish, depends_on: [a], status: completed}}\n"
-        )
-    };
-    refused_and_allowed(
-        t.path(),
-        &[
-            WEBHOOK_INTO,
-            FETCH,
-            &join("kind: join, handles: [\"{{steps.r0.output.run}}\"]"),
-        ],
-        "step \\\"r\\\"",
-    );
-    let (code, err) = validate(
-        t.path(),
-        &config(
-            &[WEBHOOK_INTO, FETCH, &join("kind: sleep, duration: 1s")],
-            "",
-        ),
-    );
-    assert_eq!(code, 0, "{err}");
     // A child's result read back by handle is its spawner's.
     for tool in ["subagent.status", "subagent.await", "subagent.list"] {
-        refused_and_allowed(
+        let (code, err) = validate(
             t.path(),
-            &[
-                WEBHOOK_INTO,
-                FETCH_SPAWNS,
-                &caller(&format!(
-                    "kind: agent, instruction: \"Look.\", servers: [], tools: [{tool}]"
-                )),
-            ],
-            &format!("(through {tool})"),
+            &config(&[WEBHOOK_INTO, FETCH_SPAWNS, &caller(&agent(tool))], ""),
         );
+        assert_eq!(code, 0, "{tool}: {err}");
     }
-    // The control: a child it never reads back hands it nothing.
-    let (code, err) = validate(
-        t.path(),
-        &config(
-            &[
-                WEBHOOK_INTO,
-                FETCH,
-                &caller("kind: workflow, name: fetch, mode: detached"),
-            ],
-            "",
-        ),
-    );
-    assert_eq!(code, 0, "{err}");
 }
 
-/// The root conversation reads results back too — by default, the note a
-/// failed run leaves in its transcript — and holding `mail` it is refused,
-/// naming the edge; a root that reads nothing back loads.
+/// The root conversation reads results back through every edge it has — the
+/// read-back tools, the plan, the children, and the notes a finished run and
+/// a child's result leave once opted into — and, holding `mail`, loads: what
+/// it reads is withheld from it at runtime, not refused at load.
 #[test]
-fn the_root_reading_back_a_tainted_result_is_refused() {
+fn the_root_reading_back_a_tainted_result_loads() {
     let t = tempfile::tempdir().unwrap();
-    let quiet = config(&[WEBHOOK_INTO, FETCH], "");
-    let (code, err) = validate(t.path(), &quiet);
-    assert_eq!(code, 0, "{err}");
-    let (code, err) = validate(
-        t.path(),
-        &quiet.replace("  on_workflow_finished: ignore\n", ""),
+    let body = config(&[WEBHOOK_INTO, FETCH_SPAWNS], "").replace(
+        "  instruction: Triage the inbox.\n",
+        "  instruction: Triage the inbox.\n  on_workflow_finished: note\n  \
+         wake_on: [subagent_result, workflow_finished, workflow_failed]\n",
     );
-    assert_eq!(code, 2, "{err}");
-    for want in [
-        "the root conversation: lethal-trifecta refused",
-        "it reads back the result of workflow \\\"fetch\\\"",
-        "(the note `agent.on_workflow_finished` writes into its transcript)",
-        "mcp server \\\"mail\\\" [sensitive, egress]",
-    ] {
-        assert!(err.contains(want), "no {want:?} in\n{err}");
-    }
+    let (code, err) = validate(t.path(), &body);
+    assert_eq!(code, 0, "{err}");
+    let (code, err) = validate(t.path(), &config(&[WEBHOOK_INTO, FETCH], ""));
+    assert_eq!(code, 0, "{err}");
 }
 
 /// A reload that changes only the workflows re-derives what the workflow

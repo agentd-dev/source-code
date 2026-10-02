@@ -266,6 +266,7 @@ pub const EVENT_FAMILIES: &[&str] = &[
     "pressure",
     "proc",
     "prompt",
+    "readback",
     "registry",
     "restore",
     "root",

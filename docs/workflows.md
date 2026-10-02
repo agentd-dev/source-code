@@ -1025,14 +1025,16 @@ gate something the agent-editable half of the config asserts about itself.
 Instead a workflow tool inherits the union of the tags of the tools its steps
 actually reach, plus `egress` for steps that reach outside by construction
 (`http`, `a2a.send`, `a2a.delegate`), plus the taint its run carries — `untrusted_input`
-when it reads a stream outside input feeds, or reads back a run that does
-([security.md](security.md#streams-carry-the-taint-of-what-feeds-them)). That taint
+when it reads a stream outside input feeds, or, holding a leg less, reads back a run that
+does ([security.md](security.md#streams-carry-the-taint-of-what-feeds-them)). That taint
 depends on the whole workflow set, so the tags are derived again whenever it
 changes — a reload that re-reads the workflows, and `workflow.create`, `update` or
 `delete` — and each derivation that moves them is logged
 (`registry.workflow_tools`), so an operator can inspect the conclusion. A `sync`
-tool's reply is its run's output, and a caller reading it carries that taint into
-the trifecta check; an `async` one hands back a run id.
+tool's reply is its run's output: a caller holding both `sensitive` and `egress` is
+handed its status with that output withheld when the run may carry outside input
+(`readback.withheld`), and one holding a leg less is handed it whole and carries the
+taint on; an `async` one hands back a run id.
 
 ## See also
 

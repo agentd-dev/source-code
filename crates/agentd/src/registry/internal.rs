@@ -934,10 +934,13 @@ pub fn onward(name: &str) -> Option<Onward> {
     }
 }
 
-/// Which run's result an internal contract hands back to its caller. The
-/// stream-taint check (`config::taint`) follows these edges BACK: a caller
-/// handed the output of a run the outside text reaches has that text in front
-/// of it, exactly as if it had read the stream itself.
+/// Which run's result an internal contract hands back to its caller. A
+/// caller handed the output of a run the outside text reaches has that text
+/// in front of it, exactly as if it had read the stream itself: the runtime
+/// withholds it from a caller holding `sensitive` and `egress`
+/// (`runtime::withhold`), and the stream-taint check (`config::taint`)
+/// follows the edge BACK into a caller holding a leg less, which is handed
+/// it whole.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadBack {
     /// The run it starts, when the call waits for it (`wait: true`).

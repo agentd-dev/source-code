@@ -634,7 +634,10 @@ impl Runtime {
         g.as_mut().map(|b| b.try_take()).unwrap_or(true)
     }
 
-    /// A warm subagent finished a turn (non-terminal).
+    /// A warm subagent finished a turn (non-terminal). Its result is noted to
+    /// the root only when the wake policy asks for subagent results, as a
+    /// finished child's is, and withheld there as any read-back is
+    /// (`withhold`).
     pub(crate) fn on_subagent_turn(&mut self, node: NodeId, outcome: Outcome) {
         let Some(ChildKind::Subagent { handle }) = self.children.get(node).map(|c| c.kind.clone())
         else {
@@ -649,11 +652,20 @@ impl Runtime {
             "subagent.turn",
             json!({"handle": handle, "status": outcome.status.as_str()}),
         );
-        // Notify the root context (wake policy: subagent_result).
-        self.note_root(format!(
-            "subagent {handle} finished a turn: {}",
-            distill_text(&outcome.result)
-        ));
+        if self
+            .settings
+            .agent
+            .wake_on()
+            .contains(&crate::config::settings::WakeEvent::SubagentResult)
+        {
+            let text = self.withhold_text(
+                &super::withhold::Reader::Conversation,
+                super::withhold::Source::Child(&handle),
+                distill_text(&outcome.result),
+                "agent.wake_on",
+            );
+            self.note_root(format!("subagent {handle} finished a turn: {text}"));
+        }
     }
 
     /// A subagent finished (result or failure).
@@ -685,19 +697,19 @@ impl Runtime {
             json!({"handle": handle, "status": status, "tokens": tokens, "err": error}),
         );
         // Answer waiters.
-        let waiting: Vec<super::reactor::Target> = self
+        let waiting: Vec<(super::reactor::Target, String)> = self
             .pending
             .iter()
             .filter(|p| matches!(&p.kind, PendingKind::Subagent { handle: h } if *h == handle))
-            .map(|p| p.target.clone())
+            .map(|p| (p.target.clone(), p.name.clone()))
             .collect();
         self.pending
             .retain(|p| !matches!(&p.kind, PendingKind::Subagent { handle: h } if *h == handle));
-        for t in waiting {
-            self.reply(
+        for (t, name) in waiting {
+            self.reply_read_back(
                 &t,
                 json!({"handle": handle, "status": status, "result": result, "error": error}),
-                false,
+                &name,
             );
         }
         // Settle whatever plan item this subagent was bound to, then note the
@@ -709,13 +721,20 @@ impl Runtime {
             .map(distill_text)
             .or(error.clone())
             .unwrap_or_default();
-        self.settle_plan_bindings(&plan_binding_subagent(&handle), ok, &note);
+        let source = super::withhold::Source::Child(&handle);
+        self.settle_plan_bindings(&plan_binding_subagent(&handle), source, ok, &note);
         if self
             .settings
             .agent
             .wake_on()
             .contains(&crate::config::settings::WakeEvent::SubagentResult)
         {
+            let note = self.withhold_text(
+                &super::withhold::Reader::Conversation,
+                source,
+                note,
+                "agent.wake_on",
+            );
             self.note_root(format!("subagent {handle} {status}: {note}"));
         }
     }
@@ -731,18 +750,26 @@ impl Runtime {
     }
 
     /// Auto-advance plan items bound to a finished run/subagent (every context).
+    /// The note is withheld as any read-back is (`withhold`): a plan lives in
+    /// a conversation, whose model reads it every turn after.
     pub(crate) fn settle_plan_bindings(
         &mut self,
         binding: &crate::context::plan::Binding,
+        source: super::withhold::Source,
         ok: bool,
         note: &str,
     ) {
+        let reader = super::withhold::Reader::Conversation;
+        let withheld = self.withheld(&reader, source).filter(|_| !note.is_empty());
+        let note = withheld.as_deref().unwrap_or(note);
+        let mut settled = false;
         for id in self.contexts.ids() {
             if let Some(c) = self.contexts.get_mut(&id)
                 && let Some(p) = c.plan.as_mut()
             {
                 let advanced = p.settle_binding(binding, ok, Some(note));
                 if !advanced.is_empty() {
+                    settled = true;
                     c.touch();
                     self.log.info(
                         "plan.updated",
@@ -750,6 +777,9 @@ impl Runtime {
                     );
                 }
             }
+        }
+        if settled && let Some(marker) = &withheld {
+            self.log_withheld(&reader, source, marker, "plan.update");
         }
     }
 

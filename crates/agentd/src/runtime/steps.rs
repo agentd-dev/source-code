@@ -457,9 +457,10 @@ impl Runtime {
     }
 
     /// Re-derive the workflow tools and the read-back contracts' tags from
-    /// the set installed now. They carry the taint of the runs whose result
-    /// they return, which the whole set decides — so a definition the agent
-    /// writes or deletes, which is never a tool itself, can still move them.
+    /// the set installed now — and what a read-back withholds from whom.
+    /// They carry the taint of the runs whose result they return, which the
+    /// whole set decides — so a definition the agent writes or deletes,
+    /// which is never a tool itself, can still move them.
     /// A retired definition's live runs count until the last one lands
     /// ([`Self::retired_with_live_runs`]). Logged only when something moved.
     pub(crate) fn retag_workflow_tools(&mut self) {
@@ -474,9 +475,16 @@ impl Runtime {
         let errs = registry.register_workflow_tools(&self.settings, &defs);
         // The tool names are the installed set's, already registered once,
         // so a collision cannot appear here; were one to, the running
-        // registry stays rather than losing a tool.
-        if errs.is_empty() && !registry.same_tools(&self.registry) {
+        // registry stays rather than losing a tool. What a read-back
+        // withholds moves with the set too, and is switched in with it.
+        if !errs.is_empty() {
+            return;
+        }
+        let tools_moved = !registry.same_tools(&self.registry);
+        if tools_moved || !registry.same_withholding(&self.registry) {
             self.registry = registry;
+        }
+        if tools_moved {
             self.log_workflow_tools();
         }
     }
@@ -3185,6 +3193,17 @@ impl Runtime {
                         && st.wait.as_ref().is_some_and(|w| w["kind"] == "child_run")
                 })
         {
+            // The parent's `workflow` step reads its child back: withheld
+            // when the parent holds both other legs and the child carries
+            // outside input the parent was not handed (`withhold`).
+            let mut out =
+                json!({"run": run_id, "status": status, "output": output, "error": error});
+            let withheld = self.withhold_record(
+                &super::withhold::Reader::Run(pr.clone()),
+                super::withhold::Source::Run(run_id),
+                &mut out,
+                "workflow step",
+            );
             self.finish_step_pub(
                 &pr,
                 &ps,
@@ -3193,11 +3212,13 @@ impl Runtime {
                 } else {
                     StepStatus::Failed
                 },
-                Some(json!({"run": run_id, "status": status, "output": output, "error": error})),
+                Some(out),
                 (status != RunStatus::Completed).then(|| {
-                    error
-                        .clone()
-                        .unwrap_or_else(|| format!("child run {}", status.as_str()))
+                    withheld.clone().unwrap_or_else(|| {
+                        error
+                            .clone()
+                            .unwrap_or_else(|| format!("child run {}", status.as_str()))
+                    })
                 }),
                 0,
             );
@@ -3228,19 +3249,19 @@ impl Runtime {
             self.pin_written.remove(&hash);
         }
         // Answer waiters (workflow.wait / run sync).
-        let waiting: Vec<Target> = self
+        let waiting: Vec<(Target, String)> = self
             .pending
             .iter()
             .filter(|p| matches!(&p.kind, PendingKind::Run { run, .. } if run == run_id))
-            .map(|p| p.target.clone())
+            .map(|p| (p.target.clone(), p.name.clone()))
             .collect();
         self.pending
             .retain(|p| !matches!(&p.kind, PendingKind::Run { run, .. } if run == run_id));
-        for t in waiting {
-            self.reply(
+        for (t, name) in waiting {
+            self.reply_read_back(
                 &t,
                 json!({"run": run_id, "status": status, "output": output, "error": error}),
-                false,
+                &name,
             );
         }
         // Plan bindings + the root note (wake policy).
@@ -3253,6 +3274,7 @@ impl Runtime {
             &crate::context::plan::Binding::Run {
                 id: run_id.to_string(),
             },
+            super::withhold::Source::Run(run_id),
             ok,
             &note,
         );
@@ -3265,6 +3287,14 @@ impl Runtime {
             }
         };
         if notify && !self.job_shape {
+            // The note lands in the root transcript, which is a read-back
+            // like any other (`withhold`).
+            let note = self.withhold_text(
+                &super::withhold::Reader::Conversation,
+                super::withhold::Source::Run(run_id),
+                note,
+                "agent.on_workflow_finished",
+            );
             let short = if note.chars().count() > 400 {
                 format!("{}…", note.chars().take(400).collect::<String>())
             } else {

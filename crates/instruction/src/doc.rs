@@ -2766,7 +2766,7 @@ fn scanner_reaches(lines: &[&str], from: usize, to: usize) -> bool {
 
 /// Every block in the document, children included, in source order (a
 /// parent before its children).
-fn every_block<'a>(top: &[&'a Block]) -> Vec<&'a Block> {
+pub(crate) fn every_block<'a>(top: &[&'a Block]) -> Vec<&'a Block> {
     fn walk<'a>(b: &'a Block, out: &mut Vec<&'a Block>) {
         out.push(b);
         for c in &b.children {
@@ -2784,7 +2784,7 @@ fn every_block<'a>(top: &[&'a Block]) -> Vec<&'a Block> {
 /// registry gives identity (`x-identity`, every prose kind from revision 1.1;
 /// S26), anywhere in the document. A sub-block's name is scoped to its
 /// parent, so it declares no document identity.
-fn identity_of(b: &Block) -> Option<(String, String)> {
+pub(crate) fn identity_of(b: &Block) -> Option<(String, String)> {
     let name = b.name.as_deref().filter(|n| !n.is_empty())?;
     lookup(&b.kind)
         .is_some_and(|k| k.identity && k.sub_of.is_none())
@@ -3274,6 +3274,13 @@ pub struct Extraction {
     pub declarations: BTreeMap<String, Vec<Value>>,
     /// The grants this document actually required, for introspection.
     pub families: Vec<String>,
+    /// The rules this delivery did not deliver because an override named
+    /// them (S24), `kind/name`, in the order delivery met them — in the
+    /// document and in everything it includes.
+    pub overridden: Vec<String>,
+    /// The document's own `overrides` targets that delivery found nowhere:
+    /// not in the document, not in anything it includes (S24).
+    pub unfound_overrides: Vec<String>,
 }
 
 /// Parse and fold an instruction document in one step — the entry point the
@@ -3529,6 +3536,12 @@ pub type IncludeResolver<'a> = &'a dyn Fn(&str) -> Option<String>;
 /// The include depth cap (§5.2 rule 3); deeper transclusion degrades to a note.
 const INCLUDE_DEPTH_CAP: usize = 8;
 
+/// The cap on the bytes one delivery inlines from all its includes together
+/// (S7 `limits.include_bytes`), 1 MiB as the reference sets it. The depth cap
+/// bounds a chain, not its width: without this, a document of a thousand
+/// includes of a large document would inline all of them.
+const INCLUDE_BYTES_CAP: usize = 1 << 20;
+
 /// Fold a parsed document into configuration + delivered prose, after checking
 /// grants. The whole document is refused if any block errors — no partial load.
 pub fn fold(doc: &Document, granted: &BTreeSet<String>) -> Result<Extraction, Vec<Refusal>> {
@@ -3614,6 +3627,8 @@ fn fold_in(doc: &Document, w: &mut Walk) -> Result<Extraction, Vec<Refusal>> {
     // §3.5: the body rendered once, region by region; then `${}` is
     // substituted LAST so a value is never re-parsed.
     let text = deliver::document(doc, w).join("\n");
+    out.overridden = w.overridden.clone();
+    out.unfound_overrides = w.unfound_overrides();
     let mut text = substitute_params(&text, &w.params);
     // The delivered text ends with exactly one newline (§3.5) — part of the
     // bytes the delivery digest covers.
@@ -3634,21 +3649,36 @@ fn fold_config(b: &Block, out: &mut Extraction, errs: &mut Vec<Refusal>) {
 
 /// Transclude an `include` (§5.2): resolve the referenced document, deliver it
 /// with its OWN parameters and label style, and inline its lines. An
-/// unavailable document, a cycle, or a too-deep include degrades to a visible
-/// note rather than looping or revealing existence.
-pub(crate) fn deliver_include(b: &Block, w: &Walk) -> Vec<String> {
+/// unavailable document, a cycle, a too-deep include, one that would take the
+/// delivery past [`INCLUDE_BYTES_CAP`], or one that does not parse (its end
+/// matter included) degrades to a visible note rather than looping or
+/// revealing existence. The overrides still pending go down into it, and what
+/// it found and overrode comes back up (S24).
+pub(crate) fn deliver_include(b: &Block, w: &mut Walk) -> Vec<String> {
+    let unavailable = || vec!["> _(included instruction not available)_".to_string()];
     let Some(id) = b.attrs.get("id").or_else(|| b.attrs.get("uri")).cloned() else {
-        return vec!["> _(included instruction not available)_".into()];
+        return unavailable();
     };
     if w.depth >= INCLUDE_DEPTH_CAP || w.seen.contains(&id) {
         return vec!["> _(included instruction not available: cycle or depth cap)_".into()];
     }
     let Some(text) = (w.resolver)(&id) else {
-        return vec!["> _(included instruction not available)_".into()];
+        return unavailable();
     };
+    // Bytes as UTF-8 (S7), counted once the resolver has handed them over —
+    // what the cap protects is the delivery's size, whatever then parses.
+    if w.include_bytes + text.len() > INCLUDE_BYTES_CAP {
+        return unavailable();
+    }
+    w.include_bytes += text.len();
     // End matter (S27) never arrives: the included document is parsed as a
     // document, which cuts it from the body it delivers.
-    let inlined = parse(&text).and_then(|d| fold_in(&d, &mut w.include(&id, &d)));
+    let Ok(d) = parse(&text) else {
+        return unavailable();
+    };
+    let mut sub = w.include(&id, &d);
+    let inlined = fold_in(&d, &mut sub);
+    w.leave(sub);
     match inlined {
         Ok(ex) => ex
             .cleaned
@@ -3656,20 +3686,32 @@ pub(crate) fn deliver_include(b: &Block, w: &Walk) -> Vec<String> {
             .split('\n')
             .map(str::to_string)
             .collect(),
-        Err(_) => vec!["> _(included instruction not available)_".into()],
+        Err(_) => unavailable(),
     }
 }
 
-/// Whether a `when` variant is kept for this reader (§5.2 rules 2–3):
-/// conditions AND together; a condition's value is a comma-separated SET of
-/// admissible values (`agent="claude, gpt"` matches either); and a condition
-/// whose key is UNKNOWN to this reader KEEPS the content — a host that cannot
-/// evaluate a dimension keeps the guidance rather than censoring it.
-pub(crate) fn when_kept(b: &Block, facts: &BTreeMap<String, String>) -> bool {
-    b.attrs.iter().all(|(k, allowed)| match facts.get(k) {
-        None => true,
-        Some(actual) => allowed.split(',').any(|v| v.trim() == actual),
-    })
+/// Whether a `when` or an `unless` variant is kept for this reader (§5.2
+/// rules 1–3, S10). A condition's value is a comma-separated SET of
+/// admissible values (`agent="claude, gpt"` matches either), and the
+/// conditions AND together. A key UNKNOWN to this reader keeps the content
+/// either way: a host that cannot evaluate a dimension keeps the guidance
+/// rather than censoring it. So a `when` is kept when every known key
+/// matches, and an `unless` is dropped only when every key is known and
+/// matches. `verbatim` is the delivery attribute, not a condition.
+pub(crate) fn variant_kept(b: &Block, facts: &BTreeMap<String, String>) -> bool {
+    let mut all = true;
+    let mut unknown = false;
+    for (k, allowed) in b.attrs.iter().filter(|(k, _)| *k != "verbatim") {
+        match facts.get(k) {
+            None => unknown = true,
+            Some(actual) => all &= allowed.split(',').any(|v| v.trim() == actual),
+        }
+    }
+    if b.kind == "unless" {
+        unknown || !all
+    } else {
+        all
+    }
 }
 
 /// A set of machinery delivers ONE line naming its members (§4.3 / Appendix A);
@@ -3833,29 +3875,27 @@ pub(crate) fn deflist_entries(body: &str) -> Vec<(String, String)> {
     out
 }
 
-/// The parameter values available for `${}` substitution: declared defaults
-/// (front-matter `parameters` and `param` blocks), with `overrides` winning.
-/// The full parameter declarations (name → attributes), from front-matter
-/// `parameters` and `param` blocks — used to render a `form` block's input
-/// list (description/required/values/default).
+/// A document's parameter declarations (name → attributes), from front-matter
+/// `parameters` and `param` blocks, a block winning a name both declare. One
+/// source for what a value is checked against (S18) and what a `form` block
+/// lists. Every value is its text: a YAML `default: 500` is `"500"`, and a
+/// YAML list of `values` is the comma-separated value a `param` attribute
+/// would carry, so both spellings check and render alike.
 pub(crate) fn param_decls(doc: &Document) -> BTreeMap<String, BTreeMap<String, String>> {
+    fn text(v: &Value) -> String {
+        match v {
+            Value::String(s) => s.clone(),
+            Value::Array(items) => items.iter().map(text).collect::<Vec<_>>().join(", "),
+            other => other.to_string(),
+        }
+    }
     let mut out: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
     if let Some(Value::Array(params)) = doc.front.get("parameters") {
         for p in params {
             if let Some(obj) = p.as_object()
                 && let Some(name) = obj.get("name").and_then(Value::as_str)
             {
-                let m = obj
-                    .iter()
-                    .map(|(k, v)| {
-                        (
-                            k.clone(),
-                            v.as_str()
-                                .map(str::to_string)
-                                .unwrap_or_else(|| v.to_string()),
-                        )
-                    })
-                    .collect();
+                let m = obj.iter().map(|(k, v)| (k.clone(), text(v))).collect();
                 out.insert(name.to_string(), m);
             }
         }
@@ -3888,42 +3928,95 @@ fn extract_param_refs(body: &str) -> Vec<String> {
     out
 }
 
-pub(crate) fn param_values(
-    doc: &Document,
-    overrides: &BTreeMap<String, String>,
-) -> BTreeMap<String, String> {
-    let mut v = BTreeMap::new();
-    if let Some(Value::Array(params)) = doc.front.get("parameters") {
-        for p in params {
-            if let (Some(name), Some(def)) = (
-                p.get("name").and_then(Value::as_str),
-                p.get("default").and_then(Value::as_str),
-            ) {
-                v.insert(name.to_string(), def.to_string());
+/// Whether `v` satisfies the declared type of a parameter (S18): a `number`
+/// is `-?digits(.digits)?`, a `boolean` `true` or `false`, an `enum` one of
+/// its `values`, a `url` `http(s)://` and no whitespace, a `duration` digits
+/// and one unit. A `string`, a `list`, an untyped and an undeclared parameter
+/// take anything.
+pub(crate) fn value_fits(decl: Option<&BTreeMap<String, String>>, v: &str) -> bool {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit());
+    match decl.and_then(|d| d.get("type")).map(String::as_str) {
+        Some("number") => {
+            let unsigned = v.strip_prefix('-').unwrap_or(v);
+            match unsigned.split_once('.') {
+                Some((int, frac)) => digits(int) && digits(frac),
+                None => digits(unsigned),
             }
         }
-    }
-    for b in doc.blocks() {
-        if b.kind == "param"
-            && let Some(name) = b
-                .name
-                .as_deref()
-                .or_else(|| b.attrs.get("name").map(String::as_str))
-            && let Some(def) = b.attrs.get("default")
-        {
-            v.insert(name.to_string(), def.clone());
+        Some("boolean") => v == "true" || v == "false",
+        Some("enum") => decl.and_then(|d| d.get("values")).is_some_and(|values| {
+            values
+                .split(',')
+                .map(str::trim)
+                .any(|a| !a.is_empty() && a == v)
+        }),
+        Some("url") => v
+            .strip_prefix("https://")
+            .or_else(|| v.strip_prefix("http://"))
+            .is_some_and(|rest| !rest.is_empty() && !rest.chars().any(char::is_whitespace)),
+        Some("duration") => {
+            let unit = v.trim_start_matches(|c: char| c.is_ascii_digit());
+            unit.len() < v.len() && ["ms", "s", "m", "h", "d", "w"].contains(&unit)
         }
+        _ => true,
     }
-    for (k, val) in overrides {
-        v.insert(k.clone(), val.clone());
-    }
-    v
+}
+
+/// The values `${name}` resolves to in a document (S18), and so the
+/// parameter facts a `when` reads (§5.2: a value is a fact only when it fits
+/// its type). A GIVEN value is used when it fits; one that does not is
+/// unresolved — its placeholder stays — and never falls back to the default,
+/// which the caller did not ask for. With no value given, the default is used
+/// when it fits. `example` is a sample for previews, never a value. A given
+/// value for a parameter the document does not declare is used as given (the
+/// reference reads it so).
+pub(crate) fn param_values(
+    doc: &Document,
+    given: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let decls = param_decls(doc);
+    let names: BTreeSet<&String> = decls.keys().chain(given.keys()).collect();
+    names
+        .into_iter()
+        .filter_map(|name| {
+            let decl = decls.get(name);
+            let value = match given.get(name) {
+                Some(v) => Some(v).filter(|v| value_fits(decl, v)),
+                None => decl
+                    .and_then(|d| d.get("default"))
+                    .filter(|d| value_fits(decl, d)),
+            };
+            value.map(|v| (name.clone(), v.clone()))
+        })
+        .collect()
 }
 
 /// Substitute `${name}` with its value (§3.5 step 6) — inserted as plain text,
-/// never re-parsed. An undeclared `${x}` is left verbatim for the resolver to
-/// report.
+/// never re-parsed. An undeclared or unresolved `${x}` is left verbatim for
+/// the resolver to report. Fenced code is not substituted (§3.4 rule 4): a
+/// `${x}` in a code sample is the sample's own syntax. An inline code span
+/// is: the corpus pins `` `${default_branch}` `` delivering `` `main` ``.
 fn substitute_params(text: &str, params: &BTreeMap<String, String>) -> String {
+    let mut in_code = None::<usize>;
+    let lines: Vec<String> = text
+        .split('\n')
+        .map(|l| {
+            // The fence rule prose delivery reads (deliver.rs): a fence
+            // closes on a delimiter of its own length.
+            match (in_code, code_fence_len(l)) {
+                (Some(open), Some(n)) if n == open => in_code = None,
+                (None, Some(n)) => in_code = Some(n),
+                (None, None) => return substitute_line(l, params),
+                _ => {}
+            }
+            l.to_string()
+        })
+        .collect();
+    lines.join("\n")
+}
+
+/// [`substitute_params`] on one line outside fenced code.
+fn substitute_line(text: &str, params: &BTreeMap<String, String>) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(pos) = rest.find("${") {
@@ -5598,24 +5691,25 @@ steps:
         assert!(e.cleaned.contains(":::!workflow"), "shown verbatim");
     }
 
-    /// Until the 1.1 variant semantics land, a structural block with a body
-    /// (`unless`, `otherwise`) delivers that body unwrapped — the behaviour
-    /// it had as an unknown bare kind. A load that reports success must never
-    /// have dropped the guidance inside, whatever the facts say.
+    /// `unless` and `otherwise` select (S10): with the condition's fact
+    /// matching, the `unless` is dropped and its `otherwise` kept; with it
+    /// not matching, the reverse. Whichever is selected, the body arrives
+    /// unwrapped and the parameter after them still resolves.
     #[test]
-    fn a_structural_block_with_a_body_never_loses_it() {
+    fn unless_and_otherwise_select_their_body() {
         let doc = parse(
             "# T\n\n:::unless{environment=\"prod\"}\nDebug freely.\n:::\n\n\
              :::otherwise\nBe careful.\n:::\n\n::param{name=p default=x}\n\nUse ${p}.",
         )
         .unwrap();
-        for env in ["prod", "dev"] {
+        for (env, kept) in [("prod", "Be careful."), ("dev", "Debug freely.")] {
             let facts: BTreeMap<String, String> = [("environment".into(), env.into())].into();
             let out = fold_full(&doc, &all_families(), &BTreeMap::new(), &facts, &|_| None)
                 .unwrap()
                 .cleaned;
             assert_eq!(
-                out, "# T\n\nDebug freely.\n\nBe careful.\n\nUse x.\n",
+                out,
+                format!("# T\n\n{kept}\n\nUse x.\n"),
                 "environment={env}"
             );
         }

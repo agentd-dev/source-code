@@ -361,6 +361,32 @@ test that fails on the old code.
     their tags on lines of their own); the default is still bold (S25). An
     included document is delivered in its own style. A context, a tool, a
     form and a glossary are the same in every style.
+- **An instruction document's variants, parameters and overrides follow
+  revision 1.1.** For a version-1 document that changes the delivered bytes:
+  - `:::unless` and `:::otherwise` select their body (S10), where both were
+    delivered unwrapped. An `unless` is dropped only when every condition's
+    key is known and matches. An `otherwise` is kept when no `when` or
+    `unless` in the run right before it was kept — only blank lines and
+    author notes may separate them, in the same parent — and one with no
+    run is always kept; attributes on it are ignored.
+  - A parameter value that does not fit its declared type (`number`,
+    `boolean`, `enum`, `url`, `duration`) is not substituted: the
+    `${name}` placeholder stays, and the default does not take its place.
+    A default that does not fit is no value either, `example` never is,
+    and only a value that fits is a fact a `when` or `unless` matches
+    (S18). A front-matter default written as a YAML number or boolean is
+    now used, where it was ignored, and a YAML list of `values` is listed
+    by a form as `one of: a, b`.
+  - `${x}` inside fenced code is no longer substituted (§3.4 rule 4); in an
+    inline code span it still is, as the corpus pins.
+  - `overrides="kind/name"` suppresses the rule it names, and its reason
+    (S24). The target is looked up in the document, then in what it
+    includes, in include order and depth first; a guardrail, or a rule
+    stronger than its overrider, in an included document is kept. An
+    `overrides` declared inside a dropped variant does not apply. The skill
+    catalogue's bodies are rendered without overrides.
+  - The includes of one delivery are capped at 1 MiB inlined together; an
+    include past the cap delivers the not-available note.
 - **`/hooks/_` is agentd's.** A `wait {on: webhook}` callback is armed under
   `/hooks/_cb/`, and configured routes match first, so a route there could
   take a suspended run's callback. A `webhook` start `path` or a wait's
@@ -411,11 +437,10 @@ not wherever a kind has identity: 1.1 gives every prose kind identity, and an
 anonymous `MUST:` stays valid. The conformance runner accounts for every
 vendored artifact; the ones this release does not meet yet are listed in the
 test as pending, and an artifact that starts passing must leave the list.
-Revision 1.1 registers `unless` and `otherwise` as structural kinds. Until
-their variant semantics land, a structural block with a body delivers that
-body unwrapped, as these did when they were unknown bare kinds: a block the
-registry knows is never dropped from the delivered text while the load
-reports success.
+Revision 1.1 registers `unless` and `otherwise` as structural kinds. A
+structural block with a body that is not a variant delivers that body
+unwrapped: a block the registry knows is never dropped from the delivered
+text while the load reports success.
 
 Instruction refusals carry their Appendix B code; config.invalid text is
 unchanged. agentd-instruction's `Refusal` is now `{line, code, message}`
@@ -466,6 +491,8 @@ normaliser is gone, and so is the `**EXAMPLE` literal.
 `InlineSkill.body` is the rendered skill prose. `Block::delivery_body` is
 what a machinery block's recorded `content` reads; delivery reads the
 source.
+`Extraction` gains `overridden`, the rules an override kept from delivery,
+and `unfound_overrides`, the document's override targets found nowhere.
 
 ## v1.17.0 — A2A, and nothing beside it
 

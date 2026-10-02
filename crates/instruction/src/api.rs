@@ -138,7 +138,7 @@ fn build_manifest(
         match b.kind.as_str() {
             "when" => {
                 let id = format!("when#{}", b.line);
-                if doc::when_kept(b, &when_facts) {
+                if doc::variant_kept(b, &when_facts) {
                     kept.push(id);
                 } else {
                     dropped.push(id);

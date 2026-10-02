@@ -73,13 +73,6 @@ fn inputs_of(suite: &str) -> &'static [&'static str] {
 /// closes them. Shrink-only: an entry that starts passing must be deleted
 /// here, and the test says so.
 const PENDING: &[&str] = &[
-    // Delivery semantics of revision 1.1 — `unless`/`otherwise` and
-    // variant groups (S10), typed parameter values (S18), overrides (S24) —
-    // land in unit V6. research-agent's `depth` fails its enum type.
-    "corpus/overrides/delivered.txt",
-    "corpus/parameter-types/delivered.txt",
-    "corpus/research-agent/delivered.txt",
-    "corpus/variants/delivered.txt",
     // The S7 resolution manifest — unit V7.
     "corpus/author-notes/manifest.canonical.json",
     "corpus/author-notes/manifest.json",

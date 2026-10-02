@@ -746,6 +746,21 @@ impl DeviceGrant {
         self.pending.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// The table, and the time read while holding it — for the reason
+    /// [`LaunchSlot::table_now`] gives: a code [`DeviceGrant::make_room`]
+    /// expired at `t` still occupies a slot at `t - 1`, and a caller holding
+    /// that older time would displace it again and admit one past the bound.
+    fn table_now(
+        &self,
+    ) -> (
+        std::sync::MutexGuard<'_, HashMap<String, Authorization>>,
+        u64,
+    ) {
+        let t = self.table();
+        let now = (self.clock)();
+        (t, now)
+    }
+
     /// Drop what has been expired long enough that no client is still asking
     /// about it: kept one more code lifetime so a late poll is told
     /// `expired_token` rather than that it never existed.
@@ -854,8 +869,7 @@ impl DeviceGrant {
 
     /// The authorizations waiting on an operator, oldest first.
     pub fn pending(&self) -> Vec<PendingView> {
-        let now = (self.clock)();
-        let mut t = self.table();
+        let (mut t, now) = self.table_now();
         self.prune(&mut t, now);
         let mut out: Vec<PendingView> = t
             .values()
@@ -870,8 +884,7 @@ impl DeviceGrant {
     pub fn find(&self, typed: &str) -> Result<PendingView, String> {
         let code =
             normalize_user_code(typed).ok_or_else(|| format!("{typed:?} is not a device code"))?;
-        let now = (self.clock)();
-        let t = self.table();
+        let (t, now) = self.table_now();
         t.values()
             .find(|a| a.user_code == code && !a.expired(now) && a.decision == Decision::Pending)
             .map(Authorization::view)
@@ -905,8 +918,7 @@ impl DeviceGrant {
             }
             None => None,
         };
-        let now = (self.clock)();
-        let mut t = self.table();
+        let (mut t, now) = self.table_now();
         let mut out = Vec::new();
         for a in t.values_mut() {
             if a.decision == Decision::Pending
@@ -1128,6 +1140,17 @@ impl LaunchSlot {
         self.table.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// The table, and the time read while holding it. A time read before the
+    /// lock can be older than one an earlier holder already acted on: a
+    /// request it displaced at `t` is still live at `t - 1`, so a caller with
+    /// the older time would count it again, displace it a second time in
+    /// place of a live one, and let one tab more than the bound wait.
+    fn table_now(&self) -> (std::sync::MutexGuard<'_, LaunchTable>, u64) {
+        let t = self.table();
+        let now = (self.clock)();
+        (t, now)
+    }
+
     /// The UI origin this slot was made for, if any.
     pub fn origin(&self) -> Option<&str> {
         self.origin.as_deref()
@@ -1142,9 +1165,8 @@ impl LaunchSlot {
     /// was issued, and the earlier code, if any, still stands.
     pub fn issue(&self, bind: LaunchBind, client_id: &str) -> std::io::Result<String> {
         let code = format!("{LAUNCH_CODE_PREFIX}{}", (self.mint)(SECRET_BYTES)?);
-        let now = (self.clock)();
         let ttl = ms(crate::runtime::surface::launch::LAUNCH_CODE_TTL);
-        let mut t = self.table();
+        let (mut t, now) = self.table_now();
         t.prune(now);
         t.codes.retain(|_, c| c.bind != bind);
         t.codes.insert(
@@ -1186,8 +1208,7 @@ impl LaunchSlot {
         let Some(code) = normalize_user_code(typed) else {
             return false;
         };
-        let now = (self.clock)();
-        let mut t = self.table();
+        let (mut t, now) = self.table_now();
         let Some(r) = t
             .requests
             .values_mut()
@@ -1211,9 +1232,8 @@ impl LaunchSlot {
     /// launcher shows one prompt however many asked, and says how many more
     /// there are.
     pub fn waiting(&self) -> usize {
-        let now = (self.clock)();
-        self.table()
-            .requests
+        let (t, now) = self.table_now();
+        t.requests
             .values()
             .filter(|r| !r.expired(now) && !r.approved)
             .count()
@@ -1468,9 +1488,8 @@ impl Authority {
             },
         };
 
-        let now = (device.clock)();
         let source = peer.map(SourceKey::of);
-        let mut t = device.table();
+        let (mut t, now) = device.table_now();
         device.prune(&mut t, now);
         let network = source.map(SourceKey::network);
         let live = t.values().filter(|a| a.occupies(now));
@@ -1610,9 +1629,8 @@ impl Authority {
             return Reply::limited(retry, "too many token requests from this source");
         }
 
-        let now = (device.clock)();
         let key = hash(device_code);
-        let mut t = device.table();
+        let (mut t, now) = device.table_now();
         device.prune(&mut t, now);
         let Some(a) = t.get_mut(&key).filter(|a| a.client_id == client_id) else {
             return Reply::error(OAuthError::new(
@@ -1750,9 +1768,8 @@ impl Authority {
         peer: Option<IpAddr>,
         origin: Option<&str>,
     ) -> Reply {
-        let now = (slot.clock)();
         let key = hash(code);
-        let mut t = slot.table();
+        let (mut t, now) = slot.table_now();
         t.prune(now);
         let Some(held) = t.codes.get(&key) else {
             drop(t);
@@ -1790,9 +1807,8 @@ impl Authority {
         peer: Option<IpAddr>,
         origin: Option<&str>,
     ) -> Reply {
-        let now = (slot.clock)();
         let key = hash(request_code);
-        let mut t = slot.table();
+        let (mut t, now) = slot.table_now();
         t.prune(now);
         let Some(r) = t.requests.get_mut(&key).filter(|r| {
             loopback(peer)
@@ -1952,8 +1968,7 @@ impl Authority {
                 "a launch sign-in is asked for from this host only",
             ));
         }
-        let now = (slot.clock)();
-        let mut t = slot.table();
+        let (mut t, now) = slot.table_now();
         t.prune(now);
         let minted = (|| {
             let request_code = format!("{LAUNCH_REQUEST_PREFIX}{}", (slot.mint)(SECRET_BYTES)?);
@@ -2103,9 +2118,38 @@ fn revoke_with(sessions: &Sessions, content_type: Option<&str>, body: &[u8]) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     const FORM: Option<&str> = Some("application/x-www-form-urlencoded");
+
+    /// A clock that moves a millisecond on every read and, once armed, runs
+    /// something right after its next read — as though the reading thread
+    /// were preempted between reading the time and acting on it, and another
+    /// request ran in full meanwhile.
+    #[derive(Clone, Default)]
+    struct Preempt(Arc<Mutex<Option<Then>>>);
+
+    /// What runs while the reader is preempted.
+    type Then = Box<dyn FnOnce() + Send>;
+
+    impl Preempt {
+        fn clock(&self) -> Clock {
+            let now = AtomicU64::new(1_000_000);
+            let armed = self.clone();
+            Arc::new(move || {
+                let t = now.fetch_add(1, Ordering::SeqCst);
+                let then = armed.0.lock().unwrap().take();
+                if let Some(then) = then {
+                    then();
+                }
+                t
+            })
+        }
+
+        fn arm(&self, then: impl FnOnce() + Send + 'static) {
+            *self.0.lock().unwrap() = Some(Box::new(then));
+        }
+    }
 
     struct Fixture {
         now: Arc<AtomicU64>,
@@ -2668,6 +2712,54 @@ mod tests {
         let (displaced_dc, _) = &firsts[1];
         let r = f.poll(displaced_dc, "cli");
         assert_eq!(error_of(&r), "expired_token", "{r:?}");
+    }
+
+    /// The global bound holds however two newcomers interleave. One that read
+    /// the time and was then overtaken by another — which displaced the
+    /// oldest waiting code — must not judge the table by its older time: the
+    /// displaced code would still occupy a slot there, give way a second time
+    /// in place of a live one, and one code past the bound would wait. The
+    /// time is read under the table's lock, so nothing can overtake it.
+    #[test]
+    fn the_global_bound_holds_when_a_request_is_overtaken() {
+        let preempt = Preempt::default();
+        let cfg: settings::DeviceGrant = serde_json::from_value(json!({"enabled": true})).unwrap();
+        let auth = Arc::new(Authority::new(
+            Some(DeviceGrant::new(&cfg, preempt.clock(), os_mint())),
+            None,
+            Arc::new(Sessions::new(system_clock())),
+        ));
+        auth.set_issuer("https://agent.example:8443");
+        let ask = |a: &Authority, peer: &str| {
+            let r = a.device_authorization(FORM, b"client_id=cli", Some(peer.parse().unwrap()));
+            assert_eq!(r.status, 200, "{r:?}");
+        };
+        for n in 0..PENDING_GLOBAL / PENDING_PER_NETWORK {
+            for s in 0..PENDING_PER_NETWORK / PENDING_PER_SOURCE {
+                for _ in 0..PENDING_PER_SOURCE {
+                    ask(&auth, &format!("2001:db8:{n:x}:{s:x}::1"));
+                }
+            }
+        }
+        // A newcomer is overtaken by another right after it reads the time —
+        // when it reads it where another request can still run.
+        let overtaken = Arc::new(AtomicBool::new(false));
+        preempt.arm({
+            let auth = Arc::clone(&auth);
+            let overtaken = Arc::clone(&overtaken);
+            move || {
+                let free = auth.device().unwrap().pending.try_lock().is_ok();
+                if free {
+                    ask(&auth, "203.0.113.9");
+                    overtaken.store(true, Ordering::SeqCst);
+                }
+            }
+        });
+        ask(&auth, "198.51.100.7");
+        if !overtaken.load(Ordering::SeqCst) {
+            ask(&auth, "203.0.113.9");
+        }
+        assert_eq!(auth.device().unwrap().pending().len(), PENDING_GLOBAL);
     }
 
     #[test]
@@ -3331,6 +3423,58 @@ mod tests {
         );
         f.advance(LAUNCH_REQUEST_TTL);
         assert_eq!(f.slot.waiting(), 0, "nor expired ones");
+    }
+
+    /// The bound holds however two tabs' requests interleave. One that read
+    /// the time and was then overtaken by another — which displaced the
+    /// oldest waiting request — must not judge the table by its older time:
+    /// the displaced request would look live there, give way a second time in
+    /// place of a live one, and one tab past the bound would wait (the e2e
+    /// flood once read `[16 more waiting]`). The time is read under the
+    /// table's lock, so nothing can overtake it.
+    #[test]
+    fn the_request_bound_holds_when_a_request_is_overtaken() {
+        let preempt = Preempt::default();
+        let slot = Arc::new(LaunchSlot::with(Some(UI), preempt.clock(), os_mint()).unwrap());
+        let authority = |slot: &Arc<LaunchSlot>| {
+            Authority::new(
+                None,
+                Some(Arc::clone(slot)),
+                Arc::new(Sessions::new(system_clock())),
+            )
+        };
+        let ask = |a: &Authority| {
+            let r = a.launch_authorization(
+                FORM,
+                b"client_id=agentd-ui",
+                Some(LOCAL.parse().unwrap()),
+                Some(UI),
+            );
+            assert_eq!(r.status, 200, "{r:?}");
+        };
+        let auth = authority(&slot);
+        for _ in 0..LAUNCH_PENDING_MAX {
+            ask(&auth);
+        }
+        // A request is overtaken by another right after it reads the time —
+        // when it reads it where another request can still run.
+        let overtaken = Arc::new(AtomicBool::new(false));
+        preempt.arm({
+            let slot = Arc::clone(&slot);
+            let overtaken = Arc::clone(&overtaken);
+            move || {
+                let free = slot.table.try_lock().is_ok();
+                if free {
+                    ask(&authority(&slot));
+                    overtaken.store(true, Ordering::SeqCst);
+                }
+            }
+        });
+        ask(&auth);
+        if !overtaken.load(Ordering::SeqCst) {
+            ask(&auth);
+        }
+        assert_eq!(slot.waiting(), LAUNCH_PENDING_MAX);
     }
 
     /// A code or a request presented from off the host is refused, and the

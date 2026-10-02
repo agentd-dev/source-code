@@ -313,7 +313,6 @@ workflows:
         server: drive_docs
         uri: "drive://hiring/candidates.xlsx"
         debounce_ms: 4000
-        coalesce: true
 
       rows:
         kind: mcp.tool

@@ -649,9 +649,6 @@
         "fields": [
           "cron",
           "every",
-          "tz",
-          "jitter",
-          "catch_up",
           "at",
           "inputs"
         ],
@@ -687,7 +684,6 @@
         "fields": [
           "name",
           "filter",
-          "deliver",
           "inputs"
         ],
         "implemented": true,
@@ -769,10 +765,7 @@
           "server",
           "uri",
           "debounce_ms",
-          "coalesce",
           "filter",
-          "deliver",
-          "on_no_listener",
           "window",
           "inputs"
         ],

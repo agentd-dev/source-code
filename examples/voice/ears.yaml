@@ -126,7 +126,6 @@ workflows:
         uri: "mic://utterance/latest"
         # A stutter, a false wake, and the real sentence are one utterance.
         debounce_ms: 350
-        coalesce: true
         # The CEL variable is `content` — the parsed resource body.
         filter: "content.confidence > 0.55 && content.text != ''"
         # The last six utterances, oldest→newest, delivered as `output.window`.
@@ -384,11 +383,12 @@ workflows:
   # pipeline; WHEN it listens, how eagerly, and to which word are decisions that
   # live here, survive a restart, and land in the audit log. Two schedules
   # rather than one clever node: the config says what happens at seven and what
-  # happens at eleven, and neither can drift into the other.
+  # happens at eleven (UTC, as every `cron` is), and neither can drift into the
+  # other.
   - name: mic-arm
     description: Start listening in the morning.
     steps:
-      tick: { kind: schedule, cron: "0 7 * * *", tz: UTC }
+      tick: { kind: schedule, cron: "0 7 * * *" }
       arm:
         kind: mcp.tool
         depends_on: tick
@@ -400,7 +400,7 @@ workflows:
   - name: mic-disarm
     description: Stop listening at night.
     steps:
-      tick: { kind: schedule, cron: "0 23 * * *", tz: UTC }
+      tick: { kind: schedule, cron: "0 23 * * *" }
       disarm:
         kind: mcp.tool
         depends_on: tick

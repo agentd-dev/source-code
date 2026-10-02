@@ -125,7 +125,7 @@ pub const KINDS: &[KindInfo] = &[
     k(
         "schedule",
         true,
-        &["cron", "every", "tz", "jitter", "catch_up", "at", "inputs"],
+        &["cron", "every", "at", "inputs"],
         &[],
         true,
         false,
@@ -133,17 +133,7 @@ pub const KINDS: &[KindInfo] = &[
     k(
         "subscribe",
         true,
-        &[
-            "server",
-            "uri",
-            "debounce_ms",
-            "coalesce",
-            "filter",
-            "deliver",
-            "on_no_listener",
-            "window",
-            "inputs",
-        ],
+        &["server", "uri", "debounce_ms", "filter", "window", "inputs"],
         &["server", "uri"],
         true,
         false,
@@ -178,7 +168,7 @@ pub const KINDS: &[KindInfo] = &[
     k(
         "signal",
         true,
-        &["name", "filter", "deliver", "inputs"],
+        &["name", "filter", "inputs"],
         &["name"],
         true,
         false,
@@ -3321,6 +3311,53 @@ mod tests {
         // A step kind is not a start kind, however plausible it sounds.
         assert!(!is_long_lived_start("wait"));
         assert!(!is_long_lived_start("nonsense"));
+    }
+
+    /// The start fields that parsed and did nothing — `schedule.tz` most
+    /// dangerously, a cron the operator believed local running in UTC — are
+    /// not in the catalogue, so a document naming one meets the same refusal
+    /// as any misspelling: the error for each reads exactly as the error for a
+    /// made-up field does, with nothing that knows the name it once had.
+    #[test]
+    fn fields_nothing_reads_are_unknown_like_any_other() {
+        let refusal = |kind: &str, base: Value, field: &str| -> String {
+            let mut start = base;
+            start["kind"] = json!(kind);
+            start[field] = json!(true);
+            let e = wf(json!({"name": "w", "steps": {
+                "s": start,
+                "a": {"kind": "noop", "depends_on": ["s"]}
+            }}))
+            .unwrap_err();
+            let mut hits: Vec<String> = e
+                .into_iter()
+                .filter(|m| m.contains(&format!("{field:?}")))
+                .collect();
+            assert_eq!(hits.len(), 1, "{kind}.{field}: {hits:?}");
+            hits.remove(0)
+        };
+        for (kind, base, fields) in [
+            (
+                "schedule",
+                json!({"every": "1h"}),
+                &["tz", "jitter", "catch_up"][..],
+            ),
+            (
+                "subscribe",
+                json!({"server": "s", "uri": "x://y"}),
+                &["coalesce", "deliver", "on_no_listener"][..],
+            ),
+            ("signal", json!({"name": "go"}), &["deliver"][..]),
+        ] {
+            let generic = refusal(kind, base.clone(), "zz_made_up");
+            for field in fields {
+                assert_eq!(
+                    refusal(kind, base.clone(), field),
+                    generic.replace("zz_made_up", field),
+                    "{kind}.{field} is refused by the generic unknown-field check"
+                );
+            }
+        }
     }
 
     // Asserts a `when: CEL parse` diagnostic, so it needs the `cel` feature.

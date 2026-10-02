@@ -134,7 +134,7 @@ workflows:
   # ── Nightly regression sweep ──────────────────────────────────────────────
   - name: nightly-regression
     steps:
-      wake: { kind: schedule, cron: "43 2 * * *", tz: UTC }
+      wake: { kind: schedule, cron: "43 2 * * *" }
 
       sweep:
         kind: agent

@@ -266,7 +266,6 @@ workflows:
         server: home
         uri: "home://state/notable"
         debounce_ms: 2000
-        coalesce: true
         filter: "content.severity == 'notable'"
 
       phrase:

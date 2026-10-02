@@ -100,7 +100,7 @@ workflows:
   # ── 1+2. The weekly plan: research → draft → ONE approval → queue ─────────
   - name: weekly-plan
     steps:
-      wake: { kind: schedule, cron: "37 6 * * 1", tz: UTC }
+      wake: { kind: schedule, cron: "37 6 * * 1" }
 
       research:
         kind: agent
@@ -194,7 +194,7 @@ workflows:
   - name: daily-slot
     concurrency: { max_runs: 1 }
     steps:
-      wake: { kind: schedule, cron: "13 15 * * 1-5", tz: UTC }
+      wake: { kind: schedule, cron: "13 15 * * 1-5" }
 
       # `memory.shift` pops the queue head durably — a data step, not a
       # model turn asked to "remove the first element of this array".
@@ -228,7 +228,7 @@ workflows:
   - name: outreach
     concurrency: { max_runs: 10, on_overflow: queue }
     steps:
-      wake: { kind: schedule, cron: "29 8 * * 2", tz: UTC }
+      wake: { kind: schedule, cron: "29 8 * * 2" }
 
       pick:
         kind: agent

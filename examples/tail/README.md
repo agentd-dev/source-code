@@ -43,7 +43,7 @@ agentd's durable memory, so it survives a restart of *either* process.
 
 ```yaml
 changed:  { kind: subscribe, server: files, uri: "{{config.watch_uri}}",
-            debounce_ms: 500, coalesce: true }
+            debounce_ms: 500 }
 cursor:   { kind: memory.get, key: csv_offset }
 read:     { kind: mcp.tool, server: files, tool: read_since,
             args: { after: "{{ steps.cursor.output.value | 0 }}" } }

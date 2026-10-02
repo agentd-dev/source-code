@@ -325,7 +325,7 @@ from source with `cd interface && npm install && npm run build`.
   (`default < config file < env < flag`), limits, secrets, exit codes.
 - **[modes-and-triggers.md](modes-and-triggers.md)** — the lifecycle
   (`lifecycle.run_until`) and workflow start-node triggers as exit predicates,
-  reactive routing (exactly-one-owner, spawn-vs-continue, debounce/coalesce),
+  reactive routing (exactly-one-owner, spawn-vs-continue, debounce),
   self-subscribe, and `schedule`/cron.
 - **[architecture.md](architecture.md)** — how the supervisor, the reactor, the
   child loop and the durable store fit together.

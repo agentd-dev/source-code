@@ -84,7 +84,7 @@ workflows:
   # ── The morning standup ───────────────────────────────────────────────────
   - name: standup
     steps:
-      wake: { kind: schedule, cron: "51 7 * * 1-5", tz: UTC }
+      wake: { kind: schedule, cron: "51 7 * * 1-5" }
 
       ask:
         kind: foreach
@@ -138,7 +138,7 @@ workflows:
   # ── The weekly retro ──────────────────────────────────────────────────────
   - name: retro
     steps:
-      wake: { kind: schedule, cron: "39 16 * * 5", tz: UTC }
+      wake: { kind: schedule, cron: "39 16 * * 5" }
 
       ask:
         kind: foreach

@@ -324,11 +324,11 @@ per matching file and each file carries its own name (a path, or
 | `once` | armed at boot/restore, or `workflow.run` | `policy: ensure\|always` |
 | `manual` | `workflow.run` only | — |
 | `loop` | the previous run finished | `interval`, `delay`, `until`, `max_iterations`, `backoff` |
-| `schedule` | cron or interval | `cron` (5-field), `every`, `tz` (UTC default), `jitter`, `catch_up`, `at` (one-shot) |
-| `subscribe` | an MCP resource changed (notify-then-read) | **`server`**, **`uri`**, `debounce_ms`, `coalesce`, `filter`, `deliver`, `window` |
+| `schedule` | cron or interval | `cron` (5-field, UTC), `every`, `at` (one-shot) |
+| `subscribe` | an MCP resource changed (notify-then-read) | **`server`**, **`uri`**, `debounce_ms`, `filter`, `window` |
 | `stream` | an event lands on a declared durable stream | **`stream`**, `subject`, `filter`, `from`, `rate`, `batch` |
 | `correlate` | a correlated SET of stream events has arrived | **`stream`**, **`on`**, `by`, **`window`**, `on_incomplete`, `filter`, `max_pending` |
-| `signal` | a named signal arrives | **`name`**, `filter`, `deliver` |
+| `signal` | a named signal arrives | **`name`**, `filter` |
 | `event` | an internal event | **`on`**: `workflow.finished`, `workflow.failed`, `human.asked`, `human.answered`, `lifecycle.shutdown` (the complete set) |
 | `a2a` | a principal sends a message whose command matches | `command` (absent = any message), `roles`, `inputs` |
 | `webhook` | an inbound HTTP request | **`path`**, `methods`, `auth`, `idempotency`, `respond`, `parallelism` |

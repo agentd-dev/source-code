@@ -161,9 +161,9 @@ counts as satisfied, so a step depending on any of them still runs.
 | `once` | `policy`, `inputs` |
 | `manual` | `inputs` |
 | `loop` | `interval`, `delay`, `until`, `max_iterations`, `backoff`, `inputs` |
-| `schedule` | `cron`, `every`, `tz`, `jitter`, `catch_up`, `at`, `inputs` |
-| `subscribe` | **`server`**, **`uri`**, `debounce_ms`, `coalesce`, `filter`, `deliver`, `on_no_listener`, `window`, `inputs` |
-| `signal` | **`name`**, `filter`, `deliver`, `inputs` |
+| `schedule` | `cron`, `every`, `at`, `inputs` |
+| `subscribe` | **`server`**, **`uri`**, `debounce_ms`, `filter`, `window`, `inputs` |
+| `signal` | **`name`**, `filter`, `inputs` |
 | `event` | **`on`**, `filter`, `inputs` |
 | `stream` | **`stream`**, `subject`, `filter`, `from`, `rate`, `batch`, `inputs` |
 | `correlate` | **`stream`**, **`on`**, `by`, `window`, `on_incomplete`, `filter`, `max_pending`, `inputs` |
@@ -180,9 +180,8 @@ Behaviour the field names do not give away:
   `{outcome: {ok, output}, last}`; a failed run waits `backoff.initial` instead
   of `interval`.
 - `schedule` computes the next occurrence from *now*, so missed occurrences are
-  skipped, never replayed. `at` is a delay, not a wall-clock time. `cron` needs
-  the `cron` build feature. `tz`, `jitter` and `catch_up` parse but nothing
-  reads them.
+  skipped, never replayed. `at` is a delay, not a wall-clock time. `cron` is
+  read in UTC and needs the `cron` build feature.
 - `subscribe` is notify-then-read: an MCP resource update makes it re-read the
   resource and apply the CEL `filter` over `content`. `debounce_ms` keeps the
   newest payload and fires when the window closes. `window: {samples: N}`
@@ -452,7 +451,7 @@ variable named after the step id when `writes` is absent. `mode` is
 | `finish` | `status`, `output`, `reason` |
 | `fail` | `message`, `code` |
 | `assert` | **`condition`**, `message` |
-| `emit` | `stream` + `subject` (together), `data`, `correlation`, `note`, `audit`, `metric`, `value` |
+| `emit` | `stream` + `subject` (together), `data`, `correlation`, `forward`, `note`, `audit`, `value` |
 | `noop` (no fields) / `checkpoint` | `name` |
 
 `finish` closes the run: it maps `status` to `completed`, `refused` or

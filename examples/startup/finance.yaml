@@ -297,7 +297,7 @@ workflows:
   # events booked while this workflow did not exist yet.
   - name: monthly-close
     steps:
-      wake: { kind: schedule, cron: "17 6 1 * *", tz: UTC }
+      wake: { kind: schedule, cron: "17 6 1 * *" }
       report:
         kind: agent
         depends_on: wake

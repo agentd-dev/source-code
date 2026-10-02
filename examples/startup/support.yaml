@@ -254,7 +254,7 @@ workflows:
   # who looks unhappy. Sales decides what to do about it.
   - name: churn-watch
     steps:
-      wake: { kind: schedule, cron: "23 9 * * 1", tz: UTC }
+      wake: { kind: schedule, cron: "23 9 * * 1" }
       review:
         kind: agent
         depends_on: wake

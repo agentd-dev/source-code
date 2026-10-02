@@ -131,7 +131,7 @@ that an `agent` step takes `instruction` (a `prompt` belongs to `think`) and a
 $ agentd -c release.yaml --validate-config      # two guessed field names
 {"event":"config.invalid","msg":"workflow \"release\" step \"draft\": unknown field \"prompt\" for kind \"agent\" (allowed: instruction, output_contract, output_schema, tools, servers, limits, context, skills, system, model)"}
 {"event":"config.invalid","msg":"workflow \"release\" step \"draft\": kind \"agent\" requires field \"instruction\""}
-{"event":"config.invalid","msg":"workflow \"release\" step \"start\": unknown field \"debounce\" for kind \"subscribe\" (allowed: server, uri, debounce_ms, coalesce, filter, deliver, on_no_listener, window, inputs)"}
+{"event":"config.invalid","msg":"workflow \"release\" step \"start\": unknown field \"debounce\" for kind \"subscribe\" (allowed: server, uri, debounce_ms, filter, window, inputs)"}
 ```
 
 Structure is checked too: a workflow needs a start node and a `finish` step,

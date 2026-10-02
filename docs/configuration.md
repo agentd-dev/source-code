@@ -1035,9 +1035,9 @@ long-lived **daemon**, and what wakes it:
 | `once` | once, at startup (unless a live run was restored) | `policy` |
 | `manual` | only when explicitly triggered (`workflow.run`, or an A2A `workflow.run` command) | — |
 | `loop` | repeatedly, on an interval, until a condition | `interval`, `delay`, `until`, `max_iterations`, `backoff` |
-| `schedule` | on a clock | `cron: "0 2 * * *"` (needs `--features cron`), or `every: 1h`, or `at: "02:00Z"`; plus `tz`, `jitter`, `catch_up` |
-| `subscribe` | when an MCP **resource** updates | `server`, `uri` (both required), `debounce_ms`, `coalesce`, `filter`, `deliver`, `on_no_listener`, `window` |
-| `signal` | when a named signal arrives | `name` (required), `filter`, `deliver` |
+| `schedule` | on a clock | `cron: "0 2 * * *"` (needs `--features cron`), or `every: 1h`, or `at: "02:00Z"` |
+| `subscribe` | when an MCP **resource** updates | `server`, `uri` (both required), `debounce_ms`, `filter`, `window` |
+| `signal` | when a named signal arrives | `name` (required), `filter` |
 | `event` | on a runtime event | `on` (required — the event name as the runtime spells it, e.g. `workflow.finished`), `filter` |
 | `stream` | on each event of a declared stream | `stream` (required), `subject` (exact or `prefix.*`), `filter`, `from` (`new` \| `earliest`) |
 | `correlate` | when a **set** of related stream events has arrived — a join over events, not steps | `stream`, `on` (two or more subject patterns) and `window` (all required), `by`, `on_incomplete`, `filter`, `max_pending` |

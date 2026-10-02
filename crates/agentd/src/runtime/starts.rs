@@ -2,8 +2,8 @@
 //! **Start nodes** are a workflow's triggers: beyond `once`
 //! and `manual`, the long-lived start kinds fire runs while the instance lives
 //! — `loop` (re-run on completion, `interval`/`until`/`max_iterations`/
-//! `backoff`), `schedule` (cron / `every`, `catch_up`), `subscribe` (an MCP
-//! resource update, notify-then-read, `debounce`/`coalesce`/`filter`/`window`),
+//! `backoff`), `schedule` (cron / `every` / `at`), `subscribe` (an MCP
+//! resource update, notify-then-read, `debounce_ms`/`filter`/`window`),
 //! `signal` (a named signal), `event` (an internal lifecycle event), and `a2a`
 //! (a principal's message routed here). A `subscribe` start has no `claim` or
 //! `shard`: agentd holds no lease and partitions no work — exactly-one-owner
@@ -373,7 +373,7 @@ impl Runtime {
                             json!({"scheduled_for": next}),
                             "schedule",
                         );
-                        // Arm the following occurrence (catch_up: one — fire once, skip missed).
+                        // Arm the following occurrence (fire once, skip missed).
                         let following = self.next_schedule_ms(&spec, now, at_fired);
                         let mut st = self.start_state(&workflow, &node);
                         match following {
@@ -442,9 +442,8 @@ impl Runtime {
         }
     }
 
-    /// A `loop`/`schedule`/`subscribe` start fires: `deliver: run` (default)
-    /// accepts a durable start event; `deliver: wait` would resolve a `wait`
-    /// step (P4b). Applies the per-start `inputs` mapping.
+    /// A `loop`/`schedule`/`subscribe` start fires: accepts a durable start
+    /// event, applying the per-start `inputs` mapping.
     pub(crate) fn fire_start(
         &mut self,
         workflow: &str,
@@ -755,7 +754,7 @@ impl Runtime {
         self.set_start_state(workflow, node, st);
     }
 
-    /// A subscribed resource updated: debounce/coalesce/filter, then fire a run.
+    /// A subscribed resource updated: debounce/filter, then fire a run.
     pub(crate) fn on_subscribe_resource(&mut self, server: &str, uri: &str) {
         let matches: Vec<(String, String, Map<String, Value>)> = self
             .workflows

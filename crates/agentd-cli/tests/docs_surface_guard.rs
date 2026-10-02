@@ -15,12 +15,15 @@
 //!   file agentd.dev serves under one;
 //! - the launcher's section of the interface page names every flag and
 //!   override variable of [`LAUNCH_CONTRACT`] and the grant its clients sign
-//!   in with.
+//!   in with;
+//! - a node table lists, for each kind, only fields the node catalogue gives
+//!   that kind.
 //!
 //! The check is positive: it asks whether a name is one agentd serves, never
 //! whether it is on a list of names that went away. History — `CHANGELOG.md`,
 //! `rfcs/`, `docs/design/` — is not scanned; it records what was.
 
+use agentd::engine::model::kind_info;
 use agentd::runtime::surface::launch::{LAUNCH_CONTRACT, LAUNCH_GRANT_TYPE};
 use agentd::runtime::surface::{EXTENSION_METHODS, Ext, SpecMethod, UNIX_BINDING};
 use std::path::{Path, PathBuf};
@@ -479,6 +482,126 @@ fn says_launcher_gone(line: &str) -> bool {
             .any(|claim| lower.contains(claim))
 }
 
+// ---- node fields ------------------------------------------------------------
+
+/// The cells of a markdown table row, or `None` when the line is not one. An
+/// escaped `\|` (a value list such as `ensure\|always`) stays in its cell.
+fn table_cells(line: &str) -> Option<Vec<String>> {
+    let row = line.trim().strip_prefix('|')?.strip_suffix('|')?;
+    let mut cells = vec![String::new()];
+    let mut escaped = false;
+    for c in row.chars() {
+        if c == '|' && !escaped {
+            cells.push(String::new());
+        } else {
+            cells.last_mut().unwrap().push(c);
+        }
+        escaped = c == '\\';
+    }
+    Some(cells.into_iter().map(|c| c.trim().to_string()).collect())
+}
+
+/// The field names a node-table cell lists: each backticked name, read up to a
+/// `:` (`policy: ensure` names `policy`). Parentheses hold values and asides —
+/// `from` (`new` \| `earliest`), (needs `--features cron`) — not fields, so
+/// they are dropped first; and what is not a bare snake_case name, such as
+/// `workflow.finished`, is a value too.
+fn listed_fields(cell: &str) -> Vec<String> {
+    let mut outside = String::new();
+    let (mut depth, mut in_tick) = (0usize, false);
+    for c in cell.chars() {
+        match c {
+            '`' => in_tick = !in_tick,
+            '(' if !in_tick => depth += 1,
+            ')' if !in_tick && depth > 0 => {
+                depth -= 1;
+                continue;
+            }
+            _ => {}
+        }
+        if depth == 0 {
+            outside.push(c);
+        }
+    }
+    outside
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .map(|t| t.split(':').next().unwrap_or("").trim().to_string())
+        .filter(|t| {
+            t.starts_with(|c: char| c.is_ascii_lowercase())
+                && t.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        })
+        .collect()
+}
+
+/// A node table — one whose first column is a kind — lists, in its field
+/// columns, only fields the catalogue gives that kind. The catalogue
+/// ([`KINDS`](agentd::engine::model::KINDS)) is what the loader accepts, so a field a page offers and the
+/// catalogue lacks is one a reader copies into a document the loader then
+/// refuses; and a field the catalogue kept only for a page to describe is one
+/// that parses and does nothing. Prose outside a node table is not read.
+#[test]
+fn node_tables_name_only_fields_the_kind_accepts() {
+    let mut found = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut rows = 0;
+    // The header of the table the previous line belongs to, if any.
+    let mut header: Option<(String, Vec<String>)> = None;
+    for (file, n, line) in scanned_lines() {
+        let Some(cells) = table_cells(&line) else {
+            header = None;
+            continue;
+        };
+        let Some((_, head)) = header.as_ref().filter(|(f, _)| *f == file) else {
+            header = Some((file, cells));
+            continue;
+        };
+        if !head[0].to_lowercase().contains("kind") {
+            continue;
+        }
+        let Some(info) = cells[0]
+            .strip_prefix('`')
+            .and_then(|c| c.strip_suffix('`'))
+            .and_then(kind_info)
+        else {
+            continue;
+        };
+        rows += 1;
+        seen.insert(file.clone());
+        for (title, cell) in head.iter().zip(&cells).skip(1) {
+            let title = title.to_lowercase();
+            if !["field", "required", "option"]
+                .iter()
+                .any(|w| title.contains(w))
+            {
+                continue;
+            }
+            for f in listed_fields(cell) {
+                if !info.fields.contains(&f.as_str()) {
+                    found.push(format!(
+                        "{file}:{n}: `{}` has no field `{f}` (it takes: {})",
+                        info.name,
+                        info.fields.join(", ")
+                    ));
+                }
+            }
+        }
+    }
+    // The scan must reach the catalogue's own pages, or it proves nothing.
+    for page in [
+        "docs/node-registry.md",
+        "docs/workflows.md",
+        "docs/configuration.md",
+        "web/public/llms.txt",
+    ] {
+        assert!(seen.contains(page), "no node table read in {page}");
+    }
+    assert!(rows > 100, "only {rows} node-table rows read");
+    assert!(found.is_empty(), "{}", found.join("\n"));
+}
+
 /// The matchers themselves: each shape is caught, and what merely resembles
 /// one is not.
 #[test]
@@ -577,4 +700,31 @@ fn the_matchers_find_each_shape_and_nothing_else() {
         slugify(" Fullscreen (default) vs `--inline`"),
         "fullscreen-default-vs---inline"
     );
+
+    assert_eq!(
+        table_cells("| `once` | `policy: ensure\\|always` |").unwrap(),
+        ["`once`", "`policy: ensure\\|always`"]
+    );
+    assert_eq!(table_cells("`once` | not a row"), None);
+    for (cell, want) in [
+        (
+            "**`server`**, **`uri`**, `debounce_ms`, `filter`",
+            &["server", "uri", "debounce_ms", "filter"][..],
+        ),
+        (
+            "`cron: \"0 2 * * *\"` (needs `--features cron`), or `every: 1h`",
+            &["cron", "every"][..],
+        ),
+        (
+            "`stream` (required), `from` (`new` \\| `earliest`)",
+            &["stream", "from"][..],
+        ),
+        ("**`on`**: `workflow.finished`, `human.asked`", &["on"][..]),
+        (
+            "`cron` `every` `at` `inputs`",
+            &["cron", "every", "at", "inputs"][..],
+        ),
+    ] {
+        assert_eq!(listed_fields(cell), want, "in {cell}");
+    }
 }

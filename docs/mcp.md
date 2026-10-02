@@ -238,9 +238,9 @@ content. So agentd does **notify-then-read**: on wake it issues a fresh
 1. It's two round-trips, and the read can race a subsequent update. agentd's
    contract is **at-least-once delivery + convergence by re-reading current
    state** — redelivery is harmless because you always act on what the resource
-   *is now*, not on a stale diff. (Debounce, coalescing and filtering of these
-   wakes are options on the `subscribe` start node — `debounce_ms`, `coalesce`,
-   `filter`; see [workflows.md](workflows.md).)
+   *is now*, not on a stale diff. (Debouncing and filtering of these wakes are
+   options on the `subscribe` start node — `debounce_ms` and `filter`; see
+   [workflows.md](workflows.md).)
 2. Subscriptions are (re-)armed whenever the workflow that owns them is armed —
    at startup, and again after a config reload — so a restart restores every
    watched URI — the starts', the suspended `wait {on: resource}` steps' and

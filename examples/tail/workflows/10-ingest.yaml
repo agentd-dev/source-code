@@ -17,7 +17,6 @@ steps:
     server: files
     uri: "{{config.watch_uri}}"
     debounce_ms: 500          # a burst of appends is one firing
-    coalesce: true
 
   # The durable cursor. `| 0` matters: on the very first run the key does not
   # exist, and a template path with no value and no default is a step failure.

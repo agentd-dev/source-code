@@ -466,7 +466,31 @@ impl Runtime {
         kind: &str,
         run_id: Option<&str>,
     ) -> Admission {
-        self.admit_start(workflow, node, spec, payload, kind, run_id, None)
+        self.admit_start(workflow, node, spec, payload, kind, run_id, None, None)
+    }
+
+    /// Like [`Runtime::fire_start`], for a firing that hands the run text
+    /// another run, child or peer carried (a signal): the start records it,
+    /// and the run carries it (`withhold`).
+    pub(crate) fn fire_start_carrying(
+        &mut self,
+        workflow: &str,
+        node: &str,
+        spec: &Map<String, Value>,
+        payload: Value,
+        kind: &str,
+        carries: &super::withhold::Carries,
+    ) -> Admission {
+        self.admit_start(
+            workflow,
+            node,
+            spec,
+            payload,
+            kind,
+            None,
+            None,
+            Some(carries),
+        )
     }
 
     /// A durable stream consumer (`stream`, its `batch`, `correlate`) offers
@@ -487,7 +511,16 @@ impl Runtime {
         kind: &str,
         origin: Value,
     ) -> Admission {
-        self.admit_start(workflow, node, spec, payload, kind, None, Some(origin))
+        self.admit_start(
+            workflow,
+            node,
+            spec,
+            payload,
+            kind,
+            None,
+            Some(origin),
+            None,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -500,6 +533,7 @@ impl Runtime {
         kind: &str,
         run_id: Option<&str>,
         origin: Option<Value>,
+        carries: Option<&super::withhold::Carries>,
     ) -> Admission {
         // Every line about this firing carries the same identity, plus the
         // stream position when a consumer is offering an event.
@@ -599,6 +633,11 @@ impl Runtime {
         }
         if let Some(rid) = run_id {
             ev["run_id"] = json!(rid);
+        }
+        // Beside the trigger payload, never inside it: a payload is whatever
+        // the caller sent, and must not be able to say what the run carries.
+        if let Some(c) = carries.filter(|c| !c.is_empty()) {
+            ev["carries"] = json!(c);
         }
         // A trigger firing is work done on SOMEBODY's behalf, even when nobody
         // typed anything: a schedule, a webhook, a stream. Passing no principal
@@ -890,6 +929,7 @@ impl Runtime {
         payload: &Value,
         _broadcast: bool,
         sender: &super::waits::SignalSender,
+        carries: &super::withhold::Carries,
     ) -> u64 {
         let (by, may_start) = match sender {
             super::waits::SignalSender::Runtime => (None, None),
@@ -931,7 +971,7 @@ impl Runtime {
             if let Some(id) = &by {
                 trigger["principal"] = json!(id);
             }
-            self.fire_start(&workflow, &node, &spec, trigger, "signal");
+            self.fire_start_carrying(&workflow, &node, &spec, trigger, "signal", carries);
             fired += 1;
         }
         fired

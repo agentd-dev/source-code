@@ -1052,12 +1052,15 @@ impl crate::runtime::reactor::Runtime {
         if let Some((signal, path)) = callback {
             self.webhook_callbacks.lock().unwrap().remove(&path);
             // An operator-configured route: the runtime is the sender.
+            // What the caller posted, the waiting run's own definition
+            // carries already (`wait {on: webhook}`, `config::taint`).
             let delivered = self.deliver_signal(
                 &signal,
                 payload,
                 None,
                 None,
                 &super::waits::SignalSender::Runtime,
+                &Default::default(),
             );
             self.log.info(
                 "webhook.callback",
@@ -1277,12 +1280,15 @@ impl crate::runtime::reactor::Runtime {
             .unwrap_or_default();
         match crate::engine::template::render_str(tpl, &data) {
             Ok(Value::String(name)) if !name.is_empty() => {
+                // A relayed signal's receivers carry the route already
+                // (`config::taint`), from their own definitions.
                 let resumed = self.deliver_signal(
                     &name,
                     payload,
                     None,
                     None,
                     &super::waits::SignalSender::Runtime,
+                    &Default::default(),
                 );
                 self.log.info(
                     "webhook.signal",

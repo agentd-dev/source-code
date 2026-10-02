@@ -247,7 +247,7 @@ whose reply can carry a result to it):
 - a sync workflow tool's reply, and `workflow.run` with `wait: true`;
 - `workflow.wait`, the `workflow.wait` step and `wait {on: run}`;
 - `workflow.status`, whose runs carry their `output` and `error` (and, by run id, their
-  step outputs and variables);
+  step outputs and variables), and `status`, whose run list carries every run's;
 - a `workflow` step that is not `detached`, and a `join`, which hands back each handle's
   output — a run's or a child's;
 - a child read back by handle: `subagent.status`, `subagent.await`, `wait {on: subagent}`,
@@ -258,29 +258,58 @@ whose reply can carry a result to it):
 - the notes a finished run (`agent.on_workflow_finished`) and a child's result
   (`subagent_result` in `agent.wake_on`, which also notes every turn of a warm child) leave
   in the root transcript. Both are opt-in: `on_workflow_finished` defaults to `ignore`, and
-  `subagent_result` is not in the default `wake_on`.
+  `subagent_result` is not in the default `wake_on`;
+- the note an `emit` step without a `stream:` writes into the root transcript, which is
+  rendered from the run's own data.
 
 Who holds both legs is worked out with the reach the load-time check judges by
-(`config/taint.rs::Withholding`, derived with the registry on every workflow change): a
-conversation by everything the root grant reaches; a run by what its model-driven steps
-reach and what everything it hands its text on to reaches — the runs it starts or signals,
-the runs consuming a stream it emits onto; a flat child by its template's servers and tools,
-or, freeform, every server. A run carries outside input when its definition can be handed
-some (the taint above), when an A2A peer's own request started it, or when a run that
-carries it started it; a child carries what the run or child that spawned it carried —
-and, when a policy rule routes a read-back contract up to it and it holds a leg less, any
-run's. A result is withheld only for text the reader was not handed already: each run
-records where its outside text entered (an outside caller's route, or a mirrored stream),
-so a route's own run reading back a child it started reads nothing new. The telemetry taps
-are not read-backs: a stream the daemon's events are tapped onto
-(`observability.runtime_events`, an audit `sink: [stream]`) is fed by every run, and its
-consumers are judged as any consumer is.
+(`config/taint.rs::Withholding`, derived with the registry on every workflow change), and
+each context is judged by what it can hand the text on to, not only by its own servers: a
+conversation by everything the root grant reaches, every run it can start and every child
+one of them can spawn (a `subagent` step spawns one whatever `tools.disabled` says of the
+root's own `subagent.run`); a run by what its model-driven steps reach and what everything
+it hands its text on to reaches — the runs it starts or signals, the runs consuming a stream
+it emits onto; a flat child by its template's servers and tools, or, freeform, every server.
+A child of a template the settings no longer hold, an instance child and a run of a
+workflow the set does not hold are taken to hold both.
+
+What a run or a child carries is recorded on its own durable record (`RunState::carries`,
+the subagent record's `carries`) as text reaches it, and only ever added to:
+
+- a run, when it starts: what its definition can be handed (the taint above), what an A2A
+  peer's own request handed it (`workflow.run` over A2A by an `agent` principal), and what
+  the run, child or peer that started it carried — a `workflow` step, the `workflow.run`
+  tool and a workflow tool alike;
+- a run, when a signal or an A2A message reaches it: what the sender carried — a
+  `workflow.signal` step or tool, a peer's own `workflow.signal`, a peer's message to a
+  `wait {on: message}` — and a `signal` start records the same on the run it starts;
+- a run, when it ends: what its definition can be handed by then, before the definition
+  can be released;
+- a child, when it is spawned: what its spawner carried; and when `subagent.send` steers
+  it (the tool, a `tool` step, or the A2A op): what the sender carried;
+- a run or a child that holds a leg less, when it is handed a result whole: what that
+  result carried.
+
+A read is judged by those records, together with what the definition's entry in the table
+says now, which can only add — never by what happens to be installed or on record when the
+result is read. So a definition that is deleted or replaced, a spawner's run that is
+evicted, a restart, and a peer the process has not heard from since all leave a result as
+withheld as it was; a run or a child with no record left is taken to carry text from an
+origin no reader holds. A result is withheld only for text the reader was not handed
+already: each record names where its outside text entered (an outside caller's route, a
+mirrored stream, an A2A peer), so a route's own run reading back a child it started reads
+nothing new. The telemetry taps are not read-backs: a stream the daemon's events are tapped
+onto (`observability.runtime_events`, an audit `sink: [stream]`) is fed by every run, and
+its consumers are judged as any consumer is.
 
 A context that holds a leg less is handed the text whole, as before — and then carries it:
 its own result is withheld in turn from a reader holding both, and what it starts or feeds
 is judged as a run that read a tainted stream would be. So a read-back is never refused at
 load: a reader holding both legs is withheld from, and one holding a leg less can hand the
-text only to what its own reach covers. An operator reading a run over A2A — the
+text only to what its own reach covers. One gap: what a run that only the runtime knows to
+carry outside input — one an A2A peer's request started — puts on a stream with `emit` is
+not carried to the stream's consumers; the static check follows a run's `emit` only for
+the taint it can see in the definitions. An operator reading a run over A2A — the
 `workflow.status` op, the run's task — is no model's context, and reads it whole.
 `security.allow_trifecta` lifts the withholding with every other trifecta gate.
 

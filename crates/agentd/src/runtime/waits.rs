@@ -194,12 +194,14 @@ impl Runtime {
                 let target_run = spec.get("run").and_then(Value::as_str).map(str::to_string);
                 // A workflow's own step signals as the runtime: the operator
                 // wrote it, whoever the run happens to be working for.
+                let carries = self.run_carries(run_id);
                 let delivered = self.deliver_signal(
                     &name,
                     payload,
                     target_run.as_deref(),
                     Some(run_id),
                     &SignalSender::Runtime,
+                    &carries,
                 );
                 self.finish_step_pub(
                     run_id,
@@ -1099,9 +1101,18 @@ impl Runtime {
                 }
             }
         }
+        // A peer agent's message is another agent's output: the run it wakes
+        // carries it (`withhold`), decided now, while who sent it is known.
+        let carries = match &sender {
+            Some(p) if p.role == crate::config::settings::Role::Agent => {
+                super::withhold::peer_carries(&p.id, "handed a message")
+            }
+            _ => Default::default(),
+        };
         let mut delivered = 0u64;
         for (rid, sid) in hits {
             delivered += 1;
+            self.hand_run(&rid, &carries);
             self.finish_step_pub(
                 &rid,
                 &sid,
@@ -1148,6 +1159,7 @@ impl Runtime {
         target_run: Option<&str>,
         from_run: Option<&str>,
         sender: &SignalSender,
+        carries: &super::withhold::Carries,
     ) -> u64 {
         let mut delivered = 0u64;
         let mut hits: Vec<(String, String)> = Vec::new();
@@ -1172,6 +1184,9 @@ impl Runtime {
         }
         for (rid, sid) in hits {
             delivered += 1;
+            // The payload is the sender's text: the run carries what the
+            // sender did (`withhold`).
+            self.hand_run(&rid, carries);
             self.finish_step_pub(
                 &rid,
                 &sid,
@@ -1192,7 +1207,7 @@ impl Runtime {
             }
         }
         // Signal start nodes.
-        delivered += self.fire_signal_starts(name, &payload, target_run.is_none(), sender);
+        delivered += self.fire_signal_starts(name, &payload, target_run.is_none(), sender, carries);
         // When this signal is the configured `lifecycle.until_signal` it is the
         // retirement trigger: stop admitting, drain live runs, exit cleanly.
         // Delivery to whatever was parked on the signal happens first (above),
@@ -1425,7 +1440,7 @@ impl Runtime {
             }
         };
         let cascade = spec.get("cascade").and_then(Value::as_bool).unwrap_or(true);
-        let payload = json!({"workflow": name, "node": start_node, "payload": {"requested_by": caller.label_pub()}, "inputs": inputs, "parent": {"run": run_id, "step": step_id, "cascade": cascade}, "conversation": self.runs.get(run_id).and_then(|r| r.conversation.clone()), "task": self.runs.get(run_id).and_then(|r| r.task.clone()), "msg_depth": self.runs.get(run_id).map(|r| r.msg_depth).unwrap_or(0)});
+        let payload = json!({"workflow": name, "node": start_node, "payload": {"requested_by": caller.label_pub()}, "inputs": inputs, "parent": {"run": run_id, "step": step_id, "cascade": cascade}, "conversation": self.runs.get(run_id).and_then(|r| r.conversation.clone()), "task": self.runs.get(run_id).and_then(|r| r.task.clone()), "msg_depth": self.runs.get(run_id).map(|r| r.msg_depth).unwrap_or(0), "carries": self.run_carries(run_id)});
         match self.accept_event(
             kinds::WORKFLOW_RUN,
             self.runs.get(run_id).and_then(|r| r.principal.clone()),

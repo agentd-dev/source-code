@@ -210,6 +210,8 @@ impl Runtime {
                 json!({"caller": caller.node.map(|n| n.0), "ctx": caller.ctx, "run": caller.run, "step": caller.step, "subagent": caller.subagent, "depth": 0}),
             ),
             principal: caller.principal.clone(),
+            // What the caller carries, the child is handed (`withhold`).
+            carries: self.caller_carries(caller),
             tokens: 0,
             created: now_ms(),
             updated: now_ms(),

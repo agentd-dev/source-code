@@ -13,7 +13,7 @@ use super::template::{self, Data};
 use crate::state::now_ms;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -137,6 +137,55 @@ impl RunStatus {
     }
 }
 
+/// Where the outside text a run or a child carries entered, and the first
+/// reason, as the marker that withholds its result names it
+/// (`runtime::withhold`).
+///
+/// Recorded on the run (and the child) itself, from what started it — its
+/// definition's taint, the A2A peer whose request it was, the run, child or
+/// conversation that started, spawned, signalled or steered it — and only
+/// ever added to. Worked out again at read time instead, it would be judged
+/// against whatever is installed then: a definition deleted or replaced, a
+/// spawner's record evicted, a restart that forgot which peer asked, and the
+/// result would go out whole. Durable for the same reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct Carries {
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub origins: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
+}
+
+impl Carries {
+    pub fn is_empty(&self) -> bool {
+        self.origins.is_empty()
+    }
+
+    /// Add `origins`; the reason is kept only from the first that brought
+    /// something new. Whether anything was new.
+    pub fn add(
+        &mut self,
+        origins: impl IntoIterator<Item = String>,
+        why: impl FnOnce() -> String,
+    ) -> bool {
+        let before = self.origins.len();
+        self.origins.extend(origins);
+        let grew = self.origins.len() > before;
+        if grew && self.why.is_none() {
+            self.why = Some(why());
+        }
+        grew
+    }
+
+    /// Add everything `other` carries. Whether anything was new.
+    pub fn union(&mut self, other: &Carries) -> bool {
+        let why = other.why.clone();
+        self.add(other.origins.iter().cloned(), || {
+            why.unwrap_or_else(|| "it may carry outside input".into())
+        })
+    }
+}
+
 /// How the run started: which start node fired, what payload it carried, and
 /// when. Visible to templates as `run.start`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -188,6 +237,9 @@ pub struct RunState {
     pub children: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<Value>,
+    /// Where the outside text this run carries entered ([`Carries`]).
+    #[serde(default, skip_serializing_if = "Carries::is_empty")]
+    pub carries: Carries,
     /// How many `message` hops caused this run, counted from the last trigger
     /// that was not itself a delivered message. A run started by a schedule,
     /// webhook or stream is depth 0; one started by an agent that a `message`
@@ -267,6 +319,7 @@ impl RunState {
             conversation: None,
             children: Vec::new(),
             parent: None,
+            carries: Carries::default(),
             msg_depth: 0,
             key: None,
             attempt: 1,

@@ -804,6 +804,20 @@ impl Runtime {
         );
         run.principal = ev.principal.clone();
         run.parent = ev.payload.get("parent").cloned().filter(|p| !p.is_null());
+        // What the run carries, on its own record from the start
+        // (`withhold`): what its definition can be handed, and what whoever
+        // started it handed it — an A2A peer, a run, a child, a conversation
+        // — which the start event recorded when it was accepted.
+        if let Some(t) = self.registry.withholding().run(&name) {
+            run.carries.add(t.origins.iter().cloned(), || t.why.clone());
+        }
+        if let Some(c) = ev
+            .payload
+            .get("carries")
+            .and_then(|c| serde_json::from_value::<super::withhold::Carries>(c.clone()).ok())
+        {
+            run.carries.union(&c);
+        }
         run.conversation = ev
             .payload
             .get("conversation")
@@ -1753,8 +1767,16 @@ impl Runtime {
                     return;
                 }
                 if let Some(n) = spec.get("note").and_then(Value::as_str) {
-                    let text = format!("run {run_id}: {n}");
-                    self.note_root(text);
+                    // The note is rendered from the run's own data, so it is
+                    // the run's text in the root transcript: a read-back,
+                    // withheld like the note a finished run leaves.
+                    let n = self.withhold_text(
+                        &super::withhold::Reader::Conversation,
+                        super::withhold::Source::Run(run_id),
+                        n.to_string(),
+                        "emit note",
+                    );
+                    self.note_root(format!("run {run_id}: {n}"));
                 }
                 if let Some(a) = spec.get("audit") {
                     self.log.info(
@@ -3232,6 +3254,12 @@ impl Runtime {
         crate::obs::metrics::record_run_status(status.as_str());
         self.log.info("run.done", json!({"run": run_id, "workflow": workflow, "status": status, "err": error, "output": if self.log.content_capture() { output.clone().unwrap_or(Value::Null) } else { Value::Null }}));
         self.governor.drop_scope(&format!("run:{run_id}"));
+        // What the table says the run carries now goes on its record before
+        // the sweep below can release the definition it ran under: the
+        // result outlives the definition, and the waiters below, the plan
+        // and every later read judge it by the record (`withhold`).
+        let carries = self.run_carries(run_id);
+        self.hand_run(run_id, &carries);
         self.retire_sweep();
         // Durable-pin GC for the ordinary path: when the LAST run of a
         // definition version lands, its stored pin has no reader left. (A
@@ -3516,7 +3544,9 @@ impl Runtime {
                     }
                     _ => Value::Null,
                 };
-                let payload = json!({"workflow": wname, "node": start, "payload": {"requested_by": caller.label_pub()}, "inputs": args.get("inputs").cloned().unwrap_or(json!({})), "request": request, "conversation": caller.ctx, "msg_depth": caller.msg_depth});
+                // The run is handed its caller's text, and so carries what the
+                // caller does (`withhold`) — a workflow tool's run included.
+                let payload = json!({"workflow": wname, "node": start, "payload": {"requested_by": caller.label_pub()}, "inputs": args.get("inputs").cloned().unwrap_or(json!({})), "request": request, "conversation": caller.ctx, "msg_depth": caller.msg_depth, "carries": self.caller_carries(caller)});
                 match self.accept_event(kinds::WORKFLOW_RUN, caller.principal.clone(), payload) {
                     Ok(_) => {
                         // Process it right away so the caller learns the run id.
@@ -3808,7 +3838,7 @@ impl Runtime {
             }
             "workflow.signal" => {
                 let sname = args["name"].as_str().unwrap_or("").to_string();
-                let _ = self.accept_event(kinds::SIGNAL, caller.principal.clone(), json!({"name": sname, "payload": args.get("payload").cloned().unwrap_or(Value::Null), "run": args.get("run"), "from": caller.label_pub()}));
+                let _ = self.accept_event(kinds::SIGNAL, caller.principal.clone(), json!({"name": sname, "payload": args.get("payload").cloned().unwrap_or(Value::Null), "run": args.get("run"), "from": caller.label_pub(), "carries": self.caller_carries(caller)}));
                 // The signal goes on the durable inbox; waits and `signal`
                 // start nodes are woken when the loop drains it, so no
                 // delivery count is available at this point.

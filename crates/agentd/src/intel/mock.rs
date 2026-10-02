@@ -36,7 +36,10 @@
 //! is the number of `role: tool` messages already in the transcript (clamped to
 //! the last turn). A turn carries `content` (final text) or `tool_calls`, an
 //! optional `usage`, and an optional `delay_ms`; `"echo_tool_result": true`
-//! answers with the content of the last tool result in the transcript.
+//! answers with the content of the last tool result in the transcript. A
+//! tool call's `arguments_from_tool_result` maps argument names to JSON
+//! pointers into the last tool result, so a call can name what an earlier
+//! one returned — a run id, a handle — that no script can know beforehand.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -332,7 +335,22 @@ fn playbook_response(playbook: &serde_json::Value, body: &str) -> String {
             .iter()
             .enumerate()
             .map(|(i, c)| {
-                let args = c.get("arguments").cloned().unwrap_or(serde_json::json!({}));
+                let mut args = c.get("arguments").cloned().unwrap_or(serde_json::json!({}));
+                if let Some(from) = c
+                    .get("arguments_from_tool_result")
+                    .and_then(serde_json::Value::as_object)
+                {
+                    let last: serde_json::Value =
+                        serde_json::from_str(&last_tool_result(body)).unwrap_or_default();
+                    for (name, pointer) in from {
+                        if let (Some(p), Some(o)) = (pointer.as_str(), args.as_object_mut()) {
+                            o.insert(
+                                name.clone(),
+                                last.pointer(p).cloned().unwrap_or(serde_json::Value::Null),
+                            );
+                        }
+                    }
+                }
                 let args = match args {
                     serde_json::Value::String(s) => s,
                     other => other.to_string(),
@@ -497,6 +515,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(m.text.as_deref(), Some(r#"{"intent":"status"}"#));
+    }
+
+    #[test]
+    fn a_call_names_what_the_last_tool_result_returned() {
+        let pb = serde_json::json!({"turns": [{"tool_calls": [{"name": "workflow.wait",
+            "arguments": {"timeout": "1s"}, "arguments_from_tool_result": {"run": "/run"}}]}]});
+        let body = r#"{"messages":[{"role":"tool","content":"{\"run\":\"w-01\",\"status\":\"running\"}"}]}"#;
+        let resp: serde_json::Value = serde_json::from_str(&playbook_response(&pb, body)).unwrap();
+        let args: serde_json::Value = serde_json::from_str(
+            resp["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(args, serde_json::json!({"run": "w-01", "timeout": "1s"}));
     }
 
     #[test]

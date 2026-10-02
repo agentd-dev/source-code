@@ -159,7 +159,9 @@ impl super::reactor::Runtime {
                 "workflow.unloaded",
                 json!({"workflow": wf.name, "hash": &wf.hash[..12.min(wf.hash.len())], "reason": reason, "live_runs": 0}),
             );
-            // Gone with nothing in flight: what it tainted goes with it.
+            // Gone with nothing in flight: the read-back contracts' tags
+            // lose what it tainted. Its finished runs keep what they carry
+            // on their own records (`withhold`).
             self.retag_workflow_tools();
             return;
         }
@@ -271,8 +273,10 @@ impl super::reactor::Runtime {
             self.pin_written.remove(hash);
         }
         self.retiring.retain(|hash, _| referenced.contains(hash));
-        // A released pin no longer has a run whose result a read-back could
-        // return, so the taint it kept in the read-back contracts goes.
+        // A released pin has no run left in flight, so the taint it kept in
+        // the read-back contracts' tags goes. Its finished runs stay readable
+        // and keep what they carry on their own records (`withhold`), which
+        // the run's terminal step wrote before this sweep.
         if !dropped.is_empty() {
             self.retag_workflow_tools();
         }

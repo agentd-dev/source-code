@@ -157,7 +157,8 @@ pub fn inputs_moved(old: &Settings, new: &Settings) -> bool {
 pub struct Withholding {
     /// Each workflow whose runs can carry outside text.
     runs: BTreeMap<String, Tainted>,
-    /// Whether a turn under the root grant holds both legs.
+    /// Whether a turn under the root grant holds both legs — itself, or
+    /// through what it hands its text on to.
     root: bool,
     /// The workflows whose text can reach both legs: their own model-driven
     /// steps, or what they hand the text on to.
@@ -167,6 +168,8 @@ pub struct Withholding {
     /// Each kind of flat child — by template, `None` for a freeform spawn —
     /// whose text can reach both legs.
     children: BTreeSet<Option<String>>,
+    /// Every flat template the settings hold.
+    templates: BTreeSet<String>,
     /// Each kind of flat child that holds a leg less and can read a run's or
     /// a child's result back: its own result may carry any of them.
     child_reads: BTreeSet<Option<String>>,
@@ -212,16 +215,23 @@ impl Withholding {
     }
 
     /// Whether a flat child of `template` (`None`: a freeform spawn) holds
-    /// both legs.
+    /// both legs. A template the settings no longer hold — a warm child
+    /// outliving a reload that removed it — is taken to, as an unknown
+    /// workflow is.
     pub fn child_holds_both(&self, template: Option<&str>) -> bool {
-        self.children.contains(&template.map(str::to_string))
+        template.is_some_and(|t| !self.templates.contains(t))
+            || self.children.contains(&template.map(str::to_string))
     }
 
     /// The origins a child of `template` may have read back on its own:
-    /// every tainted run's, when it holds a leg less and can read one.
+    /// every tainted run's, when it holds a leg less and can read one — or
+    /// when its template is no longer held, and what it could read is not
+    /// known.
     pub fn child_reads(&self, template: Option<&str>) -> &BTreeSet<String> {
         static NONE: BTreeSet<String> = BTreeSet::new();
-        if self.child_reads.contains(&template.map(str::to_string)) {
+        if template.is_some_and(|t| !self.templates.contains(t))
+            || self.child_reads.contains(&template.map(str::to_string))
+        {
             &self.any
         } else {
             &NONE
@@ -274,12 +284,30 @@ pub fn withholding(s: &Settings, workflows: &[&Workflow]) -> Withholding {
             child_reads.insert(kind);
         }
     }
+    // The root by its onward reach, as a run is: what it is handed whole it
+    // can pass to any run it starts, and any child — a run's `subagent` step
+    // spawns one whatever `tools.disabled` says of the root's own
+    // `subagent.run`.
+    let root = {
+        let mut e = Edges::default();
+        ctx.any_spawn("", &mut e);
+        let mut held = ctx.root();
+        held.extend(e.held);
+        let mut started: Started = ctx
+            .names
+            .iter()
+            .map(|n| (n.clone(), String::new()))
+            .collect();
+        started.extend(e.started);
+        holds_both(s, &p.onward(held, &started, &e.emits))
+    };
     Withholding {
         runs,
-        root: holds_both(s, &ctx.root()),
+        root,
         workflows: p.both.clone(),
         names: workflows.iter().map(|w| w.name.clone()).collect(),
         children,
+        templates: ctx.flat.keys().cloned().collect(),
         child_reads,
         any,
     }
@@ -1100,8 +1128,8 @@ impl<'a> Reach<'a> {
 
     /// What a turn under the root grant reaches: every server, and what the
     /// root's own tools reach — it holds every internal contract's grant.
-    /// Where it starts runs, and what its children's tools reach, add nothing:
-    /// a run or a child reaches no more than the root already does.
+    /// The runs it starts and the children they spawn are not included:
+    /// [`withholding`] adds them to judge it as a reader.
     fn root(&self) -> Vec<Held> {
         let mut out = self.all();
         if self
@@ -1255,8 +1283,9 @@ impl<'a> Reach<'a> {
                     e.read.extend(self.workflows_named(args, "name", &via));
                 }
             }
-            // A run id names no workflow until the run exists.
-            ReadBack::Run => e
+            // A run id names no workflow until the run exists; `status`
+            // lists every run.
+            ReadBack::Run | ReadBack::Every => e
                 .read
                 .extend(self.names.iter().map(|n| (n.clone(), via.clone()))),
             ReadBack::Runs => match args.and_then(|a| a.get("run")) {
@@ -2381,6 +2410,26 @@ mod tests {
             assert!(w.workflow_holds_both("relay"), "{hand_on}");
             assert!(w.run("relay").is_none(), "{hand_on}");
         }
+    }
+
+    /// A child whose template the settings no longer hold — a warm child
+    /// outliving the reload that removed it — is read as holding both legs
+    /// and as having read back any tainted run, as an unknown workflow is:
+    /// what it could reach is not known, so the answer errs toward
+    /// withholding.
+    #[test]
+    fn a_child_of_a_template_no_longer_held_errs_toward_withholding() {
+        let s = servers(json!({"subagents": {"templates": {
+            "desk": {"instruction": "x", "servers": ["notes"]}}}}));
+        let ws = [intake("webhook"), fetch(Value::Null)];
+        let w = withheld(&s, &ws);
+        assert!(!w.child_holds_both(Some("desk")));
+        assert!(w.child_reads(Some("desk")).is_empty());
+        assert!(w.child_holds_both(Some("gone")));
+        assert_eq!(
+            w.child_reads(Some("gone")),
+            &w.run("fetch").expect("fetch is tainted").origins
+        );
     }
 
     /// Nothing an untainted run hands back is withheld: the table names no

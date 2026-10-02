@@ -1348,6 +1348,12 @@ impl Runtime {
                         }
                     }
                 }
+                // A run's terminal step answers its waiters itself
+                // (`on_run_terminal`, withheld there), so a terminal run is
+                // only found here by a wait that step missed. The withholding
+                // below is a safety net no test reaches; a child's is reached
+                // by an instance child in `mode: sync`, whose report arrives
+                // while it keeps running.
                 PendingKind::Run { run, deadline_ms } => match self.runs.get(run) {
                     Some(r) if r.status.is_terminal() => {
                         let mut v = json!({"run": run, "status": r.status, "output": r.output, "error": r.error});

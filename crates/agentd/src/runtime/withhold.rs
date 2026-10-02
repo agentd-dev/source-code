@@ -18,17 +18,24 @@
 //! Who holds what, and which runs can carry outside text, is the
 //! [`Withholding`](crate::config::taint::Withholding) the registry derives
 //! with every workflow set — the reach the load-time check judges by, so the
-//! two answers are one. At runtime a run started by an A2A peer's own request,
-//! or by a run that carries outside text, carries it too, and a child carries
-//! what the run or child that spawned it carried. A result whose every origin
-//! the reader holds already is not withheld: a route's own run reading back
-//! the child it handed its text to reads nothing new.
+//! two answers are one. What a run or a child carries is recorded on its own
+//! record ([`Carries`]) when text reaches it: its definition's taint when it
+//! starts, the A2A peer whose request started it, and whatever the run,
+//! child or conversation that started, spawned, signalled or steered it
+//! carried then. Read back, a result is judged by that record — together
+//! with what its definition's entry in the table says now, which can only
+//! add — never by what happens to be installed or on record at the time:
+//! a definition deleted, a spawner's run evicted, a restart, all leave it in
+//! place. A run or a child with no record at all is taken to carry text from
+//! an origin no reader holds. A result whose every origin the reader holds
+//! already is not withheld: a route's own run reading back the child it
+//! handed its text to reads nothing new.
 
 use super::reactor::{Runtime, Target};
 use super::tools::ToolCaller;
 use crate::config::settings::Role;
+pub(crate) use crate::engine::run::Carries;
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
 
 /// A context a result is read back into.
 #[derive(Debug, Clone)]
@@ -50,27 +57,28 @@ pub(crate) enum Source<'a> {
     Child(&'a str),
 }
 
-/// Where a run's or a child's outside text entered, and the first reason.
-#[derive(Debug, Default)]
-struct Carried {
-    origins: BTreeSet<String>,
-    why: Option<String>,
+/// The origin of a run or a child no longer on record: no reader holds it,
+/// so a reader holding both legs is withheld from.
+const GONE: &str = "an origin no longer on record";
+
+/// What a run or a child that is not on record carries: [`GONE`].
+fn gone(what: String) -> Carries {
+    let mut c = Carries::default();
+    c.add([GONE.to_string()], || {
+        format!("{what} is no longer on record")
+    });
+    c
 }
 
-impl Carried {
-    fn add(&mut self, origins: impl IntoIterator<Item = String>, why: impl FnOnce() -> String) {
-        let before = self.origins.len();
-        self.origins.extend(origins);
-        if self.origins.len() > before && self.why.is_none() {
-            self.why = Some(why());
-        }
-    }
+/// What an A2A peer's own request hands a run or a child: a peer agent's
+/// message is another agent's output, as an `a2a` start's is.
+pub(crate) fn peer_carries(peer: &str, how: &str) -> Carries {
+    let mut c = Carries::default();
+    c.add([format!("the A2A peer {peer}")], || {
+        format!("it was {how} by the A2A peer {peer}")
+    });
+    c
 }
-
-/// How far a run's parents, or a child's spawners, are followed: far past
-/// any real nesting (`limits.subagents.depth` defaults to 3), and a bound,
-/// so a record that names itself cannot spin.
-const MAX_HOPS: usize = 32;
 
 impl Reader {
     fn label(&self) -> String {
@@ -120,7 +128,7 @@ impl Runtime {
         let (both, handed, who) = match reader {
             Reader::Conversation => (
                 table.root_holds_both(),
-                Carried::default(),
+                Carries::default(),
                 "this conversation".to_string(),
             ),
             Reader::Run(id) => {
@@ -141,14 +149,22 @@ impl Runtime {
                 format!("subagent {h}"),
             ),
         };
-        if !both {
-            return None;
-        }
         let (carried, what) = match source {
             Source::Run(id) => (self.run_carries(id), "this run"),
             Source::Child(h) => (self.child_carries(h), "this subagent"),
         };
         if carried.origins.is_subset(&handed.origins) {
+            return None;
+        }
+        if !both {
+            // Handed whole, the reader carries it on: its own result is
+            // judged with it, whatever the table says the reader can read.
+            if matches!(reader, Reader::Run(_) | Reader::Child(_)) {
+                self.read_flows
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((reader.clone(), carried));
+            }
             return None;
         }
         Some(format!(
@@ -191,14 +207,17 @@ impl Runtime {
     }
 
     /// Withhold from `reader` what a read-back reply carries: each run of a
-    /// `runs` list (`workflow.status`), each child of a `subagents` list
-    /// (`subagent.list`), or the one run or child the reply is about
-    /// (`workflow.run` with `wait`, `workflow.wait`, a sync workflow tool,
-    /// `subagent.status`, `subagent.await`). `None` reads it all.
+    /// `runs` list (`workflow.status`, `status`), each child of a
+    /// `subagents` list (`subagent.list`, `status`), or the one run or child
+    /// the reply is about (`workflow.run` with `wait`, `workflow.wait`, a
+    /// sync workflow tool, `subagent.status`, `subagent.await`). `None`
+    /// reads it all.
     pub(crate) fn withhold_reply(&self, reader: Option<&Reader>, reply: &mut Value, via: &str) {
         let Some(reader) = reader else { return };
+        let mut listed = false;
         for (list, key) in [("runs", "id"), ("subagents", "handle")] {
             if let Some(items) = reply.get_mut(list).and_then(Value::as_array_mut) {
+                listed = true;
                 for item in items {
                     let Some(id) = item.get(key).and_then(Value::as_str).map(str::to_string) else {
                         continue;
@@ -210,8 +229,10 @@ impl Runtime {
                     };
                     self.withhold_record(reader, source, item, via);
                 }
-                return;
             }
+        }
+        if listed {
+            return;
         }
         if let Some(id) = reply.get("run").and_then(Value::as_str).map(str::to_string) {
             self.withhold_record(reader, Source::Run(&id), reply, via);
@@ -264,84 +285,122 @@ impl Runtime {
         );
     }
 
-    /// Where the outside text a run carries entered: what its definition can
-    /// be handed (the registry's table), an A2A peer's request that started
-    /// it, and the run that started it.
-    fn run_carries(&self, id: &str) -> Carried {
-        let mut c = Carried::default();
-        let mut next = Some(id.to_string());
-        for _ in 0..MAX_HOPS {
-            let Some(r) = next.take().and_then(|id| self.runs.get(&id)) else {
-                break;
-            };
-            if let Some(t) = self.registry.withholding().run(&r.workflow) {
-                c.add(t.origins.iter().cloned(), || t.why.clone());
+    /// What run `id` carries: its record ([`Carries`]), and what its
+    /// definition's entry in the table says now — which only adds, so a
+    /// definition that changed taint since the run started errs toward
+    /// withholding. A run no longer on record carries [`GONE`].
+    pub(crate) fn run_carries(&self, id: &str) -> Carries {
+        let Some(r) = self.runs.get(id) else {
+            return gone(format!("run {id}"));
+        };
+        let mut c = r.carries.clone();
+        if let Some(t) = self.registry.withholding().run(&r.workflow) {
+            c.add(t.origins.iter().cloned(), || t.why.clone());
+        }
+        self.unsettled(|r| matches!(r, Reader::Run(x) if x == id), &mut c);
+        c
+    }
+
+    /// What child `handle` carries: its record — what its spawner and every
+    /// run or child that steered it carried then — and what a child of its
+    /// kind can read back on its own. A child no longer on record carries
+    /// [`GONE`].
+    pub(crate) fn child_carries(&self, handle: &str) -> Carries {
+        let Some(s) = self.subagents.get(handle) else {
+            return gone(format!("subagent {handle}"));
+        };
+        let mut c = s.carries.clone();
+        if let Some(t) = self.child_template(handle) {
+            let reads = self.registry.withholding().child_reads(t);
+            c.add(reads.iter().cloned(), || {
+                "it can read back another run's result".to_string()
+            });
+        }
+        self.unsettled(|r| matches!(r, Reader::Child(x) if x == handle), &mut c);
+        c
+    }
+
+    /// Add to `c` what a reader `is` was handed whole and not yet settled.
+    fn unsettled(&self, is: impl Fn(&Reader) -> bool, c: &mut Carries) {
+        for (r, from) in self
+            .read_flows
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            if is(r) {
+                c.union(from);
             }
-            // A peer agent's message is another agent's output, as an `a2a`
-            // start's is: a run it asked for directly carries it.
-            if let Some(p) = r.principal.as_deref()
-                && r.start.payload.get("requested_by").and_then(Value::as_str) == Some(p)
-                && self
-                    .principal_index
-                    .get(p)
-                    .is_some_and(|p| p.role == Role::Agent)
-            {
-                c.add([format!("the A2A peer {p}")], || {
-                    format!("it was started by the A2A peer {p}")
-                });
+        }
+    }
+
+    /// Write what each reader was handed whole onto its record
+    /// ([`Runtime::read_flows`]).
+    pub(crate) fn settle_read_flows(&mut self) {
+        let flows = std::mem::take(&mut *self.read_flows.lock().unwrap_or_else(|e| e.into_inner()));
+        for (reader, carries) in flows {
+            match reader {
+                Reader::Run(id) => self.hand_run(&id, &carries),
+                Reader::Child(h) => self.steer_carries(&h, &carries),
+                Reader::Conversation => {}
             }
-            next = r
-                .parent
-                .as_ref()
-                .and_then(|p| p.get("run"))
-                .and_then(Value::as_str)
-                .map(str::to_string);
+        }
+    }
+
+    /// What a tool call's caller carries, and so hands whatever it starts,
+    /// spawns, signals or steers: a run's or a child's record and, for a call
+    /// an A2A peer (an `agent` principal) made or a turn of its own
+    /// conversation, the peer's text — decided now, while who it is is
+    /// known, and recorded on what it reaches.
+    ///
+    /// A conversation carries nothing else. A root holding both legs is
+    /// withheld every tainted result; one holding a leg less is judged by
+    /// everything it can hand its text on to (`config::taint::Withholding`),
+    /// so what it starts or spawns holds a leg less too, and no reader
+    /// downstream of it holds both.
+    pub(crate) fn caller_carries(&self, caller: &ToolCaller) -> Carries {
+        if let Some(h) = &caller.subagent {
+            return self.child_carries(h);
+        }
+        if let Some(r) = &caller.run {
+            return self.run_carries(r);
+        }
+        let mut c = Carries::default();
+        if let Some(p) = caller.principal.as_deref()
+            && self
+                .principal_index
+                .get(p)
+                .is_some_and(|p| p.role == Role::Agent)
+        {
+            c.union(&peer_carries(p, "handed text"));
         }
         c
     }
 
-    /// Where the outside text a child carries entered: what the run or child
-    /// that spawned it carried, and what a child of its kind can read back
-    /// on its own. A child the root spawned carries nothing from it: a root
-    /// that holds both legs is never handed outside text, and one that holds
-    /// a leg less leaves nobody to withhold from.
-    fn child_carries(&self, handle: &str) -> Carried {
-        let mut c = Carried::default();
-        let mut next = Some(handle.to_string());
-        for _ in 0..MAX_HOPS {
-            let Some(h) = next.take() else { break };
-            let Some(s) = self.subagents.get(&h) else {
-                break;
-            };
-            if let Some(t) = self.child_template(&h) {
-                let reads = self.registry.withholding().child_reads(t);
-                c.add(reads.iter().cloned(), || {
-                    "it can read back another run's result".to_string()
-                });
-            }
-            let by = s.requested_by.as_ref();
-            if let Some(run) = by.and_then(|b| b.get("run")).and_then(Value::as_str) {
-                let from = self.run_carries(run);
-                let why = from.why.clone();
-                c.add(from.origins, || match why {
-                    Some(w) => format!(
-                        "it was spawned by run {run}, which {}",
-                        w.trim_start_matches("it ")
-                    ),
-                    None => format!("it was spawned by run {run}"),
-                });
-            }
-            next = by
-                .and_then(|b| b.get("subagent"))
-                .and_then(Value::as_str)
-                .map(str::to_string);
+    /// Add `carries` to child `handle`'s record — text a run, a child, a
+    /// conversation or a peer steered into it (`subagent.send`).
+    pub(crate) fn steer_carries(&mut self, handle: &str, carries: &Carries) {
+        if let Some(s) = self.subagents.get_mut(handle)
+            && s.carries.union(carries)
+        {
+            s.dirty = true;
         }
-        c
+    }
+
+    /// Add `carries` to run `id`'s record — text a signal handed it.
+    pub(crate) fn hand_run(&mut self, id: &str, carries: &Carries) {
+        if let Some(r) = self.runs.get_mut(id)
+            && r.carries.union(carries)
+        {
+            r.dirty = true;
+        }
     }
 
     /// The kind of flat child `handle` is — `Some(template)`, `Some(None)`
     /// for a freeform spawn — or `None` for an instance child, which is a
-    /// daemon of its own and holds no tool here.
+    /// daemon of its own: the table does not know its reach, so as a reader
+    /// it is taken to hold both legs, and on its own it reads nothing back
+    /// here.
     fn child_template(&self, handle: &str) -> Option<Option<&str>> {
         let s = self.subagents.get(handle)?;
         match s.tier.as_deref() {

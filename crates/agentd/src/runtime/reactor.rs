@@ -213,6 +213,12 @@ pub struct SubagentRecord {
     /// operator-only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub principal: Option<String>,
+    /// Where the outside text this child carries entered: what the one that
+    /// spawned it carried, and what every run or child that steered it with
+    /// `subagent.send` did (`runtime::withhold`). On the record, so a
+    /// spawner's run evicted or forgotten by a restart takes nothing with it.
+    #[serde(default, skip_serializing_if = "crate::engine::run::Carries::is_empty")]
+    pub carries: crate::engine::run::Carries,
     #[serde(default)]
     pub tokens: u64,
     #[serde(default)]
@@ -524,6 +530,14 @@ pub struct Runtime {
     /// without it a client polling `status` would be a store read per key per
     /// poll. Behind a lock only because the status view is built from `&self`.
     pub(crate) status_values_cache: std::sync::Mutex<Option<(Instant, Vec<String>, Value)>>,
+    /// What a reader holding a leg less was handed whole and has not yet
+    /// had written onto its own record: each run or child, and what it now
+    /// carries (`withhold`). A read is answered from `&self`, so the record
+    /// is written by [`Runtime::settle_read_flows`] at the next checkpoint,
+    /// before it is persisted — and read through here until then, so nothing
+    /// is judged without it.
+    pub(crate) read_flows:
+        std::sync::Mutex<Vec<(super::withhold::Reader, crate::engine::run::Carries)>>,
     /// The last section-diff pass (rate-limits `feed_tick`).
     #[cfg(feature = "a2a")]
     pub(crate) feed_last: Instant,
@@ -856,12 +870,22 @@ impl Runtime {
                     // acted for, so a replay after a restart is scoped as the
                     // live delivery would have been.
                     let sender = self.signal_sender(ev.principal.as_deref());
+                    // What the sending call carried, recorded when it was
+                    // accepted (`workflow.signal`).
+                    let carries = ev
+                        .payload
+                        .get("carries")
+                        .and_then(|c| {
+                            serde_json::from_value::<super::withhold::Carries>(c.clone()).ok()
+                        })
+                        .unwrap_or_default();
                     let delivered = self.deliver_signal(
                         &name,
                         payload,
                         target.as_deref(),
                         from.as_deref(),
                         &sender,
+                        &carries,
                     );
                     self.log.info(
                         "signal.received",
@@ -1492,6 +1516,9 @@ impl Runtime {
     /// Persist dirty runs/contexts/subagents; flush the manifest (debounced,
     /// forced at drain). A halting store error triggers an exit.
     pub(crate) fn checkpoint(&mut self, force: bool) {
+        // What a reader was handed goes on its record before the record is
+        // written.
+        self.settle_read_flows();
         let mut failed: Option<String> = None;
         for run in self.runs.values_mut() {
             if run.dirty {

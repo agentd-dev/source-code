@@ -49,11 +49,19 @@ impl Runtime {
                 // An instance-tier child is a separate agent, not a worker in
                 // this process's tree, so it receives over its A2A socket and
                 // the message lands in its own conversation surface.
+                // The message is the sender's text: the child carries what
+                // the sender does from here on (`withhold`), so a result read
+                // back after it is judged with it — whoever spawned the child.
+                let carries = self.caller_carries(caller);
                 if self
                     .subagents
                     .get(&handle)
                     .is_some_and(|s| s.tier.as_deref() == Some("instance"))
                 {
+                    // Recorded before the send, which may answer later: a
+                    // send that then fails leaves the child carrying more
+                    // than it was handed, which errs toward withholding.
+                    self.steer_carries(&handle, &carries);
                     return self.instance_send(&handle, &message);
                 }
                 let Some(node) = self.subagents.get(&handle).and_then(|s| s.node) else {
@@ -67,6 +75,7 @@ impl Runtime {
                     return err(format!("subagent {handle:?} is not a warm subagent"));
                 }
                 if self.children.send(node, &ControlMsg::Inject { message }) {
+                    self.steer_carries(&handle, &carries);
                     ToolOutcome::Ready(json!({"ok": true, "handle": handle}), false)
                 } else {
                     err(format!("subagent {handle:?}: send failed"))
@@ -118,10 +127,16 @@ impl Runtime {
             "subagent.status" => {
                 let handle = args["handle"].as_str().unwrap_or("").to_string();
                 match self.subagents.get(&handle) {
-                    Some(s) => ToolOutcome::Ready(
-                        json!({"handle": handle, "status": s.status, "mode": s.mode, "result": s.result, "error": s.error, "tokens": s.tokens}),
-                        false,
-                    ),
+                    // `error` only when there is one: the contract says it is a
+                    // string, and a reply that breaks its own contract reaches
+                    // the model as a schema error instead of the status.
+                    Some(s) => {
+                        let mut v = json!({"handle": handle, "status": s.status, "mode": s.mode, "result": s.result, "tokens": s.tokens});
+                        if let Some(e) = &s.error {
+                            v["error"] = json!(e);
+                        }
+                        ToolOutcome::Ready(v, false)
+                    }
                     None => err(format!("no such subagent {handle:?}")),
                 }
             }
@@ -129,10 +144,14 @@ impl Runtime {
                 let handle = args["handle"].as_str().unwrap_or("").to_string();
                 match self.subagents.get(&handle) {
                     None => err(format!("no such subagent {handle:?}")),
-                    Some(s) if is_terminal_status(&s.status) => ToolOutcome::Ready(
-                        json!({"handle": handle, "status": s.status, "result": s.result, "error": s.error}),
-                        false,
-                    ),
+                    Some(s) if is_terminal_status(&s.status) => {
+                        let mut v =
+                            json!({"handle": handle, "status": s.status, "result": s.result});
+                        if let Some(e) = &s.error {
+                            v["error"] = json!(e);
+                        }
+                        ToolOutcome::Ready(v, false)
+                    }
                     Some(_) => ToolOutcome::Deferred(PendingKind::Subagent { handle }),
                 }
             }
@@ -447,6 +466,8 @@ impl Runtime {
                 json!({"caller": caller.node.map(|n| n.0), "ctx": caller.ctx, "run": caller.run, "step": caller.step, "subagent": caller.subagent, "depth": depth}),
             ),
             principal: caller.principal.clone(),
+            // What the caller carries, the child is handed (`withhold`).
+            carries: self.caller_carries(caller),
             tokens: 0,
             created: now_ms(),
             updated: now_ms(),

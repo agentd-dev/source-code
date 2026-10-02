@@ -83,25 +83,31 @@ test that fails on the old code.
   conversation, could read a tainted run's output and act on it holding both
   other legs. Every way a run's or a child's result is read back — a sync
   workflow tool's reply, `workflow.run` with `wait`, `workflow.wait` (tool or
-  step), `wait {on: run}`, `workflow.status`, a `workflow` step that is not
-  `detached`, a `join`, `subagent.status`, `subagent.await`,
-  `subagent.list`, `wait {on: subagent}`, a `plan.update` binding's note, and
-  the notes a finished run or a child's result leave in the root transcript —
-  now answers a context that holds both legs with the run's or child's status
-  and its text (output, error, step outputs, a child's instruction) replaced
-  by a marker naming why, and logs `readback.withheld`. Who holds both legs is
-  worked out from the same reach the load-time check judges: the root grant;
-  a run's model-driven steps and everything it hands its text on to; a
-  child's template. A run carries outside input when its definition can be
-  handed some, when an A2A peer's own request started it, or when a run that
-  carries it started it, and a child carries what its spawner carried. A
-  result is withheld only for text the reader was not handed already, so a
-  route's own run reading back its child gets it whole. A context that holds
-  a leg less is handed the text whole and carries it on: its own result is
-  withheld in turn, and what it starts or feeds is judged. No read-back is
-  refused at load. The read-back contracts carry the run taint in their
-  tags, as a sync workflow tool does, so a policy matching `untrusted_input`
-  sees it.
+  step), `wait {on: run}`, `workflow.status`, `status`, a `workflow` step
+  that is not `detached`, a `join`, `subagent.status`, `subagent.await`,
+  `subagent.list`, `wait {on: subagent}`, a `plan.update` binding's note,
+  the notes a finished run or a child's result leave in the root transcript,
+  and an `emit` step's `note:` — now answers a context that holds both legs
+  with the run's or child's status and its text (output, error, step
+  outputs, a child's instruction) replaced by a marker naming why, and logs
+  `readback.withheld`. Who holds both legs is worked out from the same reach
+  the load-time check judges, counting everything a context can hand the
+  text on to: the root grant with every run it can start and every child
+  those can spawn; a run's model-driven steps and everything it hands its
+  text on to; a child's template. What a run or a child carries is recorded
+  on its own durable record as text reaches it — its definition's taint when
+  it starts and again when it ends, an A2A peer's request, signal or
+  message, and whatever the run, child or peer that started, signalled,
+  spawned or steered it carried — and a reader holding a leg less records
+  what it was handed whole. A result is judged by that record, so deleting
+  or replacing the definition, evicting the spawner's run, or a restart
+  leaves it withheld. A result is withheld only for text the reader was not
+  handed already, so a route's own run reading back its child gets it whole.
+  A context that holds a leg less is handed the text whole and carries it
+  on: its own result is withheld in turn, and what it starts or feeds is
+  judged. No read-back is refused at load. The read-back contracts carry the
+  run taint in their tags, as a sync workflow tool does, so a policy
+  matching `untrusted_input` sees it.
 - **Implicit notes are opt-in.** `agent.on_workflow_finished` defaults to
   `ignore` (it was `note`), and `subagent_result` is no longer in the default
   `agent.wake_on`; a warm child's per-turn note now reaches the root only
@@ -133,6 +139,11 @@ test that fails on the old code.
 
 ### Fixed
 
+- **`subagent.status` and `subagent.await` answer a child that finished
+  without an error.** Their reply carried `error: null`, which their own
+  contract types as a string, so a model asking about a child that had
+  finished cleanly was handed a schema error in place of its status. `error`
+  is now present only when there is one.
 - **A stream consumer moves past an event only once it fired.** The offset
   moved first, and the firing could then be shed under pressure, refused by
   a freshness freeze, or lost when the inbox write failed (its error was

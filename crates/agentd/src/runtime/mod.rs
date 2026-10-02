@@ -721,6 +721,7 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         #[cfg(feature = "a2a")]
         feed_last: Instant::now(),
         status_values_cache: std::sync::Mutex::new(None),
+        read_flows: std::sync::Mutex::new(Vec::new()),
         #[cfg(feature = "a2a")]
         webhook_callbacks: std::sync::Arc::new(std::sync::Mutex::new(
             std::collections::HashMap::new(),

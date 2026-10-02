@@ -348,12 +348,20 @@ impl Runtime {
                     id: principal.id.clone(),
                     operator: principal.is_operator(),
                 };
+                // A peer agent's payload is its text, and the runs it wakes
+                // or starts carry it (`withhold`).
+                let carries = if principal.role == crate::config::settings::Role::Agent {
+                    crate::runtime::withhold::peer_carries(&principal.id, "signalled")
+                } else {
+                    Default::default()
+                };
                 let delivered = self.deliver_signal(
                     &name,
                     payload,
                     target.as_deref(),
                     Some(&principal.id),
                     &sender,
+                    &carries,
                 );
                 Answer::Done {
                     link: None,
@@ -416,7 +424,7 @@ impl Runtime {
             Link::Run { id: run_id.clone() },
             Some(message),
         );
-        let payload = json!({
+        let mut payload = json!({
             "workflow": name,
             "run_id": run_id,
             "inputs": data.get("inputs").cloned().unwrap_or_else(|| json!({})),
@@ -424,6 +432,17 @@ impl Runtime {
             "task": task_id,
             "conversation": ctx,
         });
+        // A peer agent's request is another agent's output, as an `a2a`
+        // start's is: the run carries it (`withhold`). Decided here, where
+        // the principal's role is known, and recorded with the start — not
+        // looked up when the result is read, after a restart or a reload
+        // may have forgotten who asked.
+        if principal.role == crate::config::settings::Role::Agent {
+            payload["carries"] = json!(crate::runtime::withhold::peer_carries(
+                &principal.id,
+                "started"
+            ));
+        }
         match self.accept_event(kinds::WORKFLOW_RUN, Some(principal.id.clone()), payload) {
             Ok(_) => {
                 if let Some(t) = self.tasks.get_mut(&task_id) {

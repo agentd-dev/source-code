@@ -743,7 +743,12 @@ pub fn contracts() -> Vec<Contract> {
         "status",
         "The instance status: runs, subagents, conversations, budget, store.",
         obj(json!({}), &[]),
-        json!({"type": "object"}),
+        // The fields a read-back test reads off the shape are declared: each
+        // run in `runs` carries its output and error.
+        open_obj(
+            json!({"runs": arr(json!({"type": "object"})), "subagents": arr(json!({"type": "object"}))}),
+            &[],
+        ),
         true,
         DefaultGrant {
             root: true,
@@ -949,6 +954,9 @@ pub enum ReadBack {
     Run,
     /// A run named by id, or every run of a workflow named by `name`.
     Runs,
+    /// Every run on record: `status`, whose run list carries each run's
+    /// output and error.
+    Every,
     /// A child named by handle — whose spawner only the handle knows. What a
     /// child returns is what the run that spawned (or steered) it handed it,
     /// worked over, so it is that run's result too.
@@ -970,6 +978,7 @@ pub fn read_back(name: &str) -> Option<ReadBack> {
         "workflow.run" => Some(ReadBack::Started),
         "workflow.wait" => Some(ReadBack::Run),
         "workflow.status" => Some(ReadBack::Runs),
+        "status" => Some(ReadBack::Every),
         // `subagent.list` too: it hands back the opening of each child's
         // instruction, which is the spawner's text.
         "subagent.status" | "subagent.await" | "subagent.list" => Some(ReadBack::Child),
@@ -1019,6 +1028,7 @@ mod tests {
         // Not vacuous: the shapes above really are the contracts'.
         assert!(classified.contains(&"workflow.status"), "{classified:?}");
         assert!(classified.contains(&"plan.update"), "{classified:?}");
+        assert!(classified.contains(&"status"), "{classified:?}");
     }
 
     /// `ask_human`'s contract has to say what the implementation does, in both

@@ -95,15 +95,7 @@ pub fn deliver(document: &Document, ctx: &Context) -> Result<Delivery, Vec<Refus
         Some(r) => r,
         None => &resolve_none,
     };
-    let ex = doc::fold_full(
-        document,
-        &ctx.grants,
-        &ctx.params,
-        &ctx.facts,
-        &resolver,
-        0,
-        &BTreeSet::new(),
-    )?;
+    let ex = doc::fold_full(document, &ctx.grants, &ctx.params, &ctx.facts, &resolver)?;
     Ok(Delivery {
         text: ex.cleaned,
         manifest: build_manifest(document, ctx, resolver),
@@ -456,7 +448,7 @@ mod tests {
             (Some("tip"), Some("alert"))
         );
         assert_eq!(blocks[2]["body"]["text"], "Sleep on it.\nThen decide.");
-        // Delivery is the same normalized text as before lifting.
+        // Each lifted block delivers its label, from the block.
         let out = deliver(&d, &Context::default()).unwrap();
         assert_eq!(
             out.text,

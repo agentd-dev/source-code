@@ -276,16 +276,14 @@ test that fails on the old code.
   paragraph after a rule is its reason (S14); a rule that already has
   `because=` and is followed by one refuses (`because-repeated`). A skill's
   `trigger` is what the catalogue says it is for, with `when` as its alias.
-  The delivered text is unchanged for now: these lines reach the model as
-  they did, and the rendered forms come with the 1.1 delivery.
+  How these lines are delivered is the 1.1 delivery's, below.
 - **An instruction document reads author notes, end matter and `!eval`, and
   holds attribute values and overrides to the 1.1 registry.** A line that
   begins with `<!--` at column 0, outside fenced code and front matter,
   opens an author note (S9), which ends at the first line holding `-->`:
   nothing in it is parsed, so a commented-out `:::!workflow` no longer loads
-  and a `[[kind/name]]` in it is not resolved — in a set's rows too. Its
-  lines still reach the model as written until the 1.1 delivery strips
-  them. A document may end with end matter (S27): after a blank line, a
+  and a `[[kind/name]]` in it is not resolved — in a set's rows too, and
+  the 1.1 delivery below strips it. A document may end with end matter (S27): after a blank line, a
   `---`, a YAML mapping and a closing `---` as its last lines. It is the
   document's record: a document with any block no longer delivers it, and
   end matter there that is not a YAML mapping refuses the document
@@ -314,6 +312,55 @@ test that fails on the old code.
   delivered as a rule. A `MUST[x]:` in a YAML section's description is that
   description's text and declares no `must/x`. Front matter may be empty
   (`---` then `---`), and an integer `spec: 1` reads as the version `"1"`.
+- **An instruction document is delivered block by block, in its own label
+  style.** Delivery re-normalised the whole spliced text, keyword by keyword,
+  so it could not tell a rule from a keyword line quoted in an example, and a
+  rule nested in a body was delivered raw or not at all. Every block is now
+  rendered once, from the block, as the reference does (`deliver.ts`), and a
+  prose body is delivered by the same rules. For a version-1 document that
+  changes the delivered bytes:
+  - A rule's name never reaches the model (S12): `NEVER[x]: …` delivers
+    `**NEVER:** …`. A condition renders, `**MUST (if c):** …` (S15), and a
+    reason goes on its own line straight after its rule,
+    `**BECAUSE:** …`, keeping its line's indentation and list marker and
+    dropping the blank lines before it (S14); a container's `because=` goes
+    after its body.
+  - An alias delivers its canonical label (`ALWAYS:` as `**MUST:**`,
+    `AVOID:` as `**SHOULD NOT:**`), and `:::info` is labelled `**NOTE:**`,
+    not `**INFO:**`.
+  - A list marker is kept as written: `* MUST:` and `1) MUST:` were
+    rewritten to `- ` and `1. `.
+  - A keyword line that is indented is prose and delivered as written,
+    because the keyword grammar matches at column 0; it was bolded.
+  - An example is quoted (S16): `**EXAMPLE{ (avoid)}{ — title}:**` on its
+    own line, then the body as written, with no keyword bolded and no
+    reference degraded in it. An output is `**OUTPUT{ (format)}{ —
+    title}:**` on its own line, then its body as prose (S17); its schema is
+    never delivered.
+  - A keyword line in an unknown bare block's body, or a bare `:::eval`'s,
+    is no longer bolded: the body is delivered raw, fences removed (S23).
+  - A rule inside a body — an output, a context, a kept `when`, a tool — is
+    rendered as a rule; one inside a `:::context` was dropped. Machinery
+    nested in a body still delivers nothing: only top-level machinery is
+    folded, so an acknowledgement there would claim a block is loaded that
+    is not.
+  - Author notes are never delivered (S9), in prose or in any body, and
+    neither is end matter, an included document's included (S27). A
+    `verbatim` body keeps `<!--` as written.
+  - A reference inside an inline code span is no longer degraded, and a
+    line of only spaces or tabs is delivered empty.
+  - A skill written with a trigger says when to use it (S11): `[skill "x" is
+    available — use it when …; reference it as @skill/x]`, from `trigger` or
+    a skill's `when`, `trigger` winning.
+  - The skill catalogue's body is rendered as the skill's prose would be
+    delivered — rules labelled and never named, notes stripped — where it
+    carried `MUST[name]:` raw.
+  - `delivery: {labels: plain}` delivers `MUST: x`, and `delivery: {labels:
+    tags}` delivers `<must>x</must>` (a multi-line body opens the tag on its
+    first line and closes it on its last; an example and an output stand
+    their tags on lines of their own); the default is still bold (S25). An
+    included document is delivered in its own style. A context, a tool, a
+    form and a glossary are the same in every style.
 - **`/hooks/_` is agentd's.** A `wait {on: webhook}` callback is armed under
   `/hooks/_cb/`, and configured routes match first, so a route there could
   take a suspended run's callback. A `webhook` start `path` or a wait's
@@ -411,6 +458,14 @@ reference and are raised upstream: an empty `:::unless` refuses as
 `missing-attribute`, the Appendix B condition, where the reference reports
 `schema`; and the corpus does not pin the line `end-matter-yaml` names,
 which here, as in the reference, is the first end-matter line.
+
+agentd-instruction delivers each block from its tree, in the new private
+`deliver` module. `doc::fold_full` takes `(doc, granted, params, facts,
+resolver)`: the include depth and the cycle path are its own. The keyword
+normaliser is gone, and so is the `**EXAMPLE` literal.
+`InlineSkill.body` is the rendered skill prose. `Block::delivery_body` is
+what a machinery block's recorded `content` reads; delivery reads the
+source.
 
 ## v1.17.0 — A2A, and nothing beside it
 

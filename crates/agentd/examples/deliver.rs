@@ -64,15 +64,7 @@ fn main() {
 
     // The runtime supplies `agent` as a fact (§5.2) — the library assumes none.
     let facts: BTreeMap<String, String> = [("agent".to_string(), "agentd".to_string())].into();
-    match idoc::fold_full(
-        &doc,
-        &idoc::all_families(),
-        &overrides,
-        &facts,
-        &resolve,
-        0,
-        &std::collections::BTreeSet::new(),
-    ) {
+    match idoc::fold_full(&doc, &idoc::all_families(), &overrides, &facts, &resolve) {
         Ok(ex) => print!("{}", ex.cleaned),
         Err(errs) => {
             eprintln!("refused:");

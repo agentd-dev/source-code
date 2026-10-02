@@ -4212,8 +4212,6 @@ impl Settings {
                     &BTreeMap::new(),
                     &facts,
                     &|_| None,
-                    0,
-                    &std::collections::BTreeSet::new(),
                 )?;
                 let channels =
                     crate::config::humans::address_document_gates(&parsed, &mut ex.workflows);

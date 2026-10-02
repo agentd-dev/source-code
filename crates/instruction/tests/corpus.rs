@@ -73,29 +73,13 @@ fn inputs_of(suite: &str) -> &'static [&'static str] {
 /// closes them. Shrink-only: an entry that starts passing must be deleted
 /// here, and the test says so.
 const PENDING: &[&str] = &[
-    // Cases new in revision 1.1 (S8-S27): the delivery of every 1.1
-    // construct lands in units V5-V6.
-    "corpus/author-notes/delivered.txt",
-    "corpus/conditions/delivered.txt",
-    "corpus/eval/delivered.txt",
-    "corpus/examples-avoid/delivered.txt",
-    "corpus/labels-plain/delivered.txt",
-    "corpus/labels-tags/delivered.txt",
-    "corpus/named-rules/delivered.txt",
-    "corpus/output/delivered.txt",
-    "corpus/overrides-house/delivered.txt",
+    // Delivery semantics of revision 1.1 — `unless`/`otherwise` and
+    // variant groups (S10), typed parameter values (S18), overrides (S24) —
+    // land in unit V6. research-agent's `depth` fails its enum type.
     "corpus/overrides/delivered.txt",
     "corpus/parameter-types/delivered.txt",
-    "corpus/permissions/delivered.txt",
-    "corpus/reasons/delivered.txt",
-    "corpus/skill-trigger/delivered.txt",
-    "corpus/variants/delivered.txt",
-    // Delivered text upstream changed for 1.1 (the skill-trigger
-    // acknowledgement; research-agent's enum-typed parameter) — units V5-V6.
-    "corpus/coding-agent/delivered.txt",
     "corpus/research-agent/delivered.txt",
-    "corpus/spec-example/delivered.txt",
-    "corpus/support-agent/delivered.txt",
+    "corpus/variants/delivered.txt",
     // The S7 resolution manifest — unit V7.
     "corpus/author-notes/manifest.canonical.json",
     "corpus/author-notes/manifest.json",

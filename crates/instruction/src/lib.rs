@@ -27,6 +27,8 @@ pub mod sign;
 pub mod yaml;
 
 mod api;
+// Block-scoped delivery (§3.5): the renderer `doc::fold_full` drives.
+mod deliver;
 pub use api::{Context, Delivery, deliver, parse, tree_json, validate};
 
 // Every refusal from `parse` to the API is one structured type carrying its

@@ -24,6 +24,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::Value;
 
 use crate::Refusal;
+use crate::deliver::{self, Walk};
 
 /// How a block reaches (or does not reach) the model at delivery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -644,16 +645,17 @@ pub struct Block {
     /// The form this block was AUTHORED in (§4). A set member carries
     /// `Form::Set` plus its `set_group`; the §9.1 dump renders it as "member".
     pub form: Form,
-    /// The body WITH lifted keyword/alert lines still in position — what
-    /// delivery and the skill catalogue read (§3.5 normalizes those lines in
-    /// place). `None` means nothing was lifted and `body` is the whole story.
-    /// The tree (§9.1) always reads `body`, which excludes lifted children.
+    /// The body WITH lifted keyword/alert lines still in position — what a
+    /// machinery block's recorded `content` reads. `None` means nothing was
+    /// lifted and `body` is the whole story. The tree (§9.1) always reads
+    /// `body`, which excludes lifted children; delivery reads the source.
     pub raw_body: Option<String>,
     /// The block's line region in the document body (0-based, inclusive), set
     /// for TOP-LEVEL blocks by the walk. Delivery replaces exactly this region
     /// with the block's delivered form, leaving every other line untouched
-    /// (§3.5 layout). `(0, 0)` on children, which delivery never addresses.
-    /// A rule's region covers the reason that follows it.
+    /// (§3.5 layout). `(0, 0)` on children in the tree: delivery walks a body
+    /// again on its own, which gives its blocks regions in that body. A
+    /// rule's region covers the reason that follows it.
     pub region: (usize, usize),
     /// The lines of the rule's `BECAUSE:` paragraph (S14; 0-based body
     /// lines, inclusive), when one follows it. Its text is `attrs.because`.
@@ -665,8 +667,9 @@ pub struct Block {
 }
 
 impl Block {
-    /// The body text delivery reads: lifted keyword/alert lines re-included
-    /// in position when any were lifted, else `body` itself.
+    /// The body with lifted keyword/alert lines re-included in position when
+    /// any were lifted, else `body` itself — what a machinery block records
+    /// as its `content`. Delivery renders from the source instead.
     pub fn delivery_body(&self) -> &str {
         self.raw_body.as_deref().unwrap_or(&self.body)
     }
@@ -691,9 +694,7 @@ pub enum Node {
     Text(String),
     /// An author note (S9; §3.3 rule 11): body lines `start..=end` (0-based),
     /// from a column-0 `<!--` to the first line holding `-->`. Never scanned
-    /// for blocks, references or keywords. Delivery still passes its lines
-    /// through as text, as it did before notes were read; the 1.1 delivery
-    /// strips them.
+    /// for blocks, references or keywords, and never delivered.
     Note {
         start: usize,
         end: usize,
@@ -767,7 +768,63 @@ pub fn parse(text: &str) -> Result<Document, Vec<Refusal>> {
         None => (&text[body_start..], None),
     };
     let lines: Vec<&str> = body.split('\n').collect();
+    let (nodes, set_notes) = walk_nodes(&lines, base, &mut errs);
 
+    let blocks: Vec<&Block> = nodes
+        .iter()
+        .filter_map(|n| match n {
+            Node::Block(b) => Some(b),
+            Node::Text(_) | Node::Note { .. } | Node::Inert { .. } => None,
+        })
+        .collect();
+    // Identity and references are document-wide (S26): a rule named inside a
+    // `when`, a section or any container body is as addressable, and as
+    // unique, as one at the top level.
+    let all = every_block(&blocks);
+    check_identity(&blocks, &all, &mut errs);
+    check_refs(&all, &mut errs);
+    check_placement(&blocks, &mut errs);
+    check_attr_values(&all, &front, &mut errs);
+    check_overrides(&all, &mut errs);
+    // An author note is not scanned for references (§3.3 rule 11), at the
+    // top level or in a body.
+    let notes: Vec<(usize, usize)> = nodes
+        .iter()
+        .filter_map(|n| match n {
+            Node::Note { start, end } => Some((*start, *end)),
+            _ => None,
+        })
+        .chain(all.iter().flat_map(|b| b.notes.iter().copied()))
+        .chain(set_notes)
+        .collect();
+    check_inline_refs(&all, body, base, &notes, &mut errs);
+
+    if errs.is_empty() {
+        Ok(Document {
+            front,
+            has_front_matter: body_start > 0,
+            nodes,
+            end_matter,
+            source: body.to_string(),
+            raw: text.to_string(),
+        })
+    } else {
+        Err(errs)
+    }
+}
+
+/// The node walk (§3.3): `lines` read as a run of prose interleaved with
+/// blocks, every form recognised at column 0. `parse` walks a document's body
+/// with it, and delivery walks each prose body with it again, so a body is
+/// read exactly as the document is (a rule inside a `when` is a rule).
+/// `base` is the number of the line before `lines[0]`, for refusals. Returns
+/// the nodes, each block's region indexing `lines`, and the author notes in
+/// top-level sets' bodies, which no block carries.
+pub(crate) fn walk_nodes(
+    lines: &[&str],
+    base: usize,
+    errs: &mut Vec<Refusal>,
+) -> (Vec<Node>, Vec<(usize, usize)>) {
     // Top-level walk that interleaves text runs with blocks, so delivery keeps
     // the prose between blocks. Every form is recognized here (all at column 0):
     // a sigiled heading opens a section; a `:::` line opens a container or a
@@ -815,7 +872,7 @@ pub fn parse(text: &str) -> Result<Document, Vec<Refusal>> {
         // that never closes runs to the end and is not refused.
         if note_opens(lines[i]) {
             flush!();
-            let end = note_end(&lines, i, lines.len()).unwrap_or(lines.len() - 1);
+            let end = note_end(lines, i, lines.len()).unwrap_or(lines.len() - 1);
             nodes.push(Node::Note { start: i, end });
             i = end + 1;
             continue;
@@ -823,7 +880,7 @@ pub fn parse(text: &str) -> Result<Document, Vec<Refusal>> {
         // A keyword paragraph / list item, or a blockquote alert, is a block
         // of its prose kind (§4.5/§4.6) — lifted so the tree carries it.
         if (keyword_line(lines[i]).is_some() || alert_block_kind(lines[i]).is_some())
-            && let Some((b, next)) = lift_keyword_or_alert(&lines, i, base, lines.len(), &mut errs)
+            && let Some((b, next)) = lift_keyword_or_alert(lines, i, base, lines.len(), errs)
         {
             flush!();
             nodes.push(Node::Block(b));
@@ -834,7 +891,7 @@ pub fn parse(text: &str) -> Result<Document, Vec<Refusal>> {
         // is `[i, next-1]` — delivery replaces exactly this run of source lines.
         if let Some(sec) = section_open(lines[i]) {
             flush!();
-            let (block, next) = parse_section(&lines, i, sec, base, &mut errs);
+            let (block, next) = parse_section(lines, i, sec, base, errs);
             if let Some(mut b) = block {
                 // A section's region ends at its LAST NON-BLANK line (§3.5) —
                 // trailing blank lines before the next heading are delivered,
@@ -851,7 +908,7 @@ pub fn parse(text: &str) -> Result<Document, Vec<Refusal>> {
         }
         if let Some(of) = open_fence(lines[i]) {
             flush!();
-            match parse_fenced(&lines, i, of, base, lines.len(), &mut errs) {
+            match parse_fenced(lines, i, of, base, lines.len(), errs) {
                 // A rule container's region covers the reason that follows it.
                 Fenced::Blocks {
                     blocks,
@@ -878,7 +935,7 @@ pub fn parse(text: &str) -> Result<Document, Vec<Refusal>> {
             }
             continue;
         }
-        match leaf_open(lines[i]).map(|lf| parse_leaf(lf, base + i + 1, &mut errs)) {
+        match leaf_open(lines[i]).map(|lf| parse_leaf(lf, base + i + 1, errs)) {
             Some(Leafed::Block(mut b)) => {
                 flush!();
                 b.region = (i, i);
@@ -896,47 +953,7 @@ pub fn parse(text: &str) -> Result<Document, Vec<Refusal>> {
         nodes.push(Node::Text(pending));
     }
 
-    let blocks: Vec<&Block> = nodes
-        .iter()
-        .filter_map(|n| match n {
-            Node::Block(b) => Some(b),
-            Node::Text(_) | Node::Note { .. } | Node::Inert { .. } => None,
-        })
-        .collect();
-    // Identity and references are document-wide (S26): a rule named inside a
-    // `when`, a section or any container body is as addressable, and as
-    // unique, as one at the top level.
-    let all = every_block(&blocks);
-    check_identity(&blocks, &all, &mut errs);
-    check_refs(&all, &mut errs);
-    check_placement(&blocks, &mut errs);
-    check_attr_values(&all, &front, &mut errs);
-    check_overrides(&all, &mut errs);
-    // An author note is not scanned for references (§3.3 rule 11), at the
-    // top level or in a body.
-    let notes: Vec<(usize, usize)> = nodes
-        .iter()
-        .filter_map(|n| match n {
-            Node::Note { start, end } => Some((*start, *end)),
-            _ => None,
-        })
-        .chain(all.iter().flat_map(|b| b.notes.iter().copied()))
-        .chain(set_notes)
-        .collect();
-    check_inline_refs(&all, body, base, &notes, &mut errs);
-
-    if errs.is_empty() {
-        Ok(Document {
-            front,
-            has_front_matter: body_start > 0,
-            nodes,
-            end_matter,
-            source: body.to_string(),
-            raw: text.to_string(),
-        })
-    } else {
-        Err(errs)
-    }
+    (nodes, set_notes)
 }
 
 fn body_start_line(text: &str, body_start: usize) -> usize {
@@ -1407,8 +1424,8 @@ struct Collected {
     children: Vec<Block>,
     /// The body with child blocks removed — what the §9.1 tree reads.
     body: Vec<String>,
-    /// The body WITH lifted keyword/alert lines still in place — delivery's
-    /// view.
+    /// The body WITH lifted keyword/alert lines still in place — a
+    /// machinery block's recorded `content`.
     raw: Vec<String>,
     /// The author notes directly in this body (0-based body lines,
     /// inclusive). Their lines are in `body` and `raw`, as the tree keeps
@@ -1505,7 +1522,7 @@ fn collect_body(
                     notes,
                 } => {
                     // A child's reason is its own (the tree), and stays in the
-                    // text delivery reads until delivery renders reasons.
+                    // recorded content beside the lifted lines.
                     for l in lines.get(closed..next).unwrap_or_default() {
                         c.raw.push(l.to_string());
                     }
@@ -1533,8 +1550,8 @@ fn collect_body(
             continue;
         }
         // A keyword paragraph or alert in a Markdown body is a CHILD block —
-        // excluded from `body` (the §9.1 tree) but kept in `raw` (delivery
-        // normalizes it in place). Only where the kind interprets its body as
+        // excluded from `body` (the §9.1 tree) but kept in `raw` (a recorded
+        // `content` keeps it in place). Only where the kind interprets its body as
         // prose: never inside YAML/code/table bodies, never inside `example`.
         if scan.lift
             && (keyword_line(line).is_some() || alert_block_kind(line).is_some())
@@ -2233,7 +2250,7 @@ fn fence_close_len(line: &str) -> Option<usize> {
 }
 
 /// The backtick/tilde count of a fenced-code delimiter line, else None.
-fn code_fence_len(line: &str) -> Option<usize> {
+pub(crate) fn code_fence_len(line: &str) -> Option<usize> {
     let t = line.trim_start();
     for delim in ['`', '~'] {
         let n = t.chars().take_while(|&c| c == delim).count();
@@ -3276,15 +3293,7 @@ pub fn extract_with_facts(
     facts: &BTreeMap<String, String>,
 ) -> Result<Extraction, Vec<Refusal>> {
     let doc = parse(text)?;
-    fold_full(
-        &doc,
-        granted,
-        &BTreeMap::new(),
-        facts,
-        &|_| None,
-        0,
-        &BTreeSet::new(),
-    )
+    fold_full(&doc, granted, &BTreeMap::new(), facts, &|_| None)
 }
 
 /// Merge a fragment UNDER a document: a key already present in `into` wins, so
@@ -3534,117 +3543,38 @@ pub fn fold_with_params(
     granted: &BTreeSet<String>,
     overrides: &BTreeMap<String, String>,
 ) -> Result<Extraction, Vec<Refusal>> {
-    fold_full(
-        doc,
-        granted,
-        overrides,
-        &BTreeMap::new(),
-        &|_| None,
-        0,
-        &BTreeSet::new(),
-    )
+    fold_full(doc, granted, overrides, &BTreeMap::new(), &|_| None)
 }
 
-/// The full fold: `${parameter}` overrides, and an `include` resolver so a
-/// document can transclude others (§5.2), recursively, resolved with their own
-/// parameters. The delivered text runs the §3.5 pipeline: prose degraded to its
-/// Appendix A form, machinery replaced by its acknowledgement line (a set as
-/// one line), includes inlined, inline references degraded, and `${}`
-/// substituted LAST so a value is never re-parsed as Markdown.
+/// The full fold: `${parameter}` values, runtime `facts` for `when`, and an
+/// `include` resolver so a document can transclude others (§5.2),
+/// recursively, each delivered with its own parameters and label style. The
+/// delivered text runs the §3.5 pipeline: every block rendered once from
+/// itself (prose labelled, machinery replaced by its acknowledgement line — a
+/// set as one line — includes inlined), inline references degraded in prose,
+/// and `${}` substituted LAST so a value is never re-parsed as Markdown.
 pub fn fold_full(
     doc: &Document,
     granted: &BTreeSet<String>,
-    overrides: &BTreeMap<String, String>,
+    params: &BTreeMap<String, String>,
     facts: &BTreeMap<String, String>,
     resolve: IncludeResolver,
-    depth: usize,
-    seen: &BTreeSet<String>,
 ) -> Result<Extraction, Vec<Refusal>> {
+    fold_in(doc, &mut Walk::new(doc, granted, params, facts, resolve))
+}
+
+/// Fold one document of a delivery — the delivered one, or an include.
+fn fold_in(doc: &Document, w: &mut Walk) -> Result<Extraction, Vec<Refusal>> {
     let mut errs = Vec::new();
-    check_grants(doc, granted, &mut errs);
+    check_grants(doc, w.granted, &mut errs);
     let mut out = Extraction {
         families: families_used(doc).into_iter().collect(),
         ..Extraction::default()
     };
-    // The parameter context is needed during the walk to select `when`
-    // variants, again at the end for `${}` substitution, and (as full
-    // declarations) to render a `form` block's input list.
-    let params = param_values(doc, overrides);
-    let decls = param_decls(doc);
-    // `when` evaluates over the resolved parameters PLUS the runtime facts
-    // (facts win a collision — they are runtime-authoritative); `${}`
-    // substitution uses the parameters only.
-    let mut when_facts = params.clone();
-    for (k, v) in facts {
-        when_facts.insert(k.clone(), v.clone());
-    }
-
-    // Pass 1: fold configuration, and record each TOP-LEVEL block's delivered
-    // lines against the source region it occupies. Consecutive members of one
-    // set are gathered so the set delivers a single line for its whole region.
-    let nodes = &doc.nodes;
-    let mut regions: Vec<(usize, usize, Vec<String>)> = Vec::new();
-    let mut i = 0;
-    while i < nodes.len() {
-        match &nodes[i] {
-            // An author note rides as text until delivery strips it.
-            Node::Text(_) | Node::Note { .. } => i += 1,
-            // An inert block delivers its body, fences gone.
-            Node::Inert { region, body, .. } => {
-                regions.push((region.0, region.1, body_lines(body)));
-                i += 1;
-            }
-            Node::Block(b) if b.set_group.is_some() => {
-                let g = b.set_group;
-                let mut members = vec![b];
-                let mut j = i + 1;
-                while let Some(Node::Block(bb)) = nodes.get(j) {
-                    if bb.set_group == g {
-                        members.push(bb);
-                        j += 1;
-                    } else {
-                        break;
-                    }
-                }
-                for m in &members {
-                    fold_config(m, &mut out, &mut errs);
-                }
-                regions.push((b.region.0, b.region.1, deliver_set_lines(&members)));
-                i = j;
-            }
-            Node::Block(b) if matches!(b.form, Form::Keyword | Form::Alert) => {
-                // A lifted keyword/alert delivers its RAW source lines through
-                // the same normalizer the un-lifted text pass applies — so the
-                // delivered bytes are identical by construction to when these
-                // lines rode in a prose run.
-                let src: Vec<String> = doc.source.split('\n').collect::<Vec<_>>()
-                    [b.region.0..=b.region.1]
-                    .iter()
-                    .map(|l| l.to_string())
-                    .collect();
-                regions.push((b.region.0, b.region.1, normalize_lines(src)));
-                i += 1;
-            }
-            Node::Block(b) => {
-                fold_config(b, &mut out, &mut errs);
-                let mut delivered =
-                    deliver_block_lines(b, &when_facts, &decls, granted, resolve, depth, seen);
-                // A rule container's region covers its reason (S14). Until
-                // delivery renders reasons, the reason's source lines are
-                // delivered as they were when they were prose after the
-                // block: a blank line when blanks separated them (runs of
-                // blanks collapse to one anyway), then the lines verbatim.
-                if let Some((start, end)) = b.reason {
-                    let src: Vec<&str> = doc.source.split('\n').collect();
-                    if src[start - 1].trim().is_empty() {
-                        delivered.push(String::new());
-                    }
-                    delivered.extend(src[start..=end].iter().map(|l| l.to_string()));
-                }
-                regions.push((b.region.0, b.region.1, delivered));
-                i += 1;
-            }
-        }
+    // Configuration folds from the top-level machinery, a set's members
+    // each on their own.
+    for b in doc.blocks() {
+        fold_config(b, &mut out, &mut errs);
     }
     if !errs.is_empty() {
         return Err(errs);
@@ -3668,32 +3598,23 @@ pub fn fold_full(
         resolve_secret_refs(wf, &secret_refs);
     }
 
-    // Pass 2 (§3.5 layout): rebuild the delivered text line by line — each
-    // block's region is REPLACED by its delivered form; every other line
-    // (prose, headings, blank lines) is delivered unchanged.
-    let body_lines: Vec<&str> = doc.source.split('\n').collect();
-    let mut lines: Vec<String> = Vec::new();
-    let mut li = 0;
-    let mut ri = 0;
-    while li < body_lines.len() {
-        if ri < regions.len() && regions[ri].0 == li {
-            lines.extend(regions[ri].2.iter().cloned());
-            li = regions[ri].1 + 1;
-            ri += 1;
-        } else {
-            lines.push(body_lines[li].to_string());
-            li += 1;
+    // A skill's catalogue body is its prose as this document delivers it.
+    // Identity is per kind, so a name finds the one skill block it came from.
+    let lines: Vec<&str> = doc.source.split('\n').collect();
+    for b in doc.blocks().filter(|b| b.kind == "skill") {
+        if let Some(sk) = out
+            .skills
+            .iter_mut()
+            .find(|sk| b.attrs.get("name") == Some(&sk.name))
+        {
+            sk.body = deliver::skill_body(b, &lines, w);
         }
     }
 
-    // Pass 3 (§3.5 steps 4–6): keyword/alert forms normalize to their bold
-    // delivered form; runs of blank lines collapse to one and the document's
-    // leading/trailing blanks are trimmed; inline references degrade; and
-    // `${}` is substituted LAST so a value is never re-parsed.
-    let lines = normalize_lines(lines);
-    let text = collapse_blanks(lines).join("\n");
-    let text = degrade_inline_refs(&text);
-    let mut text = substitute_params(&text, &params);
+    // §3.5: the body rendered once, region by region; then `${}` is
+    // substituted LAST so a value is never re-parsed.
+    let text = deliver::document(doc, w).join("\n");
+    let mut text = substitute_params(&text, &w.params);
     // The delivered text ends with exactly one newline (§3.5) — part of the
     // bytes the delivery digest covers.
     if !text.is_empty() {
@@ -3711,80 +3632,23 @@ fn fold_config(b: &Block, out: &mut Extraction, errs: &mut Vec<Refusal>) {
     }
 }
 
-/// The lines a block delivers, replacing its source region (§3.5 steps 4–5).
-#[allow(clippy::too_many_arguments)]
-fn deliver_block_lines(
-    b: &Block,
-    params: &BTreeMap<String, String>,
-    decls: &BTreeMap<String, BTreeMap<String, String>>,
-    granted: &BTreeSet<String>,
-    resolve: IncludeResolver,
-    depth: usize,
-    seen: &BTreeSet<String>,
-) -> Vec<String> {
-    match b.disposition {
-        Disposition::Prose => deliver_prose_lines(b, decls),
-        Disposition::Structural if b.kind == "when" => {
-            // A KEPT `when` delivers its body unwrapped; a dropped one nothing.
-            if when_kept(b, params) {
-                body_lines(b.delivery_body())
-            } else {
-                Vec::new()
-            }
-        }
-        Disposition::Structural if b.kind == "include" => {
-            deliver_include(b, granted, params, resolve, depth, seen)
-        }
-        // A structural kind with no body (`param`) delivers nothing. One that
-        // has a body and no delivery semantics here yet (`unless`,
-        // `otherwise`, registered in revision 1.1) delivers that body
-        // unwrapped, as it did when it was an unknown bare kind: a catch-all
-        // that delivered nothing would silently drop the guidance inside —
-        // typically the safety fallback an `otherwise` carries — while the
-        // load still reported success. Keyed on the schema's `x-body`, so a
-        // structural kind a later registry adds keeps its text too.
-        Disposition::Structural => match lookup(&b.kind).map(|k| k.body) {
-            Some(BodyKind::None) => Vec::new(),
-            _ => body_lines(b.delivery_body()),
-        },
-        Disposition::Machinery => machinery_ack(b).into_iter().collect(),
-    }
-}
-
 /// Transclude an `include` (§5.2): resolve the referenced document, deliver it
-/// with its OWN parameters, and inline its lines. An unavailable document, a
-/// cycle, or a too-deep include degrades to a visible note rather than looping
-/// or revealing existence.
-fn deliver_include(
-    b: &Block,
-    granted: &BTreeSet<String>,
-    facts: &BTreeMap<String, String>,
-    resolve: IncludeResolver,
-    depth: usize,
-    seen: &BTreeSet<String>,
-) -> Vec<String> {
+/// with its OWN parameters and label style, and inline its lines. An
+/// unavailable document, a cycle, or a too-deep include degrades to a visible
+/// note rather than looping or revealing existence.
+pub(crate) fn deliver_include(b: &Block, w: &Walk) -> Vec<String> {
     let Some(id) = b.attrs.get("id").or_else(|| b.attrs.get("uri")).cloned() else {
         return vec!["> _(included instruction not available)_".into()];
     };
-    if depth >= INCLUDE_DEPTH_CAP || seen.contains(&id) {
+    if w.depth >= INCLUDE_DEPTH_CAP || w.seen.contains(&id) {
         return vec!["> _(included instruction not available: cycle or depth cap)_".into()];
     }
-    let Some(text) = resolve(&id) else {
+    let Some(text) = (w.resolver)(&id) else {
         return vec!["> _(included instruction not available)_".into()];
     };
-    let mut seen2 = seen.clone();
-    seen2.insert(id);
-    let inlined = parse(&text).and_then(|d| {
-        fold_full(
-            &d,
-            granted,
-            &BTreeMap::new(),
-            facts,
-            resolve,
-            depth + 1,
-            &seen2,
-        )
-    });
+    // End matter (S27) never arrives: the included document is parsed as a
+    // document, which cuts it from the body it delivers.
+    let inlined = parse(&text).and_then(|d| fold_in(&d, &mut w.include(&id, &d)));
     match inlined {
         Ok(ex) => ex
             .cleaned
@@ -3793,17 +3657,6 @@ fn deliver_include(
             .map(str::to_string)
             .collect(),
         Err(_) => vec!["> _(included instruction not available)_".into()],
-    }
-}
-
-/// A body split into delivered lines, with outer blank lines trimmed but inner
-/// line breaks preserved.
-fn body_lines(body: &str) -> Vec<String> {
-    let t = body.trim_matches('\n');
-    if t.is_empty() {
-        Vec::new()
-    } else {
-        t.split('\n').map(str::to_string).collect()
     }
 }
 
@@ -3821,7 +3674,7 @@ pub(crate) fn when_kept(b: &Block, facts: &BTreeMap<String, String>) -> bool {
 
 /// A set of machinery delivers ONE line naming its members (§4.3 / Appendix A);
 /// a set of a kind that delivers nothing (no `x-acknowledgement`) is silent.
-fn deliver_set_lines(members: &[&Block]) -> Vec<String> {
+pub(crate) fn deliver_set_lines(members: &[&Block]) -> Vec<String> {
     let first = members[0];
     let Some(k) = lookup(&first.kind) else {
         return Vec::new();
@@ -3842,10 +3695,21 @@ fn deliver_set_lines(members: &[&Block]) -> Vec<String> {
 }
 
 /// A machinery block's acknowledgement line from the schema's `x-acknowledgement`
-/// template, or `None` for a kind that delivers nothing (§3.5 step 5).
-fn machinery_ack(b: &Block) -> Option<String> {
+/// template, or `None` for a kind that delivers nothing (§3.5 step 5). A block
+/// with a trigger says when to use it (S11): `trigger`, or on a skill its
+/// version-1 alias `when` — `trigger` winning — fills the kind's
+/// `x-acknowledgement-trigger` instead.
+pub(crate) fn machinery_ack(b: &Block) -> Option<String> {
     let kind = lookup(&b.kind)?;
-    let tmpl = kind.ack.as_deref()?;
+    let plain = kind.ack.as_deref()?;
+    let trigger = b
+        .attrs
+        .get("trigger")
+        .or_else(|| (b.kind == "skill").then(|| b.attrs.get("when")).flatten());
+    let tmpl = match (trigger, kind.ack_trigger.as_deref()) {
+        (Some(_), Some(t)) => t,
+        _ => plain,
+    };
     // Identity is the `name` attribute (`x-identity`); a block that reaches
     // delivery without one was already refused at parse.
     let name = b
@@ -3858,121 +3722,74 @@ fn machinery_ack(b: &Block) -> Option<String> {
     Some(
         tmpl.replace("{name}", &name)
             .replace("{path}", &path)
-            .replace("{target}", &target),
+            .replace("{target}", &target)
+            .replace("{trigger}", trigger.map_or("", String::as_str)),
     )
 }
 
-/// Prose degrades to its delivered form (Appendix A): a normativity keyword
-/// becomes `**KEYWORD:** body` (label on the first body line only);
-/// `example`/`context`/`form`/`tool`/`glossary` take their own shapes. (An
-/// unknown bare name is no block: its body is an inert node's, §3.3 rule 2.)
-fn deliver_prose_lines(
+/// A `form` delivers its input list, not its body (§5.1): the body is a
+/// capture TEMPLATE for an editor. The list is the parameters the body
+/// references, in first-reference order, with their metadata.
+pub(crate) fn form_lines(
     b: &Block,
     decls: &BTreeMap<String, BTreeMap<String, String>>,
 ) -> Vec<String> {
-    let title = b.attrs.get("title").cloned();
-    let body = body_lines(b.delivery_body());
-    match b.kind.as_str() {
-        "context" => {
-            let t = title.map(|t| format!(" title=\"{t}\"")).unwrap_or_default();
-            let mut out = vec![format!("<reference{t}>")];
-            out.extend(body);
-            out.push("</reference>".into());
-            out
-        }
-        "example" => {
-            let t = title.map(|t| format!(" — {t}")).unwrap_or_default();
-            let mut out = vec![format!("**EXAMPLE{t}:**")];
-            out.extend(body);
-            out
-        }
-        "form" => {
-            // The body is a capture TEMPLATE for an editor, not delivered
-            // (§5.1). The delivered text is a list of the parameters the body
-            // references, in first-reference order, with their metadata.
-            let t = title.map(|t| format!(" — {t}")).unwrap_or_default();
-            let mut out = vec![format!("**Inputs to collect{t}**")];
-            for name in extract_param_refs(&b.body) {
-                let mut line = format!("- **{name}**");
-                let mut segs: Vec<String> = Vec::new();
-                if let Some(d) = decls.get(&name) {
-                    if let Some(desc) = d.get("description").filter(|s| !s.is_empty()) {
-                        segs.push(desc.clone());
-                    }
-                    if d.get("required").map(|v| v != "false").unwrap_or(false) {
-                        segs.push("required".into());
-                    }
-                    if let Some(values) = d.get("values").filter(|s| !s.is_empty()) {
-                        segs.push(format!("one of: {values}"));
-                    }
-                    if let Some(def) = d.get("default").filter(|s| !s.is_empty()) {
-                        segs.push(format!("default: {def}"));
-                    }
-                }
-                if !segs.is_empty() {
-                    line.push_str(&format!(" — {}", segs.join("; ")));
-                }
-                out.push(line);
+    let t = b
+        .attrs
+        .get("title")
+        .map(|t| format!(" — {t}"))
+        .unwrap_or_default();
+    let mut out = vec![format!("**Inputs to collect{t}**")];
+    for name in extract_param_refs(&b.body) {
+        let mut line = format!("- **{name}**");
+        let mut segs: Vec<String> = Vec::new();
+        if let Some(d) = decls.get(&name) {
+            if let Some(desc) = d.get("description").filter(|s| !s.is_empty()) {
+                segs.push(desc.clone());
             }
-            out
+            if d.get("required").map(|v| v != "false").unwrap_or(false) {
+                segs.push("required".into());
+            }
+            if let Some(values) = d.get("values").filter(|s| !s.is_empty()) {
+                segs.push(format!("one of: {values}"));
+            }
+            if let Some(def) = d.get("default").filter(|s| !s.is_empty()) {
+                segs.push(format!("default: {def}"));
+            }
         }
-        "tool" => {
-            let cap = b.attrs.get("cap").cloned().unwrap_or_default();
-            // The label is explicit, else the block's name, else the last path
-            // segment of the capability, title-cased.
-            let label = b
-                .attrs
-                .get("label")
-                .or(b.name.as_ref())
-                .cloned()
-                .or_else(|| {
-                    cap.rsplit(['/', ':'])
-                        .find(|s| !s.is_empty())
-                        .map(title_case)
-                });
-            let mut head = label
-                .map(|l| format!("**Tool — {l}** (`{cap}`)"))
-                .unwrap_or_else(|| format!("**Tool** (`{cap}`)"));
-            if let Some(allow) = b.attrs.get("allow").filter(|a| !a.is_empty()) {
-                head.push_str(&format!(" — allowed: {allow}"));
-            }
-            if let Some(deny) = b.attrs.get("deny").filter(|d| !d.is_empty()) {
-                head.push_str(&format!("; denied: {deny}"));
-            }
-            let mut out = vec![head];
-            out.extend(body);
-            out
+        if !segs.is_empty() {
+            line.push_str(&format!(" — {}", segs.join("; ")));
         }
-        "glossary" => deflist_entries(&b.body)
-            .into_iter()
-            .map(|(term, def)| format!("**{term}** — {def}"))
-            .collect(),
-        k => {
-            // The keyword prefixes the FIRST body line; the rest are unchanged.
-            // `:::should{not}` is the container spelling of `SHOULD NOT:` and
-            // keeps its polarity the same way, through the negated label.
-            let negated = b
-                .attrs
-                .get("not")
-                .is_some_and(|v| v.is_empty() || v == "true");
-            let kw = match registry().negated_label(k) {
-                Some(label) if negated => label.to_string(),
-                _ => k.to_uppercase(),
-            };
-            let mut out = Vec::new();
-            for (n, line) in body.iter().enumerate() {
-                if n == 0 {
-                    out.push(format!("**{kw}:** {}", line.trim_start()));
-                } else {
-                    out.push(line.clone());
-                }
-            }
-            if out.is_empty() {
-                out.push(format!("**{kw}:**"));
-            }
-            out
-        }
+        out.push(line);
     }
+    out
+}
+
+/// A `tool`'s head line: its label and capability, then its allow/deny
+/// policy. The label is explicit, else the block's name, else the last path
+/// segment of the capability, title-cased.
+pub(crate) fn tool_head(b: &Block) -> String {
+    let cap = b.attrs.get("cap").cloned().unwrap_or_default();
+    let label = b
+        .attrs
+        .get("label")
+        .or(b.name.as_ref())
+        .cloned()
+        .or_else(|| {
+            cap.rsplit(['/', ':'])
+                .find(|s| !s.is_empty())
+                .map(title_case)
+        });
+    let mut head = label
+        .map(|l| format!("**Tool — {l}** (`{cap}`)"))
+        .unwrap_or_else(|| format!("**Tool** (`{cap}`)"));
+    if let Some(allow) = b.attrs.get("allow").filter(|a| !a.is_empty()) {
+        head.push_str(&format!(" — allowed: {allow}"));
+    }
+    if let Some(deny) = b.attrs.get("deny").filter(|d| !d.is_empty()) {
+        head.push_str(&format!("; denied: {deny}"));
+    }
+    head
 }
 
 /// Upper-case the first character of a word (`ticketing` → `Ticketing`).
@@ -4132,226 +3949,6 @@ fn substitute_params(text: &str, params: &BTreeMap<String, String>) -> String {
     out
 }
 
-/// Degrade inline references in the delivered text (Appendix A): `[[kind/name]]`
-/// and `[[kind/name|Label]]` to the label (or `name`), and `[Label](#kind/name)`
-/// to `Label`. References inside fenced code are left untouched.
-fn degrade_inline_refs(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut in_code = None::<usize>;
-    for line in text.split_inclusive('\n') {
-        let bare = line.strip_suffix('\n').unwrap_or(line);
-        if let Some(tl) = in_code {
-            if code_fence_len(bare) == Some(tl) {
-                in_code = None;
-            }
-            out.push_str(line);
-            continue;
-        }
-        if let Some(tl) = code_fence_len(bare) {
-            in_code = Some(tl);
-            out.push_str(line);
-            continue;
-        }
-        out.push_str(&degrade_line_refs(line));
-    }
-    out
-}
-
-fn degrade_line_refs(line: &str) -> String {
-    // [[kind/name]] or [[kind/name|Label]] → Label or name.
-    let mut s = String::with_capacity(line.len());
-    let mut rest = line;
-    while let Some(pos) = rest.find("[[") {
-        let after = &rest[pos + 2..];
-        let Some(end) = after.find("]]") else {
-            break;
-        };
-        let inner = &after[..end];
-        let shown = match inner.split_once('|') {
-            Some((target, label)) => {
-                if is_ref_target(target) {
-                    label.to_string()
-                } else {
-                    format!("[[{inner}]]")
-                }
-            }
-            None => match inner.split_once('/') {
-                Some((_, name)) if is_ref_target(inner) => name.to_string(),
-                _ => format!("[[{inner}]]"),
-            },
-        };
-        s.push_str(&rest[..pos]);
-        s.push_str(&shown);
-        rest = &after[end + 2..];
-    }
-    s.push_str(rest);
-    // [Label](#kind/name) → Label.
-    let mut t = String::with_capacity(s.len());
-    let mut rest = s.as_str();
-    while let Some(open) = rest.find('[') {
-        let after = &rest[open + 1..];
-        let Some(close) = after.find(']') else { break };
-        let label = &after[..close];
-        let tail = &after[close + 1..];
-        if let Some(frag) = tail.strip_prefix("(#")
-            && let Some(fend) = frag.find(')')
-            && is_ref_target(&frag[..fend])
-        {
-            t.push_str(&rest[..open]);
-            t.push_str(label);
-            rest = &frag[fend + 1..];
-            continue;
-        }
-        // Not a fragment reference — keep the `[` and continue past it.
-        t.push_str(&rest[..open + 1]);
-        rest = after;
-    }
-    t.push_str(rest);
-    t
-}
-
-/// Whether `kind/name` names a known kind (so it is a reference, not prose).
-fn is_ref_target(s: &str) -> bool {
-    matches!(s.split_once('/'), Some((k, n)) if is_kind_token(k) && is_name(n) && lookup(k).is_some())
-}
-
-/// Normalize keyword lines (`MUST: …`, `**NEVER:**`, list items) and blockquote
-/// alerts (`> [!TIP]`) to their delivered bold form (Appendix A), driven by the
-/// schema's keyword map. The keyword label prefixes the FIRST line only;
-/// continuation lines keep their breaks (an alert's `> ` prefixes are removed).
-/// Fenced code is left untouched.
-fn normalize_lines(lines: Vec<String>) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let mut in_code = None::<usize>;
-    let mut i = 0;
-    while i < lines.len() {
-        let line = &lines[i];
-        if let Some(tl) = in_code {
-            if code_fence_len(line) == Some(tl) {
-                in_code = None;
-            }
-            out.push(line.clone());
-            i += 1;
-            continue;
-        }
-        if let Some(tl) = code_fence_len(line) {
-            in_code = Some(tl);
-            out.push(line.clone());
-            i += 1;
-            continue;
-        }
-        // An alert: `> [!KIND]`, then the `>`-quoted body. The label prefixes
-        // the first body line; the rest keep their own lines, `> ` stripped.
-        if let Some(kw) = alert_open_kind(line) {
-            let mut body = Vec::new();
-            i += 1;
-            while i < lines.len() {
-                if let Some(rest) = lines[i].strip_prefix('>') {
-                    body.push(rest.strip_prefix(' ').unwrap_or(rest).to_string());
-                    i += 1;
-                } else {
-                    break;
-                }
-            }
-            for (n, l) in body.iter().enumerate() {
-                out.push(if n == 0 {
-                    format!("**{kw}:** {}", l.trim_start())
-                } else {
-                    l.clone()
-                });
-            }
-            continue;
-        }
-        out.push(normalize_keyword_line(line).unwrap_or_else(|| line.clone()));
-        i += 1;
-    }
-    out
-}
-
-/// Collapse runs of two or more blank lines into one, and trim the document's
-/// leading and trailing blank lines (§3.5 layout).
-fn collapse_blanks(lines: Vec<String>) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let mut prev_blank = false;
-    for l in lines {
-        let blank = l.trim().is_empty();
-        if blank && prev_blank {
-            continue;
-        }
-        prev_blank = blank;
-        out.push(l);
-    }
-    while out.first().is_some_and(|l| l.trim().is_empty()) {
-        out.remove(0);
-    }
-    while out.last().is_some_and(|l| l.trim().is_empty()) {
-        out.pop();
-    }
-    out
-}
-
-/// The canonical delivered keyword for a `> [!KIND]` alert opener, if the line
-/// is one — read as the tree reads it — and KIND is a known keyword.
-fn alert_open_kind(line: &str) -> Option<String> {
-    canonical_keyword(&alert_keyword(line)?)
-}
-
-/// Normalize one keyword line to `[- ]**KEYWORD:** rest`, preserving a leading
-/// list marker; `None` if the line is not a keyword line.
-fn normalize_keyword_line(line: &str) -> Option<String> {
-    let (marker, rest) = split_list_marker(line);
-    let rest = rest.strip_prefix("**").unwrap_or(rest);
-    // The keyword runs up to the first colon; check longest keywords first.
-    let colon = rest.find(':')?;
-    let kw_raw = rest[..colon].trim_end_matches("**").trim();
-    let canon = canonical_keyword(kw_raw)?;
-    let after = rest[colon + 1..].trim_start_matches("**");
-    let after = after.strip_prefix([' ', '\t'])?;
-    Some(format!("{marker}**{canon}:** {}", after.trim_start()))
-}
-
-/// Split a leading unordered/ordered list marker (`- `, `* `, `1. `) off a
-/// line, returning `(marker_including_trailing_space, remainder)`.
-fn split_list_marker(line: &str) -> (String, &str) {
-    let trimmed = line.trim_start();
-    let indent = &line[..line.len() - trimmed.len()];
-    if let Some(rest) = trimmed
-        .strip_prefix("- ")
-        .or_else(|| trimmed.strip_prefix("* "))
-        .or_else(|| trimmed.strip_prefix("+ "))
-    {
-        return (format!("{indent}- "), rest);
-    }
-    // Ordered: digits then `.`/`)` then space.
-    let digits: String = trimmed.chars().take_while(|c| c.is_ascii_digit()).collect();
-    if !digits.is_empty() {
-        let after = &trimmed[digits.len()..];
-        if let Some(rest) = after
-            .strip_prefix(". ")
-            .or_else(|| after.strip_prefix(") "))
-        {
-            return (format!("{indent}{digits}. "), rest);
-        }
-    }
-    (indent.to_string(), trimmed)
-}
-
-/// The canonical uppercase keyword a keyword token maps to (`MUST NOT` →
-/// `NEVER`, `INFO` → `NOTE`), from the schema's keyword table. A negating
-/// keyword (`SHOULD NOT`) maps to the same kind as its positive form, so its
-/// label comes from the registry's negated labels — upper-casing the kind
-/// alone delivered `SHOULD NOT:` as `**SHOULD:**`, the rule's opposite.
-fn canonical_keyword(kw: &str) -> Option<String> {
-    let reg = registry();
-    let kind = reg.keyword_kind(kw)?;
-    if reg.keyword_negates(kw)
-        && let Some(label) = reg.negated_label(kind)
-    {
-        return Some(label.to_string());
-    }
-    Some(kind.to_uppercase())
-}
-
 /// A line that opens a keyword block (§4.5; S12, S15), as
 /// `x-grammar.keywordLine` matches it: an optional column-0 list marker, an
 /// optional `**`, a keyword, an optional `[name]`, an optional
@@ -4420,7 +4017,7 @@ fn keyword_tail(after: &str) -> Option<(Option<&str>, Option<&str>, &str)> {
 
 /// The length of a column-0 list marker (`[-*+][ \t]+` or
 /// `[0-9]+[.)][ \t]+`) at the start of `line`, or 0.
-fn list_marker_len(line: &str) -> usize {
+pub(crate) fn list_marker_len(line: &str) -> usize {
     let after = if let Some(r) = line.strip_prefix(['-', '*', '+']) {
         r
     } else {
@@ -5880,8 +5477,6 @@ into: {stream: s, subject: x.y}
             &BTreeMap::new(),
             &BTreeMap::new(),
             &resolve,
-            0,
-            &BTreeSet::new(),
         )
         .unwrap();
         assert!(
@@ -5969,12 +5564,19 @@ steps:
 
     #[test]
     fn delivered_text_has_no_front_matter_fences_or_declared_placeholders() {
-        // The peer's guard: after delivery, no `---`, no `:::`, no declared `${`.
-        let doc = "---\nspec: \"1\"\n---\n# Title\n\n::param{name=env default=prod}\n\nGuidance for ${env}.\n\n:::!workflow{name=w}\nsteps: { f: { kind: manual } }\n:::";
+        // The peer's guard: after delivery, no `---`, no `:::`, no declared
+        // `${` — and no end matter (S27), whose record never reaches the
+        // model.
+        let doc = "---\nspec: \"1\"\n---\n# Title\n\n::param{name=env default=prod}\n\nGuidance for ${env}.\n\n:::!workflow{name=w}\nsteps: { f: { kind: manual } }\n:::\n\n---\nowners: [ana]\n---\n";
         let e = fold(&parse(doc).unwrap(), &grants(&[])).unwrap();
         assert!(
             !e.cleaned.contains("---"),
             "no front matter:\n{}",
+            e.cleaned
+        );
+        assert!(
+            !e.cleaned.contains("owners"),
+            "no end matter:\n{}",
             e.cleaned
         );
         assert!(!e.cleaned.contains(":::"), "no fences:\n{}", e.cleaned);
@@ -6009,17 +5611,9 @@ steps:
         .unwrap();
         for env in ["prod", "dev"] {
             let facts: BTreeMap<String, String> = [("environment".into(), env.into())].into();
-            let out = fold_full(
-                &doc,
-                &all_families(),
-                &BTreeMap::new(),
-                &facts,
-                &|_| None,
-                0,
-                &BTreeSet::new(),
-            )
-            .unwrap()
-            .cleaned;
+            let out = fold_full(&doc, &all_families(), &BTreeMap::new(), &facts, &|_| None)
+                .unwrap()
+                .cleaned;
             assert_eq!(
                 out, "# T\n\nDebug freely.\n\nBe careful.\n\nUse x.\n",
                 "environment={env}"
@@ -6733,20 +6327,24 @@ steps:
         assert!(parse(":::must{because=\"a\"}\nx\n:::").is_ok());
     }
 
-    /// Until delivery renders reasons, a container's `BECAUSE:` paragraph,
-    /// now inside the rule's region, is delivered exactly as it was when it
-    /// was prose after the block — never dropped.
+    /// A container's `BECAUSE:` paragraph, inside the rule's region, is its
+    /// reason (S14): delivered on its own line straight after the rule's
+    /// text, the blank lines between them gone — and inside a body, where
+    /// the rule it follows is rendered too.
     #[test]
-    fn a_containers_reason_is_still_delivered() {
+    fn a_containers_reason_is_delivered_after_its_rule() {
         for (doc, want) in [
             (
                 ":::must\nx\n:::\n\nBECAUSE: y\nand z.\n\nAfter.",
-                "**MUST:** x\n\nBECAUSE: y\nand z.\n\nAfter.\n",
+                "**MUST:** x\n**BECAUSE:** y\nand z.\n\nAfter.\n",
             ),
-            (":::must\nx\n:::\nBECAUSE: y", "**MUST:** x\nBECAUSE: y\n"),
+            (
+                ":::must\nx\n:::\nBECAUSE: y",
+                "**MUST:** x\n**BECAUSE:** y\n",
+            ),
             (
                 "::::context\n:::must\nx\n:::\nBECAUSE: y\n::::",
-                "<reference>\nBECAUSE: y\n</reference>\n",
+                "<reference>\n**MUST:** x\n**BECAUSE:** y\n</reference>\n",
             ),
         ] {
             let d = parse(doc).unwrap();

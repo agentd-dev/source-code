@@ -252,6 +252,22 @@ fn the_schema_registry_agrees_with_the_parser() {
         listed, known,
         "the schema's x-registry.machinery drifted from its own $defs.kinds"
     );
+    // The names refused bare are `x-registry.reserved-bare` (S23), not the
+    // whole machinery list: `eval`, registered after version 1, is prose
+    // when written bare.
+    let mut reserved: Vec<&str> = schema["x-registry"]["reserved-bare"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    reserved.sort_unstable();
+    let parser: Vec<&str> = agentd::config::idoc::reserved_bare_names().collect();
+    assert!(!reserved.is_empty());
+    assert_eq!(
+        reserved, parser,
+        "the parser's reserved bare names drifted from x-registry.reserved-bare"
+    );
 }
 
 /// Drift check against the spec repo, when it is reachable: the vendored JSON

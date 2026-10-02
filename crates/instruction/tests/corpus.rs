@@ -73,16 +73,11 @@ fn inputs_of(suite: &str) -> &'static [&'static str] {
 /// closes them. Shrink-only: an entry that starts passing must be deleted
 /// here, and the test says so.
 const PENDING: &[&str] = &[
-    // Cases new in revision 1.1 (S8-S27): the notes, end matter, eval
-    // blocks and the delivery of every 1.1 construct land in units V4-V6.
+    // Cases new in revision 1.1 (S8-S27): the delivery of every 1.1
+    // construct lands in units V5-V6.
     "corpus/author-notes/delivered.txt",
-    "corpus/author-notes/tree.json",
     "corpus/conditions/delivered.txt",
-    "corpus/end-matter/delivered.txt",
-    "corpus/end-matter/tree.json",
     "corpus/eval/delivered.txt",
-    "corpus/eval/doc.md",
-    "corpus/eval/tree.json",
     "corpus/examples-avoid/delivered.txt",
     "corpus/labels-plain/delivered.txt",
     "corpus/labels-tags/delivered.txt",
@@ -156,10 +151,6 @@ const PENDING: &[&str] = &[
     "corpus/variants/manifest.json",
     "corpus/verbatim/manifest.canonical.json",
     "corpus/verbatim/manifest.json",
-    // Refusals new in revision 1.1 — unit V4.
-    "refusals/output-schema-not-a-reference/refusals.json",
-    "refusals/override-guardrail/refusals.json",
-    "refusals/override-stronger/refusals.json",
     // The S19 advisories — unit V9, which deletes this list.
     "advisories/empty-variant/advisories.json",
     "advisories/keyword-in-example/advisories.json",

@@ -208,6 +208,11 @@ pub fn tree_json(document: &Document) -> Value {
         tree.insert("frontMatter".into(), json!(document.front));
     }
     tree.insert("blocks".into(), json!(grouped_json(&nodes)));
+    // `endMatter` follows the blocks, and only when the document has some
+    // (S27). An inert block is no block, so the tree never shows one.
+    if let Some(end_matter) = &document.end_matter {
+        tree.insert("endMatter".into(), json!(end_matter));
+    }
     Value::Object(tree)
 }
 
@@ -467,6 +472,18 @@ mod tests {
         assert!(t.get("frontMatter").is_none(), "{t}");
         let t = tree_json(&parse("---\nspec: \"1\"\n---\nMUST: x").unwrap());
         assert_eq!(t["frontMatter"], json!({"spec": "1"}));
+    }
+
+    /// `endMatter` follows the blocks when the document has end matter, and
+    /// is absent when it has none; an inert block is never in the tree.
+    #[test]
+    fn end_matter_is_in_the_tree_only_when_written_and_inert_blocks_never() {
+        let t = tree_json(&parse("MUST: x\n\n---\nowners: [ana]\n---\n").unwrap());
+        assert_eq!(t["endMatter"], json!({"owners": ["ana"]}));
+        assert_eq!(t["blocks"].as_array().unwrap().len(), 1);
+        let t = tree_json(&parse("MUST: x\n\n:::eval\nprose\n:::\n").unwrap());
+        assert!(t.get("endMatter").is_none(), "{t}");
+        assert_eq!(t["blocks"].as_array().unwrap().len(), 1, "{t}");
     }
 
     #[test]

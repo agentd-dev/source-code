@@ -4,9 +4,11 @@
 //! as a library.
 //!
 //! One Markdown file defines a whole agent. This crate turns such a document
-//! into a typed block tree ([`doc::parse`]), validates it against the spec's
-//! own vendored JSON Schema registry (kinds, forms, grants, the semantic
-//! rules, Appendix B refusal shapes), runs the §3.5 delivery pipeline
+//! into a typed block tree ([`doc::parse`]) — author notes set aside unread,
+//! end matter split off as the document's record ([`doc::split_end_matter`])
+//! — validates it against the spec's own vendored JSON Schema registry
+//! (kinds, forms, grants, attribute values, the semantic rules, Appendix B
+//! refusal shapes), runs the §3.5 delivery pipeline
 //! byte-exactly ([`deliver`] — prose degraded, machinery acknowledged, `when`
 //! selected, includes transcluded, `${}` substituted last), and — behind the
 //! `sign` feature — computes §7 digests and verifies author/delivery JWS

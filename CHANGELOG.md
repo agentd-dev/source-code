@@ -278,6 +278,28 @@ test that fails on the old code.
   `trigger` is what the catalogue says it is for, with `when` as its alias.
   The delivered text is unchanged for now: these lines reach the model as
   they did, and the rendered forms come with the 1.1 delivery.
+- **An instruction document reads author notes, end matter and `!eval`, and
+  holds attribute values and overrides to the 1.1 registry.** A line that
+  begins with `<!--` at column 0 opens an author note (S9), which ends at the
+  first line holding `-->`: nothing in it is parsed, so a commented-out
+  `:::!workflow` no longer loads and a `[[kind/name]]` in it is not
+  resolved. Its lines still reach the model as written until the 1.1
+  delivery strips them. A document may end with end matter (S27): after a
+  blank line, a `---`, a YAML mapping and a closing `---` as its last lines.
+  It is the document's record and is no longer delivered; end matter that
+  is not a YAML mapping refuses the document (`end-matter-yaml`). A bare
+  `:::eval` is prose, as is any machinery name registered after version 1
+  (S23); `:::!eval` loads, needs a name and a `target=@kind/name` that
+  resolves, and configures and delivers nothing. A value outside an
+  attribute's schema `enum` or `pattern` (`::param{type=integer}`,
+  `:::output{schema=reply}`) refuses (`attribute-value`), on a block, on
+  each row of a set, and on a front-matter `parameters` entry. A `:::when`
+  or `:::unless` with no condition refuses (`missing-attribute`), and so
+  does an `overrides` that names a guardrail (`override-guardrail`) or a
+  stronger rule (`override-stronger`) in the same document. An unknown bare
+  container's body is read raw to its first closing fence, so a fence
+  inside it no longer opens a block, and an unknown bare leaf
+  (`::aside{…}`) stays in the text as written, where it was dropped.
 - **`/hooks/_` is agentd's.** A `wait {on: webhook}` callback is armed under
   `/hooks/_cb/`, and configured routes match first, so a route there could
   take a suspended run's callback. A `webhook` start `path` or a wait's
@@ -361,6 +383,20 @@ and its condition are attributes, an alias kind stays as written, a rule's
 reason is `attrs.because`, and `frontMatter` appears only when the document
 has front matter. `Block` gains `reason` and `Document` gains
 `has_front_matter`.
+
+agentd-instruction reads author notes (S9), end matter (S27) and `!eval`
+(S23), and enforces attribute values and overrides (S24). `doc::Node` gains
+`Note` and `Inert`: an unknown bare block, or `eval` written bare, is an
+`Inert` node rather than a `Block` of prose disposition, and the tree never
+shows one. `Block` gains `notes`; `Document` gains `end_matter`, and its
+`source` excludes end matter while `raw` keeps it. New:
+`doc::split_end_matter` and `SplitEndMatter`, `doc::reserved_bare_names()`
+and `Registry::needs_attrs`. `tree_json` emits `endMatter` after the blocks
+when the document has end matter. Two choices differ from the TypeScript
+reference and are raised upstream: an empty `:::unless` refuses as
+`missing-attribute`, the Appendix B condition, where the reference reports
+`schema`; and the corpus does not pin the line `end-matter-yaml` names,
+which here, as in the reference, is the first end-matter line.
 
 ## v1.17.0 — A2A, and nothing beside it
 

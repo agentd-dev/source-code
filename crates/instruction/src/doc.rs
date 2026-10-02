@@ -162,6 +162,9 @@ pub struct Registry {
     multivalued: BTreeMap<String, BTreeSet<String>>,
     /// (kind, attribute) → the values or pattern its schema allows.
     attr_rules: BTreeMap<(String, String), AttrRule>,
+    /// The kinds whose attributes the schema requires at least one of
+    /// (`minProperties`): a `when` or an `unless` with no condition.
+    needs_attrs: BTreeSet<String>,
     /// The machinery names in the SCHEMA's order (refusals cite the first few).
     machinery_order: Vec<String>,
     /// kind → the attribute names its schema declares.
@@ -194,15 +197,32 @@ pub fn schema_json() -> &'static str {
 /// or set fence, a section heading, or a sigiled/structural leaf. This is what
 /// the loader keys on to decide whether to run extraction: a document written
 /// entirely in leaf or section form (no `:::` line at all) must still be
-/// recognized, or its machinery is silently delivered as prose.
+/// recognized, or its machinery is silently delivered as prose. A fence inside
+/// an author note is not a block (§3.3 rule 11): a commented-out `:::!workflow`
+/// is never parsed.
 pub fn contains_blocks(text: &str) -> bool {
-    text.split('\n').any(|line| {
-        open_fence(line).is_some()
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        if note_opens(line) {
+            match note_end(&lines, i, lines.len()) {
+                Some(end) => i = end + 1,
+                None => return false,
+            }
+            continue;
+        }
+        if open_fence(line).is_some()
             || section_open(line).is_some()
             || leaf_open(line).is_some_and(|lf| {
                 lf.sigil || lookup(&lf.kind).is_some_and(|k| k.disposition != Disposition::Prose)
             })
-    })
+        {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 impl Registry {
@@ -274,8 +294,12 @@ impl Registry {
         let mut multivalued: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let mut attr_names: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let mut attr_rules: BTreeMap<(String, String), AttrRule> = BTreeMap::new();
+        let mut needs_attrs = BTreeSet::new();
         if let Some(attrs) = schema["$defs"]["attrs"].as_object() {
             for (kind, spec) in attrs {
+                if spec["minProperties"].as_u64().is_some_and(|n| n > 0) {
+                    needs_attrs.insert(kind.clone());
+                }
                 if let Some(props) = spec["properties"].as_object() {
                     for (attr, a) in props {
                         attr_names
@@ -385,6 +409,7 @@ impl Registry {
             wire_floor: str_list(&reg["wire-floor"]),
             multivalued,
             attr_rules,
+            needs_attrs,
             machinery_order,
             attrs: attr_names,
             version,
@@ -499,6 +524,13 @@ impl Registry {
         self.attr_rules.get(&(kind.to_string(), attr.to_string()))
     }
 
+    /// Whether the schema requires `kind` to carry at least one attribute
+    /// (`minProperties`): the variant kinds, whose attributes are their
+    /// conditions.
+    pub fn needs_attrs(&self, kind: &str) -> bool {
+        self.needs_attrs.contains(kind)
+    }
+
     /// The attribute names `kind`'s schema declares, if it declares any.
     pub fn attrs_of(&self, kind: &str) -> Option<&BTreeSet<String>> {
         self.attrs.get(kind)
@@ -536,14 +568,21 @@ pub fn lookup(name: &str) -> Option<&'static Kind> {
     registry().kinds.get(name)
 }
 
-/// The machinery names — reserved in the bare namespace: a bare `:::workflow`
-/// (sigil forgotten) is refused rather than silently demoted to prose.
+/// The top-level machinery names, sigiled in every form. Which of them a
+/// bare block may not take is [`reserved_bare_names`].
 pub fn machinery_names() -> impl Iterator<Item = &'static str> {
     registry()
         .kinds
         .values()
         .filter(|k| k.disposition == Disposition::Machinery && k.sub_of.is_none())
         .map(|k| k.name.as_str())
+}
+
+/// The names a BARE block may not take (§3.3 rule 3; S23): the machinery of
+/// version 1, refused bare. Machinery registered later (`eval`) is not among
+/// them, so a version-1 document that wrote `:::eval` as prose stays prose.
+pub fn reserved_bare_names() -> impl Iterator<Item = &'static str> {
+    registry().reserved_bare.iter().map(String::as_str)
 }
 
 /// The full grant set — every capability family. Used for operator-authored
@@ -597,6 +636,10 @@ pub struct Block {
     /// The lines of the rule's `BECAUSE:` paragraph (S14; 0-based body
     /// lines, inclusive), when one follows it. Its text is `attrs.because`.
     pub reason: Option<(usize, usize)>,
+    /// The author notes in this block's own body (S9; 0-based body lines,
+    /// inclusive), not those of its children. Their lines stay in `body`, as
+    /// the §9.1 tree keeps them, and are recorded for delivery to strip.
+    pub notes: Vec<(usize, usize)>,
 }
 
 impl Block {
@@ -618,11 +661,31 @@ impl Block {
     }
 }
 
-/// A top-level document node, in source order: a run of prose text, or a block.
-/// Delivery walks these so the words BETWEEN blocks are preserved.
+/// A top-level document node, in source order: a run of prose text, an
+/// author note, an inert block, or a block. Delivery walks these so the words
+/// BETWEEN blocks are preserved.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Node {
     Text(String),
+    /// An author note (S9; §3.3 rule 11): body lines `start..=end` (0-based),
+    /// from a column-0 `<!--` to the first line holding `-->`. Never scanned
+    /// for blocks, references or keywords. Delivery still passes its lines
+    /// through as text, as it did before notes were read; the 1.1 delivery
+    /// strips them.
+    Note {
+        start: usize,
+        end: usize,
+    },
+    /// An inert block (§3.3 rule 2; S23): an unknown bare name, or machinery
+    /// registered after version 1 written bare (`:::eval`). It is no block
+    /// and not in the tree; its body, read raw, is prose. `region` is its
+    /// lines fences included (0-based, inclusive), `line` its opener.
+    Inert {
+        kind: String,
+        line: usize,
+        region: (usize, usize),
+        body: String,
+    },
     Block(Block),
 }
 
@@ -635,10 +698,14 @@ pub struct Document {
     /// absent block from an empty one, which the §9.1 tree keeps apart.
     pub has_front_matter: bool,
     pub nodes: Vec<Node>,
-    /// The whole source with front matter stripped.
+    /// The end matter (S27; §3.1.1), when the document ends with one: its
+    /// record — owners, approvals, changelog — which never reaches the model.
+    pub end_matter: Option<BTreeMap<String, Value>>,
+    /// The body the blocks were read from: the source with front matter and
+    /// end matter stripped. Block regions index its lines.
     pub source: String,
-    /// The original text verbatim (front matter included) — what an authored
-    /// digest is computed over.
+    /// The original text verbatim (front and end matter included) — what an
+    /// authored digest is computed over.
     pub raw: String,
 }
 
@@ -647,7 +714,7 @@ impl Document {
     pub fn blocks(&self) -> impl Iterator<Item = &Block> {
         self.nodes.iter().filter_map(|n| match n {
             Node::Block(b) => Some(b),
-            Node::Text(_) => None,
+            Node::Text(_) | Node::Note { .. } | Node::Inert { .. } => None,
         })
     }
 }
@@ -659,9 +726,25 @@ impl Document {
 pub fn parse(text: &str) -> Result<Document, Vec<Refusal>> {
     let mut errs = Vec::new();
     let (front, body_start) = parse_front_matter(text, &mut errs);
-    let body = &text[body_start..];
-    let lines: Vec<&str> = body.split('\n').collect();
     let base = body_start_line(text, body_start);
+    // End matter (S27) is the document's record, not its text: it is cut from
+    // what the block scanner reads, so nothing in it is a block, a keyword or
+    // a reference. Malformed end matter is refused, and still ends the body
+    // where it opens.
+    let (body, end_matter) = match end_matter_span(text, base) {
+        Some(span) => {
+            let fields = match span.fields {
+                Ok(m) => Some(m),
+                Err(r) => {
+                    errs.push(r);
+                    None
+                }
+            };
+            (&text[body_start..span.before.len()], fields)
+        }
+        None => (&text[body_start..], None),
+    };
+    let lines: Vec<&str> = body.split('\n').collect();
 
     // Top-level walk that interleaves text runs with blocks, so delivery keeps
     // the prose between blocks. Every form is recognized here (all at column 0):
@@ -678,6 +761,14 @@ pub fn parse(text: &str) -> Result<Document, Vec<Refusal>> {
             }
         };
     }
+    macro_rules! text {
+        ($line:expr) => {
+            if !pending.is_empty() {
+                pending.push('\n');
+            }
+            pending.push_str($line);
+        };
+    }
     while i < lines.len() {
         // Fenced code at top level suspends ALL recognition (§3.3 rule 5):
         // fences, leaves, headings and keywords inside it are content.
@@ -685,20 +776,24 @@ pub fn parse(text: &str) -> Result<Document, Vec<Refusal>> {
             if code_fence_len(lines[i]) == Some(tl) {
                 in_code = None;
             }
-            if !pending.is_empty() {
-                pending.push('\n');
-            }
-            pending.push_str(lines[i]);
+            text!(lines[i]);
             i += 1;
             continue;
         }
         if let Some(tl) = code_fence_len(lines[i]) {
             in_code = Some(tl);
-            if !pending.is_empty() {
-                pending.push('\n');
-            }
-            pending.push_str(lines[i]);
+            text!(lines[i]);
             i += 1;
+            continue;
+        }
+        // An author note (S9) is its own node, out of the text runs: nothing
+        // in it is read, so a commented-out `:::!workflow` never folds. One
+        // that never closes runs to the end and is not refused.
+        if note_opens(lines[i]) {
+            flush!();
+            let end = note_end(&lines, i, lines.len()).unwrap_or(lines.len() - 1);
+            nodes.push(Node::Note { start: i, end });
+            i = end + 1;
             continue;
         }
         // A keyword paragraph / list item, or a blockquote alert, is a block
@@ -728,30 +823,44 @@ pub fn parse(text: &str) -> Result<Document, Vec<Refusal>> {
                 nodes.push(Node::Block(b));
             }
             i = next;
-        } else if let Some(of) = open_fence(lines[i]) {
-            flush!();
-            // A rule container's region covers the reason that follows it.
-            let (blocks, _, next) =
-                parse_fence_and_reason(&lines, i, of, base, lines.len(), &mut errs);
-            for mut b in blocks {
-                b.region = (i, next.saturating_sub(1));
-                nodes.push(Node::Block(b));
-            }
-            i = next;
-        } else if let Some(lf) = leaf_open(lines[i]) {
-            flush!();
-            if let Some(mut b) = parse_leaf(lf, base + i + 1, &mut errs) {
-                b.region = (i, i);
-                nodes.push(Node::Block(b));
-            }
-            i += 1;
-        } else {
-            if !pending.is_empty() {
-                pending.push('\n');
-            }
-            pending.push_str(lines[i]);
-            i += 1;
+            continue;
         }
+        if let Some(of) = open_fence(lines[i]) {
+            flush!();
+            match parse_fenced(&lines, i, of, base, lines.len(), &mut errs) {
+                // A rule container's region covers the reason that follows it.
+                Fenced::Blocks { blocks, next, .. } => {
+                    for mut b in blocks {
+                        b.region = (i, next.saturating_sub(1));
+                        nodes.push(Node::Block(b));
+                    }
+                    i = next;
+                }
+                Fenced::Inert { kind, body, next } => {
+                    nodes.push(Node::Inert {
+                        kind,
+                        line: base + i + 1,
+                        region: (i, next.saturating_sub(1)),
+                        body: body.join("\n"),
+                    });
+                    i = next;
+                }
+            }
+            continue;
+        }
+        match leaf_open(lines[i]).map(|lf| parse_leaf(lf, base + i + 1, &mut errs)) {
+            Some(Leafed::Block(mut b)) => {
+                flush!();
+                b.region = (i, i);
+                nodes.push(Node::Block(*b));
+            }
+            Some(Leafed::Refused) => flush!(),
+            // An inert leaf is a line of prose, as written.
+            Some(Leafed::Inert) | None => {
+                text!(lines[i]);
+            }
+        }
+        i += 1;
     }
     if !pending.is_empty() {
         nodes.push(Node::Text(pending));
@@ -761,7 +870,7 @@ pub fn parse(text: &str) -> Result<Document, Vec<Refusal>> {
         .iter()
         .filter_map(|n| match n {
             Node::Block(b) => Some(b),
-            Node::Text(_) => None,
+            Node::Text(_) | Node::Note { .. } | Node::Inert { .. } => None,
         })
         .collect();
     // Identity and references are document-wide (S26): a rule named inside a
@@ -771,13 +880,26 @@ pub fn parse(text: &str) -> Result<Document, Vec<Refusal>> {
     check_identity(&blocks, &all, &mut errs);
     check_refs(&all, &mut errs);
     check_placement(&blocks, &mut errs);
-    check_inline_refs(&all, body, base, &mut errs);
+    check_attr_values(&all, &front, &mut errs);
+    check_overrides(&all, &mut errs);
+    // An author note is not scanned for references (§3.3 rule 11), at the
+    // top level or in a body.
+    let notes: Vec<(usize, usize)> = nodes
+        .iter()
+        .filter_map(|n| match n {
+            Node::Note { start, end } => Some((*start, *end)),
+            _ => None,
+        })
+        .chain(all.iter().flat_map(|b| b.notes.iter().copied()))
+        .collect();
+    check_inline_refs(&all, body, base, &notes, &mut errs);
 
     if errs.is_empty() {
         Ok(Document {
             front,
             has_front_matter: body_start > 0,
             nodes,
+            end_matter,
             source: body.to_string(),
             raw: text.to_string(),
         })
@@ -815,38 +937,110 @@ struct SectionTok {
     attr_src: String,
 }
 
-/// Parse a `:::` block — a container (one block) or a set (many). Returns the
-/// member blocks in source order and the index just past the closing fence.
-fn parse_fence(
+/// A `:::` opener, classified once (§3.3): blocks, or an inert block.
+enum Fenced {
+    /// The blocks it declares (none when it is refused), the index just past
+    /// its close, and the index just past the reason that follows it.
+    Blocks {
+        blocks: Vec<Block>,
+        closed: usize,
+        next: usize,
+    },
+    /// An inert block (§3.3 rule 2; S23): its body lines, raw, and the index
+    /// just past its close.
+    Inert {
+        kind: String,
+        body: Vec<String>,
+        next: usize,
+    },
+}
+
+/// Classify the `:::` opener at `open_idx`, then parse it as a block or
+/// swallow it as an inert one. `bound` is where the enclosing body ends.
+fn parse_fenced(
     lines: &[&str],
     open_idx: usize,
     of: OpenFence,
     line_base: usize,
+    bound: usize,
     errs: &mut Vec<Refusal>,
-) -> (Vec<Block>, usize) {
+) -> Fenced {
     let line_no = line_base + open_idx + 1;
     let form = if of.is_set {
         Form::Set
     } else {
         Form::Container
     };
-    let disposition = classify(&of.kind, of.sigil, form, line_no, errs);
+    let disposition = match classify(&of.kind, of.sigil, form, line_no, errs) {
+        Class::Block(d) => Some(d),
+        Class::Refused => None,
+        Class::Inert => {
+            // Read as the reference scanner reads one: raw, to the FIRST
+            // close fence long enough — no nesting, no code, no notes — so
+            // nothing inside an inert block opens a block of its own.
+            let close = (open_idx + 1..bound)
+                .find(|&j| fence_close_len(lines[j]).is_some_and(|n| n >= of.len));
+            if close.is_none() {
+                errs.push(Refusal::at(
+                    line_no,
+                    "unclosed-fence",
+                    format!(
+                        ":::{} is never closed (expected a line of ≥{} colons)",
+                        of.kind, of.len
+                    ),
+                ));
+            }
+            let end = close.unwrap_or(bound);
+            return Fenced::Inert {
+                kind: of.kind,
+                body: lines[open_idx + 1..end]
+                    .iter()
+                    .map(|l| l.to_string())
+                    .collect(),
+                next: close.map_or(bound, |c| c + 1),
+            };
+        }
+    };
+    let (blocks, closed, next) =
+        parse_fence_and_reason(lines, open_idx, of, disposition, line_base, bound, errs);
+    Fenced::Blocks {
+        blocks,
+        closed,
+        next,
+    }
+}
 
+/// Parse a `:::` block — a container (one block) or a set (many) — of the
+/// `disposition` classify gave it, or `None` when it was refused (the body is
+/// still read, to find its close). Returns the member blocks in source order
+/// and the index just past the closing fence.
+fn parse_fence(
+    lines: &[&str],
+    open_idx: usize,
+    of: OpenFence,
+    disposition: Option<Disposition>,
+    line_base: usize,
+    errs: &mut Vec<Refusal>,
+) -> (Vec<Block>, usize) {
+    let line_no = line_base + open_idx + 1;
     let attrs = attrs_or_empty(&of.attr_src, &of.kind, line_no, errs);
-    // A `verbatim` body is quoted whole — nested fence syntax is content, not
-    // structure (for tutorials that must show a fence).
-    let verbatim = attrs.contains_key("verbatim");
-    // Keyword/alert lifting applies only where the body is interpreted as
-    // prose — never in YAML/code/table bodies, and never inside `example`
-    // (its body is quoted material; the keyword-scope rule excludes it).
-    let lift = !of.is_set
-        && of.kind != "example"
-        && lookup(&of.kind)
-            .map(|k| k.body == BodyKind::Markdown)
-            .unwrap_or(true);
+    let body_kind = lookup(&of.kind).map_or(BodyKind::Markdown, |k| k.body);
+    let scan = BodyScan {
+        // A `verbatim` body is quoted whole — nested fence syntax is content,
+        // not structure (for tutorials that must show a fence).
+        verbatim: attrs.contains_key("verbatim"),
+        // Keyword/alert lifting applies only where the body is interpreted
+        // as prose — never in YAML/code/table bodies, and never inside
+        // `example` (its body is quoted material; the keyword-scope rule
+        // excludes it).
+        lift: !of.is_set && of.kind != "example" && body_kind == BodyKind::Markdown,
+        // A note is a note wherever the body is Markdown, an example's
+        // included; in a YAML or code body `<!--` is content (§3.3 rule 11).
+        notes: body_kind == BodyKind::Markdown,
+        set: of.is_set,
+    };
 
-    let (children, body_lines, raw_lines, close_idx, closed) =
-        collect_body(lines, open_idx + 1, of.len, line_base, verbatim, lift, errs);
+    let (c, close_idx, closed) = collect_body(lines, open_idx + 1, of.len, line_base, scan, errs);
     if !closed {
         errs.push(Refusal::at(
             line_no,
@@ -865,12 +1059,12 @@ fn parse_fence(
     };
 
     if of.is_set {
-        let members = parse_set_body(&of.kind, disposition, &attrs, &body_lines, line_no, errs);
+        let members = parse_set_body(&of.kind, disposition, &attrs, &c.body, line_no, errs);
         (members, close_idx + 1)
     } else {
         let name = attrs.get("name").cloned();
-        let body = body_lines.join("\n");
-        let raw_body = (raw_lines != body_lines).then(|| raw_lines.join("\n"));
+        let body = c.body.join("\n");
+        let raw_body = (c.raw != c.body).then(|| c.raw.join("\n"));
         (
             vec![Block {
                 kind: of.kind,
@@ -878,25 +1072,38 @@ fn parse_fence(
                 name,
                 attrs,
                 body,
-                children,
+                children: c.children,
                 line: line_no,
                 set_group: None,
                 form: Form::Container,
                 raw_body,
                 region: (0, 0),
                 reason: None,
+                notes: c.notes,
             }],
             close_idx + 1,
         )
     }
 }
 
+/// A `::` leaf, classified: a block, a refusal (recorded), or an inert name
+/// whose line stays prose, as written.
+enum Leafed {
+    Block(Box<Block>),
+    Refused,
+    Inert,
+}
+
 /// Parse a `::kind{attrs}` leaf — one instance, no body.
-fn parse_leaf(lf: LeafTok, line_no: usize, errs: &mut Vec<Refusal>) -> Option<Block> {
-    let disposition = classify(&lf.kind, lf.sigil, Form::Leaf, line_no, errs)?;
+fn parse_leaf(lf: LeafTok, line_no: usize, errs: &mut Vec<Refusal>) -> Leafed {
+    let disposition = match classify(&lf.kind, lf.sigil, Form::Leaf, line_no, errs) {
+        Class::Block(d) => d,
+        Class::Refused => return Leafed::Refused,
+        Class::Inert => return Leafed::Inert,
+    };
     let attrs = attrs_or_empty(&lf.attr_src, &lf.kind, line_no, errs);
     let name = attrs.get("name").cloned();
-    Some(Block {
+    Leafed::Block(Box::new(Block {
         kind: lf.kind,
         disposition,
         name,
@@ -909,7 +1116,8 @@ fn parse_leaf(lf: LeafTok, line_no: usize, errs: &mut Vec<Refusal>) -> Option<Bl
         raw_body: None,
         region: (0, 0),
         reason: None,
-    })
+        notes: Vec::new(),
+    }))
 }
 
 /// Parse a `## !kind name` section — one instance whose body is the section
@@ -924,8 +1132,18 @@ fn parse_section(
     errs: &mut Vec<Refusal>,
 ) -> (Option<Block>, usize) {
     let line_no = line_base + open_idx + 1;
-    let end = section_extent(lines, open_idx + 1, sec.level);
-    let disposition = classify(&sec.kind, true, Form::Section, line_no, errs);
+    let body_kind = lookup(&sec.kind)
+        .map(|k| k.body)
+        .unwrap_or(BodyKind::Markdown);
+    // Notes are read in a Markdown section only; in a YAML or code section,
+    // its description included, `<!--` is content (§3.3 rule 11).
+    let notes = body_kind == BodyKind::Markdown;
+    let end = section_extent(lines, open_idx + 1, sec.level, notes);
+    // `## !kind` is sigiled, so it is never inert.
+    let disposition = match classify(&sec.kind, true, Form::Section, line_no, errs) {
+        Class::Block(d) => Some(d),
+        Class::Refused | Class::Inert => None,
+    };
 
     let mut attrs = attrs_or_empty(&sec.attr_src, &sec.kind, line_no, errs);
     attrs.entry("name".to_string()).or_insert(sec.name.clone());
@@ -934,9 +1152,6 @@ fn parse_section(
         return (None, end);
     };
 
-    let body_kind = lookup(&sec.kind)
-        .map(|k| k.body)
-        .unwrap_or(BodyKind::Markdown);
     if matches!(body_kind, BodyKind::Yaml | BodyKind::Code) {
         // A YAML/code section is heading + description + the single fenced code
         // block that is its definition. It ENDS at that fence — content after it
@@ -944,7 +1159,7 @@ fn parse_section(
         // swallow the blocks that follow it (the section-boundary trap).
         match find_code_fence(lines, open_idx + 1, end) {
             Some((fo, fc)) => {
-                let (children, _, _) = collect_range(lines, open_idx + 1, fo, line_base, errs);
+                let c = collect_range(lines, open_idx + 1, fo, line_base, false, errs);
                 let desc = lines[open_idx + 1..fo].join("\n");
                 if !desc.trim().is_empty() {
                     attrs
@@ -958,13 +1173,14 @@ fn parse_section(
                         name: Some(sec.name),
                         attrs,
                         body: lines[fo + 1..fc].join("\n"),
-                        children,
+                        children: c.children,
                         line: line_no,
                         set_group: None,
                         form: Form::Section,
                         raw_body: None,
                         region: (0, 0),
                         reason: None,
+                        notes: Vec::new(),
                     }),
                     fc + 1,
                 )
@@ -989,22 +1205,22 @@ fn parse_section(
     } else {
         // A Markdown section is the whole section beneath the heading. Nested
         // fences/leaves are its children; the rest is its prose.
-        let (children, prose_lines, raw_lines) =
-            collect_range(lines, open_idx + 1, end, line_base, errs);
+        let c = collect_range(lines, open_idx + 1, end, line_base, notes, errs);
         (
             Some(Block {
                 kind: sec.kind,
                 disposition,
                 name: Some(sec.name),
                 attrs,
-                body: prose_lines.join("\n"),
-                children,
+                body: c.body.join("\n"),
+                children: c.children,
                 line: line_no,
                 set_group: None,
                 form: Form::Section,
-                raw_body: (raw_lines != prose_lines).then(|| raw_lines.join("\n")),
+                raw_body: (c.raw != c.body).then(|| c.raw.join("\n")),
                 region: (0, 0),
                 reason: None,
+                notes: c.notes,
             }),
             end,
         )
@@ -1016,7 +1232,8 @@ fn parse_section(
 /// sigiled heading; or a **sigiled** fence, leaf or set at column 0. A BARE
 /// fence (a sub-block like `:::case`, or a `:::example`) belongs to the section
 /// and is skipped whole — machinery, being sigiled, is never a section's child.
-fn section_extent(lines: &[&str], from: usize, level: usize) -> usize {
+/// With `notes` (a Markdown section), nothing inside an author note ends it.
+fn section_extent(lines: &[&str], from: usize, level: usize, notes: bool) -> usize {
     let mut i = from;
     let mut in_code = None::<usize>;
     while i < lines.len() {
@@ -1032,6 +1249,17 @@ fn section_extent(lines: &[&str], from: usize, level: usize) -> usize {
             in_code = Some(tl);
             i += 1;
             continue;
+        }
+        if notes && note_opens(line) {
+            match note_end(lines, i, lines.len()) {
+                Some(end) => {
+                    i = end + 1;
+                    continue;
+                }
+                // A note that never closes runs to the end, and so does the
+                // section it opened in.
+                None => return lines.len(),
+            }
         }
         if section_open(line).is_some() {
             return i; // (b) a sigiled heading
@@ -1142,23 +1370,57 @@ fn extract_single_code_block(lines: &[String]) -> Option<(String, String)> {
     (count == 1).then(|| (code.unwrap_or_default().join("\n"), desc.join("\n")))
 }
 
+/// How a container's body is read.
+#[derive(Debug, Clone, Copy)]
+struct BodyScan {
+    /// `verbatim`: captured raw, nothing inside it parsed.
+    verbatim: bool,
+    /// Keyword and alert lines are child blocks (a Markdown body, never an
+    /// example's or a set's).
+    lift: bool,
+    /// A column-0 `<!--` opens an author note (S9): the body is Markdown.
+    notes: bool,
+    /// The body is a set's rows or entries: a note's lines are kept out of
+    /// what the set parser reads, as the reference parser skips them.
+    set: bool,
+}
+
+/// What a body walk collects.
+#[derive(Debug, Default)]
+struct Collected {
+    children: Vec<Block>,
+    /// The body with child blocks removed — what the §9.1 tree reads.
+    body: Vec<String>,
+    /// The body WITH lifted keyword/alert lines still in place — delivery's
+    /// view.
+    raw: Vec<String>,
+    /// The author notes directly in this body (0-based body lines,
+    /// inclusive). Their lines are in `body` and `raw`, as the tree keeps
+    /// them.
+    notes: Vec<(usize, usize)>,
+}
+
+impl Collected {
+    /// A line of the body, in both views.
+    fn line(&mut self, l: &str) {
+        self.body.push(l.to_string());
+        self.raw.push(l.to_string());
+    }
+}
+
 /// Collect a container's body: raw lines that are not part of a nested block,
 /// plus the recursively-parsed children. `open_len` is the opening fence
-/// length; the close is the first fence of `>= open_len` colons. A `verbatim`
-/// body is captured raw — no nested parsing.
+/// length; the close is the first fence of `>= open_len` colons. Returns what
+/// was collected, the close's index, and whether the body closed.
 fn collect_body(
     lines: &[&str],
     from: usize,
     open_len: usize,
     line_base: usize,
-    verbatim: bool,
-    lift: bool,
+    scan: BodyScan,
     errs: &mut Vec<Refusal>,
-) -> (Vec<Block>, Vec<String>, Vec<String>, usize, bool) {
-    let mut children = Vec::new();
-    let mut body = Vec::new();
-    // The body WITH lifted keyword/alert lines still in place — delivery's view.
-    let mut raw = Vec::new();
+) -> (Collected, usize, bool) {
+    let mut c = Collected::default();
     let mut i = from;
     let mut in_code = None::<usize>;
     while i < lines.len() {
@@ -1167,8 +1429,7 @@ fn collect_body(
             if code_fence_len(line) == Some(tick_len) {
                 in_code = None;
             }
-            body.push(line.to_string());
-            raw.push(line.to_string());
+            c.line(line);
             i += 1;
             continue;
         }
@@ -1178,38 +1439,66 @@ fn collect_body(
             && len >= open_len
             && open_fence(line).is_none()
         {
-            return (children, body, raw, i, true);
+            return (c, i, true);
         }
-        if verbatim {
-            body.push(line.to_string());
-            raw.push(line.to_string());
+        if scan.verbatim {
+            c.line(line);
             i += 1;
+            continue;
+        }
+        // An author note: its lines stay in the body (the tree keeps them),
+        // but nothing in it is read — no fence inside it opens or closes a
+        // block, and no keyword inside it is lifted. One that never closes
+        // runs to the end, and the container with it.
+        if scan.notes && note_opens(line) {
+            let end = note_end(lines, i, lines.len()).unwrap_or(lines.len() - 1);
+            if !scan.set {
+                for l in &lines[i..=end] {
+                    c.line(l);
+                }
+            }
+            c.notes.push((i, end));
+            i = end + 1;
             continue;
         }
         if let Some(tl) = code_fence_len(line) {
             in_code = Some(tl);
-            body.push(line.to_string());
-            raw.push(line.to_string());
+            c.line(line);
             i += 1;
             continue;
         }
-        // A nested container or set (shorter fence) — recurse.
+        // A nested container or set — recurse; an inert one's body is this
+        // body's text, fences dropped, as the reference parser reads it.
         if let Some(of) = open_fence(line) {
-            let (kids, closed, next) =
-                parse_fence_and_reason(lines, i, of, line_base, lines.len(), errs);
-            // A child's reason is its own (the tree), and stays in the text
-            // delivery reads until delivery renders reasons.
-            for l in lines.get(closed..next).unwrap_or_default() {
-                raw.push(l.to_string());
+            match parse_fenced(lines, i, of, line_base, lines.len(), errs) {
+                Fenced::Blocks {
+                    blocks,
+                    closed,
+                    next,
+                } => {
+                    // A child's reason is its own (the tree), and stays in the
+                    // text delivery reads until delivery renders reasons.
+                    for l in lines.get(closed..next).unwrap_or_default() {
+                        c.raw.push(l.to_string());
+                    }
+                    c.children.extend(blocks);
+                    i = next;
+                }
+                Fenced::Inert { body, next, .. } => {
+                    for l in &body {
+                        c.line(l);
+                    }
+                    i = next;
+                }
             }
-            children.extend(kids);
-            i = next;
             continue;
         }
-        // A nested leaf.
+        // A nested leaf; an inert one is a line of the body.
         if let Some(lf) = leaf_open(line) {
-            if let Some(c) = parse_leaf(lf, line_base + i + 1, errs) {
-                children.push(c);
+            match parse_leaf(lf, line_base + i + 1, errs) {
+                Leafed::Block(b) => c.children.push(*b),
+                Leafed::Refused => {}
+                Leafed::Inert => c.line(line),
             }
             i += 1;
             continue;
@@ -1218,37 +1507,35 @@ fn collect_body(
         // excluded from `body` (the §9.1 tree) but kept in `raw` (delivery
         // normalizes it in place). Only where the kind interprets its body as
         // prose: never inside YAML/code/table bodies, never inside `example`.
-        if lift
+        if scan.lift
             && (keyword_line(line).is_some() || alert_block_kind(line).is_some())
             && let Some((b, next)) = lift_keyword_or_alert(lines, i, line_base, lines.len(), errs)
         {
             for l in &lines[i..next.min(lines.len())] {
-                raw.push(l.to_string());
+                c.raw.push(l.to_string());
             }
-            children.push(b);
+            c.children.push(b);
             i = next;
             continue;
         }
-        body.push(line.to_string());
-        raw.push(line.to_string());
+        c.line(line);
         i += 1;
     }
-    (children, body, raw, lines.len(), false)
+    (c, lines.len(), false)
 }
 
 /// Walk a bounded range `[from, end)` (a section body), splitting nested
-/// fences/leaves out as children and returning the remaining prose lines.
+/// fences/leaves out as children and keeping the remaining prose lines. With
+/// `notes` (a Markdown section), author notes are read as in a container.
 fn collect_range(
     lines: &[&str],
     from: usize,
     end: usize,
     line_base: usize,
+    notes: bool,
     errs: &mut Vec<Refusal>,
-) -> (Vec<Block>, Vec<String>, Vec<String>) {
-    let mut children = Vec::new();
-    let mut prose = Vec::new();
-    // The prose WITH lifted keyword/alert lines in place — delivery's view.
-    let mut raw = Vec::new();
+) -> Collected {
+    let mut c = Collected::default();
     let mut i = from;
     let mut in_code = None::<usize>;
     while i < end {
@@ -1257,30 +1544,52 @@ fn collect_range(
             if code_fence_len(line) == Some(tick_len) {
                 in_code = None;
             }
-            prose.push(line.to_string());
-            raw.push(line.to_string());
+            c.line(line);
             i += 1;
+            continue;
+        }
+        if notes && note_opens(line) {
+            let close = note_end(lines, i, end).unwrap_or(end - 1);
+            for l in &lines[i..=close] {
+                c.line(l);
+            }
+            c.notes.push((i, close));
+            i = close + 1;
             continue;
         }
         if let Some(tl) = code_fence_len(line) {
             in_code = Some(tl);
-            prose.push(line.to_string());
-            raw.push(line.to_string());
+            c.line(line);
             i += 1;
             continue;
         }
         if let Some(of) = open_fence(line) {
-            let (kids, closed, next) = parse_fence_and_reason(lines, i, of, line_base, end, errs);
-            for l in lines.get(closed..next).unwrap_or_default() {
-                raw.push(l.to_string());
+            match parse_fenced(lines, i, of, line_base, end, errs) {
+                Fenced::Blocks {
+                    blocks,
+                    closed,
+                    next,
+                } => {
+                    for l in lines.get(closed..next).unwrap_or_default() {
+                        c.raw.push(l.to_string());
+                    }
+                    c.children.extend(blocks);
+                    i = next.min(end);
+                }
+                Fenced::Inert { body, next, .. } => {
+                    for l in &body {
+                        c.line(l);
+                    }
+                    i = next.min(end);
+                }
             }
-            children.extend(kids);
-            i = next.min(end);
             continue;
         }
         if let Some(lf) = leaf_open(line) {
-            if let Some(c) = parse_leaf(lf, line_base + i + 1, errs) {
-                children.push(c);
+            match parse_leaf(lf, line_base + i + 1, errs) {
+                Leafed::Block(b) => c.children.push(*b),
+                Leafed::Refused => {}
+                Leafed::Inert => c.line(line),
             }
             i += 1;
             continue;
@@ -1292,30 +1601,34 @@ fn collect_range(
             && let Some((b, next)) = lift_keyword_or_alert(lines, i, line_base, end, errs)
         {
             for l in &lines[i..next.min(end)] {
-                raw.push(l.to_string());
+                c.raw.push(l.to_string());
             }
-            children.push(b);
+            c.children.push(b);
             i = next.min(end);
             continue;
         }
-        prose.push(line.to_string());
-        raw.push(line.to_string());
+        c.line(line);
         i += 1;
     }
-    (children, prose, raw)
+    c
+}
+
+/// What the lexical rules (§3.3) make of a block opener.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Class {
+    /// A block of this disposition.
+    Block(Disposition),
+    /// Inert prose (§3.3 rule 2; S23): an unknown bare name, or machinery
+    /// registered after version 1 written bare. No block, and never refused.
+    Inert,
+    /// Refused; the refusal is recorded.
+    Refused,
 }
 
 /// Classify a block by kind, sigil and form, enforcing the lexical rules
 /// (§3.3): the reserved-bare and sigiled-prose guards, unknown-kind policy, and
-/// per-kind form acceptance (§4). Returns the disposition, or `None` having
-/// recorded a refusal.
-fn classify(
-    kind: &str,
-    sigil: bool,
-    form: Form,
-    line_no: usize,
-    errs: &mut Vec<Refusal>,
-) -> Option<Disposition> {
+/// per-kind form acceptance (§4).
+fn classify(kind: &str, sigil: bool, form: Form, line_no: usize, errs: &mut Vec<Refusal>) -> Class {
     match lookup(kind) {
         // Sub-blocks (`case`, `override`, `signature`, `schema`, `preview`) are
         // written UNSIGILED — the parent's fence and sigil govern them.
@@ -1330,13 +1643,13 @@ fn classify(
                         k.sub_of.as_deref().unwrap_or("")
                     ),
                 ));
-                return None;
+                return Class::Refused;
             }
             if !k.forms.contains(&form) {
                 errs.push(form_refusal(k, form, line_no));
-                return None;
+                return Class::Refused;
             }
-            Some(Disposition::Machinery)
+            Class::Block(Disposition::Machinery)
         }
         Some(k) => {
             let want_sigil = k.disposition == Disposition::Machinery;
@@ -1345,12 +1658,18 @@ fn classify(
             // bare heading never reaches here (section_open needs the `!`).
             if form != Form::Section {
                 if want_sigil && !sigil {
+                    // Only version-1 machinery is reserved bare (S23): a
+                    // version-1 document may have written `:::eval` as prose,
+                    // and it stays prose.
+                    if !registry().reserved_bare(kind) {
+                        return Class::Inert;
+                    }
                     errs.push(Refusal::at(
                         line_no,
                         "bare-machinery-kind",
                         format!("{kind:?} is a machinery kind — did you mean :::!{kind}"),
                     ));
-                    return None;
+                    return Class::Refused;
                 }
                 if !want_sigil && sigil {
                     // A sigiled structural kind is the same mistake: the `!`
@@ -1367,7 +1686,7 @@ fn classify(
                             }
                         ),
                     ));
-                    return None;
+                    return Class::Refused;
                 }
             } else if !want_sigil {
                 errs.push(Refusal::at(
@@ -1382,7 +1701,7 @@ fn classify(
                         }
                     ),
                 ));
-                return None;
+                return Class::Refused;
             }
             if !k.forms.contains(&form) {
                 if form == Form::Set && k.body == BodyKind::Deflist {
@@ -1395,9 +1714,9 @@ fn classify(
                 } else {
                     errs.push(form_refusal(k, form, line_no));
                 }
-                return None;
+                return Class::Refused;
             }
-            Some(k.disposition)
+            Class::Block(k.disposition)
         }
         None => {
             if sigil {
@@ -1417,10 +1736,10 @@ fn classify(
                         head.join(", ")
                     ),
                 ));
-                None
+                Class::Refused
             } else {
                 // Unknown bare name — fail OPEN: inert prose, delivered verbatim.
-                Some(Disposition::Prose)
+                Class::Inert
             }
         }
     }
@@ -1587,6 +1906,7 @@ fn parse_table_set(
             raw_body: None,
             region: (0, 0),
             reason: None,
+            notes: Vec::new(),
         });
     }
     out
@@ -1658,6 +1978,7 @@ fn parse_deflist_set(
             raw_body: None,
             region: (0, 0),
             reason: None,
+            notes: Vec::new(),
         });
     }
     out
@@ -1883,6 +2204,24 @@ fn code_fence_len(line: &str) -> Option<usize> {
     None
 }
 
+/// Whether `line` opens an author note (S9; §3.3 rule 11, `x-grammar.
+/// authorNoteOpen`): `<!--` at column 0. One that begins mid-line is inline
+/// HTML, and prose.
+fn note_opens(line: &str) -> bool {
+    line.starts_with("<!--")
+}
+
+/// The index of the line that closes the author note opened at `open`: the
+/// first line holding `-->` (`authorNoteClose`), searched past the opener's
+/// own four characters, so `<!-->` does not close itself. `None` when no line
+/// before `bound` closes it.
+fn note_end(lines: &[&str], open: usize, bound: usize) -> Option<usize> {
+    (open..bound).find(|&j| {
+        let l = if j == open { &lines[j][4..] } else { lines[j] };
+        l.contains("-->")
+    })
+}
+
 /// `{key=value key2="quoted"}` → map, collecting EVERY problem (Appendix B
 /// shapes) rather than stopping at the first. A bare token is a legal flag
 /// only when the kind's schema declares it (or `verbatim`) — `{name=on call}`
@@ -2036,13 +2375,9 @@ fn parse_attrs(src: &str, kind: &str, line_no: usize) -> (BTreeMap<String, Strin
 /// a document pinning a higher version is refused rather than mis-read.
 fn parse_front_matter(text: &str, errs: &mut Vec<Refusal>) -> (BTreeMap<String, Value>, usize) {
     let mut map = BTreeMap::new();
-    let Some(rest) = text.strip_prefix("---\n") else {
+    let Some((block, body_start)) = front_matter_bounds(text) else {
         return (map, 0);
     };
-    let Some(end) = rest.find("\n---") else {
-        return (map, 0);
-    };
-    let block = &rest[..end];
     match crate::yaml::parse(block) {
         Ok(Value::Object(m)) => {
             for (kk, v) in m {
@@ -2096,14 +2431,259 @@ fn parse_front_matter(text: &str, errs: &mut Vec<Refusal>) -> (BTreeMap<String, 
             ));
         }
     }
-    // Advance past the closing `---` line.
-    let after = end + "\n---".len();
-    let abs = "---\n".len() + after;
-    let nl = text[abs..]
+    (map, body_start)
+}
+
+/// Where front matter lies: the YAML between a leading `---\n` and the next
+/// `\n---`, and the byte offset the body begins at, past the closing line.
+/// `None` when the text opens with no front matter.
+fn front_matter_bounds(text: &str) -> Option<(&str, usize)> {
+    let rest = text.strip_prefix("---\n")?;
+    let end = rest.find("\n---")?;
+    let after = "---\n".len() + end + "\n---".len();
+    let body_start = text[after..]
         .find('\n')
-        .map(|n| abs + n + 1)
+        .map(|n| after + n + 1)
         .unwrap_or(text.len());
-    (map, nl)
+    Some((&rest[..end], body_start))
+}
+
+/// A document split at its end matter (S27; §3.1.1).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SplitEndMatter<'a> {
+    /// The text before the end matter's opening `---`, front matter
+    /// included; the whole text when there is no end matter.
+    pub before: &'a str,
+    /// The end matter's keys, when the text ends with end matter.
+    pub end_matter: Option<BTreeMap<String, Value>>,
+    /// The 1-based line of the end matter's opening `---`.
+    pub opener_line: Option<usize>,
+}
+
+/// Split a whole document — front matter and all — at its end matter, as
+/// [`parse`] does before it reads a block: for a reader that needs the text
+/// without its record (a folder of documents, a prompt) and never parses it.
+/// End matter that is not YAML, or not a mapping, is refused
+/// (`end-matter-yaml`), naming its first line.
+pub fn split_end_matter(text: &str) -> Result<SplitEndMatter<'_>, Refusal> {
+    let from = front_matter_bounds(text).map_or(0, |(_, start)| body_start_line(text, start));
+    Ok(match end_matter_span(text, from) {
+        None => SplitEndMatter {
+            before: text,
+            end_matter: None,
+            opener_line: None,
+        },
+        Some(span) => SplitEndMatter {
+            before: span.before,
+            end_matter: Some(span.fields?),
+            opener_line: Some(span.opener_line),
+        },
+    })
+}
+
+/// End matter found in a text, its YAML judged: what precedes its opener,
+/// the opener's 1-based line, and its keys or the refusal.
+struct EndMatterSpan<'a> {
+    before: &'a str,
+    opener_line: usize,
+    fields: Result<BTreeMap<String, Value>, Refusal>,
+}
+
+/// The end matter of `text`, whose body starts at line `from` (0-based), if
+/// it has any.
+fn end_matter_span(text: &str, from: usize) -> Option<EndMatterSpan<'_>> {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let (open, close) = find_end_matter(&lines, from)?;
+    let before: usize = lines[..open].iter().map(|l| l.len() + 1).sum();
+    Some(EndMatterSpan {
+        before: &text[..before],
+        opener_line: open + 1,
+        // The first end-matter line: the opener's 1-based line plus one.
+        fields: end_matter_fields(&lines[open + 1..close].join("\n"), open + 2),
+    })
+}
+
+/// End matter's YAML as its keys, or the refusal. Both refusals name `first`,
+/// the first end-matter line, as the reference parser does; the corpus does
+/// not pin it.
+fn end_matter_fields(yaml: &str, first: usize) -> Result<BTreeMap<String, Value>, Refusal> {
+    match crate::yaml::parse(yaml) {
+        Ok(Value::Object(m)) => Ok(m.into_iter().collect()),
+        Ok(_) => Err(Refusal::at(
+            first,
+            "end-matter-yaml",
+            "end matter is not a YAML mapping — write key: value lines",
+        )),
+        Err(e) => Err(Refusal::at(
+            first,
+            "end-matter-yaml",
+            format!(
+                "end matter is not valid YAML: {}",
+                e.to_string().lines().next().unwrap_or_default()
+            ),
+        )),
+    }
+}
+
+/// The end matter's opening and closing lines (0-based), found as the
+/// reference implementation's `findEndMatter` finds them. `from` is the first
+/// body line, so the front matter's closing fence is never an opener.
+fn find_end_matter(lines: &[&str], from: usize) -> Option<(usize, usize)> {
+    // The close: the last non-blank line, a `---` after the first body line.
+    let close = (from..lines.len())
+        .rev()
+        .find(|&k| !lines[k].trim().is_empty())?;
+    if close <= from || lines[close].trim_end() != "---" {
+        return None;
+    }
+    // The opener: the NEAREST `---` before the close, and only that one. If
+    // it fails a condition there is no end matter — never a search further
+    // back, which would reach past a `---` in fenced code to a thematic break
+    // and swallow the prose between them.
+    let open = (from..close)
+        .rev()
+        .find(|&k| lines[k].trim_end() == "---")?;
+    if open + 1 >= close {
+        return None;
+    }
+    // It follows a blank line, or begins the body.
+    if open > from && !lines[open - 1].trim().is_empty() {
+        return None;
+    }
+    if !is_mapping_key_line(lines[open + 1]) {
+        return None;
+    }
+    scanner_reaches(lines, from, open).then_some((open, close))
+}
+
+/// Whether `line` opens with a YAML mapping key, as the reference pattern
+/// `^[A-Za-z_][\w.-]*[ \t]*:([ \t]|$)` reads one (its `\w` is ASCII): `name:`,
+/// `a.b:` and `key :` do; `- x:` does not.
+fn is_mapping_key_line(line: &str) -> bool {
+    let mut chars = line.chars();
+    if !chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+    {
+        return false;
+    }
+    let rest = chars
+        .as_str()
+        .trim_start_matches(|c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+        .trim_start_matches([' ', '\t']);
+    rest.strip_prefix(':')
+        .is_some_and(|r| r.is_empty() || r.starts_with([' ', '\t']))
+}
+
+/// Condition 3 of §3.1.1, ported from the reference implementation's
+/// `scannerReaches`: walking `lines[from..to)` as the block scanner does,
+/// does it reach line `to` outside fenced code, an author note, and the body
+/// of an inert or a verbatim block? The walk is reduced to the decisions that
+/// consume lines, and made of this parser's own primitives, so the two agree
+/// on what is code, a fence and a note. Its `section` and stack decide what
+/// encloses a line, which decides whether `<!--` there opens a note.
+fn scanner_reaches(lines: &[&str], from: usize, to: usize) -> bool {
+    // classify's refusals are the parse's to report; this only reads.
+    let mut scratch = Vec::new();
+    let body_of = |kind: &str| lookup(kind).map_or(BodyKind::Markdown, |k| k.body);
+    // The open containers: (fence length, kind).
+    let mut stack: Vec<(usize, String)> = Vec::new();
+    // The open section: (heading level, kind).
+    let mut section: Option<(usize, String)> = None;
+    let mut code: Option<usize> = None;
+    let closes = |l: &str, n: usize| fence_close_len(l).is_some_and(|m| m >= n);
+    let mut k = from;
+    while k < to {
+        let l = lines[k];
+        if let Some(tl) = code {
+            if code_fence_len(l) == Some(tl) {
+                code = None;
+                // A YAML or code section ends at its fence.
+                if stack.is_empty()
+                    && section.as_ref().is_some_and(|(_, kind)| {
+                        matches!(body_of(kind), BodyKind::Yaml | BodyKind::Code)
+                    })
+                {
+                    section = None;
+                }
+            }
+            k += 1;
+            continue;
+        }
+        if let Some(tl) = code_fence_len(l) {
+            code = Some(tl);
+            k += 1;
+            continue;
+        }
+        let enclosing = stack
+            .last()
+            .map(|(_, kind)| kind.as_str())
+            .or(section.as_ref().map(|(_, kind)| kind.as_str()));
+        if note_opens(l) && enclosing.is_none_or(|kind| body_of(kind) == BodyKind::Markdown) {
+            match note_end(lines, k, to) {
+                Some(end) => {
+                    k = end + 1;
+                    continue;
+                }
+                None => return false,
+            }
+        }
+        if stack.last().is_some_and(|(n, _)| closes(l, *n)) {
+            stack.pop();
+            k += 1;
+            continue;
+        }
+        if let Some(of) = open_fence(l) {
+            if of.sigil && stack.is_empty() {
+                section = None;
+            }
+            let form = if of.is_set {
+                Form::Set
+            } else {
+                Form::Container
+            };
+            let class = classify(&of.kind, of.sigil, form, 0, &mut scratch);
+            // An inert or a verbatim body is read raw to its first close.
+            if class == Class::Inert
+                || parse_attrs(&of.attr_src, &of.kind, 0)
+                    .0
+                    .contains_key("verbatim")
+            {
+                match (k + 1..to).find(|&j| closes(lines[j], of.len)) {
+                    Some(j) => {
+                        k = j + 1;
+                        continue;
+                    }
+                    None => return false,
+                }
+            }
+            stack.push((of.len, of.kind));
+            k += 1;
+            continue;
+        }
+        if let Some(lf) = leaf_open(l) {
+            if lf.sigil && stack.is_empty() {
+                section = None;
+            }
+            k += 1;
+            continue;
+        }
+        if stack.is_empty()
+            && let Some(level) = heading_level(l)
+        {
+            if let Some(sec) = section_open(l) {
+                section = matches!(
+                    classify(&sec.kind, true, Form::Section, 0, &mut scratch),
+                    Class::Block(_)
+                )
+                .then_some((sec.level, sec.kind));
+            } else if section.as_ref().is_some_and(|(at, _)| level <= *at) {
+                section = None;
+            }
+        }
+        k += 1;
+    }
+    code.is_none()
 }
 
 /// Every block in the document, children included, in source order (a
@@ -2278,14 +2858,27 @@ fn check_refs(blocks: &[&Block], errs: &mut Vec<Refusal>) {
 /// Inline references in prose (§4.7): every `[[kind/name]]` and `[text](#kind/name)`
 /// whose kind is a known kind must resolve to a declared block of that kind.
 /// Dangling ones are refused — the class of bug a real check catches that
-/// eyeballing does not. Refs inside fenced code are inert (code-suspends).
-fn check_inline_refs(blocks: &[&Block], body: &str, base: usize, errs: &mut Vec<Refusal>) {
+/// eyeballing does not. Refs inside fenced code are inert (code-suspends), and
+/// so are the lines of an author note (`notes`, 0-based body lines; §3.3 rule
+/// 11).
+fn check_inline_refs(
+    blocks: &[&Block],
+    body: &str,
+    base: usize,
+    notes: &[(usize, usize)],
+    errs: &mut Vec<Refusal>,
+) {
     let ids: BTreeSet<(String, String)> = blocks.iter().filter_map(|b| identity_of(b)).collect();
     // Scan the SOURCE line by line (code fences suspend recognition, §4.7
     // rule 4) so every refusal names its line. YAML bodies rarely carry the
     // inline forms, and a `[[x/y]]` whose kind is unknown is prose, not a ref.
     let mut in_code = None::<usize>;
     for (i, line) in body.split('\n').enumerate() {
+        // A note is read outside code only, so its lines are skipped before
+        // a fence inside one could be taken for code.
+        if notes.iter().any(|&(start, end)| (start..=end).contains(&i)) {
+            continue;
+        }
         if let Some(tl) = in_code {
             if code_fence_len(line) == Some(tl) {
                 in_code = None;
@@ -2451,6 +3044,106 @@ fn check_placement(blocks: &[&Block], errs: &mut Vec<Refusal>) {
     }
     for b in blocks {
         walk(b, None, errs);
+    }
+}
+
+/// Attribute values (validate.ts): every value the schema constrains by an
+/// `enum` or a `pattern`, on every block — a set's members included — at the
+/// block's line, and on each front-matter `parameters[]` entry, a `param`
+/// declared where there is no block line. A variant kind written with no
+/// condition (`minProperties`) is refused here too.
+fn check_attr_values(all: &[&Block], front: &BTreeMap<String, Value>, errs: &mut Vec<Refusal>) {
+    for b in all {
+        for (attr, value) in &b.attrs {
+            if let Some(why) = attr_value_problem(&b.kind, attr, &Value::String(value.clone())) {
+                errs.push(Refusal::at(b.line, "attribute-value", why));
+            }
+        }
+        // The reference parser reports this through the schema (code
+        // `schema`); `missing-attribute` is the Appendix B condition.
+        if b.attrs.is_empty() && registry().needs_attrs(&b.kind) {
+            errs.push(Refusal::at(
+                b.line,
+                "missing-attribute",
+                format!(
+                    "{kind} requires at least one condition — write :::{kind}{{key=\"value\"}}",
+                    kind = b.kind
+                ),
+            ));
+        }
+    }
+    let params = front.get("parameters").and_then(Value::as_array);
+    for entry in params.into_iter().flatten().filter_map(Value::as_object) {
+        for (attr, value) in entry {
+            if let Some(why) = attr_value_problem("param", attr, value) {
+                errs.push(Refusal::new("attribute-value", why));
+            }
+        }
+    }
+}
+
+/// Why `value` is not admissible for `kind`'s attribute `attr`, if it is not:
+/// outside its `enum`, or not matching its `pattern`. Every pattern the
+/// registry carries is the `@kind/name` reference grammar (a registry test
+/// holds it so), which [`is_reference`] matches without a regex engine.
+fn attr_value_problem(kind: &str, attr: &str, value: &Value) -> Option<String> {
+    let rule = registry().attr_rule(kind, attr)?;
+    if let Some(values) = &rule.values
+        && !value
+            .as_str()
+            .is_some_and(|v| values.iter().any(|a| a == v))
+    {
+        return Some(format!("{attr} must be one of: {}", values.join(", ")));
+    }
+    if rule.pattern.is_some() && value.as_str().is_some_and(|v| !is_reference(v)) {
+        return Some(format!("{attr} must be a reference written @kind/name"));
+    }
+    None
+}
+
+/// `@kind/name`, as `x-grammar.attrRef` matches it.
+fn is_reference(s: &str) -> bool {
+    s.strip_prefix('@')
+        .and_then(|r| r.split_once('/'))
+        .is_some_and(|(k, n)| is_kind_token(k) && is_name(n))
+}
+
+/// Overrides (S24): a rule may name rules it overrides (`overrides="kind/
+/// name"`), but never a guardrail and never a rule stronger than itself. A
+/// target is looked up among this document's blocks; one not found here is
+/// not refused (it may be in an included document, which delivery looks in).
+/// The refusal names the overriding block's line.
+fn check_overrides(all: &[&Block], errs: &mut Vec<Refusal>) {
+    let reg = registry();
+    let ids: BTreeSet<(String, String)> = all.iter().filter_map(|b| identity_of(b)).collect();
+    for b in all {
+        let Some(own) = reg.strength(&b.kind) else {
+            continue;
+        };
+        let Some(list) = b.attrs.get("overrides") else {
+            continue;
+        };
+        for target in list.split(',').map(str::trim) {
+            let Some((kind, name)) = target.split_once('/') else {
+                continue;
+            };
+            if !ids.contains(&(kind.to_string(), name.to_string())) {
+                continue;
+            }
+            if kind == "guardrail" {
+                errs.push(Refusal::at(
+                    b.line,
+                    "override-guardrail",
+                    format!("{target} is a guardrail — a guardrail is never overridden"),
+                ));
+            } else if reg.strength(kind).unwrap_or(0) > own {
+                errs.push(Refusal::at(
+                    b.line,
+                    "override-stronger",
+                    format!("a {} may not override the stronger {target}", b.kind),
+                ));
+            }
+        }
     }
 }
 
@@ -2811,7 +3504,13 @@ pub fn fold_full(
     let mut i = 0;
     while i < nodes.len() {
         match &nodes[i] {
-            Node::Text(_) => i += 1,
+            // An author note rides as text until delivery strips it.
+            Node::Text(_) | Node::Note { .. } => i += 1,
+            // An inert block delivers its body, fences gone.
+            Node::Inert { region, body, .. } => {
+                regions.push((region.0, region.1, body_lines(body)));
+                i += 1;
+            }
             Node::Block(b) if b.set_group.is_some() => {
                 let g = b.set_group;
                 let mut members = vec![b];
@@ -3082,8 +3781,8 @@ fn machinery_ack(b: &Block) -> Option<String> {
 
 /// Prose degrades to its delivered form (Appendix A): a normativity keyword
 /// becomes `**KEYWORD:** body` (label on the first body line only);
-/// `example`/`context`/`form`/`tool`/`glossary` take their own shapes; an
-/// unknown bare block delivers its body as prose.
+/// `example`/`context`/`form`/`tool`/`glossary` take their own shapes. (An
+/// unknown bare name is no block: its body is an inert node's, §3.3 rule 2.)
 fn deliver_prose_lines(
     b: &Block,
     decls: &BTreeMap<String, BTreeMap<String, String>>,
@@ -3165,7 +3864,7 @@ fn deliver_prose_lines(
             .into_iter()
             .map(|(term, def)| format!("**{term}** — {def}"))
             .collect(),
-        k if NORMATIVITY.contains(&k) || lookup(k).is_some() => {
+        k => {
             // The keyword prefixes the FIRST body line; the rest are unchanged.
             // `:::should{not}` is the container spelling of `SHOULD NOT:` and
             // keeps its polarity the same way, through the negated label.
@@ -3190,8 +3889,6 @@ fn deliver_prose_lines(
             }
             out
         }
-        // Unknown bare name — inert: the body is delivered as prose, fences gone.
-        _ => body,
     }
 }
 
@@ -3203,19 +3900,6 @@ fn title_case(s: &str) -> String {
         None => String::new(),
     }
 }
-
-/// The normativity prose kinds, whose delivered form is `**KEYWORD:** body`.
-const NORMATIVITY: &[&str] = &[
-    "must",
-    "should",
-    "never",
-    "guardrail",
-    "note",
-    "tip",
-    "warning",
-    "caution",
-    "important",
-];
 
 /// Parse a definition-list body into `(term, definition)` pairs (for
 /// `glossary` delivery).
@@ -3695,7 +4379,8 @@ fn reason_line(line: &str) -> Option<(usize, usize)> {
 /// lines a keyword or a reason owns (§4.5 rule 3). It stops at a blank line
 /// and at anything that starts something else — a keyword, a reason, a list
 /// item or quote, a block form, a heading, a code fence — as the reference
-/// implementation's `paragraphEnd` does. A code fence stops it even when
+/// implementation's `paragraphEnd` does, and so does an author note: a note
+/// right after a rule is never its text. A code fence stops it even when
 /// indented, as the walk's own code tracking reads one, so a paragraph never
 /// swallows the line that opens code.
 fn paragraph_end(lines: &[&str], k: usize, bound: usize) -> usize {
@@ -3714,6 +4399,7 @@ fn paragraph_end(lines: &[&str], k: usize, bound: usize) -> usize {
             || section_open(l).is_some()
             || heading_level(l).is_some()
             || code_fence_len(l).is_some()
+            || note_opens(l)
         {
             break;
         }
@@ -3784,11 +4470,12 @@ fn parse_fence_and_reason(
     lines: &[&str],
     open_idx: usize,
     of: OpenFence,
+    disposition: Option<Disposition>,
     line_base: usize,
     bound: usize,
     errs: &mut Vec<Refusal>,
 ) -> (Vec<Block>, usize, usize) {
-    let (mut blocks, next) = parse_fence(lines, open_idx, of, line_base, errs);
+    let (mut blocks, next) = parse_fence(lines, open_idx, of, disposition, line_base, errs);
     let end = match blocks.as_mut_slice() {
         [b] if b.form == Form::Container => {
             attach_reason(b, lines, next, bound, line_base, errs).unwrap_or(next)
@@ -3836,6 +4523,7 @@ pub(crate) fn lift_keyword_or_alert(
         raw_body: None,
         region: (0, 0), // set below, once the reason is known
         reason: None,
+        notes: Vec::new(),
     };
     // A keyword's flags (`SHOULD NOT` → `not`) are the only thing that keep
     // its polarity: it maps to the same kind as its positive form (S8).
@@ -4076,6 +4764,21 @@ fn fold_machinery(b: &Block, out: &mut Extraction, errs: &mut Vec<Refusal>) {
         "tools" => {
             if let Some(m) = body_map(b, errs) {
                 merge_map(frag(&mut out.config, "tools"), m);
+            }
+        }
+        // `!eval` (S23) holds a rule's test cases for an evaluation harness:
+        // it configures nothing here, declares nothing, and has no
+        // acknowledgement. Its body is still YAML and must parse as YAML; its
+        // body schema is informative (S22), so the shape is never refused.
+        "eval" => {
+            if !b.body.trim().is_empty()
+                && let Err(e) = crate::yaml::parse(&b.body)
+            {
+                errs.push(Refusal::at(
+                    b.line,
+                    "invalid-yaml-body",
+                    format!(":::!eval body is not valid YAML: {e}"),
+                ));
             }
         }
         "skill" => match b.attrs.get("name") {
@@ -4402,9 +5105,19 @@ mod tests {
     fn prose_is_bare_and_unknown_bare_is_inert() {
         let d = parse(":::note\nremember this\n:::").unwrap();
         assert_eq!(d.blocks().next().unwrap().disposition, Disposition::Prose);
-        // Unknown bare name fails OPEN — inert prose, still parses.
+        // Unknown bare name fails OPEN — inert prose, still parses. It is no
+        // block (the tree never shows one); its body is kept as text.
         let d = parse(":::whatever\nfree text\n:::").unwrap();
-        assert_eq!(d.blocks().next().unwrap().disposition, Disposition::Prose);
+        assert!(d.blocks().next().is_none());
+        assert_eq!(
+            d.nodes,
+            [Node::Inert {
+                kind: "whatever".into(),
+                line: 1,
+                region: (0, 2),
+                body: "free text".into(),
+            }]
+        );
         // Unknown MACHINERY fails closed.
         let e = parse(":::!whatever\nx\n:::").unwrap_err();
         assert!(e[0].message.contains("unknown machinery"), "{e:?}");
@@ -5615,6 +6328,63 @@ steps:
                 "literal-credential",
                 "literal credential",
             ),
+            // An inert block that never closes (S23).
+            (
+                "intro\n:::aside\nopen",
+                true,
+                Some(2),
+                "unclosed-fence",
+                ":::aside is never closed",
+            ),
+            (
+                "Body.\n\n---\nk: [a\n---\n",
+                true,
+                Some(4),
+                "end-matter-yaml",
+                "end matter is not valid YAML",
+            ),
+            (
+                "::param{name=n source=env}",
+                true,
+                Some(1),
+                "attribute-value",
+                "source must be one of: static, workspace, agent_attribute, prompt",
+            ),
+            (
+                "\n:::output{schema=reply}\nx\n:::",
+                true,
+                Some(2),
+                "attribute-value",
+                "schema must be a reference written @kind/name",
+            ),
+            (
+                ":::unless\nx\n:::",
+                true,
+                Some(1),
+                "missing-attribute",
+                "unless requires at least one condition",
+            ),
+            (
+                "GUARDRAIL[g]: no.\n\n:::must{overrides=guardrail/g}\nx\n:::",
+                true,
+                Some(3),
+                "override-guardrail",
+                "guardrail/g is a guardrail",
+            ),
+            (
+                "MUST[m]: a\n\n:::should{overrides=must/m}\nx\n:::",
+                true,
+                Some(3),
+                "override-stronger",
+                "a should may not override the stronger must/m",
+            ),
+            (
+                "MUST[m]: a\n\n:::!eval{name=e target=@must/m}\ncases: [\n:::",
+                true,
+                Some(3),
+                "invalid-yaml-body",
+                ":::!eval body is not valid YAML",
+            ),
         ];
         let mut misses = Vec::new();
         for (text, granted_all, line, code, fragment) in cases {
@@ -6056,5 +6826,409 @@ steps:
     #[test]
     fn the_wire_floor_is_the_registrys() {
         assert_eq!(registry().wire_floor(), crate::sign::WIRE_FLOOR);
+    }
+
+    // ── author notes, end matter, inert blocks, attribute values and
+    //    overrides (S9, S10, S16-S17, S23, S24, S27) ──
+
+    /// The top-level nodes' shapes, without their contents.
+    fn shapes(d: &Document) -> Vec<String> {
+        d.nodes
+            .iter()
+            .map(|n| match n {
+                Node::Text(t) => format!("text {t:?}"),
+                Node::Note { start, end } => format!("note {start}-{end}"),
+                Node::Inert { kind, .. } => format!("inert {kind}"),
+                Node::Block(b) => format!("{} @{}", b.kind, b.line),
+            })
+            .collect()
+    }
+
+    /// A column-0 `<!--` opens a note that ends at the first `-->`; it is its
+    /// own node, nothing in it is read, and one that never closes runs to the
+    /// end without a refusal (§3.3 rule 11).
+    #[test]
+    fn an_author_note_is_its_own_node_and_nothing_in_it_is_read() {
+        // One line, and a keyword right after it with no blank line between.
+        let d = parse("<!-- legal asked for this -->\nMUST: quote it.\n").unwrap();
+        assert_eq!(shapes(&d), ["note 0-0", "must @2"]);
+        // Several lines: the commented-out machinery is never parsed or folded.
+        let doc = "Intro.\n<!--\n:::!workflow{name=old}\nsteps: {}\n:::\n-->\nAfter.\n";
+        let d = parse(doc).unwrap();
+        assert_eq!(
+            shapes(&d),
+            ["text \"Intro.\"", "note 1-5", "text \"After.\\n\""]
+        );
+        assert!(extract(doc, &BTreeSet::new()).unwrap().workflows.is_empty());
+        // `<!-->` does not close itself: the search starts past the opener.
+        let d = parse("<!-->\nMUST: hidden\n-->\nshown\n").unwrap();
+        assert_eq!(shapes(&d), ["note 0-2", "text \"shown\\n\""]);
+        // Unclosed: to the end, and not refused.
+        let d = parse("Intro.\n<!-- open\n:::!workflow{name=w}\n").unwrap();
+        assert_eq!(shapes(&d), ["text \"Intro.\"", "note 1-3"]);
+        // A comment that begins mid-line is inline HTML: prose.
+        let d = parse("Inline <!-- stays --> text.\n").unwrap();
+        assert_eq!(shapes(&d), ["text \"Inline <!-- stays --> text.\\n\""]);
+        // A note inside fenced code is code.
+        let d = parse("```\n<!--\n```\nMUST: x\n").unwrap();
+        assert_eq!(d.blocks().count(), 1);
+    }
+
+    /// A reference inside a note is never resolved, at the top level or in a
+    /// body, while the same reference outside one is refused.
+    #[test]
+    fn a_reference_inside_a_note_is_not_scanned() {
+        assert!(parse("<!-- see [[must/nowhere]] -->\n").is_ok());
+        assert!(parse("<!--\nsee [[must/nowhere]]\n-->\n").is_ok());
+        assert!(parse(":::note\n<!-- see [[must/nowhere]] -->\nx\n:::\n").is_ok());
+        let e = parse("see [[must/nowhere]]\n").unwrap_err();
+        assert_eq!(e[0].code, "dangling-reference");
+        // A fence inside a note is no code: the line after the note is read.
+        let e = parse("<!--\n```\n-->\nsee [[must/nowhere]]\n").unwrap_err();
+        assert_eq!((e[0].line, e[0].code), (Some(4), "dangling-reference"));
+    }
+
+    /// In a Markdown body a note's lines stay in the body text (the tree
+    /// keeps them) and are recorded for delivery to strip, but no fence in it
+    /// opens or closes a block and no keyword in it is lifted.
+    #[test]
+    fn a_note_in_a_markdown_body_stays_in_its_text_and_is_never_read() {
+        let b = only_block(":::context{title=\"T\"}\nA.\n<!--\nMUST: hidden\n:::\n-->\nB.\n:::\n");
+        assert_eq!(b.body, "A.\n<!--\nMUST: hidden\n:::\n-->\nB.");
+        assert!(b.children.is_empty(), "{:?}", b.children);
+        assert_eq!(b.notes, [(2, 5)]);
+        // In a section, a heading inside a note does not end the section.
+        let b = only_block("## !skill s\nDo it.\n<!--\n## !skill t\n-->\nMore.\n");
+        assert!(b.body.contains("## !skill t") && b.body.contains("More."));
+        assert_eq!(b.notes, [(2, 4)]);
+        // A keyword paragraph stops at a note: the note is not its text.
+        let b = only_block("MUST: quote it.\n<!-- why -->\n");
+        assert_eq!(b.body, "quote it.");
+    }
+
+    /// In a YAML or code body `<!--` is content, and a verbatim body is raw:
+    /// the close after it closes the block.
+    #[test]
+    fn a_note_opener_in_a_yaml_code_or_verbatim_body_is_content() {
+        let d = parse(":::!workflow{name=w}\n<!--\n:::\nAfter.\n").unwrap();
+        let b = d.blocks().next().unwrap();
+        assert_eq!((b.body.as_str(), b.notes.is_empty()), ("<!--", true));
+        let d = parse(":::note{verbatim}\n<!--\n:::\nAfter.\n").unwrap();
+        let b = d.blocks().next().unwrap();
+        assert_eq!((b.body.as_str(), b.notes.is_empty()), ("<!--", true));
+        // In a YAML section's description too.
+        let b = only_block("## !workflow w\n<!--\n```yaml\nsteps: {}\n```\n");
+        assert_eq!(b.body, "steps: {}");
+    }
+
+    #[test]
+    fn contains_blocks_ignores_a_fence_inside_a_note() {
+        assert!(!contains_blocks(
+            "<!--\n:::!workflow{name=w}\nsteps: {}\n:::\n-->\n"
+        ));
+        assert!(!contains_blocks("<!-- open\n::!human{name=a}\n"));
+        assert!(contains_blocks("<!-- x -->\n::!human{name=a}\n"));
+    }
+
+    /// The end matter a document is split at, if any — `split_end_matter`'s
+    /// keys, or `None`.
+    fn end_matter_of(text: &str) -> Option<BTreeMap<String, Value>> {
+        split_end_matter(text).unwrap().end_matter
+    }
+
+    /// End matter is the document's record (S27): read into the tree, cut
+    /// from the body, and kept in `raw`, which the author digest covers.
+    #[test]
+    fn end_matter_is_the_documents_record_and_not_its_body() {
+        let text = "# Desk\n\nMUST: quote it.\n\n---\nowners: [ana]\n---\n";
+        let split = split_end_matter(text).unwrap();
+        assert_eq!(split.before, "# Desk\n\nMUST: quote it.\n\n");
+        assert_eq!(split.opener_line, Some(5));
+        let d = parse(text).unwrap();
+        assert_eq!(
+            d.end_matter,
+            Some([("owners".to_string(), serde_json::json!(["ana"]))].into())
+        );
+        assert!(!d.source.contains("owners"), "{:?}", d.source);
+        assert_eq!(d.raw, text);
+        assert_eq!(d.blocks().count(), 1);
+        // No end matter: the whole text, nothing split.
+        let split = split_end_matter("plain\n").unwrap();
+        assert_eq!(
+            (split.before, split.end_matter, split.opener_line),
+            ("plain\n", None, None)
+        );
+    }
+
+    /// Each condition of `findEndMatter` (§3.1.1), one by one.
+    #[test]
+    fn end_matter_is_found_only_where_the_reference_finds_it() {
+        // A thematic break followed by a blank line stays prose…
+        assert_eq!(end_matter_of("Intro.\n\n---\n\nk: v\n---\n"), None);
+        // …and so does a setext heading's underline.
+        assert_eq!(end_matter_of("Intro.\n\nkey: value\n---\n"), None);
+        // The opener follows a blank line.
+        assert_eq!(end_matter_of("Text.\n---\nk: v\n---\n"), None);
+        // The opener may be the first body line after front matter.
+        let text = "---\nspec: \"1\"\n---\n---\nk: v\n---\n";
+        assert!(end_matter_of(text).is_some());
+        assert_eq!(parse(text).unwrap().source, "");
+        // The front matter's closing fence is never an opener: the search
+        // starts at the first body line.
+        let text = "---\nspec: \"1\"\n\n---\nk: v\n---\n";
+        assert_eq!(end_matter_of(text), None);
+        let d = parse(text).unwrap();
+        assert!(d.end_matter.is_none() && d.source.contains("k: v"));
+        // Only the NEAREST `---` before the close is considered: inside fenced
+        // code it is no opener, and the thematic break before it is never
+        // reached.
+        assert_eq!(
+            end_matter_of("Intro.\n\n---\na: b\n```\n\n---\nk: v\n```\n---\n"),
+            None
+        );
+        // Not inside an unclosed note, an inert block or a verbatim body.
+        assert_eq!(end_matter_of("Intro.\n<!--\n\n---\nk: v\n---\n"), None);
+        assert_eq!(end_matter_of(":::aside\nx\n\n---\nk: v\n---\n"), None);
+        assert_eq!(
+            end_matter_of(":::note{verbatim}\nx\n\n---\nk: v\n---\n"),
+            None
+        );
+        // A closed note before it is passed over.
+        assert!(end_matter_of("<!-- n -->\n\n---\nk: v\n---\n").is_some());
+        // The line after the opener begins with a mapping key.
+        assert!(end_matter_of("Body.\n\n---\na.b: 1\n---\n").is_some());
+        assert!(end_matter_of("Body.\n\n---\nkey : 1\n---\n").is_some());
+        assert_eq!(end_matter_of("Body.\n\n---\n- x: 1\n---\n"), None);
+        assert!(is_mapping_key_line("_k:") && !is_mapping_key_line("k:v"));
+    }
+
+    /// End matter ends a document, never a body: a trailing section ends
+    /// before it, and a container whose body ends in `---`/`k: v`/`---` keeps
+    /// those lines.
+    #[test]
+    fn end_matter_ends_the_document_and_never_a_body() {
+        let d = parse("## !skill s\nDo it.\n\n---\nowner: ana\n---\n").unwrap();
+        let b = d.blocks().next().unwrap();
+        assert!(!b.body.contains("owner"), "{:?}", b.body);
+        assert!(d.end_matter.is_some_and(|m| m.contains_key("owner")));
+        let d = parse(":::when{env=\"x\"}\nText.\n\n---\nk: v\n---\n:::\n").unwrap();
+        assert!(d.end_matter.is_none());
+        assert!(d.blocks().next().unwrap().body.contains("k: v"));
+    }
+
+    /// Malformed end matter is refused at its first line (the opener's plus
+    /// one), from `split_end_matter` and from `parse` alike, and still ends
+    /// the body: nothing in it is read as a block.
+    #[test]
+    fn malformed_end_matter_is_refused_at_its_first_line() {
+        let text = "Body.\n\n---\nk: [a\n:::!workflow\n---\n";
+        let r = split_end_matter(text).unwrap_err();
+        assert_eq!((r.line, r.code), (Some(4), "end-matter-yaml"));
+        assert!(
+            r.message.starts_with("end matter is not valid YAML: "),
+            "{r}"
+        );
+        assert_eq!(parse(text).unwrap_err(), [r]);
+        let r = end_matter_fields("- a", 7).unwrap_err();
+        assert_eq!(
+            (r.line, r.code, r.message.as_str()),
+            (
+                Some(7),
+                "end-matter-yaml",
+                "end matter is not a YAML mapping — write key: value lines"
+            )
+        );
+    }
+
+    /// Machinery registered after version 1 (`eval`, S23) is not reserved
+    /// bare: `:::eval` is inert prose, while a version-1 name written bare
+    /// is still refused. `:::!eval` names a rule by `@kind/name`, which must
+    /// resolve, has a YAML body, configures nothing and acknowledges nothing.
+    #[test]
+    fn a_bare_eval_is_prose_and_a_sigiled_one_is_inert_machinery() {
+        let d = parse(":::eval\nA bare eval is prose.\n:::\n").unwrap();
+        assert_eq!(shapes(&d), ["inert eval"]);
+        assert_eq!(
+            parse(":::workflow{name=w}\nsteps: {}\n:::").unwrap_err()[0].code,
+            "bare-machinery-kind"
+        );
+        // An inert leaf is a line of prose, as written; inside a body too.
+        let d = parse("::eval{name=x}\n:::note\n::eval{name=y}\n:::\n").unwrap();
+        assert_eq!(shapes(&d)[0], "text \"::eval{name=x}\"");
+        assert_eq!(d.blocks().next().unwrap().body, "::eval{name=y}");
+        // An inert block in a body is that body's text, fences dropped, read
+        // raw: a keyword inside it is not lifted.
+        let b = only_block(":::note\nA.\n:::aside\nMUST: raw\n:::\nB.\n:::\n");
+        assert_eq!(
+            (b.body.as_str(), b.children.len()),
+            ("A.\nMUST: raw\nB.", 0)
+        );
+
+        let doc = "MUST[escalate]: escalate.\n\n:::!eval{name=e target=@must/escalate}\n\
+                   cases:\n  - name: c\n    given: { message: hi }\n    expect: { contains: [x] }\n:::\n";
+        let d = parse(doc).unwrap();
+        let ex = fold(&d, &BTreeSet::new()).unwrap();
+        assert!(ex.declarations.is_empty() && ex.config.is_empty(), "{ex:?}");
+        assert!(!ex.cleaned.contains("eval"), "{}", ex.cleaned);
+        // A name is required; the target is a reference, and it resolves.
+        let e = parse(":::!eval{target=@must/m}\ncases: []\n:::\n").unwrap_err();
+        assert!(e.iter().any(|r| r.code == "missing-attribute"), "{e:?}");
+        let e =
+            parse("MUST[m]: x\n\n:::!eval{name=e target=must/m}\ncases: []\n:::\n").unwrap_err();
+        assert_eq!(
+            (e[0].line, e[0].code, e[0].message.as_str()),
+            (
+                Some(3),
+                "attribute-value",
+                "target must be a reference written @kind/name"
+            )
+        );
+        let e = parse(":::!eval{name=e target=@must/gone}\ncases: []\n:::\n").unwrap_err();
+        assert_eq!(e[0].code, "dangling-reference");
+        // Its body shape is informative (S22): YAML that is no mapping loads.
+        let d = parse("MUST[m]: x\n\n:::!eval{name=e target=@must/m}\n- a\n:::\n").unwrap();
+        assert!(fold(&d, &BTreeSet::new()).is_ok());
+    }
+
+    /// Every attribute the schema constrains by `enum` or `pattern` is held
+    /// to it: on a block, on each row of a set, and on a front-matter
+    /// `parameters[]` entry, which has no block line.
+    #[test]
+    fn attribute_values_are_held_to_the_schema() {
+        let enum_msg = "type must be one of: string, number, boolean, enum, list, url, duration";
+        let e = parse("::param{name=n type=integer}").unwrap_err();
+        assert_eq!(
+            (e[0].line, e[0].code, e[0].message.as_str()),
+            (Some(1), "attribute-value", enum_msg)
+        );
+        // A flag where a value is required is no admissible value either.
+        assert_eq!(
+            parse("::param{name=n type}").unwrap_err()[0].code,
+            "attribute-value"
+        );
+        // Each row of a set, at the set's line.
+        let e = parse("\n:::param[]\n| name | type |\n|---|---|\n| a | string |\n| b | int |\n:::")
+            .unwrap_err();
+        assert_eq!(
+            (e[0].line, e[0].code, e[0].message.as_str()),
+            (Some(2), "attribute-value", enum_msg)
+        );
+        // Front matter: no line.
+        let e = parse("---\nparameters:\n  - {name: n, source: env}\n---\nx\n").unwrap_err();
+        assert_eq!((e[0].line, e[0].code), (None, "attribute-value"));
+        assert!(e[0].message.starts_with("source must be one of:"), "{e:?}");
+        // Admissible values load.
+        assert!(
+            parse("---\nparameters:\n  - {name: n, type: number}\n---\n::param{name=m source=prompt}\n")
+                .is_ok()
+        );
+        assert!(
+            parse("::!data{name=d format=table}\n")
+                .is_err_and(|e| e.iter().all(|r| r.code != "attribute-value"))
+        );
+        // A pattern: the schema's reference grammar.
+        assert!(
+            parse(":::!data{name=reply}\na: 1\n:::\n:::output{schema=@data/reply}\nx\n:::\n")
+                .is_ok()
+        );
+        assert!(is_reference("@a-b/c.d_e") && !is_reference("@1a/b") && !is_reference("a/b"));
+    }
+
+    /// Every pattern the registry carries is `x-grammar.attrRef`, which
+    /// `is_reference` matches. A re-vendor that adds another pattern fails
+    /// here rather than going unenforced.
+    #[test]
+    fn every_attribute_pattern_is_the_reference_grammar() {
+        let schema: Value = serde_json::from_str(schema_json()).unwrap();
+        let attr_ref = schema["x-grammar"]["attrRef"].as_str().unwrap();
+        let patterns: Vec<_> = registry()
+            .attr_rules
+            .iter()
+            .filter_map(|((k, a), r)| r.pattern.as_ref().map(|p| (k, a, p)))
+            .collect();
+        assert!(!patterns.is_empty());
+        for (kind, attr, p) in patterns {
+            assert_eq!(
+                p, attr_ref,
+                "{kind}.{attr} carries a pattern is_reference does not match"
+            );
+        }
+    }
+
+    /// `unless` (and `when`) need a condition: the schema's `minProperties`.
+    /// `unless` and `otherwise` are structural containers, `otherwise` takes
+    /// any attributes, and blocks nested in any variant stay its children.
+    #[test]
+    fn variant_containers_parse_and_need_a_condition() {
+        for kind in ["unless", "when"] {
+            let e = parse(&format!(":::{kind}\nx\n:::")).unwrap_err();
+            assert_eq!(
+                (e[0].line, e[0].code, e[0].message.clone()),
+                (
+                    Some(1),
+                    "missing-attribute",
+                    format!(
+                        "{kind} requires at least one condition — write :::{kind}{{key=\"value\"}}"
+                    )
+                )
+            );
+        }
+        let needs: Vec<&str> = registry().needs_attrs.iter().map(String::as_str).collect();
+        assert_eq!(
+            needs,
+            ["unless", "when"],
+            "the message speaks of conditions"
+        );
+        let d = parse(
+            ":::unless{env=\"prod\"}\nA.\n:::\n:::otherwise{ignored=\"yes\"}\nB.\n\n::::when{tier=\"x\"}\nMUST: c.\n::::\n:::\n",
+        )
+        .unwrap();
+        let blocks: Vec<&Block> = d.blocks().collect();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(
+            (blocks[0].kind.as_str(), blocks[0].disposition),
+            ("unless", Disposition::Structural)
+        );
+        assert_eq!(blocks[1].kind, "otherwise");
+        assert_eq!(blocks[1].children[0].kind, "when");
+        assert_eq!(blocks[1].children[0].children[0].kind, "must");
+    }
+
+    /// Overrides (S24): never a guardrail, never a stronger rule; a weaker or
+    /// equal rule may be overridden, and a target this document does not
+    /// declare is not refused (it may be in an include).
+    #[test]
+    fn an_override_may_not_name_a_guardrail_or_a_stronger_rule() {
+        let e =
+            parse("GUARDRAIL[g]: no.\n\n:::must{overrides=\"guardrail/g\"}\nx\n:::").unwrap_err();
+        assert_eq!(
+            (e[0].line, e[0].code, e[0].message.as_str()),
+            (
+                Some(3),
+                "override-guardrail",
+                "guardrail/g is a guardrail — a guardrail is never overridden"
+            )
+        );
+        let e = parse("MUST[m]: a\n\n:::should{overrides=\"must/m\"}\nb\n:::").unwrap_err();
+        assert_eq!(
+            (e[0].line, e[0].code, e[0].message.as_str()),
+            (
+                Some(3),
+                "override-stronger",
+                "a should may not override the stronger must/m"
+            )
+        );
+        assert!(
+            parse("SHOULD[s]: a\n\n:::must{overrides=\"should/s, must/elsewhere\"}\nb\n:::")
+                .is_ok()
+        );
+        assert!(parse("MUST[m]: a\n\n:::must{overrides=\"must/m\"}\nb\n:::").is_ok());
+    }
+
+    #[test]
+    fn reserved_bare_names_are_the_registrys_version_1_machinery() {
+        let names: Vec<&str> = reserved_bare_names().collect();
+        assert!(names.contains(&"workflow") && !names.contains(&"eval"));
+        assert!(names.iter().all(|n| machinery_names().any(|m| m == *n)));
     }
 }

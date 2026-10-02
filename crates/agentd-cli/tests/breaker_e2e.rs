@@ -91,7 +91,7 @@ fn the_breaker_opens_survives_restarts_probes_and_closes() {
              store:\n  kind: file\n  file:\n    path: {dir}/state\n\
              workflows:\n  - name: pay\n    steps:\n\
              \x20     start: {{kind: once, policy: always}}\n\
-             \x20     charge: {{kind: http, depends_on: [start], method: POST, url: \"http://127.0.0.1:{port}/charge\", allow_private: true, breaker: {{failures: 2, cooldown: \"2s\"}}}}\n\
+             \x20     charge: {{kind: http, depends_on: [start], method: POST, url: \"http://127.0.0.1:{port}/charge\", allow_private: true, breaker: {{failures: 2, cooldown: \"8s\"}}}}\n\
              \x20     done: {{kind: finish, depends_on: [charge], status: completed}}\n\
              lifecycle:\n  run_until: idle\n  idle_grace: 300ms\n\
              observability:\n  log_level: info\n"
@@ -108,6 +108,12 @@ fn the_breaker_opens_survives_restarts_probes_and_closes() {
         "1 failure < 2:\n{l1}"
     );
     let l2 = life(&cfg, &state);
+    // The circuit opened before life 2 returned, so the cooldown has run out
+    // by `opened_by + COOLDOWN` at the latest. The cooldown is long enough
+    // that life 3 always starts inside it, even on a slow runner: a 2 s one
+    // let a loaded CI host's shutdown and boot outlast it, and life 3 probed.
+    let opened_by = std::time::Instant::now();
+    const COOLDOWN: std::time::Duration = std::time::Duration::from_secs(8);
     assert_eq!(hits.load(Ordering::SeqCst), 2, "life 2 dialled:\n{l2}");
     assert_eq!(events(&l2, "breaker.open").len(), 1, "opens at 2:\n{l2}");
 
@@ -131,9 +137,11 @@ fn the_breaker_opens_survives_restarts_probes_and_closes() {
         "no re-open logging on a fast-fail:\n{l3}"
     );
 
-    // The remote recovers; the cooldown passes.
+    // The remote recovers; the cooldown passes — waited for from when the
+    // circuit opened, not for a fixed time, so a fast host does not idle.
     healthy.store(true, Ordering::SeqCst);
-    std::thread::sleep(std::time::Duration::from_millis(2_300));
+    let reopen = opened_by + COOLDOWN + std::time::Duration::from_millis(300);
+    std::thread::sleep(reopen.saturating_duration_since(std::time::Instant::now()));
 
     // Life 4: the one probe goes through, succeeds, closes the circuit.
     let l4 = life(&cfg, &state);

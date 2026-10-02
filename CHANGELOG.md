@@ -280,26 +280,40 @@ test that fails on the old code.
   they did, and the rendered forms come with the 1.1 delivery.
 - **An instruction document reads author notes, end matter and `!eval`, and
   holds attribute values and overrides to the 1.1 registry.** A line that
-  begins with `<!--` at column 0 opens an author note (S9), which ends at the
-  first line holding `-->`: nothing in it is parsed, so a commented-out
-  `:::!workflow` no longer loads and a `[[kind/name]]` in it is not
-  resolved. Its lines still reach the model as written until the 1.1
-  delivery strips them. A document may end with end matter (S27): after a
-  blank line, a `---`, a YAML mapping and a closing `---` as its last lines.
-  It is the document's record and is no longer delivered; end matter that
-  is not a YAML mapping refuses the document (`end-matter-yaml`). A bare
+  begins with `<!--` at column 0, outside fenced code and front matter,
+  opens an author note (S9), which ends at the first line holding `-->`:
+  nothing in it is parsed, so a commented-out `:::!workflow` no longer loads
+  and a `[[kind/name]]` in it is not resolved — in a set's rows too. Its
+  lines still reach the model as written until the 1.1 delivery strips
+  them. A document may end with end matter (S27): after a blank line, a
+  `---`, a YAML mapping and a closing `---` as its last lines. It is the
+  document's record: a document with any block no longer delivers it, and
+  end matter there that is not a YAML mapping refuses the document
+  (`end-matter-yaml`). A document with no block at all still reaches the
+  model as written, end matter included and unchecked, until the delivery
+  gate widens later in this release. A bare
   `:::eval` is prose, as is any machinery name registered after version 1
   (S23); `:::!eval` loads, needs a name and a `target=@kind/name` that
   resolves, and configures and delivers nothing. A value outside an
   attribute's schema `enum` or `pattern` (`::param{type=integer}`,
   `:::output{schema=reply}`) refuses (`attribute-value`), on a block, on
-  each row of a set, and on a front-matter `parameters` entry. A `:::when`
+  each row of a set (at the set's line, where the reference reports it, and
+  once however many rows share the value), and on a front-matter
+  `parameters` entry. A `:::when`
   or `:::unless` with no condition refuses (`missing-attribute`), and so
   does an `overrides` that names a guardrail (`override-guardrail`) or a
   stronger rule (`override-stronger`) in the same document. An unknown bare
   container's body is read raw to its first closing fence, so a fence
-  inside it no longer opens a block, and an unknown bare leaf
-  (`::aside{…}`) stays in the text as written, where it was dropped.
+  inside it no longer opens a block; one nested in another block's body
+  now delivers its text, which was dropped (`:::note` holding an
+  `:::aside` delivered `A. C.` and now delivers `A. B. C.`). An unknown bare
+  leaf (`::aside{…}`) stays in the text as written, where it was dropped. A
+  blockquote alert is read as `x-grammar.alertOpen` reads one — `>` at
+  column 0 and one word, `> [!NOTE]` — so an indented one, or `> [!SHOULD
+  NOT]`, is a plain quote and delivered as written, where it was read and
+  delivered as a rule. A `MUST[x]:` in a YAML section's description is that
+  description's text and declares no `must/x`. Front matter may be empty
+  (`---` then `---`), and an integer `spec: 1` reads as the version `"1"`.
 - **`/hooks/_` is agentd's.** A `wait {on: webhook}` callback is armed under
   `/hooks/_cb/`, and configured routes match first, so a route there could
   take a suspended run's callback. A `webhook` start `path` or a wait's

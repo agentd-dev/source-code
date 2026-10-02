@@ -262,11 +262,37 @@ fn the_schema_registry_agrees_with_the_parser() {
         .filter_map(Value::as_str)
         .collect();
     reserved.sort_unstable();
-    let parser: Vec<&str> = agentd::config::idoc::reserved_bare_names().collect();
     assert!(!reserved.is_empty());
+    // By behaviour, not by the loader's copy of the same list: the machinery
+    // names the parser refuses when written bare are exactly reserved-bare,
+    // and every other one written bare is inert prose — no block, no
+    // refusal — unless it is a sub-block, which is written bare.
+    let bare = |k: &str| agentd::config::idoc::parse(&format!(":::{k}\n:::\n"));
+    let refused: Vec<&str> = known
+        .iter()
+        .copied()
+        .filter(|k| bare(k).is_err_and(|e| e.iter().any(|r| r.code == "bare-machinery-kind")))
+        .collect();
     assert_eq!(
-        reserved, parser,
-        "the parser's reserved bare names drifted from x-registry.reserved-bare"
+        reserved, refused,
+        "the names refused bare drifted from x-registry.reserved-bare"
+    );
+    let mut inert = 0;
+    for k in known.iter().filter(|k| !reserved.contains(k)) {
+        if agentd::config::idoc::lookup(k).is_some_and(|kind| kind.sub_of.is_some()) {
+            continue;
+        }
+        let d = bare(k).unwrap_or_else(|e| panic!(":::{k} written bare is refused: {e:?}"));
+        assert_eq!(
+            d.blocks().count(),
+            0,
+            ":::{k} written bare declared a block"
+        );
+        inert += 1;
+    }
+    assert!(
+        inert > 0,
+        "no machinery registered after version 1 was checked"
     );
 }
 

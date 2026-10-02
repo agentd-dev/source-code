@@ -509,4 +509,15 @@ mod tests {
         assert_eq!(blocks[3]["children"][0]["kind"], "override");
         assert_eq!(blocks[3]["children"][0]["sigil"], false);
     }
+
+    /// `spec: 1` is the version "1" in the tree, as the reference writes it,
+    /// at the top and in the front matter alike.
+    #[test]
+    fn an_integer_spec_is_its_string_in_the_tree() {
+        let t = tree_json(&parse("---\nspec: 1\n---\nMUST: x\n").unwrap());
+        assert_eq!(
+            (&t["spec"], &t["frontMatter"]["spec"]),
+            (&json!("1"), &json!("1"))
+        );
+    }
 }

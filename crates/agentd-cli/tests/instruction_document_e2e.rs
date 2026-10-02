@@ -296,14 +296,28 @@ fn the_spec_corpus_documents_load_with_their_gates_answered_by_operators() {
         let env = json!({"webhooks": {"listen": "http://127.0.0.1:18081"}});
         // The binary's own validation, as a deployment runs it.
         let (valid, err, _) = load_with(&doc, &ALL, env.clone());
-        // Three of the documents' workflows carry `when:` CEL conditions,
-        // which a build without `cel` refuses at load. Such a row checks
-        // exactly that, so no row passes a case over in silence.
-        let needs_cel = ["deploy-runbook", "orchestrator", "coding-agent"].contains(&case);
-        if needs_cel && !cfg!(feature = "cel") {
+        // Three of the documents' workflows carry `when:` CEL conditions, and
+        // two schedule with `cron:`; a build without `cel` or `cron` refuses
+        // them at load rather than run them half-armed. Such a row checks
+        // exactly that — refused, naming a feature it lacks — so no row
+        // passes a case over in silence. `cron` is read off the document
+        // itself, so a corpus that gains a schedule cannot slip past.
+        let mut missing: Vec<&str> = Vec::new();
+        if ["deploy-runbook", "orchestrator", "coding-agent"].contains(&case)
+            && !cfg!(feature = "cel")
+        {
+            missing.push("cel");
+        }
+        if doc.contains("cron:") && !cfg!(feature = "cron") {
+            missing.push("cron");
+        }
+        if !missing.is_empty() {
             assert!(
-                !valid && err.contains("the 'cel' build feature"),
-                "{case} without `cel` is refused naming the feature:\n{err}"
+                !valid
+                    && missing
+                        .iter()
+                        .any(|f| err.contains(&format!("the '{f}' build feature"))),
+                "{case} without {missing:?} is refused naming one of them:\n{err}"
             );
             let _ = std::fs::remove_file(&secret);
             continue;

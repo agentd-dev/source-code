@@ -48,17 +48,25 @@ const ROOTS: &[&str] = &[
     "rfcs/0044-enterprise-managed-authorization.md",
 ];
 
-/// Trees under the roots that are not agentd's to spell: build output,
+/// Paths under the roots that are not agentd's to spell: build output,
 /// dependencies, the design notes (history, like the older RFCs), and the
 /// vendored upstream Instruction Specification corpus, which is checked
-/// against the published one byte for byte.
-const SKIP_DIRS: &[&str] = &[
+/// against the published one byte for byte. A prefix, so a file is skipped
+/// exactly as a directory is.
+const SKIP_PATHS: &[&str] = &[
     "target",
     "node_modules",
     "dist",
     "docs/design",
     "crates/agentd-cli/tests/instruction-spec-corpus",
     "crates/instruction/tests",
+    // The vendored specification schema is upstream's to spell: its S22
+    // `x-body-schema` names `agentd.dev/schema/workflow-3.json` and
+    // `config-1.json`, where agentd's own names are `workflow.json` and
+    // `config.json`, unversioned. The
+    // drift tests hold this file to upstream's byte for byte, so the fix is
+    // upstream's — the URL erratum is raised there — never a local edit.
+    "crates/instruction/src/instruction.schema.json",
 ];
 
 /// The names agentd gives its extensions, its unix binding and its launch
@@ -237,7 +245,7 @@ fn skipped(rel: &Path) -> bool {
             c.as_os_str().to_str(),
             Some("target" | "node_modules" | "dist")
         )
-    }) || SKIP_DIRS.iter().any(|d| rel_str.starts_with(d))
+    }) || SKIP_PATHS.iter().any(|d| rel_str.starts_with(d))
         || rel == Path::new("crates/agentd-cli/tests/unversioned_guard.rs")
 }
 

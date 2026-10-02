@@ -1,0 +1,28 @@
+{
+  "authored": {
+    "digest": "sha256:d453c250926f64fdff6f197ef0bd730d0b002926bfc3516dbe718d12b8b299ab"
+  },
+  "parameters": [
+    {
+      "name": "audience",
+      "source": "prompt",
+      "value_digest": "sha256:b2db06dc38aa0314f6b426c1ea79f7d2763985d231bfb84ed22a90a5977a6e1a"
+    },
+    {
+      "name": "product",
+      "source": "workspace",
+      "value_digest": "sha256:b5dbde1082f9a25bf96da9c074cb0a0432eca02991d00931f9c88930eb0b48fe"
+    }
+  ],
+  "facts": [],
+  "variants": {
+    "kept": [],
+    "dropped": []
+  },
+  "includes": [],
+  "limits": {
+    "include_depth": 0,
+    "include_bytes": 0
+  },
+  "unresolved": []
+}

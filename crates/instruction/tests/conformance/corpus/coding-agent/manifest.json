@@ -1,0 +1,36 @@
+{
+  "authored": {
+    "digest": "sha256:166158ead6ba4601f631b5f1c669222650f06c7ec31e55a6cc060f71d206a3c1"
+  },
+  "parameters": [
+    {
+      "name": "default_branch",
+      "source": "workspace",
+      "value_digest": "sha256:0d6e4079e36703ebd37c00722f5891d28b0e2811dc114b129215123adcce3605"
+    },
+    {
+      "name": "repo",
+      "source": "workspace",
+      "value_digest": "sha256:c7198fbc1945371705d8eb78866b4e79fd4f7dd9ad2705c7c62d6056abf53d5e"
+    }
+  ],
+  "facts": [
+    {
+      "key": "agent",
+      "value_digest": "sha256:2dde44a97b1d5463d0f79e87bc8dd35ed61aac2a407204c7f8b4315c7ea10a43"
+    }
+  ],
+  "variants": {
+    "kept": [],
+    "dropped": [
+      "when#1",
+      "when#2"
+    ]
+  },
+  "includes": [],
+  "limits": {
+    "include_depth": 0,
+    "include_bytes": 0
+  },
+  "unresolved": []
+}

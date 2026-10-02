@@ -1,0 +1,29 @@
+{
+  "spec": "1",
+  "blocks": [
+    {
+      "kind": "must",
+      "sigil": false,
+      "form": "keyword",
+      "line": 4,
+      "attrs": {},
+      "body": {
+        "type": "markdown",
+        "text": "quote the refund policy verbatim."
+      }
+    },
+    {
+      "kind": "context",
+      "sigil": false,
+      "form": "container",
+      "line": 12,
+      "attrs": {
+        "title": "Refund window"
+      },
+      "body": {
+        "type": "markdown",
+        "text": "Refunds are possible for 30 days.\n<!-- the window moves to 14 days in January -->"
+      }
+    }
+  ]
+}

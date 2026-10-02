@@ -1,0 +1,11 @@
+# Latitude
+
+**MAY:** skip the greeting for internal users.
+
+**MUST:** cite the instruction version you followed.
+
+**SHOULD NOT:** internal jargon.
+
+**MAY:** answer in the customer's language.
+
+**MUST:** Sign off with your role, not your name.

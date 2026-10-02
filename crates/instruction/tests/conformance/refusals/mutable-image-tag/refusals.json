@@ -1,6 +1,7 @@
 [
   {
     "line": 1,
+    "code": "mutable-image-tag",
     "message": "image \"py311\" is not digest-pinned"
   }
 ]

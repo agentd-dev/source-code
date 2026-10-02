@@ -1,0 +1,2 @@
+:::when{agent="claude"}
+:::

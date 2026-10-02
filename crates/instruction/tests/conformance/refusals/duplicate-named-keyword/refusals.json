@@ -1,0 +1,7 @@
+[
+  {
+    "line": 3,
+    "code": "duplicate-identity",
+    "message": "duplicate must/a (first declared at line 1)"
+  }
+]

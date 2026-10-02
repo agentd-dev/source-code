@@ -1,0 +1,7 @@
+# Refund rules
+
+**NEVER:** promise a refund above the plan limit without approval.
+
+**MUST:** When you escalate, say so in the reply.
+
+The ceiling rule is refund-ceiling; the escalation rule is the note rule.

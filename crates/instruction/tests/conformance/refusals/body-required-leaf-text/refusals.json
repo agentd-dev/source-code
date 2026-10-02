@@ -1,6 +1,7 @@
 [
   {
     "line": 1,
+    "code": "body-required",
     "message": "file requires a body (a text body) — use :::!file"
   }
 ]

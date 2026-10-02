@@ -1,0 +1,9 @@
+# Refunds
+
+**MUST:** quote the refund policy verbatim.
+
+<reference title="Refund window">
+Refunds are possible for 30 days.
+</reference>
+
+Inline <!-- this stays: it is inline HTML --> text.

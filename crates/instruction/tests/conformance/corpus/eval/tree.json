@@ -1,0 +1,32 @@
+{
+  "spec": "1",
+  "blocks": [
+    {
+      "kind": "must",
+      "sigil": false,
+      "form": "keyword",
+      "line": 3,
+      "attrs": {
+        "name": "escalate"
+      },
+      "body": {
+        "type": "markdown",
+        "text": "escalate refunds above the limit to the on-call engineer."
+      }
+    },
+    {
+      "kind": "eval",
+      "sigil": true,
+      "form": "container",
+      "line": 5,
+      "attrs": {
+        "name": "large-refund",
+        "target": "@must/escalate"
+      },
+      "body": {
+        "type": "yaml",
+        "text": "cases:\n  - name: escalates\n    given: { message: \"Please refund my $900 annual plan.\" }\n    expect:\n      contains: [\"on-call\"]\n      judge: \"The reply escalates and promises no refund.\""
+      }
+    }
+  ]
+}

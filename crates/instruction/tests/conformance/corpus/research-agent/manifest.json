@@ -1,0 +1,31 @@
+{
+  "authored": {
+    "digest": "sha256:53c0ff0c151cde38e2a8fd3f9aee095cf13d5b60121a45fc588958f6a81d7203"
+  },
+  "parameters": [
+    {
+      "name": "topic",
+      "source": "prompt",
+      "value_digest": "sha256:4b4e49dd2de5eae9881688638d7453803ea88b3721146b8f97a5508b5b5c6aa5"
+    }
+  ],
+  "facts": [],
+  "variants": {
+    "kept": [
+      "when#1",
+      "when#2"
+    ],
+    "dropped": []
+  },
+  "includes": [
+    {
+      "target": "ins_house-style",
+      "digest": "sha256:00897acdccc3a2e23f1efa7cba38bb4f1a51a37ad18f96b28149c052455d8dae"
+    }
+  ],
+  "limits": {
+    "include_depth": 1,
+    "include_bytes": 1860
+  },
+  "unresolved": []
+}

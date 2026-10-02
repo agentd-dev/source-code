@@ -1,0 +1,8 @@
+[
+  {
+    "line": 1,
+    "code": "param-default-type",
+    "severity": "warning",
+    "message": "line 1: default \"abc\" is not a number"
+  }
+]

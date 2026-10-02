@@ -1,6 +1,7 @@
 [
   {
     "line": 1,
+    "code": "unknown-machinery-kind",
     "message": "unknown machinery kind \"worfklow\" — this reader implements version 1 (known: workflow, skill, config, …)"
   }
 ]

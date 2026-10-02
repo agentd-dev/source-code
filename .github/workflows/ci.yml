@@ -32,10 +32,41 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: instruction-md/specification
+          # The spec revision the vendored copy was taken from. Moving this is
+          # a deliberate change, made in the same commit as a re-vendor (the
+          # two drift tests print the commands); following upstream main
+          # would turn the drift tests red on any upstream commit.
+          ref: 345f27588f5982cbe530254b82aba4ed90a34292
           path: .spec-upstream
       - run: echo "INSTRUCTION_SPEC_REPO=$GITHUB_WORKSPACE/.spec-upstream" >> "$GITHUB_ENV"
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      # agentd-instruction is published on its own and most consumers build it
+      # without `sign`, a row --all-features never sees: lint and test it in
+      # its default build too.
+      - if: ${{ !cancelled() }}
+        run: cargo clippy -p agentd-instruction --all-targets -- -D warnings
+      - if: ${{ !cancelled() }}
+        run: cargo clippy -p agentd-instruction --all-targets --features sign -- -D warnings
+      - if: ${{ !cancelled() }}
+        run: cargo test -p agentd-instruction --no-fail-fast
+      # The two drift checks, by exact name, against the pinned checkout above.
+      # Each skips where no spec clone exists, and a skipped test still reports
+      # `ok` — so this step fails on the skip marker, and unless exactly the one
+      # test passed, rather than trusting the suite's verdict.
+      - name: spec drift (pinned)
+        if: ${{ !cancelled() }}
+        run: |
+          drift() {
+            out=$(cargo test -p "$1" --all-features --test "$2" -- --exact "$3" --nocapture 2>&1) || true
+            echo "$out"
+            if grep -q "drift check skipped" <<<"$out" || ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
+              echo "::error::$3 did not run against the pinned spec revision"
+              return 1
+            fi
+          }
+          drift agentd-instruction corpus the_vendored_corpus_matches_upstream_when_present
+          drift agentd-cli instruction_spec_corpus the_vendored_schema_matches_upstream_when_present
       # The whole workspace under all features: agentd's feature-gated tests
       # (a2a_*_e2e / otel_e2e / …) and the black-box agentd-conformance suite,
       # which builds + drives the real binary, both run here.

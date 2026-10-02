@@ -184,7 +184,7 @@ serde_json = "1"
 # The Instruction Specification reference implementation, extracted (C-01) so
 # the platform and agentd run the SAME parser/validator/delivery code.
 # `config::idoc` and `config::yaml` re-export it; behaviour is unchanged.
-instruction-core = { package = "agentd-instruction", path = "../instruction", version = "0.2.0" }
+instruction-core = { package = "agentd-instruction", path = "../instruction", version = "0.3.0" }
 
 # --- feature: cron --- hand-rolled in triggers/timer.rs; no dependency.
 

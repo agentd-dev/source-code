@@ -33,6 +33,11 @@ ROWS=(
   "--all-features"
 )
 
+# agentd-instruction's own rows (ci.yml's gate job): the crate is published on
+# its own and most consumers build it without `sign`, which the union and the
+# rows above never lint.
+INSTRUCTION_ROWS=("" "--features sign")
+
 fail=0
 # A check this machine could not run. It does not fail the gate — CI runs it —
 # but the verdict names it, so "GATE CLEAN" never claims a check that did not
@@ -46,7 +51,7 @@ cargo fmt --all --check || fail=1
 step "clippy (workspace, all features)"
 cargo clippy --workspace --all-targets --all-features -- -D warnings || fail=1
 
-step "clippy matrix (${#ROWS[@]} rows x 2 crates)"
+step "clippy matrix (${#ROWS[@]} rows x 2 crates, ${#INSTRUCTION_ROWS[@]} agentd-instruction rows)"
 for F in "${ROWS[@]}"; do
   for P in agentd-core agentd-cli; do
     if ! cargo clippy -p "$P" --all-targets $F -- -D warnings >/tmp/ci-gate.log 2>&1; then
@@ -55,6 +60,13 @@ for F in "${ROWS[@]}"; do
       fail=1
     fi
   done
+done
+for F in "${INSTRUCTION_ROWS[@]}"; do
+  if ! cargo clippy -p agentd-instruction --all-targets $F -- -D warnings >/tmp/ci-gate.log 2>&1; then
+    echo "  FAIL  agentd-instruction  ${F:-<default>}"
+    grep -m3 -E '^error' /tmp/ci-gate.log | sed 's/^/        /'
+    fail=1
+  fi
 done
 [ $fail -eq 0 ] && echo "  all rows clean"
 
@@ -79,8 +91,59 @@ else
 fi
 
 if [ "${1:-}" != "quick" ]; then
+  # The drift tests compare the vendored schema and conformance fixtures with
+  # the specification, and SKIP where no clone is at hand — reporting `ok`. So
+  # this step pins them: it reads ci.yml's spec revision (never a second copy
+  # here), extracts exactly that revision from a local clone, and points
+  # INSTRUCTION_SPEC_REPO at it for this step AND the workspace test run. A
+  # local checkout that has moved past the pin then reddens nothing and greens
+  # nothing, and a run that could not reach the pin FAILS — it is never
+  # recorded as NOT RUN, because CI always runs it.
+  step "spec drift (pinned)"
+  spec_sha=$(sed -n '/repository: instruction-md\/specification/,/path:/s/^ *ref: *\([0-9a-f]\{40\}\) *$/\1/p' \
+               .github/workflows/ci.yml | head -n1)
+  spec_clone=${INSTRUCTION_SPEC_REPO:-/root/instruction-md/specification}
+  spec_tree=$(mktemp -d)
+  trap 'rm -rf "$spec_tree"' EXIT
+  drift() {
+    local out
+    out=$(cargo test -p "$1" --all-features --test "$2" -- --exact "$3" --nocapture 2>&1) || true
+    if grep -q "drift check skipped" <<<"$out" || ! grep -qE "test result: ok\. 1 passed" <<<"$out"; then
+      echo "  FAIL  $3 did not run and pass against $spec_sha"
+      grep -E 'drifted|differs|not vendored|not upstream|skipped|panicked' <<<"$out" | head -n8 | sed 's/^/        /'
+      fail=1
+    else
+      echo "  ok    $3"
+    fi
+  }
+  if [ -z "$spec_sha" ]; then
+    echo "  FAIL  ci.yml's instruction-md/specification checkout pins no 40-hex ref"
+    fail=1
+  elif ! git -C "$spec_clone" rev-parse --git-dir >/dev/null 2>&1; then
+    echo "  FAIL  no spec clone at $spec_clone — clone instruction-md/specification"
+    echo "        (or set INSTRUCTION_SPEC_REPO to one)"
+    fail=1
+  elif ! git -C "$spec_clone" cat-file -e "$spec_sha^{commit}" 2>/dev/null; then
+    echo "  FAIL  $spec_clone lacks the pinned revision $spec_sha — fetch upstream"
+    fail=1
+  elif ! git -C "$spec_clone" archive "$spec_sha" | tar -x -C "$spec_tree"; then
+    echo "  FAIL  could not extract $spec_sha from $spec_clone"
+    fail=1
+  else
+    export INSTRUCTION_SPEC_REPO="$spec_tree"
+    echo "  spec $spec_sha from $spec_clone"
+    drift agentd-instruction corpus the_vendored_corpus_matches_upstream_when_present
+    drift agentd-cli instruction_spec_corpus the_vendored_schema_matches_upstream_when_present
+  fi
+
   step "test (workspace, all features)"
   cargo test --workspace --all-features --no-fail-fast || fail=1
+
+  # ci.yml's gate job: agentd-instruction in its default build (no `sign`),
+  # where a test that only compiles with a feature would break the consumers
+  # that never enable it.
+  step "test (agentd-instruction, default features)"
+  cargo test -p agentd-instruction --no-fail-fast || fail=1
 
   # A release publishes agentd-net, agentd-mcp, agentd-core and agentd-cli to
   # crates.io. `cargo publish` refuses a crate whose path dependency is not

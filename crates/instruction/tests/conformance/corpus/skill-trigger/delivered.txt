@@ -1,0 +1,5 @@
+# Support
+
+[skill "tone" is available — use it when writing to customers; reference it as @skill/tone]
+
+[skill "refunds" is available — use it when a refund is requested; reference it as @skill/refunds]

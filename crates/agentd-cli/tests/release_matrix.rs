@@ -202,6 +202,176 @@ fn the_local_gate_runs_the_same_rows_as_ci() {
     );
 }
 
+fn gate_script() -> String {
+    std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/ci-gate.sh"))
+        .unwrap()
+}
+
+/// ci.yml's `gate` job: everything before the next job.
+fn gate_job(ci: &str) -> &str {
+    let job = ci
+        .split("\n  gate:\n")
+        .nth(1)
+        .expect("ci.yml has a `gate` job");
+    job.split("\n  deny:\n").next().unwrap_or(job)
+}
+
+/// The two drift tests: (package, test target, test name). Each compares a
+/// vendored copy of the Instruction Specification with upstream, and each
+/// SKIPS — reporting `ok` — where no spec clone is at hand.
+const DRIFT_TESTS: &[(&str, &str, &str)] = &[
+    (
+        "agentd-instruction",
+        "crates/instruction/tests/corpus.rs",
+        "the_vendored_corpus_matches_upstream_when_present",
+    ),
+    (
+        "agentd-cli",
+        "crates/agentd-cli/tests/instruction_spec_corpus.rs",
+        "the_vendored_schema_matches_upstream_when_present",
+    ),
+];
+
+/// CI checks the vendored specification against ONE upstream revision, named
+/// by its full sha. Following upstream's main turned the drift tests red on any
+/// upstream commit — a failure about someone else's repository, not this one —
+/// and moving the pin is now a change made with the re-vendor it describes.
+#[test]
+fn the_spec_checkout_is_pinned() {
+    let ci = workflow("ci.yml");
+    let step = ci
+        .split("repository: instruction-md/specification")
+        .nth(1)
+        .expect("ci.yml checks out instruction-md/specification");
+    let step = step.split("\n      - ").next().unwrap_or(step);
+    let pin = step
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("ref:"))
+        .map(str::trim)
+        .unwrap_or_else(|| panic!("the spec checkout carries no `ref:`:\n{step}"));
+    assert!(
+        pin.len() == 40 && pin.bytes().all(|b| b.is_ascii_hexdigit()),
+        "the spec checkout must pin a full 40-hex commit sha, not {pin:?}"
+    );
+}
+
+/// Both drift checks RUN, in CI and in the local gate, against the pinned
+/// revision: each gate runs them by exact name and fails on the skip marker or
+/// on anything but one passing test, because a skipped drift test still says
+/// `ok`. Neither gate may `--skip` them, and the local gate reads the pin from
+/// ci.yml instead of keeping a copy that could fall out of step.
+#[test]
+fn the_spec_drift_checks_cannot_be_skipped() {
+    let ci = workflow("ci.yml");
+    let gate = gate_script();
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for (file, text) in [
+        ("ci.yml's gate job", gate_job(&ci)),
+        ("scripts/ci-gate.sh", &gate),
+    ] {
+        for (pkg, source, name) in DRIFT_TESTS {
+            let target = Path::new(source).file_stem().unwrap().to_str().unwrap();
+            assert!(
+                text.lines()
+                    .any(|l| l.trim() == format!("drift {pkg} {target} {name}")),
+                "{file} does not run {name} by name"
+            );
+            // The marker the gate looks for is the one the test prints.
+            let test_src = std::fs::read_to_string(root.join(source)).unwrap();
+            assert!(
+                test_src.contains(&format!("fn {name}()"))
+                    && test_src.contains("drift check skipped"),
+                "{source} no longer has {name} printing \"drift check skipped\" when it skips"
+            );
+        }
+        for needle in [
+            r#"--exact "$3" --nocapture"#,
+            "drift check skipped",
+            r"test result: ok\. 1 passed",
+        ] {
+            assert!(
+                text.contains(needle),
+                "{file}'s drift step lacks {needle:?}"
+            );
+        }
+        for l in text.lines().filter(|l| l.contains("--skip")) {
+            assert!(
+                !DRIFT_TESTS.iter().any(|(_, _, name)| l.contains(name)) && !l.contains("vendored"),
+                "{file} skips a drift test: {l}"
+            );
+        }
+    }
+    // The pin has one home: ci.yml. The local gate reads it, so it holds no
+    // sha of its own.
+    let hex_run = gate
+        .split(|c: char| !c.is_ascii_hexdigit())
+        .find(|t| t.len() >= 40);
+    assert!(
+        hex_run.is_none(),
+        "scripts/ci-gate.sh carries a commit sha ({hex_run:?}) — read ci.yml's pin instead"
+    );
+    assert!(
+        gate.contains("repository: instruction-md\\/specification")
+            && gate.contains(".github/workflows/ci.yml"),
+        "scripts/ci-gate.sh must read the spec pin from ci.yml"
+    );
+    // And the workspace test run sees the same pinned tree.
+    let export = gate.find("export INSTRUCTION_SPEC_REPO=");
+    let tests = gate.find("cargo test --workspace");
+    assert!(
+        matches!((export, tests), (Some(e), Some(t)) if e < t),
+        "scripts/ci-gate.sh must point INSTRUCTION_SPEC_REPO at the pinned tree before the workspace test run"
+    );
+}
+
+/// agentd-instruction is linted and tested in its default build — without
+/// `sign` — in CI and before a push. Every other row is agentd-core's or
+/// agentd-cli's, and those enable `sign` in the union, so a lint or a test
+/// that breaks only for the crate's own default consumers went unseen.
+#[test]
+fn the_local_gate_lints_the_instruction_crate_without_sign() {
+    let ci = workflow("ci.yml");
+    let job = gate_job(&ci);
+    let gate = gate_script();
+    let rows: Vec<&str> = gate
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("INSTRUCTION_ROWS=("))
+        .expect("scripts/ci-gate.sh declares INSTRUCTION_ROWS")
+        .trim_end_matches(')')
+        .split('"')
+        .skip(1)
+        .step_by(2)
+        .collect();
+    assert_eq!(rows, ["", "--features sign"], "INSTRUCTION_ROWS");
+    assert!(
+        gate.contains("for F in \"${INSTRUCTION_ROWS[@]}\"")
+            && gate.contains("cargo clippy -p agentd-instruction --all-targets $F -- -D warnings"),
+        "scripts/ci-gate.sh does not lint agentd-instruction over INSTRUCTION_ROWS"
+    );
+    for row in rows {
+        let line = if row.is_empty() {
+            "run: cargo clippy -p agentd-instruction --all-targets -- -D warnings".to_string()
+        } else {
+            format!("run: cargo clippy -p agentd-instruction --all-targets {row} -- -D warnings")
+        };
+        assert!(
+            job.lines()
+                .any(|l| l.trim().trim_start_matches("- ") == line),
+            "ci.yml's gate job lacks `{line}`"
+        );
+    }
+    assert!(
+        job.lines().any(|l| l.trim().trim_start_matches("- ")
+            == "run: cargo test -p agentd-instruction --no-fail-fast"),
+        "ci.yml's gate job does not test agentd-instruction in its default build"
+    );
+    assert!(
+        gate.lines()
+            .any(|l| l.trim() == "cargo test -p agentd-instruction --no-fail-fast || fail=1"),
+        "scripts/ci-gate.sh does not test agentd-instruction in its default build"
+    );
+}
+
 /// deny.toml is enforced, in CI and before a push. It sat unenforced from
 /// v1.16.0 on, failing on licences nobody saw, because no job ran it. And
 /// agentd's own AGPL is excepted per crate, never allowed: on the allow-list

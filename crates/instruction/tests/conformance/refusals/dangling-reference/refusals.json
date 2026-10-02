@@ -1,6 +1,7 @@
 [
   {
     "line": 1,
+    "code": "dangling-reference",
     "message": "@function/lint does not resolve — no function named \"lint\""
   }
 ]

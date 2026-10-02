@@ -283,6 +283,13 @@ test that fails on the old code.
 - CI builds clean on Rust 1.99, and a failed clippy step no longer skips the
   test steps after it, so a lint error cannot hide a test failure. The job
   still fails.
+- CI checks the vendored Instruction Specification against one pinned
+  upstream revision, not upstream's moving main. Both drift checks run by
+  name in CI and in `scripts/ci-gate.sh`, and a run that skipped fails: a
+  skipped drift test still reports `ok`. The local gate reads the pin from
+  `ci.yml` and fails when it cannot reach that revision.
+- agentd-instruction is linted with and without `sign`, and tested in its
+  default build, in CI and in `scripts/ci-gate.sh`.
 
 ### Crates
 
@@ -290,6 +297,15 @@ agentd-mcp has breaking API changes: `McpError::SessionExpired` is a new
 variant, and `capabilities()` and `protocol_version()` return owned values,
 because the negotiated state now belongs to the live connection, which a
 re-dial replaces.
+
+agentd-instruction 0.3.0 re-vendors Instruction Specification 345f275
+(registry revision 1.1); CI pins that revision. The schema and the whole
+conformance directory (corpus, refusals, advisories, README, LICENSE) are
+upstream's bytes. A name is required where the schema's rules require one,
+not wherever a kind has identity: 1.1 gives every prose kind identity, and an
+anonymous `MUST:` stays valid. The conformance runner accounts for every
+vendored artifact; the ones this release does not meet yet are listed in the
+test as pending, and an artifact that starts passing must leave the list.
 
 ## v1.17.0 — A2A, and nothing beside it
 

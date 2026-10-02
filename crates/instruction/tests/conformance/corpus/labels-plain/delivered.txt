@@ -1,0 +1,5 @@
+MUST (if a refund is requested): confirm the plan.
+BECAUSE: limits differ.
+
+EXAMPLE (avoid) — Terse:
+Done.

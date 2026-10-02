@@ -1,0 +1,68 @@
+{
+  "spec": "1",
+  "blocks": [
+    {
+      "kind": "when",
+      "sigil": false,
+      "form": "container",
+      "line": 3,
+      "attrs": {
+        "environment": "production"
+      },
+      "body": {
+        "type": "markdown",
+        "text": "Every write is visible to a customer."
+      }
+    },
+    {
+      "kind": "when",
+      "sigil": false,
+      "form": "container",
+      "line": 7,
+      "attrs": {
+        "environment": "staging"
+      },
+      "body": {
+        "type": "markdown",
+        "text": "This is a rehearsal against copied data."
+      }
+    },
+    {
+      "kind": "otherwise",
+      "sigil": false,
+      "form": "container",
+      "line": 11,
+      "attrs": {},
+      "body": {
+        "type": "markdown",
+        "text": "You are in an environment this document does not know. Do not write anything."
+      }
+    },
+    {
+      "kind": "unless",
+      "sigil": false,
+      "form": "container",
+      "line": 15,
+      "attrs": {
+        "host": "agentd"
+      },
+      "body": {
+        "type": "markdown",
+        "text": "You are running interactively; ask before any destructive step."
+      }
+    },
+    {
+      "kind": "unless",
+      "sigil": false,
+      "form": "container",
+      "line": 19,
+      "attrs": {
+        "host": "claude-code"
+      },
+      "body": {
+        "type": "markdown",
+        "text": "This line is dropped: the host is claude-code."
+      }
+    }
+  ]
+}

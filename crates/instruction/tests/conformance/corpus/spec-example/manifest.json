@@ -1,0 +1,42 @@
+{
+  "authored": {
+    "digest": "sha256:95d4a392fca2661d22cf29e61f14a5785b685d578ee301188e5702cc93289875"
+  },
+  "parameters": [
+    {
+      "name": "environment",
+      "source": "workspace",
+      "value_digest": "sha256:ab8e18ef4ebebeddc0b3152ce9c9006e14fc05242e3fc9ce32246ea6a9543074"
+    },
+    {
+      "name": "plan_limit",
+      "source": "workspace",
+      "value_digest": "sha256:0604cd3138feed202ef293e062da2f4720f77a05d25ee036a7a01c9cfcdd1f0a"
+    }
+  ],
+  "facts": [
+    {
+      "key": "environment",
+      "value_digest": "sha256:ab8e18ef4ebebeddc0b3152ce9c9006e14fc05242e3fc9ce32246ea6a9543074"
+    }
+  ],
+  "variants": {
+    "kept": [
+      "when#1"
+    ],
+    "dropped": [
+      "when#2"
+    ]
+  },
+  "includes": [
+    {
+      "target": "ins_house-style",
+      "digest": "sha256:00897acdccc3a2e23f1efa7cba38bb4f1a51a37ad18f96b28149c052455d8dae"
+    }
+  ],
+  "limits": {
+    "include_depth": 1,
+    "include_bytes": 1860
+  },
+  "unresolved": []
+}

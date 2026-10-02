@@ -1,0 +1,55 @@
+{
+  "spec": "1",
+  "blocks": [
+    {
+      "kind": "should",
+      "sigil": false,
+      "form": "keyword",
+      "line": 3,
+      "attrs": {
+        "not": true
+      },
+      "body": {
+        "type": "markdown",
+        "text": "store customer data in the workspace."
+      }
+    },
+    {
+      "kind": "should",
+      "sigil": false,
+      "form": "keyword",
+      "line": 5,
+      "attrs": {
+        "not": true
+      },
+      "body": {
+        "type": "markdown",
+        "text": "paste tickets into chat."
+      }
+    },
+    {
+      "kind": "should",
+      "sigil": false,
+      "form": "keyword",
+      "line": 6,
+      "attrs": {},
+      "body": {
+        "type": "markdown",
+        "text": "link to the ticket instead."
+      }
+    },
+    {
+      "kind": "should",
+      "sigil": false,
+      "form": "container",
+      "line": 8,
+      "attrs": {
+        "not": true
+      },
+      "body": {
+        "type": "markdown",
+        "text": "keep copies of invoices after the ticket closes."
+      }
+    }
+  ]
+}

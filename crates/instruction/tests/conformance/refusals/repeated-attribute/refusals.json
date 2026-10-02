@@ -1,6 +1,7 @@
 [
   {
     "line": 1,
+    "code": "repeated-attribute",
     "message": "attribute \"name\" is repeated"
   }
 ]

@@ -1,0 +1,47 @@
+{
+  "spec": "1",
+  "blocks": [
+    {
+      "kind": "include",
+      "sigil": false,
+      "form": "leaf",
+      "line": 3,
+      "attrs": {
+        "id": "ins_overrides-house"
+      }
+    },
+    {
+      "kind": "must",
+      "sigil": false,
+      "form": "container",
+      "line": 5,
+      "attrs": {
+        "name": "full-steps",
+        "overrides": [
+          "should/brevity"
+        ]
+      },
+      "body": {
+        "type": "markdown",
+        "text": "Include every step of the procedure, however long the reply becomes."
+      }
+    },
+    {
+      "kind": "must",
+      "sigil": false,
+      "form": "container",
+      "line": 9,
+      "attrs": {
+        "name": "relaxed",
+        "overrides": [
+          "guardrail/no-pii",
+          "should/nowhere"
+        ]
+      },
+      "body": {
+        "type": "markdown",
+        "text": "This override cannot silence a guardrail and names a rule that does not exist."
+      }
+    }
+  ]
+}

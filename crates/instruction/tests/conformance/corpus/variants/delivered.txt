@@ -1,0 +1,5 @@
+# Deploy assistant
+
+You are in an environment this document does not know. Do not write anything.
+
+You are running interactively; ask before any destructive step.

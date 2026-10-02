@@ -1,0 +1,7 @@
+[
+  {
+    "line": 4,
+    "code": "because-repeated",
+    "message": "must already has a reason (because=) — a rule has one reason"
+  }
+]

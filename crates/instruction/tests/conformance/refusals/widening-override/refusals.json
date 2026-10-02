@@ -1,6 +1,7 @@
 [
   {
     "line": 2,
+    "code": "widening-override",
     "message": "override may not re-enable a tool — overrides only narrow"
   }
 ]

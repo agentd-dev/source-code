@@ -1,0 +1,17 @@
+{
+  "authored": {
+    "digest": "sha256:773d2c07908dcad96e1ab05db5571a2ec9541980fdf9639947e0329e5fae4766"
+  },
+  "parameters": [],
+  "facts": [],
+  "variants": {
+    "kept": [],
+    "dropped": []
+  },
+  "includes": [],
+  "limits": {
+    "include_depth": 0,
+    "include_bytes": 0
+  },
+  "unresolved": []
+}

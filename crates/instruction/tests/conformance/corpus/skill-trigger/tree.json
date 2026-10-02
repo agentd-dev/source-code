@@ -1,0 +1,33 @@
+{
+  "spec": "1",
+  "blocks": [
+    {
+      "kind": "skill",
+      "sigil": true,
+      "form": "container",
+      "line": 3,
+      "attrs": {
+        "name": "tone",
+        "trigger": "writing to customers"
+      },
+      "body": {
+        "type": "markdown",
+        "text": "Warm, concise, specific."
+      }
+    },
+    {
+      "kind": "skill",
+      "sigil": true,
+      "form": "section",
+      "line": 7,
+      "attrs": {
+        "when": "a refund is requested",
+        "name": "refunds"
+      },
+      "body": {
+        "type": "markdown",
+        "text": "\nConfirm the plan first.\n"
+      }
+    }
+  ]
+}

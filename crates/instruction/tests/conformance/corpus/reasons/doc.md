@@ -1,0 +1,16 @@
+# Plans
+
+MUST: confirm the customer's plan before quoting any limit.
+BECAUSE: limits differ by plan, and a quoted limit is binding.
+
+- MUST: link the ticket.
+  BECAUSE: the audit follows links.
+- SHOULD: reply within the hour.
+
+:::never{because="refunds above the limit are a finance decision"}
+Promise a refund above the limit.
+:::
+
+NEVER: guess at policy.
+
+BECAUSE: a confident wrong answer costs more than an honest delay.

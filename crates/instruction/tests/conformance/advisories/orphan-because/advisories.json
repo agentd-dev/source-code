@@ -1,0 +1,8 @@
+[
+  {
+    "line": 3,
+    "code": "orphan-because",
+    "severity": "warning",
+    "message": "line 3: BECAUSE: follows no rule — it is delivered as written"
+  }
+]

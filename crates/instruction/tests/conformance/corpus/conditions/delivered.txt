@@ -1,0 +1,7 @@
+# Refunds
+
+**NEVER (if the refund exceeds 500 USD):** promise it without approval.
+
+**MUST (if the customer mentions a chargeback):** hand off to billing.
+
+**SHOULD (if the customer is on a free plan):** Point to the self-service refund page first.

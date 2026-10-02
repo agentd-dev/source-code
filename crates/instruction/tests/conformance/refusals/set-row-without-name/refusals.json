@@ -1,6 +1,7 @@
 [
   {
     "line": 1,
+    "code": "set-row-without-name",
     "message": "row 1 has no name — every member of human[] needs one"
   }
 ]

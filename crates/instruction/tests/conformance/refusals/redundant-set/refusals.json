@@ -1,6 +1,7 @@
 [
   {
     "line": 1,
+    "code": "redundant-set",
     "message": "glossary is already a list — write :::glossary"
   }
 ]

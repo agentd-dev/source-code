@@ -1,0 +1,42 @@
+{
+  "spec": "1",
+  "blocks": [
+    {
+      "kind": "data",
+      "sigil": true,
+      "form": "container",
+      "line": 3,
+      "attrs": {
+        "name": "reply"
+      },
+      "body": {
+        "type": "table",
+        "rows": [
+          {
+            "field": "summary",
+            "type": "string"
+          },
+          {
+            "field": "next_step",
+            "type": "string"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "output",
+      "sigil": false,
+      "form": "container",
+      "line": 10,
+      "attrs": {
+        "format": "json",
+        "schema": "@data/reply",
+        "title": "Reply"
+      },
+      "body": {
+        "type": "markdown",
+        "text": "One object. `summary` is one sentence; `next_step` says what happens next and when."
+      }
+    }
+  ]
+}

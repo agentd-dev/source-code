@@ -1,22 +1,27 @@
 [
   {
     "line": 1,
+    "code": "id-class-shorthand",
     "message": "\"#oncall\" is not an attribute — identity is name=oncall"
   },
   {
     "line": 1,
+    "code": "malformed-attributes",
     "message": "attributes: expected key=value, found \"#\" — quote values with spaces"
   },
   {
     "line": 1,
+    "code": "malformed-attributes",
     "message": "attributes: expected key=value, found \"oncall\" — quote values with spaces"
   },
   {
     "line": 1,
+    "code": "malformed-attributes",
     "message": "attributes: expected key=value, found \".\" — quote values with spaces"
   },
   {
     "line": 1,
+    "code": "malformed-attributes",
     "message": "attributes: expected key=value, found \"human\" — quote values with spaces"
   }
 ]

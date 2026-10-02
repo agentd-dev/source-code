@@ -24,14 +24,17 @@ where someone happens to have a checkout does not hold.
    it; `the_vendored_schema_matches_upstream_when_present` checks the copy
    against the published original.
 
-2. `crates/instruction/tests/conformance/**` (102 files)
-   The specification's conformance corpus: the shared fixtures the Rust and
-   TypeScript implementations are both held to. Licence: **Apache-2.0** — see
-   `crates/instruction/tests/conformance/LICENSE`, copied alongside the
-   fixtures with the corpus README as that licence requires. Vendored so the
-   suite runs everywhere rather than only where a sibling checkout exists;
-   `the_vendored_corpus_matches_upstream_when_present` checks every file
-   against the published corpus in both directions.
+2. `crates/instruction/tests/conformance/**`
+   The specification's conformance fixtures, the whole directory as upstream
+   publishes it: `corpus/` (delivered text, block trees, resolution
+   manifests), `refusals/`, `advisories/`, and the `README.md` and `LICENSE`
+   that accompany them — the shared fixtures the Rust and TypeScript
+   implementations are both held to. Licence: **Apache-2.0**, every file of it,
+   `advisories/` included — see `crates/instruction/tests/conformance/LICENSE`,
+   copied alongside the fixtures with the README as that licence requires.
+   Vendored so the suite runs everywhere rather than only where a sibling
+   checkout exists; `the_vendored_corpus_matches_upstream_when_present` checks
+   every file against the published fixtures in both directions.
 
 Both licences are compatible with distributing this repository under the AGPL:
 CC BY 4.0 and Apache-2.0 permit redistribution with attribution, which this

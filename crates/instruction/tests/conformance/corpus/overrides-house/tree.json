@@ -1,0 +1,48 @@
+{
+  "spec": "1",
+  "frontMatter": {
+    "id": "instruction://ins_overrides-house"
+  },
+  "blocks": [
+    {
+      "kind": "should",
+      "sigil": false,
+      "form": "keyword",
+      "line": 4,
+      "attrs": {
+        "name": "brevity",
+        "because": "people skim."
+      },
+      "body": {
+        "type": "markdown",
+        "text": "keep replies under five sentences."
+      }
+    },
+    {
+      "kind": "must",
+      "sigil": false,
+      "form": "keyword",
+      "line": 7,
+      "attrs": {
+        "name": "tone"
+      },
+      "body": {
+        "type": "markdown",
+        "text": "be warm."
+      }
+    },
+    {
+      "kind": "guardrail",
+      "sigil": false,
+      "form": "keyword",
+      "line": 9,
+      "attrs": {
+        "name": "no-pii"
+      },
+      "body": {
+        "type": "markdown",
+        "text": "never reveal another customer's data."
+      }
+    }
+  ]
+}

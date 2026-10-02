@@ -1,6 +1,7 @@
 [
   {
     "line": 1,
+    "code": "missing-attribute",
     "message": "workflow requires name"
   }
 ]

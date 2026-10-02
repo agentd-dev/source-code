@@ -86,9 +86,9 @@ through approve-refund.
 
 [mcp server "billing" is connected; its tools are available]
 
-[skill "support-tone" is available — reference it as @skill/support-tone]
+[skill "support-tone" is available — use it when writing to customers; reference it as @skill/support-tone]
 
-[skill "refund-handling" is available — reference it as @skill/refund-handling]
+[skill "refund-handling" is available — use it when a refund is requested or implied; reference it as @skill/refund-handling]
 
 [workflow "approve-refund" is loaded and runs autonomously]
 

@@ -1,0 +1,27 @@
+{
+  "authored": {
+    "digest": "sha256:b5c599a7a58926027400aab4de74fb93f35c1595b6ef6a2359c8cd18ea09a054"
+  },
+  "parameters": [],
+  "facts": [],
+  "variants": {
+    "kept": [],
+    "dropped": []
+  },
+  "includes": [
+    {
+      "target": "ins_overrides-house",
+      "digest": "sha256:868ff57f05fafc35ac41adf046c7801d42b1745b33b25d5c5f9274f3625a1280"
+    }
+  ],
+  "limits": {
+    "include_depth": 1,
+    "include_bytes": 200
+  },
+  "unresolved": [
+    "should/nowhere"
+  ],
+  "overridden": [
+    "should/brevity"
+  ]
+}

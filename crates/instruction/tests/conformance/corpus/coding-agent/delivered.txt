@@ -50,9 +50,9 @@ approve, retry a deploy, or change the pipeline.
 
 [channel "eng" is available for #eng]
 
-[skill "code-review" is available — reference it as @skill/code-review]
+[skill "code-review" is available — use it when reviewing a diff, yours or someone else's; reference it as @skill/code-review]
 
-[skill "commit-messages" is available — reference it as @skill/commit-messages]
+[skill "commit-messages" is available — use it when writing a commit or PR description; reference it as @skill/commit-messages]
 
 [workflow "ci-triage" is loaded and runs autonomously]
 

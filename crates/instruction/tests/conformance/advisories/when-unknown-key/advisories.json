@@ -1,0 +1,8 @@
+[
+  {
+    "line": 1,
+    "code": "when-unknown-key",
+    "severity": "warning",
+    "message": "line 1: \"agnet\" is not a context key or a parameter — the content is kept for every reader"
+  }
+]

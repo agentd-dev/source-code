@@ -1,0 +1,60 @@
+{
+  "spec": "1",
+  "blocks": [
+    {
+      "kind": "may",
+      "sigil": false,
+      "form": "keyword",
+      "line": 3,
+      "attrs": {},
+      "body": {
+        "type": "markdown",
+        "text": "skip the greeting for internal users."
+      }
+    },
+    {
+      "kind": "always",
+      "sigil": false,
+      "form": "keyword",
+      "line": 5,
+      "attrs": {},
+      "body": {
+        "type": "markdown",
+        "text": "cite the instruction version you followed."
+      }
+    },
+    {
+      "kind": "avoid",
+      "sigil": false,
+      "form": "keyword",
+      "line": 7,
+      "attrs": {},
+      "body": {
+        "type": "markdown",
+        "text": "internal jargon."
+      }
+    },
+    {
+      "kind": "may",
+      "sigil": false,
+      "form": "alert",
+      "line": 9,
+      "attrs": {},
+      "body": {
+        "type": "markdown",
+        "text": "answer in the customer's language."
+      }
+    },
+    {
+      "kind": "always",
+      "sigil": false,
+      "form": "container",
+      "line": 12,
+      "attrs": {},
+      "body": {
+        "type": "markdown",
+        "text": "Sign off with your role, not your name."
+      }
+    }
+  ]
+}

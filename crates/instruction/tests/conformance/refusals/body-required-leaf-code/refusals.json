@@ -1,6 +1,7 @@
 [
   {
     "line": 1,
+    "code": "body-required",
     "message": "function requires a body (its code) — use :::!function"
   }
 ]

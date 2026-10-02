@@ -1,6 +1,7 @@
 [
   {
     "line": 1,
+    "code": "body-required",
     "message": "must requires a body (text) — write \"MUST: …\" or use :::must"
   }
 ]

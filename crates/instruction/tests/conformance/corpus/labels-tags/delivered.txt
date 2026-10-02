@@ -1,0 +1,11 @@
+<must if="a refund is requested">confirm the plan.</must>
+<because>limits differ.</because>
+
+<never>guess.</never>
+
+<output format="json" title="Reply">
+One object.
+</output>
+
+<may>skip the greeting
+for internal users.</may>

@@ -1,0 +1,60 @@
+{
+  "spec": "1",
+  "frontMatter": {
+    "delivery": {
+      "labels": "tags"
+    }
+  },
+  "blocks": [
+    {
+      "kind": "must",
+      "sigil": false,
+      "form": "keyword",
+      "line": 4,
+      "attrs": {
+        "if": "a refund is requested",
+        "because": "limits differ."
+      },
+      "body": {
+        "type": "markdown",
+        "text": "confirm the plan."
+      }
+    },
+    {
+      "kind": "never",
+      "sigil": false,
+      "form": "keyword",
+      "line": 7,
+      "attrs": {},
+      "body": {
+        "type": "markdown",
+        "text": "guess."
+      }
+    },
+    {
+      "kind": "output",
+      "sigil": false,
+      "form": "container",
+      "line": 9,
+      "attrs": {
+        "format": "json",
+        "title": "Reply"
+      },
+      "body": {
+        "type": "markdown",
+        "text": "One object."
+      }
+    },
+    {
+      "kind": "may",
+      "sigil": false,
+      "form": "keyword",
+      "line": 13,
+      "attrs": {},
+      "body": {
+        "type": "markdown",
+        "text": "skip the greeting\nfor internal users."
+      }
+    }
+  ]
+}

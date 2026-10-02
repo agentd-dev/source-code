@@ -1,0 +1,14 @@
+[
+  {
+    "line": 1,
+    "code": "orphan-otherwise",
+    "severity": "warning",
+    "message": "line 1: otherwise follows no when or unless — it is always kept"
+  },
+  {
+    "line": 1,
+    "code": "otherwise-conditions",
+    "severity": "warning",
+    "message": "line 1: otherwise takes no conditions — they are ignored"
+  }
+]

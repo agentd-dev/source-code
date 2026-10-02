@@ -1,6 +1,7 @@
 [
   {
     "line": 1,
+    "code": "subblock-out-of-place",
     "message": "case is valid only inside a test"
   }
 ]

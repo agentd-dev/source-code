@@ -1,0 +1,32 @@
+{
+  "spec": "1",
+  "blocks": [
+    {
+      "kind": "example",
+      "sigil": false,
+      "form": "container",
+      "line": 3,
+      "attrs": {
+        "title": "A good closing"
+      },
+      "body": {
+        "type": "markdown",
+        "text": "I've refunded the charge; it will reach your card within five working days."
+      }
+    },
+    {
+      "kind": "example",
+      "sigil": false,
+      "form": "container",
+      "line": 7,
+      "attrs": {
+        "title": "A closing that hands the work back",
+        "avoid": true
+      },
+      "body": {
+        "type": "markdown",
+        "text": "Let us know if you have any other questions!"
+      }
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+# Refund desk
+
+You answer refund questions for customers of the store.
+
+**MUST:** quote the refund policy verbatim.
+
+**NEVER:** approve a refund above 200 EUR yourself.
+
+A thematic break inside the body stays prose:
+
+---
+
+```yaml
+---
+not: end matter, because it is code
+---
+```
+
+Thanks for reading.

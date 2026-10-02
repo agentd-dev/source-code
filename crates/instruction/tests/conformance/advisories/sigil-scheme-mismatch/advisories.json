@@ -1,0 +1,8 @@
+[
+  {
+    "line": 1,
+    "code": "sigil-scheme-mismatch",
+    "severity": "warning",
+    "message": "line 1: \"@\" is for people and agents — this is an ordinary link"
+  }
+]

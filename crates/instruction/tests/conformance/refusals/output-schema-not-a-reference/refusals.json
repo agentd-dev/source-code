@@ -1,0 +1,7 @@
+[
+  {
+    "line": 1,
+    "code": "attribute-value",
+    "message": "schema must be a reference written @kind/name"
+  }
+]

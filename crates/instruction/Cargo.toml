@@ -41,7 +41,7 @@
 # would stake a claim on their namespace; the lib is still `instruction_core`,
 # the same package-vs-lib split agentd-core/`agentd` already uses.
 name = "agentd-instruction"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.96"
 description = "Reference implementation of the Instruction Specification: parser, validator, delivery pipeline, and signature verification"

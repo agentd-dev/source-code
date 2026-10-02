@@ -1,6 +1,7 @@
 [
   {
     "line": 1,
+    "code": "unpinned-remote-asset",
     "message": "remote src requires sha256"
   }
 ]

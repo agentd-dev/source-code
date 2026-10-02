@@ -1,0 +1,20 @@
+[
+  {
+    "line": 1,
+    "code": "near-miss-keyword",
+    "severity": "warning",
+    "message": "line 1: \"Must:\" is prose — write \"MUST:\" to make it a rule"
+  },
+  {
+    "line": 3,
+    "code": "near-miss-keyword",
+    "severity": "warning",
+    "message": "line 3: \"**Never**:\" is prose — write \"NEVER:\" to make it a rule"
+  },
+  {
+    "line": 5,
+    "code": "near-miss-keyword",
+    "severity": "warning",
+    "message": "line 5: \"MUST\" is prose — write \"MUST:\" to make it a rule"
+  }
+]

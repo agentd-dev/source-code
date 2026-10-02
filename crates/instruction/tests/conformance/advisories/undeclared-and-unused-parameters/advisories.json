@@ -1,0 +1,14 @@
+[
+  {
+    "line": 1,
+    "code": "unused-parameter",
+    "severity": "info",
+    "message": "line 1: parameter \"unused\" is declared but never used"
+  },
+  {
+    "line": 3,
+    "code": "undeclared-parameter",
+    "severity": "warning",
+    "message": "line 3: ${who} is not declared — it is delivered as written"
+  }
+]

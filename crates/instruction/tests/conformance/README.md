@@ -1,7 +1,7 @@
 # Conformance fixtures
 
 Data only — runners live with implementations (`instruction-md test conformance/` for the
-TypeScript implementation; `cargo run -p instruction-core --example dump` for the Rust one).
+TypeScript implementation; `cargo run -p agentd-instruction --example dump` for the Rust one).
 Layout per [proposal S5](../proposals/S5-conformance-fixtures.md):
 
 ```text

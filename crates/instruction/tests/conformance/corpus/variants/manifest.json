@@ -1,0 +1,33 @@
+{
+  "authored": {
+    "digest": "sha256:00863bc1b2497ffd9498223fd2213ef413fb46a73a8a388dce271c8ef1fd254d"
+  },
+  "parameters": [],
+  "facts": [
+    {
+      "key": "environment",
+      "value_digest": "sha256:ef260e9aa3c673af240d17a2660480361a8e081d1ffeca2a5ed0e3219fc18567"
+    },
+    {
+      "key": "host",
+      "value_digest": "sha256:28e174396028f226b3bead259d19749205378d9204ce12fd9b1918ab6032a15d"
+    }
+  ],
+  "variants": {
+    "kept": [
+      "otherwise#1",
+      "unless#1"
+    ],
+    "dropped": [
+      "when#1",
+      "when#2",
+      "unless#2"
+    ]
+  },
+  "includes": [],
+  "limits": {
+    "include_depth": 0,
+    "include_bytes": 0
+  },
+  "unresolved": []
+}

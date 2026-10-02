@@ -1,0 +1,8 @@
+[
+  {
+    "line": 1,
+    "code": "unqualified-wikilink",
+    "severity": "warning",
+    "message": "line 1: [[oncall]] is not a reference — write [[kind/name]]"
+  }
+]

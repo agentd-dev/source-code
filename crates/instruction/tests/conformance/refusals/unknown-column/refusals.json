@@ -1,6 +1,7 @@
 [
   {
     "line": 1,
+    "code": "unknown-column",
     "message": "\"channel_id\" is not an attribute of human"
   }
 ]

@@ -1,0 +1,68 @@
+{
+  "spec": "1",
+  "blocks": [
+    {
+      "kind": "must",
+      "sigil": false,
+      "form": "keyword",
+      "line": 3,
+      "attrs": {
+        "because": "limits differ by plan, and a quoted limit is binding."
+      },
+      "body": {
+        "type": "markdown",
+        "text": "confirm the customer's plan before quoting any limit."
+      }
+    },
+    {
+      "kind": "must",
+      "sigil": false,
+      "form": "keyword",
+      "line": 6,
+      "attrs": {
+        "because": "the audit follows links."
+      },
+      "body": {
+        "type": "markdown",
+        "text": "link the ticket."
+      }
+    },
+    {
+      "kind": "should",
+      "sigil": false,
+      "form": "keyword",
+      "line": 8,
+      "attrs": {},
+      "body": {
+        "type": "markdown",
+        "text": "reply within the hour."
+      }
+    },
+    {
+      "kind": "never",
+      "sigil": false,
+      "form": "container",
+      "line": 10,
+      "attrs": {
+        "because": "refunds above the limit are a finance decision"
+      },
+      "body": {
+        "type": "markdown",
+        "text": "Promise a refund above the limit."
+      }
+    },
+    {
+      "kind": "never",
+      "sigil": false,
+      "form": "keyword",
+      "line": 14,
+      "attrs": {
+        "because": "a confident wrong answer costs more than an honest delay."
+      },
+      "body": {
+        "type": "markdown",
+        "text": "guess at policy."
+      }
+    }
+  ]
+}

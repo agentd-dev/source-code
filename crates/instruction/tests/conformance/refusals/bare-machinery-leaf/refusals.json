@@ -1,6 +1,7 @@
 [
   {
     "line": 1,
+    "code": "bare-machinery-kind",
     "message": "\"human\" is a machinery kind — did you mean :::!human"
   }
 ]

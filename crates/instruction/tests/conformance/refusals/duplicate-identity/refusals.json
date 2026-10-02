@@ -1,6 +1,7 @@
 [
   {
     "line": 2,
+    "code": "duplicate-identity",
     "message": "duplicate human/oncall (first declared at line 1)"
   }
 ]

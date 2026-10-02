@@ -22,6 +22,9 @@
       "items": {
         "$ref": "#/$defs/block"
       }
+    },
+    "endMatter": {
+      "$ref": "#/$defs/endMatter"
     }
   },
   "additionalProperties": false,
@@ -62,10 +65,143 @@
         },
         "signature": {
           "type": "object"
+        },
+        "delivery": {
+          "type": "object",
+          "properties": {
+            "labels": {
+              "enum": [
+                "bold",
+                "plain",
+                "tags"
+              ]
+            }
+          },
+          "additionalProperties": true
         }
       },
       "additionalProperties": true,
       "$comment": "Unknown keys are preserved and ignored (§3.1 rule 2)."
+    },
+    "endMatter": {
+      "type": "object",
+      "properties": {
+        "authors": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          ]
+        },
+        "owners": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          ]
+        },
+        "reviewers": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          ]
+        },
+        "approved": {
+          "type": "object",
+          "properties": {
+            "by": {
+              "type": "string"
+            },
+            "on": {
+              "description": "a date; any YAML scalar"
+            }
+          },
+          "additionalProperties": true
+        },
+        "review": {
+          "type": "object",
+          "properties": {
+            "every": {
+              "type": "string",
+              "description": "a duration, e.g. 90d"
+            },
+            "next": {
+              "description": "a date; any YAML scalar"
+            }
+          },
+          "additionalProperties": true
+        },
+        "changelog": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "version": {
+                "description": "any YAML scalar"
+              },
+              "date": {
+                "description": "a date; any YAML scalar"
+              },
+              "by": {
+                "type": "string"
+              },
+              "summary": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": true
+          }
+        },
+        "sources": {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "title": {
+                    "type": "string"
+                  },
+                  "url": {
+                    "type": "string"
+                  }
+                },
+                "additionalProperties": true
+              }
+            ]
+          }
+        },
+        "contact": {
+          "type": "string"
+        },
+        "notes": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true,
+      "$comment": "The document's record (S27): who wrote, owns and approved it, what changed and why, what it rests on. Never delivered; unknown keys are preserved and ignored (§3.1.1)."
     },
     "body": {
       "type": "object",
@@ -186,7 +322,14 @@
             "case",
             "signature",
             "schema",
-            "preview"
+            "preview",
+            "may",
+            "always",
+            "avoid",
+            "output",
+            "unless",
+            "otherwise",
+            "eval"
           ]
         },
         "sigil": {
@@ -863,6 +1006,90 @@
           "then": {
             "$ref": "#/$defs/kinds/preview"
           }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "may"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/may"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "always"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/always"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "avoid"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/avoid"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "output"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/output"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "unless"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/unless"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "otherwise"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/otherwise"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "eval"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/kinds/eval"
+          }
         }
       ]
     },
@@ -878,6 +1105,19 @@
           },
           "verbatim": {
             "type": "boolean"
+          },
+          "if": {
+            "type": "string"
+          },
+          "because": {
+            "type": "string"
+          },
+          "overrides": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "x-multivalued": true
           }
         },
         "additionalProperties": false
@@ -892,6 +1132,22 @@
             "type": "string"
           },
           "verbatim": {
+            "type": "boolean"
+          },
+          "if": {
+            "type": "string"
+          },
+          "because": {
+            "type": "string"
+          },
+          "overrides": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "x-multivalued": true
+          },
+          "not": {
             "type": "boolean"
           }
         },
@@ -908,6 +1164,19 @@
           },
           "verbatim": {
             "type": "boolean"
+          },
+          "if": {
+            "type": "string"
+          },
+          "because": {
+            "type": "string"
+          },
+          "overrides": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "x-multivalued": true
           }
         },
         "additionalProperties": false
@@ -923,6 +1192,19 @@
           },
           "verbatim": {
             "type": "boolean"
+          },
+          "if": {
+            "type": "string"
+          },
+          "because": {
+            "type": "string"
+          },
+          "overrides": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "x-multivalued": true
           }
         },
         "additionalProperties": false
@@ -1027,6 +1309,9 @@
             "type": "string"
           },
           "verbatim": {
+            "type": "boolean"
+          },
+          "avoid": {
             "type": "boolean"
           }
         },
@@ -1155,7 +1440,10 @@
               "string",
               "number",
               "boolean",
-              "enum"
+              "enum",
+              "list",
+              "url",
+              "duration"
             ]
           },
           "values": {
@@ -1185,6 +1473,9 @@
           },
           "verbatim": {
             "type": "boolean"
+          },
+          "example": {
+            "type": "string"
           }
         },
         "additionalProperties": false
@@ -1221,6 +1512,9 @@
           },
           "verbatim": {
             "type": "boolean"
+          },
+          "trigger": {
+            "type": "string"
           }
         },
         "additionalProperties": false
@@ -1786,6 +2080,151 @@
           }
         },
         "additionalProperties": false
+      },
+      "may": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "verbatim": {
+            "type": "boolean"
+          },
+          "if": {
+            "type": "string"
+          },
+          "because": {
+            "type": "string"
+          },
+          "overrides": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "x-multivalued": true
+          },
+          "not": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "always": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "verbatim": {
+            "type": "boolean"
+          },
+          "if": {
+            "type": "string"
+          },
+          "because": {
+            "type": "string"
+          },
+          "overrides": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "x-multivalued": true
+          },
+          "not": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "avoid": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "verbatim": {
+            "type": "boolean"
+          },
+          "if": {
+            "type": "string"
+          },
+          "because": {
+            "type": "string"
+          },
+          "overrides": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "x-multivalued": true
+          },
+          "not": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "output": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "verbatim": {
+            "type": "boolean"
+          },
+          "format": {
+            "type": "string"
+          },
+          "schema": {
+            "type": "string",
+            "pattern": "^@([A-Za-z][A-Za-z0-9_-]*)/([A-Za-z0-9][A-Za-z0-9._-]*)$"
+          }
+        },
+        "additionalProperties": false
+      },
+      "unless": {
+        "type": "object",
+        "minProperties": 1,
+        "additionalProperties": {
+          "type": "string"
+        }
+      },
+      "otherwise": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "string"
+        },
+        "$comment": "S10: conditions are ignored and reported"
+      },
+      "eval": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "target": {
+            "type": "string",
+            "pattern": "^@([A-Za-z][A-Za-z0-9_-]*)/([A-Za-z0-9][A-Za-z0-9._-]*)$"
+          },
+          "verbatim": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
       }
     },
     "kinds": {
@@ -1862,7 +2301,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -1876,7 +2322,7 @@
           "alert"
         ],
         "x-body": "markdown",
-        "x-identity": false,
+        "x-identity": true,
         "x-identity-scope": "document",
         "x-grant": "default"
       },
@@ -1953,7 +2399,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -1967,7 +2420,7 @@
           "alert"
         ],
         "x-body": "markdown",
-        "x-identity": false,
+        "x-identity": true,
         "x-identity-scope": "document",
         "x-grant": "default"
       },
@@ -2044,7 +2497,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -2058,7 +2518,7 @@
           "alert"
         ],
         "x-body": "markdown",
-        "x-identity": false,
+        "x-identity": true,
         "x-identity-scope": "document",
         "x-grant": "default"
       },
@@ -2135,7 +2595,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -2149,7 +2616,7 @@
           "alert"
         ],
         "x-body": "markdown",
-        "x-identity": false,
+        "x-identity": true,
         "x-identity-scope": "document",
         "x-grant": "default"
       },
@@ -2226,7 +2693,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -2240,7 +2714,7 @@
           "alert"
         ],
         "x-body": "markdown",
-        "x-identity": false,
+        "x-identity": true,
         "x-identity-scope": "document",
         "x-grant": "default"
       },
@@ -2317,7 +2791,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -2331,9 +2812,10 @@
           "alert"
         ],
         "x-body": "markdown",
-        "x-identity": false,
+        "x-identity": true,
         "x-identity-scope": "document",
-        "x-grant": "default"
+        "x-grant": "default",
+        "x-alias-of": "note"
       },
       "tip": {
         "$comment": "tip: prose",
@@ -2408,7 +2890,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -2422,7 +2911,7 @@
           "alert"
         ],
         "x-body": "markdown",
-        "x-identity": false,
+        "x-identity": true,
         "x-identity-scope": "document",
         "x-grant": "default"
       },
@@ -2499,7 +2988,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -2513,7 +3009,7 @@
           "alert"
         ],
         "x-body": "markdown",
-        "x-identity": false,
+        "x-identity": true,
         "x-identity-scope": "document",
         "x-grant": "default"
       },
@@ -2590,7 +3086,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -2604,7 +3107,7 @@
           "alert"
         ],
         "x-body": "markdown",
-        "x-identity": false,
+        "x-identity": true,
         "x-identity-scope": "document",
         "x-grant": "default"
       },
@@ -2681,7 +3184,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -2695,7 +3205,7 @@
           "alert"
         ],
         "x-body": "markdown",
-        "x-identity": false,
+        "x-identity": true,
         "x-identity-scope": "document",
         "x-grant": "default"
       },
@@ -2772,7 +3282,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -2786,7 +3303,7 @@
           "alert"
         ],
         "x-body": "markdown",
-        "x-identity": false,
+        "x-identity": true,
         "x-identity-scope": "document",
         "x-grant": "default"
       },
@@ -2861,7 +3378,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -2873,7 +3397,7 @@
           "container"
         ],
         "x-body": "markdown",
-        "x-identity": false,
+        "x-identity": true,
         "x-identity-scope": "document",
         "x-grant": "default"
       },
@@ -2948,7 +3472,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -2960,7 +3491,7 @@
           "container"
         ],
         "x-body": "markdown",
-        "x-identity": false,
+        "x-identity": true,
         "x-identity-scope": "document",
         "x-grant": "default"
       },
@@ -3036,7 +3567,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -3049,7 +3587,7 @@
           "leaf"
         ],
         "x-body": "markdown",
-        "x-identity": false,
+        "x-identity": true,
         "x-identity-scope": "document",
         "x-grant": "default"
       },
@@ -3124,7 +3662,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -3136,7 +3681,7 @@
           "container"
         ],
         "x-body": "deflist",
-        "x-identity": false,
+        "x-identity": true,
         "x-identity-scope": "document",
         "x-grant": "default"
       },
@@ -3211,7 +3756,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -3298,7 +3850,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -3387,7 +3946,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -3494,7 +4060,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -3531,7 +4104,8 @@
               ]
             }
           }
-        }
+        },
+        "x-body-schema": "https://agentd.dev/schema/workflow-3.json"
       },
       "skill": {
         "$comment": "skill: machinery, family core",
@@ -3607,7 +4181,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -3645,7 +4226,8 @@
               ]
             }
           }
-        }
+        },
+        "x-acknowledgement-trigger": "[skill \"{name}\" is available — use it when {trigger}; reference it as @skill/{name}]"
       },
       "config": {
         "$comment": "config: machinery, family core",
@@ -3718,7 +4300,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -3734,7 +4323,8 @@
         "x-identity-scope": "document",
         "x-family": "core",
         "x-grant": "default",
-        "x-acknowledgement": "[runtime configuration is applied]"
+        "x-acknowledgement": "[runtime configuration is applied]",
+        "x-body-schema": "https://agentd.dev/schema/config-1.json"
       },
       "mcp": {
         "$comment": "mcp: machinery, family core",
@@ -3809,7 +4399,14 @@
                     "volume",
                     "image",
                     "agent",
-                    "override"
+                    "override",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -3847,6 +4444,25 @@
               "required": [
                 "name"
               ]
+            }
+          }
+        },
+        "x-body-schema": {
+          "type": "object",
+          "properties": {
+            "auth": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "type": "string"
+                },
+                "token": {
+                  "type": "string"
+                }
+              }
+            },
+            "timeout": {
+              "type": "string"
             }
           }
         }
@@ -3925,7 +4541,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -3961,6 +4584,22 @@
               "required": [
                 "name"
               ]
+            }
+          }
+        },
+        "x-body-schema": {
+          "type": "object",
+          "properties": {
+            "retention": {
+              "type": "object",
+              "properties": {
+                "max_age": {
+                  "type": "string"
+                },
+                "max_events": {
+                  "type": "integer"
+                }
+              }
             }
           }
         }
@@ -4036,7 +4675,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -4052,7 +4698,21 @@
         "x-identity-scope": "document",
         "x-family": "core",
         "x-grant": "default",
-        "x-acknowledgement": "[tool policy is applied]"
+        "x-acknowledgement": "[tool policy is applied]",
+        "x-body-schema": {
+          "type": "object",
+          "properties": {
+            "disabled": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "overrides": {
+              "type": "object"
+            }
+          }
+        }
       },
       "file": {
         "$comment": "file: machinery, family material",
@@ -4125,7 +4785,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -4234,7 +4901,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -4344,7 +5018,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -4454,7 +5135,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -4564,7 +5252,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -4674,7 +5369,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -4785,7 +5487,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -4895,7 +5604,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -4929,6 +5645,20 @@
               "required": [
                 "name"
               ]
+            }
+          }
+        },
+        "x-body-schema": {
+          "type": "object",
+          "properties": {
+            "auth": {
+              "type": "object"
+            },
+            "routing": {
+              "type": "object"
+            },
+            "rate": {
+              "type": "object"
             }
           }
         }
@@ -5006,7 +5736,14 @@
                     "image",
                     "agent",
                     "schema",
-                    "preview"
+                    "preview",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -5121,7 +5858,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -5157,6 +5901,28 @@
               "required": [
                 "name"
               ]
+            }
+          }
+        },
+        "x-body-schema": {
+          "type": "object",
+          "properties": {
+            "reach": {
+              "type": "object",
+              "properties": {
+                "channel": {
+                  "type": "string"
+                },
+                "escalate_after": {
+                  "type": "string"
+                }
+              }
+            },
+            "may": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
             }
           }
         }
@@ -5235,7 +6001,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -5349,7 +6122,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -5384,6 +6164,20 @@
               "required": [
                 "name"
               ]
+            }
+          }
+        },
+        "x-body-schema": {
+          "type": "object",
+          "properties": {
+            "auth": {
+              "type": "object"
+            },
+            "grants": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
             }
           }
         }
@@ -5459,7 +6253,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -5492,6 +6293,20 @@
               "required": [
                 "name"
               ]
+            }
+          }
+        },
+        "x-body-schema": {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string"
+            },
+            "allow": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
             }
           }
         }
@@ -5569,7 +6384,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -5678,7 +6500,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -5788,7 +6617,14 @@
                     "volume",
                     "image",
                     "agent",
-                    "signature"
+                    "signature",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -5903,7 +6739,14 @@
                     "volume",
                     "image",
                     "agent",
-                    "case"
+                    "case",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -6015,7 +6858,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -6124,7 +6974,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -6233,7 +7090,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -6341,7 +7205,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -6452,7 +7323,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -6563,7 +7441,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -6653,7 +7538,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -6760,7 +7652,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -6848,7 +7747,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -6936,7 +7842,14 @@
                     "git",
                     "volume",
                     "image",
-                    "agent"
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
                   ]
                 }
               }
@@ -6952,6 +7865,773 @@
         "x-identity-scope": "parent",
         "x-grant": "default",
         "x-parent": "ui"
+      },
+      "may": {
+        "$comment": "may: prose",
+        "properties": {
+          "kind": {
+            "const": "may"
+          },
+          "sigil": {
+            "const": false
+          },
+          "form": {
+            "enum": [
+              "container",
+              "keyword",
+              "alert"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/may"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-body": "markdown",
+        "x-identity-scope": "document",
+        "x-grant": "default",
+        "x-disposition": "prose",
+        "x-forms": [
+          "container",
+          "keyword",
+          "alert"
+        ],
+        "x-identity": true
+      },
+      "always": {
+        "$comment": "always: prose",
+        "properties": {
+          "kind": {
+            "const": "always"
+          },
+          "sigil": {
+            "const": false
+          },
+          "form": {
+            "enum": [
+              "container",
+              "keyword",
+              "alert"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/always"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-body": "markdown",
+        "x-identity-scope": "document",
+        "x-grant": "default",
+        "x-disposition": "prose",
+        "x-forms": [
+          "container",
+          "keyword",
+          "alert"
+        ],
+        "x-identity": true,
+        "x-alias-of": "must"
+      },
+      "avoid": {
+        "$comment": "avoid: prose",
+        "properties": {
+          "kind": {
+            "const": "avoid"
+          },
+          "sigil": {
+            "const": false
+          },
+          "form": {
+            "enum": [
+              "container",
+              "keyword",
+              "alert"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/avoid"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-body": "markdown",
+        "x-identity-scope": "document",
+        "x-grant": "default",
+        "x-disposition": "prose",
+        "x-forms": [
+          "container",
+          "keyword",
+          "alert"
+        ],
+        "x-identity": true,
+        "x-alias-of": "should"
+      },
+      "output": {
+        "$comment": "output: prose",
+        "properties": {
+          "kind": {
+            "const": "output"
+          },
+          "sigil": {
+            "const": false
+          },
+          "form": {
+            "enum": [
+              "container"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/output"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-body": "markdown",
+        "x-identity-scope": "document",
+        "x-grant": "default",
+        "x-disposition": "prose",
+        "x-forms": [
+          "container"
+        ],
+        "x-identity": true
+      },
+      "unless": {
+        "$comment": "unless: structural",
+        "properties": {
+          "kind": {
+            "const": "unless"
+          },
+          "sigil": {
+            "const": false
+          },
+          "form": {
+            "enum": [
+              "container"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/unless"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-body": "markdown",
+        "x-identity-scope": "document",
+        "x-grant": "default",
+        "x-disposition": "structural",
+        "x-forms": [
+          "container"
+        ],
+        "x-identity": false
+      },
+      "otherwise": {
+        "$comment": "otherwise: structural",
+        "properties": {
+          "kind": {
+            "const": "otherwise"
+          },
+          "sigil": {
+            "const": false
+          },
+          "form": {
+            "enum": [
+              "container"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/otherwise"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-body": "markdown",
+        "x-identity-scope": "document",
+        "x-grant": "default",
+        "x-disposition": "structural",
+        "x-forms": [
+          "container"
+        ],
+        "x-identity": false
+      },
+      "eval": {
+        "$comment": "eval: machinery, family core",
+        "properties": {
+          "kind": {
+            "const": "eval"
+          },
+          "sigil": {
+            "const": true
+          },
+          "form": {
+            "enum": [
+              "container",
+              "section"
+            ]
+          },
+          "attrs": {
+            "$ref": "#/$defs/attrs/eval"
+          },
+          "body": {
+            "$ref": "#/$defs/body"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "must",
+                    "should",
+                    "never",
+                    "guardrail",
+                    "note",
+                    "info",
+                    "tip",
+                    "important",
+                    "warning",
+                    "caution",
+                    "example",
+                    "context",
+                    "form",
+                    "tool",
+                    "glossary",
+                    "when",
+                    "include",
+                    "param",
+                    "workflow",
+                    "skill",
+                    "config",
+                    "mcp",
+                    "stream",
+                    "tools",
+                    "file",
+                    "data",
+                    "media",
+                    "asset",
+                    "knowledge",
+                    "retrieval",
+                    "source",
+                    "endpoint",
+                    "ui",
+                    "human",
+                    "channel",
+                    "peer",
+                    "policy",
+                    "secret-ref",
+                    "runtime",
+                    "function",
+                    "test",
+                    "fixture",
+                    "git",
+                    "volume",
+                    "image",
+                    "agent",
+                    "may",
+                    "always",
+                    "avoid",
+                    "output",
+                    "unless",
+                    "otherwise",
+                    "eval"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "x-body": "yaml",
+        "x-identity-scope": "document",
+        "x-grant": "default",
+        "if": {
+          "properties": {
+            "form": {
+              "not": {
+                "const": "set"
+              }
+            }
+          }
+        },
+        "then": {
+          "properties": {
+            "attrs": {
+              "required": [
+                "name"
+              ]
+            }
+          }
+        },
+        "x-disposition": "machinery",
+        "x-forms": [
+          "container",
+          "section"
+        ],
+        "x-identity": true,
+        "x-family": "core",
+        "x-noun": "eval",
+        "x-nouns": "evals",
+        "x-body-schema": {
+          "type": "object",
+          "required": [
+            "cases"
+          ],
+          "properties": {
+            "cases": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "name",
+                  "given",
+                  "expect"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "given": {
+                    "type": "object",
+                    "required": [
+                      "message"
+                    ],
+                    "properties": {
+                      "message": {
+                        "type": "string"
+                      },
+                      "params": {
+                        "type": "object",
+                        "additionalProperties": {
+                          "type": "string"
+                        }
+                      },
+                      "facts": {
+                        "type": "object",
+                        "additionalProperties": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  },
+                  "expect": {
+                    "type": "object",
+                    "minProperties": 1,
+                    "properties": {
+                      "contains": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "not_contains": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "matches": {
+                        "type": "string"
+                      },
+                      "judge": {
+                        "type": "string"
+                      }
+                    },
+                    "additionalProperties": false
+                  }
+                }
+              }
+            }
+          }
+        }
       }
     }
   },
@@ -6985,7 +8665,8 @@
       "git",
       "volume",
       "image",
-      "agent"
+      "agent",
+      "eval"
     ],
     "prose": [
       "must",
@@ -7002,12 +8683,18 @@
       "context",
       "form",
       "tool",
-      "glossary"
+      "glossary",
+      "may",
+      "always",
+      "avoid",
+      "output"
     ],
     "structural": [
       "when",
       "include",
-      "param"
+      "param",
+      "unless",
+      "otherwise"
     ],
     "subblocks": {
       "override": "mcp",
@@ -7023,7 +8710,8 @@
         "config",
         "mcp",
         "stream",
-        "tools"
+        "tools",
+        "eval"
       ],
       "material": [
         "file",
@@ -7126,7 +8814,10 @@
       "WARNING": "warning",
       "CAUTION": "caution",
       "IMPORTANT": "important",
-      "EXAMPLE": "example"
+      "EXAMPLE": "example",
+      "MAY": "may",
+      "ALWAYS": "always",
+      "AVOID": "avoid"
     },
     "sigils": {
       "#": [
@@ -7153,7 +8844,86 @@
       "keyword": "KEYWORD: …",
       "alert": "> [!KEYWORD]"
     },
-    "reserved-inline": ":kind[text]{attrs}"
+    "reserved-inline": ":kind[text]{attrs}",
+    "reserved-bare": [
+      "workflow",
+      "skill",
+      "config",
+      "mcp",
+      "stream",
+      "tools",
+      "file",
+      "data",
+      "media",
+      "asset",
+      "knowledge",
+      "retrieval",
+      "source",
+      "endpoint",
+      "ui",
+      "human",
+      "channel",
+      "peer",
+      "policy",
+      "secret-ref",
+      "runtime",
+      "function",
+      "test",
+      "fixture",
+      "git",
+      "volume",
+      "image",
+      "agent"
+    ],
+    "revision": "1.1",
+    "keyword-flags": {
+      "SHOULD NOT": {
+        "not": true
+      }
+    },
+    "reason-keyword": "BECAUSE",
+    "labels": {
+      "must": "MUST",
+      "should": "SHOULD",
+      "never": "NEVER",
+      "guardrail": "GUARDRAIL",
+      "note": "NOTE",
+      "info": "NOTE",
+      "tip": "TIP",
+      "important": "IMPORTANT",
+      "warning": "WARNING",
+      "caution": "CAUTION",
+      "may": "MAY",
+      "always": "MUST",
+      "avoid": "SHOULD NOT",
+      "example": "EXAMPLE",
+      "output": "OUTPUT",
+      "because": "BECAUSE"
+    },
+    "negated-labels": {
+      "should": "SHOULD NOT"
+    },
+    "strengths": {
+      "guardrail": 4,
+      "never": 3,
+      "must": 3,
+      "always": 3,
+      "should": 2,
+      "avoid": 2,
+      "may": 1
+    },
+    "context-keys": [
+      "agent",
+      "model",
+      "host",
+      "environment",
+      "locale"
+    ],
+    "label-styles": [
+      "bold",
+      "plain",
+      "tags"
+    ]
   },
   "x-grammar": {
     "kind": "^[A-Za-z][A-Za-z0-9_-]*$",
@@ -7163,7 +8933,7 @@
     "closeFence": "^:{3,}\\s*$",
     "leaf": "^::(?!:)(!?)([A-Za-z][A-Za-z0-9_-]*)\\s*(\\{.*\\})?\\s*$",
     "sectionHeading": "^(#{1,6})[ \\t]+!([A-Za-z][A-Za-z0-9_-]*)[ \\t]+([A-Za-z0-9][A-Za-z0-9._-]*)\\s*(\\{.*\\})?\\s*#*\\s*$",
-    "keywordLine": "^(?:[-*+][ \\t]+|[0-9]+[.)][ \\t]+)?(\\*\\*)?(MUST NOT|SHOULD NOT|MUST|SHOULD|NEVER|GUARDRAIL|NOTE|INFO|TIP|WARNING|CAUTION|IMPORTANT|EXAMPLE):(\\*\\*)?[ \\t]+",
+    "keywordLine": "^(?:[-*+][ \\t]+|[0-9]+[.)][ \\t]+)?(\\*\\*)?(MUST NOT|SHOULD NOT|MUST|SHOULD|NEVER|GUARDRAIL|NOTE|INFO|TIP|WARNING|CAUTION|IMPORTANT|EXAMPLE|MAY|ALWAYS|AVOID)(?:\\[([A-Za-z0-9][A-Za-z0-9._-]*)\\])?(?:[ \\t]+\\(if[ \\t]+([^()]+?)\\))?:(\\*\\*)?[ \\t]+",
     "alertOpen": "^>[ \\t]*\\[!([A-Za-z]+)\\][ \\t]*$",
     "attrPair": "([A-Za-z][A-Za-z0-9_.-]*)(?:=(\\\"(?:[^\\\"\\\\\\\\]|\\\\\\\\.)*\\\"|[^\\s}\\\"]+))?",
     "attrRef": "^@([A-Za-z][A-Za-z0-9_-]*)/([A-Za-z0-9][A-Za-z0-9._-]*)$",
@@ -7174,7 +8944,10 @@
     "tag": "(?:^|[\\s(])#([A-Za-z][A-Za-z0-9_-]*)",
     "defListTerm": "^([A-Za-z0-9][A-Za-z0-9._-]*)\\s*(\\{.*\\})?\\s*$",
     "defListDef": "^:[ \\t]+",
-    "codeFenceOpen": "^(`{3,}|~{3,})(.*)$"
+    "codeFenceOpen": "^(`{3,}|~{3,})(.*)$",
+    "reasonLine": "^([ \\t]*)((?:[-*+][ \\t]+|[0-9]+[.)][ \\t]+)?)(\\*\\*)?BECAUSE:(\\*\\*)?[ \\t]+",
+    "authorNoteOpen": "^<!--",
+    "authorNoteClose": "-->"
   },
   "x-semantic-rules": [
     {
@@ -7271,6 +9044,36 @@
       "id": "front-matter-absent",
       "spec": "§3.1",
       "rule": "A document with no front matter, or with front matter lacking spec, is version 1."
+    },
+    {
+      "id": "author-notes",
+      "spec": "§3.3 rule 11 (S9)",
+      "rule": "A column-0 line beginning <!-- opens an author note that ends at the first line containing -->; it is not scanned for blocks and not delivered."
+    },
+    {
+      "id": "variant-groups",
+      "spec": "§5.2 (S10)",
+      "rule": "An otherwise is kept iff no when/unless of the run immediately before it (same parent, blank lines only between) was kept; an unless drops its body iff every key is known and matches."
+    },
+    {
+      "id": "reason-attaches",
+      "spec": "§4.5 rule 7 (S14)",
+      "rule": "BECAUSE attaches to the normativity block immediately before it in the same parent; a rule has at most one reason."
+    },
+    {
+      "id": "overrides",
+      "spec": "§5.1 (S24)",
+      "rule": "An overrides target is looked up in the document then its includes; a local guardrail target, or a stronger local target, is refused; a found target is not delivered and is recorded in manifest.overridden."
+    },
+    {
+      "id": "prose-identity",
+      "spec": "§3.3 rule 9 (S26)",
+      "rule": "A prose block with a name has identity kind/name, unique per kind; unnamed prose blocks are anonymous."
+    },
+    {
+      "id": "end-matter",
+      "spec": "§3.1.1 (S27)",
+      "rule": "A YAML block that ends the document — a column-0 --- after a blank line, outside fenced code, whose first line is a mapping key, closed by --- as the last non-blank line — is end matter: not scanned for blocks and never delivered; it must be a YAML mapping."
     }
   ]
 }

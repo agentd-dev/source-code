@@ -1,6 +1,7 @@
 [
   {
     "line": 1,
+    "code": "malformed-attributes",
     "message": "attributes: expected key=value, found \"call\" — quote values with spaces"
   }
 ]

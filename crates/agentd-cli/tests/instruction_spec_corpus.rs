@@ -255,12 +255,15 @@ fn the_schema_registry_agrees_with_the_parser() {
 }
 
 /// Drift check against the spec repo, when it is reachable: the vendored JSON
-/// Schema's registry and grammar must match upstream's. Compared SEMANTICALLY
-/// (the parsed `x-registry`/`x-grammar`/`$defs`), so a reformat upstream is not
-/// a false alarm but a real registry change is. Skips cleanly where upstream is
-/// absent (CI, before any clone); an EXPLICIT but missing path fails rather than
-/// skips — a drift check that skips on a bad path reports health it never
-/// performed, the vacuous-pass trap this whole effort has been hunting.
+/// Schema must match upstream's — the WHOLE parsed document, not a chosen few
+/// keys, so `x-semantic-rules`, `properties.endMatter` or `required` cannot
+/// drift unseen beside a registry that still agrees. Compared SEMANTICALLY (the
+/// parsed value), so a reformat upstream is not a false alarm but any real
+/// change is. Skips cleanly where upstream is absent (a machine with no spec
+/// clone); CI checks out the pinned revision and `scripts/ci-gate.sh` refuses a
+/// run that skipped. An EXPLICIT but missing path fails rather than skips — a
+/// drift check that skips on a bad path reports health it never performed, the
+/// vacuous-pass trap this whole effort has been hunting.
 #[test]
 fn the_vendored_schema_matches_upstream_when_present() {
     let explicit = std::env::var("INSTRUCTION_SPEC_REPO");
@@ -281,11 +284,23 @@ fn the_vendored_schema_matches_upstream_when_present() {
     let up_schema: Value = serde_json::from_str(&std::fs::read_to_string(&up).unwrap())
         .expect("upstream schema is valid JSON");
     let ours: Value = serde_json::from_str(agentd::config::idoc::schema_json()).unwrap();
-    for key in ["x-registry", "x-grammar", "$defs"] {
-        assert_eq!(
-            ours[key], up_schema[key],
-            "the vendored schema's {key:?} drifted from upstream — \
-             re-vendor crates/instruction/src/instruction.schema.json"
-        );
-    }
+    // Name the top-level keys that differ, so a failure says where to look
+    // in a schema of several thousand lines.
+    let keys = |v: &Value| -> std::collections::BTreeSet<String> {
+        v.as_object()
+            .into_iter()
+            .flat_map(|m| m.keys().cloned())
+            .collect()
+    };
+    let drifted: Vec<String> = keys(&ours)
+        .union(&keys(&up_schema))
+        .filter(|k| ours.get(k.as_str()) != up_schema.get(k.as_str()))
+        .cloned()
+        .collect();
+    assert!(
+        drifted.is_empty() && ours == up_schema,
+        "the vendored schema drifted from {upstream} at {drifted:?} — re-vendor with: \
+         cp {upstream}/instruction.schema.json crates/instruction/src/instruction.schema.json"
+    );
+    eprintln!("schema drift check: identical to {upstream}");
 }

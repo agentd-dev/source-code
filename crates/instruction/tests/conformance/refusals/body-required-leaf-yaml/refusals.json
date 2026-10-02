@@ -1,6 +1,7 @@
 [
   {
     "line": 1,
+    "code": "body-required",
     "message": "runtime requires a body (its definition) — use :::!runtime"
   }
 ]

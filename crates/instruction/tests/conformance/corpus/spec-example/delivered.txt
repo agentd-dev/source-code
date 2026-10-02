@@ -79,7 +79,7 @@ Open and update tickets. Never delete; deletion is a compliance decision.
 
 [mcp server "ticketing" is connected; its tools are available]
 
-[skill "support-tone" is available — reference it as @skill/support-tone]
+[skill "support-tone" is available — use it when writing to customers; reference it as @skill/support-tone]
 
 [workflow "approve-refund" is loaded and runs autonomously]
 

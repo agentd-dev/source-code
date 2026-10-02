@@ -1,0 +1,57 @@
+{
+  "spec": "1",
+  "blocks": [
+    {
+      "kind": "param",
+      "sigil": false,
+      "form": "leaf",
+      "line": 3,
+      "attrs": {
+        "name": "plan_limit",
+        "type": "string",
+        "source": "workspace",
+        "required": true
+      }
+    },
+    {
+      "kind": "never",
+      "sigil": false,
+      "form": "keyword",
+      "line": 5,
+      "attrs": {
+        "name": "refund-ceiling",
+        "if": "the refund exceeds ${plan_limit}"
+      },
+      "body": {
+        "type": "markdown",
+        "text": "promise it without approval."
+      }
+    },
+    {
+      "kind": "must",
+      "sigil": false,
+      "form": "keyword",
+      "line": 7,
+      "attrs": {
+        "if": "the customer mentions a chargeback"
+      },
+      "body": {
+        "type": "markdown",
+        "text": "hand off to billing."
+      }
+    },
+    {
+      "kind": "should",
+      "sigil": false,
+      "form": "container",
+      "line": 9,
+      "attrs": {
+        "if": "the customer is on a free plan"
+      },
+      "body": {
+        "type": "markdown",
+        "text": "Point to the self-service refund page first."
+      }
+    }
+  ]
+}

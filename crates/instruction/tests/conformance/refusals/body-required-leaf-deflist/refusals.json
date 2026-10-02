@@ -1,6 +1,7 @@
 [
   {
     "line": 1,
+    "code": "body-required",
     "message": "glossary requires a body (its entries) — use :::glossary"
   }
 ]

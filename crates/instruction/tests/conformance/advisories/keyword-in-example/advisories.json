@@ -1,0 +1,8 @@
+[
+  {
+    "line": 2,
+    "code": "keyword-in-example",
+    "severity": "info",
+    "message": "line 2: \"MUST:\" inside an example is quoted text, not a rule"
+  }
+]

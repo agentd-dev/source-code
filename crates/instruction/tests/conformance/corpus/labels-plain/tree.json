@@ -1,0 +1,38 @@
+{
+  "spec": "1",
+  "frontMatter": {
+    "delivery": {
+      "labels": "plain"
+    }
+  },
+  "blocks": [
+    {
+      "kind": "must",
+      "sigil": false,
+      "form": "keyword",
+      "line": 4,
+      "attrs": {
+        "if": "a refund is requested",
+        "because": "limits differ."
+      },
+      "body": {
+        "type": "markdown",
+        "text": "confirm the plan."
+      }
+    },
+    {
+      "kind": "example",
+      "sigil": false,
+      "form": "container",
+      "line": 7,
+      "attrs": {
+        "title": "Terse",
+        "avoid": true
+      },
+      "body": {
+        "type": "markdown",
+        "text": "Done."
+      }
+    }
+  ]
+}

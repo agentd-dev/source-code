@@ -69,7 +69,15 @@ pub struct Kind {
     pub disposition: Disposition,
     pub forms: Vec<Form>,
     pub body: BodyKind,
+    /// `x-identity`: the block HAS an identity when it is named — its `name`
+    /// is unique per kind and `@kind/name` can address it. It does not say a
+    /// name is required: from registry revision 1.1 every prose kind carries
+    /// it, and an anonymous `MUST:` line is still the commonest block there is.
     pub identity: bool,
+    /// Whether the schema REQUIRES a `name` (`then.properties.attrs.required`
+    /// lists it): params, most machinery, `case` and `eval`. This, not
+    /// `identity`, is what refuses an unnamed block.
+    pub requires_name: bool,
     /// The capability family this machinery belongs to (`None` for prose and
     /// structural). Presentational: the grant is `grant`, not this.
     pub family: Option<String>,
@@ -230,6 +238,9 @@ impl Registry {
                     forms,
                     body,
                     identity: d["x-identity"].as_bool().unwrap_or(false),
+                    requires_name: d["then"]["properties"]["attrs"]["required"]
+                        .as_array()
+                        .is_some_and(|r| r.iter().any(|a| a == "name")),
                     family: d["x-family"].as_str().map(str::to_string),
                     grant,
                     sub_of: d["x-parent"].as_str().map(str::to_string),
@@ -1239,7 +1250,7 @@ fn parse_table_set(
         .into_iter()
         .map(|c| c.to_lowercase())
         .collect();
-    let wants_name = lookup(kind).is_some_and(|k| k.identity);
+    let wants_name = lookup(kind).is_some_and(|k| k.requires_name);
     let mut out = Vec::new();
     // Every header cell must be an attribute of the kind (§4.3.1) — an
     // unknown column is a refusal naming it.
@@ -1757,11 +1768,13 @@ fn parse_front_matter(text: &str, errs: &mut Vec<String>) -> (BTreeMap<String, V
 fn check_identity(blocks: &[&Block], errs: &mut Vec<String>) {
     let mut seen: BTreeMap<(String, String), usize> = BTreeMap::new();
     for b in blocks {
-        // `x-identity`: identity is the `name` ATTRIBUTE and nothing else. A
+        // A required name is the `name` ATTRIBUTE and nothing else. A
         // `name:` key inside a YAML body is a body field that happens to be
         // called name — it does not make the block named. Set MEMBERS carry
         // their names per row and are checked as the set is parsed.
-        if lookup(&b.kind).is_some_and(|k| k.identity)
+        // `requires_name`, not `identity`: a named prose block has identity,
+        // an unnamed one is still a valid block.
+        if lookup(&b.kind).is_some_and(|k| k.requires_name)
             && b.set_group.is_none()
             && b.name.as_deref().unwrap_or("").is_empty()
         {
@@ -3754,24 +3767,39 @@ mod tests {
         assert_eq!(r.version(), 1);
         assert_eq!(
             machinery_names().count(),
-            28,
-            "28 machinery kinds (override is a sub-block)"
+            29,
+            "29 machinery kinds (override, case, signature, schema and preview are sub-blocks)"
         );
         assert_eq!(
             r.kinds
                 .values()
                 .filter(|k| k.disposition == Disposition::Prose && k.sub_of.is_none())
                 .count(),
-            15,
-            "15 prose kinds (glossary added)"
+            19,
+            "19 prose kinds (1.1 adds may, always, avoid and output)"
         );
         assert_eq!(
             r.kinds
                 .values()
                 .filter(|k| k.disposition == Disposition::Structural)
                 .count(),
-            3,
-            "3 structural kinds (param added)"
+            5,
+            "5 structural kinds (1.1 adds unless and otherwise)"
+        );
+        // Revision 1.1 gives every prose kind identity (`x-identity`), but a
+        // name is REQUIRED only where the schema's `then` lists it — so an
+        // anonymous `MUST:` stays valid and an unnamed `!workflow` does not.
+        assert!(lookup("must").unwrap().identity);
+        assert!(!lookup("must").unwrap().requires_name);
+        assert!(lookup("workflow").unwrap().requires_name);
+        assert!(lookup("param").unwrap().requires_name);
+        assert!(lookup("eval").unwrap().requires_name);
+        assert!(!lookup("config").unwrap().requires_name);
+        assert!(parse(":::must\nCite sources.\n:::\nMUST: be brief.\n").is_ok());
+        let e = parse(":::!workflow\nsteps: []\n:::").unwrap_err();
+        assert!(
+            e.iter().any(|m| m.contains("workflow requires name")),
+            "{e:?}"
         );
         assert_eq!(lookup("context").unwrap().disposition, Disposition::Prose);
         assert_eq!(

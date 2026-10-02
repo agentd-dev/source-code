@@ -1,6 +1,7 @@
 [
   {
     "line": 1,
+    "code": "sigiled-prose-kind",
     "message": "\"must\" is a prose kind — did you mean :::must"
   }
 ]

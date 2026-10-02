@@ -1,6 +1,7 @@
 [
   {
     "line": 1,
+    "code": "body-required",
     "message": "data requires a body (its rows) — use :::!data"
   }
 ]

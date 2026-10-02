@@ -1,6 +1,7 @@
 [
   {
     "line": 1,
+    "code": "body-required",
     "message": "workflow requires a body (its steps) — use :::!workflow"
   }
 ]

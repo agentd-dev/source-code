@@ -1,0 +1,7 @@
+{
+  "params": {},
+  "facts": {
+    "environment": "dev",
+    "host": "claude-code"
+  }
+}

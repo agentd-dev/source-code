@@ -1,0 +1,24 @@
+{
+  "authored": {
+    "digest": "sha256:f2663423c5e14a28b82b39e3b663ce095ac0643ef982b22bafa5dda4ed32db9b"
+  },
+  "parameters": [],
+  "facts": [
+    {
+      "key": "environment",
+      "value_digest": "sha256:e919a75364398a449f860aeadddc57fa0502145a4e63959ddb33c417a48dc0da"
+    }
+  ],
+  "variants": {
+    "kept": [],
+    "dropped": [
+      "when#1"
+    ]
+  },
+  "includes": [],
+  "limits": {
+    "include_depth": 0,
+    "include_bytes": 0
+  },
+  "unresolved": []
+}

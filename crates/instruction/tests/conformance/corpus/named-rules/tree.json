@@ -1,0 +1,31 @@
+{
+  "spec": "1",
+  "blocks": [
+    {
+      "kind": "never",
+      "sigil": false,
+      "form": "keyword",
+      "line": 3,
+      "attrs": {
+        "name": "refund-ceiling"
+      },
+      "body": {
+        "type": "markdown",
+        "text": "promise a refund above the plan limit without approval."
+      }
+    },
+    {
+      "kind": "must",
+      "sigil": false,
+      "form": "container",
+      "line": 5,
+      "attrs": {
+        "name": "escalation-note"
+      },
+      "body": {
+        "type": "markdown",
+        "text": "When you escalate, say so in the reply."
+      }
+    }
+  ]
+}

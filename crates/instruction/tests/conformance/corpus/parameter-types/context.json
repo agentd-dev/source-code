@@ -1,0 +1,9 @@
+{
+  "params": {
+    "limit": "lots",
+    "docs": "https://handbook.example/refunds",
+    "tier": "enterprise",
+    "regions": "eu, us"
+  },
+  "facts": {}
+}

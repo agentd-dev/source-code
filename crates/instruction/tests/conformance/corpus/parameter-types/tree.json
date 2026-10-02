@@ -1,0 +1,77 @@
+{
+  "spec": "1",
+  "blocks": [
+    {
+      "kind": "param",
+      "sigil": false,
+      "form": "set",
+      "line": 3,
+      "attrs": {},
+      "members": [
+        {
+          "kind": "param",
+          "sigil": false,
+          "form": "member",
+          "line": 3,
+          "attrs": {
+            "name": "limit",
+            "type": "number",
+            "default": "500",
+            "example": "750",
+            "source": "workspace"
+          }
+        },
+        {
+          "kind": "param",
+          "sigil": false,
+          "form": "member",
+          "line": 3,
+          "attrs": {
+            "name": "docs",
+            "type": "url",
+            "example": "https://docs.test",
+            "source": "workspace"
+          }
+        },
+        {
+          "kind": "param",
+          "sigil": false,
+          "form": "member",
+          "line": 3,
+          "attrs": {
+            "name": "wait",
+            "type": "duration",
+            "default": "15m",
+            "source": "workspace"
+          }
+        },
+        {
+          "kind": "param",
+          "sigil": false,
+          "form": "member",
+          "line": 3,
+          "attrs": {
+            "name": "tier",
+            "type": "enum",
+            "values": [
+              "free",
+              "pro"
+            ],
+            "source": "workspace"
+          }
+        },
+        {
+          "kind": "param",
+          "sigil": false,
+          "form": "member",
+          "line": 3,
+          "attrs": {
+            "name": "regions",
+            "type": "list",
+            "source": "workspace"
+          }
+        }
+      ]
+    }
+  ]
+}

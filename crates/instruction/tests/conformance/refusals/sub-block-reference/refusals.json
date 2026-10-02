@@ -1,6 +1,7 @@
 [
   {
     "line": 15,
+    "code": "subblock-reference",
     "message": "case/c: sub-blocks cannot be referenced"
   }
 ]

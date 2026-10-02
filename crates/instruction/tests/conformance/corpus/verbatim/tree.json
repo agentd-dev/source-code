@@ -1,0 +1,19 @@
+{
+  "spec": "1",
+  "blocks": [
+    {
+      "kind": "context",
+      "sigil": false,
+      "form": "container",
+      "line": 3,
+      "attrs": {
+        "title": "How to declare a human",
+        "verbatim": true
+      },
+      "body": {
+        "type": "markdown",
+        "text": "Write it like this:\n:::!human{name=oncall role=approver}\n:::"
+      }
+    }
+  ]
+}

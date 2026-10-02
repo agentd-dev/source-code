@@ -5,6 +5,196 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## Unreleased
+
+Reading the substrate an MCP Events bridge would stand on (RFC 0045) found
+eleven defects in agentd's streams, webhooks and resource subscriptions, and
+none of them needs Events to matter. Two lost events outright: a stream
+consumer moved past an event its start then refused to fire, and a stream
+event a webhook had already acknowledged could be overwritten after a crash.
+The others went quiet without a word in any log: a trim that skipped a
+lagging consumer, a resource subscription a restarted server had forgotten,
+a listen stream that ended, a subscribe that failed once and was never asked
+again. This is RFC 0045's P0. It adds no Events surface, and every fix has a
+test that fails on the old code.
+
+### Security (breaking)
+
+- **A stream carries the taint of what feeds it, and a workflow that reads
+  outside input into `sensitive` + `egress` is refused at load.** The root
+  grant fold judged servers and the `subagent.run` gate judged a child's
+  servers; neither saw text that reached a run through a stream, and workflow
+  agent steps had no trifecta gate at all. So a config whose servers were all
+  tagged passed, while a webhook `into:` appended a caller's body to a stream
+  whose consumer handed it to an agent holding both other legs. Every stream
+  now gets a tag set from what the configuration declares feeds it: a webhook
+  or A2A `into:`, a template's `mirror_streams`, a run that a webhook or A2A
+  start fires and that emits into it, and an `emit` from a run that read a
+  tainted stream. A run that reads a tainted stream is judged with every
+  server its model-driven steps reach, and so is any run it starts or feeds,
+  through a `workflow` or `message` step, a workflow tool, or the tools that
+  hand text on (`message.send`, `workflow.run`, `workflow.signal`,
+  `subagent.run`, `subagent.send`). The pattern this refuses is a reader and
+  an actor in one run, or an actor in a run the reader starts; what passes is
+  the reader/actor split `docs/security.md` describes ("Streams carry the
+  taint of what feeds them"), where no model-driven step that sees the text
+  holds both other legs. It runs at `--validate-config`, at start, on every
+  reload, and on `workflow.create`/`update`; a stored definition it refuses
+  is left out of a reload rather than vetoing it. The refusal names the
+  workflow, the stream, what feeds it, and the servers that bring the other
+  two legs. `security.allow_trifecta` lifts it with every other trifecta
+  gate. It is coarse and static, per stream and per server, not data-flow
+  tracking; `docs/security.md` lists what it does not follow.
+- **A step's `servers:` is a cap.** With `security.policies` set, a tool a
+  rule might touch was served through the supervisor's own connections and
+  the step's plan still offered every server's tools, so a step held to
+  `notes` could call `mail`. A step now sees only the MCP tools of the
+  servers it lists, and a subagent's gated list only those of the servers it
+  was handed.
+- **A workflow tool's `grant` is enforced.** It was not, for root, workflow
+  or subagent callers. A tool declared `workflows: false` or `root: false` is
+  no longer offered to that caller.
+- **A served document opens a webhook route only under the `interface`
+  grant.** RFC 0042 lets a document write `workflows`, and a `webhook` start
+  or a `wait {on: webhook}` inside one opens a route on the operator's
+  listener. `:::!endpoint` needed the `interface` grant to do that; the same
+  route written as a `:::!workflow` block or a `:::!config` entry needed
+  nothing. Every spelling needs it now, including what a document references
+  (`file:`, `url:`, `uri:`, `dir:`), which is judged once it resolves, at
+  startup and on every reload. A subagent template opens no route through
+  either door, since a child has no listener; before, a route in its
+  `:::!config` fragment was accepted at boot and refused by the child at
+  every spawn. A `wait {on: webhook}` nested in a body now also needs a
+  listener and, on a non-loopback bind, auth, like one at the top level. A
+  workflow the agent writes with `workflow.create`/`update` can still open a
+  route; `docs/security.md` says so.
+- **Webhook idempotency markers are agentd's own.** They lived under
+  `wh_idem/`, which `memory.*` did not reserve, so a model steered by an
+  injected payload could forge a marker (a real delivery then answered
+  `200 duplicate`) or erase one (a replay fired twice). They live under
+  `_wh_idem/` now, which `memory.*` refuses. Nothing reads the old keys.
+- **The parent refuses an `_instance.emit` into a stream the child's
+  template does not mirror,** so the producers the taint check judges are the
+  ones the runtime allows.
+
+### Fixed
+
+- **A stream consumer moves past an event only once it fired.** The offset
+  moved first, and the firing could then be shed under pressure, refused by
+  a freshness freeze, or lost when the inbox write failed (its error was
+  discarded). The event was consumed all the same and never offered again; a
+  `batch` lost the whole batch and a `correlate` join a completed set. Firing
+  a start now says what became of it, and a consumer moves past an event only
+  when it was accepted. Runs that pressure or a freeze used to drop now fire
+  later. Two refusals would repeat for ever, so they are discarded by name
+  instead of holding the consumer: an `inputs` mapping that cannot render
+  (`start.inputs.invalid`), and a start bigger than `store.max_value_bytes`
+  (`start.too_large`, new). Their lines name every event they held. A held
+  join stops walking the stream and keeps its refused set in `pending`, so
+  `max_pending` still counts it and no event sharing its correlation is lost.
+  A store read error holds a consumer at that seq (`stream.read.failed`)
+  instead of skipping a whole backlog unfired; a corrupt record is named
+  (`stream.event.corrupt`) and skipped. A held consumer's refusal line is
+  written once, when the hold starts.
+- **An acknowledged stream event is never overwritten.** An event was written
+  under a key derived from the stream head, and the head lives in the
+  debounced manifest, so a process killed between the two left an event past
+  the head that the next life overwrote. Event keys are create-only now: an
+  occupied key is kept and the append steps over it (`stream.head.recovered`).
+  A webhook `into:` saves the stream head before its `202`.
+- **A trim past a lagging consumer is said.** `stream.consumer.skipped`
+  (stream, workflow, node, from, to, events) is logged once per skip, and
+  `agent_stream_lag{stream,consumer}`, named in RFC 0035 and never built, is
+  written on every consumer pass (32 named consumers per start kind, the rest
+  in one `other` series).
+- **A webhook is marked seen only once it is kept.** The idempotency marker
+  was written before the fire or append, so a delivery refused with `503`
+  was answered `200 duplicate` on the sender's retry and lost. It is written
+  once the run is admitted or the event appended, and a route's `signal:`
+  goes out at the same point, so a retry is processed and wakes a waiter
+  once. A firing the runtime refuses is no longer answered `202`: shed,
+  frozen and a failed inbox write answer `503`, an `inputs` mapping that
+  cannot render `422`, a start too large for the store `413`, and a
+  `respond: sync` route is answered at once instead of waiting for a run that
+  never starts. Markers answer replays for seven days and are then swept in
+  whole buckets, without reading a live marker; a store without `list` keeps
+  them. Markers written by an earlier release are not read, so a replay that
+  straddles the upgrade may fire once more.
+- **A server that forgets the session is re-dialed and its subscriptions
+  restored.** A restarted MCP server forgot every subscription it held, while
+  agentd's transport never said so: each call failed as a transport error
+  until a reload, and a later subscribe returned early as "already covered".
+  A `404` on a request that carried the session is now `SessionExpired`, the
+  SDK no longer handshakes again behind the runtime's back, and the runtime
+  re-dials (bounded by the management timeout, backing off 1s to 30s while
+  the server refuses). The subscriptions are restored from what wants them:
+  the armed `subscribe` starts, the suspended resource waits, and the
+  resource instruction, which is also read again. It logs `mcp.disconnect`
+  and `mcp.connect` with `reason: session_lost`.
+- **A listen stream that ends is opened again.** The `subscriptions/listen`
+  pump stopped silently. It now logs `mcp.listen.ended` and listens again
+  with the same filter, backing off 250ms to 30s; a replaced pump is aborted
+  rather than left listening with the old filter, and SDK notifications,
+  which the pump dropped, wake it. A listen's acknowledgment is checked: a
+  URI it leaves out is refused rather than recorded as watched, and a
+  re-listen that comes back narrower is said (`mcp.listen.narrowed`) and
+  retried. This path serves MCP `2026-07-28` servers only, a revision agentd
+  does not negotiate yet (rmcp 3.1.2), so today only the tests reach it.
+- **`resources/subscribe` needs the server's capability.** It was sent
+  whether or not the server advertised `resources.subscribe`, though the docs
+  said it never was, so a server that ignored it left a start or a wait
+  waiting on nothing. A `subscribe` start now logs
+  `start.subscribe.unsupported` at error level, a `wait {on: resource}` step
+  fails naming the capability, and a resource instruction logs
+  `instruction.subscribe.unsupported` once.
+- **A failed resource subscribe is asked again.** A URI was recorded before
+  the server call, so a failure left it recorded and every retry answered
+  "already covered" without contacting the server. It is recorded once the
+  server accepts it; adding a URI sends only that URI; and a subscribe that
+  fails in a way that may pass (a timeout, a `5xx`, a session lost mid-call)
+  is retried from the loop on a 1s to 30s backoff.
+- **A restored resource wait is subscribed again at boot.** Its record
+  survived a restart; the subscription that wakes it did not, and boot armed
+  only the `subscribe` starts, so it sat until its timeout. Boot and reload
+  now share one restore. A wait that can never be woken fails its step
+  (`wait.resubscribe.fail`): its server is gone from the config, or does not
+  offer `resources.subscribe`. A configured server that is only down at boot
+  leaves its waits parked, said at error level, until a reload connects it.
+- **The launcher writes each terminal line in one piece,** so a sign-in
+  prompt is never read, or interleaved, without its "[n more waiting]" count.
+
+### Changed (breaking)
+
+- **`/hooks/_` is agentd's.** A `wait {on: webhook}` callback is armed under
+  `/hooks/_cb/`, and configured routes match first, so a route there could
+  take a suspended run's callback. A `webhook` start `path` or a wait's
+  `webhook.path` under `/hooks/_` is refused when the workflow is parsed,
+  wherever it came from.
+
+### Removed
+
+- The start fields nothing read: `schedule.tz`, `schedule.jitter`,
+  `schedule.catch_up`, `subscribe.coalesce`, `subscribe.deliver`,
+  `subscribe.on_no_listener` and `signal.deliver`. They parsed and changed
+  nothing (a `tz` ran its cron in UTC regardless). A workflow that names one
+  meets the generic unknown-field refusal. The shipped examples, the docs,
+  the published schemas and the site editor no longer offer them, and a docs
+  check now holds every node table to the fields the node catalogue gives
+  that kind.
+
+### Tooling
+
+- CI builds clean on Rust 1.99, and a failed clippy step no longer skips the
+  test steps after it, so a lint error cannot hide a test failure. The job
+  still fails.
+
+### Crates
+
+agentd-mcp has breaking API changes: `McpError::SessionExpired` is a new
+variant, and `capabilities()` and `protocol_version()` return owned values,
+because the negotiated state now belongs to the live connection, which a
+re-dial replaces.
+
 ## v1.17.0 — A2A, and nothing beside it
 
 The A2A listener spoke a private dialect beside the specification: an

@@ -1,12 +1,12 @@
 # RFC 0045: MCP Events
 
-**Status:** Draft. It tracks an external **draft**: MCP Events is a design sketch in an MCP incubation repository. No SEP has been filed or numbered, and it is not part of the MCP specification (§2.1). Anything marked **[draft may change]** follows text that is still open upstream.
+**Status:** Draft; P0 implemented (`8b0ec078`…`599dbfa4` on `main`, unreleased; §8). The Events surface itself (P1 onwards) is not built. It tracks an external **draft**: MCP Events is a design sketch in an MCP incubation repository. No SEP has been filed or numbered, and it is not part of the MCP specification (§2.1). Anything marked **[draft may change]** follows text that is still open upstream.
 **Author:** Andrii Tsok (drafted with Claude)
-**Date:** 2026-09-29. Revised 2026-09-30 after three adversarial reviews (spec fidelity, codebase fidelity, design completeness).
+**Date:** 2026-09-29. Revised 2026-09-30 after three adversarial reviews (spec fidelity, codebase fidelity, design completeness). Decisions Q1, Q3 and Q8 and the order of work recorded 2026-10-01 (§11). P0 implemented 2026-10-01/02, and §8 P0 corrected to what it proved.
 **Extends:** RFC 0035 (event streams). MCP events land in declared streams and are consumed by the existing `stream` and `correlate` starts and by `wait {on: event}`. **Supersedes only the consumption half of RFC 0035 Phase D** ("the MCP broker profile"). Phase D was never built. Its publish half, a broker exposed as an MCP server with `publish` tools (`rfcs/0035-event-streams.md:175-179`), needs no profile, and MCP Events has no publish operation. RFC 0035 is annotated with a pointer, not rewritten (§4, row 1).
-**Depends on:** RFC 0031 (endpoint authentication: every `events/*` call is signed like any other MCP request), RFC 0037 (service catalog and egress policy), RFC 0042 (what a served document may configure), RFC 0043 (the A2A boundary, v1.17.0). It also depends on an **rmcp upgrade to ≥ 3.5.0** so that agentd can speak MCP `2026-07-28`, the revision both known Events implementations require. That upgrade changes every MCP connection, so it is a decision in its own right (§6, §11 Q1).
+**Depends on:** RFC 0031 (endpoint authentication: every `events/*` call is signed like any other MCP request), RFC 0037 (service catalog and egress policy), RFC 0042 (what a served document may configure), RFC 0043 (the A2A boundary, v1.17.0). It also depends on an **rmcp upgrade to ≥ 3.5.0** so that agentd can speak MCP `2026-07-28`, the revision both known Events implementations require. That upgrade changes every MCP connection, so it was a decision in its own right, and the user took it: upgrade, with the `Auto` lifecycle (§6, §11 Q1).
 **Standards basis:** *MCP Events — Design Sketch* (status "Draft proposal", Peter Alexander, dated 2026-02-19, merged into the incubation repository `modelcontextprotocol/experimental-ext-triggers-events` on 2026-09-08 at `6682596d`). Standard Webhooks, as the draft profiles it. MCP revision `2026-07-28`: extension negotiation (SEP-2133), stateless requests, `subscriptions/listen`, the standard request headers, and the error-code allocation policy.
-**Scheduling:** work starts only after the v1.17.0 release gate and the instruction-core Spec 1.1 re-vendor that is already scheduled next. No file in the repository is touched by this draft.
+**Scheduling:** decided 2026-10-01 (§11): P0 first, on its own, after v1.17.0; then the instruction-core Spec 1.1 re-vendor; then P1 and the phases after it. P0 is on `main` (§8).
 
 Citation keys used below:
 
@@ -17,7 +17,7 @@ Citation keys used below:
 - **[MTG]** = https://github.com/modelcontextprotocol/modelcontextprotocol/discussions/3096 (MCP Core Maintainer Meeting, July 15, 2026; notes posted 2026-07-16)
 - **[I4]** = https://github.com/modelcontextprotocol/experimental-ext-triggers-events/issues/4
 
-agentd paths are relative to `crates/agentd/src` unless they start with `crates/`, `docs/`, `rfcs/`, `examples/` or `web/`. Every agentd reference was checked read-only against `main` at `04607fb5` ("release: v1.17.0"). rmcp references are to the 3.1.2 source that agentd locks, unless marked 3.5.0.
+agentd paths are relative to `crates/agentd/src` unless they start with `crates/`, `docs/`, `rfcs/`, `examples/` or `web/`. Every agentd reference was checked read-only against `main` at `04607fb5` ("release: v1.17.0"), and line numbers are that commit's: P0 has since moved some of them. rmcp references are to the 3.1.2 source that agentd locks, unless marked 3.5.0.
 
 ---
 
@@ -54,8 +54,8 @@ No start or wait kind is added. The design rests on six rules:
 
 The work is feature-gated (`mcp-events`) and phased (§8):
 
-- **P0** fixes defects in the substrate the bridge relies on. It is worth shipping without MCP Events.
-- **P1** upgrades rmcp to ≥ 3.5.0, so that agentd can speak `2026-07-28`. It affects every MCP server, so it waits for the user's decision (§11 Q1).
+- **P0** fixes defects in the substrate the bridge relies on. It is worth shipping without MCP Events, and it is implemented.
+- **P1** upgrades rmcp to ≥ 3.5.0, so that agentd can speak `2026-07-28`. It affects every MCP server; the user decided for it (§11 Q1).
 - **P2** builds the bridge and **poll**.
 - **P3** adds **webhook**, the subset ChatGPT ships.
 - **Push** waits for the SEP (P4), because it is the mode maintainers questioned most [MTG].
@@ -313,7 +313,7 @@ agentd has about twenty separate event mechanisms. **Only one is durable, ordere
 | 19 | `tools/list_changed` | in | Root: logged only (`runtime/mod.rs:2182`). Warm subagents refresh their tools. | — | `subagent/control.rs:721` |
 | 20 | Config file watch | in | none | `lifecycle.watch_config` | `config/watch.rs` |
 
-The following defects matter to any event bridge. **All were found by reading, none executed** (the v1.17.0 gate forbids builds). P0 (§8) fixes each one.
+The following defects matter to any event bridge. **All were found by reading, none executed** (the v1.17.0 gate forbids builds). P0 (§8) fixes each one, and §8 P0 records where the fix turned out different from this reading.
 
 - **D1. A stream consumer consumes events it did not fire.** `poll_stream_starts` runs every tick whatever the pressure (`runtime/reactor.rs:594-595`). It advances `offset` *before* firing (`runtime/streams.rs:289-296`). `fire_start_run` then returns without firing in four cases:
   - under shed (`runtime/starts.rs:416-426`, logged as `start.shed`);
@@ -322,7 +322,7 @@ The following defects matter to any event bridge. **All were found by reading, n
   - when the inbox write-ahead fails, whose result is discarded (`:527`, `let _ = self.accept_event(...)`).
 
   None of those log lines names the stream, the seq or the event id. In every case the event is consumed and never replayed. `batch` mode loses a whole batch the same way (`runtime/streams.rs:346-357`). `correlate` has the same shape. The `rate` path already does this correctly: it leaves the event unconsumed (`runtime/streams.rs:318-339`).
-- **D2. An acknowledged stream event can be overwritten after a crash.** Event records are written straight away (`runtime/streams.rs:79-83`), but the stream head `seq` lives in the manifest, which is flushed debounced (default 250 ms, `state/mod.rs:269, 764-790`). Event keys are not manifest-indexed (`state/mod.rs:40-42`). After a crash inside that window, the next append reuses a `seq`, and the store's first-touch path adopts the key and overwrites it (`state/mod.rs:624-636`). A webhook `into:` may already have answered 202 for that event (`runtime/webhooks.rs:951-994`). *Confidence: medium. Not reproduced.*
+- **D2. An acknowledged stream event can be overwritten after a crash.** Event records are written straight away (`runtime/streams.rs:79-83`), but the stream head `seq` lives in the manifest, which is flushed debounced (default 250 ms, `state/mod.rs:269, 764-790`). Event keys are not manifest-indexed (`state/mod.rs:40-42`). After a crash inside that window, the next append reuses a `seq`, and the store's first-touch path adopts the key and overwrites it (`state/mod.rs:624-636`). A webhook `into:` may already have answered 202 for that event (`runtime/webhooks.rs:951-994`). *Confidence: medium. Not reproduced.* Reproduced since: P0's kill-point test overwrites the event on the old code (`57f23292`).
 - **D3. A lagging consumer skips trimmed events without a word.** When retention trims past a lagging consumer, it skips forward silently (`runtime/streams.rs:244-246`). No log, and no `agent_stream_lag` metric, although RFC 0035 §8 names one (`rfcs/0035-event-streams.md:285`).
 - **D4. No trifecta gate sees input that arrives through a stream, and workflow agent steps have no trifecta gate at all.** `check_trifecta` runs in three places:
   - the root grant at validation, over all configured servers, where an untagged server counts as `untrusted_input` (`config/settings/mod.rs:7571-7597`);
@@ -697,13 +697,14 @@ Push is designed here so that the P2 bridge fits it, but it is built only once t
   - a `cursor: null` type that has a record logs `mcp.events.gap` with cause `no_replay`.
 - **Reload.** A binding's identity is `(server, name, canonical(arguments))`. `stage_mcp` (`runtime/reload.rs:307`) already dials changed servers beside the running ones and commits all or nothing (`dbc286de`, `0b43a02e`). **Bindings are not part of a server's dial spec**: `events` stays out of `to_spec()` and out of the `same` comparison (`runtime/reload.rs:336-356`). Editing a binding therefore never re-dials the server, and adding the first one needs no new handshake, because the extension is declared on every connection (§5.3).
   - A binding that is unchanged on an unchanged server is not touched.
-  - On a re-dialed server, it is re-armed from its records: the same hook as `resubscribe_on` (`runtime/reload.rs:794`), extended to bindings.
+  - On a re-dialed server, it is re-armed from its records, through the path P0 gave every subscription owner (`Runtime::resubscribe_where`, which a reload, a lost session and the retry loop all reach), extended to bindings.
   - A removed binding stops. Webhook bindings unsubscribe, and the records are deleted.
   - A changed `into`, `replay`, `rate` or `ttl` is applied without a new server-side subscription. A changed `delivery` list re-arms.
   - Changed `arguments` make a new binding, and the old one is removed. The draft does the same: "To change what a subscription listens for …, `events/unsubscribe` the old one and `events/subscribe` a new one" [DS L391].
   - Tests pin that editing `rate` or `into` causes no re-dial, and that adding a binding causes no re-dial.
-- **Session loss** (P0, D6; revisions ≤ 2025-11-25 only, since `2026-07-28` has no sessions). agentd maps a `404` on a session-bearing request to `SessionExpired`, and sets `reinit_on_expired_session(false)`, so that rmcp does not re-initialize behind the runtime's back. The runtime then re-dials and re-arms everything that lives on the connection: resource subscriptions (with `uris` cleared and rebuilt) and bindings.
-  - It logs with the names the code already uses: `mcp.disconnect` (cause `session_lost`) and `mcp.connect` on the re-dial.
+- **Session loss** (P0, D6; revisions ≤ 2025-11-25 only, since `2026-07-28` has no sessions). agentd maps a `404` on a session-bearing request to `SessionExpired`, and sets `reinit_on_expired_session(false)`, so that rmcp does not re-initialize behind the runtime's back. The runtime then re-dials and re-arms everything that lives on the connection: resource subscriptions and bindings.
+  - *As built in P0:* the resource subscriptions are restored from their owners (the armed `subscribe` starts, the suspended resource waits, the resource instruction, which is also read again), not from the lost connection's URI set, which only knows what it held (`Runtime::restore_subscriptions`). The re-dial is bounded by the management timeout and backs off 1s→30s while the server refuses, one lost server per reactor pass.
+  - It logs with the names the code already uses: `mcp.disconnect` and `mcp.connect` (or `mcp.connect.fail`), each with `reason: session_lost`.
   - RFC 0035 §5.5 names `mcp.connected` / `.disconnected` and `subscription.lost` (`rfcs/0035-event-streams.md:212`), which nothing emits. The RFC 0035 annotation (§4, row 1) records the names the code actually uses.
   - A test restarts a mock server mid-session and checks that the subscription is restored.
 - **Listen loss** (`2026-07-28`, P0, D7). The end of a listen pump is logged, and the pump re-listens with backoff.
@@ -782,15 +783,22 @@ agentd promises, per binding:
   - a webhook `into:` adds `untrusted_input`;
   - an A2A `into:` adds `untrusted_input` (peer content);
   - an MCP events binding adds the server's tag set (`McpServer::tag_set`, `config/settings/mod.rs:1958`), plus `untrusted_input` when the server is untagged. That is the rule the root-grant fold already applies (`:7576`);
-  - a `mirror_streams` entry adds the child stream's derived tags, or `untrusted_input` when they cannot be computed;
+  - a `mirror_streams` entry adds the child stream's derived tags, or `untrusted_input` when they cannot be computed. *As built:* always `untrusted_input`, because the child's producers are compiled into another process and cannot be judged from the parent's configuration; the parent refuses an `_instance.emit` into a stream the template does not mirror, so the producer set judged is the one enforced;
   - an `emit` from a workflow that consumes a tainted stream carries the consumed streams' tags to its target. This is a fixed point over the workflow graph, because every `emit` target is static.
   - The runtime-events tap adds none: it carries agentd's own facts, and server-supplied free text is stripped from them (§5.12).
 - **The check (new).** For each workflow that consumes a tainted stream (through a `stream` or `correlate` start, or a `wait {on: event}`), agentd folds the stream's tags together with the tags of every server that the workflow's `agent` steps and subagent spawns can reach. It then runs `check_trifecta` **at validation**, so a bad combination fails at load, not when the first event arrives.
   - A workflow that reacts to an email event and hands an agent a server that can send email is refused at load, unless `security.allow_trifecta` is set.
   - Agent-stored workflows are checked the same way when they are registered.
   - Workflow-as-tool `derived_tags` (`registry/mod.rs:512`) also include the consumed streams' tags.
+- **As built in P0** (`f56997f9`, `7a594545`; `config/taint.rs`). The check follows more edges than the list above:
+  - a run that outside text reaches directly (a webhook or A2A start that fires a run, a `wait {on: webhook}`, a webhook start's `signal:` relay) is the operator's call and is not judged on its own reach, but what it `emit`s taints the target stream exactly as `into:` does;
+  - a tainted run's taint follows a `workflow` step, a workflow tool its agent can call, a `message` step (to the root grant), and the same edges spelled as tools: `message.send`, `workflow.run`, `workflow.signal`, `subagent.run` and `subagent.send` (`registry/internal.rs` classifies the contracts that hand text on), plus `knowledge.*` and `search.*` to their profile servers;
+  - a field the engine renders at dispatch is read as naming anything: a templated `servers` entry reaches every server, a templated `emit` target taints every declared stream;
+  - a step's `servers:` is now a real cap, also under `security.policies`, so the reach the check judges is the reach the step has.
+
+  It runs in `validate()` over the inline definitions (so `--validate-config` reports it), in the loader over the whole resolved set at start and on every reload, on `workflow.create`/`update`, and on stored definitions, which are left out rather than allowed to veto a reload. The refusal names the workflow, the stream, what feeds it, and the servers that bring the other two legs. Not followed, and `docs/security.md` says so: deterministic steps (`mcp.tool`, `http`, `a2a.send`, `a2a.delegate`, whose target no model picks), text passed through shared state or a result read back by its caller, and a route opened by a definition the agent writes.
 - **What this is, and is not.** It is coarse and static: per stream, not per value. It is not data-flow taint tracking. It is a grant-level check, like the existing root fold, and it fits `docs/security.md`'s model, which gains a paragraph on it. Process isolation (the reader/actor split, `docs/security.md:291-311`) stays the recommended way to handle untrusted content.
-- **Behaviour change.** It can refuse configurations that load today (§8.1). Whether the first release refuses or only warns is **Q8** (§11).
+- **Behaviour change.** It can refuse configurations that load today (§8.1). Q8 is decided: the first release refuses at load (exit 2); `security.allow_trifecta` lifts it with every other trifecta gate (§11).
 - The model sees a payload only if a step passes it to an agent step. Instruction text in the examples says to treat payloads as data. [OAI] gives server authors the same advice.
 
 #### 5.11.4 Replay and forgery
@@ -834,9 +842,9 @@ agentd promises, per binding:
 | `mcp.events.paused` / `.resumed` | warn / info | server, event, cause (`pressure`, `rate`, `refusal`, `store_degraded`) |
 | `mcp.events.delivery_suspended` | warn | server, event, last_error (a draft category) |
 | `mcp.events.error` | warn | server, event, code (from `notifications/events/error`; P4) |
-| `mcp.disconnect` (cause `session_lost`) / `mcp.connect` | warn / info | server (existing names, P0, D6) |
-| `stream.consumer.skipped` | warn | stream, workflow, node, events (P0, D3) |
-| `start.shed` / `start.frozen` / `start.inputs.invalid` | warn | gain stream, seq and event id when the start is a stream consumer (P0, D1) |
+| `mcp.disconnect` / `mcp.connect` (`reason: session_lost`) | warn / info | server (existing names, P0, D6) |
+| `stream.consumer.skipped` | warn | stream, workflow, node, from, to, events (P0, D3) |
+| `start.shed` / `start.frozen` / `start.inputs.invalid` / `start.too_large` | warn | gain what the consumer holds when the start is a stream consumer: stream, seq and event id; a batch's range; a join's correlation, with `seqs` and `event_ids` (P0, D1) |
 
 - **No server-controlled free text is logged raw.** That covers `terminated.error.message`, the `data.reason` of `notifications/events/error` (for example `"Gmail API 503"`, [DS L262]) and the `terminated` `reason`. Logs and metrics carry codes and the closed `lastError` categories. Any free text that is kept has control characters stripped and is truncated to 200 bytes, so a server cannot inject terminal escapes into an operator's console.
 - **Payload data is never logged.** `event_id` is logged, and it is the dedup handle.
@@ -1091,12 +1099,12 @@ Each phase ships only when all of the following are green:
 - the shipped examples validate;
 - the RFC 0042 and reload completeness tests (`config/settings/mod.rs:8964, 9011`), `schema_matches_struct_at_every_object` (`:8374`), and the A2A feed's published-bundle check (`docs/ext/events.md:148-150`).
 
-Nothing starts before v1.17.0 is released and the instruction-core Spec 1.1 re-vendor, already scheduled next, is done.
+The order was decided on 2026-10-01 (§11): P0 first, after v1.17.0, since it fixes defects that matter without Events; then the instruction-core Spec 1.1 re-vendor; then P1 and the phases after it.
 
 ```mermaid
 flowchart LR
     P0["P0 substrate fixes (no Events surface)"]
-    P1["P1 rmcp 3.5 or later, Auto lifecycle, MCP 2026-07-28 (decision Q1)"]
+    P1["P1 rmcp 3.5 or later, Auto lifecycle, MCP 2026-07-28 (Q1, decided)"]
     P2["P2 bridge and poll (feature mcp-events)"]
     P3["P3 webhook"]
     P4["P4 contingent: push, SEP alignment, rmcp Events, resources as events"]
@@ -1108,28 +1116,30 @@ flowchart LR
     P3 --> P4
 ```
 
-### P0 — Substrate fixes (no Events surface; they ship on their own)
+### P0 — Substrate fixes (no Events surface; they ship on their own) — implemented
+
+**Implemented** on `main`, unreleased, in `8b0ec078`…`599dbfa4`: `8b0ec078` (D1, D3), `57f23292` (D2, D11, `/hooks/_`), `291f5bde` (review of those), `f56997f9` (D4), `9d8b0db6` (item 13), `7a594545` (review of those), `ac078900` (D6, D7, D8, D10), `09f7ee3b` (D5), `55c1bfe0` (review of those), `599dbfa4` (D9). Two commits in the range are not P0: `b6ac983e` (the launcher's terminal lines) and `5d7d57af` (CI on Rust 1.99). The scope below is as planned; each *As built* note records where the implementation proved the plan wrong or went further.
 
 **Scope:**
 
-1. **D1.** `fire_start_run` returns an admission outcome: `accepted`, `shed`, `frozen`, `inbox_failed` or `inputs_invalid`. Stream, `correlate` and `batch` consumers advance the offset only on `accepted`, or on a deliberately discarded `inputs_invalid`, which is logged with the stream, seq and event id. In every other case the event (or the batch) stays unconsumed, as the `rate` path already does.
-2. **D2.** An event key is create-only. A conflict on a `Kind::Event` put advances the stream head and retries instead of adopting and overwriting. The head `seq` is flushed before an append is acknowledged externally (webhook `into:` today, and later the webhook-mode 2xx).
-3. **D3.** Trimming past a consumer logs `stream.consumer.skipped`, and `agent_stream_lag{stream,consumer}` is written.
-4. **D4.** Static stream taint from every declared producer, and a load-time trifecta check for every workflow that consumes a tainted stream (§5.11.3). `docs/security.md` gains the paragraph.
-5. **D5.** Boot re-subscribes suspended `wait {on: resource}` steps, through the same code as `resubscribe_on`.
-6. **D6.** A session `404` maps to `SessionExpired`, with `reinit_on_expired_session(false)`. The runtime re-dials, rebuilds `uris` and re-arms, logging `mcp.disconnect` (cause `session_lost`) and `mcp.connect`.
-7. **D7.** The end of a listen pump is logged, and the pump re-listens with backoff.
-8. **D8.** The `resources.subscribe` capability is checked before subscribing. A missing capability is a loud `start.subscribe.unsupported` / wait failure. `docs/mcp.md` and the doc comment at `crates/mcp/src/wire.rs:59-62` then state the truth.
-9. **D9.** Delete the seven dead fields from `KINDS` (`engine/model.rs:128, 134-147, 179-185`): `subscribe.coalesce`, `.deliver`, `.on_no_listener`, `signal.deliver`, and `schedule.tz`, `.jitter`, `.catch_up`. Update every touch point listed in D9 in the same change: four shipped examples, a README, five docs, and the web schemas, node list, editor and `llms.txt`. The removed fields are refused only by the generic unknown-field check.
-10. **D10.** A URI is inserted into `uris` only after the server call succeeds, and the per-URI path subscribes only the new URI.
-11. **D11.** The webhook dedup marker is written only after a successful fire or append, in the same reactor pass. The key becomes `_wh_idem/…` outright (rule 1: nothing reads the old key). Markers gain an expiry sweep.
-12. **Reserve `/hooks/_`** at load for agentd's own routes. This protects today's `_cb` callbacks and, later, the MCP routes.
+1. **D1.** `fire_start_run` returns an admission outcome: `accepted`, `shed`, `frozen`, `inbox_failed` or `inputs_invalid`. Stream, `correlate` and `batch` consumers advance the offset only on `accepted`, or on a deliberately discarded `inputs_invalid`, which is logged with the stream, seq and event id. In every other case the event (or the batch) stays unconsumed, as the `rate` path already does. *As built:* a sixth outcome, `too_large` (a start bigger than `store.max_value_bytes`, which the inbox refuses identically on every offer), is discarded like `inputs_invalid`, with a `start.too_large` line naming every event it held. A held consumer's refusal line is written once when the hold starts, not on every pass. A refused `correlate` set goes back into the durable `pending`, and a held join stops walking the stream, so `max_pending` keeps counting it and no event sharing its correlation is lost. A store read error holds the consumer at that seq (`stream.read.failed`); only a missing record is skipped, and a corrupt one is named (`stream.event.corrupt`). The inbox write now comes before `start.fired`.
+2. **D2.** An event key is create-only. A conflict on a `Kind::Event` put advances the stream head and retries instead of adopting and overwriting. The head `seq` is flushed before an append is acknowledged externally (webhook `into:` today, and later the webhook-mode 2xx). *As built:* event keys are written with `Durable::create`; an occupied key is left as it is and the append steps the head over it, keeping the earlier event and logging `stream.head.recovered`. A gap longer than 1024 keys is recorded as far as it was walked and the append refused, so a broken store cannot hold the loop. The kill-point test reproduced the overwrite on the old code, so risk 8's smaller fix did not apply.
+3. **D3.** Trimming past a consumer logs `stream.consumer.skipped`, and `agent_stream_lag{stream,consumer}` is written. *As built:* the skip is logged once, since it persists. The gauge is written on every consumer pass, replaced whole per start kind so a removed consumer stops being exported, and bounded at 32 named consumers per kind, the rest folded into one `other` series carrying their worst lag.
+4. **D4.** Static stream taint from every declared producer, and a load-time trifecta check for every workflow that consumes a tainted stream (§5.11.3). `docs/security.md` gains the paragraph. *As built:* it follows more edges than §5.11.3 first listed, and that section now records them. It refuses from its first release (Q8). `docs/security.md` gains a section, not a paragraph.
+5. **D5.** Boot re-subscribes suspended `wait {on: resource}` steps, through the same code as `resubscribe_on`. *As built:* the wait half of `resubscribe_on` became `Runtime::resubscribe_waits`, which boot and reload both call (`wait.resubscribed` carries `reason`). A restored wait that can never be woken fails its step (`wait.resubscribe.fail`, error level): its server is gone from the config, or does not advertise `resources.subscribe`. A server that is configured but down at boot leaves its waits parked under their own timeouts, said at error level, until a reload connects it.
+6. **D6.** A session `404` maps to `SessionExpired`, with `reinit_on_expired_session(false)`. The runtime re-dials, rebuilds `uris` and re-arms, logging `mcp.disconnect` (cause `session_lost`) and `mcp.connect`. *As built:* the re-dial restores from the subscription owners (the armed `subscribe` starts, the suspended waits, the resource instruction, which is also read again), not from the lost connection's URI set; the field is `reason: session_lost`. The re-dial is bounded by the management timeout, backs off 1s→30s while the server refuses, takes one lost server per pass, and moves the lost connection's queued notifications to the new one. On an idle daemon, the notification stream's redial is the request that finds the `404`.
+7. **D7.** The end of a listen pump is logged, and the pump re-listens with backoff. *As built:* `mcp.listen.ended`, re-listening with the same filter on a 250ms→30s backoff. A replaced pump is now aborted (it was only detached, and went on listening with the old filter), and the pump's parse of SDK notifications, which dropped every wake, is fixed. Both were dormant defects the test exposed. A re-listen the server acknowledges with fewer URIs is `mcp.listen.narrowed`, and those URIs are retried.
+8. **D8.** The `resources.subscribe` capability is checked before subscribing. A missing capability is a loud `start.subscribe.unsupported` / wait failure. `docs/mcp.md` and the doc comment at `crates/mcp/src/wire.rs:59-62` then state the truth. *As built:* a `wait {on: resource}` step fails naming the capability; a resource instruction logs `instruction.subscribe.unsupported` once. The doc comment now lists what is actually gated: `tools/call` never was.
+9. **D9.** Delete the seven dead fields from `KINDS` (`engine/model.rs:128, 134-147, 179-185`): `subscribe.coalesce`, `.deliver`, `.on_no_listener`, `signal.deliver`, and `schedule.tz`, `.jitter`, `.catch_up`. Update every touch point listed in D9 in the same change: four shipped examples, a README, five docs, and the web schemas, node list, editor and `llms.txt`. The removed fields are refused only by the generic unknown-field check. *As built:* the inventory missed eight `tz: UTC` schedules in the startup and voice examples; they went too (cron is read in UTC, so nothing changed). `docs_surface_guard` now checks that every node table in the docs lists only fields `KINDS` gives that kind; its first run also corrected a stale `emit.metric` row in `docs/workflows.md`.
+10. **D10.** A URI is inserted into `uris` only after the server call succeeds, and the per-URI path subscribes only the new URI. *As built:* a subscribe that fails in a way that may pass (a timeout, a `5xx`, a session lost mid-call, a listen acknowledged without the URI) is asked again from the loop on the same 1s→30s backoff (`Runtime::retry_subscribe`), for starts, waits and the instruction alike. At the stateless revision a listen's acknowledgment is checked: a URI it leaves out is refused and not recorded.
+11. **D11.** The webhook dedup marker is written only after a successful fire or append, in the same reactor pass. The key becomes `_wh_idem/…` outright (rule 1: nothing reads the old key). Markers gain an expiry sweep. *As built:* a marker answers replays for seven days. Markers live in TTL-wide buckets (`_wh_idem/b<n>/…`); a replay looks in the current bucket and the one before, and the sweep deletes only buckets that expired whole, without reading a live marker. A store without `list` keeps its markers, unread. A route's `signal:` also goes out only once the delivery is kept. A firing the runtime refuses is no longer answered `202`: shed, frozen and a failed inbox write answer `503`, an `inputs` mapping that cannot render answers `422`, a `too_large` start answers `413`, and a `respond: sync` route is answered at once.
+12. **Reserve `/hooks/_`** at load for agentd's own routes. This protects today's `_cb` callbacks and, later, the MCP routes. *As built:* a `webhook` start path or a wait's `webhook.path` there is refused when the workflow is parsed, which covers configured, instruction-delivered and agent-stored workflows alike.
 13. **File the pre-existing RFC 0042 gap** (no `interface` gate on `kind: webhook` starts inside `:::!workflow`) as its own issue. *Done in `9d8b0db6`, not filed: a document's every spelling of a route (`:::!workflow`, `:::!config`, and what either references) needs the `interface` grant, and a template opens none. Still open, and recorded in `docs/security.md`: a definition the agent writes with `workflow.create`/`update` may open a route.*
 
 **Tests:**
 
 - A kill-point test: crash between the event put and the manifest flush, then restart. The acknowledged event survives, and the next append gets a new `seq`.
-- Stream consumption under shed and under a freshness freeze: freeze, emit, unfreeze, and nothing is lost. The same for `batch` and `correlate`.
+- Stream consumption under shed and under a freshness freeze: freeze, emit, unfreeze, and nothing is lost. The same for `batch` and `correlate`. *(As built, the freeze lifts across a restart onto an instruction that needs no registry, and each event fires exactly once.)*
 - A resource wait survives a restart and resolves on an update.
 - A mock server restarts mid-session, and the subscription is restored and logged.
 - A failed subscribe, retried, contacts the server again (D10).
@@ -1139,9 +1149,11 @@ flowchart LR
 - A configured route under `/hooks/_` is refused.
 - The dead fields are refused by the generic error, and every shipped example validates.
 
+All of these exist: `crates/agentd-cli/tests/store_kill_e2e.rs`, `streams_e2e.rs`, `wait_resource_e2e.rs`, `mcp_subscribe_e2e.rs` and `webhook_e2e.rs`; `crates/mcp/tests/subscriptions.rs`; and unit tests in `config/taint.rs`, `runtime/webhooks.rs`, `config/settings/mod.rs` and `engine/model.rs`.
+
 **Depends on:** nothing. **Behaviour changes:** §8.1.
 
-### P1 — rmcp ≥ 3.5.0 and MCP `2026-07-28` (not Events-specific; decision Q1)
+### P1 — rmcp ≥ 3.5.0 and MCP `2026-07-28` (not Events-specific; decided, Q1)
 
 **Scope:**
 
@@ -1239,14 +1251,18 @@ flowchart LR
 | Change | Phase | Effect |
 |---|---|---|
 | Stream consumers no longer consume events they did not fire (shed, frozen, inbox failure) | P0 | Runs that pressure or a freshness freeze used to drop now fire later |
-| Streams carry derived taint, checked at load | P0 | A config where a webhook-`into:` or A2A-`into:` fed workflow reaches `sensitive` + `egress` servers fails validation (or warns first, Q8). That can include existing workflows' agent steps. |
+| A start larger than `store.max_value_bytes` is discarded by name | P0 | `start.too_large` names every event it held, instead of wedging its consumer; a webhook answers `413` |
+| Streams carry derived taint, checked at load | P0 | A config where a webhook-`into:` or A2A-`into:` fed workflow reaches `sensitive` + `egress` servers fails validation, exit 2 (Q8: refuse). That can include existing workflows' agent steps, and a run a webhook or A2A start fires that emits into such a stream. |
+| A step's `servers:` is a cap, and a workflow tool's `grant` is enforced | P0 | Under `security.policies` a step no longer sees the tools of servers it does not list; a workflow tool declared `workflows: false` (or `root: false`) is no longer offered to that caller |
+| A served document opens a webhook route only under the `interface` grant | P0 | A document, or anything it references, that declares a `webhook` start or a `wait {on: webhook}` without `agent.document_capabilities: [interface]` fails validation. A subagent template opens none |
 | Dead `subscribe`, `signal` and `schedule` fields removed | P0 | A config naming them fails validation with the generic unknown-field error. Four shipped examples and the docs change in the same commit. |
 | `resources/subscribe` refused without the capability | P0 | A server that silently ignored the subscription now produces a visible failure |
 | A failed resource subscribe is retried for real | P0 | Waits that silently parked with no subscription now subscribe; a subscribe that fails in a way that may pass is asked again on a 1s→30s backoff |
 | Subscriptions are restored after a lost session, from the starts, waits and instruction that want them | P0 | A server back without `resources.subscribe` fails its resource waits and says `start.subscribe.unsupported`, as at boot; the instruction is read again |
 | A restored or re-dialed resource wait that can never be woken fails | P0 | At boot, and on a server a reload drops: the server gone from the config, or without `resources.subscribe`. A server that is configured but not connected leaves its waits parked, said at error level, until a reload connects it |
 | A stateless listen's acknowledgment is checked | P0 | A URI the server leaves out is refused (a wait on it fails), not recorded as watched |
-| Webhook idempotency marker written after the append, under `_wh_idem/` | P0 | A retry after a `503` is processed. Markers written by an older release are ignored, so a replay that straddles the upgrade may fire once more. |
+| Webhook idempotency marker written after the append, under `_wh_idem/` | P0 | A retry after a `503` is processed. Markers written by an older release are ignored, so a replay that straddles the upgrade may fire once more. Markers expire after seven days. |
+| A webhook firing the runtime refuses is not answered `202` | P0 | Shed, frozen and a failed inbox write answer `503`; an `inputs` mapping that cannot render answers `422`; a `respond: sync` route is answered at once |
 | `/hooks/_` reserved | P0 | A configured route under it fails validation |
 | rmcp ≥ 3.5.0 with the `Auto` lifecycle | P1 | `2026-07-28` servers get stateless requests and `subscriptions/listen` |
 | `wait {on: webhook}` uses `webhooks.url` when set | P3 | Identical unless `webhooks.url` is set |
@@ -1257,15 +1273,15 @@ flowchart LR
 
 1. **Draft churn.** The capability spelling, the error numbers, the verification scheme, multi-name subscriptions (wire-breaking) and **the set of modes** can all change (§2.14). *Mitigation:* the feature gate, one wire module, push deferred to P4, and §11 Q4.
 2. **The ecosystem is `2026-07-28` and webhook-first.** Both known Events implementations require `2026-07-28`. ChatGPT's documented example lists only `"delivery": ["webhook"]` [OAI]. Webhook needs a public https endpoint. Behind NAT only poll works, and the only poll-capable implementation found is `mcp.d`. *Mitigation:* P1 and P3. Stated plainly.
-3. **The rmcp upgrade touches every MCP connection** (P1), not just Events. *Mitigation:* its own phase, mocks for both revisions, and a user decision (Q1).
+3. **The rmcp upgrade touches every MCP connection** (P1), not just Events. *Mitigation:* its own phase, after the Spec 1.1 re-vendor, and mocks for both revisions. The user decided for it (Q1).
 4. **Gateways.** An MCP-terminating gateway in the path, such as mcpg, answers `events/*` with `-32601` unless it implements Events. Bindings then refuse (§5.13). The gateway must add pass-through or its own Events surface. mcpg's watch strategies (poll, webhook token, NATS, Kafka, Postgres NOTIFY) could later become an Events *server*, which is a separate decision in a separate repository.
 5. **Hand-rolled wire.** agentd maintains it until rmcp catches up. *Mitigation:* confinement, and the P2 drift check against the draft's own JSON examples.
 6. **Silent webhook loss remains possible** when a server omits `deliveryStatus` and abandons deliveries that never reached agentd (§5.6.3). *Mitigation:* none on agentd's side beyond re-arming. Raised with the WG.
 7. **Emit-only upstreams.** They are at-most-once across *server* restarts [DS L897]. agentd signals the gap but cannot recover it.
-8. **Durability.** The webhook 2xx contract depends on D2 and D11, and on a persistent store with `on_error: halt`. D2 was found by reading. If the P0 kill-point test shows the overwrite cannot happen, the fix shrinks to one forced manifest flush before each external acknowledgement.
+8. **Durability.** The webhook 2xx contract depends on D2 and D11, and on a persistent store with `on_error: halt`. D2 was found by reading. If the P0 kill-point test shows the overwrite cannot happen, the fix shrinks to one forced manifest flush before each external acknowledgement. *Settled in P0:* the kill-point test overwrote the event on the old code, so the full fix (create-only event keys and the head flush) shipped.
 9. **Injection surface and cost.** Payloads are attacker-reachable text in systems like email and chat, and anyone who can write to the upstream controls the event rate. *Mitigation:* `rate` is required on untrusted servers, and taint is checked at load (§5.11.3). Beyond that, what reaches a model is the author's choice, as with tool results.
 10. **Replicas.** Poll replicas each process every event (§5.10), as with resource subscriptions today (`docs/scaling.md`). Webhook replicas need distinct URLs.
-11. **The load-time taint check refuses configurations that load today** (§8.1, Q8).
+11. **The load-time taint check refuses configurations that load today** (§8.1). Q8 decided that it refuses from the first release; the release note names the pattern and the reader/actor split as the fix.
 
 ---
 
@@ -1279,7 +1295,7 @@ flowchart LR
   A binding plus a stream costs one extra config line.
 - **rmcp `CustomRequest`.** Rejected for now, because of the untagged-result shadowing, the dropped `events` capability, and the lack of per-request notification routing (§6.3). Timeouts are not a reason (§6.3).
 - **Wait for the SEP and rmcp.** Rejected as the default, because no date exists. The feature gate and Q4 keep this RFC's work from becoming a public commitment before the SEP exists.
-- **Webhook first.** The trade-off is real. ChatGPT-profile servers are webhook-only, so webhook reaches production servers first. Poll needs no inbound exposure, exercises the whole bridge, and has an interop peer in `mcp.d`. The recommendation stays poll first, with webhook directly after (Q3).
+- **Webhook first.** The trade-off is real. ChatGPT-profile servers are webhook-only, so webhook reaches production servers first. Poll needs no inbound exposure, exercises the whole bridge, and has an interop peer in `mcp.d`. The user chose poll first, with webhook directly after (Q3, decided 2026-10-01).
 - **Persist the webhook secret in the store.** Rejected. The store may be remote (`store.http`, `store.mcp`), and RFC 0044's sealed credential store is not built. Every arm is a fresh subscription anyway, so no secret needs to survive a restart.
 - **Rely on the server's dual-sign grace window across a restart.** An earlier draft did. It is replaced by the always-fresh arm, because a live subscription ignores the client's cursor [DS L400].
 - **Derive each binding's secret** as HKDF-SHA256(operator secret, binding-hash). It is stable across restarts and shared by replicas, so a load-balanced cluster could hold one subscription. Not in v1: it needs an operator-held secret. And replicas would then share one subscription while keeping separate cursors, so each replica's re-arm would replay events the others had already appended into their own stores (Q5).
@@ -1296,17 +1312,26 @@ flowchart LR
 
 Only genuine decisions are listed. Everything else is decided above.
 
+**Decided by the user on 2026-10-01:**
+
+- **Q1:** (a). Upgrade rmcp to ≥ 3.5.0 with the `Auto` lifecycle, as P1.
+- **Q3:** poll first (P2), webhook directly after (P3).
+- **Q8:** the taint check refuses at load. P0 shipped it that way (`f56997f9`).
+- **The order of work:** P0 first, then the instruction-core Spec 1.1 re-vendor, then P1 and the phases after it (§8).
+
+Q2, Q4, Q5, Q6, Q7, Q9 and Q10 are still open. None of them blocks P1.
+
 1. **Upgrade rmcp to ≥ 3.5.0 and adopt the `Auto` lifecycle (P1)?** Both known Events implementations require `2026-07-28`, so without this agentd reaches no Events server. The change affects every MCP connection.
    - (a) Yes, as P1, before the bridge ships.
    - (b) Not now. Pin `rmcp = "=3.1.2"` in `crates/mcp/Cargo.toml` so that a routine update cannot move it, and build against the mock only. (The published `agentd-mcp` 2.0.0 declares `^3.1`, so its downstream users can already resolve 3.5.x.)
 
-   Recommendation: (a).
+   Recommendation: (a). **Decided 2026-10-01: (a).**
 2. **Which capability spellings does agentd accept while upstream is unsettled?**
    - (a) Both current external spellings: the top-level `capabilities.events` (the draft on `main` [DS L17-29], and ChatGPT's profile [OAI]) *and* `capabilities.extensions["io.modelcontextprotocol/events"]` (PR #7, the conformance draft, `mcp.d`). They live in one constant, and the loser is deleted when the SEP decides. On `2025-11-25` both are tolerance, since neither is in that schema. On `2026-07-28` they are read from `server/discover`.
    - (b) Only the extension key, MCP's sanctioned mechanism (SEP-2133). That excludes ChatGPT-profile servers until they move.
 
    Recommendation: (a). Both are external text in force today (user rule 3), and neither is an agentd-owned name.
-3. **Poll first or webhook first?** Poll (P2) needs no inbound exposure, exercises the whole bridge, and has `mcp.d` as an interop peer. Webhook (P3) is what ChatGPT-profile servers offer, and they are the only production servers known. Recommendation: poll first, webhook directly after. Swap them if reaching servers built for ChatGPT matters more to you than a smaller first step.
+3. **Poll first or webhook first?** Poll (P2) needs no inbound exposure, exercises the whole bridge, and has `mcp.d` as an interop peer. Webhook (P3) is what ChatGPT-profile servers offer, and they are the only production servers known. Recommendation: poll first, webhook directly after. Swap them if reaching servers built for ChatGPT matters more to you than a smaller first step. **Decided 2026-10-01: poll first, webhook directly after.**
 4. **Ship in release binaries while the extension is a draft?** Recommendation: keep `mcp-events` out of the release feature set (build-from-source, like `exec` and `cel`) until an SEP number exists, and log a one-line "tracking a draft" warning at load when it is built in.
 5. **Webhook secret and replicas.**
    - (a) Mint a secret at every arm, as designed. Replicas each need a distinct `webhooks.url`.
@@ -1319,7 +1344,7 @@ Only genuine decisions are listed. Everything else is decided above.
 
    Recommendation: static only for v1.
 7. **Subscriptions as a user.** Once RFC 0044's per-principal credentials exist, should a binding be ownable by a principal: subscribed with that principal's credential, with the runs it starts owned by that principal? Or should MCP events stay autonomous (`identity.autonomous_as`) by design? Recommendation: stay autonomous until someone needs a user's events. The draft's "receipt is not authority" rule fits autonomy best.
-8. **D4's taint check: refuse at load, or warn first?** Refusing is the only form in which the check is not decorative. But it can refuse existing configurations, and the only existing escape hatch, `security.allow_trifecta`, disables every trifecta check, not just this one. Recommendation: refuse at load, with a release note that names the pattern and the reader/actor split as the fix.
+8. **D4's taint check: refuse at load, or warn first?** Refusing is the only form in which the check is not decorative. But it can refuse existing configurations, and the only existing escape hatch, `security.allow_trifecta`, disables every trifecta check, not just this one. Recommendation: refuse at load, with a release note that names the pattern and the reader/actor split as the fix. **Decided 2026-10-01: refuse at load.** Implemented in P0.
 9. **A per-binding view on the A2A feed** (for the TUI and web UI). Adding one is an incompatible change to a closed schema, which the extension's rule answers with a new name. Recommendation: counts only in v1. Decide the name only if the UI needs more.
 10. **Documents declaring bindings.** v1 refuses them. Recommendation: revisit after P3, with a rule such as "poll only, on servers the operator catalogued".
 

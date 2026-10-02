@@ -100,13 +100,49 @@ pub fn spawn_mock_mcp(uri: &str, emit: bool) -> MockMcp {
     }
 }
 
-/// A free loopback TCP port (bind :0, read it back, release).
+/// A loopback TCP port nothing holds, for something the test then tells to
+/// listen on it.
+///
+/// Not one the kernel picks for `bind :0`: a port read back that way and
+/// released returns to the ephemeral pool, where any socket on the host — a
+/// test running beside this one asking for its own port, a launcher's
+/// `--port 0`, the source port of an outgoing connection — can be handed it
+/// before the daemon binds. The daemon then fails with `Address already in
+/// use`, and the test talks to whatever got the port instead. So ports come
+/// from below the ephemeral range, which the kernel never hands out on its
+/// own: each process walks the stretch from an offset its pid picks (so test
+/// binaries running at once start apart), never hands a port out twice, and
+/// skips one something already holds.
 pub fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind :0")
-        .local_addr()
-        .expect("addr")
-        .port()
+    const LOW: u64 = 10_000;
+    static HANDED_OUT: AtomicU64 = AtomicU64::new(0);
+    let high = ephemeral_low();
+    assert!(
+        high > LOW + 1_000,
+        "the ephemeral port range starts at {high}: no room below it for test ports"
+    );
+    let span = high - LOW;
+    let start = u64::from(std::process::id()).wrapping_mul(7_919) % span;
+    loop {
+        let n = HANDED_OUT.fetch_add(1, Ordering::Relaxed);
+        assert!(
+            n < span,
+            "every port in {LOW}..{high} was handed out or held"
+        );
+        let port = (LOW + (start + n) % span) as u16;
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+}
+
+/// The lowest port the kernel picks on its own. Linux says in procfs; the
+/// default elsewhere (the BSDs, macOS: 49152) starts no lower than Linux's.
+pub fn ephemeral_low() -> u64 {
+    std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+        .ok()
+        .and_then(|r| r.split_whitespace().next()?.parse().ok())
+        .unwrap_or(32_768)
 }
 
 /// A unique path under the temp dir (per-process + per-call), for addr-files

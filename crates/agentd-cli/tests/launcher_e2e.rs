@@ -14,21 +14,33 @@ mod common;
 
 use std::collections::BTreeMap;
 use std::io::Write;
-use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-use common::{HttpReply, SendMessage};
+use common::{HttpReply, SendMessage, free_port};
 use serde_json::{Value, json};
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+/// The ports every launch here listens on are none the kernel hands out by
+/// itself. This binary is where `bind :0` ports collided: a daemon handed one
+/// another socket had taken failed to bind, while its launcher — whose
+/// readiness probe connected to that socket — went on: a client that never
+/// started, or a tab's sign-in answered 404 by another test's daemon.
+#[test]
+fn launch_ports_are_never_ephemeral_or_handed_out_twice() {
+    let low = common::ephemeral_low();
+    let ports: Vec<u16> = (0..64).map(|_| free_port()).collect();
+    assert!(
+        ports.iter().all(|&p| u64::from(p) < low),
+        "a port from the ephemeral range (from {low}): {ports:?}"
+    );
+    let distinct: std::collections::BTreeSet<u16> = ports.iter().copied().collect();
+    assert_eq!(
+        distinct.len(),
+        ports.len(),
+        "a port handed out twice: {ports:?}"
+    );
 }
 
 /// A loopback daemon that never dials its model: `preflight: never` and no
@@ -170,8 +182,9 @@ impl Scratch {
         while !self.path(name).exists() {
             assert!(
                 Instant::now() < deadline,
-                "{name} never appeared; launcher stderr:\n{}",
-                self.read("launcher.err")
+                "{name} never appeared; launcher stderr:\n{}\ndaemon log:\n{}",
+                self.read("launcher.err"),
+                self.read("daemon.log")
             );
             std::thread::sleep(Duration::from_millis(20));
         }

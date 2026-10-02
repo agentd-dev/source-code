@@ -13,22 +13,14 @@
 mod common;
 
 use std::io::Write;
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use common::{SendMessage, error_of, get_card, rpc_result as rpc};
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
+use common::{SendMessage, error_of, free_port, get_card, rpc_result as rpc};
 
 fn command(addr: &str, op: &str, args: Value) -> Value {
     SendMessage::command(op, args).result(addr)

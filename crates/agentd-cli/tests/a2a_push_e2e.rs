@@ -17,17 +17,9 @@ use serde_json::{Value, json};
 
 mod common;
 
-use common::{SendMessage, get_card, rpc};
+use common::{SendMessage, free_port, get_card, rpc};
 
 use std::process::{Child, Command, Stdio};
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 /// One delivery, as the receiver saw it: the headers, then the body.
 type Delivery = (Vec<(String, String)>, Value);

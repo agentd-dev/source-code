@@ -11,28 +11,17 @@
 
 mod common;
 
-use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use common::{SendMessage, get_card, rpc_result as rpc};
+use common::{SendMessage, free_port, get_card, rpc_result as rpc};
 
 fn sigterm(pid: u32) {
     unsafe {
         libc::kill(pid as i32, libc::SIGTERM);
     }
-}
-
-/// A free loopback port (bind :0, read the port, drop). A tiny TOCTOU window —
-/// agentd rebinds within milliseconds.
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }
 
 struct MockLlm {

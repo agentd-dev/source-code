@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use common::{SendMessage, rpc_result as rpc};
+use common::{SendMessage, free_port, rpc_result as rpc};
 
 // ---- A2A client ------------------------------------------------------------
 
@@ -132,14 +132,6 @@ impl Drop for Daemon {
         let _ = self.child.wait();
         let _ = std::fs::remove_file(&self.stderr_path);
     }
-}
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }
 
 fn write_config(yaml: &str) -> String {

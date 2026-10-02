@@ -43,13 +43,12 @@
 mod common;
 
 use std::io::BufRead;
-use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use common::{SendMessage, a2a_open, a2a_post, a2a_post_within, rpc, rpc_as, rpc_body};
+use common::{SendMessage, a2a_open, a2a_post, a2a_post_within, free_port, rpc, rpc_as, rpc_body};
 
 /// The bearers the two principals present. Literal here, `{{secret:…}}` in the
 /// config — a bearer is a secret, and the config may only carry a reference.
@@ -62,17 +61,6 @@ fn sigterm(pid: u32) {
     unsafe {
         libc::kill(pid as i32, libc::SIGTERM);
     }
-}
-
-/// A free loopback port (bind :0, read the port, drop). Only a candidate: the
-/// port is free when probed, not when the daemon binds it — see
-/// [`respawn`].
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }
 
 struct MockLlm {

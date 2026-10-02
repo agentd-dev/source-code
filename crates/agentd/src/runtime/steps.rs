@@ -340,6 +340,25 @@ impl Runtime {
                 if let Ok(Some(env)) = self.durable.get(Kind::Memory, id)
                     && let Some(def) = env.state.get("value")
                 {
+                    // A route needs the operator's grant at every load, not
+                    // only when it was written: the grant is restart-only, so
+                    // a boot without it leaves out what an earlier grant let
+                    // the agent store — kept in the store, and loaded again
+                    // once the grant is back. The document's rule, applied
+                    // the way a stored definition is held to every rule: it
+                    // cannot refuse the operator's boot, so it stays out.
+                    let routes = crate::config::settings::stored_route_refusals(
+                        def,
+                        &self.settings.agent.document_capabilities,
+                    );
+                    if !routes.is_empty() {
+                        warnings.push((
+                            "workflow.stored.invalid",
+                            json!({"name": name, "errors": routes,
+                                   "note": "not loaded; the stored definition is kept and loads once the operator grants what it needs"}),
+                        ));
+                        continue;
+                    }
                     match parse_workflow(def) {
                         Ok(mut w) => {
                             self.fill_durable_default(&mut w);
@@ -435,6 +454,24 @@ impl Runtime {
             shadowed,
             warnings,
         })
+    }
+
+    /// Re-derive the workflow tools and the read-back contracts' tags from
+    /// the set installed now. They carry the taint of the runs whose result
+    /// they return, which the whole set decides — so a definition the agent
+    /// writes or deletes, which is never a tool itself, can still move them.
+    /// Logged only when something moved.
+    pub(crate) fn retag_workflow_tools(&mut self) {
+        let mut registry = self.registry.clone();
+        let defs: Vec<&Workflow> = self.workflows.values().map(AsRef::as_ref).collect();
+        let errs = registry.register_workflow_tools(&self.settings, &defs);
+        // The tool names are the installed set's, already registered once,
+        // so a collision cannot appear here; were one to, the running
+        // registry stays rather than losing a tool.
+        if errs.is_empty() && !registry.same_tools(&self.registry) {
+            self.registry = registry;
+            self.log_workflow_tools();
+        }
     }
 
     /// What `w` names that the registry and servers it would run with do not
@@ -3623,12 +3660,23 @@ impl Runtime {
                                 w.name
                             ));
                         }
+                        // A route on the operator's webhook listener answers
+                        // the network with the auth the definition names, so
+                        // a definition the agent writes opens one only under
+                        // the grant a served document needs. Judged here, in
+                        // the one handler every caller of the tool reaches.
+                        let mut problems = crate::config::settings::stored_route_refusals(
+                            &def,
+                            &self.settings.agent.document_capabilities,
+                        );
                         // Checked now against what is running, as a start
                         // checks a configured one: a definition naming a
                         // tool, server or stream this agent does not have is
                         // refused here rather than stored to fail when it
                         // runs.
-                        let mut problems = self.reference_errors(&w, &self.registry, &self.mcp);
+                        if problems.is_empty() {
+                            problems = self.reference_errors(&w, &self.registry, &self.mcp);
+                        }
                         // The taint check, over the running set with this
                         // definition in place of any it replaces — the same
                         // line a configured definition is held to at load.
@@ -3671,6 +3719,7 @@ impl Runtime {
                             "workflow.defined",
                             json!({"name": wname, "hash": &hash[..12], "op": name}),
                         );
+                        self.retag_workflow_tools();
                         if arm {
                             self.arm_workflows();
                         }
@@ -3701,6 +3750,7 @@ impl Runtime {
                 // "stop being a workflow", not "strand whatever is in flight".
                 self.retire_workflow(&wf, "deleted");
                 self.log.info("workflow.deleted", json!({"name": wname}));
+                self.retag_workflow_tools();
                 ToolOutcome::Ready(json!({"ok": true}), false)
             }
             "workflow.signal" => {

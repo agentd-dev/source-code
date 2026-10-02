@@ -227,14 +227,53 @@ who opened the route decided what its work may do (`examples/startup/sre.yaml`).
 a run puts on a stream is judged like `into:`: its `emit` taints the target, and the
 stream's consumers are checked.
 
+**A result read back taints its reader.** A run's result is the text it was handed, worked
+over, so a caller that reads it back carries that run's tags and is judged with them — the
+same check, over the caller's own reach. The read-back edges, in every spelling
+(`registry/internal.rs::read_back` for the tools):
+
+- a sync workflow tool's reply (an `async` one returns a run id; reading that run is its own
+  edge);
+- a `workflow` step, unless `mode: detached` — `sync` waits for the child's output, and an
+  `async` one's handle is read by a `join`;
+- `workflow.run` with `wait: true` — a model holding the tool can ask for it on any workflow,
+  and a deterministic `tool` step only when its `wait` is `true` or templated;
+- `workflow.wait`, the `workflow.wait` step and `wait {on: run}`: a run id names any
+  workflow's run;
+- `workflow.status`, whose runs carry their `output` and `error`: by run id any workflow, by
+  `name` that workflow's runs;
+- for the root conversation, also the note `agent.on_workflow_finished` leaves in its
+  transcript when a run finishes or fails (by default, a failed run's error).
+
+A result taints its reader only with text the reader was not already handed. Each run's
+taint records where the outside text entered — an outside caller's route, or a mirrored
+stream — and a stream carries the origins of its producers, so a route's own run that reads
+back a child it started, or what a consumer made of the text its own route put on a stream,
+reads back nothing new and stays the operator's call. Reading back what another route was
+handed is new, and is judged.
+
+The root conversation is a caller too. When it can read back a tainted run's result — a
+read-back contract it may call (granted, not in `tools.disabled`, and in
+`agent.tools.internal`), a sync workflow tool granted to the root, or the
+`on_workflow_finished` note — it is judged with everything the root grant reaches. A root
+holding both `sensitive` and `egress` beside a tainted run is refused unless its read-back is
+taken away: `tools.disabled` (or an `agent.tools.internal` list) without `workflow.run`,
+`workflow.wait` and `workflow.status`, a workflow tool's `grant.root: false` or
+`mode: async`, and `agent.on_workflow_finished: ignore`. An operator reads a run's outcome
+over A2A — the `workflow.status` op and the run's task — which none of these touch
+(`examples/startup/sre.yaml`).
+
 All three legs and no `security.allow_trifecta` is exit `2` — from `--validate-config` for
 the inline definitions and those in local files and folders (`file:`, `dir:`, the adopted
 `workflows/` folder), and at the start and on every reload for the whole set once `url:`
 and `uri:` definitions resolve. A reload that moves anything the check
 reads (`config/taint.rs::inputs_moved`: the servers, the service catalog, the templates,
-the streams, the tools, the policies) re-judges the definitions, the stored ones included. A refused
+the streams, the tools, the policies, and what the root reads back — `agent.tools`,
+`agent.on_workflow_finished`, `agent.wake_on`) re-judges the definitions, the stored ones
+included. A refused
 reload keeps the running configuration. The message names the workflow, the stream, what
-feeds it and the servers that brought the other two legs:
+feeds it — or the result it reads back, and the edge it reads it through — and the servers
+that brought the other two legs:
 
 ```text
 workflow "triage": lethal-trifecta refused — it consumes stream "inbox" (fed by webhook
@@ -246,14 +285,19 @@ A definition the agent writes is held to the same line: `workflow.create`/`updat
 refuses one that would complete the trifecta, and a stored one that a reload makes
 complete it is left out (`workflow.stored.invalid`), not allowed to veto the reload.
 
-A workflow tool's tags include the taint its run carries
-(`registry/mod.rs::register_workflow_tools`), so a policy matching `untrusted_input` sees
-it.
+A workflow tool's tags include the taint its run carries, and the read-back contracts
+(`workflow.run`, `workflow.wait`, `workflow.status`) carry the taint of every run, since any
+run's output may be what they return (`registry/mod.rs::register_workflow_tools`) — so a
+policy matching `untrusted_input` sees both. They are re-derived whenever the workflow set
+changes: at startup, on every reload that re-reads the workflows (a workflow-only one
+included), and when `workflow.create`/`update`/`delete` changes it, since a definition that
+is no tool can still taint what a tool's run reads.
 
 This is coarse and static on purpose — per stream, not per value, and per server, like
 gate 1. It is a grant-level check, not data-flow tracking. What it accepts is what it
 judges: every model-driven step of a run the outside text reaches — the run that reads
-the stream and any run it starts or feeds — is judged together, so a reader and an actor
+the stream, any run it starts or feeds, and any caller that reads its result back — is
+judged together, so a reader and an actor
 in one run, or an actor in a run the reader starts, are refused alike. A run that has to
 act on what it read does it either with no model-driven step holding both other legs
 (narrow `servers:` and give the step a `tools:` list that leaves out the tools that hand
@@ -266,13 +310,8 @@ What it does not follow, so an operator knows where the line is:
   *arguments* are templated, though, and can carry what a model that read the outside
   text produced — give that model an `output_schema` so what reaches the arguments is
   constrained.
-- **Shared state and results read back.** Text a model writes to memory or an artifact,
-  and a run's result read back through `workflow.run {wait}`, `workflow.wait`,
-  `workflow.status` or a workflow tool's reply, is not traced to whoever reads it.
-- **A definition the agent writes that opens a route.** `workflow.create`/`update` does
-  not refuse a `webhook` start or a `wait {on: webhook}` — only the configuration's
-  documents are held to the `interface` grant ([Inbound webhooks](#inbound-webhooks)).
-  `security.workflows.immutable` closes the tool.
+- **Shared state.** Text a model writes to memory or an artifact is not traced to whoever
+  reads it.
 
 ### The tag floor and closed egress
 
@@ -1058,6 +1097,18 @@ request is in:
   a body (`engine/model.rs::inbound_routes`) — and the listener and auth checks read it too. An
   `a2a` start is not on it: it answers on the A2A listener, whose callers and their roles are
   the operator's.
+- **A definition the agent stores opens a route only under the same grant.**
+  `workflow.create` and `workflow.update` refuse a definition that opens a route — the same
+  list, nested ones included — unless the operator's `agent.document_capabilities` holds
+  `interface`, naming the workflow, the step and the grant
+  (`config/settings/mod.rs::stored_route_refusals`). The check is in the tool's one handler,
+  so it holds for every caller the tool is granted to. It runs again at every load: the grant
+  is restart-only, as it is for a document (a reload that drops it is refused, and the routes
+  stored under it stay until the restart), and a start without it leaves out a stored
+  definition that opens a route (`workflow.stored.invalid`) — kept in the store, and loaded
+  again once the grant is back. A document whose route loses its grant refuses the start; a
+  stored definition cannot refuse the operator's start, so it is left out, as it is for every
+  other check it fails.
 
 ## SSRF defenses
 

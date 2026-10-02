@@ -67,9 +67,38 @@ test that fails on the old code.
   either door, since a child has no listener; before, a route in its
   `:::!config` fragment was accepted at boot and refused by the child at
   every spawn. A `wait {on: webhook}` nested in a body now also needs a
-  listener and, on a non-loopback bind, auth, like one at the top level. A
-  workflow the agent writes with `workflow.create`/`update` can still open a
-  route; `docs/security.md` says so.
+  listener and, on a non-loopback bind, auth, like one at the top level.
+- **A definition the agent stores opens a webhook route only under the same
+  grant.** `workflow.create` and `workflow.update` stored a `webhook` start
+  or a `wait {on: webhook}` (nested ones included) whatever the operator had
+  granted, so a route a document could not open, the agent could. They refuse
+  one now unless `agent.document_capabilities` holds `interface`, naming the
+  step and the grant, for every caller the tool is granted to. The grant is
+  restart-only, so a reload cannot drop it; a start without it leaves a
+  stored route out (`workflow.stored.invalid`) and keeps it in the store
+  until the grant is back.
+- **A tainted run's result read back taints its caller.** The taint check
+  followed outside text forward into the runs it reached and not back out of
+  them: a workflow could read a tainted run's output and act on it holding
+  both other legs. A caller that reads a result back now carries the run's
+  taint and is judged with it: through a sync workflow tool's reply, a
+  `workflow` step that is not `detached`, `workflow.run` with `wait`,
+  `workflow.wait` (tool or step), `wait {on: run}` and `workflow.status`. The
+  root conversation is a caller too, through those tools and through the note
+  `agent.on_workflow_finished` leaves in its transcript (by default, a failed
+  run's error). A root holding `sensitive` and `egress` beside a webhook or
+  A2A route is refused at load unless its read-back is taken away:
+  `tools.disabled` without `workflow.run`, `workflow.wait` and
+  `workflow.status` (or an `agent.tools.internal` list), a workflow tool's
+  `grant.root: false` or `mode: async`, and `agent.on_workflow_finished:
+  ignore`. A result taints only with text its reader was not handed already,
+  so a route's own run reading back its child stays the operator's call. The
+  refusal names the edge. `examples/startup/sre.yaml`,
+  `examples/voice/hands.yaml` and `examples/hiring/actions.yaml` were refused
+  under this rule and now disable the read-back tools and the note.
+  `workflow.run`, `workflow.wait` and `workflow.status` carry the run taint in
+  their tags, as a sync workflow tool does, so a policy matching
+  `untrusted_input` sees it.
 - **Webhook idempotency markers are agentd's own.** They lived under
   `wh_idem/`, which `memory.*` did not reserve, so a model steered by an
   injected payload could forge a marker (a real delivery then answered
@@ -78,6 +107,11 @@ test that fails on the old code.
 - **The parent refuses an `_instance.emit` into a stream the child's
   template does not mirror,** so the producers the taint check judges are the
   ones the runtime allows.
+- **A workflow tool's tags follow the workflow set.** They were derived once,
+  when the registry was built, so a reload that changed only the workflows
+  kept the tags the previous set derived, and a definition written at runtime
+  never moved them. They are re-derived on every workflow change: a reload
+  that re-reads the workflows, and `workflow.create`/`update`/`delete`.
 
 ### Fixed
 

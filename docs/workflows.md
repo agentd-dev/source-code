@@ -830,6 +830,14 @@ wrote it — so a workflow removed from the configuration is gone, and an old
 runtime edit of it is not armed in its place. A name the configuration stops
 defining is free to create again.
 
+A definition `workflow.create` or `workflow.update` writes may open an inbound
+route — a `webhook` start, or a `wait {on: webhook}` at any depth — only when the
+operator grants `interface` in `agent.document_capabilities`, the grant a served
+document needs for the same route. Without it the call is refused naming the step
+and the grant, and a stored one is left out of a start without it
+(`workflow.stored.invalid`) until the grant is back
+([security.md](security.md#inbound-webhooks)).
+
 | Cap | Value |
 |---|---|
 | top-level steps per workflow | 512 (body steps are not counted) |
@@ -1004,7 +1012,7 @@ validated fail-closed. `workflow.create`/`update` are root-callable, so a root
 turn could otherwise mint itself a new tool name — or shadow one — with no
 operator in the loop. A `tool:` block from either is refused; the configuration
 is the only door — read at startup, and re-read by a reload, which registers
-the workflow tools again on the registry it rebuilds. A name that shadows an
+the workflow tools again. A name that shadows an
 internal contract, or that two workflows both claim, is exit 2 (a refused
 reload).
 
@@ -1014,8 +1022,14 @@ gate something the agent-editable half of the config asserts about itself.
 Instead a workflow tool inherits the union of the tags of the tools its steps
 actually reach, plus `egress` for steps that reach outside by construction
 (`http`, `a2a.send`, `a2a.delegate`), plus the taint its run carries — `untrusted_input`
-when it reads a stream outside input feeds ([security.md](security.md#streams-carry-the-taint-of-what-feeds-them)). What was derived is logged at startup, so
-an operator can inspect the conclusion.
+when it reads a stream outside input feeds, or reads back a run that does
+([security.md](security.md#streams-carry-the-taint-of-what-feeds-them)). That taint
+depends on the whole workflow set, so the tags are derived again whenever it
+changes — a reload that re-reads the workflows, and `workflow.create`, `update` or
+`delete` — and each derivation that moves them is logged
+(`registry.workflow_tools`), so an operator can inspect the conclusion. A `sync`
+tool's reply is its run's output, and a caller reading it carries that taint into
+the trifecta check; an `async` one hands back a run id.
 
 ## See also
 

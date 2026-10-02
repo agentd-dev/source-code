@@ -484,6 +484,21 @@ impl Runtime {
                 }
                 Some(r)
             }
+            // Workflows re-staged on a registry that is kept still move what
+            // the workflow tools and the read-back contracts carry: the taint
+            // of the runs whose result they return, which the whole set
+            // decides. Re-derived on a copy, and swapped in only when a tag
+            // moved, so a reload that changed nothing still says so.
+            None if workflows.is_some() => {
+                let live = workflows.as_ref().map_or(&self.workflows, |p| &p.workflows);
+                let defs: Vec<&crate::engine::Workflow> = live.values().map(|w| &**w).collect();
+                let mut r = self.registry.clone();
+                let errs = r.register_workflow_tools(&self.settings, &defs);
+                if !errs.is_empty() {
+                    return Err(errs);
+                }
+                (!r.same_tools(&self.registry)).then_some(r)
+            }
             None => None,
         };
         // Skills sources — the config section, or the instruction's inline

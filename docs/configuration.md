@@ -1770,10 +1770,16 @@ inline value is fine; from a file it must be a **reference**:
 - `{{secret:NAME}}` — resolved from the environment variable `NAME`.
 - `{{secret-file:PATH}}` — resolved by reading the mounted file at `PATH`.
 
-References resolve **at startup**, not at `--validate-config` (which is
-deliberately environment-independent): an unset env var or an unreadable file is
-`agentd: intelligence.token: {{secret:LLM_KEY}} is not set in the environment` →
-exit `2` before the first dial. The resolved value is never stored in the
+References are checked by **`--validate-config` and again at startup**, by one
+scan over the whole document and every inline workflow
+(`config/settings/mod.rs::missing_references`), so the two cannot disagree: an
+unset env var, a `{{secret-file:…}}` path that does not exist, or a
+`{{config.…}}` with no `vars` entry is
+`{{secret:LLM_KEY}} is not set in the environment (referenced at config.intelligence.token)`
+→ exit `2` before the first dial. Validation therefore reads the environment it
+runs in: run it with the daemon's. The secrets a definition in a `file:`,
+`dir:`, `url:` or `uri:` source names are checked at startup, once it is read.
+The value itself is read only at startup, and it is never stored in the
 settings or logged — header NAMES only ever reach the logs, and the operator-only
 A2A `config` command returns the merged document with the `{{secret:…}}`
 references still unresolved.

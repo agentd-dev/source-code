@@ -28,6 +28,11 @@ agent:
     When you cannot do something, say what you would need rather than
     apologising at length. You are being read aloud to someone standing in a
     kitchen.
+  # No run's result is read back into this conversation (the note a finished
+  # or failed run would leave): a run's text came from `ears`, and this root
+  # holds `home` and `personal`, the other two legs. RFC 0045 §5.11.3;
+  # docs/security.md, "Streams carry the taint of what feeds them".
+  on_workflow_finished: ignore
 
 # Two tiers on one endpoint. The deep tier exists for exactly one step: the
 # open question a person asks out loud, where the agent has tools and has to
@@ -73,6 +78,14 @@ mcp:
 store:
   kind: file
   file: { path: /var/lib/agentd/hands }
+
+# Nothing here reads a run's result back: `workflow.run` with `wait`,
+# `workflow.wait` and `workflow.status` hand the caller what a run was handed,
+# and the models on this instance hold both of the other legs. Whoever needs
+# a run's outcome reads it over A2A (the `workflow.status` op, the run's
+# task), which these do not touch.
+tools:
+  disabled: [workflow.run, workflow.wait, workflow.status]
 
 # The unix-socket fast lane: `ears` is on this box, so there is no TLS
 # handshake, no TCP stack, and no certificate to rotate. The kernel does the

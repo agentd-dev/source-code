@@ -185,6 +185,10 @@ pub enum Caller<'a> {
 pub struct Registry {
     tools: BTreeMap<String, ToolSpec>,
     servers: Vec<String>,
+    /// The tags each read-back contract had before a workflow set's run
+    /// taint was folded in ([`Registry::register_workflow_tools`]), so a
+    /// re-registration starts from them rather than from the last set's.
+    read_back_base: BTreeMap<String, Vec<TrifectaTag>>,
     /// Non-fatal findings from the build (collisions, missing profile tools).
     pub warnings: Vec<String>,
 }
@@ -413,8 +417,11 @@ impl Registry {
     }
 
     /// Register every workflow carrying a `tool:` block as a first-class
-    /// contract. Called on a freshly built registry only: after the startup
-    /// workflow load, and on the registry a reload builds.
+    /// contract, replacing whatever an earlier set registered: after the
+    /// startup workflow load, on the registry a reload builds or re-derives,
+    /// and when `workflow.create`/`update`/`delete` changes the installed set
+    /// — the tags below are derived from the whole set, so a definition that
+    /// is not a tool can still move them.
     ///
     /// Configuration-only is the whole safety argument. The registry is
     /// otherwise built from settings plus connected servers and validated
@@ -433,16 +440,49 @@ impl Registry {
     /// reads from outside, so a policy matching on tags — and an operator
     /// reading the derived tags logged at startup — sees the truth about what
     /// the procedure can do.
+    ///
+    /// The contracts that hand a run's result back (`workflow.run`,
+    /// `workflow.wait`, `workflow.status`, `internal::read_back`) carry the
+    /// union of every run's taint the same way: any run's output may be what
+    /// they return, and the stream-taint check judges their callers as
+    /// having read it.
     pub fn register_workflow_tools(
         &mut self,
         settings: &Settings,
         workflows: &[&crate::engine::Workflow],
     ) -> Vec<String> {
         let mut errors = Vec::new();
+        // Nothing derived from an earlier set survives: its tools go, and the
+        // read-back contracts return to the tags they were built with.
+        self.tools.retain(|_, t| t.class != ToolClass::Workflow);
+        for t in self.tools.values_mut() {
+            if internal::read_back(&t.name).is_some() {
+                t.tags = self
+                    .read_back_base
+                    .entry(t.name.clone())
+                    .or_insert_with(|| t.tags.clone())
+                    .clone();
+            }
+        }
         // What each run carries from a tainted stream (or from a caller
         // outside the boundary) is part of what calling the tool reaches: its
         // result is that run's output (RFC 0045 §5.11.3).
         let taint = crate::config::taint::run_tags(settings, workflows);
+        let any_run: Vec<TrifectaTag> = taint.values().flatten().fold(Vec::new(), |mut acc, t| {
+            if !acc.contains(t) {
+                acc.push(*t);
+            }
+            acc
+        });
+        for t in self.tools.values_mut() {
+            if internal::read_back(&t.name).is_some() {
+                for tag in &any_run {
+                    if !t.tags.contains(tag) {
+                        t.tags.push(*tag);
+                    }
+                }
+            }
+        }
         for w in workflows {
             let Some(t) = &w.tool else { continue };
             if let Some(existing) = self.tools.get(&t.name) {
@@ -510,6 +550,12 @@ impl Registry {
             );
         }
         errors
+    }
+
+    /// Whether `other` holds exactly these tools, as callers see them — what
+    /// a reload asks of a re-derived registry before it reports a change.
+    pub fn same_tools(&self, other: &Registry) -> bool {
+        self.tools == other.tools
     }
 
     /// The trifecta tags a workflow's steps actually reach — the union over
@@ -1294,6 +1340,56 @@ mod tests {
             reg.get("inbox.next").unwrap().tags,
             vec![TrifectaTag::UntrustedInput]
         );
+    }
+
+    /// The contracts that hand a run's result back carry every run's taint,
+    /// as a sync workflow tool carries its own run's — and a registration
+    /// over another set starts from the tags they were built with, so a
+    /// set that drops the tainted producer drops the taint.
+    #[test]
+    fn read_back_contracts_carry_the_run_taint_and_lose_it_with_the_producer() {
+        let parse = |v: Value| crate::engine::model::parse_workflow(&v).unwrap();
+        let intake = parse(json!({"name": "intake", "steps": {
+            "s": {"kind": "webhook", "path": "/in", "into": {"stream": "inbox", "subject": "m"}}
+        }}));
+        let reader = parse(
+            json!({"name": "reader", "tool": {"name": "inbox.next"}, "steps": {
+                "s": {"kind": "manual"},
+                "w": {"kind": "wait", "depends_on": ["s"], "on": "event", "stream": "inbox"},
+                "f": {"kind": "finish", "depends_on": ["w"], "status": "completed"}
+            }}),
+        );
+        let s = settings(json!({"streams": {"inbox": {}}, "tools": {"narrow": {
+            "workflow.status": {"tags": ["sensitive"]}
+        }}}));
+        let mut reg = Registry::build(&s, &[]).unwrap();
+        let built = reg.clone();
+        assert!(
+            reg.register_workflow_tools(&s, &[&intake, &reader])
+                .is_empty()
+        );
+        for c in ["workflow.run", "workflow.wait", "workflow.status"] {
+            assert!(
+                reg.get(c)
+                    .unwrap()
+                    .tags
+                    .contains(&TrifectaTag::UntrustedInput),
+                "{c}"
+            );
+        }
+        // Not a read-back: it names runs, not what they produced.
+        assert!(reg.get("workflow.list").unwrap().tags.is_empty());
+        // Re-registered without the producer: the taint goes, the tags the
+        // contract was built with stay, and nothing else moved.
+        assert!(reg.register_workflow_tools(&s, &[&reader]).is_empty());
+        assert_eq!(
+            reg.get("workflow.status").unwrap().tags,
+            vec![TrifectaTag::Sensitive]
+        );
+        assert!(reg.get("inbox.next").unwrap().tags.is_empty());
+        assert!(!reg.same_tools(&built), "the workflow tool is registered");
+        assert!(reg.register_workflow_tools(&s, &[]).is_empty());
+        assert!(reg.same_tools(&built), "{:?}", reg.get("inbox.next"));
     }
 
     #[test]

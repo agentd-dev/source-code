@@ -934,9 +934,58 @@ pub fn onward(name: &str) -> Option<Onward> {
     }
 }
 
+/// Which run's result an internal contract hands back to its caller. The
+/// stream-taint check (`config::taint`) follows these edges BACK: a caller
+/// handed the output of a run the outside text reaches has that text in front
+/// of it, exactly as if it had read the stream itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadBack {
+    /// The run it starts, when the call waits for it (`wait: true`).
+    Started,
+    /// A run named by id — whose workflow only the run knows.
+    Run,
+    /// A run named by id, or every run of a workflow named by `name`.
+    Runs,
+}
+
+/// The contracts whose reply carries a run's result, and which run. Kept
+/// beside [`onward`] for the same reason; the test below holds every name to a
+/// contract. `workflow.list` is not one: it names runs and their status, never
+/// what they produced.
+pub fn read_back(name: &str) -> Option<ReadBack> {
+    match name {
+        "workflow.run" => Some(ReadBack::Started),
+        "workflow.wait" => Some(ReadBack::Run),
+        "workflow.status" => Some(ReadBack::Runs),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every contract `read_back` classifies exists, and each one's output
+    /// schema really carries a result — a renamed contract would drop out of
+    /// the taint check's read-back edges without a word.
+    #[test]
+    fn every_read_back_edge_names_a_contract_that_returns_a_result() {
+        let all = contracts();
+        let classified: Vec<&Contract> =
+            all.iter().filter(|c| read_back(c.name).is_some()).collect();
+        assert_eq!(
+            classified.iter().map(|c| c.name).collect::<Vec<_>>(),
+            ["workflow.run", "workflow.status", "workflow.wait"]
+        );
+        for c in classified {
+            let out = c.output["properties"].to_string();
+            assert!(
+                out.contains("\"output\"") || out.contains("\"runs\""),
+                "{} hands back no result: {out}",
+                c.name
+            );
+        }
+    }
 
     /// `ask_human`'s contract has to say what the implementation does, in both
     /// directions. It once drifted apart in both at the same time: `to` was

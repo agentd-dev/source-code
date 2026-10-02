@@ -548,6 +548,190 @@ fn a_name_moves_between_the_runtime_and_the_configuration_across_restarts() {
 }
 
 // ---------------------------------------------------------------------------
+// A route from a stored definition (RFC 0045 §8 item 13): a definition the
+// agent writes opens an inbound route on the operator's webhook listener only
+// under the grant a served document needs, `interface`.
+
+/// A definition opening a route with a `webhook` start.
+fn hook_definition(name: &str) -> serde_json::Value {
+    serde_json::json!({"name": name, "steps": {
+        "s": {"kind": "webhook", "path": format!("/in/{name}")},
+        "f": {"kind": "finish", "depends_on": ["s"], "status": "completed"}}})
+}
+
+/// A definition opening one with a `wait {on: webhook}` nested in a body.
+fn nested_hook_definition(name: &str) -> serde_json::Value {
+    serde_json::json!({"name": name, "steps": {
+        "s": {"kind": "manual"},
+        "each": {"kind": "foreach", "depends_on": ["s"], "over": "{{inputs.items}}",
+                 "body": {"steps": {
+                     "w": {"kind": "wait", "on": "webhook", "webhook": {"path": "/in/nested"}}
+                 }}},
+        "f": {"kind": "finish", "depends_on": ["each"], "status": "completed"}}})
+}
+
+/// [`model_config`], with `agent.document_capabilities` granting `grants`.
+fn granted_config(
+    t: &std::path::Path,
+    dir: &std::path::Path,
+    instruction: &std::path::Path,
+    grants: &str,
+) -> String {
+    model_config(t, dir, instruction).replacen(
+        "agent: { name: edits,",
+        &format!("agent: {{ document_capabilities: [{grants}], name: edits,"),
+        1,
+    )
+}
+
+/// Whether each tool call of the run was refused, in order.
+fn call_errors(stderr: &str) -> Vec<bool> {
+    events(stderr, "tool.result")
+        .iter()
+        .filter_map(|e| e["is_error"].as_bool())
+        .collect()
+}
+
+#[test]
+fn a_runtime_definition_opens_a_route_only_under_the_interface_grant() {
+    for grants in ["", "interface"] {
+        let t = tempfile::tempdir().unwrap();
+        let wf = t.path().join("workflows");
+        std::fs::create_dir(&wf).unwrap();
+        std::fs::write(wf.join("keep.yaml"), workflow_file("keep", "kept")).unwrap();
+        let doc = t.path().join("agent.md");
+        std::fs::write(&doc, "Keep things tidy.\n").unwrap();
+        let cfg = t.path().join("agent.yaml");
+        std::fs::write(&cfg, granted_config(t.path(), &wf, &doc, grants)).unwrap();
+        std::fs::write(
+            t.path().join("play.json"),
+            one_call_per_turn(
+                0,
+                &[
+                    call(
+                        "workflow.create",
+                        serde_json::json!({"definition": definition("mine")}),
+                    ),
+                    call(
+                        "workflow.create",
+                        serde_json::json!({"definition": hook_definition("hook"), "arm": false}),
+                    ),
+                    // The route nested in a body, written over a definition
+                    // that opened none.
+                    call(
+                        "workflow.update",
+                        serde_json::json!({"name": "mine", "definition": nested_hook_definition("mine")}),
+                    ),
+                ],
+            ),
+        )
+        .unwrap();
+        let (code, _, stderr) = run(&cfg);
+        assert_eq!(code, Some(0), "stderr:\n{stderr}");
+        if grants.is_empty() {
+            assert_eq!(
+                defined(&stderr),
+                [("workflow.create".to_string(), "mine".to_string())],
+                "{stderr}"
+            );
+            assert_eq!(call_errors(&stderr), [false, true, true], "{stderr}");
+            // The last refusal, echoed: it names the step inside the body
+            // and the grant.
+            let answer = replies(&stderr);
+            for want in [
+                "workflow \"mine\" step \"each/w\" is a `wait {on: webhook}`",
+                "`workflow.create`/`update` may open one only under the `interface` grant",
+                "agent.document_capabilities: [interface]",
+            ] {
+                assert!(answer.contains(want), "no {want:?} in the answer: {answer}");
+            }
+        } else {
+            assert_eq!(
+                defined(&stderr),
+                [
+                    ("workflow.create".to_string(), "mine".to_string()),
+                    ("workflow.create".to_string(), "hook".to_string()),
+                    ("workflow.update".to_string(), "mine".to_string())
+                ],
+                "{stderr}"
+            );
+            assert_eq!(call_errors(&stderr), [false, false, false], "{stderr}");
+        }
+    }
+}
+
+/// The grant is read at every load, not only when the definition was
+/// written: a restart without it leaves out the stored route — it cannot
+/// refuse the operator's start, as no stored definition can — keeps it in
+/// the store, and a restart with the grant back loads it again.
+#[test]
+fn a_stored_route_loads_only_while_the_grant_stands() {
+    let t = tempfile::tempdir().unwrap();
+    let wf = t.path().join("workflows");
+    std::fs::create_dir(&wf).unwrap();
+    std::fs::write(wf.join("keep.yaml"), workflow_file("keep", "kept")).unwrap();
+    let doc = t.path().join("agent.md");
+    std::fs::write(&doc, "Keep things tidy.\n").unwrap();
+    let cfg = t.path().join("agent.yaml");
+    let play = t.path().join("play.json");
+
+    std::fs::write(&cfg, granted_config(t.path(), &wf, &doc, "interface")).unwrap();
+    std::fs::write(
+        &play,
+        one_call_per_turn(
+            0,
+            &[call(
+                "workflow.create",
+                serde_json::json!({"definition": hook_definition("hook"), "arm": false}),
+            )],
+        ),
+    )
+    .unwrap();
+    let (code, _, stderr) = run(&cfg);
+    assert_eq!(code, Some(0), "stderr:\n{stderr}");
+    assert_eq!(
+        defined(&stderr),
+        [("workflow.create".to_string(), "hook".to_string())],
+        "{stderr}"
+    );
+
+    std::fs::write(&play, one_call_per_turn(1, &[])).unwrap();
+    std::fs::write(&cfg, granted_config(t.path(), &wf, &doc, "")).unwrap();
+    let (code, _, stderr) = run(&cfg);
+    assert_eq!(
+        code,
+        Some(0),
+        "the stored route refused the start:\n{stderr}"
+    );
+    assert!(
+        events(&stderr, "workflow.stored.invalid")
+            .iter()
+            .any(|e| e["name"] == "hook"
+                && e["errors"].as_array().is_some_and(|es| es.iter().any(|m| m
+                    .as_str()
+                    .is_some_and(|m| m.contains("step \"s\" is a `webhook` start")
+                        && m.contains("the `interface` grant"))))),
+        "{stderr}"
+    );
+    assert!(
+        events(&stderr, "workflow.loaded")
+            .iter()
+            .all(|e| e["name"] != "hook"),
+        "{stderr}"
+    );
+
+    std::fs::write(&cfg, granted_config(t.path(), &wf, &doc, "interface")).unwrap();
+    let (code, _, stderr) = run(&cfg);
+    assert_eq!(code, Some(0), "stderr:\n{stderr}");
+    assert!(
+        events(&stderr, "workflow.loaded")
+            .iter()
+            .any(|e| e["name"] == "hook" && e["source"] == "store"),
+        "the grant back loads it again: {stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Reload: the same refusal, and the running definition stays.
 
 #[cfg(feature = "hot-reload")]
@@ -952,4 +1136,91 @@ fn a_refused_reload_keeps_the_names_the_running_configuration_owns() {
     }
     assert!(defined(&log).is_empty(), "{log}");
     assert!(events(&log, "workflow.deleted").is_empty(), "{log}");
+}
+
+/// A reload cannot take the `interface` grant away — it is restart-only, as
+/// it is for a served document — so a reload that drops it is refused, and
+/// the routes the agent stored under it stay what they were until the
+/// restart that `a_stored_route_loads_only_while_the_grant_stands` covers.
+#[cfg(all(feature = "hot-reload", feature = "a2a"))]
+#[test]
+fn a_reload_dropping_the_interface_grant_is_refused_and_the_grant_stands() {
+    let t = tempfile::tempdir().unwrap();
+    let wf = t.path().join("workflows");
+    std::fs::create_dir(&wf).unwrap();
+    std::fs::write(wf.join("tick.yaml"), workflow_file("tick", "ticked")).unwrap();
+    let play = t.path().join("play.json");
+    let cfg = t.path().join("agent.yaml");
+    let body = |port: u16, grants: &str| {
+        daemon_config(
+            &wf,
+            "Keep things tidy.",
+            &format!(
+                "intelligence: {{ endpoints: \"mock:file:{}\", model: mock }}\n\
+                 a2a: {{ listen: \"http://127.0.0.1:{port}\" }}\n",
+                play.display()
+            ),
+        )
+        .replacen(
+            "agent:\n",
+            &format!("agent:\n  document_capabilities: [{grants}]\n"),
+            1,
+        )
+    };
+    let (d, addr) = common::spawn_bound(|port| {
+        std::fs::write(&cfg, body(port, "interface")).unwrap();
+        let d = Daemon::spawn(&cfg);
+        let log = d.err_path.clone();
+        (d, log)
+    });
+    let port: u16 = addr
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse().ok())
+        .unwrap_or_else(|| panic!("no port in {addr}"));
+    let converse = |name: &str| {
+        std::fs::write(
+            &play,
+            one_call_per_turn(
+                0,
+                &[call(
+                    "workflow.create",
+                    serde_json::json!({"definition": hook_definition(name), "arm": false}),
+                )],
+            ),
+        )
+        .unwrap();
+        let sent = common::SendMessage::text("go").post(&addr);
+        assert_eq!(
+            sent["result"]["task"]["status"]["state"], "TASK_STATE_COMPLETED",
+            "{sent}"
+        );
+    };
+
+    converse("hook");
+    std::fs::write(&cfg, body(port, "")).unwrap();
+    d.sighup();
+    let log = d.wait_for(
+        |l| !events(l, "config.reload.restart_required").is_empty(),
+        "the refusal",
+        10,
+    );
+    assert!(
+        events(&log, "config.reload.restart_required")
+            .iter()
+            .any(|e| e["paths"]
+                .as_array()
+                .is_some_and(|p| p.iter().any(|p| p == "agent.document_capabilities"))),
+        "{log}"
+    );
+    assert!(events(&log, "config.reloaded").is_empty(), "{log}");
+    converse("hook2");
+    assert_eq!(
+        defined(&d.stderr()),
+        [
+            ("workflow.create".to_string(), "hook".to_string()),
+            ("workflow.create".to_string(), "hook2".to_string())
+        ],
+        "the running grant stands until a restart:\n{}",
+        d.stderr()
+    );
 }

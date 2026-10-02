@@ -54,6 +54,12 @@ agent:
     The status page is customers reading during an outage: update it early,
     in plain words, and close it honestly.
   ask_human_fallback: wait
+  # No run's result is read back into this conversation (the note a finished
+  # or failed run would leave): an incident run's text came from an alert
+  # webhook, and this root holds `infra` and `statuspage`, the other two
+  # legs. RFC 0045 §5.11.3; docs/security.md, "Streams carry the taint of
+  # what feeds them".
+  on_workflow_finished: ignore
 
 intelligence:
   endpoints: https://api.openai.com/v1
@@ -66,6 +72,14 @@ intelligence:
 store:
   kind: file
   file: { path: /var/lib/agentd/startup/sre }
+
+# Nothing here reads a run's result back: `workflow.run` with `wait`,
+# `workflow.wait` and `workflow.status` hand the caller what a run was handed,
+# and the models on this instance hold both of the other legs. Whoever needs
+# a run's outcome reads it over A2A (the `workflow.status` op, the run's
+# task), which these do not touch.
+tools:
+  disabled: [workflow.run, workflow.wait, workflow.status]
 
 mcp:
   servers:

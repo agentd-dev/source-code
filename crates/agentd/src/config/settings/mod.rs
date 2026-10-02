@@ -1198,10 +1198,54 @@ pub(crate) fn document_route_refusals<'a>(
     granted: &std::collections::BTreeSet<String>,
     document: &str,
 ) -> Vec<String> {
+    ungranted_routes(
+        workflows,
+        |g| granted.contains(g),
+        |name, step, what, grant| {
+            format!(
+                "workflow {name:?} step {step:?} from {document} is {what}, which opens an inbound \
+             route on the operator's webhook listener — a served document may open one only \
+             under the `{grant}` grant, the one `:::!endpoint` needs \
+             (`agent.document_capabilities: [{grant}]`); grant it, or declare the workflow in \
+             the operator's configuration"
+            )
+        },
+    )
+}
+
+/// The routes a definition stored with `workflow.create`/`update` would
+/// open without the operator's grant — the same grant a served document
+/// needs, read from the operator's own `agent.document_capabilities` (a
+/// stored definition carries no signature to narrow it by). Whoever calls
+/// the tool, the definition is not the operator's configuration: a route it
+/// opened would answer the network with the auth the agent chose for it.
+pub(crate) fn stored_route_refusals(def: &Value, capabilities: &[String]) -> Vec<String> {
+    ungranted_routes(
+        std::iter::once(def),
+        |g| capabilities.iter().any(|c| c == g),
+        |name, step, what, grant| {
+            format!(
+                "workflow {name:?} step {step:?} is {what}, which opens an inbound route on the \
+                 operator's webhook listener — a definition stored with \
+                 `workflow.create`/`update` may open one only under the `{grant}` grant, the one \
+                 a served document needs (`agent.document_capabilities: [{grant}]`); the operator \
+                 grants it, or declares the workflow in the configuration"
+            )
+        },
+    )
+}
+
+/// Every route `workflows` open, unless `granted` holds the grant opening one
+/// needs, each said by `say(workflow, step, what, grant)`.
+fn ungranted_routes<'a>(
+    workflows: impl IntoIterator<Item = &'a Value>,
+    granted: impl Fn(&str) -> bool,
+    say: impl Fn(&str, &str, &str, &str) -> String,
+) -> Vec<String> {
     let Some(grant) = crate::config::idoc::grant_of("endpoint") else {
         return Vec::new();
     };
-    if granted.contains(grant) {
+    if granted(grant) {
         return Vec::new();
     }
     workflows
@@ -1210,16 +1254,8 @@ pub(crate) fn document_route_refusals<'a>(
             let name = w.get("name").and_then(Value::as_str).unwrap_or("?");
             crate::engine::model::inbound_routes(w)
                 .into_iter()
-                .map(move |r| {
-                    format!(
-                        "workflow {name:?} step {:?} from {document} is {}, which opens an inbound \
-                         route on the operator's webhook listener — a served document may open one \
-                         only under the `{grant}` grant, the one `:::!endpoint` needs \
-                         (`agent.document_capabilities: [{grant}]`); grant it, or declare the \
-                         workflow in the operator's configuration",
-                        r.step, r.what
-                    )
-                })
+                .map(|r| say(name, &r.step, r.what, grant))
+                .collect::<Vec<_>>()
         })
         .collect()
 }
@@ -10034,6 +10070,37 @@ mod tests {
         ) {
             panic!("an endpoint block under its grant: {e}");
         }
+    }
+
+    /// A definition stored with `workflow.create`/`update` is held to the
+    /// grant a document is: every route it opens — a `webhook` start, a
+    /// `wait {on: webhook}` at the top or nested in a body or a branch —
+    /// is refused without `interface`, naming the step and the grant, and
+    /// nothing is with it. One that opens none needs no grant.
+    #[test]
+    fn a_stored_definition_opens_a_route_only_under_the_interface_grant() {
+        let def = json!({"name": "hooks", "steps": {
+            "s": {"kind": "webhook", "path": "/in"},
+            "w": {"kind": "wait", "depends_on": ["s"], "on": "webhook"},
+            "each": {"kind": "foreach", "depends_on": ["w"], "over": "{{inputs.x}}",
+                     "body": {"steps": {"n": {"kind": "wait", "on": "webhook"}}}},
+            "par": {"kind": "parallel", "depends_on": ["each"], "branches": {
+                "b": {"steps": {"m": {"kind": "wait", "on": "webhook"}}}}},
+            "f": {"kind": "finish", "depends_on": ["par"], "status": "completed"}}});
+        let refused = stored_route_refusals(&def, &["material".to_string()]);
+        assert_eq!(refused.len(), 4, "{refused:?}");
+        for step in ["\"s\"", "\"w\"", "\"each/n\"", "\"par/b/m\""] {
+            assert!(
+                refused.iter().any(|r| r.starts_with(&format!("workflow \"hooks\" step {step}"))
+                    && r.contains("`workflow.create`/`update` may open one only under the `interface` grant")),
+                "{step}: {refused:?}"
+            );
+        }
+        assert!(stored_route_refusals(&def, &["interface".to_string()]).is_empty());
+        let quiet = json!({"name": "quiet", "steps": {
+            "s": {"kind": "manual"},
+            "w": {"kind": "wait", "depends_on": ["s"], "on": "signal", "signal": "go"}}});
+        assert!(stored_route_refusals(&quiet, &[]).is_empty());
     }
 
     /// A route the OPERATOR configures is theirs to open: the same workflow,

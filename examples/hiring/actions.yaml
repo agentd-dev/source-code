@@ -41,6 +41,12 @@ agent:
       - One matrix row per candidate. Update it; never append a duplicate.
       - If a fact you need is missing, say what is missing. Do not invent an
         address, a score, or a requirement.
+  # No run's result is read back into this conversation (the note a finished
+  # or failed run would leave): each run's text is the intake agent's analysis
+  # of a CV, and this root holds `drive` and `email`, the other two legs.
+  # RFC 0045 §5.11.3; docs/security.md, "Streams carry the taint of what
+  # feeds them".
+  on_workflow_finished: ignore
 
 intelligence:
   endpoints: https://gateway.internal/v1
@@ -65,6 +71,14 @@ mcp:
 store:
   kind: file
   file: { path: /var/lib/agentd/hiring-actions }
+
+# Nothing here reads a run's result back: `workflow.run` with `wait`,
+# `workflow.wait` and `workflow.status` hand the caller what a run was handed,
+# and the models on this instance hold both of the other legs. Whoever needs
+# a run's outcome reads it over A2A (the `workflow.status` op, the run's
+# task), which these do not touch.
+tools:
+  disabled: [workflow.run, workflow.wait, workflow.status]
 
 a2a:
   listen: "https://0.0.0.0:8444"

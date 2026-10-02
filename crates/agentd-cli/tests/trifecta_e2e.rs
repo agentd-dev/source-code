@@ -19,8 +19,11 @@ use std::path::Path;
 use std::process::Command;
 
 /// A sensitive + egress server — the two legs the root fold allows together —
-/// and the stream an outside edge can append to.
+/// and the stream an outside edge can append to. The root reads no run's
+/// result back: holding `mail`, it would otherwise be refused beside every
+/// workflow these tests judge.
 const BASE: &str = "agent:\n  name: taint\n  instruction: Triage the inbox.\n\
+     \x20 on_workflow_finished: ignore\n  tools: {internal: [workflow.create]}\n\
      store: {kind: memory}\n\
      mcp:\n  servers:\n\
      \x20   - {name: mail, endpoint: \"https://mail.invalid/mcp\", tags: {\"*\": [sensitive, egress]}}\n\
@@ -293,8 +296,7 @@ fn a_reload_introducing_the_path_is_refused_and_the_running_config_stays() {
          f: {kind: finish, depends_on: [a], status: completed}\n",
     )
     .unwrap();
-    let port = common::free_port();
-    let body = |tags: &str| {
+    let body = |port: u16, tags: &str| {
         format!(
             "agent:\n  name: taint\n  instruction: Triage the inbox.\n\
              store: {{kind: memory}}\n\
@@ -309,9 +311,20 @@ fn a_reload_introducing_the_path_is_refused_and_the_running_config_stays() {
         )
     };
     let cfg = t.path().join("agent.yaml");
-    let original = body("sensitive");
-    std::fs::write(&cfg, &original).unwrap();
-    let d = Daemon::spawn(&cfg);
+    // The port is the one the daemon reports binding, not a probe: another
+    // test can take a probed port before the daemon binds it, and a daemon
+    // that lost that race is retried on a fresh one.
+    let (d, bound) = common::spawn_listener_bound("webhooks.listen", |port| {
+        std::fs::write(&cfg, body(port, "sensitive")).unwrap();
+        let d = Daemon::spawn(&cfg);
+        let log = d.log.to_string_lossy().into_owned();
+        (d, log)
+    });
+    let port: u16 = bound
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse().ok())
+        .unwrap_or_else(|| panic!("no port in {bound}"));
+    let original = body(port, "sensitive");
     d.wait_for(
         |d| {
             d.events("workflow.loaded")
@@ -322,7 +335,7 @@ fn a_reload_introducing_the_path_is_refused_and_the_running_config_stays() {
     );
 
     // `egress` joins the consumer's server: the trifecta is complete.
-    std::fs::write(&cfg, body("sensitive, egress")).unwrap();
+    std::fs::write(&cfg, body(port, "sensitive, egress")).unwrap();
     d.sighup();
     d.wait_for(
         |d| !d.events("config.reload.invalid").is_empty(),
@@ -383,6 +396,7 @@ fn an_agent_written_definition_is_held_to_the_same_check() {
     let body = |a_tags: &str| {
         format!(
             "agent:\n  name: taint\n  prompt: go\n  instruction: Triage the inbox.\n\
+             \x20 on_workflow_finished: ignore\n  tools: {{internal: [workflow.create]}}\n\
              intelligence: {{ endpoints: \"mock:file:{}\", model: mock }}\n\
              store: {{kind: memory}}\n\
              lifecycle: {{run_until: drained}}\n\
@@ -604,4 +618,222 @@ fn a_reader_holding_a_tool_that_hands_text_on_is_refused() {
         assert_eq!(code, 2, "{tool}: {err}");
         assert!(err.contains("lethal-trifecta refused"), "{tool}: {err}");
     }
+}
+
+// ---- results read back (RFC 0045 §5.11.3, "follow it") --------------------
+
+/// `fetch` reads `inbox` into an agent holding `notes` alone — two legs, and
+/// allowed — and is a sync tool, so its reply is what it read, worked over.
+/// Not granted to the root, which these tests keep from reading back.
+const FETCH: &str = "  - name: fetch\n    tool: {name: inbox.next, grant: {root: false}}\n    steps:\n      \
+     s: {kind: manual}\n      \
+     w: {kind: wait, depends_on: [s], on: event, stream: inbox}\n      \
+     a: {kind: agent, depends_on: [w], instruction: \"Read it.\", servers: [notes], tools: [\"notes.*\"]}\n      \
+     f: {kind: finish, depends_on: [a], status: completed}\n";
+
+/// A manually started workflow whose step `r` reads something back before
+/// an agent holding `mail` — both other legs — acts.
+fn caller(read: &str) -> String {
+    format!(
+        "  - name: caller\n    steps:\n      s: {{kind: manual}}\n      \
+         r: {{depends_on: [s], {read}}}\n      \
+         a: {{kind: agent, depends_on: [r], instruction: \"Act.\", servers: [mail], tools: [\"mail.*\"]}}\n      \
+         f: {{kind: finish, depends_on: [a], status: completed}}\n"
+    )
+}
+
+/// Every spelling of a result read back makes its caller carry the text the
+/// run was handed: refused at load naming the edge, and loaded under the
+/// explicit allow.
+#[test]
+fn a_caller_reading_back_a_tainted_result_is_refused_through_each_path() {
+    let t = tempfile::tempdir().unwrap();
+    for (read, edge) in [
+        (
+            "kind: agent, instruction: \"Look.\", servers: [], tools: [inbox.next]",
+            "(through its tool \\\"inbox.next\\\")",
+        ),
+        ("kind: workflow, name: fetch", "step \\\"r\\\""),
+        (
+            "kind: tool, name: workflow.run, args: {name: fetch, wait: true}",
+            "step \\\"r\\\"",
+        ),
+        (
+            "kind: agent, instruction: \"Look.\", servers: [], tools: [workflow.run]",
+            "(through workflow.run)",
+        ),
+        (
+            "kind: workflow.wait, run: \"{{inputs.run}}\"",
+            "step \\\"r\\\"",
+        ),
+        (
+            "kind: wait, on: run, run: \"{{inputs.run}}\"",
+            "step \\\"r\\\"",
+        ),
+        (
+            "kind: agent, instruction: \"Look.\", servers: [], tools: [workflow.wait]",
+            "(through workflow.wait)",
+        ),
+        (
+            "kind: agent, instruction: \"Look.\", servers: [], tools: [workflow.status]",
+            "(through workflow.status)",
+        ),
+    ] {
+        let workflows = [WEBHOOK_INTO, FETCH, &caller(read)];
+        let (code, err) = validate(t.path(), &config(&workflows, ""));
+        assert_eq!(code, 2, "{read}: {err}");
+        for want in [
+            "workflow \\\"caller\\\": lethal-trifecta refused",
+            "it reads back the result of workflow \\\"fetch\\\"",
+            edge,
+            "mcp server \\\"mail\\\" [sensitive, egress]",
+        ] {
+            assert!(err.contains(want), "{read}: no {want:?} in\n{err}");
+        }
+        let (code, err) = validate(
+            t.path(),
+            &config(&workflows, "security:\n  allow_trifecta: true\n"),
+        );
+        assert_eq!(code, 0, "{read}: {err}");
+    }
+    // The control: a child it never reads back hands it nothing.
+    let (code, err) = validate(
+        t.path(),
+        &config(
+            &[
+                WEBHOOK_INTO,
+                FETCH,
+                &caller("kind: workflow, name: fetch, mode: detached"),
+            ],
+            "",
+        ),
+    );
+    assert_eq!(code, 0, "{err}");
+}
+
+/// The root conversation reads results back too — by default, the note a
+/// failed run leaves in its transcript — and holding `mail` it is refused,
+/// naming the edge; a root that reads nothing back loads.
+#[test]
+fn the_root_reading_back_a_tainted_result_is_refused() {
+    let t = tempfile::tempdir().unwrap();
+    let quiet = config(&[WEBHOOK_INTO, FETCH], "");
+    let (code, err) = validate(t.path(), &quiet);
+    assert_eq!(code, 0, "{err}");
+    let (code, err) = validate(
+        t.path(),
+        &quiet.replace("  on_workflow_finished: ignore\n", ""),
+    );
+    assert_eq!(code, 2, "{err}");
+    for want in [
+        "the root conversation: lethal-trifecta refused",
+        "it reads back the result of workflow \\\"fetch\\\"",
+        "(the note `agent.on_workflow_finished` writes into its transcript)",
+        "mcp server \\\"mail\\\" [sensitive, egress]",
+    ] {
+        assert!(err.contains(want), "no {want:?} in\n{err}");
+    }
+}
+
+/// A reload that changes only the workflows re-derives what the workflow
+/// tools carry. A new producer taints the stream `fetch` reads; the registry
+/// is kept (no tool or server moved), and before, so were the tags derived
+/// from the set that had no producer.
+#[cfg(all(feature = "hot-reload", feature = "a2a"))]
+#[test]
+fn a_workflow_only_reload_retags_the_workflow_tools() {
+    let t = tempfile::tempdir().unwrap();
+    let cfg = t.path().join("agent.yaml");
+    let body = |port: u16, workflows: &str| {
+        format!(
+            "agent:\n  name: taint\n  instruction: Triage the inbox.\n\
+             store: {{kind: memory}}\n\
+             lifecycle: {{run_until: drained}}\n\
+             observability:\n  log_level: info\n\
+             a2a: {{ listen: \"http://127.0.0.1:{port}\" }}\n\
+             streams:\n  inbox: {{}}\n\
+             workflows:\n{FETCH}{workflows}"
+        )
+    };
+    let (d, bound) = common::spawn_bound(|port| {
+        std::fs::write(&cfg, body(port, "")).unwrap();
+        let d = Daemon::spawn(&cfg);
+        let log = d.log.to_string_lossy().into_owned();
+        (d, log)
+    });
+    let port: u16 = bound
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse().ok())
+        .unwrap_or_else(|| panic!("no port in {bound}"));
+    let tags = |d: &Daemon| -> Vec<serde_json::Value> {
+        d.events("registry.workflow_tools")
+            .iter()
+            .filter(|e| e["tool"] == "inbox.next")
+            .map(|e| e["tags"].clone())
+            .collect()
+    };
+    assert_eq!(tags(&d), [serde_json::json!([])], "{}", d.log());
+
+    std::fs::write(&cfg, body(port, A2A_INTO)).unwrap();
+    d.sighup();
+    d.wait_for(|d| !d.events("config.reloaded").is_empty(), "the reload");
+    assert_eq!(
+        tags(&d)[1..],
+        [serde_json::json!(["untrusted_input"])],
+        "{}",
+        d.log()
+    );
+}
+
+/// A definition the agent writes moves the workflow tools' tags too: one
+/// that appends an A2A peer's text to `inbox` taints what `fetch`'s tool
+/// returns, though it is no tool itself. Re-derived at the write, as a
+/// reload re-derives them.
+#[test]
+fn a_definition_the_agent_writes_retags_the_workflow_tools() {
+    let t = tempfile::tempdir().unwrap();
+    let play = t.path().join("play.json");
+    std::fs::write(
+        &play,
+        serde_json::json!({"turns": [
+            {"tool_calls": [{"name": "workflow.create", "arguments": {"definition": {
+                "name": "feed", "steps": {
+                    "hook": {"kind": "a2a", "command": "note",
+                             "into": {"stream": "inbox", "subject": "msg"}}}}}}]},
+            {"echo_tool_result": true}
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    let cfg = t.path().join("agent.yaml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "agent:\n  name: taint\n  prompt: go\n  instruction: Triage the inbox.\n\
+             intelligence: {{ endpoints: \"mock:file:{}\", model: mock }}\n\
+             store: {{kind: memory}}\n\
+             lifecycle: {{run_until: idle, idle_grace: 300ms}}\n\
+             observability:\n  log_level: info\n\
+             streams:\n  inbox: {{}}\n\
+             workflows:\n{FETCH}",
+            play.display()
+        ),
+    )
+    .unwrap();
+    let (code, err) = agentd(&["--config", &cfg.to_string_lossy()]);
+    assert_eq!(code, 0, "{err}");
+    let tags: Vec<serde_json::Value> = err
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["event"] == "registry.workflow_tools" && v["tool"] == "inbox.next")
+        .map(|v| v["tags"].clone())
+        .collect();
+    assert_eq!(
+        tags,
+        [
+            serde_json::json!([]),
+            serde_json::json!(["untrusted_input"])
+        ],
+        "{err}"
+    );
 }

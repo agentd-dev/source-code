@@ -98,6 +98,26 @@ pub struct Kind {
     /// (`x-noun`/`x-nouns`): `[3 human roles are declared: …]`.
     pub noun: Option<String>,
     pub nouns: Option<String>,
+    /// `x-alias-of`: the kind this one is another spelling of (`always` →
+    /// `must`, `avoid` → `should`, `info` → `note`). The tree keeps the
+    /// alias as authored; delivery labels it as its canonical kind.
+    pub alias_of: Option<String>,
+    /// `x-acknowledgement-trigger`: the acknowledgement a block delivers when
+    /// it carries a trigger (S11, `!skill`'s "use it when …").
+    pub ack_trigger: Option<String>,
+    /// `x-body-schema`: what the body is expected to hold, a JSON Schema or a
+    /// URL naming one. Informative only (S22): a reader never refuses a
+    /// document by it, so it is kept as data and nothing here reads it.
+    pub body_schema: Option<Value>,
+}
+
+/// What the schema constrains an attribute's value to (`$defs.attrs.<kind>.
+/// properties.<attr>`): an `enum` of admissible values, a `pattern`, or both.
+/// Loaded here, enforced at validation.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AttrRule {
+    pub values: Option<Vec<String>>,
+    pub pattern: Option<String>,
 }
 
 /// The registry as loaded from the vendored JSON Schema — every kind, plus the
@@ -106,21 +126,50 @@ pub struct Registry {
     kinds: BTreeMap<String, Kind>,
     grant_tokens: BTreeSet<String>,
     keywords: BTreeMap<String, String>,
-    /// The keywords whose `x-registry.keyword-flags` set `not` (`SHOULD NOT`):
-    /// the keyword maps to the same kind as its positive form, so the flag is
-    /// the only thing that keeps the rule's polarity.
-    negating_keywords: BTreeSet<String>,
+    /// The keywords, longest first: the order `x-grammar.keywordLine`'s
+    /// alternation tries them in, so `MUST NOT:` is never read as `MUST`
+    /// followed by text.
+    keywords_longest_first: Vec<String>,
+    /// keyword → the attributes its `x-registry.keyword-flags` set true
+    /// (`SHOULD NOT` → `not`): the keyword maps to the same kind as its
+    /// positive form, so the flag is the only thing that keeps the rule's
+    /// polarity.
+    keyword_flags: BTreeMap<String, BTreeSet<String>>,
+    /// kind → its delivered label (`x-registry.labels`; `always` → `MUST`).
+    labels: BTreeMap<String, String>,
     /// kind → the label a NEGATED block of it delivers (`should` → `SHOULD
     /// NOT`), from `x-registry.negated-labels`.
     negated_labels: BTreeMap<String, String>,
+    /// rule kind → its strength (`x-registry.strengths`). A kind listed here
+    /// is a RULE: it can carry a reason (S14) and override another (S24).
+    strengths: BTreeMap<String, u32>,
+    /// The keyword that opens a rule's reason (`BECAUSE`).
+    reason_keyword: String,
+    /// The context keys a host may supply as facts (`agent`, `model`, …).
+    context_keys: Vec<String>,
+    /// The delivery label styles a document may choose (`bold`, …).
+    label_styles: Vec<String>,
+    /// The names a BARE block may not take (§3.3; S23): machinery that was in
+    /// version 1. Machinery registered after it (`eval`) is not reserved.
+    reserved_bare: BTreeSet<String>,
+    /// sigil → the URI schemes a cross-document reference with it may use
+    /// (`@` → `principal`, `agent`).
+    sigils: BTreeMap<String, Vec<String>>,
+    /// The grants never admissible in a document that arrived over the wire.
+    wire_floor: Vec<String>,
     /// kind → the attribute names the schema marks `x-multivalued`
     /// (comma-separated within one value; normalized to arrays).
     multivalued: BTreeMap<String, BTreeSet<String>>,
+    /// (kind, attribute) → the values or pattern its schema allows.
+    attr_rules: BTreeMap<(String, String), AttrRule>,
     /// The machinery names in the SCHEMA's order (refusals cite the first few).
     machinery_order: Vec<String>,
     /// kind → the attribute names its schema declares.
     attrs: BTreeMap<String, BTreeSet<String>>,
     version: u32,
+    /// The registry revision (`1.1`) — the version of the tables, where
+    /// `version` is the document format's.
+    revision: String,
 }
 
 /// The Instruction Document Specification's registry and grammar, vendored
@@ -176,21 +225,55 @@ impl Registry {
                 }
             }
         }
-        let negating_keywords: BTreeSet<String> = reg["keyword-flags"]
+        let mut keywords_longest_first: Vec<String> = keywords.keys().cloned().collect();
+        keywords_longest_first.sort_by_key(|k| std::cmp::Reverse(k.len()));
+        let keyword_flags: BTreeMap<String, BTreeSet<String>> = reg["keyword-flags"]
             .as_object()
             .into_iter()
             .flatten()
-            .filter(|(_, flags)| flags["not"].as_bool() == Some(true))
-            .map(|(kw, _)| kw.clone())
+            .map(|(kw, flags)| {
+                let set = flags
+                    .as_object()
+                    .into_iter()
+                    .flatten()
+                    .filter(|(_, v)| v.as_bool() == Some(true))
+                    .map(|(f, _)| f.clone())
+                    .collect();
+                (kw.clone(), set)
+            })
             .collect();
-        let negated_labels: BTreeMap<String, String> = reg["negated-labels"]
+        let str_map = |key: &str| -> BTreeMap<String, String> {
+            reg[key]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                .collect()
+        };
+        let str_list = |v: &Value| -> Vec<String> {
+            v.as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|s| s.as_str().map(str::to_string))
+                .collect()
+        };
+        let labels = str_map("labels");
+        let negated_labels = str_map("negated-labels");
+        let strengths: BTreeMap<String, u32> = reg["strengths"]
             .as_object()
             .into_iter()
             .flatten()
-            .filter_map(|(kind, label)| Some((kind.clone(), label.as_str()?.to_string())))
+            .filter_map(|(k, v)| Some((k.clone(), u32::try_from(v.as_u64()?).ok()?)))
+            .collect();
+        let sigils: BTreeMap<String, Vec<String>> = reg["sigils"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(s, schemes)| (s.clone(), str_list(schemes)))
             .collect();
         let mut multivalued: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let mut attr_names: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut attr_rules: BTreeMap<(String, String), AttrRule> = BTreeMap::new();
         if let Some(attrs) = schema["$defs"]["attrs"].as_object() {
             for (kind, spec) in attrs {
                 if let Some(props) = spec["properties"].as_object() {
@@ -204,6 +287,13 @@ impl Registry {
                                 .entry(kind.clone())
                                 .or_default()
                                 .insert(attr.clone());
+                        }
+                        let rule = AttrRule {
+                            values: a.get("enum").map(str_list),
+                            pattern: a["pattern"].as_str().map(str::to_string),
+                        };
+                        if rule != AttrRule::default() {
+                            attr_rules.insert((kind.clone(), attr.clone()), rule);
                         }
                     }
                 }
@@ -269,6 +359,9 @@ impl Registry {
                     ack: d["x-acknowledgement"].as_str().map(str::to_string),
                     noun: d["x-noun"].as_str().map(str::to_string),
                     nouns: d["x-nouns"].as_str().map(str::to_string),
+                    alias_of: d["x-alias-of"].as_str().map(str::to_string),
+                    ack_trigger: d["x-acknowledgement-trigger"].as_str().map(str::to_string),
+                    body_schema: d.get("x-body-schema").cloned(),
                 },
             );
         }
@@ -276,12 +369,26 @@ impl Registry {
             kinds,
             grant_tokens,
             keywords,
-            negating_keywords,
+            keywords_longest_first,
+            keyword_flags,
+            labels,
             negated_labels,
+            strengths,
+            reason_keyword: reg["reason-keyword"]
+                .as_str()
+                .expect("the schema names its reason keyword")
+                .to_string(),
+            context_keys: str_list(&reg["context-keys"]),
+            label_styles: str_list(&reg["label-styles"]),
+            reserved_bare: str_list(&reg["reserved-bare"]).into_iter().collect(),
+            sigils,
+            wire_floor: str_list(&reg["wire-floor"]),
             multivalued,
+            attr_rules,
             machinery_order,
             attrs: attr_names,
             version,
+            revision: reg["revision"].as_str().unwrap_or_default().to_string(),
         }
     }
 
@@ -290,9 +397,29 @@ impl Registry {
         self.version
     }
 
+    /// The registry revision the vendored schema carries (`1.1`).
+    pub fn revision(&self) -> &str {
+        &self.revision
+    }
+
     /// The prose kind a keyword line introduces (`MUST` → `must`), if any.
     pub fn keyword_kind(&self, kw: &str) -> Option<&str> {
         self.keywords.get(kw).map(String::as_str)
+    }
+
+    /// Every keyword, longest first — the order a keyword line is matched in.
+    pub fn keywords_longest_first(&self) -> &[String] {
+        &self.keywords_longest_first
+    }
+
+    /// The attributes the keyword `kw` sets true on its block (`SHOULD NOT`
+    /// → `not`), per `x-registry.keyword-flags`.
+    pub fn keyword_flags(&self, kw: &str) -> impl Iterator<Item = &str> {
+        self.keyword_flags
+            .get(kw)
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
     }
 
     /// The label a negated block of `kind` delivers (`should` → `SHOULD NOT`),
@@ -304,7 +431,72 @@ impl Registry {
     /// Whether the keyword `kw` negates its kind (`SHOULD NOT`), per the
     /// registry's keyword flags.
     pub fn keyword_negates(&self, kw: &str) -> bool {
-        self.negating_keywords.contains(kw)
+        self.keyword_flags(kw).any(|f| f == "not")
+    }
+
+    /// The label a block of `kind` delivers: the negated label when the block
+    /// carries the `not` flag (S8), else the kind's own label, else its
+    /// canonical kind's (an alias delivers what it aliases).
+    pub fn label<'a>(&'a self, kind: &str, not: bool) -> Option<&'a str> {
+        let canonical = self.kinds.get(kind).and_then(|k| k.alias_of.as_deref());
+        let pick = |table: &'a BTreeMap<String, String>| -> Option<&'a str> {
+            table
+                .get(kind)
+                .or_else(|| canonical.and_then(|c| table.get(c)))
+                .map(String::as_str)
+        };
+        if not && let Some(l) = pick(&self.negated_labels) {
+            return Some(l);
+        }
+        pick(&self.labels)
+    }
+
+    /// A rule kind's strength (`guardrail` 4 … `may` 1); `None` for a kind
+    /// that is not a rule.
+    pub fn strength(&self, kind: &str) -> Option<u32> {
+        self.strengths.get(kind).copied()
+    }
+
+    /// Whether `kind` is a rule — a kind the strengths table ranks. Only a
+    /// rule takes a reason (S14).
+    pub fn is_rule(&self, kind: &str) -> bool {
+        self.strengths.contains_key(kind)
+    }
+
+    /// The keyword that opens a reason (`BECAUSE`).
+    pub fn reason_keyword(&self) -> &str {
+        &self.reason_keyword
+    }
+
+    /// The context keys a host may supply as facts.
+    pub fn context_keys(&self) -> &[String] {
+        &self.context_keys
+    }
+
+    /// The delivery label styles a document may choose.
+    pub fn label_styles(&self) -> &[String] {
+        &self.label_styles
+    }
+
+    /// Whether a BARE block may not take `name` (version-1 machinery).
+    pub fn reserved_bare(&self, name: &str) -> bool {
+        self.reserved_bare.contains(name)
+    }
+
+    /// sigil → the URI schemes a reference written with it may use.
+    pub fn sigils(&self) -> &BTreeMap<String, Vec<String>> {
+        &self.sigils
+    }
+
+    /// The grants never admissible in a document that arrived over the wire.
+    pub fn wire_floor(&self) -> &[String] {
+        &self.wire_floor
+    }
+
+    /// The values or pattern the schema allows for `kind`'s attribute `attr`,
+    /// if it constrains them.
+    pub fn attr_rule(&self, kind: &str, attr: &str) -> Option<&AttrRule> {
+        self.attr_rules.get(&(kind.to_string(), attr.to_string()))
     }
 
     /// The attribute names `kind`'s schema declares, if it declares any.
@@ -400,7 +592,11 @@ pub struct Block {
     /// for TOP-LEVEL blocks by the walk. Delivery replaces exactly this region
     /// with the block's delivered form, leaving every other line untouched
     /// (§3.5 layout). `(0, 0)` on children, which delivery never addresses.
+    /// A rule's region covers the reason that follows it.
     pub region: (usize, usize),
+    /// The lines of the rule's `BECAUSE:` paragraph (S14; 0-based body
+    /// lines, inclusive), when one follows it. Its text is `attrs.because`.
+    pub reason: Option<(usize, usize)>,
 }
 
 impl Block {
@@ -435,6 +631,9 @@ pub enum Node {
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Document {
     pub front: BTreeMap<String, Value>,
+    /// Whether the document opens with front matter at all — what tells an
+    /// absent block from an empty one, which the §9.1 tree keeps apart.
+    pub has_front_matter: bool,
     pub nodes: Vec<Node>,
     /// The whole source with front matter stripped.
     pub source: String,
@@ -504,8 +703,8 @@ pub fn parse(text: &str) -> Result<Document, Vec<Refusal>> {
         }
         // A keyword paragraph / list item, or a blockquote alert, is a block
         // of its prose kind (§4.5/§4.6) — lifted so the tree carries it.
-        if (keyword_block_parts(lines[i]).is_some() || alert_block_kind(lines[i]).is_some())
-            && let Some((b, next)) = lift_keyword_or_alert(&lines, i, base)
+        if (keyword_line(lines[i]).is_some() || alert_block_kind(lines[i]).is_some())
+            && let Some((b, next)) = lift_keyword_or_alert(&lines, i, base, lines.len(), &mut errs)
         {
             flush!();
             nodes.push(Node::Block(b));
@@ -531,7 +730,9 @@ pub fn parse(text: &str) -> Result<Document, Vec<Refusal>> {
             i = next;
         } else if let Some(of) = open_fence(lines[i]) {
             flush!();
-            let (blocks, next) = parse_fence(&lines, i, of, base, &mut errs);
+            // A rule container's region covers the reason that follows it.
+            let (blocks, _, next) =
+                parse_fence_and_reason(&lines, i, of, base, lines.len(), &mut errs);
             for mut b in blocks {
                 b.region = (i, next.saturating_sub(1));
                 nodes.push(Node::Block(b));
@@ -563,14 +764,19 @@ pub fn parse(text: &str) -> Result<Document, Vec<Refusal>> {
             Node::Text(_) => None,
         })
         .collect();
-    check_identity(&blocks, &mut errs);
-    check_refs(&blocks, &mut errs);
+    // Identity and references are document-wide (S26): a rule named inside a
+    // `when`, a section or any container body is as addressable, and as
+    // unique, as one at the top level.
+    let all = every_block(&blocks);
+    check_identity(&blocks, &all, &mut errs);
+    check_refs(&all, &mut errs);
     check_placement(&blocks, &mut errs);
-    check_inline_refs(&nodes, body, base, &mut errs);
+    check_inline_refs(&all, body, base, &mut errs);
 
     if errs.is_empty() {
         Ok(Document {
             front,
+            has_front_matter: body_start > 0,
             nodes,
             source: body.to_string(),
             raw: text.to_string(),
@@ -678,6 +884,7 @@ fn parse_fence(
                 form: Form::Container,
                 raw_body,
                 region: (0, 0),
+                reason: None,
             }],
             close_idx + 1,
         )
@@ -701,6 +908,7 @@ fn parse_leaf(lf: LeafTok, line_no: usize, errs: &mut Vec<Refusal>) -> Option<Bl
         form: Form::Leaf,
         raw_body: None,
         region: (0, 0),
+        reason: None,
     })
 }
 
@@ -756,6 +964,7 @@ fn parse_section(
                         form: Form::Section,
                         raw_body: None,
                         region: (0, 0),
+                        reason: None,
                     }),
                     fc + 1,
                 )
@@ -795,6 +1004,7 @@ fn parse_section(
                 form: Form::Section,
                 raw_body: (raw_lines != prose_lines).then(|| raw_lines.join("\n")),
                 region: (0, 0),
+                reason: None,
             }),
             end,
         )
@@ -985,7 +1195,13 @@ fn collect_body(
         }
         // A nested container or set (shorter fence) — recurse.
         if let Some(of) = open_fence(line) {
-            let (kids, next) = parse_fence(lines, i, of, line_base, errs);
+            let (kids, closed, next) =
+                parse_fence_and_reason(lines, i, of, line_base, lines.len(), errs);
+            // A child's reason is its own (the tree), and stays in the text
+            // delivery reads until delivery renders reasons.
+            for l in lines.get(closed..next).unwrap_or_default() {
+                raw.push(l.to_string());
+            }
             children.extend(kids);
             i = next;
             continue;
@@ -1003,8 +1219,8 @@ fn collect_body(
         // normalizes it in place). Only where the kind interprets its body as
         // prose: never inside YAML/code/table bodies, never inside `example`.
         if lift
-            && (keyword_block_parts(line).is_some() || alert_block_kind(line).is_some())
-            && let Some((b, next)) = lift_keyword_or_alert(lines, i, line_base)
+            && (keyword_line(line).is_some() || alert_block_kind(line).is_some())
+            && let Some((b, next)) = lift_keyword_or_alert(lines, i, line_base, lines.len(), errs)
         {
             for l in &lines[i..next.min(lines.len())] {
                 raw.push(l.to_string());
@@ -1054,7 +1270,10 @@ fn collect_range(
             continue;
         }
         if let Some(of) = open_fence(line) {
-            let (kids, next) = parse_fence(lines, i, of, line_base, errs);
+            let (kids, closed, next) = parse_fence_and_reason(lines, i, of, line_base, end, errs);
+            for l in lines.get(closed..next).unwrap_or_default() {
+                raw.push(l.to_string());
+            }
             children.extend(kids);
             i = next.min(end);
             continue;
@@ -1069,8 +1288,8 @@ fn collect_range(
         // A keyword paragraph or alert inside a section body is that section's
         // CHILD block (§4.5; the fixture corpus pins the shape) and is
         // excluded from the body prose.
-        if (keyword_block_parts(line).is_some() || alert_block_kind(line).is_some())
-            && let Some((b, next)) = lift_keyword_or_alert(lines, i, line_base)
+        if (keyword_line(line).is_some() || alert_block_kind(line).is_some())
+            && let Some((b, next)) = lift_keyword_or_alert(lines, i, line_base, end, errs)
         {
             for l in &lines[i..next.min(end)] {
                 raw.push(l.to_string());
@@ -1367,6 +1586,7 @@ fn parse_table_set(
             form: Form::Set,
             raw_body: None,
             region: (0, 0),
+            reason: None,
         });
     }
     out
@@ -1437,6 +1657,7 @@ fn parse_deflist_set(
             form: Form::Set,
             raw_body: None,
             region: (0, 0),
+            reason: None,
         });
     }
     out
@@ -1885,11 +2106,39 @@ fn parse_front_matter(text: &str, errs: &mut Vec<Refusal>) -> (BTreeMap<String, 
     (map, nl)
 }
 
-/// Identity: `name` unique per kind (top-level only — sub-blocks are
-/// parent-scoped and exempt).
-fn check_identity(blocks: &[&Block], errs: &mut Vec<Refusal>) {
-    let mut seen: BTreeMap<(String, String), usize> = BTreeMap::new();
-    for b in blocks {
+/// Every block in the document, children included, in source order (a
+/// parent before its children).
+fn every_block<'a>(top: &[&'a Block]) -> Vec<&'a Block> {
+    fn walk<'a>(b: &'a Block, out: &mut Vec<&'a Block>) {
+        out.push(b);
+        for c in &b.children {
+            walk(c, out);
+        }
+    }
+    let mut out = Vec::new();
+    for b in top {
+        walk(b, &mut out);
+    }
+    out
+}
+
+/// The identity a block declares, `kind/name`: a named block of a kind the
+/// registry gives identity (`x-identity`, every prose kind from revision 1.1;
+/// S26), anywhere in the document. A sub-block's name is scoped to its
+/// parent, so it declares no document identity.
+fn identity_of(b: &Block) -> Option<(String, String)> {
+    let name = b.name.as_deref().filter(|n| !n.is_empty())?;
+    lookup(&b.kind)
+        .is_some_and(|k| k.identity && k.sub_of.is_none())
+        .then(|| (b.kind.clone(), name.to_string()))
+}
+
+/// Identity (§3.3 rule 9): a required `name` is present, and `kind/name` is
+/// unique across the WHOLE document (S26) — a named rule inside a container
+/// body clashes with one at the top level. `top` are the top-level blocks,
+/// `all` every block.
+fn check_identity(top: &[&Block], all: &[&Block], errs: &mut Vec<Refusal>) {
+    for b in top {
         // A required name is the `name` ATTRIBUTE and nothing else. A
         // `name:` key inside a YAML body is a body field that happens to be
         // called name — it does not make the block named. Set MEMBERS carry
@@ -1906,90 +2155,103 @@ fn check_identity(blocks: &[&Block], errs: &mut Vec<Refusal>) {
                 format!("{} requires name", b.kind),
             ));
         }
-        if let Some(name) = &b.name
-            && lookup(&b.kind).is_some_and(|k| k.sub_of.is_none())
-        {
-            match seen.get(&(b.kind.clone(), name.clone())) {
-                Some(first) => errs.push(Refusal::at(
-                    b.line,
-                    "duplicate-identity",
-                    format!(
-                        "duplicate {}/{name} (first declared at line {first})",
-                        b.kind
-                    ),
-                )),
-                None => {
-                    seen.insert((b.kind.clone(), name.clone()), b.line);
-                }
+    }
+    let mut seen: BTreeMap<(String, String), usize> = BTreeMap::new();
+    for b in all {
+        let Some(id) = identity_of(b) else { continue };
+        match seen.get(&id) {
+            Some(first) => errs.push(Refusal::at(
+                b.line,
+                "duplicate-identity",
+                format!(
+                    "duplicate {}/{} (first declared at line {first})",
+                    id.0, id.1
+                ),
+            )),
+            None => {
+                seen.insert(id, b.line);
             }
         }
     }
 }
 
+/// Attributes whose value is text — for the model, or for a person reading
+/// the document — and never a reference, so an `@` in one is prose: `if`
+/// and `because` (S14, S15), `title`, `description`, a skill's `trigger`
+/// (S11) and its version-1 alias `when`. Every other attribute's
+/// `@`-prefixed value is a reference and must be qualified (§3.4). The
+/// schema has no marker this could be derived from (an `x-reference` or
+/// `x-free-text` annotation would be one), so this is the one list.
+const FREE_TEXT_ATTRS: &[&str] = &["if", "because", "title", "trigger", "description"];
+
+fn is_free_text(kind: &str, attr: &str) -> bool {
+    FREE_TEXT_ATTRS.contains(&attr) || (kind == "skill" && attr == "when")
+}
+
+/// The attribute references a block carries: each `@`-prefixed value, or
+/// comma-separated part of a multi-valued one (`may="@workflow/a,
+/// @workflow/b"`), as `(attribute, text after the @)`.
+fn attr_refs(b: &Block) -> impl Iterator<Item = (&str, &str)> {
+    b.attrs
+        .iter()
+        .filter(|(attr, _)| !is_free_text(&b.kind, attr))
+        .flat_map(|(attr, val)| {
+            val.split(',')
+                .filter_map(move |part| Some((attr.as_str(), part.trim().strip_prefix('@')?)))
+        })
+}
+
 /// `@kind/name` references: every one must resolve to a declared block, and the
-/// graph must be acyclic. References live in attribute values.
+/// graph must be acyclic. References live in attribute values, on blocks at
+/// any depth.
 fn check_refs(blocks: &[&Block], errs: &mut Vec<Refusal>) {
-    let mut ids: BTreeSet<(String, String)> = BTreeSet::new();
+    // Each identity's first declaration — the line a cycle through it names.
+    let mut ids: BTreeMap<(String, String), usize> = BTreeMap::new();
     for b in blocks {
-        if let Some(n) = &b.name {
-            ids.insert((b.kind.clone(), n.clone()));
+        if let Some(id) = identity_of(b) {
+            ids.entry(id).or_insert(b.line);
         }
     }
     for b in blocks {
-        for (attr, val) in &b.attrs {
-            // An attribute may be multi-valued (comma-separated), so each `@ref`
-            // in it resolves independently: `may="@workflow/a, @workflow/b"`.
-            for part in val.split(',') {
-                let part = part.trim();
-                let Some(target) = part.strip_prefix('@') else {
+        for (attr, target) in attr_refs(b) {
+            let (kind, name) = match target.split_once('/') {
+                Some((k, n)) => (k.to_string(), n.to_string()),
+                None => {
+                    errs.push(Refusal::at(
+                        b.line,
+                        "attribute-value",
+                        format!("{attr}=@{target} must be qualified as @kind/name"),
+                    ));
                     continue;
-                };
-                let (kind, name) = match target.split_once('/') {
-                    Some((k, n)) => (k.to_string(), n.to_string()),
-                    None => {
-                        errs.push(Refusal::at(
-                            b.line,
-                            "attribute-value",
-                            format!("{attr}=@{target} must be qualified as @kind/name"),
-                        ));
-                        continue;
-                    }
-                };
-                if lookup(&kind).is_some_and(|k| k.sub_of.is_some()) {
-                    errs.push(Refusal::at(
-                        b.line,
-                        "subblock-reference",
-                        format!("{kind}/{name}: sub-blocks cannot be referenced"),
-                    ));
-                } else if !ids.contains(&(kind.clone(), name.clone())) {
-                    errs.push(Refusal::at(
-                        b.line,
-                        "dangling-reference",
-                        format!("@{kind}/{name} does not resolve — no {kind} named {name:?}"),
-                    ));
                 }
+            };
+            if lookup(&kind).is_some_and(|k| k.sub_of.is_some()) {
+                errs.push(Refusal::at(
+                    b.line,
+                    "subblock-reference",
+                    format!("{kind}/{name}: sub-blocks cannot be referenced"),
+                ));
+            } else if !ids.contains_key(&(kind.clone(), name.clone())) {
+                errs.push(Refusal::at(
+                    b.line,
+                    "dangling-reference",
+                    format!("@{kind}/{name} does not resolve — no {kind} named {name:?}"),
+                ));
             }
         }
     }
     // Acyclicity across attribute refs (a block that names itself, or a cycle).
     let mut edges: BTreeMap<(String, String), Vec<(String, String)>> = BTreeMap::new();
     for b in blocks {
-        let Some(n) = &b.name else { continue };
-        let from = (b.kind.clone(), n.clone());
-        for val in b.attrs.values() {
-            for part in val.split(',') {
-                let Some((k, nm)) = part
-                    .trim()
-                    .strip_prefix('@')
-                    .and_then(|t| t.split_once('/'))
-                else {
-                    continue;
-                };
-                edges
-                    .entry(from.clone())
-                    .or_default()
-                    .push((k.to_string(), nm.to_string()));
-            }
+        let Some(from) = identity_of(b) else { continue };
+        for (_, target) in attr_refs(b) {
+            let Some((k, nm)) = target.split_once('/') else {
+                continue;
+            };
+            edges
+                .entry(from.clone())
+                .or_default()
+                .push((k.to_string(), nm.to_string()));
         }
     }
     let mut state: BTreeMap<(String, String), u8> = BTreeMap::new();
@@ -2001,10 +2263,7 @@ fn check_refs(blocks: &[&Block], errs: &mut Vec<Refusal>) {
             // (`reference cycle: workflow/a → workflow/b → workflow/a`).
             // Conformance compares the line with the code, so a refusal of
             // a located condition names it.
-            let line = blocks
-                .iter()
-                .find(|b| b.kind == cycle[0].0 && b.name.as_deref() == Some(cycle[0].1.as_str()))
-                .map_or(0, |b| b.line);
+            let line = ids.get(&cycle[0]).copied().unwrap_or(0);
             let spelled: Vec<String> = cycle.iter().map(|(k, n)| format!("{k}/{n}")).collect();
             errs.push(Refusal::at(
                 line,
@@ -2020,15 +2279,8 @@ fn check_refs(blocks: &[&Block], errs: &mut Vec<Refusal>) {
 /// whose kind is a known kind must resolve to a declared block of that kind.
 /// Dangling ones are refused — the class of bug a real check catches that
 /// eyeballing does not. Refs inside fenced code are inert (code-suspends).
-fn check_inline_refs(nodes: &[Node], body: &str, base: usize, errs: &mut Vec<Refusal>) {
-    let mut ids: BTreeSet<(String, String)> = BTreeSet::new();
-    for n in nodes {
-        if let Node::Block(b) = n
-            && let Some(name) = &b.name
-        {
-            ids.insert((b.kind.clone(), name.clone()));
-        }
-    }
+fn check_inline_refs(blocks: &[&Block], body: &str, base: usize, errs: &mut Vec<Refusal>) {
+    let ids: BTreeSet<(String, String)> = blocks.iter().filter_map(|b| identity_of(b)).collect();
     // Scan the SOURCE line by line (code fences suspend recognition, §4.7
     // rule 4) so every refusal names its line. YAML bodies rarely carry the
     // inline forms, and a `[[x/y]]` whose kind is unknown is prose, not a ref.
@@ -2593,11 +2845,21 @@ pub fn fold_full(
             }
             Node::Block(b) => {
                 fold_config(b, &mut out, &mut errs);
-                regions.push((
-                    b.region.0,
-                    b.region.1,
-                    deliver_block_lines(b, &when_facts, &decls, granted, resolve, depth, seen),
-                ));
+                let mut delivered =
+                    deliver_block_lines(b, &when_facts, &decls, granted, resolve, depth, seen);
+                // A rule container's region covers its reason (S14). Until
+                // delivery renders reasons, the reason's source lines are
+                // delivered as they were when they were prose after the
+                // block: a blank line when blanks separated them (runs of
+                // blanks collapse to one anyway), then the lines verbatim.
+                if let Some((start, end)) = b.reason {
+                    let src: Vec<&str> = doc.source.split('\n').collect();
+                    if src[start - 1].trim().is_empty() {
+                        delivered.push(String::new());
+                    }
+                    delivered.extend(src[start..=end].iter().map(|l| l.to_string()));
+                }
+                regions.push((b.region.0, b.region.1, delivered));
                 i += 1;
             }
         }
@@ -3326,44 +3588,269 @@ fn canonical_keyword(kw: &str) -> Option<String> {
     Some(kind.to_uppercase())
 }
 
-/// If `line` STARTS a keyword block (§4.5): the kind it maps to, whether the
-/// line is a list item (a list-item keyword is its own single-line block),
-/// and the text after the label. `None` for prose.
-pub(crate) fn keyword_block_parts(line: &str) -> Option<(String, bool, String)> {
-    let (marker, rest) = split_list_marker(line);
-    let is_item = !marker.trim().is_empty();
-    let rest2 = rest.strip_prefix("**").unwrap_or(rest);
-    let colon = rest2.find(':')?;
-    let kw_raw = rest2[..colon].trim_end_matches("**").trim();
-    let kind = registry().keyword_kind(kw_raw)?.to_string();
-    let after = rest2[colon + 1..].trim_start_matches("**");
-    let after = after.strip_prefix([' ', '\t'])?;
-    Some((kind, is_item, after.trim_start().to_string()))
+/// A line that opens a keyword block (§4.5; S12, S15), as
+/// `x-grammar.keywordLine` matches it: an optional column-0 list marker, an
+/// optional `**`, a keyword, an optional `[name]`, an optional
+/// ` (if condition)`, then `:`, an optional `**` and at least one space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct KeywordLine<'a> {
+    /// The keyword as written, a key of the registry's keyword table.
+    pub keyword: &'a str,
+    /// `MUST[name]:` — the block's identity (S12).
+    pub name: Option<&'a str>,
+    /// `MUST (if c):` — the condition, trimmed (S15).
+    pub condition: Option<&'a str>,
+    /// The text after the label.
+    pub text: &'a str,
+}
+
+/// Match `x-grammar.keywordLine` by hand (the crate has no regex
+/// dependency). The keyword alternation is tried longest first, as the
+/// pattern lists it, and a keyword that does not complete the match lets a
+/// shorter one try — the backtracking the regex does.
+pub(crate) fn keyword_line(line: &str) -> Option<KeywordLine<'_>> {
+    let rest = &line[list_marker_len(line)..];
+    let rest = rest.strip_prefix("**").unwrap_or(rest);
+    registry().keywords_longest_first().iter().find_map(|kw| {
+        let (name, condition, text) = keyword_tail(rest.strip_prefix(kw.as_str())?)?;
+        Some(KeywordLine {
+            keyword: kw.as_str(),
+            name,
+            condition,
+            text,
+        })
+    })
+}
+
+/// What follows the keyword: `([name])?([ \t]+\(if[ \t]+[^()]+?\))?:(\*\*)?[ \t]+`.
+fn keyword_tail(after: &str) -> Option<(Option<&str>, Option<&str>, &str)> {
+    let mut s = after;
+    let mut name = None;
+    if let Some(b) = s.strip_prefix('[') {
+        let close = b.find(']')?;
+        if !is_name(&b[..close]) {
+            return None;
+        }
+        name = Some(&b[..close]);
+        s = &b[close + 1..];
+    }
+    let mut condition = None;
+    let ws = s.trim_start_matches([' ', '\t']);
+    if ws.len() != s.len() {
+        // `[ \t]+(if[ \t]+([^()]+?))` — at least one blank after `if` and at
+        // least one character after that, none of them a parenthesis.
+        let c = ws.strip_prefix("(if")?;
+        let close = c.find(')')?;
+        let inner = &c[..close];
+        if inner.contains('(') || !inner.starts_with([' ', '\t']) || inner.len() < 2 {
+            return None;
+        }
+        condition = Some(inner.trim());
+        s = &c[close + 1..];
+    }
+    let s = s.strip_prefix(':')?;
+    let s = s.strip_prefix("**").unwrap_or(s);
+    let text = s.trim_start_matches([' ', '\t']);
+    (text.len() != s.len()).then_some((name, condition, text))
+}
+
+/// The length of a column-0 list marker (`[-*+][ \t]+` or
+/// `[0-9]+[.)][ \t]+`) at the start of `line`, or 0.
+fn list_marker_len(line: &str) -> usize {
+    let after = if let Some(r) = line.strip_prefix(['-', '*', '+']) {
+        r
+    } else {
+        let digits = line.len() - line.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        match line[digits..].strip_prefix(['.', ')']) {
+            Some(r) if digits > 0 => r,
+            _ => return 0,
+        }
+    };
+    let rest = after.trim_start_matches([' ', '\t']);
+    if rest.len() == after.len() {
+        0
+    } else {
+        line.len() - rest.len()
+    }
+}
+
+/// A line that opens a reason (S14), as `x-grammar.reasonLine` matches it:
+/// optional indentation, an optional list marker, an optional `**`, the
+/// registry's reason keyword and `:`, an optional `**`, at least one blank.
+/// Returns the indentation's length and the length of the whole label.
+fn reason_line(line: &str) -> Option<(usize, usize)> {
+    let t = line.trim_start_matches([' ', '\t']);
+    let indent = line.len() - t.len();
+    let r = &t[list_marker_len(t)..];
+    let r = r.strip_prefix("**").unwrap_or(r);
+    let r = r
+        .strip_prefix(registry().reason_keyword())?
+        .strip_prefix(':')?;
+    let r = r.strip_prefix("**").unwrap_or(r);
+    let text = r.trim_start_matches([' ', '\t']);
+    (text.len() != r.len()).then_some((indent, line.len() - text.len()))
+}
+
+/// Where the paragraph or list item that began at `k` ends (exclusive): the
+/// lines a keyword or a reason owns (§4.5 rule 3). It stops at a blank line
+/// and at anything that starts something else — a keyword, a reason, a list
+/// item or quote, a block form, a heading, a code fence — as the reference
+/// implementation's `paragraphEnd` does. A code fence stops it even when
+/// indented, as the walk's own code tracking reads one, so a paragraph never
+/// swallows the line that opens code.
+fn paragraph_end(lines: &[&str], k: usize, bound: usize) -> usize {
+    let mut j = k + 1;
+    while j < bound {
+        let l = lines[j];
+        if l.trim().is_empty()
+            || keyword_line(l).is_some()
+            || reason_line(l).is_some()
+            || list_marker_len(l) > 0
+            || l.starts_with('>')
+            || alert_block_kind(l).is_some()
+            || open_fence(l).is_some()
+            || fence_close_len(l).is_some()
+            || leaf_open(l).is_some()
+            || section_open(l).is_some()
+            || heading_level(l).is_some()
+            || code_fence_len(l).is_some()
+        {
+            break;
+        }
+        j += 1;
+    }
+    j
+}
+
+/// The reason after a rule (S14): a `BECAUSE:` paragraph or list item that
+/// starts at `after`, or after blank lines only — and then at column 0, so
+/// an indented `BECAUSE:` under a later item is not taken for this rule's.
+/// Returns its first line, the index just past it, and its text: the first
+/// line's remainder and the trimmed continuation lines.
+fn take_reason(lines: &[&str], after: usize, bound: usize) -> Option<(usize, usize, String)> {
+    let mut k = after;
+    while k < bound && lines[k].trim().is_empty() {
+        k += 1;
+    }
+    if k >= bound {
+        return None;
+    }
+    let (indent, label) = reason_line(lines[k])?;
+    if k > after && indent != 0 {
+        return None;
+    }
+    let end = paragraph_end(lines, k, bound);
+    let mut text = vec![&lines[k][label..]];
+    text.extend(lines[k + 1..end].iter().map(|l| l.trim()));
+    Some((k, end, text.join("\n").trim().to_string()))
+}
+
+/// Attach the reason that follows a rule block, if one does (S14), and return
+/// the index just past it. A rule carries one reason: a `because=` attribute
+/// and a `BECAUSE:` paragraph together are refused at the paragraph. A
+/// `BECAUSE:` after a block that is not a rule stays prose.
+fn attach_reason(
+    b: &mut Block,
+    lines: &[&str],
+    after: usize,
+    bound: usize,
+    line_base: usize,
+    errs: &mut Vec<Refusal>,
+) -> Option<usize> {
+    if !registry().is_rule(&b.kind) {
+        return None;
+    }
+    let (start, end, text) = take_reason(lines, after, bound)?;
+    if b.attrs.contains_key("because") {
+        errs.push(Refusal::at(
+            line_base + start + 1,
+            "because-repeated",
+            format!(
+                "{} already has a reason (because=) — a rule has one reason",
+                b.kind
+            ),
+        ));
+    } else {
+        b.attrs.insert("because".to_string(), text);
+    }
+    b.reason = Some((start, end - 1));
+    Some(end)
+}
+
+/// Parse a `:::` block, then take the reason that follows a rule container.
+/// Returns the blocks, the index just past the closing fence, and the index
+/// just past the reason (the same index when there is none).
+fn parse_fence_and_reason(
+    lines: &[&str],
+    open_idx: usize,
+    of: OpenFence,
+    line_base: usize,
+    bound: usize,
+    errs: &mut Vec<Refusal>,
+) -> (Vec<Block>, usize, usize) {
+    let (mut blocks, next) = parse_fence(lines, open_idx, of, line_base, errs);
+    let end = match blocks.as_mut_slice() {
+        [b] if b.form == Form::Container => {
+            attach_reason(b, lines, next, bound, line_base, errs).unwrap_or(next)
+        }
+        _ => next,
+    };
+    (blocks, next, end)
 }
 
 /// If `line` opens a blockquote alert (§4.6): the kind it maps to.
 pub(crate) fn alert_block_kind(line: &str) -> Option<String> {
-    let t = line.trim_start().strip_prefix('>')?.trim();
-    let inner = t.strip_prefix("[!")?.strip_suffix(']')?;
-    registry()
-        .keyword_kind(&inner.to_uppercase())
-        .map(str::to_string)
+    alert_keyword(line).and_then(|kw| registry().keyword_kind(&kw).map(str::to_string))
 }
 
-/// Lift a keyword or alert starting at `lines[i]` into a block. Returns the
-/// block and the index just past it. The block's BODY is the label-stripped
-/// text (§9.1); its REGION covers the raw lines, which is what delivery and
-/// any raw reconstruction slice from the source.
+/// The keyword a `> [!KEYWORD]` opener names, upper-cased.
+fn alert_keyword(line: &str) -> Option<String> {
+    let t = line.trim_start().strip_prefix('>')?.trim();
+    let inner = t.strip_prefix("[!")?.strip_suffix(']')?;
+    Some(inner.to_uppercase())
+}
+
+/// Lift a keyword or alert starting at `lines[i]` into a block, with the
+/// reason that follows it. Returns the block and the index just past it. The
+/// block's BODY is the label-stripped text (§9.1); its REGION covers the raw
+/// lines, reason included, which is what delivery and any raw reconstruction
+/// slice from the source. `bound` is where the enclosing body ends.
 pub(crate) fn lift_keyword_or_alert(
     lines: &[&str],
     i: usize,
     base: usize,
+    bound: usize,
+    errs: &mut Vec<Refusal>,
 ) -> Option<(Block, usize)> {
     let line = lines[i];
-    if let Some(kind) = alert_block_kind(line) {
+    let lifted = |kind: String, attrs, name, body: String, form| Block {
+        kind,
+        disposition: Disposition::Prose,
+        name,
+        attrs,
+        body,
+        children: Vec::new(),
+        line: base + i + 1,
+        set_group: None,
+        form,
+        raw_body: None,
+        region: (0, 0), // set below, once the reason is known
+        reason: None,
+    };
+    // A keyword's flags (`SHOULD NOT` → `not`) are the only thing that keep
+    // its polarity: it maps to the same kind as its positive form (S8).
+    let flags = |kw: &str| -> BTreeMap<String, String> {
+        registry()
+            .keyword_flags(kw)
+            .map(|f| (f.to_string(), "true".to_string()))
+            .collect()
+    };
+    let (mut b, j) = if let Some(kw) = alert_keyword(line)
+        && let Some(kind) = registry().keyword_kind(&kw)
+    {
         let mut body = Vec::new();
         let mut j = i + 1;
-        while j < lines.len() {
+        while j < bound {
             let t = lines[j].trim_start();
             if let Some(rest) = t.strip_prefix('>') {
                 body.push(rest.strip_prefix(' ').unwrap_or(rest).to_string());
@@ -3372,63 +3859,40 @@ pub(crate) fn lift_keyword_or_alert(
                 break;
             }
         }
-        return Some((
-            Block {
-                kind,
-                disposition: Disposition::Prose,
-                name: None,
-                attrs: BTreeMap::new(),
-                body: body.join("\n"),
-                children: Vec::new(),
-                line: base + i + 1,
-                set_group: None,
-                form: Form::Alert,
-                raw_body: None,
-                region: (i, j - 1),
-            },
-            j,
-        ));
-    }
-    let (kind, is_item, first) = keyword_block_parts(line)?;
-    let mut body = vec![first];
-    let mut j = i + 1;
-    if !is_item {
-        // A paragraph extends to the next blank line — or the next line that
-        // itself starts a keyword, an alert, or any block form.
-        while j < lines.len() {
-            let l = lines[j];
-            if l.trim().is_empty()
-                || keyword_block_parts(l).is_some()
-                || alert_block_kind(l).is_some()
-                || open_fence(l).is_some()
-                || fence_close_len(l).is_some()
-                || leaf_open(l).is_some()
-                || section_open(l).is_some()
-                || heading_level(l).is_some()
-                || code_fence_len(l).is_some()
-            {
-                break;
-            }
-            body.push(l.to_string());
-            j += 1;
+        let b = lifted(
+            kind.to_string(),
+            flags(&kw),
+            None,
+            body.join("\n"),
+            Form::Alert,
+        );
+        (b, j)
+    } else {
+        let km = keyword_line(line)?;
+        let kind = registry().keyword_kind(km.keyword)?.to_string();
+        let j = paragraph_end(lines, i, bound);
+        let mut body = vec![km.text];
+        body.extend(&lines[i + 1..j]);
+        let mut attrs = flags(km.keyword);
+        if let Some(name) = km.name {
+            attrs.insert("name".to_string(), name.to_string());
         }
-    }
-    Some((
-        Block {
+        if let Some(c) = km.condition {
+            attrs.insert("if".to_string(), c.to_string());
+        }
+        let name = km.name.map(str::to_string);
+        let b = lifted(
             kind,
-            disposition: Disposition::Prose,
-            name: None,
-            attrs: BTreeMap::new(),
-            body: body.join("\n"),
-            children: Vec::new(),
-            line: base + i + 1,
-            set_group: None,
-            form: Form::Keyword,
-            raw_body: None,
-            region: (i, j - 1),
-        },
-        j,
-    ))
+            attrs,
+            name,
+            body.join("\n").trim().to_string(),
+            Form::Keyword,
+        );
+        (b, j)
+    };
+    let end = attach_reason(&mut b, lines, j, bound, base, errs).unwrap_or(j);
+    b.region = (i, end - 1);
+    Some((b, end))
 }
 
 /// Definition-list entries for the §9.1 tree: term free text, definition
@@ -3619,7 +4083,13 @@ fn fold_machinery(b: &Block, out: &mut Extraction, errs: &mut Vec<Refusal>) {
                 out.skills.push(InlineSkill {
                     name: name.clone(),
                     description: b.attrs.get("description").cloned().unwrap_or_default(),
-                    when_to_use: b.attrs.get("when").cloned(),
+                    // `trigger` is the attribute (S11); `when` is its
+                    // version-1 alias, and `trigger` wins when both are given.
+                    when_to_use: b
+                        .attrs
+                        .get("trigger")
+                        .or_else(|| b.attrs.get("when"))
+                        .cloned(),
                     // The catalogue body keeps lifted keyword/alert guidance
                     // IN POSITION (the tree-facing `body` excludes it).
                     body: b.delivery_body().to_string(),
@@ -4002,6 +4472,7 @@ mod tests {
         // spec's own, and a drift would fail here at load, not silently.
         let r = registry();
         assert_eq!(r.version(), 1);
+        assert_eq!(r.revision(), "1.1");
         assert_eq!(
             machinery_names().count(),
             29,
@@ -5031,6 +5502,13 @@ steps:
                 "reference cycle: skill/a → skill/b → skill/a",
             ),
             (
+                "x\n\n:::must{because=\"a\"}\nx\n:::\n\nBECAUSE: b",
+                true,
+                Some(7),
+                "because-repeated",
+                "must already has a reason (because=) — a rule has one reason",
+            ),
+            (
                 "See [[case/c]].",
                 true,
                 Some(1),
@@ -5193,5 +5671,390 @@ steps:
             }
         }
         assert!(misses.is_empty(), "{}", misses.join("\n"));
+    }
+
+    // ── the 1.1 keyword grammar, reasons and identity (S8, S11-S15, S26) ──
+
+    /// The single block a document parses to, at the top level.
+    fn only_block(text: &str) -> Block {
+        let d = parse(text).unwrap();
+        let blocks: Vec<&Block> = d.blocks().collect();
+        assert_eq!(blocks.len(), 1, "{blocks:?}");
+        blocks[0].clone()
+    }
+
+    /// `SHOULD NOT:` maps to the same kind as `SHOULD:`, so the `not` flag is
+    /// the only thing in the TREE that keeps it a prohibition (S8) — on the
+    /// line, on a list item, and on the container.
+    #[test]
+    fn should_not_carries_the_not_flag_in_the_tree() {
+        let d = parse(
+            "SHOULD NOT: store data.\n\n- SHOULD NOT: paste tickets.\n- SHOULD: link.\n\n\
+             :::should{not}\nkeep copies.\n:::",
+        )
+        .unwrap();
+        let got: Vec<(&str, Form, Option<&str>)> = d
+            .blocks()
+            .map(|b| {
+                (
+                    b.kind.as_str(),
+                    b.form,
+                    b.attrs.get("not").map(String::as_str),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("should", Form::Keyword, Some("true")),
+                ("should", Form::Keyword, Some("true")),
+                ("should", Form::Keyword, None),
+                ("should", Form::Container, Some("")),
+            ]
+        );
+        let t = crate::tree_json(&d);
+        for (i, want) in [true, true, false, true].into_iter().enumerate() {
+            assert_eq!(
+                t["blocks"][i]["attrs"].get("not").is_some(),
+                want,
+                "block {i}: {}",
+                t["blocks"][i]
+            );
+        }
+    }
+
+    /// `MUST[name] (if c):` (S12, S15): the name is the block's identity, the
+    /// condition its `if`, and the text after the label its body.
+    #[test]
+    fn a_keyword_carries_its_name_and_condition() {
+        let b = only_block("NEVER[refund-ceiling] (if the refund exceeds ${limit}): promise it.");
+        assert_eq!(b.kind, "never");
+        assert_eq!(b.name.as_deref(), Some("refund-ceiling"));
+        assert_eq!(b.attrs["name"], "refund-ceiling");
+        assert_eq!(b.attrs["if"], "the refund exceeds ${limit}");
+        assert_eq!(b.body, "promise it.");
+        // Each alone, on a list item, inside bold.
+        let b = only_block("- **MUST (if  asked ):** reply.");
+        assert_eq!((b.name.as_deref(), b.attrs["if"].as_str()), (None, "asked"));
+        assert_eq!(b.body, "reply.");
+        let b = only_block("1) MAY[skip]: skip it.");
+        assert_eq!((b.kind.as_str(), b.name.as_deref()), ("may", Some("skip")));
+        assert!(!b.attrs.contains_key("if"));
+        // The longer keyword wins, and a near miss is prose: no name grammar,
+        // parentheses in the condition, no `if`, no space after the colon,
+        // an indented line, lower case.
+        assert_eq!(only_block("MUST NOT: push.").kind, "never");
+        // A paragraph runs on to the next blank line, and stops where a list
+        // item or a quote starts.
+        let d = parse("MAY: skip the greeting\nfor insiders.\n- an item\n> a quote").unwrap();
+        assert_eq!(
+            d.blocks().next().unwrap().body,
+            "skip the greeting\nfor insiders."
+        );
+        for prose in [
+            "MUST NOTE: x",
+            "MUST[-x]: y",
+            "MUST (if a (b)): y",
+            "MUST (if a (b): y",
+            "MUST (when a): y",
+            "MUST (if ): y",
+            "MUST:y",
+            "  MUST: indented",
+            "must: lower",
+        ] {
+            assert!(
+                parse(prose).unwrap().blocks().next().is_none(),
+                "{prose:?} is prose"
+            );
+        }
+    }
+
+    /// An alias kind stays as authored in the tree (`always`, `avoid`,
+    /// `may`), with no flags: `AVOID` is an alias of `SHOULD NOT`, not a
+    /// `should` block with `not`. The registry's label carries the rest.
+    #[test]
+    fn alias_kinds_stay_as_authored() {
+        let d = parse(
+            "ALWAYS: cite.\n\nAVOID: jargon.\n\n> [!MAY]\n> skip it.\n\n:::avoid\nslang.\n:::",
+        )
+        .unwrap();
+        let got: Vec<(&str, Form, usize)> = d
+            .blocks()
+            .map(|b| (b.kind.as_str(), b.form, b.attrs.len()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("always", Form::Keyword, 0),
+                ("avoid", Form::Keyword, 0),
+                ("may", Form::Alert, 0),
+                ("avoid", Form::Container, 0),
+            ]
+        );
+        let r = registry();
+        assert_eq!(r.label("always", false), Some("MUST"));
+        assert_eq!(r.label("avoid", false), Some("SHOULD NOT"));
+        assert_eq!(r.label("info", false), Some("NOTE"));
+        assert_eq!(r.label("should", true), Some("SHOULD NOT"));
+        assert_eq!(r.label("should", false), Some("SHOULD"));
+        assert_eq!(lookup("always").unwrap().alias_of.as_deref(), Some("must"));
+        assert!(r.is_rule("avoid") && !r.is_rule("note"));
+    }
+
+    /// A `BECAUSE:` is the reason of the rule before it (S14): directly
+    /// after the text (indented on a list item), or after blank lines at
+    /// column 0. Its lines leave the rule's body and join its region.
+    #[test]
+    fn a_reason_attaches_to_the_rule_before_it() {
+        let d = parse(
+            "MUST: confirm the plan.\nBECAUSE: limits differ\n  by plan.\n\n\
+             - MUST: link the ticket.\n  BECAUSE: the audit follows links.\n\n\
+             NEVER: guess.\n\nBECAUSE: a wrong answer costs more.\n\n\
+             :::never\nPromise a refund.\n:::\n- BECAUSE: finance decides.\n\n\
+             NOTE: not a rule.\n\nBECAUSE: orphan.\n\n\
+             SHOULD: reply.\n\n  BECAUSE: indented after a blank.",
+        )
+        .unwrap();
+        let blocks: Vec<&Block> = d.blocks().collect();
+        let because = |i: usize| blocks[i].attrs.get("because").map(String::as_str);
+        assert_eq!(because(0), Some("limits differ\nby plan."));
+        assert_eq!(blocks[0].body, "confirm the plan.");
+        assert_eq!((blocks[0].region, blocks[0].reason), ((0, 2), Some((1, 2))));
+        assert_eq!(because(1), Some("the audit follows links."));
+        assert_eq!(blocks[1].body, "link the ticket.");
+        assert_eq!(because(2), Some("a wrong answer costs more."));
+        assert_eq!(blocks[2].region, (7, 9));
+        assert_eq!(because(3), Some("finance decides."));
+        assert_eq!(
+            (blocks[3].kind.as_str(), blocks[3].region),
+            ("never", (11, 14))
+        );
+        // A `BECAUSE:` after a block that is not a rule, or indented after a
+        // blank line, is prose.
+        assert_eq!((blocks[4].kind.as_str(), because(4)), ("note", None));
+        assert_eq!((blocks[5].kind.as_str(), because(5)), ("should", None));
+        assert_eq!(blocks.len(), 6);
+        assert!(
+            d.nodes
+                .iter()
+                .any(|n| matches!(n, Node::Text(t) if t.contains("BECAUSE: orphan.")))
+        );
+        // A reason never steals the next rule's text, nor follows one past a
+        // container's close.
+        let d = parse(":::when{agent=x}\nMUST: a.\n:::\nBECAUSE: b.").unwrap();
+        let w = d.blocks().next().unwrap();
+        assert_eq!(w.children[0].attrs.get("because"), None);
+    }
+
+    /// A rule has one reason (S14): `because=` and a `BECAUSE:` paragraph
+    /// together are refused at the paragraph, nested or not.
+    #[test]
+    fn a_second_reason_is_refused() {
+        for (text, line) in [
+            (":::must{because=\"a\"}\nx\n:::\nBECAUSE: b", 4),
+            (
+                "::::when{agent=x}\n:::must{because=\"a\"}\nx\n:::\n\nBECAUSE: b\n::::",
+                6,
+            ),
+        ] {
+            let e = parse(text).unwrap_err();
+            assert_eq!(
+                (e[0].line, e[0].code, e[0].message.as_str()),
+                (
+                    Some(line),
+                    "because-repeated",
+                    "must already has a reason (because=) — a rule has one reason"
+                ),
+                "{text:?}"
+            );
+        }
+        assert!(parse(":::must{because=\"a\"}\nx\n:::").is_ok());
+    }
+
+    /// Until delivery renders reasons, a container's `BECAUSE:` paragraph,
+    /// now inside the rule's region, is delivered exactly as it was when it
+    /// was prose after the block — never dropped.
+    #[test]
+    fn a_containers_reason_is_still_delivered() {
+        for (doc, want) in [
+            (
+                ":::must\nx\n:::\n\nBECAUSE: y\nand z.\n\nAfter.",
+                "**MUST:** x\n\nBECAUSE: y\nand z.\n\nAfter.\n",
+            ),
+            (":::must\nx\n:::\nBECAUSE: y", "**MUST:** x\nBECAUSE: y\n"),
+            (
+                "::::context\n:::must\nx\n:::\nBECAUSE: y\n::::",
+                "<reference>\nBECAUSE: y\n</reference>\n",
+            ),
+        ] {
+            let d = parse(doc).unwrap();
+            assert!(
+                d.blocks()
+                    .any(|b| b.reason.is_some() || b.children.iter().any(|c| c.reason.is_some())),
+                "{doc:?}"
+            );
+            assert_eq!(fold(&d, &all_families()).unwrap().cleaned, want, "{doc:?}");
+        }
+    }
+
+    /// Identity is document-wide (S26): a named rule inside a container body
+    /// clashes with one at the top level, and is what a reference resolves.
+    #[test]
+    fn identity_and_references_reach_nested_blocks() {
+        let e = parse("MUST[a]: x\n\n:::when{agent=y}\nMUST[a]: z\n:::").unwrap_err();
+        assert_eq!(
+            (e[0].line, e[0].code, e[0].message.as_str()),
+            (
+                Some(4),
+                "duplicate-identity",
+                "duplicate must/a (first declared at line 1)"
+            )
+        );
+        let e =
+            parse("## !skill s\n\n:::note{name=n}\nx\n:::\n\n:::note{name=n}\ny\n:::").unwrap_err();
+        assert_eq!(e[0].code, "duplicate-identity", "{e:?}");
+        // Nested names resolve, from a wiki-link and from an attribute.
+        assert!(
+            parse(":::when{agent=y}\nNEVER[cap]: exceed it.\n:::\n\nSee [[never/cap]].").is_ok()
+        );
+        assert!(
+            parse(":::when{agent=y}\n:::!workflow{name=w}\nsteps: {}\n:::\n:::\n\n:::!skill{name=s may=@workflow/w}\nx\n:::")
+                .is_ok()
+        );
+        // A sub-block's name is scoped to its parent: two tests may each
+        // have a case called `one`.
+        assert!(
+            parse(
+                ":::!function{name=f}\nx\n:::\n\
+             ::::!test{name=a target=@function/f}\n:::case{name=one}\ngiven: {}\n:::\n::::\n\
+             ::::!test{name=b target=@function/f}\n:::case{name=one}\ngiven: {}\n:::\n::::"
+            )
+            .is_ok()
+        );
+    }
+
+    /// An `@` in a free-text attribute is prose, never a reference; in any
+    /// other attribute it is one, and an unqualified one is still refused —
+    /// `function.target` has no schema pattern to catch it otherwise.
+    #[test]
+    fn an_at_in_free_text_is_prose_and_elsewhere_a_reference() {
+        for doc in [
+            ":::must{if=\"@ops asks\" because=\"@ops said so\" title=\"@ops\"}\nx\n:::",
+            "MUST (if @ops asks): x",
+            ":::!skill{name=s description=\"ask @ops\" trigger=\"@ops pings\"}\nx\n:::",
+            ":::!skill{name=s when=\"@ops pings\"}\nx\n:::",
+        ] {
+            assert!(parse(doc).is_ok(), "{doc:?}: {:?}", parse(doc).err());
+        }
+        let e = parse(":::!function{name=f target=@bare}\nx\n:::").unwrap_err();
+        assert_eq!(
+            (e[0].code, e[0].message.as_str()),
+            (
+                "attribute-value",
+                "target=@bare must be qualified as @kind/name"
+            )
+        );
+        // `when` is free text on a skill only.
+        let e = parse("::!human{name=h when=@bare}").unwrap_err();
+        assert_eq!(e[0].code, "attribute-value", "{e:?}");
+    }
+
+    /// A skill's `trigger` (S11) is what the catalogue says it is for;
+    /// `when` is its alias, and `trigger` wins when both are given.
+    #[test]
+    fn a_skill_trigger_wins_over_when() {
+        let when_to_use = |doc: &str| {
+            fold(&parse(doc).unwrap(), &all_families()).unwrap().skills[0]
+                .when_to_use
+                .clone()
+        };
+        assert_eq!(
+            when_to_use(":::!skill{name=s trigger=\"t\" when=\"w\"}\nx\n:::").as_deref(),
+            Some("t")
+        );
+        assert_eq!(
+            when_to_use(":::!skill{name=s when=\"w\"}\nx\n:::").as_deref(),
+            Some("w")
+        );
+        assert_eq!(
+            when_to_use("## !skill s {trigger=\"t\"}\n\nx").as_deref(),
+            Some("t")
+        );
+    }
+
+    /// The 1.1 registry tables load from the schema: the sigil→scheme table
+    /// a reference is checked against, the wire floor, the rule strengths,
+    /// the context keys and the attribute rules.
+    #[test]
+    fn the_registry_tables_load() {
+        let r = registry();
+        let sigils: Vec<(&str, Vec<&str>)> = r
+            .sigils()
+            .iter()
+            .map(|(s, v)| (s.as_str(), v.iter().map(String::as_str).collect()))
+            .collect();
+        assert_eq!(
+            sigils,
+            [
+                ("#", vec!["instruction"]),
+                (
+                    "&",
+                    vec![
+                        "server",
+                        "skill",
+                        "model",
+                        "service",
+                        "sandbox",
+                        "connector"
+                    ]
+                ),
+                ("@", vec!["principal", "agent"]),
+            ]
+        );
+        assert_eq!(r.wire_floor(), ["compose", "identity"]);
+        assert_eq!(
+            (r.strength("guardrail"), r.strength("may")),
+            (Some(4), Some(1))
+        );
+        assert_eq!(r.reason_keyword(), "BECAUSE");
+        assert!(r.context_keys().iter().any(|k| k == "agent"));
+        assert!(r.label_styles().iter().any(|s| s == "tags"));
+        assert!(r.reserved_bare("workflow") && !r.reserved_bare("eval"));
+        assert_eq!(
+            r.attr_rule("param", "source")
+                .and_then(|a| a.values.clone()),
+            Some(vec![
+                "static".to_string(),
+                "workspace".into(),
+                "agent_attribute".into(),
+                "prompt".into()
+            ])
+        );
+        assert!(
+            r.attr_rule("eval", "target")
+                .is_some_and(|a| a.pattern.is_some())
+        );
+        assert!(
+            lookup("skill")
+                .unwrap()
+                .ack_trigger
+                .as_deref()
+                .is_some_and(|t| t.contains("{trigger}"))
+        );
+        assert!(lookup("mcp").unwrap().body_schema.is_some());
+        assert!(
+            r.keywords_longest_first()
+                .windows(2)
+                .all(|w| w[0].len() >= w[1].len()),
+            "longest first"
+        );
+    }
+
+    /// The wire floor `sign` enforces is the registry's: the hard-coded list
+    /// cannot drift from the schema.
+    #[cfg(feature = "sign")]
+    #[test]
+    fn the_wire_floor_is_the_registrys() {
+        assert_eq!(registry().wire_floor(), crate::sign::WIRE_FLOOR);
     }
 }

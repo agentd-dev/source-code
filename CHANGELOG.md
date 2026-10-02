@@ -262,6 +262,22 @@ test that fails on the old code.
   `--prompt-missing` can ask for it.
   `url:` and `uri:` definitions are still read at startup, because reading
   them dials.
+- **An instruction document's names are unique across the whole document,
+  and its keyword lines read the 1.1 grammar.** A name was judged among
+  top-level blocks only, so a rule or a machinery block named inside a
+  `:::when`, a section or another container could repeat a name in use, and
+  could not be referenced. Names are now judged document-wide (S26): a name
+  reused inside a nested container refuses (`duplicate-identity`), and a
+  wiki-link or `@kind/name` resolves to a nested block. An `@` inside an
+  `if`, `because`, `title`, `trigger` or `description` attribute, or a
+  skill's `when`, is text and no longer a reference; anywhere else an
+  unqualified `@name` still refuses. `MUST[name]:` names a one-line rule
+  (S12), `MUST (if …):` gives it a condition (S15), and a `BECAUSE:`
+  paragraph after a rule is its reason (S14); a rule that already has
+  `because=` and is followed by one refuses (`because-repeated`). A skill's
+  `trigger` is what the catalogue says it is for, with `when` as its alias.
+  The delivered text is unchanged for now: these lines reach the model as
+  they did, and the rendered forms come with the 1.1 delivery.
 - **`/hooks/_` is agentd's.** A `wait {on: webhook}` callback is armed under
   `/hooks/_cb/`, and configured routes match first, so a route there could
   take a suspended run's callback. A `webhook` start `path` or a wait's
@@ -332,6 +348,19 @@ line, code and message. A reference cycle and unreadable front matter now
 name a line, as Appendix B and the other ports do: `line N: reference cycle:
 skill/a → skill/b → skill/a` (it was `reference cycle through skill/a`), and
 line 1 for the front matter.
+
+agentd-instruction reads the rest of the revision 1.1 registry: labels and
+negated labels, keyword flags, rule strengths, the reason keyword, context
+keys, label styles, reserved bare names, the sigil table, the wire floor and
+the revision, and per kind `x-alias-of`, `x-acknowledgement-trigger` and
+`x-body-schema` (kept as data, never used to refuse), and per attribute its
+`enum` and `pattern` (`Registry::attr_rule`). Keyword lines are matched by
+`x-grammar.keywordLine`: at column 0, with an optional `[name]` and
+`(if …)`. In the tree a keyword's flags (`SHOULD NOT` sets `not`), its name
+and its condition are attributes, an alias kind stays as written, a rule's
+reason is `attrs.because`, and `frontMatter` appears only when the document
+has front matter. `Block` gains `reason` and `Document` gains
+`has_front_matter`.
 
 ## v1.17.0 — A2A, and nothing beside it
 

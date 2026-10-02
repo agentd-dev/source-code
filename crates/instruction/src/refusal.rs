@@ -168,7 +168,6 @@ mod tests {
     /// unit. Shrink-only: the unit that builds a code removes it here, and the
     /// accounting test fails until it does.
     const PENDING_CODES: &[(&str, &str)] = &[
-        ("because-repeated", "V3"),
         ("end-matter-yaml", "V4"),
         ("override-guardrail", "V4"),
         ("override-stronger", "V4"),

@@ -73,45 +73,28 @@ fn inputs_of(suite: &str) -> &'static [&'static str] {
 /// closes them. Shrink-only: an entry that starts passing must be deleted
 /// here, and the test says so.
 const PENDING: &[&str] = &[
-    // Cases new in revision 1.1 (S8-S26): the forms, notes, end matter,
-    // variants, typed parameters and overrides they exercise land in
-    // units V3-V6.
+    // Cases new in revision 1.1 (S8-S27): the notes, end matter, eval
+    // blocks and the delivery of every 1.1 construct land in units V4-V6.
     "corpus/author-notes/delivered.txt",
     "corpus/author-notes/tree.json",
     "corpus/conditions/delivered.txt",
-    "corpus/conditions/tree.json",
     "corpus/end-matter/delivered.txt",
     "corpus/end-matter/tree.json",
     "corpus/eval/delivered.txt",
     "corpus/eval/doc.md",
     "corpus/eval/tree.json",
     "corpus/examples-avoid/delivered.txt",
-    "corpus/examples-avoid/tree.json",
     "corpus/labels-plain/delivered.txt",
-    "corpus/labels-plain/tree.json",
     "corpus/labels-tags/delivered.txt",
-    "corpus/labels-tags/tree.json",
     "corpus/named-rules/delivered.txt",
-    "corpus/named-rules/doc.md",
-    "corpus/named-rules/tree.json",
     "corpus/output/delivered.txt",
-    "corpus/output/tree.json",
     "corpus/overrides-house/delivered.txt",
-    "corpus/overrides-house/tree.json",
     "corpus/overrides/delivered.txt",
-    "corpus/overrides/tree.json",
     "corpus/parameter-types/delivered.txt",
-    "corpus/parameter-types/tree.json",
     "corpus/permissions/delivered.txt",
-    "corpus/permissions/tree.json",
     "corpus/reasons/delivered.txt",
-    "corpus/reasons/tree.json",
-    "corpus/should-not/tree.json",
     "corpus/skill-trigger/delivered.txt",
-    "corpus/skill-trigger/tree.json",
     "corpus/variants/delivered.txt",
-    "corpus/variants/tree.json",
-    "corpus/verbatim/tree.json",
     // Delivered text upstream changed for 1.1 (the skill-trigger
     // acknowledgement; research-agent's enum-typed parameter) — units V5-V6.
     "corpus/coding-agent/delivered.txt",
@@ -173,9 +156,7 @@ const PENDING: &[&str] = &[
     "corpus/variants/manifest.json",
     "corpus/verbatim/manifest.canonical.json",
     "corpus/verbatim/manifest.json",
-    // Refusals new in revision 1.1 — units V3-V4.
-    "refusals/because-repeated/refusals.json",
-    "refusals/duplicate-named-keyword/refusals.json",
+    // Refusals new in revision 1.1 — unit V4.
     "refusals/output-schema-not-a-reference/refusals.json",
     "refusals/override-guardrail/refusals.json",
     "refusals/override-stronger/refusals.json",

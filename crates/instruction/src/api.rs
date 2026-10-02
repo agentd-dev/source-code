@@ -193,11 +193,22 @@ fn authored_digest(document: &Document) -> String {
 /// under a synthetic `form: "set"` node with `members`.
 pub fn tree_json(document: &Document) -> Value {
     let nodes: Vec<&Block> = document.blocks().collect();
-    json!({
-        "spec": document.front.get("spec").cloned().unwrap_or_else(|| json!("1")),
-        "frontMatter": document.front,
-        "blocks": grouped_json(&nodes),
-    })
+    let mut tree = serde_json::Map::new();
+    tree.insert(
+        "spec".into(),
+        document
+            .front
+            .get("spec")
+            .cloned()
+            .unwrap_or_else(|| json!("1")),
+    );
+    // `frontMatter` is the document's front matter when it has some, and
+    // absent when it has none — not an empty mapping in its place.
+    if document.has_front_matter {
+        tree.insert("frontMatter".into(), json!(document.front));
+    }
+    tree.insert("blocks".into(), json!(grouped_json(&nodes)));
+    Value::Object(tree)
 }
 
 /// Render a run of sibling blocks, grouping consecutive members of one
@@ -446,6 +457,16 @@ mod tests {
             out.text,
             "**MUST:** run the tests.\n\n- **NEVER:** push to main.\n\n**TIP:** Sleep on it.\nThen decide.\n"
         );
+    }
+
+    /// `frontMatter` is in the tree when the document has front matter, and
+    /// absent, not an empty mapping, when it has none.
+    #[test]
+    fn front_matter_is_in_the_tree_only_when_written() {
+        let t = tree_json(&parse("MUST: x").unwrap());
+        assert!(t.get("frontMatter").is_none(), "{t}");
+        let t = tree_json(&parse("---\nspec: \"1\"\n---\nMUST: x").unwrap());
+        assert_eq!(t["frontMatter"], json!({"spec": "1"}));
     }
 
     #[test]

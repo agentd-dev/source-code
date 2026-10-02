@@ -228,8 +228,9 @@ a run puts on a stream is judged like `into:`: its `emit` taints the target, and
 stream's consumers are checked.
 
 All three legs and no `security.allow_trifecta` is exit `2` — from `--validate-config` for
-the inline definitions, and at the start and on every reload for the whole set once
-`file:`, `url:` and `dir:` definitions resolve. A reload that moves anything the check
+the inline definitions and those in local files and folders (`file:`, `dir:`, the adopted
+`workflows/` folder), and at the start and on every reload for the whole set once `url:`
+and `uri:` definitions resolve. A reload that moves anything the check
 reads (`config/taint.rs::inputs_moved`: the servers, the service catalog, the templates,
 the streams, the tools, the policies) re-judges the definitions, the stored ones included. A refused
 reload keeps the running configuration. The message names the workflow, the stream, what
@@ -1046,8 +1047,9 @@ request is in:
   `agent.document_capabilities` (capped by what a signature attests), and so does every other
   spelling of the route: a `:::!workflow` block, a `:::!config` `workflows:` entry, and a
   `file:`/`url:`/`uri:`/`dir:` entry the document names. Without the grant the load is refused,
-  naming the workflow, the step and the document — inline definitions at config load (so
-  `--validate-config` reports them), references once they resolve at startup or on a reload
+  naming the workflow, the step and the document — inline definitions and local `file:`/`dir:`
+  ones at config load (so `--validate-config` reports them), `url:`/`uri:` references once
+  they resolve at startup or on a reload
   (`config/settings/mod.rs::document_route_refusals`). The same workflow in the operator's own
   configuration needs no grant. A subagent template's machinery opens no route at all, through
   either door into the child's `workflows`: a child has no listener, and the parent's routes

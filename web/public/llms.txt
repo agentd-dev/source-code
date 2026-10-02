@@ -523,7 +523,7 @@ Useful to know so you do not assume otherwise:
 | exit `7` | a budget (steps/tokens/deadline) was exhausted — `lifecycle.exit_code_map` can make this non-fatal |
 | "store.kind is none but the instance is long-lived" | drop `store.kind` to get the file store, or configure `mcp`/`http` |
 | "is locked by pid N" | another agentd is using that state directory — give this one its own `agent.name` or `store.file.path` |
-| a workflow never fires | check `armed`, the start node's conditions, and that the binary was built with the feature that start needs — a CEL guard on a non-`cel` build is refused at validation (exit `2`), but a `cron:` schedule on a non-`cron` build simply never arms, and says nothing |
+| a workflow never fires | check `armed`, the start node's conditions, and that the binary was built with the feature that start needs — a CEL guard on a non-`cel` build and a `cron:` schedule on a non-`cron` build are both refused at validation (exit `2`) |
 | the trifecta gate refuses startup | tag your MCP servers; an untagged server counts as untrusted input |
 
 ---

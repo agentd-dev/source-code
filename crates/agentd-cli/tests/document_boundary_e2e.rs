@@ -142,8 +142,8 @@ fn a_template_document_route_is_refused_at_load() {
 }
 
 /// A document's `file:` reference is the document's machinery one hop away:
-/// it resolves at startup, after `--validate-config` could see it, and the
-/// start refuses it there — under the grant, it loads.
+/// a local file, so `--validate-config` reads it and refuses it as the start
+/// does — under the grant, it loads.
 #[test]
 fn a_document_reference_to_a_route_is_refused_at_startup() {
     let t = tempfile::tempdir().unwrap();
@@ -166,20 +166,24 @@ fn a_document_reference_to_a_route_is_refused_at_startup() {
     let cfg = t.path().join("agent.yaml");
     let port = common::free_port();
 
+    // The JSON line escapes the quotes, a refusal while the start loads its
+    // configuration does not; read both as written.
+    let names_it = |err: &str| {
+        let err = err.replace("\\\"", "\"");
+        err.contains(&format!(
+            "workflow \"intake\" step \"hook\" from the instruction document {}",
+            doc.display()
+        )) && err.contains("`interface` grant")
+    };
     let (code, err) = validate(&cfg, &config(&doc, port, ""));
     assert_eq!(
-        code, 0,
-        "a reference is not resolved by --validate-config: {err}"
+        code, 2,
+        "a local reference is read by --validate-config: {err}"
     );
+    assert!(names_it(&err), "{err}");
     let (code, err) = start(&cfg, |_| false);
     assert_eq!(code, Some(2), "{err}");
-    assert!(
-        err.contains(&format!(
-            "workflow \\\"intake\\\" step \\\"hook\\\" from the instruction document {}",
-            doc.display()
-        )) && err.contains("`interface` grant"),
-        "{err}"
-    );
+    assert!(names_it(&err), "{err}");
 
     std::fs::write(
         &cfg,

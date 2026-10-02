@@ -140,8 +140,8 @@ fn a_stream_nothing_outside_feeds_loads() {
     assert_eq!(code, 0, "{err}");
 }
 
-/// A consumer defined in a FILE is not visible to `--validate-config`; the
-/// loader checks it once the definitions resolve, and the start refuses.
+/// A consumer defined in a local FILE is read by `--validate-config` and
+/// refused there, and the start refuses it too.
 #[test]
 fn a_file_defined_consumer_refuses_the_start() {
     let t = tempfile::tempdir().unwrap();
@@ -165,6 +165,12 @@ fn a_file_defined_consumer_refuses_the_start() {
         ),
     )
     .unwrap();
+    let (code, err) = agentd(&["--config", &cfg.to_string_lossy(), "--validate-config"]);
+    assert_eq!(code, 2, "{err}");
+    assert_names(
+        &err,
+        "webhook `into:` at workflow \\\"intake\\\" step \\\"hook\\\"",
+    );
     // A start that is NOT refused serves its webhook until stopped, so it is
     // given a deadline rather than waited on.
     let log = t.path().join("daemon.log");
@@ -192,10 +198,8 @@ fn a_file_defined_consumer_refuses_the_start() {
     };
     let err = std::fs::read_to_string(&log).unwrap_or_default();
     assert_eq!(code, 2, "{err}");
-    assert_names(
-        &err,
-        "webhook `into:` at workflow \\\"intake\\\" step \\\"hook\\\"",
-    );
+    // Refused while the configuration loads, so it is the plain usage line.
+    assert!(names_all(&err, "triage", "mail"), "{err}");
 }
 
 /// A daemon whose stderr log a test reads, stopped on drop.
@@ -258,10 +262,13 @@ impl Drop for Daemon {
     }
 }
 
-/// Whether some `config.reload.invalid` / `workflow.stored.invalid` line or
-/// tool reply names the workflow, the stream, the producer and the server.
-#[cfg(feature = "hot-reload")]
+/// Whether a refusal — the start's, or a `config.reload.invalid` /
+/// `workflow.stored.invalid` line or tool reply — names the workflow, the
+/// stream, the producer and the server. Read as written: a refusal carried
+/// inside another message (a reload's error quotes the load's) has its quotes
+/// escaped once more.
 fn names_all(m: &str, workflow: &str, server: &str) -> bool {
+    let m = m.replace("\\\"", "\"");
     m.contains(&format!("workflow \"{workflow}\""))
         && m.contains("stream \"inbox\"")
         && m.contains("webhook `into:` at workflow \"intake\"")

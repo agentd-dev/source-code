@@ -187,7 +187,7 @@ impl Runtime {
             || taint_inputs_moved
         {
             let mut staged = super::steps::StagedWorkflows::default();
-            let docs = self.workflow_documents(&mut staged.errs);
+            let docs = super::steps::workflow_documents(&self.settings, &mut staged.errs);
             // A `uri:` document is read through a connected MCP server. When
             // this reload changes the servers, it is read through the set the
             // reload would run on, once that is staged below.

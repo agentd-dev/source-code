@@ -124,98 +124,11 @@ impl Runtime {
     /// message instead of hiding the rest.
     pub(crate) fn load_workflows(&mut self) -> Result<(), Vec<String>> {
         let mut staged = StagedWorkflows::default();
-        let docs = self.workflow_documents(&mut staged.errs);
+        let docs = workflow_documents(&self.settings, &mut staged.errs);
         self.stage_workflows(docs, &self.mcp, &mut staged);
         let prepared = self.prepare_workflows(staged, &self.registry, &self.mcp)?;
         self.install_workflows(prepared);
         Ok(())
-    }
-
-    /// The configured workflow entries as a flat list of documents, each with
-    /// the source a refusal names it by. Reads folders; installs nothing.
-    pub(crate) fn workflow_documents(&self, errs: &mut Vec<String>) -> Vec<WorkflowDocument> {
-        // A `{dir}` entry expands into one entry per matching file BEFORE
-        // resolution, so everything downstream — parsing, naming, the duplicate
-        // check — sees a plain list of documents and needs no directory case.
-        // Each document travels with where it came from, so two that resolve
-        // to one name can be refused naming both.
-        let mut docs: Vec<WorkflowDocument> = Vec::new();
-        for (i, doc) in self.settings.workflows.clone().into_iter().enumerate() {
-            let from_document = self.settings.agent.document_workflows.contains(&i);
-            // The ENTRY fold runs here, BEFORE the dir expansion, because a
-            // `dir:` is consumed by that expansion and would never reach the
-            // per-document fold below — `{{config.wf_dir}}` went to the
-            // filesystem verbatim and failed as "not a directory". `file:` and
-            // `url:` are folded again below (idempotent: a folded string has no
-            // tokens left), which keeps the inline case reporting an unresolved
-            // reference exactly once.
-            let mut doc = doc;
-            if doc.get("steps").is_none() {
-                substitute_config_vars(&mut doc, &self.settings.vars, "workflow entry", errs);
-            }
-            // `dir:` is the folder source shared with instructions: a path,
-            // or `{path, glob, order}`. `glob` and `order` live INSIDE it —
-            // one home for the settings that qualify a folder, here as
-            // everywhere else.
-            let entry_dir = match doc.get("dir") {
-                None => None,
-                Some(v) => match serde_json::from_value::<Dir>(v.clone()) {
-                    Ok(dir) => {
-                        if doc.get("glob").is_some() {
-                            errs.push(
-                                "workflow entry: `glob` beside `dir` — it belongs inside \
-                                 (`dir: {path: …, glob: …}`), which is where `order` lives too"
-                                    .to_string(),
-                            );
-                        }
-                        Some(dir)
-                    }
-                    Err(e) => {
-                        errs.push(format!("workflow entry dir: {e}"));
-                        None
-                    }
-                },
-            };
-            match entry_dir {
-                None => docs.push(WorkflowDocument {
-                    entry: doc,
-                    source: self.settings.workflow_entry_source(i),
-                    from_document,
-                }),
-                Some(dir) => {
-                    let pattern = dir.glob().unwrap_or("*.yaml,*.yml,*.json");
-                    match expand_dir_ordered(dir.path(), pattern, dir.order()) {
-                        Ok(paths) if paths.is_empty() => {
-                            // Silence here would mean a schedule that never
-                            // fires and no way to tell why.
-                            errs.push(format!(
-                                "workflow dir {}: no file matched {pattern:?}",
-                                dir.path()
-                            ));
-                        }
-                        Ok(paths) => {
-                            for path in paths {
-                                let mut d = json!({"file": path});
-                                if let Some(a) = doc.get("armed") {
-                                    d["armed"] = a.clone();
-                                }
-                                let source = format!(
-                                    "file {path} (from {})",
-                                    self.settings.workflow_entry_source(i)
-                                );
-                                docs.push(WorkflowDocument {
-                                    entry: d,
-                                    source,
-                                    from_document,
-                                });
-                            }
-                        }
-                        Err(e) => errs.push(format!("workflow dir {}: {e}", dir.path())),
-                    }
-                }
-            }
-        }
-        docs
     }
 
     /// Resolve and parse workflow documents into `staged`: read each `file:`,
@@ -261,19 +174,7 @@ impl Runtime {
                 doc.get("file").and_then(Value::as_str),
                 doc.get("uri").and_then(Value::as_str),
             ) {
-                (Some(path), _) => match std::fs::read_to_string(path)
-                    .map_err(|e| e.to_string())
-                    .and_then(|t| {
-                        crate::config::file::parse_document(
-                            &t,
-                            crate::config::file::Format::detect(
-                                Some(std::path::Path::new(path)),
-                                &t,
-                            ),
-                        )
-                    })
-                    .and_then(|d| as_definition(d, &doc))
-                {
+                (Some(path), _) => match read_workflow_file(path, &doc) {
                     Ok(d) => d,
                     Err(e) => {
                         errs.push(format!("workflow file {path}: {e}"));
@@ -3870,6 +3771,110 @@ fn collect_memory_keys(v: &Value, out: &mut Vec<String>) {
         Value::Object(o) => o.values().for_each(|x| collect_memory_keys(x, out)),
         _ => {}
     }
+}
+
+/// The configured workflow entries as a flat list of documents, each with
+/// the source a refusal names it by. Reads folders; installs nothing — and
+/// needs nothing but the settings, so `--validate-config` expands the same
+/// folders the loader does.
+pub(crate) fn workflow_documents(
+    settings: &crate::config::settings::Settings,
+    errs: &mut Vec<String>,
+) -> Vec<WorkflowDocument> {
+    // A `{dir}` entry expands into one entry per matching file BEFORE
+    // resolution, so everything downstream — parsing, naming, the duplicate
+    // check — sees a plain list of documents and needs no directory case.
+    // Each document travels with where it came from, so two that resolve
+    // to one name can be refused naming both.
+    let mut docs: Vec<WorkflowDocument> = Vec::new();
+    for (i, doc) in settings.workflows.clone().into_iter().enumerate() {
+        let from_document = settings.agent.document_workflows.contains(&i);
+        // The ENTRY fold runs here, BEFORE the dir expansion, because a
+        // `dir:` is consumed by that expansion and would never reach the
+        // per-document fold below — `{{config.wf_dir}}` went to the
+        // filesystem verbatim and failed as "not a directory". `file:` and
+        // `url:` are folded again below (idempotent: a folded string has no
+        // tokens left), which keeps the inline case reporting an unresolved
+        // reference exactly once.
+        let mut doc = doc;
+        if doc.get("steps").is_none() {
+            substitute_config_vars(&mut doc, &settings.vars, "workflow entry", errs);
+        }
+        // `dir:` is the folder source shared with instructions: a path,
+        // or `{path, glob, order}`. `glob` and `order` live INSIDE it —
+        // one home for the settings that qualify a folder, here as
+        // everywhere else.
+        let entry_dir = match doc.get("dir") {
+            None => None,
+            Some(v) => match serde_json::from_value::<Dir>(v.clone()) {
+                Ok(dir) => {
+                    if doc.get("glob").is_some() {
+                        errs.push(
+                            "workflow entry: `glob` beside `dir` — it belongs inside \
+                             (`dir: {path: …, glob: …}`), which is where `order` lives too"
+                                .to_string(),
+                        );
+                    }
+                    Some(dir)
+                }
+                Err(e) => {
+                    errs.push(format!("workflow entry dir: {e}"));
+                    None
+                }
+            },
+        };
+        match entry_dir {
+            None => docs.push(WorkflowDocument {
+                entry: doc,
+                source: settings.workflow_entry_source(i),
+                from_document,
+            }),
+            Some(dir) => {
+                let pattern = dir.glob().unwrap_or("*.yaml,*.yml,*.json");
+                match expand_dir_ordered(dir.path(), pattern, dir.order()) {
+                    Ok(paths) if paths.is_empty() => {
+                        // Silence here would mean a schedule that never
+                        // fires and no way to tell why.
+                        errs.push(format!(
+                            "workflow dir {}: no file matched {pattern:?}",
+                            dir.path()
+                        ));
+                    }
+                    Ok(paths) => {
+                        for path in paths {
+                            let mut d = json!({"file": path});
+                            if let Some(a) = doc.get("armed") {
+                                d["armed"] = a.clone();
+                            }
+                            let source =
+                                format!("file {path} (from {})", settings.workflow_entry_source(i));
+                            docs.push(WorkflowDocument {
+                                entry: d,
+                                source,
+                                from_document,
+                            });
+                        }
+                    }
+                    Err(e) => errs.push(format!("workflow dir {}: {e}", dir.path())),
+                }
+            }
+        }
+    }
+    docs
+}
+
+/// A `file:` entry's document, read from the local filesystem as a
+/// definition. Shared with `--validate-config`, which reads the same files.
+pub(crate) fn read_workflow_file(path: &str, entry: &Value) -> Result<Value, String> {
+    std::fs::read_to_string(path)
+        .map_err(|e| e.to_string())
+        .and_then(|t| {
+            crate::config::file::parse_document(
+                &t,
+                crate::config::file::Format::detect(Some(std::path::Path::new(path)), &t),
+            )
+        })
+        .and_then(|d| as_definition(d, entry))
 }
 
 /// A resolved document as a definition: a mapping, which takes its entry's

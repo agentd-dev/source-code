@@ -206,7 +206,7 @@ a bad document only reproduces it).
 | the **file** layer carries no inline credential | `config file: intelligence.token carries an inline credential; use {{secret:NAME}} / {{secret-file:PATH}} (or set it from env/flag)` |
 | no credential-shaped header (`intelligence.headers`, an MCP server's, a peer's, `store.http.headers`) has an inline value | `intelligence.headers['authorization'] looks like a credential but has an inline value; use {{secret:NAME}} / {{secret-file:PATH}}` |
 | the root grant is not a lethal trifecta | `lethal-trifecta refused: the root grant wires untrusted_input + sensitive + egress into one agent; narrow the tags or set security.allow_trifecta (audited)` |
-| no workflow reads outside input from a stream into model-driven steps that reach `sensitive` + `egress` — a webhook or A2A `into:`, a subagent template's `mirror_streams`, or an `emit` from a run that carries outside text (one that read a tainted stream, or that a webhook or A2A start fired) taints the stream, and a run such a run starts (a `workflow` step, a workflow tool, `workflow.run` or `workflow.signal`) carries the taint too; a step reaches its `servers:` plus whatever its tools hand text on to (`subagent.run`, `subagent.send`, `message.send`, `exec`, a mapped tool's server); unless `security.allow_trifecta` is set. `--validate-config` judges the inline definitions; the start and every reload judge the whole set once `file:`, `url:` and `dir:` definitions resolve, and a definition the agent writes with `workflow.create`/`update` is refused the same way ([security.md](security.md#streams-carry-the-taint-of-what-feeds-them)) | `` workflow "triage": lethal-trifecta refused — it consumes stream "inbox" (fed by webhook `into:` at workflow "intake" step "hook"), and its model-driven steps reach mcp server "mail" [sensitive, egress]: untrusted input + sensitive + egress in one run. … `` |
+| no workflow reads outside input from a stream into model-driven steps that reach `sensitive` + `egress` — a webhook or A2A `into:`, a subagent template's `mirror_streams`, or an `emit` from a run that carries outside text (one that read a tainted stream, or that a webhook or A2A start fired) taints the stream, and a run such a run starts (a `workflow` step, a workflow tool, `workflow.run` or `workflow.signal`) carries the taint too; a step reaches its `servers:` plus whatever its tools hand text on to (`subagent.run`, `subagent.send`, `message.send`, `exec`, a mapped tool's server); unless `security.allow_trifecta` is set. `--validate-config` judges the inline definitions and those in local files and folders (`file:`, `dir:`, the adopted `workflows/` folder); the start and every reload judge the whole set once `url:` and `uri:` definitions resolve, and a definition the agent writes with `workflow.create`/`update` is refused the same way ([security.md](security.md#streams-carry-the-taint-of-what-feeds-them)) | `` workflow "triage": lethal-trifecta refused — it consumes stream "inbox" (fed by webhook `into:` at workflow "intake" step "hook"), and its model-driven steps reach mcp server "mail" [sensitive, egress]: untrusted input + sensitive + egress in one run. … `` |
 
 Non-fatal findings come back on the same channel as
 `{"event":"config.warning","msg":…}` and do **not** change the exit code — a
@@ -1035,7 +1035,7 @@ long-lived **daemon**, and what wakes it:
 | `once` | once, at startup (unless a live run was restored) | `policy` |
 | `manual` | only when explicitly triggered (`workflow.run`, or an A2A `workflow.run` command) | — |
 | `loop` | repeatedly, on an interval, until a condition | `interval`, `delay`, `until`, `max_iterations`, `backoff` |
-| `schedule` | on a clock | `cron: "0 2 * * *"` (needs `--features cron`), or `every: 1h`, or `at: "02:00Z"` |
+| `schedule` | on a clock | `cron: "0 2 * * *"` (needs `--features cron`), or `every: 1h`, or `at: 2h` (a one-shot **delay**, not a wall-clock time) |
 | `subscribe` | when an MCP **resource** updates | `server`, `uri` (both required), `debounce_ms`, `filter`, `window` |
 | `signal` | when a named signal arrives | `name` (required), `filter` |
 | `event` | on a runtime event | `on` (required — the event name as the runtime spells it, e.g. `workflow.finished`), `filter` |
@@ -1079,11 +1079,12 @@ workflows:
 
 Every workflow needs a start node and a `finish` step, and every non-start step
 declares `depends_on`; `--validate-config` runs the same workflow parse the
-runtime does for **inline** `steps:`, so a mistyped field is caught before the
-first side effect (§2). A `file:`, `dir:` or `url:` reference carries no
-steps in the config document itself; it is resolved at startup, when the file is
-read or the URL fetched — so a typo inside a referenced definition (or a `dir:`
-that matches no file) surfaces there instead.
+runtime does for inline `steps:` and for the definitions in local files and
+folders — a `file:`, a `dir:` (one that matches no file is refused), and the
+`workflows/` folder adopted beside the config — so a mistyped field is caught
+before the first side effect (§2). A `url:` or `uri:` reference is read by
+dialling, so it is resolved at startup, and a typo inside such a definition
+surfaces there instead.
 
 The **job** shape needs no workflow at all: `agentd --instruction "…"
 --intelligence https://…` expands to a `once → agent → finish` workflow, runs one
@@ -1129,10 +1130,10 @@ are refused: exit `2` at startup, and a refused reload that applies nothing
 definition loads; nothing decides which one wins, because the later one
 silently replacing the other is how an operator's workflow changed without a
 word. Two files in one folder are named in folder order, so the message reads
-the same on every machine. `--validate-config` reads no workflow file, so it
-judges only the names it can see — inline entries and the document's — and a
-collision involving a `file:`, `dir:`, `url:` or `uri:` document is found when
-the daemon loads it. A subagent template's workflows follow the same rule: a
+the same on every machine. `--validate-config` judges the names it can read —
+inline entries, the document's, and the local files and folders — and a
+collision involving a `url:` or `uri:` document is found when the daemon loads
+it. A subagent template's workflows follow the same rule: a
 collision among its `:::!config` workflows, its `:::!workflow` blocks and the
 reporter and stream mirrors agentd composes for the child is refused at the
 parent's startup, naming the template.

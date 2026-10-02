@@ -188,3 +188,70 @@ fn sigkill_then_removed_definition_still_finishes_the_run() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A pin this build cannot read is a refused run, said twice — never a run
+/// dropped in silence. The pin is the definition as the run STARTED with it,
+/// parsed again at boot with today's parser; a field a later version deleted
+/// (RFC 0045 D9 removed seven) makes that parse fail. The run then has no
+/// definition to finish under, so it is refused by the resume policy, and
+/// both lines name why: `workflow.pin_missing` carries the parser's error and
+/// `run.refused` the run; a job then exits `5`.
+#[test]
+fn sigkill_then_an_unreadable_pin_refuses_the_run_loudly() {
+    let dir = common::unique_path("phx-old", "d");
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = format!("{dir}/c.yaml");
+    std::fs::write(&cfg, config(&dir, "old-def", true)).unwrap();
+    drop(kill_mid_run(&cfg));
+    // The pin as an older build wrote it: a start field this build no longer
+    // takes.
+    fn pins(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                pins(&p, out);
+            } else if p.to_string_lossy().contains("_pins") {
+                out.push(p);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    pins(std::path::Path::new(&format!("{dir}/state")), &mut found);
+    let mut edited = 0;
+    for p in found {
+        let mut env: Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        if let Some(s) = env.pointer_mut("/state/definition/steps/s") {
+            s["coalesce"] = Value::Bool(true);
+            std::fs::write(&p, serde_json::to_vec(&env).unwrap()).unwrap();
+            edited += 1;
+        }
+    }
+    assert_eq!(edited, 1, "one pin for the killed run");
+    // The configuration moved on, so the run can only finish under its pin.
+    std::fs::write(&cfg, config(&dir, "new-def", true)).unwrap();
+    let (code, l2) = life(&cfg);
+    // A job whose run was refused says so in its exit code too (REFUSED).
+    assert_eq!(code, Some(5), "{l2}");
+    assert!(
+        events(&l2, "workflow.pin_missing")
+            .iter()
+            .any(|e| e["workflow"] == "slow"
+                && e["err"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("unknown field \"coalesce\""))),
+        "the unreadable pin is said, with the parser's reason:\n{l2}"
+    );
+    assert!(
+        events(&l2, "run.refused").iter().any(|e| e["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("\"slow\" definition changed"))),
+        "the run it pinned is refused, not dropped:\n{l2}"
+    );
+    assert!(
+        !events(&l2, "run.done")
+            .iter()
+            .any(|e| e["workflow"] == "slow" && e["output"] == "old-def"),
+        "nothing ran under a definition this build could not read:\n{l2}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

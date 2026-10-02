@@ -181,7 +181,12 @@ Behaviour the field names do not give away:
   of `interval`.
 - `schedule` computes the next occurrence from *now*, so missed occurrences are
   skipped, never replayed. `at` is a delay, not a wall-clock time. `cron` is
-  read in UTC and needs the `cron` build feature.
+  read in UTC and needs the `cron` build feature. An `at` beside a `cron` is the
+  first occurrence, and `cron` takes over after it. A schedule that could never
+  fire is refused at load: one with none of `cron`, `every` and `at`, an
+  `every`/`at` that is not a duration, a `cron` that does not parse or that the
+  build cannot read, and an `every` beside either of the others (it would be
+  the whole schedule).
 - `subscribe` is notify-then-read: an MCP resource update makes it re-read the
   resource and apply the CEL `filter` over `content`. `debounce_ms` keeps the
   newest payload and fires when the window closes. `window: {samples: N}`

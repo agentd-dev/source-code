@@ -80,10 +80,18 @@ fn run(cfg: &std::path::Path) -> (Option<i32>, String, String) {
 }
 
 /// The `config.invalid` errors a refused start logged.
+/// The refusals of a start: `config.invalid` lines from the loader, and the
+/// plain `agentd: …` line of a refusal while the configuration loads, which
+/// is where a local file's or folder's definition is judged.
 fn invalid(stderr: &str) -> Vec<String> {
     events(stderr, "config.invalid")
         .iter()
         .filter_map(|e| e["error"].as_str().map(str::to_string))
+        .chain(
+            stderr
+                .lines()
+                .filter_map(|l| l.strip_prefix("agentd: ").map(str::to_string)),
+        )
         .collect()
 }
 
@@ -669,7 +677,8 @@ fn a_reload_that_would_define_a_name_twice_is_refused_and_the_running_one_stays(
     );
     let refusal = events(&log, "config.reload.invalid")
         .iter()
-        .filter_map(|e| e["error"].as_str().map(str::to_string))
+        // The load's refusal, quoted inside the reload's error.
+        .filter_map(|e| e["error"].as_str().map(|m| m.replace("\\\"", "\"")))
         .find(|e| e.contains("\"tick\" is defined twice"))
         .unwrap_or_else(|| panic!("no refusal naming the workflow:\n{log}"));
     assert!(

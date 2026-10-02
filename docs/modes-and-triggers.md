@@ -70,7 +70,8 @@ workflows:
 ```
 
 `cron` is a 5-field UTC expression and needs the `cron` build feature (it is in
-the released binaries). `at:` is not a wall-clock time — it is a one-shot
+the released binaries; a build without it refuses a `cron` schedule at load).
+`at:` is not a wall-clock time — it is a one-shot
 **delay**, `at: 8h`, that consumes itself when it fires; `every: 24h` paces a
 plain interval with no build feature at all.
 

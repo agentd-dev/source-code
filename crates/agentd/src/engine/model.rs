@@ -2249,6 +2249,63 @@ fn parse_step(
                 errs.push(format!("{at}: max_pending takes 1..=100000"));
             }
         }
+        // A schedule is refused here when it could never fire, because the
+        // runtime drops what it cannot read: `every`/`at` that are not
+        // durations, a `cron` that does not parse or that this build cannot
+        // read, or no clock at all, would validate and then arm nothing — a
+        // run that simply never happens. `at` is a delay, so the wall-clock
+        // `"02:00Z"` a reader might write is one of these. `every` is read
+        // before the other two and keeps the schedule for ever, so beside
+        // either it leaves that one accepted and ignored; `at` beside `cron`
+        // is meant — it is the first occurrence, then `cron` takes over.
+        "schedule" => {
+            let clocks: Vec<&str> = ["cron", "every", "at"]
+                .into_iter()
+                .filter(|f| spec.contains_key(*f))
+                .collect();
+            if clocks.is_empty() {
+                errs.push(format!(
+                    "{at}: a schedule needs `cron`, `every` or `at` — without one it never fires"
+                ));
+            } else if clocks.len() > 1 && clocks.contains(&"every") {
+                errs.push(format!(
+                    "{at}: `every` takes no {} beside it — `every` is the whole schedule, \
+                     so the other would never be read",
+                    clocks.join(" and ")
+                ));
+            }
+            for (field, shape) in [
+                ("every", "a duration (e.g. \"1h\")"),
+                (
+                    "at",
+                    "a duration (e.g. \"2h\") — a one-shot delay, not a wall-clock time",
+                ),
+            ] {
+                if spec.get(field).is_some_and(|v| {
+                    v.as_str()
+                        .is_none_or(|d| crate::config::parse_duration(d).is_err())
+                }) {
+                    errs.push(format!("{at}: {field} must be {shape}"));
+                }
+            }
+            if let Some(c) = spec.get("cron") {
+                #[cfg(feature = "cron")]
+                if let Err(e) = c
+                    .as_str()
+                    .ok_or_else(|| "must be a string".to_string())
+                    .and_then(crate::triggers::timer::CronExpr::parse)
+                {
+                    errs.push(format!("{at}: cron: {e}"));
+                }
+                #[cfg(not(feature = "cron"))]
+                {
+                    let _ = c;
+                    errs.push(format!(
+                        "{at}: cron schedules require the 'cron' build feature"
+                    ));
+                }
+            }
+        }
         // `window: {samples: N}` — deliver the last N read values as an array
         // (the trend, not just the latest reading — the hardware-stream shape).
         // N is capped because the ring rides the durable start-state: every
@@ -3357,6 +3414,68 @@ mod tests {
                     "{kind}.{field} is refused by the generic unknown-field check"
                 );
             }
+        }
+    }
+
+    /// A schedule that could never fire is refused at load, naming why: the
+    /// runtime drops a clock it cannot read, so each of these would otherwise
+    /// validate and arm nothing.
+    #[test]
+    fn a_schedule_that_could_never_fire_is_refused() {
+        let check = |clock: Value| {
+            let mut start = clock;
+            start["kind"] = json!("schedule");
+            wf(json!({"name": "w", "steps": {
+                "s": start,
+                "f": {"kind": "finish", "depends_on": ["s"]}
+            }}))
+        };
+        for ok in [
+            json!({"every": "1h"}),
+            json!({"at": "2h"}),
+            json!({"at": "0s"}),
+        ] {
+            let r = check(ok.clone());
+            assert!(r.is_ok(), "{ok}: {:?}", r.err());
+        }
+        for (bad, says) in [
+            (json!({}), "needs `cron`, `every` or `at`"),
+            (json!({"at": "02:00Z"}), "at must be a duration"),
+            (json!({"at": 7200}), "at must be a duration"),
+            (json!({"every": "banana"}), "every must be a duration"),
+            (json!({"every": "1h", "at": "2h"}), "`every` takes no"),
+        ] {
+            let e = check(bad.clone()).unwrap_err();
+            assert!(e.iter().any(|m| m.contains(says)), "{bad}: {e:?}");
+        }
+        // `cron` is read only where the feature compiles the parser in;
+        // elsewhere it is refused naming the feature, not armed to never fire.
+        #[cfg(feature = "cron")]
+        {
+            assert!(check(json!({"cron": "0 2 * * *"})).is_ok());
+            assert!(check(json!({"cron": "0 2 * * *", "at": "1m"})).is_ok());
+            for (bad, says) in [
+                (
+                    json!({"cron": "02:00"}),
+                    "cron: cron needs exactly 5 fields",
+                ),
+                (
+                    json!({"cron": "0 2 * * *", "every": "1h"}),
+                    "`every` takes no",
+                ),
+            ] {
+                let e = check(bad.clone()).unwrap_err();
+                assert!(e.iter().any(|m| m.contains(says)), "{bad}: {e:?}");
+            }
+        }
+        #[cfg(not(feature = "cron"))]
+        {
+            let e = check(json!({"cron": "0 2 * * *"})).unwrap_err();
+            assert!(
+                e.iter()
+                    .any(|m| m.contains("require the 'cron' build feature")),
+                "{e:?}"
+            );
         }
     }
 

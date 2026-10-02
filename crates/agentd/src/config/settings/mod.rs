@@ -7683,8 +7683,9 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
     // then exits 2 on the first real start: a typo'd step field (`prompt:` on
     // an `agent` node) validated clean and failed in production, which is what
     // the pre-flight check exists to prevent. Reported after the structural
-    // checks above so the more basic error still leads. `file:`/`uri:` refs
-    // resolve at startup, so only inline definitions are checkable here.
+    // checks above so the more basic error still leads. Inline definitions are
+    // parsed here; those in local files and folders below; `url:`/`uri:` refs
+    // are read by dialling, so they wait for startup.
     // `store.durability.{a2a,steps}` is parsed, published in the schema, and
     // surfaced in the manifest — and read by no writer. `eventual` therefore
     // promised a weaker-but-faster durability that was never implemented, on the
@@ -7718,10 +7719,10 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             }
         }
     }
-    let mut inline = Vec::new();
+    let mut parsed = Vec::new();
     for w in &s.workflows {
-        // A reference — file, uri, url or dir — resolves at startup, so there
-        // is nothing to parse here. Only inline definitions are checkable.
+        // A reference — file, uri, url or dir — has no definition inline; the
+        // local ones are read below.
         if w.get("steps").is_none() {
             // A credential in a `headers` value must be a reference, the same
             // rule every other header in this config follows.
@@ -7742,7 +7743,7 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
         match crate::engine::model::parse_workflow(w) {
             // The parser's messages already name the workflow and the step.
             Err(errs) => d.errors.extend(errs),
-            Ok(parsed) => inline.push(parsed),
+            Ok(w) => parsed.push(w),
         }
         // Fan-out is checked HERE rather than in the parser because the ceiling
         // is a config value the parser cannot see.
@@ -7770,13 +7771,82 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             }
         }
     }
+    // Definitions in local files and folders — a `file:`, a `dir:`, and the
+    // `workflows/` folder adopted beside the config — get the same parse, the
+    // way the loader reads them (`workflow_documents` expands the folders for
+    // both). They are local reads, so nothing about them waits for startup:
+    // skipping them passed a folder definition with a field its kind does not
+    // take, and the first real start refused it with exit 2. Their `config.*`
+    // references fold in as the loader folds them, and one that does not
+    // resolve is refused here as it is there. A missing one in an ENTRY was
+    // already named by the whole-document scan, so the expansion's own report
+    // of it is not repeated. Their secrets are left to the start's second
+    // preflight, which can prompt for one under `--prompt-missing`; refusing
+    // here would end the run before the prompt.
+    //
+    // A name such a definition shares with another is the loader's refusal
+    // too, worded the same (`duplicate_workflow`); inline entries that share
+    // one were named by the entry check above.
+    let mut defined: BTreeMap<String, String> = BTreeMap::new();
+    for (i, w) in s.workflows.iter().enumerate() {
+        if w.get("steps").is_some()
+            && let Some(name) = w.get("name").and_then(Value::as_str)
+        {
+            defined
+                .entry(name.to_string())
+                .or_insert_with(|| s.workflow_entry_source(i));
+        }
+    }
+    let mut expansion = Vec::new();
+    let documents = crate::runtime::steps::workflow_documents(s, &mut expansion);
+    d.errors.extend(
+        expansion
+            .into_iter()
+            .filter(|e| !e.ends_with("is not defined in vars")),
+    );
+    for doc in documents {
+        let Some(path) = doc.entry.get("file").and_then(Value::as_str) else {
+            continue;
+        };
+        let mut def = match crate::runtime::steps::read_workflow_file(path, &doc.entry) {
+            Ok(def) => def,
+            Err(e) => {
+                d.errors.push(format!("workflow file {path}: {e}"));
+                continue;
+            }
+        };
+        substitute_config_vars(&mut def, &s.vars, "workflow", &mut d.errors);
+        if doc.from_document {
+            let refused = document_route_refusals(
+                std::iter::once(&def),
+                &s.agent.document_grants,
+                &doc.source,
+            );
+            if !refused.is_empty() {
+                d.errors.extend(refused);
+                continue;
+            }
+        }
+        match crate::engine::model::parse_workflow(&def) {
+            Err(errs) => d.errors.extend(errs),
+            Ok(w) => match defined.get(&w.name) {
+                Some(first) => d
+                    .errors
+                    .push(duplicate_workflow(&w.name, first, &doc.source)),
+                None => {
+                    defined.insert(w.name.clone(), doc.source);
+                    parsed.push(w);
+                }
+            },
+        }
+    }
     // Trifecta over what reaches a run through a stream. The root fold above
     // judges the servers; this judges the input a webhook or peer appends to a
-    // stream and the agent steps that read it. Over the inline definitions
-    // only, as the checks above — the loader runs it again over the whole set
-    // once file, URL and directory definitions resolve, and a refusal here is
-    // one there too (the analysis only grows with the set).
-    for e in crate::config::taint::refusals(s, &inline.iter().collect::<Vec<_>>()) {
+    // stream and the agent steps that read it. Over the inline and local
+    // definitions, as the checks above — the loader runs it again over the
+    // whole set once URL and resource definitions resolve, and a refusal here
+    // is one there too (the analysis only grows with the set).
+    for e in crate::config::taint::refusals(s, &parsed.iter().collect::<Vec<_>>()) {
         err(&mut d, e);
     }
     d
@@ -8918,7 +8988,7 @@ mod tests {
         assert_eq!(l.settings.store.kind, StoreKind::File);
         // A long-lived start node ⇒ the same default.
         let f = write_tmp(
-            "workflows:\n  - name: w\n    steps:\n      s: {kind: schedule, cron: \"* * * * *\"}\n      f: {kind: finish, depends_on: [s], status: completed}\n",
+            "workflows:\n  - name: w\n    steps:\n      s: {kind: schedule, every: 1m}\n      f: {kind: finish, depends_on: [s], status: completed}\n",
             "yaml",
         );
         let (l, _) = load(
@@ -9645,6 +9715,75 @@ mod tests {
             assert_eq!(dir.glob(), Some("*.md"));
             assert_eq!(dir.path(), path);
         }
+    }
+
+    /// `--validate-config` parses the definitions in local files and folders —
+    /// the `workflows/` folder adopted beside the config, a `dir:`, a `file:` —
+    /// with the parse the loader runs. Skipping them passed a folder
+    /// definition the first real start then refused with exit 2.
+    #[test]
+    fn validation_parses_local_file_and_folder_workflows() {
+        let validate_in = |workflows: Option<Value>, files: &[(&str, &str)]| {
+            let dir = tempfile::tempdir().unwrap();
+            for (rel, text) in files {
+                let p = dir.path().join(rel);
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(p, text).unwrap();
+            }
+            let mut doc = json!({"agent": {"name": "a", "preflight": "never"},
+                "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
+                "store": {"kind": "memory"}});
+            if let Some(w) = workflows {
+                let root = dir.path().to_string_lossy().to_string();
+                doc["workflows"] =
+                    serde_json::from_str(&w.to_string().replace("ROOT", &root)).unwrap();
+            }
+            let cfg = dir.path().join("agentd.json");
+            std::fs::write(&cfg, doc.to_string()).unwrap();
+            let args = vec!["-c".to_string(), cfg.to_string_lossy().to_string()];
+            let env: Vec<(String, String)> = Vec::new();
+            // The loader validates as it loads, so a refusal is its error.
+            match super::load(&args, &env) {
+                Ok((l, _)) => validate(&l).errors,
+                Err(e) => vec![e.to_string()],
+            }
+        };
+        let good = "name: w\nsteps:\n  s: {kind: schedule, every: 1h}\n  f: {kind: finish, depends_on: [s]}\n";
+        let bad = "name: w\nsteps:\n  s: {kind: subscribe, server: x, uri: \"x://y\", coalesce: true}\n  f: {kind: finish, depends_on: [s]}\n";
+        let unknown = "unknown field \"coalesce\" for kind \"subscribe\"";
+
+        // The adopted folder: a good definition validates, a bad one does not.
+        let e = validate_in(None, &[("workflows/w.yaml", good)]);
+        assert!(e.is_empty(), "{e:?}");
+        let e = validate_in(None, &[("workflows/w.yaml", bad)]);
+        assert!(e.iter().any(|m| m.contains(unknown)), "{e:?}");
+        // A named folder and a named file read the same way.
+        let e = validate_in(Some(json!([{"dir": "ROOT/defs"}])), &[("defs/w.yaml", bad)]);
+        assert!(e.iter().any(|m| m.contains(unknown)), "{e:?}");
+        let e = validate_in(Some(json!([{"file": "ROOT/w.yaml"}])), &[("w.yaml", bad)]);
+        assert!(e.iter().any(|m| m.contains(unknown)), "{e:?}");
+        // A name a folder definition shares with an inline one is refused,
+        // naming both, as the loader refuses it.
+        let e = validate_in(
+            Some(json!([
+                {"name": "w", "steps": {"s": {"kind": "manual"},
+                    "f": {"kind": "finish", "depends_on": ["s"]}}},
+                {"dir": "ROOT/defs"}
+            ])),
+            &[("defs/w.yaml", good)],
+        );
+        assert!(
+            e.iter()
+                .any(|m| m.contains("workflow \"w\" is defined twice") && m.contains("w.yaml")),
+            "{e:?}"
+        );
+        // A file that is not there is the loader's refusal too.
+        let e = validate_in(Some(json!([{"file": "ROOT/gone.yaml"}])), &[]);
+        assert!(
+            e.iter()
+                .any(|m| m.contains("workflow file ") && m.contains("gone.yaml")),
+            "{e:?}"
+        );
     }
 
     /// The short and long forms are the SAME setting, so an agent defined

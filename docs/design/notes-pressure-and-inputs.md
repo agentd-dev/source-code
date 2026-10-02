@@ -195,19 +195,22 @@ with two hard constraints:
 
 agentd deliberately reaches the world through MCP, and a device is not an
 exception: **the driver gets an MCP server, and the workflow subscribes to it.**
-That is not a workaround — a `subscribe` start node with `debounce_ms`,
-`coalesce` and `filter` is a good fit for exactly the problem hardware streams
-have, which is that they produce far more samples than anyone wants runs.
+That is not a workaround — a `subscribe` start node with `debounce_ms` and
+`filter` is a good fit for exactly the problem hardware streams have, which is
+that they produce far more samples than anyone wants runs.
 
 ```yaml
 sensor:
   kind: subscribe
   server: driver
   uri: "device://thermocouple/3"
-  debounce_ms: 250
-  coalesce: true          # 1000 samples/sec become one run per quarter second
+  debounce_ms: 250        # 1000 samples/sec become one run per quarter second
   filter: "value > 90"    # …and only when it matters
 ```
+
+(An earlier draft of this note also set `coalesce: true`. No code ever read
+that field — `debounce_ms` alone keeps the newest payload of a burst — and it
+has since been deleted, so a definition naming it is refused; RFC 0045 D9.)
 
 Three ways to wire the device, in order of preference:
 

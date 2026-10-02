@@ -11,11 +11,11 @@
 //! file passes is held to the table the loader reads.
 #![cfg(unix)]
 
-#[cfg(all(feature = "cel", feature = "sign"))]
+#[cfg(all(feature = "cel", feature = "sign", feature = "cron"))]
 mod common;
 
 use std::path::{Path, PathBuf};
-#[cfg(all(feature = "cel", feature = "sign"))]
+#[cfg(all(feature = "cel", feature = "sign", feature = "cron"))]
 use std::process::Command;
 
 fn examples_root() -> PathBuf {
@@ -23,7 +23,7 @@ fn examples_root() -> PathBuf {
 }
 
 /// Every `.yaml`/`.yml` under `examples/`, recursively.
-#[cfg(all(feature = "cel", feature = "sign"))]
+#[cfg(all(feature = "cel", feature = "sign", feature = "cron"))]
 fn yaml_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
@@ -40,7 +40,7 @@ fn yaml_files(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// Every `{{secret:NAME}}` an example references.
-#[cfg(all(feature = "cel", feature = "sign"))]
+#[cfg(all(feature = "cel", feature = "sign", feature = "cron"))]
 fn secret_names(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut rest = text;
@@ -54,13 +54,13 @@ fn secret_names(text: &str) -> Vec<String> {
     out
 }
 
-/// The examples are written against the RELEASE build. Two use a CEL `when:`
-/// and one carries a `trust` pin, so a build without `cel` or `sign` refuses
-/// them for a reason that has nothing to do with whether the example is
-/// current. This asks its question only on a build that can answer it — if a
+/// The examples are written against the RELEASE build. Two use a CEL `when:`,
+/// one carries a `trust` pin and several schedule on a `cron`, so a build
+/// without `cel`, `sign` or `cron` refuses them for a reason that has nothing
+/// to do with whether the example is current. This asks its question only on a build that can answer it — if a
 /// future example needs another feature, it says so by failing here.
 #[test]
-#[cfg(all(feature = "cel", feature = "sign"))]
+#[cfg(all(feature = "cel", feature = "sign", feature = "cron"))]
 fn every_shipped_example_config_validates() {
     let mut files = Vec::new();
     yaml_files(&examples_root(), &mut files);
@@ -73,7 +73,10 @@ fn every_shipped_example_config_validates() {
         // Picked by SHAPE: Kubernetes manifests (a top-level `apiVersion:`)
         // and standalone workflow documents (a top-level `steps:`) live here
         // too and are not configs. Every other YAML file is one, so an example
-        // cannot opt out of the check by what it leaves out.
+        // cannot opt out of the check by what it leaves out. A standalone
+        // workflow is checked through the config that reads it — the
+        // `workflows/` folder beside it, or a `file:`/`dir:` entry — because
+        // `--validate-config` parses local definitions too.
         if text
             .lines()
             .any(|l| l.starts_with("apiVersion:") || l.starts_with("steps:"))
@@ -136,7 +139,7 @@ fn every_shipped_example_config_validates() {
 /// agent is refused — which is what SAMPLES.md teaches, and therefore something
 /// a test should hold still. Note the file is `.json`: the config sweep above
 /// collects only `.yaml`/`.yml`, so nothing covered it until now.
-#[cfg(all(feature = "cel", feature = "sign"))]
+#[cfg(all(feature = "cel", feature = "sign", feature = "cron"))]
 #[test]
 fn the_server_fragment_layers_under_a_config_and_its_trifecta_is_refused() {
     let frag = examples_root().join("mcp-servers.fragment.json");

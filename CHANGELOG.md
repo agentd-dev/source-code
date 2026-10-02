@@ -38,8 +38,10 @@ test that fails on the old code.
   an actor in one run, or an actor in a run the reader starts; what passes is
   the reader/actor split `docs/security.md` describes ("Streams carry the
   taint of what feeds them"), where no model-driven step that sees the text
-  holds both other legs. It runs at `--validate-config`, at start, on every
-  reload, and on `workflow.create`/`update`; a stored definition it refuses
+  holds both other legs. It runs at `--validate-config` (over inline
+  definitions and those in local files and folders), at start and on every
+  reload (over the whole set, `url:` and `uri:` definitions included), and on
+  `workflow.create`/`update`; a stored definition it refuses
   is left out of a reload rather than vetoing it. The refusal names the
   workflow, the stream, what feeds it, and the servers that bring the other
   two legs. `security.allow_trifecta` lifts it with every other trifecta
@@ -165,6 +167,26 @@ test that fails on the old code.
 
 ### Changed (breaking)
 
+- **A `schedule` that could never fire is refused at load.** The runtime
+  drops a clock it cannot read, so a schedule with no `cron`, `every` or
+  `at`, an `every` or `at` that is not a duration (the docs offered
+  `at: "02:00Z"`, but `at` is a delay), a `cron` that does not parse, or a
+  `cron` on a build without the `cron` feature validated and then never ran.
+  An `every` beside `cron` or `at` is refused too, because `every` is read
+  first and the other never was. An `at` beside a `cron` is still the first
+  occurrence before `cron` takes over. As with the removed fields, a run in
+  flight on such a definition is refused at the first restart, and a stored
+  one no longer loads.
+- **`--validate-config` parses workflow definitions in local files and
+  folders.** It parsed inline ones only, so a definition in a `file:`, a
+  `dir:` or the `workflows/` folder beside the config validated whatever it
+  held, and the first real start refused it with exit `2`. These are local
+  reads, so they are now parsed, their `config.*` references resolved, a
+  name they share refused, and the stream-taint check run over them, as for
+  inline ones. A secret only they name is still checked at start, where
+  `--prompt-missing` can ask for it.
+  `url:` and `uri:` definitions are still read at startup, because reading
+  them dials.
 - **`/hooks/_` is agentd's.** A `wait {on: webhook}` callback is armed under
   `/hooks/_cb/`, and configured routes match first, so a route there could
   take a suspended run's callback. A `webhook` start `path` or a wait's
@@ -177,10 +199,15 @@ test that fails on the old code.
   `schedule.catch_up`, `subscribe.coalesce`, `subscribe.deliver`,
   `subscribe.on_no_listener` and `signal.deliver`. They parsed and changed
   nothing (a `tz` ran its cron in UTC regardless). A workflow that names one
-  meets the generic unknown-field refusal. The shipped examples, the docs,
-  the published schemas and the site editor no longer offer them, and a docs
-  check now holds every node table to the fields the node catalogue gives
-  that kind.
+  meets the generic unknown-field refusal. That holds for what was stored
+  before the upgrade too: a run in flight on a definition that named one is
+  refused at the first restart, because the definition it is pinned to no
+  longer parses (`workflow.pin_missing`, then `run.refused`), and a
+  definition stored with `workflow.create`/`update` that names one no longer
+  loads (`workflow.stored.invalid`). The shipped examples, the docs, the
+  published schemas and the site editor no longer offer them, and a docs
+  check now holds every node table, including a row that names a family of
+  kinds, to the fields the node catalogue gives those kinds.
 
 ### Tooling
 

@@ -507,6 +507,19 @@ fn table_cells(line: &str) -> Option<Vec<String>> {
 /// they are dropped first; and what is not a bare snake_case name, such as
 /// `workflow.finished`, is a value too.
 fn listed_fields(cell: &str) -> Vec<String> {
+    listed_names(cell)
+        .into_iter()
+        .map(|t| t.split(':').next().unwrap_or("").trim().to_string())
+        .filter(|t| {
+            t.starts_with(|c: char| c.is_ascii_lowercase())
+                && t.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        })
+        .collect()
+}
+
+/// Every backticked name in a cell, outside parentheses.
+fn listed_names(cell: &str) -> Vec<String> {
     let mut outside = String::new();
     let (mut depth, mut in_tick) = (0usize, false);
     for c in cell.chars() {
@@ -527,21 +540,41 @@ fn listed_fields(cell: &str) -> Vec<String> {
         .split('`')
         .skip(1)
         .step_by(2)
-        .map(|t| t.split(':').next().unwrap_or("").trim().to_string())
-        .filter(|t| {
-            t.starts_with(|c: char| c.is_ascii_lowercase())
-                && t.chars()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        .map(str::to_string)
+        .collect()
+}
+
+/// The kinds a node-table row's first cell names. One row may stand for a
+/// family — `memory.get` / `.set` / `.push`, `noop` (no fields) / `checkpoint`
+/// — so asides in parentheses are dropped and a name starting with `.` takes
+/// the family of the name before it (`.set` after `memory.get` is
+/// `memory.set`). The names are returned as written out; whether each is a
+/// kind is the caller's question.
+fn kinds_in_cell(cell: &str) -> Vec<String> {
+    let mut family = String::new();
+    listed_names(cell)
+        .into_iter()
+        .map(|name| {
+            let full = match name.strip_prefix('.') {
+                Some(member) => format!("{family}.{member}"),
+                None => name,
+            };
+            family = full.split('.').next().unwrap_or("").to_string();
+            full
         })
         .collect()
 }
 
 /// A node table — one whose first column is a kind — lists, in its field
-/// columns, only fields the catalogue gives that kind. The catalogue
-/// ([`KINDS`](agentd::engine::model::KINDS)) is what the loader accepts, so a field a page offers and the
-/// catalogue lacks is one a reader copies into a document the loader then
-/// refuses; and a field the catalogue kept only for a page to describe is one
-/// that parses and does nothing. Prose outside a node table is not read.
+/// columns, only fields the catalogue gives the kinds of that row. The
+/// catalogue ([`KINDS`](agentd::engine::model::KINDS)) is what the loader
+/// accepts, so a field a page offers and the catalogue lacks is one a reader
+/// copies into a document the loader then refuses; and a field the catalogue
+/// kept only for a page to describe is one that parses and does nothing. A row
+/// that names a family of kinds is held to what the family takes together; a
+/// row in such a table that names no kind the catalogue knows is itself a
+/// finding, because skipping it would leave its fields unread. Prose outside a
+/// node table, and a kind table with no field column, are not read.
 #[test]
 fn node_tables_name_only_fields_the_kind_accepts() {
     let mut found = Vec::new();
@@ -558,32 +591,47 @@ fn node_tables_name_only_fields_the_kind_accepts() {
             header = Some((file, cells));
             continue;
         };
-        if !head[0].to_lowercase().contains("kind") {
-            continue;
-        }
-        let Some(info) = cells[0]
-            .strip_prefix('`')
-            .and_then(|c| c.strip_suffix('`'))
-            .and_then(kind_info)
-        else {
-            continue;
-        };
-        rows += 1;
-        seen.insert(file.clone());
-        for (title, cell) in head.iter().zip(&cells).skip(1) {
+        let is_field_column = |title: &String| {
             let title = title.to_lowercase();
-            if !["field", "required", "option"]
+            ["field", "required", "option"]
                 .iter()
                 .any(|w| title.contains(w))
-            {
+        };
+        if !head[0].to_lowercase().contains("kind")
+            || !head.iter().skip(1).any(is_field_column)
+            || cells
+                .iter()
+                .all(|c| c.chars().all(|c| matches!(c, '-' | ':')))
+        {
+            continue;
+        }
+        let names = kinds_in_cell(&cells[0]);
+        let infos: Vec<_> = names.iter().filter_map(|k| kind_info(k)).collect();
+        if names.is_empty() || infos.len() != names.len() {
+            found.push(format!(
+                "{file}:{n}: a node-table row must name kinds the catalogue knows, got {}",
+                cells[0]
+            ));
+            continue;
+        }
+        rows += 1;
+        seen.insert(file.clone());
+        let mut takes: Vec<&str> = infos
+            .iter()
+            .flat_map(|i| i.fields.iter().copied())
+            .collect();
+        takes.sort_unstable();
+        takes.dedup();
+        let named = infos.iter().map(|i| i.name).collect::<Vec<_>>().join(" / ");
+        for (title, cell) in head.iter().zip(&cells).skip(1) {
+            if !is_field_column(title) {
                 continue;
             }
             for f in listed_fields(cell) {
-                if !info.fields.contains(&f.as_str()) {
+                if !takes.contains(&f.as_str()) {
                     found.push(format!(
-                        "{file}:{n}: `{}` has no field `{f}` (it takes: {})",
-                        info.name,
-                        info.fields.join(", ")
+                        "{file}:{n}: `{named}` has no field `{f}` (it takes: {})",
+                        takes.join(", ")
                     ));
                 }
             }
@@ -726,5 +774,28 @@ fn the_matchers_find_each_shape_and_nothing_else() {
         ),
     ] {
         assert_eq!(listed_fields(cell), want, "in {cell}");
+    }
+    for (cell, want) in [
+        ("`once`", &["once"][..]),
+        (
+            "`memory.get` / `.set` / `.pop`",
+            &["memory.get", "memory.set", "memory.pop"][..],
+        ),
+        (
+            "`knowledge.search` / `.get`, `search.query` / `.fetch`",
+            &[
+                "knowledge.search",
+                "knowledge.get",
+                "search.query",
+                "search.fetch",
+            ][..],
+        ),
+        (
+            "`noop` (no fields) / `checkpoint`",
+            &["noop", "checkpoint"][..],
+        ),
+        ("Kind", &[][..]),
+    ] {
+        assert_eq!(kinds_in_cell(cell), want, "in {cell}");
     }
 }

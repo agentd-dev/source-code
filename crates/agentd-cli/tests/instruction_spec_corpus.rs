@@ -60,6 +60,44 @@ fn run_case(doc_path: &Path, grants: &[Value]) -> (bool, String, Value) {
     (valid, errtext, caps)
 }
 
+/// Whether THIS test binary was built without the named cargo feature. Only
+/// the features a document can need at validation are listed; any other name
+/// answers `false`, so a new feature-gated refusal fails the corpus (and gets
+/// an arm here) rather than being skipped unexamined.
+fn lacks_feature(feature: &str) -> bool {
+    match feature {
+        "cron" => !cfg!(feature = "cron"),
+        "cel" => !cfg!(feature = "cel"),
+        "a2a" => !cfg!(feature = "a2a"),
+        "tls" => !cfg!(feature = "tls"),
+        _ => false,
+    }
+}
+
+/// The features named when EVERY `config.invalid` line in `errtext` is a
+/// "needs the '<feature>' build feature" refusal for a feature this build
+/// lacks; `None` when any line is another error (or there are none), so a
+/// document refused for a real reason still fails.
+fn only_absent_feature_refusals(errtext: &str) -> Option<Vec<String>> {
+    let mut features = Vec::new();
+    for line in errtext.lines() {
+        let Ok(ev) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if ev["event"] != "config.invalid" {
+            continue;
+        }
+        let msg = ev["msg"].as_str().or(ev["error"].as_str())?;
+        let (_, rest) = msg.split_once("the '")?;
+        let (feature, tail) = rest.split_once('\'')?;
+        if !tail.starts_with(" build feature") || !lacks_feature(feature) {
+            return None;
+        }
+        features.push(feature.to_string());
+    }
+    (!features.is_empty()).then_some(features)
+}
+
 #[test]
 fn the_conformance_corpus_passes_against_this_binary() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/instruction-spec-corpus");
@@ -80,6 +118,7 @@ fn the_conformance_corpus_passes_against_this_binary() {
         "{ver} validates the probe but extracts no directives — extraction regressed"
     );
     let mut cases = 0usize;
+    let mut skipped = 0usize;
     let mut failures: Vec<String> = Vec::new();
     let mut dirs: Vec<_> = std::fs::read_dir(&root)
         .expect("corpus directory exists")
@@ -123,6 +162,22 @@ fn the_conformance_corpus_passes_against_this_binary() {
             }
             let grants: Vec<Value> = exp["grants"].as_array().cloned().unwrap_or_default();
             let (valid, errtext, caps) = run_case(&doc, &grants);
+            // A valid document this build refuses ONLY because it uses an
+            // optional capability compiled out of it (a `cron:` schedule
+            // without the `cron` feature) is SKIPPED, not failed: refusing
+            // it is the honest answer — accepting it would register a
+            // workflow that never runs. The skip is narrow so it cannot hide
+            // a real regression: every refusal line must name a feature that
+            // `lacks_feature` confirms is absent from THIS build, and the
+            // rows that build the feature run the fixture in full.
+            if !valid
+                && exp["valid"].as_bool() == Some(true)
+                && let Some(features) = only_absent_feature_refusals(&errtext)
+            {
+                eprintln!("  skip {name} (needs build feature {features:?})");
+                skipped += 1;
+                continue;
+            }
             if Some(valid) != exp["valid"].as_bool() {
                 failures.push(format!(
                     "{name}: valid={valid}, expected {} — said: {}",
@@ -160,6 +215,13 @@ fn the_conformance_corpus_passes_against_this_binary() {
         }
     }
     assert!(cases >= 6, "the corpus is present ({cases} cases found)");
+    // The feature skip must leave a corpus that still tests something: if a
+    // refusal ever started naming a missing feature for most documents, this
+    // run would otherwise report green over nothing.
+    assert!(
+        skipped * 2 < cases,
+        "{skipped} of {cases} corpus cases skipped for missing build features"
+    );
     assert!(
         failures.is_empty(),
         "{} corpus failures:\n  {}",

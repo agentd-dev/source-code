@@ -1,10 +1,12 @@
 # Vendored from the Instruction Document Spec repo
 
-Upstream: **https://github.com/instruction-md/specification** (published
-`main`). The org's `instruction-md/source-code` stays private — this repo is
-the open split. History was rewritten several times pre-publication so hashes
-are unstable — this file and the drift check key on CONTENT, never the id. Raw
-base: https://raw.githubusercontent.com/instruction-md/specification/main/ .
+Upstream: **https://github.com/instruction-md/specification**, pinned at
+revision `345f27588f5982cbe530254b82aba4ed90a34292` — the revision the vendored
+schema and conformance fixtures were copied from. The org's
+`instruction-md/source-code` stays private — this repo is the open split. CI
+checks out that exact sha (`.github/workflows/ci.yml`); moving the pin is a
+deliberate change, made in the same commit as a re-vendor. Raw base:
+https://raw.githubusercontent.com/instruction-md/specification/345f27588f5982cbe530254b82aba4ed90a34292/ .
 
 License provenance: the repo's root `LICENSE` is CC-BY-4.0 (spec text), which is
 what GitHub's repo badge reports. The behavioural fixtures vendored here are
@@ -13,8 +15,8 @@ Apache-2.0 — cite the corpus's own license file, not the repo badge.
 ## The registry is the vendored JSON Schema
 
 The reference implementation does not transcribe the registry into Rust. It
-**vendors the spec's own `instruction-document.schema.json`** (at
-`crates/agentd/src/config/instruction-document.schema.json`) and reads the
+**vendors the spec's own `instruction.schema.json`** (at
+`crates/instruction/src/instruction.schema.json`) and reads the
 kinds, forms, bodies and grants from its `x-registry` and `$defs.kinds`. A
 kind, form or grant therefore cannot drift from the specification: there is one
 copy of the registry, and it is the normative one.
@@ -27,14 +29,16 @@ copy of the registry, and it is the normative one.
   `the_schema_registry_agrees_with_the_parser` checks the schema's two views of
   its machinery set agree (the flat `x-registry.machinery` list vs the per-kind
   `$defs.kinds.*.x-disposition`), and `the_vendored_schema_matches_upstream_when_present`
-  compares the vendored schema's `x-registry`/`x-grammar`/`$defs` SEMANTICALLY
-  against upstream — a reformat is not a false alarm, a real registry change is.
+  compares the WHOLE vendored schema SEMANTICALLY against upstream (as parsed
+  JSON) — a reformat is not a false alarm, any real change is.
 
-The drift check runs whenever the upstream path exists (override with
-`INSTRUCTION_SPEC_REPO`); when it does not (CI), it skips and the behavioural
-fixtures still run. An EXPLICIT `INSTRUCTION_SPEC_REPO` that has no schema fails
-rather than skips — a drift check that skips on a bad path reports health it
-never performed.
+The drift checks (this one, and `the_vendored_corpus_matches_upstream_when_present`
+over the crate's `tests/conformance/` tree) run against `INSTRUCTION_SPEC_REPO`,
+else a sibling checkout at the default path, and skip only when neither exists.
+An EXPLICIT `INSTRUCTION_SPEC_REPO` that has no schema fails rather than skips.
+CI sets it to the pinned checkout, and both CI's `spec drift (pinned)` step and
+`scripts/ci-gate.sh` fail a run in which either test skipped — a drift check
+that skips reports health it never performed.
 
 ## A conformance claim carries its binary version
 

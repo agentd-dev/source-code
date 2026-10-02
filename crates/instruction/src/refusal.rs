@@ -35,7 +35,8 @@ impl Refusal {
         }
     }
 
-    /// A refusal of the document as a whole (front matter, a cycle) — no line.
+    /// A refusal of the document as a whole (the `spec` version it pins) — no
+    /// line.
     pub fn new(code: &'static str, message: impl Into<String>) -> Refusal {
         // A code outside the list is a condition no reader could match: catch
         // it where it is minted, in every debug build and test run.
@@ -180,19 +181,37 @@ mod tests {
         ("wire-floor", "V8"),
     ];
 
+    /// Every `.rs` file under `dir`, at any depth, sorted. Recursive, so a
+    /// module that moves into a directory of its own keeps its constructors
+    /// in view of the accounting.
+    fn rs_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut files = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for p in std::fs::read_dir(&d)
+                .unwrap()
+                .filter_map(|e| e.ok().map(|e| e.path()))
+            {
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    files.push(p);
+                }
+            }
+        }
+        files.sort();
+        files
+    }
+
     /// The crate's non-test source, every `.rs` file under `src/` except this
     /// one (whose lists name every code), each cut at its test module.
     fn crate_source() -> String {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
-        let mut files: Vec<_> = std::fs::read_dir(dir)
-            .unwrap()
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| {
-                p.extension().is_some_and(|x| x == "rs")
-                    && p.file_name().is_some_and(|n| n != "refusal.rs")
-            })
+        let own = std::path::Path::new(dir).join("refusal.rs");
+        let files: Vec<_> = rs_files(std::path::Path::new(dir))
+            .into_iter()
+            .filter(|p| *p != own)
             .collect();
-        files.sort();
         assert!(files.len() > 1, "no crate source under {dir}");
         files
             .iter()
@@ -206,23 +225,135 @@ mod tests {
             .collect()
     }
 
-    /// The code of every constructor call in the crate source: the first
-    /// string literal after `Refusal::at(` or `Refusal::new(` (a line argument
-    /// is an expression, never a literal). Scoped to the calls, so a code
-    /// that merely appears as a word elsewhere (`"schema"` is also a
-    /// workflow-step key) never counts as built.
-    fn constructed_codes() -> Vec<String> {
-        let src = crate_source();
+    /// The code ARGUMENT of every constructor call in `src`: the second
+    /// argument of `Refusal::at(line, code, …)`, the first of
+    /// `Refusal::new(code, …)`. Scoped to the calls, so a code that merely
+    /// appears as a word elsewhere (`"schema"` is also a workflow-step key)
+    /// never counts as built. A code that is not a string literal is an
+    /// error, not a guess: a code chosen through a variable is one this scan
+    /// could not hold to [`CODES`], so every site must name its own.
+    fn codes_in(src: &str) -> Result<Vec<String>, String> {
         let mut out = Vec::new();
-        for call in ["Refusal::at(", "Refusal::new("] {
+        for (call, skip) in [("Refusal::at(", 1), ("Refusal::new(", 0)] {
             for (at, _) in src.match_indices(call) {
-                let rest = &src[at + call.len()..];
-                let open = rest.find('"').expect("a code literal");
-                let len = rest[open + 1..].find('"').expect("a closed literal");
-                out.push(rest[open + 1..open + 1 + len].to_string());
+                let mut rest = src[at + call.len()..].trim_start();
+                // Skip the leading arguments: up to the first comma outside
+                // any bracket or string.
+                for _ in 0..skip {
+                    let (mut depth, mut in_str, mut escaped) = (0i32, false, false);
+                    let mut end = None;
+                    for (i, c) in rest.char_indices() {
+                        match c {
+                            _ if escaped => escaped = false,
+                            '\\' if in_str => escaped = true,
+                            '"' => in_str = !in_str,
+                            '(' | '[' | '{' if !in_str => depth += 1,
+                            ')' | ']' | '}' if !in_str => depth -= 1,
+                            ',' if !in_str && depth == 0 => {
+                                end = Some(i);
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    let end = end.ok_or_else(|| format!("{call}: no code argument"))?;
+                    rest = rest[end + 1..].trim_start();
+                }
+                let lit = rest
+                    .strip_prefix('"')
+                    .and_then(|r| r.find('"').map(|len| &r[..len]))
+                    .ok_or_else(|| {
+                        let head: String = rest.chars().take(40).collect();
+                        format!("{call}: the code is not a string literal: {head:?}")
+                    })?;
+                out.push(lit.to_string());
             }
         }
-        out
+        Ok(out)
+    }
+
+    fn constructed_codes() -> Vec<String> {
+        codes_in(&crate_source()).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    #[test]
+    fn the_scan_reads_the_code_argument_and_refuses_a_non_literal() {
+        let src = r#"
+            Refusal::at(b.line + f("x", y), "duplicate-identity", format!("x"));
+            Refusal::at(
+                line_no,
+                "unclosed-fence",
+                "never closed",
+            );
+            Refusal::new("schema", "x");
+        "#;
+        assert_eq!(
+            codes_in(src).unwrap(),
+            ["duplicate-identity", "unclosed-fence", "schema"]
+        );
+        // A code through a variable is refused rather than read as whatever
+        // literal happens to come next.
+        let err =
+            codes_in("Refusal::at(1, code, \"x\"); Refusal::new(\"schema\", \"y\");").unwrap_err();
+        assert!(err.contains("not a string literal"), "{err}");
+    }
+
+    #[test]
+    fn the_scan_reaches_a_module_in_a_subdirectory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("manifest")).unwrap();
+        std::fs::write(dir.path().join("lib.rs"), "").unwrap();
+        std::fs::write(dir.path().join("manifest/mod.rs"), "").unwrap();
+        std::fs::write(dir.path().join("manifest/notes.txt"), "").unwrap();
+        let found: Vec<_> = rs_files(dir.path())
+            .iter()
+            .map(|p| p.strip_prefix(dir.path()).unwrap().to_path_buf())
+            .collect();
+        assert_eq!(
+            found,
+            [
+                std::path::PathBuf::from("lib.rs"),
+                std::path::PathBuf::from("manifest/mod.rs")
+            ]
+        );
+    }
+
+    /// Two [`UNDETECTED`] entries are unreachable only because of what the
+    /// vendored schema says. Read those premises from it, so a re-vendor that
+    /// makes either condition reachable fails here, naming the entry to
+    /// replace with a detection site.
+    #[test]
+    fn the_unreachable_codes_are_still_unreachable_under_the_schema() {
+        use crate::doc::{BodyKind, Form};
+        let schema: serde_json::Value = serde_json::from_str(crate::doc::schema_json()).unwrap();
+        let close = schema["x-grammar"]["closeFence"].as_str().unwrap();
+        assert_eq!(
+            close, "^:{3,}\\s*$",
+            "closeFence changed — a close fence may now carry text, so \
+             `text-after-close-fence` needs a detection site: remove it from UNDETECTED"
+        );
+        let names: Vec<String> = schema["$defs"]["kinds"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        for name in &names {
+            let k = crate::doc::lookup(name).unwrap();
+            assert!(
+                k.body != BodyKind::None
+                    || k.forms.iter().all(|f| matches!(f, Form::Leaf | Form::Set)),
+                "{name} has no body yet takes a form that has one ({:?}) — \
+                 `body-forbidden` needs a detection site: remove it from UNDETECTED",
+                k.forms
+            );
+        }
+        assert!(
+            UNDETECTED
+                .iter()
+                .any(|(c, _)| *c == "text-after-close-fence")
+                && UNDETECTED.iter().any(|(c, _)| *c == "body-forbidden")
+        );
     }
 
     #[test]
@@ -297,8 +428,14 @@ mod tests {
                 "line": 3, "code": "unclosed-fence", "message": ":::!skill is never closed",
             })
         );
-        let whole = Refusal::new("front-matter-yaml", "front matter is not valid YAML: x");
-        assert_eq!(whole.to_string(), "front matter is not valid YAML: x");
+        let whole = Refusal::new(
+            "unimplemented-version",
+            "front matter: spec \"2\" is not implemented",
+        );
+        assert_eq!(
+            whole.to_string(),
+            "front matter: spec \"2\" is not implemented"
+        );
         assert_eq!(
             serde_json::to_value(&whole).unwrap()["line"],
             serde_json::Value::Null

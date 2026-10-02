@@ -38,8 +38,9 @@ const CONFORMANCE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/conformanc
 const SUITES: &[&str] = &["corpus", "refusals", "advisories"];
 const ROOT_FILES: &[&str] = &["README.md", "LICENSE"];
 
-/// The artifacts each suite's case may carry, beside its `doc.md` input and an
-/// optional `context.json`. Anything else is an unknown artifact.
+/// The artifacts each suite's case may carry, beside its `doc.md` input (and,
+/// for the corpus, an optional `context.json` — see [`inputs_of`]). Anything
+/// else is an unknown artifact.
 fn artifacts_of(suite: &str) -> &'static [&'static str] {
     match suite {
         "corpus" => &[
@@ -52,6 +53,18 @@ fn artifacts_of(suite: &str) -> &'static [&'static str] {
         "refusals" => &["refusals.json"],
         "advisories" => &["advisories.json"],
         _ => &[],
+    }
+}
+
+/// The input files a suite's case may carry. Only the corpus runner reads a
+/// `context.json` (params, facts); the refusal runner validates under every
+/// grant and the advisory runner reads nothing. So a `context.json` anywhere
+/// else is an unknown artifact — a refusal case that meant limited grants
+/// would otherwise be judged under all of them without a word.
+fn inputs_of(suite: &str) -> &'static [&'static str] {
+    match suite {
+        "corpus" => &["doc.md", "context.json"],
+        _ => &["doc.md"],
     }
 }
 
@@ -93,7 +106,6 @@ const PENDING: &[&str] = &[
     "corpus/permissions/tree.json",
     "corpus/reasons/delivered.txt",
     "corpus/reasons/tree.json",
-    "corpus/should-not/delivered.txt",
     "corpus/should-not/tree.json",
     "corpus/skill-trigger/delivered.txt",
     "corpus/skill-trigger/tree.json",
@@ -200,8 +212,28 @@ impl Ledger {
     /// Fail on every unlisted failure, every listed pass, and every listed
     /// key of `suite` this run never recorded; print the counts.
     fn finish(self, suite: &str) {
+        let total = self.outcomes.len();
+        let verdict = self.judge(suite, PENDING, Path::new(CONFORMANCE));
+        eprintln!(
+            "{suite}: {total} artifacts — {} pass, {} pending, {} failing",
+            verdict.passed,
+            verdict.pending_failed,
+            verdict.failures.len()
+        );
+        assert!(
+            verdict.failures.is_empty(),
+            "{} {suite} failures:\n{}",
+            verdict.failures.len(),
+            verdict.failures.join("\n")
+        );
+    }
+
+    /// The judgment `finish` asserts on, against a given pending list and
+    /// fixture root — apart from the live run, so each of its rules has a
+    /// test of its own (see `the_ledger_*` below).
+    fn judge(self, suite: &str, pending_list: &[&str], root: &Path) -> Verdict {
         let prefix = format!("{suite}/");
-        let pending: BTreeSet<&str> = PENDING
+        let pending: BTreeSet<&str> = pending_list
             .iter()
             .copied()
             .filter(|k| k.starts_with(&prefix))
@@ -209,7 +241,7 @@ impl Ledger {
         let mut failures = self.structural;
         // A PENDING key outside every suite is checked by every run, so a
         // typo'd suite cannot hide in a list no runner reads.
-        for key in PENDING {
+        for key in pending_list {
             if !SUITES.iter().any(|s| key.starts_with(&format!("{s}/"))) {
                 failures.push(format!("PENDING {key:?} names no suite"));
             }
@@ -227,7 +259,7 @@ impl Ledger {
         }
         for key in &pending {
             if !self.outcomes.contains_key(*key) {
-                let exists = Path::new(CONFORMANCE).join(key).is_file();
+                let exists = root.join(key).is_file();
                 failures.push(if exists {
                     format!("PENDING {key:?} is not an artifact this runner compares")
                 } else {
@@ -235,26 +267,31 @@ impl Ledger {
                 });
             }
         }
-        eprintln!(
-            "{suite}: {} artifacts — {passed} pass, {pending_failed} pending, {} failing",
-            self.outcomes.len(),
-            failures.len()
-        );
-        assert!(
-            failures.is_empty(),
-            "{} {suite} failures:\n{}",
-            failures.len(),
-            failures.join("\n")
-        );
+        Verdict {
+            failures,
+            passed,
+            pending_failed,
+        }
     }
 }
 
+/// What [`Ledger::judge`] found: every failure, and the counts it printed.
+struct Verdict {
+    failures: Vec<String>,
+    passed: usize,
+    pending_failed: usize,
+}
+
 /// The suite's cases, in order, with every file in each case directory
-/// checked against what the suite knows (`doc.md`, `context.json`, and
+/// checked against what the suite knows ([`inputs_of`] and
 /// [`artifacts_of`]). A stray file at the suite root, a case without
 /// `doc.md`, or an unknown file is recorded as structural.
 fn cases(suite: &str, ledger: &mut Ledger) -> Vec<PathBuf> {
-    let root = Path::new(CONFORMANCE).join(suite);
+    cases_in(Path::new(CONFORMANCE), suite, ledger)
+}
+
+fn cases_in(conformance: &Path, suite: &str, ledger: &mut Ledger) -> Vec<PathBuf> {
+    let root = conformance.join(suite);
     assert!(
         root.is_dir(),
         "{root:?} missing — the fixtures are vendored in-tree and must be present; \
@@ -277,8 +314,7 @@ fn cases(suite: &str, ledger: &mut Ledger) -> Vec<PathBuf> {
         }
         for f in std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()) {
             let file = f.file_name().to_string_lossy().into_owned();
-            if file != "doc.md" && file != "context.json" && !artifacts_of(suite).contains(&&*file)
-            {
+            if !inputs_of(suite).contains(&&*file) && !artifacts_of(suite).contains(&&*file) {
                 ledger
                     .structural
                     .push(format!("{suite}/{case}/{file}: unknown artifact"));
@@ -293,6 +329,18 @@ fn cases(suite: &str, ledger: &mut Ledger) -> Vec<PathBuf> {
 
 fn case_name(dir: &Path) -> String {
     dir.file_name().unwrap().to_string_lossy().into_owned()
+}
+
+/// The refusal-matching rule (the Go port's
+/// TestRefusalCasesYieldThePinnedMessages): a pinned refusal is matched by one
+/// we produce with the same line — a `null` line matches only a refusal that
+/// names none — the same code, and the same message. The code is the
+/// contract (S20), so the right line and message under the wrong code is a
+/// miss.
+fn refusal_matches(want: &serde_json::Value, got: &instruction_core::Refusal) -> bool {
+    got.line.map(u64::from) == want["line"].as_u64()
+        && Some(got.code) == want["code"].as_str()
+        && Some(got.message.as_str()) == want["message"].as_str()
 }
 
 fn refused(errs: &[instruction_core::Refusal]) -> String {
@@ -483,11 +531,9 @@ fn the_shared_refusal_corpus_matches() {
                 },
             ),
         };
-        // The matching rule (the Go port's
-        // TestRefusalCasesYieldThePinnedMessages): every pinned refusal is
-        // matched by one we produce with the same line — a `null` line
-        // matches only a refusal that names none — the same code, and the
-        // same message. Extra refusals are allowed: a reader may say more.
+        // Every pinned refusal is matched by one we produce
+        // ([`refusal_matches`]). Extra refusals are allowed: a reader may say
+        // more.
         let mut msgs = Vec::new();
         for w in &want {
             let wline = w["line"].as_u64();
@@ -501,9 +547,7 @@ fn the_shared_refusal_corpus_matches() {
                     "refusals/{name}: pinned code {wcode:?} is not in CODES"
                 ));
             }
-            let hit = got
-                .iter()
-                .any(|g| g.line.map(u64::from) == wline && g.code == wcode && g.message == wmsg);
+            let hit = got.iter().any(|g| refusal_matches(w, g));
             if !hit {
                 msgs.push(format!(
                     "  want [{wline:?}] {wcode} {wmsg:?}; got: {}",
@@ -669,5 +713,146 @@ fn the_refusal_codes_are_appendix_b_when_present() {
     assert!(
         missing.is_empty() && extra.is_empty(),
         "CODES differs from Appendix B in {upstream}: missing {missing:?}, not in the table {extra:?}"
+    );
+}
+
+// ── The runner's own rules, judged on synthetic outcomes ────────────────────
+// The live fixtures exercise none of these conditions today (no listed entry
+// passes, none is missing, no stray file is vendored), so each rule is held
+// here instead — a reverted rule fails its test, not just a future re-vendor.
+
+/// A ledger with these outcomes, judged against `pending` over `root`.
+fn judged(outcomes: &[(&str, Result<(), String>)], pending: &[&str], root: &Path) -> Vec<String> {
+    let mut ledger = Ledger::default();
+    for (key, outcome) in outcomes {
+        ledger.record(key.to_string(), outcome.clone());
+    }
+    ledger.judge("corpus", pending, root).failures
+}
+
+#[test]
+fn the_ledger_fails_a_listed_entry_that_now_passes() {
+    let root = Path::new(CONFORMANCE);
+    let key = "corpus/coding-agent/tree.json";
+    let failures = judged(&[(key, Ok(()))], &[key], root);
+    assert_eq!(
+        failures,
+        [format!("{key}: now passes — remove it from PENDING")]
+    );
+    // Still failing, it is pending and nothing else.
+    assert!(judged(&[(key, Err("x".into()))], &[key], root).is_empty());
+}
+
+#[test]
+fn the_ledger_fails_an_unlisted_failure_and_passes_an_unlisted_pass() {
+    let root = Path::new(CONFORMANCE);
+    let failures = judged(
+        &[
+            ("corpus/a/tree.json", Err("tree.json differs".into())),
+            ("corpus/b/tree.json", Ok(())),
+        ],
+        &[],
+        root,
+    );
+    assert_eq!(failures, ["corpus/a/tree.json: tree.json differs"]);
+}
+
+#[test]
+fn the_ledger_fails_a_listed_entry_no_run_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("corpus/a")).unwrap();
+    std::fs::write(dir.path().join("corpus/a/notes.txt"), "").unwrap();
+    let failures = judged(
+        &[],
+        &[
+            "corpus/a/notes.txt",
+            "corpus/gone/tree.json",
+            "corpsu/a/tree.json",
+        ],
+        dir.path(),
+    );
+    assert_eq!(
+        failures,
+        [
+            "PENDING \"corpsu/a/tree.json\" names no suite",
+            "PENDING \"corpus/a/notes.txt\" is not an artifact this runner compares",
+            "PENDING \"corpus/gone/tree.json\" names a nonexistent file",
+        ]
+    );
+}
+
+#[test]
+fn a_case_file_the_suite_does_not_know_is_an_unknown_artifact() {
+    let dir = tempfile::tempdir().unwrap();
+    let write = |rel: &str| {
+        let p = dir.path().join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, "").unwrap();
+    };
+    for f in [
+        "corpus/a/doc.md",
+        "corpus/a/context.json",
+        "corpus/a/delivered.txt",
+        "corpus/a/notes.txt",
+        "corpus/b/tree.json",
+        "corpus/stray.md",
+        "refusals/r/doc.md",
+        "refusals/r/refusals.json",
+        "refusals/r/context.json",
+    ] {
+        write(f);
+    }
+    let mut corpus = Ledger::default();
+    let found = cases_in(dir.path(), "corpus", &mut corpus);
+    assert_eq!(found.len(), 2);
+    let mut structural = corpus.structural;
+    structural.sort();
+    assert_eq!(
+        structural,
+        [
+            "corpus/a/notes.txt: unknown artifact",
+            "corpus/b: case has no doc.md",
+            "corpus/stray.md: unknown artifact (not a case)",
+        ]
+    );
+    // `context.json` is an input only the corpus runner reads.
+    let mut refusals = Ledger::default();
+    cases_in(dir.path(), "refusals", &mut refusals);
+    assert_eq!(
+        refusals.structural,
+        ["refusals/r/context.json: unknown artifact"]
+    );
+}
+
+#[test]
+fn a_refusal_matches_on_line_code_and_message() {
+    let want = serde_json::json!({"line": 3, "code": "unclosed-fence", "message": "m"});
+    let got = |line: Option<u32>, code: &'static str, message: &str| instruction_core::Refusal {
+        line,
+        code,
+        message: message.into(),
+    };
+    assert!(refusal_matches(&want, &got(Some(3), "unclosed-fence", "m")));
+    assert!(
+        !refusal_matches(&want, &got(Some(3), "malformed-attributes", "m")),
+        "wrong code"
+    );
+    assert!(
+        !refusal_matches(&want, &got(Some(4), "unclosed-fence", "m")),
+        "wrong line"
+    );
+    assert!(
+        !refusal_matches(&want, &got(None, "unclosed-fence", "m")),
+        "no line"
+    );
+    assert!(
+        !refusal_matches(&want, &got(Some(3), "unclosed-fence", "n")),
+        "wrong message"
+    );
+    let whole = serde_json::json!({"line": null, "code": "schema", "message": "m"});
+    assert!(refusal_matches(&whole, &got(None, "schema", "m")));
+    assert!(
+        !refusal_matches(&whole, &got(Some(1), "schema", "m")),
+        "a null line names none"
     );
 }

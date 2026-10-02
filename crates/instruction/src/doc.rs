@@ -106,6 +106,13 @@ pub struct Registry {
     kinds: BTreeMap<String, Kind>,
     grant_tokens: BTreeSet<String>,
     keywords: BTreeMap<String, String>,
+    /// The keywords whose `x-registry.keyword-flags` set `not` (`SHOULD NOT`):
+    /// the keyword maps to the same kind as its positive form, so the flag is
+    /// the only thing that keeps the rule's polarity.
+    negating_keywords: BTreeSet<String>,
+    /// kind → the label a NEGATED block of it delivers (`should` → `SHOULD
+    /// NOT`), from `x-registry.negated-labels`.
+    negated_labels: BTreeMap<String, String>,
     /// kind → the attribute names the schema marks `x-multivalued`
     /// (comma-separated within one value; normalized to arrays).
     multivalued: BTreeMap<String, BTreeSet<String>>,
@@ -169,6 +176,19 @@ impl Registry {
                 }
             }
         }
+        let negating_keywords: BTreeSet<String> = reg["keyword-flags"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(_, flags)| flags["not"].as_bool() == Some(true))
+            .map(|(kw, _)| kw.clone())
+            .collect();
+        let negated_labels: BTreeMap<String, String> = reg["negated-labels"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter_map(|(kind, label)| Some((kind.clone(), label.as_str()?.to_string())))
+            .collect();
         let mut multivalued: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let mut attr_names: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         if let Some(attrs) = schema["$defs"]["attrs"].as_object() {
@@ -256,6 +276,8 @@ impl Registry {
             kinds,
             grant_tokens,
             keywords,
+            negating_keywords,
+            negated_labels,
             multivalued,
             machinery_order,
             attrs: attr_names,
@@ -273,7 +295,18 @@ impl Registry {
         self.keywords.get(kw).map(String::as_str)
     }
 
-    /// Whether the schema marks `kind`'s attribute `attr` multi-valued.
+    /// The label a negated block of `kind` delivers (`should` → `SHOULD NOT`),
+    /// if the registry gives it one.
+    pub fn negated_label(&self, kind: &str) -> Option<&str> {
+        self.negated_labels.get(kind).map(String::as_str)
+    }
+
+    /// Whether the keyword `kw` negates its kind (`SHOULD NOT`), per the
+    /// registry's keyword flags.
+    pub fn keyword_negates(&self, kw: &str) -> bool {
+        self.negating_keywords.contains(kw)
+    }
+
     /// The attribute names `kind`'s schema declares, if it declares any.
     pub fn attrs_of(&self, kind: &str) -> Option<&BTreeSet<String>> {
         self.attrs.get(kind)
@@ -298,6 +331,7 @@ impl Registry {
             .map(|(k, _)| k.as_str())
     }
 
+    /// Whether the schema marks `kind`'s attribute `attr` multi-valued.
     pub fn is_multivalued(&self, kind: &str, attr: &str) -> bool {
         self.multivalued
             .get(kind)
@@ -1794,11 +1828,15 @@ fn parse_front_matter(text: &str, errs: &mut Vec<Refusal>) -> (BTreeMap<String, 
                 map.insert(kk, v);
             }
         }
-        Ok(_) => errs.push(Refusal::new(
+        // Line 1, the front matter's opening fence, as every port names it:
+        // conformance compares the line with the code.
+        Ok(_) => errs.push(Refusal::at(
+            1,
             "front-matter-yaml",
             "front matter must be a YAML mapping",
         )),
-        Err(e) => errs.push(Refusal::new(
+        Err(e) => errs.push(Refusal::at(
+            1,
             "front-matter-yaml",
             format!("front matter is not valid YAML: {e}"),
         )),
@@ -1956,10 +1994,22 @@ fn check_refs(blocks: &[&Block], errs: &mut Vec<Refusal>) {
     }
     let mut state: BTreeMap<(String, String), u8> = BTreeMap::new();
     for node in edges.keys() {
-        if has_cycle(node, &edges, &mut state) {
-            errs.push(Refusal::new(
+        let mut path = Vec::new();
+        if let Some(cycle) = find_cycle(node, &edges, &mut state, &mut path) {
+            // Appendix B's shape, as every port writes it: the line of the
+            // block the cycle starts at, and the cycle spelled out
+            // (`reference cycle: workflow/a → workflow/b → workflow/a`).
+            // Conformance compares the line with the code, so a refusal of
+            // a located condition names it.
+            let line = blocks
+                .iter()
+                .find(|b| b.kind == cycle[0].0 && b.name.as_deref() == Some(cycle[0].1.as_str()))
+                .map_or(0, |b| b.line);
+            let spelled: Vec<String> = cycle.iter().map(|(k, n)| format!("{k}/{n}")).collect();
+            errs.push(Refusal::at(
+                line,
                 "reference-cycle",
-                format!("reference cycle through {}/{}", node.0, node.1),
+                format!("reference cycle: {}", spelled.join(" → ")),
             ));
             break;
         }
@@ -2049,26 +2099,38 @@ fn is_kind_token(s: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
 }
 
-fn has_cycle(
+/// Depth-first search for a reference cycle reachable from `node`, returning
+/// it as the nodes walked, first node repeated at the end.
+fn find_cycle(
     node: &(String, String),
     edges: &BTreeMap<(String, String), Vec<(String, String)>>,
     state: &mut BTreeMap<(String, String), u8>,
-) -> bool {
+    path: &mut Vec<(String, String)>,
+) -> Option<Vec<(String, String)>> {
     match state.get(node) {
-        Some(1) => return true,  // on the current path
-        Some(2) => return false, // done
+        // On the current path: the cycle is the path from this node's first
+        // visit, closed by the node again.
+        Some(1) => {
+            let from = path.iter().position(|p| p == node).unwrap_or(0);
+            let mut cycle = path[from..].to_vec();
+            cycle.push(node.clone());
+            return Some(cycle);
+        }
+        Some(2) => return None, // done
         _ => {}
     }
     state.insert(node.clone(), 1);
+    path.push(node.clone());
     if let Some(next) = edges.get(node) {
         for n in next {
-            if has_cycle(n, edges, state) {
-                return true;
+            if let Some(cycle) = find_cycle(n, edges, state, path) {
+                return Some(cycle);
             }
         }
     }
+    path.pop();
     state.insert(node.clone(), 2);
-    false
+    None
 }
 
 /// The grants a document actually requires (the non-default families it uses),
@@ -2629,8 +2691,18 @@ fn deliver_block_lines(
         Disposition::Structural if b.kind == "include" => {
             deliver_include(b, granted, params, resolve, depth, seen)
         }
-        // `param` and any other structural block deliver nothing.
-        Disposition::Structural => Vec::new(),
+        // A structural kind with no body (`param`) delivers nothing. One that
+        // has a body and no delivery semantics here yet (`unless`,
+        // `otherwise`, registered in revision 1.1) delivers that body
+        // unwrapped, as it did when it was an unknown bare kind: a catch-all
+        // that delivered nothing would silently drop the guidance inside —
+        // typically the safety fallback an `otherwise` carries — while the
+        // load still reported success. Keyed on the schema's `x-body`, so a
+        // structural kind a later registry adds keeps its text too.
+        Disposition::Structural => match lookup(&b.kind).map(|k| k.body) {
+            Some(BodyKind::None) => Vec::new(),
+            _ => body_lines(b.delivery_body()),
+        },
         Disposition::Machinery => machinery_ack(b).into_iter().collect(),
     }
 }
@@ -2833,7 +2905,16 @@ fn deliver_prose_lines(
             .collect(),
         k if NORMATIVITY.contains(&k) || lookup(k).is_some() => {
             // The keyword prefixes the FIRST body line; the rest are unchanged.
-            let kw = k.to_uppercase();
+            // `:::should{not}` is the container spelling of `SHOULD NOT:` and
+            // keeps its polarity the same way, through the negated label.
+            let negated = b
+                .attrs
+                .get("not")
+                .is_some_and(|v| v.is_empty() || v == "true");
+            let kw = match registry().negated_label(k) {
+                Some(label) if negated => label.to_string(),
+                _ => k.to_uppercase(),
+            };
             let mut out = Vec::new();
             for (n, line) in body.iter().enumerate() {
                 if n == 0 {
@@ -3230,9 +3311,19 @@ fn split_list_marker(line: &str) -> (String, &str) {
 }
 
 /// The canonical uppercase keyword a keyword token maps to (`MUST NOT` →
-/// `NEVER`, `INFO` → `NOTE`), from the schema's keyword table.
+/// `NEVER`, `INFO` → `NOTE`), from the schema's keyword table. A negating
+/// keyword (`SHOULD NOT`) maps to the same kind as its positive form, so its
+/// label comes from the registry's negated labels — upper-casing the kind
+/// alone delivered `SHOULD NOT:` as `**SHOULD:**`, the rule's opposite.
 fn canonical_keyword(kw: &str) -> Option<String> {
-    registry().keyword_kind(kw).map(|kind| kind.to_uppercase())
+    let reg = registry();
+    let kind = reg.keyword_kind(kw)?;
+    if reg.keyword_negates(kw)
+        && let Some(label) = reg.negated_label(kind)
+    {
+        return Some(label.to_string());
+    }
+    Some(kind.to_uppercase())
 }
 
 /// If `line` STARTS a keyword block (§4.5): the kind it maps to, whether the
@@ -3941,6 +4032,22 @@ mod tests {
         assert!(lookup("param").unwrap().requires_name);
         assert!(lookup("eval").unwrap().requires_name);
         assert!(!lookup("config").unwrap().requires_name);
+        // A set row needs a name exactly when the kind REQUIRES one
+        // (`parse_table_set` keys on `requires_name`). Every set-form kind
+        // in the schema both requires a name and has identity, so today the
+        // two fields pick the same rows and nothing else tells the choice
+        // apart: a registry that gives a name-optional kind the set form
+        // fails here, and must bring a set-row test deciding which it means.
+        let apart: Vec<&str> = r
+            .kinds
+            .values()
+            .filter(|k| k.forms.contains(&Form::Set) && !(k.requires_name && k.identity))
+            .map(|k| k.name.as_str())
+            .collect();
+        assert!(
+            apart.is_empty(),
+            "set-form kinds whose requires_name and identity no longer agree: {apart:?}"
+        );
         assert!(parse(":::must\nCite sources.\n:::\nMUST: be brief.\n").is_ok());
         let e = parse(":::!workflow\nsteps: []\n:::").unwrap_err();
         assert!(
@@ -4613,5 +4720,478 @@ steps:
         let e = fold(&d, &grants(&[])).unwrap();
         assert!(e.workflows.is_empty());
         assert!(e.cleaned.contains(":::!workflow"), "shown verbatim");
+    }
+
+    /// Until the 1.1 variant semantics land, a structural block with a body
+    /// (`unless`, `otherwise`) delivers that body unwrapped — the behaviour
+    /// it had as an unknown bare kind. A load that reports success must never
+    /// have dropped the guidance inside, whatever the facts say.
+    #[test]
+    fn a_structural_block_with_a_body_never_loses_it() {
+        let doc = parse(
+            "# T\n\n:::unless{environment=\"prod\"}\nDebug freely.\n:::\n\n\
+             :::otherwise\nBe careful.\n:::\n\n::param{name=p default=x}\n\nUse ${p}.",
+        )
+        .unwrap();
+        for env in ["prod", "dev"] {
+            let facts: BTreeMap<String, String> = [("environment".into(), env.into())].into();
+            let out = fold_full(
+                &doc,
+                &all_families(),
+                &BTreeMap::new(),
+                &facts,
+                &|_| None,
+                0,
+                &BTreeSet::new(),
+            )
+            .unwrap()
+            .cleaned;
+            assert_eq!(
+                out, "# T\n\nDebug freely.\n\nBe careful.\n\nUse x.\n",
+                "environment={env}"
+            );
+        }
+    }
+
+    /// `SHOULD NOT:` maps to the same kind as `SHOULD:`; the registry's
+    /// keyword flag and negated label are all that keep it a prohibition, in
+    /// every spelling: the line, a list item, and `:::should{not}`.
+    #[test]
+    fn should_not_keeps_its_polarity_in_delivery() {
+        let out = fold(
+            &parse(
+                "SHOULD NOT: store data.\n\n- SHOULD NOT: paste tickets.\n- SHOULD: link.\n\n\
+                 :::should{not}\nkeep copies.\n:::\n\n:::should\nask first.\n:::",
+            )
+            .unwrap(),
+            &all_families(),
+        )
+        .unwrap()
+        .cleaned;
+        assert_eq!(
+            out,
+            "**SHOULD NOT:** store data.\n\n- **SHOULD NOT:** paste tickets.\n- **SHOULD:** link.\n\n\
+             **SHOULD NOT:** keep copies.\n\n**SHOULD:** ask first.\n"
+        );
+    }
+
+    /// Every refusal comes from the document, as a reader would see it: the
+    /// parse refusals, else what folding under `grants` refuses.
+    fn refusals_of(doc: &Document, granted: &BTreeSet<String>) -> Vec<Refusal> {
+        fold(doc, granted).err().unwrap_or_default()
+    }
+
+    /// The code is the contract (S20), so every constructor site's choice of
+    /// code is pinned here — line, code, and a fragment of the message that
+    /// names the site — including the sites no `refusals.json` fixture
+    /// reaches and the codes several sites share, where the accounting test
+    /// in `refusal.rs` only proves SOME site builds the code.
+    #[test]
+    fn every_refusal_site_names_its_line_and_code() {
+        let all = all_families();
+        // (document, all families granted?, line, code, message fragment)
+        let cases: &[(&str, bool, Option<u32>, &str, &str)] = &[
+            (
+                ":::note\nopen",
+                true,
+                Some(1),
+                "unclosed-fence",
+                "never closed",
+            ),
+            (
+                "## !workflow nightly\n\nprose only",
+                true,
+                Some(1),
+                "section-without-fence",
+                "",
+            ),
+            // A sigiled sub-block is no machinery kind of its own.
+            (
+                ":::!case{name=c}\ngiven: {}\n:::",
+                true,
+                Some(1),
+                "unknown-machinery-kind",
+                "is a sub-block",
+            ),
+            (
+                ":::workflow{name=w}\nsteps: {}\n:::",
+                true,
+                Some(1),
+                "bare-machinery-kind",
+                "is a machinery kind",
+            ),
+            (
+                ":::!note\nhi\n:::",
+                true,
+                Some(1),
+                "sigiled-prose-kind",
+                "is a prose kind",
+            ),
+            (
+                ":::!when{env=prod}\nhi\n:::",
+                true,
+                Some(1),
+                "sigiled-prose-kind",
+                "is a structural kind",
+            ),
+            (
+                "## !must r1\n\ntext",
+                true,
+                Some(1),
+                "sigiled-prose-kind",
+                "the section form is machinery only",
+            ),
+            (
+                ":::glossary[]\nTerm\n:   def\n:::",
+                true,
+                Some(1),
+                "redundant-set",
+                "already a list",
+            ),
+            (
+                ":::!nope\nx\n:::",
+                true,
+                Some(1),
+                "unknown-machinery-kind",
+                "unknown machinery kind",
+            ),
+            (
+                "::!workflow{name=w}",
+                true,
+                Some(1),
+                "body-required",
+                "requires a body",
+            ),
+            (
+                ":::!image{name=i digest=sha256:ab}\n:::",
+                true,
+                Some(1),
+                "form-not-accepted",
+                "does not take the container form",
+            ),
+            (
+                ":::!human[]\n| name |\n:::",
+                true,
+                Some(1),
+                "set-body-mixed",
+                "a table or a definition list",
+            ),
+            (
+                ":::!human[]\n| name | channel_id |\n|---|---|\n| a | x |\n:::",
+                true,
+                Some(1),
+                "unknown-column",
+                "not an attribute of human",
+            ),
+            (
+                ":::!human[]\n| channel |\n|---|\n| x |\n:::",
+                true,
+                Some(1),
+                "set-row-without-name",
+                "has no name",
+            ),
+            (
+                ":::!human[]\nnot a table\n:::",
+                true,
+                Some(1),
+                "set-body-mixed",
+                "a table or a definition list",
+            ),
+            (
+                ":::note #x\nhi\n:::",
+                true,
+                Some(1),
+                "malformed-attributes",
+                "wrapped in { }",
+            ),
+            (
+                ":::must{#ops}\nhi\n:::",
+                true,
+                Some(1),
+                "id-class-shorthand",
+                "identity is name=ops",
+            ),
+            (
+                ":::must{.loud}\nhi\n:::",
+                true,
+                Some(1),
+                "malformed-attributes",
+                "found \".\"",
+            ),
+            (
+                ":::must{=x}\nhi\n:::",
+                true,
+                Some(1),
+                "malformed-attributes",
+                "empty attribute name",
+            ),
+            (
+                ":::must{verbatim verbatim}\nhi\n:::",
+                true,
+                Some(1),
+                "repeated-attribute",
+                "is repeated",
+            ),
+            (
+                ":::must{name=on call}\nhi\n:::",
+                true,
+                Some(1),
+                "malformed-attributes",
+                "found \"call\"",
+            ),
+            (
+                ":::must{title=a}b}\nhi\n:::",
+                true,
+                Some(1),
+                "malformed-attributes",
+                "runs into",
+            ),
+            (
+                ":::must{title=a title=b}\nhi\n:::",
+                true,
+                Some(1),
+                "repeated-attribute",
+                "is repeated",
+            ),
+            (
+                "---\n- a\n---\nhi",
+                true,
+                Some(1),
+                "front-matter-yaml",
+                "must be a YAML mapping",
+            ),
+            (
+                "---\na: [\n---\nhi",
+                true,
+                Some(1),
+                "front-matter-yaml",
+                "not valid YAML",
+            ),
+            (
+                "---\nspec: \"1.0\"\n---\nhi",
+                true,
+                None,
+                "non-integer-version",
+                "versions are integers",
+            ),
+            (
+                "---\nspec: \"1.0\"\n---\nhi",
+                true,
+                None,
+                "schema",
+                "must match pattern",
+            ),
+            (
+                "---\nspec: \"2\"\n---\nhi",
+                true,
+                None,
+                "unimplemented-version",
+                "not implemented",
+            ),
+            (
+                "text\n\n:::!workflow\nsteps: {}\n:::",
+                true,
+                Some(3),
+                "missing-attribute",
+                "workflow requires name",
+            ),
+            (
+                ":::!workflow{name=w}\nsteps: {}\n:::\n\n:::!workflow{name=w}\nsteps: {}\n:::",
+                true,
+                Some(5),
+                "duplicate-identity",
+                "first declared at line 1",
+            ),
+            (
+                ":::!skill{name=s may=@bare}\nhi\n:::",
+                true,
+                Some(1),
+                "attribute-value",
+                "must be qualified",
+            ),
+            (
+                ":::!skill{name=s may=@case/c}\nhi\n:::",
+                true,
+                Some(1),
+                "subblock-reference",
+                "cannot be referenced",
+            ),
+            (
+                ":::!skill{name=s may=@workflow/nope}\nhi\n:::",
+                true,
+                Some(1),
+                "dangling-reference",
+                "does not resolve",
+            ),
+            (
+                "x\n\n:::!skill{name=a may=@skill/b}\nhi\n:::\n\n:::!skill{name=b may=@skill/a}\nhi\n:::",
+                true,
+                Some(3),
+                "reference-cycle",
+                "reference cycle: skill/a → skill/b → skill/a",
+            ),
+            (
+                "See [[case/c]].",
+                true,
+                Some(1),
+                "subblock-reference",
+                "cannot be referenced",
+            ),
+            (
+                "x\nSee [[workflow/nope]].",
+                true,
+                Some(2),
+                "dangling-reference",
+                "does not resolve",
+            ),
+            (
+                ":::!runtime{name=r}\nimage: x\n:::",
+                false,
+                Some(1),
+                "ungranted-family",
+                "needs the `compute` capability",
+            ),
+            (
+                ":::override{target=t}\ndisabled: true\n:::",
+                true,
+                Some(1),
+                "subblock-out-of-place",
+                "only inside a mcp",
+            ),
+            // body_map, the explicit kinds' body.
+            (
+                ":::!workflow{name=w}\n- a\n:::",
+                true,
+                Some(1),
+                "invalid-yaml-body",
+                "!workflow body must be a YAML mapping",
+            ),
+            (
+                ":::!workflow{name=w}\na: [\n:::",
+                true,
+                Some(1),
+                "invalid-yaml-body",
+                "!workflow body is not valid YAML",
+            ),
+            // The fallback for every other YAML-bodied kind.
+            (
+                ":::!runtime{name=r}\n- a\n:::",
+                true,
+                Some(1),
+                "invalid-yaml-body",
+                "!runtime body must be a YAML mapping",
+            ),
+            (
+                ":::!runtime{name=r}\na: [\n:::",
+                true,
+                Some(1),
+                "invalid-yaml-body",
+                "!runtime body is not valid YAML",
+            ),
+            (
+                "::::!mcp{name=m}\n:::override\ndisabled: true\n:::\n::::",
+                true,
+                Some(2),
+                "missing-attribute",
+                "needs a target",
+            ),
+            (
+                "::::!mcp{name=m}\n:::override{target=t}\ndisabled: false\n:::\n::::",
+                true,
+                Some(2),
+                "widening-override",
+                "may not re-enable",
+            ),
+            (
+                ":::!config\ndocument_capabilities: [compute]\n:::",
+                true,
+                Some(1),
+                "self-grant",
+                "may not write `document_capabilities`",
+            ),
+            (
+                "::!image{name=i}",
+                true,
+                Some(1),
+                "mutable-image-tag",
+                "not digest-pinned",
+            ),
+            (
+                ":::!runtime{name=r}\nnetwork: any\n:::",
+                true,
+                Some(1),
+                "network-any",
+                "network: any is refused",
+            ),
+            (
+                "::!asset{name=a src=https://x.example/a.png}",
+                true,
+                Some(1),
+                "unpinned-remote-asset",
+                "requires sha256",
+            ),
+            (
+                ":::!config\nkey: sk-ant-abcdefghijklmnopqrstuvwxyz0123\n:::",
+                true,
+                Some(2),
+                "literal-credential",
+                "literal credential",
+            ),
+        ];
+        let mut misses = Vec::new();
+        for (text, granted_all, line, code, fragment) in cases {
+            let granted = if *granted_all {
+                all.clone()
+            } else {
+                BTreeSet::new()
+            };
+            let got = match parse(text) {
+                Err(e) => e,
+                Ok(d) => refusals_of(&d, &granted),
+            };
+            if !got
+                .iter()
+                .any(|r| r.line == *line && r.code == *code && r.message.contains(fragment))
+            {
+                misses.push(format!(
+                    "{text:?}\n  want [{line:?}] {code} ~{fragment:?}\n  got  {got:?}"
+                ));
+            }
+        }
+        // The fold-time name checks sit behind parse's own (`check_identity`
+        // refuses an unnamed block first), so they are reached the way a
+        // `Document` built by hand reaches them: with the name taken away.
+        for (text, fragment) in [
+            (
+                "::::!mcp{name=m}\nurl: https://x.example\n::::",
+                "mcp requires name",
+            ),
+            (
+                ":::!stream{name=s}\nretain: 1h\n:::",
+                "stream requires name",
+            ),
+            (":::!skill{name=s}\nhi\n:::", "skill requires name"),
+            (
+                ":::!endpoint{name=e}\npath: /x\n:::",
+                "endpoint requires name",
+            ),
+        ] {
+            let mut d = parse(text).unwrap();
+            for n in &mut d.nodes {
+                if let Node::Block(b) = n {
+                    b.name = None;
+                    b.attrs.remove("name");
+                }
+            }
+            let got = refusals_of(&d, &all);
+            if !got.iter().any(|r| {
+                r.line == Some(1) && r.code == "missing-attribute" && r.message == fragment
+            }) {
+                misses.push(format!(
+                    "{text:?} (unnamed)\n  want [1] missing-attribute {fragment:?}\n  got  {got:?}"
+                ));
+            }
+        }
+        assert!(misses.is_empty(), "{}", misses.join("\n"));
     }
 }

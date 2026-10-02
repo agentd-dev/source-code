@@ -233,6 +233,12 @@ test that fails on the old code.
   leaves its waits parked, said at error level, until a reload connects it.
 - **The launcher writes each terminal line in one piece,** so a sign-in
   prompt is never read, or interleaved, without its "[n more waiting]" count.
+- **An instruction's `SHOULD NOT:` reached the model as `**SHOULD:**`.**
+  The keyword maps to the same kind as `SHOULD:`, and delivery labelled a
+  line by its kind alone, so a prohibition was delivered as a
+  recommendation; `:::should{not}` lost its flag the same way. Both now
+  deliver `**SHOULD NOT:**`, from the registry's keyword flags and negated
+  labels.
 
 ### Changed (breaking)
 
@@ -306,6 +312,11 @@ not wherever a kind has identity: 1.1 gives every prose kind identity, and an
 anonymous `MUST:` stays valid. The conformance runner accounts for every
 vendored artifact; the ones this release does not meet yet are listed in the
 test as pending, and an artifact that starts passing must leave the list.
+Revision 1.1 registers `unless` and `otherwise` as structural kinds. Until
+their variant semantics land, a structural block with a body delivers that
+body unwrapped, as these did when they were unknown bare kinds: a block the
+registry knows is never dropped from the delivered text while the load
+reports success.
 
 Instruction refusals carry their Appendix B code; config.invalid text is
 unchanged. agentd-instruction's `Refusal` is now `{line, code, message}`
@@ -317,7 +328,10 @@ what it was. `From<String>`, `message_body()` and the string-parsing path
 behind them are removed. New `CODES` lists every code (Appendix B, plus the
 `schema` code a fixture pins), and `UNDETECTED` names the Appendix B codes
 this crate never emits, with the reason. The refusal fixtures are matched by
-line, code and message.
+line, code and message. A reference cycle and unreadable front matter now
+name a line, as Appendix B and the other ports do: `line N: reference cycle:
+skill/a → skill/b → skill/a` (it was `reference cycle through skill/a`), and
+line 1 for the front matter.
 
 ## v1.17.0 — A2A, and nothing beside it
 

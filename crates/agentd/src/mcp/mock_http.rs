@@ -332,10 +332,22 @@ fn handle_request(req: Request, state: &State) -> (Response, bool) {
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
             eprintln!("MOCK_SUBSCRIBE {asked}");
-            let refused = state
-                .refuse_subscribes
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                .is_ok();
+            // Take one refusal if any are left. A compare-exchange loop, not
+            // `fetch_update`: newer toolchains deprecate that name for
+            // `try_update`, which the MSRV does not have.
+            let refused = {
+                let left = &state.refuse_subscribes;
+                let mut n = left.load(Ordering::SeqCst);
+                loop {
+                    if n == 0 {
+                        break false;
+                    }
+                    match left.compare_exchange_weak(n, n - 1, Ordering::SeqCst, Ordering::SeqCst) {
+                        Ok(_) => break true,
+                        Err(now) => n = now,
+                    }
+                }
+            };
             if refused {
                 return (
                     Response::err(req.id, json::INTERNAL_ERROR, "subscribe refused"),

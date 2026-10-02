@@ -42,7 +42,8 @@ jobs:
       # --no-fail-fast, and the checks after it run even when it fails: one
       # red test binary must not hide the verdict of every binary (and every
       # check) that comes after it.
-      - run: cargo test --workspace --all-features --no-fail-fast
+      - if: ${{ !cancelled() }}
+        run: cargo test --workspace --all-features --no-fail-fast
       # The published JSON Schemas — the config and workflow schemas, and the
       # A2A extension registry and bundles served at each extension's URI — are
       # generated from the binary and committed, because the site build has no
@@ -203,8 +204,10 @@ jobs:
       # CLI mirrors + forwards); each matrix row gates BOTH crates so a drift
       # between them fails loudly.
       - run: cargo clippy -p agentd-core --all-targets ${{ matrix.features }} -- -D warnings
-      - run: cargo clippy -p agentd-cli --all-targets ${{ matrix.features }} -- -D warnings
-      - run: cargo test -p agentd-core ${{ matrix.features }} --no-fail-fast
+      - if: ${{ !cancelled() }}
+        run: cargo clippy -p agentd-cli --all-targets ${{ matrix.features }} -- -D warnings
+      - if: ${{ !cancelled() }}
+        run: cargo test -p agentd-core ${{ matrix.features }} --no-fail-fast
       - if: ${{ !cancelled() }}
         run: cargo test -p agentd-cli ${{ matrix.features }} --no-fail-fast
 

@@ -311,19 +311,28 @@ fn a_reload_introducing_the_path_is_refused_and_the_running_config_stays() {
         )
     };
     let cfg = t.path().join("agent.yaml");
-    // The port is the one the daemon reports binding, not a probe: another
-    // test can take a probed port before the daemon binds it, and a daemon
-    // that lost that race is retried on a fresh one.
-    let (d, bound) = common::spawn_listener_bound("webhooks.listen", |port| {
+    // The webhook listener is served only by an `a2a` build. There, the port
+    // is the one the daemon reports binding, not a probe: another test can
+    // take a probed port before the daemon binds it, and a daemon that lost
+    // that race is retried on a fresh one. A build without `a2a` binds
+    // nothing, so it has no port to race for — and no bind line to wait on.
+    let (d, port) = if cfg!(feature = "a2a") {
+        let (d, bound) = common::spawn_listener_bound("webhooks.listen", |port| {
+            std::fs::write(&cfg, body(port, "sensitive")).unwrap();
+            let d = Daemon::spawn(&cfg);
+            let log = d.log.to_string_lossy().into_owned();
+            (d, log)
+        });
+        let port: u16 = bound
+            .rsplit_once(':')
+            .and_then(|(_, p)| p.parse().ok())
+            .unwrap_or_else(|| panic!("no port in {bound}"));
+        (d, port)
+    } else {
+        let port = common::free_port();
         std::fs::write(&cfg, body(port, "sensitive")).unwrap();
-        let d = Daemon::spawn(&cfg);
-        let log = d.log.to_string_lossy().into_owned();
-        (d, log)
-    });
-    let port: u16 = bound
-        .rsplit_once(':')
-        .and_then(|(_, p)| p.parse().ok())
-        .unwrap_or_else(|| panic!("no port in {bound}"));
+        (Daemon::spawn(&cfg), port)
+    };
     let original = body(port, "sensitive");
     d.wait_for(
         |d| {

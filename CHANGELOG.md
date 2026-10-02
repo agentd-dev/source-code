@@ -104,6 +104,12 @@ test that fails on the old code.
   the head that the next life overwrote. Event keys are create-only now: an
   occupied key is kept and the append steps over it (`stream.head.recovered`).
   A webhook `into:` saves the stream head before its `202`.
+- **A job waits for its last `forward:` before it exits.** An `emit …
+  forward:` pushes on its own thread, and a job-shaped instance exits the
+  moment its run is terminal, so the push of the run's last emit was killed
+  mid-dial whenever it was slower than the final checkpoint. The idle exit
+  now waits for every push in flight; each is bounded by its own 30s
+  deadline.
 - **A trim past a lagging consumer is said.** `stream.consumer.skipped`
   (stream, workflow, node, from, to, events) is logged once per skip, and
   `agent_stream_lag{stream,consumer}`, named in RFC 0035 and never built, is

@@ -413,6 +413,14 @@ pub struct Runtime {
     pub(crate) subagents: BTreeMap<String, SubagentRecord>,
     pub(crate) instruction: Instruction,
     pub(crate) job_shape: bool,
+    /// `emit … forward:` pushes still on the wire. The push runs on its own
+    /// thread so a slow receiver never holds the loop, but the idle exit must
+    /// still wait for it: a job-shaped instance exits the moment its run is
+    /// terminal, and a process exit kills a detached thread mid-dial — the
+    /// last emit's forward was lost whenever the dial was slower than the
+    /// final checkpoint. Each push is bounded by its own deadline, so the
+    /// wait is too.
+    pub(crate) forwards_in_flight: Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) exit: Option<i32>,
     pub(crate) draining: bool,
     /// The lifetime token ceiling has tripped and its policy has been applied.
@@ -1411,7 +1419,11 @@ impl Runtime {
             || !self.pending.is_empty()
             || !self.executing.is_empty()
             || self.runs.values().any(|r| !r.status.is_terminal())
-            || !self.timers.is_empty();
+            || !self.timers.is_empty()
+            || self
+                .forwards_in_flight
+                .load(std::sync::atomic::Ordering::SeqCst)
+                > 0;
         if busy {
             self.idle_since = None;
             return None;

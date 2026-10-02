@@ -379,8 +379,9 @@ fn an_emit_forwarded_to_a_peer_lands_on_that_peers_stream() {
     );
     assert!(
         wait_for(&b, "\"event\":\"start.a2a.into\"", 20),
-        "B received the forward and appended it:\n{}",
-        b.stderr()
+        "B received the forward and appended it:\n{}\n--- A (the sender) ---\n{}",
+        b.stderr(),
+        a.stderr()
     );
     assert!(
         wait_for(&b, "peer sent order.placed", 20),

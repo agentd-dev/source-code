@@ -658,6 +658,7 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
             version: 1,
         },
         job_shape: false,
+        forwards_in_flight: Default::default(),
         // Populated lazily: a principal's ID is derived when the caller is
         // resolved (`user:<sub>`), not declared in config, so the quotas an
         // operator wrote can only be indexed once someone presents them.

@@ -703,6 +703,34 @@ pub(crate) struct Forwarded<'a> {
     pub step_id: &'a str,
 }
 
+/// One `forward:` push counted in flight for the whole life of its thread.
+/// Moved into the thread's closure, it drops when the push ends by any path —
+/// sent, failed, or the spawn itself refused — so the count cannot leak and
+/// pin the instance alive. The drop also wakes the reactor, so an idle exit
+/// that was waiting on this push is decided now rather than a tick later.
+pub(crate) struct ForwardInFlight {
+    count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    wake: std::sync::mpsc::Sender<crate::runtime::events::Event>,
+}
+
+impl ForwardInFlight {
+    fn start(rt: &crate::runtime::reactor::Runtime) -> Self {
+        rt.forwards_in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        ForwardInFlight {
+            count: std::sync::Arc::clone(&rt.forwards_in_flight),
+            wake: rt.events_tx.clone(),
+        }
+    }
+}
+
+impl Drop for ForwardInFlight {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        let _ = self.wake.send(crate::runtime::events::Event::Tick);
+    }
+}
+
 impl crate::runtime::reactor::Runtime {
     /// Push a just-appended event to a fleet PEER — `emit`'s
     /// `forward: {peer: name}` (RFC 0035 §5).
@@ -747,9 +775,12 @@ impl crate::runtime::reactor::Runtime {
         let log = self.log.clone();
         let (st, sub, peer_name) = (stream.to_string(), subject.to_string(), peer.to_string());
         let msg_id = id.to_string();
+        let in_flight = ForwardInFlight::start(self);
         std::thread::Builder::new()
             .name("stream:forward:peer".into())
             .spawn(move || {
+                // Bound by name: a closure captures only what it mentions.
+                let _in_flight = in_flight;
                 let deadline = std::time::Instant::now() + timeout;
                 if let Err(e) = crate::mcp::a2a_client::send(
                     &endpoint,
@@ -772,10 +803,10 @@ impl crate::runtime::reactor::Runtime {
     /// Push a just-appended event to an outbound webhook — `emit`'s
     /// `forward: {webhook: URL}` (RFC 0035 §5).
     ///
-    /// Fire-and-forget on its own thread, like every other outbound dial in the
-    /// daemon: the durable append already happened and IS the source of truth,
-    /// so a slow or dead receiver must not hold the single-writer loop or fail
-    /// the step. A consumer that misses the push still reads the event from its
+    /// On its own thread, like every other outbound dial in the daemon: the
+    /// durable append already happened and IS the source of truth, so a slow
+    /// or dead receiver must not hold the single-writer loop or fail the step.
+    /// It does hold an idle exit until it ends ([`ForwardInFlight`]). A consumer that misses the push still reads the event from its
     /// offset — the push is a latency optimisation, not the delivery.
     ///
     /// It is a covered egress surface, judged by the same `egress_allows` rule
@@ -816,9 +847,12 @@ impl crate::runtime::reactor::Runtime {
         ];
         let log = self.log.clone();
         let (url, st, sub) = (url.to_string(), stream.to_string(), subject.to_string());
+        let in_flight = ForwardInFlight::start(self);
         std::thread::Builder::new()
             .name("stream:forward".into())
             .spawn(move || {
+                // Bound by name: a closure captures only what it mentions.
+                let _in_flight = in_flight;
                 let outcome = crate::runtime::http_node::do_http(
                     &url,
                     "POST",

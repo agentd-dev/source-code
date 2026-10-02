@@ -426,6 +426,78 @@ fn a_forwarded_emit_notifies_a_webhook_and_still_appends() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// **A job-shaped instance does not exit out from under its last forward.**
+///
+/// A `once`-only configuration exits the moment its run is terminal, and the
+/// forward runs on its own thread — so the push of the run's last `emit`
+/// raced the process exit and was lost whenever the dial was slower than the
+/// final checkpoint (the cross-instance forward e2e failed this way under
+/// load). The receiver here answers only after a delay far longer than that
+/// exit takes, so the outcome does not depend on scheduling: the instance
+/// waits, hears the 503, and logs the failure before it exits.
+#[test]
+fn a_job_waits_for_its_forward_before_it_exits() {
+    use std::io::{BufRead, BufReader, Read, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let recv_port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        if let Ok((sock, _)) = listener.accept() {
+            let mut reader = BufReader::new(sock.try_clone().unwrap());
+            let mut len = 0usize;
+            loop {
+                let mut l = String::new();
+                if reader.read_line(&mut l).unwrap_or(0) == 0 || l.trim().is_empty() {
+                    break;
+                }
+                if let Some(v) = l.to_ascii_lowercase().strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap_or(0);
+                }
+            }
+            let _ = reader.read_exact(&mut vec![0u8; len]);
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            let mut sock = sock;
+            let _ = sock.write_all(
+                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+        }
+    });
+
+    let dir = common::unique_path("forward-job", "d");
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg_path = common::unique_path("forward-job", "yaml");
+    std::fs::write(
+        &cfg_path,
+        format!(
+            "agent:\n  name: forwarder\n\
+             store:\n  kind: file\n  file:\n    path: {dir}/state\n  checkpoint:\n    debounce_ms: 0\n\
+             streams:\n  outbox:\n    retention: {{ max_events: 100 }}\n\
+             workflows:\n  - name: producer\n    steps:\n\
+             \x20     s:  {{kind: once, policy: always}}\n\
+             \x20     e:  {{kind: emit, depends_on: [s], stream: outbox, subject: \"thing.happened\",\n\
+             \x20          data: {{n: 7}}, forward: {{webhook: \"http://127.0.0.1:{recv_port}/hook\", allow_private: true}}}}\n\
+             \x20     f:  {{kind: finish, depends_on: [e], status: completed}}\n\
+             observability:\n  log_level: info\n  log_content: true\n"
+        ),
+    )
+    .unwrap();
+
+    let (code, log) = life(&cfg_path);
+    assert_eq!(code, Some(0), "the job exited cleanly:\n{log}");
+    let failed = events(&log, "stream.forward.failed");
+    assert_eq!(
+        failed
+            .iter()
+            .map(|e| e["status"].clone())
+            .collect::<Vec<_>>(),
+        vec![json!(503)],
+        "the job heard its forward's answer before it exited:\n{log}"
+    );
+
+    std::fs::remove_file(&cfg_path).ok();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Write `cfg` as a JSON config and run one life of the daemon on it.
 fn life_json(cfg: &Value) -> (Option<i32>, String) {
     let path = common::unique_path("streams-cfg", "json");

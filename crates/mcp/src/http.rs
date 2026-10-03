@@ -176,8 +176,12 @@ pub trait RequestSigner: Send + Sync {
 
 /// The Streamable HTTP transport for one MCP server. Cheap to hold; each request
 /// opens a fresh connection (`Connection: close`), so there is no persistent
-/// socket to reap. `session` is set from the server's `Mcp-Session-Id` on the
-/// first response and echoed thereafter.
+/// socket to reap. `session` is set from the `Mcp-Session-Id` on the answer to
+/// an `initialize` request — the one message that opens a session — and echoed
+/// thereafter. The header on any other answer is ignored: a server that stamps
+/// one on a `server/discover` refusal must not have it carried into the
+/// `initialize` that follows, and a revision without sessions never gets one
+/// echoed back.
 pub struct HttpTransport {
     endpoint: McpEndpoint,
     /// Caller-owned auth + framing headers (e.g. `Authorization`, `x-api-key`).
@@ -319,7 +323,17 @@ impl HttpTransport {
     /// pumped out of the `text/event-stream` (queuing any interleaved
     /// notifications via `on_notification`). For a NOTIFICATION (`id` absent), the
     /// server replies `202 Accepted` with no body and `Ok(None)` is returned.
-    /// Captures/echoes `Mcp-Session-Id`.
+    ///
+    /// The server's JSON-RPC answer is the request's answer whatever status it
+    /// rides: a non-2xx `application/json` body carrying an `error` with an
+    /// integer `code` is returned as the response, so the caller sees the
+    /// server's own error rather than the bare status. `401` and `403` are the
+    /// exception — they stay [`HttpError::Status`], so an auth failure is never
+    /// taken for an answer. Any other non-2xx is [`HttpError::Status`], and a
+    /// 2xx to a request with an empty body is [`HttpError::NoResponse`].
+    ///
+    /// Echoes `Mcp-Session-Id`, and adopts it only from the answer to an
+    /// `initialize` request.
     pub fn send<F: FnMut(Value)>(
         &self,
         request_id: Option<i64>,
@@ -334,11 +348,14 @@ impl HttpTransport {
         // so a mis-satisfied requirement cannot spin. Without a signer this is
         // exactly one pass.
         const MAX_AUTH_ATTEMPTS: usize = 3;
+        // Read once, not per attempt: the body is the same on every retry.
+        let opens_session = request_id.is_some() && is_initialize(body);
         let mut attempt = 0;
         loop {
             attempt += 1;
             match self.send_once(
                 request_id,
+                opens_session,
                 body,
                 timeout,
                 extra_headers,
@@ -352,6 +369,7 @@ impl HttpTransport {
                 SendOutcome::RetryAuth => {
                     return match self.send_once(
                         request_id,
+                        opens_session,
                         body,
                         timeout,
                         extra_headers,
@@ -369,9 +387,12 @@ impl HttpTransport {
     /// One send attempt: build headers (+ AAuth signing), POST, and classify the
     /// response — a parsed result, a terminal error, or `RetryAuth` (the signer
     /// satisfied an `AAuth-Requirement`; the caller re-signs and retries).
+    /// `opens_session`: this is an `initialize`, whose answer's `Mcp-Session-Id`
+    /// is adopted.
     fn send_once<F: FnMut(Value)>(
         &self,
         request_id: Option<i64>,
+        opens_session: bool,
         body: &[u8],
         timeout: Duration,
         extra_headers: &[(&str, &str)],
@@ -415,8 +436,9 @@ impl HttpTransport {
         )
         .map_err(HttpError::Http)?;
 
-        // Adopt a server-assigned session id (initialize response).
-        if let Some(sid) = resp.header("mcp-session-id") {
+        // Adopt a server-assigned session id — from the `initialize` answer
+        // only, see the struct doc.
+        if let (true, Some(sid)) = (opens_session, resp.header("mcp-session-id")) {
             *self.session.lock().unwrap_or_else(|e| e.into_inner()) = Some(sid.to_string());
         }
 
@@ -449,8 +471,31 @@ impl HttpTransport {
         }
 
         if !resp.is_success() {
-            self.note_status(resp.status, session.is_some());
-            return Ok(SendOutcome::Error(HttpError::Status(resp.status)));
+            // First, so a `404` on a session marks it lost whatever the body.
+            let status = resp.status;
+            self.note_status(status, session.is_some());
+            // A server that refuses a request in JSON-RPC — a version it does
+            // not speak, a header that does not match the body — says why in
+            // the body, and that is the request's answer: the code is what a
+            // caller acts on, and the message is what an operator needs, where
+            // the status alone says only "HTTP 400". An auth failure never is:
+            // whatever its body says, `401`/`403` is the signal the credential
+            // machinery and the operator act on.
+            let answerable = request_id.is_some()
+                && !matches!(status, 401 | 403)
+                && resp
+                    .content_type()
+                    .is_some_and(|ct| ct.eq_ignore_ascii_case("application/json"));
+            if answerable
+                && let Ok(bytes) = resp.into_body()
+                && let Ok(v) = serde_json::from_slice::<Value>(&bytes)
+                && v.get("error")
+                    .and_then(|e| e.get("code"))
+                    .is_some_and(|c| c.is_i64())
+            {
+                return Ok(SendOutcome::Result(Some(v)));
+            }
+            return Ok(SendOutcome::Error(HttpError::Status(status)));
         }
 
         // A notification POST is acknowledged with an empty body (often 202).
@@ -468,6 +513,12 @@ impl HttpTransport {
             Ok(SendOutcome::Error(HttpError::NoResponse))
         } else {
             let bytes = resp.into_body().map_err(HttpError::Http)?;
+            // A request accepted with nothing to say — a `202` — was not
+            // answered, and saying so beats a JSON parse error about an empty
+            // body.
+            if bytes.iter().all(u8::is_ascii_whitespace) {
+                return Ok(SendOutcome::Error(HttpError::NoResponse));
+            }
             let v: Value = serde_json::from_slice(&bytes)
                 .map_err(|e| HttpError::Http(io::Error::new(io::ErrorKind::InvalidData, e)))?;
             Ok(SendOutcome::Result(Some(v)))
@@ -547,9 +598,27 @@ impl HttpTransport {
 /// stream, so it survives on the notification thread).
 pub type EventStream = http::SseReader<std::io::BufReader<Box<dyn http::Stream>>>;
 
+/// Is this JSON-RPC body an `initialize` request — the one message whose answer
+/// opens a session?
+fn is_initialize(body: &[u8]) -> bool {
+    // Only the method is read; every other field is skipped unparsed.
+    #[derive(serde::Deserialize)]
+    struct Head {
+        method: Option<String>,
+    }
+    serde_json::from_slice::<Head>(body).is_ok_and(|h| h.method.as_deref() == Some("initialize"))
+}
+
 /// Route one SSE event: if its `data` is the JSON-RPC response for `request_id`,
 /// return it; a message without a matching id (a notification/other) is handed to
 /// `on_notification` and `None` is returned so the caller keeps reading.
+///
+/// A JSON-RPC ERROR (an `error`, no `method`) answers this POST whatever its id
+/// says. A POST's stream carries only its own exchange — what else the server
+/// sends on it is a request or notification of its own, and those carry a
+/// `method` — and a server that could not read the request's id answers with a
+/// null one, or none. Handed on as a notification it would be dropped, and the
+/// request would end with no answer at all instead of the server's error.
 fn route_message<F: FnMut(Value)>(
     ev: &SseEvent,
     request_id: Option<i64>,
@@ -558,7 +627,8 @@ fn route_message<F: FnMut(Value)>(
     let v: Value = serde_json::from_str(&ev.data).ok()?;
     let id_matches =
         matches!((request_id, v.get("id").and_then(Value::as_i64)), (Some(a), Some(b)) if a == b);
-    if id_matches {
+    let is_error = v.get("error").is_some() && v.get("method").is_none();
+    if id_matches || (request_id.is_some() && is_error) {
         Some(v)
     } else {
         on_notification(v);

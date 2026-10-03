@@ -21,6 +21,17 @@
 //! response that arrived as Server-Sent Events is replayed to the SDK as the
 //! event stream it expects, in order, including any notifications that came
 //! interleaved with the reply.
+//!
+//! ## The server's answer, whatever carries it
+//!
+//! A server's JSON-RPC answer is the request's answer in any body: a `400` or
+//! `500` whose body is a JSON-RPC error, or an error frame on an event stream
+//! whose id the server could not fill in. The SDK routes answers by id, so an
+//! error whose id is wrong — or, outside the bootstrap, missing — is put back
+//! on the request it answers (see `answered`). The bootstrap messages —
+//! `server/discover` and `initialize` — are handed back whole, as one JSON
+//! answer, because the SDK's bootstrap reader skips an error it meets on a
+//! stream and would never see a refusal.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -63,7 +74,7 @@ enum Pumped {
     Message(Value),
     /// The exchange ended: the reply (`None` when the POST was a notification
     /// and `202 Accepted` came back), or the transport error that ended it.
-    Done(Result<Option<Value>, String>),
+    Done(Result<Option<Value>, HttpError>),
 }
 
 /// One JSON value as the SDK expects to read it off a stream.
@@ -87,6 +98,20 @@ impl StreamableHttpClient for AgentdHttp {
     /// either way. A notification-only POST is answered `202 Accepted` by the
     /// server and reported as accepted here.
     ///
+    /// **The bootstrap messages are handed back whole.** `server/discover` and
+    /// `initialize` come back as one JSON answer, not a stream: the SDK reads
+    /// them looking for a RESPONSE and passes over an error on a stream, so a
+    /// server's refusal — the `-32601` of a server without `server/discover`,
+    /// the `-32022` of one that does not speak the offered revision — would be
+    /// skipped and the handshake would fail for want of an answer instead of
+    /// with the server's reason. A failure with no JSON-RPC answer at all is
+    /// the transport's error. An `initialize` whose server speaks first (a log
+    /// line, a ping) keeps its stream, with the answer at its end.
+    ///
+    /// **A server's JSON-RPC answer is the request's answer**, whatever status
+    /// or frame carried it (see [`HttpTransport::send`]), and is put back on
+    /// the request by id (`answered`).
+    ///
     /// **The stream is live, not a replay.** The spec lets a server interleave a
     /// REQUEST of its own on the response stream of a POST — an elicitation, a
     /// sampling call — and then block until the client answers it (over a
@@ -104,11 +129,12 @@ impl StreamableHttpClient for AgentdHttp {
     /// connection waits for too. A full window holds the next POST the same
     /// way. So a request's stream is handed back at once, and a slow tool — or
     /// one abandoned at its caller's bound and left running to the socket's
-    /// timeout — holds no call but its own. Only `initialize` waits for its
-    /// first frame, because the session it opens rides that answer's head. A
-    /// notification, or our answer to a server's request, waits for its `202`,
-    /// which a server gives at once; the SDK bounds replies and cancellations
-    /// (its control POSTs) at 5 s.
+    /// timeout — holds no call but its own. Only the bootstrap waits:
+    /// `initialize` for its first frame, because the session it opens rides
+    /// that answer's head, and `server/discover` for its answer, which nothing
+    /// can be sent before anyway. A notification, or our answer to a server's
+    /// request, waits for its `202`, which a server gives at once; the SDK
+    /// bounds replies and cancellations (its control POSTs) at 5 s.
     async fn post_message(
         &self,
         _uri: Arc<str>,
@@ -120,11 +146,14 @@ impl StreamableHttpClient for AgentdHttp {
         let body = serde_json::to_vec(&message)
             .map_err(|e| StreamableHttpError::Client(TransportError(e.to_string())))?;
         let request_id = request_id_of(&message);
-        let opens_session = matches!(
-            &message,
-            rmcp::model::JsonRpcMessage::Request(r)
-                if matches!(r.request, rmcp::model::ClientRequest::InitializeRequest(_))
-        );
+        let (bootstrap, discovers) = match &message {
+            rmcp::model::JsonRpcMessage::Request(r) => match r.request {
+                rmcp::model::ClientRequest::DiscoverRequest(_) => (true, true),
+                rmcp::model::ClientRequest::InitializeRequest(_) => (true, false),
+                _ => (false, false),
+            },
+            _ => (false, false),
+        };
         let http = Arc::clone(&self.http);
         let timeout = self.timeout;
         let extra = header_pairs(auth_header, custom_headers);
@@ -149,24 +178,27 @@ impl StreamableHttpClient for AgentdHttp {
             let resp = http.send(request_id, &body, timeout, &refs, |n| {
                 let _ = notes_tx.send(Pumped::Message(n));
             });
-            let _ = tx.send(Pumped::Done(resp.map_err(|e| e.to_string())));
+            let _ = tx.send(Pumped::Done(resp));
         });
 
-        // A request other than `initialize`: its answer, or the error that
+        // A request other than the bootstrap: its answer, or the error that
         // ended its exchange, reaches the SDK on the stream. An exchange that
         // fails before the server said anything becomes an error RESPONSE to
         // this request carrying the transport's reason — the SDK itself answers
         // a stream that closed early with a synthesised error, but a generic
         // one, and "HTTP 401" is what an operator needs to see.
-        if let (Some(id), false) = (request_id, opens_session) {
+        if let (Some(id), false) = (request_id, bootstrap) {
             let session = self.http.session_id();
             let frames = futures::stream::unfold(Some(rx), move |rx| async move {
                 let mut rx = rx?;
                 match rx.recv().await {
-                    Some(Pumped::Message(v)) | Some(Pumped::Done(Ok(Some(v)))) => {
-                        Some((Ok(as_event(&v)), Some(rx)))
+                    Some(Pumped::Message(v)) => Some((Ok(as_event(&v)), Some(rx))),
+                    Some(Pumped::Done(Ok(Some(v)))) => {
+                        Some((Ok(as_event(&answered(id, v, false))), Some(rx)))
                     }
-                    Some(Pumped::Done(Err(e))) => Some((Ok(as_event(&failed(id, &e))), None)),
+                    Some(Pumped::Done(Err(e))) => {
+                        Some((Ok(as_event(&failed(id, &e.to_string()))), None))
+                    }
                     // Accepted with no body, or the pump vanished: the stream
                     // is over, and the SDK fails the request for want of an
                     // answer.
@@ -179,8 +211,30 @@ impl StreamableHttpClient for AgentdHttp {
         // Wait for the first frame. `Mcp-Session-Id` rides the response HEAD,
         // which the transport has already recorded by the time any frame can
         // reach us, so reading it here is not early.
-        let first = match rx.recv().await {
-            Some(Pumped::Message(v)) | Some(Pumped::Done(Ok(Some(v)))) => v,
+        //
+        // `server/discover` waits for its answer instead: nothing it is sent
+        // before that has a lifecycle to arrive in yet.
+        let first = loop {
+            match rx.recv().await {
+                Some(Pumped::Message(_)) if discovers => continue,
+                first => break first,
+            }
+        };
+        let first = match first {
+            Some(Pumped::Message(v)) => v,
+            // The whole answer, as one message: see this method's doc.
+            Some(Pumped::Done(Ok(Some(v)))) => {
+                let v = match request_id {
+                    Some(id) => answered(id, v, true),
+                    None => v,
+                };
+                let message =
+                    serde_json::from_value(v).map_err(StreamableHttpError::Deserialize)?;
+                return Ok(StreamableHttpPostResponse::Json(
+                    message,
+                    self.http.session_id(),
+                ));
+            }
             // A notification: nothing came back, and nothing should have.
             Some(Pumped::Done(Ok(None))) => return Ok(StreamableHttpPostResponse::Accepted),
             // The server no longer knows the session this message carried.
@@ -193,7 +247,7 @@ impl StreamableHttpClient for AgentdHttp {
                 return Err(StreamableHttpError::SessionExpired);
             }
             Some(Pumped::Done(Err(e))) => {
-                return Err(StreamableHttpError::Client(TransportError(e)));
+                return Err(StreamableHttpError::Client(TransportError(e.to_string())));
             }
             // The pump vanished without reporting — only reachable if the
             // blocking thread itself died, which is a dead socket either way.
@@ -205,9 +259,14 @@ impl StreamableHttpClient for AgentdHttp {
         };
         let session = self.http.session_id();
 
-        let rest = futures::stream::unfold(rx, |mut rx| async move {
+        let rest = futures::stream::unfold(rx, move |mut rx| async move {
             match rx.recv().await {
-                Some(Pumped::Message(v)) | Some(Pumped::Done(Ok(Some(v)))) => {
+                Some(Pumped::Message(v)) => Some((Ok(as_event(&v)), rx)),
+                Some(Pumped::Done(Ok(Some(v)))) => {
+                    let v = match request_id {
+                        Some(id) => answered(id, v, true),
+                        None => v,
+                    };
                     Some((Ok(as_event(&v)), rx))
                 }
                 // Done — cleanly, or with an error the first frame already
@@ -345,6 +404,33 @@ fn request_id_of(message: &rmcp::model::ClientJsonRpcMessage) -> Option<i64> {
     serde_json::to_value(message)
         .ok()
         .and_then(|v| v.get("id").and_then(Value::as_i64))
+}
+
+/// A request's final answer, put back on the request it answers.
+///
+/// The SDK routes an answer by its id, and a server that refused a request it
+/// could not read — a gateway's `400`, a version check ahead of the parser —
+/// answers with whatever id it had: none, `null`, or a placeholder (the Python
+/// SDK's middleware sends the string `"server-error"`). On this POST it can
+/// only be this request's answer, so an error whose id is not `id` gets `id`.
+///
+/// A null or absent id is the exception during the bootstrap: the SDK's
+/// bootstrap reader already takes an id-less error as the answer, so there it
+/// is left as the server sent it. Everywhere else the SDK drops an id-less
+/// error as unroutable, and the call would wait out the end of its stream.
+/// A success is never touched — its id is the SDK's to check.
+fn answered(id: i64, mut v: Value, bootstrap: bool) -> Value {
+    if v.get("error").is_none() {
+        return v;
+    }
+    let fix = match v.get("id") {
+        None | Some(Value::Null) => !bootstrap,
+        Some(got) => got.as_i64() != Some(id),
+    };
+    if fix && let Some(obj) = v.as_object_mut() {
+        obj.insert("id".to_string(), Value::from(id));
+    }
+    v
 }
 
 /// The error response a request gets when its exchange ended before the

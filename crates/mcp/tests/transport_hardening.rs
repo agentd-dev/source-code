@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Transport hardening: the three places where a stream, not a request, is the
-//! thing that has to be right.
+//! Transport hardening: the places where a stream, or the body around an
+//! answer, not the request itself, is the thing that has to be right.
 //!
 //! * The server→client notification stream (the `GET` dial) is a DIAL like any
 //!   other, and a signed server rejects an unsigned one — silently, from the
@@ -11,6 +11,10 @@
 //! * The raw listener's reader parses a request head before anyone has
 //!   authenticated, so its bounds are the only thing between a remote peer and
 //!   our memory.
+//! * A server's JSON-RPC answer is the request's answer wherever it rides — a
+//!   `400` body, an event-stream frame with no id — and the bootstrap messages
+//!   are handed to the SDK whole, so a refusal reaches the handshake as the
+//!   server's own error. A session is taken only from the `initialize` answer.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -473,4 +477,343 @@ fn an_oversized_request_head_is_refused_431() {
         call.len()
     );
     assert_eq!(status_of(&addr, ok.as_bytes()), 200);
+}
+
+// ------------------------------- 4. the server's answer, whatever carries it
+
+use rmcp::model::ClientJsonRpcMessage;
+use rmcp::transport::streamable_http_client::{
+    StreamableHttpClient, StreamableHttpError, StreamableHttpPostResponse,
+};
+use std::collections::HashMap;
+
+/// A server that answers each POST with the exact bytes `answer` returns for
+/// the JSON-RPC message it carried, and a `GET` with `405`: no push channel.
+fn spawn_scripted(answer: impl Fn(&Value) -> Vec<u8> + Send + Sync + 'static) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let answer = Arc::new(answer);
+    std::thread::spawn(move || {
+        for conn in listener.incoming().flatten() {
+            let answer = Arc::clone(&answer);
+            std::thread::spawn(move || {
+                conn.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                let mut w = conn.try_clone().unwrap();
+                let mut r = BufReader::new(conn);
+                let Some((start, headers)) = read_head(&mut r) else {
+                    return;
+                };
+                let body = read_body(&mut r, &headers);
+                let out = if start.starts_with("POST") {
+                    answer(&serde_json::from_slice(&body).unwrap_or(Value::Null))
+                } else {
+                    b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n".to_vec()
+                };
+                let _ = w.write_all(&out);
+                let _ = w.flush();
+            });
+        }
+    });
+    format!("http://{addr}/mcp")
+}
+
+/// One raw HTTP response: a status line, extra header lines, a body.
+fn raw(status: &str, headers: &[&str], body: &str) -> Vec<u8> {
+    let mut out = format!("HTTP/1.1 {status}\r\n");
+    for h in headers {
+        out.push_str(h);
+        out.push_str("\r\n");
+    }
+    out.push_str(&format!(
+        "Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    ));
+    out.into_bytes()
+}
+
+fn json_body(status: &str, body: &Value) -> Vec<u8> {
+    raw(
+        status,
+        &["Content-Type: application/json"],
+        &body.to_string(),
+    )
+}
+
+/// A JSON-RPC error with the given id, code and message.
+fn rpc_error(id: Value, code: i64, message: &str) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
+}
+
+/// The `initialize` answer of a 2025-11-25 server, carrying session `s-1`.
+fn initialized(msg: &Value) -> Vec<u8> {
+    let resp = json!({
+        "jsonrpc": "2.0", "id": msg["id"],
+        "result": {
+            "protocolVersion": msg["params"]["protocolVersion"],
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "scripted", "version": "0"}
+        }
+    });
+    raw(
+        "200 OK",
+        &["Content-Type: application/json", "Mcp-Session-Id: s-1"],
+        &resp.to_string(),
+    )
+}
+
+/// The `server/discover` request the SDK sends first on the discover path.
+fn discover() -> ClientJsonRpcMessage {
+    serde_json::from_value(
+        json!({"jsonrpc": "2.0", "id": 0, "method": "server/discover", "params": {}}),
+    )
+    .expect("a server/discover request")
+}
+
+type Posted =
+    Result<StreamableHttpPostResponse, StreamableHttpError<mcp::rmcp_transport::TransportError>>;
+
+/// POST one message through agentd's socket, as the SDK's worker does.
+fn post(ep: &str, message: ClientJsonRpcMessage) -> Posted {
+    let http = Arc::new(HttpTransport::new(McpEndpoint::parse(ep).unwrap(), vec![]));
+    let agentd = mcp::rmcp_transport::AgentdHttp::new(http, Duration::from_secs(5));
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(agentd.post_message(Arc::from(ep), message, None, None, HashMap::new()))
+}
+
+/// The one JSON answer a POST was handed back as, or a panic naming what came
+/// back instead.
+fn whole(out: Posted) -> Value {
+    match out {
+        Ok(StreamableHttpPostResponse::Json(m, _)) => serde_json::to_value(m).unwrap(),
+        other => panic!("expected one JSON answer, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_discover_answer_comes_back_whole() {
+    // The SDK's bootstrap reader looks for a RESPONSE on a stream and passes
+    // over an error, so a discover refusal handed back as a stream would never
+    // be seen. Handed back whole it is: as the server sent it…
+    let ep =
+        spawn_scripted(|_| json_body("200 OK", &rpc_error(json!(0), -32601, "Method not found")));
+    let got = whole(post(&ep, discover()));
+    assert_eq!(got["error"]["code"], -32601, "{got}");
+    assert_eq!(got["id"], 0, "{got}");
+
+    // …with a placeholder id put back on the request (the Python SDK's
+    // middleware answers `"server-error"`)…
+    let ep = spawn_scripted(|_| {
+        json_body(
+            "400 Bad Request",
+            &rpc_error(json!("server-error"), -32601, "Method not found"),
+        )
+    });
+    let got = whole(post(&ep, discover()));
+    assert_eq!(got["error"]["code"], -32601, "{got}");
+    assert_eq!(got["id"], 0, "re-correlated: {got}");
+
+    // …and a null id left null: the bootstrap reader takes an id-less error
+    // as the answer.
+    let ep = spawn_scripted(|_| {
+        json_body(
+            "400 Bad Request",
+            &rpc_error(Value::Null, -32000, "Bad Request"),
+        )
+    });
+    let got = whole(post(&ep, discover()));
+    assert_eq!(got["error"]["code"], -32000, "{got}");
+    assert_eq!(got["id"], Value::Null, "{got}");
+
+    // What the server says before its answer is not handed on: no lifecycle
+    // exists yet to receive it.
+    let ep = spawn_scripted(|_| {
+        let note = json!({"jsonrpc": "2.0", "method": "notifications/message",
+                          "params": {"level": "info", "data": "hello"}});
+        let answer = rpc_error(json!(0), -32601, "Method not found");
+        raw(
+            "200 OK",
+            &["Content-Type: text/event-stream"],
+            &format!("data: {note}\n\ndata: {answer}\n\n"),
+        )
+    });
+    let got = whole(post(&ep, discover()));
+    assert_eq!(got["error"]["code"], -32601, "{got}");
+}
+
+/// A frame the server could not put the request's id on.
+fn id_less_frame() -> Vec<u8> {
+    let frame = rpc_error(Value::Null, -32601, "no such method, said the server");
+    raw(
+        "200 OK",
+        &["Content-Type: text/event-stream"],
+        &format!("data: {frame}\n\n"),
+    )
+}
+
+#[test]
+fn an_error_frame_that_cannot_carry_the_id_answers_its_post() {
+    // A POST's stream carries only its own exchange, so an error on it is its
+    // answer whatever the id says — not a notification to be dropped.
+    let ep = spawn_scripted(|_| id_less_frame());
+    let got = whole(post(&ep, discover()));
+    assert_eq!(got["error"]["code"], -32601, "{got}");
+
+    // And on a call, where the SDK routes by id: the frame is put back on the
+    // call, which ends with the server's error rather than waiting out its
+    // stream for an answer that came.
+    let ep = spawn_scripted(|msg| match msg["method"].as_str() {
+        Some("initialize") => initialized(msg),
+        Some("tools/call") => id_less_frame(),
+        _ => raw("202 Accepted", &[], ""),
+    });
+    let mut c = mcp::client::McpClient::connect("frames", &ep, vec![], Duration::from_secs(5))
+        .expect("connect");
+    c.initialize().expect("initialize");
+    let err = c
+        .call_tool("t", Some(json!({})))
+        .expect_err("the server refused the call")
+        .to_string();
+    assert!(err.contains("no such method, said the server"), "{err}");
+}
+
+#[test]
+fn a_json_rpc_error_in_a_4xx_or_5xx_body_is_the_requests_answer() {
+    for (status, code, message) in [
+        ("400 Bad Request", -32020, "Mcp-Name does not match"),
+        (
+            "500 Internal Server Error",
+            -32603,
+            "the tool's backend is down",
+        ),
+    ] {
+        let ep = spawn_scripted(move |msg| match msg["method"].as_str() {
+            Some("initialize") => initialized(msg),
+            Some("tools/call") => json_body(status, &rpc_error(Value::Null, code, message)),
+            _ => raw("202 Accepted", &[], ""),
+        });
+        let mut c = mcp::client::McpClient::connect("bodies", &ep, vec![], Duration::from_secs(5))
+            .expect("connect");
+        c.initialize().expect("initialize");
+        let err = c
+            .call_tool("t", Some(json!({})))
+            .expect_err("the server refused the call")
+            .to_string();
+        assert!(
+            err.contains(message),
+            "{status}: the server's own error: {err}"
+        );
+    }
+}
+
+#[test]
+fn an_auth_failure_or_a_bodyless_status_stays_a_status() {
+    let challenge = rpc_error(Value::Null, -32001, "the server's own words on auth");
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        // Whatever an auth failure's body says, it is the status the credential
+        // machinery and the operator act on — never an answer.
+        ("401", json_body("401 Unauthorized", &challenge)),
+        ("401", raw("401 Unauthorized", &[], "")),
+        ("403", json_body("403 Forbidden", &challenge)),
+        ("404", raw("404 Not Found", &[], "")),
+        (
+            "503",
+            raw(
+                "503 Service Unavailable",
+                &["Content-Type: text/plain"],
+                "down",
+            ),
+        ),
+    ];
+    for (code, bytes) in cases {
+        let ep = spawn_scripted(move |_| bytes.clone());
+        let err = match post(&ep, discover()) {
+            Err(e) => e.to_string(),
+            Ok(other) => panic!("HTTP {code} is a status, not an answer: {other:?}"),
+        };
+        assert!(
+            err.contains(&format!("server returned HTTP {code}")),
+            "{err}"
+        );
+        assert!(!err.contains("the server's own words"), "{err}");
+    }
+}
+
+#[test]
+fn a_success_with_no_body_is_no_answer() {
+    // A `202` to a request: accepted, and not answered. Said as that, not as a
+    // JSON parse error about an empty body.
+    let ep = spawn_scripted(|_| raw("202 Accepted", &[], ""));
+    let err = match post(&ep, discover()) {
+        Err(e) => e.to_string(),
+        Ok(other) => panic!("a 202 is no answer: {other:?}"),
+    };
+    assert!(err.contains("no JSON-RPC response"), "{err}");
+}
+
+#[test]
+fn a_session_is_taken_only_from_the_initialize_answer() {
+    // Every answer is stamped; only the `initialize` answer's stamp is a
+    // session.
+    let ep = spawn_scripted(|msg| {
+        let sid = match msg["method"].as_str() {
+            Some("initialize") => "y",
+            _ if msg["id"] == 9 => "z",
+            _ => "x",
+        };
+        let resp = json!({"jsonrpc": "2.0", "id": msg["id"], "result": {}});
+        raw(
+            "200 OK",
+            &[
+                "Content-Type: application/json",
+                &format!("Mcp-Session-Id: {sid}"),
+            ],
+            &resp.to_string(),
+        )
+    });
+    let t = HttpTransport::new(McpEndpoint::parse(&ep).unwrap(), vec![]);
+    let send = |id: i64, method: &str| {
+        let body = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": {}});
+        t.send(
+            Some(id),
+            body.to_string().as_bytes(),
+            Duration::from_secs(5),
+            &[],
+            |_| {},
+        )
+        .expect("answered");
+    };
+
+    send(0, "server/discover");
+    send(1, "tools/list");
+    assert_eq!(
+        t.session_id(),
+        None,
+        "a stamp on another answer is not a session"
+    );
+    send(2, "initialize");
+    assert_eq!(t.session_id().as_deref(), Some("y"));
+    send(9, "tools/list");
+    assert_eq!(
+        t.session_id().as_deref(),
+        Some("y"),
+        "the session is the initialize answer's"
+    );
+}
+
+#[test]
+fn an_initialize_refused_with_a_json_rpc_error_says_the_servers_error() {
+    let ep = spawn_scripted(|_| {
+        json_body(
+            "400 Bad Request",
+            &rpc_error(Value::Null, -32022, "Unsupported protocol version"),
+        )
+    });
+    let err = match RmcpBuilder::new("refuses", &ep, vec![], Duration::from_secs(5)).connect() {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("the server refused the handshake"),
+    };
+    assert!(err.contains("Unsupported protocol version"), "{err}");
 }
